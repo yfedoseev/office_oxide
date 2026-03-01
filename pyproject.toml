@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "office-oxide"
+version = "0.1.0"
+description = "The fastest Office document processing library for Python"
+requires-python = ">=3.8"
+license = {text = "MIT OR Apache-2.0"}
+keywords = ["docx", "xlsx", "pptx", "office", "text-extraction"]
+
+[tool.maturin]
+features = ["python"]
+python-source = "python"
+module-name = "office_oxide._native"
+manifest-path = "crates/office_oxide/Cargo.toml"

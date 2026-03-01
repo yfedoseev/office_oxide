@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/office_core",
+    "crates/docx_oxide",
+    "crates/xlsx_oxide",
+    "crates/pptx_oxide",
+    "crates/office_oxide",
+    "crates/office_oxide_cli",
+    "crates/office_oxide_mcp",
+]
+exclude = ["bench_rust"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/user/office_oxide"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Shared across crates
+quick-xml = { version = "0.37", features = ["serialize"] }
+zip = { version = "8.1", default-features = false, features = ["deflate"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+memmap2 = "0.9"
+rayon = "1.10"
+
+# Internal crates
+office_core = { path = "crates/office_core" }
+docx_oxide = { path = "crates/docx_oxide" }
+xlsx_oxide = { path = "crates/xlsx_oxide" }
+pptx_oxide = { path = "crates/pptx_oxide" }
+
+# Bindings
+pyo3 = { version = "0.28", features = ["extension-module"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3

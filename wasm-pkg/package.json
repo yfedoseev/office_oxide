@@ -1,0 +1,9 @@
+{
+  "name": "office-oxide",
+  "version": "0.1.0",
+  "description": "Fast Office document processing (DOCX/XLSX/PPTX) compiled to WebAssembly",
+  "license": "MIT OR Apache-2.0",
+  "main": "office_oxide.js",
+  "types": "office_oxide.d.ts",
+  "keywords": ["docx", "xlsx", "pptx", "office", "wasm", "text-extraction"]
+}

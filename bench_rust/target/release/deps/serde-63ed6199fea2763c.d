@@ -1,0 +1,14 @@
+/home/yfedoseev/projects/office_oxide/bench_rust/target/release/deps/serde-63ed6199fea2763c.d: /home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/yfedoseev/projects/office_oxide/bench_rust/target/release/build/serde-882ad471add7f2e9/out/private.rs
+
+/home/yfedoseev/projects/office_oxide/bench_rust/target/release/deps/libserde-63ed6199fea2763c.rlib: /home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/yfedoseev/projects/office_oxide/bench_rust/target/release/build/serde-882ad471add7f2e9/out/private.rs
+
+/home/yfedoseev/projects/office_oxide/bench_rust/target/release/deps/libserde-63ed6199fea2763c.rmeta: /home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/yfedoseev/projects/office_oxide/bench_rust/target/release/build/serde-882ad471add7f2e9/out/private.rs
+
+/home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/home/yfedoseev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/home/yfedoseev/projects/office_oxide/bench_rust/target/release/build/serde-882ad471add7f2e9/out/private.rs:
+
+# env-dep:OUT_DIR=/home/yfedoseev/projects/office_oxide/bench_rust/target/release/build/serde-882ad471add7f2e9/out

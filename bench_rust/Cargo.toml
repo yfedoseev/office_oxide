@@ -1,0 +1,25 @@
+[package]
+name = "bench_rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+calamine = "0.26"
+dotext = "0.1"
+docx-rs = "0.4"
+
+[[bin]]
+name = "bench_rust"
+path = "src/main.rs"
+
+[[bin]]
+name = "find_oom"
+path = "src/find_oom.rs"
+
+[[bin]]
+name = "dotext_perfile"
+path = "src/dotext_perfile.rs"
+
+[profile.release]
+lto = true
+opt-level = 3

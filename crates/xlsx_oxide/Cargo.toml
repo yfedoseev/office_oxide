@@ -1,0 +1,19 @@
+[package]
+name = "xlsx_oxide"
+description = "High-performance Excel spreadsheet (.xlsx) processing in Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+office_core.workspace = true
+quick-xml.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+log.workspace = true
+rayon = { workspace = true, optional = true }
+
+[features]
+mmap = ["office_core/mmap"]
+parallel = ["dep:rayon"]

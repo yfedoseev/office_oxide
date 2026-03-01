@@ -1,0 +1,12 @@
+/target/
+**/__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+*.so
+*.dylib
+node_modules/
+wasm-pkg/pkg/
+*.wasm

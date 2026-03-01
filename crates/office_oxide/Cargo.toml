@@ -1,0 +1,56 @@
+[package]
+name = "office_oxide"
+description = "The fastest document processing suite — read, write, convert DOCX/XLSX/PPTX/PDF"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "office_oxide"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+office_core.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+
+[dependencies.docx_oxide]
+workspace = true
+optional = true
+
+[dependencies.xlsx_oxide]
+workspace = true
+optional = true
+
+[dependencies.pptx_oxide]
+workspace = true
+optional = true
+
+[features]
+default = ["docx", "xlsx", "pptx"]
+docx = ["dep:docx_oxide"]
+xlsx = ["dep:xlsx_oxide"]
+pptx = ["dep:pptx_oxide"]
+python = ["dep:pyo3"]
+wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde-wasm-bindgen"]
+mmap = ["office_core/mmap", "docx_oxide?/mmap", "xlsx_oxide?/mmap", "pptx_oxide?/mmap"]
+parallel = ["xlsx_oxide?/parallel", "pptx_oxide?/parallel"]
+
+[dependencies.pyo3]
+workspace = true
+optional = true
+
+[dependencies.wasm-bindgen]
+version = "0.2"
+optional = true
+
+[dependencies.js-sys]
+version = "0.3"
+optional = true
+
+[dependencies.serde-wasm-bindgen]
+version = "0.6"
+optional = true

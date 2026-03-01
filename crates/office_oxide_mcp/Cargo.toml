@@ -1,0 +1,16 @@
+[package]
+name = "office_oxide_mcp"
+description = "MCP server for Office document processing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "office-oxide-mcp"
+path = "src/main.rs"
+
+[dependencies]
+office_oxide = { path = "../office_oxide" }
+serde = { workspace = true }
+serde_json.workspace = true
