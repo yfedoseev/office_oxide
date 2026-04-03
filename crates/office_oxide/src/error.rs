@@ -16,6 +16,18 @@ pub enum OfficeError {
     #[error(transparent)]
     Pptx(#[from] pptx_oxide::PptxError),
 
+    #[cfg(feature = "doc")]
+    #[error(transparent)]
+    Doc(#[from] doc_oxide::DocError),
+
+    #[cfg(feature = "xls")]
+    #[error(transparent)]
+    Xls(#[from] xls_oxide::XlsError),
+
+    #[cfg(feature = "ppt")]
+    #[error(transparent)]
+    Ppt(#[from] ppt_oxide::PptError),
+
     #[error("unsupported format: {0}")]
     UnsupportedFormat(String),
 }

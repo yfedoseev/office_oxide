@@ -2,6 +2,10 @@
 resolver = "2"
 members = [
     "crates/office_core",
+    "crates/cfb_oxide",
+    "crates/xls_oxide",
+    "crates/ppt_oxide",
+    "crates/doc_oxide",
     "crates/docx_oxide",
     "crates/xlsx_oxide",
     "crates/pptx_oxide",

@@ -15,5 +15,7 @@ pub mod opc;
 pub mod properties;
 pub mod theme;
 pub mod editable;
+pub mod traits;
 
 pub use error::{Error, Result};
+pub use traits::OfficeDocument;

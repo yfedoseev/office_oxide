@@ -63,7 +63,7 @@ fn collect_files(dir: &std::path::Path, out: &mut Vec<String>) {
             collect_files(&path, out);
         } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             match ext.to_ascii_lowercase().as_str() {
-                "docx" | "xlsx" | "pptx" => {
+                "docx" | "xlsx" | "pptx" | "doc" | "xls" | "ppt" => {
                     out.push(path.to_string_lossy().into_owned());
                 }
                 _ => {}

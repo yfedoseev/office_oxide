@@ -1,0 +1,85 @@
+[
+  {
+    "library": "office_oxide",
+    "language": "Rust",
+    "total": 916,
+    "ok": 899,
+    "pass_rate": 98.1,
+    "mean_ms": 10.9,
+    "p99_ms": 238,
+    "wall_s": 13.9,
+    "license": "MIT"
+  },
+  {
+    "library": "xlrd",
+    "language": "Python",
+    "format": "xls",
+    "total": 494,
+    "ok": 460,
+    "pass_rate": 93.1,
+    "mean_ms": 36.6,
+    "p99_ms": 502.8,
+    "wall_s": 16.9,
+    "license": "BSD-3"
+  },
+  {
+    "library": "python-calamine",
+    "language": "Rust (Python)",
+    "format": "xls",
+    "total": 494,
+    "ok": 448,
+    "pass_rate": 90.7,
+    "mean_ms": 9.0,
+    "p99_ms": 96.2,
+    "wall_s": 33.1,
+    "license": "MIT"
+  },
+  {
+    "library": "antiword",
+    "language": "C",
+    "total": 246,
+    "ok": 189,
+    "pass_rate": 76.8,
+    "mean_ms": 4.5,
+    "p99_ms": 66.0,
+    "wall_s": 1.0,
+    "license": "GPL-2.0",
+    "format": "doc"
+  },
+  {
+    "library": "catdoc",
+    "language": "C",
+    "total": 246,
+    "ok": 222,
+    "pass_rate": 90.2,
+    "mean_ms": 4.3,
+    "p99_ms": 41.1,
+    "wall_s": 1.0,
+    "license": "GPL-2.0",
+    "format": "doc"
+  },
+  {
+    "library": "xls2csv",
+    "language": "C",
+    "total": 494,
+    "ok": 415,
+    "pass_rate": 84.0,
+    "mean_ms": 6.9,
+    "p99_ms": 57.6,
+    "wall_s": 3.5,
+    "license": "GPL-2.0",
+    "format": "xls"
+  },
+  {
+    "library": "catppt",
+    "language": "C",
+    "total": 176,
+    "ok": 137,
+    "pass_rate": 77.8,
+    "mean_ms": 2.8,
+    "p99_ms": 8.3,
+    "wall_s": 0.5,
+    "license": "GPL-2.0",
+    "format": "ppt"
+  }
+]

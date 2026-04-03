@@ -1,0 +1,12 @@
+[package]
+name = "ppt_oxide"
+description = "Pure Rust reader for legacy PowerPoint Binary (.ppt) files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cfb_oxide = { path = "../cfb_oxide" }
+office_core.workspace = true
+thiserror.workspace = true

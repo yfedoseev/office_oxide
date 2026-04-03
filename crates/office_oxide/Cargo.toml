@@ -29,11 +29,26 @@ optional = true
 workspace = true
 optional = true
 
+[dependencies.doc_oxide]
+path = "../doc_oxide"
+optional = true
+
+[dependencies.xls_oxide]
+path = "../xls_oxide"
+optional = true
+
+[dependencies.ppt_oxide]
+path = "../ppt_oxide"
+optional = true
+
 [features]
-default = ["docx", "xlsx", "pptx"]
+default = ["docx", "xlsx", "pptx", "doc", "xls", "ppt"]
 docx = ["dep:docx_oxide"]
 xlsx = ["dep:xlsx_oxide"]
 pptx = ["dep:pptx_oxide"]
+doc = ["dep:doc_oxide"]
+xls = ["dep:xls_oxide"]
+ppt = ["dep:ppt_oxide"]
 python = ["dep:pyo3"]
 wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde-wasm-bindgen"]
 mmap = ["office_core/mmap", "docx_oxide?/mmap", "xlsx_oxide?/mmap", "pptx_oxide?/mmap"]

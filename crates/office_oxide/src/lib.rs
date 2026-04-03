@@ -13,6 +13,7 @@ mod convert_pptx;
 pub use error::{OfficeError, Result};
 pub use format::DocumentFormat;
 pub use ir::DocumentIR;
+pub use office_core::OfficeDocument;
 
 pub mod create;
 pub mod edit;
@@ -29,6 +30,12 @@ pub use docx_oxide;
 pub use xlsx_oxide;
 #[cfg(feature = "pptx")]
 pub use pptx_oxide;
+#[cfg(feature = "doc")]
+pub use doc_oxide;
+#[cfg(feature = "xls")]
+pub use xls_oxide;
+#[cfg(feature = "ppt")]
+pub use ppt_oxide;
 pub use office_core;
 
 use std::io::{Read, Seek};
@@ -36,7 +43,27 @@ use std::path::Path;
 
 use log::info;
 
-/// A unified document handle supporting DOCX, XLSX, and PPTX formats.
+/// Dispatch a method call to the inner document type across all feature-gated variants.
+macro_rules! dispatch_inner {
+    ($self:expr, $method:ident) => {
+        match &$self.inner {
+            #[cfg(feature = "docx")]
+            DocumentInner::Docx(doc) => doc.$method(),
+            #[cfg(feature = "xlsx")]
+            DocumentInner::Xlsx(doc) => doc.$method(),
+            #[cfg(feature = "pptx")]
+            DocumentInner::Pptx(doc) => doc.$method(),
+            #[cfg(feature = "doc")]
+            DocumentInner::Doc(doc) => doc.$method(),
+            #[cfg(feature = "xls")]
+            DocumentInner::Xls(doc) => doc.$method(),
+            #[cfg(feature = "ppt")]
+            DocumentInner::Ppt(doc) => doc.$method(),
+        }
+    };
+}
+
+/// A unified document handle supporting DOCX, XLSX, PPTX, DOC, XLS, and PPT formats.
 pub struct Document {
     inner: DocumentInner,
 }
@@ -48,6 +75,12 @@ enum DocumentInner {
     Xlsx(Box<xlsx_oxide::XlsxDocument>),
     #[cfg(feature = "pptx")]
     Pptx(Box<pptx_oxide::PptxDocument>),
+    #[cfg(feature = "doc")]
+    Doc(Box<doc_oxide::DocDocument>),
+    #[cfg(feature = "xls")]
+    Xls(Box<xls_oxide::XlsDocument>),
+    #[cfg(feature = "ppt")]
+    Ppt(Box<ppt_oxide::PptDocument>),
 }
 
 impl Document {
@@ -64,6 +97,9 @@ impl Document {
                     .to_string(),
             )
         })?;
+        // Sniff magic bytes to detect format mismatches (e.g., .doc that's actually OOXML, or vice versa).
+        let format = sniff_format(path, format);
+
         match format {
             #[cfg(feature = "docx")]
             DocumentFormat::Docx => {
@@ -79,6 +115,21 @@ impl Document {
             DocumentFormat::Pptx => {
                 let doc = pptx_oxide::PptxDocument::open(path)?;
                 Ok(Self { inner: DocumentInner::Pptx(Box::new(doc)) })
+            }
+            #[cfg(feature = "doc")]
+            DocumentFormat::Doc => {
+                let doc = doc_oxide::DocDocument::open(path)?;
+                Ok(Self { inner: DocumentInner::Doc(Box::new(doc)) })
+            }
+            #[cfg(feature = "xls")]
+            DocumentFormat::Xls => {
+                let doc = xls_oxide::XlsDocument::open(path)?;
+                Ok(Self { inner: DocumentInner::Xls(Box::new(doc)) })
+            }
+            #[cfg(feature = "ppt")]
+            DocumentFormat::Ppt => {
+                let doc = ppt_oxide::PptDocument::open(path)?;
+                Ok(Self { inner: DocumentInner::Ppt(Box::new(doc)) })
             }
             #[allow(unreachable_patterns)]
             _ => Err(OfficeError::UnsupportedFormat(format!("{format:?}"))),
@@ -138,6 +189,21 @@ impl Document {
                 let doc = pptx_oxide::PptxDocument::from_reader(reader)?;
                 Ok(Self { inner: DocumentInner::Pptx(Box::new(doc)) })
             }
+            #[cfg(feature = "doc")]
+            DocumentFormat::Doc => {
+                let doc = doc_oxide::DocDocument::from_reader(reader)?;
+                Ok(Self { inner: DocumentInner::Doc(Box::new(doc)) })
+            }
+            #[cfg(feature = "xls")]
+            DocumentFormat::Xls => {
+                let doc = xls_oxide::XlsDocument::from_reader(reader)?;
+                Ok(Self { inner: DocumentInner::Xls(Box::new(doc)) })
+            }
+            #[cfg(feature = "ppt")]
+            DocumentFormat::Ppt => {
+                let doc = ppt_oxide::PptDocument::from_reader(reader)?;
+                Ok(Self { inner: DocumentInner::Ppt(Box::new(doc)) })
+            }
             #[allow(unreachable_patterns)]
             _ => Err(OfficeError::UnsupportedFormat(format!("{format:?}"))),
         }
@@ -152,31 +218,23 @@ impl Document {
             DocumentInner::Xlsx(_) => DocumentFormat::Xlsx,
             #[cfg(feature = "pptx")]
             DocumentInner::Pptx(_) => DocumentFormat::Pptx,
+            #[cfg(feature = "doc")]
+            DocumentInner::Doc(_) => DocumentFormat::Doc,
+            #[cfg(feature = "xls")]
+            DocumentInner::Xls(_) => DocumentFormat::Xls,
+            #[cfg(feature = "ppt")]
+            DocumentInner::Ppt(_) => DocumentFormat::Ppt,
         }
     }
 
     /// Extract plain text using the format-specific implementation.
     pub fn plain_text(&self) -> String {
-        match &self.inner {
-            #[cfg(feature = "docx")]
-            DocumentInner::Docx(doc) => doc.plain_text(),
-            #[cfg(feature = "xlsx")]
-            DocumentInner::Xlsx(doc) => doc.plain_text(),
-            #[cfg(feature = "pptx")]
-            DocumentInner::Pptx(doc) => doc.plain_text(),
-        }
+        dispatch_inner!(self, plain_text)
     }
 
     /// Convert to markdown using the format-specific implementation.
     pub fn to_markdown(&self) -> String {
-        match &self.inner {
-            #[cfg(feature = "docx")]
-            DocumentInner::Docx(doc) => doc.to_markdown(),
-            #[cfg(feature = "xlsx")]
-            DocumentInner::Xlsx(doc) => doc.to_markdown(),
-            #[cfg(feature = "pptx")]
-            DocumentInner::Pptx(doc) => doc.to_markdown(),
-        }
+        dispatch_inner!(self, to_markdown)
     }
 
     /// Convert to the format-agnostic Document IR.
@@ -188,6 +246,13 @@ impl Document {
             DocumentInner::Xlsx(doc) => convert_xlsx::xlsx_to_ir(doc),
             #[cfg(feature = "pptx")]
             DocumentInner::Pptx(doc) => convert_pptx::pptx_to_ir(doc),
+            // Legacy formats: convert via plain text for now (no deep IR).
+            #[cfg(feature = "doc")]
+            DocumentInner::Doc(doc) => plain_text_to_ir(&doc.plain_text(), "Document", DocumentFormat::Doc),
+            #[cfg(feature = "xls")]
+            DocumentInner::Xls(doc) => plain_text_to_ir(&doc.plain_text(), "Spreadsheet", DocumentFormat::Xls),
+            #[cfg(feature = "ppt")]
+            DocumentInner::Ppt(doc) => plain_text_to_ir(&doc.plain_text(), "Presentation", DocumentFormat::Ppt),
         }
     }
 
@@ -216,6 +281,107 @@ impl Document {
             DocumentInner::Pptx(doc) => Some(doc),
             _ => None,
         }
+    }
+
+    /// Access the underlying DOC document, if this is a legacy .doc file.
+    #[cfg(feature = "doc")]
+    pub fn as_doc(&self) -> Option<&doc_oxide::DocDocument> {
+        match &self.inner {
+            DocumentInner::Doc(doc) => Some(doc),
+            _ => None,
+        }
+    }
+
+    /// Access the underlying XLS document, if this is a legacy .xls file.
+    #[cfg(feature = "xls")]
+    pub fn as_xls(&self) -> Option<&xls_oxide::XlsDocument> {
+        match &self.inner {
+            DocumentInner::Xls(doc) => Some(doc),
+            _ => None,
+        }
+    }
+
+    /// Access the underlying PPT document, if this is a legacy .ppt file.
+    #[cfg(feature = "ppt")]
+    pub fn as_ppt(&self) -> Option<&ppt_oxide::PptDocument> {
+        match &self.inner {
+            DocumentInner::Ppt(doc) => Some(doc),
+            _ => None,
+        }
+    }
+}
+
+/// Simple IR conversion from plain text for legacy formats.
+fn plain_text_to_ir(text: &str, title: &str, format: DocumentFormat) -> DocumentIR {
+    use ir::{Element, InlineContent, Metadata, Paragraph, Section, TextSpan};
+
+    let elements: Vec<Element> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    text: line.to_string(),
+                    bold: false,
+                    italic: false,
+                    strikethrough: false,
+                    hyperlink: None,
+                })],
+            })
+        })
+        .collect();
+
+    DocumentIR {
+        metadata: Metadata {
+            format,
+            title: Some(title.to_string()),
+        },
+        sections: vec![Section {
+            title: Some(title.to_string()),
+            elements,
+        }],
+    }
+}
+
+impl OfficeDocument for Document {
+    fn plain_text(&self) -> String {
+        self.plain_text()
+    }
+
+    fn to_markdown(&self) -> String {
+        self.to_markdown()
+    }
+}
+
+/// Sniff magic bytes to detect format mismatches.
+///
+/// Handles cases like:
+/// - `.doc` file that's actually OOXML (ZIP) → route to DOCX parser
+/// - `.docx` file that's actually OLE2 (CFB) → route to DOC parser
+/// - Same for xls/xlsx and ppt/pptx
+fn sniff_format(path: &Path, ext_format: DocumentFormat) -> DocumentFormat {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return ext_format;
+    };
+    let mut magic = [0u8; 4];
+    if std::io::Read::read(&mut file, &mut magic).unwrap_or(0) < 4 {
+        return ext_format;
+    }
+
+    let is_zip = magic == [0x50, 0x4B, 0x03, 0x04]; // PK\x03\x04
+    let is_cfb = magic == [0xD0, 0xCF, 0x11, 0xE0]; // CFB signature (first 4 bytes)
+
+    match ext_format {
+        // Legacy extension but actually OOXML (ZIP)
+        DocumentFormat::Doc if is_zip => DocumentFormat::Docx,
+        DocumentFormat::Xls if is_zip => DocumentFormat::Xlsx,
+        DocumentFormat::Ppt if is_zip => DocumentFormat::Pptx,
+        // OOXML extension but actually legacy (CFB)
+        DocumentFormat::Docx if is_cfb => DocumentFormat::Doc,
+        DocumentFormat::Xlsx if is_cfb => DocumentFormat::Xls,
+        DocumentFormat::Pptx if is_cfb => DocumentFormat::Ppt,
+        // No mismatch
+        _ => ext_format,
     }
 }
 

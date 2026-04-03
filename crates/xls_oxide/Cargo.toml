@@ -1,0 +1,12 @@
+[package]
+name = "xls_oxide"
+description = "Pure Rust reader for legacy Excel Binary (.xls) BIFF8 files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cfb_oxide = { path = "../cfb_oxide" }
+office_core.workspace = true
+thiserror.workspace = true

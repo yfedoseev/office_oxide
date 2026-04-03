@@ -65,6 +65,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
 
 [[package]]
+name = "cfb_oxide"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -149,6 +156,15 @@ name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+
+[[package]]
+name = "doc_oxide"
+version = "0.1.0"
+dependencies = [
+ "cfb_oxide",
+ "office_core",
+ "thiserror",
+]
 
 [[package]]
 name = "docx_oxide"
@@ -290,10 +306,12 @@ dependencies = [
 name = "office_oxide"
 version = "0.1.0"
 dependencies = [
+ "doc_oxide",
  "docx_oxide",
  "js-sys",
  "log",
  "office_core",
+ "ppt_oxide",
  "pptx_oxide",
  "pyo3",
  "serde",
@@ -301,6 +319,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "wasm-bindgen",
+ "xls_oxide",
  "xlsx_oxide",
 ]
 
@@ -339,6 +358,15 @@ name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
+
+[[package]]
+name = "ppt_oxide"
+version = "0.1.0"
+dependencies = [
+ "cfb_oxide",
+ "office_core",
+ "thiserror",
+]
 
 [[package]]
 name = "pptx_oxide"
@@ -643,6 +671,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "xls_oxide"
+version = "0.1.0"
+dependencies = [
+ "cfb_oxide",
+ "office_core",
+ "thiserror",
 ]
 
 [[package]]

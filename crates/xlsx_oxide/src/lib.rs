@@ -220,3 +220,13 @@ fn dereference_shared_strings(ws: &mut Worksheet, sst: &SharedStringTable) {
         }
     }
 }
+
+impl office_core::OfficeDocument for XlsxDocument {
+    fn plain_text(&self) -> String {
+        self.plain_text()
+    }
+
+    fn to_markdown(&self) -> String {
+        self.to_markdown()
+    }
+}

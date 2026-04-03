@@ -1,0 +1,10 @@
+[package]
+name = "cfb_oxide"
+description = "Pure Rust reader for Compound Binary File (OLE2/CFBF) containers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true

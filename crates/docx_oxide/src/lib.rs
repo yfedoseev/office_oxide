@@ -1036,6 +1036,16 @@ fn parse_hf_type(e: &quick_xml::events::BytesStart) -> CoreResult<HeaderFooterTy
 // Tests
 // ---------------------------------------------------------------------------
 
+impl office_core::OfficeDocument for DocxDocument {
+    fn plain_text(&self) -> String {
+        self.plain_text()
+    }
+
+    fn to_markdown(&self) -> String {
+        self.to_markdown()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

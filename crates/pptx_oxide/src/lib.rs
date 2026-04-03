@@ -191,3 +191,13 @@ fn xml_csl_name(xml_data: &[u8]) -> String {
 fn extract_notes_text(xml_data: &[u8]) -> Option<String> {
     slide::extract_notes_text(xml_data)
 }
+
+impl office_core::OfficeDocument for PptxDocument {
+    fn plain_text(&self) -> String {
+        self.plain_text()
+    }
+
+    fn to_markdown(&self) -> String {
+        self.to_markdown()
+    }
+}
