@@ -1,4 +1,5 @@
 /target/
+bench_rust/target/
 **/__pycache__/
 *.pyc
 .venv/
