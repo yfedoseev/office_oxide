@@ -1,13 +1,76 @@
+# Rust
 /target/
 bench_rust/target/
+**/*.rs.bk
+*.pdb
+
+# Python
 **/__pycache__/
 *.pyc
+*.pyo
 .venv/
 *.egg-info/
 dist/
 build/
 *.so
 *.dylib
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.whl
+.ort/
+
+# Node / WASM
 node_modules/
 wasm-pkg/pkg/
 *.wasm
+wasm-pack.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CI / Coverage
+lcov.info
+tarpaulin-report.html
+coverage/
+
+# Development tools
+.claude/
+.agents/
+.cursor/
+.playwright-mcp/
+Claude.md
+
+# Website assets
+oxide_fyi_home.png
+oxide_fyi_snapshot.md
+
+# Temporary
+*.tmp
+*.log
+.env
+.env.*
+
+# Generated exports
+markdown_exports/
+html_exports/
+
+# Large test files
+tests/fixtures/large/
+tests/fixtures/real/
+
+# Keep small test fixtures
+!tests/fixtures/simple.*
+!tests/fixtures/hello_world.*

@@ -1,0 +1,228 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Check formatting
+  fmt:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+  # Linting with Clippy
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  # Build and test
+  test:
+    name: Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable, beta]
+        include:
+          - os: ubuntu-latest
+            rust: nightly
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.rust }}
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Run tests
+        run: cargo test --verbose
+
+      - name: Build documentation
+        run: cargo doc --no-deps
+
+  # Test feature combinations
+  features:
+    name: Feature Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features:
+          - ""
+          - "mmap"
+          - "parallel"
+          - "python"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build with features
+        run: cargo build -p office_oxide --no-default-features --features "${{ matrix.features }}"
+        if: matrix.features != ''
+
+      - name: Build without features
+        run: cargo build -p office_oxide --no-default-features
+        if: matrix.features == ''
+
+  # Python bindings test
+  python:
+    name: Python Bindings
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Create virtual environment
+        run: uv venv
+
+      - name: Install maturin
+        run: uv pip install maturin pytest
+
+      - name: Build Python package
+        run: uv run maturin build --release --features python --out dist
+
+      - name: Install wheel
+        shell: bash
+        run: |
+          wheel=$(ls dist/*.whl)
+          uv pip install "$wheel"
+
+      - name: Test Python bindings
+        run: uv run python -c "import office_oxide; print('office_oxide imported successfully')"
+
+  # WASM build check
+  wasm-build:
+    name: WASM Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build WASM
+        run: cargo build -p office_oxide --lib --target wasm32-unknown-unknown --features wasm,default
+
+  # Code coverage with enforcement
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate coverage
+        run: |
+          cargo llvm-cov --lib --tests --lcov --output-path lcov.info \
+            --ignore-filename-regex '(python\.rs|wasm\.rs)'
+
+      - name: Enforce 85% coverage threshold
+        run: |
+          cargo llvm-cov report \
+            --ignore-filename-regex '(python\.rs|wasm\.rs)' \
+            --fail-under-lines 85
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v6
+        with:
+          files: ./lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  # Security audit
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run security audit
+        uses: actions-rust-lang/audit@v1
+
+  # Check dependencies
+  deny:
+    name: Dependency Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check dependencies
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: ""

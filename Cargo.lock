@@ -59,17 +59,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "atoi_simd"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3cdb3708a128e559a30fb830e8a77a5022ee6902806925c216658652b452a44"
+dependencies = [
+ "debug_unsafe",
+ "rustversion",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
-
-[[package]]
-name = "cfb_oxide"
-version = "0.1.0"
-dependencies = [
- "thiserror",
-]
 
 [[package]]
 name = "cfg-if"
@@ -158,24 +161,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
-name = "doc_oxide"
-version = "0.1.0"
-dependencies = [
- "cfb_oxide",
- "office_core",
- "thiserror",
-]
-
-[[package]]
-name = "docx_oxide"
-version = "0.1.0"
-dependencies = [
- "log",
- "office_core",
- "quick-xml",
- "serde",
- "thiserror",
-]
+name = "debug_unsafe"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7eed2c4702fa172d1ce21078faa7c5203e69f5394d48cc436d25928394a867a2"
 
 [[package]]
 name = "either"
@@ -197,6 +186,12 @@ name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+
+[[package]]
+name = "fast-float2"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8eb564c5c7423d25c886fb561d1e4ee69f72354d16918afa32c08811f6b6a55"
 
 [[package]]
 name = "flate2"
@@ -290,37 +285,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "office_core"
-version = "0.1.0"
-dependencies = [
- "encoding_rs",
- "log",
- "memmap2",
- "quick-xml",
- "serde",
- "thiserror",
- "zip",
-]
-
-[[package]]
 name = "office_oxide"
 version = "0.1.0"
 dependencies = [
- "doc_oxide",
- "docx_oxide",
+ "atoi_simd",
+ "encoding_rs",
+ "fast-float2",
  "js-sys",
+ "libc",
  "log",
- "office_core",
- "ppt_oxide",
- "pptx_oxide",
+ "memmap2",
  "pyo3",
+ "quick-xml",
+ "rayon",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
  "thiserror",
  "wasm-bindgen",
- "xls_oxide",
- "xlsx_oxide",
+ "zip",
 ]
 
 [[package]]
@@ -358,27 +341,6 @@ name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
-
-[[package]]
-name = "ppt_oxide"
-version = "0.1.0"
-dependencies = [
- "cfb_oxide",
- "office_core",
- "thiserror",
-]
-
-[[package]]
-name = "pptx_oxide"
-version = "0.1.0"
-dependencies = [
- "log",
- "office_core",
- "quick-xml",
- "rayon",
- "serde",
- "thiserror",
-]
 
 [[package]]
 name = "proc-macro2"
@@ -674,27 +636,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "xls_oxide"
-version = "0.1.0"
-dependencies = [
- "cfb_oxide",
- "office_core",
- "thiserror",
-]
-
-[[package]]
-name = "xlsx_oxide"
-version = "0.1.0"
-dependencies = [
- "log",
- "office_core",
- "quick-xml",
- "rayon",
- "serde",
- "thiserror",
-]
-
-[[package]]
 name = "zip"
 version = "8.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -710,9 +651,9 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.6.2"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c745c48e1007337ed136dc99df34128b9faa6ed542d80a1c673cf55a6d7236c8"
+checksum = "3be3d40e40a133f9c916ee3f9f4fa2d9d63435b5fbe1bfc6d9dae0aa0ada1513"
 
 [[package]]
 name = "zmij"

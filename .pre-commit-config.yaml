@@ -1,0 +1,61 @@
+repos:
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v6.0.0
+  hooks:
+  - id: check-toml
+    name: check toml files
+  - id: check-yaml
+    name: check yaml files
+
+# https://docs.rs/cargo-deny/latest/cargo_deny/#pre-commit-hook
+- repo: https://github.com/EmbarkStudios/cargo-deny
+  rev: 0.19.0
+  hooks:
+    - id: cargo-deny
+      args: ["check"]
+
+- repo: local
+  hooks:
+    # rust codes
+    - id: cargo-fmt
+      name: cargo fmt
+      entry: cargo fmt --all -- --check
+      language: system
+      pass_filenames: false
+      types: [rust]
+
+    - id: cargo-check
+      name: cargo check
+      entry: cargo check
+      language: system
+      pass_filenames: false
+      types: [rust]
+
+    - id: cargo-clippy
+      name: cargo clippy
+      entry: cargo clippy -- -D warnings
+      language: system
+      pass_filenames: false
+      types: [rust]
+
+    - id: cargo-clippy-python
+      name: cargo clippy python
+      entry: cargo clippy --features python -- -D warnings
+      language: system
+      pass_filenames: false
+      types: [rust]
+
+- repo: https://github.com/allganize/ty-pre-commit
+  rev: v0.0.18
+  hooks:
+    # Run the type checker.
+    - id: ty-check
+      exclude: .*test.*.py$
+
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  rev: v0.15.5
+  hooks:
+  - id: ruff-check
+    args: [--fix]
+  # Run the formatter.
+  - id: ruff-format

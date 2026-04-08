@@ -1,9 +1,46 @@
 {
-  "name": "office-oxide",
+  "name": "office-oxide-wasm",
   "version": "0.1.0",
-  "description": "Fast Office document processing (DOCX/XLSX/PPTX) compiled to WebAssembly",
+  "description": "Fast Office document processing (DOCX/XLSX/PPTX/DOC/XLS/PPT) compiled to WebAssembly. Rust core, zero JS dependencies.",
   "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yfedoseev/office_oxide"
+  },
+  "homepage": "https://oxide.fyi",
+  "bugs": {
+    "url": "https://github.com/yfedoseev/office_oxide/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "office_oxide_bg.wasm",
+    "office_oxide.js",
+    "office_oxide.d.ts",
+    "office_oxide_bg.wasm.d.ts"
+  ],
   "main": "office_oxide.js",
   "types": "office_oxide.d.ts",
-  "keywords": ["docx", "xlsx", "pptx", "office", "wasm", "text-extraction"]
+  "sideEffects": false,
+  "keywords": [
+    "docx",
+    "xlsx",
+    "pptx",
+    "doc",
+    "xls",
+    "ppt",
+    "office",
+    "wasm",
+    "webassembly",
+    "text-extraction",
+    "document-parser",
+    "rust",
+    "rust-wasm",
+    "serverless",
+    "node",
+    "browser",
+    "zero-dependency",
+    "typescript"
+  ]
 }

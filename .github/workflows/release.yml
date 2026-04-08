@@ -1,0 +1,459 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v0.1.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Validate tag matches version
+  validate:
+    name: Validate Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Get version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Detected version: $VERSION"
+
+      - name: Validate tag matches version
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          EXPECTED_TAG="v$VERSION"
+          if [ "$TAG" != "$EXPECTED_TAG" ]; then
+            echo "Error: Tag '$TAG' does not match Cargo.toml version '$VERSION'"
+            echo "Expected tag: $EXPECTED_TAG"
+            exit 1
+          fi
+
+      - name: Validate version consistency
+        run: |
+          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          PY_VERSION=$(grep '^version = ' pyproject.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if [ "$CARGO_VERSION" != "$PY_VERSION" ]; then
+            echo "Error: Cargo.toml ($CARGO_VERSION) and pyproject.toml ($PY_VERSION) versions don't match"
+            exit 1
+          fi
+          echo "Cargo.toml and pyproject.toml versions match: $CARGO_VERSION"
+
+      - name: Verify release is from main branch
+        run: |
+          git fetch origin main
+          TAG_SHA=$(git rev-parse HEAD)
+          if ! git merge-base --is-ancestor $TAG_SHA origin/main; then
+            echo "Error: Release tags must be created from commits on the main branch"
+            exit 1
+          fi
+          echo "Verified: Tag points to a commit on main branch"
+
+  # Build native binaries for CLI and MCP
+  build-binaries:
+    name: Build Binaries (${{ matrix.target }})
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: office_oxide-linux-x86_64
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact_name: office_oxide-linux-x86_64-musl
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: office_oxide-linux-aarch64
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: office_oxide-macos-x86_64
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: office_oxide-macos-aarch64
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: office_oxide-windows-x86_64
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }} -p office_oxide_cli -p office_oxide_mcp
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          ARCHIVE="${{ matrix.artifact_name }}-${VERSION}.tar.gz"
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/office-oxide staging/
+          cp target/${{ matrix.target }}/release/office-oxide-mcp staging/
+          tar -czf "$ARCHIVE" -C staging .
+          echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          ARCHIVE="${{ matrix.artifact_name }}-${VERSION}.zip"
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/office-oxide.exe staging/
+          cp target/${{ matrix.target }}/release/office-oxide-mcp.exe staging/
+          cd staging && 7z a "../$ARCHIVE" . && cd ..
+          echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ env.ARCHIVE }}
+          retention-days: 7
+
+  # Build WASM package
+  build-wasm:
+    name: Build WASM
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-wasm-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build WASM binary
+        run: cargo build -p office_oxide --lib --target wasm32-unknown-unknown --features wasm,default --release
+
+      - name: Install matching wasm-bindgen-cli
+        run: |
+          WASM_BINDGEN_VERSION=$(grep -A1 'name = "wasm-bindgen"' Cargo.lock | grep version | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "Installing wasm-bindgen-cli@${WASM_BINDGEN_VERSION}"
+          cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION"
+
+      - name: Generate bindings
+        run: |
+          wasm-bindgen --target nodejs --out-dir wasm-out/ \
+            target/wasm32-unknown-unknown/release/office_oxide.wasm
+
+      - name: Copy package files
+        run: |
+          cp wasm-pkg/package.json wasm-out/
+
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: wasm-package
+          path: wasm-out/
+          retention-days: 7
+
+  # Build Python wheels
+  build-python-wheels:
+    name: Build Python wheels (${{ matrix.target }})
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: wheels-linux-x86_64
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: wheels-macos-x86_64
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: wheels-macos-aarch64
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: wheels-windows-x86_64
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install maturin
+        run: uv pip install --system maturin
+
+      - name: Build wheels
+        run: maturin build --release --features python --target ${{ matrix.target }} --out dist
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/*.whl
+          retention-days: 7
+
+  # Create GitHub Release
+  create-release:
+    name: Create GitHub Release
+    needs: [validate, build-binaries, build-python-wheels, build-wasm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Organize release files
+        run: |
+          mkdir -p release-files
+          find artifacts -type f \( -name "*.whl" -o -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release-files/ \;
+          echo "=== Release files ==="
+          ls -lh release-files/
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          chmod +x .github/scripts/extract-release-notes.sh
+          .github/scripts/extract-release-notes.sh "${{ needs.validate.outputs.version }}"
+
+      - name: Read release title
+        id: title
+        run: echo "title=$(cat release-title.txt)" >> $GITHUB_OUTPUT
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.title.outputs.title }}
+          body_path: release-notes.md
+          files: release-files/*
+          draft: false
+          prerelease: ${{ contains(needs.validate.outputs.version, '-') }}
+          fail_on_unmatched_files: false
+
+  # Publish to crates.io
+  publish-crates:
+    name: Publish to crates.io
+    needs: [validate, create-release]
+    runs-on: ubuntu-latest
+    if: ${{ !contains(needs.validate.outputs.version, '-') }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify crates.io readiness
+        run: cargo publish -p office_oxide --dry-run
+
+      - name: Publish office_oxide
+        run: cargo publish -p office_oxide
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+
+      - name: Wait for crates.io index update
+        run: sleep 30
+
+      - name: Publish office_oxide_cli
+        run: cargo publish -p office_oxide_cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+
+      - name: Publish office_oxide_mcp
+        run: cargo publish -p office_oxide_mcp
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+
+  # Publish to PyPI
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [validate, build-python-wheels, create-release]
+    runs-on: ubuntu-latest
+    if: ${{ !contains(needs.validate.outputs.version, '-') }}
+    steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: wheels
+          pattern: wheels-*
+          merge-multiple: true
+
+      - name: List wheels
+        run: |
+          echo "=== Wheels to publish ==="
+          ls -lh wheels/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          packages-dir: wheels/
+          skip-existing: true
+
+  # Publish to npm
+  publish-npm:
+    name: Publish to npm
+    needs: [validate, build-wasm, create-release]
+    runs-on: ubuntu-latest
+    if: ${{ !contains(needs.validate.outputs.version, '-') }}
+    steps:
+      - name: Download WASM artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: wasm-package
+          path: wasm-out
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish to npm
+        working-directory: wasm-out
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # Publish to Homebrew
+  publish-homebrew:
+    name: Publish to Homebrew
+    needs: [validate, build-binaries, create-release]
+    runs-on: ubuntu-latest
+    if: ${{ !contains(needs.validate.outputs.version, '-') }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: office_oxide-*
+          merge-multiple: true
+
+      - name: Generate Homebrew formula
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          SHA_MACOS_ARM=$(sha256sum artifacts/office_oxide-macos-aarch64-${VERSION}.tar.gz | cut -d' ' -f1)
+          SHA_MACOS_X86=$(sha256sum artifacts/office_oxide-macos-x86_64-${VERSION}.tar.gz | cut -d' ' -f1)
+          SHA_LINUX_X86=$(sha256sum artifacts/office_oxide-linux-x86_64-musl-${VERSION}.tar.gz | cut -d' ' -f1)
+          sed -e "s/{{VERSION}}/${VERSION}/g" \
+              -e "s/{{SHA256_MACOS_ARM}}/${SHA_MACOS_ARM}/g" \
+              -e "s/{{SHA256_MACOS_X86}}/${SHA_MACOS_X86}/g" \
+              -e "s/{{SHA256_LINUX_X86}}/${SHA_LINUX_X86}/g" \
+              .github/templates/office-oxide.rb > formula.rb
+
+      - name: Push to Homebrew tap
+        uses: dmnemec/copy_file_to_another_repo_action@main
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        with:
+          source_file: formula.rb
+          destination_repo: yfedoseev/homebrew-tap
+          destination_folder: Formula
+          destination_branch_name: main
+          user_email: yfedoseev@gmail.com
+          user_name: Yury Fedoseev
+          destination_file: office-oxide.rb
+          commit_message: "Update office-oxide to v${{ needs.validate.outputs.version }}"
+
+  # Publish to Scoop
+  publish-scoop:
+    name: Publish to Scoop
+    needs: [validate, build-binaries, create-release]
+    runs-on: ubuntu-latest
+    if: ${{ !contains(needs.validate.outputs.version, '-') }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: office_oxide-windows-x86_64
+          path: artifacts
+
+      - name: Generate Scoop manifest
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          SHA_WINDOWS=$(sha256sum artifacts/office_oxide-windows-x86_64-${VERSION}.zip | cut -d' ' -f1)
+          sed -e "s/{{VERSION}}/${VERSION}/g" \
+              -e "s/{{SHA256_WINDOWS}}/${SHA_WINDOWS}/g" \
+              .github/templates/office-oxide.json > manifest.json
+
+      - name: Push to Scoop bucket
+        uses: dmnemec/copy_file_to_another_repo_action@main
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+        with:
+          source_file: manifest.json
+          destination_repo: yfedoseev/scoop-bucket
+          destination_folder: bucket
+          destination_branch_name: main
+          user_email: yfedoseev@gmail.com
+          user_name: Yury Fedoseev
+          destination_file: office-oxide.json
+          commit_message: "Update office-oxide to v${{ needs.validate.outputs.version }}"

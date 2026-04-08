@@ -1,15 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/office_core",
-    "crates/cfb_oxide",
-    "crates/xls_oxide",
-    "crates/ppt_oxide",
-    "crates/doc_oxide",
-    "crates/docx_oxide",
-    "crates/xlsx_oxide",
-    "crates/pptx_oxide",
-    "crates/office_oxide",
+    ".",
     "crates/office_oxide_cli",
     "crates/office_oxide_mcp",
 ]
@@ -19,31 +11,80 @@ exclude = ["bench_rust"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/user/office_oxide"
+repository = "https://github.com/yfedoseev/office_oxide"
+homepage = "https://oxide.fyi"
+documentation = "https://office.oxide.fyi/docs/getting-started/rust"
 rust-version = "1.85"
 
-[workspace.dependencies]
-# Shared across crates
+[package]
+name = "office_oxide"
+description = "The fastest Office document processing library — DOCX, XLSX, PPTX, DOC, XLS, PPT"
+authors = ["Yury Fedoseev <yfedoseev@gmail.com>"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["docx", "xlsx", "pptx", "office", "text-extraction"]
+categories = ["parsing", "text-processing"]
+
+[lib]
+name = "office_oxide"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+# Core parsing
 quick-xml = { version = "0.37", features = ["serialize"] }
 zip = { version = "8.1", default-features = false, features = ["deflate"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
-memmap2 = "0.9"
-rayon = "1.10"
+encoding_rs = "0.8"
+atoi_simd = "0.18"
+fast-float2 = "0.2"
+libc = "0.2"
 
-# Internal crates
-office_core = { path = "crates/office_core" }
-docx_oxide = { path = "crates/docx_oxide" }
-xlsx_oxide = { path = "crates/xlsx_oxide" }
-pptx_oxide = { path = "crates/pptx_oxide" }
+# Optional
+memmap2 = { version = "0.9", optional = true }
+rayon = { version = "1.10", optional = true }
 
-# Bindings
-pyo3 = { version = "0.28", features = ["extension-module"] }
+# Python bindings
+pyo3 = { version = "0.28", features = ["extension-module"], optional = true }
+
+# WASM bindings
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+
+[features]
+default = []
+python = ["dep:pyo3"]
+wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde-wasm-bindgen"]
+mmap = ["dep:memmap2"]
+parallel = ["dep:rayon"]
+
+[package.metadata.docs.rs]
+features = ["python", "parallel"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.maturin]
+name = "office-oxide"
+python-source = "python"
 
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
 opt-level = 3
+
+[profile.release-small]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

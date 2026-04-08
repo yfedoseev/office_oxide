@@ -5,13 +5,49 @@ build-backend = "maturin"
 [project]
 name = "office-oxide"
 version = "0.1.0"
-description = "The fastest Office document processing library for Python"
+description = "The fastest Office document processing library for Python — DOCX, XLSX, PPTX, DOC, XLS, PPT"
 requires-python = ">=3.8"
 license = {text = "MIT OR Apache-2.0"}
-keywords = ["docx", "xlsx", "pptx", "office", "text-extraction"]
+authors = [
+    {name = "Yury Fedoseev", email = "yfedoseev@gmail.com"},
+]
+keywords = ["docx", "xlsx", "pptx", "doc", "xls", "ppt", "office", "text-extraction", "document-parser"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Text Processing",
+    "Topic :: Office/Business",
+]
+
+[project.urls]
+Homepage = "https://oxide.fyi"
+Documentation = "https://office.oxide.fyi/docs/getting-started/python"
+Repository = "https://github.com/yfedoseev/office_oxide"
+Changelog = "https://github.com/yfedoseev/office_oxide/blob/main/CHANGELOG.md"
+"Bug Tracker" = "https://github.com/yfedoseev/office_oxide/issues"
+
+[dependency-groups]
+dev = [
+    "maturin>=1.0",
+    "pytest>=7.0",
+    "ruff>=0.4",
+]
 
 [tool.maturin]
 features = ["python"]
 python-source = "python"
 module-name = "office_oxide._native"
-manifest-path = "crates/office_oxide/Cargo.toml"
+manifest-path = "Cargo.toml"

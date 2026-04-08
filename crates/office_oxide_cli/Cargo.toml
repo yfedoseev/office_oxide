@@ -1,16 +1,56 @@
 [package]
 name = "office_oxide_cli"
-description = "CLI tool for Office document processing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 rust-version.workspace = true
+description = "CLI for office-oxide — the fastest Office document toolkit. Extract text, convert to markdown, dump IR, and inspect DOCX/XLSX/PPTX/DOC/XLS/PPT files."
+documentation = "https://office.oxide.fyi"
+readme = "README.md"
+keywords = ["office", "cli", "text-extraction", "docx", "xlsx"]
+categories = ["command-line-utilities", "text-processing"]
 
 [[bin]]
 name = "office-oxide"
 path = "src/main.rs"
 
 [dependencies]
-office_oxide = { path = "../office_oxide" }
+office_oxide = { path = "../.." }
 clap = { version = "4", features = ["derive"] }
-serde_json.workspace = true
+serde_json = "1"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/office_oxide-{ target }-{ version }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/office_oxide-linux-x86_64-{ version }.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/office_oxide-linux-x86_64-musl-{ version }.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/office_oxide-linux-aarch64-{ version }.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/office_oxide-macos-x86_64-{ version }.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/office_oxide-macos-aarch64-{ version }.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/office_oxide-windows-x86_64-{ version }.zip"
+pkg-fmt = "zip"
+
+[package.metadata.deb]
+maintainer = "Yury Fedoseev <yfedoseev@gmail.com>"
+copyright = "2025-2026, Yury Fedoseev"
+depends = "$auto"
+section = "utility"
+priority = "optional"
+assets = [
+    ["target/release/office-oxide", "usr/bin/", "755"],
+]

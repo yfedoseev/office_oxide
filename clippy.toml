@@ -1,0 +1,26 @@
+# Clippy configuration for office_oxide
+# See https://rust-lang.github.io/rust-clippy/master/index.html
+
+# Cognitive complexity threshold
+cognitive-complexity-threshold = 25
+
+# Maximum number of single char bindings
+single-char-binding-names-threshold = 4
+
+# Maximum number of bool parameters
+too-many-arguments-threshold = 7
+
+# Maximum size of types to copy by value
+trivial-copy-size-limit = 128
+
+# Minimum array size to trigger large-types-passed-by-value
+pass-by-value-size-limit = 256
+
+# Maximum size for an enum variant
+enum-variant-size-threshold = 200
+
+# Maximum size for a structure
+type-complexity-threshold = 250
+
+# Don't warn about these lints in tests
+avoid-breaking-exported-api = false
