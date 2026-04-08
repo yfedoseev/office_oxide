@@ -1,232 +1,212 @@
 # office_oxide — Architecture
 
-## Workspace Structure
+## Project Structure
 
 ```
 office_oxide/
-├── Cargo.toml                  # Workspace root
-├── docs/
-│   ├── MISSION.md              # Project mission and roadmap
-│   ├── ARCHITECTURE.md         # This file
-│   ├── specs/
-│   │   ├── opc_shared_spec.md  # Open Packaging Conventions (shared)
-│   │   ├── docx_spec.md        # WordprocessingML spec reference
-│   │   ├── xlsx_spec.md        # SpreadsheetML spec reference
-│   │   └── pptx_spec.md        # PresentationML spec reference
-│   └── architecture/
-│       └── conversion_pipeline.md
+├── Cargo.toml                  # Workspace root + library package
+├── src/
+│   ├── lib.rs                  # Unified API: Document, extract_text, to_markdown
+│   ├── format.rs               # DocumentFormat enum + detection
+│   ├── error.rs                # OfficeError (wraps all format errors)
+│   ├── ir.rs                   # Document IR types
+│   ├── ir_render.rs            # IR → plain text / markdown renderers
+│   ├── convert_docx.rs         # DOCX → IR converter
+│   ├── convert_xlsx.rs         # XLSX → IR converter
+│   ├── convert_pptx.rs         # PPTX → IR converter
+│   ├── convert_doc.rs          # DOC → IR converter
+│   ├── convert_xls.rs          # XLS → IR converter
+│   ├── convert_ppt.rs          # PPT → IR converter
+│   ├── create.rs               # IR → format creation
+│   ├── edit.rs                 # Unified editing API
+│   ├── python.rs               # PyO3 bindings (feature: python)
+│   ├── wasm.rs                 # wasm-bindgen bindings (feature: wasm)
+│   ├── core/                   # Shared OPC/XML primitives
+│   │   ├── opc.rs              # OpcReader/OpcWriter (ZIP-based packages)
+│   │   ├── xml.rs              # XML parsing utilities, namespace constants
+│   │   ├── content_types.rs    # [Content_Types].xml parser
+│   │   ├── relationships.rs    # .rels parser + builder
+│   │   ├── editable.rs         # EditablePackage (round-trip OPC editing)
+│   │   ├── theme.rs            # DrawingML theme parser
+│   │   ├── properties.rs       # Dublin Core + app properties
+│   │   ├── units.rs            # Twip, HalfPoint, Emu
+│   │   ├── parallel.rs         # cfg-gated parallel/sequential map
+│   │   ├── traits.rs           # OfficeDocument trait
+│   │   └── error.rs            # Core error type
+│   ├── cfb/                    # Compound File Binary (OLE2) reader
+│   ├── docx/                   # DOCX parser, writer, editor
+│   ├── xlsx/                   # XLSX parser, writer, editor
+│   ├── pptx/                   # PPTX parser, writer, editor
+│   ├── doc/                    # Legacy .doc parser
+│   ├── xls/                    # Legacy .xls parser
+│   └── ppt/                    # Legacy .ppt parser
 ├── crates/
-│   ├── office_core/            # Shared primitives
-│   ├── docx_oxide/             # Word document processing
-│   ├── xlsx_oxide/             # Excel spreadsheet processing
-│   ├── pptx_oxide/             # PowerPoint processing
-│   └── office_oxide/           # Unified API + bindings
-└── pdf_oxide -> ~/projects/pdf_oxide_fixes  # Symlink or git submodule
+│   ├── office_oxide_cli/       # CLI binary: office-oxide
+│   └── office_oxide_mcp/       # MCP server binary: office-oxide-mcp
+├── tests/                      # Integration tests
+├── python/                     # Python package (office_oxide/)
+├── wasm-pkg/                   # npm package config
+└── docs/                       # Architecture + spec references
 ```
 
-## Crate Dependency Graph
+## Module Dependency Graph
 
 ```
-                    office_oxide (unified API + bindings)
+                    src/lib.rs (unified API + bindings)
                    /        |          \
-              docx_oxide  xlsx_oxide  pptx_oxide
+              src/docx   src/xlsx   src/pptx    (OOXML formats)
+              src/doc    src/xls    src/ppt     (legacy formats)
                    \        |          /
-                    office_core (OPC, XML, themes)
+                    src/core (OPC, XML, themes)
                          |
-                     pdf_oxide (for → PDF conversion)
+                      src/cfb (OLE2 container — legacy formats only)
 ```
 
-## office_core — Shared Primitives
+Binary crates depend on the library:
+```
+office_oxide_cli  ──→  office_oxide (lib)
+office_oxide_mcp  ──→  office_oxide (lib)
+```
 
-All OOXML formats share the Open Packaging Conventions (OPC) layer. This crate provides:
+## core — Shared Primitives
+
+All OOXML formats share the Open Packaging Conventions (OPC) layer:
 
 ### OPC Layer
 - **ZIP archive** read/write (using `zip` crate)
 - **Content Types** parser (`[Content_Types].xml`)
 - **Relationships** parser (`.rels` files)
 - **Part resolution** — URI-based part lookup
+- **Case-insensitive** ZIP entry lookup + backslash path normalization
 
 ### XML Layer
 - **Fast XML parsing** via `quick-xml` (SAX-style, zero-copy)
-- **Namespace handling** — resolve OOXML namespaces
-- **Shared string table** — common across XLSX, used concept in DOCX/PPTX
-- **XML writing** — streaming XML output
+- **Namespace handling** — OOXML Transitional + Strict dual namespace matching
+- **Namespace-agnostic** attribute lookup for prefixed attributes (`d3p1:id`, etc.)
+- **Tolerant numeric parsing** — strips unit suffixes, handles decimals
 
 ### DrawingML Shared
 - **Themes** (`a:theme`) — colors, fonts, effects
-- **Colors** — scheme colors, RGB, HSL, system colors
-- **Fonts** — major/minor font schemes, font fallback
-- **Styles** — shared style concepts
+- **Colors** — scheme colors, RGB, HSL, system colors, tint/shade
+- **Units** — Twip, HalfPoint, Emu
 
 ### Core Properties
 - **Dublin Core metadata** — title, creator, subject, description
 - **App properties** — application, version, word count, etc.
-- **Custom properties** — user-defined key-value pairs
 
-### Common Types
-- **EMU** (English Metric Units) — shared coordinate system
-- **ST_Percentage**, **ST_Coordinate**, etc. — shared simple types
-- **Color types** — scheme, RGB, theme color with tint/shade
-
-## docx_oxide — Word Documents
+## docx — Word Documents
 
 ### Read Path
 ```
 .docx file
-  → ZIP extraction (office_core)
+  → ZIP extraction (core::opc)
   → Relationship resolution
-  → document.xml parsing
+  → document.xml parsing (SAX-style, non-trimming reader for whitespace preservation)
   → Element tree: Document → Body → [Block-level elements]
-      ├── Paragraph (w:p)
-      │   ├── Run (w:r) → Text (w:t)
-      │   ├── Hyperlink
-      │   ├── Field codes
-      │   └── Drawing/Image
-      ├── Table (w:tbl)
-      │   └── Row → Cell → [Block-level elements] (recursive)
-      ├── Structured Document Tag (w:sdt)
-      └── Section Properties (w:sectPr)
+      ├── Paragraph (w:p) → Run (w:r) → Text (w:t)
+      ├── Table (w:tbl) → Row → Cell → [Block-level elements] (recursive)
+      ├── Hyperlinks (resolved via relationships)
+      └── Headers/Footers
   → Style resolution (styles.xml)
   → Numbering resolution (numbering.xml)
-  → Header/Footer processing
 ```
 
-### Write Path
-```
-Builder API
-  → Element tree construction
-  → Style sheet generation
-  → Numbering definitions
-  → Relationship tracking
-  → XML serialization (quick-xml)
-  → ZIP packaging (office_core)
-  → .docx output
-```
+### Write / Edit
+- `DocxWriter` — builder API for creating new documents
+- `EditableDocx` — load, replace text in `<w:t>` elements, save
 
-### Conversion Paths
-- **DOCX → Text**: Walk element tree, extract w:t content with spacing
-- **DOCX → Markdown**: Map elements to Markdown (headings, lists, tables, bold/italic)
-- **DOCX → HTML**: Map elements to HTML with CSS styles
-- **DOCX → PDF**: Use pdf_oxide writer — map fonts, layout paragraphs, render tables
-
-## xlsx_oxide — Excel Spreadsheets
+## xlsx — Excel Spreadsheets
 
 ### Read Path
 ```
 .xlsx file
-  → ZIP extraction (office_core)
-  → workbook.xml → Sheet list, defined names
-  → sharedStrings.xml → String table
+  → ZIP extraction (core::opc)
+  → sharedStrings.xml → String table (parsed first, non-trimming reader)
   → styles.xml → Number formats, cell styles
-  → sheet{N}.xml → Cell grid
-      ├── Row (r attribute = row number)
-      │   └── Cell (r attribute = "A1" reference)
-      │       ├── Type: string (s), number (n), boolean (b), error (e), inline string (inlineStr)
-      │       ├── Value (v element)
-      │       ├── Formula (f element)
-      │       └── Style index (s attribute → styles.xml)
-      ├── Merge cells
-      ├── Conditional formatting
-      └── Data validations
-  → Formula evaluation (optional)
+  → workbook.xml → Sheet list
+  → sheet{N}.xml → Cell grid (parallel when feature enabled)
+      ├── Cell types: string, number, boolean, error, inline string, date
+      ├── Shared string dereference (inline during parse)
+      └── Date detection (built-in format IDs + custom format scanning)
 ```
 
 ### Key Design Decisions
-- **Shared strings**: XLSX stores repeated strings once in a lookup table. Must load this first.
-- **Cell references**: "A1" style (column letters + row number). Need bidirectional conversion.
-- **Date handling**: Excel stores dates as serial numbers. Need epoch conversion (1900 vs 1904 date system).
-- **Formula evaluation**: MVP = extract formula text. Future = evaluate simple formulas.
+- **Shared strings loaded first** — worksheets reference them by index
+- **Date handling**: 1900 date system with Lotus 1-2-3 bug compatibility (serial 60 = Feb 29, 1900)
+- **Phase 1/Phase 2 parsing**: gather raw data sequentially (requires `&mut archive`), then parse worksheets in parallel via `core::parallel::map_collect`
 
-## pptx_oxide — PowerPoint Presentations
+### Write / Edit
+- `XlsxWriter` — builder API with sheets, rows, cells
+- `EditableXlsx` — load, set cell values, save
+
+## pptx — PowerPoint Presentations
 
 ### Read Path
 ```
 .pptx file
-  → ZIP extraction (office_core)
-  → presentation.xml → Slide list, slide size
-  → slideMasters/ → Base layouts and styles
-  → slideLayouts/ → Layout templates
-  → slides/slide{N}.xml → Slide content
+  → ZIP extraction (core::opc)
+  → Theme resolution
+  → presentation.xml → Slide list
+  → slides/slide{N}.xml → Shape tree (parallel when feature enabled)
       └── Shape tree (p:spTree)
-          ├── Shape (p:sp) → Text body, geometry
+          ├── AutoShape (p:sp) → Text body
           ├── Picture (p:pic) → Image reference
           ├── Group shape (p:grpSp) → Nested shapes
-          ├── Connection (p:cxnSp)
-          └── Graphic frame (p:graphicFrame) → Tables, charts
-  → Theme resolution
-  → Notes extraction
+          ├── Graphic frame (p:graphicFrame) → Tables
+          └── Connector (p:cxnSp)
+  → Notes slide extraction
+  → Spatial sorting (y then x) for text extraction order
 ```
 
-### Key Design Decisions
-- **Slide inheritance**: Slides inherit from layouts, which inherit from masters. Must resolve the chain.
-- **Shape positioning**: Absolute positioning in EMU (1 inch = 914400 EMU).
-- **Text extraction order**: Shapes have no guaranteed reading order. Need spatial sorting.
+### Write / Edit
+- `PptxWriter` — builder API with slides, titles, text, bullet lists
+- `EditablePptx` — load, replace text in `<a:t>` elements, save
 
-## Conversion Pipeline Architecture
+## Legacy Formats (doc, xls, ppt)
 
-All format conversions flow through an intermediate representation:
+All three use the CFB (Compound File Binary / OLE2) container:
+
+```
+.doc/.xls/.ppt file
+  → cfb::CfbReader (header, FAT, DIFAT, directory, mini-stream)
+  → Stream extraction (case-insensitive lookup)
+  → Format-specific binary parsing
+```
+
+- **doc**: FIB → piece table → text reassembly (CP1252 + UTF-16LE dual encoding)
+- **xls**: BIFF8 record iterator with CONTINUE merging → SST, cell records (LABELSST, NUMBER, RK, MULRK, FORMULA)
+- **ppt**: 8-byte record headers → container/atom tree → TextCharsAtom (UTF-16LE) / TextBytesAtom (Latin-1)
+
+## Document IR
+
+All format conversions flow through a format-agnostic intermediate representation:
 
 ```
 Source Format                     Target Format
 ─────────────                     ─────────────
-DOCX ──┐                    ┌──→ PDF (via pdf_oxide)
+DOCX ──┐                    ┌──→ Plain Text
 XLSX ──┤                    ├──→ Markdown
-PPTX ──┤──→ Document IR ────├──→ HTML
-PDF  ──┘    (unified)       ├──→ Plain Text
-                            ├──→ JSON (structured)
-                            └──→ CSV (tables only)
+PPTX ──┤──→ Document IR ────├──→ JSON (structured)
+DOC  ──┤    (unified)       └──→ CSV (tables only)
+XLS  ──┤
+PPT  ──┘
 ```
 
-The **Document IR** is a format-agnostic intermediate representation:
-- Headings with levels
-- Paragraphs with inline formatting (bold, italic, underline, etc.)
-- Tables with cells, spans, and alignment
-- Images with dimensions and alt text
-- Lists (ordered, unordered) with nesting
-- Metadata (title, author, dates)
-- Page/slide/sheet boundaries
-
-This IR enables any-to-any conversion without N*M converter implementations.
+IR types (`src/ir.rs`): `DocumentIR`, `Section`, `Element` (Heading, Paragraph, Table, List, Image, ThematicBreak), `InlineContent` (Text, LineBreak). All derive `serde::Serialize`/`Deserialize` for direct JSON serialization.
 
 ## Performance Strategy
 
-### Zero-Copy Where Possible
-- Parse XML attributes without allocation using `quick-xml`'s borrowed API
-- Memory-map ZIP entries for large files
-- Return `&str` references into parsed data
-
-### Streaming Processing
-- SAX-style XML parsing (not DOM) — constant memory
-- Process sheets/slides independently
-- Stream output for large spreadsheets (millions of rows)
-
-### Parallelism
-- Parse independent sheets/slides in parallel (Rayon)
-- Parallel style/theme resolution
-- Concurrent image extraction
-
-### Caching
-- Cache parsed styles, themes, shared strings
-- Lazy parsing — only parse parts that are accessed
-- LRU cache for frequently accessed elements
+- **SAX-style XML parsing** (not DOM) — constant memory via `quick-xml`
+- **Zero-copy attributes** — parse without allocation using borrowed API
+- **Optional memory-mapping** — `mmap` feature for large files
+- **Parallel parsing** — `parallel` feature uses Rayon for sheets/slides
+- **Lazy parsing** — only parse parts that are accessed
+- **Stack-depth protection** — `with_parse_stack` spawns threads when stack is low (Python/WASM interop)
 
 ## Testing Strategy
 
-### Corpus Testing
-- Collect real-world documents (same approach as pdf_oxide's 3,830 PDF corpus)
-- Sources: government databases, academic papers, public datasets
-- Automated quality scoring
-
-### Round-Trip Testing
-- Create document → Write → Read back → Compare
-- Ensures write path produces valid files
-
-### Compatibility Testing
-- Test output opens correctly in MS Office, LibreOffice, Google Docs
-- Test reading files produced by each of these applications
-
-### Fuzz Testing
-- Fuzz ZIP parsing layer
-- Fuzz XML parsing
-- Fuzz cell reference parsing
-- Fuzz number format parsing
+- **310+ unit and integration tests** across all formats
+- **5,146-file corpus validation** — 98.3% pass rate, all failures are genuinely invalid files
+- **Round-trip testing** — create → write → read back → compare
+- **CI matrix** — Linux/macOS/Windows, stable/beta/nightly Rust, Python 3.8–3.14
+- **85% code coverage enforcement** via cargo-llvm-cov
