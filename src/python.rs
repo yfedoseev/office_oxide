@@ -64,6 +64,11 @@ impl PyDocument {
         self.inner.to_markdown()
     }
 
+    /// Convert the document to an HTML fragment.
+    fn to_html(&self) -> String {
+        self.inner.to_html()
+    }
+
     /// Convert the document to a format-agnostic intermediate representation (nested dicts/lists).
     fn to_ir<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let doc_ir = self.inner.to_ir();
@@ -228,6 +233,11 @@ fn to_markdown(path: &str) -> PyResult<String> {
     Ok(crate::to_markdown(path)?)
 }
 
+#[pyfunction]
+fn to_html(path: &str) -> PyResult<String> {
+    Ok(crate::to_html(path)?)
+}
+
 /// Python module entry point.
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -235,5 +245,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("OfficeOxideError", m.py().get_type::<OfficeOxideError>())?;
     m.add_function(wrap_pyfunction!(extract_text, m)?)?;
     m.add_function(wrap_pyfunction!(to_markdown, m)?)?;
+    m.add_function(wrap_pyfunction!(to_html, m)?)?;
     Ok(())
 }

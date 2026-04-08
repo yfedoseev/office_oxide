@@ -42,6 +42,12 @@ impl WasmDocument {
         self.inner.to_markdown()
     }
 
+    /// Convert the document to an HTML fragment.
+    #[wasm_bindgen(js_name = "toHtml")]
+    pub fn to_html(&self) -> String {
+        self.inner.to_html()
+    }
+
     /// Convert the document to a JSON IR representation.
     #[wasm_bindgen(js_name = "toIr")]
     pub fn to_ir(&self) -> Result<JsValue, JsValue> {

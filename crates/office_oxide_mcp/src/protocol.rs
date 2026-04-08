@@ -35,7 +35,7 @@ pub fn handle_tools_list(id: &Value) -> Value {
                             },
                             "format": {
                                 "type": "string",
-                                "enum": ["text", "markdown", "ir"],
+                                "enum": ["text", "markdown", "html", "ir"],
                                 "description": "Output format (default: text)"
                             }
                         },
@@ -86,6 +86,7 @@ fn call_extract(id: &Value, args: &Value) -> Value {
     let content = match format {
         "text" => doc.plain_text(),
         "markdown" => doc.to_markdown(),
+        "html" => doc.to_html(),
         "ir" => match serde_json::to_string_pretty(&ir_to_json(&doc.to_ir())) {
             Ok(s) => s,
             Err(e) => return tool_error(id, &e.to_string()),

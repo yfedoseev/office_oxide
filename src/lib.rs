@@ -250,6 +250,11 @@ impl Document {
         dispatch_inner!(self, to_markdown)
     }
 
+    /// Convert to an HTML fragment.
+    pub fn to_html(&self) -> String {
+        self.to_ir().to_html()
+    }
+
     /// Convert to the format-agnostic Document IR.
     pub fn to_ir(&self) -> DocumentIR {
         match &self.inner {
@@ -348,4 +353,9 @@ pub fn extract_text(path: impl AsRef<Path>) -> Result<String> {
 /// Convert any supported document file to markdown.
 pub fn to_markdown(path: impl AsRef<Path>) -> Result<String> {
     Ok(Document::open(path)?.to_markdown())
+}
+
+/// Convert any supported document file to an HTML fragment.
+pub fn to_html(path: impl AsRef<Path>) -> Result<String> {
+    Ok(Document::open(path)?.to_html())
 }

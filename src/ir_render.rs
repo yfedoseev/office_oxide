@@ -16,6 +16,17 @@ impl DocumentIR {
         }
     }
 
+    /// Render the IR as an HTML fragment (no `<html>`/`<body>` wrapper).
+    pub fn to_html(&self) -> String {
+        let section_texts: Vec<String> = self
+            .sections
+            .iter()
+            .map(render_section_html)
+            .filter(|s| !s.is_empty())
+            .collect();
+        section_texts.join("\n<hr />\n")
+    }
+
     /// Render the IR as markdown.
     pub fn to_markdown(&self) -> String {
         let section_texts: Vec<String> = self
@@ -271,6 +282,126 @@ fn render_list_markdown(list: &List, indent: usize) -> String {
     lines.join("\n")
 }
 
+// ---------------------------------------------------------------------------
+// HTML rendering
+// ---------------------------------------------------------------------------
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn render_section_html(section: &Section) -> String {
+    let mut parts = Vec::new();
+    if let Some(ref title) = section.title {
+        if !title.is_empty() {
+            parts.push(format!("<h2>{}</h2>", escape_html(title)));
+        }
+    }
+    for elem in &section.elements {
+        let html = render_element_html(elem);
+        if !html.is_empty() {
+            parts.push(html);
+        }
+    }
+    parts.join("\n")
+}
+
+fn render_element_html(element: &Element) -> String {
+    match element {
+        Element::Heading(h) => {
+            let level = h.level.clamp(1, 6);
+            let content = render_inline_html(&h.content);
+            format!("<h{level}>{content}</h{level}>")
+        }
+        Element::Paragraph(p) => {
+            let content = render_inline_html(&p.content);
+            format!("<p>{content}</p>")
+        }
+        Element::Table(t) => render_table_html(t),
+        Element::List(l) => render_list_html(l),
+        Element::Image(img) => {
+            let alt = img
+                .alt_text
+                .as_deref()
+                .map(escape_html)
+                .unwrap_or_default();
+            format!("<img alt=\"{alt}\" />")
+        }
+        Element::ThematicBreak => "<hr />".to_string(),
+    }
+}
+
+fn render_inline_html(content: &[InlineContent]) -> String {
+    let mut out = String::new();
+    for item in content {
+        match item {
+            InlineContent::Text(span) => {
+                let mut text = escape_html(&span.text);
+
+                if span.bold {
+                    text = format!("<strong>{text}</strong>");
+                }
+                if span.italic {
+                    text = format!("<em>{text}</em>");
+                }
+                if span.strikethrough {
+                    text = format!("<del>{text}</del>");
+                }
+                if let Some(ref url) = span.hyperlink {
+                    text = format!("<a href=\"{}\">{text}</a>", escape_html(url));
+                }
+
+                out.push_str(&text);
+            }
+            InlineContent::LineBreak => out.push_str("<br />"),
+        }
+    }
+    out
+}
+
+fn render_table_html(table: &Table) -> String {
+    let mut html = String::from("<table>\n");
+
+    for row in &table.rows {
+        html.push_str("<tr>");
+        let tag = if row.is_header { "th" } else { "td" };
+        for cell in &row.cells {
+            let mut attrs = String::new();
+            if cell.col_span > 1 {
+                attrs.push_str(&format!(" colspan=\"{}\"", cell.col_span));
+            }
+            if cell.row_span > 1 {
+                attrs.push_str(&format!(" rowspan=\"{}\"", cell.row_span));
+            }
+            let content: Vec<String> = cell.content.iter().map(render_element_html).collect();
+            html.push_str(&format!("<{tag}{attrs}>{}</{tag}>", content.join("")));
+        }
+        html.push_str("</tr>\n");
+    }
+
+    html.push_str("</table>");
+    html
+}
+
+fn render_list_html(list: &List) -> String {
+    let tag = if list.ordered { "ol" } else { "ul" };
+    let mut html = format!("<{tag}>\n");
+    for item in &list.items {
+        let content = render_inline_html(&item.content);
+        html.push_str(&format!("<li>{content}"));
+        if let Some(ref nested) = item.nested {
+            html.push('\n');
+            html.push_str(&render_list_html(nested));
+        }
+        html.push_str("</li>\n");
+    }
+    html.push_str(&format!("</{tag}>"));
+    html
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,5 +636,126 @@ mod tests {
         assert!(plain.contains("Data A"));
         assert!(plain.contains("---"));
         assert!(plain.contains("Data B"));
+    }
+
+    #[test]
+    fn html_paragraph() {
+        let ir = simple_ir(vec![Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan {
+                text: "Hello world".to_string(),
+                bold: false,
+                italic: false,
+                strikethrough: false,
+                hyperlink: None,
+            })],
+        })]);
+        assert_eq!(ir.to_html(), "<p>Hello world</p>");
+    }
+
+    #[test]
+    fn html_formatting() {
+        let ir = simple_ir(vec![Element::Paragraph(Paragraph {
+            content: vec![
+                InlineContent::Text(TextSpan {
+                    text: "bold".to_string(),
+                    bold: true,
+                    italic: false,
+                    strikethrough: false,
+                    hyperlink: None,
+                }),
+                InlineContent::Text(TextSpan {
+                    text: " and ".to_string(),
+                    bold: false,
+                    italic: false,
+                    strikethrough: false,
+                    hyperlink: None,
+                }),
+                InlineContent::Text(TextSpan {
+                    text: "link".to_string(),
+                    bold: false,
+                    italic: false,
+                    strikethrough: false,
+                    hyperlink: Some("https://example.com".to_string()),
+                }),
+            ],
+        })]);
+        assert_eq!(
+            ir.to_html(),
+            "<p><strong>bold</strong> and <a href=\"https://example.com\">link</a></p>"
+        );
+    }
+
+    #[test]
+    fn html_escaping() {
+        let ir = simple_ir(vec![Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan {
+                text: "<script>alert('xss')</script>".to_string(),
+                bold: false,
+                italic: false,
+                strikethrough: false,
+                hyperlink: None,
+            })],
+        })]);
+        assert!(ir.to_html().contains("&lt;script&gt;"));
+        assert!(!ir.to_html().contains("<script>"));
+    }
+
+    #[test]
+    fn html_table() {
+        let ir = simple_ir(vec![Element::Table(Table {
+            rows: vec![TableRow {
+                cells: vec![TableCell {
+                    content: vec![Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan {
+                            text: "A".to_string(),
+                            bold: false,
+                            italic: false,
+                            strikethrough: false,
+                            hyperlink: None,
+                        })],
+                    })],
+                    col_span: 1,
+                    row_span: 1,
+                }],
+                is_header: true,
+            }],
+        })]);
+        let html = ir.to_html();
+        assert!(html.contains("<table>"));
+        assert!(html.contains("<th>"));
+        assert!(html.contains("A"));
+    }
+
+    #[test]
+    fn html_list() {
+        let ir = simple_ir(vec![Element::List(List {
+            ordered: true,
+            items: vec![
+                ListItem {
+                    content: vec![InlineContent::Text(TextSpan {
+                        text: "First".to_string(),
+                        bold: false,
+                        italic: false,
+                        strikethrough: false,
+                        hyperlink: None,
+                    })],
+                    nested: None,
+                },
+                ListItem {
+                    content: vec![InlineContent::Text(TextSpan {
+                        text: "Second".to_string(),
+                        bold: false,
+                        italic: false,
+                        strikethrough: false,
+                        hyperlink: None,
+                    })],
+                    nested: None,
+                },
+            ],
+        })]);
+        let html = ir.to_html();
+        assert!(html.contains("<ol>"));
+        assert!(html.contains("<li>First</li>"));
+        assert!(html.contains("<li>Second</li>"));
     }
 }
