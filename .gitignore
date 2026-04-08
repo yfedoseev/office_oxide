@@ -53,10 +53,6 @@ coverage/
 .playwright-mcp/
 Claude.md
 
-# Website assets
-oxide_fyi_home.png
-oxide_fyi_snapshot.md
-
 # Temporary
 *.tmp
 *.log
