@@ -43,9 +43,7 @@ const CT_SLIDE_MASTER: &str =
 // Namespaces
 // ---------------------------------------------------------------------------
 
-const NS_PML: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
-const NS_DML: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
-const NS_REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+use crate::core::xml::ns::{PML_STR as NS_PML, DRAWING_ML_STR as NS_DML, R_STR as NS_REL};
 
 // ---------------------------------------------------------------------------
 // Slide size (standard 16:9 in EMU)

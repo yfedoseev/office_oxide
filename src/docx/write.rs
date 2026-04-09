@@ -40,8 +40,7 @@ const CT_STYLES: &str =
 const CT_NUMBERING: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml";
 
-const WML_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+use crate::core::xml::ns::{WML_STR as WML_NS, R_STR as R_NS};
 
 // ---------------------------------------------------------------------------
 // Data model

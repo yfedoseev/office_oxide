@@ -22,13 +22,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         if let Some(ref notes) = slide.notes {
             if !notes.is_empty() {
                 elements.push(Element::Paragraph(Paragraph {
-                    content: vec![InlineContent::Text(TextSpan {
-                        text: notes.clone(),
-                        bold: false,
-                        italic: false,
-                        strikethrough: false,
-                        hyperlink: None,
-                    })],
+                    content: vec![InlineContent::Text(TextSpan::plain(notes.clone()))],
                 }));
             }
         }
@@ -220,13 +214,7 @@ fn convert_text_paragraph_inline(
             }
             crate::pptx::TextContent::Field(field) => {
                 if !field.text.is_empty() {
-                    content.push(InlineContent::Text(TextSpan {
-                        text: field.text.clone(),
-                        bold: false,
-                        italic: false,
-                        strikethrough: false,
-                        hyperlink: None,
-                    }));
+                    content.push(InlineContent::Text(TextSpan::plain(field.text.clone())));
                 }
             }
         }

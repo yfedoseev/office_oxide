@@ -618,10 +618,7 @@ fn parse_num_pr_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Resu
 
 /// Parse a boolean toggle attribute. `<w:b/>` = true, `<w:b w:val="0"/>` = false.
 fn parse_toggle(e: &BytesStart) -> bool {
-    match xml::optional_attr_str(e, b"w:val") {
-        Ok(Some(ref val)) => !matches!(val.as_ref(), "0" | "false" | "off"),
-        _ => true, // bare element = true
-    }
+    xml::parse_toggle(e, b"w:val")
 }
 
 fn parse_underline(e: &BytesStart) -> UnderlineType {

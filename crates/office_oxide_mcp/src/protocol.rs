@@ -87,7 +87,7 @@ fn call_extract(id: &Value, args: &Value) -> Value {
         "text" => doc.plain_text(),
         "markdown" => doc.to_markdown(),
         "html" => doc.to_html(),
-        "ir" => match serde_json::to_string_pretty(&ir_to_json(&doc.to_ir())) {
+        "ir" => match serde_json::to_string_pretty(&doc.to_ir()) {
             Ok(s) => s,
             Err(e) => return tool_error(id, &e.to_string()),
         },
@@ -127,21 +127,6 @@ fn call_info(id: &Value, args: &Value) -> Value {
         "result": {
             "content": [{ "type": "text", "text": info.to_string() }]
         }
-    })
-}
-
-fn ir_to_json(ir: &office_oxide::DocumentIR) -> Value {
-    json!({
-        "metadata": {
-            "format": format!("{:?}", ir.metadata.format),
-            "title": ir.metadata.title,
-        },
-        "sections": ir.sections.iter().map(|s| {
-            json!({
-                "title": s.title,
-                "element_count": s.elements.len(),
-            })
-        }).collect::<Vec<_>>(),
     })
 }
 

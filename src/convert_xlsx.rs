@@ -16,13 +16,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                         content: if text.is_empty() {
                             Vec::new()
                         } else {
-                            vec![InlineContent::Text(TextSpan {
-                                text,
-                                bold: false,
-                                italic: false,
-                                strikethrough: false,
-                                hyperlink: None,
-                            })]
+                            vec![InlineContent::Text(TextSpan::plain(text))]
                         },
                     })],
                     col_span: 1,

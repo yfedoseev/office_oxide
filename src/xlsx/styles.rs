@@ -496,10 +496,7 @@ fn parse_xfs(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Vec<C
 
 /// Parse a toggle element.
 fn parse_toggle(e: &quick_xml::events::BytesStart) -> bool {
-    match xml::optional_attr_str(e, b"val") {
-        Ok(Some(ref val)) => !matches!(val.as_ref(), "0" | "false" | "off"),
-        _ => true,
-    }
+    xml::parse_toggle(e, b"val")
 }
 
 #[cfg(test)]

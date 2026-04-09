@@ -29,8 +29,7 @@ const CT_STYLES: &str =
 // SML namespace constants
 // ---------------------------------------------------------------------------
 
-const NS_SML: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-const NS_REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+use crate::core::xml::ns::{SML_STR as NS_SML, R_STR as NS_REL};
 
 // ---------------------------------------------------------------------------
 // Public types

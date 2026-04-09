@@ -58,6 +58,19 @@ pub struct TextSpan {
     pub hyperlink: Option<String>,
 }
 
+impl TextSpan {
+    /// Create a plain (unformatted) text span.
+    pub fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            bold: false,
+            italic: false,
+            strikethrough: false,
+            hyperlink: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Table {
     pub rows: Vec<TableRow>,

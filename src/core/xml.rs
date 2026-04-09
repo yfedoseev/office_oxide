@@ -40,6 +40,18 @@ pub mod ns {
     pub const EXTENDED_PROPERTIES: &[u8] =
         b"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties";
 
+    // String variants for XML writing (same URIs as above, as &str)
+    pub const WML_STR: &str =
+        "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    pub const SML_STR: &str =
+        "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    pub const PML_STR: &str =
+        "http://schemas.openxmlformats.org/presentationml/2006/main";
+    pub const DRAWING_ML_STR: &str =
+        "http://schemas.openxmlformats.org/drawingml/2006/main";
+    pub const R_STR: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
     // Strict OOXML variants
     pub const STRICT_WML: &[u8] = b"http://purl.oclc.org/ooxml/wordprocessingml/main";
     pub const STRICT_SML: &[u8] = b"http://purl.oclc.org/ooxml/spreadsheetml/main";
@@ -142,6 +154,17 @@ pub fn optional_prefixed_attr_str<'a>(
         }
     }
     Ok(None)
+}
+
+/// Parse an OOXML boolean toggle element.
+///
+/// Bare element (`<b/>`) = true, `val="0"` / `val="false"` / `val="off"` = false.
+/// The `attr_name` is typically `b"w:val"` (WML) or `b"val"` (SML/DrawingML).
+pub fn parse_toggle(e: &BytesStart, attr_name: &[u8]) -> bool {
+    match optional_attr_str(e, attr_name) {
+        Ok(Some(ref val)) => !matches!(val.as_ref(), "0" | "false" | "off"),
+        _ => true,
+    }
 }
 
 /// Read text content between start and end tags, consuming through the matching end tag.

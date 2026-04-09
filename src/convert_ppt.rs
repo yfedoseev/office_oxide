@@ -22,55 +22,30 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                     }
                     elements.push(Element::Heading(Heading {
                         level: 1,
-                        content: vec![InlineContent::Text(TextSpan {
-                            text: text.to_string(),
-                            bold: true,
-                            italic: false,
-                            strikethrough: false,
-                            hyperlink: None,
-                        })],
+                        content: vec![InlineContent::Text(TextSpan { bold: true, ..TextSpan::plain(text) })],
                     }));
                 }
                 TextType::Body | TextType::HalfBody | TextType::QuarterBody => {
                     for line in text.lines() {
                         if !line.trim().is_empty() {
                             elements.push(Element::Paragraph(Paragraph {
-                                content: vec![InlineContent::Text(TextSpan {
-                                    text: line.to_string(),
-                                    bold: false,
-                                    italic: false,
-                                    strikethrough: false,
-                                    hyperlink: None,
-                                })],
+                                content: vec![InlineContent::Text(TextSpan::plain(line))],
                             }));
                         }
                     }
                 }
                 TextType::Notes => {
-                    // Notes as regular paragraphs
                     for line in text.lines() {
                         if !line.trim().is_empty() {
                             elements.push(Element::Paragraph(Paragraph {
-                                content: vec![InlineContent::Text(TextSpan {
-                                    text: line.to_string(),
-                                    bold: false,
-                                    italic: true,
-                                    strikethrough: false,
-                                    hyperlink: None,
-                                })],
+                                content: vec![InlineContent::Text(TextSpan { italic: true, ..TextSpan::plain(line) })],
                             }));
                         }
                     }
                 }
                 _ => {
                     elements.push(Element::Paragraph(Paragraph {
-                        content: vec![InlineContent::Text(TextSpan {
-                            text: text.to_string(),
-                            bold: false,
-                            italic: false,
-                            strikethrough: false,
-                            hyperlink: None,
-                        })],
+                        content: vec![InlineContent::Text(TextSpan::plain(text))],
                     }));
                 }
             }

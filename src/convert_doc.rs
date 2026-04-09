@@ -23,23 +23,11 @@ pub(crate) fn doc_to_ir(doc: &crate::doc::DocDocument) -> DocumentIR {
         if is_heading {
             elements.push(Element::Heading(Heading {
                 level: if elements.is_empty() { 1 } else { 2 },
-                content: vec![InlineContent::Text(TextSpan {
-                    text: trimmed.to_string(),
-                    bold: true,
-                    italic: false,
-                    strikethrough: false,
-                    hyperlink: None,
-                })],
+                content: vec![InlineContent::Text(TextSpan { bold: true, ..TextSpan::plain(trimmed) })],
             }));
         } else {
             elements.push(Element::Paragraph(Paragraph {
-                content: vec![InlineContent::Text(TextSpan {
-                    text: line.to_string(),
-                    bold: false,
-                    italic: false,
-                    strikethrough: false,
-                    hyperlink: None,
-                })],
+                content: vec![InlineContent::Text(TextSpan::plain(line))],
             }));
         }
     }

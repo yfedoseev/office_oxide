@@ -169,25 +169,13 @@ fn convert_run(
                 // Page/column breaks handled at paragraph level
             }
             crate::docx::RunContent::Tab => {
-                content.push(InlineContent::Text(TextSpan {
-                    text: "\t".to_string(),
-                    bold: false,
-                    italic: false,
-                    strikethrough: false,
-                    hyperlink: None,
-                }));
+                content.push(InlineContent::Text(TextSpan::plain("\t")));
             }
             crate::docx::RunContent::Drawing(drawing) => {
                 // Emit as a separate image element — but we're in inline context,
                 // so we just note the alt text inline
                 if drawing.description.is_some() {
-                    content.push(InlineContent::Text(TextSpan {
-                        text: String::new(),
-                        bold: false,
-                        italic: false,
-                        strikethrough: false,
-                        hyperlink: None,
-                    }));
+                    content.push(InlineContent::Text(TextSpan::plain("")));
                 }
             }
         }

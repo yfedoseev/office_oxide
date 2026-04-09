@@ -5,7 +5,6 @@ use pyo3::types::{PyDict, PyList};
 
 use crate::error::OfficeError;
 use crate::format::DocumentFormat;
-use crate::ir;
 use crate::Document;
 
 pyo3::create_exception!(office_oxide, OfficeOxideError, pyo3::exceptions::PyException);
@@ -70,9 +69,11 @@ impl PyDocument {
     }
 
     /// Convert the document to a format-agnostic intermediate representation (nested dicts/lists).
-    fn to_ir<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+    fn to_ir<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
         let doc_ir = self.inner.to_ir();
-        ir_to_pydict(py, &doc_ir)
+        let json_value = serde_json::to_value(&doc_ir)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(json_value_to_py(py, &json_value))
     }
 
     /// Save/convert the document to a file. Legacy formats are converted to OOXML.
@@ -85,136 +86,36 @@ impl PyDocument {
 }
 
 // ---------------------------------------------------------------------------
-// IR → Python dict conversion
+// serde_json::Value → Python object conversion
 // ---------------------------------------------------------------------------
 
-fn ir_to_pydict<'py>(py: Python<'py>, doc: &ir::DocumentIR) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-
-    // metadata
-    let meta = PyDict::new(py);
-    meta.set_item("format", format!("{:?}", doc.metadata.format))?;
-    meta.set_item("title", doc.metadata.title.as_deref())?;
-    dict.set_item("metadata", meta)?;
-
-    // sections
-    let sections = PyList::empty(py);
-    for section in &doc.sections {
-        sections.append(section_to_pydict(py, section)?)?;
-    }
-    dict.set_item("sections", sections)?;
-
-    Ok(dict)
-}
-
-fn section_to_pydict<'py>(py: Python<'py>, section: &ir::Section) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("title", section.title.as_deref())?;
-
-    let elements = PyList::empty(py);
-    for elem in &section.elements {
-        elements.append(element_to_pyobj(py, elem)?)?;
-    }
-    dict.set_item("elements", elements)?;
-
-    Ok(dict)
-}
-
-fn element_to_pyobj<'py>(py: Python<'py>, elem: &ir::Element) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    match elem {
-        ir::Element::Heading(h) => {
-            dict.set_item("type", "heading")?;
-            dict.set_item("level", h.level)?;
-            dict.set_item("content", inline_content_to_pylist(py, &h.content)?)?;
-        }
-        ir::Element::Paragraph(p) => {
-            dict.set_item("type", "paragraph")?;
-            dict.set_item("content", inline_content_to_pylist(py, &p.content)?)?;
-        }
-        ir::Element::Table(t) => {
-            dict.set_item("type", "table")?;
-            let rows = PyList::empty(py);
-            for row in &t.rows {
-                let row_dict = PyDict::new(py);
-                row_dict.set_item("is_header", row.is_header)?;
-                let cells = PyList::empty(py);
-                for cell in &row.cells {
-                    let cell_dict = PyDict::new(py);
-                    cell_dict.set_item("col_span", cell.col_span)?;
-                    cell_dict.set_item("row_span", cell.row_span)?;
-                    let cell_elements = PyList::empty(py);
-                    for e in &cell.content {
-                        cell_elements.append(element_to_pyobj(py, e)?)?;
-                    }
-                    cell_dict.set_item("content", cell_elements)?;
-                    cells.append(cell_dict)?;
-                }
-                row_dict.set_item("cells", cells)?;
-                rows.append(row_dict)?;
-            }
-            dict.set_item("rows", rows)?;
-        }
-        ir::Element::List(l) => {
-            dict.set_item("type", "list")?;
-            dict.set_item("ordered", l.ordered)?;
-            dict.set_item("items", list_items_to_pylist(py, &l.items)?)?;
-        }
-        ir::Element::Image(img) => {
-            dict.set_item("type", "image")?;
-            dict.set_item("alt_text", img.alt_text.as_deref())?;
-        }
-        ir::Element::ThematicBreak => {
-            dict.set_item("type", "thematic_break")?;
-        }
-    }
-    Ok(dict)
-}
-
-fn inline_content_to_pylist<'py>(
-    py: Python<'py>,
-    content: &[ir::InlineContent],
-) -> PyResult<Bound<'py, PyList>> {
-    let list = PyList::empty(py);
-    for item in content {
-        let dict = PyDict::new(py);
-        match item {
-            ir::InlineContent::Text(span) => {
-                dict.set_item("type", "text")?;
-                dict.set_item("text", &span.text)?;
-                dict.set_item("bold", span.bold)?;
-                dict.set_item("italic", span.italic)?;
-                dict.set_item("strikethrough", span.strikethrough)?;
-                dict.set_item("hyperlink", span.hyperlink.as_deref())?;
-            }
-            ir::InlineContent::LineBreak => {
-                dict.set_item("type", "line_break")?;
+fn json_value_to_py(py: Python<'_>, value: &serde_json::Value) -> PyObject {
+    match value {
+        serde_json::Value::Null => py.None(),
+        serde_json::Value::Bool(b) => b.into_pyobject(py).unwrap().into_any().unbind(),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.into_pyobject(py).unwrap().into_any().unbind()
+            } else {
+                n.as_f64().unwrap_or(0.0).into_pyobject(py).unwrap().into_any().unbind()
             }
         }
-        list.append(dict)?;
-    }
-    Ok(list)
-}
-
-fn list_items_to_pylist<'py>(
-    py: Python<'py>,
-    items: &[ir::ListItem],
-) -> PyResult<Bound<'py, PyList>> {
-    let list = PyList::empty(py);
-    for item in items {
-        let dict = PyDict::new(py);
-        dict.set_item("content", inline_content_to_pylist(py, &item.content)?)?;
-        if let Some(ref nested) = item.nested {
-            let nested_dict = PyDict::new(py);
-            nested_dict.set_item("ordered", nested.ordered)?;
-            nested_dict.set_item("items", list_items_to_pylist(py, &nested.items)?)?;
-            dict.set_item("nested", nested_dict)?;
-        } else {
-            dict.set_item("nested", py.None())?;
+        serde_json::Value::String(s) => s.into_pyobject(py).unwrap().into_any().unbind(),
+        serde_json::Value::Array(arr) => {
+            let list = PyList::empty(py);
+            for item in arr {
+                list.append(json_value_to_py(py, item)).unwrap();
+            }
+            list.unbind().into()
         }
-        list.append(dict)?;
+        serde_json::Value::Object(map) => {
+            let dict = PyDict::new(py);
+            for (k, v) in map {
+                dict.set_item(k, json_value_to_py(py, v)).unwrap();
+            }
+            dict.unbind().into()
+        }
     }
-    Ok(list)
 }
 
 // ---------------------------------------------------------------------------
