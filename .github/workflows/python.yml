@@ -109,8 +109,10 @@ jobs:
         run: uv run ruff check python/
 
   # Build Linux wheels (manylinux + musllinux, x86_64 + aarch64)
+  # Only build wheels on release — cross-compilation is slow and not needed on every push
   build-wheels-linux:
     name: Build wheels (linux ${{ matrix.target }} ${{ matrix.manylinux }})
+    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -145,6 +147,7 @@ jobs:
   # Build macOS wheels (x86_64 + arm64)
   build-wheels-macos:
     name: Build wheels (macos ${{ matrix.target }})
+    if: github.event_name == 'release'
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -170,6 +173,7 @@ jobs:
   # Build Windows wheels (x64 + arm64)
   build-wheels-windows:
     name: Build wheels (windows ${{ matrix.target }})
+    if: github.event_name == 'release'
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -196,6 +200,7 @@ jobs:
   # Build source distribution (universal fallback for any Rust-capable platform)
   build-sdist:
     name: Build source distribution
+    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
