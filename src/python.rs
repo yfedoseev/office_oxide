@@ -1,7 +1,6 @@
 use std::io::Cursor;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
 
 use crate::error::OfficeError;
 use crate::format::DocumentFormat;
@@ -69,11 +68,13 @@ impl PyDocument {
     }
 
     /// Convert the document to a format-agnostic intermediate representation (nested dicts/lists).
-    fn to_ir<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+    fn to_ir<'py>(&self, py: Python<'py>) -> PyResult<Py<PyAny>> {
         let doc_ir = self.inner.to_ir();
-        let json_value = serde_json::to_value(&doc_ir)
+        let json_str = serde_json::to_string(&doc_ir)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        Ok(json_value_to_py(py, &json_value))
+        let json_module = py.import("json")?;
+        let result = json_module.call_method1("loads", (json_str,))?;
+        Ok(result.unbind())
     }
 
     /// Save/convert the document to a file. Legacy formats are converted to OOXML.
@@ -82,39 +83,6 @@ impl PyDocument {
         self.inner.save_as(path).map_err(|e| {
             pyo3::exceptions::PyIOError::new_err(e.to_string())
         })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// serde_json::Value → Python object conversion
-// ---------------------------------------------------------------------------
-
-fn json_value_to_py(py: Python<'_>, value: &serde_json::Value) -> PyObject {
-    match value {
-        serde_json::Value::Null => py.None(),
-        serde_json::Value::Bool(b) => b.into_pyobject(py).unwrap().into_any().unbind(),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                i.into_pyobject(py).unwrap().into_any().unbind()
-            } else {
-                n.as_f64().unwrap_or(0.0).into_pyobject(py).unwrap().into_any().unbind()
-            }
-        }
-        serde_json::Value::String(s) => s.into_pyobject(py).unwrap().into_any().unbind(),
-        serde_json::Value::Array(arr) => {
-            let list = PyList::empty(py);
-            for item in arr {
-                list.append(json_value_to_py(py, item)).unwrap();
-            }
-            list.unbind().into()
-        }
-        serde_json::Value::Object(map) => {
-            let dict = PyDict::new(py);
-            for (k, v) in map {
-                dict.set_item(k, json_value_to_py(py, v)).unwrap();
-            }
-            dict.unbind().into()
-        }
     }
 }
 
