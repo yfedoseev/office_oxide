@@ -1,0 +1,102 @@
+# Office Oxide — The Fastest Office Document Library for Python, Rust & WASM
+
+> The fastest library for Office document processing.
+> Text extraction, markdown, HTML, creation, and editing for DOCX, XLSX, PPTX, DOC, XLS, PPT.
+> Up to 100x faster than python-docx, openpyxl, python-pptx.
+> 98.1% pass rate on 6,062 real-world files. Zero failures on valid documents.
+> MIT / Apache-2.0 license. Current version: 0.1.0.
+
+- Python: `pip install office-oxide`
+- Rust: `cargo add office_oxide`
+- JavaScript/WASM: `npm install office-oxide-wasm`
+- CLI: `cargo install office_oxide_cli`
+- MCP Server: `cargo install office_oxide_mcp`
+- Documentation: https://office.oxide.fyi
+- GitHub: https://github.com/yfedoseev/office_oxide
+
+## Supported Formats
+
+6 formats: DOCX, XLSX, PPTX (modern OOXML) and DOC, XLS, PPT (legacy binary).
+Output: plain text, markdown, HTML, JSON IR, CSV (XLSX only).
+Read, write, and edit OOXML formats. Read + convert legacy formats.
+
+## Getting Started
+
+- [README](https://raw.githubusercontent.com/yfedoseev/office_oxide/main/README.md): Full overview, benchmarks, installation, API examples
+- [Rust API (docs.rs)](https://docs.rs/office_oxide): Complete Rust API reference
+- [Architecture](https://raw.githubusercontent.com/yfedoseev/office_oxide/main/docs/ARCHITECTURE.md): Module structure and design decisions
+- [Changelog](https://raw.githubusercontent.com/yfedoseev/office_oxide/main/CHANGELOG.md): Version history
+
+## Python API
+
+```python
+from office_oxide import Document, extract_text, to_markdown, to_html
+
+text = extract_text("report.docx")
+markdown = to_markdown("data.xlsx")
+html = to_html("slides.pptx")
+
+doc = Document.open("file.docx")
+doc.plain_text()
+doc.to_markdown()
+doc.to_html()
+doc.to_ir()       # Structured dict
+doc.save_as("output.docx")
+```
+
+## Rust API
+
+```rust
+use office_oxide::Document;
+let doc = Document::open("report.docx")?;
+doc.plain_text();
+doc.to_markdown();
+doc.to_html();
+doc.to_ir();  // DocumentIR struct
+```
+
+Sub-modules: office_oxide::{docx, xlsx, pptx, doc, xls, ppt, create, edit, ir}
+
+## JavaScript/WASM API
+
+```javascript
+const { WasmDocument } = require("office-oxide-wasm");
+const doc = new WasmDocument(buffer, "docx");
+doc.plainText();
+doc.toMarkdown();
+doc.toHtml();
+doc.toIr();
+```
+
+## CLI
+
+```bash
+office-oxide text report.docx
+office-oxide markdown data.xlsx
+office-oxide html slides.pptx
+office-oxide ir document.docx
+office-oxide info file.pptx
+```
+
+## MCP Server
+
+Gives Claude, Cursor, and AI assistants the ability to read Office documents locally.
+Tools: extract (text/markdown/html/ir), info.
+Config: `{"mcpServers": {"office-oxide": {"command": "office-oxide-mcp"}}}`
+
+## Performance
+
+Benchmarked on 6,062 files from 11 open-source test suites.
+DOCX: 7ms mean (8-100x faster than python-docx, mammoth, markitdown).
+XLSX: 6ms mean (matches calamine, 40x faster than openpyxl).
+PPTX: 3ms mean (8x faster than python-pptx).
+Legacy DOC: 2ms, XLS: 9ms, PPT: 6ms.
+98.1% overall pass rate. All failures are genuinely invalid files (CVE exploits, corrupted, encrypted).
+
+## Use Cases
+
+- RAG / LLM pipelines: Extract clean text or markdown for retrieval-augmented generation
+- Document processing at scale: Parse thousands of documents in seconds
+- AI assistants: MCP server for Claude, Cursor, and other tools
+- Format conversion: Convert between formats via intermediate representation
+- Drop-in replacement for python-docx, openpyxl, python-pptx, xlrd

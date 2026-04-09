@@ -1,6 +1,6 @@
 # Office Oxide — The Fastest Office Document Library for Rust, Python & WASM
 
-The fastest library for text extraction from Office documents. Rust core with Python bindings and WASM support. Handles DOCX, XLSX, PPTX, DOC, XLS, and PPT. 8-100× faster than python-docx, openpyxl, python-pptx, and xlrd. Matches calamine on XLSX. 100% pass rate on all valid files in a 2,570-file corpus. MIT licensed.
+The fastest library for text extraction from Office documents. Rust core with Python bindings and WASM support. Handles DOCX, XLSX, PPTX, DOC, XLS, and PPT. Up to 100× faster than python-docx, openpyxl, python-pptx, and xlrd. Matches calamine on XLSX. 98.1% pass rate on 6,062 files — all failures are genuinely invalid. MIT licensed.
 
 [![Crates.io](https://img.shields.io/crates/v/office_oxide.svg)](https://crates.io/crates/office_oxide)
 [![PyPI](https://img.shields.io/pypi/v/office-oxide.svg)](https://pypi.org/project/office-oxide/)
@@ -136,14 +136,14 @@ Zero panics, zero timeouts, zero false negatives on valid documents.
 
 ## Supported Formats
 
-| Format | Extension | Read | Write | Edit | Convert | Text | Markdown | IR |
-|--------|-----------|------|-------|------|---------|------|----------|----|
-| Word (OOXML) | .docx | Yes | Yes | Yes | — | Yes | Yes | Yes |
-| Excel (OOXML) | .xlsx | Yes | Yes | Yes | — | Yes | Yes | Yes |
-| PowerPoint (OOXML) | .pptx | Yes | Yes | Yes | — | Yes | Yes | Yes |
-| Word (Legacy) | .doc | Yes | — | — | → .docx | Yes | Yes | Yes |
-| Excel (Legacy) | .xls | Yes | — | — | → .xlsx | Yes | Yes | Yes |
-| PowerPoint (Legacy) | .ppt | Yes | — | — | → .pptx | Yes | Yes | Yes |
+| Format | Extension | Read | Write | Edit | Convert | Text | Markdown | HTML | IR |
+|--------|-----------|------|-------|------|---------|------|----------|------|----|
+| Word (OOXML) | .docx | Yes | Yes | Yes | — | Yes | Yes | Yes | Yes |
+| Excel (OOXML) | .xlsx | Yes | Yes | Yes | — | Yes | Yes | Yes | Yes |
+| PowerPoint (OOXML) | .pptx | Yes | Yes | Yes | — | Yes | Yes | Yes | Yes |
+| Word (Legacy) | .doc | Yes | — | — | → .docx | Yes | Yes | Yes | Yes |
+| Excel (Legacy) | .xls | Yes | — | — | → .xlsx | Yes | Yes | Yes | Yes |
+| PowerPoint (Legacy) | .ppt | Yes | — | — | → .pptx | Yes | Yes | Yes | Yes |
 
 Legacy formats can be converted to modern OOXML with `save_as()`:
 
@@ -155,16 +155,18 @@ doc.save_as("report.docx")  # Converts DOC → DOCX
 ## Python API
 
 ```python
-from office_oxide import Document, extract_text, to_markdown
+from office_oxide import Document, extract_text, to_markdown, to_html
 
 # Quick extraction
 text = extract_text("report.docx")
 markdown = to_markdown("spreadsheet.xlsx")
+html = to_html("slides.pptx")
 
 # Document object
 doc = Document.open("presentation.pptx")
 text = doc.plain_text()
 md = doc.to_markdown()
+html = doc.to_html()
 ir = doc.to_ir()  # Structured JSON intermediate representation
 fmt = doc.format_name()  # "pptx"
 
@@ -190,6 +192,7 @@ let doc = Document::from_reader(file, DocumentFormat::Xlsx)?;
 // Extract content
 let text = doc.plain_text();
 let markdown = doc.to_markdown();
+let html = doc.to_html();
 let ir = doc.to_ir(); // Format-agnostic DocumentIR
 
 // Access format-specific types
@@ -238,6 +241,33 @@ office_oxide = "0.1"
 npm install office-oxide-wasm
 ```
 
+### MCP Server (for AI assistants)
+
+Give Claude, Cursor, or any MCP-compatible tool the ability to read Office documents:
+
+```bash
+cargo install office_oxide_mcp
+```
+
+Add to Claude Desktop `claude_desktop_config.json`:
+```json
+{
+  "mcpServers": {
+    "office-oxide": { "command": "office-oxide-mcp" }
+  }
+}
+```
+
+### CLI
+
+```bash
+cargo install office_oxide_cli
+office-oxide text report.docx
+office-oxide markdown data.xlsx
+office-oxide html slides.pptx
+office-oxide ir document.docx
+```
+
 ## Building from Source
 
 ```bash
@@ -262,7 +292,7 @@ maturin develop --features python
 - **Document processing at scale** — Parse thousands of documents in seconds
 - **Data extraction** — Pull structured data from spreadsheets, tables, and presentations
 - **Format conversion** — Convert between formats via the intermediate representation
-- **python-docx / openpyxl alternative** — 10-60× faster, supports all 6 formats in one library
+- **python-docx / openpyxl alternative** — Up to 100× faster, supports all 6 formats in one library
 
 ## License
 
@@ -282,11 +312,11 @@ cargo build && cargo test && cargo fmt && cargo clippy -- -D warnings
 @software{office_oxide,
   title = {Office Oxide: Fast Office Document Processing for Rust and Python},
   author = {Yury Fedoseev},
-  year = {2025},
+  year = {2026},
   url = {https://github.com/yfedoseev/office_oxide}
 }
 ```
 
 ---
 
-**Rust** + **Python** + **WASM** | MIT/Apache-2.0 | 96.2% pass rate on 2,570 files | 10-60× faster than Python alternatives | 6 formats
+**Rust** + **Python** + **WASM** | MIT/Apache-2.0 | 98.1% pass rate on 6,062 files | Up to 100× faster than alternatives | 6 formats

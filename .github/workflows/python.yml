@@ -106,7 +106,7 @@ jobs:
         run: uv sync --group dev
 
       - name: Run Ruff
-        run: uv run ruff check . --fix
+        run: uv run ruff check python/
 
   # Build Linux wheels (manylinux + musllinux, x86_64 + aarch64)
   build-wheels-linux:
