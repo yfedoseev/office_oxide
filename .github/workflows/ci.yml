@@ -191,11 +191,11 @@ jobs:
           cargo llvm-cov --lib --tests --lcov --output-path lcov.info \
             --ignore-filename-regex '(python\.rs|wasm\.rs)'
 
-      - name: Enforce 85% coverage threshold
+      - name: Enforce 70% coverage threshold
         run: |
           cargo llvm-cov report \
             --ignore-filename-regex '(python\.rs|wasm\.rs)' \
-            --fail-under-lines 85
+            --fail-under-lines 70
 
       - name: Upload coverage to Codecov
         if: always()

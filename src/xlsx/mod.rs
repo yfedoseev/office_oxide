@@ -18,6 +18,7 @@
 
 pub mod cell;
 pub mod date;
+pub mod edit;
 pub mod error;
 pub mod shared_strings;
 pub mod styles;
@@ -25,7 +26,6 @@ pub mod text;
 pub mod workbook;
 pub mod worksheet;
 pub mod write;
-pub mod edit;
 
 pub use cell::{Cell, CellRef, CellValue};
 pub use date::DateTimeValue;
@@ -43,7 +43,7 @@ use log::debug;
 use zip::read::ZipArchive;
 
 use crate::core::opc::{self, OpcReader};
-use crate::core::relationships::{rel_types, Relationships};
+use crate::core::relationships::{Relationships, rel_types};
 use crate::core::theme::Theme;
 
 /// A parsed XLSX document.
@@ -95,7 +95,8 @@ impl XlsxDocument {
         let file = File::open(path).map_err(crate::core::Error::from)?;
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(crate::core::Error::from)? };
         debug!("XLSX fast path: mmap opened ({} bytes)", mmap.len());
-        let archive = ZipArchive::new(std::io::Cursor::new(mmap)).map_err(crate::core::Error::from)?;
+        let archive =
+            ZipArchive::new(std::io::Cursor::new(mmap)).map_err(crate::core::Error::from)?;
         Self::from_zip(archive)
     }
 
@@ -106,7 +107,10 @@ impl XlsxDocument {
     }
 
     /// Read a ZIP entry by name with UTF-8 transcoding for XML parts.
-    fn read_xml_entry<R: Read + Seek>(archive: &mut ZipArchive<R>, name: &str) -> std::result::Result<Vec<u8>, crate::core::Error> {
+    fn read_xml_entry<R: Read + Seek>(
+        archive: &mut ZipArchive<R>,
+        name: &str,
+    ) -> std::result::Result<Vec<u8>, crate::core::Error> {
         let data = opc::read_zip_entry(archive, name)?;
         if name.ends_with(".xml") || name.ends_with(".rels") {
             if let Some(utf8_data) = crate::core::xml::ensure_utf8(&data) {
@@ -185,7 +189,7 @@ impl XlsxDocument {
                         Ok(data) => data,
                         Err(_) => continue,
                     }
-                }
+                },
             };
 
             // Read worksheet relationships (for hyperlinks)
@@ -271,17 +275,18 @@ impl XlsxDocument {
                         format!("/xl/worksheets/sheet{}.xml", idx),
                         format!("/xl/worksheets/sheet{}.xml", sheet.sheet_id),
                     ];
-                    match candidates
-                        .iter()
-                        .find_map(|c| crate::core::opc::PartName::new(c).ok().filter(|pn| opc.has_part(pn)))
-                    {
+                    match candidates.iter().find_map(|c| {
+                        crate::core::opc::PartName::new(c)
+                            .ok()
+                            .filter(|pn| opc.has_part(pn))
+                    }) {
                         Some(pn) => {
                             debug!("worksheet fallback: '{}' -> '{}'", sheet.rel_id, pn);
                             pn
-                        }
+                        },
                         None => continue,
                     }
-                }
+                },
             };
             let ws_rels = opc
                 .read_rels_for(&part_name)

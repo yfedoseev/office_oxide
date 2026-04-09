@@ -49,7 +49,8 @@ pub fn parse_clx(data: &[u8]) -> Result<Vec<Piece>> {
     if pos + 4 > data.len() {
         return Err(DocError::InvalidPieceTable("Pcdt size truncated".into()));
     }
-    let pcdt_size = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+    let pcdt_size =
+        u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
     pos += 4;
 
     if pos + pcdt_size > data.len() {
@@ -80,9 +81,7 @@ fn parse_plc_pcd(data: &[u8]) -> Result<Vec<Piece>> {
 
     let cp_array_size = (n + 1) * 4;
     if cp_array_size + n * 8 > data.len() {
-        return Err(DocError::InvalidPieceTable(
-            "PlcPcd size mismatch".into(),
-        ));
+        return Err(DocError::InvalidPieceTable("PlcPcd size mismatch".into()));
     }
 
     let mut pieces = Vec::with_capacity(n);
@@ -207,11 +206,11 @@ pub fn sanitize_text(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
-            '\r' => result.push('\n'), // Paragraph mark
-            '\x07' => result.push('\t'),         // Cell/row mark → tab
-            '\x0C' => result.push('\n'),         // Page break / section break
-            '\x0B' => result.push('\n'),         // Vertical tab → newline
-            '\x01' | '\x08' | '\x13' | '\x14' | '\x15' => {} // Field codes, picture, etc. — skip
+            '\r' => result.push('\n'),                        // Paragraph mark
+            '\x07' => result.push('\t'),                      // Cell/row mark → tab
+            '\x0C' => result.push('\n'),                      // Page break / section break
+            '\x0B' => result.push('\n'),                      // Vertical tab → newline
+            '\x01' | '\x08' | '\x13' | '\x14' | '\x15' => {}, // Field codes, picture, etc. — skip
             _ => result.push(ch),
         }
     }

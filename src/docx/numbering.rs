@@ -58,23 +58,21 @@ impl NumberingDefinitions {
 
         loop {
             match reader.read_event()? {
-                Event::Start(ref e) => {
-                    match e.local_name().as_ref() {
-                        b"abstractNum" => {
-                            if let Some(an) = parse_abstract_num(&mut reader, e)? {
-                                defs.abstract_nums.insert(an.abstract_num_id, an);
-                            }
+                Event::Start(ref e) => match e.local_name().as_ref() {
+                    b"abstractNum" => {
+                        if let Some(an) = parse_abstract_num(&mut reader, e)? {
+                            defs.abstract_nums.insert(an.abstract_num_id, an);
                         }
-                        b"num" => {
-                            if let Some(inst) = parse_num_instance(&mut reader, e)? {
-                                defs.instances.insert(inst.num_id, inst);
-                            }
+                    },
+                    b"num" => {
+                        if let Some(inst) = parse_num_instance(&mut reader, e)? {
+                            defs.instances.insert(inst.num_id, inst);
                         }
-                        _ => {}
-                    }
-                }
+                    },
+                    _ => {},
+                },
                 Event::Eof => break,
-                _ => {}
+                _ => {},
             }
         }
         Ok(defs)
@@ -113,14 +111,14 @@ fn parse_abstract_num(
                 } else {
                     xml::skip_element_fast(reader)?;
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"abstractNum" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -130,7 +128,9 @@ fn parse_abstract_num(
     }))
 }
 
-fn parse_numbering_level(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<NumberingLevel> {
+fn parse_numbering_level(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> crate::core::Result<NumberingLevel> {
     let mut start_val = 1u32;
     let mut format = NumberFormat::Decimal;
     let mut level_text = String::new();
@@ -144,36 +144,36 @@ fn parse_numbering_level(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             start_val = val.parse().unwrap_or(1);
                         }
-                    }
+                    },
                     b"numFmt" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             format = parse_number_format(&val);
                         }
-                    }
+                    },
                     b"lvlText" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             level_text = val.into_owned();
                         }
-                    }
+                    },
                     b"lvlJc" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             justification =
                                 Some(super::formatting::parse_justification_value(&val));
                         }
-                    }
+                    },
                     b"pPr" | b"rPr" => {
                         // Skip sub-properties for now (they apply to the numbering marker)
-                    }
-                    _ => {}
+                    },
+                    _ => {},
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"lvl" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -217,14 +217,14 @@ fn parse_num_instance(
                         abstract_num_id = val.parse().unwrap_or(0);
                     }
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"num" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 

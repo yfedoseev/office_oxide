@@ -8,8 +8,8 @@ use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::path::Path;
 
-use zip::write::{SimpleFileOptions, ZipWriter};
 use zip::CompressionMethod;
+use zip::write::{SimpleFileOptions, ZipWriter};
 
 use super::content_types::{ContentTypes, ContentTypesBuilder};
 use super::error::Result;
@@ -100,8 +100,7 @@ impl EditablePackage {
     /// Write the package to any `Write + Seek` destination.
     pub fn write_to<W: Write + Seek>(&self, writer: W) -> Result<()> {
         let mut zip = ZipWriter::new(writer);
-        let options = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Deflated);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
         // Write all parts
         for (name, data) in &self.parts {

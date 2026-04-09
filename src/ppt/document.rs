@@ -5,8 +5,8 @@ use std::io::{Read, Seek};
 use crate::cfb::CfbReader;
 
 use super::error::Result;
-use super::images::{extract_images, PptImage};
-use super::text::{extract_slides_text, SlideText, TextType};
+use super::images::{PptImage, extract_images};
+use super::text::{SlideText, TextType, extract_slides_text};
 
 /// A parsed legacy PowerPoint document.
 #[derive(Debug)]
@@ -29,8 +29,8 @@ impl PptDocument {
                 return Ok(Self {
                     slides: Vec::new(),
                     images: Vec::new(),
-                })
-            }
+                });
+            },
         };
 
         let slides = extract_slides_text(&stream);
@@ -87,14 +87,14 @@ impl PptDocument {
                         out.push_str("### ");
                         out.push_str(&run.text);
                         out.push_str("\n\n");
-                    }
+                    },
                     TextType::Notes => {
                         // Skip notes in main content.
-                    }
+                    },
                     _ => {
                         out.push_str(&run.text);
                         out.push_str("\n\n");
-                    }
+                    },
                 }
             }
         }
@@ -124,14 +124,21 @@ mod tests {
             slides: vec![
                 SlideText {
                     text_runs: vec![
-                        TextRun { text_type: TextType::Title, text: "Welcome".into() },
-                        TextRun { text_type: TextType::Body, text: "Hello world".into() },
+                        TextRun {
+                            text_type: TextType::Title,
+                            text: "Welcome".into(),
+                        },
+                        TextRun {
+                            text_type: TextType::Body,
+                            text: "Hello world".into(),
+                        },
                     ],
                 },
                 SlideText {
-                    text_runs: vec![
-                        TextRun { text_type: TextType::Title, text: "Slide 2".into() },
-                    ],
+                    text_runs: vec![TextRun {
+                        text_type: TextType::Title,
+                        text: "Slide 2".into(),
+                    }],
                 },
             ],
         };
@@ -147,8 +154,14 @@ mod tests {
             images: Vec::new(),
             slides: vec![SlideText {
                 text_runs: vec![
-                    TextRun { text_type: TextType::Title, text: "My Title".into() },
-                    TextRun { text_type: TextType::Body, text: "Content here".into() },
+                    TextRun {
+                        text_type: TextType::Title,
+                        text: "My Title".into(),
+                    },
+                    TextRun {
+                        text_type: TextType::Body,
+                        text: "Content here".into(),
+                    },
                 ],
             }],
         };
@@ -164,8 +177,14 @@ mod tests {
             images: Vec::new(),
             slides: vec![SlideText {
                 text_runs: vec![
-                    TextRun { text_type: TextType::Title, text: "Title".into() },
-                    TextRun { text_type: TextType::Notes, text: "Speaker notes".into() },
+                    TextRun {
+                        text_type: TextType::Title,
+                        text: "Title".into(),
+                    },
+                    TextRun {
+                        text_type: TextType::Notes,
+                        text: "Speaker notes".into(),
+                    },
                 ],
             }],
         };

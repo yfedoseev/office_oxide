@@ -67,18 +67,12 @@ mod tests {
 
     #[test]
     fn from_path() {
-        assert_eq!(
-            DocumentFormat::from_path(Path::new("report.docx")),
-            Some(DocumentFormat::Docx)
-        );
+        assert_eq!(DocumentFormat::from_path(Path::new("report.docx")), Some(DocumentFormat::Docx));
         assert_eq!(
             DocumentFormat::from_path(Path::new("/tmp/data.xlsx")),
             Some(DocumentFormat::Xlsx)
         );
-        assert_eq!(
-            DocumentFormat::from_path(Path::new("slides.PPTX")),
-            Some(DocumentFormat::Pptx)
-        );
+        assert_eq!(DocumentFormat::from_path(Path::new("slides.PPTX")), Some(DocumentFormat::Pptx));
         assert_eq!(DocumentFormat::from_path(Path::new("notes.txt")), None);
         assert_eq!(DocumentFormat::from_path(Path::new("noext")), None);
     }

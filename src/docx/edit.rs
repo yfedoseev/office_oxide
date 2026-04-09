@@ -43,7 +43,8 @@ impl EditableDocx {
         let (new_xml, count) = replace_in_wt_elements(&xml_str, find, replace);
 
         if count > 0 {
-            self.package.set_part(self.main_part.clone(), new_xml.into_bytes());
+            self.package
+                .set_part(self.main_part.clone(), new_xml.into_bytes());
         }
         count
     }

@@ -19,9 +19,9 @@ pub fn extract_images(data: &[u8]) -> Vec<DocImage> {
         // Check if this looks like a BLIP record.
         if is_blip_type(rec_type) {
             let ver_inst = u16::from_le_bytes([data[pos], data[pos + 1]]);
-            let rec_len = u32::from_le_bytes([
-                data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
-            ]) as usize;
+            let rec_len =
+                u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                    as usize;
             let inst = ver_inst >> 4;
 
             let data_start = pos + 8;
@@ -79,10 +79,10 @@ fn has_valid_signature(rec_type: u16, data: &[u8]) -> bool {
     }
     match rec_type {
         0xF01D | 0xF02A => data.len() >= 2 && data[0] == 0xFF && data[1] == 0xD8, // JPEG
-        0xF01E => data.len() >= 4 && data.starts_with(b"\x89PNG"),                 // PNG
+        0xF01E => data.len() >= 4 && data.starts_with(b"\x89PNG"),                // PNG
         0xF01A => data.len() >= 4 && data[..4] == [0x01, 0x00, 0x00, 0x00],       // EMF
-        0xF01B => data.len() > 10,                                                  // WMF (varied headers)
-        _ => data.len() > 10,                                                        // Others: trust if non-trivial
+        0xF01B => data.len() > 10, // WMF (varied headers)
+        _ => data.len() > 10,      // Others: trust if non-trivial
     }
 }
 
@@ -160,8 +160,12 @@ mod tests {
     fn rejects_false_positive() {
         // Data that happens to have a BLIP type at the right offset but no valid image sig.
         let mut data = vec![0u8; 100];
-        data[2] = 0x1D; data[3] = 0xF0; // looks like JPEG BLIP type
-        data[4] = 30; data[5] = 0; data[6] = 0; data[7] = 0; // rec_len=30
+        data[2] = 0x1D;
+        data[3] = 0xF0; // looks like JPEG BLIP type
+        data[4] = 30;
+        data[5] = 0;
+        data[6] = 0;
+        data[7] = 0; // rec_len=30
         // But UID + tag (17 bytes) then data won't start with 0xFF 0xD8
         let images = extract_images(&data);
         assert!(images.is_empty());

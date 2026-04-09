@@ -16,6 +16,7 @@
 //! ```
 
 pub mod document;
+pub mod edit;
 pub mod error;
 pub mod formatting;
 pub mod headers;
@@ -27,7 +28,6 @@ pub mod styles;
 pub mod table;
 pub mod text;
 pub mod write;
-pub mod edit;
 
 pub use document::{BlockElement, Body};
 pub use error::{DocxError, Result};
@@ -50,7 +50,7 @@ use log::debug;
 use quick_xml::events::Event;
 
 use crate::core::opc::OpcReader;
-use crate::core::relationships::{rel_types, TargetMode};
+use crate::core::relationships::{TargetMode, rel_types};
 use crate::core::theme::Theme;
 use crate::core::units::Emu;
 use crate::core::xml;
@@ -192,19 +192,17 @@ fn parse_body_elements(xml_data: &[u8]) -> CoreResult<Vec<BlockElement>> {
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                match e.local_name().as_ref() {
-                    b"p" => {
-                        elements.push(BlockElement::Paragraph(parse_paragraph(&mut reader)?));
-                    }
-                    b"tbl" => {
-                        elements.push(BlockElement::Table(parse_table(&mut reader)?));
-                    }
-                    _ => {}
-                }
-            }
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"p" => {
+                    elements.push(BlockElement::Paragraph(parse_paragraph(&mut reader)?));
+                },
+                b"tbl" => {
+                    elements.push(BlockElement::Table(parse_table(&mut reader)?));
+                },
+                _ => {},
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
     Ok(elements)
@@ -222,30 +220,28 @@ fn parse_document(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                match e.local_name().as_ref() {
-                    b"body" => {
-                        in_body = true;
-                    }
-                    b"p" if in_body => {
-                        elements.push(BlockElement::Paragraph(parse_paragraph(&mut reader)?));
-                    }
-                    b"tbl" if in_body => {
-                        elements.push(BlockElement::Table(parse_table(&mut reader)?));
-                    }
-                    b"sectPr" if in_body => {
-                        sections.push(parse_section_properties(&mut reader, e)?);
-                    }
-                    _ => {}
-                }
-            }
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"body" => {
+                    in_body = true;
+                },
+                b"p" if in_body => {
+                    elements.push(BlockElement::Paragraph(parse_paragraph(&mut reader)?));
+                },
+                b"tbl" if in_body => {
+                    elements.push(BlockElement::Table(parse_table(&mut reader)?));
+                },
+                b"sectPr" if in_body => {
+                    sections.push(parse_section_properties(&mut reader, e)?);
+                },
+                _ => {},
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"body" {
                     in_body = false;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -277,14 +273,14 @@ fn resolve_hyperlinks(
                         }
                     }
                 }
-            }
+            },
             BlockElement::Table(t) => {
                 for row in &mut t.rows {
                     for cell in &mut row.cells {
                         resolve_hyperlinks(&mut cell.content, rels);
                     }
                 }
-            }
+            },
         }
     }
 }
@@ -298,33 +294,31 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                match e.local_name().as_ref() {
-                    b"pPr" => {
-                        paragraph.properties = Some(parse_paragraph_properties_fast(reader)?);
-                    }
-                    b"r" => {
-                        paragraph
-                            .content
-                            .push(ParagraphContent::Run(parse_run(reader)?));
-                    }
-                    b"hyperlink" => {
-                        paragraph.content.push(ParagraphContent::Hyperlink(
-                            parse_hyperlink(reader, e)?,
-                        ));
-                    }
-                    _ => {
-                        xml::skip_element_fast(reader)?;
-                    }
-                }
-            }
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"pPr" => {
+                    paragraph.properties = Some(parse_paragraph_properties_fast(reader)?);
+                },
+                b"r" => {
+                    paragraph
+                        .content
+                        .push(ParagraphContent::Run(parse_run(reader)?));
+                },
+                b"hyperlink" => {
+                    paragraph
+                        .content
+                        .push(ParagraphContent::Hyperlink(parse_hyperlink(reader, e)?));
+                },
+                _ => {
+                    xml::skip_element_fast(reader)?;
+                },
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"p" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
     Ok(paragraph)
@@ -335,65 +329,61 @@ fn parse_run(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Run> {
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                match e.local_name().as_ref() {
-                    b"rPr" => {
-                        run.properties = Some(parse_run_properties_fast(reader)?);
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"rPr" => {
+                    run.properties = Some(parse_run_properties_fast(reader)?);
+                },
+                b"t" => {
+                    let text = xml::read_text_content_fast(reader)?;
+                    if !text.is_empty() {
+                        run.content.push(RunContent::Text(text));
                     }
-                    b"t" => {
-                        let text = xml::read_text_content_fast(reader)?;
-                        if !text.is_empty() {
-                            run.content.push(RunContent::Text(text));
-                        }
+                },
+                b"br" => {
+                    let break_type = match xml::optional_attr_str(e, b"w:type")? {
+                        Some(ref t) => match t.as_ref() {
+                            "page" => BreakType::Page,
+                            "column" => BreakType::Column,
+                            _ => BreakType::Line,
+                        },
+                        None => BreakType::Line,
+                    };
+                    run.content.push(RunContent::Break(break_type));
+                    xml::skip_element_fast(reader)?;
+                },
+                b"drawing" => {
+                    if let Some(drawing) = parse_drawing(reader)? {
+                        run.content.push(RunContent::Drawing(drawing));
                     }
-                    b"br" => {
-                        let break_type = match xml::optional_attr_str(e, b"w:type")? {
-                            Some(ref t) => match t.as_ref() {
-                                "page" => BreakType::Page,
-                                "column" => BreakType::Column,
-                                _ => BreakType::Line,
-                            },
-                            None => BreakType::Line,
-                        };
-                        run.content.push(RunContent::Break(break_type));
-                        xml::skip_element_fast(reader)?;
-                    }
-                    b"drawing" => {
-                        if let Some(drawing) = parse_drawing(reader)? {
-                            run.content.push(RunContent::Drawing(drawing));
-                        }
-                    }
-                    _ => {
-                        xml::skip_element_fast(reader)?;
-                    }
-                }
-            }
-            Event::Empty(ref e) => {
-                match e.local_name().as_ref() {
-                    b"br" => {
-                        let break_type = match xml::optional_attr_str(e, b"w:type")? {
-                            Some(ref t) => match t.as_ref() {
-                                "page" => BreakType::Page,
-                                "column" => BreakType::Column,
-                                _ => BreakType::Line,
-                            },
-                            None => BreakType::Line,
-                        };
-                        run.content.push(RunContent::Break(break_type));
-                    }
-                    b"tab" => {
-                        run.content.push(RunContent::Tab);
-                    }
-                    _ => {}
-                }
-            }
+                },
+                _ => {
+                    xml::skip_element_fast(reader)?;
+                },
+            },
+            Event::Empty(ref e) => match e.local_name().as_ref() {
+                b"br" => {
+                    let break_type = match xml::optional_attr_str(e, b"w:type")? {
+                        Some(ref t) => match t.as_ref() {
+                            "page" => BreakType::Page,
+                            "column" => BreakType::Column,
+                            _ => BreakType::Line,
+                        },
+                        None => BreakType::Line,
+                    };
+                    run.content.push(RunContent::Break(break_type));
+                },
+                b"tab" => {
+                    run.content.push(RunContent::Tab);
+                },
+                _ => {},
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"r" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
     Ok(run)
@@ -426,14 +416,14 @@ fn parse_hyperlink(
                 } else {
                     xml::skip_element_fast(reader)?;
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"hyperlink" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -470,15 +460,15 @@ fn parse_drawing(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<Dra
                         if let Ok(Some(desc)) = xml::optional_attr_str(e, b"descr") {
                             description = Some(desc.into_owned());
                         }
-                    }
+                    },
                     b"blip" => {
                         if let Ok(Some(embed)) = xml::optional_attr_str(e, b"r:embed") {
                             relationship_id = Some(embed.into_owned());
                         }
-                    }
-                    _ => {}
+                    },
+                    _ => {},
                 }
-            }
+            },
             Event::Empty(ref e) => {
                 let local = e.local_name();
                 let local_bytes = local.as_ref();
@@ -488,23 +478,23 @@ fn parse_drawing(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<Dra
                         if let Ok(Some(desc)) = xml::optional_attr_str(e, b"descr") {
                             description = Some(desc.into_owned());
                         }
-                    }
+                    },
                     b"blip" => {
                         if let Ok(Some(embed)) = xml::optional_attr_str(e, b"r:embed") {
                             relationship_id = Some(embed.into_owned());
                         }
-                    }
-                    _ => {}
+                    },
+                    _ => {},
                 }
-            }
+            },
             Event::End(_) => {
                 depth -= 1;
                 if depth == 0 {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -541,29 +531,27 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Table> {
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                match e.local_name().as_ref() {
-                    b"tblPr" => {
-                        properties = Some(parse_table_properties(reader)?);
-                    }
-                    b"tblGrid" => {
-                        grid = parse_table_grid(reader)?;
-                    }
-                    b"tr" => {
-                        rows.push(parse_table_row(reader)?);
-                    }
-                    _ => {
-                        xml::skip_element_fast(reader)?;
-                    }
-                }
-            }
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"tblPr" => {
+                    properties = Some(parse_table_properties(reader)?);
+                },
+                b"tblGrid" => {
+                    grid = parse_table_grid(reader)?;
+                },
+                b"tr" => {
+                    rows.push(parse_table_row(reader)?);
+                },
+                _ => {
+                    xml::skip_element_fast(reader)?;
+                },
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"tbl" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -579,62 +567,60 @@ fn parse_table_properties(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<T
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                match e.local_name().as_ref() {
-                    b"tblW" => {
-                        props.width = parse_table_width(e)?;
-                        xml::skip_element_fast(reader)?;
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"tblW" => {
+                    props.width = parse_table_width(e)?;
+                    xml::skip_element_fast(reader)?;
+                },
+                b"jc" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                        props.justification =
+                            Some(self::formatting::parse_justification_value(&val));
                     }
-                    b"jc" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                            props.justification =
-                                Some(self::formatting::parse_justification_value(&val));
-                        }
-                        xml::skip_element_fast(reader)?;
+                    xml::skip_element_fast(reader)?;
+                },
+                b"tblStyle" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                        props.style_id = Some(val.into_owned());
                     }
-                    b"tblStyle" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                            props.style_id = Some(val.into_owned());
-                        }
-                        xml::skip_element_fast(reader)?;
+                    xml::skip_element_fast(reader)?;
+                },
+                _ => {
+                    xml::skip_element_fast(reader)?;
+                },
+            },
+            Event::Empty(ref e) => match e.local_name().as_ref() {
+                b"tblW" => {
+                    props.width = parse_table_width(e)?;
+                },
+                b"jc" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                        props.justification =
+                            Some(self::formatting::parse_justification_value(&val));
                     }
-                    _ => {
-                        xml::skip_element_fast(reader)?;
+                },
+                b"tblStyle" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                        props.style_id = Some(val.into_owned());
                     }
-                }
-            }
-            Event::Empty(ref e) => {
-                match e.local_name().as_ref() {
-                    b"tblW" => {
-                        props.width = parse_table_width(e)?;
-                    }
-                    b"jc" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                            props.justification =
-                                Some(self::formatting::parse_justification_value(&val));
-                        }
-                    }
-                    b"tblStyle" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                            props.style_id = Some(val.into_owned());
-                        }
-                    }
-                    _ => {}
-                }
-            }
+                },
+                _ => {},
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"tblPr" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
     Ok(props)
 }
 
-fn parse_table_grid(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Vec<crate::core::units::Twip>> {
+fn parse_table_grid(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> CoreResult<Vec<crate::core::units::Twip>> {
     let mut cols = Vec::new();
 
     loop {
@@ -646,14 +632,14 @@ fn parse_table_grid(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Vec<cra
                         cols.push(crate::core::units::Twip(val));
                     }
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"tblGrid" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
     Ok(cols)
@@ -665,33 +651,33 @@ fn parse_table_row(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableRow
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                match e.local_name().as_ref() {
-                    b"trPr" => {
-                        properties = Some(parse_table_row_properties(reader)?);
-                    }
-                    b"tc" => {
-                        cells.push(parse_table_cell(reader)?);
-                    }
-                    _ => {
-                        xml::skip_element_fast(reader)?;
-                    }
-                }
-            }
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"trPr" => {
+                    properties = Some(parse_table_row_properties(reader)?);
+                },
+                b"tc" => {
+                    cells.push(parse_table_cell(reader)?);
+                },
+                _ => {
+                    xml::skip_element_fast(reader)?;
+                },
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"tr" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
     Ok(TableRow { properties, cells })
 }
 
-fn parse_table_row_properties(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableRowProperties> {
+fn parse_table_row_properties(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> CoreResult<TableRowProperties> {
     let mut props = TableRowProperties::default();
 
     loop {
@@ -700,14 +686,14 @@ fn parse_table_row_properties(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResu
                 if e.local_name().as_ref() == b"tblHeader" {
                     props.is_header = true;
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"trPr" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
     Ok(props)
@@ -719,29 +705,27 @@ fn parse_table_cell(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableCe
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                match e.local_name().as_ref() {
-                    b"tcPr" => {
-                        properties = Some(parse_table_cell_properties(reader)?);
-                    }
-                    b"p" => {
-                        content.push(BlockElement::Paragraph(parse_paragraph(reader)?));
-                    }
-                    b"tbl" => {
-                        content.push(BlockElement::Table(parse_table(reader)?));
-                    }
-                    _ => {
-                        xml::skip_element_fast(reader)?;
-                    }
-                }
-            }
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"tcPr" => {
+                    properties = Some(parse_table_cell_properties(reader)?);
+                },
+                b"p" => {
+                    content.push(BlockElement::Paragraph(parse_paragraph(reader)?));
+                },
+                b"tbl" => {
+                    content.push(BlockElement::Table(parse_table(reader)?));
+                },
+                _ => {
+                    xml::skip_element_fast(reader)?;
+                },
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"tc" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -758,79 +742,69 @@ fn parse_table_cell_properties(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                match e.local_name().as_ref() {
-                    b"tcW" => {
-                        props.width = parse_table_width(e)?;
-                        xml::skip_element_fast(reader)?;
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"tcW" => {
+                    props.width = parse_table_width(e)?;
+                    xml::skip_element_fast(reader)?;
+                },
+                b"vMerge" => {
+                    let val = xml::optional_attr_str(e, b"w:val")?;
+                    props.vertical_merge = Some(match val.as_deref() {
+                        Some("restart") => MergeType::Restart,
+                        _ => MergeType::Continue,
+                    });
+                    xml::skip_element_fast(reader)?;
+                },
+                b"gridSpan" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                        props.grid_span = val.parse().ok();
                     }
-                    b"vMerge" => {
-                        let val = xml::optional_attr_str(e, b"w:val")?;
-                        props.vertical_merge = Some(match val.as_deref() {
-                            Some("restart") => MergeType::Restart,
-                            _ => MergeType::Continue,
-                        });
-                        xml::skip_element_fast(reader)?;
+                    xml::skip_element_fast(reader)?;
+                },
+                b"shd" => {
+                    props.shading = Some(Shading {
+                        fill: xml::optional_attr_str(e, b"w:fill")?.map(|v| v.into_owned()),
+                        color: xml::optional_attr_str(e, b"w:color")?.map(|v| v.into_owned()),
+                        pattern: xml::optional_attr_str(e, b"w:val")?.map(|v| v.into_owned()),
+                    });
+                    xml::skip_element_fast(reader)?;
+                },
+                _ => {
+                    xml::skip_element_fast(reader)?;
+                },
+            },
+            Event::Empty(ref e) => match e.local_name().as_ref() {
+                b"tcW" => {
+                    props.width = parse_table_width(e)?;
+                },
+                b"vMerge" => {
+                    let val = xml::optional_attr_str(e, b"w:val")?;
+                    props.vertical_merge = Some(match val.as_deref() {
+                        Some("restart") => MergeType::Restart,
+                        _ => MergeType::Continue,
+                    });
+                },
+                b"gridSpan" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                        props.grid_span = val.parse().ok();
                     }
-                    b"gridSpan" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                            props.grid_span = val.parse().ok();
-                        }
-                        xml::skip_element_fast(reader)?;
-                    }
-                    b"shd" => {
-                        props.shading = Some(Shading {
-                            fill: xml::optional_attr_str(e, b"w:fill")?
-                                .map(|v| v.into_owned()),
-                            color: xml::optional_attr_str(e, b"w:color")?
-                                .map(|v| v.into_owned()),
-                            pattern: xml::optional_attr_str(e, b"w:val")?
-                                .map(|v| v.into_owned()),
-                        });
-                        xml::skip_element_fast(reader)?;
-                    }
-                    _ => {
-                        xml::skip_element_fast(reader)?;
-                    }
-                }
-            }
-            Event::Empty(ref e) => {
-                match e.local_name().as_ref() {
-                    b"tcW" => {
-                        props.width = parse_table_width(e)?;
-                    }
-                    b"vMerge" => {
-                        let val = xml::optional_attr_str(e, b"w:val")?;
-                        props.vertical_merge = Some(match val.as_deref() {
-                            Some("restart") => MergeType::Restart,
-                            _ => MergeType::Continue,
-                        });
-                    }
-                    b"gridSpan" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                            props.grid_span = val.parse().ok();
-                        }
-                    }
-                    b"shd" => {
-                        props.shading = Some(Shading {
-                            fill: xml::optional_attr_str(e, b"w:fill")?
-                                .map(|v| v.into_owned()),
-                            color: xml::optional_attr_str(e, b"w:color")?
-                                .map(|v| v.into_owned()),
-                            pattern: xml::optional_attr_str(e, b"w:val")?
-                                .map(|v| v.into_owned()),
-                        });
-                    }
-                    _ => {}
-                }
-            }
+                },
+                b"shd" => {
+                    props.shading = Some(Shading {
+                        fill: xml::optional_attr_str(e, b"w:fill")?.map(|v| v.into_owned()),
+                        color: xml::optional_attr_str(e, b"w:color")?.map(|v| v.into_owned()),
+                        pattern: xml::optional_attr_str(e, b"w:val")?.map(|v| v.into_owned()),
+                    });
+                },
+                _ => {},
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"tcPr" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
     Ok(props)
@@ -867,93 +841,90 @@ fn parse_section_properties(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) => {
-                match e.local_name().as_ref() {
-                        b"pgSz" => {
-                            let w: i32 = xml::optional_attr_str(e, b"w:w")?
+            Event::Start(ref e) | Event::Empty(ref e) => match e.local_name().as_ref() {
+                b"pgSz" => {
+                    let w: i32 = xml::optional_attr_str(e, b"w:w")?
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(12240);
+                    let h: i32 = xml::optional_attr_str(e, b"w:h")?
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(15840);
+                    let orient =
+                        xml::optional_attr_str(e, b"w:orient")?.map(|v| match v.as_ref() {
+                            "landscape" => PageOrientation::Landscape,
+                            _ => PageOrientation::Portrait,
+                        });
+                    props.page_size = Some(PageSize {
+                        width: crate::core::units::Twip(w),
+                        height: crate::core::units::Twip(h),
+                        orient,
+                    });
+                },
+                b"pgMar" => {
+                    props.margins = Some(PageMargins {
+                        top: crate::core::units::Twip(
+                            xml::optional_attr_str(e, b"w:top")?
                                 .and_then(|v| v.parse().ok())
-                                .unwrap_or(12240);
-                            let h: i32 = xml::optional_attr_str(e, b"w:h")?
+                                .unwrap_or(1440),
+                        ),
+                        bottom: crate::core::units::Twip(
+                            xml::optional_attr_str(e, b"w:bottom")?
                                 .and_then(|v| v.parse().ok())
-                                .unwrap_or(15840);
-                            let orient = xml::optional_attr_str(e, b"w:orient")?.map(|v| {
-                                match v.as_ref() {
-                                    "landscape" => PageOrientation::Landscape,
-                                    _ => PageOrientation::Portrait,
-                                }
-                            });
-                            props.page_size = Some(PageSize {
-                                width: crate::core::units::Twip(w),
-                                height: crate::core::units::Twip(h),
-                                orient,
-                            });
-                        }
-                        b"pgMar" => {
-                            props.margins = Some(PageMargins {
-                                top: crate::core::units::Twip(
-                                    xml::optional_attr_str(e, b"w:top")?
-                                        .and_then(|v| v.parse().ok())
-                                        .unwrap_or(1440),
-                                ),
-                                bottom: crate::core::units::Twip(
-                                    xml::optional_attr_str(e, b"w:bottom")?
-                                        .and_then(|v| v.parse().ok())
-                                        .unwrap_or(1440),
-                                ),
-                                left: crate::core::units::Twip(
-                                    xml::optional_attr_str(e, b"w:left")?
-                                        .and_then(|v| v.parse().ok())
-                                        .unwrap_or(1440),
-                                ),
-                                right: crate::core::units::Twip(
-                                    xml::optional_attr_str(e, b"w:right")?
-                                        .and_then(|v| v.parse().ok())
-                                        .unwrap_or(1440),
-                                ),
-                                header: xml::optional_attr_str(e, b"w:header")?
-                                    .and_then(|v| v.parse().ok())
-                                    .map(crate::core::units::Twip),
-                                footer: xml::optional_attr_str(e, b"w:footer")?
-                                    .and_then(|v| v.parse().ok())
-                                    .map(crate::core::units::Twip),
-                                gutter: xml::optional_attr_str(e, b"w:gutter")?
-                                    .and_then(|v| v.parse().ok())
-                                    .map(crate::core::units::Twip),
-                            });
-                        }
-                        b"headerReference" => {
-                            let hf_type = parse_hf_type(e)?;
-                            if let Ok(Some(rid)) = xml::optional_attr_str(e, b"r:id") {
-                                props.header_refs.push(HeaderFooterRef {
-                                    hf_type,
-                                    relationship_id: rid.into_owned(),
-                                });
-                            }
-                        }
-                        b"footerReference" => {
-                            let hf_type = parse_hf_type(e)?;
-                            if let Ok(Some(rid)) = xml::optional_attr_str(e, b"r:id") {
-                                props.footer_refs.push(HeaderFooterRef {
-                                    hf_type,
-                                    relationship_id: rid.into_owned(),
-                                });
-                            }
-                        }
-                        b"cols" => {
-                            if let Ok(Some(num)) = xml::optional_attr_str(e, b"w:num") {
-                                props.columns = num.parse().ok();
-                            }
-                        }
-                        _ => {}
+                                .unwrap_or(1440),
+                        ),
+                        left: crate::core::units::Twip(
+                            xml::optional_attr_str(e, b"w:left")?
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(1440),
+                        ),
+                        right: crate::core::units::Twip(
+                            xml::optional_attr_str(e, b"w:right")?
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(1440),
+                        ),
+                        header: xml::optional_attr_str(e, b"w:header")?
+                            .and_then(|v| v.parse().ok())
+                            .map(crate::core::units::Twip),
+                        footer: xml::optional_attr_str(e, b"w:footer")?
+                            .and_then(|v| v.parse().ok())
+                            .map(crate::core::units::Twip),
+                        gutter: xml::optional_attr_str(e, b"w:gutter")?
+                            .and_then(|v| v.parse().ok())
+                            .map(crate::core::units::Twip),
+                    });
+                },
+                b"headerReference" => {
+                    let hf_type = parse_hf_type(e)?;
+                    if let Ok(Some(rid)) = xml::optional_attr_str(e, b"r:id") {
+                        props.header_refs.push(HeaderFooterRef {
+                            hf_type,
+                            relationship_id: rid.into_owned(),
+                        });
                     }
-            }
+                },
+                b"footerReference" => {
+                    let hf_type = parse_hf_type(e)?;
+                    if let Ok(Some(rid)) = xml::optional_attr_str(e, b"r:id") {
+                        props.footer_refs.push(HeaderFooterRef {
+                            hf_type,
+                            relationship_id: rid.into_owned(),
+                        });
+                    }
+                },
+                b"cols" => {
+                    if let Ok(Some(num)) = xml::optional_attr_str(e, b"w:num") {
+                        props.columns = num.parse().ok();
+                    }
+                },
+                _ => {},
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"sectPr" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
     Ok(props)

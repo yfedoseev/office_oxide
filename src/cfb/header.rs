@@ -72,14 +72,10 @@ impl CfbHeader {
 
         // v3 must be 512, v4 must be 4096
         if major_version == 3 && sector_size != 512 {
-            return Err(CfbError::InvalidHeader(
-                "v3 sector size must be 512".into(),
-            ));
+            return Err(CfbError::InvalidHeader("v3 sector size must be 512".into()));
         }
         if major_version == 4 && sector_size != 4096 {
-            return Err(CfbError::InvalidHeader(
-                "v4 sector size must be 4096".into(),
-            ));
+            return Err(CfbError::InvalidHeader("v4 sector size must be 4096".into()));
         }
 
         let mini_sector_power = u16::from_le_bytes([buf[0x20], buf[0x21]]);
@@ -87,16 +83,13 @@ impl CfbHeader {
 
         let fat_sector_count = u32::from_le_bytes([buf[0x2C], buf[0x2D], buf[0x2E], buf[0x2F]]);
         let first_dir_sector = u32::from_le_bytes([buf[0x30], buf[0x31], buf[0x32], buf[0x33]]);
-        let mini_stream_cutoff =
-            u32::from_le_bytes([buf[0x38], buf[0x39], buf[0x3A], buf[0x3B]]);
+        let mini_stream_cutoff = u32::from_le_bytes([buf[0x38], buf[0x39], buf[0x3A], buf[0x3B]]);
         let first_mini_fat_sector =
             u32::from_le_bytes([buf[0x3C], buf[0x3D], buf[0x3E], buf[0x3F]]);
         let mini_fat_sector_count =
             u32::from_le_bytes([buf[0x40], buf[0x41], buf[0x42], buf[0x43]]);
-        let first_difat_sector =
-            u32::from_le_bytes([buf[0x44], buf[0x45], buf[0x46], buf[0x47]]);
-        let difat_sector_count =
-            u32::from_le_bytes([buf[0x48], buf[0x49], buf[0x4A], buf[0x4B]]);
+        let first_difat_sector = u32::from_le_bytes([buf[0x44], buf[0x45], buf[0x46], buf[0x47]]);
+        let difat_sector_count = u32::from_le_bytes([buf[0x48], buf[0x49], buf[0x4A], buf[0x4B]]);
 
         // Read the 109 DIFAT entries from header (offsets 0x4C..0x200).
         let mut header_difat = Vec::with_capacity(109);

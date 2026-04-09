@@ -185,7 +185,7 @@ pub fn is_date_format_string(format: &str) -> bool {
             // Skip escaped character
             '\\' => {
                 chars.next();
-            }
+            },
             // Skip quoted section
             '"' => {
                 for ch in chars.by_ref() {
@@ -193,7 +193,7 @@ pub fn is_date_format_string(format: &str) -> bool {
                         break;
                     }
                 }
-            }
+            },
             // Skip bracketed sections like [Red], [$-409]
             '[' => {
                 for ch in chars.by_ref() {
@@ -201,22 +201,22 @@ pub fn is_date_format_string(format: &str) -> bool {
                         break;
                     }
                 }
-            }
+            },
             // Date/time tokens
             'y' | 'Y' | 'd' | 'D' | 'h' | 'H' | 's' | 'S' => {
                 has_date_token = true;
-            }
+            },
             // 'm' is ambiguous (month or minute) — consider it date-like
             'm' | 'M' => {
                 has_date_token = true;
-            }
+            },
             // AM/PM marker
             'A' | 'a' => {
                 if chars.peek() == Some(&'M') || chars.peek() == Some(&'m') {
                     has_date_token = true;
                 }
-            }
-            _ => {}
+            },
+            _ => {},
         }
     }
 

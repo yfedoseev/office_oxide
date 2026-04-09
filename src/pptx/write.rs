@@ -18,8 +18,8 @@
 use std::io::{Seek, Write};
 use std::path::Path;
 
-use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
+use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 
 use crate::core::opc::{OpcWriter, PartName};
 use crate::core::relationships::rel_types;
@@ -32,8 +32,7 @@ use super::Result;
 
 const CT_PRESENTATION: &str =
     "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml";
-const CT_SLIDE: &str =
-    "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
+const CT_SLIDE: &str = "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
 const CT_SLIDE_LAYOUT: &str =
     "application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml";
 const CT_SLIDE_MASTER: &str =
@@ -43,7 +42,7 @@ const CT_SLIDE_MASTER: &str =
 // Namespaces
 // ---------------------------------------------------------------------------
 
-use crate::core::xml::ns::{PML_STR as NS_PML, DRAWING_ML_STR as NS_DML, R_STR as NS_REL};
+use crate::core::xml::ns::{DRAWING_ML_STR as NS_DML, PML_STR as NS_PML, R_STR as NS_REL};
 
 // ---------------------------------------------------------------------------
 // Slide size (standard 16:9 in EMU)
@@ -156,31 +155,19 @@ impl PptxWriter {
 
         // --- Presentation relationships ---
         // rId1 = slide master
-        opc.add_part_rel(
-            &pres_part,
-            rel_types::SLIDE_MASTER,
-            "slideMasters/slideMaster1.xml",
-        );
+        opc.add_part_rel(&pres_part, rel_types::SLIDE_MASTER, "slideMasters/slideMaster1.xml");
 
         // rId2..rId(n+1) = slides
         let mut slide_parts = Vec::with_capacity(self.slides.len());
         for i in 0..self.slides.len() {
             let idx = i + 1;
             let slide_part = PartName::new(&format!("/ppt/slides/slide{idx}.xml"))?;
-            opc.add_part_rel(
-                &pres_part,
-                rel_types::SLIDE,
-                &format!("slides/slide{idx}.xml"),
-            );
+            opc.add_part_rel(&pres_part, rel_types::SLIDE, &format!("slides/slide{idx}.xml"));
             slide_parts.push(slide_part);
         }
 
         // --- Slide master relationship: rId1 = slide layout ---
-        opc.add_part_rel(
-            &master_part,
-            rel_types::SLIDE_LAYOUT,
-            "../slideLayouts/slideLayout1.xml",
-        );
+        opc.add_part_rel(&master_part, rel_types::SLIDE_LAYOUT, "../slideLayouts/slideLayout1.xml");
 
         // --- Each slide relationship: rId1 = slide layout ---
         for slide_part in &slide_parts {
@@ -539,12 +526,12 @@ fn write_body_shape(w: &mut Writer<Vec<u8>>, id: u32, items: &[BodyItem]) {
         match item {
             BodyItem::Text(text) => {
                 write_text_paragraph(w, text);
-            }
+            },
             BodyItem::BulletList(bullets) => {
                 for bullet in bullets {
                     write_bullet_paragraph(w, bullet);
                 }
-            }
+            },
         }
     }
 

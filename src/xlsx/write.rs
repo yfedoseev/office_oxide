@@ -6,8 +6,8 @@
 use std::io::{Seek, Write};
 use std::path::Path;
 
-use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
+use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 
 use crate::core::opc::{OpcWriter, PartName};
 use crate::core::relationships::rel_types;
@@ -22,14 +22,13 @@ const CT_WORKBOOK: &str =
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml";
 const CT_WORKSHEET: &str =
     "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml";
-const CT_STYLES: &str =
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml";
+const CT_STYLES: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml";
 
 // ---------------------------------------------------------------------------
 // SML namespace constants
 // ---------------------------------------------------------------------------
 
-use crate::core::xml::ns::{SML_STR as NS_SML, R_STR as NS_REL};
+use crate::core::xml::ns::{R_STR as NS_REL, SML_STR as NS_SML};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -243,7 +242,7 @@ impl XlsxWriter {
         match cell {
             CellData::Empty => {
                 // Skip empty cells entirely
-            }
+            },
             CellData::String(s) => {
                 let mut c = BytesStart::new("c");
                 c.push_attribute(("r", cell_ref.as_str()));
@@ -257,7 +256,7 @@ impl XlsxWriter {
                 w.write_event(Event::End(BytesEnd::new("is")))?;
 
                 w.write_event(Event::End(BytesEnd::new("c")))?;
-            }
+            },
             CellData::Number(n) => {
                 let mut c = BytesStart::new("c");
                 c.push_attribute(("r", cell_ref.as_str()));
@@ -270,7 +269,7 @@ impl XlsxWriter {
                 w.write_event(Event::End(BytesEnd::new("v")))?;
 
                 w.write_event(Event::End(BytesEnd::new("c")))?;
-            }
+            },
             CellData::Boolean(b) => {
                 let mut c = BytesStart::new("c");
                 c.push_attribute(("r", cell_ref.as_str()));
@@ -283,7 +282,7 @@ impl XlsxWriter {
                 w.write_event(Event::End(BytesEnd::new("v")))?;
 
                 w.write_event(Event::End(BytesEnd::new("c")))?;
-            }
+            },
         }
 
         Ok(())

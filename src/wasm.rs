@@ -2,8 +2,8 @@ use std::io::Cursor;
 
 use wasm_bindgen::prelude::*;
 
-use crate::format::DocumentFormat;
 use crate::Document;
+use crate::format::DocumentFormat;
 
 /// A parsed Office document for use in JavaScript/WASM.
 #[wasm_bindgen]
@@ -19,8 +19,8 @@ impl WasmDocument {
         let fmt = DocumentFormat::from_extension(format)
             .ok_or_else(|| JsValue::from_str(&format!("unsupported format: {format}")))?;
         let cursor = Cursor::new(data.to_vec());
-        let inner = Document::from_reader(cursor, fmt)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let inner =
+            Document::from_reader(cursor, fmt).map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(WasmDocument { inner })
     }
 
@@ -52,7 +52,6 @@ impl WasmDocument {
     #[wasm_bindgen(js_name = "toIr")]
     pub fn to_ir(&self) -> Result<JsValue, JsValue> {
         let ir = self.inner.to_ir();
-        serde_wasm_bindgen::to_value(&ir)
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+        serde_wasm_bindgen::to_value(&ir).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 }

@@ -81,7 +81,7 @@ pub struct BlipImage {
 fn uid_size(rec_type: u16, inst: u16) -> usize {
     let base = match rec_type {
         0xF01A..=0xF01C => 16, // Metafiles: 16 bytes UID only
-        _ => 17,                          // Bitmaps: 16 bytes UID + 1 byte tag
+        _ => 17,               // Bitmaps: 16 bytes UID + 1 byte tag
     };
     // If inst bit 0 is set, there's a secondary UID (16 more bytes).
     if inst & 1 != 0 { base + 16 } else { base }

@@ -21,8 +21,8 @@
 use std::io::{Seek, Write};
 use std::path::Path;
 
-use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
+use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 
 use crate::core::opc::{OpcWriter, PartName};
 use crate::core::relationships::rel_types;
@@ -35,12 +35,11 @@ use super::Result;
 
 const CT_DOCUMENT: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml";
-const CT_STYLES: &str =
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml";
+const CT_STYLES: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml";
 const CT_NUMBERING: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml";
 
-use crate::core::xml::ns::{WML_STR as WML_NS, R_STR as R_NS};
+use crate::core::xml::ns::{R_STR as R_NS, WML_STR as WML_NS};
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -124,7 +123,8 @@ impl DocxWriter {
             .iter()
             .map(|row| row.iter().map(|s| s.to_string()).collect())
             .collect();
-        self.elements.push(DocxElement::Table(DocxTable { rows: owned }));
+        self.elements
+            .push(DocxElement::Table(DocxTable { rows: owned }));
         self
     }
 
@@ -195,7 +195,9 @@ impl DocxWriter {
 
     /// Check whether any element uses numbering (lists).
     fn has_lists(&self) -> bool {
-        self.elements.iter().any(|e| matches!(e, DocxElement::Paragraph(p) if p.numbering.is_some()))
+        self.elements
+            .iter()
+            .any(|e| matches!(e, DocxElement::Paragraph(p) if p.numbering.is_some()))
     }
 
     /// Generate the `word/document.xml` content.
@@ -210,7 +212,8 @@ impl DocxWriter {
         let mut root = BytesStart::new("w:document");
         root.push_attribute(("xmlns:w", WML_NS));
         root.push_attribute(("xmlns:r", R_NS));
-        w.write_event(Event::Start(root)).expect("write document start");
+        w.write_event(Event::Start(root))
+            .expect("write document start");
 
         // <w:body>
         w.write_event(Event::Start(BytesStart::new("w:body")))
@@ -271,7 +274,8 @@ fn write_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxParagraph) {
 
             let mut num_id_elem = BytesStart::new("w:numId");
             num_id_elem.push_attribute(("w:val", num_id.to_string().as_str()));
-            w.write_event(Event::Empty(num_id_elem)).expect("write numId");
+            w.write_event(Event::Empty(num_id_elem))
+                .expect("write numId");
 
             w.write_event(Event::End(BytesEnd::new("w:numPr")))
                 .expect("write numPr end");
@@ -379,7 +383,8 @@ fn generate_styles_xml() -> Vec<u8> {
 
     let mut root = BytesStart::new("w:styles");
     root.push_attribute(("xmlns:w", WML_NS));
-    w.write_event(Event::Start(root)).expect("write styles start");
+    w.write_event(Event::Start(root))
+        .expect("write styles start");
 
     // Normal style
     write_paragraph_style(&mut w, "Normal", "Normal", None);
@@ -410,12 +415,14 @@ fn write_paragraph_style(
     let mut elem = BytesStart::new("w:style");
     elem.push_attribute(("w:type", "paragraph"));
     elem.push_attribute(("w:styleId", style_id));
-    w.write_event(Event::Start(elem)).expect("write style start");
+    w.write_event(Event::Start(elem))
+        .expect("write style start");
 
     // <w:name w:val="..."/>
     let mut name_elem = BytesStart::new("w:name");
     name_elem.push_attribute(("w:val", name));
-    w.write_event(Event::Empty(name_elem)).expect("write style name");
+    w.write_event(Event::Empty(name_elem))
+        .expect("write style name");
 
     // <w:pPr><w:outlineLvl w:val="N"/></w:pPr> for headings
     if let Some(level) = outline_level {
@@ -444,7 +451,8 @@ fn generate_numbering_xml() -> Vec<u8> {
 
     let mut root = BytesStart::new("w:numbering");
     root.push_attribute(("xmlns:w", WML_NS));
-    w.write_event(Event::Start(root)).expect("write numbering start");
+    w.write_event(Event::Start(root))
+        .expect("write numbering start");
 
     // Abstract numbering definition 0: bullet
     write_abstract_num(&mut w, 0, "bullet", "\u{2022}");
@@ -473,7 +481,8 @@ fn write_abstract_num(
 ) {
     let mut elem = BytesStart::new("w:abstractNum");
     elem.push_attribute(("w:abstractNumId", abstract_num_id.to_string().as_str()));
-    w.write_event(Event::Start(elem)).expect("write abstractNum start");
+    w.write_event(Event::Start(elem))
+        .expect("write abstractNum start");
 
     // Single level: ilvl="0"
     let mut lvl = BytesStart::new("w:lvl");
@@ -503,7 +512,8 @@ fn write_num(w: &mut Writer<Vec<u8>>, num_id: u32, abstract_num_id: u32) {
 
     let mut abs = BytesStart::new("w:abstractNumId");
     abs.push_attribute(("w:val", abstract_num_id.to_string().as_str()));
-    w.write_event(Event::Empty(abs)).expect("write abstractNumId");
+    w.write_event(Event::Empty(abs))
+        .expect("write abstractNumId");
 
     w.write_event(Event::End(BytesEnd::new("w:num")))
         .expect("write num end");

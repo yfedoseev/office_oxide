@@ -1,10 +1,10 @@
 use std::io::Cursor;
 
-use office_oxide::{Document, DocumentFormat, OfficeError};
 use office_oxide::ir::*;
+use office_oxide::{Document, DocumentFormat, OfficeError};
 
 use office_oxide::core::opc::{OpcWriter, PartName};
-use office_oxide::core::relationships::{rel_types, TargetMode};
+use office_oxide::core::relationships::{TargetMode, rel_types};
 
 // ===========================================================================
 // Builders
@@ -51,10 +51,7 @@ fn make_docx_with_styles(document_xml: &[u8], styles_xml: &[u8]) -> Vec<u8> {
     writer.finish().unwrap().into_inner()
 }
 
-fn make_docx_with_numbering(
-    document_xml: &[u8],
-    numbering_xml: &[u8],
-) -> Vec<u8> {
+fn make_docx_with_numbering(document_xml: &[u8], numbering_xml: &[u8]) -> Vec<u8> {
     let cursor = Cursor::new(Vec::new());
     let mut writer = OpcWriter::new(cursor).unwrap();
     let doc_part = PartName::new("/word/document.xml").unwrap();
@@ -170,8 +167,11 @@ impl PptxBuilder {
                 xml,
             )
             .unwrap();
-        self.writer
-            .add_part_rel(&self.pres_part, rel_types::SLIDE, &format!("slides/slide{n}.xml"));
+        self.writer.add_part_rel(
+            &self.pres_part,
+            rel_types::SLIDE,
+            &format!("slides/slide{n}.xml"),
+        );
         self
     }
 
@@ -328,18 +328,9 @@ fn pptx_via_unified_api() {
 
 #[test]
 fn format_detection() {
-    assert_eq!(
-        DocumentFormat::from_extension("docx"),
-        Some(DocumentFormat::Docx)
-    );
-    assert_eq!(
-        DocumentFormat::from_extension("xlsx"),
-        Some(DocumentFormat::Xlsx)
-    );
-    assert_eq!(
-        DocumentFormat::from_extension("pptx"),
-        Some(DocumentFormat::Pptx)
-    );
+    assert_eq!(DocumentFormat::from_extension("docx"), Some(DocumentFormat::Docx));
+    assert_eq!(DocumentFormat::from_extension("xlsx"), Some(DocumentFormat::Xlsx));
+    assert_eq!(DocumentFormat::from_extension("pptx"), Some(DocumentFormat::Pptx));
     assert_eq!(DocumentFormat::from_extension("txt"), None);
     assert_eq!(DocumentFormat::from_extension("pdf"), None);
 }
@@ -419,9 +410,17 @@ fn docx_to_ir_headings_and_formatting() {
     // Second element should be paragraph with bold + italic
     if let Element::Paragraph(p) = &section.elements[1] {
         // Should have bold text
-        assert!(p.content.iter().any(|c| matches!(c, InlineContent::Text(s) if s.bold && s.text == "Bold text")));
+        assert!(
+            p.content
+                .iter()
+                .any(|c| matches!(c, InlineContent::Text(s) if s.bold && s.text == "Bold text"))
+        );
         // Should have italic text
-        assert!(p.content.iter().any(|c| matches!(c, InlineContent::Text(s) if s.italic)));
+        assert!(
+            p.content
+                .iter()
+                .any(|c| matches!(c, InlineContent::Text(s) if s.italic))
+        );
     } else {
         panic!("expected paragraph, got {:?}", section.elements[1]);
     }
@@ -536,9 +535,14 @@ fn pptx_to_ir_slides_as_sections() {
     assert_eq!(ir.sections[0].title.as_deref(), Some("Intro"));
 
     // Body content should be a paragraph (title is used as section title, not element)
-    assert!(ir.sections[0].elements.iter().any(|e| matches!(e, Element::Paragraph(p) if
-        p.content.iter().any(|c| matches!(c, InlineContent::Text(s) if s.text == "Welcome"))
-    )));
+    assert!(
+        ir.sections[0]
+            .elements
+            .iter()
+            .any(|e| matches!(e, Element::Paragraph(p) if
+                p.content.iter().any(|c| matches!(c, InlineContent::Text(s) if s.text == "Welcome"))
+            ))
+    );
 }
 
 // ===========================================================================
@@ -647,8 +651,18 @@ fn docx_lists_to_ir() {
     if let Element::List(list) = &ir.sections[0].elements[0] {
         assert!(!list.ordered); // bullet = unordered
         // Check first item text
-        assert!(list.items[0].content.iter().any(|c| matches!(c, InlineContent::Text(s) if s.text == "First item")));
-        assert!(list.items[1].content.iter().any(|c| matches!(c, InlineContent::Text(s) if s.text == "Second item")));
+        assert!(
+            list.items[0]
+                .content
+                .iter()
+                .any(|c| matches!(c, InlineContent::Text(s) if s.text == "First item"))
+        );
+        assert!(
+            list.items[1]
+                .content
+                .iter()
+                .any(|c| matches!(c, InlineContent::Text(s) if s.text == "Second item"))
+        );
     }
 
     // Second element should be a paragraph
@@ -741,7 +755,7 @@ fn unsupported_format_error() {
     let result = Document::open("notes.txt");
     assert!(result.is_err());
     match result {
-        Err(OfficeError::UnsupportedFormat(_)) => {}
+        Err(OfficeError::UnsupportedFormat(_)) => {},
         _ => panic!("expected UnsupportedFormat error"),
     }
 }
@@ -891,7 +905,9 @@ fn pptx_image_to_ir() {
     let doc = Document::from_reader(Cursor::new(data), DocumentFormat::Pptx).unwrap();
     let ir = doc.to_ir();
 
-    assert!(ir.sections[0].elements.iter().any(|e| matches!(e, Element::Image(img) if img.alt_text.as_deref() == Some("A scenic view"))));
+    assert!(ir.sections[0].elements.iter().any(
+        |e| matches!(e, Element::Image(img) if img.alt_text.as_deref() == Some("A scenic view"))
+    ));
 }
 
 // ===========================================================================
@@ -943,7 +959,9 @@ fn docx_strikethrough_and_hyperlink_in_ir() {
 
     // First paragraph has strikethrough
     if let Element::Paragraph(p) = &ir.sections[0].elements[0] {
-        assert!(p.content.iter().any(|c| matches!(c, InlineContent::Text(s) if s.strikethrough && s.text == "deleted")));
+        assert!(p.content.iter().any(
+            |c| matches!(c, InlineContent::Text(s) if s.strikethrough && s.text == "deleted")
+        ));
     } else {
         panic!("expected paragraph");
     }

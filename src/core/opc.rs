@@ -5,14 +5,14 @@ use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 use log::{debug, trace};
+use zip::CompressionMethod;
 use zip::read::ZipArchive;
 use zip::write::{SimpleFileOptions, ZipWriter};
-use zip::CompressionMethod;
 
 use super::content_types::{ContentTypes, ContentTypesBuilder};
 use super::error::{Error, Result};
 use super::properties::{AppProperties, CoreProperties};
-use super::relationships::{rel_types, Relationships, RelationshipsBuilder, TargetMode};
+use super::relationships::{Relationships, RelationshipsBuilder, TargetMode, rel_types};
 
 // ---------------------------------------------------------------------------
 // PartName
@@ -31,10 +31,7 @@ fn decode_percent_encoding(input: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (
-                hex_digit(bytes[i + 1]),
-                hex_digit(bytes[i + 2]),
-            ) {
+            if let (Some(hi), Some(lo)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
                 decoded.push(hi << 4 | lo);
                 i += 3;
                 continue;
@@ -69,47 +66,33 @@ impl PartName {
 
         // Must start with '/'
         if !name.starts_with('/') {
-            return Err(Error::InvalidPartName(format!(
-                "must start with '/': {name}"
-            )));
+            return Err(Error::InvalidPartName(format!("must start with '/': {name}")));
         }
         // Must not end with '/'
         if name.len() > 1 && name.ends_with('/') {
-            return Err(Error::InvalidPartName(format!(
-                "must not end with '/': {name}"
-            )));
+            return Err(Error::InvalidPartName(format!("must not end with '/': {name}")));
         }
         // No empty segments (//)
         if name.contains("//") {
-            return Err(Error::InvalidPartName(format!(
-                "empty segment (//): {name}"
-            )));
+            return Err(Error::InvalidPartName(format!("empty segment (//): {name}")));
         }
         // No dot segments
         for segment in name.split('/').skip(1) {
             if segment == "." || segment == ".." {
-                return Err(Error::InvalidPartName(format!(
-                    "dot segment not allowed: {name}"
-                )));
+                return Err(Error::InvalidPartName(format!("dot segment not allowed: {name}")));
             }
             // Segments must not end with '.'
             if segment.ends_with('.') {
-                return Err(Error::InvalidPartName(format!(
-                    "segment ends with dot: {name}"
-                )));
+                return Err(Error::InvalidPartName(format!("segment ends with dot: {name}")));
             }
         }
         // No query/fragment
         if name.contains('?') || name.contains('#') {
-            return Err(Error::InvalidPartName(format!(
-                "query/fragment not allowed: {name}"
-            )));
+            return Err(Error::InvalidPartName(format!("query/fragment not allowed: {name}")));
         }
         // No backslashes
         if name.contains('\\') {
-            return Err(Error::InvalidPartName(format!(
-                "backslash not allowed: {name}"
-            )));
+            return Err(Error::InvalidPartName(format!("backslash not allowed: {name}")));
         }
 
         Ok(Self(name))
@@ -199,13 +182,13 @@ fn normalize_path(path: &str) -> String {
                 if segments.is_empty() {
                     segments.push(""); // preserve leading slash
                 }
-            }
+            },
             ".." => {
                 // Go up one level, but don't go above root
                 if segments.len() > 1 {
                     segments.pop();
                 }
-            }
+            },
             s => segments.push(s),
         }
     }
@@ -259,8 +242,7 @@ impl<R: Read + Seek> OpcReader<R> {
         let content_types = ContentTypes::parse(&ct_data)?;
 
         // Eagerly parse _rels/.rels
-        let rels_data = read_zip_entry(&mut archive, "_rels/.rels")
-            .unwrap_or_default();
+        let rels_data = read_zip_entry(&mut archive, "_rels/.rels").unwrap_or_default();
         let package_rels = if rels_data.is_empty() {
             Relationships::empty()
         } else {
@@ -307,15 +289,15 @@ impl<R: Read + Seek> OpcReader<R> {
             Ok(data) => {
                 trace!("read_rels_for '{}' ({} bytes)", part, data.len());
                 Relationships::parse(&data)
-            }
+            },
             Err(Error::Zip(zip::result::ZipError::FileNotFound)) => {
                 trace!("read_rels_for '{}': no rels file", part);
                 Ok(Relationships::empty())
-            }
+            },
             Err(Error::MissingPart(_)) => {
                 trace!("read_rels_for '{}': no rels file", part);
                 Ok(Relationships::empty())
-            }
+            },
             Err(e) => Err(e),
         }
     }
@@ -350,9 +332,7 @@ impl<R: Read + Seek> OpcReader<R> {
             }
         }
 
-        Err(Error::RelationshipNotFound(
-            "officeDocument relationship not found".to_string(),
-        ))
+        Err(Error::RelationshipNotFound("officeDocument relationship not found".to_string()))
     }
 
     /// List all part names in the package (excluding special OPC files).
@@ -392,7 +372,10 @@ impl<R: Read + Seek> OpcReader<R> {
 
 /// Read a ZIP entry by name, returning its bytes.
 /// Falls back to case-insensitive and backslash-normalized lookup if exact match fails.
-pub(crate) fn read_zip_entry<R: Read + Seek>(archive: &mut ZipArchive<R>, name: &str) -> Result<Vec<u8>> {
+pub(crate) fn read_zip_entry<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    name: &str,
+) -> Result<Vec<u8>> {
     // Try exact match first
     let index = match archive.index_for_name(name) {
         Some(i) => i,
@@ -412,7 +395,7 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(archive: &mut ZipArchive<R>, name: 
                 }
             }
             found.ok_or_else(|| Error::MissingPart(name.to_string()))?
-        }
+        },
     };
     let mut file = archive
         .by_index(index)
@@ -420,16 +403,17 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(archive: &mut ZipArchive<R>, name: 
     let mut buf = Vec::with_capacity(file.size() as usize);
     match file.read_to_end(&mut buf) {
         Ok(_) => Ok(buf),
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidData
-            && e.to_string().contains("checksum")
-            && !buf.is_empty() =>
+        Err(e)
+            if e.kind() == std::io::ErrorKind::InvalidData
+                && e.to_string().contains("checksum")
+                && !buf.is_empty() =>
         {
             // CRC32 mismatch — the data was fully decompressed but the checksum
             // doesn't match. Accept the data anyway for tolerance of real-world
             // files with minor corruption (e.g., re-saved without recomputing CRC).
             trace!("read_zip_entry '{}': ignoring CRC mismatch", name);
             Ok(buf)
-        }
+        },
         Err(e) => Err(e.into()),
     }
 }
@@ -465,20 +449,13 @@ impl<W: Write + Seek> OpcWriter<W> {
     }
 
     /// Add a part to the package.
-    pub fn add_part(
-        &mut self,
-        name: &PartName,
-        content_type: &str,
-        data: &[u8],
-    ) -> Result<()> {
+    pub fn add_part(&mut self, name: &PartName, content_type: &str, data: &[u8]) -> Result<()> {
         // Register content type override
-        self.content_types
-            .add_override(name.clone(), content_type);
+        self.content_types.add_override(name.clone(), content_type);
 
         // Write to ZIP
         let zip_path = &name.as_str()[1..]; // strip leading /
-        let options = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Deflated);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
         self.writer.start_file(zip_path, options)?;
         self.writer.write_all(data)?;
         Ok(())
@@ -490,12 +467,7 @@ impl<W: Write + Seek> OpcWriter<W> {
     }
 
     /// Add a part-level relationship and return its rId.
-    pub fn add_part_rel(
-        &mut self,
-        source: &PartName,
-        rel_type: &str,
-        target: &str,
-    ) -> String {
+    pub fn add_part_rel(&mut self, source: &PartName, rel_type: &str, target: &str) -> String {
         self.part_rels
             .entry(source.as_str().to_string())
             .or_default()
@@ -525,8 +497,7 @@ impl<W: Write + Seek> OpcWriter<W> {
             "application/vnd.openxmlformats-package.core-properties+xml",
         );
         let zip_path = &name.as_str()[1..];
-        let options = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Deflated);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
         self.writer.start_file(zip_path, options)?;
         self.writer.write_all(&data)?;
         self.package_rels
@@ -543,8 +514,7 @@ impl<W: Write + Seek> OpcWriter<W> {
             "application/vnd.openxmlformats-officedocument.extended-properties+xml",
         );
         let zip_path = &name.as_str()[1..];
-        let options = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Deflated);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
         self.writer.start_file(zip_path, options)?;
         self.writer.write_all(&data)?;
         self.package_rels
@@ -555,8 +525,7 @@ impl<W: Write + Seek> OpcWriter<W> {
     /// Finalize the OPC package: writes [Content_Types].xml, _rels/.rels,
     /// part-level .rels files, and closes the ZIP archive.
     pub fn finish(mut self) -> Result<W> {
-        let options = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Deflated);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
         // Write part-level .rels files
         for (source_path, builder) in &self.part_rels {
@@ -665,11 +634,13 @@ mod tests {
 
         // Add a part
         let doc_name = PartName::new("/word/document.xml").unwrap();
-        writer.add_part(
-            &doc_name,
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
-            b"<document/>",
-        ).unwrap();
+        writer
+            .add_part(
+                &doc_name,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                b"<document/>",
+            )
+            .unwrap();
         writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
 
         let result = writer.finish().unwrap();
@@ -683,7 +654,9 @@ mod tests {
         let ct = reader.content_types().resolve(&doc_name);
         assert_eq!(
             ct,
-            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml")
+            Some(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"
+            )
         );
 
         // Check package rels

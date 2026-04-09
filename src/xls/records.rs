@@ -124,7 +124,9 @@ mod tests {
     #[test]
     fn iterate_single_record() {
         let stream = make_record(RT_BOF, &[0x00, 0x06, 0x05, 0x00]);
-        let records: Vec<_> = RecordIter::new(&stream).collect::<std::result::Result<_, _>>().unwrap();
+        let records: Vec<_> = RecordIter::new(&stream)
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].record_type, RT_BOF);
         assert_eq!(records[0].data, &[0x00, 0x06, 0x05, 0x00]);
@@ -134,7 +136,9 @@ mod tests {
     fn iterate_multiple_records() {
         let mut stream = make_record(RT_BOF, &[0x00, 0x06]);
         stream.extend(make_record(RT_EOF, &[]));
-        let records: Vec<_> = RecordIter::new(&stream).collect::<std::result::Result<_, _>>().unwrap();
+        let records: Vec<_> = RecordIter::new(&stream)
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].record_type, RT_BOF);
         assert_eq!(records[1].record_type, RT_EOF);
@@ -146,7 +150,9 @@ mod tests {
         stream.extend(make_record(RT_CONTINUE, &[0x03, 0x04]));
         stream.extend(make_record(RT_CONTINUE, &[0x05]));
         stream.extend(make_record(RT_EOF, &[]));
-        let records: Vec<_> = RecordIter::new(&stream).collect::<std::result::Result<_, _>>().unwrap();
+        let records: Vec<_> = RecordIter::new(&stream)
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
         assert_eq!(records.len(), 2); // SST (merged) + EOF
         assert_eq!(records[0].record_type, RT_SST);
         assert_eq!(records[0].data, &[0x01, 0x02, 0x03, 0x04, 0x05]);
@@ -159,7 +165,9 @@ mod tests {
         stream.extend_from_slice(&RT_BOF.to_le_bytes());
         stream.extend_from_slice(&10u16.to_le_bytes());
         stream.extend_from_slice(&[0x00, 0x00]);
-        let results: Vec<_> = RecordIter::new(&stream).collect::<std::result::Result<_, _>>().unwrap();
+        let results: Vec<_> = RecordIter::new(&stream)
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].record_type, RT_BOF);
         assert_eq!(results[0].data.len(), 2); // only 2 bytes available
@@ -167,7 +175,9 @@ mod tests {
 
     #[test]
     fn empty_stream() {
-        let records: Vec<_> = RecordIter::new(&[]).collect::<std::result::Result<_, _>>().unwrap();
+        let records: Vec<_> = RecordIter::new(&[])
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
         assert!(records.is_empty());
     }
 }

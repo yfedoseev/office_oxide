@@ -142,10 +142,7 @@ mod tests {
         let r = CellRef { col: 0, row: 0 };
         assert_eq!(r.to_string(), "A1");
 
-        let r = CellRef {
-            col: 26,
-            row: 99,
-        };
+        let r = CellRef { col: 26, row: 99 };
         assert_eq!(r.to_string(), "AA100");
     }
 

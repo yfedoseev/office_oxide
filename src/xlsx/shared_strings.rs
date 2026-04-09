@@ -49,9 +49,9 @@ impl SharedStringTable {
                     if e.local_name().as_ref() == b"si" {
                         strings.push(parse_si(&mut reader)?);
                     }
-                }
+                },
                 Event::Eof => break,
-                _ => {}
+                _ => {},
             }
         }
 
@@ -80,26 +80,24 @@ fn parse_si(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Shared
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                match e.local_name().as_ref() {
-                    b"t" => {
-                        plain_text = Some(xml::read_text_content_fast(reader)?);
-                    }
-                    b"r" => {
-                        runs.push(parse_rich_text_run(reader)?);
-                    }
-                    _ => {
-                        xml::skip_element_fast(reader)?;
-                    }
-                }
-            }
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"t" => {
+                    plain_text = Some(xml::read_text_content_fast(reader)?);
+                },
+                b"r" => {
+                    runs.push(parse_rich_text_run(reader)?);
+                },
+                _ => {
+                    xml::skip_element_fast(reader)?;
+                },
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"si" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -130,20 +128,20 @@ fn parse_rich_text_run(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Re
                 match e.local_name().as_ref() {
                     b"t" => {
                         text = xml::read_text_content_fast(reader)?;
-                    }
+                    },
                     _ => {
                         // Skip rPr and any other elements — only extract text
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"r" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -190,8 +188,7 @@ pub(crate) fn parse_color_ref(
                 _ => None,
             };
             if let Some(slot) = slot {
-                let tint = xml::optional_attr_str(e, b"tint")?
-                    .and_then(|v| v.parse().ok());
+                let tint = xml::optional_attr_str(e, b"tint")?.and_then(|v| v.parse().ok());
                 return Ok(Some(ColorRef::Theme {
                     slot,
                     tint,

@@ -3,7 +3,9 @@ use std::io::Cursor;
 use office_oxide::core::content_types::{ContentTypes, ContentTypesBuilder};
 use office_oxide::core::opc::{OpcReader, OpcWriter, PartName};
 use office_oxide::core::properties::{AppProperties, CoreProperties};
-use office_oxide::core::relationships::{rel_types, Relationships, RelationshipsBuilder, TargetMode};
+use office_oxide::core::relationships::{
+    Relationships, RelationshipsBuilder, TargetMode, rel_types,
+};
 use office_oxide::core::theme::{ColorRef, RgbColor, Theme, ThemeColorSlot};
 use office_oxide::core::units::{Angle60k, Emu, HalfPoint, Percentage1000, Twip};
 
@@ -140,10 +142,7 @@ fn full_round_trip() {
     let theme_data = reader.read_part(&theme_name).unwrap();
     let theme = Theme::parse(&theme_data).unwrap();
     assert_eq!(theme.name, "Test Theme");
-    assert_eq!(
-        theme.resolve_color(ThemeColorSlot::Accent1),
-        Some(&RgbColor([255, 0, 0]))
-    );
+    assert_eq!(theme.resolve_color(ThemeColorSlot::Accent1), Some(&RgbColor([255, 0, 0])));
     assert_eq!(theme.font_scheme.major_latin, "Arial");
     assert_eq!(theme.font_scheme.minor_latin, "Times New Roman");
 
@@ -155,10 +154,7 @@ fn full_round_trip() {
     let cp_name = PartName::new(&format!("/{}", cp_rel.target)).unwrap();
     let cp_data = reader.read_part(&cp_name).unwrap();
     let parsed_core = CoreProperties::parse(&cp_data).unwrap();
-    assert_eq!(
-        parsed_core.title.as_deref(),
-        Some("Integration Test Document")
-    );
+    assert_eq!(parsed_core.title.as_deref(), Some("Integration Test Document"));
     assert_eq!(parsed_core.creator.as_deref(), Some("office_oxide"));
 
     // Verify app properties
@@ -185,10 +181,7 @@ fn full_round_trip() {
 #[test]
 fn part_name_case_insensitive_content_type_lookup() {
     let mut builder = ContentTypesBuilder::new();
-    builder.add_override(
-        PartName::new("/Word/Document.xml").unwrap(),
-        "application/vnd.test",
-    );
+    builder.add_override(PartName::new("/Word/Document.xml").unwrap(), "application/vnd.test");
     let ct = builder.build();
 
     // Lookup with different case should still find it
@@ -406,11 +399,8 @@ fn relationships_builder_generates_sequential_ids() {
     let mut builder = RelationshipsBuilder::new();
     let id1 = builder.add(rel_types::OFFICE_DOCUMENT, "word/document.xml");
     let id2 = builder.add(rel_types::CORE_PROPERTIES, "docProps/core.xml");
-    let id3 = builder.add_with_mode(
-        rel_types::HYPERLINK,
-        "https://example.com",
-        TargetMode::External,
-    );
+    let id3 =
+        builder.add_with_mode(rel_types::HYPERLINK, "https://example.com", TargetMode::External);
     assert_eq!(id1, "rId1");
     assert_eq!(id2, "rId2");
     assert_eq!(id3, "rId3");

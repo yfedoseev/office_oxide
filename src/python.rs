@@ -2,9 +2,9 @@ use std::io::Cursor;
 
 use pyo3::prelude::*;
 
+use crate::Document;
 use crate::error::OfficeError;
 use crate::format::DocumentFormat;
-use crate::Document;
 
 pyo3::create_exception!(office_oxide, OfficeOxideError, pyo3::exceptions::PyException);
 
@@ -32,9 +32,8 @@ impl PyDocument {
     /// Open a document from raw bytes with an explicit format string ("docx", "xlsx", or "pptx").
     #[staticmethod]
     fn from_bytes(data: &[u8], format: &str) -> PyResult<Self> {
-        let fmt = DocumentFormat::from_extension(format).ok_or_else(|| {
-            OfficeOxideError::new_err(format!("unsupported format: {format}"))
-        })?;
+        let fmt = DocumentFormat::from_extension(format)
+            .ok_or_else(|| OfficeOxideError::new_err(format!("unsupported format: {format}")))?;
         let cursor = Cursor::new(data.to_vec());
         let inner = Document::from_reader(cursor, fmt)?;
         Ok(PyDocument { inner })
@@ -80,9 +79,9 @@ impl PyDocument {
     /// Save/convert the document to a file. Legacy formats are converted to OOXML.
     /// Example: doc.save_as("output.docx") converts DOC → DOCX.
     fn save_as(&self, path: &str) -> PyResult<()> {
-        self.inner.save_as(path).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(e.to_string())
-        })
+        self.inner
+            .save_as(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
     }
 }
 

@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub fn handle_initialize(id: &Value) -> Value {
     json!({

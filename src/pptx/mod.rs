@@ -15,13 +15,13 @@
 //! println!("{}", doc.to_markdown());
 //! ```
 
+pub mod edit;
 pub mod error;
 pub mod presentation;
 pub mod shape;
 pub mod slide;
 pub mod text;
 pub mod write;
-pub mod edit;
 
 pub use error::{PptxError, Result};
 pub use presentation::{PresentationInfo, SlideId, SlideSize};
@@ -35,10 +35,10 @@ pub use slide::Slide;
 use std::io::{Read, Seek};
 use std::path::Path;
 
-use log::debug;
 use crate::core::opc::OpcReader;
-use crate::core::relationships::{rel_types, Relationships};
+use crate::core::relationships::{Relationships, rel_types};
 use crate::core::theme::Theme;
+use log::debug;
 
 /// A parsed PPTX document.
 #[derive(Debug, Clone)]
@@ -114,18 +114,17 @@ impl PptxDocument {
                 .unwrap_or_else(|_| Relationships::empty());
             let slide_data = opc.read_part(&part_name)?;
 
-            let notes_data = if let Some(notes_rel) =
-                slide_rels.first_by_type(rel_types::NOTES_SLIDE)
-            {
-                let notes_part = part_name.resolve_relative(&notes_rel.target)?;
-                if opc.has_part(&notes_part) {
-                    Some(opc.read_part(&notes_part)?)
+            let notes_data =
+                if let Some(notes_rel) = slide_rels.first_by_type(rel_types::NOTES_SLIDE) {
+                    let notes_part = part_name.resolve_relative(&notes_rel.target)?;
+                    if opc.has_part(&notes_part) {
+                        Some(opc.read_part(&notes_part)?)
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
 
             bundles.push(SlideBundle {
                 slide_data,
@@ -168,10 +167,10 @@ fn xml_csl_name(xml_data: &[u8]) -> String {
                         .map(|v| v.into_owned())
                         .unwrap_or_default();
                 }
-            }
+            },
             Ok(Event::Eof) => break,
             Err(_) => break,
-            _ => {}
+            _ => {},
         }
     }
     String::new()

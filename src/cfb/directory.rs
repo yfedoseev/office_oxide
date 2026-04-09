@@ -75,8 +75,7 @@ impl DirEntry {
         // Stream size: v3 uses only low 32 bits, v4 uses full 64 bits.
         let size_low = u32::from_le_bytes([buf[0x78], buf[0x79], buf[0x7A], buf[0x7B]]) as u64;
         let stream_size = if major_version == 4 {
-            let size_high =
-                u32::from_le_bytes([buf[0x7C], buf[0x7D], buf[0x7E], buf[0x7F]]) as u64;
+            let size_high = u32::from_le_bytes([buf[0x7C], buf[0x7D], buf[0x7E], buf[0x7F]]) as u64;
             (size_high << 32) | size_low
         } else {
             size_low

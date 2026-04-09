@@ -20,9 +20,9 @@ pub fn extract_images(data: &[u8]) -> Vec<XlsImage> {
 
         if is_blip_type(rec_type) {
             let ver_inst = u16::from_le_bytes([data[pos], data[pos + 1]]);
-            let rec_len = u32::from_le_bytes([
-                data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
-            ]) as usize;
+            let rec_len =
+                u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                    as usize;
             let inst = ver_inst >> 4;
 
             let data_start = pos + 8;
@@ -70,7 +70,9 @@ fn metafile_header_size(rec_type: u16) -> usize {
 }
 
 fn has_valid_signature(rec_type: u16, data: &[u8]) -> bool {
-    if data.is_empty() { return false; }
+    if data.is_empty() {
+        return false;
+    }
     match rec_type {
         0xF01D | 0xF02A => data.len() >= 2 && data[0] == 0xFF && data[1] == 0xD8,
         0xF01E => data.len() >= 4 && data.starts_with(b"\x89PNG"),

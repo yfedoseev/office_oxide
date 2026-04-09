@@ -87,31 +87,29 @@ impl StyleSheet {
 
         loop {
             match reader.read_event()? {
-                Event::Start(ref e) => {
-                    match e.local_name().as_ref() {
-                        b"numFmts" => {
-                            number_formats = parse_num_fmts(&mut reader)?;
-                        }
-                        b"fonts" => {
-                            fonts = parse_fonts(&mut reader)?;
-                        }
-                        b"fills" => {
-                            fills = parse_fills(&mut reader)?;
-                        }
-                        b"borders" => {
-                            borders = parse_borders(&mut reader)?;
-                        }
-                        b"cellXfs" => {
-                            cell_formats = parse_xfs(&mut reader)?;
-                        }
-                        b"cellStyleXfs" => {
-                            cell_style_formats = parse_xfs(&mut reader)?;
-                        }
-                        _ => {}
-                    }
-                }
+                Event::Start(ref e) => match e.local_name().as_ref() {
+                    b"numFmts" => {
+                        number_formats = parse_num_fmts(&mut reader)?;
+                    },
+                    b"fonts" => {
+                        fonts = parse_fonts(&mut reader)?;
+                    },
+                    b"fills" => {
+                        fills = parse_fills(&mut reader)?;
+                    },
+                    b"borders" => {
+                        borders = parse_borders(&mut reader)?;
+                    },
+                    b"cellXfs" => {
+                        cell_formats = parse_xfs(&mut reader)?;
+                    },
+                    b"cellStyleXfs" => {
+                        cell_style_formats = parse_xfs(&mut reader)?;
+                    },
+                    _ => {},
+                },
                 Event::Eof => break,
-                _ => {}
+                _ => {},
             }
         }
 
@@ -162,14 +160,14 @@ fn parse_num_fmts(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<
                     let format_code = xml::required_attr_str(e, b"formatCode")?.into_owned();
                     formats.push(NumberFormat { id, format_code });
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"numFmts" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -188,14 +186,14 @@ fn parse_fonts(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Vec
                 } else {
                     xml::skip_element_fast(reader)?;
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"fonts" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -214,39 +212,35 @@ fn parse_font(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Font
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) => {
-                match e.local_name().as_ref() {
-                    b"b" => bold = parse_toggle(e),
-                    b"i" => italic = parse_toggle(e),
-                    b"u" => {
-                        underline = Some(
-                            xml::optional_attr_str(e, b"val")?
-                                .map(|v| v.into_owned())
-                                .unwrap_or_else(|| "single".to_string()),
-                        );
-                    }
-                    b"strike" => strike = parse_toggle(e),
-                    b"sz" => {
-                        size = xml::optional_attr_str(e, b"val")?
-                            .and_then(|v| v.parse().ok());
-                    }
-                    b"name" => {
-                        name = xml::optional_attr_str(e, b"val")?
-                            .map(|v| v.into_owned());
-                    }
-                    b"color" => {
-                        color = parse_color_ref(e)?;
-                    }
-                    _ => {}
-                }
-            }
+            Event::Start(ref e) | Event::Empty(ref e) => match e.local_name().as_ref() {
+                b"b" => bold = parse_toggle(e),
+                b"i" => italic = parse_toggle(e),
+                b"u" => {
+                    underline = Some(
+                        xml::optional_attr_str(e, b"val")?
+                            .map(|v| v.into_owned())
+                            .unwrap_or_else(|| "single".to_string()),
+                    );
+                },
+                b"strike" => strike = parse_toggle(e),
+                b"sz" => {
+                    size = xml::optional_attr_str(e, b"val")?.and_then(|v| v.parse().ok());
+                },
+                b"name" => {
+                    name = xml::optional_attr_str(e, b"val")?.map(|v| v.into_owned());
+                },
+                b"color" => {
+                    color = parse_color_ref(e)?;
+                },
+                _ => {},
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"font" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -273,14 +267,14 @@ fn parse_fills(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Vec
                 } else {
                     xml::skip_element_fast(reader)?;
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"fills" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -295,28 +289,26 @@ fn parse_fill(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Fill
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) => {
-                match e.local_name().as_ref() {
-                    b"patternFill" => {
-                        pattern_type = xml::optional_attr_str(e, b"patternType")?
-                            .map(|v| v.into_owned());
-                    }
-                    b"fgColor" => {
-                        fg_color = parse_color_ref(e)?;
-                    }
-                    b"bgColor" => {
-                        bg_color = parse_color_ref(e)?;
-                    }
-                    _ => {}
-                }
-            }
+            Event::Start(ref e) | Event::Empty(ref e) => match e.local_name().as_ref() {
+                b"patternFill" => {
+                    pattern_type =
+                        xml::optional_attr_str(e, b"patternType")?.map(|v| v.into_owned());
+                },
+                b"fgColor" => {
+                    fg_color = parse_color_ref(e)?;
+                },
+                b"bgColor" => {
+                    bg_color = parse_color_ref(e)?;
+                },
+                _ => {},
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"fill" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -339,14 +331,14 @@ fn parse_borders(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<V
                 } else {
                     xml::skip_element_fast(reader)?;
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"borders" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -362,17 +354,15 @@ fn parse_border(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Bo
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                match e.local_name().as_ref() {
-                    b"left" | b"start" => left = parse_border_side(reader, e)?,
-                    b"right" | b"end" => right = parse_border_side(reader, e)?,
-                    b"top" => top = parse_border_side(reader, e)?,
-                    b"bottom" => bottom = parse_border_side(reader, e)?,
-                    _ => {
-                        xml::skip_element_fast(reader)?;
-                    }
-                }
-            }
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"left" | b"start" => left = parse_border_side(reader, e)?,
+                b"right" | b"end" => right = parse_border_side(reader, e)?,
+                b"top" => top = parse_border_side(reader, e)?,
+                b"bottom" => bottom = parse_border_side(reader, e)?,
+                _ => {
+                    xml::skip_element_fast(reader)?;
+                },
+            },
             Event::Empty(ref e) => {
                 match e.local_name().as_ref() {
                     b"left" | b"start" | b"right" | b"end" | b"top" | b"bottom" => {
@@ -387,20 +377,20 @@ fn parse_border(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Bo
                                 b"right" | b"end" => right = Some(side),
                                 b"top" => top = Some(side),
                                 b"bottom" => bottom = Some(side),
-                                _ => {}
+                                _ => {},
                             }
                         }
-                    }
-                    _ => {}
+                    },
+                    _ => {},
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"border" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -417,8 +407,7 @@ fn parse_border_side(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
 ) -> crate::core::Result<Option<BorderSide>> {
-    let style = xml::optional_attr_str(start, b"style")?
-        .map(|v| v.into_owned());
+    let style = xml::optional_attr_str(start, b"style")?.map(|v| v.into_owned());
     let mut color = None;
 
     loop {
@@ -427,7 +416,7 @@ fn parse_border_side(
                 if e.local_name().as_ref() == b"color" {
                     color = parse_color_ref(e)?;
                 }
-            }
+            },
             Event::End(ref e) => {
                 let local = e.local_name();
                 if matches!(
@@ -436,9 +425,9 @@ fn parse_border_side(
                 ) {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -459,16 +448,15 @@ fn parse_xfs(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Vec<C
                     let number_format_id: u32 = xml::optional_attr_str(e, b"numFmtId")?
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0);
-                    let font_index = xml::optional_attr_str(e, b"fontId")?
-                        .and_then(|v| v.parse().ok());
-                    let fill_index = xml::optional_attr_str(e, b"fillId")?
-                        .and_then(|v| v.parse().ok());
-                    let border_index = xml::optional_attr_str(e, b"borderId")?
-                        .and_then(|v| v.parse().ok());
+                    let font_index =
+                        xml::optional_attr_str(e, b"fontId")?.and_then(|v| v.parse().ok());
+                    let fill_index =
+                        xml::optional_attr_str(e, b"fillId")?.and_then(|v| v.parse().ok());
+                    let border_index =
+                        xml::optional_attr_str(e, b"borderId")?.and_then(|v| v.parse().ok());
                     let apply_number_format = xml::optional_attr_str(e, b"applyNumberFormat")?
                         .is_some_and(|v| matches!(v.as_ref(), "1" | "true"));
-                    let xf_id = xml::optional_attr_str(e, b"xfId")?
-                        .and_then(|v| v.parse().ok());
+                    let xf_id = xml::optional_attr_str(e, b"xfId")?.and_then(|v| v.parse().ok());
 
                     formats.push(CellFormat {
                         number_format_id,
@@ -479,15 +467,15 @@ fn parse_xfs(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Vec<C
                         xf_id,
                     });
                 }
-            }
+            },
             Event::End(ref e) => {
                 let local = e.local_name();
                 if matches!(local.as_ref(), b"cellXfs" | b"cellStyleXfs") {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 

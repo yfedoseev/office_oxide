@@ -1,10 +1,8 @@
 use std::io::Cursor;
 
-use office_oxide::docx::{
-    BlockElement, BreakType, DocxDocument, ParagraphContent, RunContent,
-};
 use office_oxide::core::opc::{OpcWriter, PartName};
-use office_oxide::core::relationships::{rel_types, TargetMode};
+use office_oxide::core::relationships::{TargetMode, rel_types};
+use office_oxide::docx::{BlockElement, BreakType, DocxDocument, ParagraphContent, RunContent};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -28,36 +26,47 @@ impl DocxBuilder {
     }
 
     fn with_document(mut self, xml: &[u8]) -> Self {
-        self.cursor.as_mut().unwrap().add_part(
-            &self.doc_part,
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
-            xml,
-        ).unwrap();
+        self.cursor
+            .as_mut()
+            .unwrap()
+            .add_part(
+                &self.doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                xml,
+            )
+            .unwrap();
         self
     }
 
     fn with_styles(mut self, xml: &[u8]) -> Self {
         let part = PartName::new("/word/styles.xml").unwrap();
-        self.cursor.as_mut().unwrap().add_part(
-            &part,
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml",
-            xml,
-        ).unwrap();
-        self.cursor.as_mut().unwrap().add_part_rel(
-            &self.doc_part,
-            rel_types::STYLES,
-            "styles.xml",
-        );
+        self.cursor
+            .as_mut()
+            .unwrap()
+            .add_part(
+                &part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml",
+                xml,
+            )
+            .unwrap();
+        self.cursor
+            .as_mut()
+            .unwrap()
+            .add_part_rel(&self.doc_part, rel_types::STYLES, "styles.xml");
         self
     }
 
     fn with_numbering(mut self, xml: &[u8]) -> Self {
         let part = PartName::new("/word/numbering.xml").unwrap();
-        self.cursor.as_mut().unwrap().add_part(
-            &part,
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml",
-            xml,
-        ).unwrap();
+        self.cursor
+            .as_mut()
+            .unwrap()
+            .add_part(
+                &part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml",
+                xml,
+            )
+            .unwrap();
         self.cursor.as_mut().unwrap().add_part_rel(
             &self.doc_part,
             rel_types::NUMBERING,
@@ -246,10 +255,7 @@ fn round_trip_table_with_merged_cells() {
 
         // First row: merged cell has gridSpan=2
         let cell0 = &t.rows[0].cells[0];
-        assert_eq!(
-            cell0.properties.as_ref().unwrap().grid_span,
-            Some(2)
-        );
+        assert_eq!(cell0.properties.as_ref().unwrap().grid_span, Some(2));
 
         // Second row: first cell starts vertical merge
         let cell_v = &t.rows[1].cells[0];
@@ -293,7 +299,7 @@ fn round_trip_hyperlink() {
             match &hl.target {
                 office_oxide::docx::HyperlinkTarget::External(url) => {
                     assert_eq!(url, "https://example.com");
-                }
+                },
                 _ => panic!("expected external hyperlink"),
             }
             assert_eq!(hl.runs.len(), 1);
@@ -329,10 +335,7 @@ fn round_trip_section_properties() {
     let ps = sect.page_size.as_ref().unwrap();
     assert_eq!(ps.width.0, 15840);
     assert_eq!(ps.height.0, 12240);
-    assert_eq!(
-        ps.orient,
-        Some(office_oxide::docx::headers::PageOrientation::Landscape)
-    );
+    assert_eq!(ps.orient, Some(office_oxide::docx::headers::PageOrientation::Landscape));
     let margins = sect.margins.as_ref().unwrap();
     assert_eq!(margins.top.0, 720);
     assert_eq!(margins.left.0, 1440);
@@ -452,7 +455,7 @@ fn internal_bookmark_hyperlink() {
             match &hl.target {
                 office_oxide::docx::HyperlinkTarget::Internal(anchor) => {
                     assert_eq!(anchor, "section1");
-                }
+                },
                 _ => panic!("expected internal hyperlink"),
             }
         }
@@ -610,7 +613,9 @@ fn missing_document_part() {
     let cursor = Cursor::new(Vec::new());
     let mut writer = OpcWriter::new(cursor).unwrap();
     let part = PartName::new("/word/other.xml").unwrap();
-    writer.add_part(&part, "application/xml", b"<root/>").unwrap();
+    writer
+        .add_part(&part, "application/xml", b"<root/>")
+        .unwrap();
     // Note: no officeDocument relationship
     let result = writer.finish().unwrap();
     let data = result.into_inner();

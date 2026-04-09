@@ -20,10 +20,10 @@ mod error;
 mod header;
 mod reader;
 
-pub use blip::{extract_blip_images, BlipFormat, BlipImage};
+pub use blip::{BlipFormat, BlipImage, extract_blip_images};
 pub use directory::{DirEntry, EntryType};
 pub use error::{CfbError, Result};
 pub use header::{
-    CfbHeader, CFB_SIGNATURE, DIFAT_SECT, END_OF_CHAIN, FAT_SECT, FREE_SECT, MAX_REG_SECT,
+    CFB_SIGNATURE, CfbHeader, DIFAT_SECT, END_OF_CHAIN, FAT_SECT, FREE_SECT, MAX_REG_SECT,
 };
 pub use reader::CfbReader;

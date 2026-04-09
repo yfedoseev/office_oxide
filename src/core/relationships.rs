@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use quick_xml::events::{BytesDecl, BytesStart, Event};
 use quick_xml::Writer;
+use quick_xml::events::{BytesDecl, BytesStart, Event};
 
 use super::error::{Error, Result};
 use super::opc::PartName;
@@ -110,7 +110,7 @@ impl Relationships {
                         let target_mode = match xml::optional_attr_str(e, b"TargetMode")? {
                             Some(ref m) if m.eq_ignore_ascii_case("External") => {
                                 TargetMode::External
-                            }
+                            },
                             _ => TargetMode::Internal,
                         };
                         rels.push(Relationship {
@@ -120,9 +120,9 @@ impl Relationships {
                             target_mode,
                         });
                     }
-                }
+                },
                 Event::Eof => break,
-                _ => {}
+                _ => {},
             }
         }
 
@@ -254,13 +254,7 @@ impl RelationshipsBuilder {
     }
 
     /// Add a relationship with an explicit ID (for round-trip preservation).
-    pub fn add_with_id(
-        &mut self,
-        id: &str,
-        rel_type: &str,
-        target: &str,
-        target_mode: TargetMode,
-    ) {
+    pub fn add_with_id(&mut self, id: &str, rel_type: &str, target: &str, target_mode: TargetMode) {
         self.rels.push(Relationship {
             id: id.to_string(),
             rel_type: rel_type.to_string(),
@@ -300,9 +294,7 @@ impl RelationshipsBuilder {
         }
 
         writer
-            .write_event(Event::End(quick_xml::events::BytesEnd::new(
-                "Relationships",
-            )))
+            .write_event(Event::End(quick_xml::events::BytesEnd::new("Relationships")))
             .expect("write end");
 
         writer.into_inner()
@@ -377,9 +369,6 @@ mod tests {
         let xml = builder.serialize();
         let rels = Relationships::parse(&xml).unwrap();
         assert_eq!(rels.all().len(), 1);
-        assert_eq!(
-            rels.get_by_id("rId1").unwrap().rel_type,
-            rel_types::OFFICE_DOCUMENT
-        );
+        assert_eq!(rels.get_by_id("rId1").unwrap().rel_type, rel_types::OFFICE_DOCUMENT);
     }
 }

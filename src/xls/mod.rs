@@ -16,8 +16,8 @@ mod records;
 mod sst;
 mod workbook;
 
-pub use cell::{Cell, CellValue};
-pub use error::{XlsError, Result};
-pub use images::{ImageFormat, XlsImage};
 pub use crate::core::OfficeDocument;
+pub use cell::{Cell, CellValue};
+pub use error::{Result, XlsError};
+pub use images::{ImageFormat, XlsImage};
 pub use workbook::{Sheet, XlsDocument};

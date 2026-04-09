@@ -15,7 +15,7 @@ mod fib;
 pub mod images;
 mod piece_table;
 
+pub use crate::core::OfficeDocument;
 pub use document::DocDocument;
 pub use error::{DocError, Result};
 pub use images::{DocImage, ImageFormat};
-pub use crate::core::OfficeDocument;

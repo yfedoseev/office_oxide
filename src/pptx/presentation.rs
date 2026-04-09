@@ -37,14 +37,14 @@ impl PresentationInfo {
                     if e.local_name().as_ref() == b"sldIdLst" {
                         slides = parse_slide_id_list(&mut reader)?;
                     }
-                }
+                },
                 Event::Empty(ref e) => {
                     if e.local_name().as_ref() == b"sldSz" {
                         slide_size = Some(parse_slide_size(e)?);
                     }
-                }
+                },
                 Event::Eof => break,
-                _ => {}
+                _ => {},
             }
         }
 
@@ -71,14 +71,14 @@ fn parse_slide_id_list(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Vec<
                     // resolve by position (convention: rId2 = slide1, rId3 = slide2, etc.)
                     slides.push(SlideId { id, rel_id });
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"sldIdLst" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 

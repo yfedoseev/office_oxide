@@ -46,9 +46,7 @@ impl Fib {
         let wident = u16::from_le_bytes([data[0], data[1]]);
         // 0xA5EC = Word 97 and later. 0xA5DC = Word 6/95. Others may appear.
         if wident != 0xA5EC && wident != 0xA5DC {
-            return Err(DocError::InvalidFib(format!(
-                "unknown wIdent: 0x{wident:04X}"
-            )));
+            return Err(DocError::InvalidFib(format!("unknown wIdent: 0x{wident:04X}")));
         }
 
         let version = u16::from_le_bytes([data[2], data[3]]);

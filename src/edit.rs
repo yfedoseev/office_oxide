@@ -6,8 +6,8 @@
 use std::io::{Read, Seek, Write};
 use std::path::Path;
 
-use crate::format::DocumentFormat;
 use crate::Result;
+use crate::format::DocumentFormat;
 
 /// An editable document that supports text replacement and saving.
 ///
@@ -38,16 +38,22 @@ impl EditableDocument {
         match format {
             DocumentFormat::Docx => {
                 let doc = crate::docx::edit::EditableDocx::open(path)?;
-                Ok(Self { inner: EditableInner::Docx(doc) })
-            }
+                Ok(Self {
+                    inner: EditableInner::Docx(doc),
+                })
+            },
             DocumentFormat::Xlsx => {
                 let doc = crate::xlsx::edit::EditableXlsx::open(path)?;
-                Ok(Self { inner: EditableInner::Xlsx(doc) })
-            }
+                Ok(Self {
+                    inner: EditableInner::Xlsx(doc),
+                })
+            },
             DocumentFormat::Pptx => {
                 let doc = crate::pptx::edit::EditablePptx::open(path)?;
-                Ok(Self { inner: EditableInner::Pptx(doc) })
-            }
+                Ok(Self {
+                    inner: EditableInner::Pptx(doc),
+                })
+            },
             _ => Err(crate::OfficeError::UnsupportedFormat(format!("{format:?}"))),
         }
     }
@@ -57,16 +63,22 @@ impl EditableDocument {
         match format {
             DocumentFormat::Docx => {
                 let doc = crate::docx::edit::EditableDocx::from_reader(reader)?;
-                Ok(Self { inner: EditableInner::Docx(doc) })
-            }
+                Ok(Self {
+                    inner: EditableInner::Docx(doc),
+                })
+            },
             DocumentFormat::Xlsx => {
                 let doc = crate::xlsx::edit::EditableXlsx::from_reader(reader)?;
-                Ok(Self { inner: EditableInner::Xlsx(doc) })
-            }
+                Ok(Self {
+                    inner: EditableInner::Xlsx(doc),
+                })
+            },
             DocumentFormat::Pptx => {
                 let doc = crate::pptx::edit::EditablePptx::from_reader(reader)?;
-                Ok(Self { inner: EditableInner::Pptx(doc) })
-            }
+                Ok(Self {
+                    inner: EditableInner::Pptx(doc),
+                })
+            },
             _ => Err(crate::OfficeError::UnsupportedFormat(format!("{format:?}"))),
         }
     }
@@ -97,7 +109,7 @@ impl EditableDocument {
             EditableInner::Xlsx(doc) => {
                 doc.set_cell(sheet_index, cell_ref, value)?;
                 Ok(())
-            }
+            },
             _ => Err(crate::OfficeError::UnsupportedFormat(
                 "set_cell is only supported for XLSX".to_string(),
             )),

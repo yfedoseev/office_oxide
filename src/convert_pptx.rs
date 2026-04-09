@@ -52,17 +52,17 @@ fn collect_shape_entries<'a>(
         match shape {
             crate::pptx::Shape::Group(grp) => {
                 collect_shape_entries(&grp.children, entries);
-            }
+            },
             crate::pptx::Shape::AutoShape(auto) => {
                 entries.push((auto.position.as_ref(), shape));
-            }
+            },
             crate::pptx::Shape::Picture(pic) => {
                 entries.push((pic.position.as_ref(), shape));
-            }
+            },
             crate::pptx::Shape::GraphicFrame(gf) => {
                 entries.push((gf.position.as_ref(), shape));
-            }
-            crate::pptx::Shape::Connector(_) => {}
+            },
+            crate::pptx::Shape::Connector(_) => {},
         }
     }
 }
@@ -99,13 +99,13 @@ fn find_title_text(shapes: &[crate::pptx::Shape]) -> Option<String> {
                         }
                     }
                 }
-            }
+            },
             crate::pptx::Shape::Group(grp) => {
                 if let Some(title) = find_title_text(&grp.children) {
                     return Some(title);
                 }
-            }
-            _ => {}
+            },
+            _ => {},
         }
     }
     None
@@ -127,10 +127,7 @@ fn plain_text_from_body(body: &crate::pptx::TextBody) -> String {
     parts.join("\n")
 }
 
-fn convert_shape(
-    shape: &crate::pptx::Shape,
-    elements: &mut Vec<Element>,
-) {
+fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
     match shape {
         crate::pptx::Shape::AutoShape(auto) => {
             // Skip title placeholder — used as section title
@@ -145,23 +142,23 @@ fn convert_shape(
             if let Some(ref tb) = auto.text_body {
                 convert_text_body(tb, elements);
             }
-        }
+        },
         crate::pptx::Shape::Picture(pic) => {
             elements.push(Element::Image(Image {
                 alt_text: pic.alt_text.clone(),
             }));
-        }
+        },
         crate::pptx::Shape::Group(grp) => {
             for child in &grp.children {
                 convert_shape(child, elements);
             }
-        }
+        },
         crate::pptx::Shape::GraphicFrame(gf) => {
             if let crate::pptx::GraphicContent::Table(ref tbl) = gf.content {
                 elements.push(convert_pptx_table(tbl));
             }
-        }
-        crate::pptx::Shape::Connector(_) => {}
+        },
+        crate::pptx::Shape::Connector(_) => {},
     }
 }
 
@@ -186,19 +183,15 @@ fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) 
     }
 }
 
-fn convert_text_paragraph_inline(
-    para: &crate::pptx::TextParagraph,
-) -> Vec<InlineContent> {
+fn convert_text_paragraph_inline(para: &crate::pptx::TextParagraph) -> Vec<InlineContent> {
     let mut content = Vec::new();
     for tc in &para.content {
         match tc {
             crate::pptx::TextContent::Run(run) => {
                 if !run.text.is_empty() {
-                    let hyperlink = run.hyperlink.as_ref().and_then(|h| {
-                        match &h.target {
-                            crate::pptx::HyperlinkTarget::External(url) => Some(url.clone()),
-                            crate::pptx::HyperlinkTarget::Internal(_) => None,
-                        }
+                    let hyperlink = run.hyperlink.as_ref().and_then(|h| match &h.target {
+                        crate::pptx::HyperlinkTarget::External(url) => Some(url.clone()),
+                        crate::pptx::HyperlinkTarget::Internal(_) => None,
                     });
                     content.push(InlineContent::Text(TextSpan {
                         text: run.text.clone(),
@@ -208,25 +201,21 @@ fn convert_text_paragraph_inline(
                         hyperlink,
                     }));
                 }
-            }
+            },
             crate::pptx::TextContent::LineBreak => {
                 content.push(InlineContent::LineBreak);
-            }
+            },
             crate::pptx::TextContent::Field(field) => {
                 if !field.text.is_empty() {
                     content.push(InlineContent::Text(TextSpan::plain(field.text.clone())));
                 }
-            }
+            },
         }
     }
     content
 }
 
-fn build_nested_list(
-    ordered: bool,
-    items: &[(u8, Vec<InlineContent>)],
-    base_level: u8,
-) -> List {
+fn build_nested_list(ordered: bool, items: &[(u8, Vec<InlineContent>)], base_level: u8) -> List {
     let mut list_items = Vec::new();
     let mut idx = 0;
 
@@ -239,11 +228,7 @@ fn build_nested_list(
                 nested_end += 1;
             }
             let nested = if nested_end > nested_start {
-                Some(build_nested_list(
-                    ordered,
-                    &items[nested_start..nested_end],
-                    base_level + 1,
-                ))
+                Some(build_nested_list(ordered, &items[nested_start..nested_end], base_level + 1))
             } else {
                 None
             };

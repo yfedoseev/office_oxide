@@ -17,13 +17,19 @@ pub(crate) fn doc_to_ir(doc: &crate::doc::DocDocument) -> DocumentIR {
         let is_heading = trimmed.len() < 100
             && !trimmed.ends_with('.')
             && !trimmed.ends_with(',')
-            && (trimmed.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_uppercase())
+            && (trimmed
+                .chars()
+                .filter(|c| c.is_alphabetic())
+                .all(|c| c.is_uppercase())
                 || (elements.is_empty() && trimmed.len() < 60));
 
         if is_heading {
             elements.push(Element::Heading(Heading {
                 level: if elements.is_empty() { 1 } else { 2 },
-                content: vec![InlineContent::Text(TextSpan { bold: true, ..TextSpan::plain(trimmed) })],
+                content: vec![InlineContent::Text(TextSpan {
+                    bold: true,
+                    ..TextSpan::plain(trimmed)
+                })],
             }));
         } else {
             elements.push(Element::Paragraph(Paragraph {
@@ -45,9 +51,6 @@ pub(crate) fn doc_to_ir(doc: &crate::doc::DocDocument) -> DocumentIR {
             format: DocumentFormat::Doc,
             title: title.clone(),
         },
-        sections: vec![Section {
-            title,
-            elements,
-        }],
+        sections: vec![Section { title, elements }],
     }
 }

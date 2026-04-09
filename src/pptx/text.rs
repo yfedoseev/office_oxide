@@ -1,7 +1,7 @@
+use super::PptxDocument;
 use super::shape::{
     GraphicContent, HyperlinkTarget, Shape, ShapePosition, Table, TextBody, TextContent,
 };
-use super::PptxDocument;
 
 impl PptxDocument {
     /// Extract plain text from the entire presentation.
@@ -126,17 +126,17 @@ fn collect_text_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePositio
                         entries.push((auto.position.clone(), text));
                     }
                 }
-            }
+            },
             Shape::Picture(pic) => {
                 if let Some(ref alt) = pic.alt_text {
                     if !alt.is_empty() {
                         entries.push((pic.position.clone(), alt.clone()));
                     }
                 }
-            }
+            },
             Shape::Group(grp) => {
                 collect_text_entries(&grp.children, entries);
-            }
+            },
             Shape::GraphicFrame(gf) => {
                 if let GraphicContent::Table(ref tbl) = gf.content {
                     let text = plain_text_from_table(tbl);
@@ -144,8 +144,8 @@ fn collect_text_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePositio
                         entries.push((gf.position.clone(), text));
                     }
                 }
-            }
-            Shape::Connector(_) => {}
+            },
+            Shape::Connector(_) => {},
         }
     }
 }
@@ -190,10 +190,7 @@ fn plain_text_from_table(table: &Table) -> String {
 // Markdown collection
 // ---------------------------------------------------------------------------
 
-fn collect_markdown_entries(
-    shapes: &[Shape],
-    entries: &mut Vec<(Option<ShapePosition>, String)>,
-) {
+fn collect_markdown_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePosition>, String)>) {
     for shape in shapes {
         match shape {
             Shape::AutoShape(auto) => {
@@ -211,17 +208,17 @@ fn collect_markdown_entries(
                         entries.push((auto.position.clone(), md));
                     }
                 }
-            }
+            },
             Shape::Picture(pic) => {
                 if let Some(ref alt) = pic.alt_text {
                     if !alt.is_empty() {
                         entries.push((pic.position.clone(), format!("![{alt}]()")));
                     }
                 }
-            }
+            },
             Shape::Group(grp) => {
                 collect_markdown_entries(&grp.children, entries);
-            }
+            },
             Shape::GraphicFrame(gf) => {
                 if let GraphicContent::Table(ref tbl) = gf.content {
                     let md = markdown_table(tbl);
@@ -229,8 +226,8 @@ fn collect_markdown_entries(
                         entries.push((gf.position.clone(), md));
                     }
                 }
-            }
-            Shape::Connector(_) => {}
+            },
+            Shape::Connector(_) => {},
         }
     }
 }
@@ -250,13 +247,13 @@ fn markdown_paragraph(para: &super::shape::TextParagraph) -> String {
         match content {
             TextContent::Run(run) => {
                 text.push_str(&markdown_run(run));
-            }
+            },
             TextContent::LineBreak => {
                 text.push_str("  \n");
-            }
+            },
             TextContent::Field(field) => {
                 text.push_str(&field.text);
-            }
+            },
         }
     }
     // Add bullet indent for outline levels > 0
@@ -292,10 +289,10 @@ fn markdown_run(run: &super::shape::TextRun) -> String {
         match &link.target {
             HyperlinkTarget::External(url) => {
                 text = format!("[{text}]({url})");
-            }
+            },
             HyperlinkTarget::Internal(_) => {
                 // Internal links — just keep the text
-            }
+            },
         }
     }
 
@@ -408,13 +405,13 @@ fn find_title_text(shapes: &[Shape]) -> Option<String> {
                         }
                     }
                 }
-            }
+            },
             Shape::Group(grp) => {
                 if let Some(title) = find_title_text(&grp.children) {
                     return Some(title);
                 }
-            }
-            _ => {}
+            },
+            _ => {},
         }
     }
     None
@@ -422,10 +419,10 @@ fn find_title_text(shapes: &[Shape]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::pptx::shape::*;
-    use crate::pptx::slide::Slide;
     use crate::pptx::PptxDocument;
     use crate::pptx::presentation::PresentationInfo;
+    use crate::pptx::shape::*;
+    use crate::pptx::slide::Slide;
 
     fn make_doc(slides: Vec<Slide>) -> PptxDocument {
         PptxDocument {

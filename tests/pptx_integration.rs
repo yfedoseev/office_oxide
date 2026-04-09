@@ -1,7 +1,7 @@
 use std::io::Cursor;
 
 use office_oxide::core::opc::{OpcWriter, PartName};
-use office_oxide::core::relationships::{rel_types, TargetMode};
+use office_oxide::core::relationships::{TargetMode, rel_types};
 use office_oxide::pptx::PptxDocument;
 
 // ---------------------------------------------------------------------------
@@ -89,11 +89,7 @@ impl PptxBuilder {
     fn with_theme(mut self, xml: &[u8]) -> Self {
         let part = PartName::new("/ppt/theme/theme1.xml").unwrap();
         self.writer
-            .add_part(
-                &part,
-                "application/vnd.openxmlformats-officedocument.theme+xml",
-                xml,
-            )
+            .add_part(&part, "application/vnd.openxmlformats-officedocument.theme+xml", xml)
             .unwrap();
         self.writer
             .add_part_rel(&self.pres_part, rel_types::THEME, "theme/theme1.xml");
@@ -490,11 +486,7 @@ fn multiple_slides() {
     );
 
     let data = PptxBuilder::new()
-        .with_presentation(&pres_xml(&[
-            (256, "rId1"),
-            (257, "rId2"),
-            (258, "rId3"),
-        ]))
+        .with_presentation(&pres_xml(&[(256, "rId1"), (257, "rId2"), (258, "rId3")]))
         .with_slide(&slide_xml(&s1))
         .with_slide(&slide_xml(&s2))
         .with_slide(&slide_xml(&s3))

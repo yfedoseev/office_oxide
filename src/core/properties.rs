@@ -1,5 +1,5 @@
-use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
+use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use serde::{Deserialize, Serialize};
 
 use super::error::Result;
@@ -73,7 +73,7 @@ impl CoreProperties {
                         b"contentStatus" => Ctx::ContentStatus,
                         _ => Ctx::None,
                     };
-                }
+                },
                 Event::Text(ref e) => {
                     let text = e.unescape()?.into_owned();
                     if text.is_empty() {
@@ -92,14 +92,14 @@ impl CoreProperties {
                         Ctx::Category => props.category = Some(text),
                         Ctx::ContentStatus => props.content_status = Some(text),
                         Ctx::Language => props.language = Some(text),
-                        Ctx::None => {}
+                        Ctx::None => {},
                     }
-                }
+                },
                 Event::End(_) => {
                     ctx = Ctx::None;
-                }
+                },
                 Event::Eof => break,
-                _ => {}
+                _ => {},
             }
         }
 
@@ -114,7 +114,10 @@ impl CoreProperties {
             .expect("write decl");
 
         let mut root = BytesStart::new("cp:coreProperties");
-        root.push_attribute(("xmlns:cp", "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"));
+        root.push_attribute((
+            "xmlns:cp",
+            "http://schemas.openxmlformats.org/package/2006/metadata/core-properties",
+        ));
         root.push_attribute(("xmlns:dc", "http://purl.org/dc/elements/1.1/"));
         root.push_attribute(("xmlns:dcterms", "http://purl.org/dc/terms/"));
         root.push_attribute(("xmlns:dcmitype", "http://purl.org/dc/dcmitype/"));
@@ -203,7 +206,7 @@ impl AppProperties {
                     let local = e.local_name();
                     let local_bytes = local.as_ref();
                     current_tag = Some(String::from_utf8_lossy(local_bytes).into_owned());
-                }
+                },
                 Event::Text(ref e) => {
                     let text = e.unescape()?.into_owned();
                     if let Some(ref tag) = current_tag {
@@ -218,21 +221,21 @@ impl AppProperties {
                             "Characters" => props.characters = text.parse().ok(),
                             "CharactersWithSpaces" => {
                                 props.characters_with_spaces = text.parse().ok();
-                            }
+                            },
                             "Lines" => props.lines = text.parse().ok(),
                             "Paragraphs" => props.paragraphs = text.parse().ok(),
                             "Slides" => props.slides = text.parse().ok(),
                             "Notes" => props.notes = text.parse().ok(),
                             "HiddenSlides" => props.hidden_slides = text.parse().ok(),
-                            _ => {}
+                            _ => {},
                         }
                     }
-                }
+                },
                 Event::End(_) => {
                     current_tag = None;
-                }
+                },
                 Event::Eof => break,
-                _ => {}
+                _ => {},
             }
         }
 
@@ -321,10 +324,7 @@ mod tests {
         assert_eq!(props.creator.as_deref(), Some("Jane Smith"));
         assert_eq!(props.keywords.as_deref(), Some("finance; quarterly; report"));
         assert_eq!(props.revision.as_deref(), Some("4"));
-        assert_eq!(
-            props.created.as_deref(),
-            Some("2024-10-01T09:00:00Z")
-        );
+        assert_eq!(props.created.as_deref(), Some("2024-10-01T09:00:00Z"));
         assert_eq!(props.content_status.as_deref(), Some("Final"));
     }
 

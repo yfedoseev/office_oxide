@@ -142,29 +142,25 @@ impl Theme {
                             if let Ok(Some(name)) = xml::optional_attr_str(e, b"name") {
                                 theme_name = name.into_owned();
                             }
-                        }
+                        },
                         b"clrScheme" => {
-                            color_scheme =
-                                Some(parse_color_scheme(&mut reader, e)?);
-                        }
+                            color_scheme = Some(parse_color_scheme(&mut reader, e)?);
+                        },
                         b"fontScheme" => {
-                            font_scheme =
-                                Some(parse_font_scheme(&mut reader, e)?);
-                        }
-                        _ => {}
+                            font_scheme = Some(parse_font_scheme(&mut reader, e)?);
+                        },
+                        _ => {},
                     }
-                }
+                },
                 Event::Eof => break,
-                _ => {}
+                _ => {},
             }
         }
 
-        let color_scheme = color_scheme.ok_or_else(|| {
-            Error::MalformedXml("theme missing clrScheme".to_string())
-        })?;
-        let font_scheme = font_scheme.ok_or_else(|| {
-            Error::MalformedXml("theme missing fontScheme".to_string())
-        })?;
+        let color_scheme = color_scheme
+            .ok_or_else(|| Error::MalformedXml("theme missing clrScheme".to_string()))?;
+        let font_scheme = font_scheme
+            .ok_or_else(|| Error::MalformedXml("theme missing fontScheme".to_string()))?;
 
         Ok(Theme {
             name: theme_name,
@@ -212,15 +208,14 @@ fn parse_color_scheme(
                     // <a:sysClr val="windowText" lastClr="000000"/>
                     if let Some(slot) = current_slot {
                         // Use lastClr for the actual color value
-                        if let Ok(Some(last_clr)) = xml::optional_attr_str(e, b"lastClr")
-                        {
+                        if let Ok(Some(last_clr)) = xml::optional_attr_str(e, b"lastClr") {
                             if let Ok(rgb) = RgbColor::from_hex(&last_clr) {
                                 colors.insert(slot, rgb);
                             }
                         }
                     }
                 }
-            }
+            },
             Event::End(ref e) => {
                 let local = e.local_name();
                 let local_bytes = local.as_ref();
@@ -232,9 +227,9 @@ fn parse_color_scheme(
                 if ThemeColorSlot::from_element_name(local_bytes).is_some() {
                     current_slot = None;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -279,10 +274,10 @@ fn parse_font_scheme(
                             match ctx {
                                 FontCtx::Major => major_latin = typeface,
                                 FontCtx::Minor => minor_latin = typeface,
-                                FontCtx::None => {}
+                                FontCtx::None => {},
                             }
                         }
-                    }
+                    },
                     b"ea" => {
                         if let Ok(Some(tf)) = xml::optional_attr_str(e, b"typeface") {
                             let typeface = tf.into_owned();
@@ -290,11 +285,11 @@ fn parse_font_scheme(
                                 match ctx {
                                     FontCtx::Major => major_ea = Some(typeface),
                                     FontCtx::Minor => minor_ea = Some(typeface),
-                                    FontCtx::None => {}
+                                    FontCtx::None => {},
                                 }
                             }
                         }
-                    }
+                    },
                     b"cs" => {
                         if let Ok(Some(tf)) = xml::optional_attr_str(e, b"typeface") {
                             let typeface = tf.into_owned();
@@ -302,14 +297,14 @@ fn parse_font_scheme(
                                 match ctx {
                                     FontCtx::Major => major_cs = Some(typeface),
                                     FontCtx::Minor => minor_cs = Some(typeface),
-                                    FontCtx::None => {}
+                                    FontCtx::None => {},
                                 }
                             }
                         }
-                    }
-                    _ => {}
+                    },
+                    _ => {},
                 }
-            }
+            },
             Event::End(ref e) => {
                 let local = e.local_name();
                 let local_bytes = local.as_ref();
@@ -317,11 +312,11 @@ fn parse_font_scheme(
                 match local_bytes {
                     b"fontScheme" => break,
                     b"majorFont" | b"minorFont" => ctx = FontCtx::None,
-                    _ => {}
+                    _ => {},
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -368,7 +363,7 @@ impl ColorRef {
                     .cloned()
                     .unwrap_or(RgbColor([0, 0, 0]));
                 apply_tint_shade(&base, *tint, *shade)
-            }
+            },
             Self::System(name) => {
                 // Map common system colors to reasonable defaults
                 match name.as_str() {
@@ -378,7 +373,7 @@ impl ColorRef {
                     "highlight" => RgbColor([0, 120, 215]),
                     _ => RgbColor([0, 0, 0]),
                 }
-            }
+            },
             Self::Auto => RgbColor([0, 0, 0]),
         }
     }
@@ -476,20 +471,11 @@ mod tests {
 
         // System colors (via lastClr)
         assert_eq!(cs.colors.get(&ThemeColorSlot::Dk1), Some(&RgbColor([0, 0, 0])));
-        assert_eq!(
-            cs.colors.get(&ThemeColorSlot::Lt1),
-            Some(&RgbColor([255, 255, 255]))
-        );
+        assert_eq!(cs.colors.get(&ThemeColorSlot::Lt1), Some(&RgbColor([255, 255, 255])));
 
         // sRGB colors
-        assert_eq!(
-            cs.colors.get(&ThemeColorSlot::Accent1),
-            Some(&RgbColor([0x44, 0x72, 0xC4]))
-        );
-        assert_eq!(
-            cs.colors.get(&ThemeColorSlot::Hlink),
-            Some(&RgbColor([0x05, 0x63, 0xC1]))
-        );
+        assert_eq!(cs.colors.get(&ThemeColorSlot::Accent1), Some(&RgbColor([0x44, 0x72, 0xC4])));
+        assert_eq!(cs.colors.get(&ThemeColorSlot::Hlink), Some(&RgbColor([0x05, 0x63, 0xC1])));
 
         // All 12 slots present
         assert_eq!(cs.colors.len(), 12);
@@ -546,23 +532,11 @@ mod tests {
 
     #[test]
     fn theme_color_slot_from_scheme_val() {
-        assert_eq!(
-            ThemeColorSlot::from_scheme_val("accent1"),
-            Some(ThemeColorSlot::Accent1)
-        );
-        assert_eq!(
-            ThemeColorSlot::from_scheme_val("dk1"),
-            Some(ThemeColorSlot::Dk1)
-        );
+        assert_eq!(ThemeColorSlot::from_scheme_val("accent1"), Some(ThemeColorSlot::Accent1));
+        assert_eq!(ThemeColorSlot::from_scheme_val("dk1"), Some(ThemeColorSlot::Dk1));
         // tx1 maps to dk1 (text1 = dark1)
-        assert_eq!(
-            ThemeColorSlot::from_scheme_val("tx1"),
-            Some(ThemeColorSlot::Dk1)
-        );
+        assert_eq!(ThemeColorSlot::from_scheme_val("tx1"), Some(ThemeColorSlot::Dk1));
         // bg1 maps to lt1 (background1 = light1)
-        assert_eq!(
-            ThemeColorSlot::from_scheme_val("bg1"),
-            Some(ThemeColorSlot::Lt1)
-        );
+        assert_eq!(ThemeColorSlot::from_scheme_val("bg1"), Some(ThemeColorSlot::Lt1));
     }
 }

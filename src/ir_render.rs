@@ -71,7 +71,7 @@ fn render_element_plain(element: &Element) -> String {
             } else {
                 String::new()
             }
-        }
+        },
         Element::ThematicBreak => "---".to_string(),
     }
 }
@@ -145,14 +145,14 @@ fn render_element_markdown(element: &Element) -> String {
             let hashes = "#".repeat(h.level.min(6) as usize);
             let text = render_inline_markdown(&h.content);
             format!("{hashes} {text}")
-        }
+        },
         Element::Paragraph(p) => render_inline_markdown(&p.content),
         Element::Table(t) => render_table_markdown(t),
         Element::List(l) => render_list_markdown(l, 0),
         Element::Image(img) => {
             let alt = img.alt_text.as_deref().unwrap_or("");
             format!("![{alt}]()")
-        }
+        },
         Element::ThematicBreak => "---".to_string(),
     }
 }
@@ -180,7 +180,7 @@ fn render_inline_markdown(content: &[InlineContent]) -> String {
                 }
 
                 out.push_str(&text);
-            }
+            },
             InlineContent::LineBreak => out.push_str("  \n"),
         }
     }
@@ -192,12 +192,7 @@ fn render_table_markdown(table: &Table) -> String {
         return String::new();
     }
 
-    let col_count = table
-        .rows
-        .iter()
-        .map(|r| r.cells.len())
-        .max()
-        .unwrap_or(0);
+    let col_count = table.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0);
     if col_count == 0 {
         return String::new();
     }
@@ -315,21 +310,17 @@ fn render_element_html(element: &Element) -> String {
             let level = h.level.clamp(1, 6);
             let content = render_inline_html(&h.content);
             format!("<h{level}>{content}</h{level}>")
-        }
+        },
         Element::Paragraph(p) => {
             let content = render_inline_html(&p.content);
             format!("<p>{content}</p>")
-        }
+        },
         Element::Table(t) => render_table_html(t),
         Element::List(l) => render_list_html(l),
         Element::Image(img) => {
-            let alt = img
-                .alt_text
-                .as_deref()
-                .map(escape_html)
-                .unwrap_or_default();
+            let alt = img.alt_text.as_deref().map(escape_html).unwrap_or_default();
             format!("<img alt=\"{alt}\" />")
-        }
+        },
         Element::ThematicBreak => "<hr />".to_string(),
     }
 }
@@ -355,7 +346,7 @@ fn render_inline_html(content: &[InlineContent]) -> String {
                 }
 
                 out.push_str(&text);
-            }
+            },
             InlineContent::LineBreak => out.push_str("<br />"),
         }
     }

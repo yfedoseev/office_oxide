@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use quick_xml::events::{BytesDecl, BytesStart, Event};
 use quick_xml::Writer;
+use quick_xml::events::{BytesDecl, BytesStart, Event};
 
 use super::error::Result;
 use super::opc::PartName;
@@ -35,20 +35,19 @@ impl ContentTypes {
                         b"Default" => {
                             let ext = xml::required_attr_str(e, b"Extension")?;
                             let ct = xml::required_attr_str(e, b"ContentType")?;
-                            defaults
-                                .insert(ext.to_ascii_lowercase(), ct.into_owned());
-                        }
+                            defaults.insert(ext.to_ascii_lowercase(), ct.into_owned());
+                        },
                         b"Override" => {
                             let pn = xml::required_attr_str(e, b"PartName")?;
                             let ct = xml::required_attr_str(e, b"ContentType")?;
                             let part_name = PartName::new(&pn)?;
                             overrides.insert(part_name, ct.into_owned());
-                        }
-                        _ => {}
+                        },
+                        _ => {},
                     }
-                }
+                },
                 Event::Eof => break,
-                _ => {}
+                _ => {},
             }
         }
 
@@ -111,8 +110,7 @@ impl ContentTypesBuilder {
     }
 
     pub fn add_override(&mut self, part_name: PartName, content_type: &str) {
-        self.overrides
-            .push((part_name, content_type.to_string()));
+        self.overrides.push((part_name, content_type.to_string()));
     }
 
     pub fn build(self) -> ContentTypes {
@@ -136,7 +134,9 @@ impl ContentTypesBuilder {
             "xmlns",
             "http://schemas.openxmlformats.org/package/2006/content-types",
         ));
-        writer.write_event(Event::Start(types)).expect("write start");
+        writer
+            .write_event(Event::Start(types))
+            .expect("write start");
 
         // Write defaults (sorted for deterministic output)
         let mut sorted_defaults: Vec<_> = self.defaults.iter().collect();
@@ -145,7 +145,9 @@ impl ContentTypesBuilder {
             let mut elem = BytesStart::new("Default");
             elem.push_attribute(("Extension", ext.as_str()));
             elem.push_attribute(("ContentType", ct.as_str()));
-            writer.write_event(Event::Empty(elem)).expect("write default");
+            writer
+                .write_event(Event::Empty(elem))
+                .expect("write default");
         }
 
         // Write overrides
@@ -153,7 +155,9 @@ impl ContentTypesBuilder {
             let mut elem = BytesStart::new("Override");
             elem.push_attribute(("PartName", pn.as_str()));
             elem.push_attribute(("ContentType", ct.as_str()));
-            writer.write_event(Event::Empty(elem)).expect("write override");
+            writer
+                .write_event(Event::Empty(elem))
+                .expect("write override");
         }
 
         writer
@@ -198,7 +202,9 @@ mod tests {
         let pn = PartName::new("/word/document.xml").unwrap();
         assert_eq!(
             ct.resolve(&pn),
-            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml")
+            Some(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"
+            )
         );
     }
 

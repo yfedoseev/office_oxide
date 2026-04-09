@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 
+use quick_xml::NsReader;
 use quick_xml::events::BytesStart;
 use quick_xml::name::{Namespace, ResolveResult};
-use quick_xml::NsReader;
 
 use super::error::{Error, Result};
 
@@ -21,44 +21,33 @@ pub mod ns {
     pub const DC_TERMS: &[u8] = b"http://purl.org/dc/terms/";
 
     // DrawingML
-    pub const DRAWING_ML: &[u8] =
-        b"http://schemas.openxmlformats.org/drawingml/2006/main";
+    pub const DRAWING_ML: &[u8] = b"http://schemas.openxmlformats.org/drawingml/2006/main";
 
     // Format-specific
-    pub const WML: &[u8] =
-        b"http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-    pub const SML: &[u8] =
-        b"http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-    pub const PML: &[u8] =
-        b"http://schemas.openxmlformats.org/presentationml/2006/main";
+    pub const WML: &[u8] = b"http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    pub const SML: &[u8] = b"http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    pub const PML: &[u8] = b"http://schemas.openxmlformats.org/presentationml/2006/main";
 
     // Office document relationships (r: prefix in content XML)
-    pub const R: &[u8] =
-        b"http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    pub const R: &[u8] = b"http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
     // Extended properties
     pub const EXTENDED_PROPERTIES: &[u8] =
         b"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties";
 
     // String variants for XML writing (same URIs as above, as &str)
-    pub const WML_STR: &str =
-        "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-    pub const SML_STR: &str =
-        "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
-    pub const PML_STR: &str =
-        "http://schemas.openxmlformats.org/presentationml/2006/main";
-    pub const DRAWING_ML_STR: &str =
-        "http://schemas.openxmlformats.org/drawingml/2006/main";
-    pub const R_STR: &str =
-        "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    pub const WML_STR: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    pub const SML_STR: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    pub const PML_STR: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
+    pub const DRAWING_ML_STR: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
+    pub const R_STR: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
     // Strict OOXML variants
     pub const STRICT_WML: &[u8] = b"http://purl.oclc.org/ooxml/wordprocessingml/main";
     pub const STRICT_SML: &[u8] = b"http://purl.oclc.org/ooxml/spreadsheetml/main";
     pub const STRICT_PML: &[u8] = b"http://purl.oclc.org/ooxml/presentationml/main";
     pub const STRICT_DRAWING: &[u8] = b"http://purl.oclc.org/ooxml/drawingml/main";
-    pub const STRICT_R: &[u8] =
-        b"http://purl.oclc.org/ooxml/officeDocument/relationships";
+    pub const STRICT_R: &[u8] = b"http://purl.oclc.org/ooxml/officeDocument/relationships";
 }
 
 /// Return the Strict namespace variant for a Transitional namespace, if one exists.
@@ -81,7 +70,7 @@ pub fn matches_start(resolve: &ResolveResult, start: &BytesStart, ns: &[u8], loc
         && match resolve {
             ResolveResult::Bound(Namespace(n)) => {
                 *n == ns || strict_alternate(ns).is_some_and(|s| *n == s)
-            }
+            },
             _ => false,
         }
 }
@@ -92,7 +81,7 @@ pub fn matches_ns(resolve: &ResolveResult, ns: &[u8]) -> bool {
     match resolve {
         ResolveResult::Bound(Namespace(n)) => {
             *n == ns || strict_alternate(ns).is_some_and(|s| *n == s)
-        }
+        },
         _ => false,
     }
 }
@@ -128,7 +117,7 @@ pub fn optional_attr_str<'a>(event: &'a BytesStart, key: &[u8]) -> Result<Option
         Some(Cow::Borrowed(b)) => Ok(Some(Cow::Borrowed(std::str::from_utf8(b)?))),
         Some(Cow::Owned(v)) => {
             Ok(Some(Cow::Owned(String::from_utf8(v).map_err(|e| e.utf8_error())?)))
-        }
+        },
         None => Ok(None),
     }
 }
@@ -176,19 +165,19 @@ pub fn read_text_content(reader: &mut NsReader<&[u8]>) -> Result<String> {
         match reader.read_event()? {
             Event::Text(e) => {
                 text.push_str(&e.unescape()?);
-            }
+            },
             Event::CData(e) => {
                 text.push_str(std::str::from_utf8(&e)?);
-            }
+            },
             Event::Start(_) => depth += 1,
             Event::End(_) => {
                 depth -= 1;
                 if depth == 0 {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
     Ok(text)
@@ -206,9 +195,9 @@ pub fn skip_element(reader: &mut NsReader<&[u8]>) -> Result<()> {
                 if depth == 0 {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
     Ok(())
@@ -249,19 +238,19 @@ pub fn read_text_content_fast(reader: &mut quick_xml::Reader<&[u8]>) -> Result<S
         match reader.read_event()? {
             Event::Text(e) => {
                 text.push_str(&e.unescape()?);
-            }
+            },
             Event::CData(e) => {
                 text.push_str(&String::from_utf8_lossy(&e));
-            }
+            },
             Event::Start(_) => depth += 1,
             Event::End(_) => {
                 depth -= 1;
                 if depth == 0 {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
     Ok(text)
@@ -279,9 +268,9 @@ pub fn skip_element_fast(reader: &mut quick_xml::Reader<&[u8]>) -> Result<()> {
                 if depth == 0 {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
     Ok(())
@@ -326,7 +315,10 @@ pub fn ensure_utf8(data: &[u8]) -> Option<Vec<u8>> {
 
     // Replace the encoding declaration with utf-8 so the XML parser doesn't complain
     let mut utf8 = result.into_owned().into_bytes();
-    if let Some(pos) = utf8.windows(9).position(|w| w.eq_ignore_ascii_case(b"encoding=")) {
+    if let Some(pos) = utf8
+        .windows(9)
+        .position(|w| w.eq_ignore_ascii_case(b"encoding="))
+    {
         let rest = &utf8[pos + 9..];
         if let Some(&quote) = rest.first() {
             if quote == b'"' || quote == b'\'' {

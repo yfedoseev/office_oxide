@@ -1,7 +1,7 @@
+use super::XlsxDocument;
 use super::cell::{Cell, CellValue};
 use super::date;
 use super::worksheet::Row;
-use super::XlsxDocument;
 
 impl XlsxDocument {
     /// Extract all text as a plain string (one sheet per section, tab-separated cells).
@@ -135,19 +135,16 @@ impl XlsxDocument {
     /// Write a cell value directly to a buffer (avoids allocation for shared strings).
     pub fn write_cell_value(&self, cell: &Cell, buf: &mut String) {
         match &cell.value {
-            CellValue::Empty => {}
+            CellValue::Empty => {},
             CellValue::Number(n) => {
                 if date::is_date_cell(cell.style_index, self.styles.as_ref()) {
-                    if let Some(dt) = date::DateTimeValue::from_serial(
-                        *n,
-                        self.workbook.date1904,
-                    ) {
+                    if let Some(dt) = date::DateTimeValue::from_serial(*n, self.workbook.date1904) {
                         buf.push_str(&dt.to_iso_string());
                         return;
                     }
                 }
                 write_number(*n, buf);
-            }
+            },
             CellValue::String(s) => buf.push_str(s),
             CellValue::SharedString(idx) => {
                 let s = self.shared_strings.get(*idx).unwrap_or("");
@@ -156,10 +153,12 @@ impl XlsxDocument {
                     buf.push_str(s);
                 } else {
                     let mut end = 32_768;
-                    while !s.is_char_boundary(end) && end > 0 { end -= 1; }
+                    while !s.is_char_boundary(end) && end > 0 {
+                        end -= 1;
+                    }
                     buf.push_str(&s[..end]);
                 }
-            }
+            },
             CellValue::Boolean(b) => buf.push_str(if *b { "TRUE" } else { "FALSE" }),
             CellValue::Error(e) => buf.push_str(e),
             CellValue::Date(dt) => buf.push_str(&dt.to_iso_string()),

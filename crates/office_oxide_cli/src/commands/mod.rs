@@ -1,8 +1,8 @@
-mod text;
-mod markdown;
 mod html;
 mod info;
 mod ir;
+mod markdown;
+mod text;
 
 use clap::Subcommand;
 

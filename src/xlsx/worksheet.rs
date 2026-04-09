@@ -60,52 +60,46 @@ impl Worksheet {
 
         loop {
             match reader.read_event()? {
-                Event::Start(ref e) => {
-                    match e.local_name().as_ref() {
-                        b"dimension" => {
-                            dimension = xml::optional_attr_str(e, b"ref")?
-                                .map(|v| v.into_owned());
-                            reader.read_to_end(e.to_end().name())?;
+                Event::Start(ref e) => match e.local_name().as_ref() {
+                    b"dimension" => {
+                        dimension = xml::optional_attr_str(e, b"ref")?.map(|v| v.into_owned());
+                        reader.read_to_end(e.to_end().name())?;
+                    },
+                    b"row" => {
+                        rows.push(parse_row_fast(&mut reader, e)?);
+                    },
+                    b"mergeCell" => {
+                        if let Some(range) = xml::optional_attr_str(e, b"ref")? {
+                            merged_cells.push(range.into_owned());
                         }
-                        b"row" => {
-                            rows.push(parse_row_fast(&mut reader, e)?);
+                        reader.read_to_end(e.to_end().name())?;
+                    },
+                    b"hyperlink" => {
+                        if let Some(hl) = parse_hyperlink(e, rels)? {
+                            hyperlinks.push(hl);
                         }
-                        b"mergeCell" => {
-                            if let Some(range) = xml::optional_attr_str(e, b"ref")? {
-                                merged_cells.push(range.into_owned());
-                            }
-                            reader.read_to_end(e.to_end().name())?;
+                        reader.read_to_end(e.to_end().name())?;
+                    },
+                    _ => {},
+                },
+                Event::Empty(ref e) => match e.local_name().as_ref() {
+                    b"dimension" => {
+                        dimension = xml::optional_attr_str(e, b"ref")?.map(|v| v.into_owned());
+                    },
+                    b"mergeCell" => {
+                        if let Some(range) = xml::optional_attr_str(e, b"ref")? {
+                            merged_cells.push(range.into_owned());
                         }
-                        b"hyperlink" => {
-                            if let Some(hl) = parse_hyperlink(e, rels)? {
-                                hyperlinks.push(hl);
-                            }
-                            reader.read_to_end(e.to_end().name())?;
+                    },
+                    b"hyperlink" => {
+                        if let Some(hl) = parse_hyperlink(e, rels)? {
+                            hyperlinks.push(hl);
                         }
-                        _ => {}
-                    }
-                }
-                Event::Empty(ref e) => {
-                    match e.local_name().as_ref() {
-                        b"dimension" => {
-                            dimension = xml::optional_attr_str(e, b"ref")?
-                                .map(|v| v.into_owned());
-                        }
-                        b"mergeCell" => {
-                            if let Some(range) = xml::optional_attr_str(e, b"ref")? {
-                                merged_cells.push(range.into_owned());
-                            }
-                        }
-                        b"hyperlink" => {
-                            if let Some(hl) = parse_hyperlink(e, rels)? {
-                                hyperlinks.push(hl);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                    },
+                    _ => {},
+                },
                 Event::Eof => break,
-                _ => {}
+                _ => {},
             }
         }
 
@@ -170,19 +164,19 @@ fn parse_row_fast(
                 } else {
                     reader.read_to_end(e.to_end().name())?;
                 }
-            }
+            },
             Event::Empty(ref e) => {
                 if e.local_name().as_ref() == b"c" {
                     cells.push(parse_empty_cell(e)?);
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"row" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
@@ -215,8 +209,7 @@ fn parse_cell_fast(
         .unwrap_or_default();
     let reference = CellRef::parse(&ref_str).unwrap_or(CellRef { col: 0, row: 0 });
 
-    let cell_type = xml::optional_attr_str(start, b"t")?
-        .map(|v| v.into_owned());
+    let cell_type = xml::optional_attr_str(start, b"t")?.map(|v| v.into_owned());
     let style_index = xml::optional_attr_str(start, b"s")?
         .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok());
 
@@ -225,72 +218,65 @@ fn parse_cell_fast(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                match e.local_name().as_ref() {
-                    b"v" => {
-                        raw_value = Some(read_text_fast(reader)?);
-                    }
-                    b"f" => {
-                        formula = Some(read_text_fast(reader)?);
-                    }
-                    b"is" => {
-                        raw_value = Some(parse_inline_string_fast(reader)?);
-                    }
-                    _ => {
-                        reader.read_to_end(e.to_end().name())?;
-                    }
-                }
-            }
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"v" => {
+                    raw_value = Some(read_text_fast(reader)?);
+                },
+                b"f" => {
+                    formula = Some(read_text_fast(reader)?);
+                },
+                b"is" => {
+                    raw_value = Some(parse_inline_string_fast(reader)?);
+                },
+                _ => {
+                    reader.read_to_end(e.to_end().name())?;
+                },
+            },
             Event::Empty(ref e) => {
                 if e.local_name().as_ref() == b"f" {
                     formula = None;
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"c" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 
     let value = match cell_type.as_deref() {
         Some("s") => {
-            match raw_value.as_deref().and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok()) {
+            match raw_value
+                .as_deref()
+                .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok())
+            {
                 Some(idx) => CellValue::SharedString(idx),
                 None => CellValue::Empty,
             }
-        }
-        Some("str") | Some("inlineStr") => {
-            match raw_value {
-                Some(s) => CellValue::String(s),
-                None => CellValue::Empty,
-            }
-        }
-        Some("b") => {
-            match raw_value.as_deref() {
-                Some("1") | Some("true") => CellValue::Boolean(true),
-                Some("0") | Some("false") => CellValue::Boolean(false),
-                _ => CellValue::Empty,
-            }
-        }
-        Some("e") => {
-            match raw_value {
-                Some(s) => CellValue::Error(s),
-                None => CellValue::Error(String::new()),
-            }
-        }
-        _ => {
-            match raw_value {
-                Some(s) => match fast_float2::parse::<f64, _>(&s) {
-                    Ok(n) => CellValue::Number(n),
-                    Err(_) => CellValue::String(s),
-                },
-                None => CellValue::Empty,
-            }
-        }
+        },
+        Some("str") | Some("inlineStr") => match raw_value {
+            Some(s) => CellValue::String(s),
+            None => CellValue::Empty,
+        },
+        Some("b") => match raw_value.as_deref() {
+            Some("1") | Some("true") => CellValue::Boolean(true),
+            Some("0") | Some("false") => CellValue::Boolean(false),
+            _ => CellValue::Empty,
+        },
+        Some("e") => match raw_value {
+            Some(s) => CellValue::Error(s),
+            None => CellValue::Error(String::new()),
+        },
+        _ => match raw_value {
+            Some(s) => match fast_float2::parse::<f64, _>(&s) {
+                Ok(n) => CellValue::Number(n),
+                Err(_) => CellValue::String(s),
+            },
+            None => CellValue::Empty,
+        },
     };
 
     Ok(Cell {
@@ -318,14 +304,14 @@ fn parse_inline_string_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::cor
                 } else {
                     reader.read_to_end(e.to_end().name())?;
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"is" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
 

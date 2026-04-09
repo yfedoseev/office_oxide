@@ -27,7 +27,7 @@ fn main() {
                 let _ = writeln!(stdout, "{err}");
                 let _ = stdout.flush();
                 continue;
-            }
+            },
         };
 
         let id = &request["id"];

@@ -27,10 +27,7 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             format: DocumentFormat::Docx,
             title: title.clone(),
         },
-        sections: vec![Section {
-            title,
-            elements,
-        }],
+        sections: vec![Section { title, elements }],
     }
 }
 
@@ -49,8 +46,7 @@ fn convert_block_elements(
                     .as_ref()
                     .and_then(|pp| pp.numbering_ref.as_ref())
                 {
-                    let list_element =
-                        convert_list_group(blocks, &mut i, nr.num_id, doc);
+                    let list_element = convert_list_group(blocks, &mut i, nr.num_id, doc);
                     elements.push(list_element);
                     continue;
                 }
@@ -80,11 +76,11 @@ fn convert_block_elements(
                     }
                 }
                 i += 1;
-            }
+            },
             crate::docx::BlockElement::Table(t) => {
                 elements.push(convert_table(t, doc));
                 i += 1;
-            }
+            },
         }
     }
 }
@@ -113,7 +109,7 @@ fn convert_paragraph_inline(
         match pc {
             crate::docx::ParagraphContent::Run(run) => {
                 convert_run(run, None, &mut content);
-            }
+            },
             crate::docx::ParagraphContent::Hyperlink(hl) => {
                 let url = match &hl.target {
                     crate::docx::HyperlinkTarget::External(url) => Some(url.clone()),
@@ -122,7 +118,7 @@ fn convert_paragraph_inline(
                 for run in &hl.runs {
                     convert_run(run, url.as_deref(), &mut content);
                 }
-            }
+            },
         }
     }
     content
@@ -159,25 +155,25 @@ fn convert_run(
                     strikethrough: strike,
                     hyperlink: hyperlink_url.map(|s| s.to_string()),
                 }));
-            }
+            },
             crate::docx::RunContent::Break(crate::docx::BreakType::Line) => {
                 content.push(InlineContent::LineBreak);
-            }
+            },
             crate::docx::RunContent::Break(
                 crate::docx::BreakType::Page | crate::docx::BreakType::Column,
             ) => {
                 // Page/column breaks handled at paragraph level
-            }
+            },
             crate::docx::RunContent::Tab => {
                 content.push(InlineContent::Text(TextSpan::plain("\t")));
-            }
+            },
             crate::docx::RunContent::Drawing(drawing) => {
                 // Emit as a separate image element — but we're in inline context,
                 // so we just note the alt text inline
                 if drawing.description.is_some() {
                     content.push(InlineContent::Text(TextSpan::plain("")));
                 }
-            }
+            },
         }
     }
 }
@@ -193,17 +189,14 @@ fn split_at_page_break(
         match pc {
             crate::docx::ParagraphContent::Run(run) => {
                 for rc in &run.content {
-                    if matches!(
-                        rc,
-                        crate::docx::RunContent::Break(crate::docx::BreakType::Page)
-                    ) {
+                    if matches!(rc, crate::docx::RunContent::Break(crate::docx::BreakType::Page)) {
                         has_break = true;
                     }
                 }
                 if !has_break {
                     convert_run(run, None, &mut content);
                 }
-            }
+            },
             crate::docx::ParagraphContent::Hyperlink(hl) => {
                 if !has_break {
                     let url = match &hl.target {
@@ -214,7 +207,7 @@ fn split_at_page_break(
                         convert_run(run, url.as_deref(), &mut content);
                     }
                 }
-            }
+            },
         }
     }
     (content, has_break)
@@ -266,11 +259,7 @@ fn convert_list_group(
     Element::List(build_nested_list(is_ordered, &items, 0))
 }
 
-fn build_nested_list(
-    ordered: bool,
-    items: &[(u8, Vec<InlineContent>)],
-    base_level: u8,
-) -> List {
+fn build_nested_list(ordered: bool, items: &[(u8, Vec<InlineContent>)], base_level: u8) -> List {
     let mut list_items = Vec::new();
     let mut idx = 0;
 
@@ -320,10 +309,7 @@ fn build_nested_list(
 // Table conversion
 // ---------------------------------------------------------------------------
 
-fn convert_table(
-    table: &crate::docx::Table,
-    doc: &crate::docx::DocxDocument,
-) -> Element {
+fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) -> Element {
     // First pass: compute row_span from vMerge patterns
     let num_rows = table.rows.len();
     let num_cols = table
@@ -332,12 +318,7 @@ fn convert_table(
         .map(|r| {
             r.cells
                 .iter()
-                .map(|c| {
-                    c.properties
-                        .as_ref()
-                        .and_then(|p| p.grid_span)
-                        .unwrap_or(1) as usize
-                })
+                .map(|c| c.properties.as_ref().and_then(|p| p.grid_span).unwrap_or(1) as usize)
                 .sum::<usize>()
         })
         .max()
@@ -352,10 +333,7 @@ fn convert_table(
         while row < num_rows {
             let cell = get_cell_at_grid_col(&table.rows[row], col);
             if let Some(cell) = cell {
-                let vmerge = cell
-                    .properties
-                    .as_ref()
-                    .and_then(|p| p.vertical_merge);
+                let vmerge = cell.properties.as_ref().and_then(|p| p.vertical_merge);
                 if matches!(vmerge, Some(crate::docx::table::MergeType::Restart)) {
                     // Count continuation cells below
                     let mut span = 1u32;
@@ -364,9 +342,7 @@ fn convert_table(
                         let next_cell = get_cell_at_grid_col(&table.rows[next], col);
                         if let Some(nc) = next_cell {
                             if matches!(
-                                nc.properties
-                                    .as_ref()
-                                    .and_then(|p| p.vertical_merge),
+                                nc.properties.as_ref().and_then(|p| p.vertical_merge),
                                 Some(crate::docx::table::MergeType::Continue)
                             ) {
                                 span += 1;
@@ -387,10 +363,7 @@ fn convert_table(
 
     let mut ir_rows = Vec::new();
     for (row_idx, row) in table.rows.iter().enumerate() {
-        let is_header = row
-            .properties
-            .as_ref()
-            .is_some_and(|p| p.is_header);
+        let is_header = row.properties.as_ref().is_some_and(|p| p.is_header);
 
         let mut ir_cells = Vec::new();
         let mut grid_col = 0;

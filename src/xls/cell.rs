@@ -26,7 +26,7 @@ impl CellValue {
                 } else {
                     format!("{n}")
                 }
-            }
+            },
             Self::String(s) => s.clone(),
             Self::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
             Self::Error(code) => match code {
@@ -177,7 +177,7 @@ fn parse_label(data: &[u8]) -> Result<Vec<Cell>> {
             let start = 8;
             let end = (start + str_len).min(data.len());
             data[start..end].iter().map(|&b| b as char).collect()
-        }
+        },
     };
     Ok(vec![Cell {
         row,
@@ -241,7 +241,7 @@ fn parse_formula(data: &[u8]) -> Result<Vec<Cell>> {
                     col,
                     value: CellValue::String(String::new()),
                 }])
-            }
+            },
             1 => Ok(vec![Cell {
                 row,
                 col,
@@ -401,7 +401,7 @@ mod tests {
         data.extend_from_slice(&0u16.to_le_bytes());
         data.extend_from_slice(&0u16.to_le_bytes());
         data.push(0x07); // #DIV/0!
-        data.push(1);    // is_error = true
+        data.push(1); // is_error = true
         let rec = BiffRecord {
             record_type: RT_BOOLERR,
             data,

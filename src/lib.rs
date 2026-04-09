@@ -1,36 +1,36 @@
 // Sub-modules (previously separate crates)
-pub mod core;
 pub mod cfb;
-pub mod docx;
-pub mod xlsx;
-pub mod pptx;
+pub mod core;
 pub mod doc;
-pub mod xls;
+pub mod docx;
 pub mod ppt;
+pub mod pptx;
+pub mod xls;
+pub mod xlsx;
 
 // Top-level modules
+mod convert_doc;
+mod convert_docx;
+mod convert_ppt;
+mod convert_pptx;
+mod convert_xls;
+mod convert_xlsx;
+pub mod create;
+pub mod edit;
 pub mod error;
 pub mod format;
 pub mod ir;
 mod ir_render;
-mod convert_docx;
-mod convert_xlsx;
-mod convert_pptx;
-mod convert_doc;
-mod convert_xls;
-mod convert_ppt;
-pub mod create;
-pub mod edit;
 
 #[cfg(feature = "python")]
 mod python;
 #[cfg(feature = "wasm")]
 mod wasm;
 
+pub use core::OfficeDocument;
 pub use error::{OfficeError, Result};
 pub use format::DocumentFormat;
 pub use ir::DocumentIR;
-pub use core::OfficeDocument;
 
 use std::io::{Read, Seek};
 use std::path::Path;
@@ -53,7 +53,10 @@ fn needs_stack_thread() -> bool {
         // Check RLIMIT_STACK on Unix
         #[cfg(unix)]
         {
-            let mut rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            let mut rlim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
             let ret = unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut rlim) };
             if ret == 0 && rlim.rlim_cur != libc::RLIM_INFINITY {
                 return (rlim.rlim_cur as usize) < MIN_STACK_INLINE;
@@ -139,28 +142,40 @@ impl Document {
         match format {
             DocumentFormat::Docx => {
                 let doc = docx::DocxDocument::open(path)?;
-                Ok(Self { inner: DocumentInner::Docx(Box::new(doc)) })
-            }
+                Ok(Self {
+                    inner: DocumentInner::Docx(Box::new(doc)),
+                })
+            },
             DocumentFormat::Xlsx => {
                 let doc = xlsx::XlsxDocument::open(path)?;
-                Ok(Self { inner: DocumentInner::Xlsx(Box::new(doc)) })
-            }
+                Ok(Self {
+                    inner: DocumentInner::Xlsx(Box::new(doc)),
+                })
+            },
             DocumentFormat::Pptx => {
                 let doc = pptx::PptxDocument::open(path)?;
-                Ok(Self { inner: DocumentInner::Pptx(Box::new(doc)) })
-            }
+                Ok(Self {
+                    inner: DocumentInner::Pptx(Box::new(doc)),
+                })
+            },
             DocumentFormat::Doc => {
                 let doc = doc::DocDocument::open(path)?;
-                Ok(Self { inner: DocumentInner::Doc(Box::new(doc)) })
-            }
+                Ok(Self {
+                    inner: DocumentInner::Doc(Box::new(doc)),
+                })
+            },
             DocumentFormat::Xls => {
                 let doc = xls::XlsDocument::open(path)?;
-                Ok(Self { inner: DocumentInner::Xls(Box::new(doc)) })
-            }
+                Ok(Self {
+                    inner: DocumentInner::Xls(Box::new(doc)),
+                })
+            },
             DocumentFormat::Ppt => {
                 let doc = ppt::PptDocument::open(path)?;
-                Ok(Self { inner: DocumentInner::Ppt(Box::new(doc)) })
-            }
+                Ok(Self {
+                    inner: DocumentInner::Ppt(Box::new(doc)),
+                })
+            },
         }
     }
 
@@ -180,22 +195,31 @@ impl Document {
         match format {
             DocumentFormat::Docx => {
                 let doc = docx::DocxDocument::open_mmap(path)?;
-                Ok(Self { inner: DocumentInner::Docx(Box::new(doc)) })
-            }
+                Ok(Self {
+                    inner: DocumentInner::Docx(Box::new(doc)),
+                })
+            },
             DocumentFormat::Xlsx => {
                 let doc = xlsx::XlsxDocument::open_mmap(path)?;
-                Ok(Self { inner: DocumentInner::Xlsx(Box::new(doc)) })
-            }
+                Ok(Self {
+                    inner: DocumentInner::Xlsx(Box::new(doc)),
+                })
+            },
             DocumentFormat::Pptx => {
                 let doc = pptx::PptxDocument::open_mmap(path)?;
-                Ok(Self { inner: DocumentInner::Pptx(Box::new(doc)) })
-            }
+                Ok(Self {
+                    inner: DocumentInner::Pptx(Box::new(doc)),
+                })
+            },
             _ => Err(OfficeError::UnsupportedFormat(format!("{format:?}"))),
         }
     }
 
     /// Open a document from any `Read + Seek` source with an explicit format.
-    pub fn from_reader<R: Read + Seek + Send + 'static>(reader: R, format: DocumentFormat) -> Result<Self> {
+    pub fn from_reader<R: Read + Seek + Send + 'static>(
+        reader: R,
+        format: DocumentFormat,
+    ) -> Result<Self> {
         with_parse_stack(move || Self::from_reader_inner(reader, format))
     }
 
@@ -203,28 +227,40 @@ impl Document {
         match format {
             DocumentFormat::Docx => {
                 let doc = docx::DocxDocument::from_reader(reader)?;
-                Ok(Self { inner: DocumentInner::Docx(Box::new(doc)) })
-            }
+                Ok(Self {
+                    inner: DocumentInner::Docx(Box::new(doc)),
+                })
+            },
             DocumentFormat::Xlsx => {
                 let doc = xlsx::XlsxDocument::from_reader(reader)?;
-                Ok(Self { inner: DocumentInner::Xlsx(Box::new(doc)) })
-            }
+                Ok(Self {
+                    inner: DocumentInner::Xlsx(Box::new(doc)),
+                })
+            },
             DocumentFormat::Pptx => {
                 let doc = pptx::PptxDocument::from_reader(reader)?;
-                Ok(Self { inner: DocumentInner::Pptx(Box::new(doc)) })
-            }
+                Ok(Self {
+                    inner: DocumentInner::Pptx(Box::new(doc)),
+                })
+            },
             DocumentFormat::Doc => {
                 let doc = doc::DocDocument::from_reader(reader)?;
-                Ok(Self { inner: DocumentInner::Doc(Box::new(doc)) })
-            }
+                Ok(Self {
+                    inner: DocumentInner::Doc(Box::new(doc)),
+                })
+            },
             DocumentFormat::Xls => {
                 let doc = xls::XlsDocument::from_reader(reader)?;
-                Ok(Self { inner: DocumentInner::Xls(Box::new(doc)) })
-            }
+                Ok(Self {
+                    inner: DocumentInner::Xls(Box::new(doc)),
+                })
+            },
             DocumentFormat::Ppt => {
                 let doc = ppt::PptDocument::from_reader(reader)?;
-                Ok(Self { inner: DocumentInner::Ppt(Box::new(doc)) })
-            }
+                Ok(Self {
+                    inner: DocumentInner::Ppt(Box::new(doc)),
+                })
+            },
         }
     }
 
@@ -268,27 +304,45 @@ impl Document {
     }
 
     pub fn as_docx(&self) -> Option<&docx::DocxDocument> {
-        match &self.inner { DocumentInner::Docx(doc) => Some(doc), _ => None }
+        match &self.inner {
+            DocumentInner::Docx(doc) => Some(doc),
+            _ => None,
+        }
     }
 
     pub fn as_xlsx(&self) -> Option<&xlsx::XlsxDocument> {
-        match &self.inner { DocumentInner::Xlsx(doc) => Some(doc), _ => None }
+        match &self.inner {
+            DocumentInner::Xlsx(doc) => Some(doc),
+            _ => None,
+        }
     }
 
     pub fn as_pptx(&self) -> Option<&pptx::PptxDocument> {
-        match &self.inner { DocumentInner::Pptx(doc) => Some(doc), _ => None }
+        match &self.inner {
+            DocumentInner::Pptx(doc) => Some(doc),
+            _ => None,
+        }
     }
 
     pub fn as_doc(&self) -> Option<&doc::DocDocument> {
-        match &self.inner { DocumentInner::Doc(doc) => Some(doc), _ => None }
+        match &self.inner {
+            DocumentInner::Doc(doc) => Some(doc),
+            _ => None,
+        }
     }
 
     pub fn as_xls(&self) -> Option<&xls::XlsDocument> {
-        match &self.inner { DocumentInner::Xls(doc) => Some(doc), _ => None }
+        match &self.inner {
+            DocumentInner::Xls(doc) => Some(doc),
+            _ => None,
+        }
     }
 
     pub fn as_ppt(&self) -> Option<&ppt::PptDocument> {
-        match &self.inner { DocumentInner::Ppt(doc) => Some(doc), _ => None }
+        match &self.inner {
+            DocumentInner::Ppt(doc) => Some(doc),
+            _ => None,
+        }
     }
 
     /// Save/convert the document to a file. Format is detected from the extension.

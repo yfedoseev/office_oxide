@@ -42,12 +42,7 @@ impl EditableXlsx {
     /// Set a cell value in a worksheet.
     ///
     /// `sheet_index` is 0-based. `cell_ref` is like "A1", "B2", etc.
-    pub fn set_cell(
-        &mut self,
-        sheet_index: usize,
-        cell_ref: &str,
-        value: CellValue,
-    ) -> Result<()> {
+    pub fn set_cell(&mut self, sheet_index: usize, cell_ref: &str, value: CellValue) -> Result<()> {
         let part_name = PartName::new(&format!("/xl/worksheets/sheet{}.xml", sheet_index + 1))?;
         let Some(data) = self.package.get_part(&part_name) else {
             return Err(super::XlsxError::Core(crate::core::Error::MissingPart(
@@ -92,12 +87,12 @@ fn set_cell_in_xml(xml: &str, cell_ref: &str, value: &CellValue) -> String {
         CellValue::String(s) => {
             let escaped = escape_xml(s);
             format!(r#"<c r="{cell_ref}" t="inlineStr"><is><t>{escaped}</t></is></c>"#)
-        }
+        },
         CellValue::Number(n) => format!(r#"<c r="{cell_ref}"><v>{n}</v></c>"#),
         CellValue::Boolean(b) => {
             let v = if *b { "1" } else { "0" };
             format!(r#"<c r="{cell_ref}" t="b"><v>{v}</v></c>"#)
-        }
+        },
     };
 
     // Try to find existing cell with this reference

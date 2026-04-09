@@ -3,9 +3,9 @@
 use std::io::{Seek, Write};
 use std::path::Path;
 
+use crate::Result;
 use crate::format::DocumentFormat;
 use crate::ir::*;
-use crate::Result;
 
 /// Create a document file from a `DocumentIR`.
 pub fn create_from_ir(
@@ -17,20 +17,16 @@ pub fn create_from_ir(
         DocumentFormat::Docx => {
             let writer = ir_to_docx(ir);
             writer.save(path)?;
-        }
+        },
         DocumentFormat::Xlsx => {
             let writer = ir_to_xlsx(ir);
             writer.save(path)?;
-        }
+        },
         DocumentFormat::Pptx => {
             let writer = ir_to_pptx(ir);
             writer.save(path)?;
-        }
-        _ => {
-            return Err(crate::OfficeError::UnsupportedFormat(format!(
-                "{format:?}"
-            )))
-        }
+        },
+        _ => return Err(crate::OfficeError::UnsupportedFormat(format!("{format:?}"))),
     }
     Ok(())
 }
@@ -45,20 +41,16 @@ pub fn create_from_ir_to_writer<W: Write + Seek>(
         DocumentFormat::Docx => {
             let w = ir_to_docx(ir);
             w.write_to(writer)?;
-        }
+        },
         DocumentFormat::Xlsx => {
             let w = ir_to_xlsx(ir);
             w.write_to(writer)?;
-        }
+        },
         DocumentFormat::Pptx => {
             let w = ir_to_pptx(ir);
             w.write_to(writer)?;
-        }
-        _ => {
-            return Err(crate::OfficeError::UnsupportedFormat(format!(
-                "{format:?}"
-            )))
-        }
+        },
+        _ => return Err(crate::OfficeError::UnsupportedFormat(format!("{format:?}"))),
     }
     Ok(())
 }
@@ -86,13 +78,13 @@ fn add_element_to_docx(writer: &mut crate::docx::write::DocxWriter, elem: &Eleme
         Element::Heading(h) => {
             let text = inline_to_text(&h.content);
             writer.add_heading(&text, h.level);
-        }
+        },
         Element::Paragraph(p) => {
             let text = inline_to_text(&p.content);
             if !text.is_empty() {
                 writer.add_paragraph(&text);
             }
-        }
+        },
         Element::Table(t) => {
             let rows: Vec<Vec<String>> = t
                 .rows
@@ -118,13 +110,13 @@ fn add_element_to_docx(writer: &mut crate::docx::write::DocxWriter, elem: &Eleme
                 .map(|r| r.iter().map(String::as_str).collect())
                 .collect();
             writer.add_table(&row_refs);
-        }
+        },
         Element::List(l) => {
             let items: Vec<String> = l.items.iter().map(|i| inline_to_text(&i.content)).collect();
             let item_refs: Vec<&str> = items.iter().map(String::as_str).collect();
             writer.add_list(&item_refs, l.ordered);
-        }
-        Element::ThematicBreak | Element::Image(_) => {}
+        },
+        Element::ThematicBreak | Element::Image(_) => {},
     }
 }
 
@@ -166,20 +158,20 @@ fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                             .collect();
                         sheet.add_row(cells);
                     }
-                }
+                },
                 Element::Paragraph(p) => {
                     let text = inline_to_text(&p.content);
                     if !text.is_empty() {
                         sheet.add_row(vec![CellData::String(text)]);
                     }
-                }
+                },
                 Element::Heading(h) => {
                     let text = inline_to_text(&h.content);
                     if !text.is_empty() {
                         sheet.add_row(vec![CellData::String(text)]);
                     }
-                }
-                _ => {}
+                },
+                _ => {},
             }
         }
     }
@@ -210,20 +202,20 @@ fn ir_to_pptx(ir: &DocumentIR) -> crate::pptx::write::PptxWriter {
                     } else {
                         slide.add_text(&text);
                     }
-                }
+                },
                 Element::Paragraph(p) => {
                     let text = inline_to_text(&p.content);
                     if !text.is_empty() {
                         slide.add_text(&text);
                     }
-                }
+                },
                 Element::List(l) => {
                     let items: Vec<String> =
                         l.items.iter().map(|i| inline_to_text(&i.content)).collect();
                     let item_refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
                     slide.add_bullet_list(&item_refs);
-                }
-                _ => {}
+                },
+                _ => {},
             }
         }
     }

@@ -125,7 +125,9 @@ pub(crate) fn parse_justification_value(val: &str) -> Justification {
 /// Parse `w:rPr` element children using NsReader. Caller has already consumed the `Start(w:rPr)` event.
 /// NOTE: Only used by test code via NsReader. Production code uses `parse_run_properties_fast`.
 #[cfg(test)]
-pub(crate) fn parse_run_properties(reader: &mut quick_xml::NsReader<&[u8]>) -> crate::core::Result<RunProperties> {
+pub(crate) fn parse_run_properties(
+    reader: &mut quick_xml::NsReader<&[u8]>,
+) -> crate::core::Result<RunProperties> {
     let wml = xml::ns::WML;
     let mut props = RunProperties::default();
 
@@ -138,45 +140,45 @@ pub(crate) fn parse_run_properties(reader: &mut quick_xml::NsReader<&[u8]>) -> c
                         b"b" => {
                             props.bold = Some(parse_toggle(e));
                             xml::skip_element(reader)?;
-                        }
+                        },
                         b"i" => {
                             props.italic = Some(parse_toggle(e));
                             xml::skip_element(reader)?;
-                        }
+                        },
                         b"strike" => {
                             props.strike = Some(parse_toggle(e));
                             xml::skip_element(reader)?;
-                        }
+                        },
                         b"dstrike" => {
                             props.dstrike = Some(parse_toggle(e));
                             xml::skip_element(reader)?;
-                        }
+                        },
                         b"u" => {
                             props.underline = Some(parse_underline(e));
                             xml::skip_element(reader)?;
-                        }
+                        },
                         b"sz" => {
                             if let Some(val) = parse_half_point_val(e)? {
                                 props.font_size = Some(val);
                             }
                             xml::skip_element(reader)?;
-                        }
+                        },
                         b"rFonts" => {
                             if let Ok(Some(ascii)) = xml::optional_attr_str(e, b"w:ascii") {
                                 props.font_name = Some(ascii.into_owned());
                             }
                             xml::skip_element(reader)?;
-                        }
+                        },
                         b"color" => {
                             props.color = parse_color_ref(e)?;
                             xml::skip_element(reader)?;
-                        }
+                        },
                         b"highlight" => {
                             if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                                 props.highlight = Some(val.into_owned());
                             }
                             xml::skip_element(reader)?;
-                        }
+                        },
                         b"vertAlign" => {
                             if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                                 props.vertical_align = Some(match val.as_ref() {
@@ -186,21 +188,21 @@ pub(crate) fn parse_run_properties(reader: &mut quick_xml::NsReader<&[u8]>) -> c
                                 });
                             }
                             xml::skip_element(reader)?;
-                        }
+                        },
                         b"rStyle" => {
                             if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                                 props.style_id = Some(val.into_owned());
                             }
                             xml::skip_element(reader)?;
-                        }
+                        },
                         _ => {
                             xml::skip_element(reader)?;
-                        }
+                        },
                     }
                 } else {
                     xml::skip_element(reader)?;
                 }
-            }
+            },
             (ref resolve, Event::Empty(ref e)) => {
                 if xml::matches_ns(resolve, wml) {
                     let local = e.local_name();
@@ -214,20 +216,20 @@ pub(crate) fn parse_run_properties(reader: &mut quick_xml::NsReader<&[u8]>) -> c
                             if let Some(val) = parse_half_point_val(e)? {
                                 props.font_size = Some(val);
                             }
-                        }
+                        },
                         b"rFonts" => {
                             if let Ok(Some(ascii)) = xml::optional_attr_str(e, b"w:ascii") {
                                 props.font_name = Some(ascii.into_owned());
                             }
-                        }
+                        },
                         b"color" => {
                             props.color = parse_color_ref(e)?;
-                        }
+                        },
                         b"highlight" => {
                             if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                                 props.highlight = Some(val.into_owned());
                             }
-                        }
+                        },
                         b"vertAlign" => {
                             if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                                 props.vertical_align = Some(match val.as_ref() {
@@ -236,23 +238,23 @@ pub(crate) fn parse_run_properties(reader: &mut quick_xml::NsReader<&[u8]>) -> c
                                     _ => VerticalAlign::Baseline,
                                 });
                             }
-                        }
+                        },
                         b"rStyle" => {
                             if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                                 props.style_id = Some(val.into_owned());
                             }
-                        }
-                        _ => {}
+                        },
+                        _ => {},
                     }
                 }
-            }
+            },
             (ref resolve, Event::End(ref e)) => {
                 if xml::matches_ns(resolve, wml) && e.local_name().as_ref() == b"rPr" {
                     break;
                 }
-            }
+            },
             (_, Event::Eof) => break,
-            _ => {}
+            _ => {},
         }
     }
     Ok(props)
@@ -278,24 +280,24 @@ pub(crate) fn parse_paragraph_properties(
                                 props.style_id = Some(val.into_owned());
                             }
                             xml::skip_element(reader)?;
-                        }
+                        },
                         b"jc" => {
                             if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                                 props.justification = Some(parse_justification_value(&val));
                             }
                             xml::skip_element(reader)?;
-                        }
+                        },
                         b"ind" => {
                             props.indent = Some(parse_indent(e)?);
                             xml::skip_element(reader)?;
-                        }
+                        },
                         b"spacing" => {
                             props.spacing = Some(parse_spacing(e)?);
                             xml::skip_element(reader)?;
-                        }
+                        },
                         b"numPr" => {
                             props.numbering_ref = Some(parse_num_pr(reader)?);
-                        }
+                        },
                         b"outlineLvl" => {
                             if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                                 if let Ok(lvl) = val.parse::<u8>() {
@@ -303,18 +305,18 @@ pub(crate) fn parse_paragraph_properties(
                                 }
                             }
                             xml::skip_element(reader)?;
-                        }
+                        },
                         b"rPr" => {
                             props.run_properties = Some(parse_run_properties(reader)?);
-                        }
+                        },
                         _ => {
                             xml::skip_element(reader)?;
-                        }
+                        },
                     }
                 } else {
                     xml::skip_element(reader)?;
                 }
-            }
+            },
             (ref resolve, Event::Empty(ref e)) => {
                 if xml::matches_ns(resolve, wml) {
                     let local = e.local_name();
@@ -323,36 +325,36 @@ pub(crate) fn parse_paragraph_properties(
                             if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                                 props.style_id = Some(val.into_owned());
                             }
-                        }
+                        },
                         b"jc" => {
                             if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                                 props.justification = Some(parse_justification_value(&val));
                             }
-                        }
+                        },
                         b"ind" => {
                             props.indent = Some(parse_indent(e)?);
-                        }
+                        },
                         b"spacing" => {
                             props.spacing = Some(parse_spacing(e)?);
-                        }
+                        },
                         b"outlineLvl" => {
                             if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                                 if let Ok(lvl) = val.parse::<u8>() {
                                     props.outline_level = Some(lvl);
                                 }
                             }
-                        }
-                        _ => {}
+                        },
+                        _ => {},
                     }
                 }
-            }
+            },
             (ref resolve, Event::End(ref e)) => {
                 if xml::matches_ns(resolve, wml) && e.local_name().as_ref() == b"pPr" {
                     break;
                 }
-            }
+            },
             (_, Event::Eof) => break,
-            _ => {}
+            _ => {},
         }
     }
     Ok(props)
@@ -376,45 +378,45 @@ pub(crate) fn parse_run_properties_fast(
                     b"b" => {
                         props.bold = Some(parse_toggle(e));
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                     b"i" => {
                         props.italic = Some(parse_toggle(e));
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                     b"strike" => {
                         props.strike = Some(parse_toggle(e));
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                     b"dstrike" => {
                         props.dstrike = Some(parse_toggle(e));
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                     b"u" => {
                         props.underline = Some(parse_underline(e));
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                     b"sz" => {
                         if let Some(val) = parse_half_point_val(e)? {
                             props.font_size = Some(val);
                         }
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                     b"rFonts" => {
                         if let Ok(Some(ascii)) = xml::optional_attr_str(e, b"w:ascii") {
                             props.font_name = Some(ascii.into_owned());
                         }
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                     b"color" => {
                         props.color = parse_color_ref(e)?;
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                     b"highlight" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             props.highlight = Some(val.into_owned());
                         }
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                     b"vertAlign" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             props.vertical_align = Some(match val.as_ref() {
@@ -424,18 +426,18 @@ pub(crate) fn parse_run_properties_fast(
                             });
                         }
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                     b"rStyle" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             props.style_id = Some(val.into_owned());
                         }
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                     _ => {
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                 }
-            }
+            },
             Event::Empty(ref e) => {
                 let local = e.local_name();
                 match local.as_ref() {
@@ -448,20 +450,20 @@ pub(crate) fn parse_run_properties_fast(
                         if let Some(val) = parse_half_point_val(e)? {
                             props.font_size = Some(val);
                         }
-                    }
+                    },
                     b"rFonts" => {
                         if let Ok(Some(ascii)) = xml::optional_attr_str(e, b"w:ascii") {
                             props.font_name = Some(ascii.into_owned());
                         }
-                    }
+                    },
                     b"color" => {
                         props.color = parse_color_ref(e)?;
-                    }
+                    },
                     b"highlight" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             props.highlight = Some(val.into_owned());
                         }
-                    }
+                    },
                     b"vertAlign" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             props.vertical_align = Some(match val.as_ref() {
@@ -470,22 +472,22 @@ pub(crate) fn parse_run_properties_fast(
                                 _ => VerticalAlign::Baseline,
                             });
                         }
-                    }
+                    },
                     b"rStyle" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             props.style_id = Some(val.into_owned());
                         }
-                    }
-                    _ => {}
+                    },
+                    _ => {},
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"rPr" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
     Ok(props)
@@ -507,24 +509,24 @@ pub(crate) fn parse_paragraph_properties_fast(
                             props.style_id = Some(val.into_owned());
                         }
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                     b"jc" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             props.justification = Some(parse_justification_value(&val));
                         }
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                     b"ind" => {
                         props.indent = Some(parse_indent(e)?);
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                     b"spacing" => {
                         props.spacing = Some(parse_spacing(e)?);
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                     b"numPr" => {
                         props.numbering_ref = Some(parse_num_pr_fast(reader)?);
-                    }
+                    },
                     b"outlineLvl" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             if let Ok(lvl) = val.parse::<u8>() {
@@ -532,15 +534,15 @@ pub(crate) fn parse_paragraph_properties_fast(
                             }
                         }
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                     b"rPr" => {
                         props.run_properties = Some(parse_run_properties_fast(reader)?);
-                    }
+                    },
                     _ => {
                         xml::skip_element_fast(reader)?;
-                    }
+                    },
                 }
-            }
+            },
             Event::Empty(ref e) => {
                 let local = e.local_name();
                 match local.as_ref() {
@@ -548,35 +550,35 @@ pub(crate) fn parse_paragraph_properties_fast(
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             props.style_id = Some(val.into_owned());
                         }
-                    }
+                    },
                     b"jc" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             props.justification = Some(parse_justification_value(&val));
                         }
-                    }
+                    },
                     b"ind" => {
                         props.indent = Some(parse_indent(e)?);
-                    }
+                    },
                     b"spacing" => {
                         props.spacing = Some(parse_spacing(e)?);
-                    }
+                    },
                     b"outlineLvl" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             if let Ok(lvl) = val.parse::<u8>() {
                                 props.outline_level = Some(lvl);
                             }
                         }
-                    }
-                    _ => {}
+                    },
+                    _ => {},
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"pPr" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
     Ok(props)
@@ -595,22 +597,22 @@ fn parse_num_pr_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Resu
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             num_id = val.parse().unwrap_or(0);
                         }
-                    }
+                    },
                     b"ilvl" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             ilvl = val.parse().unwrap_or(0);
                         }
-                    }
-                    _ => {}
+                    },
+                    _ => {},
                 }
-            }
+            },
             Event::End(ref e) => {
                 if e.local_name().as_ref() == b"numPr" {
                     break;
                 }
-            }
+            },
             Event::Eof => break,
-            _ => {}
+            _ => {},
         }
     }
     Ok(NumberingRef { num_id, ilvl })
@@ -668,7 +670,7 @@ fn parse_half_point_val(e: &BytesStart) -> crate::core::Result<Option<HalfPoint>
         Some(ref val) => {
             let v: u32 = parse_numeric(val)?;
             Ok(Some(HalfPoint(v)))
-        }
+        },
         None => Ok(None),
     }
 }
@@ -741,13 +743,12 @@ fn parse_spacing(e: &BytesStart) -> crate::core::Result<ParagraphSpacing> {
     }
     if let Some(val) = xml::optional_attr_str(e, b"w:line")? {
         let line_val: i32 = parse_numeric(&val)?;
-        let rule = xml::optional_attr_str(e, b"w:lineRule")?
-            .map(|r| match r.as_ref() {
-                "auto" => LineSpacingRule::Auto,
-                "exact" => LineSpacingRule::Exact,
-                "atLeast" => LineSpacingRule::AtLeast,
-                _ => LineSpacingRule::Auto,
-            });
+        let rule = xml::optional_attr_str(e, b"w:lineRule")?.map(|r| match r.as_ref() {
+            "auto" => LineSpacingRule::Auto,
+            "exact" => LineSpacingRule::Exact,
+            "atLeast" => LineSpacingRule::AtLeast,
+            _ => LineSpacingRule::Auto,
+        });
         spacing.line = Some(SpacingLine {
             value: line_val,
             rule,
@@ -772,23 +773,23 @@ fn parse_num_pr(reader: &mut quick_xml::NsReader<&[u8]>) -> crate::core::Result<
                             if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                                 num_id = val.parse().unwrap_or(0);
                             }
-                        }
+                        },
                         b"ilvl" => {
                             if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                                 ilvl = val.parse().unwrap_or(0);
                             }
-                        }
-                        _ => {}
+                        },
+                        _ => {},
                     }
                 }
-            }
+            },
             (ref resolve, Event::End(ref e)) => {
                 if xml::matches_ns(resolve, wml) && e.local_name().as_ref() == b"numPr" {
                     break;
                 }
-            }
+            },
             (_, Event::Eof) => break,
-            _ => {}
+            _ => {},
         }
     }
     Ok(NumberingRef { num_id, ilvl })
@@ -800,16 +801,17 @@ mod tests {
 
     #[test]
     fn parse_toggle_bare() {
-        let xml = br#"<w:b xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
+        let xml =
+            br#"<w:b xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
         let mut reader = xml::make_reader(xml);
         loop {
             match reader.read_resolved_event().unwrap() {
                 (_, Event::Empty(ref e)) => {
                     assert!(parse_toggle(e));
                     break;
-                }
+                },
                 (_, Event::Eof) => panic!("unexpected eof"),
-                _ => {}
+                _ => {},
             }
         }
     }
@@ -823,16 +825,17 @@ mod tests {
                 (_, Event::Empty(ref e)) => {
                     assert!(!parse_toggle(e));
                     break;
-                }
+                },
                 (_, Event::Eof) => panic!("unexpected eof"),
-                _ => {}
+                _ => {},
             }
         }
     }
 
     #[test]
     fn parse_run_props_bold_italic() {
-        let xml = br#"<w:rPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+        let xml =
+            br#"<w:rPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
             <w:b/>
             <w:i/>
             <w:sz w:val="24"/>
@@ -852,7 +855,8 @@ mod tests {
 
     #[test]
     fn parse_paragraph_props_style_justification() {
-        let xml = br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+        let xml =
+            br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
             <w:pStyle w:val="Heading1"/>
             <w:jc w:val="center"/>
             <w:outlineLvl w:val="0"/>
@@ -882,9 +886,9 @@ mod tests {
                     assert!(indent.right.is_none());
                     assert!(indent.first_line.is_none());
                     break;
-                }
+                },
                 (_, Event::Eof) => panic!("unexpected eof"),
-                _ => {}
+                _ => {},
             }
         }
     }

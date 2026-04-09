@@ -28,7 +28,7 @@ pub fn parse_sst(data: &[u8]) -> Result<Vec<String>> {
             Ok((s, new_pos)) => {
                 strings.push(s);
                 pos = new_pos;
-            }
+            },
             Err(_) => break, // Tolerate truncated SST
         }
     }
@@ -43,9 +43,7 @@ pub fn parse_sst(data: &[u8]) -> Result<Vec<String>> {
 /// Returns (string, new_position).
 pub fn read_unicode_string(data: &[u8], pos: usize) -> Result<(String, usize)> {
     if pos + 3 > data.len() {
-        return Err(XlsError::Corrupted(format!(
-            "unicode string header truncated at {pos}"
-        )));
+        return Err(XlsError::Corrupted(format!("unicode string header truncated at {pos}")));
     }
 
     let char_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
@@ -79,7 +77,12 @@ pub fn read_unicode_string(data: &[u8], pos: usize) -> Result<(String, usize)> {
         if offset + 4 > data.len() {
             return Err(XlsError::Corrupted("ext size truncated".into()));
         }
-        let n = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]) as usize;
+        let n = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize;
         offset += 4;
         n
     } else {
@@ -106,9 +109,7 @@ pub fn read_unicode_string(data: &[u8], pos: usize) -> Result<(String, usize)> {
     } else {
         // Compressed: 1 byte per char, Latin-1.
         if offset + char_count > data.len() {
-            return Err(XlsError::Corrupted(format!(
-                "compressed string truncated at {offset}"
-            )));
+            return Err(XlsError::Corrupted(format!("compressed string truncated at {offset}")));
         }
         let s: String = data[offset..offset + char_count]
             .iter()
@@ -153,9 +154,7 @@ pub fn read_short_unicode_string(data: &[u8], pos: usize) -> Result<(String, usi
         String::from_utf16_lossy(&chars)
     } else {
         if offset + char_count > data.len() {
-            return Err(XlsError::Corrupted(
-                "short compressed string truncated".into(),
-            ));
+            return Err(XlsError::Corrupted("short compressed string truncated".into()));
         }
         let s: String = data[offset..offset + char_count]
             .iter()

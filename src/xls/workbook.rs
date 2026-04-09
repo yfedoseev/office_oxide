@@ -4,9 +4,9 @@ use std::io::{Read, Seek};
 
 use crate::cfb::CfbReader;
 
-use super::cell::{parse_cell_record, Cell, CellValue};
+use super::cell::{Cell, CellValue, parse_cell_record};
 use super::error::{Result, XlsError};
-use super::images::{extract_images, XlsImage};
+use super::images::{XlsImage, extract_images};
 use super::records::*;
 use super::sst::{parse_sst, read_short_unicode_string, read_unicode_string};
 
@@ -44,9 +44,7 @@ impl XlsDocument {
         } else if cfb.has_stream("Book") {
             cfb.open_stream("Book")?
         } else {
-            return Err(XlsError::MissingStream(
-                "neither Workbook nor Book stream found".into(),
-            ));
+            return Err(XlsError::MissingStream("neither Workbook nor Book stream found".into()));
         };
         // Drop CFB early to free file handle and memory.
         drop(cfb);
@@ -95,20 +93,23 @@ impl XlsDocument {
                 Phase::Globals => match rec.record_type {
                     RT_FILEPASS => {
                         // File is encrypted — we can't read it.
-                        return Ok(Self { sheets: Vec::new(), images: Vec::new() });
-                    }
+                        return Ok(Self {
+                            sheets: Vec::new(),
+                            images: Vec::new(),
+                        });
+                    },
                     RT_BOUNDSHEET => {
                         if let Ok(info) = parse_boundsheet(&rec.data) {
                             sheet_infos.push(info);
                         }
-                    }
+                    },
                     RT_SST => {
                         sst = parse_sst(&rec.data)?;
-                    }
+                    },
                     RT_EOF => {
                         phase = Phase::BetweenSheets;
-                    }
-                    _ => {}
+                    },
+                    _ => {},
                 },
                 Phase::BetweenSheets => {
                     if rec.record_type == RT_BOF {
@@ -116,7 +117,7 @@ impl XlsDocument {
                         cells.clear();
                         pending_formula_string = None;
                     }
-                }
+                },
                 Phase::InSheet => match rec.record_type {
                     RT_EOF => {
                         let name = if sheet_idx < sheet_infos.len() {
@@ -124,15 +125,14 @@ impl XlsDocument {
                         } else {
                             format!("Sheet{}", sheet_idx + 1)
                         };
-                        let hidden =
-                            sheet_idx < sheet_infos.len() && sheet_infos[sheet_idx].hidden;
+                        let hidden = sheet_idx < sheet_infos.len() && sheet_infos[sheet_idx].hidden;
                         if !hidden {
                             let rows = build_grid(&mut cells);
                             sheets.push(Sheet { name, rows });
                         }
                         sheet_idx += 1;
                         phase = Phase::BetweenSheets;
-                    }
+                    },
                     RT_STRING => {
                         if let Some((row, col)) = pending_formula_string.take() {
                             if rec.data.len() >= 3 {
@@ -145,7 +145,7 @@ impl XlsDocument {
                                 }
                             }
                         }
-                    }
+                    },
                     RT_FORMULA => {
                         pending_formula_string = None;
                         if rec.data.len() >= 14 {
@@ -160,7 +160,7 @@ impl XlsDocument {
                         if let Ok(parsed) = parse_cell_record(&rec, &sst) {
                             cells.extend(parsed);
                         }
-                    }
+                    },
                     _ => {
                         pending_formula_string = None;
                         // Skip LABEL/RSTRING parsing for non-BIFF8 (avoids slow unicode fallback).
@@ -169,21 +169,30 @@ impl XlsDocument {
                             if rec.data.len() >= 8 {
                                 let row = u16::from_le_bytes([rec.data[0], rec.data[1]]);
                                 let col = u16::from_le_bytes([rec.data[2], rec.data[3]]);
-                                let str_len = u16::from_le_bytes([rec.data[6], rec.data[7]]) as usize;
+                                let str_len =
+                                    u16::from_le_bytes([rec.data[6], rec.data[7]]) as usize;
                                 let start = 8;
                                 let end = (start + str_len).min(rec.data.len());
-                                let s: String = rec.data[start..end].iter().map(|&b| b as char).collect();
-                                cells.push(Cell { row, col, value: CellValue::String(s) });
+                                let s: String =
+                                    rec.data[start..end].iter().map(|&b| b as char).collect();
+                                cells.push(Cell {
+                                    row,
+                                    col,
+                                    value: CellValue::String(s),
+                                });
                             }
                         } else if let Ok(parsed) = parse_cell_record(&rec, &sst) {
                             cells.extend(parsed);
                         }
-                    }
+                    },
                 },
             }
         }
 
-        Ok(Self { sheets, images: Vec::new() })
+        Ok(Self {
+            sheets,
+            images: Vec::new(),
+        })
     }
 
     /// Get all extracted images.
@@ -320,7 +329,10 @@ fn build_grid(cells: &mut [Cell]) -> Vec<Vec<CellValue>> {
     }
 
     // Trim trailing empty rows.
-    while grid.last().is_some_and(|row| row.iter().all(|c| matches!(c, CellValue::Empty))) {
+    while grid
+        .last()
+        .is_some_and(|row| row.iter().all(|c| matches!(c, CellValue::Empty)))
+    {
         grid.pop();
     }
 
@@ -354,7 +366,10 @@ fn build_grid_sparse(cells: &mut [Cell], max_col: usize) -> Vec<Vec<CellValue>> 
     }
 
     // Trim trailing empty rows.
-    while grid.last().is_some_and(|row| row.iter().all(|c| matches!(c, CellValue::Empty))) {
+    while grid
+        .last()
+        .is_some_and(|row| row.iter().all(|c| matches!(c, CellValue::Empty)))
+    {
         grid.pop();
     }
 
@@ -378,9 +393,21 @@ mod tests {
     #[test]
     fn build_grid_from_cells() {
         let mut cells = vec![
-            Cell { row: 0, col: 0, value: CellValue::String("A1".into()) },
-            Cell { row: 0, col: 1, value: CellValue::Number(42.0) },
-            Cell { row: 1, col: 0, value: CellValue::String("A2".into()) },
+            Cell {
+                row: 0,
+                col: 0,
+                value: CellValue::String("A1".into()),
+            },
+            Cell {
+                row: 0,
+                col: 1,
+                value: CellValue::Number(42.0),
+            },
+            Cell {
+                row: 1,
+                col: 0,
+                value: CellValue::String("A2".into()),
+            },
         ];
         let grid = build_grid(&mut cells);
         assert_eq!(grid.len(), 2);
@@ -420,7 +447,10 @@ mod tests {
             sheets: vec![Sheet {
                 name: "Sheet1".into(),
                 rows: vec![
-                    vec![CellValue::String("Name".into()), CellValue::String("Age".into())],
+                    vec![
+                        CellValue::String("Name".into()),
+                        CellValue::String("Age".into()),
+                    ],
                     vec![CellValue::String("Alice".into()), CellValue::Number(30.0)],
                 ],
             }],

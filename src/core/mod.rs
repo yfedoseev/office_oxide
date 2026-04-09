@@ -6,17 +6,17 @@
 //! DOCX, XLSX, and PPTX formats: ZIP archive handling, content types,
 //! relationships, core properties, and DrawingML shared types.
 
+pub mod content_types;
+pub mod editable;
 pub mod error;
+pub mod opc;
+pub mod parallel;
+pub mod properties;
+pub mod relationships;
+pub mod theme;
+pub mod traits;
 pub mod units;
 pub mod xml;
-pub mod content_types;
-pub mod relationships;
-pub mod opc;
-pub mod properties;
-pub mod theme;
-pub mod editable;
-pub mod parallel;
-pub mod traits;
 
 pub use error::{Error, Result};
 pub use traits::OfficeDocument;

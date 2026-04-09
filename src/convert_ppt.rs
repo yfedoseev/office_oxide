@@ -22,9 +22,12 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                     }
                     elements.push(Element::Heading(Heading {
                         level: 1,
-                        content: vec![InlineContent::Text(TextSpan { bold: true, ..TextSpan::plain(text) })],
+                        content: vec![InlineContent::Text(TextSpan {
+                            bold: true,
+                            ..TextSpan::plain(text)
+                        })],
                     }));
-                }
+                },
                 TextType::Body | TextType::HalfBody | TextType::QuarterBody => {
                     for line in text.lines() {
                         if !line.trim().is_empty() {
@@ -33,21 +36,24 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                             }));
                         }
                     }
-                }
+                },
                 TextType::Notes => {
                     for line in text.lines() {
                         if !line.trim().is_empty() {
                             elements.push(Element::Paragraph(Paragraph {
-                                content: vec![InlineContent::Text(TextSpan { italic: true, ..TextSpan::plain(line) })],
+                                content: vec![InlineContent::Text(TextSpan {
+                                    italic: true,
+                                    ..TextSpan::plain(line)
+                                })],
                             }));
                         }
                     }
-                }
+                },
                 _ => {
                     elements.push(Element::Paragraph(Paragraph {
                         content: vec![InlineContent::Text(TextSpan::plain(text))],
                     }));
-                }
+                },
             }
         }
 

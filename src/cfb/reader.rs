@@ -1,6 +1,6 @@
 use std::io::{Read, Seek, SeekFrom};
 
-use super::directory::{parse_directory, DirEntry, EntryType, NO_ENTRY};
+use super::directory::{DirEntry, EntryType, NO_ENTRY, parse_directory};
 use super::error::{CfbError, Result};
 use super::header::{CfbHeader, MAX_REG_SECT};
 
@@ -80,9 +80,9 @@ impl<R: Read + Seek> CfbReader<R> {
     /// Find a stream entry by name (case-insensitive).
     pub fn find_entry(&self, name: &str) -> Option<usize> {
         let lower = name.to_ascii_lowercase();
-        self.entries.iter().position(|e| {
-            e.entry_type == EntryType::Stream && e.name.to_ascii_lowercase() == lower
-        })
+        self.entries
+            .iter()
+            .position(|e| e.entry_type == EntryType::Stream && e.name.to_ascii_lowercase() == lower)
     }
 
     /// Find an entry by path (e.g., "Storage1/StreamName"), case-insensitive.
@@ -139,9 +139,10 @@ impl<R: Read + Seek> CfbReader<R> {
 
     /// Read a stream by directory entry index.
     pub fn read_stream_by_index(&mut self, index: usize) -> Result<Vec<u8>> {
-        let entry = self.entries.get(index).ok_or_else(|| {
-            CfbError::StreamNotFound(format!("no entry at index {index}"))
-        })?;
+        let entry = self
+            .entries
+            .get(index)
+            .ok_or_else(|| CfbError::StreamNotFound(format!("no entry at index {index}")))?;
 
         let size = entry.stream_size as usize;
         let start = entry.start_sector;
@@ -232,8 +233,7 @@ impl<R: Read + Seek> CfbReader<R> {
 
         // Read each FAT sector and concatenate entries.
         let entries_per_fat_sector = header.sector_size / 4;
-        let mut fat =
-            Vec::with_capacity(fat_sectors.len() * entries_per_fat_sector);
+        let mut fat = Vec::with_capacity(fat_sectors.len() * entries_per_fat_sector);
         let mut sector_buf = vec![0u8; header.sector_size];
 
         for &fat_sec in &fat_sectors {
@@ -302,9 +302,7 @@ impl<R: Read + Seek> CfbReader<R> {
 
         while sector <= MAX_REG_SECT && remaining > 0 {
             if visited > max_sectors {
-                return Err(CfbError::CorruptedStream(
-                    "mini-FAT chain cycle detected".into(),
-                ));
+                return Err(CfbError::CorruptedStream("mini-FAT chain cycle detected".into()));
             }
 
             let offset = sector as usize * mini_sector_size;
@@ -411,8 +409,8 @@ mod tests {
         write_dir_entry(
             &mut file[dir_offset..dir_offset + 128],
             "Root Entry",
-            5,  // root storage
-            1,  // child = entry 1
+            5, // root storage
+            1, // child = entry 1
             END_OF_CHAIN,
             0,
         );
@@ -568,8 +566,8 @@ mod tests {
             &mut file[dir_offset..dir_offset + 128],
             "Root Entry",
             5,
-            1, // child = entry 1
-            2, // start sector (mini-stream container)
+            1,   // child = entry 1
+            2,   // start sector (mini-stream container)
             512, // mini-stream container size
         );
         // Entry 1: "SmallStream" — small stream, goes to mini-stream
@@ -589,7 +587,7 @@ mod tests {
         // ── Sector 1: FAT ──
         let fat_offset = 512 + sector_size;
         write_fat_entry(&mut file, fat_offset, 0, END_OF_CHAIN); // dir
-        write_fat_entry(&mut file, fat_offset, 1, FAT_SECT);     // FAT
+        write_fat_entry(&mut file, fat_offset, 1, FAT_SECT); // FAT
         write_fat_entry(&mut file, fat_offset, 2, END_OF_CHAIN); // mini-stream container
         write_fat_entry(&mut file, fat_offset, 3, END_OF_CHAIN); // mini-FAT
         for i in 4..128 {

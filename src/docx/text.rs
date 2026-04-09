@@ -1,3 +1,4 @@
+use super::DocxDocument;
 use super::document::BlockElement;
 use super::hyperlink::HyperlinkTarget;
 use super::image::DrawingInfo;
@@ -5,7 +6,6 @@ use super::numbering::NumberingDefinitions;
 use super::paragraph::{BreakType, ParagraphContent, Run, RunContent};
 use super::styles::StyleSheet;
 use super::table::Table;
-use super::DocxDocument;
 
 // ---------------------------------------------------------------------------
 // Plain text extraction
@@ -50,14 +50,14 @@ fn plain_text_blocks(elements: &[BlockElement], out: &mut String) {
                             for run in &hl.runs {
                                 plain_text_run(run, out);
                             }
-                        }
+                        },
                     }
                 }
                 out.push('\n');
-            }
+            },
             BlockElement::Table(table) => {
                 plain_text_table(table, out);
-            }
+            },
         }
     }
 }
@@ -69,7 +69,7 @@ fn plain_text_run(run: &Run, out: &mut String) {
             RunContent::Break(BreakType::Line) => out.push('\n'),
             RunContent::Break(BreakType::Page | BreakType::Column) => out.push('\n'),
             RunContent::Tab => out.push('\t'),
-            RunContent::Drawing(_) => {}
+            RunContent::Drawing(_) => {},
         }
     }
 }
@@ -157,16 +157,16 @@ fn markdown_blocks(elements: &[BlockElement], ctx: &MarkdownCtx, out: &mut Strin
                                     out.push_str("](");
                                     out.push_str(url);
                                     out.push(')');
-                                }
+                                },
                                 HyperlinkTarget::Internal(anchor) => {
                                     out.push('[');
                                     out.push_str(&text);
                                     out.push_str("](#");
                                     out.push_str(anchor);
                                     out.push(')');
-                                }
+                                },
                             }
-                        }
+                        },
                     }
                 }
                 out.push('\n');
@@ -175,10 +175,10 @@ fn markdown_blocks(elements: &[BlockElement], ctx: &MarkdownCtx, out: &mut Strin
                 if heading_level.is_some() {
                     out.push('\n');
                 }
-            }
+            },
             BlockElement::Table(table) => {
                 markdown_table(table, ctx, out);
-            }
+            },
         }
     }
 }
@@ -208,11 +208,11 @@ fn markdown_run(run: &Run, out: &mut String) {
             RunContent::Break(BreakType::Line) => text.push_str("  \n"),
             RunContent::Break(BreakType::Page | BreakType::Column) => {
                 text.push_str("\n\n---\n\n");
-            }
+            },
             RunContent::Tab => text.push('\t'),
             RunContent::Drawing(drawing) => {
                 markdown_drawing(drawing, &mut text);
-            }
+            },
         }
     }
 

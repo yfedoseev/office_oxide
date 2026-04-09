@@ -1,8 +1,8 @@
 use std::io::Cursor;
 
-use office_oxide::xlsx::{CellValue, SheetState, XlsxDocument};
 use office_oxide::core::opc::{OpcWriter, PartName};
-use office_oxide::core::relationships::{rel_types, TargetMode};
+use office_oxide::core::relationships::{TargetMode, rel_types};
+use office_oxide::xlsx::{CellValue, SheetState, XlsxDocument};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -49,11 +49,8 @@ impl XlsxBuilder {
                 xml,
             )
             .unwrap();
-        self.writer.add_part_rel(
-            &self.workbook_part,
-            rel_types::WORKSHEET,
-            rel_target,
-        );
+        self.writer
+            .add_part_rel(&self.workbook_part, rel_types::WORKSHEET, rel_target);
         self
     }
 
@@ -83,23 +80,16 @@ impl XlsxBuilder {
                 xml,
             )
             .unwrap();
-        self.writer.add_part_rel(
-            &self.workbook_part,
-            rel_types::STYLES,
-            "styles.xml",
-        );
+        self.writer
+            .add_part_rel(&self.workbook_part, rel_types::STYLES, "styles.xml");
         self
     }
 
     fn with_sheet_hyperlink(mut self, sheet_rel_target: &str, url: &str) -> Self {
         let part_path = format!("/xl/{}", sheet_rel_target);
         let part = PartName::new(&part_path).unwrap();
-        self.writer.add_part_rel_with_mode(
-            &part,
-            rel_types::HYPERLINK,
-            url,
-            TargetMode::External,
-        );
+        self.writer
+            .add_part_rel_with_mode(&part, rel_types::HYPERLINK, url, TargetMode::External);
         self
     }
 
@@ -412,7 +402,9 @@ fn hyperlinks() {
     assert_eq!(hl1.cell_ref, "A1");
     assert_eq!(hl1.tooltip.as_deref(), Some("Visit example"));
     match &hl1.target {
-        office_oxide::xlsx::HyperlinkTarget::External(url) => assert_eq!(url, "https://example.com"),
+        office_oxide::xlsx::HyperlinkTarget::External(url) => {
+            assert_eq!(url, "https://example.com")
+        },
         _ => panic!("expected external hyperlink"),
     }
 
