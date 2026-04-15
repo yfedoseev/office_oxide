@@ -191,6 +191,16 @@ jobs:
           wasm-bindgen --target nodejs --out-dir wasm-out/ \
             target/wasm32-unknown-unknown/release/office_oxide.wasm
 
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      - name: Optimize wasm with wasm-opt -Oz
+        run: |
+          ls -la wasm-out/*.wasm
+          wasm-opt -Oz --strip-debug --strip-producers \
+            wasm-out/office_oxide_bg.wasm -o wasm-out/office_oxide_bg.wasm
+          ls -la wasm-out/*.wasm
+
       - name: Copy package files
         run: |
           cp wasm-pkg/package.json wasm-out/

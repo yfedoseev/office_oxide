@@ -30,6 +30,14 @@ rust-version.workspace = true
 readme = "README.md"
 keywords = ["docx", "xlsx", "pptx", "office", "text-extraction"]
 categories = ["parsing", "text-processing"]
+include = [
+    "/src/**/*",
+    "/Cargo.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+]
 
 [lib]
 name = "office_oxide"
