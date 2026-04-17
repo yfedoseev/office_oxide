@@ -522,8 +522,8 @@ impl<W: Write + Seek> OpcWriter<W> {
         Ok(())
     }
 
-    /// Finalize the OPC package: writes [Content_Types].xml, _rels/.rels,
-    /// part-level .rels files, and closes the ZIP archive.
+    /// Finalize the OPC package: writes `[Content_Types].xml`, `_rels/.rels`,
+    /// part-level `.rels` files, and closes the ZIP archive.
     pub fn finish(mut self) -> Result<W> {
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 

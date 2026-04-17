@@ -86,17 +86,16 @@ fn is_title_placeholder(ph_type: Option<&str>) -> bool {
 fn find_title_text(shapes: &[crate::pptx::Shape]) -> Option<String> {
     for shape in shapes {
         match shape {
-            crate::pptx::Shape::AutoShape(auto) => {
+            crate::pptx::Shape::AutoShape(auto)
                 if auto
                     .placeholder
                     .as_ref()
-                    .is_some_and(|ph| is_title_placeholder(ph.ph_type.as_deref()))
-                {
-                    if let Some(ref tb) = auto.text_body {
-                        let text = plain_text_from_body(tb);
-                        if !text.is_empty() {
-                            return Some(text);
-                        }
+                    .is_some_and(|ph| is_title_placeholder(ph.ph_type.as_deref())) =>
+            {
+                if let Some(ref tb) = auto.text_body {
+                    let text = plain_text_from_body(tb);
+                    if !text.is_empty() {
+                        return Some(text);
                     }
                 }
             },

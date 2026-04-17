@@ -33,15 +33,11 @@ impl PresentationInfo {
 
         loop {
             match reader.read_event()? {
-                Event::Start(ref e) => {
-                    if e.local_name().as_ref() == b"sldIdLst" {
-                        slides = parse_slide_id_list(&mut reader)?;
-                    }
+                Event::Start(ref e) if e.local_name().as_ref() == b"sldIdLst" => {
+                    slides = parse_slide_id_list(&mut reader)?;
                 },
-                Event::Empty(ref e) => {
-                    if e.local_name().as_ref() == b"sldSz" {
-                        slide_size = Some(parse_slide_size(e)?);
-                    }
+                Event::Empty(ref e) if e.local_name().as_ref() == b"sldSz" => {
+                    slide_size = Some(parse_slide_size(e)?);
                 },
                 Event::Eof => break,
                 _ => {},
@@ -57,25 +53,21 @@ fn parse_slide_id_list(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Vec<
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) => {
-                if e.local_name().as_ref() == b"sldId" {
-                    let id: u32 = xml::optional_attr_str(e, b"id")?
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
-                    // r:id may be missing in some files (LibreOffice test fixtures)
-                    // or use a different prefix like d3p1:id instead of r:id
-                    let rel_id = xml::optional_attr_str(e, b"r:id")?
-                        .map(|v| v.into_owned())
-                        .unwrap_or_default();
-                    // Always add the slide — if r:id is missing, we'll try to
-                    // resolve by position (convention: rId2 = slide1, rId3 = slide2, etc.)
-                    slides.push(SlideId { id, rel_id });
-                }
+            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"sldId" => {
+                let id: u32 = xml::optional_attr_str(e, b"id")?
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                // r:id may be missing in some files (LibreOffice test fixtures)
+                // or use a different prefix like d3p1:id instead of r:id
+                let rel_id = xml::optional_attr_str(e, b"r:id")?
+                    .map(|v| v.into_owned())
+                    .unwrap_or_default();
+                // Always add the slide — if r:id is missing, we'll try to
+                // resolve by position (convention: rId2 = slide1, rId3 = slide2, etc.)
+                slides.push(SlideId { id, rel_id });
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"sldIdLst" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"sldIdLst" => {
+                break;
             },
             Event::Eof => break,
             _ => {},

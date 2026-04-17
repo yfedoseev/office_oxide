@@ -38,10 +38,8 @@ impl Slide {
 
         loop {
             match reader.read_event()? {
-                Event::Start(ref e) => {
-                    if e.local_name().as_ref() == b"spTree" {
-                        shapes = parse_shape_tree(&mut reader, rels)?;
-                    }
+                Event::Start(ref e) if e.local_name().as_ref() == b"spTree" => {
+                    shapes = parse_shape_tree(&mut reader, rels)?;
                 },
                 Event::Eof => break,
                 _ => {},
@@ -78,10 +76,8 @@ fn parse_shape_tree(
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"spTree" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"spTree" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -126,10 +122,8 @@ fn parse_auto_shape(
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"sp" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"sp" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -175,10 +169,8 @@ fn parse_picture(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Shape> {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"pic" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"pic" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -226,10 +218,8 @@ fn parse_group_shape(
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"grpSp" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"grpSp" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -286,10 +276,8 @@ fn parse_graphic_frame(
                     },
                 }
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"graphicFrame" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"graphicFrame" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -310,18 +298,14 @@ fn parse_graphic_data_table(
 ) -> CoreResult<GraphicContent> {
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"tbl" {
-                    let table = parse_table(reader, rels)?;
-                    // Skip to end of graphicData
-                    skip_to_end_of(reader, b"graphicData")?;
-                    return Ok(GraphicContent::Table(table));
-                }
+            Event::Start(ref e) if e.local_name().as_ref() == b"tbl" => {
+                let table = parse_table(reader, rels)?;
+                // Skip to end of graphicData
+                skip_to_end_of(reader, b"graphicData")?;
+                return Ok(GraphicContent::Table(table));
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"graphicData" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"graphicData" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -373,10 +357,8 @@ fn parse_connector(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Shape> {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"cxnSp" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"cxnSp" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -449,10 +431,8 @@ fn parse_nv_common_props(
                 },
                 _ => {},
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"nvSpPr" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"nvSpPr" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -472,21 +452,17 @@ fn parse_nv_pic_props(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) => {
-                if e.local_name().as_ref() == b"cNvPr" {
-                    id = xml::optional_attr_str(e, b"id")?
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
-                    name = xml::optional_attr_str(e, b"name")?
-                        .map(|v| v.into_owned())
-                        .unwrap_or_default();
-                    alt_text = xml::optional_attr_str(e, b"descr")?.map(|v| v.into_owned());
-                }
+            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"cNvPr" => {
+                id = xml::optional_attr_str(e, b"id")?
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                name = xml::optional_attr_str(e, b"name")?
+                    .map(|v| v.into_owned())
+                    .unwrap_or_default();
+                alt_text = xml::optional_attr_str(e, b"descr")?.map(|v| v.into_owned());
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"nvPicPr" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"nvPicPr" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -503,20 +479,16 @@ fn parse_nv_grp_props(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<(u32,
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) => {
-                if e.local_name().as_ref() == b"cNvPr" {
-                    id = xml::optional_attr_str(e, b"id")?
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
-                    name = xml::optional_attr_str(e, b"name")?
-                        .map(|v| v.into_owned())
-                        .unwrap_or_default();
-                }
+            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"cNvPr" => {
+                id = xml::optional_attr_str(e, b"id")?
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                name = xml::optional_attr_str(e, b"name")?
+                    .map(|v| v.into_owned())
+                    .unwrap_or_default();
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"nvGrpSpPr" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"nvGrpSpPr" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -535,20 +507,16 @@ fn parse_nv_graphic_frame_props(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) => {
-                if e.local_name().as_ref() == b"cNvPr" {
-                    id = xml::optional_attr_str(e, b"id")?
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
-                    name = xml::optional_attr_str(e, b"name")?
-                        .map(|v| v.into_owned())
-                        .unwrap_or_default();
-                }
+            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"cNvPr" => {
+                id = xml::optional_attr_str(e, b"id")?
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                name = xml::optional_attr_str(e, b"name")?
+                    .map(|v| v.into_owned())
+                    .unwrap_or_default();
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"nvGraphicFramePr" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"nvGraphicFramePr" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -565,20 +533,16 @@ fn parse_nv_cxn_props(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<(u32,
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) => {
-                if e.local_name().as_ref() == b"cNvPr" {
-                    id = xml::optional_attr_str(e, b"id")?
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
-                    name = xml::optional_attr_str(e, b"name")?
-                        .map(|v| v.into_owned())
-                        .unwrap_or_default();
-                }
+            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"cNvPr" => {
+                id = xml::optional_attr_str(e, b"id")?
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                name = xml::optional_attr_str(e, b"name")?
+                    .map(|v| v.into_owned())
+                    .unwrap_or_default();
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"nvCxnSpPr" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"nvCxnSpPr" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -600,15 +564,11 @@ fn parse_shape_properties(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"xfrm" {
-                    position = Some(parse_xfrm_contents(reader)?);
-                }
+            Event::Start(ref e) if e.local_name().as_ref() == b"xfrm" => {
+                position = Some(parse_xfrm_contents(reader)?);
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"spPr" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"spPr" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -626,15 +586,11 @@ fn parse_grp_shape_properties(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"xfrm" {
-                    position = Some(parse_xfrm_contents(reader)?);
-                }
+            Event::Start(ref e) if e.local_name().as_ref() == b"xfrm" => {
+                position = Some(parse_xfrm_contents(reader)?);
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"grpSpPr" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"grpSpPr" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -764,10 +720,8 @@ fn parse_text_paragraph(
                 },
                 _ => {},
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"p" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"p" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -805,19 +759,15 @@ fn parse_text_run(
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::Empty(ref e) => {
-                if e.local_name().as_ref() == b"rPr" {
-                    let props = parse_run_properties_empty(e, rels)?;
-                    bold = props.0;
-                    italic = props.1;
-                    strikethrough = props.2;
-                    hyperlink = props.3;
-                }
+            Event::Empty(ref e) if e.local_name().as_ref() == b"rPr" => {
+                let props = parse_run_properties_empty(e, rels)?;
+                bold = props.0;
+                italic = props.1;
+                strikethrough = props.2;
+                hyperlink = props.3;
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"r" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"r" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -847,15 +797,13 @@ fn parse_run_properties(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) => {
-                if e.local_name().as_ref() == b"hlinkClick" {
-                    hyperlink = parse_hlink_click(e, rels)?;
-                }
+            Event::Start(ref e) | Event::Empty(ref e)
+                if e.local_name().as_ref() == b"hlinkClick" =>
+            {
+                hyperlink = parse_hlink_click(e, rels)?;
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"rPr" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"rPr" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -921,15 +869,11 @@ fn parse_text_field(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"t" {
-                    text = xml::read_text_content_fast(reader)?;
-                }
+            Event::Start(ref e) if e.local_name().as_ref() == b"t" => {
+                text = xml::read_text_content_fast(reader)?;
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"fld" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"fld" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -957,10 +901,8 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>, rels: &Relationships) -> C
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"tbl" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"tbl" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -979,15 +921,11 @@ fn parse_table_row(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"tc" {
-                    cells.push(parse_table_cell(reader, e, rels)?);
-                }
+            Event::Start(ref e) if e.local_name().as_ref() == b"tc" => {
+                cells.push(parse_table_cell(reader, e, rels)?);
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"tr" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"tr" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -1018,15 +956,11 @@ fn parse_table_cell(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"txBody" {
-                    text_body = Some(parse_text_body(reader, rels)?);
-                }
+            Event::Start(ref e) if e.local_name().as_ref() == b"txBody" => {
+                text_body = Some(parse_text_body(reader, rels)?);
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"tc" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"tc" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -1056,10 +990,8 @@ pub(crate) fn extract_notes_text(xml_data: &[u8]) -> Option<String> {
     // Parse the notes slide's shape tree
     loop {
         match reader.read_event() {
-            Ok(Event::Start(ref e)) => {
-                if e.local_name().as_ref() == b"spTree" {
-                    shapes = parse_shape_tree(&mut reader, &rels).ok()?;
-                }
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"spTree" => {
+                shapes = parse_shape_tree(&mut reader, &rels).ok()?;
             },
             Ok(Event::Eof) => break,
             Err(_) => break,

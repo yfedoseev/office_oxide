@@ -52,12 +52,9 @@ pub fn extract_text_runs(data: &[u8]) -> Vec<TextRun> {
         };
 
         match rec.header.rec_type {
-            RT_TEXT_HEADER => {
-                if rec.data.len() >= 4 {
-                    let t =
-                        u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]);
-                    current_type = TextType::from_u32(t);
-                }
+            RT_TEXT_HEADER if rec.data.len() >= 4 => {
+                let t = u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]);
+                current_type = TextType::from_u32(t);
             },
             RT_TEXT_CHARS => {
                 // UTF-16LE text.
@@ -127,12 +124,9 @@ pub fn extract_slides_text(data: &[u8]) -> Vec<SlideText> {
                     text_runs: Vec::new(),
                 });
             },
-            RT_TEXT_HEADER if in_slide_list => {
-                if rec.data.len() >= 4 {
-                    let t =
-                        u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]);
-                    current_type = TextType::from_u32(t);
-                }
+            RT_TEXT_HEADER if in_slide_list && rec.data.len() >= 4 => {
+                let t = u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]);
+                current_type = TextType::from_u32(t);
             },
             RT_TEXT_CHARS if in_slide_list => {
                 let text = decode_utf16le(&rec.data);

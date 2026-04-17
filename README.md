@@ -1,6 +1,6 @@
 # Office Oxide — The Fastest Office Document Library for Rust, Python & WASM
 
-The fastest library for text extraction from Office documents. Rust core with Python bindings and WASM support. Handles DOCX, XLSX, PPTX, DOC, XLS, and PPT. Up to 100× faster than python-docx, openpyxl, python-pptx, and xlrd. Matches calamine on XLSX. 98.1% pass rate on 6,062 files — all failures are genuinely invalid. MIT licensed.
+The fastest library for text extraction from Office documents. Rust core with Python bindings and WASM support. Handles DOCX, XLSX, PPTX, DOC, XLS, and PPT. Up to 100× faster than python-docx, openpyxl, python-pptx, and xlrd. Beats calamine on XLSX. **98.4% pass rate on 6,062 files** — zero failures on legitimate Office documents. MIT/Apache-2.0 dual-licensed.
 
 [![Crates.io](https://img.shields.io/crates/v/office_oxide.svg)](https://crates.io/crates/office_oxide)
 [![PyPI](https://img.shields.io/pypi/v/office-oxide.svg)](https://pypi.org/project/office-oxide/)
@@ -59,80 +59,83 @@ npm install office-oxide-wasm
 
 ## Why office_oxide?
 
-- **Fast** — 8-100× faster than python-docx, openpyxl, mammoth, markitdown; matches or beats calamine on XLSX
-- **Reliable** — 100% pass rate on all valid documents in a 2,570-file corpus — the 99 non-passing files (3.8%) are all genuinely invalid (CVE exploits, fuzz-corrupted, XML bombs, encrypted)
+- **Fast** — 8-100× faster than python-docx, openpyxl, python-pptx, xlrd; beats calamine on XLSX
+- **Reliable** — 98.4% pass rate on a 6,062-file corpus. The 97 non-passing files are all invalid archives, non-Office inputs (WordPerfect, pre-OLE2 Excel 3/4, empty, mislabeled), or fuzz/CVE fixtures. Zero failures on legitimate Word 97+ / Excel 97+ / PowerPoint 97+ files
 - **Complete** — 6 formats: DOCX, XLSX, PPTX + legacy DOC, XLS, PPT
 - **Multi-platform** — Rust, Python, JavaScript/WASM — one library, all platforms
 - **Permissive** — MIT / Apache-2.0, no AGPL or GPL restrictions
 
 ## Performance
 
-Benchmarked on 2,570 files from 7 independent public test suites (Apache POI, LibreOffice, Apache Tika, calamine, python-docx, python-pptx, mammoth). Text extraction, single-thread, no warm-up.
+Benchmarked on **6,062 files** from 11 independent public test suites. Single-thread, release build with LTO, warm disk cache (steady-state), median of three runs on an idle system. Full methodology in [BENCHMARKS.md](BENCHMARKS.md).
 
-### DOCX — 187 files
-
-| Library | Language | Mean | p99 | Pass Rate | License |
-|---------|----------|------|-----|-----------|---------|
-| **office_oxide** | **Rust** | **7ms** | **160ms** | **91.4%** | **MIT** |
-| docx2txt | Python | 54ms | 898ms | 90.9% | MIT |
-| python-docx | Python | 110ms | 631ms | 89.8% | MIT |
-| mammoth | Python | 353ms | 8,536ms | 90.4% | BSD-2 |
-| markitdown | Python | 773ms | 18,883ms | 98.9% | MIT |
-
-### PPTX — 563 files
+### DOCX — 2,538 files
 
 | Library | Language | Mean | p99 | Pass Rate | License |
 |---------|----------|------|-----|-----------|---------|
-| **office_oxide** | **Rust** | **3ms** | **19ms** | **97.5%** | **MIT** |
-| python-pptx | Python | 24ms | 219ms | 96.6% | MIT |
-| markitdown | Python | 38ms | 393ms | 98.6% | MIT |
+| **office_oxide** | **Rust** | **0.8ms** | **3.9ms** | **98.9%** | **MIT** |
+| python-docx | Python | 11.8ms | 98ms | 95.1% | MIT |
 
-### XLSX — 718 files
+### XLSX — 1,802 files
 
 | Library | Language | Mean | p99 | Pass Rate | License |
 |---------|----------|------|-----|-----------|---------|
-| **office_oxide** | **Rust** | **6ms** | **83ms** | **96.5%** | **MIT** |
-| python-calamine | Rust/Python | 5ms | 324ms | 96.0% | MIT |
-| openpyxl | Python | 245ms | 4,998ms | 94.4% | MIT |
+| **office_oxide** | **Rust** | **5.0ms** | **40ms** | **97.8%** | **MIT** |
+| python-calamine | Rust/Python | 13.9ms | 183ms | 96.6% | MIT |
+| openpyxl | Python | 94.5ms | 698ms | 96.2% | MIT |
 
-office_oxide and calamine are comparable on XLSX mean, but office_oxide is 1.6× faster on large files (>50KB), has better p99 latency, handles 13 more files, and never panics. calamine is spreadsheet-only; office_oxide handles all 6 formats.
+### PPTX — 806 files
 
-### Legacy Formats — 1,103 files
+| Library | Language | Mean | p99 | Pass Rate | License |
+|---------|----------|------|-----|-----------|---------|
+| **office_oxide** | **Rust** | **0.7ms** | **3.9ms** | **98.4%** | **MIT** |
+| python-pptx | Python | 32.5ms | 174ms | 86.7% | MIT |
 
-| Library | Format | Mean | p99 | Pass Rate |
-|---------|--------|------|-----|-----------|
-| **office_oxide** | **DOC** | **2ms** | **12ms** | **99.4%** |
-| **office_oxide** | **XLS** | **9ms** | **121ms** | **95.2%** |
-| xlrd | XLS | 114ms | 1,758ms | 90.9% |
-| **office_oxide** | **PPT** | **6ms** | **40ms** | **95.9%** |
+### Legacy Formats — 916 files
 
-No other Python library supports .doc or .ppt text extraction without a JVM (Apache Tika) or external binaries.
+| Library | Format | Mean | p99 | Pass Rate | License |
+|---------|--------|------|-----|-----------|---------|
+| **office_oxide** | **DOC** (246) | **0.3ms** | **3.4ms** | **94.7%** | **MIT** |
+| catdoc | DOC | 4.3ms | 41ms | 90.2% | GPL-2.0 |
+| antiword | DOC | 4.5ms | 66ms | 76.8% | GPL-2.0 |
+| **office_oxide** | **XLS** (494) | **2.8ms** | 75ms | **99.2%** | **MIT** |
+| xls2csv (catdoc) | XLS | 6.9ms | **58ms** | 84.0% | GPL-2.0 |
+| python-calamine | XLS | 9.0ms | 96ms | 90.7% | MIT |
+| xlrd | XLS | 36.6ms | 503ms | 93.1% | BSD-3 |
+| **office_oxide** | **PPT** (176) | **0.7ms** | **6.6ms** | **100%** | **MIT** |
+| catppt (catdoc) | PPT | 2.8ms | 8ms | 77.8% | GPL-2.0 |
+
+On .xls, xls2csv has a tighter p99 (58ms vs 75ms) because it emits truncated/lossy output on complex sheets. office_oxide is 2.4× faster on the mean and passes 15pp more of the corpus. No other Rust or Python library supports .doc, .xls, and .ppt text extraction without a JVM (Apache Tika) or external binaries.
 
 ### Corpus
 
-| Source | Files | Formats | License |
-|--------|------:|---------|---------|
-| [Apache POI](https://github.com/apache/poi) | 1,197 | All 6 | Apache-2.0 |
-| [LibreOffice](https://github.com/LibreOffice/core) | 848 | All 6 | MPL-2.0 |
-| [Apache Tika](https://github.com/apache/tika) | 87 | All 6 | Apache-2.0 |
-| [calamine](https://github.com/tafia/calamine) | 42 | XLSX/XLS | MIT |
-| [python-docx](https://github.com/python-openxml/python-docx) | 24 | DOCX | MIT |
-| [python-pptx](https://github.com/scanny/python-pptx) | 348 | PPTX | MIT |
-| [mammoth](https://github.com/mwilliamson/python-mammoth) | 24 | DOCX | BSD-2 |
-| **Total** | **2,570** | | |
+| Source | Files | License |
+|--------|------:|---------|
+| [LibreOffice Core](https://github.com/LibreOffice/core) | 2,185 | MPL-2.0 |
+| [Apache POI](https://github.com/apache/poi) | 1,298 | Apache-2.0 |
+| [Open XML SDK](https://github.com/OfficeDev/Open-XML-SDK) | 707 | MIT |
+| [ClosedXML](https://github.com/ClosedXML/ClosedXML) | 371 | MIT |
+| [Pandoc](https://github.com/jgm/pandoc) | 224 | GPL-2.0 |
+| [python-docx](https://github.com/python-openxml/python-docx) + [python-pptx](https://github.com/scanny/python-pptx) | 111 | MIT |
+| [Apache Tika](https://github.com/apache/tika) | 108 | Apache-2.0 |
+| [calamine](https://github.com/tafia/calamine) | 28 | MIT |
+| [openpreserve](https://github.com/openpreserve/format-corpus) | 20 | CC0 |
+| [oletools](https://github.com/decalage2/oletools) | 17 | BSD-2 |
+| LibreOffice (legacy) | 12 | MPL-2.0 |
+| **Total** | **6,062** | |
 
-### Pass Rate
+### Pass Rate — 98.4% (5,965 / 6,062)
 
-100% pass rate on all valid documents — the 99 non-passing files (3.8% of the corpus) are all genuinely invalid:
+All 97 non-passing files are invalid inputs:
 
-| Category | Count | Examples |
-|----------|------:|---------|
-| Invalid CFB/OLE2 container | 43 | CVE exploits with corrupted headers (CVE-2006-3059, CVE-2007-0031, etc.) |
-| Invalid ZIP archive | 41 | ClusterFuzz crash cases, truncated files |
-| Malformed XML | 10 | XML bombs (`lol9` entity), ill-formed tags |
-| Missing required part | 5 | Encrypted/password-protected files |
+| Category | Count | Notes |
+|----------|------:|-------|
+| Invalid ZIP / CFB archive | 43 | Truncated, missing EOCD, bad CFB magic |
+| Missing required part | 21 | Encrypted, password-protected, or stream absent |
+| Malformed XML | 18 | XML bombs, ill-formed tags, fuzz-corrupted content |
+| Invalid CFB header | 15 | WordPerfect / IBM DisplayWrite / Excel 3/4 misnamed as .doc/.xls, CVE-exploit fixtures |
 
-Zero panics, zero timeouts, zero false negatives on valid documents.
+**Zero failures on legitimate Word 97+ / Excel 97+ / PowerPoint 97+ files.** Zero panics, zero timeouts, zero false negatives on valid documents. Full breakdown in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Supported Formats
 
@@ -319,4 +322,4 @@ cargo build && cargo test && cargo fmt && cargo clippy -- -D warnings
 
 ---
 
-**Rust** + **Python** + **WASM** | MIT/Apache-2.0 | 98.1% pass rate on 6,062 files | Up to 100× faster than alternatives | 6 formats
+**Rust** + **Python** + **WASM** | MIT/Apache-2.0 | 98.4% pass rate on 6,062 files (zero failures on legitimate Office docs) | Up to 100× faster than alternatives | 6 formats

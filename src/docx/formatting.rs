@@ -203,55 +203,53 @@ pub(crate) fn parse_run_properties(
                     xml::skip_element(reader)?;
                 }
             },
-            (ref resolve, Event::Empty(ref e)) => {
-                if xml::matches_ns(resolve, wml) {
-                    let local = e.local_name();
-                    match local.as_ref() {
-                        b"b" => props.bold = Some(parse_toggle(e)),
-                        b"i" => props.italic = Some(parse_toggle(e)),
-                        b"strike" => props.strike = Some(parse_toggle(e)),
-                        b"dstrike" => props.dstrike = Some(parse_toggle(e)),
-                        b"u" => props.underline = Some(parse_underline(e)),
-                        b"sz" => {
-                            if let Some(val) = parse_half_point_val(e)? {
-                                props.font_size = Some(val);
-                            }
-                        },
-                        b"rFonts" => {
-                            if let Ok(Some(ascii)) = xml::optional_attr_str(e, b"w:ascii") {
-                                props.font_name = Some(ascii.into_owned());
-                            }
-                        },
-                        b"color" => {
-                            props.color = parse_color_ref(e)?;
-                        },
-                        b"highlight" => {
-                            if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                                props.highlight = Some(val.into_owned());
-                            }
-                        },
-                        b"vertAlign" => {
-                            if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                                props.vertical_align = Some(match val.as_ref() {
-                                    "superscript" => VerticalAlign::Superscript,
-                                    "subscript" => VerticalAlign::Subscript,
-                                    _ => VerticalAlign::Baseline,
-                                });
-                            }
-                        },
-                        b"rStyle" => {
-                            if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                                props.style_id = Some(val.into_owned());
-                            }
-                        },
-                        _ => {},
-                    }
+            (ref resolve, Event::Empty(ref e)) if xml::matches_ns(resolve, wml) => {
+                let local = e.local_name();
+                match local.as_ref() {
+                    b"b" => props.bold = Some(parse_toggle(e)),
+                    b"i" => props.italic = Some(parse_toggle(e)),
+                    b"strike" => props.strike = Some(parse_toggle(e)),
+                    b"dstrike" => props.dstrike = Some(parse_toggle(e)),
+                    b"u" => props.underline = Some(parse_underline(e)),
+                    b"sz" => {
+                        if let Some(val) = parse_half_point_val(e)? {
+                            props.font_size = Some(val);
+                        }
+                    },
+                    b"rFonts" => {
+                        if let Ok(Some(ascii)) = xml::optional_attr_str(e, b"w:ascii") {
+                            props.font_name = Some(ascii.into_owned());
+                        }
+                    },
+                    b"color" => {
+                        props.color = parse_color_ref(e)?;
+                    },
+                    b"highlight" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                            props.highlight = Some(val.into_owned());
+                        }
+                    },
+                    b"vertAlign" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                            props.vertical_align = Some(match val.as_ref() {
+                                "superscript" => VerticalAlign::Superscript,
+                                "subscript" => VerticalAlign::Subscript,
+                                _ => VerticalAlign::Baseline,
+                            });
+                        }
+                    },
+                    b"rStyle" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                            props.style_id = Some(val.into_owned());
+                        }
+                    },
+                    _ => {},
                 }
             },
-            (ref resolve, Event::End(ref e)) => {
-                if xml::matches_ns(resolve, wml) && e.local_name().as_ref() == b"rPr" {
-                    break;
-                }
+            (ref resolve, Event::End(ref e))
+                if xml::matches_ns(resolve, wml) && e.local_name().as_ref() == b"rPr" =>
+            {
+                break;
             },
             (_, Event::Eof) => break,
             _ => {},
@@ -317,41 +315,39 @@ pub(crate) fn parse_paragraph_properties(
                     xml::skip_element(reader)?;
                 }
             },
-            (ref resolve, Event::Empty(ref e)) => {
-                if xml::matches_ns(resolve, wml) {
-                    let local = e.local_name();
-                    match local.as_ref() {
-                        b"pStyle" => {
-                            if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                                props.style_id = Some(val.into_owned());
+            (ref resolve, Event::Empty(ref e)) if xml::matches_ns(resolve, wml) => {
+                let local = e.local_name();
+                match local.as_ref() {
+                    b"pStyle" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                            props.style_id = Some(val.into_owned());
+                        }
+                    },
+                    b"jc" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                            props.justification = Some(parse_justification_value(&val));
+                        }
+                    },
+                    b"ind" => {
+                        props.indent = Some(parse_indent(e)?);
+                    },
+                    b"spacing" => {
+                        props.spacing = Some(parse_spacing(e)?);
+                    },
+                    b"outlineLvl" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                            if let Ok(lvl) = val.parse::<u8>() {
+                                props.outline_level = Some(lvl);
                             }
-                        },
-                        b"jc" => {
-                            if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                                props.justification = Some(parse_justification_value(&val));
-                            }
-                        },
-                        b"ind" => {
-                            props.indent = Some(parse_indent(e)?);
-                        },
-                        b"spacing" => {
-                            props.spacing = Some(parse_spacing(e)?);
-                        },
-                        b"outlineLvl" => {
-                            if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                                if let Ok(lvl) = val.parse::<u8>() {
-                                    props.outline_level = Some(lvl);
-                                }
-                            }
-                        },
-                        _ => {},
-                    }
+                        }
+                    },
+                    _ => {},
                 }
             },
-            (ref resolve, Event::End(ref e)) => {
-                if xml::matches_ns(resolve, wml) && e.local_name().as_ref() == b"pPr" {
-                    break;
-                }
+            (ref resolve, Event::End(ref e))
+                if xml::matches_ns(resolve, wml) && e.local_name().as_ref() == b"pPr" =>
+            {
+                break;
             },
             (_, Event::Eof) => break,
             _ => {},
@@ -481,10 +477,8 @@ pub(crate) fn parse_run_properties_fast(
                     _ => {},
                 }
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"rPr" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"rPr" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -572,10 +566,8 @@ pub(crate) fn parse_paragraph_properties_fast(
                     _ => {},
                 }
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"pPr" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"pPr" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -606,10 +598,8 @@ fn parse_num_pr_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Resu
                     _ => {},
                 }
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"numPr" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"numPr" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -765,28 +755,28 @@ fn parse_num_pr(reader: &mut quick_xml::NsReader<&[u8]>) -> crate::core::Result<
 
     loop {
         match reader.read_resolved_event()? {
-            (ref resolve, Event::Start(ref e)) | (ref resolve, Event::Empty(ref e)) => {
-                if xml::matches_ns(resolve, wml) {
-                    let local = e.local_name();
-                    match local.as_ref() {
-                        b"numId" => {
-                            if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                                num_id = val.parse().unwrap_or(0);
-                            }
-                        },
-                        b"ilvl" => {
-                            if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                                ilvl = val.parse().unwrap_or(0);
-                            }
-                        },
-                        _ => {},
-                    }
+            (ref resolve, Event::Start(ref e)) | (ref resolve, Event::Empty(ref e))
+                if xml::matches_ns(resolve, wml) =>
+            {
+                let local = e.local_name();
+                match local.as_ref() {
+                    b"numId" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                            num_id = val.parse().unwrap_or(0);
+                        }
+                    },
+                    b"ilvl" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                            ilvl = val.parse().unwrap_or(0);
+                        }
+                    },
+                    _ => {},
                 }
             },
-            (ref resolve, Event::End(ref e)) => {
-                if xml::matches_ns(resolve, wml) && e.local_name().as_ref() == b"numPr" {
-                    break;
-                }
+            (ref resolve, Event::End(ref e))
+                if xml::matches_ns(resolve, wml) && e.local_name().as_ref() == b"numPr" =>
+            {
+                break;
             },
             (_, Event::Eof) => break,
             _ => {},

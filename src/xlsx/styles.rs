@@ -154,17 +154,13 @@ fn parse_num_fmts(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) => {
-                if e.local_name().as_ref() == b"numFmt" {
-                    let id: u32 = xml::required_attr_str(e, b"numFmtId")?.parse()?;
-                    let format_code = xml::required_attr_str(e, b"formatCode")?.into_owned();
-                    formats.push(NumberFormat { id, format_code });
-                }
+            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"numFmt" => {
+                let id: u32 = xml::required_attr_str(e, b"numFmtId")?.parse()?;
+                let format_code = xml::required_attr_str(e, b"formatCode")?.into_owned();
+                formats.push(NumberFormat { id, format_code });
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"numFmts" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"numFmts" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -187,10 +183,8 @@ fn parse_fonts(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Vec
                     xml::skip_element_fast(reader)?;
                 }
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"fonts" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"fonts" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -234,10 +228,8 @@ fn parse_font(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Font
                 },
                 _ => {},
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"font" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"font" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -268,10 +260,8 @@ fn parse_fills(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Vec
                     xml::skip_element_fast(reader)?;
                 }
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"fills" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"fills" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -302,10 +292,8 @@ fn parse_fill(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Fill
                 },
                 _ => {},
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"fill" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"fill" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -332,10 +320,8 @@ fn parse_borders(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<V
                     xml::skip_element_fast(reader)?;
                 }
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"borders" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"borders" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -384,10 +370,8 @@ fn parse_border(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Bo
                     _ => {},
                 }
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"border" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"border" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -412,10 +396,8 @@ fn parse_border_side(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) => {
-                if e.local_name().as_ref() == b"color" {
-                    color = parse_color_ref(e)?;
-                }
+            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"color" => {
+                color = parse_color_ref(e)?;
             },
             Event::End(ref e) => {
                 let local = e.local_name();
@@ -443,30 +425,26 @@ fn parse_xfs(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Vec<C
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) => {
-                if e.local_name().as_ref() == b"xf" {
-                    let number_format_id: u32 = xml::optional_attr_str(e, b"numFmtId")?
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
-                    let font_index =
-                        xml::optional_attr_str(e, b"fontId")?.and_then(|v| v.parse().ok());
-                    let fill_index =
-                        xml::optional_attr_str(e, b"fillId")?.and_then(|v| v.parse().ok());
-                    let border_index =
-                        xml::optional_attr_str(e, b"borderId")?.and_then(|v| v.parse().ok());
-                    let apply_number_format = xml::optional_attr_str(e, b"applyNumberFormat")?
-                        .is_some_and(|v| matches!(v.as_ref(), "1" | "true"));
-                    let xf_id = xml::optional_attr_str(e, b"xfId")?.and_then(|v| v.parse().ok());
+            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"xf" => {
+                let number_format_id: u32 = xml::optional_attr_str(e, b"numFmtId")?
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let font_index = xml::optional_attr_str(e, b"fontId")?.and_then(|v| v.parse().ok());
+                let fill_index = xml::optional_attr_str(e, b"fillId")?.and_then(|v| v.parse().ok());
+                let border_index =
+                    xml::optional_attr_str(e, b"borderId")?.and_then(|v| v.parse().ok());
+                let apply_number_format = xml::optional_attr_str(e, b"applyNumberFormat")?
+                    .is_some_and(|v| matches!(v.as_ref(), "1" | "true"));
+                let xf_id = xml::optional_attr_str(e, b"xfId")?.and_then(|v| v.parse().ok());
 
-                    formats.push(CellFormat {
-                        number_format_id,
-                        font_index,
-                        fill_index,
-                        border_index,
-                        apply_number_format,
-                        xf_id,
-                    });
-                }
+                formats.push(CellFormat {
+                    number_format_id,
+                    font_index,
+                    fill_index,
+                    border_index,
+                    apply_number_format,
+                    xf_id,
+                });
             },
             Event::End(ref e) => {
                 let local = e.local_name();

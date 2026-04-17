@@ -159,14 +159,14 @@ fn xml_csl_name(xml_data: &[u8]) -> String {
 
     loop {
         match reader.read_event() {
-            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-                if e.local_name().as_ref() == b"cSld" {
-                    return crate::core::xml::optional_attr_str(e, b"name")
-                        .ok()
-                        .flatten()
-                        .map(|v| v.into_owned())
-                        .unwrap_or_default();
-                }
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e))
+                if e.local_name().as_ref() == b"cSld" =>
+            {
+                return crate::core::xml::optional_attr_str(e, b"name")
+                    .ok()
+                    .flatten()
+                    .map(|v| v.into_owned())
+                    .unwrap_or_default();
             },
             Ok(Event::Eof) => break,
             Err(_) => break,

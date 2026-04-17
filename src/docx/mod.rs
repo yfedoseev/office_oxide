@@ -235,10 +235,8 @@ fn parse_document(
                 },
                 _ => {},
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"body" {
-                    in_body = false;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"body" => {
+                in_body = false;
             },
             Event::Eof => break,
             _ => {},
@@ -312,10 +310,8 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"p" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"p" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -377,10 +373,8 @@ fn parse_run(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Run> {
                 },
                 _ => {},
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"r" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"r" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -417,10 +411,8 @@ fn parse_hyperlink(
                     xml::skip_element_fast(reader)?;
                 }
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"hyperlink" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"hyperlink" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -545,10 +537,8 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Table> {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"tbl" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"tbl" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -606,10 +596,8 @@ fn parse_table_properties(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<T
                 },
                 _ => {},
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"tblPr" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"tblPr" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -625,18 +613,14 @@ fn parse_table_grid(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) => {
-                if e.local_name().as_ref() == b"gridCol" {
-                    if let Ok(Some(w)) = xml::optional_attr_str(e, b"w:w") {
-                        let val: i32 = w.parse().unwrap_or(0);
-                        cols.push(crate::core::units::Twip(val));
-                    }
+            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"gridCol" => {
+                if let Ok(Some(w)) = xml::optional_attr_str(e, b"w:w") {
+                    let val: i32 = w.parse().unwrap_or(0);
+                    cols.push(crate::core::units::Twip(val));
                 }
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"tblGrid" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"tblGrid" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -662,10 +646,8 @@ fn parse_table_row(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableRow
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"tr" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"tr" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -682,15 +664,13 @@ fn parse_table_row_properties(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) => {
-                if e.local_name().as_ref() == b"tblHeader" {
-                    props.is_header = true;
-                }
+            Event::Start(ref e) | Event::Empty(ref e)
+                if e.local_name().as_ref() == b"tblHeader" =>
+            {
+                props.is_header = true;
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"trPr" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"trPr" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -719,10 +699,8 @@ fn parse_table_cell(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableCe
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"tc" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"tc" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -798,10 +776,8 @@ fn parse_table_cell_properties(
                 },
                 _ => {},
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"tcPr" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"tcPr" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -918,10 +894,8 @@ fn parse_section_properties(
                 },
                 _ => {},
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"sectPr" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"sectPr" => {
+                break;
             },
             Event::Eof => break,
             _ => {},

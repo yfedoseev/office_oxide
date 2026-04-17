@@ -112,10 +112,8 @@ fn parse_abstract_num(
                     xml::skip_element_fast(reader)?;
                 }
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"abstractNum" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"abstractNum" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -167,10 +165,8 @@ fn parse_numbering_level(
                     _ => {},
                 }
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"lvl" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"lvl" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -211,17 +207,15 @@ fn parse_num_instance(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) => {
-                if e.local_name().as_ref() == b"abstractNumId" {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                        abstract_num_id = val.parse().unwrap_or(0);
-                    }
+            Event::Start(ref e) | Event::Empty(ref e)
+                if e.local_name().as_ref() == b"abstractNumId" =>
+            {
+                if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    abstract_num_id = val.parse().unwrap_or(0);
                 }
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"num" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"num" => {
+                break;
             },
             Event::Eof => break,
             _ => {},

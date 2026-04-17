@@ -109,10 +109,8 @@ fn parse_doc_defaults(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Res
                     },
                 }
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"docDefaults" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"docDefaults" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -136,10 +134,8 @@ fn parse_nested_rpr(
                     xml::skip_element_fast(reader)?;
                 }
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"rPrDefault" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"rPrDefault" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -163,10 +159,8 @@ fn parse_nested_ppr(
                     xml::skip_element_fast(reader)?;
                 }
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"pPrDefault" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"pPrDefault" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -237,10 +231,8 @@ fn parse_style(
                 },
                 _ => {},
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"style" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"style" => {
+                break;
             },
             Event::Eof => break,
             _ => {},

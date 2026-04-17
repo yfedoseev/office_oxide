@@ -211,10 +211,8 @@ pub fn is_date_format_string(format: &str) -> bool {
                 has_date_token = true;
             },
             // AM/PM marker
-            'A' | 'a' => {
-                if chars.peek() == Some(&'M') || chars.peek() == Some(&'m') {
-                    has_date_token = true;
-                }
+            'A' | 'a' if (chars.peek() == Some(&'M') || chars.peek() == Some(&'m')) => {
+                has_date_token = true;
             },
             _ => {},
         }

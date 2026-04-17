@@ -45,10 +45,8 @@ impl SharedStringTable {
 
         loop {
             match reader.read_event()? {
-                Event::Start(ref e) => {
-                    if e.local_name().as_ref() == b"si" {
-                        strings.push(parse_si(&mut reader)?);
-                    }
+                Event::Start(ref e) if e.local_name().as_ref() == b"si" => {
+                    strings.push(parse_si(&mut reader)?);
                 },
                 Event::Eof => break,
                 _ => {},
@@ -91,10 +89,8 @@ fn parse_si(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Shared
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"si" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"si" => {
+                break;
             },
             Event::Eof => break,
             _ => {},
@@ -135,10 +131,8 @@ fn parse_rich_text_run(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Re
                     },
                 }
             },
-            Event::End(ref e) => {
-                if e.local_name().as_ref() == b"r" {
-                    break;
-                }
+            Event::End(ref e) if e.local_name().as_ref() == b"r" => {
+                break;
             },
             Event::Eof => break,
             _ => {},

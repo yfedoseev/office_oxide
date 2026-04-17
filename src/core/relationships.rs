@@ -101,25 +101,23 @@ impl Relationships {
 
         loop {
             match reader.read_event()? {
-                Event::Start(ref e) | Event::Empty(ref e) => {
-                    if e.local_name().as_ref() == b"Relationship" {
-                        let id = xml::required_attr_str(e, b"Id")?.into_owned();
-                        let rel_type =
-                            normalize_rel_type(xml::required_attr_str(e, b"Type")?.into_owned());
-                        let target = xml::required_attr_str(e, b"Target")?.into_owned();
-                        let target_mode = match xml::optional_attr_str(e, b"TargetMode")? {
-                            Some(ref m) if m.eq_ignore_ascii_case("External") => {
-                                TargetMode::External
-                            },
-                            _ => TargetMode::Internal,
-                        };
-                        rels.push(Relationship {
-                            id,
-                            rel_type,
-                            target,
-                            target_mode,
-                        });
-                    }
+                Event::Start(ref e) | Event::Empty(ref e)
+                    if e.local_name().as_ref() == b"Relationship" =>
+                {
+                    let id = xml::required_attr_str(e, b"Id")?.into_owned();
+                    let rel_type =
+                        normalize_rel_type(xml::required_attr_str(e, b"Type")?.into_owned());
+                    let target = xml::required_attr_str(e, b"Target")?.into_owned();
+                    let target_mode = match xml::optional_attr_str(e, b"TargetMode")? {
+                        Some(ref m) if m.eq_ignore_ascii_case("External") => TargetMode::External,
+                        _ => TargetMode::Internal,
+                    };
+                    rels.push(Relationship {
+                        id,
+                        rel_type,
+                        target,
+                        target_mode,
+                    });
                 },
                 Event::Eof => break,
                 _ => {},
