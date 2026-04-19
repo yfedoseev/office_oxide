@@ -37,7 +37,7 @@
   ],
   "scripts": {
     "postinstall": "node scripts/check-prebuild.cjs",
-    "test": "node --test test/"
+    "test": "node --test test/*.mjs"
   },
   "dependencies": {
     "koffi": "^2.9.0"
