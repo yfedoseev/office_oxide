@@ -9,7 +9,7 @@ namespace OfficeOxide.Internal;
 internal static partial class NativeMethods
 {
     // The library name is "office_oxide" — .NET will look for
-    // libofice_oxide.so / .dylib / office_oxide.dll on the native search path.
+    // liboffice_oxide.so / .dylib / office_oxide.dll on the native search path.
     private const string Lib = "office_oxide";
 
     internal const int OfficeOk = 0;

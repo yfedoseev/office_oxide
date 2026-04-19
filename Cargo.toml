@@ -45,7 +45,7 @@ include = [
 name = "office_oxide"
 # cdylib: Python (maturin), WASM, C# (P/Invoke), Node.js (dynamic)
 # rlib: native Rust consumers
-# staticlib: Go (CGo) — produces libofice_oxide.a for self-contained binaries
+# staticlib: Go (CGo) — produces liboffice_oxide.a for self-contained binaries
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]

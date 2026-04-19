@@ -23,7 +23,7 @@ You must either:
    The `office_oxide_dev` build tag points cgo at `target/release/`.
 
 2. **Point cgo at an installed prefix.** Build the library once, place
-   `libofice_oxide.a` (or `.so` / `.dylib`) somewhere on your link path,
+   `liboffice_oxide.a` (or `.so` / `.dylib`) somewhere on your link path,
    and the header somewhere on your include path, then set:
 
    ```bash

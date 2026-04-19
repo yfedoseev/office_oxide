@@ -1,7 +1,7 @@
 //! C Foreign Function Interface (FFI) for office_oxide.
 //!
 //! Provides `#[no_mangle] pub extern "C"` functions that Go (CGo), Node.js (N-API),
-//! and C# (P/Invoke) bindings can link against. The compiled `libofice_oxide.so` /
+//! and C# (P/Invoke) bindings can link against. The compiled `liboffice_oxide.so` /
 //! `.dylib` / `.dll` / `.a` exports these symbols.
 //!
 //! # Error Convention

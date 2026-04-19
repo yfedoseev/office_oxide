@@ -27,10 +27,10 @@ if (fs.existsSync(candidate)) {
 process.stderr.write(
   `\n[office-oxide] No prebuilt native library for ${process.platform}-${process.arch}.\n` +
   `  Tried: ${candidate}\n` +
-  `  Set OFFICE_OXIDE_LIB=/path/to/libofice_oxide.{so,dylib,dll}\n` +
+  `  Set OFFICE_OXIDE_LIB=/path/to/liboffice_oxide.{so,dylib,dll}\n` +
   `  or build from source in the office_oxide monorepo:\n` +
   `    cargo build --release --lib\n` +
-  `    export OFFICE_OXIDE_LIB=$(pwd)/target/release/libofice_oxide.so\n\n`,
+  `    export OFFICE_OXIDE_LIB=$(pwd)/target/release/liboffice_oxide.so\n\n`,
 );
 // Exit 0 so `npm install` still succeeds for headless CI / custom setups.
 process.exit(0);

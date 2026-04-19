@@ -15,7 +15,7 @@ npm install office-oxide
 The native shared library is resolved (in order):
 
 1. `OFFICE_OXIDE_LIB` environment variable (absolute path).
-2. `prebuilds/<platform>-<arch>/libofice_oxide.{so|dylib|dll}` inside the npm package.
+2. `prebuilds/<platform>-<arch>/liboffice_oxide.{so|dylib|dll}` inside the npm package.
 3. The system library search path.
 
 ## Quick start
