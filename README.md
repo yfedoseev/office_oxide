@@ -1,12 +1,31 @@
-# Office Oxide — The Fastest Office Document Library for Rust, Python & WASM
+# Office Oxide — The Fastest Office Document Library, Everywhere
 
-The fastest library for text extraction from Office documents. Rust core with Python bindings and WASM support. Handles DOCX, XLSX, PPTX, DOC, XLS, and PPT. Up to 100× faster than python-docx, openpyxl, python-pptx, and xlrd. Beats calamine on XLSX. **98.4% pass rate on 6,062 files** — zero failures on legitimate Office documents. MIT/Apache-2.0 dual-licensed.
+The fastest library for text extraction from Office documents. Rust core with **first-class bindings for Python, Go, C#/.NET, Node.js (native and WASM), and a stable C FFI**. Handles DOCX, XLSX, PPTX, DOC, XLS, and PPT. Up to 100× faster than python-docx, openpyxl, python-pptx, and xlrd. Beats calamine on XLSX. **98.4% pass rate on 6,062 files** — zero failures on legitimate Office documents. MIT/Apache-2.0 dual-licensed.
 
 [![Crates.io](https://img.shields.io/crates/v/office_oxide.svg)](https://crates.io/crates/office_oxide)
 [![PyPI](https://img.shields.io/pypi/v/office-oxide.svg)](https://pypi.org/project/office-oxide/)
-[![npm](https://img.shields.io/npm/v/office-oxide-wasm)](https://www.npmjs.com/package/office-oxide-wasm)
+[![npm (wasm)](https://img.shields.io/npm/v/office-oxide-wasm?label=npm%20wasm)](https://www.npmjs.com/package/office-oxide-wasm)
+[![npm (native)](https://img.shields.io/npm/v/office-oxide?label=npm%20native)](https://www.npmjs.com/package/office-oxide)
+[![NuGet](https://img.shields.io/nuget/v/OfficeOxide)](https://www.nuget.org/packages/OfficeOxide)
+[![Go Reference](https://pkg.go.dev/badge/github.com/yfedoseev/office_oxide/go.svg)](https://pkg.go.dev/github.com/yfedoseev/office_oxide/go)
 [![Build Status](https://github.com/yfedoseev/office_oxide/workflows/CI/badge.svg)](https://github.com/yfedoseev/office_oxide/actions)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](https://opensource.org/licenses)
+
+## Available bindings
+
+| Language | Package | Directory | Docs |
+| --- | --- | --- | --- |
+| Rust | `office_oxide` on crates.io | [`src/`](src/) | [lib.rs](src/lib.rs) |
+| Python | `office-oxide` on PyPI | [`python/`](python/) | [python/](python/office_oxide/) |
+| Go | `github.com/yfedoseev/office_oxide/go` | [`go/`](go/) | [go/README.md](go/README.md) |
+| C# / .NET | `OfficeOxide` on NuGet | [`csharp/`](csharp/) | [csharp/OfficeOxide/README.md](csharp/OfficeOxide/README.md) |
+| Node.js (native) | `office-oxide` on npm | [`js/`](js/) | [js/README.md](js/README.md) |
+| Node.js / browser (WASM) | `office-oxide-wasm` on npm | [`wasm-pkg/`](wasm-pkg/) | [wasm-pkg/README.md](wasm-pkg/README.md) |
+| C / other | header-only via FFI | [`include/office_oxide_c/`](include/office_oxide_c/) | [office_oxide.h](include/office_oxide_c/office_oxide.h) |
+| CLI | `office-oxide` binary | [`crates/office_oxide_cli/`](crates/office_oxide_cli/) | |
+| MCP server | `office-oxide-mcp` binary | [`crates/office_oxide_mcp/`](crates/office_oxide_mcp/) | |
+
+Ready-to-run demos (`extract`, `replace`, `read_xlsx`) exist for every binding under [`examples/`](examples/). Deeper language-specific guides live in [`docs/`](docs/): [Rust](docs/getting-started-rust.md) · [Python](docs/getting-started-python.md) · [Go](docs/getting-started-go.md) · [C#](docs/getting-started-csharp.md) · [JavaScript (native)](docs/getting-started-javascript.md) · [WASM](docs/getting-started-wasm.md) · [C FFI](docs/getting-started-c.md).
 
 ## Quick Start
 
@@ -18,11 +37,11 @@ from office_oxide import Document, extract_text, to_markdown
 text = extract_text("report.docx")
 markdown = to_markdown("data.xlsx")
 
-# Or use the Document object for more control
-doc = Document.open("slides.pptx")
-print(doc.plain_text())
-print(doc.to_markdown())
-print(doc.format_name())  # "pptx"
+# Context-managed document; accepts str or pathlib.Path
+with Document.open("slides.pptx") as doc:
+    print(doc.format)       # "pptx"
+    print(doc.plain_text())
+    print(doc.to_markdown())
 ```
 
 ```bash
@@ -41,21 +60,64 @@ let ir = doc.to_ir(); // Format-agnostic intermediate representation
 
 ```toml
 [dependencies]
-office_oxide = "0.1"
+office_oxide = "0.1.0"
 ```
 
-### JavaScript/WASM
+### JavaScript / WASM
+
+Browser + bundlers:
+
 ```javascript
-const { WasmDocument } = require("office-oxide-wasm");
+import { WasmDocument } from "office-oxide-wasm";
 
 const doc = new WasmDocument(buffer, "docx");
 console.log(doc.plainText());
 console.log(doc.toMarkdown());
+doc.free();
+```
+
+Node.js native (koffi + C FFI, no node-gyp):
+
+```javascript
+import { Document } from "office-oxide";
+
+using doc = Document.open("report.docx");
+console.log(doc.format);          // "docx"
+console.log(doc.plainText());
+console.log(doc.toMarkdown());
+console.log(doc.toIr());
 ```
 
 ```bash
-npm install office-oxide-wasm
+npm install office-oxide         # native addon
+npm install office-oxide-wasm    # portable WASM
 ```
+
+### Go
+
+```go
+import oo "github.com/yfedoseev/office_oxide/go"
+
+doc, _ := oo.Open("report.docx")
+defer doc.Close()
+text, _ := doc.PlainText()
+md,   _ := doc.ToMarkdown()
+```
+
+### C# / .NET
+
+```csharp
+using OfficeOxide;
+
+using var doc = Document.Open("report.docx");
+Console.WriteLine(doc.Format);        // "docx"
+Console.WriteLine(doc.PlainText());
+Console.WriteLine(doc.ToMarkdown());
+```
+
+### C (raw FFI)
+
+Include [`include/office_oxide_c/office_oxide.h`](include/office_oxide_c/office_oxide.h) and link against `liboffice_oxide`. See [`examples/c/extract.c`](examples/c/extract.c) for a working sample.
 
 ## Why office_oxide?
 
@@ -235,7 +297,7 @@ Wheels available for Linux, macOS, and Windows. Python 3.8–3.14.
 
 ```toml
 [dependencies]
-office_oxide = "0.1"
+office_oxide = "0.1.0"
 ```
 
 ### JavaScript/WASM

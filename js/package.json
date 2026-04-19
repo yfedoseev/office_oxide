@@ -1,0 +1,60 @@
+{
+  "name": "office-oxide",
+  "version": "0.1.0",
+  "description": "Fast Office document processing (DOCX/XLSX/PPTX/DOC/XLS/PPT) for Node.js — native bindings backed by the Rust office_oxide library.",
+  "license": "MIT OR Apache-2.0",
+  "author": "Yury Fedoseev <yfedoseev@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yfedoseev/office_oxide.git"
+  },
+  "homepage": "https://oxide.fyi",
+  "bugs": {
+    "url": "https://github.com/yfedoseev/office_oxide/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "type": "module",
+  "main": "./lib/index.cjs",
+  "module": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "import": "./lib/index.js",
+      "require": "./lib/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/",
+    "prebuilds/",
+    "scripts/",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/check-prebuild.cjs",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "koffi": "^2.9.0"
+  },
+  "keywords": [
+    "docx",
+    "xlsx",
+    "pptx",
+    "doc",
+    "xls",
+    "ppt",
+    "office",
+    "text-extraction",
+    "document-parser",
+    "markdown",
+    "rust",
+    "native",
+    "nodejs"
+  ]
+}

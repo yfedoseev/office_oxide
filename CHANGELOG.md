@@ -5,9 +5,81 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] - 2026-04-07
+## [0.1.0] - 2026-04-20
 
 > Initial public release
+
+### Cross-language bindings
+
+- **Rust core** (`office_oxide` on crates.io): unified `Document` handle for
+  all six formats, `EditableDocument` for DOCX/XLSX/PPTX editing, format-
+  agnostic `DocumentIR`.
+- **Python** (`office-oxide` on PyPI): context-manager `Document` /
+  `EditableDocument`, `os.PathLike` support, complete type stubs in
+  `_native.pyi` (`Literal` format names, `_Path` alias).
+- **Go** (`github.com/yfedoseev/office_oxide/go`): CGo wrapper over the C FFI
+  with idiomatic `Open` / `Close` / error-return API, `go/cmd/install` helper
+  that fetches the matching native archive and prints the
+  `CGO_CFLAGS` / `CGO_LDFLAGS` to export.
+- **C# / .NET** (`OfficeOxide` on NuGet): `LibraryImport` P/Invoke,
+  `IDisposable`, `async/await`, `IsAotCompatible=true`, `IsTrimmable=true`.
+  Four `SetCell` overloads + `SetCellEmpty`. Net 8 and net 10 target
+  frameworks.
+- **Node.js native** (`office-oxide` on npm): [koffi](https://koffi.dev)-based,
+  no node-gyp, ESM + CJS entry points with an `exports` map, TypeScript
+  definitions, `Symbol.dispose` support, platform prebuilds staged into
+  `prebuilds/<platform>-<arch>/`.
+- **WASM** (`office-oxide-wasm` on npm): three sub-path exports — default
+  ESM for bundlers, `office-oxide-wasm/node` for CJS, `office-oxide-wasm/web`
+  for native-ESM browser imports. TypeScript definitions shipped.
+- **C FFI** (`include/office_oxide_c/office_oxide.h`): stable
+  `office_document_*` / `office_editable_*` surface with out-param error
+  codes and explicit memory ownership. Exported from the cdylib + staticlib;
+  the substrate that Go, C#, and Node-native link against.
+
+### Tooling
+
+- **CLI** (`office-oxide` binary): `text`, `markdown`, `html`, `info`, `ir`
+  subcommands.
+- **MCP server** (`office-oxide-mcp` binary): `extract` and `info` tools
+  over JSON-RPC 2.0 / stdio.
+
+### Performance
+
+- Up to 100× faster than `python-docx`, `openpyxl`, `python-pptx`, `xlrd`.
+- Beats `calamine` on XLSX and all Rust / Python alternatives on .xls.
+- 98.4% pass rate on a 6,062-file public corpus (LibreOffice, Apache POI,
+  python-pptx, python-docx, Pandoc, etc.); zero failures on legitimate
+  Word 97+ / Excel 97+ / PowerPoint 97+ inputs.
+
+### Documentation & examples
+
+- Per-language getting-started guides in [`docs/`](docs/): Rust, Python,
+  Go, C#, JavaScript (native), WASM, and C / raw FFI.
+- Per-binding READMEs in [`python/`](python/README.md), [`go/`](go/README.md),
+  [`csharp/OfficeOxide/`](csharp/OfficeOxide/README.md),
+  [`js/`](js/README.md), [`wasm-pkg/`](wasm-pkg/README.md).
+- Identical `extract` / `replace` / `read_xlsx` demos per language under
+  [`examples/`](examples/).
+
+### Release CI
+
+- Version parity across `Cargo.toml`, `pyproject.toml`,
+  `wasm-pkg/package.json`, `js/package.json`, and
+  `csharp/OfficeOxide/OfficeOxide.csproj`.
+- 6-target native-lib build matrix producing `.tar.gz` / `.zip` archives
+  with the shared library, static archive, and public header.
+- 3-target WASM build (bundler / nodejs / web) with per-target module-type
+  hints so Node + bundlers + browsers each load the right code.
+- NuGet packaging with `runtimes/<rid>/native/` prebuilts, Node
+  `prebuilds/<platform>-<arch>/` staging, and a `go/v*` module tag for the
+  Go module proxy.
+
+---
+
+## [0.1.0-draft] - 2026-04-07 (not released)
+
+> Internal milestone before the public release above.
 
 Single consolidated `office_oxide` crate with modules per format, plus
 companion workspace crates `office_oxide_cli` and `office_oxide_mcp`.

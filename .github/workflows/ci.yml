@@ -149,6 +149,60 @@ jobs:
       - name: Test Python bindings
         run: uv run python -c "import office_oxide; print('office_oxide imported successfully')"
 
+  # Go binding test
+  go:
+    name: Go bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Rust lib
+        run: cargo build --release --lib
+      - name: Run go test
+        run: go test -tags office_oxide_dev -v ./...
+        working-directory: go
+
+  # C# binding test
+  csharp:
+    name: C# bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --lib
+      - run: dotnet test csharp/OfficeOxide.Tests/OfficeOxide.Tests.csproj
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/release
+
+  # Node-native binding test (koffi)
+  node-native:
+    name: Node-native bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --lib
+      - run: npm install --silent
+        working-directory: js
+      - run: node --test test/basic.test.mjs
+        working-directory: js
+        env:
+          OFFICE_OXIDE_LIB: ${{ github.workspace }}/target/release/liboffice_oxide.so
+
   # WASM build check
   wasm-build:
     name: WASM Build

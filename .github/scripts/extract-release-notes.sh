@@ -31,7 +31,9 @@ awk "/^## \[${VERSION}\]/{flag=1; next} /^## \[/{flag=0} flag" "$CHANGELOG" \
   | sed '1{/^$/d}' > changelog-section.md
 
 if [ ! -s changelog-section.md ]; then
-  echo "Warning: No changelog content found for version ${VERSION}" >&2
+  echo "Error: No changelog content found for version ${VERSION}" >&2
+  echo "  Add a '## [${VERSION}]' section to ${CHANGELOG} before tagging." >&2
+  exit 2
 fi
 
 # Build release body = changelog section + installation footer
@@ -40,25 +42,36 @@ cat >> release-notes.md << 'FOOTER'
 
 ---
 
-### Installation
+### Install
 
-**Rust (crates.io)**
+**Rust** &nbsp; `cargo add office_oxide`
+
+**Python** &nbsp; `pip install office-oxide`
+
+**JavaScript (WASM, universal)** &nbsp; `npm install office-oxide-wasm`
+
+**Node.js (native)** &nbsp; `npm install office-oxide`
+
+**Go** &nbsp;
 ```bash
-cargo add office_oxide
+go get github.com/yfedoseev/office_oxide/go
+# fetch the native library matching your platform:
+go run github.com/yfedoseev/office_oxide/go/cmd/install@latest
 ```
 
-**Python (PyPI)**
+**C# / .NET** &nbsp; `dotnet add package OfficeOxide`
+
+**CLI**
 ```bash
-pip install office-oxide
+cargo binstall office_oxide_cli      # pre-built binary
+brew install yfedoseev/tap/office-oxide
+scoop bucket add yfedoseev https://github.com/yfedoseev/scoop-bucket && scoop install office-oxide
 ```
 
-**JavaScript/WASM (npm)**
-```bash
-npm install office-oxide-wasm
-```
+**Raw C FFI** — download the `native-<platform>-<arch>` asset below and include `include/office_oxide_c/office_oxide.h`.
 
 ### Changelog
-See [CHANGELOG.md](https://github.com/yfedoseev/office_oxide/blob/main/CHANGELOG.md) for full details.
+Full history: [CHANGELOG.md](https://github.com/yfedoseev/office_oxide/blob/main/CHANGELOG.md)
 FOOTER
 
 # Cleanup

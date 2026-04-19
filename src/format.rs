@@ -1,7 +1,7 @@
 use std::path::Path;
 
 /// Supported document formats.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DocumentFormat {
     Docx,
@@ -13,7 +13,42 @@ pub enum DocumentFormat {
 }
 
 impl DocumentFormat {
+    /// Returns the canonical file extension (without the leading dot).
+    #[must_use]
+    pub fn extension(&self) -> &'static str {
+        match self {
+            Self::Docx => "docx",
+            Self::Xlsx => "xlsx",
+            Self::Pptx => "pptx",
+            Self::Doc => "doc",
+            Self::Xls => "xls",
+            Self::Ppt => "ppt",
+        }
+    }
+
+    /// Returns the canonical MIME type.
+    #[must_use]
+    pub fn mime_type(&self) -> &'static str {
+        match self {
+            Self::Docx => {
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            },
+            Self::Xlsx => {
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            },
+            Self::Pptx => {
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            },
+            Self::Doc => "application/msword",
+            Self::Xls => "application/vnd.ms-excel",
+            Self::Ppt => "application/vnd.ms-powerpoint",
+        }
+    }
+}
+
+impl DocumentFormat {
     /// Detect format from a file extension string (case-insensitive, without dot).
+    #[must_use]
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_ascii_lowercase().as_str() {
             "docx" => Some(Self::Docx),
@@ -27,6 +62,7 @@ impl DocumentFormat {
     }
 
     /// Detect format from a file path's extension.
+    #[must_use]
     pub fn from_path(path: &Path) -> Option<Self> {
         let ext = path.extension()?.to_str()?;
         Self::from_extension(ext)
@@ -34,6 +70,7 @@ impl DocumentFormat {
 
     /// If this is a legacy format, return the corresponding OOXML format.
     /// Used when magic bytes reveal the file is actually OOXML despite the extension.
+    #[must_use]
     pub fn ooxml_upgrade(&self) -> Option<Self> {
         match self {
             Self::Doc => Some(Self::Docx),
@@ -44,6 +81,7 @@ impl DocumentFormat {
     }
 
     /// Returns true if this is a legacy binary format (doc/xls/ppt).
+    #[must_use]
     pub fn is_legacy(&self) -> bool {
         matches!(self, Self::Doc | Self::Xls | Self::Ppt)
     }

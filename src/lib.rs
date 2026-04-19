@@ -1,4 +1,7 @@
 // Sub-modules (previously separate crates)
+/// Library version (matches the Cargo package version).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod cfb;
 pub mod core;
 pub mod doc;
@@ -21,6 +24,9 @@ pub mod error;
 pub mod format;
 pub mod ir;
 mod ir_render;
+
+#[cfg(not(target_family = "wasm"))]
+pub mod ffi;
 
 #[cfg(feature = "python")]
 mod python;
@@ -121,6 +127,7 @@ enum DocumentInner {
 
 impl Document {
     /// Open a document from a file path. Format is detected from the extension.
+    #[must_use = "opening a document allocates — use the returned handle or drop it"]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_owned();
         with_parse_stack(move || Self::open_inner(&path))
@@ -216,6 +223,7 @@ impl Document {
     }
 
     /// Open a document from any `Read + Seek` source with an explicit format.
+    #[must_use = "opening a document allocates — use the returned handle or drop it"]
     pub fn from_reader<R: Read + Seek + Send + 'static>(
         reader: R,
         format: DocumentFormat,

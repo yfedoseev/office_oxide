@@ -26,8 +26,22 @@ htmlcov/
 # Node / WASM
 node_modules/
 wasm-pkg/pkg/
+wasm-pkg/bundler/
+wasm-pkg/node/
+wasm-pkg/web/
 *.wasm
 wasm-pack.log
+
+# Node native binding (prebuilds are populated by release CI)
+js/prebuilds/
+
+# C# build artifacts + release-only runtime payloads
+csharp/**/bin/
+csharp/**/obj/
+csharp/**/runtimes/
+
+# Go installer binary (built from go/cmd/install)
+/go/install
 
 # IDE
 .vscode/

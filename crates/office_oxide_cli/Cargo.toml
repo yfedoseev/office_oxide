@@ -45,6 +45,10 @@ pkg-url = "{ repo }/releases/download/v{ version }/office_oxide-macos-aarch64-{ 
 pkg-url = "{ repo }/releases/download/v{ version }/office_oxide-windows-x86_64-{ version }.zip"
 pkg-fmt = "zip"
 
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/office_oxide-windows-aarch64-{ version }.zip"
+pkg-fmt = "zip"
+
 [package.metadata.deb]
 maintainer = "Yury Fedoseev <yfedoseev@gmail.com>"
 copyright = "2025-2026, Yury Fedoseev"

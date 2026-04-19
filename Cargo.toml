@@ -37,11 +37,16 @@ include = [
     "/CHANGELOG.md",
     "/LICENSE-MIT",
     "/LICENSE-APACHE",
+    "/include/**/*",
+    "/cbindgen.toml",
 ]
 
 [lib]
 name = "office_oxide"
-crate-type = ["rlib", "cdylib"]
+# cdylib: Python (maturin), WASM, C# (P/Invoke), Node.js (dynamic)
+# rlib: native Rust consumers
+# staticlib: Go (CGo) — produces libofice_oxide.a for self-contained binaries
+crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
 # Core parsing
@@ -82,6 +87,20 @@ rustdoc-args = ["--cfg", "docsrs"]
 [package.metadata.maturin]
 name = "office-oxide"
 python-source = "python"
+
+# wasm-opt in the local wasm-pack cache predates bulk-memory support that
+# modern rustc emits. Disable it — size is already driven by the Rust LTO
+# release profile.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[[example]]
+name = "extract"
+path = "examples/rust/extract.rs"
+
+[[example]]
+name = "make_smoke"
+path = "examples/rust/make_smoke.rs"
 
 [profile.release]
 lto = true

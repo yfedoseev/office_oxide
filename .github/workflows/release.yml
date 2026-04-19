@@ -27,6 +27,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Setup Node (for package.json version parity check)
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
       - name: Get version from Cargo.toml
         id: version
         run: |
@@ -45,15 +50,14 @@ jobs:
             exit 1
           fi
 
-      - name: Validate version consistency
+      - name: Validate version consistency across all bindings
+        run: bash .github/scripts/check-versions.sh
+
+      - name: Validate CHANGELOG has an entry for this version
         run: |
-          CARGO_VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          PY_VERSION=$(grep '^version = ' pyproject.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          if [ "$CARGO_VERSION" != "$PY_VERSION" ]; then
-            echo "Error: Cargo.toml ($CARGO_VERSION) and pyproject.toml ($PY_VERSION) versions don't match"
-            exit 1
-          fi
-          echo "Cargo.toml and pyproject.toml versions match: $CARGO_VERSION"
+          # Re-run extraction with failure on empty body (script exits 2).
+          bash .github/scripts/extract-release-notes.sh "${{ steps.version.outputs.version }}"
+          rm -f release-title.txt release-notes.md
 
       - name: Verify release is from main branch
         run: |
@@ -97,6 +101,10 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: office_oxide-windows-x86_64
+
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            artifact_name: office_oxide-windows-aarch64
 
     steps:
       - uses: actions/checkout@v6
@@ -158,9 +166,131 @@ jobs:
           path: ${{ env.ARCHIVE }}
           retention-days: 7
 
-  # Build WASM package
+  # Build shared/static native libraries for Go, C#, and Node-native consumers
+  build-native-libs:
+    name: Build native libs (${{ matrix.target }})
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: native-linux-x86_64
+            shared_ext: so
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: native-linux-aarch64
+            shared_ext: so
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: native-macos-x86_64
+            shared_ext: dylib
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: native-macos-aarch64
+            shared_ext: dylib
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: native-windows-x86_64
+            shared_ext: dll
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            artifact_name: native-windows-aarch64
+            shared_ext: dll
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cross-compilation tools (linux aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build library (cdylib + staticlib)
+        run: cargo build --release --lib --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p staging/lib staging/include
+          cp target/${{ matrix.target }}/release/liboffice_oxide.${{ matrix.shared_ext }} staging/lib/
+          cp target/${{ matrix.target }}/release/liboffice_oxide.a staging/lib/ 2>/dev/null || true
+          cp -r include/office_oxide_c staging/include/
+          tar -czf ${{ matrix.artifact_name }}.tar.gz -C staging .
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p staging/lib staging/include
+          cp target/${{ matrix.target }}/release/office_oxide.dll staging/lib/
+          cp target/${{ matrix.target }}/release/office_oxide.lib staging/lib/ 2>/dev/null || true
+          cp -r include/office_oxide_c staging/include/
+          cd staging && 7z a "../${{ matrix.artifact_name }}.zip" . && cd ..
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.artifact_name }}.tar.gz
+            ${{ matrix.artifact_name }}.zip
+          retention-days: 7
+
+  # Test Go binding against the monorepo's freshly built static library
+  test-go:
+    name: Test Go binding
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      - run: cargo build --release --lib
+      - run: go test -tags office_oxide_dev -v ./...
+        working-directory: go
+
+  # Test C# binding
+  test-csharp:
+    name: Test C# binding
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - run: cargo build --release --lib
+      - run: dotnet test csharp/OfficeOxide.Tests/OfficeOxide.Tests.csproj
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/release
+
+  # Test Node native binding (koffi)
+  test-node-native:
+    name: Test Node native binding
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+      - run: cargo build --release --lib
+      - run: npm install --silent
+        working-directory: js
+      - run: node --test test/basic.test.mjs
+        working-directory: js
+        env:
+          OFFICE_OXIDE_LIB: ${{ github.workspace }}/target/release/liboffice_oxide.so
+
+  # Build WASM package (bundler + node + web targets in one staged dir).
   build-wasm:
-    name: Build WASM
+    name: Build WASM (bundler + node + web)
     needs: validate
     runs-on: ubuntu-latest
     steps:
@@ -171,45 +301,48 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Cache cargo registry
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-wasm-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build WASM binary
-        run: cargo build -p office_oxide --lib --target wasm32-unknown-unknown --features wasm,default --release
-
-      - name: Install matching wasm-bindgen-cli
-        run: |
-          WASM_BINDGEN_VERSION=$(grep -A1 'name = "wasm-bindgen"' Cargo.lock | grep version | head -1 | sed 's/.*"\(.*\)"/\1/')
-          echo "Installing wasm-bindgen-cli@${WASM_BINDGEN_VERSION}"
-          cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION"
-
-      - name: Generate bindings
-        run: |
-          wasm-bindgen --target nodejs --out-dir wasm-out/ \
-            target/wasm32-unknown-unknown/release/office_oxide.wasm
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Install binaryen (wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
 
-      - name: Optimize wasm with wasm-opt -Oz
-        run: |
-          ls -la wasm-out/*.wasm
-          wasm-opt -Oz --strip-debug --strip-producers \
-            wasm-out/office_oxide_bg.wasm -o wasm-out/office_oxide_bg.wasm
-          ls -la wasm-out/*.wasm
+      - name: Build bundler target
+        run: wasm-pack build --target bundler --release --out-dir wasm-pkg/bundler --no-default-features --features wasm
 
-      - name: Copy package files
+      - name: Build nodejs target
+        run: wasm-pack build --target nodejs --release --out-dir wasm-pkg/node --no-default-features --features wasm
+
+      - name: Build web target
+        run: wasm-pack build --target web --release --out-dir wasm-pkg/web --no-default-features --features wasm
+
+      - name: Optimize each .wasm with system wasm-opt
         run: |
-          cp wasm-pkg/package.json wasm-out/
+          set -euo pipefail
+          for w in wasm-pkg/bundler/office_oxide_bg.wasm \
+                   wasm-pkg/node/office_oxide_bg.wasm \
+                   wasm-pkg/web/office_oxide_bg.wasm; do
+            echo "optimizing $w"
+            wasm-opt -Oz --strip-debug --strip-producers "$w" -o "$w.opt"
+            mv "$w.opt" "$w"
+          done
+          ls -lah wasm-pkg/*/office_oxide_bg.wasm
+
+      - name: Normalise per-target package.json to a single "type" hint
+        run: |
+          # wasm-pack emits a full per-target package.json that conflicts with
+          # our top-level exports map. Replace each with a minimal hint so
+          # Node picks the right module system per subpath.
+          rm -f wasm-pkg/{bundler,node,web}/README.md wasm-pkg/{bundler,node,web}/LICENSE-*
+          printf '{"type": "module"}\n'   > wasm-pkg/bundler/package.json
+          printf '{"type": "commonjs"}\n' > wasm-pkg/node/package.json
+          printf '{"type": "module"}\n'   > wasm-pkg/web/package.json
 
       - name: Upload WASM artifact
         uses: actions/upload-artifact@v7
         with:
           name: wasm-package
-          path: wasm-out/
+          path: wasm-pkg/
           retention-days: 7
 
   # Build Python wheels
@@ -266,10 +399,305 @@ jobs:
           path: dist/*.whl
           retention-days: 7
 
+  # Package Node-native npm package with prebuilt native libs
+  package-node-native:
+    name: Package node-native npm (office-oxide)
+    needs: [validate, build-native-libs]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Download native artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: native
+          pattern: native-*
+          merge-multiple: false
+      - name: Stage prebuilds/<platform>-<arch>
+        run: |
+          set -euo pipefail
+          mkdir -p js/prebuilds
+          map_dir() {
+            case "$1" in
+              native-linux-x86_64)    echo "linux-x64";;
+              native-linux-aarch64)   echo "linux-arm64";;
+              native-macos-x86_64)    echo "darwin-x64";;
+              native-macos-aarch64)   echo "darwin-arm64";;
+              native-windows-x86_64)  echo "win32-x64";;
+              native-windows-aarch64) echo "win32-arm64";;
+              *) echo "$1";;
+            esac
+          }
+          for dir in native/native-*; do
+            base=$(basename "$dir")
+            out="js/prebuilds/$(map_dir "$base")"
+            mkdir -p "$out"
+            # Extract archives and pull only the shared library
+            for f in "$dir"/*.tar.gz "$dir"/*.zip; do
+              [ -e "$f" ] || continue
+              tmp=$(mktemp -d)
+              case "$f" in
+                *.tar.gz) tar -xzf "$f" -C "$tmp";;
+                *.zip)    unzip -q "$f" -d "$tmp";;
+              esac
+              find "$tmp/lib" -maxdepth 1 \( -name 'liboffice_oxide.so' -o -name 'liboffice_oxide.dylib' -o -name 'office_oxide.dll' \) -exec cp {} "$out" \; || true
+              rm -rf "$tmp"
+            done
+          done
+          ls -R js/prebuilds
+      - uses: actions/upload-artifact@v7
+        with:
+          name: node-native-package
+          path: js/
+          retention-days: 7
+
+  # ─── Smoke tests on built artifacts ────────────────────────────────────────
+  # Everything below here proves "the bits we're about to publish actually
+  # work when installed". Release is gated on these passing.
+
+  verify-python-wheel:
+    name: Smoke-test Python wheel
+    needs: [validate, build-python-wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v8
+        with:
+          path: wheels
+          pattern: wheels-linux-x86_64
+          merge-multiple: true
+      - name: Install the built wheel
+        run: pip install wheels/*.whl
+      - name: Build a tiny fixture with the Rust core and extract through the wheel
+        run: |
+          cargo run --release --example make_smoke -- /tmp/ffi_smoke.docx
+          python - <<'PY'
+          from office_oxide import Document, version, __version__
+          assert version() == "${{ needs.validate.outputs.version }}", f"version mismatch: {version()}"
+          assert __version__ == version()
+          with Document.open("/tmp/ffi_smoke.docx") as d:
+              assert d.format == "docx"
+              text = d.plain_text()
+              assert "Hello" in text, f"unexpected plain text: {text!r}"
+          print("wheel smoke OK:", version())
+          PY
+
+  verify-wasm:
+    name: Smoke-test WASM package (Node target)
+    needs: [validate, build-wasm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v8
+        with:
+          name: wasm-package
+          path: wasm-pkg
+      - name: Build a fixture
+        run: cargo run --release --example make_smoke -- /tmp/ffi_smoke.docx
+      - name: Require the Node target and extract
+        run: |
+          node -e "
+            const fs = require('fs');
+            const mod = require('./wasm-pkg/node/office_oxide.js');
+            const doc = new mod.WasmDocument(fs.readFileSync('/tmp/ffi_smoke.docx'), 'docx');
+            const text = doc.plainText();
+            if (!text.startsWith('Hello')) { throw new Error('bad text: ' + text); }
+            doc.free();
+            console.log('wasm node smoke OK');
+          "
+
+  verify-node-native:
+    name: Smoke-test Node-native package
+    needs: [validate, package-node-native]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v8
+        with:
+          name: node-native-package
+          path: staged-js
+      - name: npm pack + install into a fresh project
+        run: |
+          cd staged-js && npm pack --silent && cd ..
+          mkdir -p /tmp/consumer && cd /tmp/consumer
+          npm init -y >/dev/null
+          npm install "$GITHUB_WORKSPACE"/staged-js/office-oxide-*.tgz --silent
+      - name: Build a fixture
+        run: cargo run --release --example make_smoke -- /tmp/ffi_smoke.docx
+      - name: require + extract
+        working-directory: /tmp/consumer
+        run: |
+          node -e "
+            const { Document, version } = require('office-oxide');
+            if (version() !== '${{ needs.validate.outputs.version }}') {
+              throw new Error('version mismatch: ' + version());
+            }
+            const d = Document.open('/tmp/ffi_smoke.docx');
+            if (!d.plainText().startsWith('Hello')) { throw new Error('bad text'); }
+            d.close();
+            console.log('node-native smoke OK:', version());
+          "
+
+  verify-nuget:
+    name: Smoke-test NuGet package
+    needs: [validate, build-native-libs]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - uses: actions/download-artifact@v8
+        with:
+          path: native
+          pattern: native-*
+      - name: Stage runtime libs + pack
+        run: |
+          set -euo pipefail
+          map_rid() {
+            case "$1" in
+              native-linux-x86_64)    echo "linux-x64";;
+              native-linux-aarch64)   echo "linux-arm64";;
+              native-macos-x86_64)    echo "osx-x64";;
+              native-macos-aarch64)   echo "osx-arm64";;
+              native-windows-x86_64)  echo "win-x64";;
+              native-windows-aarch64) echo "win-arm64";;
+              *) echo "$1";;
+            esac
+          }
+          for dir in native/native-*; do
+            base=$(basename "$dir")
+            rid=$(map_rid "$base")
+            out="csharp/OfficeOxide/runtimes/${rid}/native"
+            mkdir -p "$out"
+            tmp=$(mktemp -d)
+            for f in "$dir"/*.tar.gz "$dir"/*.zip; do
+              [ -e "$f" ] || continue
+              case "$f" in
+                *.tar.gz) tar -xzf "$f" -C "$tmp";;
+                *.zip)    unzip -q "$f" -d "$tmp";;
+              esac
+            done
+            find "$tmp/lib" -maxdepth 1 \( -name 'liboffice_oxide.so' -o -name 'liboffice_oxide.dylib' -o -name 'office_oxide.dll' \) -exec cp {} "$out" \;
+            rm -rf "$tmp"
+          done
+          dotnet pack csharp/OfficeOxide/OfficeOxide.csproj -c Release -o nuget-out
+      - name: Install + reference .nupkg from a throwaway project
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/nugetfeed && cp nuget-out/*.nupkg /tmp/nugetfeed/
+          mkdir -p /tmp/consumer && cd /tmp/consumer
+          dotnet new console >/dev/null
+          dotnet nuget add source /tmp/nugetfeed --name local >/dev/null
+          dotnet add package OfficeOxide --version "${{ needs.validate.outputs.version }}" --source local >/dev/null
+          cat > Program.cs <<'CS'
+          using OfficeOxide;
+          using var doc = Document.Open("/tmp/ffi_smoke.docx");
+          if (!doc.PlainText().StartsWith("Hello"))
+              throw new System.Exception("bad text: " + doc.PlainText());
+          System.Console.WriteLine($"nuget smoke OK: {Document.Version}");
+          CS
+      - name: Build fixture
+        run: cargo run --release --example make_smoke -- /tmp/ffi_smoke.docx
+      - name: Run
+        working-directory: /tmp/consumer
+        run: dotnet run -c Release
+
+  verify-go-install:
+    name: Smoke-test Go install helper
+    needs: [validate, build-native-libs]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v8
+        with:
+          name: native-linux-x86_64
+          path: release-assets
+      - name: Stage the native-linux-x86_64 archive where the installer expects it
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.validate.outputs.version }}"
+          mkdir -p /tmp/simulated-releases
+          cp release-assets/native-linux-x86_64.tar.gz \
+             /tmp/simulated-releases/native-linux-x86_64-${VERSION}.tar.gz
+          # The installer uses the default version from main.go — in real releases
+          # that matches the workflow version because check-versions.sh enforces it.
+      - name: Serve the archive via a local HTTP server + patch the installer URL
+        run: |
+          set -euo pipefail
+          (cd /tmp/simulated-releases && python3 -m http.server 8089 >/tmp/server.log 2>&1 &)
+          sleep 2
+          VERSION="${{ needs.validate.outputs.version }}"
+          # Temporarily point the installer at the local server
+          sed -i "s|https://github.com/yfedoseev/office_oxide/releases/download|http://localhost:8089/|; s|/v${VERSION}/||" \
+            go/cmd/install/main.go
+          go run ./go/cmd/install -prefix /tmp/oo-go-install
+      - name: Build a consumer against the installed lib
+        run: |
+          set -euo pipefail
+          cargo run --release --example make_smoke -- /tmp/ffi_smoke.docx
+          mkdir -p /tmp/go-consumer && cd /tmp/go-consumer
+          cat > go.mod <<'MOD'
+          module consumer
+
+          go 1.21
+          MOD
+          cat > main.go <<'GO'
+          package main
+
+          /*
+          #cgo CFLAGS: -I__PREFIX__/include/office_oxide_c
+          #cgo LDFLAGS: -L__PREFIX__/lib -loffice_oxide -Wl,-rpath,__PREFIX__/lib
+          #include "office_oxide.h"
+          */
+          import "C"
+          import (
+              "fmt"
+              "unsafe"
+          )
+          func main() {
+              cpath := C.CString("/tmp/ffi_smoke.docx")
+              defer C.free(unsafe.Pointer(cpath))
+              var err C.int
+              doc := C.office_document_open(cpath, &err)
+              if doc == nil { panic(fmt.Sprintf("open failed err=%d", err)) }
+              defer C.office_document_free(doc)
+              text := C.office_document_plain_text(doc, &err)
+              defer C.office_oxide_free_string(text)
+              fmt.Println("go install smoke OK")
+          }
+          GO
+          sed -i "s|__PREFIX__|/tmp/oo-go-install|g" main.go
+          go run main.go
+
   # Create GitHub Release
   create-release:
     name: Create GitHub Release
-    needs: [validate, build-binaries, build-python-wheels, build-wasm]
+    needs:
+      - validate
+      - build-binaries
+      - build-python-wheels
+      - build-wasm
+      - build-native-libs
+      - verify-python-wheel
+      - verify-wasm
+      - verify-node-native
+      - verify-nuget
+      - verify-go-install
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -317,7 +745,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Verify crates.io readiness
+      - name: Dry-run office_oxide
         run: cargo publish -p office_oxide --dry-run
 
       - name: Publish office_oxide
@@ -328,8 +756,18 @@ jobs:
       - name: Wait for crates.io index update
         run: sleep 30
 
+      - name: Dry-run office_oxide_cli
+        run: cargo publish -p office_oxide_cli --dry-run
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+
       - name: Publish office_oxide_cli
         run: cargo publish -p office_oxide_cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+
+      - name: Dry-run office_oxide_mcp
+        run: cargo publish -p office_oxide_mcp --dry-run
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
 
@@ -364,9 +802,9 @@ jobs:
           packages-dir: wheels/
           skip-existing: true
 
-  # Publish to npm
-  publish-npm:
-    name: Publish to npm
+  # Publish WASM package to npm (office-oxide-wasm)
+  publish-npm-wasm:
+    name: Publish npm (office-oxide-wasm)
     needs: [validate, build-wasm, create-release]
     runs-on: ubuntu-latest
     if: ${{ !contains(needs.validate.outputs.version, '-') }}
@@ -388,6 +826,101 @@ jobs:
         run: npm publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # Publish Node-native package (office-oxide) with prebuilt native libs
+  publish-npm-native:
+    name: Publish npm (office-oxide native)
+    needs: [validate, package-node-native, create-release]
+    runs-on: ubuntu-latest
+    if: ${{ !contains(needs.validate.outputs.version, '-') }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: node-native-package
+          path: js
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Publish to npm
+        working-directory: js
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # Publish NuGet package (OfficeOxide) with runtime-specific native libs
+  publish-nuget:
+    name: Publish to NuGet
+    needs: [validate, build-native-libs, create-release]
+    runs-on: ubuntu-latest
+    if: ${{ !contains(needs.validate.outputs.version, '-') }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - uses: actions/download-artifact@v8
+        with:
+          path: native
+          pattern: native-*
+          merge-multiple: false
+      - name: Stage native libs under runtimes/<rid>/native/
+        run: |
+          set -euo pipefail
+          mkdir -p csharp/OfficeOxide/runtimes
+          map_rid() {
+            case "$1" in
+              native-linux-x86_64)    echo "linux-x64";;
+              native-linux-aarch64)   echo "linux-arm64";;
+              native-macos-x86_64)    echo "osx-x64";;
+              native-macos-aarch64)   echo "osx-arm64";;
+              native-windows-x86_64)  echo "win-x64";;
+              native-windows-aarch64) echo "win-arm64";;
+              *) echo "$1";;
+            esac
+          }
+          for dir in native/native-*; do
+            base=$(basename "$dir")
+            rid=$(map_rid "$base")
+            out="csharp/OfficeOxide/runtimes/${rid}/native"
+            mkdir -p "$out"
+            tmp=$(mktemp -d)
+            for f in "$dir"/*.tar.gz "$dir"/*.zip; do
+              [ -e "$f" ] || continue
+              case "$f" in
+                *.tar.gz) tar -xzf "$f" -C "$tmp";;
+                *.zip)    unzip -q "$f" -d "$tmp";;
+              esac
+            done
+            find "$tmp/lib" -maxdepth 1 \( -name 'liboffice_oxide.so' -o -name 'liboffice_oxide.dylib' -o -name 'office_oxide.dll' \) -exec cp {} "$out" \;
+            rm -rf "$tmp"
+          done
+          ls -R csharp/OfficeOxide/runtimes
+      - name: Pack NuGet
+        run: dotnet pack csharp/OfficeOxide/OfficeOxide.csproj -c Release -o nuget-out /p:IncludeRuntimeLibs=true
+      - name: Push to NuGet
+        run: dotnet nuget push nuget-out/*.nupkg --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+
+  # Tag the Go module. Go uses git tags for versioning; we tag `go/` subdir.
+  publish-go-tag:
+    name: Tag Go module
+    needs: [validate, build-native-libs, create-release]
+    runs-on: ubuntu-latest
+    if: ${{ !contains(needs.validate.outputs.version, '-') }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Push go/v${{ needs.validate.outputs.version }} tag
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          TAG="go/v${VERSION}"
+          git config user.email "yfedoseev@gmail.com"
+          git config user.name "Yury Fedoseev"
+          git tag -a "$TAG" -m "Go module release $TAG"
+          git push origin "$TAG"
 
   # Publish to Homebrew
   publish-homebrew:
@@ -440,18 +973,21 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Download Windows artifact
+      - name: Download Windows artifacts (x64 + arm64)
         uses: actions/download-artifact@v8
         with:
-          name: office_oxide-windows-x86_64
           path: artifacts
+          pattern: office_oxide-windows-*
+          merge-multiple: true
 
       - name: Generate Scoop manifest
         run: |
           VERSION="${{ needs.validate.outputs.version }}"
-          SHA_WINDOWS=$(sha256sum artifacts/office_oxide-windows-x86_64-${VERSION}.zip | cut -d' ' -f1)
+          SHA_X64=$(sha256sum artifacts/office_oxide-windows-x86_64-${VERSION}.zip | cut -d' ' -f1)
+          SHA_ARM=$(sha256sum artifacts/office_oxide-windows-aarch64-${VERSION}.zip | cut -d' ' -f1)
           sed -e "s/{{VERSION}}/${VERSION}/g" \
-              -e "s/{{SHA256_WINDOWS}}/${SHA_WINDOWS}/g" \
+              -e "s/{{SHA256_WINDOWS_X64}}/${SHA_X64}/g" \
+              -e "s/{{SHA256_WINDOWS_ARM64}}/${SHA_ARM}/g" \
               .github/templates/office-oxide.json > manifest.json
 
       - name: Push to Scoop bucket
