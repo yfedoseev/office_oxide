@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main, develop]
 
+# Cancel in-progress runs on the same ref when a new one starts.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -41,8 +46,8 @@ jobs:
       - name: Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Run Clippy
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Run Clippy on full workspace
+        run: cargo clippy --all-targets --workspace -- -D warnings
 
   # Build and test
   test:
@@ -75,8 +80,10 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
-      - name: Build documentation
-        run: cargo doc --no-deps
+      - name: Build documentation (warnings as errors)
+        run: cargo doc --no-deps --workspace
+        env:
+          RUSTDOCFLAGS: "-D warnings"
 
   # Test feature combinations
   features:
@@ -243,13 +250,13 @@ jobs:
       - name: Generate coverage
         run: |
           cargo llvm-cov --lib --tests --lcov --output-path lcov.info \
-            --ignore-filename-regex '(python\.rs|wasm\.rs)'
+            --ignore-filename-regex '(python\.rs|wasm\.rs|ffi\.rs)'
 
-      - name: Enforce 70% coverage threshold
+      - name: Enforce 85% coverage threshold
         run: |
           cargo llvm-cov report \
-            --ignore-filename-regex '(python\.rs|wasm\.rs)' \
-            --fail-under-lines 70
+            --ignore-filename-regex '(python\.rs|wasm\.rs|ffi\.rs)' \
+            --fail-under-lines 85
 
       - name: Upload coverage to Codecov
         if: always()
@@ -269,14 +276,80 @@ jobs:
       - name: Run security audit
         uses: actions-rust-lang/audit@v1
 
-  # Check dependencies
+  # cargo-deny: licenses / advisories / bans / sources (single consolidated gate)
   deny:
-    name: Dependency Check
+    name: Dependency Check (cargo-deny)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
       - name: Check dependencies
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          arguments: ""
+          command: check
+          arguments: --all-features
+
+  # TOML formatting check (taplo)
+  taplo:
+    name: TOML format (taplo)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: taplo
+      - name: Install taplo
+        uses: taiki-e/install-action@v2
+        with:
+          tool: taplo-cli
+      - name: Check TOML formatting
+        run: taplo fmt --check
+
+  # Feature powerset: build with every combination of features to catch cfg-rot.
+  # Skips dev-deps; root crate only (binary crates have no optional features).
+  features-powerset:
+    name: Feature powerset (cargo-hack)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: hack
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - name: Build every feature combination (root crate)
+        run: cargo hack check --feature-powerset --no-dev-deps --lib -p office_oxide
+
+  # Public-API semver check (PR only — compares against base branch)
+  semver-checks:
+    name: Semver check (PR only)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          feature-group: default-features
+
+  # MSRV: verify the oldest supported Rust toolchain still builds the library
+  msrv:
+    name: MSRV build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          v=$(grep -E '^rust-version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=${v:-1.85}" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: Build with MSRV toolchain
+        run: cargo build --lib -p office_oxide

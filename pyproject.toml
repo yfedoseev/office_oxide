@@ -7,11 +7,19 @@ name = "office-oxide"
 version = "0.1.0"
 description = "The fastest Office document processing library for Python — DOCX, XLSX, PPTX, DOC, XLS, PPT"
 requires-python = ">=3.8"
-license = {text = "MIT OR Apache-2.0"}
-authors = [
-    {name = "Yury Fedoseev", email = "yfedoseev@gmail.com"},
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Yury Fedoseev", email = "yfedoseev@gmail.com" }]
+keywords = [
+    "docx",
+    "xlsx",
+    "pptx",
+    "doc",
+    "xls",
+    "ppt",
+    "office",
+    "text-extraction",
+    "document-parser",
 ]
-keywords = ["docx", "xlsx", "pptx", "doc", "xls", "ppt", "office", "text-extraction", "document-parser"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -40,11 +48,7 @@ Changelog = "https://github.com/yfedoseev/office_oxide/blob/main/CHANGELOG.md"
 "Bug Tracker" = "https://github.com/yfedoseev/office_oxide/issues"
 
 [dependency-groups]
-dev = [
-    "maturin>=1.0",
-    "pytest>=7.0",
-    "ruff>=0.4",
-]
+dev = ["maturin>=1.0", "pytest>=7.0", "ruff>=0.4"]
 
 [tool.maturin]
 features = ["python"]

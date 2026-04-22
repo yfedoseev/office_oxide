@@ -30,12 +30,8 @@ impl DocumentFormat {
     #[must_use]
     pub fn mime_type(&self) -> &'static str {
         match self {
-            Self::Docx => {
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            },
-            Self::Xlsx => {
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            },
+            Self::Docx => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            Self::Xlsx => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             Self::Pptx => {
                 "application/vnd.openxmlformats-officedocument.presentationml.presentation"
             },

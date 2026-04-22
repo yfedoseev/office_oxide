@@ -1,11 +1,22 @@
 [workspace]
 resolver = "2"
-members = [
-    ".",
-    "crates/office_oxide_cli",
-    "crates/office_oxide_mcp",
-]
+members = [".", "crates/office_oxide_cli", "crates/office_oxide_mcp"]
 exclude = ["bench_rust"]
+
+# Clippy lint configuration shared by every workspace member and every target
+# (lib, bin, test, example, bench). Centralises the allow-list so new crates
+# don't need their own #![allow] attributes.
+[workspace.lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"
+needless_range_loop = "allow"
+enum_variant_names = "allow"
+wrong_self_convention = "allow"
+explicit_counter_loop = "allow"
+should_implement_trait = "allow"
+collapsible_match = "allow"
+match_like_matches_macro = "allow"
+manual_find = "allow"
 
 [workspace.package]
 version = "0.1.0"
@@ -40,6 +51,9 @@ include = [
     "/include/**/*",
     "/cbindgen.toml",
 ]
+
+[lints]
+workspace = true
 
 [lib]
 name = "office_oxide"

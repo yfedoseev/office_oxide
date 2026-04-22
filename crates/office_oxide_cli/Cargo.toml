@@ -11,6 +11,10 @@ documentation = "https://office.oxide.fyi"
 readme = "README.md"
 keywords = ["office", "cli", "text-extraction", "docx", "xlsx"]
 categories = ["command-line-utilities", "text-processing"]
+include = ["/src/**/*", "/Cargo.toml", "/README.md"]
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "office-oxide"
@@ -55,6 +59,4 @@ copyright = "2025-2026, Yury Fedoseev"
 depends = "$auto"
 section = "utility"
 priority = "optional"
-assets = [
-    ["target/release/office-oxide", "usr/bin/", "755"],
-]
+assets = [["target/release/office-oxide", "usr/bin/", "755"]]

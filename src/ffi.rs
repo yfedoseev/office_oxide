@@ -227,9 +227,7 @@ pub unsafe extern "C" fn office_document_free(handle: *mut OfficeDocumentHandle)
 
 /// Return the document format as a static C string. Do not free. Returns NULL on invalid handle.
 #[unsafe(no_mangle)]
-pub extern "C" fn office_document_format(
-    handle: *const OfficeDocumentHandle,
-) -> *const c_char {
+pub extern "C" fn office_document_format(handle: *const OfficeDocumentHandle) -> *const c_char {
     if handle.is_null() {
         return ptr::null();
     }
@@ -557,10 +555,7 @@ pub extern "C" fn office_editable_save_to_bytes(
 /// One-shot: open a file, extract plain text, return. Free the result with
 /// `office_oxide_free_string`.
 #[unsafe(no_mangle)]
-pub extern "C" fn office_extract_text(
-    path: *const c_char,
-    error_code: *mut i32,
-) -> *mut c_char {
+pub extern "C" fn office_extract_text(path: *const c_char, error_code: *mut i32) -> *mut c_char {
     let Some(path) = cstr_to_pathbuf(path) else {
         set_err(error_code, OFFICE_ERR_INVALID_ARG);
         return ptr::null_mut();
@@ -579,10 +574,7 @@ pub extern "C" fn office_extract_text(
 
 /// One-shot: open a file, convert to markdown, return. Free with `office_oxide_free_string`.
 #[unsafe(no_mangle)]
-pub extern "C" fn office_to_markdown(
-    path: *const c_char,
-    error_code: *mut i32,
-) -> *mut c_char {
+pub extern "C" fn office_to_markdown(path: *const c_char, error_code: *mut i32) -> *mut c_char {
     let Some(path) = cstr_to_pathbuf(path) else {
         set_err(error_code, OFFICE_ERR_INVALID_ARG);
         return ptr::null_mut();
@@ -601,10 +593,7 @@ pub extern "C" fn office_to_markdown(
 
 /// One-shot: open a file, convert to HTML, return. Free with `office_oxide_free_string`.
 #[unsafe(no_mangle)]
-pub extern "C" fn office_to_html(
-    path: *const c_char,
-    error_code: *mut i32,
-) -> *mut c_char {
+pub extern "C" fn office_to_html(path: *const c_char, error_code: *mut i32) -> *mut c_char {
     let Some(path) = cstr_to_pathbuf(path) else {
         set_err(error_code, OFFICE_ERR_INVALID_ARG);
         return ptr::null_mut();

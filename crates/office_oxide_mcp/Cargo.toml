@@ -11,6 +11,10 @@ documentation = "https://office.oxide.fyi"
 readme = "README.md"
 keywords = ["mcp", "office", "claude", "llm", "ai"]
 categories = ["command-line-utilities", "text-processing"]
+include = ["/src/**/*", "/Cargo.toml", "/README.md"]
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "office-oxide-mcp"
