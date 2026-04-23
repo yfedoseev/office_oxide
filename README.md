@@ -1,6 +1,14 @@
-# Office Oxide — The Fastest Office Document Library, Everywhere
+# Office Oxide — The Fastest Native Office Document Library
 
-The fastest library for text extraction from Office documents. Rust core with **first-class bindings for Python, Go, C#/.NET, Node.js (native and WASM), and a stable C FFI**. Handles DOCX, XLSX, PPTX, DOC, XLS, and PPT. Up to 100× faster than python-docx, openpyxl, python-pptx, and xlrd. Beats calamine on XLSX. **98.4% pass rate on 6,062 files** — zero failures on legitimate Office documents. MIT/Apache-2.0 dual-licensed.
+A fast, memory-safe library for text extraction from Office documents. Rust core with **first-class bindings for Python, Go, C#/.NET, Node.js (native and WASM), and a stable C FFI**. Handles DOCX, XLSX, PPTX, DOC, XLS, and PPT. Up to 100× faster than python-docx, openpyxl, python-pptx, and xlrd. Beats python-calamine on XLSX. **98.4% pass rate on 6,062 files** — zero failures on legitimate Office documents. MIT/Apache-2.0 dual-licensed.
+
+> **Scope of "fastest".** Benchmarks compare Office Oxide against other
+> native / embeddable libraries (no JVM runtime required): python-docx,
+> openpyxl, python-pptx, python-calamine, xlrd, markitdown, catdoc,
+> antiword, xls2csv, calamine (Rust), dotext, docx-rs. Apache POI and
+> Apache Tika are out of scope for this comparison because they require
+> a JVM and are targeted at a different deployment shape. POI/Tika
+> numbers may be added in a future release.
 
 [![Crates.io](https://img.shields.io/crates/v/office_oxide.svg)](https://crates.io/crates/office_oxide)
 [![PyPI](https://img.shields.io/pypi/v/office-oxide.svg)](https://pypi.org/project/office-oxide/)

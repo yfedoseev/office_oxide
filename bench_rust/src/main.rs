@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use dotext::MsDoc;
+use serde::Serialize;
 
 fn collect_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -22,13 +23,14 @@ fn collect_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
             collect_recursive(&path, out);
         } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             match ext.to_ascii_lowercase().as_str() {
-                "docx" | "xlsx" | "pptx" => out.push(path),
+                "docx" | "xlsx" | "pptx" | "xls" => out.push(path),
                 _ => {}
             }
         }
     }
 }
 
+#[derive(Serialize)]
 struct Stats {
     ok: usize,
     fail: usize,
@@ -47,6 +49,11 @@ impl Stats {
         let key = if e.len() > 80 { format!("{}...", &e[..80]) } else { e };
         *self.errors.entry(key).or_insert(0) += 1;
     }
+}
+
+fn try_office_oxide(path: &Path) -> Result<String, String> {
+    let doc = office_oxide::Document::open(path).map_err(|e| format!("{}", e))?;
+    Ok(doc.plain_text())
 }
 
 fn try_calamine(path: &Path) -> Result<String, String> {
@@ -121,7 +128,7 @@ fn try_docx_rs(path: &Path) -> Result<String, String> {
 
 type LibFn = fn(&Path) -> Result<String, String>;
 
-fn run_lib(lib_name: &str, ext_filter: &str, func: LibFn, files: &[PathBuf]) -> Stats {
+fn run_lib(ext_filter: &str, func: LibFn, files: &[PathBuf]) -> Stats {
     let mut stats = Stats::new();
     for path in files {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
@@ -145,8 +152,12 @@ fn print_stats(lib_name: &str, ext: &str, s: &Stats) {
     let total = s.ok + s.fail;
     let pct = if total > 0 { s.ok as f64 / total as f64 * 100.0 } else { 0.0 };
     let wall = s.total_ms / 1000.0;
+    let mean = if total > 0 { s.total_ms / total as f64 } else { 0.0 };
     println!("{} ({}):", lib_name, ext);
-    println!("  Total: {}  OK: {}  FAIL: {}  Rate: {:.1}%  Wall: {:.1}s", total, s.ok, s.fail, pct, wall);
+    println!(
+        "  Total: {}  OK: {}  FAIL: {}  Rate: {:.1}%  Wall: {:.1}s  Mean: {:.2}ms",
+        total, s.ok, s.fail, pct, wall, mean
+    );
     if !s.errors.is_empty() {
         let mut errs: Vec<(&String, &usize)> = s.errors.iter().collect();
         errs.sort_by(|a, b| b.1.cmp(a.1));
@@ -157,37 +168,130 @@ fn print_stats(lib_name: &str, ext: &str, s: &Stats) {
     println!();
 }
 
+/// Peak resident-set size of this process in KB. Linux reports KB, macOS bytes.
+fn peak_rss_kb() -> i64 {
+    // SAFETY: getrusage with a valid struct pointer is defined to succeed for RUSAGE_SELF.
+    unsafe {
+        let mut r: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut r) != 0 {
+            return 0;
+        }
+        if cfg!(target_os = "macos") {
+            r.ru_maxrss / 1024
+        } else {
+            r.ru_maxrss
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct Run<'a> {
+    lib: &'a str,
+    ext: &'a str,
+    #[serde(flatten)]
+    stats: &'a Stats,
+}
+
+#[derive(Serialize)]
+struct Report<'a> {
+    peak_rss_kb: i64,
+    peak_rss_delta_kb: i64,
+    runs: Vec<Run<'a>>,
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+
+    // Optional --json OUT flag; strip it from the positional args.
+    let mut json_out: Option<String> = None;
+    let mut args: Vec<String> = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == "--json" && i + 1 < raw.len() {
+            json_out = Some(raw[i + 1].clone());
+            i += 2;
+        } else {
+            args.push(raw[i].clone());
+            i += 1;
+        }
+    }
+
     if args.len() < 2 {
-        eprintln!("Usage: bench_rust --lib <calamine|dotext|docx-rs|all> DIR");
+        eprintln!(
+            "Usage: bench_rust [--json OUT] --lib <office_oxide|calamine|dotext|docx-rs|all> DIR"
+        );
         std::process::exit(1);
     }
 
-    let lib_arg = if args[0] == "--lib" { &args[1] } else { &args[0] };
+    let lib_arg = if args[0] == "--lib" { args[1].clone() } else { args[0].clone() };
     let dir_arg = args.last().unwrap();
     let dir = Path::new(dir_arg);
     let files = collect_files(dir);
     eprintln!("Found {} files", files.len());
 
+    let rss_start = peak_rss_kb();
     println!("\n=== Rust Library Benchmark Results ===\n");
 
     let run_all = lib_arg == "all";
+    let mut results: Vec<(String, String, Stats)> = Vec::new();
 
+    if run_all || lib_arg == "office_oxide" {
+        for ext in ["docx", "xlsx", "pptx", "xls"] {
+            let s = run_lib(ext, try_office_oxide, &files);
+            print_stats("office_oxide", ext, &s);
+            results.push(("office_oxide".into(), ext.into(), s));
+        }
+    }
     if run_all || lib_arg == "calamine" {
-        let s = run_lib("calamine", "xlsx", try_calamine, &files);
-        print_stats("calamine", "xlsx", &s);
+        for ext in ["xlsx", "xls"] {
+            let s = run_lib(ext, try_calamine, &files);
+            print_stats("calamine", ext, &s);
+            results.push(("calamine".into(), ext.into(), s));
+        }
     }
     if run_all || lib_arg == "docx-rs" {
-        let s = run_lib("docx-rs", "docx", try_docx_rs, &files);
+        let s = run_lib("docx", try_docx_rs, &files);
         print_stats("docx-rs", "docx", &s);
+        results.push(("docx-rs".into(), "docx".into(), s));
     }
     if run_all || lib_arg == "dotext" {
-        let s1 = run_lib("dotext", "docx", try_dotext_docx, &files);
+        let s1 = run_lib("docx", try_dotext_docx, &files);
         print_stats("dotext", "docx", &s1);
-        let s2 = run_lib("dotext", "xlsx", try_dotext_xlsx, &files);
+        results.push(("dotext".into(), "docx".into(), s1));
+        let s2 = run_lib("xlsx", try_dotext_xlsx, &files);
         print_stats("dotext", "xlsx", &s2);
-        let s3 = run_lib("dotext", "pptx", try_dotext_pptx, &files);
+        results.push(("dotext".into(), "xlsx".into(), s2));
+        let s3 = run_lib("pptx", try_dotext_pptx, &files);
         print_stats("dotext", "pptx", &s3);
+        results.push(("dotext".into(), "pptx".into(), s3));
+    }
+
+    let rss_end = peak_rss_kb();
+    println!(
+        "Peak RSS: {:.1} MiB (delta {:.1} MiB)",
+        rss_end as f64 / 1024.0,
+        (rss_end - rss_start) as f64 / 1024.0
+    );
+
+    if let Some(path) = json_out {
+        let runs: Vec<Run> = results
+            .iter()
+            .map(|(lib, ext, s)| Run { lib: lib.as_str(), ext: ext.as_str(), stats: s })
+            .collect();
+        let report = Report {
+            peak_rss_kb: rss_end,
+            peak_rss_delta_kb: rss_end - rss_start,
+            runs,
+        };
+        match std::fs::File::create(&path) {
+            Ok(f) => {
+                if let Err(e) = serde_json::to_writer_pretty(f, &report) {
+                    eprintln!("failed to write {}: {}", path, e);
+                } else {
+                    eprintln!("wrote JSON results to {}", path);
+                }
+            }
+            Err(e) => eprintln!("failed to open {}: {}", path, e),
+        }
     }
 }

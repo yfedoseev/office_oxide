@@ -1,12 +1,21 @@
+# Standalone crate — intentionally NOT part of the workspace so it can
+# depend on both office_oxide (path) and third-party parsers without
+# polluting the published workspace dependency graph.
+[workspace]
+
 [package]
 name = "bench_rust"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+office_oxide = { path = "..", default-features = false }
 calamine = "0.26"
 dotext = "0.1"
 docx-rs = "0.4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [[bin]]
 name = "bench_rust"
