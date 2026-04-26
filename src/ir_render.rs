@@ -199,9 +199,6 @@ fn render_table_markdown(table: &Table) -> String {
 
     let mut result = String::new();
 
-    // Find first header row, or use first row
-    let has_header = table.rows.first().is_some_and(|r| r.is_header);
-
     let first_row = &table.rows[0];
     result.push('|');
     for i in 0..col_count {
@@ -244,7 +241,6 @@ fn render_table_markdown(table: &Table) -> String {
         result.pop();
     }
 
-    let _ = has_header; // header status used for semantic correctness
     result
 }
 
