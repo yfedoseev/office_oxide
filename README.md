@@ -311,8 +311,25 @@ office_oxide = "0.1.0"
 ### JavaScript/WASM
 
 ```bash
-npm install office-oxide-wasm
+npm install office-oxide-wasm    # portable WASM (browser + Node.js)
+npm install office-oxide         # native addon via koffi (Node.js only, no node-gyp)
 ```
+
+### Go
+
+```bash
+go get github.com/yfedoseev/office_oxide/go
+```
+
+See [go/README.md](go/README.md) for setup details.
+
+### C# / .NET
+
+```bash
+dotnet add package OfficeOxide
+```
+
+See [csharp/OfficeOxide/README.md](csharp/OfficeOxide/README.md) for setup details.
 
 ### MCP Server (for AI assistants)
 
@@ -351,6 +368,10 @@ cargo test
 
 # Python bindings
 maturin develop --features python
+
+# Shared library for Go, JS/TS (koffi), and C# bindings
+cargo build --release --lib
+# Output: target/release/liboffice_oxide.{so,dylib} or office_oxide.dll
 ```
 
 ## Documentation
@@ -358,6 +379,14 @@ maturin develop --features python
 - **[API Docs (Rust)](https://docs.rs/office_oxide)** — Full Rust API reference
 - **[Documentation Site](https://office.oxide.fyi)** — Guides and examples
 - **[Architecture](docs/ARCHITECTURE.md)** — System design and module structure
+
+## Why I built this
+
+I needed a library that could read all six Office formats at once — not six separate packages — and I needed it without pulling in a JVM, a Python runtime, or a GPL-licensed dependency. Nothing existed that combined speed, correctness, and a permissive license across the full DOCX / XLSX / PPTX / DOC / XLS / PPT surface, so I wrote it in Rust and wrapped it for every language I use day-to-day. The same binary powers Python via PyO3, Node.js via koffi, Go via cgo, C# via P/Invoke, and the browser via WASM — one fix lands everywhere.
+
+If it saves you a dependency, a license audit, or a weekend, consider leaving a star. If something's broken or missing, [open an issue](https://github.com/yfedoseev/office_oxide/issues) — I read all of them.
+
+— Yury
 
 ## Use Cases
 
@@ -383,7 +412,7 @@ cargo build && cargo test && cargo fmt && cargo clippy -- -D warnings
 
 ```bibtex
 @software{office_oxide,
-  title = {Office Oxide: Fast Office Document Processing for Rust and Python},
+  title = {Office Oxide: Fast Office Document Processing for Rust, Python, Go, JavaScript, and C#},
   author = {Yury Fedoseev},
   year = {2026},
   url = {https://github.com/yfedoseev/office_oxide}
@@ -392,4 +421,4 @@ cargo build && cargo test && cargo fmt && cargo clippy -- -D warnings
 
 ---
 
-**Rust** + **Python** + **WASM** | MIT/Apache-2.0 | 98.4% pass rate on 6,062 files (zero failures on legitimate Office docs) | Up to 100× faster than alternatives | 6 formats
+**Rust** + **Python** + **Go** + **JS/TS** + **C#** + **WASM** + **CLI** + **MCP** | MIT/Apache-2.0 | 98.4% pass rate on 6,062 files (zero failures on legitimate Office docs) | Up to 100× faster than alternatives | 6 formats
