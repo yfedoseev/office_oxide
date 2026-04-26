@@ -310,6 +310,49 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
 
+  # Unused dependencies (cargo-shear)
+  shear:
+    name: Unused deps (cargo-shear)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: shear
+      - name: Install cargo-shear
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-shear
+      - name: Check for unused dependencies
+        run: cargo shear
+
+  # Benchmark smoke test — verify all benches compile
+  bench:
+    name: Benchmark Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
+      - name: Build benchmarks (compile check only)
+        run: cargo bench --no-run
+
+  # CLI smoke test — verify the CLI binary builds and responds to --help
+  cli:
+    name: CLI Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build CLI
+        run: cargo build -p office_oxide_cli
+      - name: Verify CLI --help
+        run: cargo run -p office_oxide_cli -- --help
+
   # Security audit
   audit:
     name: Security Audit
