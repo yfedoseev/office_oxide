@@ -116,6 +116,30 @@ path = "examples/rust/extract.rs"
 name = "make_smoke"
 path = "examples/rust/make_smoke.rs"
 
+[[example]]
+name = "01_extract"
+path = "examples/rust/01_extract.rs"
+
+[[example]]
+name = "02_create_rich"
+path = "examples/rust/02_create_rich.rs"
+
+[[example]]
+name = "03_create_xlsx"
+path = "examples/rust/03_create_xlsx.rs"
+
+[[example]]
+name = "04_create_pptx"
+path = "examples/rust/04_create_pptx.rs"
+
+[[example]]
+name = "05_edit"
+path = "examples/rust/05_edit.rs"
+
+[[example]]
+name = "06_from_markdown"
+path = "examples/rust/06_from_markdown.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1

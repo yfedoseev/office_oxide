@@ -16,7 +16,7 @@ We take the security of office_oxide seriously. If you believe you have found a 
 
 **Please do not report security vulnerabilities through public GitHub issues.**
 
-Instead, please email security reports to the maintainers. You can find contact information in [CONTRIBUTING.md](CONTRIBUTING.md).
+Instead, please email security reports directly to **yfedoseev@gmail.com** with the subject line `[office_oxide] Security Vulnerability Report`.
 
 ### What to Include
 

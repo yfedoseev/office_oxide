@@ -93,6 +93,18 @@ public sealed class Document : IDisposable
 
     private delegate IntPtr StringCall(IntPtr h, out int err);
 
+    /// <summary>
+    /// Convert a Markdown string to an Office document file.
+    /// </summary>
+    /// <param name="markdown">The Markdown content.</param>
+    /// <param name="format">Output format: "docx", "xlsx", or "pptx".</param>
+    /// <param name="path">Destination file path.</param>
+    public static void CreateFromMarkdown(string markdown, string format, string path)
+    {
+        int rc = NativeMethods.OfficeCreateFromMarkdown(markdown, format, path, out int errCode);
+        if (rc != 0) throw new OfficeOxideException(errCode, nameof(CreateFromMarkdown));
+    }
+
     private string CallString(StringCall call, string op)
     {
         EnsureOpen();

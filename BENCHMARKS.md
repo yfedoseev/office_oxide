@@ -209,3 +209,4 @@ Rust comparison crates (from `bench_rust/Cargo.toml`):
   (`bench_python.py --json`, `bench_rust`) capture RSS but we have not
   yet executed a full corpus run with those numbers recorded. Expected
   in the next benchmark release.
+

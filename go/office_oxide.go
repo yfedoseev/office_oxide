@@ -405,3 +405,21 @@ func ToHTML(path string) (string, error) {
 	defer C.office_oxide_free_string(out)
 	return C.GoString(out), nil
 }
+
+// CreateFromMarkdown converts a Markdown string into an Office document file.
+//
+// format must be "docx", "xlsx", or "pptx" (case-insensitive).
+func CreateFromMarkdown(markdown, format, path string) error {
+	cmd := C.CString(markdown)
+	defer C.free(unsafe.Pointer(cmd))
+	cfmt := C.CString(format)
+	defer C.free(unsafe.Pointer(cfmt))
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+	var errCode C.int
+	rc := C.office_create_from_markdown(cmd, cfmt, cpath, &errCode)
+	if rc != 0 {
+		return &Error{Code: int(errCode), Op: "CreateFromMarkdown"}
+	}
+	return nil
+}

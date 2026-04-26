@@ -7,6 +7,38 @@ use crate::Result;
 use crate::format::DocumentFormat;
 use crate::ir::*;
 
+/// Create a document file by parsing Markdown and converting it to the target format.
+///
+/// This is the primary integration bridge between markdown-producing tools and Office documents.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use office_oxide::create::create_from_markdown;
+/// use office_oxide::format::DocumentFormat;
+///
+/// let markdown = "# Report\n\nThis is a paragraph.\n\n- item one\n- item two\n";
+/// create_from_markdown(markdown, DocumentFormat::Docx, "report.docx").unwrap();
+/// ```
+pub fn create_from_markdown(
+    markdown: &str,
+    format: DocumentFormat,
+    path: impl AsRef<Path>,
+) -> Result<()> {
+    let ir = DocumentIR::from_markdown(markdown, format);
+    create_from_ir(&ir, format, path)
+}
+
+/// Create a document by parsing Markdown and writing to any `Write + Seek` destination.
+pub fn create_from_markdown_to_writer<W: Write + Seek>(
+    markdown: &str,
+    format: DocumentFormat,
+    writer: W,
+) -> Result<()> {
+    let ir = DocumentIR::from_markdown(markdown, format);
+    create_from_ir_to_writer(&ir, format, writer)
+}
+
 /// Create a document file from a `DocumentIR`.
 pub fn create_from_ir(
     ir: &DocumentIR,
@@ -128,7 +160,7 @@ fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
 
     for section in &ir.sections {
         let name = section.title.as_deref().unwrap_or("Sheet");
-        let sheet = writer.add_sheet(name);
+        let mut sheet = writer.add_sheet(name);
 
         for elem in &section.elements {
             match elem {

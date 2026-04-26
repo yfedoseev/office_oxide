@@ -23,6 +23,7 @@ pub mod edit;
 pub mod error;
 pub mod format;
 pub mod ir;
+mod ir_from_markdown;
 mod ir_render;
 
 #[cfg(not(target_family = "wasm"))]

@@ -79,21 +79,39 @@ This project adheres to the [Contributor Covenant Code of Conduct](CODE_OF_CONDU
 
 ```
 office_oxide/
+├── src/
+│   ├── lib.rs             # Unified Document API + convenience functions
+│   ├── core/              # Shared OPC/ZIP/XML/theme primitives (55 tests)
+│   ├── cfb/               # CFBF/OLE2 container reader (18 tests)
+│   ├── docx/              # Word document (.docx) — read/write/edit (36 tests)
+│   ├── xlsx/              # Excel spreadsheet (.xlsx) — read/write/edit (57 tests)
+│   ├── pptx/              # PowerPoint presentation (.pptx) — read/write/edit (40 tests)
+│   ├── doc/               # Legacy Word Binary (.doc) (15 tests)
+│   ├── xls/               # Legacy Excel Binary (.xls) (24 tests)
+│   ├── ppt/               # Legacy PowerPoint Binary (.ppt) (15 tests)
+│   ├── ir.rs              # Format-agnostic DocumentIR
+│   ├── ir_render.rs       # IR → plain_text / markdown / html
+│   ├── create.rs          # IR → DOCX/XLSX/PPTX creation
+│   ├── edit.rs            # Unified EditableDocument API
+│   ├── python.rs          # PyO3 bindings (feature = python)
+│   ├── wasm.rs            # wasm-bindgen bindings (feature = wasm)
+│   └── ffi.rs             # C FFI for Go/C#/Node.js (cdylib + staticlib)
 ├── crates/
-│   ├── office_core/       # Shared OPC/ZIP/XML primitives
-│   ├── cfb_oxide/         # CFBF/OLE2 container reader
-│   ├── doc_oxide/         # Legacy Word Binary (.doc)
-│   ├── xls_oxide/         # Legacy Excel Binary (.xls)
-│   ├── ppt_oxide/         # Legacy PowerPoint Binary (.ppt)
-│   ├── docx_oxide/        # Word document (.docx)
-│   ├── xlsx_oxide/        # Excel spreadsheet (.xlsx)
-│   ├── pptx_oxide/        # PowerPoint presentation (.pptx)
-│   ├── office_oxide/      # Unified API + Python/WASM bindings
-│   ├── office_oxide_cli/  # CLI tool
-│   └── office_oxide_mcp/  # MCP server
-├── python/                # Python package (stubs, __init__.py)
-├── wasm-pkg/              # WASM package config
-└── docs/                  # Architecture and specification docs
+│   ├── office_oxide_cli/  # CLI binary: office-oxide
+│   └── office_oxide_mcp/  # MCP server binary: office-oxide-mcp
+├── examples/
+│   ├── rust/              # extract.rs, make_smoke.rs
+│   ├── python/            # extract.py, read_xlsx.py, replace.py
+│   ├── go/                # extract, read_xlsx, replace
+│   ├── javascript/        # extract.mjs, read_xlsx.mjs, replace.mjs
+│   └── c/                 # extract.c
+├── python/                # Python package: office_oxide/__init__.py, _native.pyi
+├── go/                    # Go bindings (CGo over C FFI)
+├── js/                    # Node.js native bindings (koffi)
+├── wasm-pkg/              # WASM npm package config
+├── csharp/                # C# / .NET bindings (P/Invoke)
+├── include/               # C header: office_oxide_c/office_oxide.h
+└── docs/                  # Architecture, per-language getting-started guides
 ```
 
 ## Development Workflow
@@ -129,11 +147,14 @@ Write code following our [Coding Standards](#coding-standards).
 # Run all tests
 cargo test
 
-# Run specific crate tests
-cargo test -p docx_oxide
+# Run tests for a specific module (all in the same crate)
+cargo test docx::
 
 # Run with features
 cargo test --features python
+
+# Build and verify examples
+cargo build --examples
 
 # Watch mode (auto-reload)
 cargo watch -x test

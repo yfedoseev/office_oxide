@@ -77,4 +77,5 @@ export const native = {
   extractText: lib.func('HeapStr office_extract_text(const char* path, _Out_ int* error_code)'),
   toMarkdown: lib.func('HeapStr office_to_markdown(const char* path, _Out_ int* error_code)'),
   toHtml: lib.func('HeapStr office_to_html(const char* path, _Out_ int* error_code)'),
+  createFromMarkdown: lib.func('int32_t office_create_from_markdown(const char* markdown, const char* format, const char* path, _Out_ int* error_code)'),
 };

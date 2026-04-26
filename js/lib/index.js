@@ -158,3 +158,15 @@ function oneShot(fn, name, path) {
 export function extractText(path) { return oneShot(native.extractText, 'extractText', path); }
 export function toMarkdown(path) { return oneShot(native.toMarkdown, 'toMarkdown', path); }
 export function toHtml(path) { return oneShot(native.toHtml, 'toHtml', path); }
+
+/**
+ * Convert a Markdown string to an Office document file.
+ * @param {string} markdown - The Markdown content.
+ * @param {string} format - One of "docx", "xlsx", or "pptx".
+ * @param {string} path - Output file path.
+ */
+export function createFromMarkdown(markdown, format, path) {
+  const err = [0];
+  const rc = native.createFromMarkdown(markdown, format, path, err);
+  if (rc !== 0) throw new OfficeOxideError(err[0], 'createFromMarkdown');
+}

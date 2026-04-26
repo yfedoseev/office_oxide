@@ -76,7 +76,7 @@ fn docx_write_list_round_trip() {
 fn xlsx_write_cells_round_trip() {
     let mut writer = office_oxide::xlsx::write::XlsxWriter::new();
     {
-        let sheet = writer.add_sheet("Data");
+        let mut sheet = writer.add_sheet("Data");
         sheet.add_row(vec![
             office_oxide::xlsx::write::CellData::String("Name".into()),
             office_oxide::xlsx::write::CellData::String("Score".into()),
@@ -107,11 +107,11 @@ fn xlsx_write_cells_round_trip() {
 fn xlsx_write_multiple_sheets_round_trip() {
     let mut writer = office_oxide::xlsx::write::XlsxWriter::new();
     {
-        let s1 = writer.add_sheet("Sheet1");
+        let mut s1 = writer.add_sheet("Sheet1");
         s1.add_row(vec![office_oxide::xlsx::write::CellData::String("A1".into())]);
     }
     {
-        let s2 = writer.add_sheet("Sheet2");
+        let mut s2 = writer.add_sheet("Sheet2");
         s2.add_row(vec![office_oxide::xlsx::write::CellData::String("B1".into())]);
     }
 
@@ -130,7 +130,7 @@ fn xlsx_write_multiple_sheets_round_trip() {
 fn xlsx_write_empty_cells_round_trip() {
     let mut writer = office_oxide::xlsx::write::XlsxWriter::new();
     {
-        let sheet = writer.add_sheet("Sparse");
+        let mut sheet = writer.add_sheet("Sparse");
         sheet.add_row(vec![
             office_oxide::xlsx::write::CellData::String("Start".into()),
             office_oxide::xlsx::write::CellData::Empty,
@@ -375,7 +375,7 @@ fn docx_edit_replace_text_round_trip() {
 fn xlsx_edit_set_cell_round_trip() {
     let mut writer = office_oxide::xlsx::write::XlsxWriter::new();
     {
-        let sheet = writer.add_sheet("Sheet1");
+        let mut sheet = writer.add_sheet("Sheet1");
         sheet.add_row(vec![office_oxide::xlsx::write::CellData::String(
             "Original".into(),
         )]);

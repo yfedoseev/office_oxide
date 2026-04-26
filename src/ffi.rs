@@ -609,3 +609,48 @@ pub extern "C" fn office_to_html(path: *const c_char, error_code: *mut i32) -> *
         },
     }
 }
+
+/// One-shot: convert a Markdown string to an Office document at `path`.
+///
+/// `format` must be one of `"docx"`, `"xlsx"`, or `"pptx"` (case-insensitive).
+/// Returns `OFFICE_OK` (0) on success, a negative error code on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn office_create_from_markdown(
+    markdown: *const c_char,
+    format: *const c_char,
+    path: *const c_char,
+    error_code: *mut i32,
+) -> i32 {
+    let Some(md) = cstr_to_str(markdown) else {
+        set_err(error_code, OFFICE_ERR_INVALID_ARG);
+        return OFFICE_ERR_INVALID_ARG;
+    };
+    let Some(fmt_str) = cstr_to_str(format) else {
+        set_err(error_code, OFFICE_ERR_INVALID_ARG);
+        return OFFICE_ERR_INVALID_ARG;
+    };
+    let Some(out_path) = cstr_to_pathbuf(path) else {
+        set_err(error_code, OFFICE_ERR_INVALID_ARG);
+        return OFFICE_ERR_INVALID_ARG;
+    };
+    let doc_format = match fmt_str.to_ascii_lowercase().as_str() {
+        "docx" => crate::DocumentFormat::Docx,
+        "xlsx" => crate::DocumentFormat::Xlsx,
+        "pptx" => crate::DocumentFormat::Pptx,
+        _ => {
+            set_err(error_code, OFFICE_ERR_INVALID_ARG);
+            return OFFICE_ERR_INVALID_ARG;
+        },
+    };
+    match crate::create::create_from_markdown(md, doc_format, &out_path) {
+        Ok(()) => {
+            set_err(error_code, OFFICE_OK);
+            OFFICE_OK
+        },
+        Err(e) => {
+            let code = classify_error(&e);
+            set_err(error_code, code);
+            code
+        },
+    }
+}

@@ -23,12 +23,13 @@ jobs:
         python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13', '3.14']
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -52,7 +53,7 @@ jobs:
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v4
 
       - name: Create virtual environment with uv
         run: uv venv
@@ -83,7 +84,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -97,7 +98,7 @@ jobs:
         run: cargo clippy --features python --all-targets -- -D warnings
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v4
 
       - name: Pin Python version
         run: uv python pin 3.11
@@ -127,9 +128,9 @@ jobs:
           - target: aarch64
             manylinux: musllinux_1_2
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - name: Build wheels
@@ -139,7 +140,7 @@ jobs:
           manylinux: ${{ matrix.manylinux }}
           args: --release --features python --out dist
       - name: Upload wheels as artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.target }}-${{ matrix.manylinux }}
           path: dist/*.whl
@@ -154,9 +155,9 @@ jobs:
       matrix:
         target: [x86_64, aarch64]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - name: Build wheels
@@ -165,7 +166,7 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --features python --out dist
       - name: Upload wheels as artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-${{ matrix.target }}
           path: dist/*.whl
@@ -180,9 +181,9 @@ jobs:
       matrix:
         target: [x64, aarch64]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           architecture: x64
@@ -192,7 +193,7 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --features python --out dist
       - name: Upload wheels as artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: wheels-windows-${{ matrix.target }}
           path: dist/*.whl
@@ -203,14 +204,14 @@ jobs:
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: --out dist
       - name: Upload sdist as artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -223,13 +224,13 @@ jobs:
     if: github.event_name == 'release' && github.event.action == 'published'
 
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v4
         with:
           name: sdist
           path: dist

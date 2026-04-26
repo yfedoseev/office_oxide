@@ -21,7 +21,7 @@ jobs:
     name: Format Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -36,7 +36,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -62,7 +62,7 @@ jobs:
           - os: ubuntu-latest
             rust: nightly
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -76,6 +76,19 @@ jobs:
 
       - name: Build
         run: cargo build --verbose
+
+      - name: Build examples
+        run: cargo build --examples --verbose
+
+      - name: Run Rust examples (self-contained)
+        if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
+        run: |
+          cargo run --example 01_extract
+          cargo run --example 02_create_rich
+          cargo run --example 03_create_xlsx
+          cargo run --example 04_create_pptx
+          cargo run --example 05_edit
+          cargo run --example 06_from_markdown
 
       - name: Run tests
         run: cargo test --verbose
@@ -97,7 +110,7 @@ jobs:
           - "parallel"
           - "python"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -122,12 +135,13 @@ jobs:
         python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -136,7 +150,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v4
 
       - name: Create virtual environment
         run: uv venv
@@ -156,12 +170,20 @@ jobs:
       - name: Test Python bindings
         run: uv run python -c "import office_oxide; print('office_oxide imported successfully')"
 
+      - name: Run Python examples
+        if: matrix.python-version == '3.12'
+        run: |
+          uv run python examples/python/01_extract/main.py
+          uv run python examples/python/02_create_from_markdown/main.py
+          uv run python examples/python/03_edit/main.py
+          uv run python examples/python/04_batch/main.py
+
   # Go binding test
   go:
     name: Go bindings
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-go@v5
         with:
@@ -173,12 +195,18 @@ jobs:
         run: go test -tags office_oxide_dev -v ./...
         working-directory: go
 
+      - name: Run Go examples
+        run: |
+          (cd examples/go/01_extract && go run -tags office_oxide_dev .)
+          (cd examples/go/02_create_from_markdown && go run -tags office_oxide_dev .)
+          (cd examples/go/03_edit && go run -tags office_oxide_dev .)
+
   # C# binding test
   csharp:
     name: C# bindings
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-dotnet@v4
         with:
@@ -191,14 +219,22 @@ jobs:
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/release
 
+      - name: Run C# examples
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/release
+        run: |
+          dotnet run --project examples/csharp/01_extract/01_extract.csproj
+          dotnet run --project examples/csharp/02_create_from_markdown/02_create_from_markdown.csproj
+          dotnet run --project examples/csharp/03_edit/03_edit.csproj
+
   # Node-native binding test (koffi)
   node-native:
     name: Node-native bindings
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
       - uses: Swatinem/rust-cache@v2
@@ -210,12 +246,20 @@ jobs:
         env:
           OFFICE_OXIDE_LIB: ${{ github.workspace }}/target/release/liboffice_oxide.so
 
+      - name: Run JS examples
+        env:
+          OFFICE_OXIDE_LIB: ${{ github.workspace }}/target/release/liboffice_oxide.so
+        run: |
+          node examples/javascript/01_extract.mjs
+          node examples/javascript/02_create_from_markdown.mjs
+          node examples/javascript/03_edit.mjs
+
   # WASM build check
   wasm-build:
     name: WASM Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -234,7 +278,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -260,7 +304,7 @@ jobs:
 
       - name: Upload coverage to Codecov
         if: always()
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v5
         with:
           files: ./lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -271,7 +315,7 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Run security audit
         uses: actions-rust-lang/audit@v1
@@ -281,7 +325,7 @@ jobs:
     name: Dependency Check (cargo-deny)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - name: Check dependencies
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
@@ -293,7 +337,7 @@ jobs:
     name: TOML format (taplo)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -311,7 +355,7 @@ jobs:
     name: Feature powerset (cargo-hack)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -329,7 +373,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
           feature-group: default-features
@@ -339,7 +383,7 @@ jobs:
     name: MSRV build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - name: Read MSRV from Cargo.toml
         id: msrv
         run: |

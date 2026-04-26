@@ -103,6 +103,9 @@ internal static partial class NativeMethods
     [LibraryImport(Lib, EntryPoint = "office_to_html", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial IntPtr OfficeToHtml(string path, out int errorCode);
 
+    [LibraryImport(Lib, EntryPoint = "office_create_from_markdown", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial int OfficeCreateFromMarkdown(string markdown, string format, string path, out int errorCode);
+
     /// <summary>
     /// Take an FFI-allocated UTF-8 C string, copy it to a managed string,
     /// and free the original allocation.

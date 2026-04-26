@@ -269,6 +269,18 @@ fn to_html(path: PathBuf) -> PyResult<String> {
     Ok(crate::to_html(&path)?)
 }
 
+/// Create an Office document from Markdown text.
+///
+/// `format` must be one of `"docx"`, `"xlsx"`, or `"pptx"`.
+#[pyfunction]
+#[pyo3(signature = (markdown, format, path, /))]
+fn create_from_markdown(markdown: &str, format: &str, path: PathBuf) -> PyResult<()> {
+    let fmt = crate::format::DocumentFormat::from_extension(format)
+        .ok_or_else(|| OfficeOxideError::new_err(format!("unsupported format: {format}")))?;
+    crate::create::create_from_markdown(markdown, fmt, &path)?;
+    Ok(())
+}
+
 /// Library version (matches the Rust crate version).
 #[pyfunction]
 fn version() -> &'static str {
@@ -285,6 +297,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_text, m)?)?;
     m.add_function(wrap_pyfunction!(to_markdown, m)?)?;
     m.add_function(wrap_pyfunction!(to_html, m)?)?;
+    m.add_function(wrap_pyfunction!(create_from_markdown, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     Ok(())
 }

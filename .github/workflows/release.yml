@@ -25,10 +25,10 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Setup Node (for package.json version parity check)
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
 
@@ -107,7 +107,7 @@ jobs:
             artifact_name: office_oxide-windows-aarch64
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -160,7 +160,7 @@ jobs:
           echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ env.ARCHIVE }}
@@ -200,7 +200,7 @@ jobs:
             artifact_name: native-windows-aarch64
             shared_ext: dll
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -230,7 +230,7 @@ jobs:
           cp target/${{ matrix.target }}/release/office_oxide.lib staging/lib/ 2>/dev/null || true
           cp -r include/office_oxide_c staging/include/
           cd staging && 7z a "../${{ matrix.artifact_name }}.zip" . && cd ..
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: |
@@ -244,7 +244,7 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-go@v5
         with:
@@ -259,7 +259,7 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-dotnet@v4
         with:
@@ -275,9 +275,9 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
       - run: cargo build --release --lib
@@ -294,7 +294,7 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -339,7 +339,7 @@ jobs:
           printf '{"type": "module"}\n'   > wasm-pkg/web/package.json
 
       - name: Upload WASM artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: wasm-package
           path: wasm-pkg/
@@ -371,10 +371,10 @@ jobs:
             artifact_name: wheels-windows-x86_64
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -384,7 +384,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v4
 
       - name: Install maturin
         run: uv pip install --system maturin
@@ -393,7 +393,7 @@ jobs:
         run: maturin build --release --features python --target ${{ matrix.target }} --out dist
 
       - name: Upload wheels
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: dist/*.whl
@@ -405,9 +405,9 @@ jobs:
     needs: [validate, build-native-libs]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - name: Download native artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           path: native
           pattern: native-*
@@ -444,7 +444,7 @@ jobs:
             done
           done
           ls -R js/prebuilds
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v4
         with:
           name: node-native-package
           path: js/
@@ -459,11 +459,11 @@ jobs:
     needs: [validate, build-python-wheels]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v4
         with:
           path: wheels
           pattern: wheels-linux-x86_64
@@ -489,12 +489,12 @@ jobs:
     needs: [validate, build-wasm]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v4
         with:
           name: wasm-package
           path: wasm-pkg
@@ -517,12 +517,12 @@ jobs:
     needs: [validate, package-node-native]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v4
         with:
           name: node-native-package
           path: staged-js
@@ -553,11 +553,11 @@ jobs:
     needs: [validate, build-native-libs]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v4
         with:
           path: native
           pattern: native-*
@@ -618,12 +618,12 @@ jobs:
     needs: [validate, build-native-libs]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: '1.21'
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v4
         with:
           name: native-linux-x86_64
           path: release-assets
@@ -700,10 +700,10 @@ jobs:
       - verify-go-install
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
 
@@ -740,7 +740,7 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !contains(needs.validate.outputs.version, '-') }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -784,7 +784,7 @@ jobs:
     if: ${{ !contains(needs.validate.outputs.version, '-') }}
     steps:
       - name: Download wheel artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           path: wheels
           pattern: wheels-*
@@ -810,13 +810,13 @@ jobs:
     if: ${{ !contains(needs.validate.outputs.version, '-') }}
     steps:
       - name: Download WASM artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           name: wasm-package
           path: wasm-out
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
@@ -834,11 +834,11 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !contains(needs.validate.outputs.version, '-') }}
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v4
         with:
           name: node-native-package
           path: js
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
@@ -855,11 +855,11 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !contains(needs.validate.outputs.version, '-') }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v4
         with:
           path: native
           pattern: native-*
@@ -910,7 +910,7 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !contains(needs.validate.outputs.version, '-') }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Push go/v${{ needs.validate.outputs.version }} tag
@@ -929,10 +929,10 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !contains(needs.validate.outputs.version, '-') }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Download binary artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
           pattern: office_oxide-*
@@ -971,10 +971,10 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !contains(needs.validate.outputs.version, '-') }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Download Windows artifacts (x64 + arm64)
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
           pattern: office_oxide-windows-*
