@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // ESM entry point for office-oxide.
 //
 // The native functions that allocate C strings already return JS strings

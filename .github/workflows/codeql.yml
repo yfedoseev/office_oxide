@@ -1,0 +1,49 @@
+name: CodeQL SAST
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Weekly on Wednesday at 02:00 UTC
+    - cron: '0 2 * * 3'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: CodeQL analysis
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write  # upload SARIF results
+      actions: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@ce64ddcb0d8d890d2df4a9d1c04ff297367dea2a # v3
+        with:
+          languages: ${{ matrix.language }}
+          # Use default queries + security-extended suite
+          queries: security-extended
+
+      - name: Build for CodeQL
+        run: cargo build --lib
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@ce64ddcb0d8d890d2df4a9d1c04ff297367dea2a # v3
+        with:
+          category: "/language:${{ matrix.language }}"

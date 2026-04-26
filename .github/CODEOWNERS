@@ -1,0 +1,9 @@
+# Default owner for all files
+* @yfedoseev
+
+# Binding-specific ownership (update when additional maintainers join)
+/go/         @yfedoseev
+/python/     @yfedoseev
+/js/         @yfedoseev
+/wasm-pkg/   @yfedoseev
+/csharp/     @yfedoseev

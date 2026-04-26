@@ -1,0 +1,89 @@
+name: Bug Report
+description: Something isn't working correctly
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time to report a bug. Please fill in as much detail as possible.
+        **Do not report security vulnerabilities here** — see [SECURITY.md](../../SECURITY.md) for the private reporting process.
+
+  - type: input
+    id: version
+    attributes:
+      label: office_oxide version
+      description: Output of `cargo pkgid office_oxide` or the version in your Cargo.toml / pip show office-oxide
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: binding
+    attributes:
+      label: Binding / language
+      options:
+        - Rust
+        - Python
+        - Go
+        - "JavaScript (native / koffi)"
+        - "JavaScript / WASM"
+        - "C# / .NET"
+        - C FFI
+        - CLI (office-oxide)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: format
+    attributes:
+      label: Document format
+      options:
+        - DOCX
+        - XLSX
+        - PPTX
+        - DOC
+        - XLS
+        - PPT
+        - "Not format-specific"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "e.g. Ubuntu 24.04, macOS 15.3, Windows 11"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug clearly. Include the error message or unexpected output.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Minimal reproducer
+      description: |
+        The smallest code that triggers the bug. A self-contained snippet is ideal.
+        If the bug requires a specific file, please attach a minimal example document (redact any sensitive content).
+      render: rust
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Anything else that might help — stack traces, related issues, etc.

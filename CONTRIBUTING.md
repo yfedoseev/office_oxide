@@ -330,6 +330,17 @@ Before submitting a PR, ensure:
 3. Once approved, your PR will be merged
 4. Your changes will appear in the next release
 
+## Developer Certificate of Origin (DCO)
+
+All commits must carry a `Signed-off-by` trailer certifying that you wrote the code and have the right to contribute it under the project's MIT OR Apache-2.0 license. Add it with:
+
+```bash
+git commit -s -m "feat(docx): add heading extraction"
+# Produces: Signed-off-by: Your Name <you@example.com>
+```
+
+This is checked automatically on every pull request by the DCO CI job. There is no CLA to sign — the sign-off is all that's required.
+
 ## License
 
 By contributing, you agree that your contributions will be dual licensed under **MIT OR Apache-2.0**, without any additional terms or conditions.

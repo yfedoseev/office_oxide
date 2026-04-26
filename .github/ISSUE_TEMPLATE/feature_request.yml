@@ -1,0 +1,57 @@
+name: Feature Request
+description: Propose a new capability or improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement! Please describe the problem you're trying to solve
+        rather than jumping straight to the solution — it helps us find the best approach together.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What are you trying to do that isn't possible today, or what is awkward/slow?
+      placeholder: "When processing XLSX files with thousands of rows, I need to..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed API / behaviour
+      description: |
+        If you have a concrete idea, show the API you'd like to call, or describe
+        how the output should differ from today.
+      render: rust
+    validations:
+      required: false
+
+  - type: dropdown
+    id: binding
+    attributes:
+      label: Which binding(s) does this affect?
+      multiple: true
+      options:
+        - Rust (core)
+        - Python
+        - Go
+        - "JavaScript (native)"
+        - WASM
+        - "C# / .NET"
+        - C FFI
+        - CLI
+        - "All bindings"
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Have you tried any workarounds? Why don't they satisfy the need?
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Links to specs, related issues, prior art in other libraries, etc.

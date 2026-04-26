@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! # office_oxide
 //!
 //! The fastest Office document processing library for Rust.

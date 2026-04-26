@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
 """office_oxide — fast Office document processing (DOCX, XLSX, PPTX, DOC, XLS, PPT).
 
 Quick start::

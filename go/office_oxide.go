@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 // Package officeoxide provides idiomatic Go bindings for the office_oxide
 // Rust library, which parses, converts, and edits Microsoft Office documents
 // (DOCX, XLSX, PPTX, DOC, XLS, PPT).
