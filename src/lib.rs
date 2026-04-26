@@ -1,3 +1,30 @@
+//! # office_oxide
+//!
+//! The fastest Office document processing library for Rust.
+//!
+//! Reads, writes, and edits **DOCX, XLSX, PPTX, DOC, XLS, PPT** — all six
+//! Microsoft Office formats — with a single unified API and zero C/C++
+//! dependencies.
+//!
+//! ## Quick start
+//!
+//! ```rust,no_run
+//! use office_oxide::Document;
+//!
+//! let doc = Document::open("report.docx")?;
+//! println!("{}", doc.plain_text());
+//! # Ok::<(), office_oxide::OfficeError>(())
+//! ```
+//!
+//! ## Feature flags
+//!
+//! | Flag | What it enables |
+//! |------|-----------------|
+//! | `python` | PyO3 Python bindings |
+//! | `wasm` | wasm-bindgen WASM bindings |
+//! | `mmap` | Memory-mapped file I/O |
+//! | `parallel` | Rayon-based parallel processing |
+
 // Sub-modules (previously separate crates)
 /// Library version (matches the Cargo package version).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
