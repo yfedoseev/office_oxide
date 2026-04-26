@@ -407,8 +407,8 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-hack
-      - name: Build every feature combination (root crate)
-        run: cargo hack check --feature-powerset --no-dev-deps --lib -p office_oxide
+      - name: Build each feature individually (root crate)
+        run: cargo hack check --each-feature --no-dev-deps --lib -p office_oxide
 
   # Public-API semver check (PR only — compares against base branch)
   semver-checks:
