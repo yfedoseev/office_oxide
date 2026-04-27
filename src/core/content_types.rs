@@ -73,10 +73,12 @@ impl ContentTypes {
         None
     }
 
+    /// Return the default content-type map keyed by lowercase file extension.
     pub fn defaults(&self) -> &HashMap<String, String> {
         &self.defaults
     }
 
+    /// Return the override content-type map keyed by part name.
     pub fn overrides(&self) -> &HashMap<PartName, String> {
         &self.overrides
     }
@@ -90,6 +92,7 @@ pub struct ContentTypesBuilder {
 }
 
 impl ContentTypesBuilder {
+    /// Create a new builder pre-populated with the standard OPC defaults.
     pub fn new() -> Self {
         let mut defaults = HashMap::new();
         // Standard defaults present in all OPC packages
@@ -104,15 +107,18 @@ impl ContentTypesBuilder {
         }
     }
 
+    /// Register a default content type for a file extension (case-insensitive).
     pub fn add_default(&mut self, extension: &str, content_type: &str) {
         self.defaults
             .insert(extension.to_ascii_lowercase(), content_type.to_string());
     }
 
+    /// Register an override content type for a specific part name.
     pub fn add_override(&mut self, part_name: PartName, content_type: &str) {
         self.overrides.push((part_name, content_type.to_string()));
     }
 
+    /// Consume the builder and return a `ContentTypes` lookup table.
     pub fn build(self) -> ContentTypes {
         let overrides = self.overrides.into_iter().collect();
         ContentTypes {

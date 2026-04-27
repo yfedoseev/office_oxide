@@ -12,35 +12,50 @@ use super::table::TableProperties;
 /// Parsed stylesheet from `word/styles.xml`.
 #[derive(Debug, Clone, Default)]
 pub struct StyleSheet {
+    /// Document-wide default formatting.
     pub doc_defaults: Option<DocDefaults>,
+    /// Map from style ID to style definition.
     pub styles: HashMap<String, Style>,
 }
 
 /// Document-wide default properties.
 #[derive(Debug, Clone, Default)]
 pub struct DocDefaults {
+    /// Default run properties applied to all text.
     pub run_properties: Option<RunProperties>,
+    /// Default paragraph properties.
     pub paragraph_properties: Option<ParagraphProperties>,
 }
 
 /// A single style definition.
 #[derive(Debug, Clone)]
 pub struct Style {
+    /// Unique style identifier (e.g., `"Heading1"`).
     pub style_id: String,
+    /// Kind of style (paragraph, character, table, or numbering).
     pub style_type: StyleType,
+    /// Human-readable style name.
     pub name: Option<String>,
+    /// ID of the parent style this style inherits from.
     pub based_on: Option<String>,
+    /// Run-level overrides for this style.
     pub run_properties: Option<RunProperties>,
+    /// Paragraph-level overrides for this style.
     pub paragraph_properties: Option<ParagraphProperties>,
+    /// Table-level overrides for this style.
     pub table_properties: Option<TableProperties>,
 }
 
 /// The kind of style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StyleType {
+    /// Paragraph style.
     Paragraph,
+    /// Character (inline) style.
     Character,
+    /// Table style.
     Table,
+    /// Numbering style.
     Numbering,
 }
 

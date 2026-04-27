@@ -7,21 +7,27 @@ type CoreResult<T> = crate::core::Result<T>;
 /// Metadata from `ppt/presentation.xml`.
 #[derive(Debug, Clone)]
 pub struct PresentationInfo {
+    /// Ordered list of slide identifiers.
     pub slides: Vec<SlideId>,
+    /// Physical slide dimensions, if present.
     pub slide_size: Option<SlideSize>,
 }
 
 /// An entry in the slide list (`p:sldIdLst`).
 #[derive(Debug, Clone)]
 pub struct SlideId {
+    /// Numeric slide identifier from `id` attribute.
     pub id: u32,
+    /// Relationship ID used to resolve the slide part path.
     pub rel_id: String,
 }
 
 /// Slide dimensions from `p:sldSz`.
 #[derive(Debug, Clone)]
 pub struct SlideSize {
+    /// Width in EMU (English Metric Units).
     pub cx: i64,
+    /// Height in EMU.
     pub cy: i64,
 }
 

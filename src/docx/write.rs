@@ -55,9 +55,13 @@ use crate::core::xml::ns::{R_STR as R_NS, WML_STR as WML_NS};
 /// Paragraph text alignment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Alignment {
+    /// Left-aligned.
     Left,
+    /// Centered.
     Center,
+    /// Right-aligned.
     Right,
+    /// Justified (both edges).
     Justify,
 }
 
@@ -87,10 +91,15 @@ impl Alignment {
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct Run {
+    /// The text content of this run.
     pub text: String,
+    /// Bold formatting.
     pub bold: bool,
+    /// Italic formatting.
     pub italic: bool,
+    /// Underline formatting.
     pub underline: bool,
+    /// Strikethrough formatting.
     pub strikethrough: bool,
     /// 6-char hex color string, e.g. `"FF0000"` (no leading `#`).
     pub color: Option<String>,
@@ -106,9 +115,13 @@ impl Run {
         Self { text: text.into(), ..Default::default() }
     }
 
+    /// Apply bold formatting.
     pub fn bold(mut self) -> Self { self.bold = true; self }
+    /// Apply italic formatting.
     pub fn italic(mut self) -> Self { self.italic = true; self }
+    /// Apply underline formatting.
     pub fn underline(mut self) -> Self { self.underline = true; self }
+    /// Apply strikethrough formatting.
     pub fn strikethrough(mut self) -> Self { self.strikethrough = true; self }
 
     /// Set the font color. `hex` is a 6-character hex string without `#`.

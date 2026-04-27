@@ -9,44 +9,63 @@ use super::formatting::Justification;
 /// All numbering definitions from `word/numbering.xml`.
 #[derive(Debug, Clone, Default)]
 pub struct NumberingDefinitions {
+    /// Abstract numbering definitions, keyed by abstract ID.
     pub abstract_nums: HashMap<u32, AbstractNum>,
+    /// Concrete numbering instances, keyed by `numId`.
     pub instances: HashMap<u32, NumberingInstance>,
 }
 
 /// An abstract numbering definition.
 #[derive(Debug, Clone)]
 pub struct AbstractNum {
+    /// Abstract numbering ID.
     pub abstract_num_id: u32,
+    /// Per-level definitions, keyed by level index (0-based).
     pub levels: HashMap<u8, NumberingLevel>,
 }
 
 /// A single level within a numbering definition.
 #[derive(Debug, Clone)]
 pub struct NumberingLevel {
+    /// Starting value for this level.
     pub start: u32,
+    /// Number format (decimal, bullet, roman, etc.).
     pub format: NumberFormat,
+    /// Level text template (e.g., `"%1."`, `"•"`).
     pub level_text: String,
+    /// Justification of the numbering marker.
     pub justification: Option<Justification>,
 }
 
 /// A concrete numbering instance referencing an abstract definition.
 #[derive(Debug, Clone)]
 pub struct NumberingInstance {
+    /// Numbering instance ID referenced by paragraphs.
     pub num_id: u32,
+    /// ID of the abstract numbering this instance references.
     pub abstract_num_id: u32,
+    /// Level overrides within this instance.
     pub overrides: HashMap<u8, NumberingLevel>,
 }
 
 /// Number format type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NumberFormat {
+    /// Arabic decimal numbers (1, 2, 3, …).
     Decimal,
+    /// Bullet character.
     Bullet,
+    /// Lowercase letters (a, b, c, …).
     LowerLetter,
+    /// Uppercase letters (A, B, C, …).
     UpperLetter,
+    /// Lowercase Roman numerals (i, ii, iii, …).
     LowerRoman,
+    /// Uppercase Roman numerals (I, II, III, …).
     UpperRoman,
+    /// No numbering.
     None,
+    /// Any other format value.
     Other(String),
 }
 

@@ -8,13 +8,21 @@
 /// Image format stored in a BLIP record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlipFormat {
+    /// Enhanced Metafile (EMF).
     Emf,
+    /// Windows Metafile (WMF).
     Wmf,
+    /// Apple PICT image.
     Pict,
+    /// JPEG image.
     Jpeg,
+    /// PNG image.
     Png,
+    /// Device-Independent Bitmap (DIB/BMP).
     Dib,
+    /// TIFF image.
     Tiff,
+    /// Unrecognized record type.
     Unknown(u16),
 }
 

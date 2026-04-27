@@ -7,12 +7,15 @@ use super::cell::{Cell, CellRef, CellValue};
 /// A parsed worksheet from `xl/worksheets/sheetN.xml`.
 #[derive(Debug, Clone)]
 pub struct Worksheet {
+    /// Sheet display name.
     pub name: String,
     /// Dimension string like "A1:G50", if present.
     pub dimension: Option<String>,
+    /// Data rows.
     pub rows: Vec<Row>,
     /// Merged cell ranges like "A1:C1".
     pub merged_cells: Vec<String>,
+    /// Hyperlinks defined on this sheet.
     pub hyperlinks: Vec<HyperlinkInfo>,
 }
 
@@ -21,6 +24,7 @@ pub struct Worksheet {
 pub struct Row {
     /// 1-based row number from the `r` attribute.
     pub index: u32,
+    /// Cells in this row.
     pub cells: Vec<Cell>,
 }
 
@@ -29,7 +33,9 @@ pub struct Row {
 pub struct HyperlinkInfo {
     /// Cell reference like "A1".
     pub cell_ref: String,
+    /// Hyperlink destination.
     pub target: HyperlinkTarget,
+    /// Optional tooltip text.
     pub tooltip: Option<String>,
 }
 

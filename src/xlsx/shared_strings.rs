@@ -6,24 +6,33 @@ use crate::core::xml;
 /// Parsed shared string table from `xl/sharedStrings.xml`.
 #[derive(Debug, Clone)]
 pub struct SharedStringTable {
+    /// All shared string entries, indexed by their 0-based SST index.
     pub strings: Vec<SharedString>,
 }
 
 /// A single shared string entry.
 #[derive(Debug, Clone)]
 pub struct SharedString {
+    /// Plain-text representation of the string.
     pub text: String,
+    /// Rich-text runs, if this entry contains formatting.
     pub rich_text: Option<Vec<RichTextRun>>,
 }
 
 /// A run within a rich text shared string.
 #[derive(Debug, Clone)]
 pub struct RichTextRun {
+    /// The text of this run.
     pub text: String,
+    /// Bold toggle.
     pub bold: Option<bool>,
+    /// Italic toggle.
     pub italic: Option<bool>,
+    /// Font size in points.
     pub font_size: Option<f64>,
+    /// Font family name.
     pub font_name: Option<String>,
+    /// Text color.
     pub color: Option<ColorRef>,
 }
 

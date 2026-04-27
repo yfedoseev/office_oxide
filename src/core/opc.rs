@@ -98,6 +98,7 @@ impl PartName {
         Ok(Self(name))
     }
 
+    /// Return the part name as a string slice (always starts with `/`).
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -256,10 +257,12 @@ impl<R: Read + Seek> OpcReader<R> {
         })
     }
 
+    /// Return the parsed `[Content_Types].xml` table.
     pub fn content_types(&self) -> &ContentTypes {
         &self.content_types
     }
 
+    /// Return the package-level relationships from `_rels/.rels`.
     pub fn package_rels(&self) -> &Relationships {
         &self.package_rels
     }
@@ -439,6 +442,7 @@ impl OpcWriter<File> {
 }
 
 impl<W: Write + Seek> OpcWriter<W> {
+    /// Create a new OPC package writer wrapping an arbitrary `Write + Seek` sink.
     pub fn new(writer: W) -> Result<Self> {
         Ok(Self {
             writer: ZipWriter::new(writer),

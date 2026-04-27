@@ -9,46 +9,67 @@ use super::xml;
 
 /// Standard relationship type URIs (Transitional / ECMA-376).
 pub mod rel_types {
+    /// Relationship type for the main office document part.
     pub const OFFICE_DOCUMENT: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument";
+    /// Relationship type for core (Dublin Core) properties.
     pub const CORE_PROPERTIES: &str =
         "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties";
+    /// Relationship type for extended (application) properties.
     pub const EXTENDED_PROPERTIES: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties";
+    /// Relationship type for the package thumbnail.
     pub const THUMBNAIL: &str =
         "http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail";
+    /// Relationship type for `styles.xml`.
     pub const STYLES: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles";
+    /// Relationship type for `theme/theme1.xml`.
     pub const THEME: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme";
+    /// Relationship type for document settings.
     pub const SETTINGS: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings";
+    /// Relationship type for the font table.
     pub const FONT_TABLE: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/fontTable";
+    /// Relationship type for embedded images.
     pub const IMAGE: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
+    /// Relationship type for hyperlinks.
     pub const HYPERLINK: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
+    /// Relationship type for `numbering.xml`.
     pub const NUMBERING: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering";
+    /// Relationship type for comments.
     pub const COMMENTS: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
+    /// Relationship type for document headers.
     pub const HEADER: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/header";
+    /// Relationship type for document footers.
     pub const FOOTER: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer";
+    /// Relationship type for worksheet parts.
     pub const WORKSHEET: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet";
+    /// Relationship type for the shared string table.
     pub const SHARED_STRINGS: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings";
+    /// Relationship type for slide parts.
     pub const SLIDE: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide";
+    /// Relationship type for slide layout parts.
     pub const SLIDE_LAYOUT: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout";
+    /// Relationship type for slide master parts.
     pub const SLIDE_MASTER: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster";
+    /// Relationship type for notes slide parts.
     pub const NOTES_SLIDE: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide";
+    /// Relationship type for chart parts.
     pub const CHART: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart";
 }
@@ -71,17 +92,25 @@ fn normalize_rel_type(rel_type: String) -> String {
     }
 }
 
+/// Indicates whether a relationship target is inside or outside the package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetMode {
+    /// Target is another part within the same OPC package.
     Internal,
+    /// Target is an external resource (e.g., a hyperlink URL).
     External,
 }
 
+/// A single relationship entry from a `.rels` file.
 #[derive(Debug, Clone)]
 pub struct Relationship {
+    /// Relationship ID (`rId1`, `rId2`, …).
     pub id: String,
+    /// Relationship type URI.
     pub rel_type: String,
+    /// Target path or URL.
     pub target: String,
+    /// Whether the target is internal or external.
     pub target_mode: TargetMode,
 }
 
@@ -150,10 +179,12 @@ impl Relationships {
         }
     }
 
+    /// Look up a relationship by its ID.
     pub fn get_by_id(&self, id: &str) -> Option<&Relationship> {
         self.by_id.get(id).map(|&i| &self.rels[i])
     }
 
+    /// Return all relationships with the given type URI.
     pub fn get_by_type(&self, rel_type: &str) -> Vec<&Relationship> {
         self.by_type
             .get(rel_type)
@@ -161,12 +192,14 @@ impl Relationships {
             .unwrap_or_default()
     }
 
+    /// Return the first relationship with the given type URI.
     pub fn first_by_type(&self, rel_type: &str) -> Option<&Relationship> {
         self.by_type
             .get(rel_type)
             .and_then(|indices| indices.first().map(|&i| &self.rels[i]))
     }
 
+    /// Return a slice of all relationships in parse order.
     pub fn all(&self) -> &[Relationship] {
         &self.rels
     }
@@ -221,6 +254,7 @@ pub struct RelationshipsBuilder {
 }
 
 impl RelationshipsBuilder {
+    /// Create an empty builder.
     pub fn new() -> Self {
         Self {
             rels: Vec::new(),
@@ -261,6 +295,7 @@ impl RelationshipsBuilder {
         });
     }
 
+    /// Returns `true` if no relationships have been added.
     pub fn is_empty(&self) -> bool {
         self.rels.is_empty()
     }

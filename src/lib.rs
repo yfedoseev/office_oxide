@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+#![warn(missing_docs)]
 //! # office_oxide
 //!
 //! The fastest Office document processing library for Rust.
@@ -30,13 +31,21 @@
 /// Library version (matches the Cargo package version).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Compound Binary File (OLE2/CFB) container reader, used by legacy formats.
 pub mod cfb;
+/// Shared OOXML primitives: OPC, XML utilities, relationships, theme, units.
 pub mod core;
+/// Legacy Word Binary (.doc) document reader.
 pub mod doc;
+/// Word document (.docx) reader, writer, and editor.
 pub mod docx;
+/// Legacy PowerPoint Binary (.ppt) presentation reader.
 pub mod ppt;
+/// PowerPoint presentation (.pptx) reader, writer, and editor.
 pub mod pptx;
+/// Legacy Excel Binary (.xls) workbook reader.
 pub mod xls;
+/// Excel spreadsheet (.xlsx) reader, writer, and editor.
 pub mod xlsx;
 
 // Top-level modules
@@ -46,10 +55,15 @@ mod convert_ppt;
 mod convert_pptx;
 mod convert_xls;
 mod convert_xlsx;
+/// Document creation API: write new DOCX/XLSX/PPTX from scratch or from IR.
 pub mod create;
+/// Document editing API: modify existing DOCX/XLSX/PPTX files in-place.
 pub mod edit;
+/// Top-level error type wrapping all format-specific errors.
 pub mod error;
+/// `DocumentFormat` enum and format detection utilities.
 pub mod format;
+/// Format-agnostic intermediate representation (IR) of a document.
 pub mod ir;
 mod ir_from_markdown;
 mod ir_render;
@@ -340,6 +354,7 @@ impl Document {
         }
     }
 
+    /// Return the inner DOCX document, if this document is a DOCX.
     pub fn as_docx(&self) -> Option<&docx::DocxDocument> {
         match &self.inner {
             DocumentInner::Docx(doc) => Some(doc),
@@ -347,6 +362,7 @@ impl Document {
         }
     }
 
+    /// Return the inner XLSX document, if this document is an XLSX.
     pub fn as_xlsx(&self) -> Option<&xlsx::XlsxDocument> {
         match &self.inner {
             DocumentInner::Xlsx(doc) => Some(doc),
@@ -354,6 +370,7 @@ impl Document {
         }
     }
 
+    /// Return the inner PPTX document, if this document is a PPTX.
     pub fn as_pptx(&self) -> Option<&pptx::PptxDocument> {
         match &self.inner {
             DocumentInner::Pptx(doc) => Some(doc),
@@ -361,6 +378,7 @@ impl Document {
         }
     }
 
+    /// Return the inner DOC document, if this document is a legacy DOC.
     pub fn as_doc(&self) -> Option<&doc::DocDocument> {
         match &self.inner {
             DocumentInner::Doc(doc) => Some(doc),
@@ -368,6 +386,7 @@ impl Document {
         }
     }
 
+    /// Return the inner XLS document, if this document is a legacy XLS.
     pub fn as_xls(&self) -> Option<&xls::XlsDocument> {
         match &self.inner {
             DocumentInner::Xls(doc) => Some(doc),
@@ -375,6 +394,7 @@ impl Document {
         }
     }
 
+    /// Return the inner PPT document, if this document is a legacy PPT.
     pub fn as_ppt(&self) -> Option<&ppt::PptDocument> {
         match &self.inner {
             DocumentInner::Ppt(doc) => Some(doc),

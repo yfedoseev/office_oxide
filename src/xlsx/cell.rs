@@ -72,13 +72,17 @@ impl fmt::Display for CellRef {
 /// Parsed cell value (after shared string dereferencing).
 #[derive(Debug, Clone)]
 pub enum CellValue {
+    /// Cell is empty.
     Empty,
+    /// Numeric value.
     Number(f64),
+    /// Inline or resolved string.
     String(String),
     /// Index into the shared string table (resolved after SST is loaded).
     SharedString(u32),
+    /// Boolean value.
     Boolean(bool),
-    /// Error value like #DIV/0!, #REF!, etc.
+    /// Error value like `#DIV/0!`, `#REF!`, etc.
     Error(String),
     /// Resolved from a number + date format detection.
     Date(DateTimeValue),

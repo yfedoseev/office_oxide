@@ -5,31 +5,41 @@ use serde::{Deserialize, Serialize};
 pub struct Emu(pub i64);
 
 impl Emu {
+    /// Number of EMUs per inch.
     pub const PER_INCH: i64 = 914_400;
+    /// Number of EMUs per centimetre.
     pub const PER_CM: i64 = 360_000;
+    /// Number of EMUs per point.
     pub const PER_PT: i64 = 12_700;
+    /// Number of EMUs per pixel at 96 DPI.
     pub const PER_PIXEL_96DPI: i64 = 9_525;
 
+    /// Create an `Emu` from a measurement in inches.
     pub fn from_inches(inches: f64) -> Self {
         Self((inches * Self::PER_INCH as f64) as i64)
     }
 
+    /// Create an `Emu` from a measurement in centimetres.
     pub fn from_cm(cm: f64) -> Self {
         Self((cm * Self::PER_CM as f64) as i64)
     }
 
+    /// Create an `Emu` from a measurement in points.
     pub fn from_pt(pt: f64) -> Self {
         Self((pt * Self::PER_PT as f64) as i64)
     }
 
+    /// Convert to inches.
     pub fn to_inches(self) -> f64 {
         self.0 as f64 / Self::PER_INCH as f64
     }
 
+    /// Convert to centimetres.
     pub fn to_cm(self) -> f64 {
         self.0 as f64 / Self::PER_CM as f64
     }
 
+    /// Convert to points.
     pub fn to_pt(self) -> f64 {
         self.0 as f64 / Self::PER_PT as f64
     }
@@ -45,25 +55,32 @@ impl Emu {
 pub struct Twip(pub i32);
 
 impl Twip {
+    /// Number of twips per inch.
     pub const PER_INCH: i32 = 1_440;
+    /// Number of twips per point.
     pub const PER_PT: i32 = 20;
 
+    /// Create a `Twip` from a measurement in points.
     pub fn from_pt(pt: f64) -> Self {
         Self((pt * Self::PER_PT as f64) as i32)
     }
 
+    /// Create a `Twip` from a measurement in inches.
     pub fn from_inches(inches: f64) -> Self {
         Self((inches * Self::PER_INCH as f64) as i32)
     }
 
+    /// Convert to `Emu` (approximate; loses sub-twip precision).
     pub fn to_emu(self) -> Emu {
         Emu(self.0 as i64 * 635)
     }
 
+    /// Convert to inches.
     pub fn to_inches(self) -> f64 {
         self.0 as f64 / Self::PER_INCH as f64
     }
 
+    /// Convert to points.
     pub fn to_pt(self) -> f64 {
         self.0 as f64 / Self::PER_PT as f64
     }
@@ -74,10 +91,12 @@ impl Twip {
 pub struct HalfPoint(pub u32);
 
 impl HalfPoint {
+    /// Convert to points.
     pub fn to_points(self) -> f64 {
         self.0 as f64 / 2.0
     }
 
+    /// Create a `HalfPoint` from a point value.
     pub fn from_points(pt: f64) -> Self {
         Self((pt * 2.0) as u32)
     }
@@ -88,14 +107,17 @@ impl HalfPoint {
 pub struct Percentage1000(pub i32);
 
 impl Percentage1000 {
+    /// Convert to a fraction in the range 0.0–1.0.
     pub fn to_fraction(self) -> f64 {
         self.0 as f64 / 100_000.0
     }
 
+    /// Convert to a percentage value (e.g., 50.0 for 50%).
     pub fn to_percent(self) -> f64 {
         self.0 as f64 / 1_000.0
     }
 
+    /// Create from a percentage value (e.g., `50.0` for 50%).
     pub fn from_percent(pct: f64) -> Self {
         Self((pct * 1_000.0) as i32)
     }
@@ -106,10 +128,12 @@ impl Percentage1000 {
 pub struct Angle60k(pub i32);
 
 impl Angle60k {
+    /// Convert to degrees.
     pub fn to_degrees(self) -> f64 {
         self.0 as f64 / 60_000.0
     }
 
+    /// Create from a degree value.
     pub fn from_degrees(deg: f64) -> Self {
         Self((deg * 60_000.0) as i32)
     }

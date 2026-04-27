@@ -15,12 +15,19 @@
 //! println!("{}", doc.to_markdown());
 //! ```
 
+/// In-place editing of PPTX documents.
 pub mod edit;
+/// Error types for PPTX parsing and creation.
 pub mod error;
+/// `ppt/presentation.xml` data model.
 pub mod presentation;
+/// Shape data model for PresentationML slides.
 pub mod shape;
+/// Slide XML parser.
 pub mod slide;
+/// Text extraction utilities for PPTX.
 pub mod text;
+/// PPTX creation (write) API.
 pub mod write;
 
 pub use error::{PptxError, Result};
@@ -43,8 +50,11 @@ use log::debug;
 /// A parsed PPTX document.
 #[derive(Debug, Clone)]
 pub struct PptxDocument {
+    /// Metadata from `ppt/presentation.xml` (slide list, dimensions).
     pub presentation: PresentationInfo,
+    /// Parsed slides, in presentation order.
     pub slides: Vec<Slide>,
+    /// Theme data (colors, fonts), if present.
     pub theme: Option<Theme>,
 }
 

@@ -17,8 +17,11 @@ type RunProps = (Option<bool>, Option<bool>, bool, Option<HyperlinkInfo>);
 /// A parsed PPTX slide.
 #[derive(Debug, Clone)]
 pub struct Slide {
+    /// Slide name from the `<p:cSld name="...">` attribute.
     pub name: String,
+    /// All top-level shapes on this slide.
     pub shapes: Vec<Shape>,
+    /// Speaker notes text, if a notes slide is present.
     pub notes: Option<String>,
 }
 

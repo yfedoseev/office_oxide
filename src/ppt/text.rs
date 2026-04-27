@@ -5,17 +5,26 @@ use super::records::*;
 /// Text type from TextHeaderAtom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextType {
+    /// Title placeholder text.
     Title,
+    /// Body / content placeholder text.
     Body,
+    /// Speaker notes text.
     Notes,
+    /// Other or unclassified text.
     Other,
+    /// Centered body placeholder.
     CenterBody,
+    /// Centered title placeholder.
     CenterTitle,
+    /// Half-size body placeholder.
     HalfBody,
+    /// Quarter-size body placeholder.
     QuarterBody,
 }
 
 impl TextType {
+    /// Convert a `TextHeaderAtom` type integer to a `TextType`.
     pub fn from_u32(val: u32) -> Self {
         match val {
             0 => Self::Title,
@@ -34,7 +43,9 @@ impl TextType {
 /// A text run extracted from a slide.
 #[derive(Debug, Clone)]
 pub struct TextRun {
+    /// The role of this text within its slide.
     pub text_type: TextType,
+    /// The decoded text content.
     pub text: String,
 }
 
@@ -175,6 +186,7 @@ pub fn extract_slides_text(data: &[u8]) -> Vec<SlideText> {
 /// Text content of a single slide.
 #[derive(Debug, Clone)]
 pub struct SlideText {
+    /// All text runs belonging to this slide.
     pub text_runs: Vec<TextRun>,
 }
 

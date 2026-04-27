@@ -8,9 +8,13 @@ use super::shared_strings::parse_color_ref;
 /// Parsed stylesheet from `xl/styles.xml`.
 #[derive(Debug, Clone)]
 pub struct StyleSheet {
+    /// Custom number formats (IDs ≥ 164).
     pub number_formats: Vec<NumberFormat>,
+    /// Font definitions.
     pub fonts: Vec<Font>,
+    /// Fill definitions.
     pub fills: Vec<Fill>,
+    /// Border definitions.
     pub borders: Vec<Border>,
     /// Cell formats (the `cellXfs` array — cells reference by index via `s` attribute).
     pub cell_formats: Vec<CellFormat>,
@@ -21,53 +25,76 @@ pub struct StyleSheet {
 /// A custom number format (ID >= 164).
 #[derive(Debug, Clone)]
 pub struct NumberFormat {
+    /// Format ID (used by `CellFormat.number_format_id`).
     pub id: u32,
+    /// Excel format code string (e.g., `"#,##0.00"`).
     pub format_code: String,
 }
 
 /// A font definition.
 #[derive(Debug, Clone)]
 pub struct Font {
+    /// Bold toggle.
     pub bold: bool,
+    /// Italic toggle.
     pub italic: bool,
+    /// Underline style value.
     pub underline: Option<String>,
+    /// Strikethrough toggle.
     pub strike: bool,
+    /// Font size in points.
     pub size: Option<f64>,
+    /// Font family name.
     pub name: Option<String>,
+    /// Font color reference.
     pub color: Option<ColorRef>,
 }
 
 /// A fill definition.
 #[derive(Debug, Clone)]
 pub struct Fill {
+    /// Fill pattern type (e.g., `"solid"`).
     pub pattern_type: Option<String>,
+    /// Foreground color.
     pub fg_color: Option<ColorRef>,
+    /// Background color.
     pub bg_color: Option<ColorRef>,
 }
 
 /// A border definition.
 #[derive(Debug, Clone)]
 pub struct Border {
+    /// Left border.
     pub left: Option<BorderSide>,
+    /// Right border.
     pub right: Option<BorderSide>,
+    /// Top border.
     pub top: Option<BorderSide>,
+    /// Bottom border.
     pub bottom: Option<BorderSide>,
 }
 
 /// A single border side.
 #[derive(Debug, Clone)]
 pub struct BorderSide {
+    /// Border style (e.g., `"thin"`, `"medium"`).
     pub style: String,
+    /// Border color.
     pub color: Option<ColorRef>,
 }
 
 /// A cell format entry from `cellXfs` or `cellStyleXfs`.
 #[derive(Debug, Clone)]
 pub struct CellFormat {
+    /// Index into the number format array (or built-in format ID).
     pub number_format_id: u32,
+    /// Index into the fonts array.
     pub font_index: Option<u32>,
+    /// Index into the fills array.
     pub fill_index: Option<u32>,
+    /// Index into the borders array.
     pub border_index: Option<u32>,
+    /// Whether the number format is explicitly applied.
     pub apply_number_format: bool,
     /// Reference to a `cellStyleXfs` entry.
     pub xf_id: Option<u32>,

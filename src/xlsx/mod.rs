@@ -16,15 +16,25 @@
 //! println!("{}", doc.to_markdown());
 //! ```
 
+/// Cell value types and cell reference types.
 pub mod cell;
+/// Date/time serial number conversion for XLSX dates.
 pub mod date;
+/// In-place editing of existing XLSX files.
 pub mod edit;
+/// XLSX-specific error type.
 pub mod error;
+/// Shared string table (SST) parsing and lookup.
 pub mod shared_strings;
+/// Spreadsheet styles: number formats, fonts, fills, borders, cell formats.
 pub mod styles;
+/// Text extraction and markdown/CSV rendering for XLSX.
 pub mod text;
+/// Workbook-level metadata and sheet list.
 pub mod workbook;
+/// Worksheet parsing: cells, dimensions, hyperlinks.
 pub mod worksheet;
+/// XLSX creation (write) API.
 pub mod write;
 
 pub use cell::{Cell, CellRef, CellValue};
@@ -49,10 +59,15 @@ use crate::core::theme::Theme;
 /// A parsed XLSX document.
 #[derive(Debug, Clone)]
 pub struct XlsxDocument {
+    /// Workbook-level metadata (name, sheets list, date system).
     pub workbook: WorkbookInfo,
+    /// Parsed worksheets in sheet-order.
     pub worksheets: Vec<Worksheet>,
+    /// Shared string table.
     pub shared_strings: SharedStringTable,
+    /// Stylesheet (lazily parsed; access via `ensure_styles()`).
     pub styles: Option<StyleSheet>,
+    /// DrawingML theme (lazily parsed; access via `ensure_theme()`).
     pub theme: Option<Theme>,
     // Raw bytes for lazy parsing (None after parsing or if not present)
     styles_data: Option<Vec<u8>>,

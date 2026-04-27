@@ -66,8 +66,11 @@ const CT_STYLES: &str = "application/vnd.openxmlformats-officedocument.spreadshe
 /// Horizontal alignment inside a cell.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HAlign {
+    /// Align content to the left edge.
     Left,
+    /// Center content horizontally.
     Center,
+    /// Align content to the right edge.
     Right,
 }
 
@@ -75,8 +78,8 @@ pub enum HAlign {
 /// `CellStyle::custom_format`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum NumberFormat {
-    #[default]
     /// General text (default).
+    #[default]
     General,
     /// Integer: `0`
     Integer,
@@ -114,8 +117,11 @@ impl NumberFormat {
 /// Style applied to a single cell.
 #[derive(Debug, Clone, Default)]
 pub struct CellStyle {
+    /// Apply bold font weight.
     pub bold: bool,
+    /// Apply italic style.
     pub italic: bool,
+    /// Apply single underline.
     pub underline: bool,
     /// RGB hex color for the font, e.g. `"FF0000"` for red. No leading `#`.
     pub font_color: Option<String>,
@@ -125,7 +131,9 @@ pub struct CellStyle {
     pub font_name: Option<String>,
     /// Background fill color (RGB hex, no `#`).
     pub background_color: Option<String>,
+    /// Number format to apply to the cell value.
     pub number_format: NumberFormat,
+    /// Horizontal alignment override.
     pub h_align: Option<HAlign>,
     /// Wrap text within the cell.
     pub wrap_text: bool,

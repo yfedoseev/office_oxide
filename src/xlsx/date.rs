@@ -5,12 +5,19 @@ use super::styles::StyleSheet;
 /// A date/time value converted from an Excel serial number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DateTimeValue {
+    /// Year component (e.g., 2024).
     pub year: i32,
+    /// Month component (1–12).
     pub month: u32,
+    /// Day component (1–31).
     pub day: u32,
+    /// Hour component (0–23).
     pub hour: u32,
+    /// Minute component (0–59).
     pub minute: u32,
+    /// Second component (0–59).
     pub second: u32,
+    /// Millisecond component (0–999).
     pub millisecond: u32,
 }
 

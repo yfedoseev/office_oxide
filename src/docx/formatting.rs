@@ -4,101 +4,152 @@ use crate::core::units::{HalfPoint, Twip};
 /// Run-level formatting properties (`w:rPr`).
 #[derive(Debug, Clone, Default)]
 pub struct RunProperties {
+    /// Bold toggle.
     pub bold: Option<bool>,
+    /// Italic toggle.
     pub italic: Option<bool>,
+    /// Underline style.
     pub underline: Option<UnderlineType>,
+    /// Single strikethrough toggle.
     pub strike: Option<bool>,
+    /// Double strikethrough toggle.
     pub dstrike: Option<bool>,
+    /// Font size in half-points.
     pub font_size: Option<HalfPoint>,
+    /// Primary font family name.
     pub font_name: Option<String>,
+    /// Text color reference.
     pub color: Option<ColorRef>,
+    /// Highlight color name (e.g., `"yellow"`).
     pub highlight: Option<String>,
+    /// Vertical alignment (superscript/subscript).
     pub vertical_align: Option<VerticalAlign>,
+    /// Character style ID.
     pub style_id: Option<String>,
 }
 
 /// Paragraph-level formatting properties (`w:pPr`).
 #[derive(Debug, Clone, Default)]
 pub struct ParagraphProperties {
+    /// Paragraph style ID.
     pub style_id: Option<String>,
+    /// Text justification.
     pub justification: Option<Justification>,
+    /// Paragraph indentation.
     pub indent: Option<ParagraphIndent>,
+    /// Paragraph spacing.
     pub spacing: Option<ParagraphSpacing>,
+    /// Numbering reference for list paragraphs.
     pub numbering_ref: Option<NumberingRef>,
+    /// Outline level (0 = Heading 1, 1 = Heading 2, …).
     pub outline_level: Option<u8>,
+    /// Paragraph-mark run properties (`w:rPr` inside `w:pPr`).
     pub run_properties: Option<RunProperties>,
 }
 
 /// Underline style.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnderlineType {
+    /// Single underline.
     Single,
+    /// Double underline.
     Double,
+    /// Thick (heavy) underline.
     Thick,
+    /// Dotted underline.
     Dotted,
+    /// Dashed underline.
     Dash,
+    /// Dot-dash underline.
     DotDash,
+    /// Dot-dot-dash underline.
     DotDotDash,
+    /// Wave underline.
     Wave,
+    /// Underline under words only.
     Words,
+    /// No underline (explicit removal).
     None,
+    /// Any other underline value.
     Other(String),
 }
 
 /// Vertical alignment (superscript/subscript).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerticalAlign {
+    /// Superscript text.
     Superscript,
+    /// Subscript text.
     Subscript,
+    /// Normal (baseline) alignment.
     Baseline,
 }
 
 /// Paragraph justification / alignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Justification {
+    /// Left-aligned (default).
     Left,
+    /// Centered.
     Center,
+    /// Right-aligned.
     Right,
+    /// Justified (both edges).
     Both,
+    /// Distributed (East Asian spacing).
     Distribute,
 }
 
 /// Paragraph indentation values.
 #[derive(Debug, Clone, Default)]
 pub struct ParagraphIndent {
+    /// Left indent in twips.
     pub left: Option<Twip>,
+    /// Right indent in twips.
     pub right: Option<Twip>,
+    /// First-line indent in twips (positive = indent).
     pub first_line: Option<Twip>,
+    /// Hanging indent in twips (first-line de-indent).
     pub hanging: Option<Twip>,
 }
 
 /// Paragraph spacing.
 #[derive(Debug, Clone, Default)]
 pub struct ParagraphSpacing {
+    /// Space before the paragraph in twips.
     pub before: Option<Twip>,
+    /// Space after the paragraph in twips.
     pub after: Option<Twip>,
+    /// Line spacing value and rule.
     pub line: Option<SpacingLine>,
 }
 
 /// Line spacing rule and value.
 #[derive(Debug, Clone)]
 pub struct SpacingLine {
+    /// Line spacing value (interpretation depends on `rule`).
     pub value: i32,
+    /// The rule governing how `value` is applied.
     pub rule: Option<LineSpacingRule>,
 }
 
 /// Line spacing rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineSpacingRule {
+    /// Automatic (proportional to font size).
     Auto,
+    /// Exact line height in twips.
     Exact,
+    /// Minimum line height in twips.
     AtLeast,
 }
 
 /// Reference to a numbering definition from a paragraph.
 #[derive(Debug, Clone)]
 pub struct NumberingRef {
+    /// Numbering instance ID.
     pub num_id: u32,
+    /// Indent level (0-based).
     pub ilvl: u8,
 }
 

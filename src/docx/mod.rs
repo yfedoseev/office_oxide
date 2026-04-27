@@ -15,18 +15,31 @@
 //! println!("{}", doc.to_markdown());
 //! ```
 
+/// Document body and block-level element types.
 pub mod document;
+/// In-place editing of existing DOCX files.
 pub mod edit;
+/// DOCX-specific error type.
 pub mod error;
+/// Run and paragraph formatting types (`RunProperties`, `ParagraphProperties`, etc.).
 pub mod formatting;
+/// Section properties, headers, footers, page size/margin types.
 pub mod headers;
+/// Hyperlink types (`Hyperlink`, `HyperlinkTarget`).
 pub mod hyperlink;
+/// Drawing/image reference type (`DrawingInfo`).
 pub mod image;
+/// Numbering definitions and list format types.
 pub mod numbering;
+/// Paragraph, run, and inline content types.
 pub mod paragraph;
+/// Style sheet and style definition types.
 pub mod styles;
+/// Table structure types.
 pub mod table;
+/// Text extraction and markdown rendering for DOCX.
 pub mod text;
+/// DOCX creation (write) API.
 pub mod write;
 
 pub use document::{BlockElement, Body};

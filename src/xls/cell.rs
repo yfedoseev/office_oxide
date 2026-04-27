@@ -7,11 +7,16 @@ use super::sst::read_unicode_string;
 /// A cell value in an XLS spreadsheet.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum CellValue {
+    /// Cell contains no value.
     #[default]
     Empty,
+    /// Floating-point number.
     Number(f64),
+    /// Text string (from SST or inline label).
     String(String),
+    /// Boolean value.
     Bool(bool),
+    /// Error code byte (e.g. `0x07` = `#DIV/0!`).
     Error(u8),
 }
 
@@ -46,8 +51,11 @@ impl CellValue {
 /// A cell with its position and value.
 #[derive(Debug, Clone)]
 pub struct Cell {
+    /// 0-based row index.
     pub row: u16,
+    /// 0-based column index.
     pub col: u16,
+    /// The parsed cell value.
     pub value: CellValue,
 }
 

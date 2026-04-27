@@ -12,17 +12,29 @@ use super::xml;
 /// Core properties (Dublin Core + OPC metadata) from `docProps/core.xml`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CoreProperties {
+    /// Document title.
     pub title: Option<String>,
+    /// Document subject.
     pub subject: Option<String>,
+    /// Primary author.
     pub creator: Option<String>,
+    /// Search keywords.
     pub keywords: Option<String>,
+    /// Document description or abstract.
     pub description: Option<String>,
+    /// User who last saved the document.
     pub last_modified_by: Option<String>,
+    /// Revision number as a string.
     pub revision: Option<String>,
+    /// Creation date-time (ISO 8601).
     pub created: Option<String>,
+    /// Last-modified date-time (ISO 8601).
     pub modified: Option<String>,
+    /// Document category.
     pub category: Option<String>,
+    /// Content status (e.g., "Draft", "Final").
     pub content_status: Option<String>,
+    /// Document language.
     pub language: Option<String>,
 }
 
@@ -177,19 +189,33 @@ fn write_datetime_element(w: &mut Writer<Vec<u8>>, tag: &str, value: &str) {
 /// Extended/application properties from `docProps/app.xml`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct AppProperties {
+    /// Producing application name.
     pub application: Option<String>,
+    /// Application version string.
     pub app_version: Option<String>,
+    /// Company or organisation name.
     pub company: Option<String>,
+    /// Template the document is based on.
     pub template: Option<String>,
+    /// Total editing time in minutes.
     pub total_time: Option<u32>,
+    /// Number of pages.
     pub pages: Option<u32>,
+    /// Word count.
     pub words: Option<u32>,
+    /// Character count (excluding spaces).
     pub characters: Option<u32>,
+    /// Character count (including spaces).
     pub characters_with_spaces: Option<u32>,
+    /// Line count.
     pub lines: Option<u32>,
+    /// Paragraph count.
     pub paragraphs: Option<u32>,
+    /// Slide count (presentations).
     pub slides: Option<u32>,
+    /// Notes-page count (presentations).
     pub notes: Option<u32>,
+    /// Hidden slide count (presentations).
     pub hidden_slides: Option<u32>,
 }
 

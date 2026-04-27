@@ -4,11 +4,17 @@ use std::path::Path;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DocumentFormat {
+    /// Office Open XML Word document (`.docx`).
     Docx,
+    /// Office Open XML Excel spreadsheet (`.xlsx`).
     Xlsx,
+    /// Office Open XML PowerPoint presentation (`.pptx`).
     Pptx,
+    /// Legacy Word Binary document (`.doc`).
     Doc,
+    /// Legacy Excel Binary workbook (`.xls`).
     Xls,
+    /// Legacy PowerPoint Binary presentation (`.ppt`).
     Ppt,
 }
 

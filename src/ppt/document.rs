@@ -11,6 +11,7 @@ use super::text::{SlideText, TextType, extract_slides_text};
 /// A parsed legacy PowerPoint document.
 #[derive(Debug)]
 pub struct PptDocument {
+    /// Text content extracted from each slide.
     pub slides: Vec<SlideText>,
     images: Vec<PptImage>,
 }

@@ -9,44 +9,65 @@ use super::error::{Error, Result};
 /// OOXML namespace URI constants. Match by URI, never by prefix.
 pub mod ns {
     // OPC package namespaces
+    /// `[Content_Types].xml` namespace.
     pub const CONTENT_TYPES: &[u8] =
         b"http://schemas.openxmlformats.org/package/2006/content-types";
+    /// `.rels` relationships namespace.
     pub const RELATIONSHIPS: &[u8] =
         b"http://schemas.openxmlformats.org/package/2006/relationships";
+    /// Core properties namespace.
     pub const CORE_PROPERTIES: &[u8] =
         b"http://schemas.openxmlformats.org/package/2006/metadata/core-properties";
 
     // Dublin Core
+    /// Dublin Core elements namespace.
     pub const DC: &[u8] = b"http://purl.org/dc/elements/1.1/";
+    /// Dublin Core terms namespace.
     pub const DC_TERMS: &[u8] = b"http://purl.org/dc/terms/";
 
     // DrawingML
+    /// DrawingML main namespace (`a:` prefix).
     pub const DRAWING_ML: &[u8] = b"http://schemas.openxmlformats.org/drawingml/2006/main";
 
     // Format-specific
+    /// WordprocessingML namespace (`w:` prefix).
     pub const WML: &[u8] = b"http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    /// SpreadsheetML namespace (`x:` prefix).
     pub const SML: &[u8] = b"http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    /// PresentationML namespace (`p:` prefix).
     pub const PML: &[u8] = b"http://schemas.openxmlformats.org/presentationml/2006/main";
 
     // Office document relationships (r: prefix in content XML)
+    /// Relationships namespace used inline in content XML (`r:` prefix).
     pub const R: &[u8] = b"http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
     // Extended properties
+    /// Extended (application) properties namespace.
     pub const EXTENDED_PROPERTIES: &[u8] =
         b"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties";
 
     // String variants for XML writing (same URIs as above, as &str)
+    /// `WML` as a `&str` for use in XML writing.
     pub const WML_STR: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    /// `SML` as a `&str` for use in XML writing.
     pub const SML_STR: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    /// `PML` as a `&str` for use in XML writing.
     pub const PML_STR: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
+    /// `DRAWING_ML` as a `&str` for use in XML writing.
     pub const DRAWING_ML_STR: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
+    /// `R` as a `&str` for use in XML writing.
     pub const R_STR: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
     // Strict OOXML variants
+    /// ISO 29500 Strict variant of `WML`.
     pub const STRICT_WML: &[u8] = b"http://purl.oclc.org/ooxml/wordprocessingml/main";
+    /// ISO 29500 Strict variant of `SML`.
     pub const STRICT_SML: &[u8] = b"http://purl.oclc.org/ooxml/spreadsheetml/main";
+    /// ISO 29500 Strict variant of `PML`.
     pub const STRICT_PML: &[u8] = b"http://purl.oclc.org/ooxml/presentationml/main";
+    /// ISO 29500 Strict variant of `DRAWING_ML`.
     pub const STRICT_DRAWING: &[u8] = b"http://purl.oclc.org/ooxml/drawingml/main";
+    /// ISO 29500 Strict variant of `R`.
     pub const STRICT_R: &[u8] = b"http://purl.oclc.org/ooxml/officeDocument/relationships";
 }
 

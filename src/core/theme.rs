@@ -8,17 +8,29 @@ use super::xml;
 /// The 12 named theme color slots in DrawingML.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThemeColorSlot {
+    /// Dark 1 (text/foreground primary).
     Dk1,
+    /// Light 1 (background primary).
     Lt1,
+    /// Dark 2 (text/foreground secondary).
     Dk2,
+    /// Light 2 (background secondary).
     Lt2,
+    /// Accent color 1.
     Accent1,
+    /// Accent color 2.
     Accent2,
+    /// Accent color 3.
     Accent3,
+    /// Accent color 4.
     Accent4,
+    /// Accent color 5.
     Accent5,
+    /// Accent color 6.
     Accent6,
+    /// Hyperlink color.
     Hlink,
+    /// Followed hyperlink color.
     FolHlink,
 }
 
@@ -66,6 +78,10 @@ impl ThemeColorSlot {
 pub struct RgbColor(pub [u8; 3]);
 
 impl RgbColor {
+    /// Parse an sRGB color from a 6-character hex string (e.g., `"4472C4"`).
+    ///
+    /// # Errors
+    /// Returns an error if `hex` is not exactly 6 hex characters.
     pub fn from_hex(hex: &str) -> Result<Self> {
         if hex.len() != 6 {
             return Err(Error::MalformedXml(format!(
@@ -78,18 +94,22 @@ impl RgbColor {
         Ok(Self([r, g, b]))
     }
 
+    /// Format as a 6-character uppercase hex string (e.g., `"4472C4"`).
     pub fn to_hex(&self) -> String {
         format!("{:02X}{:02X}{:02X}", self.0[0], self.0[1], self.0[2])
     }
 
+    /// Red component (0–255).
     pub fn red(&self) -> u8 {
         self.0[0]
     }
 
+    /// Green component (0–255).
     pub fn green(&self) -> u8 {
         self.0[1]
     }
 
+    /// Blue component (0–255).
     pub fn blue(&self) -> u8 {
         self.0[2]
     }
@@ -98,27 +118,39 @@ impl RgbColor {
 /// Color scheme: the 12 named colors in a theme.
 #[derive(Debug, Clone)]
 pub struct ColorScheme {
+    /// Scheme name (e.g., "Office").
     pub name: String,
+    /// Mapping from slot to resolved RGB color.
     pub colors: HashMap<ThemeColorSlot, RgbColor>,
 }
 
 /// Font scheme: major (heading) and minor (body) fonts.
 #[derive(Debug, Clone)]
 pub struct FontScheme {
+    /// Scheme name.
     pub name: String,
+    /// Latin typeface for major (heading) font.
     pub major_latin: String,
+    /// Latin typeface for minor (body) font.
     pub minor_latin: String,
+    /// East Asian typeface for major font (empty = inherit).
     pub major_ea: Option<String>,
+    /// East Asian typeface for minor font (empty = inherit).
     pub minor_ea: Option<String>,
+    /// Complex-script typeface for major font (empty = inherit).
     pub major_cs: Option<String>,
+    /// Complex-script typeface for minor font (empty = inherit).
     pub minor_cs: Option<String>,
 }
 
 /// A parsed DrawingML theme (`a:theme`).
 #[derive(Debug, Clone)]
 pub struct Theme {
+    /// Theme name.
     pub name: String,
+    /// Color scheme.
     pub color_scheme: ColorScheme,
+    /// Font scheme.
     pub font_scheme: FontScheme,
 }
 

@@ -72,10 +72,15 @@ const SLIDE_HEIGHT: &str = "6858000";
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct Run {
+    /// The text content of this run.
     pub text: String,
+    /// Apply bold weight.
     pub bold: bool,
+    /// Apply italic style.
     pub italic: bool,
+    /// Apply single underline.
     pub underline: bool,
+    /// Apply strikethrough.
     pub strikethrough: bool,
     /// 6-char hex color string, e.g. `"FF0000"` (no leading `#`).
     pub color: Option<String>,
@@ -91,9 +96,13 @@ impl Run {
         Self { text: text.into(), ..Default::default() }
     }
 
+    /// Enable bold weight.
     pub fn bold(mut self) -> Self { self.bold = true; self }
+    /// Enable italic style.
     pub fn italic(mut self) -> Self { self.italic = true; self }
+    /// Enable single underline.
     pub fn underline(mut self) -> Self { self.underline = true; self }
+    /// Enable strikethrough.
     pub fn strikethrough(mut self) -> Self { self.strikethrough = true; self }
 
     /// Font color as a 6-char hex string (no `#`).

@@ -4,10 +4,15 @@ use super::error::{CfbError, Result};
 pub const CFB_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 
 /// Special sector IDs.
+/// Marks a free (unused) sector in the FAT.
 pub const FREE_SECT: u32 = 0xFFFFFFFF;
+/// Marks the last sector in a chain.
 pub const END_OF_CHAIN: u32 = 0xFFFFFFFE;
+/// Marks a sector used by the FAT itself.
 pub const FAT_SECT: u32 = 0xFFFFFFFD;
+/// Marks a sector used by the DIFAT.
 pub const DIFAT_SECT: u32 = 0xFFFFFFFC;
+/// Maximum valid regular sector index.
 pub const MAX_REG_SECT: u32 = 0xFFFFFFFA;
 
 /// Parsed CFB header (first 512 bytes).

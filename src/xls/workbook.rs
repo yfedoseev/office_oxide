@@ -13,14 +13,17 @@ use super::sst::{parse_sst, read_short_unicode_string, read_unicode_string};
 /// A parsed legacy XLS document.
 #[derive(Debug)]
 pub struct XlsDocument {
+    /// Worksheets in workbook order.
     pub sheets: Vec<Sheet>,
     images: Vec<XlsImage>,
 }
 
-/// A worksheet.
+/// A worksheet from an XLS workbook.
 #[derive(Debug)]
 pub struct Sheet {
+    /// Sheet display name.
     pub name: String,
+    /// Cell values, indexed as `rows[row][col]`.
     pub rows: Vec<Vec<CellValue>>,
 }
 

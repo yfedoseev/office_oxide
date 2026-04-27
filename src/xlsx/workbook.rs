@@ -5,7 +5,9 @@ use crate::core::xml;
 /// Parsed workbook information from `xl/workbook.xml`.
 #[derive(Debug, Clone)]
 pub struct WorkbookInfo {
+    /// Ordered list of sheet metadata entries.
     pub sheets: Vec<SheetInfo>,
+    /// Named ranges and print-area definitions.
     pub defined_names: Vec<DefinedName>,
     /// Whether this workbook uses the 1904 date system (common in Mac-created files).
     pub date1904: bool,
@@ -14,28 +16,37 @@ pub struct WorkbookInfo {
 /// Metadata for a single sheet in the workbook.
 #[derive(Debug, Clone)]
 pub struct SheetInfo {
+    /// Sheet display name.
     pub name: String,
+    /// Numeric sheet ID from the workbook XML.
     pub sheet_id: u32,
     /// Relationship ID used to resolve the worksheet part path.
     pub rel_id: String,
+    /// Visibility state of this sheet.
     pub state: SheetState,
 }
 
 /// Sheet visibility state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SheetState {
+    /// Sheet is visible.
     Visible,
+    /// Sheet is hidden but can be un-hidden by the user.
     Hidden,
+    /// Sheet is very hidden (only un-hideable via VBA).
     VeryHidden,
 }
 
 /// A defined name in the workbook (named ranges, print areas, etc.).
 #[derive(Debug, Clone)]
 pub struct DefinedName {
+    /// Name string.
     pub name: String,
+    /// Formula or reference value.
     pub value: String,
     /// If set, this name is scoped to a specific sheet (0-based index).
     pub local_sheet_id: Option<u32>,
+    /// Whether this name is hidden.
     pub hidden: bool,
 }
 
