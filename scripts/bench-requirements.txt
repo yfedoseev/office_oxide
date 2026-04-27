@@ -5,5 +5,5 @@ markitdown==0.0.1a3
 python-docx==1.1.2
 openpyxl==3.1.5
 python-pptx==1.0.2
-python-calamine==0.2.3
+python-calamine==0.4.0
 xlrd==2.0.1
