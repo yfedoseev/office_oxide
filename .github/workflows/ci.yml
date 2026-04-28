@@ -3,20 +3,62 @@ name: CI
 on:
   push:
     branches: [main, develop]
+    # Skip CI when only files that can't affect any test or job change.
+    # Workflow edits themselves still trigger a run (.github/workflows/**
+    # is intentionally excluded from this list). When in doubt, leave the
+    # path out — a redundant CI run is cheaper than a regression slipping
+    # through.
     paths-ignore:
+      # Documentation / legal / informational
       - '**/*.md'
       - 'docs/**'
       - 'LICENSE-*'
+      - 'llms.txt'
+      # Repo / IDE metadata
+      - '.editorconfig'
+      - '.gitignore'
+      - '.devin/**'
+      # GitHub UI / bot config (no CI impact)
+      - '.github/CODEOWNERS'
+      - '.github/FUNDING.yml'
+      - '.github/dependabot.yml'
+      - '.github/release.yml'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/pull_request_template.md'
+      # Local dev hooks (never run in CI)
+      - '.github/hooks/**'
+      # Release-only assets — used by release.yml, not ci.yml
+      - '.github/templates/**'
+      - '.github/scripts/**'
+      # Manual benchmarking tooling — not invoked by any CI job. bench_rust
+      # is a standalone cargo project, not a workspace member.
+      - 'bench_rust/**'
+      - 'bench_python.py'
+      - 'scripts/bench.sh'
+      - 'scripts/bench-requirements.txt'
   pull_request:
     branches: [main, develop]
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
       - 'LICENSE-*'
+      - 'llms.txt'
+      - '.editorconfig'
+      - '.gitignore'
+      - '.devin/**'
+      - '.github/CODEOWNERS'
+      - '.github/FUNDING.yml'
+      - '.github/dependabot.yml'
+      - '.github/release.yml'
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/pull_request_template.md'
+      - '.github/hooks/**'
+      - '.github/templates/**'
+      - '.github/scripts/**'
+      - 'bench_rust/**'
+      - 'bench_python.py'
+      - 'scripts/bench.sh'
+      - 'scripts/bench-requirements.txt'
 
 # Minimal token permissions — jobs that need write access declare it explicitly.
 permissions:
