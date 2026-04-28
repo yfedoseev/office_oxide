@@ -3,8 +3,20 @@ name: CI
 on:
   push:
     branches: [main, develop]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE-*'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
   pull_request:
     branches: [main, develop]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE-*'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/pull_request_template.md'
 
 # Minimal token permissions — jobs that need write access declare it explicitly.
 permissions:
@@ -18,6 +30,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Warnings-as-errors workflow-wide — rustc, cargo build/test, maturin,
+  # binding cdylib builds. Clippy + rustdoc already gate this; this closes
+  # the gap so no warnings sneak in via untyped cargo invocations.
+  RUSTFLAGS: "-D warnings"
 
 jobs:
   # Check formatting
@@ -130,13 +146,57 @@ jobs:
         run: cargo build -p office_oxide --no-default-features
         if: matrix.features == ''
 
+  # Build the cdylib once per OS and upload as an artifact. Downstream
+  # binding jobs (go, csharp, node-native) consume this prebuilt lib
+  # instead of recompiling. The Rust crate is the source of truth; the
+  # bindings are thin wrappers, so one release build per platform suffices.
+  build-lib:
+    name: Build cdylib (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: build-lib-${{ matrix.os }}
+
+      - name: Build cdylib
+        run: cargo build --release --lib
+
+      # Upload all possible lib outputs; downstream jobs find the file at
+      # its original target/release/ path so binding test code works
+      # unchanged.
+      - name: Upload native lib artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-lib-${{ matrix.os }}
+          retention-days: 1
+          if-no-files-found: ignore
+          path: |
+            target/release/liboffice_oxide.so
+            target/release/liboffice_oxide.dylib
+            target/release/office_oxide.dll
+            target/release/office_oxide.lib
+            target/release/liboffice_oxide.a
+
   # Python bindings test
   python:
     name: Python Bindings
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        # Only Python versions still supported as of 2026-04.
+        # 3.8 EOL Oct 2024, 3.9 EOL Oct 2025 — dropped.
+        # 3.10 EOL Oct 2026, 3.11–3.14 still under upstream support.
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
@@ -182,77 +242,128 @@ jobs:
           uv run python examples/python/03_edit/main.py
           uv run python examples/python/04_batch/main.py
 
-  # Go binding test
+  # Go binding test — reuses the prebuilt cdylib from build-lib.
   go:
-    name: Go bindings
-    runs-on: ubuntu-latest
+    name: Go Bindings (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [build-lib]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: '1.21'
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Build Rust lib
-        run: cargo build --release --lib
+          go-version: 'stable'
+
+      # Restores the lib at target/release/ (artifact preserves layout).
+      - name: Download cdylib artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: native-lib-${{ matrix.os }}
+
       - name: Run go test
         run: go test -tags office_oxide_dev -v ./...
         working-directory: go
 
       - name: Run Go examples
+        shell: bash
         run: |
           (cd examples/go/01_extract && go run -tags office_oxide_dev .)
           (cd examples/go/02_create_from_markdown && go run -tags office_oxide_dev .)
           (cd examples/go/03_edit && go run -tags office_oxide_dev .)
 
-  # C# binding test
+  # C# binding test — reuses the prebuilt cdylib from build-lib.
   csharp:
-    name: C# bindings
-    runs-on: ubuntu-latest
+    name: C# Bindings (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [build-lib]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
           dotnet-version: |
             8.0.x
             10.0.x
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo build --release --lib
-      - run: dotnet test csharp/OfficeOxide.Tests/OfficeOxide.Tests.csproj
-        env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/target/release
+
+      - name: Download cdylib artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: native-lib-${{ matrix.os }}
+
+      # Native lib search paths differ per OS:
+      #   Linux  → LD_LIBRARY_PATH
+      #   macOS  → DYLD_LIBRARY_PATH (ignored under SIP for /usr/local/* but
+      #            works for repo-local target/release/)
+      #   Windows → PATH (DLL search rules)
+      - name: Set native lib search path
+        shell: bash
+        run: |
+          NATIVE_DIR="${{ github.workspace }}/target/release"
+          case "${{ runner.os }}" in
+            Linux)   echo "LD_LIBRARY_PATH=${NATIVE_DIR}" >> "$GITHUB_ENV";;
+            macOS)   echo "DYLD_LIBRARY_PATH=${NATIVE_DIR}" >> "$GITHUB_ENV";;
+            Windows) echo "${NATIVE_DIR}" >> "$GITHUB_PATH";;
+          esac
+
+      - name: Run C# tests
+        run: dotnet test csharp/OfficeOxide.Tests/OfficeOxide.Tests.csproj
 
       - name: Run C# examples
-        env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/target/release
         run: |
           dotnet run --project examples/csharp/01_extract/01_extract.csproj
           dotnet run --project examples/csharp/02_create_from_markdown/02_create_from_markdown.csproj
           dotnet run --project examples/csharp/03_edit/03_edit.csproj
 
-  # Node-native binding test (koffi)
+  # Node-native binding test (koffi) — reuses the prebuilt cdylib.
   node-native:
-    name: Node-native bindings
-    runs-on: ubuntu-latest
+    name: Node-native Bindings (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [build-lib]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo build --release --lib
-      - run: npm install --silent
+
+      - name: Download cdylib artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: native-lib-${{ matrix.os }}
+
+      # Resolve the platform-specific cdylib path for OFFICE_OXIDE_LIB.
+      - name: Resolve cdylib path
+        id: lib
+        shell: bash
+        run: |
+          case "${{ runner.os }}" in
+            Linux)   echo "path=${{ github.workspace }}/target/release/liboffice_oxide.so" >> "$GITHUB_OUTPUT";;
+            macOS)   echo "path=${{ github.workspace }}/target/release/liboffice_oxide.dylib" >> "$GITHUB_OUTPUT";;
+            Windows) echo "path=${{ github.workspace }}/target/release/office_oxide.dll" >> "$GITHUB_OUTPUT";;
+          esac
+
+      - name: Install JS deps
+        run: npm install --silent
         working-directory: js
-      - run: node --test test/basic.test.mjs
+
+      - name: Run Node tests
         working-directory: js
+        run: node --test test/basic.test.mjs
         env:
-          OFFICE_OXIDE_LIB: ${{ github.workspace }}/target/release/liboffice_oxide.so
+          OFFICE_OXIDE_LIB: ${{ steps.lib.outputs.path }}
 
       - name: Run JS examples
         env:
-          OFFICE_OXIDE_LIB: ${{ github.workspace }}/target/release/liboffice_oxide.so
+          OFFICE_OXIDE_LIB: ${{ steps.lib.outputs.path }}
         run: |
           node examples/javascript/01_extract.mjs
           node examples/javascript/02_create_from_markdown.mjs
