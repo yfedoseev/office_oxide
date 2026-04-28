@@ -1,0 +1,13 @@
+# taplo TOML formatter configuration
+# https://taplo.tamasfe.dev/configuration/file.html
+
+include = ["Cargo.toml", "crates/*/Cargo.toml", "deny.toml", "pyproject.toml", ".taplo.toml"]
+
+exclude = ["target/**", "**/node_modules/**", ".venv/**", "dist/**", "bench_rust/**"]
+
+[formatting]
+column_width = 100
+indent_string = "    "
+reorder_keys = false
+trailing_newline = true
+align_entries = false

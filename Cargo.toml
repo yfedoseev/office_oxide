@@ -1,0 +1,155 @@
+[workspace]
+resolver = "2"
+members = [".", "crates/office_oxide_cli", "crates/office_oxide_mcp"]
+exclude = ["bench_rust"]
+
+# Clippy lint configuration shared by every workspace member and every target
+# (lib, bin, test, example, bench). Centralises the allow-list so new crates
+# don't need their own #![allow] attributes.
+[workspace.lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"
+needless_range_loop = "allow"
+enum_variant_names = "allow"
+wrong_self_convention = "allow"
+explicit_counter_loop = "allow"
+should_implement_trait = "allow"
+collapsible_match = "allow"
+collapsible_if = "allow"
+match_like_matches_macro = "allow"
+manual_find = "allow"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yfedoseev/office_oxide"
+homepage = "https://oxide.fyi"
+documentation = "https://office.oxide.fyi/docs/getting-started/rust"
+rust-version = "1.88"
+
+[package]
+name = "office_oxide"
+description = "The fastest Office document processing library — DOCX, XLSX, PPTX, DOC, XLS, PPT"
+
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["docx", "xlsx", "pptx", "office", "text-extraction"]
+categories = ["parsing", "text-processing"]
+include = [
+    "/src/**/*",
+    "/Cargo.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/include/**/*",
+    "/cbindgen.toml",
+]
+
+[lints]
+workspace = true
+
+[lib]
+name = "office_oxide"
+# cdylib: Python (maturin), WASM, C# (P/Invoke), Node.js (dynamic)
+# rlib: native Rust consumers
+# staticlib: Go (CGo) — produces liboffice_oxide.a for self-contained binaries
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+# Core parsing
+quick-xml = { version = "0.37", features = ["serialize"] }
+zip = { version = "8.1", default-features = false, features = ["deflate"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+encoding_rs = "0.8"
+atoi_simd = "0.18"
+fast-float2 = "0.2"
+libc = "0.2"
+
+# Optional
+memmap2 = { version = "0.9", optional = true }
+rayon = { version = "1.10", optional = true }
+
+# Python bindings
+pyo3 = { version = "0.28", features = ["extension-module"], optional = true }
+
+# WASM bindings
+wasm-bindgen = { version = "0.2", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+
+[features]
+default = []
+python = ["dep:pyo3"]
+wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen"]
+mmap = ["dep:memmap2"]
+parallel = ["dep:rayon"]
+
+[package.metadata.docs.rs]
+features = ["python", "parallel"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.maturin]
+name = "office-oxide"
+python-source = "python"
+
+# wasm-opt in the local wasm-pack cache predates bulk-memory support that
+# modern rustc emits. Disable it — size is already driven by the Rust LTO
+# release profile.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[[example]]
+name = "extract"
+path = "examples/rust/extract.rs"
+
+[[example]]
+name = "make_smoke"
+path = "examples/rust/make_smoke.rs"
+
+[[example]]
+name = "01_extract"
+path = "examples/rust/01_extract.rs"
+
+[[example]]
+name = "02_create_rich"
+path = "examples/rust/02_create_rich.rs"
+
+[[example]]
+name = "03_create_xlsx"
+path = "examples/rust/03_create_xlsx.rs"
+
+[[example]]
+name = "04_create_pptx"
+path = "examples/rust/04_create_pptx.rs"
+
+[[example]]
+name = "05_edit"
+path = "examples/rust/05_edit.rs"
+
+[[example]]
+name = "06_from_markdown"
+path = "examples/rust/06_from_markdown.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3
+
+[profile.release-small]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

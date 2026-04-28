@@ -1,0 +1,95 @@
+{
+  "name": "office-oxide-wasm",
+  "version": "0.1.0",
+  "description": "Fast Office document processing (DOCX/XLSX/PPTX/DOC/XLS/PPT) compiled to WebAssembly. Rust core, zero JS dependencies. Works in Node.js, bundlers, and browsers.",
+  "license": "MIT OR Apache-2.0",
+  "author": "Yury Fedoseev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yfedoseev/office_oxide.git"
+  },
+  "homepage": "https://oxide.fyi",
+  "bugs": {
+    "url": "https://github.com/yfedoseev/office_oxide/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "type": "module",
+  "main": "./node/office_oxide.js",
+  "module": "./bundler/office_oxide.js",
+  "browser": "./web/office_oxide.js",
+  "types": "./bundler/office_oxide.d.ts",
+  "exports": {
+    ".": {
+      "types": "./bundler/office_oxide.d.ts",
+      "node": {
+        "require": "./node/office_oxide.js",
+        "default": "./node/office_oxide.js"
+      },
+      "browser": {
+        "import": "./web/office_oxide.js",
+        "default": "./web/office_oxide.js"
+      },
+      "import": "./bundler/office_oxide.js",
+      "default": "./bundler/office_oxide.js"
+    },
+    "./node": {
+      "types": "./node/office_oxide.d.ts",
+      "default": "./node/office_oxide.js"
+    },
+    "./web": {
+      "types": "./web/office_oxide.d.ts",
+      "default": "./web/office_oxide.js"
+    },
+    "./bundler": {
+      "types": "./bundler/office_oxide.d.ts",
+      "default": "./bundler/office_oxide.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "sideEffects": [
+    "./web/office_oxide.js",
+    "./bundler/office_oxide.js"
+  ],
+  "files": [
+    "node/office_oxide.js",
+    "node/office_oxide.d.ts",
+    "node/office_oxide_bg.wasm",
+    "node/office_oxide_bg.wasm.d.ts",
+    "bundler/office_oxide.js",
+    "bundler/office_oxide_bg.js",
+    "bundler/office_oxide.d.ts",
+    "bundler/office_oxide_bg.wasm",
+    "bundler/office_oxide_bg.wasm.d.ts",
+    "web/office_oxide.js",
+    "web/office_oxide.d.ts",
+    "web/office_oxide_bg.wasm",
+    "web/office_oxide_bg.wasm.d.ts",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "keywords": [
+    "docx",
+    "xlsx",
+    "pptx",
+    "doc",
+    "xls",
+    "ppt",
+    "office",
+    "wasm",
+    "webassembly",
+    "text-extraction",
+    "document-parser",
+    "rust",
+    "rust-wasm",
+    "serverless",
+    "node",
+    "browser",
+    "zero-dependency",
+    "typescript",
+    "esm",
+    "cjs"
+  ]
+}

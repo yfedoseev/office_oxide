@@ -1,0 +1,484 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+# Minimal token permissions — jobs that need write access declare it explicitly.
+permissions:
+  contents: read
+
+# Cancel in-progress runs on the same ref when a new one starts.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Check formatting
+  fmt:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+  # Linting with Clippy
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Run Clippy on full workspace
+        run: cargo clippy --all-targets --workspace -- -D warnings
+
+  # Build and test
+  test:
+    name: Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable, beta]
+        include:
+          - os: ubuntu-latest
+            rust: nightly
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.rust }}
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Build examples
+        run: cargo build --examples --verbose
+
+      - name: Run Rust examples (self-contained)
+        if: matrix.os == 'ubuntu-latest' && matrix.rust == 'stable'
+        run: |
+          cargo run --example 01_extract
+          cargo run --example 02_create_rich
+          cargo run --example 03_create_xlsx
+          cargo run --example 04_create_pptx
+          cargo run --example 05_edit
+          cargo run --example 06_from_markdown
+
+      - name: Run tests
+        run: cargo test --verbose
+
+      - name: Build documentation (warnings as errors)
+        run: cargo doc --no-deps --workspace
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  # Test feature combinations
+  features:
+    name: Feature Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features:
+          - ""
+          - "mmap"
+          - "parallel"
+          - "python"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build with features
+        run: cargo build -p office_oxide --no-default-features --features "${{ matrix.features }}"
+        if: matrix.features != ''
+
+      - name: Build without features
+        run: cargo build -p office_oxide --no-default-features
+        if: matrix.features == ''
+
+  # Python bindings test
+  python:
+    name: Python Bindings
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
+
+      - name: Create virtual environment
+        run: uv venv
+
+      - name: Install maturin
+        run: uv pip install maturin pytest
+
+      - name: Build Python package
+        run: uv run maturin build --release --features python --out dist
+
+      - name: Install wheel
+        shell: bash
+        run: |
+          wheel=$(ls dist/*.whl)
+          uv pip install "$wheel"
+
+      - name: Test Python bindings
+        run: uv run python -c "import office_oxide; print('office_oxide imported successfully')"
+
+      - name: Run Python examples
+        if: matrix.python-version == '3.12'
+        run: |
+          uv run python examples/python/01_extract/main.py
+          uv run python examples/python/02_create_from_markdown/main.py
+          uv run python examples/python/03_edit/main.py
+          uv run python examples/python/04_batch/main.py
+
+  # Go binding test
+  go:
+    name: Go bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.21'
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build Rust lib
+        run: cargo build --release --lib
+      - name: Run go test
+        run: go test -tags office_oxide_dev -v ./...
+        working-directory: go
+
+      - name: Run Go examples
+        run: |
+          (cd examples/go/01_extract && go run -tags office_oxide_dev .)
+          (cd examples/go/02_create_from_markdown && go run -tags office_oxide_dev .)
+          (cd examples/go/03_edit && go run -tags office_oxide_dev .)
+
+  # C# binding test
+  csharp:
+    name: C# bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo build --release --lib
+      - run: dotnet test csharp/OfficeOxide.Tests/OfficeOxide.Tests.csproj
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/release
+
+      - name: Run C# examples
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/release
+        run: |
+          dotnet run --project examples/csharp/01_extract/01_extract.csproj
+          dotnet run --project examples/csharp/02_create_from_markdown/02_create_from_markdown.csproj
+          dotnet run --project examples/csharp/03_edit/03_edit.csproj
+
+  # Node-native binding test (koffi)
+  node-native:
+    name: Node-native bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo build --release --lib
+      - run: npm install --silent
+        working-directory: js
+      - run: node --test test/basic.test.mjs
+        working-directory: js
+        env:
+          OFFICE_OXIDE_LIB: ${{ github.workspace }}/target/release/liboffice_oxide.so
+
+      - name: Run JS examples
+        env:
+          OFFICE_OXIDE_LIB: ${{ github.workspace }}/target/release/liboffice_oxide.so
+        run: |
+          node examples/javascript/01_extract.mjs
+          node examples/javascript/02_create_from_markdown.mjs
+          node examples/javascript/03_edit.mjs
+
+  # WASM build check
+  wasm-build:
+    name: WASM Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build WASM
+        run: cargo build -p office_oxide --lib --target wasm32-unknown-unknown --features wasm,default
+
+  # Code coverage with enforcement
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@d17fa930f29d14b5a8f7361cdbdf7bf1b722e982 # cargo-llvm-cov
+
+      - name: Generate coverage
+        run: |
+          cargo llvm-cov --lib --tests --lcov --output-path lcov.info \
+            --ignore-filename-regex '(python\.rs|wasm\.rs|ffi\.rs)'
+
+      - name: Enforce 75% coverage threshold
+        run: |
+          cargo llvm-cov report \
+            --ignore-filename-regex '(python\.rs|wasm\.rs|ffi\.rs)' \
+            --fail-under-lines 75
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@75cd11691c0faa626561e295848008c8a7dddffe # v5
+        with:
+          files: ./lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  # Unused dependencies (cargo-shear)
+  shear:
+    name: Unused deps (cargo-shear)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: shear
+      - name: Install cargo-shear
+        uses: taiki-e/install-action@cf525cb33f51aca27cd6fa02034117ab963ff9f1 # v2
+        with:
+          tool: cargo-shear
+      - name: Check for unused dependencies
+        run: cargo shear
+
+  # Benchmark smoke test — verify all benches compile
+  bench:
+    name: Benchmark Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: bench
+      - name: Build benchmarks (compile check only)
+        run: cargo bench --no-run
+
+  # CLI smoke test — verify the CLI binary builds and responds to --help
+  cli:
+    name: CLI Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build CLI
+        run: cargo build -p office_oxide_cli
+      - name: Verify CLI --help
+        run: cargo run -p office_oxide_cli -- --help
+
+  # Security audit
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Run security audit
+        uses: actions-rust-lang/audit@72c09e02f132669d52284a3323acdb503cfc1a24 # v1
+
+  # cargo-deny: licenses / advisories / bans / sources (single consolidated gate)
+  deny:
+    name: Dependency Check (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - name: Check dependencies
+        uses: EmbarkStudios/cargo-deny-action@91bf2b620e09e18d6eb78b92e7861937469acedb # v2
+        with:
+          command: check
+          arguments: --all-features
+
+  # cargo-geiger: report unsafe code in the dependency tree (informational)
+  geiger:
+    name: Unsafe code audit (cargo-geiger)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: geiger
+      - name: Install cargo-geiger
+        run: cargo install --locked cargo-geiger
+      - name: Run cargo-geiger
+        run: cargo geiger --all-features 2>/dev/null || true
+
+  # TOML formatting check (taplo)
+  taplo:
+    name: TOML format (taplo)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: taplo
+      - name: Install taplo
+        uses: taiki-e/install-action@cf525cb33f51aca27cd6fa02034117ab963ff9f1 # v2
+        with:
+          tool: taplo-cli
+      - name: Check TOML formatting
+        run: taplo fmt --check
+
+  # Feature powerset: build with every combination of features to catch cfg-rot.
+  # Skips dev-deps; root crate only (binary crates have no optional features).
+  features-powerset:
+    name: Feature powerset (cargo-hack)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: hack
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cf525cb33f51aca27cd6fa02034117ab963ff9f1 # v2
+        with:
+          tool: cargo-hack
+      - name: Build each feature individually (root crate)
+        run: cargo hack check --each-feature --no-dev-deps --lib -p office_oxide
+
+  # Public-API semver check (PR only — compares against base branch)
+  semver-checks:
+    name: Semver check (PR only)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
+        with:
+          feature-group: default-features
+
+  # MSRV: verify the oldest supported Rust toolchain still builds the library
+  msrv:
+    name: MSRV build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: |
+          v=$(grep -E '^rust-version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=${v:-1.85}" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: msrv
+      - name: Build with MSRV toolchain
+        run: cargo build --lib -p office_oxide
+
+  # DCO: every commit on a PR must carry a Signed-off-by trailer.
+  # Enforces the Developer Certificate of Origin (see CONTRIBUTING.md).
+  dco:
+    name: DCO check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          fetch-depth: 0
+      - name: Check DCO sign-off
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          MISSING=0
+          while IFS= read -r sha; do
+            if ! git log -1 --pretty=full "$sha" | grep -q "^Signed-off-by:"; then
+              echo "::error::Commit $sha is missing a Signed-off-by trailer (run: git commit -s --amend)"
+              MISSING=$((MISSING+1))
+            fi
+          done < <(git log --pretty=format:"%H" "${BASE}..${HEAD}")
+          [ "$MISSING" -eq 0 ] || exit 1

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/yfedoseev/office_oxide/security/advisories/new
+    about: Report a security vulnerability privately via GitHub's advisory system (see SECURITY.md)
+  - name: Question / discussion
+    url: https://github.com/yfedoseev/office_oxide/discussions
+    about: Ask a question or start a discussion about office_oxide

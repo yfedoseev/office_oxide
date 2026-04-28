@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- LibraryImport source generator replaces the DllImport IL stub, so
+         P/Invoke is AOT-safe and trim-safe. -->
+    <IsAotCompatible>true</IsAotCompatible>
+    <IsTrimmable>true</IsTrimmable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <PackageId>OfficeOxide</PackageId>
+    <Version>0.1.0</Version>
+    <Title>OfficeOxide</Title>
+    <Authors>Yury Fedoseev</Authors>
+    <Product>office_oxide</Product>
+    <Description>Idiomatic .NET bindings for office_oxide — a fast Rust library for DOCX, XLSX, PPTX, DOC, XLS, PPT parsing, conversion, and editing.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+    <PackageTags>docx;xlsx;pptx;office;text-extraction;markdown;html;document</PackageTags>
+    <RepositoryUrl>https://github.com/yfedoseev/office_oxide</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://oxide.fyi</PackageProjectUrl>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+  <!-- Pack pre-built native libs under runtimes/<rid>/native/ when available.
+       The release workflow populates runtimes/ before running `dotnet pack`.
+       Missing folders are silently ignored by MSBuild's Include glob. -->
+  <ItemGroup>
+    <None Include="runtimes/**/*" Pack="true" PackagePath="runtimes/" Condition="Exists('runtimes')" />
+  </ItemGroup>
+</Project>

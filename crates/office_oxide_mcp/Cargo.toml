@@ -1,0 +1,49 @@
+[package]
+name = "office_oxide_mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "MCP server for Office document extraction — gives Claude, Cursor, and AI assistants the ability to read DOCX/XLSX/PPTX/DOC/XLS/PPT files locally. Powered by office_oxide."
+documentation = "https://office.oxide.fyi"
+readme = "README.md"
+keywords = ["mcp", "office", "claude", "llm", "ai"]
+categories = ["command-line-utilities", "text-processing"]
+include = ["/src/**/*", "/Cargo.toml", "/README.md"]
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "office-oxide-mcp"
+path = "src/main.rs"
+
+[dependencies]
+office_oxide = { version = "0.1.0", path = "../.." }
+serde_json = "1"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/office_oxide-{ target }-{ version }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/office_oxide-linux-x86_64-{ version }.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/office_oxide-linux-x86_64-musl-{ version }.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/office_oxide-linux-aarch64-{ version }.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/office_oxide-macos-x86_64-{ version }.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/office_oxide-macos-aarch64-{ version }.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/office_oxide-windows-x86_64-{ version }.zip"
+pkg-fmt = "zip"

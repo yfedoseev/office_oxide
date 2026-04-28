@@ -1,0 +1,23 @@
+#!/bin/bash
+# Optional pre-commit hook that enforces version parity across every manifest
+# touched by the release pipeline. Symlink into .git/hooks to enable:
+#
+#     ln -s ../../.github/hooks/pre-commit .git/hooks/pre-commit
+#
+# The hook is a no-op when none of the versioned files are staged.
+
+set -euo pipefail
+
+changed=$(git diff --cached --name-only)
+
+# Only run when a version-carrying file is actually being committed.
+if ! grep -qE '^(Cargo\.toml|pyproject\.toml|wasm-pkg/package\.json|js/package\.json|csharp/OfficeOxide/OfficeOxide\.csproj|go/cmd/install/main\.go|crates/office_oxide_(cli|mcp)/Cargo\.toml)$' <<<"$changed"; then
+  exit 0
+fi
+
+if ! bash .github/scripts/check-versions.sh; then
+  echo
+  echo "pre-commit: refusing to commit with drifted versions."
+  echo "Run:  .github/scripts/bump-version.sh <target-version>"
+  exit 1
+fi

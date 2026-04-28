@@ -1,0 +1,17 @@
+changelog:
+  exclude:
+    labels: [skip-changelog]
+    authors: [dependabot]
+  categories:
+    - title: "New Features"
+      labels: [enhancement, feature]
+    - title: "Bug Fixes"
+      labels: [bug, fix]
+    - title: "Performance"
+      labels: [performance]
+    - title: "Documentation"
+      labels: [documentation]
+    - title: "Maintenance"
+      labels: [chore, maintenance]
+    - title: "Other Changes"
+      labels: ["*"]

@@ -1,0 +1,53 @@
+# cargo-deny configuration
+# See https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+version = 2
+# Threshold for unmaintained crates
+unmaintained = "none"
+# Threshold for crates that have been yanked from their source registry
+yanked = "deny"
+# Ignore certain advisories (use sparingly)
+ignore = []
+
+[licenses]
+version = 2
+# office_oxide is licensed MIT OR Apache-2.0. The allow list reflects that:
+# every transitive dep must use a permissive licence we can ship under either
+# of our two outward licences without restricting downstream users.
+#
+# Locked decision: no MPL-2.0, no GPL/AGPL/SSPL.
+# MPL is *file-level* copyleft — workable, but causes friction with some
+# downstream legal teams. Keep the ecosystem story simple.
+#
+# cargo-deny [licenses] is allow-list only — anything not listed below
+# fails the build. There is no separate `deny` array for licences.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Unicode-3.0",
+    "Zlib",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "CC0-1.0",
+    "BSL-1.0",
+]
+
+[bans]
+# Deny multiple versions of the same crate
+multiple-versions = "warn"
+# Deny wildcard dependencies
+wildcards = "warn"
+# Specific crates to deny
+deny = []
+
+[sources]
+# Deny crates from unknown registries
+unknown-registry = "deny"
+# Deny Git sources
+unknown-git = "warn"
+# Allow only crates.io
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

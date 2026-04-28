@@ -1,0 +1,83 @@
+name: Dependency Freshness
+
+on:
+  schedule:
+    - cron: "0 8 1 * *" # 1st of every month at 08:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  outdated:
+    name: cargo outdated
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: outdated
+
+      - name: Install cargo-outdated
+        run: cargo install --locked cargo-outdated
+
+      - name: Check for outdated dependencies
+        id: outdated
+        run: |
+          OUTPUT=$(cargo outdated --workspace --exit-code 0 2>&1)
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -qE "^[a-zA-Z].*->"; then
+            echo "has_outdated=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "report<<EOF"
+              echo "$OUTPUT"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "has_outdated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open issue for outdated deps
+        if: steps.outdated.outputs.has_outdated == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          script: |
+            const title = `chore: outdated dependencies (${new Date().toISOString().slice(0,7)})`;
+            const body = [
+              "Monthly dependency freshness check found outdated crates.\n",
+              "```",
+              process.env.REPORT,
+              "```",
+              "\nRun `cargo update` or bump versions in `Cargo.toml` as appropriate.",
+            ].join("\n");
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              labels: "dependencies",
+            });
+
+            const existing = issues.find(i => i.title.startsWith("chore: outdated dependencies"));
+            if (existing) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ["dependencies"],
+              });
+            }
+        env:
+          REPORT: ${{ steps.outdated.outputs.report }}

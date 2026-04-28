@@ -1,0 +1,44 @@
+# Normalize line endings to LF on commit
+* text=auto eol=lf
+
+# Windows batch files must use CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Rust
+*.rs text eol=lf
+*.toml text eol=lf
+
+# Web / config
+*.js text eol=lf
+*.mjs text eol=lf
+*.ts text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+
+# Go
+*.go text eol=lf
+
+# C#
+*.cs text eol=lf
+*.csproj text eol=lf
+*.sln text eol=lf
+
+# Binary files — no line-ending conversion
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.wasm binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.a binary
