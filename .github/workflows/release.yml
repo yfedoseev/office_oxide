@@ -1037,16 +1037,15 @@ jobs:
               -e "s/{{SHA256_WINDOWS_ARM64}}/${SHA_ARM}/g" \
               .github/templates/office-oxide.json > manifest.json
 
-      - name: Push to Scoop bucket
-        uses: dmnemec/copy_file_to_another_repo_action@bbebd3da22e4a37d04dca5f782edd5201cb97083 # main
+      - name: Push Scoop manifest
         env:
-          API_TOKEN_GITHUB: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        with:
-          source_file: manifest.json
-          destination_repo: yfedoseev/scoop-bucket
-          destination_folder: bucket
-          destination_branch_name: main
-          user_email: yfedoseev@gmail.com
-          user_name: Yury Fedoseev
-          destination_file: office-oxide.json
-          commit_message: "Update office-oxide to v${{ needs.validate.outputs.version }}"
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/yfedoseev/scoop-office-oxide.git" scoop-repo
+          cp manifest.json scoop-repo/office-oxide.json
+          cd scoop-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add office-oxide.json
+          git commit -m "Update office-oxide to v${{ needs.validate.outputs.version }}"
+          git push
