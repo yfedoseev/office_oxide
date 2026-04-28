@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "The fastest Office document processing library for Python — DOCX, XLSX, PPTX, DOC, XLS, PPT"
 requires-python = ">=3.8"
 license = { text = "MIT OR Apache-2.0" }
-authors = [{ name = "Yury Fedoseev", email = "yfedoseev@gmail.com" }]
+authors = [{ name = "Yury Fedoseev" }]
 keywords = [
     "docx",
     "xlsx",

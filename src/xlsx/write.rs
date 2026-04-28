@@ -8,7 +8,7 @@
 //! use office_oxide::xlsx::write::{XlsxWriter, CellData, CellStyle, NumberFormat, HAlign};
 //!
 //! let mut wb = XlsxWriter::new();
-//! let sheet = wb.add_sheet("Sales");
+//! let mut sheet = wb.add_sheet("Sales");
 //!
 //! // Bold header row
 //! let header_style = CellStyle::new().bold();

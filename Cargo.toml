@@ -30,7 +30,7 @@ rust-version = "1.85"
 [package]
 name = "office_oxide"
 description = "The fastest Office document processing library — DOCX, XLSX, PPTX, DOC, XLS, PPT"
-authors = ["Yury Fedoseev <yfedoseev@gmail.com>"]
+
 version.workspace = true
 edition.workspace = true
 license.workspace = true

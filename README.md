@@ -19,8 +19,6 @@ A fast, memory-safe library for text extraction from Office documents. Rust core
 [![Build Status](https://github.com/yfedoseev/office_oxide/workflows/CI/badge.svg)](https://github.com/yfedoseev/office_oxide/actions)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](https://opensource.org/licenses)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/yfedoseev/office_oxide/badge)](https://scorecard.dev/viewer/?uri=github.com/yfedoseev/office_oxide)
-<!-- OpenSSF Best Practices badge: register at https://www.bestpractices.dev/en/projects/new then replace NNNN below -->
-<!-- [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/NNNN/badge)](https://www.bestpractices.dev/projects/NNNN) -->
 
 ## Available bindings
 

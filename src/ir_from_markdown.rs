@@ -402,7 +402,9 @@ fn is_thematic_break(line: &str) -> bool {
     if t.len() < 3 {
         return false;
     }
-    let ch = t.chars().next().unwrap();
+    let Some(ch) = t.chars().next() else {
+        return false;
+    };
     if !matches!(ch, '-' | '*' | '_') {
         return false;
     }

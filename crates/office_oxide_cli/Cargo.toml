@@ -54,7 +54,7 @@ pkg-url = "{ repo }/releases/download/v{ version }/office_oxide-windows-aarch64-
 pkg-fmt = "zip"
 
 [package.metadata.deb]
-maintainer = "Yury Fedoseev <yfedoseev@gmail.com>"
+maintainer = "Yury Fedoseev"
 copyright = "2025-2026, Yury Fedoseev"
 depends = "$auto"
 section = "utility"
