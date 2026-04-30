@@ -72,6 +72,12 @@ pub mod rel_types {
     /// Relationship type for chart parts.
     pub const CHART: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart";
+    /// Relationship type for the footnotes part.
+    pub const FOOTNOTES: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes";
+    /// Relationship type for the endnotes part.
+    pub const ENDNOTES: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes";
 }
 
 /// Strict (ISO 29500) relationship type prefix.

@@ -33,6 +33,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                         if !line.trim().is_empty() {
                             elements.push(Element::Paragraph(Paragraph {
                                 content: vec![InlineContent::Text(TextSpan::plain(line))],
+                                ..Default::default()
                             }));
                         }
                     }
@@ -45,6 +46,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                                     italic: true,
                                     ..TextSpan::plain(line)
                                 })],
+                                ..Default::default()
                             }));
                         }
                     }
@@ -52,6 +54,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                 _ => {
                     elements.push(Element::Paragraph(Paragraph {
                         content: vec![InlineContent::Text(TextSpan::plain(text))],
+                        ..Default::default()
                     }));
                 },
             }
@@ -62,6 +65,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
         sections.push(Section {
             title: Some(title),
             elements,
+            ..Default::default()
         });
     }
 
@@ -71,6 +75,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Ppt,
             title,
+            ..Default::default()
         },
         sections,
     }

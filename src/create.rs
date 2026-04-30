@@ -87,18 +87,83 @@ pub fn create_from_ir_to_writer<W: Write + Seek>(
     Ok(())
 }
 
-/// Convert IR to a DOCX writer.
+// ---------------------------------------------------------------------------
+// DOCX conversion
+// ---------------------------------------------------------------------------
+
 fn ir_to_docx(ir: &DocumentIR) -> crate::docx::write::DocxWriter {
-    let mut writer = crate::docx::write::DocxWriter::new();
+    use crate::docx::write::{DocxWriter, IrParaProps, Run};
+
+    let mut writer = DocxWriter::new();
+
+    // Write metadata
+    writer.set_metadata(&ir.metadata);
 
     for section in &ir.sections {
+        // Section title becomes H1
         if let Some(ref title) = section.title {
             if !title.is_empty() {
-                writer.add_heading(title, 1);
+                let runs = [Run::new(title)];
+                let props = IrParaProps {
+                    style: Some("Heading1".to_string()),
+                    ..Default::default()
+                };
+                writer.add_ir_paragraph(&runs, Some(props));
             }
         }
+
+        // Section headers/footers
+        if let Some(ref hf) = section.header {
+            writer.add_section_header(
+                crate::docx::write::HfType::default_header(),
+                hf.content.clone(),
+            );
+        }
+        if let Some(ref hf) = section.footer {
+            writer.add_section_header(
+                crate::docx::write::HfType::default_footer(),
+                hf.content.clone(),
+            );
+        }
+        if let Some(ref hf) = section.first_page_header {
+            writer.add_section_header(
+                crate::docx::write::HfType::first_page_header(),
+                hf.content.clone(),
+            );
+        }
+        if let Some(ref hf) = section.first_page_footer {
+            writer.add_section_header(
+                crate::docx::write::HfType::first_page_footer(),
+                hf.content.clone(),
+            );
+        }
+        if let Some(ref hf) = section.even_page_header {
+            writer.add_section_header(
+                crate::docx::write::HfType::even_page_header(),
+                hf.content.clone(),
+            );
+        }
+        if let Some(ref hf) = section.even_page_footer {
+            writer.add_section_header(
+                crate::docx::write::HfType::even_page_footer(),
+                hf.content.clone(),
+            );
+        }
+
         for elem in &section.elements {
             add_element_to_docx(&mut writer, elem);
+        }
+
+        // Section page setup / columns
+        if section.page_setup.is_some()
+            || section.columns.is_some()
+            || section.break_type != SectionBreakType::Continuous
+        {
+            writer.set_section_props(
+                section.page_setup.clone(),
+                section.columns.clone(),
+                section.break_type.clone(),
+            );
         }
     }
 
@@ -106,53 +171,118 @@ fn ir_to_docx(ir: &DocumentIR) -> crate::docx::write::DocxWriter {
 }
 
 fn add_element_to_docx(writer: &mut crate::docx::write::DocxWriter, elem: &Element) {
+    use crate::docx::write::{IrParaProps, Run};
+
     match elem {
         Element::Heading(h) => {
-            let text = inline_to_text(&h.content);
-            writer.add_heading(&text, h.level);
+            let level = h.level.clamp(1, 6);
+            let runs: Vec<Run> = ir_inline_to_runs(&h.content);
+            let props = IrParaProps {
+                style: Some(format!("Heading{level}")),
+                ..Default::default()
+            };
+            writer.add_ir_paragraph(&runs, Some(props));
         },
         Element::Paragraph(p) => {
-            let text = inline_to_text(&p.content);
-            if !text.is_empty() {
-                writer.add_paragraph(&text);
+            let runs = ir_inline_to_runs(&p.content);
+            if runs.iter().any(|r| !r.text.is_empty() || r.footnote_ref.is_some() || r.endnote_ref.is_some()) {
+                let props = IrParaProps {
+                    alignment: p.alignment.clone(),
+                    indent_left_twips: p.indent_left_twips,
+                    indent_right_twips: p.indent_right_twips,
+                    first_line_indent_twips: p.first_line_indent_twips,
+                    space_before_twips: p.space_before_twips,
+                    space_after_twips: p.space_after_twips,
+                    line_spacing: p.line_spacing.clone(),
+                    keep_with_next: p.keep_with_next,
+                    keep_together: p.keep_together,
+                    page_break_before: p.page_break_before,
+                    background_color: p.background_color,
+                    outline_level: p.outline_level,
+                    border: p.border.clone(),
+                    ..Default::default()
+                };
+                writer.add_ir_paragraph(&runs, Some(props));
             }
         },
         Element::Table(t) => {
-            let rows: Vec<Vec<String>> = t
-                .rows
-                .iter()
-                .map(|r| {
-                    r.cells
-                        .iter()
-                        .map(|c| {
-                            c.content
-                                .iter()
-                                .map(|e| match e {
-                                    Element::Paragraph(p) => inline_to_text(&p.content),
-                                    _ => String::new(),
-                                })
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        })
-                        .collect()
-                })
-                .collect();
-            let row_refs: Vec<Vec<&str>> = rows
-                .iter()
-                .map(|r| r.iter().map(String::as_str).collect())
-                .collect();
-            writer.add_table(&row_refs);
+            writer.add_ir_table(t);
         },
         Element::List(l) => {
-            let items: Vec<String> = l.items.iter().map(|i| inline_to_text(&i.content)).collect();
-            let item_refs: Vec<&str> = items.iter().map(String::as_str).collect();
-            writer.add_list(&item_refs, l.ordered);
+            writer.add_ir_list(l);
         },
-        Element::ThematicBreak | Element::Image(_) => {},
+        Element::Image(img) => {
+            writer.add_ir_image(img);
+        },
+        Element::ThematicBreak => {
+            // Emit a horizontal rule as a paragraph with bottom border
+            let props = IrParaProps::default();
+            writer.add_ir_paragraph(&[], Some(props));
+        },
+        Element::PageBreak => {
+            writer.add_page_break();
+        },
+        Element::ColumnBreak => {
+            writer.add_column_break();
+        },
+        Element::TextBox(tb) => {
+            writer.add_text_box(tb);
+        },
+        Element::Footnote(n) => {
+            writer.add_footnote(n.id, &n.content);
+        },
+        Element::Endnote(n) => {
+            writer.add_endnote(n.id, &n.content);
+        },
+        Element::CodeBlock(cb) => {
+            writer.add_code_block(&cb.content);
+        },
     }
 }
 
-/// Convert IR to an XLSX writer.
+fn ir_inline_to_runs(content: &[InlineContent]) -> Vec<crate::docx::write::Run> {
+    use crate::docx::write::Run;
+    let mut runs: Vec<Run> = Vec::new();
+    for item in content {
+        match item {
+            InlineContent::Text(span) => {
+                let mut run = Run::new(&span.text);
+                run.bold = span.bold;
+                run.italic = span.italic;
+                run.strikethrough = span.strikethrough;
+                run.font_name = span.font_name.clone();
+                run.font_size_half_pt = span.font_size_half_pt;
+                run.color_rgb = span.color;
+                run.underline_style = span.underline.clone();
+                run.highlight = span.highlight;
+                run.vertical_align = span.vertical_align.clone();
+                run.all_caps = span.all_caps;
+                run.small_caps = span.small_caps;
+                run.char_spacing_half_pt = span.char_spacing_half_pt;
+                runs.push(run);
+            },
+            InlineContent::LineBreak => {
+                runs.push(Run { text: "\n".to_string(), ..Default::default() });
+            },
+            InlineContent::FootnoteRef(r) => {
+                let mut run = Run::default();
+                run.footnote_ref = Some(r.note_id);
+                runs.push(run);
+            },
+            InlineContent::EndnoteRef(r) => {
+                let mut run = Run::default();
+                run.endnote_ref = Some(r.note_id);
+                runs.push(run);
+            },
+        }
+    }
+    runs
+}
+
+// ---------------------------------------------------------------------------
+// XLSX conversion
+// ---------------------------------------------------------------------------
+
 fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
     use crate::xlsx::write::CellData;
 
@@ -211,7 +341,10 @@ fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
     writer
 }
 
-/// Convert IR to a PPTX writer.
+// ---------------------------------------------------------------------------
+// PPTX conversion
+// ---------------------------------------------------------------------------
+
 fn ir_to_pptx(ir: &DocumentIR) -> crate::pptx::write::PptxWriter {
     let mut writer = crate::pptx::write::PptxWriter::new();
 
@@ -228,7 +361,6 @@ fn ir_to_pptx(ir: &DocumentIR) -> crate::pptx::write::PptxWriter {
             match elem {
                 Element::Heading(h) => {
                     let text = inline_to_text(&h.content);
-                    // If no title yet, use heading as title
                     if slide.title.is_none() {
                         slide.set_title(&text);
                     } else {
@@ -242,8 +374,20 @@ fn ir_to_pptx(ir: &DocumentIR) -> crate::pptx::write::PptxWriter {
                     }
                 },
                 Element::List(l) => {
-                    let items: Vec<String> =
-                        l.items.iter().map(|i| inline_to_text(&i.content)).collect();
+                    let items: Vec<String> = l
+                        .items
+                        .iter()
+                        .map(|i| {
+                            i.content
+                                .iter()
+                                .map(|e| match e {
+                                    Element::Paragraph(p) => inline_to_text(&p.content),
+                                    _ => String::new(),
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .collect();
                     let item_refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
                     slide.add_bullet_list(&item_refs);
                 },
@@ -255,13 +399,17 @@ fn ir_to_pptx(ir: &DocumentIR) -> crate::pptx::write::PptxWriter {
     writer
 }
 
-/// Extract plain text from inline content.
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 fn inline_to_text(content: &[InlineContent]) -> String {
     let mut out = String::new();
     for item in content {
         match item {
             InlineContent::Text(span) => out.push_str(&span.text),
             InlineContent::LineBreak => out.push('\n'),
+            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
         }
     }
     out

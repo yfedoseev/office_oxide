@@ -26,8 +26,9 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Docx,
             title: title.clone(),
+            ..Default::default()
         },
-        sections: vec![Section { title, elements }],
+        sections: vec![Section { title, elements, ..Default::default() }],
     }
 }
 
@@ -69,6 +70,7 @@ fn convert_block_elements(
                             } else {
                                 before_break
                             },
+                            ..Default::default()
                         }));
                     }
                     if has_break {
@@ -154,6 +156,7 @@ fn convert_run(
                     italic,
                     strikethrough: strike,
                     hyperlink: hyperlink_url.map(|s| s.to_string()),
+                    ..Default::default()
                 }));
             },
             crate::docx::RunContent::Break(crate::docx::BreakType::Line) => {
@@ -259,6 +262,14 @@ fn convert_list_group(
     Element::List(build_nested_list(is_ordered, &items, 0))
 }
 
+fn inline_to_element(content: Vec<InlineContent>) -> Vec<Element> {
+    if content.is_empty() {
+        Vec::new()
+    } else {
+        vec![Element::Paragraph(Paragraph { content, ..Default::default() })]
+    }
+}
+
 fn build_nested_list(ordered: bool, items: &[(u8, Vec<InlineContent>)], base_level: u8) -> List {
     let mut list_items = Vec::new();
     let mut idx = 0;
@@ -281,7 +292,7 @@ fn build_nested_list(ordered: bool, items: &[(u8, Vec<InlineContent>)], base_lev
                 ));
             }
             list_items.push(ListItem {
-                content: content.clone(),
+                content: inline_to_element(content.clone()),
                 nested,
             });
             idx = if nested_end > nested_start {
@@ -292,7 +303,7 @@ fn build_nested_list(ordered: bool, items: &[(u8, Vec<InlineContent>)], base_lev
         } else {
             // Item at unexpected level — just add it flat
             list_items.push(ListItem {
-                content: content.clone(),
+                content: inline_to_element(content.clone()),
                 nested: None,
             });
             idx += 1;
@@ -302,6 +313,7 @@ fn build_nested_list(ordered: bool, items: &[(u8, Vec<InlineContent>)], base_lev
     List {
         ordered,
         items: list_items,
+        ..Default::default()
     }
 }
 
@@ -400,6 +412,7 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
                 content: cell_elements,
                 col_span,
                 row_span,
+                ..Default::default()
             });
 
             grid_col += col_span as usize;
@@ -408,10 +421,11 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
         ir_rows.push(TableRow {
             cells: ir_cells,
             is_header,
+            ..Default::default()
         });
     }
 
-    Element::Table(Table { rows: ir_rows })
+    Element::Table(Table { rows: ir_rows, ..Default::default() })
 }
 
 fn get_cell_at_grid_col(
@@ -441,6 +455,7 @@ impl From<&crate::docx::DrawingInfo> for Image {
     fn from(d: &crate::docx::DrawingInfo) -> Self {
         Image {
             alt_text: d.description.clone(),
+            ..Default::default()
         }
     }
 }

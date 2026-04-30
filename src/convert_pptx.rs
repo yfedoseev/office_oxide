@@ -23,6 +23,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             if !notes.is_empty() {
                 elements.push(Element::Paragraph(Paragraph {
                     content: vec![InlineContent::Text(TextSpan::plain(notes.clone()))],
+                    ..Default::default()
                 }));
             }
         }
@@ -30,6 +31,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         sections.push(Section {
             title: title.clone(),
             elements,
+            ..Default::default()
         });
     }
 
@@ -39,6 +41,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Pptx,
             title,
+            ..Default::default()
         },
         sections,
     }
@@ -145,6 +148,7 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
         crate::pptx::Shape::Picture(pic) => {
             elements.push(Element::Image(Image {
                 alt_text: pic.alt_text.clone(),
+                ..Default::default()
             }));
         },
         crate::pptx::Shape::Group(grp) => {
@@ -176,7 +180,7 @@ fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) 
         for para in &body.paragraphs {
             let content = convert_text_paragraph_inline(para);
             if !content.is_empty() {
-                elements.push(Element::Paragraph(Paragraph { content }));
+                elements.push(Element::Paragraph(Paragraph { content, ..Default::default() }));
             }
         }
     }
@@ -198,6 +202,7 @@ fn convert_text_paragraph_inline(para: &crate::pptx::TextParagraph) -> Vec<Inlin
                         italic: run.italic.unwrap_or(false),
                         strikethrough: run.strikethrough,
                         hyperlink,
+                        ..Default::default()
                     }));
                 }
             },
@@ -212,6 +217,14 @@ fn convert_text_paragraph_inline(para: &crate::pptx::TextParagraph) -> Vec<Inlin
         }
     }
     content
+}
+
+fn inline_to_element(content: Vec<InlineContent>) -> Vec<Element> {
+    if content.is_empty() {
+        Vec::new()
+    } else {
+        vec![Element::Paragraph(Paragraph { content, ..Default::default() })]
+    }
 }
 
 fn build_nested_list(ordered: bool, items: &[(u8, Vec<InlineContent>)], base_level: u8) -> List {
@@ -232,7 +245,7 @@ fn build_nested_list(ordered: bool, items: &[(u8, Vec<InlineContent>)], base_lev
                 None
             };
             list_items.push(ListItem {
-                content: content.clone(),
+                content: inline_to_element(content.clone()),
                 nested,
             });
             idx = if nested_end > nested_start {
@@ -242,7 +255,7 @@ fn build_nested_list(ordered: bool, items: &[(u8, Vec<InlineContent>)], base_lev
             };
         } else {
             list_items.push(ListItem {
-                content: content.clone(),
+                content: inline_to_element(content.clone()),
                 nested: None,
             });
             idx += 1;
@@ -252,6 +265,7 @@ fn build_nested_list(ordered: bool, items: &[(u8, Vec<InlineContent>)], base_lev
     List {
         ordered,
         items: list_items,
+        ..Default::default()
     }
 }
 
@@ -272,7 +286,7 @@ fn convert_pptx_table(table: &crate::pptx::Table) -> Element {
                 for para in &tb.paragraphs {
                     let content = convert_text_paragraph_inline(para);
                     if !content.is_empty() {
-                        cell_elements.push(Element::Paragraph(Paragraph { content }));
+                        cell_elements.push(Element::Paragraph(Paragraph { content, ..Default::default() }));
                     }
                 }
             }
@@ -281,14 +295,16 @@ fn convert_pptx_table(table: &crate::pptx::Table) -> Element {
                 content: cell_elements,
                 col_span: cell.grid_span,
                 row_span: cell.row_span,
+                ..Default::default()
             });
         }
 
         ir_rows.push(TableRow {
             cells: ir_cells,
             is_header: row_idx == 0,
+            ..Default::default()
         });
     }
 
-    Element::Table(Table { rows: ir_rows })
+    Element::Table(Table { rows: ir_rows, ..Default::default() })
 }

@@ -227,6 +227,7 @@ fn sample_ir(format: office_oxide::DocumentFormat) -> office_oxide::DocumentIR {
         metadata: Metadata {
             format,
             title: Some("Test Doc".to_string()),
+            ..Default::default()
         },
         sections: vec![Section {
             title: Some("Section 1".to_string()),
@@ -237,6 +238,7 @@ fn sample_ir(format: office_oxide::DocumentFormat) -> office_oxide::DocumentIR {
                 }),
                 Element::Paragraph(Paragraph {
                     content: vec![InlineContent::Text(TextSpan::plain("Body text here"))],
+                    ..Default::default()
                 }),
                 Element::Table(Table {
                     rows: vec![
@@ -245,42 +247,54 @@ fn sample_ir(format: office_oxide::DocumentFormat) -> office_oxide::DocumentIR {
                                 TableCell {
                                     content: vec![Element::Paragraph(Paragraph {
                                         content: vec![InlineContent::Text(TextSpan::plain("H1"))],
+                                        ..Default::default()
                                     })],
                                     col_span: 1,
                                     row_span: 1,
+                                    ..Default::default()
                                 },
                                 TableCell {
                                     content: vec![Element::Paragraph(Paragraph {
                                         content: vec![InlineContent::Text(TextSpan::plain("H2"))],
+                                        ..Default::default()
                                     })],
                                     col_span: 1,
                                     row_span: 1,
+                                    ..Default::default()
                                 },
                             ],
                             is_header: true,
+                            ..Default::default()
                         },
                         TableRow {
                             cells: vec![
                                 TableCell {
                                     content: vec![Element::Paragraph(Paragraph {
                                         content: vec![InlineContent::Text(TextSpan::plain("A"))],
+                                        ..Default::default()
                                     })],
                                     col_span: 1,
                                     row_span: 1,
+                                    ..Default::default()
                                 },
                                 TableCell {
                                     content: vec![Element::Paragraph(Paragraph {
                                         content: vec![InlineContent::Text(TextSpan::plain("B"))],
+                                        ..Default::default()
                                     })],
                                     col_span: 1,
                                     row_span: 1,
+                                    ..Default::default()
                                 },
                             ],
                             is_header: false,
+                            ..Default::default()
                         },
                     ],
+                    ..Default::default()
                 }),
             ],
+            ..Default::default()
         }],
     }
 }
@@ -425,4 +439,688 @@ fn pptx_edit_replace_text_round_trip() {
     let doc = office_oxide::pptx::PptxDocument::from_reader(out).unwrap();
     let text = doc.plain_text();
     assert!(text.contains("REPLACED"), "text: {text}");
+}
+
+// ===========================================================================
+// P0 rich IR → DOCX round-trip tests
+// ===========================================================================
+
+#[test]
+fn ir_paragraph_alignment_round_trip() {
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        metadata: Metadata {
+            format: office_oxide::DocumentFormat::Docx,
+            title: None,
+            ..Default::default()
+        },
+        sections: vec![Section {
+            elements: vec![
+                Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain("Left aligned"))],
+                    alignment: Some(ParagraphAlignment::Left),
+                    ..Default::default()
+                }),
+                Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain("Center aligned"))],
+                    alignment: Some(ParagraphAlignment::Center),
+                    ..Default::default()
+                }),
+                Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain("Justified text"))],
+                    alignment: Some(ParagraphAlignment::Justify),
+                    ..Default::default()
+                }),
+            ],
+            ..Default::default()
+        }],
+    };
+
+    let mut buf = Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(
+        &ir,
+        office_oxide::DocumentFormat::Docx,
+        &mut buf,
+    )
+    .unwrap();
+    buf.set_position(0);
+
+    let doc = office_oxide::docx::DocxDocument::from_reader(buf).unwrap();
+    let text = doc.plain_text();
+    assert!(text.contains("Left aligned"), "text: {text}");
+    assert!(text.contains("Center aligned"), "text: {text}");
+    assert!(text.contains("Justified text"), "text: {text}");
+}
+
+#[test]
+fn ir_paragraph_indentation_round_trip() {
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        sections: vec![Section {
+            elements: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain("Indented paragraph"))],
+                indent_left_twips: Some(720),
+                first_line_indent_twips: Some(360),
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+    };
+
+    let mut buf = Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(
+        &ir,
+        office_oxide::DocumentFormat::Docx,
+        &mut buf,
+    )
+    .unwrap();
+    buf.set_position(0);
+
+    let doc = office_oxide::docx::DocxDocument::from_reader(buf).unwrap();
+    assert!(doc.plain_text().contains("Indented paragraph"));
+}
+
+#[test]
+fn ir_paragraph_line_spacing_round_trip() {
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        sections: vec![Section {
+            elements: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain("1.5 line spacing"))],
+                line_spacing: Some(LineSpacing::Auto(360)), // 360 = 1.5x
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+    };
+
+    let mut buf = Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(
+        &ir,
+        office_oxide::DocumentFormat::Docx,
+        &mut buf,
+    )
+    .unwrap();
+    buf.set_position(0);
+
+    let doc = office_oxide::docx::DocxDocument::from_reader(buf).unwrap();
+    assert!(doc.plain_text().contains("1.5 line spacing"));
+}
+
+#[test]
+fn ir_table_with_borders_round_trip() {
+    use office_oxide::ir::*;
+
+    let border_line = BorderLine {
+        style: BorderStyle::Single,
+        color: Some([0, 0, 0]),
+        size: Some(4),
+        space: Some(0),
+    };
+    let table_border = TableBorder {
+        top: Some(border_line.clone()),
+        bottom: Some(border_line.clone()),
+        left: Some(border_line.clone()),
+        right: Some(border_line.clone()),
+        inside_h: Some(border_line.clone()),
+        inside_v: Some(border_line.clone()),
+    };
+
+    let ir = DocumentIR {
+        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        sections: vec![Section {
+            elements: vec![Element::Table(Table {
+                rows: vec![
+                    TableRow {
+                        cells: vec![
+                            TableCell {
+                                content: vec![Element::Paragraph(Paragraph {
+                                    content: vec![InlineContent::Text(TextSpan::plain("Name"))],
+                                    ..Default::default()
+                                })],
+                                col_span: 1,
+                                row_span: 1,
+                                ..Default::default()
+                            },
+                            TableCell {
+                                content: vec![Element::Paragraph(Paragraph {
+                                    content: vec![InlineContent::Text(TextSpan::plain("Value"))],
+                                    ..Default::default()
+                                })],
+                                col_span: 1,
+                                row_span: 1,
+                                ..Default::default()
+                            },
+                        ],
+                        is_header: true,
+                        ..Default::default()
+                    },
+                    TableRow {
+                        cells: vec![
+                            TableCell {
+                                content: vec![Element::Paragraph(Paragraph {
+                                    content: vec![InlineContent::Text(TextSpan::plain("Alice"))],
+                                    ..Default::default()
+                                })],
+                                col_span: 1,
+                                row_span: 1,
+                                ..Default::default()
+                            },
+                            TableCell {
+                                content: vec![Element::Paragraph(Paragraph {
+                                    content: vec![InlineContent::Text(TextSpan::plain("42"))],
+                                    ..Default::default()
+                                })],
+                                col_span: 1,
+                                row_span: 1,
+                                ..Default::default()
+                            },
+                        ],
+                        is_header: false,
+                        ..Default::default()
+                    },
+                ],
+                column_widths_twips: vec![2880, 2880],
+                border: Some(table_border),
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+    };
+
+    let mut buf = Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(
+        &ir,
+        office_oxide::DocumentFormat::Docx,
+        &mut buf,
+    )
+    .unwrap();
+    buf.set_position(0);
+
+    let doc = office_oxide::docx::DocxDocument::from_reader(buf).unwrap();
+    let text = doc.plain_text();
+    assert!(text.contains("Name"), "text: {text}");
+    assert!(text.contains("Alice"), "text: {text}");
+    assert!(text.contains("42"), "text: {text}");
+}
+
+#[test]
+fn ir_table_with_cell_shading_round_trip() {
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        sections: vec![Section {
+            elements: vec![Element::Table(Table {
+                rows: vec![TableRow {
+                    cells: vec![
+                        TableCell {
+                            content: vec![Element::Paragraph(Paragraph {
+                                content: vec![InlineContent::Text(TextSpan::plain("Red cell"))],
+                                ..Default::default()
+                            })],
+                            col_span: 1,
+                            row_span: 1,
+                            background_color: Some([255, 0, 0]),
+                            ..Default::default()
+                        },
+                        TableCell {
+                            content: vec![Element::Paragraph(Paragraph {
+                                content: vec![InlineContent::Text(TextSpan::plain("Blue cell"))],
+                                ..Default::default()
+                            })],
+                            col_span: 1,
+                            row_span: 1,
+                            background_color: Some([0, 0, 255]),
+                            ..Default::default()
+                        },
+                    ],
+                    is_header: false,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+    };
+
+    let mut buf = Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(
+        &ir,
+        office_oxide::DocumentFormat::Docx,
+        &mut buf,
+    )
+    .unwrap();
+    buf.set_position(0);
+
+    let doc = office_oxide::docx::DocxDocument::from_reader(buf).unwrap();
+    let text = doc.plain_text();
+    assert!(text.contains("Red cell"), "text: {text}");
+    assert!(text.contains("Blue cell"), "text: {text}");
+}
+
+#[test]
+fn ir_inline_image_round_trip() {
+    use office_oxide::ir::*;
+
+    // Minimal 1×1 white PNG (67 bytes)
+    let png_bytes: Vec<u8> = vec![
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // PNG signature
+        0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, // IHDR length + type
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
+        0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, // 8-bit RGB
+        0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, // IDAT
+        0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, // compressed pixel
+        0x00, 0x00, 0x02, 0x00, 0x01, 0xe2, 0x21, 0xbc, // CRC
+        0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, // IEND
+        0x44, 0xae, 0x42, 0x60, 0x82, // IEND CRC
+    ];
+
+    let ir = DocumentIR {
+        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        sections: vec![Section {
+            elements: vec![
+                Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain("Before image"))],
+                    ..Default::default()
+                }),
+                Element::Image(Image {
+                    alt_text: Some("test image".to_string()),
+                    data: Some(png_bytes),
+                    format: Some(ImageFormat::Png),
+                    display_width_emu: Some(914400),
+                    display_height_emu: Some(914400),
+                    ..Default::default()
+                }),
+                Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain("After image"))],
+                    ..Default::default()
+                }),
+            ],
+            ..Default::default()
+        }],
+    };
+
+    let mut buf = Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(
+        &ir,
+        office_oxide::DocumentFormat::Docx,
+        &mut buf,
+    )
+    .unwrap();
+
+    let bytes = buf.into_inner();
+
+    // Verify the media part exists in the ZIP
+    let cursor = Cursor::new(bytes.clone());
+    let mut zip = zip::ZipArchive::new(cursor).unwrap();
+    assert!(
+        zip.by_name("word/media/image1.png").is_ok(),
+        "image1.png should be in the DOCX package"
+    );
+
+    // Verify text content
+    let doc =
+        office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes)).unwrap();
+    let text = doc.plain_text();
+    assert!(text.contains("Before image"), "text: {text}");
+    assert!(text.contains("After image"), "text: {text}");
+}
+
+#[test]
+fn ir_section_page_setup_round_trip() {
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        sections: vec![Section {
+            elements: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain("A4 page content"))],
+                ..Default::default()
+            })],
+            page_setup: Some(PageSetup {
+                width_twips: 11906,  // A4 width
+                height_twips: 16838, // A4 height
+                margin_top_twips: 1440,
+                margin_bottom_twips: 1440,
+                margin_left_twips: 1800,
+                margin_right_twips: 1800,
+                landscape: false,
+                ..Default::default()
+            }),
+            break_type: SectionBreakType::NextPage,
+            ..Default::default()
+        }],
+    };
+
+    let mut buf = Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(
+        &ir,
+        office_oxide::DocumentFormat::Docx,
+        &mut buf,
+    )
+    .unwrap();
+    buf.set_position(0);
+
+    let doc = office_oxide::docx::DocxDocument::from_reader(buf).unwrap();
+    assert!(doc.plain_text().contains("A4 page content"));
+}
+
+#[test]
+fn ir_two_column_section_round_trip() {
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        sections: vec![Section {
+            elements: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain("Two column text"))],
+                ..Default::default()
+            })],
+            columns: Some(ColumnLayout {
+                count: 2,
+                space_twips: Some(720),
+                separator: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+    };
+
+    let mut buf = Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(
+        &ir,
+        office_oxide::DocumentFormat::Docx,
+        &mut buf,
+    )
+    .unwrap();
+    buf.set_position(0);
+
+    let doc = office_oxide::docx::DocxDocument::from_reader(buf).unwrap();
+    assert!(doc.plain_text().contains("Two column text"));
+}
+
+#[test]
+fn ir_run_typography_round_trip() {
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        sections: vec![Section {
+            elements: vec![Element::Paragraph(Paragraph {
+                content: vec![
+                    InlineContent::Text(TextSpan {
+                        text: "Big red".to_string(),
+                        font_size_half_pt: Some(48), // 24pt
+                        color: Some([255, 0, 0]),
+                        bold: true,
+                        ..Default::default()
+                    }),
+                    InlineContent::Text(TextSpan {
+                        text: " small blue".to_string(),
+                        font_size_half_pt: Some(16), // 8pt
+                        color: Some([0, 0, 255]),
+                        ..Default::default()
+                    }),
+                ],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+    };
+
+    let mut buf = Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(
+        &ir,
+        office_oxide::DocumentFormat::Docx,
+        &mut buf,
+    )
+    .unwrap();
+    buf.set_position(0);
+
+    let doc = office_oxide::docx::DocxDocument::from_reader(buf).unwrap();
+    let text = doc.plain_text();
+    assert!(text.contains("Big red"), "text: {text}");
+    assert!(text.contains("small blue"), "text: {text}");
+}
+
+#[test]
+fn ir_code_block_round_trip() {
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        sections: vec![Section {
+            elements: vec![Element::CodeBlock(CodeBlock {
+                language: Some("rust".to_string()),
+                content: "fn main() {\n    println!(\"hello\");\n}".to_string(),
+            })],
+            ..Default::default()
+        }],
+    };
+
+    let mut buf = Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(
+        &ir,
+        office_oxide::DocumentFormat::Docx,
+        &mut buf,
+    )
+    .unwrap();
+    buf.set_position(0);
+
+    let doc = office_oxide::docx::DocxDocument::from_reader(buf).unwrap();
+    let text = doc.plain_text();
+    assert!(text.contains("fn main"), "text: {text}");
+    assert!(text.contains("println"), "text: {text}");
+}
+
+#[test]
+fn ir_table_cell_padding_round_trip() {
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        sections: vec![Section {
+            elements: vec![Element::Table(Table {
+                rows: vec![TableRow {
+                    cells: vec![
+                        TableCell {
+                            content: vec![Element::Paragraph(Paragraph {
+                                content: vec![InlineContent::Text(TextSpan::plain("Padded"))],
+                                ..Default::default()
+                            })],
+                            col_span: 1,
+                            row_span: 1,
+                            padding: Some(CellPadding {
+                                top_twips: Some(144),
+                                bottom_twips: Some(144),
+                                left_twips: Some(288),
+                                right_twips: Some(288),
+                            }),
+                            ..Default::default()
+                        },
+                        TableCell {
+                            content: vec![Element::Paragraph(Paragraph {
+                                content: vec![InlineContent::Text(TextSpan::plain("Normal"))],
+                                ..Default::default()
+                            })],
+                            col_span: 1,
+                            row_span: 1,
+                            ..Default::default()
+                        },
+                    ],
+                    is_header: false,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+    };
+
+    let mut buf = Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(
+        &ir,
+        office_oxide::DocumentFormat::Docx,
+        &mut buf,
+    )
+    .unwrap();
+    buf.set_position(0);
+
+    // Verify the DOCX is valid and content is preserved
+    let doc = office_oxide::docx::DocxDocument::from_reader(buf.clone()).unwrap();
+    let text = doc.plain_text();
+    assert!(text.contains("Padded"), "text: {text}");
+    assert!(text.contains("Normal"), "text: {text}");
+
+    // Verify <w:tcMar> appears in the raw XML
+    buf.set_position(0);
+    let zip_bytes = buf.into_inner();
+    let mut zip = zip::ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
+    let mut doc_xml = String::new();
+    {
+        use std::io::Read;
+        zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc_xml).unwrap();
+    }
+    assert!(doc_xml.contains("w:tcMar"), "expected w:tcMar in document.xml");
+    assert!(doc_xml.contains(r#"w:w="288""#), "expected left/right padding value");
+}
+
+#[test]
+fn ir_table_cell_text_align_round_trip() {
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        sections: vec![Section {
+            elements: vec![Element::Table(Table {
+                rows: vec![TableRow {
+                    cells: vec![
+                        TableCell {
+                            content: vec![Element::Paragraph(Paragraph {
+                                content: vec![InlineContent::Text(TextSpan::plain("Centered"))],
+                                ..Default::default()
+                            })],
+                            col_span: 1,
+                            row_span: 1,
+                            text_align: Some(ParagraphAlignment::Center),
+                            ..Default::default()
+                        },
+                        TableCell {
+                            content: vec![Element::Paragraph(Paragraph {
+                                content: vec![InlineContent::Text(TextSpan::plain("Right"))],
+                                // Explicit alignment on the paragraph takes priority
+                                alignment: Some(ParagraphAlignment::Right),
+                                ..Default::default()
+                            })],
+                            col_span: 1,
+                            row_span: 1,
+                            text_align: Some(ParagraphAlignment::Center),
+                            ..Default::default()
+                        },
+                    ],
+                    is_header: false,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+    };
+
+    let mut buf = Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(
+        &ir,
+        office_oxide::DocumentFormat::Docx,
+        &mut buf,
+    )
+    .unwrap();
+    buf.set_position(0);
+
+    let doc = office_oxide::docx::DocxDocument::from_reader(buf.clone()).unwrap();
+    let text = doc.plain_text();
+    assert!(text.contains("Centered"), "text: {text}");
+    assert!(text.contains("Right"), "text: {text}");
+
+    // Verify <w:jc w:val="center"> appears in the raw XML (from cell-level alignment)
+    buf.set_position(0);
+    let zip_bytes = buf.into_inner();
+    let mut zip = zip::ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
+    let mut doc_xml = String::new();
+    {
+        use std::io::Read;
+        zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc_xml).unwrap();
+    }
+    assert!(
+        doc_xml.contains(r#"w:val="center""#),
+        "expected center alignment in document.xml"
+    );
+    // The right-aligned paragraph must not be overwritten to center
+    assert!(
+        doc_xml.contains(r#"w:val="right""#),
+        "expected right alignment preserved in document.xml"
+    );
+}
+
+#[test]
+fn ir_table_caption_round_trip() {
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        sections: vec![Section {
+            elements: vec![Element::Table(Table {
+                rows: vec![TableRow {
+                    cells: vec![TableCell {
+                        content: vec![Element::Paragraph(Paragraph {
+                            content: vec![InlineContent::Text(TextSpan::plain("Data"))],
+                            ..Default::default()
+                        })],
+                        col_span: 1,
+                        row_span: 1,
+                        ..Default::default()
+                    }],
+                    is_header: false,
+                    ..Default::default()
+                }],
+                caption: Some("Table 1: Summary of results".to_string()),
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+    };
+
+    let mut buf = Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(
+        &ir,
+        office_oxide::DocumentFormat::Docx,
+        &mut buf,
+    )
+    .unwrap();
+    buf.set_position(0);
+
+    let doc = office_oxide::docx::DocxDocument::from_reader(buf.clone()).unwrap();
+    let text = doc.plain_text();
+    assert!(text.contains("Table 1: Summary of results"), "text: {text}");
+    assert!(text.contains("Data"), "text: {text}");
+
+    // Verify the Caption style appears in the raw XML
+    buf.set_position(0);
+    let zip_bytes = buf.into_inner();
+    let mut zip = zip::ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
+    let mut doc_xml = String::new();
+    {
+        use std::io::Read;
+        zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc_xml).unwrap();
+    }
+    assert!(doc_xml.contains("Caption"), "expected Caption style in document.xml");
+    assert!(
+        doc_xml.contains("Table 1: Summary of results"),
+        "expected caption text in document.xml"
+    );
 }

@@ -20,7 +20,7 @@ match_like_matches_macro = "allow"
 manual_find = "allow"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yfedoseev/office_oxide"
