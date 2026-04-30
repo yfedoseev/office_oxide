@@ -28,7 +28,11 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             title: title.clone(),
             ..Default::default()
         },
-        sections: vec![Section { title, elements, ..Default::default() }],
+        sections: vec![Section {
+            title,
+            elements,
+            ..Default::default()
+        }],
     }
 }
 
@@ -266,7 +270,10 @@ fn inline_to_element(content: Vec<InlineContent>) -> Vec<Element> {
     if content.is_empty() {
         Vec::new()
     } else {
-        vec![Element::Paragraph(Paragraph { content, ..Default::default() })]
+        vec![Element::Paragraph(Paragraph {
+            content,
+            ..Default::default()
+        })]
     }
 }
 
@@ -425,7 +432,10 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
         });
     }
 
-    Element::Table(Table { rows: ir_rows, ..Default::default() })
+    Element::Table(Table {
+        rows: ir_rows,
+        ..Default::default()
+    })
 }
 
 fn get_cell_at_grid_col(

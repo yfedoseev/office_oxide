@@ -49,10 +49,8 @@ const CT_DOCUMENT: &str =
 const CT_STYLES: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml";
 const CT_NUMBERING: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml";
-const CT_HEADER: &str =
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml";
-const CT_FOOTER: &str =
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml";
+const CT_HEADER: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml";
+const CT_FOOTER: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml";
 const CT_FOOTNOTES: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml";
 const CT_ENDNOTES: &str =
@@ -537,10 +535,11 @@ impl DocxWriter {
 
     /// Add a paragraph from IR runs and rich paragraph properties.
     pub fn add_ir_paragraph(&mut self, runs: &[Run], props: Option<IrParaProps>) -> &mut Self {
-        self.elements.push(DocxElement::RichParagraph(DocxRichParagraph {
-            runs: runs.to_vec(),
-            props: props.unwrap_or_default(),
-        }));
+        self.elements
+            .push(DocxElement::RichParagraph(DocxRichParagraph {
+                runs: runs.to_vec(),
+                props: props.unwrap_or_default(),
+            }));
         self
     }
 
@@ -559,15 +558,14 @@ impl DocxWriter {
         };
         let format = image.format.clone().unwrap_or(ImageFormat::Png);
 
-        let (w_emu, h_emu) = if let (Some(w), Some(h)) =
-            (image.display_width_emu, image.display_height_emu)
-        {
-            (w, h)
-        } else if let (Some(pw), Some(ph)) = (image.pixel_width, image.pixel_height) {
-            (px_to_emu(pw), px_to_emu(ph))
-        } else {
-            (914400u64, 685800u64)
-        };
+        let (w_emu, h_emu) =
+            if let (Some(w), Some(h)) = (image.display_width_emu, image.display_height_emu) {
+                (w, h)
+            } else if let (Some(pw), Some(ph)) = (image.pixel_width, image.pixel_height) {
+                (px_to_emu(pw), px_to_emu(ph))
+            } else {
+                (914400u64, 685800u64)
+            };
 
         let idx = self.images.len();
         self.images.push(DocxImage {
@@ -628,7 +626,11 @@ impl DocxWriter {
         self.elements.push(DocxElement::RichList(DocxRichList {
             ordered: list.ordered,
             items,
-            start_number: if start_number != 1 { Some(start_number) } else { None },
+            start_number: if start_number != 1 {
+                Some(start_number)
+            } else {
+                None
+            },
             style,
             level,
             num_id,
@@ -639,7 +641,8 @@ impl DocxWriter {
 
     /// Add a code block.
     pub fn add_code_block(&mut self, content: &str) -> &mut Self {
-        self.elements.push(DocxElement::CodeBlock(content.to_string()));
+        self.elements
+            .push(DocxElement::CodeBlock(content.to_string()));
         self
     }
 
@@ -670,7 +673,10 @@ impl DocxWriter {
         for elem in content {
             convert_ir_element_to_docx_elements(elem, &mut elems);
         }
-        self.footnotes.push(DocxNote { id, elements: elems });
+        self.footnotes.push(DocxNote {
+            id,
+            elements: elems,
+        });
         self
     }
 
@@ -680,7 +686,10 @@ impl DocxWriter {
         for elem in content {
             convert_ir_element_to_docx_elements(elem, &mut elems);
         }
-        self.endnotes.push(DocxNote { id, elements: elems });
+        self.endnotes.push(DocxNote {
+            id,
+            elements: elems,
+        });
         self
     }
 
@@ -713,7 +722,10 @@ impl DocxWriter {
         for elem in &elements {
             convert_ir_element_to_docx_elements(elem, &mut docx_elems);
         }
-        self.headers_footers.push(DocxHf { hf_type, elements: docx_elems });
+        self.headers_footers.push(DocxHf {
+            hf_type,
+            elements: docx_elems,
+        });
         self
     }
 
@@ -771,18 +783,25 @@ impl DocxWriter {
         for (i, hf) in self.headers_footers.iter().enumerate() {
             let n = i + 1;
             let (kind, ct, rel_type) = match hf.hf_type {
-                HfType::DefaultHeader
-                | HfType::FirstPageHeader
-                | HfType::EvenPageHeader => ("header", CT_HEADER, rel_types::HEADER),
-                HfType::DefaultFooter
-                | HfType::FirstPageFooter
-                | HfType::EvenPageFooter => ("footer", CT_FOOTER, rel_types::FOOTER),
+                HfType::DefaultHeader | HfType::FirstPageHeader | HfType::EvenPageHeader => {
+                    ("header", CT_HEADER, rel_types::HEADER)
+                },
+                HfType::DefaultFooter | HfType::FirstPageFooter | HfType::EvenPageFooter => {
+                    ("footer", CT_FOOTER, rel_types::FOOTER)
+                },
             };
             let target = format!("{kind}{n}.xml");
             let rid = opc.add_part_rel(&doc_part, rel_type, &target);
             let part_name = format!("/word/{target}");
             let hf_part = PartName::new(&part_name)?;
-            let hf_xml = generate_hf_xml(&hf.elements, &image_rids, matches!(hf.hf_type, HfType::DefaultHeader | HfType::FirstPageHeader | HfType::EvenPageHeader));
+            let hf_xml = generate_hf_xml(
+                &hf.elements,
+                &image_rids,
+                matches!(
+                    hf.hf_type,
+                    HfType::DefaultHeader | HfType::FirstPageHeader | HfType::EvenPageHeader
+                ),
+            );
             opc.add_part(&hf_part, ct, &hf_xml)?;
             hf_rids.push((hf.hf_type, rid));
         }
@@ -834,7 +853,9 @@ impl DocxWriter {
                 });
             }
         }
-        if sectpr_info.is_none() && (!hf_rids.is_empty() || footnote_rid.is_some() || endnote_rid.is_some()) {
+        if sectpr_info.is_none()
+            && (!hf_rids.is_empty() || footnote_rid.is_some() || endnote_rid.is_some())
+        {
             sectpr_info = Some(SectPrInfo {
                 page_setup: None,
                 columns: None,
@@ -846,7 +867,12 @@ impl DocxWriter {
         }
 
         // --- Generate document ---
-        let document_xml = self.generate_document_xml(&image_rids, sectpr_info.as_ref(), !self.images.is_empty(), self.has_text_boxes());
+        let document_xml = self.generate_document_xml(
+            &image_rids,
+            sectpr_info.as_ref(),
+            !self.images.is_empty(),
+            self.has_text_boxes(),
+        );
         opc.add_part(&doc_part, CT_DOCUMENT, &document_xml)?;
 
         let needs_numbering = self.has_lists();
@@ -868,7 +894,9 @@ impl DocxWriter {
     }
 
     fn has_text_boxes(&self) -> bool {
-        self.elements.iter().any(|e| matches!(e, DocxElement::TextBox(_)))
+        self.elements
+            .iter()
+            .any(|e| matches!(e, DocxElement::TextBox(_)))
     }
 
     fn has_lists(&self) -> bool {
@@ -877,9 +905,10 @@ impl DocxWriter {
                 DocxElement::Paragraph(p) => p.numbering.is_some(),
                 DocxElement::RichParagraph(p) => p.props.numbering.is_some(),
                 DocxElement::RichList(_) => true,
-                DocxElement::RichTable(t) => {
-                    t.rows.iter().any(|r| r.cells.iter().any(|c| check_elements(&c.content)))
-                },
+                DocxElement::RichTable(t) => t
+                    .rows
+                    .iter()
+                    .any(|r| r.cells.iter().any(|c| check_elements(&c.content))),
                 DocxElement::TextBox(tb) => check_elements(&tb.content),
                 _ => false,
             })
@@ -976,12 +1005,24 @@ impl Default for DocxWriter {
 // ---------------------------------------------------------------------------
 
 impl HfType {
-    pub fn default_header() -> Self { Self::DefaultHeader }
-    pub fn default_footer() -> Self { Self::DefaultFooter }
-    pub fn first_page_header() -> Self { Self::FirstPageHeader }
-    pub fn first_page_footer() -> Self { Self::FirstPageFooter }
-    pub fn even_page_header() -> Self { Self::EvenPageHeader }
-    pub fn even_page_footer() -> Self { Self::EvenPageFooter }
+    pub fn default_header() -> Self {
+        Self::DefaultHeader
+    }
+    pub fn default_footer() -> Self {
+        Self::DefaultFooter
+    }
+    pub fn first_page_header() -> Self {
+        Self::FirstPageHeader
+    }
+    pub fn first_page_footer() -> Self {
+        Self::FirstPageFooter
+    }
+    pub fn even_page_header() -> Self {
+        Self::EvenPageHeader
+    }
+    pub fn even_page_footer() -> Self {
+        Self::EvenPageFooter
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1182,7 +1223,10 @@ fn ir_inline_to_runs(content: &[crate::ir::InlineContent]) -> Vec<Run> {
                 runs.push(run);
             },
             InlineContent::LineBreak => {
-                runs.push(Run { text: "\n".to_string(), ..Default::default() });
+                runs.push(Run {
+                    text: "\n".to_string(),
+                    ..Default::default()
+                });
             },
             InlineContent::FootnoteRef(r) => {
                 let mut run = Run::default();
@@ -1253,13 +1297,23 @@ fn write_docx_element(
                 match &info.positioning {
                     ImagePositioning::Inline => {
                         write_inline_image_run(
-                            w, &info.rid, info.width_emu, info.height_emu,
-                            info.alt_text.as_deref(), info.decorative, *image_counter,
+                            w,
+                            &info.rid,
+                            info.width_emu,
+                            info.height_emu,
+                            info.alt_text.as_deref(),
+                            info.decorative,
+                            *image_counter,
                         );
                     },
                     ImagePositioning::Floating(fi) => {
                         write_floating_image_run(
-                            w, &info.rid, fi, info.alt_text.as_deref(), info.decorative, *image_counter,
+                            w,
+                            &info.rid,
+                            fi,
+                            info.alt_text.as_deref(),
+                            info.decorative,
+                            *image_counter,
                         );
                     },
                 }
@@ -1455,15 +1509,18 @@ fn write_num_pr(w: &mut Writer<Vec<u8>>, num_id: u32, ilvl: u8) {
     w.write_event(Event::Empty(ilvl_elem)).expect("write ilvl");
     let mut num_id_elem = BytesStart::new("w:numId");
     num_id_elem.push_attribute(("w:val", num_id.to_string().as_str()));
-    w.write_event(Event::Empty(num_id_elem)).expect("write numId");
+    w.write_event(Event::Empty(num_id_elem))
+        .expect("write numId");
     w.write_event(Event::End(BytesEnd::new("w:numPr")))
         .expect("write numPr end");
 }
 
 fn write_rpr(w: &mut Writer<Vec<u8>>, run: &Run) {
-    w.write_event(Event::Start(BytesStart::new("w:rPr"))).expect("write rPr start");
+    w.write_event(Event::Start(BytesStart::new("w:rPr")))
+        .expect("write rPr start");
     write_rpr_content(w, run);
-    w.write_event(Event::End(BytesEnd::new("w:rPr"))).expect("write rPr end");
+    w.write_event(Event::End(BytesEnd::new("w:rPr")))
+        .expect("write rPr end");
 }
 
 fn write_rpr_content(w: &mut Writer<Vec<u8>>, run: &Run) {
@@ -1476,10 +1533,12 @@ fn write_rpr_content(w: &mut Writer<Vec<u8>>, run: &Run) {
         w.write_event(Event::Empty(elem)).expect("write rFonts");
     }
     if run.bold {
-        w.write_event(Event::Empty(BytesStart::new("w:b"))).expect("write bold");
+        w.write_event(Event::Empty(BytesStart::new("w:b")))
+            .expect("write bold");
     }
     if run.italic {
-        w.write_event(Event::Empty(BytesStart::new("w:i"))).expect("write italic");
+        w.write_event(Event::Empty(BytesStart::new("w:i")))
+            .expect("write italic");
     }
     if let Some(ref us) = run.underline_style {
         let val = underline_style_val(us);
@@ -1492,7 +1551,8 @@ fn write_rpr_content(w: &mut Writer<Vec<u8>>, run: &Run) {
         w.write_event(Event::Empty(elem)).expect("write underline");
     }
     if run.strikethrough {
-        w.write_event(Event::Empty(BytesStart::new("w:strike"))).expect("write strike");
+        w.write_event(Event::Empty(BytesStart::new("w:strike")))
+            .expect("write strike");
     }
     if let Some(ref rgb) = run.color_rgb {
         let mut elem = BytesStart::new("w:color");
@@ -1539,42 +1599,61 @@ fn write_rpr_content(w: &mut Writer<Vec<u8>>, run: &Run) {
         w.write_event(Event::Empty(elem)).expect("write vertAlign");
     }
     if run.all_caps {
-        w.write_event(Event::Empty(BytesStart::new("w:caps"))).expect("write caps");
+        w.write_event(Event::Empty(BytesStart::new("w:caps")))
+            .expect("write caps");
     }
     if run.small_caps {
-        w.write_event(Event::Empty(BytesStart::new("w:smallCaps"))).expect("write smallCaps");
+        w.write_event(Event::Empty(BytesStart::new("w:smallCaps")))
+            .expect("write smallCaps");
     }
     if let Some(spacing) = run.char_spacing_half_pt {
         let mut elem = BytesStart::new("w:spacing");
         elem.push_attribute(("w:val", spacing.to_string().as_str()));
-        w.write_event(Event::Empty(elem)).expect("write char spacing");
+        w.write_event(Event::Empty(elem))
+            .expect("write char spacing");
     }
 }
 
 fn write_field_run(w: &mut Writer<Vec<u8>>, run: &Run, instr: &str) {
     // begin run
-    w.write_event(Event::Start(BytesStart::new("w:r"))).expect("write r start");
-    if run.has_rpr() { write_rpr(w, run); }
+    w.write_event(Event::Start(BytesStart::new("w:r")))
+        .expect("write r start");
+    if run.has_rpr() {
+        write_rpr(w, run);
+    }
     let mut fc = BytesStart::new("w:fldChar");
     fc.push_attribute(("w:fldCharType", "begin"));
-    w.write_event(Event::Empty(fc)).expect("write fldChar begin");
-    w.write_event(Event::End(BytesEnd::new("w:r"))).expect("write r end");
+    w.write_event(Event::Empty(fc))
+        .expect("write fldChar begin");
+    w.write_event(Event::End(BytesEnd::new("w:r")))
+        .expect("write r end");
     // instrText run
-    w.write_event(Event::Start(BytesStart::new("w:r"))).expect("write r start");
-    if run.has_rpr() { write_rpr(w, run); }
+    w.write_event(Event::Start(BytesStart::new("w:r")))
+        .expect("write r start");
+    if run.has_rpr() {
+        write_rpr(w, run);
+    }
     let mut it = BytesStart::new("w:instrText");
     it.push_attribute(("xml:space", "preserve"));
-    w.write_event(Event::Start(it)).expect("write instrText start");
-    w.write_event(Event::Text(BytesText::new(instr))).expect("write instrText");
-    w.write_event(Event::End(BytesEnd::new("w:instrText"))).expect("write instrText end");
-    w.write_event(Event::End(BytesEnd::new("w:r"))).expect("write r end");
+    w.write_event(Event::Start(it))
+        .expect("write instrText start");
+    w.write_event(Event::Text(BytesText::new(instr)))
+        .expect("write instrText");
+    w.write_event(Event::End(BytesEnd::new("w:instrText")))
+        .expect("write instrText end");
+    w.write_event(Event::End(BytesEnd::new("w:r")))
+        .expect("write r end");
     // end run
-    w.write_event(Event::Start(BytesStart::new("w:r"))).expect("write r start");
-    if run.has_rpr() { write_rpr(w, run); }
+    w.write_event(Event::Start(BytesStart::new("w:r")))
+        .expect("write r start");
+    if run.has_rpr() {
+        write_rpr(w, run);
+    }
     let mut fc = BytesStart::new("w:fldChar");
     fc.push_attribute(("w:fldCharType", "end"));
     w.write_event(Event::Empty(fc)).expect("write fldChar end");
-    w.write_event(Event::End(BytesEnd::new("w:r"))).expect("write r end");
+    w.write_event(Event::End(BytesEnd::new("w:r")))
+        .expect("write r end");
 }
 
 fn write_run(w: &mut Writer<Vec<u8>>, run: &Run) {
@@ -1597,12 +1676,14 @@ fn write_run(w: &mut Writer<Vec<u8>>, run: &Run) {
         return;
     }
 
-    w.write_event(Event::Start(BytesStart::new("w:r"))).expect("write r start");
+    w.write_event(Event::Start(BytesStart::new("w:r")))
+        .expect("write r start");
     if run.has_rpr() {
         write_rpr(w, run);
     }
     if run.text == "\n" {
-        w.write_event(Event::Empty(BytesStart::new("w:br"))).expect("write br");
+        w.write_event(Event::Empty(BytesStart::new("w:br")))
+            .expect("write br");
     } else {
         let text = &run.text;
         let mut t_elem = BytesStart::new("w:t");
@@ -1610,10 +1691,13 @@ fn write_run(w: &mut Writer<Vec<u8>>, run: &Run) {
             t_elem.push_attribute(("xml:space", "preserve"));
         }
         w.write_event(Event::Start(t_elem)).expect("write t start");
-        w.write_event(Event::Text(BytesText::new(text))).expect("write text");
-        w.write_event(Event::End(BytesEnd::new("w:t"))).expect("write t end");
+        w.write_event(Event::Text(BytesText::new(text)))
+            .expect("write text");
+        w.write_event(Event::End(BytesEnd::new("w:t")))
+            .expect("write t end");
     }
-    w.write_event(Event::End(BytesEnd::new("w:r"))).expect("write r end");
+    w.write_event(Event::End(BytesEnd::new("w:r")))
+        .expect("write r end");
 }
 
 fn write_footnote_ref_run(w: &mut Writer<Vec<u8>>, note_id: u32, is_endnote: bool) {
@@ -1621,16 +1705,25 @@ fn write_footnote_ref_run(w: &mut Writer<Vec<u8>>, note_id: u32, is_endnote: boo
         .expect("write r start");
     w.write_event(Event::Start(BytesStart::new("w:rPr")))
         .expect("write rPr start");
-    let style_name = if is_endnote { "EndnoteReference" } else { "FootnoteReference" };
+    let style_name = if is_endnote {
+        "EndnoteReference"
+    } else {
+        "FootnoteReference"
+    };
     let mut rStyle = BytesStart::new("w:rStyle");
     rStyle.push_attribute(("w:val", style_name));
     w.write_event(Event::Empty(rStyle)).expect("write rStyle");
     w.write_event(Event::End(BytesEnd::new("w:rPr")))
         .expect("write rPr end");
-    let tag = if is_endnote { "w:endnoteReference" } else { "w:footnoteReference" };
+    let tag = if is_endnote {
+        "w:endnoteReference"
+    } else {
+        "w:footnoteReference"
+    };
     let mut ref_elem = BytesStart::new(tag);
     ref_elem.push_attribute(("w:id", note_id.to_string().as_str()));
-    w.write_event(Event::Empty(ref_elem)).expect("write note ref");
+    w.write_event(Event::Empty(ref_elem))
+        .expect("write note ref");
     w.write_event(Event::End(BytesEnd::new("w:r")))
         .expect("write r end");
 }
@@ -1746,7 +1839,8 @@ fn write_rich_table(
             let mut elem = BytesStart::new(*side);
             elem.push_attribute(("w:w", pad_str.as_str()));
             elem.push_attribute(("w:type", "dxa"));
-            w.write_event(Event::Empty(elem)).expect("write cell margin");
+            w.write_event(Event::Empty(elem))
+                .expect("write cell margin");
         }
         w.write_event(Event::End(BytesEnd::new("w:tblCellMar")))
             .expect("write tblCellMar end");
@@ -1831,7 +1925,8 @@ fn write_rich_table(
                 } else if cell.row_span > 1 {
                     let mut vm = BytesStart::new("w:vMerge");
                     vm.push_attribute(("w:val", "restart"));
-                    w.write_event(Event::Empty(vm)).expect("write vMerge restart");
+                    w.write_event(Event::Empty(vm))
+                        .expect("write vMerge restart");
                 }
 
                 if let Some(ref bg) = cell.background_color {
@@ -1865,17 +1960,18 @@ fn write_rich_table(
                     };
                     let mut td_elem = BytesStart::new("w:textDirection");
                     td_elem.push_attribute(("w:val", val));
-                    w.write_event(Event::Empty(td_elem)).expect("write textDirection");
+                    w.write_event(Event::Empty(td_elem))
+                        .expect("write textDirection");
                 }
 
                 if let Some(ref pad) = cell.padding {
                     w.write_event(Event::Start(BytesStart::new("w:tcMar")))
                         .expect("write tcMar start");
                     for (side, val) in [
-                        ("w:top",    pad.top_twips),
-                        ("w:left",   pad.left_twips),
+                        ("w:top", pad.top_twips),
+                        ("w:left", pad.left_twips),
                         ("w:bottom", pad.bottom_twips),
-                        ("w:right",  pad.right_twips),
+                        ("w:right", pad.right_twips),
                     ] {
                         if let Some(v) = val {
                             let mut elem = BytesStart::new(side);
@@ -1909,7 +2005,8 @@ fn write_rich_table(
 }
 
 fn write_paragraph_borders(w: &mut Writer<Vec<u8>>, border: &crate::ir::ParagraphBorder) {
-    w.write_event(Event::Start(BytesStart::new("w:pBdr"))).expect("write pBdr start");
+    w.write_event(Event::Start(BytesStart::new("w:pBdr")))
+        .expect("write pBdr start");
     for (side_tag, side) in &[
         ("w:top", &border.top),
         ("w:left", &border.left),
@@ -1921,7 +2018,8 @@ fn write_paragraph_borders(w: &mut Writer<Vec<u8>>, border: &crate::ir::Paragrap
             write_border_line(w, side_tag, bl);
         }
     }
-    w.write_event(Event::End(BytesEnd::new("w:pBdr"))).expect("write pBdr end");
+    w.write_event(Event::End(BytesEnd::new("w:pBdr")))
+        .expect("write pBdr end");
 }
 
 fn write_table_borders(w: &mut Writer<Vec<u8>>, border: &crate::ir::TableBorder, tag: &str) {
@@ -1962,7 +2060,8 @@ fn write_border_line(w: &mut Writer<Vec<u8>>, tag: &str, bl: &BorderLine) {
     } else {
         elem.push_attribute(("w:color", "000000"));
     }
-    w.write_event(Event::Empty(elem)).expect("write border line");
+    w.write_event(Event::Empty(elem))
+        .expect("write border line");
 }
 
 fn write_rich_list(
@@ -1981,7 +2080,10 @@ fn write_rich_list(
                         new_props.style = Some("ListParagraph".to_string());
                         new_props.numbering = Some((rl.num_id, rl.level));
                     }
-                    let new_p = DocxRichParagraph { runs: rp.runs.clone(), props: new_props };
+                    let new_p = DocxRichParagraph {
+                        runs: rp.runs.clone(),
+                        props: new_props,
+                    };
                     write_rich_paragraph(w, &new_p);
                 },
                 other => write_docx_element(w, other, image_rids, image_counter),
@@ -2033,9 +2135,12 @@ fn write_text_box(
         crate::ir::FloatAnchor::Paragraph => "paragraph",
     };
 
-    w.write_event(Event::Start(BytesStart::new("w:p"))).expect("write p start");
-    w.write_event(Event::Start(BytesStart::new("w:r"))).expect("write r start");
-    w.write_event(Event::Start(BytesStart::new("w:drawing"))).expect("write drawing start");
+    w.write_event(Event::Start(BytesStart::new("w:p")))
+        .expect("write p start");
+    w.write_event(Event::Start(BytesStart::new("w:r")))
+        .expect("write r start");
+    w.write_event(Event::Start(BytesStart::new("w:drawing")))
+        .expect("write drawing start");
 
     let mut anchor = BytesStart::new("wp:anchor");
     anchor.push_attribute(("distT", "0"));
@@ -2048,7 +2153,8 @@ fn write_text_box(
     anchor.push_attribute(("locked", "0"));
     anchor.push_attribute(("layoutInCell", "1"));
     anchor.push_attribute(("allowOverlap", "1"));
-    w.write_event(Event::Start(anchor)).expect("write anchor start");
+    w.write_event(Event::Start(anchor))
+        .expect("write anchor start");
 
     let mut spos = BytesStart::new("wp:simplePos");
     spos.push_attribute(("x", "0"));
@@ -2057,21 +2163,31 @@ fn write_text_box(
 
     let mut pos_h = BytesStart::new("wp:positionH");
     pos_h.push_attribute(("relativeFrom", float_anchor_val(&tb.h_anchor)));
-    w.write_event(Event::Start(pos_h)).expect("write positionH start");
+    w.write_event(Event::Start(pos_h))
+        .expect("write positionH start");
     let x_str = tb.x_emu.to_string();
-    w.write_event(Event::Start(BytesStart::new("wp:posOffset"))).expect("write posOffset start");
-    w.write_event(Event::Text(BytesText::new(&x_str))).expect("write posOffset text");
-    w.write_event(Event::End(BytesEnd::new("wp:posOffset"))).expect("write posOffset end");
-    w.write_event(Event::End(BytesEnd::new("wp:positionH"))).expect("write positionH end");
+    w.write_event(Event::Start(BytesStart::new("wp:posOffset")))
+        .expect("write posOffset start");
+    w.write_event(Event::Text(BytesText::new(&x_str)))
+        .expect("write posOffset text");
+    w.write_event(Event::End(BytesEnd::new("wp:posOffset")))
+        .expect("write posOffset end");
+    w.write_event(Event::End(BytesEnd::new("wp:positionH")))
+        .expect("write positionH end");
 
     let mut pos_v = BytesStart::new("wp:positionV");
     pos_v.push_attribute(("relativeFrom", float_anchor_val(&tb.v_anchor)));
-    w.write_event(Event::Start(pos_v)).expect("write positionV start");
+    w.write_event(Event::Start(pos_v))
+        .expect("write positionV start");
     let y_str = tb.y_emu.to_string();
-    w.write_event(Event::Start(BytesStart::new("wp:posOffset"))).expect("write posOffset start");
-    w.write_event(Event::Text(BytesText::new(&y_str))).expect("write posOffset text");
-    w.write_event(Event::End(BytesEnd::new("wp:posOffset"))).expect("write posOffset end");
-    w.write_event(Event::End(BytesEnd::new("wp:positionV"))).expect("write positionV end");
+    w.write_event(Event::Start(BytesStart::new("wp:posOffset")))
+        .expect("write posOffset start");
+    w.write_event(Event::Text(BytesText::new(&y_str)))
+        .expect("write posOffset text");
+    w.write_event(Event::End(BytesEnd::new("wp:posOffset")))
+        .expect("write posOffset end");
+    w.write_event(Event::End(BytesEnd::new("wp:positionV")))
+        .expect("write positionV end");
 
     let mut extent = BytesStart::new("wp:extent");
     extent.push_attribute(("cx", tb.width_emu.to_string().as_str()));
@@ -2091,32 +2207,42 @@ fn write_text_box(
             w.write_event(Event::Empty(ws)).expect("write wrapSquare");
         },
         crate::ir::TextWrap::Tight => {
-            w.write_event(Event::Empty(BytesStart::new("wp:wrapTight"))).expect("write wrapTight");
+            w.write_event(Event::Empty(BytesStart::new("wp:wrapTight")))
+                .expect("write wrapTight");
         },
         crate::ir::TextWrap::TopAndBottom => {
-            w.write_event(Event::Empty(BytesStart::new("wp:wrapTopAndBottom"))).expect("write wrapTopAndBottom");
+            w.write_event(Event::Empty(BytesStart::new("wp:wrapTopAndBottom")))
+                .expect("write wrapTopAndBottom");
         },
         crate::ir::TextWrap::Behind | crate::ir::TextWrap::InFront => {
-            w.write_event(Event::Empty(BytesStart::new("wp:wrapNone"))).expect("write wrapNone");
+            w.write_event(Event::Empty(BytesStart::new("wp:wrapNone")))
+                .expect("write wrapNone");
         },
         crate::ir::TextWrap::Through => {
-            w.write_event(Event::Empty(BytesStart::new("wp:wrapThrough"))).expect("write wrapThrough");
+            w.write_event(Event::Empty(BytesStart::new("wp:wrapThrough")))
+                .expect("write wrapThrough");
         },
     }
 
-    w.write_event(Event::Start(BytesStart::new("a:graphic"))).expect("write graphic start");
+    w.write_event(Event::Start(BytesStart::new("a:graphic")))
+        .expect("write graphic start");
     let mut gdata = BytesStart::new("a:graphicData");
     gdata.push_attribute(("uri", WPS_NS));
-    w.write_event(Event::Start(gdata)).expect("write graphicData start");
+    w.write_event(Event::Start(gdata))
+        .expect("write graphicData start");
 
-    w.write_event(Event::Start(BytesStart::new("wps:wsp"))).expect("write wsp start");
+    w.write_event(Event::Start(BytesStart::new("wps:wsp")))
+        .expect("write wsp start");
 
     let mut cnv_sp_pr = BytesStart::new("wps:cNvSpPr");
     cnv_sp_pr.push_attribute(("txBx", "1"));
-    w.write_event(Event::Empty(cnv_sp_pr)).expect("write cNvSpPr");
+    w.write_event(Event::Empty(cnv_sp_pr))
+        .expect("write cNvSpPr");
 
-    w.write_event(Event::Start(BytesStart::new("wps:spPr"))).expect("write spPr start");
-    w.write_event(Event::Start(BytesStart::new("a:xfrm"))).expect("write xfrm start");
+    w.write_event(Event::Start(BytesStart::new("wps:spPr")))
+        .expect("write spPr start");
+    w.write_event(Event::Start(BytesStart::new("a:xfrm")))
+        .expect("write xfrm start");
     let mut off = BytesStart::new("a:off");
     off.push_attribute(("x", "0"));
     off.push_attribute(("y", "0"));
@@ -2125,31 +2251,48 @@ fn write_text_box(
     ext.push_attribute(("cx", tb.width_emu.to_string().as_str()));
     ext.push_attribute(("cy", tb.height_emu.to_string().as_str()));
     w.write_event(Event::Empty(ext)).expect("write ext");
-    w.write_event(Event::End(BytesEnd::new("a:xfrm"))).expect("write xfrm end");
+    w.write_event(Event::End(BytesEnd::new("a:xfrm")))
+        .expect("write xfrm end");
     let mut geom = BytesStart::new("a:prstGeom");
     geom.push_attribute(("prst", "rect"));
-    w.write_event(Event::Start(geom)).expect("write prstGeom start");
-    w.write_event(Event::Empty(BytesStart::new("a:avLst"))).expect("write avLst");
-    w.write_event(Event::End(BytesEnd::new("a:prstGeom"))).expect("write prstGeom end");
-    w.write_event(Event::End(BytesEnd::new("wps:spPr"))).expect("write spPr end");
+    w.write_event(Event::Start(geom))
+        .expect("write prstGeom start");
+    w.write_event(Event::Empty(BytesStart::new("a:avLst")))
+        .expect("write avLst");
+    w.write_event(Event::End(BytesEnd::new("a:prstGeom")))
+        .expect("write prstGeom end");
+    w.write_event(Event::End(BytesEnd::new("wps:spPr")))
+        .expect("write spPr end");
 
-    w.write_event(Event::Start(BytesStart::new("wps:txbx"))).expect("write txbx start");
-    w.write_event(Event::Start(BytesStart::new("w:txbxContent"))).expect("write txbxContent start");
+    w.write_event(Event::Start(BytesStart::new("wps:txbx")))
+        .expect("write txbx start");
+    w.write_event(Event::Start(BytesStart::new("w:txbxContent")))
+        .expect("write txbxContent start");
     let mut txb_ic = 0u32;
     for elem in &tb.content {
         write_docx_element(w, elem, image_rids, &mut txb_ic);
     }
-    w.write_event(Event::End(BytesEnd::new("w:txbxContent"))).expect("write txbxContent end");
-    w.write_event(Event::End(BytesEnd::new("wps:txbx"))).expect("write txbx end");
+    w.write_event(Event::End(BytesEnd::new("w:txbxContent")))
+        .expect("write txbxContent end");
+    w.write_event(Event::End(BytesEnd::new("wps:txbx")))
+        .expect("write txbx end");
 
-    w.write_event(Event::Empty(BytesStart::new("wps:bodyPr"))).expect("write bodyPr");
-    w.write_event(Event::End(BytesEnd::new("wps:wsp"))).expect("write wsp end");
-    w.write_event(Event::End(BytesEnd::new("a:graphicData"))).expect("write graphicData end");
-    w.write_event(Event::End(BytesEnd::new("a:graphic"))).expect("write graphic end");
-    w.write_event(Event::End(BytesEnd::new("wp:anchor"))).expect("write anchor end");
-    w.write_event(Event::End(BytesEnd::new("w:drawing"))).expect("write drawing end");
-    w.write_event(Event::End(BytesEnd::new("w:r"))).expect("write r end");
-    w.write_event(Event::End(BytesEnd::new("w:p"))).expect("write p end");
+    w.write_event(Event::Empty(BytesStart::new("wps:bodyPr")))
+        .expect("write bodyPr");
+    w.write_event(Event::End(BytesEnd::new("wps:wsp")))
+        .expect("write wsp end");
+    w.write_event(Event::End(BytesEnd::new("a:graphicData")))
+        .expect("write graphicData end");
+    w.write_event(Event::End(BytesEnd::new("a:graphic")))
+        .expect("write graphic end");
+    w.write_event(Event::End(BytesEnd::new("wp:anchor")))
+        .expect("write anchor end");
+    w.write_event(Event::End(BytesEnd::new("w:drawing")))
+        .expect("write drawing end");
+    w.write_event(Event::End(BytesEnd::new("w:r")))
+        .expect("write r end");
+    w.write_event(Event::End(BytesEnd::new("w:p")))
+        .expect("write p end");
 }
 
 fn write_inline_image_run(
@@ -2193,7 +2336,8 @@ fn write_inline_image_run(
 
     let mut gdata = BytesStart::new("a:graphicData");
     gdata.push_attribute(("uri", PIC_NS));
-    w.write_event(Event::Start(gdata)).expect("write graphicData start");
+    w.write_event(Event::Start(gdata))
+        .expect("write graphicData start");
 
     // pic:pic
     w.write_event(Event::Start(BytesStart::new("pic:pic")))
@@ -2243,7 +2387,8 @@ fn write_inline_image_run(
         .expect("write xfrm end");
     let mut geom = BytesStart::new("a:prstGeom");
     geom.push_attribute(("prst", "rect"));
-    w.write_event(Event::Start(geom)).expect("write prstGeom start");
+    w.write_event(Event::Start(geom))
+        .expect("write prstGeom start");
     w.write_event(Event::Empty(BytesStart::new("a:avLst")))
         .expect("write avLst");
     w.write_event(Event::End(BytesEnd::new("a:prstGeom")))
@@ -2282,9 +2427,12 @@ fn write_floating_image_run(
         crate::ir::FloatAnchor::Paragraph => "paragraph",
     };
 
-    w.write_event(Event::Start(BytesStart::new("w:p"))).expect("write p start");
-    w.write_event(Event::Start(BytesStart::new("w:r"))).expect("write r start");
-    w.write_event(Event::Start(BytesStart::new("w:drawing"))).expect("write drawing start");
+    w.write_event(Event::Start(BytesStart::new("w:p")))
+        .expect("write p start");
+    w.write_event(Event::Start(BytesStart::new("w:r")))
+        .expect("write r start");
+    w.write_event(Event::Start(BytesStart::new("w:drawing")))
+        .expect("write drawing start");
 
     let mut anchor = BytesStart::new("wp:anchor");
     anchor.push_attribute(("behindDoc", "0"));
@@ -2295,27 +2443,39 @@ fn write_floating_image_run(
     anchor.push_attribute(("simplePos", "0"));
     anchor.push_attribute(("relativeHeight", "251659264"));
     anchor.push_attribute(("allowOverlap", if fi.allow_overlap { "1" } else { "0" }));
-    w.write_event(Event::Start(anchor)).expect("write anchor start");
+    w.write_event(Event::Start(anchor))
+        .expect("write anchor start");
 
-    w.write_event(Event::Empty(BytesStart::new("wp:simplePos"))).expect("write simplePos");
+    w.write_event(Event::Empty(BytesStart::new("wp:simplePos")))
+        .expect("write simplePos");
 
     let mut pos_h = BytesStart::new("wp:positionH");
     pos_h.push_attribute(("relativeFrom", float_anchor_val(&fi.h_anchor)));
-    w.write_event(Event::Start(pos_h)).expect("write positionH start");
+    w.write_event(Event::Start(pos_h))
+        .expect("write positionH start");
     let x_str = fi.x_emu.to_string();
-    w.write_event(Event::Start(BytesStart::new("wp:posOffset"))).expect("write posOffset start");
-    w.write_event(Event::Text(BytesText::new(&x_str))).expect("write posOffset text");
-    w.write_event(Event::End(BytesEnd::new("wp:posOffset"))).expect("write posOffset end");
-    w.write_event(Event::End(BytesEnd::new("wp:positionH"))).expect("write positionH end");
+    w.write_event(Event::Start(BytesStart::new("wp:posOffset")))
+        .expect("write posOffset start");
+    w.write_event(Event::Text(BytesText::new(&x_str)))
+        .expect("write posOffset text");
+    w.write_event(Event::End(BytesEnd::new("wp:posOffset")))
+        .expect("write posOffset end");
+    w.write_event(Event::End(BytesEnd::new("wp:positionH")))
+        .expect("write positionH end");
 
     let mut pos_v = BytesStart::new("wp:positionV");
     pos_v.push_attribute(("relativeFrom", float_anchor_val(&fi.v_anchor)));
-    w.write_event(Event::Start(pos_v)).expect("write positionV start");
+    w.write_event(Event::Start(pos_v))
+        .expect("write positionV start");
     let y_str = fi.y_emu.to_string();
-    w.write_event(Event::Start(BytesStart::new("wp:posOffset"))).expect("write posOffset start");
-    w.write_event(Event::Text(BytesText::new(&y_str))).expect("write posOffset text");
-    w.write_event(Event::End(BytesEnd::new("wp:posOffset"))).expect("write posOffset end");
-    w.write_event(Event::End(BytesEnd::new("wp:positionV"))).expect("write positionV end");
+    w.write_event(Event::Start(BytesStart::new("wp:posOffset")))
+        .expect("write posOffset start");
+    w.write_event(Event::Text(BytesText::new(&y_str)))
+        .expect("write posOffset text");
+    w.write_event(Event::End(BytesEnd::new("wp:posOffset")))
+        .expect("write posOffset end");
+    w.write_event(Event::End(BytesEnd::new("wp:positionV")))
+        .expect("write positionV end");
 
     let mut extent = BytesStart::new("wp:extent");
     extent.push_attribute(("cx", fi.width_emu.to_string().as_str()));
@@ -2337,48 +2497,66 @@ fn write_floating_image_run(
             w.write_event(Event::Empty(ws)).expect("write wrapSquare");
         },
         crate::ir::TextWrap::Tight => {
-            w.write_event(Event::Empty(BytesStart::new("wp:wrapTight"))).expect("write wrapTight");
+            w.write_event(Event::Empty(BytesStart::new("wp:wrapTight")))
+                .expect("write wrapTight");
         },
         crate::ir::TextWrap::TopAndBottom => {
-            w.write_event(Event::Empty(BytesStart::new("wp:wrapTopAndBottom"))).expect("write wrapTopAndBottom");
+            w.write_event(Event::Empty(BytesStart::new("wp:wrapTopAndBottom")))
+                .expect("write wrapTopAndBottom");
         },
         crate::ir::TextWrap::Behind => {
-            w.write_event(Event::Empty(BytesStart::new("wp:wrapNone"))).expect("write wrapNone behind");
+            w.write_event(Event::Empty(BytesStart::new("wp:wrapNone")))
+                .expect("write wrapNone behind");
         },
         crate::ir::TextWrap::InFront => {
-            w.write_event(Event::Empty(BytesStart::new("wp:wrapNone"))).expect("write wrapNone infront");
+            w.write_event(Event::Empty(BytesStart::new("wp:wrapNone")))
+                .expect("write wrapNone infront");
         },
         crate::ir::TextWrap::Through => {
-            w.write_event(Event::Empty(BytesStart::new("wp:wrapThrough"))).expect("write wrapThrough");
+            w.write_event(Event::Empty(BytesStart::new("wp:wrapThrough")))
+                .expect("write wrapThrough");
         },
     }
 
     // a:graphic (same pic:pic structure as inline)
-    w.write_event(Event::Start(BytesStart::new("a:graphic"))).expect("write graphic start");
+    w.write_event(Event::Start(BytesStart::new("a:graphic")))
+        .expect("write graphic start");
     let mut gdata = BytesStart::new("a:graphicData");
     gdata.push_attribute(("uri", PIC_NS));
-    w.write_event(Event::Start(gdata)).expect("write graphicData start");
+    w.write_event(Event::Start(gdata))
+        .expect("write graphicData start");
 
-    w.write_event(Event::Start(BytesStart::new("pic:pic"))).expect("write pic start");
-    w.write_event(Event::Start(BytesStart::new("pic:nvPicPr"))).expect("write nvPicPr start");
+    w.write_event(Event::Start(BytesStart::new("pic:pic")))
+        .expect("write pic start");
+    w.write_event(Event::Start(BytesStart::new("pic:nvPicPr")))
+        .expect("write nvPicPr start");
     let mut cnv_pr = BytesStart::new("pic:cNvPr");
     cnv_pr.push_attribute(("id", pic_id.to_string().as_str()));
     cnv_pr.push_attribute(("name", format!("Image{pic_id}").as_str()));
     w.write_event(Event::Empty(cnv_pr)).expect("write cNvPr");
-    w.write_event(Event::Empty(BytesStart::new("pic:cNvPicPr"))).expect("write cNvPicPr");
-    w.write_event(Event::End(BytesEnd::new("pic:nvPicPr"))).expect("write nvPicPr end");
+    w.write_event(Event::Empty(BytesStart::new("pic:cNvPicPr")))
+        .expect("write cNvPicPr");
+    w.write_event(Event::End(BytesEnd::new("pic:nvPicPr")))
+        .expect("write nvPicPr end");
 
-    w.write_event(Event::Start(BytesStart::new("pic:blipFill"))).expect("write blipFill start");
+    w.write_event(Event::Start(BytesStart::new("pic:blipFill")))
+        .expect("write blipFill start");
     let mut blip = BytesStart::new("a:blip");
     blip.push_attribute(("r:embed", rid));
     w.write_event(Event::Empty(blip)).expect("write blip");
-    w.write_event(Event::Start(BytesStart::new("a:stretch"))).expect("write stretch start");
-    w.write_event(Event::Empty(BytesStart::new("a:fillRect"))).expect("write fillRect");
-    w.write_event(Event::End(BytesEnd::new("a:stretch"))).expect("write stretch end");
-    w.write_event(Event::End(BytesEnd::new("pic:blipFill"))).expect("write blipFill end");
+    w.write_event(Event::Start(BytesStart::new("a:stretch")))
+        .expect("write stretch start");
+    w.write_event(Event::Empty(BytesStart::new("a:fillRect")))
+        .expect("write fillRect");
+    w.write_event(Event::End(BytesEnd::new("a:stretch")))
+        .expect("write stretch end");
+    w.write_event(Event::End(BytesEnd::new("pic:blipFill")))
+        .expect("write blipFill end");
 
-    w.write_event(Event::Start(BytesStart::new("pic:spPr"))).expect("write spPr start");
-    w.write_event(Event::Start(BytesStart::new("a:xfrm"))).expect("write xfrm start");
+    w.write_event(Event::Start(BytesStart::new("pic:spPr")))
+        .expect("write spPr start");
+    w.write_event(Event::Start(BytesStart::new("a:xfrm")))
+        .expect("write xfrm start");
     let mut off = BytesStart::new("a:off");
     off.push_attribute(("x", "0"));
     off.push_attribute(("y", "0"));
@@ -2387,21 +2565,33 @@ fn write_floating_image_run(
     ext.push_attribute(("cx", fi.width_emu.to_string().as_str()));
     ext.push_attribute(("cy", fi.height_emu.to_string().as_str()));
     w.write_event(Event::Empty(ext)).expect("write ext");
-    w.write_event(Event::End(BytesEnd::new("a:xfrm"))).expect("write xfrm end");
+    w.write_event(Event::End(BytesEnd::new("a:xfrm")))
+        .expect("write xfrm end");
     let mut geom = BytesStart::new("a:prstGeom");
     geom.push_attribute(("prst", "rect"));
-    w.write_event(Event::Start(geom)).expect("write prstGeom start");
-    w.write_event(Event::Empty(BytesStart::new("a:avLst"))).expect("write avLst");
-    w.write_event(Event::End(BytesEnd::new("a:prstGeom"))).expect("write prstGeom end");
-    w.write_event(Event::End(BytesEnd::new("pic:spPr"))).expect("write spPr end");
+    w.write_event(Event::Start(geom))
+        .expect("write prstGeom start");
+    w.write_event(Event::Empty(BytesStart::new("a:avLst")))
+        .expect("write avLst");
+    w.write_event(Event::End(BytesEnd::new("a:prstGeom")))
+        .expect("write prstGeom end");
+    w.write_event(Event::End(BytesEnd::new("pic:spPr")))
+        .expect("write spPr end");
 
-    w.write_event(Event::End(BytesEnd::new("pic:pic"))).expect("write pic end");
-    w.write_event(Event::End(BytesEnd::new("a:graphicData"))).expect("write graphicData end");
-    w.write_event(Event::End(BytesEnd::new("a:graphic"))).expect("write graphic end");
-    w.write_event(Event::End(BytesEnd::new("wp:anchor"))).expect("write anchor end");
-    w.write_event(Event::End(BytesEnd::new("w:drawing"))).expect("write drawing end");
-    w.write_event(Event::End(BytesEnd::new("w:r"))).expect("write r end");
-    w.write_event(Event::End(BytesEnd::new("w:p"))).expect("write p end");
+    w.write_event(Event::End(BytesEnd::new("pic:pic")))
+        .expect("write pic end");
+    w.write_event(Event::End(BytesEnd::new("a:graphicData")))
+        .expect("write graphicData end");
+    w.write_event(Event::End(BytesEnd::new("a:graphic")))
+        .expect("write graphic end");
+    w.write_event(Event::End(BytesEnd::new("wp:anchor")))
+        .expect("write anchor end");
+    w.write_event(Event::End(BytesEnd::new("w:drawing")))
+        .expect("write drawing end");
+    w.write_event(Event::End(BytesEnd::new("w:r")))
+        .expect("write r end");
+    w.write_event(Event::End(BytesEnd::new("w:p")))
+        .expect("write p end");
 }
 
 fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
@@ -2492,7 +2682,8 @@ fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
                 col.push_attribute(("w:space", default_space.to_string().as_str()));
                 w.write_event(Event::Empty(col)).expect("write col");
             }
-            w.write_event(Event::End(BytesEnd::new("w:cols"))).expect("write cols end");
+            w.write_event(Event::End(BytesEnd::new("w:cols")))
+                .expect("write cols end");
         }
     }
 
@@ -2504,11 +2695,7 @@ fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
 // Header/footer XML generation
 // ---------------------------------------------------------------------------
 
-fn generate_hf_xml(
-    elements: &[DocxElement],
-    image_rids: &[ImageInfo],
-    is_header: bool,
-) -> Vec<u8> {
+fn generate_hf_xml(elements: &[DocxElement], image_rids: &[ImageInfo], is_header: bool) -> Vec<u8> {
     let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
     w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
         .expect("write decl");
@@ -2530,7 +2717,8 @@ fn generate_hf_xml(
             .expect("write p end");
     }
 
-    w.write_event(Event::End(BytesEnd::new(tag))).expect("write hf end");
+    w.write_event(Event::End(BytesEnd::new(tag)))
+        .expect("write hf end");
     w.into_inner()
 }
 
@@ -2551,8 +2739,16 @@ fn generate_notes_xml(notes: &[DocxNote], image_rids: &[ImageInfo], is_endnote: 
     w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
         .expect("write decl");
 
-    let root_tag = if is_endnote { "w:endnotes" } else { "w:footnotes" };
-    let note_tag = if is_endnote { "w:endnote" } else { "w:footnote" };
+    let root_tag = if is_endnote {
+        "w:endnotes"
+    } else {
+        "w:footnotes"
+    };
+    let note_tag = if is_endnote {
+        "w:endnote"
+    } else {
+        "w:footnote"
+    };
 
     let mut root = BytesStart::new(root_tag);
     root.push_attribute(("xmlns:w", WML_NS));
@@ -2561,7 +2757,8 @@ fn generate_notes_xml(notes: &[DocxNote], image_rids: &[ImageInfo], is_endnote: 
     for note in notes {
         let mut note_elem = BytesStart::new(note_tag);
         note_elem.push_attribute(("w:id", note.id.to_string().as_str()));
-        w.write_event(Event::Start(note_elem)).expect("write note start");
+        w.write_event(Event::Start(note_elem))
+            .expect("write note start");
 
         let mut ic = 0u32;
         for elem in &note.elements {
@@ -2574,10 +2771,12 @@ fn generate_notes_xml(notes: &[DocxNote], image_rids: &[ImageInfo], is_endnote: 
                 .expect("write p end");
         }
 
-        w.write_event(Event::End(BytesEnd::new(note_tag))).expect("write note end");
+        w.write_event(Event::End(BytesEnd::new(note_tag)))
+            .expect("write note end");
     }
 
-    w.write_event(Event::End(BytesEnd::new(root_tag))).expect("write notes end");
+    w.write_event(Event::End(BytesEnd::new(root_tag)))
+        .expect("write notes end");
     w.into_inner()
 }
 
@@ -2591,52 +2790,77 @@ fn generate_core_props_xml(props: &CoreProps) -> Vec<u8> {
         .expect("write decl");
 
     let mut root = BytesStart::new("cp:coreProperties");
-    root.push_attribute(("xmlns:cp", "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"));
+    root.push_attribute((
+        "xmlns:cp",
+        "http://schemas.openxmlformats.org/package/2006/metadata/core-properties",
+    ));
     root.push_attribute(("xmlns:dc", "http://purl.org/dc/elements/1.1/"));
     root.push_attribute(("xmlns:dcterms", "http://purl.org/dc/terms/"));
     w.write_event(Event::Start(root)).expect("write core root");
 
     if let Some(ref v) = props.title {
-        w.write_event(Event::Start(BytesStart::new("dc:title"))).expect("write title start");
-        w.write_event(Event::Text(BytesText::new(v))).expect("write title text");
-        w.write_event(Event::End(BytesEnd::new("dc:title"))).expect("write title end");
+        w.write_event(Event::Start(BytesStart::new("dc:title")))
+            .expect("write title start");
+        w.write_event(Event::Text(BytesText::new(v)))
+            .expect("write title text");
+        w.write_event(Event::End(BytesEnd::new("dc:title")))
+            .expect("write title end");
     }
     if let Some(ref v) = props.subject {
-        w.write_event(Event::Start(BytesStart::new("dc:subject"))).expect("write subject start");
-        w.write_event(Event::Text(BytesText::new(v))).expect("write subject text");
-        w.write_event(Event::End(BytesEnd::new("dc:subject"))).expect("write subject end");
+        w.write_event(Event::Start(BytesStart::new("dc:subject")))
+            .expect("write subject start");
+        w.write_event(Event::Text(BytesText::new(v)))
+            .expect("write subject text");
+        w.write_event(Event::End(BytesEnd::new("dc:subject")))
+            .expect("write subject end");
     }
     if let Some(ref v) = props.author {
-        w.write_event(Event::Start(BytesStart::new("dc:creator"))).expect("write creator start");
-        w.write_event(Event::Text(BytesText::new(v))).expect("write creator text");
-        w.write_event(Event::End(BytesEnd::new("dc:creator"))).expect("write creator end");
+        w.write_event(Event::Start(BytesStart::new("dc:creator")))
+            .expect("write creator start");
+        w.write_event(Event::Text(BytesText::new(v)))
+            .expect("write creator text");
+        w.write_event(Event::End(BytesEnd::new("dc:creator")))
+            .expect("write creator end");
     }
     if let Some(ref v) = props.description {
-        w.write_event(Event::Start(BytesStart::new("dc:description"))).expect("write desc start");
-        w.write_event(Event::Text(BytesText::new(v))).expect("write desc text");
-        w.write_event(Event::End(BytesEnd::new("dc:description"))).expect("write desc end");
+        w.write_event(Event::Start(BytesStart::new("dc:description")))
+            .expect("write desc start");
+        w.write_event(Event::Text(BytesText::new(v)))
+            .expect("write desc text");
+        w.write_event(Event::End(BytesEnd::new("dc:description")))
+            .expect("write desc end");
     }
     if let Some(ref v) = props.keywords {
-        w.write_event(Event::Start(BytesStart::new("cp:keywords"))).expect("write kw start");
-        w.write_event(Event::Text(BytesText::new(v))).expect("write kw text");
-        w.write_event(Event::End(BytesEnd::new("cp:keywords"))).expect("write kw end");
+        w.write_event(Event::Start(BytesStart::new("cp:keywords")))
+            .expect("write kw start");
+        w.write_event(Event::Text(BytesText::new(v)))
+            .expect("write kw text");
+        w.write_event(Event::End(BytesEnd::new("cp:keywords")))
+            .expect("write kw end");
     }
     if let Some(ref v) = props.created {
         let mut elem = BytesStart::new("dcterms:created");
         elem.push_attribute(("xsi:type", "dcterms:W3CDTF"));
-        w.write_event(Event::Start(elem)).expect("write created start");
-        w.write_event(Event::Text(BytesText::new(v))).expect("write created text");
-        w.write_event(Event::End(BytesEnd::new("dcterms:created"))).expect("write created end");
+        w.write_event(Event::Start(elem))
+            .expect("write created start");
+        w.write_event(Event::Text(BytesText::new(v)))
+            .expect("write created text");
+        w.write_event(Event::End(BytesEnd::new("dcterms:created")))
+            .expect("write created end");
     }
     if let Some(ref v) = props.modified {
         let mut elem = BytesStart::new("dcterms:modified");
         elem.push_attribute(("xsi:type", "dcterms:W3CDTF"));
-        w.write_event(Event::Start(elem)).expect("write modified start");
-        w.write_event(Event::Text(BytesText::new(v))).expect("write modified text");
-        w.write_event(Event::End(BytesEnd::new("dcterms:modified"))).expect("write modified end");
+        w.write_event(Event::Start(elem))
+            .expect("write modified start");
+        w.write_event(Event::Text(BytesText::new(v)))
+            .expect("write modified text");
+        w.write_event(Event::End(BytesEnd::new("dcterms:modified")))
+            .expect("write modified end");
     }
 
-    w.write_event(Event::End(BytesEnd::new("cp:coreProperties"))).expect("write core end");
+    w.write_event(Event::End(BytesEnd::new("cp:coreProperties")))
+        .expect("write core end");
     w.into_inner()
 }
 
@@ -2712,46 +2936,57 @@ fn write_code_style(w: &mut Writer<Vec<u8>>) {
     let mut elem = BytesStart::new("w:style");
     elem.push_attribute(("w:type", "paragraph"));
     elem.push_attribute(("w:styleId", "Code"));
-    w.write_event(Event::Start(elem)).expect("write code style start");
+    w.write_event(Event::Start(elem))
+        .expect("write code style start");
 
     let mut name_elem = BytesStart::new("w:name");
     name_elem.push_attribute(("w:val", "Code"));
-    w.write_event(Event::Empty(name_elem)).expect("write code name");
+    w.write_event(Event::Empty(name_elem))
+        .expect("write code name");
 
     // pPr: shading
-    w.write_event(Event::Start(BytesStart::new("w:pPr"))).expect("write pPr");
+    w.write_event(Event::Start(BytesStart::new("w:pPr")))
+        .expect("write pPr");
     let mut shd = BytesStart::new("w:shd");
     shd.push_attribute(("w:val", "clear"));
     shd.push_attribute(("w:fill", "F0F0F0"));
     shd.push_attribute(("w:color", "auto"));
     w.write_event(Event::Empty(shd)).expect("write code shd");
-    w.write_event(Event::End(BytesEnd::new("w:pPr"))).expect("write pPr end");
+    w.write_event(Event::End(BytesEnd::new("w:pPr")))
+        .expect("write pPr end");
 
     // rPr: Courier New 10pt
-    w.write_event(Event::Start(BytesStart::new("w:rPr"))).expect("write rPr");
+    w.write_event(Event::Start(BytesStart::new("w:rPr")))
+        .expect("write rPr");
     let mut fonts = BytesStart::new("w:rFonts");
     fonts.push_attribute(("w:ascii", "Courier New"));
     fonts.push_attribute(("w:hAnsi", "Courier New"));
-    w.write_event(Event::Empty(fonts)).expect("write code fonts");
+    w.write_event(Event::Empty(fonts))
+        .expect("write code fonts");
     let mut sz = BytesStart::new("w:sz");
     sz.push_attribute(("w:val", "20")); // 10pt = 20 half-points
     w.write_event(Event::Empty(sz)).expect("write code sz");
-    w.write_event(Event::End(BytesEnd::new("w:rPr"))).expect("write rPr end");
+    w.write_event(Event::End(BytesEnd::new("w:rPr")))
+        .expect("write rPr end");
 
-    w.write_event(Event::End(BytesEnd::new("w:style"))).expect("write code style end");
+    w.write_event(Event::End(BytesEnd::new("w:style")))
+        .expect("write code style end");
 }
 
 fn write_character_style(w: &mut Writer<Vec<u8>>, style_id: &str, name: &str) {
     let mut elem = BytesStart::new("w:style");
     elem.push_attribute(("w:type", "character"));
     elem.push_attribute(("w:styleId", style_id));
-    w.write_event(Event::Start(elem)).expect("write char style start");
+    w.write_event(Event::Start(elem))
+        .expect("write char style start");
 
     let mut name_elem = BytesStart::new("w:name");
     name_elem.push_attribute(("w:val", name));
-    w.write_event(Event::Empty(name_elem)).expect("write char style name");
+    w.write_event(Event::Empty(name_elem))
+        .expect("write char style name");
 
-    w.write_event(Event::End(BytesEnd::new("w:style"))).expect("write char style end");
+    w.write_event(Event::End(BytesEnd::new("w:style")))
+        .expect("write char style end");
 }
 
 fn write_abstract_num(
@@ -2783,22 +3018,30 @@ fn write_abstract_num(
         .expect("write abstractNum end");
 }
 
-fn write_num(w: &mut Writer<Vec<u8>>, num_id: u32, abstract_num_id: u32, start_override: Option<u32>) {
+fn write_num(
+    w: &mut Writer<Vec<u8>>,
+    num_id: u32,
+    abstract_num_id: u32,
+    start_override: Option<u32>,
+) {
     let mut elem = BytesStart::new("w:num");
     elem.push_attribute(("w:numId", num_id.to_string().as_str()));
     w.write_event(Event::Start(elem)).expect("write num start");
 
     let mut abs = BytesStart::new("w:abstractNumId");
     abs.push_attribute(("w:val", abstract_num_id.to_string().as_str()));
-    w.write_event(Event::Empty(abs)).expect("write abstractNumId");
+    w.write_event(Event::Empty(abs))
+        .expect("write abstractNumId");
 
     if let Some(start) = start_override {
         let mut lvl_override = BytesStart::new("w:lvlOverride");
         lvl_override.push_attribute(("w:ilvl", "0"));
-        w.write_event(Event::Start(lvl_override)).expect("write lvlOverride start");
+        w.write_event(Event::Start(lvl_override))
+            .expect("write lvlOverride start");
         let mut so = BytesStart::new("w:startOverride");
         so.push_attribute(("w:val", start.to_string().as_str()));
-        w.write_event(Event::Empty(so)).expect("write startOverride");
+        w.write_event(Event::Empty(so))
+            .expect("write startOverride");
         w.write_event(Event::End(BytesEnd::new("w:lvlOverride")))
             .expect("write lvlOverride end");
     }

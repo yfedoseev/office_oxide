@@ -180,7 +180,10 @@ fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) 
         for para in &body.paragraphs {
             let content = convert_text_paragraph_inline(para);
             if !content.is_empty() {
-                elements.push(Element::Paragraph(Paragraph { content, ..Default::default() }));
+                elements.push(Element::Paragraph(Paragraph {
+                    content,
+                    ..Default::default()
+                }));
             }
         }
     }
@@ -223,7 +226,10 @@ fn inline_to_element(content: Vec<InlineContent>) -> Vec<Element> {
     if content.is_empty() {
         Vec::new()
     } else {
-        vec![Element::Paragraph(Paragraph { content, ..Default::default() })]
+        vec![Element::Paragraph(Paragraph {
+            content,
+            ..Default::default()
+        })]
     }
 }
 
@@ -286,7 +292,10 @@ fn convert_pptx_table(table: &crate::pptx::Table) -> Element {
                 for para in &tb.paragraphs {
                     let content = convert_text_paragraph_inline(para);
                     if !content.is_empty() {
-                        cell_elements.push(Element::Paragraph(Paragraph { content, ..Default::default() }));
+                        cell_elements.push(Element::Paragraph(Paragraph {
+                            content,
+                            ..Default::default()
+                        }));
                     }
                 }
             }
@@ -306,5 +315,8 @@ fn convert_pptx_table(table: &crate::pptx::Table) -> Element {
         });
     }
 
-    Element::Table(Table { rows: ir_rows, ..Default::default() })
+    Element::Table(Table {
+        rows: ir_rows,
+        ..Default::default()
+    })
 }

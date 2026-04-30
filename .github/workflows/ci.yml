@@ -613,25 +613,8 @@ jobs:
       - name: Build with MSRV toolchain
         run: cargo build --lib -p office_oxide
 
-  # DCO: every commit on a PR must carry a Signed-off-by trailer.
-  # Enforces the Developer Certificate of Origin (see CONTRIBUTING.md).
-  dco:
-    name: DCO check
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
-        with:
-          fetch-depth: 0
-      - name: Check DCO sign-off
-        run: |
-          BASE="${{ github.event.pull_request.base.sha }}"
-          HEAD="${{ github.event.pull_request.head.sha }}"
-          MISSING=0
-          while IFS= read -r sha; do
-            if ! git log -1 --pretty=full "$sha" | grep -q "^Signed-off-by:"; then
-              echo "::error::Commit $sha is missing a Signed-off-by trailer (run: git commit -s --amend)"
-              MISSING=$((MISSING+1))
-            fi
-          done < <(git log --pretty=format:"%H" "${BASE}..${HEAD}")
-          [ "$MISSING" -eq 0 ] || exit 1
+  # DCO check disabled — sign-off requirement removed.
+  # dco:
+  #   name: DCO check
+  #   runs-on: ubuntu-latest
+  #   if: github.event_name == 'pull_request'

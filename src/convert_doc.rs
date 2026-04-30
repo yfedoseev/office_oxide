@@ -53,6 +53,10 @@ pub(crate) fn doc_to_ir(doc: &crate::doc::DocDocument) -> DocumentIR {
             title: title.clone(),
             ..Default::default()
         },
-        sections: vec![Section { title, elements, ..Default::default() }],
+        sections: vec![Section {
+            title,
+            elements,
+            ..Default::default()
+        }],
     }
 }

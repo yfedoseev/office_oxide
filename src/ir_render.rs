@@ -73,14 +73,20 @@ fn render_element_plain(element: &Element) -> String {
             }
         },
         Element::ThematicBreak => "---".to_string(),
-        Element::TextBox(tb) => {
-            tb.content.iter().map(render_element_plain).collect::<Vec<_>>().join("\n\n")
-        },
+        Element::TextBox(tb) => tb
+            .content
+            .iter()
+            .map(render_element_plain)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
         Element::PageBreak => String::new(),
         Element::ColumnBreak => String::new(),
-        Element::Footnote(n) | Element::Endnote(n) => {
-            n.content.iter().map(render_element_plain).collect::<Vec<_>>().join("\n\n")
-        },
+        Element::Footnote(n) | Element::Endnote(n) => n
+            .content
+            .iter()
+            .map(render_element_plain)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
         Element::CodeBlock(cb) => cb.content.clone(),
     }
 }
@@ -120,7 +126,12 @@ fn render_list_plain(list: &List, indent: usize) -> String {
     let prefix_str = " ".repeat(indent * 2);
     let mut lines = Vec::new();
     for item in &list.items {
-        let text = item.content.iter().map(render_element_plain).collect::<Vec<_>>().join(" ");
+        let text = item
+            .content
+            .iter()
+            .map(render_element_plain)
+            .collect::<Vec<_>>()
+            .join(" ");
         lines.push(format!("{prefix_str}- {text}"));
         if let Some(ref nested) = item.nested {
             lines.push(render_list_plain(nested, indent + 1));
@@ -164,14 +175,20 @@ fn render_element_markdown(element: &Element) -> String {
             format!("![{alt}]()")
         },
         Element::ThematicBreak => "---".to_string(),
-        Element::TextBox(tb) => {
-            tb.content.iter().map(render_element_markdown).collect::<Vec<_>>().join("\n\n")
-        },
+        Element::TextBox(tb) => tb
+            .content
+            .iter()
+            .map(render_element_markdown)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
         Element::PageBreak => String::new(),
         Element::ColumnBreak => String::new(),
-        Element::Footnote(n) | Element::Endnote(n) => {
-            n.content.iter().map(render_element_markdown).collect::<Vec<_>>().join("\n\n")
-        },
+        Element::Footnote(n) | Element::Endnote(n) => n
+            .content
+            .iter()
+            .map(render_element_markdown)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
         Element::CodeBlock(cb) => {
             let lang = cb.language.as_deref().unwrap_or("");
             format!("```{lang}\n{}\n```", cb.content)
@@ -282,7 +299,12 @@ fn render_list_markdown(list: &List, indent: usize) -> String {
     let prefix_str = "  ".repeat(indent);
     let mut lines = Vec::new();
     for (i, item) in list.items.iter().enumerate() {
-        let text = item.content.iter().map(render_element_markdown).collect::<Vec<_>>().join(" ");
+        let text = item
+            .content
+            .iter()
+            .map(render_element_markdown)
+            .collect::<Vec<_>>()
+            .join(" ");
         let marker = if list.ordered {
             format!("{}. ", i + 1)
         } else {
@@ -341,14 +363,20 @@ fn render_element_html(element: &Element) -> String {
             format!("<img alt=\"{alt}\" />")
         },
         Element::ThematicBreak => "<hr />".to_string(),
-        Element::TextBox(tb) => {
-            tb.content.iter().map(render_element_html).collect::<Vec<_>>().join("\n")
-        },
+        Element::TextBox(tb) => tb
+            .content
+            .iter()
+            .map(render_element_html)
+            .collect::<Vec<_>>()
+            .join("\n"),
         Element::PageBreak => String::new(),
         Element::ColumnBreak => String::new(),
-        Element::Footnote(n) | Element::Endnote(n) => {
-            n.content.iter().map(render_element_html).collect::<Vec<_>>().join("\n")
-        },
+        Element::Footnote(n) | Element::Endnote(n) => n
+            .content
+            .iter()
+            .map(render_element_html)
+            .collect::<Vec<_>>()
+            .join("\n"),
         Element::CodeBlock(cb) => {
             let escaped = escape_html(&cb.content);
             format!("<pre><code>{escaped}</code></pre>")
@@ -413,7 +441,12 @@ fn render_list_html(list: &List) -> String {
     let tag = if list.ordered { "ol" } else { "ul" };
     let mut html = format!("<{tag}>\n");
     for item in &list.items {
-        let content = item.content.iter().map(render_element_html).collect::<Vec<_>>().join("");
+        let content = item
+            .content
+            .iter()
+            .map(render_element_html)
+            .collect::<Vec<_>>()
+            .join("");
         html.push_str(&format!("<li>{content}"));
         if let Some(ref nested) = item.nested {
             html.push('\n');
@@ -475,9 +508,17 @@ mod tests {
     fn markdown_formatting() {
         let ir = simple_ir(vec![Element::Paragraph(Paragraph {
             content: vec![
-                InlineContent::Text(TextSpan { text: "bold".to_string(), bold: true, ..Default::default() }),
+                InlineContent::Text(TextSpan {
+                    text: "bold".to_string(),
+                    bold: true,
+                    ..Default::default()
+                }),
                 InlineContent::Text(TextSpan::plain(" and ")),
-                InlineContent::Text(TextSpan { text: "italic".to_string(), italic: true, ..Default::default() }),
+                InlineContent::Text(TextSpan {
+                    text: "italic".to_string(),
+                    italic: true,
+                    ..Default::default()
+                }),
             ],
             ..Default::default()
         })]);
@@ -524,8 +565,14 @@ mod tests {
         let ir = simple_ir(vec![Element::List(List {
             ordered: false,
             items: vec![
-                ListItem { content: vec![para("First")], nested: None },
-                ListItem { content: vec![para("Second")], nested: None },
+                ListItem {
+                    content: vec![para("First")],
+                    nested: None,
+                },
+                ListItem {
+                    content: vec![para("Second")],
+                    nested: None,
+                },
             ],
             ..Default::default()
         })]);
@@ -583,7 +630,11 @@ mod tests {
     fn html_formatting() {
         let ir = simple_ir(vec![Element::Paragraph(Paragraph {
             content: vec![
-                InlineContent::Text(TextSpan { text: "bold".to_string(), bold: true, ..Default::default() }),
+                InlineContent::Text(TextSpan {
+                    text: "bold".to_string(),
+                    bold: true,
+                    ..Default::default()
+                }),
                 InlineContent::Text(TextSpan::plain(" and ")),
                 InlineContent::Text(TextSpan {
                     text: "link".to_string(),
@@ -627,8 +678,14 @@ mod tests {
         let ir = simple_ir(vec![Element::List(List {
             ordered: true,
             items: vec![
-                ListItem { content: vec![para("First")], nested: None },
-                ListItem { content: vec![para("Second")], nested: None },
+                ListItem {
+                    content: vec![para("First")],
+                    nested: None,
+                },
+                ListItem {
+                    content: vec![para("Second")],
+                    nested: None,
+                },
             ],
             ..Default::default()
         })]);

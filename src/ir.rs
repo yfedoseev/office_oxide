@@ -567,7 +567,10 @@ pub struct TextSpan {
 impl TextSpan {
     /// Create a plain (unformatted) text span.
     pub fn plain(text: impl Into<String>) -> Self {
-        Self { text: text.into(), ..Default::default() }
+        Self {
+            text: text.into(),
+            ..Default::default()
+        }
     }
 }
 

@@ -252,7 +252,10 @@ impl<'a> MarkdownParser<'a> {
             });
         }
 
-        Some(Table { rows, ..Default::default() })
+        Some(Table {
+            rows,
+            ..Default::default()
+        })
     }
 
     fn parse_list(&mut self, ordered: bool) -> List {
@@ -279,7 +282,11 @@ impl<'a> MarkdownParser<'a> {
                 },
             }
         }
-        List { ordered, items, ..Default::default() }
+        List {
+            ordered,
+            items,
+            ..Default::default()
+        }
     }
 }
 

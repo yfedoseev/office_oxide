@@ -498,7 +498,10 @@ fn ir_paragraph_indentation_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
-        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        metadata: Metadata {
+            format: office_oxide::DocumentFormat::Docx,
+            ..Default::default()
+        },
         sections: vec![Section {
             elements: vec![Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain("Indented paragraph"))],
@@ -528,7 +531,10 @@ fn ir_paragraph_line_spacing_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
-        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        metadata: Metadata {
+            format: office_oxide::DocumentFormat::Docx,
+            ..Default::default()
+        },
         sections: vec![Section {
             elements: vec![Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain("1.5 line spacing"))],
@@ -572,7 +578,10 @@ fn ir_table_with_borders_round_trip() {
     };
 
     let ir = DocumentIR {
-        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        metadata: Metadata {
+            format: office_oxide::DocumentFormat::Docx,
+            ..Default::default()
+        },
         sections: vec![Section {
             elements: vec![Element::Table(Table {
                 rows: vec![
@@ -654,7 +663,10 @@ fn ir_table_with_cell_shading_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
-        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        metadata: Metadata {
+            format: office_oxide::DocumentFormat::Docx,
+            ..Default::default()
+        },
         sections: vec![Section {
             elements: vec![Element::Table(Table {
                 rows: vec![TableRow {
@@ -722,7 +734,10 @@ fn ir_inline_image_round_trip() {
     ];
 
     let ir = DocumentIR {
-        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        metadata: Metadata {
+            format: office_oxide::DocumentFormat::Docx,
+            ..Default::default()
+        },
         sections: vec![Section {
             elements: vec![
                 Element::Paragraph(Paragraph {
@@ -765,8 +780,7 @@ fn ir_inline_image_round_trip() {
     );
 
     // Verify text content
-    let doc =
-        office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes)).unwrap();
+    let doc = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes)).unwrap();
     let text = doc.plain_text();
     assert!(text.contains("Before image"), "text: {text}");
     assert!(text.contains("After image"), "text: {text}");
@@ -777,7 +791,10 @@ fn ir_section_page_setup_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
-        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        metadata: Metadata {
+            format: office_oxide::DocumentFormat::Docx,
+            ..Default::default()
+        },
         sections: vec![Section {
             elements: vec![Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain("A4 page content"))],
@@ -816,7 +833,10 @@ fn ir_two_column_section_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
-        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        metadata: Metadata {
+            format: office_oxide::DocumentFormat::Docx,
+            ..Default::default()
+        },
         sections: vec![Section {
             elements: vec![Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain("Two column text"))],
@@ -850,7 +870,10 @@ fn ir_run_typography_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
-        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        metadata: Metadata {
+            format: office_oxide::DocumentFormat::Docx,
+            ..Default::default()
+        },
         sections: vec![Section {
             elements: vec![Element::Paragraph(Paragraph {
                 content: vec![
@@ -894,7 +917,10 @@ fn ir_code_block_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
-        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        metadata: Metadata {
+            format: office_oxide::DocumentFormat::Docx,
+            ..Default::default()
+        },
         sections: vec![Section {
             elements: vec![Element::CodeBlock(CodeBlock {
                 language: Some("rust".to_string()),
@@ -924,7 +950,10 @@ fn ir_table_cell_padding_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
-        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        metadata: Metadata {
+            format: office_oxide::DocumentFormat::Docx,
+            ..Default::default()
+        },
         sections: vec![Section {
             elements: vec![Element::Table(Table {
                 rows: vec![TableRow {
@@ -985,7 +1014,10 @@ fn ir_table_cell_padding_round_trip() {
     let mut doc_xml = String::new();
     {
         use std::io::Read;
-        zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc_xml).unwrap();
+        zip.by_name("word/document.xml")
+            .unwrap()
+            .read_to_string(&mut doc_xml)
+            .unwrap();
     }
     assert!(doc_xml.contains("w:tcMar"), "expected w:tcMar in document.xml");
     assert!(doc_xml.contains(r#"w:w="288""#), "expected left/right padding value");
@@ -996,7 +1028,10 @@ fn ir_table_cell_text_align_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
-        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        metadata: Metadata {
+            format: office_oxide::DocumentFormat::Docx,
+            ..Default::default()
+        },
         sections: vec![Section {
             elements: vec![Element::Table(Table {
                 rows: vec![TableRow {
@@ -1054,7 +1089,10 @@ fn ir_table_cell_text_align_round_trip() {
     let mut doc_xml = String::new();
     {
         use std::io::Read;
-        zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc_xml).unwrap();
+        zip.by_name("word/document.xml")
+            .unwrap()
+            .read_to_string(&mut doc_xml)
+            .unwrap();
     }
     assert!(
         doc_xml.contains(r#"w:val="center""#),
@@ -1072,7 +1110,10 @@ fn ir_table_caption_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
-        metadata: Metadata { format: office_oxide::DocumentFormat::Docx, ..Default::default() },
+        metadata: Metadata {
+            format: office_oxide::DocumentFormat::Docx,
+            ..Default::default()
+        },
         sections: vec![Section {
             elements: vec![Element::Table(Table {
                 rows: vec![TableRow {
@@ -1116,7 +1157,10 @@ fn ir_table_caption_round_trip() {
     let mut doc_xml = String::new();
     {
         use std::io::Read;
-        zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc_xml).unwrap();
+        zip.by_name("word/document.xml")
+            .unwrap()
+            .read_to_string(&mut doc_xml)
+            .unwrap();
     }
     assert!(doc_xml.contains("Caption"), "expected Caption style in document.xml");
     assert!(

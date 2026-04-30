@@ -36,7 +36,10 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
         let elements = if rows.is_empty() {
             Vec::new()
         } else {
-            vec![Element::Table(Table { rows, ..Default::default() })]
+            vec![Element::Table(Table {
+                rows,
+                ..Default::default()
+            })]
         };
 
         sections.push(Section {

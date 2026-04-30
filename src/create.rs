@@ -185,7 +185,10 @@ fn add_element_to_docx(writer: &mut crate::docx::write::DocxWriter, elem: &Eleme
         },
         Element::Paragraph(p) => {
             let runs = ir_inline_to_runs(&p.content);
-            if runs.iter().any(|r| !r.text.is_empty() || r.footnote_ref.is_some() || r.endnote_ref.is_some()) {
+            if runs
+                .iter()
+                .any(|r| !r.text.is_empty() || r.footnote_ref.is_some() || r.endnote_ref.is_some())
+            {
                 let props = IrParaProps {
                     alignment: p.alignment.clone(),
                     indent_left_twips: p.indent_left_twips,
@@ -262,7 +265,10 @@ fn ir_inline_to_runs(content: &[InlineContent]) -> Vec<crate::docx::write::Run> 
                 runs.push(run);
             },
             InlineContent::LineBreak => {
-                runs.push(Run { text: "\n".to_string(), ..Default::default() });
+                runs.push(Run {
+                    text: "\n".to_string(),
+                    ..Default::default()
+                });
             },
             InlineContent::FootnoteRef(r) => {
                 let mut run = Run::default();
