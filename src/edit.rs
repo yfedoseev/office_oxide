@@ -136,3 +136,98 @@ impl EditableDocument {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    fn make_docx_bytes() -> Vec<u8> {
+        let mut w = crate::docx::write::DocxWriter::new();
+        w.add_paragraph("Hello world");
+        let mut buf = Cursor::new(Vec::new());
+        w.write_to(&mut buf).unwrap();
+        buf.into_inner()
+    }
+
+    fn make_xlsx_bytes() -> Vec<u8> {
+        let mut w = crate::xlsx::write::XlsxWriter::new();
+        {
+            let mut sheet = w.add_sheet("Sheet1");
+            sheet.set_cell(0, 0, crate::xlsx::write::CellData::String("value".into()));
+        }
+        let mut buf = Cursor::new(Vec::new());
+        w.write_to(&mut buf).unwrap();
+        buf.into_inner()
+    }
+
+    fn make_pptx_bytes() -> Vec<u8> {
+        let mut w = crate::pptx::write::PptxWriter::new();
+        let slide = w.add_slide();
+        slide.set_title("Slide 1");
+        let mut buf = Cursor::new(Vec::new());
+        w.write_to(&mut buf).unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn docx_replace_text_roundtrip() {
+        let data = make_docx_bytes();
+        let mut doc =
+            EditableDocument::from_reader(Cursor::new(data), DocumentFormat::Docx).unwrap();
+        let count = doc.replace_text("Hello", "Hi");
+        assert!(count >= 1);
+        let mut out = Cursor::new(Vec::new());
+        doc.write_to(&mut out).unwrap();
+        assert!(!out.into_inner().is_empty());
+    }
+
+    #[test]
+    fn xlsx_set_cell_roundtrip() {
+        let data = make_xlsx_bytes();
+        let mut doc =
+            EditableDocument::from_reader(Cursor::new(data), DocumentFormat::Xlsx).unwrap();
+        doc.set_cell(0, "A1", crate::xlsx::edit::CellValue::String("updated".into()))
+            .unwrap();
+        let mut out = Cursor::new(Vec::new());
+        doc.write_to(&mut out).unwrap();
+        assert!(!out.into_inner().is_empty());
+    }
+
+    #[test]
+    fn pptx_replace_text_roundtrip() {
+        let data = make_pptx_bytes();
+        let mut doc =
+            EditableDocument::from_reader(Cursor::new(data), DocumentFormat::Pptx).unwrap();
+        doc.replace_text("Slide 1", "Updated");
+        let mut out = Cursor::new(Vec::new());
+        doc.write_to(&mut out).unwrap();
+        assert!(!out.into_inner().is_empty());
+    }
+
+    #[test]
+    fn xlsx_replace_text_returns_zero() {
+        let data = make_xlsx_bytes();
+        let mut doc =
+            EditableDocument::from_reader(Cursor::new(data), DocumentFormat::Xlsx).unwrap();
+        assert_eq!(doc.replace_text("anything", "other"), 0);
+    }
+
+    #[test]
+    fn set_cell_on_docx_returns_error() {
+        let data = make_docx_bytes();
+        let mut doc =
+            EditableDocument::from_reader(Cursor::new(data), DocumentFormat::Docx).unwrap();
+        assert!(
+            doc.set_cell(0, "A1", crate::xlsx::edit::CellValue::String("x".into()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn from_reader_unsupported_format_returns_error() {
+        let data = vec![0u8; 16];
+        assert!(EditableDocument::from_reader(Cursor::new(data), DocumentFormat::Doc).is_err());
+    }
+}

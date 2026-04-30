@@ -8,6 +8,12 @@ on:
   release:
     types: [ published ]
 
+# Cancel in-progress runs on the same ref when a new commit arrives.
+# Release events are excluded so a publish run is never interrupted.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' }}
+
 env:
   CARGO_TERM_COLOR: always
 

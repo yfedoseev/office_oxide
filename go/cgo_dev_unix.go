@@ -1,4 +1,4 @@
-//go:build office_oxide_dev
+//go:build office_oxide_dev && !windows
 
 // Dev-mode linker flags used when building inside the office_oxide monorepo.
 // Enable with `go build -tags office_oxide_dev ./...`, after running:

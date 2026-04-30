@@ -193,4 +193,115 @@ mod tests {
         assert!(text.contains("Title"));
         assert!(!text.contains("Speaker notes"));
     }
+
+    fn make_slide(runs: Vec<(TextType, &str)>) -> SlideText {
+        SlideText {
+            text_runs: runs
+                .into_iter()
+                .map(|(t, s)| TextRun {
+                    text_type: t,
+                    text: s.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn ir_empty_doc_has_no_sections() {
+        let doc = PptDocument {
+            images: Vec::new(),
+            slides: Vec::new(),
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        assert!(ir.sections.is_empty());
+        assert!(ir.metadata.title.is_none());
+    }
+
+    #[test]
+    fn ir_title_becomes_heading_and_section_title() {
+        use crate::ir::Element;
+        let doc = PptDocument {
+            images: Vec::new(),
+            slides: vec![make_slide(vec![(TextType::Title, "My Slide")])],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        assert_eq!(ir.metadata.title.as_deref(), Some("My Slide"));
+        assert!(matches!(ir.sections[0].elements[0], Element::Heading(_)));
+    }
+
+    #[test]
+    fn ir_center_title_treated_like_title() {
+        let doc = PptDocument {
+            images: Vec::new(),
+            slides: vec![make_slide(vec![(TextType::CenterTitle, "Centered")])],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        assert_eq!(ir.sections[0].title.as_deref(), Some("Centered"));
+    }
+
+    #[test]
+    fn ir_body_half_quarter_produce_paragraphs() {
+        use crate::ir::Element;
+        let doc = PptDocument {
+            images: Vec::new(),
+            slides: vec![make_slide(vec![
+                (TextType::Body, "Body text"),
+                (TextType::HalfBody, "Half body"),
+                (TextType::QuarterBody, "Quarter"),
+            ])],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        assert_eq!(ir.sections[0].elements.len(), 3);
+        assert!(matches!(ir.sections[0].elements[0], Element::Paragraph(_)));
+    }
+
+    #[test]
+    fn ir_notes_produce_italic_paragraphs() {
+        use crate::ir::{Element, InlineContent};
+        let doc = PptDocument {
+            images: Vec::new(),
+            slides: vec![make_slide(vec![(TextType::Notes, "Speaker note")])],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        if let Element::Paragraph(ref p) = ir.sections[0].elements[0] {
+            if let InlineContent::Text(ref span) = p.content[0] {
+                assert!(span.italic);
+            } else {
+                panic!("expected text span");
+            }
+        } else {
+            panic!("expected paragraph");
+        }
+    }
+
+    #[test]
+    fn ir_other_text_type_produces_paragraph() {
+        use crate::ir::Element;
+        let doc = PptDocument {
+            images: Vec::new(),
+            slides: vec![make_slide(vec![(TextType::Other, "misc text")])],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        assert!(matches!(ir.sections[0].elements[0], Element::Paragraph(_)));
+    }
+
+    #[test]
+    fn ir_slide_without_title_gets_fallback_name() {
+        let doc = PptDocument {
+            images: Vec::new(),
+            slides: vec![make_slide(vec![(TextType::Body, "content")])],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        assert_eq!(ir.sections[0].title.as_deref(), Some("Slide 1"));
+    }
+
+    #[test]
+    fn ir_format_is_ppt() {
+        let doc = PptDocument {
+            images: Vec::new(),
+            slides: Vec::new(),
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        assert_eq!(ir.metadata.format, crate::format::DocumentFormat::Ppt);
+    }
 }

@@ -442,7 +442,6 @@ pub struct DocxWriter {
     footnotes: Vec<DocxNote>,
     endnotes: Vec<DocxNote>,
     core_props: Option<CoreProps>,
-    next_abstract_num_id: u32,
     next_num_id: u32,
 }
 
@@ -456,7 +455,6 @@ impl DocxWriter {
             footnotes: Vec::new(),
             endnotes: Vec::new(),
             core_props: None,
-            next_abstract_num_id: 2,
             next_num_id: 3,
         }
     }
@@ -627,9 +625,6 @@ impl DocxWriter {
     pub fn add_ir_list(&mut self, list: &crate::ir::List) -> &mut Self {
         let num_id = self.next_num_id;
         self.next_num_id += 1;
-        let abstract_id = self.next_abstract_num_id;
-        self.next_abstract_num_id += 1;
-
         let start_number = list.start_number.unwrap_or(1);
         let style = list.style.clone();
         let level = list.level;
@@ -658,7 +653,6 @@ impl DocxWriter {
             level,
             num_id,
         }));
-        let _ = abstract_id;
         self
     }
 
@@ -2832,6 +2826,7 @@ fn generate_core_props_xml(props: &CoreProps) -> Vec<u8> {
     ));
     root.push_attribute(("xmlns:dc", "http://purl.org/dc/elements/1.1/"));
     root.push_attribute(("xmlns:dcterms", "http://purl.org/dc/terms/"));
+    root.push_attribute(("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance"));
     w.write_event(Event::Start(root)).expect("write core root");
 
     if let Some(ref v) = props.title {

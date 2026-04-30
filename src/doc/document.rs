@@ -176,4 +176,59 @@ mod tests {
         };
         assert_eq!(doc.plain_text(), "Hello World");
     }
+
+    fn make_doc(text: &str) -> DocDocument {
+        DocDocument {
+            images: Vec::new(),
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn ir_empty_doc_produces_empty_section() {
+        let ir = crate::convert_doc::doc_to_ir(&make_doc(""));
+        assert!(ir.sections[0].elements.is_empty());
+        assert!(ir.metadata.title.is_none());
+    }
+
+    #[test]
+    fn ir_allcaps_first_line_becomes_h1() {
+        use crate::ir::Element;
+        let ir = crate::convert_doc::doc_to_ir(&make_doc("INTRODUCTION\nSome text here."));
+        assert_eq!(ir.metadata.title.as_deref(), Some("INTRODUCTION"));
+        assert!(matches!(ir.sections[0].elements[0], Element::Heading(ref h) if h.level == 1));
+    }
+
+    #[test]
+    fn ir_first_short_line_no_punct_becomes_h1() {
+        use crate::ir::Element;
+        let ir = crate::convert_doc::doc_to_ir(&make_doc("My Document Title\nThis is body text."));
+        assert!(matches!(ir.sections[0].elements[0], Element::Heading(ref h) if h.level == 1));
+    }
+
+    #[test]
+    fn ir_allcaps_non_first_line_becomes_h2() {
+        use crate::ir::Element;
+        let ir = crate::convert_doc::doc_to_ir(&make_doc("Title\nSECTION TWO\nBody text."));
+        assert!(matches!(ir.sections[0].elements[1], Element::Heading(ref h) if h.level == 2));
+    }
+
+    #[test]
+    fn ir_line_ending_with_period_becomes_paragraph() {
+        use crate::ir::Element;
+        let ir = crate::convert_doc::doc_to_ir(&make_doc("This is a sentence."));
+        assert!(matches!(ir.sections[0].elements[0], Element::Paragraph(_)));
+    }
+
+    #[test]
+    fn ir_blank_lines_are_skipped() {
+        let ir = crate::convert_doc::doc_to_ir(&make_doc("Title\n\n\nText"));
+        assert_eq!(ir.sections[0].elements.len(), 2);
+    }
+
+    #[test]
+    fn ir_format_is_doc() {
+        let ir = crate::convert_doc::doc_to_ir(&make_doc("content"));
+        assert_eq!(ir.metadata.format, crate::format::DocumentFormat::Doc);
+    }
 }

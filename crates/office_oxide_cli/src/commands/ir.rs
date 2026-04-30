@@ -81,6 +81,7 @@ fn element_to_json(elem: &office_oxide::ir::Element) -> serde_json::Value {
             "language": cb.language,
             "content": cb.content,
         }),
+        _ => json!({ "type": "unknown" }),
     }
 }
 
@@ -108,6 +109,7 @@ fn inline_to_json(content: &[office_oxide::ir::InlineContent]) -> Vec<serde_json
                 "type": "endnote_ref",
                 "id": r.note_id,
             }),
+            _ => json!({ "type": "unknown" }),
         })
         .collect()
 }

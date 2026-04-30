@@ -555,6 +555,7 @@ pub struct Section {
 /// A block-level content element.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Element {
     /// A heading with a numeric level (1–6).
     Heading(Heading),
@@ -630,6 +631,7 @@ pub struct Paragraph {
 /// Inline content within a paragraph or heading.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum InlineContent {
     /// A styled text span.
     Text(TextSpan),
