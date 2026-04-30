@@ -31,11 +31,11 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 
 use crate::core::opc::{OpcWriter, PartName};
-use crate::core::relationships::{RelationshipsBuilder, TargetMode, rel_types};
+use crate::core::relationships::rel_types;
 use crate::ir::{
-    BorderLine, BorderStyle, CellVerticalAlign, ColumnLayout, FloatAnchor, ImageFormat,
-    ImagePositioning, LineSpacing, ListStyle, PageSetup, ParagraphAlignment, SectionBreakType,
-    TableAlignment, TextWrap, UnderlineStyle, VerticalAlign,
+    BorderLine, BorderStyle, CellVerticalAlign, ColumnLayout, ImageFormat, ImagePositioning,
+    LineSpacing, ListStyle, PageSetup, ParagraphAlignment, SectionBreakType, TableAlignment,
+    UnderlineStyle, VerticalAlign,
 };
 
 use super::Result;
@@ -233,20 +233,35 @@ impl From<String> for Run {
 /// Rich paragraph layout properties (used by `add_ir_paragraph`).
 #[derive(Debug, Clone, Default)]
 pub struct IrParaProps {
+    /// Text alignment for the paragraph.
     pub alignment: Option<ParagraphAlignment>,
+    /// Left indent in twips.
     pub indent_left_twips: Option<i32>,
+    /// Right indent in twips.
     pub indent_right_twips: Option<i32>,
+    /// First-line indent in twips (positive = indent, negative = hanging).
     pub first_line_indent_twips: Option<i32>,
+    /// Space before the paragraph in twips.
     pub space_before_twips: Option<u32>,
+    /// Space after the paragraph in twips.
     pub space_after_twips: Option<u32>,
+    /// Line spacing specification.
     pub line_spacing: Option<LineSpacing>,
+    /// Named paragraph style (e.g. `"Heading1"`).
     pub style: Option<String>,
+    /// Numbering list reference `(numId, indentLevel)`.
     pub numbering: Option<(u32, u8)>,
+    /// Keep this paragraph on the same page as the next paragraph.
     pub keep_with_next: bool,
+    /// Prevent a page break within the paragraph.
     pub keep_together: bool,
+    /// Force a page break before the paragraph.
     pub page_break_before: bool,
+    /// Background shading color as `[R, G, B]`.
     pub background_color: Option<[u8; 3]>,
+    /// Outline level (0 = body text, 1–9 = heading levels).
     pub outline_level: Option<u8>,
+    /// Paragraph border definition.
     pub border: Option<crate::ir::ParagraphBorder>,
 }
 
@@ -323,6 +338,7 @@ struct DocxImage {
     positioning: ImagePositioning,
 }
 
+#[allow(dead_code)]
 struct DocxSectPr {
     page_setup: Option<PageSetup>,
     columns: Option<ColumnLayout>,
@@ -333,13 +349,20 @@ struct DocxSectPr {
     endnote_rid: Option<String>,
 }
 
+/// The type of header or footer section to add.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum HfType {
+    /// Default (odd-page) header.
     DefaultHeader,
+    /// Default (odd-page) footer.
     DefaultFooter,
+    /// First-page header.
     FirstPageHeader,
+    /// First-page footer.
     FirstPageFooter,
+    /// Even-page header.
     EvenPageHeader,
+    /// Even-page footer.
     EvenPageFooter,
 }
 
@@ -1005,21 +1028,27 @@ impl Default for DocxWriter {
 // ---------------------------------------------------------------------------
 
 impl HfType {
+    /// Returns the default (odd-page) header variant.
     pub fn default_header() -> Self {
         Self::DefaultHeader
     }
+    /// Returns the default (odd-page) footer variant.
     pub fn default_footer() -> Self {
         Self::DefaultFooter
     }
+    /// Returns the first-page header variant.
     pub fn first_page_header() -> Self {
         Self::FirstPageHeader
     }
+    /// Returns the first-page footer variant.
     pub fn first_page_footer() -> Self {
         Self::FirstPageFooter
     }
+    /// Returns the even-page header variant.
     pub fn even_page_header() -> Self {
         Self::EvenPageHeader
     }
+    /// Returns the even-page footer variant.
     pub fn even_page_footer() -> Self {
         Self::EvenPageFooter
     }
@@ -1146,8 +1175,10 @@ fn convert_ir_element_to_docx_elements(elem: &crate::ir::Element, out: &mut Vec<
         E::Heading(h) => {
             let level = h.level.clamp(1, 6);
             let runs = ir_inline_to_runs(&h.content);
-            let mut props = IrParaProps::default();
-            props.style = Some(format!("Heading{level}"));
+            let props = IrParaProps {
+                style: Some(format!("Heading{level}")),
+                ..Default::default()
+            };
             out.push(DocxElement::RichParagraph(DocxRichParagraph { runs, props }));
         },
         E::Table(t) => out.push(DocxElement::RichTable(convert_ir_table(t))),
@@ -1229,13 +1260,17 @@ fn ir_inline_to_runs(content: &[crate::ir::InlineContent]) -> Vec<Run> {
                 });
             },
             InlineContent::FootnoteRef(r) => {
-                let mut run = Run::default();
-                run.footnote_ref = Some(r.note_id);
+                let run = Run {
+                    footnote_ref: Some(r.note_id),
+                    ..Default::default()
+                };
                 runs.push(run);
             },
             InlineContent::EndnoteRef(r) => {
-                let mut run = Run::default();
-                run.endnote_ref = Some(r.note_id);
+                let run = Run {
+                    endnote_ref: Some(r.note_id),
+                    ..Default::default()
+                };
                 runs.push(run);
             },
         }
@@ -1267,6 +1302,7 @@ fn ir_paragraph_to_props(p: &crate::ir::Paragraph) -> IrParaProps {
 // SectPr info helper
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 struct SectPrInfo {
     page_setup: Option<PageSetup>,
     columns: Option<ColumnLayout>,
@@ -1710,9 +1746,9 @@ fn write_footnote_ref_run(w: &mut Writer<Vec<u8>>, note_id: u32, is_endnote: boo
     } else {
         "FootnoteReference"
     };
-    let mut rStyle = BytesStart::new("w:rStyle");
-    rStyle.push_attribute(("w:val", style_name));
-    w.write_event(Event::Empty(rStyle)).expect("write rStyle");
+    let mut r_style = BytesStart::new("w:rStyle");
+    r_style.push_attribute(("w:val", style_name));
+    w.write_event(Event::Empty(r_style)).expect("write rStyle");
     w.write_event(Event::End(BytesEnd::new("w:rPr")))
         .expect("write rPr end");
     let tag = if is_endnote {
@@ -1947,9 +1983,9 @@ fn write_rich_table(
                         CellVerticalAlign::Center => "center",
                         CellVerticalAlign::Bottom => "bottom",
                     };
-                    let mut vAlign = BytesStart::new("w:vAlign");
-                    vAlign.push_attribute(("w:val", val));
-                    w.write_event(Event::Empty(vAlign)).expect("write vAlign");
+                    let mut v_align = BytesStart::new("w:vAlign");
+                    v_align.push_attribute(("w:val", val));
+                    w.write_event(Event::Empty(v_align)).expect("write vAlign");
                 }
 
                 if let Some(ref td) = cell.text_direction {
@@ -2614,7 +2650,7 @@ fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
     }
 
     if let Some(ref rid) = sp.footnote_rid {
-        let mut elem = BytesStart::new("w:footnotePr");
+        let elem = BytesStart::new("w:footnotePr");
         let _ = rid;
         w.write_event(Event::Empty(elem)).expect("write footnotePr");
     }

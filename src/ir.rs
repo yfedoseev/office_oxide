@@ -11,15 +11,25 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnderlineStyle {
+    /// Single underline.
     Single,
+    /// Double underline.
     Double,
+    /// Thick underline.
     Thick,
+    /// Dotted underline.
     Dotted,
+    /// Dashed underline.
     Dash,
+    /// Dot-dash underline.
     DotDash,
+    /// Dot-dot-dash underline.
     DotDotDash,
+    /// Wavy underline.
     Wave,
+    /// Underline applied only to words (not spaces).
     Words,
+    /// No underline.
     None,
 }
 
@@ -28,10 +38,15 @@ pub enum UnderlineStyle {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParagraphAlignment {
+    /// Left-aligned.
     Left,
+    /// Centered.
     Center,
+    /// Right-aligned.
     Right,
+    /// Justified (both edges).
     Justify,
+    /// Distributed (space between characters).
     Distribute,
 }
 
@@ -42,9 +57,13 @@ pub enum ParagraphAlignment {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LineSpacing {
+    /// Automatic line height scaled by the given value (in twentieths of a point).
     Auto(u32),
+    /// Multiple of normal line height (same units as `Auto`).
     Multiple(u32),
+    /// Exact line height in twentieths of a point.
     Exact(u32),
+    /// At-least line height in twentieths of a point.
     AtLeast(u32),
 }
 
@@ -53,15 +72,25 @@ pub enum LineSpacing {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BorderStyle {
+    /// No border.
     None,
+    /// Single-line border.
     Single,
+    /// Thick single-line border.
     Thick,
+    /// Double-line border.
     Double,
+    /// Dotted border.
     Dotted,
+    /// Dashed border.
     Dashed,
+    /// Wavy border.
     Wave,
+    /// Dashed border with small gaps.
     DashSmallGap,
+    /// Outset (3-D) border.
     Outset,
+    /// Inset (3-D) border.
     Inset,
 }
 
@@ -70,8 +99,11 @@ pub enum BorderStyle {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CellVerticalAlign {
+    /// Align content to the top of the cell.
     Top,
+    /// Align content to the middle of the cell.
     Center,
+    /// Align content to the bottom of the cell.
     Bottom,
 }
 
@@ -80,8 +112,11 @@ pub enum CellVerticalAlign {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TableAlignment {
+    /// Table aligned to the left margin.
     Left,
+    /// Table centered on the page.
     Center,
+    /// Table aligned to the right margin.
     Right,
 }
 
@@ -90,8 +125,11 @@ pub enum TableAlignment {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TextDirection {
+    /// Left-to-right, top-to-bottom (default).
     LrTb,
+    /// Top-to-bottom, right-to-left (vertical CJK).
     TbRl,
+    /// Bottom-to-top, left-to-right (rotated).
     BtLr,
 }
 
@@ -100,16 +138,24 @@ pub enum TextDirection {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageFormat {
+    /// PNG raster image.
     Png,
+    /// JPEG raster image.
     Jpeg,
+    /// GIF raster image.
     Gif,
+    /// TIFF raster image.
     Tiff,
+    /// BMP raster image.
     Bmp,
+    /// Enhanced Metafile vector image.
     Emf,
+    /// Windows Metafile vector image.
     Wmf,
 }
 
 impl ImageFormat {
+    /// Returns the MIME content-type string for this image format.
     pub fn content_type(&self) -> &'static str {
         match self {
             Self::Png => "image/png",
@@ -122,6 +168,7 @@ impl ImageFormat {
         }
     }
 
+    /// Returns the file extension (without leading dot) for this image format.
     pub fn extension(&self) -> &'static str {
         match self {
             Self::Png => "png",
@@ -137,34 +184,30 @@ impl ImageFormat {
 
 /// How an image is positioned relative to surrounding text.
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImagePositioning {
+    /// Image flows inline with surrounding text.
+    #[default]
     Inline,
+    /// Image is anchored at a fixed position with text wrap.
     Floating(FloatingImage),
-}
-
-impl Default for ImagePositioning {
-    fn default() -> Self {
-        Self::Inline
-    }
 }
 
 /// Section break type.
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SectionBreakType {
+    /// Continuous section break (no page break).
+    #[default]
     Continuous,
+    /// Section starts on the next page.
     NextPage,
+    /// Section starts on the next even-numbered page.
     EvenPage,
+    /// Section starts on the next odd-numbered page.
     OddPage,
-}
-
-impl Default for SectionBreakType {
-    fn default() -> Self {
-        Self::Continuous
-    }
 }
 
 /// Vertical text alignment (superscript / subscript).
@@ -172,45 +215,48 @@ impl Default for SectionBreakType {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerticalAlign {
+    /// Text raised above the baseline (superscript).
     Superscript,
+    /// Text lowered below the baseline (subscript).
     Subscript,
+    /// Normal baseline position.
     Baseline,
 }
 
 /// Anchor reference for a floating object.
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FloatAnchor {
+    /// Anchored relative to the page.
+    #[default]
     Page,
+    /// Anchored relative to the page margin.
     Margin,
+    /// Anchored relative to the column.
     Column,
+    /// Anchored relative to the paragraph.
     Paragraph,
-}
-
-impl Default for FloatAnchor {
-    fn default() -> Self {
-        Self::Page
-    }
 }
 
 /// Text wrap mode around a floating object.
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TextWrap {
+    /// Text wraps around a rectangular bounding box.
+    #[default]
     Square,
+    /// Text wraps tightly around the object contour.
     Tight,
+    /// Text wraps through the object's contour.
     Through,
+    /// Text appears only above and below the object.
     TopAndBottom,
+    /// Object appears behind the text layer.
     Behind,
+    /// Object appears in front of the text layer.
     InFront,
-}
-
-impl Default for TextWrap {
-    fn default() -> Self {
-        Self::Square
-    }
 }
 
 /// List marker style.
@@ -218,14 +264,23 @@ impl Default for TextWrap {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ListStyle {
+    /// Filled circle bullet marker.
     Bullet,
+    /// Decimal number marker (1, 2, 3, …).
     Decimal,
+    /// Lowercase Roman numeral marker (i, ii, iii, …).
     LowerRoman,
+    /// Uppercase Roman numeral marker (I, II, III, …).
     UpperRoman,
+    /// Lowercase alphabetic marker (a, b, c, …).
     LowerAlpha,
+    /// Uppercase alphabetic marker (A, B, C, …).
     UpperAlpha,
+    /// Dash marker.
     Dash,
+    /// Square bullet marker.
     Square,
+    /// Open circle bullet marker.
     Circle,
 }
 
@@ -235,7 +290,9 @@ pub enum ListStyle {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BorderLine {
+    /// Border line style.
     pub style: BorderStyle,
+    /// Border colour (RGB), if specified.
     pub color: Option<[u8; 3]>,
     /// Line width in eighths of a point.
     pub size: Option<u32>,
@@ -247,11 +304,17 @@ pub struct BorderLine {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TableBorder {
+    /// Top border of the table.
     pub top: Option<BorderLine>,
+    /// Bottom border of the table.
     pub bottom: Option<BorderLine>,
+    /// Left border of the table.
     pub left: Option<BorderLine>,
+    /// Right border of the table.
     pub right: Option<BorderLine>,
+    /// Horizontal interior borders between rows.
     pub inside_h: Option<BorderLine>,
+    /// Vertical interior borders between columns.
     pub inside_v: Option<BorderLine>,
 }
 
@@ -259,12 +322,19 @@ pub struct TableBorder {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PageSetup {
+    /// Page width in twips.
     pub width_twips: u32,
+    /// Page height in twips.
     pub height_twips: u32,
+    /// Top margin in twips.
     pub margin_top_twips: u32,
+    /// Bottom margin in twips.
     pub margin_bottom_twips: u32,
+    /// Left margin in twips.
     pub margin_left_twips: u32,
+    /// Right margin in twips.
     pub margin_right_twips: u32,
+    /// Whether the page is in landscape orientation.
     pub landscape: bool,
     /// Distance from top edge to header in twips (default 720 = 0.5").
     pub header_distance_twips: u32,
@@ -292,8 +362,11 @@ impl Default for PageSetup {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ColumnLayout {
+    /// Number of columns.
     pub count: u32,
+    /// Space between columns in twips.
     pub space_twips: Option<u32>,
+    /// Whether a vertical separator line is drawn between columns.
     pub separator: bool,
     /// Per-column widths in twips (overrides uniform spacing when non-empty).
     #[serde(default)]
@@ -304,10 +377,15 @@ pub struct ColumnLayout {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ParagraphBorder {
+    /// Top border of the paragraph.
     pub top: Option<BorderLine>,
+    /// Bottom border of the paragraph.
     pub bottom: Option<BorderLine>,
+    /// Left border of the paragraph.
     pub left: Option<BorderLine>,
+    /// Right border of the paragraph.
     pub right: Option<BorderLine>,
+    /// Border drawn between consecutive bordered paragraphs.
     pub between: Option<BorderLine>,
 }
 
@@ -315,9 +393,13 @@ pub struct ParagraphBorder {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CellPadding {
+    /// Top cell padding in twips.
     pub top_twips: Option<u32>,
+    /// Bottom cell padding in twips.
     pub bottom_twips: Option<u32>,
+    /// Left cell padding in twips.
     pub left_twips: Option<u32>,
+    /// Right cell padding in twips.
     pub right_twips: Option<u32>,
 }
 
@@ -325,13 +407,21 @@ pub struct CellPadding {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FloatingImage {
+    /// Horizontal offset from the anchor in EMUs.
     pub x_emu: i64,
+    /// Vertical offset from the anchor in EMUs.
     pub y_emu: i64,
+    /// Display width in EMUs.
     pub width_emu: u64,
+    /// Display height in EMUs.
     pub height_emu: u64,
+    /// Horizontal anchor reference frame.
     pub h_anchor: FloatAnchor,
+    /// Vertical anchor reference frame.
     pub v_anchor: FloatAnchor,
+    /// Text wrap mode around the image.
     pub text_wrap: TextWrap,
+    /// Whether the image may overlap other floating objects.
     #[serde(default)]
     pub allow_overlap: bool,
 }
@@ -340,6 +430,7 @@ pub struct FloatingImage {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct HeaderFooter {
+    /// Block elements that make up the header or footer.
     pub content: Vec<Element>,
 }
 
@@ -347,10 +438,15 @@ pub struct HeaderFooter {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TextBox {
+    /// Block elements inside the text box.
     pub content: Vec<Element>,
+    /// Width of the text box in EMUs.
     pub width_emu: Option<u64>,
+    /// Height of the text box in EMUs.
     pub height_emu: Option<u64>,
+    /// Horizontal position in EMUs from the anchor.
     pub x_emu: Option<i64>,
+    /// Vertical position in EMUs from the anchor.
     pub y_emu: Option<i64>,
     /// Horizontal anchor reference frame.
     #[serde(default)]
@@ -367,7 +463,9 @@ pub struct TextBox {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Note {
+    /// Numeric identifier matching the inline reference mark.
     pub id: u32,
+    /// Block elements comprising the note body.
     pub content: Vec<Element>,
     /// Optional custom marker text (when absent the auto-number is used).
     pub marker: Option<String>,
@@ -377,6 +475,7 @@ pub struct Note {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct FootnoteRef {
+    /// Numeric identifier of the referenced note.
     pub note_id: u32,
     /// Optional custom marker text (when absent the auto-number is used).
     pub marker: Option<String>,
@@ -386,7 +485,9 @@ pub struct FootnoteRef {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct CodeBlock {
+    /// Optional language identifier for syntax highlighting.
     pub language: Option<String>,
+    /// The preformatted code text.
     pub content: String,
 }
 
@@ -437,11 +538,17 @@ pub struct Section {
     /// How this section break was introduced.
     #[serde(default)]
     pub break_type: SectionBreakType,
+    /// Default header for this section.
     pub header: Option<HeaderFooter>,
+    /// Default footer for this section.
     pub footer: Option<HeaderFooter>,
+    /// Header used on the first page of this section.
     pub first_page_header: Option<HeaderFooter>,
+    /// Footer used on the first page of this section.
     pub first_page_footer: Option<HeaderFooter>,
+    /// Header used on even-numbered pages of this section.
     pub even_page_header: Option<HeaderFooter>,
+    /// Footer used on even-numbered pages of this section.
     pub even_page_footer: Option<HeaderFooter>,
 }
 
@@ -507,10 +614,13 @@ pub struct Paragraph {
     pub background_color: Option<[u8; 3]>,
     /// Paragraph borders.
     pub border: Option<ParagraphBorder>,
+    /// Keep this paragraph on the same page as the next paragraph.
     #[serde(default)]
     pub keep_with_next: bool,
+    /// Prevent a page break within this paragraph.
     #[serde(default)]
     pub keep_together: bool,
+    /// Force a page break before this paragraph.
     #[serde(default)]
     pub page_break_before: bool,
     /// Outline level (0 = body text, 1–9 = heading levels).
@@ -556,8 +666,10 @@ pub struct TextSpan {
     pub highlight: Option<[u8; 3]>,
     /// Superscript / subscript alignment.
     pub vertical_align: Option<VerticalAlign>,
+    /// Whether all characters are rendered as uppercase.
     #[serde(default)]
     pub all_caps: bool,
+    /// Whether lowercase letters are rendered as smaller capitals.
     #[serde(default)]
     pub small_caps: bool,
     /// Character spacing in half-points (negative = condensed).

@@ -271,14 +271,16 @@ fn ir_inline_to_runs(content: &[InlineContent]) -> Vec<crate::docx::write::Run> 
                 });
             },
             InlineContent::FootnoteRef(r) => {
-                let mut run = Run::default();
-                run.footnote_ref = Some(r.note_id);
-                runs.push(run);
+                runs.push(Run {
+                    footnote_ref: Some(r.note_id),
+                    ..Default::default()
+                });
             },
             InlineContent::EndnoteRef(r) => {
-                let mut run = Run::default();
-                run.endnote_ref = Some(r.note_id);
-                runs.push(run);
+                runs.push(Run {
+                    endnote_ref: Some(r.note_id),
+                    ..Default::default()
+                });
             },
         }
     }
