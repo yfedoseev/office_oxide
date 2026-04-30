@@ -91,6 +91,7 @@ const PARSE_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 /// Minimum stack size to run inline without spawning a thread (12 MB).
 /// Below this, we spawn a thread with PARSE_STACK_SIZE.
+#[cfg(unix)]
 const MIN_STACK_INLINE: usize = 12 * 1024 * 1024;
 
 /// Check once whether the current environment has a large enough stack.
