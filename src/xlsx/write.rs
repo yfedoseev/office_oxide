@@ -404,6 +404,54 @@ impl XlsxWriter {
         SheetData(self.sheets.last_mut().unwrap())
     }
 
+    /// Add a sheet and return its 0-based index (for use with index-based API).
+    pub fn add_sheet_get_index(&mut self, name: &str) -> usize {
+        self.sheets.push(SheetDataInner::new(name));
+        self.sheets.len() - 1
+    }
+
+    /// Set a cell value by sheet index.
+    pub fn sheet_set_cell(&mut self, sheet: usize, row: usize, col: usize, value: CellData) {
+        if let Some(s) = self.sheets.get_mut(sheet) {
+            s.set_cell(row, col, value);
+        }
+    }
+
+    /// Set a cell value with styling by sheet index.
+    pub fn sheet_set_cell_styled(
+        &mut self,
+        sheet: usize,
+        row: usize,
+        col: usize,
+        value: CellData,
+        style: CellStyle,
+    ) {
+        if let Some(s) = self.sheets.get_mut(sheet) {
+            s.set_cell_styled(row, col, value, style);
+        }
+    }
+
+    /// Merge a rectangular range of cells by sheet index.
+    pub fn sheet_merge_cells(
+        &mut self,
+        sheet: usize,
+        row: usize,
+        col: usize,
+        row_span: usize,
+        col_span: usize,
+    ) {
+        if let Some(s) = self.sheets.get_mut(sheet) {
+            s.merge_cells(row, col, row_span, col_span);
+        }
+    }
+
+    /// Set column width by sheet index.
+    pub fn sheet_set_column_width(&mut self, sheet: usize, col: usize, width: f64) {
+        if let Some(s) = self.sheets.get_mut(sheet) {
+            s.set_column_width(col, width);
+        }
+    }
+
     /// Save the workbook to a file.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let mut opc = OpcWriter::create(path)?;

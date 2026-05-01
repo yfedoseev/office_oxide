@@ -35,3 +35,31 @@ export function detectFormat(path: string): DocumentFormat | null;
 export function extractText(path: string): string;
 export function toMarkdown(path: string): string;
 export function toHtml(path: string): string;
+
+export type ImageFormat = 'png' | 'jpeg' | 'jpg' | 'gif';
+
+export class XlsxWriter implements Disposable {
+  constructor();
+  addSheet(name: string): number;
+  setCell(sheet: number, row: number, col: number, value: CellValue): void;
+  setCellStyled(sheet: number, row: number, col: number, value: CellValue, bold: boolean, bgColor?: string | null): void;
+  mergeCells(sheet: number, row: number, col: number, rowSpan: number, colSpan: number): void;
+  setColumnWidth(sheet: number, col: number, width: number): void;
+  save(path: string): void;
+  toBytes(): Buffer;
+  close(): void;
+  [Symbol.dispose](): void;
+}
+
+export class PptxWriter implements Disposable {
+  constructor();
+  setPresentationSize(cx: number | bigint, cy: number | bigint): void;
+  addSlide(): number;
+  setSlideTitle(slide: number, title: string): void;
+  addSlideText(slide: number, text: string): void;
+  addSlideImage(slide: number, data: Uint8Array | Buffer, format: ImageFormat, x: number | bigint, y: number | bigint, cx: number | bigint, cy: number | bigint): void;
+  save(path: string): void;
+  toBytes(): Buffer;
+  close(): void;
+  [Symbol.dispose](): void;
+}

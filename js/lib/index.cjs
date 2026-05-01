@@ -60,6 +60,28 @@ const n = {
   extractText: lib.func('HeapStr office_extract_text(const char* path, _Out_ int* error_code)'),
   toMarkdown: lib.func('HeapStr office_to_markdown(const char* path, _Out_ int* error_code)'),
   toHtml: lib.func('HeapStr office_to_html(const char* path, _Out_ int* error_code)'),
+
+  // XLSX writer
+  xlsxWriterNew: lib.func('void* office_xlsx_writer_new()'),
+  xlsxWriterFree: lib.func('void office_xlsx_writer_free(void* handle)'),
+  xlsxWriterAddSheet: lib.func('uint32_t office_xlsx_writer_add_sheet(void* handle, const char* name)'),
+  xlsxSheetSetCell: lib.func('void office_xlsx_sheet_set_cell(void* handle, uint32_t sheet, uint32_t row, uint32_t col, int32_t value_type, const char* value_str, double value_num)'),
+  xlsxSheetSetCellStyled: lib.func('void office_xlsx_sheet_set_cell_styled(void* handle, uint32_t sheet, uint32_t row, uint32_t col, int32_t value_type, const char* value_str, double value_num, bool bold, const char* bg_color)'),
+  xlsxSheetMergeCells: lib.func('void office_xlsx_sheet_merge_cells(void* handle, uint32_t sheet, uint32_t row, uint32_t col, uint32_t row_span, uint32_t col_span)'),
+  xlsxSheetSetColumnWidth: lib.func('void office_xlsx_sheet_set_column_width(void* handle, uint32_t sheet, uint32_t col, double width)'),
+  xlsxWriterSave: lib.func('int32_t office_xlsx_writer_save(void* handle, const char* path, _Out_ int* error_code)'),
+  xlsxWriterToBytes: lib.func('uint8_t* office_xlsx_writer_to_bytes(void* handle, _Out_ size_t* out_len, _Out_ int* error_code)'),
+
+  // PPTX writer
+  pptxWriterNew: lib.func('void* office_pptx_writer_new()'),
+  pptxWriterFree: lib.func('void office_pptx_writer_free(void* handle)'),
+  pptxWriterSetPresentationSize: lib.func('void office_pptx_writer_set_presentation_size(void* handle, uint64_t cx, uint64_t cy)'),
+  pptxWriterAddSlide: lib.func('uint32_t office_pptx_writer_add_slide(void* handle)'),
+  pptxSlideSetTitle: lib.func('void office_pptx_slide_set_title(void* handle, uint32_t slide, const char* title)'),
+  pptxSlideAddText: lib.func('void office_pptx_slide_add_text(void* handle, uint32_t slide, const char* text)'),
+  pptxSlideAddImage: lib.func('void office_pptx_slide_add_image(void* handle, uint32_t slide, const uint8_t* data, size_t len, const char* format, int64_t x, int64_t y, uint64_t cx, uint64_t cy)'),
+  pptxWriterSave: lib.func('int32_t office_pptx_writer_save(void* handle, const char* path, _Out_ int* error_code)'),
+  pptxWriterToBytes: lib.func('uint8_t* office_pptx_writer_to_bytes(void* handle, _Out_ size_t* out_len, _Out_ int* error_code)'),
 };
 
 class OfficeOxideError extends Error {
@@ -159,7 +181,114 @@ function extractText(p) { return oneShot(n.extractText, 'extractText', p); }
 function toMarkdown(p) { return oneShot(n.toMarkdown, 'toMarkdown', p); }
 function toHtml(p) { return oneShot(n.toHtml, 'toHtml', p); }
 
+class XlsxWriter {
+  constructor() {
+    this._h = n.xlsxWriterNew();
+    if (!this._h) throw new OfficeOxideError(5, 'XlsxWriter.new');
+  }
+  _ensure() { if (!this._h) throw new Error('XlsxWriter is closed'); }
+  addSheet(name) {
+    this._ensure();
+    return n.xlsxWriterAddSheet(this._h, name);
+  }
+  setCell(sheet, row, col, value) {
+    this._ensure();
+    let t, s = null, num = 0;
+    if (value === null || value === undefined) t = 0;
+    else if (typeof value === 'string') { t = 1; s = value; }
+    else if (typeof value === 'number') { t = 2; num = value; }
+    else if (typeof value === 'boolean') { t = 2; num = value ? 1 : 0; }
+    else { t = 1; s = String(value); }
+    n.xlsxSheetSetCell(this._h, sheet, row, col, t, s, num);
+  }
+  setCellStyled(sheet, row, col, value, bold, bgColor) {
+    this._ensure();
+    let t, s = null, num = 0;
+    if (value === null || value === undefined) t = 0;
+    else if (typeof value === 'string') { t = 1; s = value; }
+    else if (typeof value === 'number') { t = 2; num = value; }
+    else { t = 1; s = String(value); }
+    n.xlsxSheetSetCellStyled(this._h, sheet, row, col, t, s, num, bold, bgColor || null);
+  }
+  mergeCells(sheet, row, col, rowSpan, colSpan) {
+    this._ensure();
+    n.xlsxSheetMergeCells(this._h, sheet, row, col, rowSpan, colSpan);
+  }
+  setColumnWidth(sheet, col, width) {
+    this._ensure();
+    n.xlsxSheetSetColumnWidth(this._h, sheet, col, width);
+  }
+  save(path) {
+    this._ensure();
+    const e = [0];
+    const rc = n.xlsxWriterSave(this._h, path, e);
+    if (rc !== 0) throw new OfficeOxideError(e[0], 'XlsxWriter.save');
+  }
+  toBytes() {
+    this._ensure();
+    const outLen = [0]; const e = [0];
+    const ptr = n.xlsxWriterToBytes(this._h, outLen, e);
+    if (!ptr) throw new OfficeOxideError(e[0], 'XlsxWriter.toBytes');
+    try {
+      return Buffer.from(koffi.decode(ptr, 'uint8_t', outLen[0]));
+    } finally {
+      freeBytesRaw(ptr, outLen[0]);
+    }
+  }
+  close() { if (this._h) { n.xlsxWriterFree(this._h); this._h = null; } }
+  [Symbol.dispose]() { this.close(); }
+}
+
+class PptxWriter {
+  constructor() {
+    this._h = n.pptxWriterNew();
+    if (!this._h) throw new OfficeOxideError(5, 'PptxWriter.new');
+  }
+  _ensure() { if (!this._h) throw new Error('PptxWriter is closed'); }
+  setPresentationSize(cx, cy) {
+    this._ensure();
+    n.pptxWriterSetPresentationSize(this._h, BigInt(cx), BigInt(cy));
+  }
+  addSlide() {
+    this._ensure();
+    return n.pptxWriterAddSlide(this._h);
+  }
+  setSlideTitle(slide, title) {
+    this._ensure();
+    n.pptxSlideSetTitle(this._h, slide, title);
+  }
+  addSlideText(slide, text) {
+    this._ensure();
+    n.pptxSlideAddText(this._h, slide, text);
+  }
+  addSlideImage(slide, data, format, x, y, cx, cy) {
+    this._ensure();
+    const buf = data instanceof Uint8Array ? data : new Uint8Array(data);
+    n.pptxSlideAddImage(this._h, slide, buf, buf.length, format, BigInt(x), BigInt(y), BigInt(cx), BigInt(cy));
+  }
+  save(path) {
+    this._ensure();
+    const e = [0];
+    const rc = n.pptxWriterSave(this._h, path, e);
+    if (rc !== 0) throw new OfficeOxideError(e[0], 'PptxWriter.save');
+  }
+  toBytes() {
+    this._ensure();
+    const outLen = [0]; const e = [0];
+    const ptr = n.pptxWriterToBytes(this._h, outLen, e);
+    if (!ptr) throw new OfficeOxideError(e[0], 'PptxWriter.toBytes');
+    try {
+      return Buffer.from(koffi.decode(ptr, 'uint8_t', outLen[0]));
+    } finally {
+      freeBytesRaw(ptr, outLen[0]);
+    }
+  }
+  close() { if (this._h) { n.pptxWriterFree(this._h); this._h = null; } }
+  [Symbol.dispose]() { this.close(); }
+}
+
 module.exports = {
   OfficeOxideError, Document, EditableDocument,
+  XlsxWriter, PptxWriter,
   version, detectFormat, extractText, toMarkdown, toHtml,
 };

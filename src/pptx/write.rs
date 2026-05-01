@@ -305,6 +305,42 @@ impl PptxWriter {
         self.slides.last_mut().expect("just pushed")
     }
 
+    /// Add a slide and return its 0-based index (for use with index-based API).
+    pub fn add_slide_get_index(&mut self) -> usize {
+        self.slides.push(SlideData::new());
+        self.slides.len() - 1
+    }
+
+    /// Set the slide title by slide index.
+    pub fn slide_set_title(&mut self, slide: usize, title: &str) {
+        if let Some(s) = self.slides.get_mut(slide) {
+            s.set_title(title);
+        }
+    }
+
+    /// Add a plain text paragraph to the slide body by slide index.
+    pub fn slide_add_text(&mut self, slide: usize, text: &str) {
+        if let Some(s) = self.slides.get_mut(slide) {
+            s.add_text(text);
+        }
+    }
+
+    /// Embed an image on a slide by slide index.
+    pub fn slide_add_image(
+        &mut self,
+        slide: usize,
+        data: Vec<u8>,
+        format: crate::ir::ImageFormat,
+        x: i64,
+        y: i64,
+        cx: u64,
+        cy: u64,
+    ) {
+        if let Some(s) = self.slides.get_mut(slide) {
+            s.add_image(data, format, x, y, cx, cy);
+        }
+    }
+
     /// Save the presentation to a file path.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let opc = OpcWriter::create(path)?;
