@@ -106,6 +106,75 @@ internal static partial class NativeMethods
     [LibraryImport(Lib, EntryPoint = "office_create_from_markdown", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial int OfficeCreateFromMarkdown(string markdown, string format, string path, out int errorCode);
 
+    // ── XlsxWriter ────────────────────────────────────────────────────────────
+
+    [LibraryImport(Lib, EntryPoint = "office_xlsx_writer_new")]
+    internal static partial IntPtr OfficeXlsxWriterNew();
+
+    [LibraryImport(Lib, EntryPoint = "office_xlsx_writer_free")]
+    internal static partial void OfficeXlsxWriterFree(IntPtr handle);
+
+    [LibraryImport(Lib, EntryPoint = "office_xlsx_writer_add_sheet", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial uint OfficeXlsxWriterAddSheet(IntPtr handle, string name);
+
+    [LibraryImport(Lib, EntryPoint = "office_xlsx_sheet_set_cell", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial void OfficeXlsxSheetSetCell(
+        IntPtr handle, uint sheet, uint row, uint col,
+        int valueType, string? valueStr, double valueNum);
+
+    [LibraryImport(Lib, EntryPoint = "office_xlsx_sheet_set_cell_styled", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial void OfficeXlsxSheetSetCellStyled(
+        IntPtr handle, uint sheet, uint row, uint col,
+        int valueType, string? valueStr, double valueNum,
+        [MarshalAs(UnmanagedType.U1)] bool bold, string? bgColor);
+
+    [LibraryImport(Lib, EntryPoint = "office_xlsx_sheet_merge_cells")]
+    internal static partial void OfficeXlsxSheetMergeCells(
+        IntPtr handle, uint sheet, uint row, uint col, uint rowSpan, uint colSpan);
+
+    [LibraryImport(Lib, EntryPoint = "office_xlsx_sheet_set_column_width")]
+    internal static partial void OfficeXlsxSheetSetColumnWidth(
+        IntPtr handle, uint sheet, uint col, double width);
+
+    [LibraryImport(Lib, EntryPoint = "office_xlsx_writer_save", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial int OfficeXlsxWriterSave(IntPtr handle, string path, out int errorCode);
+
+    [LibraryImport(Lib, EntryPoint = "office_xlsx_writer_to_bytes")]
+    internal static partial IntPtr OfficeXlsxWriterToBytes(IntPtr handle, out nuint outLen, out int errorCode);
+
+    // ── PptxWriter ────────────────────────────────────────────────────────────
+
+    [LibraryImport(Lib, EntryPoint = "office_pptx_writer_new")]
+    internal static partial IntPtr OfficePptxWriterNew();
+
+    [LibraryImport(Lib, EntryPoint = "office_pptx_writer_free")]
+    internal static partial void OfficePptxWriterFree(IntPtr handle);
+
+    [LibraryImport(Lib, EntryPoint = "office_pptx_writer_set_presentation_size")]
+    internal static partial void OfficePptxWriterSetPresentationSize(IntPtr handle, ulong cx, ulong cy);
+
+    [LibraryImport(Lib, EntryPoint = "office_pptx_writer_add_slide")]
+    internal static partial uint OfficePptxWriterAddSlide(IntPtr handle);
+
+    [LibraryImport(Lib, EntryPoint = "office_pptx_slide_set_title", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial void OfficePptxSlideSetTitle(IntPtr handle, uint slide, string title);
+
+    [LibraryImport(Lib, EntryPoint = "office_pptx_slide_add_text", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial void OfficePptxSlideAddText(IntPtr handle, uint slide, string text);
+
+    [LibraryImport(Lib, EntryPoint = "office_pptx_slide_add_image", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial void OfficePptxSlideAddImage(
+        IntPtr handle, uint slide,
+        [In] byte[] data, nuint len,
+        string format,
+        long x, long y, ulong cx, ulong cy);
+
+    [LibraryImport(Lib, EntryPoint = "office_pptx_writer_save", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial int OfficePptxWriterSave(IntPtr handle, string path, out int errorCode);
+
+    [LibraryImport(Lib, EntryPoint = "office_pptx_writer_to_bytes")]
+    internal static partial IntPtr OfficePptxWriterToBytes(IntPtr handle, out nuint outLen, out int errorCode);
+
     /// <summary>
     /// Take an FFI-allocated UTF-8 C string, copy it to a managed string,
     /// and free the original allocation.

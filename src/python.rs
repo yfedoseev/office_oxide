@@ -294,11 +294,214 @@ fn version() -> &'static str {
     crate::VERSION
 }
 
+// ─── XlsxWriter ─────────────────────────────────────────────────────────────
+
+#[pyclass(name = "XlsxWriter", module = "office_oxide")]
+struct PyXlsxWriter {
+    writer: crate::xlsx::write::XlsxWriter,
+}
+
+#[pymethods]
+impl PyXlsxWriter {
+    #[new]
+    fn new() -> Self {
+        Self {
+            writer: crate::xlsx::write::XlsxWriter::new(),
+        }
+    }
+
+    /// Add a worksheet; returns its 0-based index.
+    fn add_sheet(&mut self, name: &str) -> usize {
+        self.writer.add_sheet_get_index(name)
+    }
+
+    /// Set a cell value (str, float, int, bool, or None).
+    fn set_cell(
+        &mut self,
+        sheet: usize,
+        row: usize,
+        col: usize,
+        value: &pyo3::Bound<'_, pyo3::PyAny>,
+    ) -> PyResult<()> {
+        use crate::xlsx::write::CellData;
+        let data = if value.is_none() {
+            CellData::Empty
+        } else if let Ok(s) = value.extract::<String>() {
+            CellData::String(s)
+        } else if let Ok(f) = value.extract::<f64>() {
+            CellData::Number(f)
+        } else if let Ok(i) = value.extract::<i64>() {
+            CellData::Number(i as f64)
+        } else if let Ok(b) = value.extract::<bool>() {
+            CellData::Number(if b { 1.0 } else { 0.0 })
+        } else {
+            CellData::String(value.str()?.to_string())
+        };
+        self.writer.sheet_set_cell(sheet, row, col, data);
+        Ok(())
+    }
+
+    /// Set a cell with styling. bg_color is a 6-char hex string or None.
+    fn set_cell_styled(
+        &mut self,
+        sheet: usize,
+        row: usize,
+        col: usize,
+        value: &pyo3::Bound<'_, pyo3::PyAny>,
+        bold: bool,
+        bg_color: Option<&str>,
+    ) -> PyResult<()> {
+        use crate::xlsx::write::{CellData, CellStyle};
+        let data = if value.is_none() {
+            CellData::Empty
+        } else if let Ok(s) = value.extract::<String>() {
+            CellData::String(s)
+        } else if let Ok(f) = value.extract::<f64>() {
+            CellData::Number(f)
+        } else if let Ok(i) = value.extract::<i64>() {
+            CellData::Number(i as f64)
+        } else {
+            CellData::String(value.str()?.to_string())
+        };
+        let mut style = CellStyle::new();
+        if bold {
+            style = style.bold();
+        }
+        if let Some(bg) = bg_color {
+            style = style.background(bg.to_string());
+        }
+        self.writer
+            .sheet_set_cell_styled(sheet, row, col, data, style);
+        Ok(())
+    }
+
+    /// Merge a rectangular range. row_span and col_span must be >= 1.
+    fn merge_cells(
+        &mut self,
+        sheet: usize,
+        row: usize,
+        col: usize,
+        row_span: usize,
+        col_span: usize,
+    ) {
+        self.writer
+            .sheet_merge_cells(sheet, row, col, row_span, col_span);
+    }
+
+    /// Set column width in Excel character units (e.g. 20.0).
+    fn set_column_width(&mut self, sheet: usize, col: usize, width: f64) {
+        self.writer.sheet_set_column_width(sheet, col, width);
+    }
+
+    /// Save to file.
+    fn save(&self, path: PathBuf) -> PyResult<()> {
+        self.writer
+            .save(&path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Serialize to bytes.
+    fn to_bytes<'py>(
+        &self,
+        py: pyo3::Python<'py>,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyBytes>> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        self.writer
+            .write_to(&mut cursor)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(pyo3::types::PyBytes::new(py, &cursor.into_inner()))
+    }
+}
+
+// ─── PptxWriter ──────────────────────────────────────────────────────────────
+
+#[pyclass(name = "PptxWriter", module = "office_oxide")]
+struct PyPptxWriter {
+    writer: crate::pptx::write::PptxWriter,
+}
+
+#[pymethods]
+impl PyPptxWriter {
+    #[new]
+    fn new() -> Self {
+        Self {
+            writer: crate::pptx::write::PptxWriter::new(),
+        }
+    }
+
+    /// Override canvas size. 914400 EMU = 1 inch.
+    fn set_presentation_size(&mut self, cx: u64, cy: u64) {
+        self.writer.set_presentation_size(cx, cy);
+    }
+
+    /// Add a slide; returns its 0-based index.
+    fn add_slide(&mut self) -> usize {
+        self.writer.add_slide_get_index()
+    }
+
+    /// Set the slide title.
+    fn set_slide_title(&mut self, slide: usize, title: &str) {
+        self.writer.slide_set_title(slide, title);
+    }
+
+    /// Add a plain text paragraph to the slide body.
+    fn add_slide_text(&mut self, slide: usize, text: &str) {
+        self.writer.slide_add_text(slide, text);
+    }
+
+    /// Embed an image. format: "png" | "jpeg" | "gif". x,y,cx,cy in EMU.
+    fn add_slide_image(
+        &mut self,
+        slide: usize,
+        data: &[u8],
+        format: &str,
+        x: i64,
+        y: i64,
+        cx: u64,
+        cy: u64,
+    ) -> PyResult<()> {
+        let fmt = match format.to_ascii_lowercase().as_str() {
+            "png" => crate::ir::ImageFormat::Png,
+            "jpeg" | "jpg" => crate::ir::ImageFormat::Jpeg,
+            "gif" => crate::ir::ImageFormat::Gif,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unsupported image format: {other}"
+                )));
+            },
+        };
+        self.writer
+            .slide_add_image(slide, data.to_vec(), fmt, x, y, cx, cy);
+        Ok(())
+    }
+
+    /// Save to file.
+    fn save(&self, path: PathBuf) -> PyResult<()> {
+        self.writer
+            .save(&path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Serialize to bytes.
+    fn to_bytes<'py>(
+        &self,
+        py: pyo3::Python<'py>,
+    ) -> PyResult<pyo3::Bound<'py, pyo3::types::PyBytes>> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        self.writer
+            .write_to(&mut cursor)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(pyo3::types::PyBytes::new(py, &cursor.into_inner()))
+    }
+}
+
 /// Python module entry point.
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDocument>()?;
     m.add_class::<PyEditable>()?;
+    m.add_class::<PyXlsxWriter>()?;
+    m.add_class::<PyPptxWriter>()?;
     m.add("OfficeOxideError", m.py().get_type::<OfficeOxideError>())?;
     m.add("__version__", crate::VERSION)?;
     m.add_function(wrap_pyfunction!(extract_text, m)?)?;

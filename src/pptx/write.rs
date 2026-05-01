@@ -51,12 +51,6 @@ const CT_SLIDE_MASTER: &str =
 use crate::core::xml::ns::{DRAWING_ML_STR as NS_DML, PML_STR as NS_PML, R_STR as NS_REL};
 
 // ---------------------------------------------------------------------------
-// Slide size (standard 16:9 in EMU)
-// ---------------------------------------------------------------------------
-
-const SLIDE_WIDTH: &str = "12192000";
-const SLIDE_HEIGHT: &str = "6858000";
-
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -171,6 +165,8 @@ enum BodyItem {
     BulletList(Vec<String>),
     /// Free-floating text box: (runs, x_emu, y_emu, cx_emu, cy_emu)
     TextBox(Vec<Run>, i64, i64, i64, i64),
+    /// Embedded image: (data, format, x_emu, y_emu, cx_emu, cy_emu)
+    Image(Vec<u8>, crate::ir::ImageFormat, i64, i64, u64, u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -242,10 +238,27 @@ impl SlideData {
         self
     }
 
+    /// Embed an image at an absolute position on the slide.
+    ///
+    /// All coordinates are in EMU (English Metric Units; 914 400 EMU = 1 inch).
+    pub fn add_image(
+        &mut self,
+        data: Vec<u8>,
+        format: crate::ir::ImageFormat,
+        x: i64,
+        y: i64,
+        cx: u64,
+        cy: u64,
+    ) -> &mut Self {
+        self.body_items
+            .push(BodyItem::Image(data, format, x, y, cx, cy));
+        self
+    }
+
     fn has_placeholder_body(&self) -> bool {
         self.body_items
             .iter()
-            .any(|i| !matches!(i, BodyItem::TextBox(..)))
+            .any(|i| !matches!(i, BodyItem::TextBox(..) | BodyItem::Image(..)))
     }
 }
 
@@ -256,18 +269,71 @@ impl SlideData {
 /// Builder for creating PPTX files from scratch.
 pub struct PptxWriter {
     slides: Vec<SlideData>,
+    /// Presentation width in EMU (default: 12 192 000 — standard 16:9).
+    cx: u64,
+    /// Presentation height in EMU (default: 6 858 000 — standard 16:9).
+    cy: u64,
 }
 
 impl PptxWriter {
     /// Create a new empty PPTX writer.
     pub fn new() -> Self {
-        Self { slides: Vec::new() }
+        Self {
+            slides: Vec::new(),
+            cx: 12_192_000,
+            cy: 6_858_000,
+        }
+    }
+
+    /// Override the presentation canvas size (in EMU).
+    ///
+    /// Call before adding slides. 914 400 EMU = 1 inch.
+    pub fn set_presentation_size(&mut self, cx: u64, cy: u64) -> &mut Self {
+        self.cx = cx;
+        self.cy = cy;
+        self
     }
 
     /// Add a new slide and return a mutable reference for configuration.
     pub fn add_slide(&mut self) -> &mut SlideData {
         self.slides.push(SlideData::new());
         self.slides.last_mut().expect("just pushed")
+    }
+
+    /// Add a slide and return its 0-based index (for use with index-based API).
+    pub fn add_slide_get_index(&mut self) -> usize {
+        self.slides.push(SlideData::new());
+        self.slides.len() - 1
+    }
+
+    /// Set the slide title by slide index.
+    pub fn slide_set_title(&mut self, slide: usize, title: &str) {
+        if let Some(s) = self.slides.get_mut(slide) {
+            s.set_title(title);
+        }
+    }
+
+    /// Add a plain text paragraph to the slide body by slide index.
+    pub fn slide_add_text(&mut self, slide: usize, text: &str) {
+        if let Some(s) = self.slides.get_mut(slide) {
+            s.add_text(text);
+        }
+    }
+
+    /// Embed an image on a slide by slide index.
+    pub fn slide_add_image(
+        &mut self,
+        slide: usize,
+        data: Vec<u8>,
+        format: crate::ir::ImageFormat,
+        x: i64,
+        y: i64,
+        cx: u64,
+        cy: u64,
+    ) {
+        if let Some(s) = self.slides.get_mut(slide) {
+            s.add_image(data, format, x, y, cx, cy);
+        }
     }
 
     /// Save the presentation to a file path.
@@ -302,15 +368,7 @@ impl PptxWriter {
 
         opc.add_part_rel(&master_part, rel_types::SLIDE_LAYOUT, "../slideLayouts/slideLayout1.xml");
 
-        for slide_part in &slide_parts {
-            opc.add_part_rel(
-                slide_part,
-                rel_types::SLIDE_LAYOUT,
-                "../slideLayouts/slideLayout1.xml",
-            );
-        }
-
-        let pres_xml = generate_presentation_xml(self.slides.len());
+        let pres_xml = generate_presentation_xml(self.slides.len(), self.cx, self.cy);
         opc.add_part(&pres_part, CT_PRESENTATION, &pres_xml)?;
 
         let master_xml = generate_slide_master_xml();
@@ -319,9 +377,38 @@ impl PptxWriter {
         let layout_xml = generate_slide_layout_xml();
         opc.add_part(&layout_part, CT_SLIDE_LAYOUT, &layout_xml)?;
 
+        let mut global_img_idx = 1u32;
         for (i, slide) in self.slides.iter().enumerate() {
-            let slide_xml = generate_slide_xml(slide);
-            opc.add_part(&slide_parts[i], CT_SLIDE, &slide_xml)?;
+            let slide_part = &slide_parts[i];
+
+            // rId1 = slide layout
+            opc.add_part_rel(
+                slide_part,
+                rel_types::SLIDE_LAYOUT,
+                "../slideLayouts/slideLayout1.xml",
+            );
+
+            // rId2+ = one per embedded image
+            let mut img_rids: Vec<(String, i64, i64, u64, u64)> = Vec::new();
+            for item in &slide.body_items {
+                if let BodyItem::Image(data, fmt, x, y, cx, cy) = item {
+                    let rid = format!("rId{}", img_rids.len() + 2);
+                    let ext = fmt.extension();
+                    opc.add_part_rel(
+                        slide_part,
+                        rel_types::IMAGE,
+                        &format!("../media/image{global_img_idx}.{ext}"),
+                    );
+                    let media_part =
+                        PartName::new(&format!("/ppt/media/image{global_img_idx}.{ext}"))?;
+                    opc.add_part(&media_part, fmt.content_type(), data)?;
+                    img_rids.push((rid, *x, *y, *cx, *cy));
+                    global_img_idx += 1;
+                }
+            }
+
+            let slide_xml = generate_slide_xml(slide, &img_rids);
+            opc.add_part(slide_part, CT_SLIDE, &slide_xml)?;
         }
 
         opc.finish()?;
@@ -441,7 +528,7 @@ fn write_dml_run(w: &mut Writer<Vec<u8>>, run: &Run) {
 // presentation.xml
 // ---------------------------------------------------------------------------
 
-fn generate_presentation_xml(slide_count: usize) -> Vec<u8> {
+fn generate_presentation_xml(slide_count: usize, cx: u64, cy: u64) -> Vec<u8> {
     let mut w = Writer::new(Vec::new());
     write_decl(&mut w);
 
@@ -471,8 +558,8 @@ fn generate_presentation_xml(slide_count: usize) -> Vec<u8> {
         .expect("write");
 
     let mut sld_sz = BytesStart::new("p:sldSz");
-    sld_sz.push_attribute(("cx", SLIDE_WIDTH));
-    sld_sz.push_attribute(("cy", SLIDE_HEIGHT));
+    sld_sz.push_attribute(("cx", cx.to_string().as_str()));
+    sld_sz.push_attribute(("cy", cy.to_string().as_str()));
     w.write_event(Event::Empty(sld_sz)).expect("write");
 
     w.write_event(Event::End(BytesEnd::new("p:presentation")))
@@ -545,7 +632,7 @@ fn generate_slide_layout_xml() -> Vec<u8> {
 // slides/slideN.xml
 // ---------------------------------------------------------------------------
 
-fn generate_slide_xml(slide: &SlideData) -> Vec<u8> {
+fn generate_slide_xml(slide: &SlideData, img_rids: &[(String, i64, i64, u64, u64)]) -> Vec<u8> {
     let mut w = Writer::new(Vec::new());
     write_decl(&mut w);
 
@@ -570,7 +657,7 @@ fn generate_slide_xml(slide: &SlideData) -> Vec<u8> {
         let placeholder_items: Vec<&BodyItem> = slide
             .body_items
             .iter()
-            .filter(|i| !matches!(i, BodyItem::TextBox(..)))
+            .filter(|i| !matches!(i, BodyItem::TextBox(..) | BodyItem::Image(..)))
             .collect();
         write_body_shape(&mut w, next_id, &placeholder_items);
         next_id += 1;
@@ -582,6 +669,12 @@ fn generate_slide_xml(slide: &SlideData) -> Vec<u8> {
             write_text_box_shape(&mut w, next_id, runs, *x, *y, *cx, *cy);
             next_id += 1;
         }
+    }
+
+    // Embedded images
+    for (rid, x, y, cx, cy) in img_rids {
+        write_pic_shape(&mut w, next_id, rid, *x, *y, *cx, *cy);
+        next_id += 1;
     }
 
     w.write_event(Event::End(BytesEnd::new("p:spTree")))
@@ -679,7 +772,7 @@ fn write_body_shape(w: &mut Writer<Vec<u8>>, id: u32, items: &[&BodyItem]) {
                     write_bullet_paragraph(w, bullet);
                 }
             },
-            BodyItem::TextBox(..) => {}, // handled separately
+            BodyItem::TextBox(..) | BodyItem::Image(..) => {}, // handled separately
         }
     }
 
@@ -756,6 +849,64 @@ fn write_text_box_shape(
         .expect("write");
 
     w.write_event(Event::End(BytesEnd::new("p:sp")))
+        .expect("write");
+}
+
+fn write_pic_shape(w: &mut Writer<Vec<u8>>, id: u32, rid: &str, x: i64, y: i64, cx: u64, cy: u64) {
+    let id_str = id.to_string();
+    let name = format!("Image {id}");
+
+    w.write_event(Event::Start(BytesStart::new("p:pic")))
+        .expect("write");
+
+    w.write_event(Event::Start(BytesStart::new("p:nvPicPr")))
+        .expect("write");
+    let mut cnv_pr = BytesStart::new("p:cNvPr");
+    cnv_pr.push_attribute(("id", id_str.as_str()));
+    cnv_pr.push_attribute(("name", name.as_str()));
+    w.write_event(Event::Empty(cnv_pr)).expect("write");
+    write_empty(w, "p:cNvPicPr");
+    write_empty(w, "p:nvPr");
+    w.write_event(Event::End(BytesEnd::new("p:nvPicPr")))
+        .expect("write");
+
+    w.write_event(Event::Start(BytesStart::new("p:blipFill")))
+        .expect("write");
+    let mut blip = BytesStart::new("a:blip");
+    blip.push_attribute(("r:embed", rid));
+    w.write_event(Event::Empty(blip)).expect("write");
+    w.write_event(Event::Start(BytesStart::new("a:stretch")))
+        .expect("write");
+    write_empty(w, "a:fillRect");
+    w.write_event(Event::End(BytesEnd::new("a:stretch")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:blipFill")))
+        .expect("write");
+
+    w.write_event(Event::Start(BytesStart::new("p:spPr")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("a:xfrm")))
+        .expect("write");
+    let mut off = BytesStart::new("a:off");
+    off.push_attribute(("x", x.to_string().as_str()));
+    off.push_attribute(("y", y.to_string().as_str()));
+    w.write_event(Event::Empty(off)).expect("write");
+    let mut ext = BytesStart::new("a:ext");
+    ext.push_attribute(("cx", cx.to_string().as_str()));
+    ext.push_attribute(("cy", cy.to_string().as_str()));
+    w.write_event(Event::Empty(ext)).expect("write");
+    w.write_event(Event::End(BytesEnd::new("a:xfrm")))
+        .expect("write");
+    let mut geom = BytesStart::new("a:prstGeom");
+    geom.push_attribute(("prst", "rect"));
+    w.write_event(Event::Start(geom)).expect("write");
+    write_empty(w, "a:avLst");
+    w.write_event(Event::End(BytesEnd::new("a:prstGeom")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:spPr")))
+        .expect("write");
+
+    w.write_event(Event::End(BytesEnd::new("p:pic")))
         .expect("write");
 }
 
@@ -839,6 +990,48 @@ mod tests {
         let doc = roundtrip(writer);
         let text = doc.plain_text();
         assert!(text.contains("Floating note"));
+    }
+
+    #[test]
+    fn set_presentation_size_written() {
+        let mut writer = PptxWriter::new();
+        writer.set_presentation_size(9_144_000, 6_858_000);
+        writer.add_slide().add_text("test");
+        let mut buf = Cursor::new(Vec::new());
+        writer.write_to(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        let cursor = Cursor::new(bytes.clone());
+        let mut zip = zip::ZipArchive::new(cursor).unwrap();
+        let mut entry = zip.by_name("ppt/presentation.xml").unwrap();
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut xml).unwrap();
+        assert!(xml.contains("cx=\"9144000\""), "expected cx in presentation.xml");
+    }
+
+    #[test]
+    fn add_image_embeds_media_part() {
+        use crate::ir::ImageFormat;
+        // Minimal 1x1 PNG
+        let png_bytes: Vec<u8> = vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // PNG signature
+            0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, // IHDR length + type
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
+            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, // bit depth, color, crc
+            0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, // IDAT
+            0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xe2, 0x21,
+            0xbc, 0x33, // crc
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82, // IEND
+        ];
+        let mut writer = PptxWriter::new();
+        writer
+            .add_slide()
+            .add_image(png_bytes, ImageFormat::Png, 0, 0, 3_000_000, 2_000_000);
+        let mut buf = Cursor::new(Vec::new());
+        writer.write_to(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+        let cursor = Cursor::new(bytes);
+        let mut zip = zip::ZipArchive::new(cursor).unwrap();
+        assert!(zip.by_name("ppt/media/image1.png").is_ok(), "media part missing");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 {
   "name": "office-oxide",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Fast Office document processing (DOCX/XLSX/PPTX/DOC/XLS/PPT) for Node.js — native bindings backed by the Rust office_oxide library.",
   "license": "MIT OR Apache-2.0",
   "author": "Yury Fedoseev",

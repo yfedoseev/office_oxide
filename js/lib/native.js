@@ -78,4 +78,26 @@ export const native = {
   toMarkdown: lib.func('HeapStr office_to_markdown(const char* path, _Out_ int* error_code)'),
   toHtml: lib.func('HeapStr office_to_html(const char* path, _Out_ int* error_code)'),
   createFromMarkdown: lib.func('int32_t office_create_from_markdown(const char* markdown, const char* format, const char* path, _Out_ int* error_code)'),
+
+  // XLSX writer
+  xlsxWriterNew: lib.func('void* office_xlsx_writer_new()'),
+  xlsxWriterFree: lib.func('void office_xlsx_writer_free(void* handle)'),
+  xlsxWriterAddSheet: lib.func('uint32_t office_xlsx_writer_add_sheet(void* handle, const char* name)'),
+  xlsxSheetSetCell: lib.func('void office_xlsx_sheet_set_cell(void* handle, uint32_t sheet, uint32_t row, uint32_t col, int32_t value_type, const char* value_str, double value_num)'),
+  xlsxSheetSetCellStyled: lib.func('void office_xlsx_sheet_set_cell_styled(void* handle, uint32_t sheet, uint32_t row, uint32_t col, int32_t value_type, const char* value_str, double value_num, bool bold, const char* bg_color)'),
+  xlsxSheetMergeCells: lib.func('void office_xlsx_sheet_merge_cells(void* handle, uint32_t sheet, uint32_t row, uint32_t col, uint32_t row_span, uint32_t col_span)'),
+  xlsxSheetSetColumnWidth: lib.func('void office_xlsx_sheet_set_column_width(void* handle, uint32_t sheet, uint32_t col, double width)'),
+  xlsxWriterSave: lib.func('int32_t office_xlsx_writer_save(void* handle, const char* path, _Out_ int* error_code)'),
+  xlsxWriterToBytes: lib.func('uint8_t* office_xlsx_writer_to_bytes(void* handle, _Out_ size_t* out_len, _Out_ int* error_code)'),
+
+  // PPTX writer
+  pptxWriterNew: lib.func('void* office_pptx_writer_new()'),
+  pptxWriterFree: lib.func('void office_pptx_writer_free(void* handle)'),
+  pptxWriterSetPresentationSize: lib.func('void office_pptx_writer_set_presentation_size(void* handle, uint64_t cx, uint64_t cy)'),
+  pptxWriterAddSlide: lib.func('uint32_t office_pptx_writer_add_slide(void* handle)'),
+  pptxSlideSetTitle: lib.func('void office_pptx_slide_set_title(void* handle, uint32_t slide, const char* title)'),
+  pptxSlideAddText: lib.func('void office_pptx_slide_add_text(void* handle, uint32_t slide, const char* text)'),
+  pptxSlideAddImage: lib.func('void office_pptx_slide_add_image(void* handle, uint32_t slide, const uint8_t* data, size_t len, const char* format, int64_t x, int64_t y, uint64_t cx, uint64_t cy)'),
+  pptxWriterSave: lib.func('int32_t office_pptx_writer_save(void* handle, const char* path, _Out_ int* error_code)'),
+  pptxWriterToBytes: lib.func('uint8_t* office_pptx_writer_to_bytes(void* handle, _Out_ size_t* out_len, _Out_ int* error_code)'),
 };

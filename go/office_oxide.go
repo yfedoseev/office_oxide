@@ -407,6 +407,268 @@ func ToHTML(path string) (string, error) {
 	return C.GoString(out), nil
 }
 
+// ─── XlsxWriter ────────────────────────────────────────────────────────────
+
+// XlsxWriter builds XLSX workbooks from scratch.
+type XlsxWriter struct {
+	handle *C.OfficeXlsxWriterHandle
+}
+
+// NewXlsxWriter creates a new, empty XLSX workbook builder.
+func NewXlsxWriter() *XlsxWriter {
+	handle := C.office_xlsx_writer_new()
+	if handle == nil {
+		panic("office_oxide: office_xlsx_writer_new returned nil")
+	}
+	w := &XlsxWriter{handle: handle}
+	runtime.SetFinalizer(w, func(w *XlsxWriter) { w.Close() })
+	return w
+}
+
+// Close releases the native handle.
+func (w *XlsxWriter) Close() {
+	if w.handle != nil {
+		C.office_xlsx_writer_free(w.handle)
+		w.handle = nil
+		runtime.SetFinalizer(w, nil)
+	}
+}
+
+// AddSheet adds a worksheet and returns its 0-based index.
+// Returns ^uint32(0) if the writer has been closed.
+func (w *XlsxWriter) AddSheet(name string) uint32 {
+	if w.handle == nil {
+		return ^uint32(0)
+	}
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+	return uint32(C.office_xlsx_writer_add_sheet(w.handle, cname))
+}
+
+// SetCell sets a cell value in the given sheet (0-based), row and column.
+// value may be nil (empty), string, float64, or bool.
+func (w *XlsxWriter) SetCell(sheet, row, col uint32, value any) {
+	if w.handle == nil {
+		return
+	}
+	var vtype C.int32_t
+	var vstr *C.char
+	var vnum C.double
+	switch v := value.(type) {
+	case nil:
+		vtype = 0
+	case string:
+		vtype = 1
+		vstr = C.CString(v)
+		defer C.free(unsafe.Pointer(vstr))
+	case float64:
+		vtype = 2
+		vnum = C.double(v)
+	case int:
+		vtype = 2
+		vnum = C.double(v)
+	case bool:
+		vtype = 2
+		if v {
+			vnum = 1.0
+		}
+	default:
+		vtype = 0
+	}
+	C.office_xlsx_sheet_set_cell(w.handle, C.uint32_t(sheet), C.uint32_t(row), C.uint32_t(col), vtype, vstr, vnum)
+}
+
+// SetCellStyled sets a cell value with bold and/or background color styling.
+// bgColor is a 6-char hex string like "D3D3D3" or "" for no fill.
+func (w *XlsxWriter) SetCellStyled(sheet, row, col uint32, value any, bold bool, bgColor string) {
+	if w.handle == nil {
+		return
+	}
+	var vtype C.int32_t
+	var vstr *C.char
+	var vnum C.double
+	switch v := value.(type) {
+	case nil:
+		vtype = 0
+	case string:
+		vtype = 1
+		vstr = C.CString(v)
+		defer C.free(unsafe.Pointer(vstr))
+	case float64:
+		vtype = 2
+		vnum = C.double(v)
+	case int:
+		vtype = 2
+		vnum = C.double(v)
+	default:
+		vtype = 0
+	}
+	var cbg *C.char
+	if bgColor != "" {
+		cbg = C.CString(bgColor)
+		defer C.free(unsafe.Pointer(cbg))
+	}
+	C.office_xlsx_sheet_set_cell_styled(w.handle, C.uint32_t(sheet), C.uint32_t(row), C.uint32_t(col), vtype, vstr, vnum, C.bool(bold), cbg)
+}
+
+// MergeCells merges a rectangular range. rowSpan and colSpan must be >= 1.
+func (w *XlsxWriter) MergeCells(sheet, row, col, rowSpan, colSpan uint32) {
+	if w.handle == nil {
+		return
+	}
+	C.office_xlsx_sheet_merge_cells(w.handle, C.uint32_t(sheet), C.uint32_t(row), C.uint32_t(col), C.uint32_t(rowSpan), C.uint32_t(colSpan))
+}
+
+// SetColumnWidth sets column width in Excel character units (e.g. 20.0).
+func (w *XlsxWriter) SetColumnWidth(sheet, col uint32, width float64) {
+	if w.handle == nil {
+		return
+	}
+	C.office_xlsx_sheet_set_column_width(w.handle, C.uint32_t(sheet), C.uint32_t(col), C.double(width))
+}
+
+// Save writes the workbook to a file.
+func (w *XlsxWriter) Save(path string) error {
+	if w.handle == nil {
+		return ErrClosed
+	}
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+	var errCode C.int
+	rc := C.office_xlsx_writer_save(w.handle, cpath, &errCode)
+	if rc != 0 {
+		return &Error{Code: int(errCode), Op: "XlsxWriter.Save"}
+	}
+	return nil
+}
+
+// ToBytes serialises the workbook to a new byte slice.
+func (w *XlsxWriter) ToBytes() ([]byte, error) {
+	if w.handle == nil {
+		return nil, ErrClosed
+	}
+	var outLen C.size_t
+	var errCode C.int
+	ptr := C.office_xlsx_writer_to_bytes(w.handle, &outLen, &errCode)
+	if ptr == nil {
+		return nil, &Error{Code: int(errCode), Op: "XlsxWriter.ToBytes"}
+	}
+	defer C.office_oxide_free_bytes(ptr, outLen)
+	return C.GoBytes(unsafe.Pointer(ptr), C.int(outLen)), nil
+}
+
+// ─── PptxWriter ─────────────────────────────────────────────────────────────
+
+// PptxWriter builds PPTX presentations from scratch.
+type PptxWriter struct {
+	handle *C.OfficePptxWriterHandle
+}
+
+// NewPptxWriter creates a new, empty PPTX presentation builder.
+func NewPptxWriter() *PptxWriter {
+	handle := C.office_pptx_writer_new()
+	if handle == nil {
+		panic("office_oxide: office_pptx_writer_new returned nil")
+	}
+	w := &PptxWriter{handle: handle}
+	runtime.SetFinalizer(w, func(w *PptxWriter) { w.Close() })
+	return w
+}
+
+// Close releases the native handle.
+func (w *PptxWriter) Close() {
+	if w.handle != nil {
+		C.office_pptx_writer_free(w.handle)
+		w.handle = nil
+		runtime.SetFinalizer(w, nil)
+	}
+}
+
+// SetPresentationSize overrides the canvas size. 914400 EMU = 1 inch.
+func (w *PptxWriter) SetPresentationSize(cx, cy uint64) {
+	if w.handle == nil {
+		return
+	}
+	C.office_pptx_writer_set_presentation_size(w.handle, C.uint64_t(cx), C.uint64_t(cy))
+}
+
+// AddSlide adds a slide and returns its 0-based index.
+// Returns ^uint32(0) if the writer has been closed.
+func (w *PptxWriter) AddSlide() uint32 {
+	if w.handle == nil {
+		return ^uint32(0)
+	}
+	return uint32(C.office_pptx_writer_add_slide(w.handle))
+}
+
+// SetSlideTitle sets the title of the given slide.
+func (w *PptxWriter) SetSlideTitle(slide uint32, title string) {
+	if w.handle == nil {
+		return
+	}
+	ctitle := C.CString(title)
+	defer C.free(unsafe.Pointer(ctitle))
+	C.office_pptx_slide_set_title(w.handle, C.uint32_t(slide), ctitle)
+}
+
+// AddSlideText adds a plain text paragraph to the slide body.
+func (w *PptxWriter) AddSlideText(slide uint32, text string) {
+	if w.handle == nil {
+		return
+	}
+	ctext := C.CString(text)
+	defer C.free(unsafe.Pointer(ctext))
+	C.office_pptx_slide_add_text(w.handle, C.uint32_t(slide), ctext)
+}
+
+// AddSlideImage embeds an image on a slide.
+// format is "png", "jpeg"/"jpg", or "gif".
+// x, y, cx, cy are in EMU (914400 = 1 inch).
+func (w *PptxWriter) AddSlideImage(slide uint32, data []byte, format string, x, y int64, cx, cy uint64) {
+	if w.handle == nil || len(data) == 0 {
+		return
+	}
+	cfmt := C.CString(format)
+	defer C.free(unsafe.Pointer(cfmt))
+	C.office_pptx_slide_add_image(
+		w.handle, C.uint32_t(slide),
+		(*C.uint8_t)(unsafe.Pointer(&data[0])), C.size_t(len(data)),
+		cfmt,
+		C.int64_t(x), C.int64_t(y),
+		C.uint64_t(cx), C.uint64_t(cy),
+	)
+}
+
+// Save writes the presentation to a file.
+func (w *PptxWriter) Save(path string) error {
+	if w.handle == nil {
+		return ErrClosed
+	}
+	cpath := C.CString(path)
+	defer C.free(unsafe.Pointer(cpath))
+	var errCode C.int
+	rc := C.office_pptx_writer_save(w.handle, cpath, &errCode)
+	if rc != 0 {
+		return &Error{Code: int(errCode), Op: "PptxWriter.Save"}
+	}
+	return nil
+}
+
+// ToBytes serialises the presentation to a new byte slice.
+func (w *PptxWriter) ToBytes() ([]byte, error) {
+	if w.handle == nil {
+		return nil, ErrClosed
+	}
+	var outLen C.size_t
+	var errCode C.int
+	ptr := C.office_pptx_writer_to_bytes(w.handle, &outLen, &errCode)
+	if ptr == nil {
+		return nil, &Error{Code: int(errCode), Op: "PptxWriter.ToBytes"}
+	}
+	defer C.office_oxide_free_bytes(ptr, outLen)
+	return C.GoBytes(unsafe.Pointer(ptr), C.int(outLen)), nil
+}
+
 // CreateFromMarkdown converts a Markdown string into an Office document file.
 //
 // format must be "docx", "xlsx", or "pptx" (case-insensitive).

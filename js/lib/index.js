@@ -5,6 +5,7 @@
 // (decoded and auto-freed via the `HeapStr` disposable type registered in
 // native.js). Errors surface as null returns + a non-zero error code.
 
+import koffi from 'koffi';
 import { native } from './native.js';
 
 export class OfficeOxideError extends Error {
@@ -170,4 +171,164 @@ export function createFromMarkdown(markdown, format, path) {
   const err = [0];
   const rc = native.createFromMarkdown(markdown, format, path, err);
   if (rc !== 0) throw new OfficeOxideError(err[0], 'createFromMarkdown');
+}
+
+export class XlsxWriter {
+  #handle;
+
+  constructor() {
+    this.#handle = native.xlsxWriterNew();
+    if (!this.#handle) throw new OfficeOxideError(5, 'XlsxWriter.new');
+  }
+
+  #ensure() {
+    if (!this.#handle) throw new Error('XlsxWriter is closed');
+  }
+
+  /** Add a worksheet; returns its 0-based index. */
+  addSheet(name) {
+    this.#ensure();
+    return native.xlsxWriterAddSheet(this.#handle, name);
+  }
+
+  /** Set a cell value. value: null | string | number | boolean */
+  setCell(sheet, row, col, value) {
+    this.#ensure();
+    let t, s = null, n = 0;
+    if (value === null || value === undefined) t = 0;
+    else if (typeof value === 'string') { t = 1; s = value; }
+    else if (typeof value === 'number') { t = 2; n = value; }
+    else if (typeof value === 'boolean') { t = 2; n = value ? 1 : 0; }
+    else { t = 1; s = String(value); }
+    native.xlsxSheetSetCell(this.#handle, sheet, row, col, t, s, n);
+  }
+
+  /** Set a cell with styling. bgColor: 6-char hex string or null. */
+  setCellStyled(sheet, row, col, value, bold, bgColor = null) {
+    this.#ensure();
+    let t, s = null, n = 0;
+    if (value === null || value === undefined) t = 0;
+    else if (typeof value === 'string') { t = 1; s = value; }
+    else if (typeof value === 'number') { t = 2; n = value; }
+    else { t = 1; s = String(value); }
+    native.xlsxSheetSetCellStyled(this.#handle, sheet, row, col, t, s, n, bold, bgColor);
+  }
+
+  /** Merge a rectangular range. rowSpan and colSpan must be >= 1. */
+  mergeCells(sheet, row, col, rowSpan, colSpan) {
+    this.#ensure();
+    native.xlsxSheetMergeCells(this.#handle, sheet, row, col, rowSpan, colSpan);
+  }
+
+  /** Set column width in Excel character units (e.g. 20.0). */
+  setColumnWidth(sheet, col, width) {
+    this.#ensure();
+    native.xlsxSheetSetColumnWidth(this.#handle, sheet, col, width);
+  }
+
+  save(path) {
+    this.#ensure();
+    const err = [0];
+    const rc = native.xlsxWriterSave(this.#handle, path, err);
+    if (rc !== 0) throw new OfficeOxideError(err[0], 'XlsxWriter.save');
+  }
+
+  toBytes() {
+    this.#ensure();
+    const outLen = [0];
+    const err = [0];
+    const ptr = native.xlsxWriterToBytes(this.#handle, outLen, err);
+    if (!ptr) throw new OfficeOxideError(err[0], 'XlsxWriter.toBytes');
+    try {
+      return Buffer.from(koffi.decode(ptr, 'uint8_t', outLen[0]));
+    } finally {
+      native.freeBytes(ptr, outLen[0]);
+    }
+  }
+
+  close() {
+    if (this.#handle) {
+      native.xlsxWriterFree(this.#handle);
+      this.#handle = null;
+    }
+  }
+
+  [Symbol.dispose]() { this.close(); }
+}
+
+export class PptxWriter {
+  #handle;
+
+  constructor() {
+    this.#handle = native.pptxWriterNew();
+    if (!this.#handle) throw new OfficeOxideError(5, 'PptxWriter.new');
+  }
+
+  #ensure() {
+    if (!this.#handle) throw new Error('PptxWriter is closed');
+  }
+
+  /** Override canvas size. 914400 EMU = 1 inch. */
+  setPresentationSize(cx, cy) {
+    this.#ensure();
+    native.pptxWriterSetPresentationSize(this.#handle, BigInt(cx), BigInt(cy));
+  }
+
+  /** Add a slide; returns its 0-based index. */
+  addSlide() {
+    this.#ensure();
+    return native.pptxWriterAddSlide(this.#handle);
+  }
+
+  /** Set the title of a slide. */
+  setSlideTitle(slide, title) {
+    this.#ensure();
+    native.pptxSlideSetTitle(this.#handle, slide, title);
+  }
+
+  /** Add a plain text paragraph to the slide body. */
+  addSlideText(slide, text) {
+    this.#ensure();
+    native.pptxSlideAddText(this.#handle, slide, text);
+  }
+
+  /**
+   * Embed an image on a slide.
+   * data: Buffer or Uint8Array; format: "png" | "jpeg" | "gif"
+   * x, y, cx, cy: EMU coordinates (914400 = 1 inch)
+   */
+  addSlideImage(slide, data, format, x, y, cx, cy) {
+    this.#ensure();
+    const buf = data instanceof Uint8Array ? data : new Uint8Array(data);
+    native.pptxSlideAddImage(this.#handle, slide, buf, buf.length, format, BigInt(x), BigInt(y), BigInt(cx), BigInt(cy));
+  }
+
+  save(path) {
+    this.#ensure();
+    const err = [0];
+    const rc = native.pptxWriterSave(this.#handle, path, err);
+    if (rc !== 0) throw new OfficeOxideError(err[0], 'PptxWriter.save');
+  }
+
+  toBytes() {
+    this.#ensure();
+    const outLen = [0];
+    const err = [0];
+    const ptr = native.pptxWriterToBytes(this.#handle, outLen, err);
+    if (!ptr) throw new OfficeOxideError(err[0], 'PptxWriter.toBytes');
+    try {
+      return Buffer.from(koffi.decode(ptr, 'uint8_t', outLen[0]));
+    } finally {
+      native.freeBytes(ptr, outLen[0]);
+    }
+  }
+
+  close() {
+    if (this.#handle) {
+      native.pptxWriterFree(this.#handle);
+      this.#handle = null;
+    }
+  }
+
+  [Symbol.dispose]() { this.close(); }
 }

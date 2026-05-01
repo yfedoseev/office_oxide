@@ -36,6 +36,7 @@ impl DocumentIR {
             metadata: Metadata {
                 format,
                 title: None,
+                ..Default::default()
             },
             sections,
         }
@@ -76,6 +77,7 @@ impl<'a> MarkdownParser<'a> {
         let mut current = Section {
             title: None,
             elements: Vec::new(),
+            ..Default::default()
         };
 
         while self.pos < self.lines.len() {
@@ -98,6 +100,7 @@ impl<'a> MarkdownParser<'a> {
                     current = Section {
                         title: None,
                         elements: Vec::new(),
+                        ..Default::default()
                     };
                 }
                 continue;
@@ -114,6 +117,7 @@ impl<'a> MarkdownParser<'a> {
                     current = Section {
                         title: Some(text.clone()),
                         elements: Vec::new(),
+                        ..Default::default()
                     };
                 } else {
                     current.elements.push(Element::Heading(Heading {
@@ -162,6 +166,7 @@ impl<'a> MarkdownParser<'a> {
             sections.push(Section {
                 title: None,
                 elements: Vec::new(),
+                ..Default::default()
             });
         }
 
@@ -195,6 +200,7 @@ impl<'a> MarkdownParser<'a> {
         let text = lines.join(" ");
         Paragraph {
             content: parse_inline(&text),
+            ..Default::default()
         }
     }
 
@@ -232,18 +238,24 @@ impl<'a> MarkdownParser<'a> {
                 .map(|cell_text| TableCell {
                     content: vec![Element::Paragraph(Paragraph {
                         content: parse_inline(cell_text.trim()),
+                        ..Default::default()
                     })],
                     col_span: 1,
                     row_span: 1,
+                    ..Default::default()
                 })
                 .collect();
             rows.push(TableRow {
                 cells,
                 is_header: i == 0,
+                ..Default::default()
             });
         }
 
-        Some(Table { rows })
+        Some(Table {
+            rows,
+            ..Default::default()
+        })
     }
 
     fn parse_list(&mut self, ordered: bool) -> List {
@@ -261,13 +273,20 @@ impl<'a> MarkdownParser<'a> {
                     self.advance();
                     let content_str = strip_list_marker(line);
                     items.push(ListItem {
-                        content: parse_inline(content_str),
+                        content: vec![Element::Paragraph(Paragraph {
+                            content: parse_inline(content_str),
+                            ..Default::default()
+                        })],
                         nested: None,
                     });
                 },
             }
         }
-        List { ordered, items }
+        List {
+            ordered,
+            items,
+            ..Default::default()
+        }
     }
 }
 
@@ -306,9 +325,7 @@ fn parse_inline(text: &str) -> Vec<InlineContent> {
                 out.push(InlineContent::Text(TextSpan {
                     text: inner.to_string(),
                     bold: true,
-                    italic: false,
-                    strikethrough: false,
-                    hyperlink: None,
+                    ..Default::default()
                 }));
                 i += 2 + end + 2;
                 plain_start = i;
@@ -324,10 +341,8 @@ fn parse_inline(text: &str) -> Vec<InlineContent> {
                 let inner = &text[i + 1..i + 1 + end];
                 out.push(InlineContent::Text(TextSpan {
                     text: inner.to_string(),
-                    bold: false,
                     italic: true,
-                    strikethrough: false,
-                    hyperlink: None,
+                    ..Default::default()
                 }));
                 i += 1 + end + 1;
                 plain_start = i;
@@ -342,10 +357,8 @@ fn parse_inline(text: &str) -> Vec<InlineContent> {
                 let inner = &text[i + 2..i + 2 + end];
                 out.push(InlineContent::Text(TextSpan {
                     text: inner.to_string(),
-                    bold: false,
-                    italic: false,
                     strikethrough: true,
-                    hyperlink: None,
+                    ..Default::default()
                 }));
                 i += 2 + end + 2;
                 plain_start = i;
@@ -376,10 +389,8 @@ fn parse_inline(text: &str) -> Vec<InlineContent> {
                         let url = &text[after_bracket + 1..after_bracket + 1 + paren_end];
                         out.push(InlineContent::Text(TextSpan {
                             text: link_text.to_string(),
-                            bold: false,
-                            italic: false,
-                            strikethrough: false,
                             hyperlink: Some(url.to_string()),
+                            ..Default::default()
                         }));
                         i = after_bracket + 1 + paren_end + 1;
                         plain_start = i;

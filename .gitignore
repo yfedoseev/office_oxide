@@ -78,6 +78,9 @@ Claude.md
 markdown_exports/
 html_exports/
 
+# Internal feature request documents (not for public distribution)
+docs/requests/
+
 # Large test files
 tests/fixtures/large/
 tests/fixtures/real/

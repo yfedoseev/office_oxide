@@ -34,6 +34,7 @@ pub(crate) fn doc_to_ir(doc: &crate::doc::DocDocument) -> DocumentIR {
         } else {
             elements.push(Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain(line))],
+                ..Default::default()
             }));
         }
     }
@@ -50,7 +51,12 @@ pub(crate) fn doc_to_ir(doc: &crate::doc::DocDocument) -> DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Doc,
             title: title.clone(),
+            ..Default::default()
         },
-        sections: vec![Section { title, elements }],
+        sections: vec![Section {
+            title,
+            elements,
+            ..Default::default()
+        }],
     }
 }

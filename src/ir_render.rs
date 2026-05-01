@@ -73,6 +73,21 @@ fn render_element_plain(element: &Element) -> String {
             }
         },
         Element::ThematicBreak => "---".to_string(),
+        Element::TextBox(tb) => tb
+            .content
+            .iter()
+            .map(render_element_plain)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        Element::PageBreak => String::new(),
+        Element::ColumnBreak => String::new(),
+        Element::Footnote(n) | Element::Endnote(n) => n
+            .content
+            .iter()
+            .map(render_element_plain)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        Element::CodeBlock(cb) => cb.content.clone(),
     }
 }
 
@@ -82,6 +97,7 @@ fn render_inline_plain(content: &[InlineContent]) -> String {
         match item {
             InlineContent::Text(span) => out.push_str(&span.text),
             InlineContent::LineBreak => out.push('\n'),
+            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
         }
     }
     out
@@ -110,7 +126,12 @@ fn render_list_plain(list: &List, indent: usize) -> String {
     let prefix_str = " ".repeat(indent * 2);
     let mut lines = Vec::new();
     for item in &list.items {
-        let text = render_inline_plain(&item.content);
+        let text = item
+            .content
+            .iter()
+            .map(render_element_plain)
+            .collect::<Vec<_>>()
+            .join(" ");
         lines.push(format!("{prefix_str}- {text}"));
         if let Some(ref nested) = item.nested {
             lines.push(render_list_plain(nested, indent + 1));
@@ -154,6 +175,24 @@ fn render_element_markdown(element: &Element) -> String {
             format!("![{alt}]()")
         },
         Element::ThematicBreak => "---".to_string(),
+        Element::TextBox(tb) => tb
+            .content
+            .iter()
+            .map(render_element_markdown)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        Element::PageBreak => String::new(),
+        Element::ColumnBreak => String::new(),
+        Element::Footnote(n) | Element::Endnote(n) => n
+            .content
+            .iter()
+            .map(render_element_markdown)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        Element::CodeBlock(cb) => {
+            let lang = cb.language.as_deref().unwrap_or("");
+            format!("```{lang}\n{}\n```", cb.content)
+        },
     }
 }
 
@@ -182,6 +221,7 @@ fn render_inline_markdown(content: &[InlineContent]) -> String {
                 out.push_str(&text);
             },
             InlineContent::LineBreak => out.push_str("  \n"),
+            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
         }
     }
     out
@@ -259,7 +299,12 @@ fn render_list_markdown(list: &List, indent: usize) -> String {
     let prefix_str = "  ".repeat(indent);
     let mut lines = Vec::new();
     for (i, item) in list.items.iter().enumerate() {
-        let text = render_inline_markdown(&item.content);
+        let text = item
+            .content
+            .iter()
+            .map(render_element_markdown)
+            .collect::<Vec<_>>()
+            .join(" ");
         let marker = if list.ordered {
             format!("{}. ", i + 1)
         } else {
@@ -318,6 +363,24 @@ fn render_element_html(element: &Element) -> String {
             format!("<img alt=\"{alt}\" />")
         },
         Element::ThematicBreak => "<hr />".to_string(),
+        Element::TextBox(tb) => tb
+            .content
+            .iter()
+            .map(render_element_html)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Element::PageBreak => String::new(),
+        Element::ColumnBreak => String::new(),
+        Element::Footnote(n) | Element::Endnote(n) => n
+            .content
+            .iter()
+            .map(render_element_html)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Element::CodeBlock(cb) => {
+            let escaped = escape_html(&cb.content);
+            format!("<pre><code>{escaped}</code></pre>")
+        },
     }
 }
 
@@ -344,6 +407,7 @@ fn render_inline_html(content: &[InlineContent]) -> String {
                 out.push_str(&text);
             },
             InlineContent::LineBreak => out.push_str("<br />"),
+            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
         }
     }
     out
@@ -377,7 +441,12 @@ fn render_list_html(list: &List) -> String {
     let tag = if list.ordered { "ol" } else { "ul" };
     let mut html = format!("<{tag}>\n");
     for item in &list.items {
-        let content = render_inline_html(&item.content);
+        let content = item
+            .content
+            .iter()
+            .map(render_element_html)
+            .collect::<Vec<_>>()
+            .join("");
         html.push_str(&format!("<li>{content}"));
         if let Some(ref nested) = item.nested {
             html.push('\n');
@@ -399,25 +468,30 @@ mod tests {
             metadata: Metadata {
                 format: DocumentFormat::Docx,
                 title: None,
+                ..Default::default()
             },
             sections: vec![Section {
                 title: None,
                 elements,
+                ..Default::default()
             }],
         }
     }
 
+    fn para(text: &str) -> Element {
+        Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan::plain(text))],
+            ..Default::default()
+        })
+    }
+
+    fn span(text: &str) -> InlineContent {
+        InlineContent::Text(TextSpan::plain(text))
+    }
+
     #[test]
     fn plain_text_paragraph() {
-        let ir = simple_ir(vec![Element::Paragraph(Paragraph {
-            content: vec![InlineContent::Text(TextSpan {
-                text: "Hello world".to_string(),
-                bold: false,
-                italic: false,
-                strikethrough: false,
-                hyperlink: None,
-            })],
-        })]);
+        let ir = simple_ir(vec![para("Hello world")]);
         assert_eq!(ir.plain_text(), "Hello world");
     }
 
@@ -425,13 +499,7 @@ mod tests {
     fn markdown_heading() {
         let ir = simple_ir(vec![Element::Heading(Heading {
             level: 2,
-            content: vec![InlineContent::Text(TextSpan {
-                text: "Title".to_string(),
-                bold: false,
-                italic: false,
-                strikethrough: false,
-                hyperlink: None,
-            })],
+            content: vec![span("Title")],
         })]);
         assert_eq!(ir.to_markdown(), "## Title");
     }
@@ -443,27 +511,30 @@ mod tests {
                 InlineContent::Text(TextSpan {
                     text: "bold".to_string(),
                     bold: true,
-                    italic: false,
-                    strikethrough: false,
-                    hyperlink: None,
+                    ..Default::default()
                 }),
-                InlineContent::Text(TextSpan {
-                    text: " and ".to_string(),
-                    bold: false,
-                    italic: false,
-                    strikethrough: false,
-                    hyperlink: None,
-                }),
+                InlineContent::Text(TextSpan::plain(" and ")),
                 InlineContent::Text(TextSpan {
                     text: "italic".to_string(),
-                    bold: false,
                     italic: true,
-                    strikethrough: false,
-                    hyperlink: None,
+                    ..Default::default()
                 }),
             ],
+            ..Default::default()
         })]);
         assert_eq!(ir.to_markdown(), "**bold** and *italic*");
+    }
+
+    fn cell(text: &str) -> TableCell {
+        TableCell {
+            content: vec![Element::Paragraph(Paragraph {
+                content: vec![span(text)],
+                ..Default::default()
+            })],
+            col_span: 1,
+            row_span: 1,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -471,68 +542,17 @@ mod tests {
         let ir = simple_ir(vec![Element::Table(Table {
             rows: vec![
                 TableRow {
-                    cells: vec![
-                        TableCell {
-                            content: vec![Element::Paragraph(Paragraph {
-                                content: vec![InlineContent::Text(TextSpan {
-                                    text: "H1".to_string(),
-                                    bold: false,
-                                    italic: false,
-                                    strikethrough: false,
-                                    hyperlink: None,
-                                })],
-                            })],
-                            col_span: 1,
-                            row_span: 1,
-                        },
-                        TableCell {
-                            content: vec![Element::Paragraph(Paragraph {
-                                content: vec![InlineContent::Text(TextSpan {
-                                    text: "H2".to_string(),
-                                    bold: false,
-                                    italic: false,
-                                    strikethrough: false,
-                                    hyperlink: None,
-                                })],
-                            })],
-                            col_span: 1,
-                            row_span: 1,
-                        },
-                    ],
+                    cells: vec![cell("H1"), cell("H2")],
                     is_header: true,
+                    ..Default::default()
                 },
                 TableRow {
-                    cells: vec![
-                        TableCell {
-                            content: vec![Element::Paragraph(Paragraph {
-                                content: vec![InlineContent::Text(TextSpan {
-                                    text: "A".to_string(),
-                                    bold: false,
-                                    italic: false,
-                                    strikethrough: false,
-                                    hyperlink: None,
-                                })],
-                            })],
-                            col_span: 1,
-                            row_span: 1,
-                        },
-                        TableCell {
-                            content: vec![Element::Paragraph(Paragraph {
-                                content: vec![InlineContent::Text(TextSpan {
-                                    text: "B".to_string(),
-                                    bold: false,
-                                    italic: false,
-                                    strikethrough: false,
-                                    hyperlink: None,
-                                })],
-                            })],
-                            col_span: 1,
-                            row_span: 1,
-                        },
-                    ],
+                    cells: vec![cell("A"), cell("B")],
                     is_header: false,
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         })]);
         let md = ir.to_markdown();
         assert!(md.contains("| H1 | H2 |"));
@@ -546,26 +566,15 @@ mod tests {
             ordered: false,
             items: vec![
                 ListItem {
-                    content: vec![InlineContent::Text(TextSpan {
-                        text: "First".to_string(),
-                        bold: false,
-                        italic: false,
-                        strikethrough: false,
-                        hyperlink: None,
-                    })],
+                    content: vec![para("First")],
                     nested: None,
                 },
                 ListItem {
-                    content: vec![InlineContent::Text(TextSpan {
-                        text: "Second".to_string(),
-                        bold: false,
-                        italic: false,
-                        strikethrough: false,
-                        hyperlink: None,
-                    })],
+                    content: vec![para("Second")],
                     nested: None,
                 },
             ],
+            ..Default::default()
         })]);
         assert_eq!(ir.to_markdown(), "- First\n- Second");
     }
@@ -575,11 +584,10 @@ mod tests {
         let ir = simple_ir(vec![Element::Paragraph(Paragraph {
             content: vec![InlineContent::Text(TextSpan {
                 text: "click".to_string(),
-                bold: false,
-                italic: false,
-                strikethrough: false,
                 hyperlink: Some("https://example.com".to_string()),
+                ..Default::default()
             })],
+            ..Default::default()
         })]);
         assert_eq!(ir.to_markdown(), "[click](https://example.com)");
     }
@@ -590,31 +598,18 @@ mod tests {
             metadata: Metadata {
                 format: DocumentFormat::Xlsx,
                 title: None,
+                ..Default::default()
             },
             sections: vec![
                 Section {
                     title: Some("Sheet1".to_string()),
-                    elements: vec![Element::Paragraph(Paragraph {
-                        content: vec![InlineContent::Text(TextSpan {
-                            text: "Data A".to_string(),
-                            bold: false,
-                            italic: false,
-                            strikethrough: false,
-                            hyperlink: None,
-                        })],
-                    })],
+                    elements: vec![para("Data A")],
+                    ..Default::default()
                 },
                 Section {
                     title: Some("Sheet2".to_string()),
-                    elements: vec![Element::Paragraph(Paragraph {
-                        content: vec![InlineContent::Text(TextSpan {
-                            text: "Data B".to_string(),
-                            bold: false,
-                            italic: false,
-                            strikethrough: false,
-                            hyperlink: None,
-                        })],
-                    })],
+                    elements: vec![para("Data B")],
+                    ..Default::default()
                 },
             ],
         };
@@ -627,15 +622,7 @@ mod tests {
 
     #[test]
     fn html_paragraph() {
-        let ir = simple_ir(vec![Element::Paragraph(Paragraph {
-            content: vec![InlineContent::Text(TextSpan {
-                text: "Hello world".to_string(),
-                bold: false,
-                italic: false,
-                strikethrough: false,
-                hyperlink: None,
-            })],
-        })]);
+        let ir = simple_ir(vec![para("Hello world")]);
         assert_eq!(ir.to_html(), "<p>Hello world</p>");
     }
 
@@ -646,25 +633,16 @@ mod tests {
                 InlineContent::Text(TextSpan {
                     text: "bold".to_string(),
                     bold: true,
-                    italic: false,
-                    strikethrough: false,
-                    hyperlink: None,
+                    ..Default::default()
                 }),
-                InlineContent::Text(TextSpan {
-                    text: " and ".to_string(),
-                    bold: false,
-                    italic: false,
-                    strikethrough: false,
-                    hyperlink: None,
-                }),
+                InlineContent::Text(TextSpan::plain(" and ")),
                 InlineContent::Text(TextSpan {
                     text: "link".to_string(),
-                    bold: false,
-                    italic: false,
-                    strikethrough: false,
                     hyperlink: Some("https://example.com".to_string()),
+                    ..Default::default()
                 }),
             ],
+            ..Default::default()
         })]);
         assert_eq!(
             ir.to_html(),
@@ -674,15 +652,7 @@ mod tests {
 
     #[test]
     fn html_escaping() {
-        let ir = simple_ir(vec![Element::Paragraph(Paragraph {
-            content: vec![InlineContent::Text(TextSpan {
-                text: "<script>alert('xss')</script>".to_string(),
-                bold: false,
-                italic: false,
-                strikethrough: false,
-                hyperlink: None,
-            })],
-        })]);
+        let ir = simple_ir(vec![para("<script>alert('xss')</script>")]);
         assert!(ir.to_html().contains("&lt;script&gt;"));
         assert!(!ir.to_html().contains("<script>"));
     }
@@ -691,21 +661,11 @@ mod tests {
     fn html_table() {
         let ir = simple_ir(vec![Element::Table(Table {
             rows: vec![TableRow {
-                cells: vec![TableCell {
-                    content: vec![Element::Paragraph(Paragraph {
-                        content: vec![InlineContent::Text(TextSpan {
-                            text: "A".to_string(),
-                            bold: false,
-                            italic: false,
-                            strikethrough: false,
-                            hyperlink: None,
-                        })],
-                    })],
-                    col_span: 1,
-                    row_span: 1,
-                }],
+                cells: vec![cell("A")],
                 is_header: true,
+                ..Default::default()
             }],
+            ..Default::default()
         })]);
         let html = ir.to_html();
         assert!(html.contains("<table>"));
@@ -719,30 +679,19 @@ mod tests {
             ordered: true,
             items: vec![
                 ListItem {
-                    content: vec![InlineContent::Text(TextSpan {
-                        text: "First".to_string(),
-                        bold: false,
-                        italic: false,
-                        strikethrough: false,
-                        hyperlink: None,
-                    })],
+                    content: vec![para("First")],
                     nested: None,
                 },
                 ListItem {
-                    content: vec![InlineContent::Text(TextSpan {
-                        text: "Second".to_string(),
-                        bold: false,
-                        italic: false,
-                        strikethrough: false,
-                        hyperlink: None,
-                    })],
+                    content: vec![para("Second")],
                     nested: None,
                 },
             ],
+            ..Default::default()
         })]);
         let html = ir.to_html();
         assert!(html.contains("<ol>"));
-        assert!(html.contains("<li>First</li>"));
-        assert!(html.contains("<li>Second</li>"));
+        assert!(html.contains("<li><p>First</p></li>"));
+        assert!(html.contains("<li><p>Second</p></li>"));
     }
 }

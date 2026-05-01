@@ -5,6 +5,170 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-04-30
+
+> Richer IR type system, DOCX writer output, improved PPTX/XLSX IR renderers, and writer APIs in all language bindings
+
+### IR — extended type system
+
+- **`TextSpan`** gains nine typography fields: `font_name`, `font_size_half_pt`,
+  `color`, `highlight`, `underline` (`UnderlineStyle` enum), `vertical_align`
+  (`VerticalAlign`: Superscript / Subscript / Baseline), `all_caps`,
+  `small_caps`, `char_spacing_half_pt`.
+- **`Paragraph`** gains twelve layout fields: `alignment` (`ParagraphAlignment`:
+  Left / Center / Right / Justify / Distribute), `indent_left_twips`,
+  `indent_right_twips`, `first_line_indent_twips`, `space_before_twips`,
+  `space_after_twips`, `line_spacing` (`LineSpacing`: Auto / Multiple / Exact /
+  AtLeast), `background_color`, `border` (`ParagraphBorder`), `keep_with_next`,
+  `keep_together`, `page_break_before`, `outline_level`.
+- **`Table`** gains `width_twips`, `column_widths_twips`, `border`
+  (`TableBorder`), `alignment` (`TableAlignment`), `indent_left_twips`,
+  `cell_padding_twips`, `caption`.
+- **`TableRow`** gains `height_twips`, `allow_break`, `repeat_as_header`.
+- **`TableCell`** gains `background_color`, `border`, `vertical_align`
+  (`CellVerticalAlign`), `text_align`, `width_twips`, `padding` (`CellPadding`),
+  `text_direction` (`TextDirection`).
+- **`Image`** gains `data`, `format` (`ImageFormat`), `pixel_width`,
+  `pixel_height`, `display_width_emu`, `display_height_emu`, `decorative`,
+  `positioning` (`ImagePositioning`: Inline or Floating with `FloatingImage`).
+- **`Section`** gains `page_setup` (`PageSetup`), `columns` (`ColumnLayout`),
+  `break_type` (`SectionBreakType`), and six header/footer slots
+  (`header`, `footer`, `first_page_header`, `first_page_footer`,
+  `even_page_header`, `even_page_footer`).
+- **`Metadata`** gains `author`, `subject`, `keywords`, `created`, `modified`,
+  `description` (written to `docProps/core.xml`).
+- **New `Element` variants**: `TextBox`, `PageBreak`, `ColumnBreak`,
+  `Footnote(Note)`, `Endnote(Note)`, `CodeBlock`.
+- **`List`** gains `start_number`, `style` (`ListStyle`), `level`.
+  `ListItem.content` promoted from `Vec<InlineContent>` to `Vec<Element>`
+  to allow block-level content (tables, images) inside list items.
+- **`InlineContent`** gains `FootnoteRef` and `EndnoteRef` variants.
+- **New supporting types**: `BorderLine`, `TableBorder`, `ParagraphBorder`,
+  `CellPadding`, `FloatingImage`, `HeaderFooter`, `TextBox`, `Note`,
+  `FootnoteRef`, `CodeBlock`, `PageSetup`, `ColumnLayout`.
+- **New enums**: `UnderlineStyle`, `ParagraphAlignment`, `LineSpacing`,
+  `BorderStyle`, `CellVerticalAlign`, `TableAlignment`, `TextDirection`,
+  `ImageFormat`, `ImagePositioning`, `SectionBreakType`, `VerticalAlign`,
+  `FloatAnchor`, `TextWrap`, `ListStyle`.
+- All new fields are `Option<_>` or default to `false`/`None` — fully
+  backwards compatible; existing callers require only `..Default::default()`
+  on struct literals.
+
+### DocxWriter — OOXML emission for all new fields
+
+- **Run properties**: `<w:rFonts>`, `<w:sz>`/`<w:szCs>`, `<w:color>`,
+  `<w:shd>` (highlight), `<w:u>`, `<w:vertAlign>`, `<w:caps>`,
+  `<w:smallCaps>`, `<w:spacing>` (character spacing).
+- **Paragraph properties**: `<w:jc>`, `<w:ind>`, `<w:spacing>` (before/after/
+  line), `<w:pBdr>`, `<w:shd>`, `<w:keepNext>`, `<w:keepLines>`,
+  `<w:pageBreakBefore>`, `<w:outlineLvl>`.
+- **Table**: `<w:tblW>`, `<w:tblInd>`, `<w:tblBorders>`, `<w:jc>` (table),
+  `<w:tblCellMar>`, `<w:tblGrid>`/`<w:gridCol>`.
+- **Table row**: `<w:trHeight>`, `<w:tblHeader>`, `<w:cantSplit>`.
+- **Table cell**: `<w:tcW>`, `<w:gridSpan>`, `<w:vMerge>`, `<w:shd>` (cell),
+  `<w:tcBorders>`, `<w:vAlign>`, `<w:textDirection>`, `<w:tcMar>` (per-edge
+  padding), cell-level `text_align` propagated to contained paragraphs.
+- **Table caption**: emitted as a `Caption`-styled paragraph before `<w:tbl>`.
+- **Images**: inline `<wp:inline>` and floating `<wp:anchor>` with
+  `<wp:wrapSquare>` / `<wp:wrapTight>` / `<wp:wrapThrough>` /
+  `<wp:wrapTopAndBottom>` / `<wp:wrapNone>`.
+- **Text boxes**: `<wp:anchor>` + `<wps:txbx>` + `<w:txbxContent>`.
+- **Sections**: `<w:sectPr>` with `<w:pgSz>`, `<w:pgMar>`, `<w:cols>` (uniform
+  and per-column widths with separator rule), `<w:type>` (Continuous / NextPage
+  / EvenPage / OddPage). Header/footer parts written to `/word/header*.xml` and
+  `/word/footer*.xml` with correct relationship entries.
+- **Footnotes / endnotes**: `/word/footnotes.xml` and `/word/endnotes.xml`
+  parts; inline `<w:footnoteReference>` / `<w:endnoteReference>` runs with
+  `FootnoteReference` / `EndnoteReference` character styles.
+- **`{PAGE}` / `{NUMPAGES}` sentinels** in header/footer text spans emitted as
+  `<w:fldChar>` / `<w:instrText>` field runs.
+- **Page break**: `<w:br w:type="page">`. **Column break**: `<w:br
+  w:type="column">`.
+- **Code blocks**: `Code`-styled paragraph with preserved whitespace and
+  line breaks.
+- **Lists**: `<w:numFmt>` driven by `ListStyle`; `<w:startOverride>` for
+  non-1 `start_number`; block-level item content (tables, images) written
+  alongside the numbered paragraph.
+- **Metadata**: `author`, `subject`, `keywords`, `description`, `created`,
+  `modified` written to `docProps/core.xml` as Dublin Core properties.
+
+### PPTX IR renderer — `ir_to_pptx`
+
+- **Rich text runs**: paragraphs and headings now emit styled `<a:r>` runs via
+  `add_rich_text()` — bold, italic, font size, color, and font name from
+  `TextSpan` are all preserved. Previously all formatting was stripped.
+- **Table elements**: rendered as tab-separated cell text (rows joined with `\n`)
+  instead of being silently dropped.
+- **Image elements**: embedded as native PPTX media via the new
+  `SlideData::add_image()` API — writes a `<p:pic>` shape with `<p:blipFill>`
+  and an OPC media part. PNG, JPEG, and GIF are supported.
+- **CodeBlock elements**: rendered with Courier New font run instead of being
+  silently dropped.
+- **Slide dimensions**: first `Section.page_setup` is now forwarded to
+  `PptxWriter::set_presentation_size()` (1 twip = 914 400/1 440 EMU), fixing
+  clipped output for landscape A4 and other non-16:9 documents.
+- **New `PptxWriter::set_presentation_size(cx, cy)`** method; emits `<p:sldSz>`
+  with the correct EMU values instead of always writing the 16:9 default.
+
+### XLSX IR renderer — `ir_to_xlsx`
+
+- **Header row styling**: rows with `TableRow.is_header = true` are now written
+  with bold weight and a grey (`D3D3D3`) background via `set_cell_styled()`.
+  `TableCell.background_color` overrides the default grey when set.
+- **Cell background color**: non-header cells with `TableCell.background_color`
+  set now get a solid fill style applied.
+- **Column widths**: `Table.column_widths_twips` is now converted to Excel
+  character-width units (`twips × 96 / (1440 × 7)`, clamped 3–80) and written
+  via `set_column_width()`.
+- **Merged cells**: `TableCell.col_span` and `row_span` > 1 now emit a
+  `<mergeCells>/<mergeCell ref="…"/>` block in the worksheet XML instead of
+  being ignored.
+- **New `SheetData::merge_cells(row, col, row_span, col_span)`** method; inserts
+  `<mergeCells>` between `</sheetData>` and `</worksheet>`.
+- Row cursor tracks absolute position across all elements in a section, so
+  paragraphs and headings interleaved with tables land in the correct rows.
+
+### Writer APIs — all language bindings
+
+`XlsxWriter` and `PptxWriter` (previously Rust-only) are now callable from
+every binding layer via a new index-based C FFI surface:
+
+**New C FFI symbols** (`include/office_oxide_c/office_oxide.h`):
+
+- `office_xlsx_writer_new/free`, `office_xlsx_writer_add_sheet` (returns sheet
+  index), `office_xlsx_sheet_set_cell`, `office_xlsx_sheet_set_cell_styled`
+  (bold + hex background), `office_xlsx_sheet_merge_cells`,
+  `office_xlsx_sheet_set_column_width`, `office_xlsx_writer_save`,
+  `office_xlsx_writer_to_bytes`
+- `office_pptx_writer_new/free`, `office_pptx_writer_set_presentation_size`,
+  `office_pptx_writer_add_slide` (returns slide index),
+  `office_pptx_slide_set_title`, `office_pptx_slide_add_text`,
+  `office_pptx_slide_add_image` (PNG/JPEG/GIF bytes + EMU geometry),
+  `office_pptx_writer_save`, `office_pptx_writer_to_bytes`
+
+**Go** — `XlsxWriter` and `PptxWriter` structs with CGo wrappers and
+`runtime.SetFinalizer` for safe GC.
+
+**C# / .NET** — new `OfficeOxide.XlsxWriter` and `OfficeOxide.PptxWriter`
+classes (`IDisposable`); P/Invoke declarations added to `NativeMethods`.
+
+**Node.js** — `XlsxWriter` and `PptxWriter` ESM + CJS classes; koffi
+function prototypes; TypeScript `ImageFormat` type and class declarations.
+
+**Python** — `XlsxWriter` and `PyO3PptxWriter` PyO3 classes calling Rust
+directly (no C FFI round-trip); exported from `office_oxide` with full type
+stubs in `_native.pyi`.
+
+### Bug fixes
+
+- `TableCell.padding` (`CellPadding`) was defined in the IR but silently
+  dropped by the writer; now emits `<w:tcMar>` with per-edge twip values.
+- `TableCell.text_align` was defined in the IR but silently dropped; now
+  propagated to contained paragraphs (respects pre-existing paragraph
+  alignment, so explicit paragraph alignment is never overwritten).
+- `Table.caption` was defined in the IR but silently dropped; now emitted
+  as a `Caption`-styled paragraph immediately before the table.
+
 ## [0.1.0] - 2026-04-27
 
 > Initial public release
@@ -221,4 +385,5 @@ companion workspace crates `office_oxide_cli` and `office_oxide_mcp`.
 - See [BENCHMARKS.md](BENCHMARKS.md) for per-format timings and the
   full failure breakdown
 
+[0.1.1]: https://github.com/yfedoseev/office_oxide/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/yfedoseev/office_oxide/releases/tag/v0.1.0

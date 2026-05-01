@@ -87,18 +87,83 @@ pub fn create_from_ir_to_writer<W: Write + Seek>(
     Ok(())
 }
 
-/// Convert IR to a DOCX writer.
+// ---------------------------------------------------------------------------
+// DOCX conversion
+// ---------------------------------------------------------------------------
+
 fn ir_to_docx(ir: &DocumentIR) -> crate::docx::write::DocxWriter {
-    let mut writer = crate::docx::write::DocxWriter::new();
+    use crate::docx::write::{DocxWriter, IrParaProps, Run};
+
+    let mut writer = DocxWriter::new();
+
+    // Write metadata
+    writer.set_metadata(&ir.metadata);
 
     for section in &ir.sections {
+        // Section title becomes H1
         if let Some(ref title) = section.title {
             if !title.is_empty() {
-                writer.add_heading(title, 1);
+                let runs = [Run::new(title)];
+                let props = IrParaProps {
+                    style: Some("Heading1".to_string()),
+                    ..Default::default()
+                };
+                writer.add_ir_paragraph(&runs, Some(props));
             }
         }
+
+        // Section headers/footers
+        if let Some(ref hf) = section.header {
+            writer.add_section_header(
+                crate::docx::write::HfType::default_header(),
+                hf.content.clone(),
+            );
+        }
+        if let Some(ref hf) = section.footer {
+            writer.add_section_header(
+                crate::docx::write::HfType::default_footer(),
+                hf.content.clone(),
+            );
+        }
+        if let Some(ref hf) = section.first_page_header {
+            writer.add_section_header(
+                crate::docx::write::HfType::first_page_header(),
+                hf.content.clone(),
+            );
+        }
+        if let Some(ref hf) = section.first_page_footer {
+            writer.add_section_header(
+                crate::docx::write::HfType::first_page_footer(),
+                hf.content.clone(),
+            );
+        }
+        if let Some(ref hf) = section.even_page_header {
+            writer.add_section_header(
+                crate::docx::write::HfType::even_page_header(),
+                hf.content.clone(),
+            );
+        }
+        if let Some(ref hf) = section.even_page_footer {
+            writer.add_section_header(
+                crate::docx::write::HfType::even_page_footer(),
+                hf.content.clone(),
+            );
+        }
+
         for elem in &section.elements {
             add_element_to_docx(&mut writer, elem);
+        }
+
+        // Section page setup / columns
+        if section.page_setup.is_some()
+            || section.columns.is_some()
+            || section.break_type != SectionBreakType::Continuous
+        {
+            writer.set_section_props(
+                section.page_setup.clone(),
+                section.columns.clone(),
+                section.break_type.clone(),
+            );
         }
     }
 
@@ -106,53 +171,126 @@ fn ir_to_docx(ir: &DocumentIR) -> crate::docx::write::DocxWriter {
 }
 
 fn add_element_to_docx(writer: &mut crate::docx::write::DocxWriter, elem: &Element) {
+    use crate::docx::write::{IrParaProps, Run};
+
     match elem {
         Element::Heading(h) => {
-            let text = inline_to_text(&h.content);
-            writer.add_heading(&text, h.level);
+            let level = h.level.clamp(1, 6);
+            let runs: Vec<Run> = ir_inline_to_runs(&h.content);
+            let props = IrParaProps {
+                style: Some(format!("Heading{level}")),
+                ..Default::default()
+            };
+            writer.add_ir_paragraph(&runs, Some(props));
         },
         Element::Paragraph(p) => {
-            let text = inline_to_text(&p.content);
-            if !text.is_empty() {
-                writer.add_paragraph(&text);
+            let runs = ir_inline_to_runs(&p.content);
+            if runs
+                .iter()
+                .any(|r| !r.text.is_empty() || r.footnote_ref.is_some() || r.endnote_ref.is_some())
+            {
+                let props = IrParaProps {
+                    alignment: p.alignment.clone(),
+                    indent_left_twips: p.indent_left_twips,
+                    indent_right_twips: p.indent_right_twips,
+                    first_line_indent_twips: p.first_line_indent_twips,
+                    space_before_twips: p.space_before_twips,
+                    space_after_twips: p.space_after_twips,
+                    line_spacing: p.line_spacing.clone(),
+                    keep_with_next: p.keep_with_next,
+                    keep_together: p.keep_together,
+                    page_break_before: p.page_break_before,
+                    background_color: p.background_color,
+                    outline_level: p.outline_level,
+                    border: p.border.clone(),
+                    ..Default::default()
+                };
+                writer.add_ir_paragraph(&runs, Some(props));
             }
         },
         Element::Table(t) => {
-            let rows: Vec<Vec<String>> = t
-                .rows
-                .iter()
-                .map(|r| {
-                    r.cells
-                        .iter()
-                        .map(|c| {
-                            c.content
-                                .iter()
-                                .map(|e| match e {
-                                    Element::Paragraph(p) => inline_to_text(&p.content),
-                                    _ => String::new(),
-                                })
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        })
-                        .collect()
-                })
-                .collect();
-            let row_refs: Vec<Vec<&str>> = rows
-                .iter()
-                .map(|r| r.iter().map(String::as_str).collect())
-                .collect();
-            writer.add_table(&row_refs);
+            writer.add_ir_table(t);
         },
         Element::List(l) => {
-            let items: Vec<String> = l.items.iter().map(|i| inline_to_text(&i.content)).collect();
-            let item_refs: Vec<&str> = items.iter().map(String::as_str).collect();
-            writer.add_list(&item_refs, l.ordered);
+            writer.add_ir_list(l);
         },
-        Element::ThematicBreak | Element::Image(_) => {},
+        Element::Image(img) => {
+            writer.add_ir_image(img);
+        },
+        Element::ThematicBreak => {
+            // Emitted as a blank paragraph (no visual rule; full border support is a future enhancement).
+            let props = IrParaProps::default();
+            writer.add_ir_paragraph(&[], Some(props));
+        },
+        Element::PageBreak => {
+            writer.add_page_break();
+        },
+        Element::ColumnBreak => {
+            writer.add_column_break();
+        },
+        Element::TextBox(tb) => {
+            writer.add_text_box(tb);
+        },
+        Element::Footnote(n) => {
+            writer.add_footnote(n.id, &n.content);
+        },
+        Element::Endnote(n) => {
+            writer.add_endnote(n.id, &n.content);
+        },
+        Element::CodeBlock(cb) => {
+            writer.add_code_block(&cb.content);
+        },
     }
 }
 
-/// Convert IR to an XLSX writer.
+fn ir_inline_to_runs(content: &[InlineContent]) -> Vec<crate::docx::write::Run> {
+    use crate::docx::write::Run;
+    let mut runs: Vec<Run> = Vec::new();
+    for item in content {
+        match item {
+            InlineContent::Text(span) => {
+                let mut run = Run::new(&span.text);
+                run.bold = span.bold;
+                run.italic = span.italic;
+                run.strikethrough = span.strikethrough;
+                run.font_name = span.font_name.clone();
+                run.font_size_half_pt = span.font_size_half_pt;
+                run.color_rgb = span.color;
+                run.underline_style = span.underline.clone();
+                run.highlight = span.highlight;
+                run.vertical_align = span.vertical_align.clone();
+                run.all_caps = span.all_caps;
+                run.small_caps = span.small_caps;
+                run.char_spacing_half_pt = span.char_spacing_half_pt;
+                runs.push(run);
+            },
+            InlineContent::LineBreak => {
+                runs.push(Run {
+                    text: "\n".to_string(),
+                    ..Default::default()
+                });
+            },
+            InlineContent::FootnoteRef(r) => {
+                runs.push(Run {
+                    footnote_ref: Some(r.note_id),
+                    ..Default::default()
+                });
+            },
+            InlineContent::EndnoteRef(r) => {
+                runs.push(Run {
+                    endnote_ref: Some(r.note_id),
+                    ..Default::default()
+                });
+            },
+        }
+    }
+    runs
+}
+
+// ---------------------------------------------------------------------------
+// XLSX conversion
+// ---------------------------------------------------------------------------
+
 fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
     use crate::xlsx::write::CellData;
 
@@ -161,46 +299,51 @@ fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
     for section in &ir.sections {
         let name = section.title.as_deref().unwrap_or("Sheet");
         let mut sheet = writer.add_sheet(name);
+        let mut row_cursor = 0usize;
 
         for elem in &section.elements {
             match elem {
                 Element::Table(t) => {
+                    for (ci, &twips) in t.column_widths_twips.iter().enumerate() {
+                        if twips > 0 {
+                            let w = (twips as f64) * 96.0 / (1440.0 * 7.0);
+                            sheet.set_column_width(ci, w.clamp(3.0, 80.0));
+                        }
+                    }
                     for row in &t.rows {
-                        let cells: Vec<CellData> = row
-                            .cells
-                            .iter()
-                            .map(|c| {
-                                let text: String = c
-                                    .content
-                                    .iter()
-                                    .map(|e| match e {
-                                        Element::Paragraph(p) => inline_to_text(&p.content),
-                                        _ => String::new(),
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(" ");
-                                if text.is_empty() {
-                                    CellData::Empty
-                                } else if let Ok(n) = text.parse::<f64>() {
-                                    CellData::Number(n)
-                                } else {
-                                    CellData::String(text)
-                                }
-                            })
-                            .collect();
-                        sheet.add_row(cells);
+                        let mut col = 0usize;
+                        for cell in &row.cells {
+                            let text = cell_text(cell);
+                            let data = text_to_cell_data(&text);
+                            if let Some(style) =
+                                xlsx_cell_style(row.is_header, cell.background_color)
+                            {
+                                sheet.set_cell_styled(row_cursor, col, data, style);
+                            } else {
+                                sheet.set_cell(row_cursor, col, data);
+                            }
+                            let cs = cell.col_span.max(1) as usize;
+                            let rs = cell.row_span.max(1) as usize;
+                            if cs > 1 || rs > 1 {
+                                sheet.merge_cells(row_cursor, col, rs, cs);
+                            }
+                            col += cs;
+                        }
+                        row_cursor += 1;
                     }
                 },
                 Element::Paragraph(p) => {
                     let text = inline_to_text(&p.content);
                     if !text.is_empty() {
-                        sheet.add_row(vec![CellData::String(text)]);
+                        sheet.set_cell(row_cursor, 0, CellData::String(text));
+                        row_cursor += 1;
                     }
                 },
                 Element::Heading(h) => {
                     let text = inline_to_text(&h.content);
                     if !text.is_empty() {
-                        sheet.add_row(vec![CellData::String(text)]);
+                        sheet.set_cell(row_cursor, 0, CellData::String(text));
+                        row_cursor += 1;
                     }
                 },
                 _ => {},
@@ -211,9 +354,18 @@ fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
     writer
 }
 
-/// Convert IR to a PPTX writer.
+// ---------------------------------------------------------------------------
+// PPTX conversion
+// ---------------------------------------------------------------------------
+
 fn ir_to_pptx(ir: &DocumentIR) -> crate::pptx::write::PptxWriter {
     let mut writer = crate::pptx::write::PptxWriter::new();
+
+    if let Some(ps) = ir.sections.iter().find_map(|s| s.page_setup.as_ref()) {
+        let cx = ps.width_twips as u64 * 914_400 / 1440;
+        let cy = ps.height_twips as u64 * 914_400 / 1440;
+        writer.set_presentation_size(cx, cy);
+    }
 
     for section in &ir.sections {
         let slide = writer.add_slide();
@@ -227,25 +379,66 @@ fn ir_to_pptx(ir: &DocumentIR) -> crate::pptx::write::PptxWriter {
         for elem in &section.elements {
             match elem {
                 Element::Heading(h) => {
-                    let text = inline_to_text(&h.content);
-                    // If no title yet, use heading as title
                     if slide.title.is_none() {
-                        slide.set_title(&text);
+                        slide.set_title(&inline_to_text(&h.content));
                     } else {
-                        slide.add_text(&text);
+                        let runs = inline_to_pptx_runs(&h.content);
+                        if !runs.is_empty() {
+                            slide.add_rich_text(&runs);
+                        }
                     }
                 },
                 Element::Paragraph(p) => {
-                    let text = inline_to_text(&p.content);
+                    let runs = inline_to_pptx_runs(&p.content);
+                    if !runs.is_empty() {
+                        slide.add_rich_text(&runs);
+                    }
+                },
+                Element::List(l) => {
+                    let items: Vec<String> = l
+                        .items
+                        .iter()
+                        .map(|i| {
+                            i.content
+                                .iter()
+                                .map(|e| match e {
+                                    Element::Paragraph(p) => inline_to_text(&p.content),
+                                    _ => String::new(),
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .collect();
+                    let item_refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
+                    slide.add_bullet_list(&item_refs);
+                },
+                Element::Table(t) => {
+                    let text = t
+                        .rows
+                        .iter()
+                        .map(|row| {
+                            row.cells
+                                .iter()
+                                .map(cell_text)
+                                .collect::<Vec<_>>()
+                                .join("\t")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     if !text.is_empty() {
                         slide.add_text(&text);
                     }
                 },
-                Element::List(l) => {
-                    let items: Vec<String> =
-                        l.items.iter().map(|i| inline_to_text(&i.content)).collect();
-                    let item_refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
-                    slide.add_bullet_list(&item_refs);
+                Element::Image(img) => {
+                    if let (Some(data), Some(fmt)) = (&img.data, &img.format) {
+                        let cx = img.display_width_emu.unwrap_or(3_000_000);
+                        let cy = img.display_height_emu.unwrap_or(2_000_000);
+                        slide.add_image(data.clone(), fmt.clone(), 0, 0, cx, cy);
+                    }
+                },
+                Element::CodeBlock(cb) => {
+                    let run = crate::pptx::write::Run::new(&cb.content).font("Courier New");
+                    slide.add_rich_text(&[run]);
                 },
                 _ => {},
             }
@@ -255,14 +448,87 @@ fn ir_to_pptx(ir: &DocumentIR) -> crate::pptx::write::PptxWriter {
     writer
 }
 
-/// Extract plain text from inline content.
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 fn inline_to_text(content: &[InlineContent]) -> String {
     let mut out = String::new();
     for item in content {
         match item {
             InlineContent::Text(span) => out.push_str(&span.text),
             InlineContent::LineBreak => out.push('\n'),
+            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
         }
     }
     out
+}
+
+fn rgb_to_hex(rgb: [u8; 3]) -> String {
+    format!("{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
+}
+
+fn cell_text(cell: &TableCell) -> String {
+    cell.content
+        .iter()
+        .map(|e| match e {
+            Element::Paragraph(p) => inline_to_text(&p.content),
+            _ => String::new(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn text_to_cell_data(text: &str) -> crate::xlsx::write::CellData {
+    use crate::xlsx::write::CellData;
+    if text.is_empty() {
+        CellData::Empty
+    } else if let Ok(n) = text.parse::<f64>() {
+        CellData::Number(n)
+    } else {
+        CellData::String(text.to_string())
+    }
+}
+
+fn xlsx_cell_style(is_header: bool, bg: Option<[u8; 3]>) -> Option<crate::xlsx::write::CellStyle> {
+    use crate::xlsx::write::CellStyle;
+    if is_header {
+        let bg_hex = bg.map(rgb_to_hex).unwrap_or_else(|| "D3D3D3".to_string());
+        Some(CellStyle::new().bold().background(bg_hex))
+    } else {
+        bg.map(|c| CellStyle::new().background(rgb_to_hex(c)))
+    }
+}
+
+fn inline_to_pptx_runs(content: &[InlineContent]) -> Vec<crate::pptx::write::Run> {
+    use crate::pptx::write::Run;
+    content
+        .iter()
+        .filter_map(|item| {
+            if let InlineContent::Text(span) = item {
+                if span.text.is_empty() {
+                    return None;
+                }
+                let mut run = Run::new(&span.text);
+                if span.bold {
+                    run = run.bold();
+                }
+                if span.italic {
+                    run = run.italic();
+                }
+                if let Some(half_pt) = span.font_size_half_pt {
+                    run = run.font_size(half_pt as f64 / 2.0);
+                }
+                if let Some(c) = span.color {
+                    run = run.color(rgb_to_hex(c));
+                }
+                if let Some(ref name) = span.font_name {
+                    run = run.font(name.clone());
+                }
+                Some(run)
+            } else {
+                None
+            }
+        })
+        .collect()
 }

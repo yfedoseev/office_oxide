@@ -482,4 +482,87 @@ mod tests {
         assert!(md.contains("| --- | --- |"));
         assert!(md.contains("| 1 | 2 |"));
     }
+
+    fn make_doc(sheets: Vec<Sheet>) -> XlsDocument {
+        XlsDocument {
+            images: Vec::new(),
+            sheets,
+        }
+    }
+
+    #[test]
+    fn ir_empty_doc_produces_no_sections() {
+        let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![]));
+        assert!(ir.sections.is_empty());
+        assert!(ir.metadata.title.is_none());
+    }
+
+    #[test]
+    fn ir_empty_sheet_has_no_table() {
+        let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![Sheet {
+            name: "Empty".into(),
+            rows: vec![],
+        }]));
+        assert_eq!(ir.sections[0].title.as_deref(), Some("Empty"));
+        assert!(ir.sections[0].elements.is_empty());
+    }
+
+    #[test]
+    fn ir_sheet_with_data_produces_table_with_header_row() {
+        use crate::ir::Element;
+        let rows = vec![
+            vec![
+                CellValue::String("Name".into()),
+                CellValue::String("Score".into()),
+            ],
+            vec![CellValue::String("Alice".into()), CellValue::Number(95.0)],
+        ];
+        let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![Sheet {
+            name: "Results".into(),
+            rows,
+        }]));
+        assert_eq!(ir.metadata.title.as_deref(), Some("Results"));
+        assert!(matches!(ir.sections[0].elements[0], Element::Table(_)));
+        if let Element::Table(ref t) = ir.sections[0].elements[0] {
+            assert!(t.rows[0].is_header);
+            assert!(!t.rows[1].is_header);
+        }
+    }
+
+    #[test]
+    fn ir_empty_cell_value_produces_empty_paragraph_content() {
+        use crate::ir::Element;
+        let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![Sheet {
+            name: "S".into(),
+            rows: vec![vec![CellValue::Empty]],
+        }]));
+        if let Element::Table(ref t) = ir.sections[0].elements[0] {
+            if let Element::Paragraph(ref p) = t.rows[0].cells[0].content[0] {
+                assert!(p.content.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn ir_multiple_sheets_produce_multiple_sections() {
+        let doc = make_doc(vec![
+            Sheet {
+                name: "A".into(),
+                rows: vec![vec![CellValue::Number(1.0)]],
+            },
+            Sheet {
+                name: "B".into(),
+                rows: vec![vec![CellValue::String("x".into())]],
+            },
+        ]);
+        let ir = crate::convert_xls::xls_to_ir(&doc);
+        assert_eq!(ir.sections.len(), 2);
+        assert_eq!(ir.sections[1].title.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn ir_format_is_xls() {
+        let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![]));
+        assert_eq!(ir.metadata.format, crate::format::DocumentFormat::Xls);
+    }
 }

@@ -650,19 +650,53 @@ fn docx_lists_to_ir() {
 
     if let Element::List(list) = &ir.sections[0].elements[0] {
         assert!(!list.ordered); // bullet = unordered
-        // Check first item text
-        assert!(
-            list.items[0]
-                .content
-                .iter()
-                .any(|c| matches!(c, InlineContent::Text(s) if s.text == "First item"))
-        );
-        assert!(
-            list.items[1]
-                .content
-                .iter()
-                .any(|c| matches!(c, InlineContent::Text(s) if s.text == "Second item"))
-        );
+        // Check first item text (content is now Vec<Element>)
+        let item0_text: String = list.items[0]
+            .content
+            .iter()
+            .filter_map(|e| {
+                if let Element::Paragraph(p) = e {
+                    Some(
+                        p.content
+                            .iter()
+                            .filter_map(|c| {
+                                if let InlineContent::Text(s) = c {
+                                    Some(s.text.as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<String>(),
+                    )
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(item0_text.contains("First item"), "item0: {item0_text}");
+        let item1_text: String = list.items[1]
+            .content
+            .iter()
+            .filter_map(|e| {
+                if let Element::Paragraph(p) = e {
+                    Some(
+                        p.content
+                            .iter()
+                            .filter_map(|c| {
+                                if let InlineContent::Text(s) = c {
+                                    Some(s.text.as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<String>(),
+                    )
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(item1_text.contains("Second item"), "item1: {item1_text}");
     }
 
     // Second element should be a paragraph
