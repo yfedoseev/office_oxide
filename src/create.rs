@@ -299,46 +299,49 @@ fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
     for section in &ir.sections {
         let name = section.title.as_deref().unwrap_or("Sheet");
         let mut sheet = writer.add_sheet(name);
+        let mut row_cursor = 0usize;
 
         for elem in &section.elements {
             match elem {
                 Element::Table(t) => {
+                    for (ci, &twips) in t.column_widths_twips.iter().enumerate() {
+                        if twips > 0 {
+                            let w = (twips as f64) * 96.0 / (1440.0 * 7.0);
+                            sheet.set_column_width(ci, w.clamp(3.0, 80.0));
+                        }
+                    }
                     for row in &t.rows {
-                        let cells: Vec<CellData> = row
-                            .cells
-                            .iter()
-                            .map(|c| {
-                                let text: String = c
-                                    .content
-                                    .iter()
-                                    .map(|e| match e {
-                                        Element::Paragraph(p) => inline_to_text(&p.content),
-                                        _ => String::new(),
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(" ");
-                                if text.is_empty() {
-                                    CellData::Empty
-                                } else if let Ok(n) = text.parse::<f64>() {
-                                    CellData::Number(n)
-                                } else {
-                                    CellData::String(text)
-                                }
-                            })
-                            .collect();
-                        sheet.add_row(cells);
+                        let mut col = 0usize;
+                        for cell in &row.cells {
+                            let text = cell_text(cell);
+                            let data = text_to_cell_data(&text);
+                            if let Some(style) = xlsx_cell_style(row.is_header, cell.background_color) {
+                                sheet.set_cell_styled(row_cursor, col, data, style);
+                            } else {
+                                sheet.set_cell(row_cursor, col, data);
+                            }
+                            let cs = cell.col_span.max(1) as usize;
+                            let rs = cell.row_span.max(1) as usize;
+                            if cs > 1 || rs > 1 {
+                                sheet.merge_cells(row_cursor, col, rs, cs);
+                            }
+                            col += cs;
+                        }
+                        row_cursor += 1;
                     }
                 },
                 Element::Paragraph(p) => {
                     let text = inline_to_text(&p.content);
                     if !text.is_empty() {
-                        sheet.add_row(vec![CellData::String(text)]);
+                        sheet.set_cell(row_cursor, 0, CellData::String(text));
+                        row_cursor += 1;
                     }
                 },
                 Element::Heading(h) => {
                     let text = inline_to_text(&h.content);
                     if !text.is_empty() {
-                        sheet.add_row(vec![CellData::String(text)]);
+                        sheet.set_cell(row_cursor, 0, CellData::String(text));
+                        row_cursor += 1;
                     }
                 },
                 _ => {},
@@ -356,6 +359,12 @@ fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
 fn ir_to_pptx(ir: &DocumentIR) -> crate::pptx::write::PptxWriter {
     let mut writer = crate::pptx::write::PptxWriter::new();
 
+    if let Some(ps) = ir.sections.iter().find_map(|s| s.page_setup.as_ref()) {
+        let cx = ps.width_twips as u64 * 914_400 / 1440;
+        let cy = ps.height_twips as u64 * 914_400 / 1440;
+        writer.set_presentation_size(cx, cy);
+    }
+
     for section in &ir.sections {
         let slide = writer.add_slide();
 
@@ -368,17 +377,19 @@ fn ir_to_pptx(ir: &DocumentIR) -> crate::pptx::write::PptxWriter {
         for elem in &section.elements {
             match elem {
                 Element::Heading(h) => {
-                    let text = inline_to_text(&h.content);
                     if slide.title.is_none() {
-                        slide.set_title(&text);
+                        slide.set_title(&inline_to_text(&h.content));
                     } else {
-                        slide.add_text(&text);
+                        let runs = inline_to_pptx_runs(&h.content);
+                        if !runs.is_empty() {
+                            slide.add_rich_text(&runs);
+                        }
                     }
                 },
                 Element::Paragraph(p) => {
-                    let text = inline_to_text(&p.content);
-                    if !text.is_empty() {
-                        slide.add_text(&text);
+                    let runs = inline_to_pptx_runs(&p.content);
+                    if !runs.is_empty() {
+                        slide.add_rich_text(&runs);
                     }
                 },
                 Element::List(l) => {
@@ -398,6 +409,34 @@ fn ir_to_pptx(ir: &DocumentIR) -> crate::pptx::write::PptxWriter {
                         .collect();
                     let item_refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
                     slide.add_bullet_list(&item_refs);
+                },
+                Element::Table(t) => {
+                    let text = t
+                        .rows
+                        .iter()
+                        .map(|row| {
+                            row.cells
+                                .iter()
+                                .map(|c| cell_text(c))
+                                .collect::<Vec<_>>()
+                                .join("\t")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !text.is_empty() {
+                        slide.add_text(&text);
+                    }
+                },
+                Element::Image(img) => {
+                    if let (Some(data), Some(fmt)) = (&img.data, &img.format) {
+                        let cx = img.display_width_emu.unwrap_or(3_000_000);
+                        let cy = img.display_height_emu.unwrap_or(2_000_000);
+                        slide.add_image(data.clone(), fmt.clone(), 0, 0, cx, cy);
+                    }
+                },
+                Element::CodeBlock(cb) => {
+                    let run = crate::pptx::write::Run::new(&cb.content).font("Courier New");
+                    slide.add_rich_text(&[run]);
                 },
                 _ => {},
             }
@@ -421,4 +460,73 @@ fn inline_to_text(content: &[InlineContent]) -> String {
         }
     }
     out
+}
+
+fn rgb_to_hex(rgb: [u8; 3]) -> String {
+    format!("{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
+}
+
+fn cell_text(cell: &TableCell) -> String {
+    cell.content
+        .iter()
+        .map(|e| match e {
+            Element::Paragraph(p) => inline_to_text(&p.content),
+            _ => String::new(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn text_to_cell_data(text: &str) -> crate::xlsx::write::CellData {
+    use crate::xlsx::write::CellData;
+    if text.is_empty() {
+        CellData::Empty
+    } else if let Ok(n) = text.parse::<f64>() {
+        CellData::Number(n)
+    } else {
+        CellData::String(text.to_string())
+    }
+}
+
+fn xlsx_cell_style(is_header: bool, bg: Option<[u8; 3]>) -> Option<crate::xlsx::write::CellStyle> {
+    use crate::xlsx::write::CellStyle;
+    if is_header {
+        let bg_hex = bg.map(rgb_to_hex).unwrap_or_else(|| "D3D3D3".to_string());
+        Some(CellStyle::new().bold().background(bg_hex))
+    } else {
+        bg.map(|c| CellStyle::new().background(rgb_to_hex(c)))
+    }
+}
+
+fn inline_to_pptx_runs(content: &[InlineContent]) -> Vec<crate::pptx::write::Run> {
+    use crate::pptx::write::Run;
+    content
+        .iter()
+        .filter_map(|item| {
+            if let InlineContent::Text(span) = item {
+                if span.text.is_empty() {
+                    return None;
+                }
+                let mut run = Run::new(&span.text);
+                if span.bold {
+                    run = run.bold();
+                }
+                if span.italic {
+                    run = run.italic();
+                }
+                if let Some(half_pt) = span.font_size_half_pt {
+                    run = run.font_size(half_pt as f64 / 2.0);
+                }
+                if let Some(c) = span.color {
+                    run = run.color(rgb_to_hex(c));
+                }
+                if let Some(ref name) = span.font_name {
+                    run = run.font(name.clone());
+                }
+                Some(run)
+            } else {
+                None
+            }
+        })
+        .collect()
 }

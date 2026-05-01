@@ -240,6 +240,8 @@ struct SheetDataInner {
     pub rows: Vec<Vec<Option<StoredCellInner>>>,
     pub col_widths: HashMap<usize, f64>,
     pub cell_styles: HashMap<(usize, usize), CellStyle>,
+    /// Merged cell regions: (row, col, row_span, col_span).
+    pub merge_regions: Vec<(usize, usize, usize, usize)>,
 }
 
 impl SheetDataInner {
@@ -249,6 +251,7 @@ impl SheetDataInner {
             rows: Vec::new(),
             col_widths: HashMap::new(),
             cell_styles: HashMap::new(),
+            merge_regions: Vec::new(),
         }
     }
 
@@ -291,6 +294,19 @@ impl SheetDataInner {
 
     pub fn set_column_width(&mut self, col: usize, width: f64) -> &mut Self {
         self.col_widths.insert(col, width);
+        self
+    }
+
+    pub fn merge_cells(
+        &mut self,
+        row: usize,
+        col: usize,
+        row_span: usize,
+        col_span: usize,
+    ) -> &mut Self {
+        if row_span > 1 || col_span > 1 {
+            self.merge_regions.push((row, col, row_span, col_span));
+        }
         self
     }
 }
@@ -347,6 +363,21 @@ impl<'a> SheetData<'a> {
     /// Set the width of a column in character units.
     pub fn set_column_width(&mut self, col: usize, width: f64) -> &mut Self {
         self.0.set_column_width(col, width);
+        self
+    }
+
+    /// Merge a rectangular range of cells.
+    ///
+    /// The top-left cell retains its value; the rest are blanked by the reader.
+    /// A span of 1×1 is a no-op.
+    pub fn merge_cells(
+        &mut self,
+        row: usize,
+        col: usize,
+        row_span: usize,
+        col_span: usize,
+    ) -> &mut Self {
+        self.0.merge_cells(row, col, row_span, col_span);
         self
     }
 }
@@ -509,6 +540,23 @@ impl XlsxWriter {
         }
 
         w.write_event(Event::End(BytesEnd::new("sheetData")))?;
+
+        if !sheet.merge_regions.is_empty() {
+            let count_str = sheet.merge_regions.len().to_string();
+            let mut mc_elem = BytesStart::new("mergeCells");
+            mc_elem.push_attribute(("count", count_str.as_str()));
+            w.write_event(Event::Start(mc_elem))?;
+            for &(row, col, row_span, col_span) in &sheet.merge_regions {
+                let tl = format!("{}{}", col_name(col as u32), row + 1);
+                let br = format!("{}{}", col_name((col + col_span - 1) as u32), row + row_span);
+                let ref_str = format!("{tl}:{br}");
+                let mut mc = BytesStart::new("mergeCell");
+                mc.push_attribute(("ref", ref_str.as_str()));
+                w.write_event(Event::Empty(mc))?;
+            }
+            w.write_event(Event::End(BytesEnd::new("mergeCells")))?;
+        }
+
         w.write_event(Event::End(BytesEnd::new("worksheet")))?;
 
         Ok(w.into_inner())
@@ -1029,5 +1077,27 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         wb.write_to(&mut buf).expect("write xlsx");
         assert!(!buf.get_ref().is_empty());
+    }
+
+    #[test]
+    fn merge_cells_xml() {
+        let mut wb = XlsxWriter::new();
+        let mut sheet = wb.add_sheet("MergeTest");
+        sheet.set_cell(0, 0, CellData::String("Merged".into()));
+        sheet.merge_cells(0, 0, 1, 2);
+
+        let mut buf = std::io::Cursor::new(Vec::new());
+        wb.write_to(&mut buf).expect("write xlsx");
+
+        // Extract sheet1.xml from the zip and verify mergeCells element
+        buf.set_position(0);
+        let mut zip = zip::ZipArchive::new(buf).expect("open zip");
+        let mut sheet_xml = String::new();
+        {
+            let mut entry = zip.by_name("xl/worksheets/sheet1.xml").expect("find sheet");
+            std::io::Read::read_to_string(&mut entry, &mut sheet_xml).expect("read");
+        }
+        assert!(sheet_xml.contains("<mergeCells"), "missing mergeCells");
+        assert!(sheet_xml.contains(r#"ref="A1:B1""#), "wrong ref");
     }
 }
