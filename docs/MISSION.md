@@ -13,7 +13,7 @@ The LLM era demands fast, reliable document processing at scale:
 - **Privacy-first processing** — on-device, in-browser (WASM), no cloud round-trips. Enterprises won't send sensitive docs to third-party APIs.
 - **Universal conversion** — the world runs on DOCX, XLSX, PPTX, and PDF. Moving between them should be instant and lossless.
 
-## Current State (v0.1.0 — shipped)
+## Current State (v0.1.1 — shipped)
 
 All six Office formats are production-ready:
 

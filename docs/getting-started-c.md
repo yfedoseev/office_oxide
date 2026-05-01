@@ -67,7 +67,7 @@ LD_LIBRARY_PATH=/usr/local/lib ./quickstart
 ### Library info
 
 ```c
-const char *version = office_oxide_version();           // "0.1.0" — don't free
+const char *version = office_oxide_version();           // "0.1.1" — don't free
 const char *fmt     = office_oxide_detect_format("f"); // "docx"/... or NULL
 ```
 

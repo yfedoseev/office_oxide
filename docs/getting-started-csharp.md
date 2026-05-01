@@ -5,7 +5,7 @@
 ## Installation
 
 ```bash
-dotnet add package OfficeOxide --version 0.1.0
+dotnet add package OfficeOxide --version 0.1.1
 ```
 
 Requires .NET 8 or .NET 10. The NuGet package ships prebuilt native libraries for `win-x64`, `linux-x64`, `linux-arm64`, `osx-x64`, `osx-arm64` under `runtimes/<rid>/native/`. `dotnet publish` places the right one next to your binary automatically.
@@ -65,7 +65,7 @@ string md   = OfficeOxide.ToMarkdown("file.pptx");
 string html = OfficeOxide.ToHtml("file.xlsx");
 
 string? fmt = Document.DetectFormat("mystery.bin"); // null if unsupported
-Console.WriteLine(Document.Version);                // "0.1.0"
+Console.WriteLine(Document.Version);                // "0.1.1"
 ```
 
 ### `EditableDocument`

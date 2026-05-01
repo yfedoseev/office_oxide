@@ -64,7 +64,7 @@ import office_oxide
 office_oxide.extract_text("file.docx")   # → str
 office_oxide.to_markdown("file.pptx")    # → str
 office_oxide.to_html("file.xlsx")        # → str
-office_oxide.version()                   # → "0.1.0"
+office_oxide.version()                   # → "0.1.1"
 ```
 
 ### `EditableDocument`
