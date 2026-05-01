@@ -5,9 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.1] - 2026-04-29
+## [0.1.1] - 2026-04-30
 
-> Richer IR type system and DOCX writer output
+> Richer IR type system, DOCX writer output, improved PPTX/XLSX IR renderers, and writer APIs in all language bindings
 
 ### IR — extended type system
 
@@ -91,6 +91,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alongside the numbered paragraph.
 - **Metadata**: `author`, `subject`, `keywords`, `description`, `created`,
   `modified` written to `docProps/core.xml` as Dublin Core properties.
+
+### PPTX IR renderer — `ir_to_pptx`
+
+- **Rich text runs**: paragraphs and headings now emit styled `<a:r>` runs via
+  `add_rich_text()` — bold, italic, font size, color, and font name from
+  `TextSpan` are all preserved. Previously all formatting was stripped.
+- **Table elements**: rendered as tab-separated cell text (rows joined with `\n`)
+  instead of being silently dropped.
+- **Image elements**: embedded as native PPTX media via the new
+  `SlideData::add_image()` API — writes a `<p:pic>` shape with `<p:blipFill>`
+  and an OPC media part. PNG, JPEG, and GIF are supported.
+- **CodeBlock elements**: rendered with Courier New font run instead of being
+  silently dropped.
+- **Slide dimensions**: first `Section.page_setup` is now forwarded to
+  `PptxWriter::set_presentation_size()` (1 twip = 914 400/1 440 EMU), fixing
+  clipped output for landscape A4 and other non-16:9 documents.
+- **New `PptxWriter::set_presentation_size(cx, cy)`** method; emits `<p:sldSz>`
+  with the correct EMU values instead of always writing the 16:9 default.
+
+### XLSX IR renderer — `ir_to_xlsx`
+
+- **Header row styling**: rows with `TableRow.is_header = true` are now written
+  with bold weight and a grey (`D3D3D3`) background via `set_cell_styled()`.
+  `TableCell.background_color` overrides the default grey when set.
+- **Cell background color**: non-header cells with `TableCell.background_color`
+  set now get a solid fill style applied.
+- **Column widths**: `Table.column_widths_twips` is now converted to Excel
+  character-width units (`twips × 96 / (1440 × 7)`, clamped 3–80) and written
+  via `set_column_width()`.
+- **Merged cells**: `TableCell.col_span` and `row_span` > 1 now emit a
+  `<mergeCells>/<mergeCell ref="…"/>` block in the worksheet XML instead of
+  being ignored.
+- **New `SheetData::merge_cells(row, col, row_span, col_span)`** method; inserts
+  `<mergeCells>` between `</sheetData>` and `</worksheet>`.
+- Row cursor tracks absolute position across all elements in a section, so
+  paragraphs and headings interleaved with tables land in the correct rows.
+
+### Writer APIs — all language bindings
+
+`XlsxWriter` and `PptxWriter` (previously Rust-only) are now callable from
+every binding layer via a new index-based C FFI surface:
+
+**New C FFI symbols** (`include/office_oxide_c/office_oxide.h`):
+
+- `office_xlsx_writer_new/free`, `office_xlsx_writer_add_sheet` (returns sheet
+  index), `office_xlsx_sheet_set_cell`, `office_xlsx_sheet_set_cell_styled`
+  (bold + hex background), `office_xlsx_sheet_merge_cells`,
+  `office_xlsx_sheet_set_column_width`, `office_xlsx_writer_save`,
+  `office_xlsx_writer_to_bytes`
+- `office_pptx_writer_new/free`, `office_pptx_writer_set_presentation_size`,
+  `office_pptx_writer_add_slide` (returns slide index),
+  `office_pptx_slide_set_title`, `office_pptx_slide_add_text`,
+  `office_pptx_slide_add_image` (PNG/JPEG/GIF bytes + EMU geometry),
+  `office_pptx_writer_save`, `office_pptx_writer_to_bytes`
+
+**Go** — `XlsxWriter` and `PptxWriter` structs with CGo wrappers and
+`runtime.SetFinalizer` for safe GC.
+
+**C# / .NET** — new `OfficeOxide.XlsxWriter` and `OfficeOxide.PptxWriter`
+classes (`IDisposable`); P/Invoke declarations added to `NativeMethods`.
+
+**Node.js** — `XlsxWriter` and `PptxWriter` ESM + CJS classes; koffi
+function prototypes; TypeScript `ImageFormat` type and class declarations.
+
+**Python** — `XlsxWriter` and `PyO3PptxWriter` PyO3 classes calling Rust
+directly (no C FFI round-trip); exported from `office_oxide` with full type
+stubs in `_native.pyi`.
 
 ### Bug fixes
 
