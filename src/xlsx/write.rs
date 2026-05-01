@@ -304,6 +304,9 @@ impl SheetDataInner {
         row_span: usize,
         col_span: usize,
     ) -> &mut Self {
+        if row_span == 0 || col_span == 0 {
+            return self;
+        }
         if row_span > 1 || col_span > 1 {
             self.merge_regions.push((row, col, row_span, col_span));
         }

@@ -218,7 +218,7 @@ fn add_element_to_docx(writer: &mut crate::docx::write::DocxWriter, elem: &Eleme
             writer.add_ir_image(img);
         },
         Element::ThematicBreak => {
-            // Emit a horizontal rule as a paragraph with bottom border
+            // Emitted as a blank paragraph (no visual rule; full border support is a future enhancement).
             let props = IrParaProps::default();
             writer.add_ir_paragraph(&[], Some(props));
         },

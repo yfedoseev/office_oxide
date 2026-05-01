@@ -416,7 +416,11 @@ type XlsxWriter struct {
 
 // NewXlsxWriter creates a new, empty XLSX workbook builder.
 func NewXlsxWriter() *XlsxWriter {
-	w := &XlsxWriter{handle: C.office_xlsx_writer_new()}
+	handle := C.office_xlsx_writer_new()
+	if handle == nil {
+		panic("office_oxide: office_xlsx_writer_new returned nil")
+	}
+	w := &XlsxWriter{handle: handle}
 	runtime.SetFinalizer(w, func(w *XlsxWriter) { w.Close() })
 	return w
 }
@@ -431,9 +435,10 @@ func (w *XlsxWriter) Close() {
 }
 
 // AddSheet adds a worksheet and returns its 0-based index.
+// Returns ^uint32(0) if the writer has been closed.
 func (w *XlsxWriter) AddSheet(name string) uint32 {
 	if w.handle == nil {
-		return 0
+		return ^uint32(0)
 	}
 	cname := C.CString(name)
 	defer C.free(unsafe.Pointer(cname))
@@ -561,7 +566,11 @@ type PptxWriter struct {
 
 // NewPptxWriter creates a new, empty PPTX presentation builder.
 func NewPptxWriter() *PptxWriter {
-	w := &PptxWriter{handle: C.office_pptx_writer_new()}
+	handle := C.office_pptx_writer_new()
+	if handle == nil {
+		panic("office_oxide: office_pptx_writer_new returned nil")
+	}
+	w := &PptxWriter{handle: handle}
 	runtime.SetFinalizer(w, func(w *PptxWriter) { w.Close() })
 	return w
 }
@@ -584,9 +593,10 @@ func (w *PptxWriter) SetPresentationSize(cx, cy uint64) {
 }
 
 // AddSlide adds a slide and returns its 0-based index.
+// Returns ^uint32(0) if the writer has been closed.
 func (w *PptxWriter) AddSlide() uint32 {
 	if w.handle == nil {
-		return 0
+		return ^uint32(0)
 	}
 	return uint32(C.office_pptx_writer_add_slide(w.handle))
 }
