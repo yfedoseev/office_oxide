@@ -305,7 +305,9 @@ struct PyXlsxWriter {
 impl PyXlsxWriter {
     #[new]
     fn new() -> Self {
-        Self { writer: crate::xlsx::write::XlsxWriter::new() }
+        Self {
+            writer: crate::xlsx::write::XlsxWriter::new(),
+        }
     }
 
     /// Add a worksheet; returns its 0-based index.
@@ -368,7 +370,8 @@ impl PyXlsxWriter {
         if let Some(bg) = bg_color {
             style = style.background(bg.to_string());
         }
-        self.writer.sheet_set_cell_styled(sheet, row, col, data, style);
+        self.writer
+            .sheet_set_cell_styled(sheet, row, col, data, style);
         Ok(())
     }
 
@@ -381,7 +384,8 @@ impl PyXlsxWriter {
         row_span: usize,
         col_span: usize,
     ) {
-        self.writer.sheet_merge_cells(sheet, row, col, row_span, col_span);
+        self.writer
+            .sheet_merge_cells(sheet, row, col, row_span, col_span);
     }
 
     /// Set column width in Excel character units (e.g. 20.0).
@@ -420,7 +424,9 @@ struct PyPptxWriter {
 impl PyPptxWriter {
     #[new]
     fn new() -> Self {
-        Self { writer: crate::pptx::write::PptxWriter::new() }
+        Self {
+            writer: crate::pptx::write::PptxWriter::new(),
+        }
     }
 
     /// Override canvas size. 914400 EMU = 1 inch.
@@ -464,7 +470,8 @@ impl PyPptxWriter {
                 )));
             },
         };
-        self.writer.slide_add_image(slide, data.to_vec(), fmt, x, y, cx, cy);
+        self.writer
+            .slide_add_image(slide, data.to_vec(), fmt, x, y, cx, cy);
         Ok(())
     }
 

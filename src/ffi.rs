@@ -668,7 +668,8 @@ pub extern "C" fn office_xlsx_sheet_set_cell(
         _ => CellData::Empty,
     };
     let h = unsafe { &mut *handle };
-    h.writer.sheet_set_cell(sheet as usize, row as usize, col as usize, data);
+    h.writer
+        .sheet_set_cell(sheet as usize, row as usize, col as usize, data);
 }
 
 /// Set a cell with styling. bold applies bold weight; bg_color is a 6-char hex
@@ -743,7 +744,8 @@ pub extern "C" fn office_xlsx_sheet_set_column_width(
         return;
     }
     let h = unsafe { &mut *handle };
-    h.writer.sheet_set_column_width(sheet as usize, col as usize, width);
+    h.writer
+        .sheet_set_column_width(sheet as usize, col as usize, width);
 }
 
 /// Save to a file. Returns OFFICE_OK (0) on success.
@@ -919,7 +921,8 @@ pub extern "C" fn office_pptx_slide_add_image(
     };
     let bytes = unsafe { slice::from_raw_parts(data, len) }.to_vec();
     let h = unsafe { &mut *handle };
-    h.writer.slide_add_image(slide as usize, bytes, fmt, x, y, cx, cy);
+    h.writer
+        .slide_add_image(slide as usize, bytes, fmt, x, y, cx, cy);
 }
 
 /// Save to a file. Returns OFFICE_OK (0) on success.

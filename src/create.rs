@@ -315,7 +315,9 @@ fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                         for cell in &row.cells {
                             let text = cell_text(cell);
                             let data = text_to_cell_data(&text);
-                            if let Some(style) = xlsx_cell_style(row.is_header, cell.background_color) {
+                            if let Some(style) =
+                                xlsx_cell_style(row.is_header, cell.background_color)
+                            {
                                 sheet.set_cell_styled(row_cursor, col, data, style);
                             } else {
                                 sheet.set_cell(row_cursor, col, data);
@@ -417,7 +419,7 @@ fn ir_to_pptx(ir: &DocumentIR) -> crate::pptx::write::PptxWriter {
                         .map(|row| {
                             row.cells
                                 .iter()
-                                .map(|c| cell_text(c))
+                                .map(cell_text)
                                 .collect::<Vec<_>>()
                                 .join("\t")
                         })

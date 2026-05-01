@@ -51,12 +51,6 @@ const CT_SLIDE_MASTER: &str =
 use crate::core::xml::ns::{DRAWING_ML_STR as NS_DML, PML_STR as NS_PML, R_STR as NS_REL};
 
 // ---------------------------------------------------------------------------
-// Slide size (standard 16:9 in EMU)
-// ---------------------------------------------------------------------------
-
-const SLIDE_WIDTH: &str = "12192000";
-const SLIDE_HEIGHT: &str = "6858000";
-
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -256,7 +250,8 @@ impl SlideData {
         cx: u64,
         cy: u64,
     ) -> &mut Self {
-        self.body_items.push(BodyItem::Image(data, format, x, y, cx, cy));
+        self.body_items
+            .push(BodyItem::Image(data, format, x, y, cx, cy));
         self
     }
 
@@ -637,10 +632,7 @@ fn generate_slide_layout_xml() -> Vec<u8> {
 // slides/slideN.xml
 // ---------------------------------------------------------------------------
 
-fn generate_slide_xml(
-    slide: &SlideData,
-    img_rids: &[(String, i64, i64, u64, u64)],
-) -> Vec<u8> {
+fn generate_slide_xml(slide: &SlideData, img_rids: &[(String, i64, i64, u64, u64)]) -> Vec<u8> {
     let mut w = Writer::new(Vec::new());
     write_decl(&mut w);
 
@@ -864,28 +856,37 @@ fn write_pic_shape(w: &mut Writer<Vec<u8>>, id: u32, rid: &str, x: i64, y: i64, 
     let id_str = id.to_string();
     let name = format!("Image {id}");
 
-    w.write_event(Event::Start(BytesStart::new("p:pic"))).expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:pic")))
+        .expect("write");
 
-    w.write_event(Event::Start(BytesStart::new("p:nvPicPr"))).expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:nvPicPr")))
+        .expect("write");
     let mut cnv_pr = BytesStart::new("p:cNvPr");
     cnv_pr.push_attribute(("id", id_str.as_str()));
     cnv_pr.push_attribute(("name", name.as_str()));
     w.write_event(Event::Empty(cnv_pr)).expect("write");
     write_empty(w, "p:cNvPicPr");
     write_empty(w, "p:nvPr");
-    w.write_event(Event::End(BytesEnd::new("p:nvPicPr"))).expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:nvPicPr")))
+        .expect("write");
 
-    w.write_event(Event::Start(BytesStart::new("p:blipFill"))).expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:blipFill")))
+        .expect("write");
     let mut blip = BytesStart::new("a:blip");
     blip.push_attribute(("r:embed", rid));
     w.write_event(Event::Empty(blip)).expect("write");
-    w.write_event(Event::Start(BytesStart::new("a:stretch"))).expect("write");
+    w.write_event(Event::Start(BytesStart::new("a:stretch")))
+        .expect("write");
     write_empty(w, "a:fillRect");
-    w.write_event(Event::End(BytesEnd::new("a:stretch"))).expect("write");
-    w.write_event(Event::End(BytesEnd::new("p:blipFill"))).expect("write");
+    w.write_event(Event::End(BytesEnd::new("a:stretch")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:blipFill")))
+        .expect("write");
 
-    w.write_event(Event::Start(BytesStart::new("p:spPr"))).expect("write");
-    w.write_event(Event::Start(BytesStart::new("a:xfrm"))).expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:spPr")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("a:xfrm")))
+        .expect("write");
     let mut off = BytesStart::new("a:off");
     off.push_attribute(("x", x.to_string().as_str()));
     off.push_attribute(("y", y.to_string().as_str()));
@@ -894,15 +895,19 @@ fn write_pic_shape(w: &mut Writer<Vec<u8>>, id: u32, rid: &str, x: i64, y: i64, 
     ext.push_attribute(("cx", cx.to_string().as_str()));
     ext.push_attribute(("cy", cy.to_string().as_str()));
     w.write_event(Event::Empty(ext)).expect("write");
-    w.write_event(Event::End(BytesEnd::new("a:xfrm"))).expect("write");
+    w.write_event(Event::End(BytesEnd::new("a:xfrm")))
+        .expect("write");
     let mut geom = BytesStart::new("a:prstGeom");
     geom.push_attribute(("prst", "rect"));
     w.write_event(Event::Start(geom)).expect("write");
     write_empty(w, "a:avLst");
-    w.write_event(Event::End(BytesEnd::new("a:prstGeom"))).expect("write");
-    w.write_event(Event::End(BytesEnd::new("p:spPr"))).expect("write");
+    w.write_event(Event::End(BytesEnd::new("a:prstGeom")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:spPr")))
+        .expect("write");
 
-    w.write_event(Event::End(BytesEnd::new("p:pic"))).expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:pic")))
+        .expect("write");
 }
 
 fn write_plain_paragraph(w: &mut Writer<Vec<u8>>, text: &str) {
@@ -1013,12 +1018,14 @@ mod tests {
             0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
             0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, // bit depth, color, crc
             0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, // IDAT
-            0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01,
-            0xe2, 0x21, 0xbc, 0x33, // crc
+            0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xe2, 0x21,
+            0xbc, 0x33, // crc
             0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82, // IEND
         ];
         let mut writer = PptxWriter::new();
-        writer.add_slide().add_image(png_bytes, ImageFormat::Png, 0, 0, 3_000_000, 2_000_000);
+        writer
+            .add_slide()
+            .add_image(png_bytes, ImageFormat::Png, 0, 0, 3_000_000, 2_000_000);
         let mut buf = Cursor::new(Vec::new());
         writer.write_to(&mut buf).unwrap();
         let bytes = buf.into_inner();
