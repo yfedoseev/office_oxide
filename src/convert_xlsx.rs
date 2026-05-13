@@ -161,10 +161,8 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                             // XLSX cell font size is in points (`<font><sz val="N"/>`
                             // where N is f32). IR uses half-points; same
                             // half-pt convention as DOCX/PPTX read paths.
-                            span.font_size_half_pt = Some(
-                                crate::core::units::HalfPoint::from_points_rounded(size_pt)
-                                    .0,
-                            );
+                            span.font_size_half_pt =
+                                Some(crate::core::units::HalfPoint::from_points_rounded(size_pt).0);
                         }
                         if font.bold {
                             span.bold = true;

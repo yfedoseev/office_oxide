@@ -335,8 +335,7 @@ fn read_blip_embed_attr(e: &quick_xml::events::BytesStart) -> CoreResult<Option<
         let key = attr.key.as_ref();
         let is_embed = key == b"r:embed" || key.ends_with(b":embed") || key == b"embed";
         if is_embed {
-            let raw = attr.unescape_value().map_err(crate::core::Error::from)?;
-            return Ok(Some(raw.into_owned()));
+            return Ok(Some(crate::core::xml::unescape_attr_value(&attr)?));
         }
     }
     Ok(None)

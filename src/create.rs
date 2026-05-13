@@ -912,13 +912,10 @@ fn emit_pptx_slides_compacted(
     // mid-block when pdf_to_ir injects gap spacers.
     fn is_body_content(elem: &Element) -> bool {
         match elem {
-            Element::Paragraph(p) => {
-                
-                p.content.iter().any(|ic| match ic {
-                    InlineContent::Text(s) => !s.text.is_empty(),
-                    _ => false,
-                })
-            },
+            Element::Paragraph(p) => p.content.iter().any(|ic| match ic {
+                InlineContent::Text(s) => !s.text.is_empty(),
+                _ => false,
+            }),
             Element::List(_) | Element::CodeBlock(_) | Element::Table(_) => true,
             _ => false,
         }

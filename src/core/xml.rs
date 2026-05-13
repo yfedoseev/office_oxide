@@ -155,12 +155,10 @@ pub fn optional_prefixed_attr_str<'a>(
         // Check prefixed: look for `:localname` at the end
         if let Some(pos) = key.iter().position(|&b| b == b':') {
             if &key[pos + 1..] == local_name {
-                let value = attr.unescape_value()?;
-                return Ok(Some(value));
+                return Ok(Some(Cow::Owned(unescape_attr_value(&attr)?)));
             }
         } else if key == local_name {
-            let value = attr.unescape_value()?;
-            return Ok(Some(value));
+            return Ok(Some(Cow::Owned(unescape_attr_value(&attr)?)));
         }
     }
     Ok(None)
@@ -185,7 +183,7 @@ pub fn read_text_content(reader: &mut NsReader<&[u8]>) -> Result<String> {
     loop {
         match reader.read_event()? {
             Event::Text(e) => {
-                text.push_str(&e.unescape()?);
+                text.push_str(&unescape_text(&e)?);
             },
             Event::CData(e) => {
                 text.push_str(std::str::from_utf8(&e)?);
@@ -238,6 +236,33 @@ pub fn make_reader(xml: &[u8]) -> NsReader<&[u8]> {
 // Fast Reader utilities (no namespace resolution — for hot-path parsing)
 // ===========================================================================
 
+/// Decode and unescape a `BytesText` event into an owned string.
+///
+/// quick-xml 0.40 removed `BytesText::unescape()` in favor of explicit
+/// `decode()` followed by `escape::unescape()`. This helper preserves
+/// the old single-call ergonomics so the parsers don't have to repeat
+/// the two-step dance. `EncodingError` and `EscapeError` go through
+/// `quick_xml::Error` to reach our `core::Error`.
+pub fn unescape_text(e: &quick_xml::events::BytesText<'_>) -> Result<String> {
+    let decoded = e.decode().map_err(quick_xml::Error::from)?;
+    let unescaped = quick_xml::escape::unescape(&decoded).map_err(quick_xml::Error::from)?;
+    Ok(unescaped.into_owned())
+}
+
+/// Decode and unescape an `Attribute` value into an owned string.
+///
+/// quick-xml 0.40 deprecated `Attribute::unescape_value()` in favor of
+/// `normalized_value()`, but the suggested replacement doesn't unescape
+/// XML entities (`&amp;`, `&lt;`, …) — only whitespace-normalizes. OOXML
+/// attribute values frequently contain hyperlinks and other content that
+/// need real entity unescaping, so we keep the old behaviour for now and
+/// centralise the deprecation suppression in one place.
+#[allow(deprecated)]
+pub fn unescape_attr_value(attr: &quick_xml::events::attributes::Attribute<'_>) -> Result<String> {
+    let cow = attr.unescape_value()?;
+    Ok(cow.into_owned())
+}
+
 /// Create a plain Reader (no namespace resolution) configured for OOXML parsing.
 /// Use this for format-specific hot paths (worksheets, slides, document body)
 /// where all elements are in a single known namespace.
@@ -258,7 +283,7 @@ pub fn read_text_content_fast(reader: &mut quick_xml::Reader<&[u8]>) -> Result<S
     loop {
         match reader.read_event()? {
             Event::Text(e) => {
-                text.push_str(&e.unescape()?);
+                text.push_str(&unescape_text(&e)?);
             },
             Event::CData(e) => {
                 text.push_str(&String::from_utf8_lossy(&e));

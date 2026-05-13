@@ -188,10 +188,8 @@ fn convert_block_elements(
                         crate::ir::InlineContent::Text(s) if s.text.is_empty()
                     )
                 });
-                let has_bottom_border = p
-                    .properties
-                    .as_ref()
-                    .is_some_and(|pp| pp.has_bottom_border);
+                let has_bottom_border =
+                    p.properties.as_ref().is_some_and(|pp| pp.has_bottom_border);
                 if is_empty_para && has_bottom_border {
                     elements.push(Element::ThematicBreak);
                     i += 1;

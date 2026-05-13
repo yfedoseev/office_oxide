@@ -243,9 +243,7 @@ impl XlsxDocument {
         match &cell.value {
             CellValue::Empty => {},
             CellValue::Number(n) => {
-                let is_date = cell
-                    .style_index
-                    .is_some_and(|i| date_indices.contains(&i));
+                let is_date = cell.style_index.is_some_and(|i| date_indices.contains(&i));
                 if is_date {
                     if let Some(dt) = date::DateTimeValue::from_serial(*n, self.workbook.date1904) {
                         buf.push_str(&dt.to_iso_string());

@@ -572,7 +572,7 @@ fn extract_chart_text(xml: &[u8]) -> String {
                 }
             },
             Ok(quick_xml::events::Event::Text(t)) => {
-                if let Ok(s) = t.unescape() {
+                if let Ok(s) = crate::core::xml::unescape_text(&t) {
                     let trimmed = s.trim();
                     if trimmed.is_empty() {
                         continue;
@@ -881,7 +881,7 @@ fn parse_drawing_anchors(xml_data: &[u8]) -> crate::core::Result<DrawingAnchors>
                         for attr in e.attributes().with_checks(false) {
                             let attr = attr.map_err(crate::core::Error::from)?;
                             let key = attr.key.as_ref();
-                            let raw = attr.unescape_value().map_err(crate::core::Error::from)?;
+                            let raw = crate::core::xml::unescape_attr_value(&attr)?;
                             match key {
                                 b"sz" => {
                                     // sz is in hundredths of a pt.
@@ -941,9 +941,7 @@ fn parse_drawing_anchors(xml_data: &[u8]) -> crate::core::Result<DrawingAnchors>
                             let attr = attr.map_err(crate::core::Error::from)?;
                             let key = attr.key.as_ref();
                             if key == b"r:embed" || key.ends_with(b":embed") || key == b"embed" {
-                                let raw =
-                                    attr.unescape_value().map_err(crate::core::Error::from)?;
-                                embed_rid = Some(raw.into_owned());
+                                embed_rid = Some(crate::core::xml::unescape_attr_value(&attr)?);
                                 break;
                             }
                         }
@@ -967,7 +965,7 @@ fn parse_drawing_anchors(xml_data: &[u8]) -> crate::core::Result<DrawingAnchors>
                         for attr in e.attributes().with_checks(false) {
                             let attr = attr.map_err(crate::core::Error::from)?;
                             let key = attr.key.as_ref();
-                            let raw = attr.unescape_value().map_err(crate::core::Error::from)?;
+                            let raw = crate::core::xml::unescape_attr_value(&attr)?;
                             match key {
                                 b"sz" => {
                                     if let Ok(n) = raw.parse::<i32>() {
@@ -984,7 +982,7 @@ fn parse_drawing_anchors(xml_data: &[u8]) -> crate::core::Result<DrawingAnchors>
                 }
             },
             Event::Text(ref e) if in_a_t => {
-                let s = e.unescape().map_err(crate::core::Error::from)?;
+                let s = crate::core::xml::unescape_text(e)?;
                 text_buf.push_str(&s);
             },
             Event::End(ref e) => {
