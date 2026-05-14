@@ -1,3 +1,11 @@
+//! `office-oxide-mcp` — Model Context Protocol server for office_oxide.
+//!
+//! Speaks JSON-RPC 2.0 over stdin/stdout. Exposes two tools:
+//! `extract` (text / markdown / html / ir from a DOCX/XLSX/PPTX/DOC/
+//! XLS/PPT file) and `info` (format detection + metadata).
+
+#![warn(missing_docs)]
+
 mod protocol;
 
 use std::io::{self, BufRead, Write};
