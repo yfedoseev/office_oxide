@@ -2,11 +2,41 @@ use crate::format::DocumentFormat;
 use crate::ir::*;
 
 pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
+    // Slide size sits at presentation level — every slide in the
+    // deck shares it. EMU → twips is /635 (914400 EMU per inch,
+    // 1440 twips per inch → 914400/1440 = 635).
+    let page_setup = doc.presentation.slide_size.as_ref().map(|sz| PageSetup {
+        width_twips: (sz.cx.max(0) / 635) as u32,
+        height_twips: (sz.cy.max(0) / 635) as u32,
+        landscape: sz.cx > sz.cy,
+        ..Default::default()
+    });
+
     let mut sections = Vec::new();
 
-    for slide in &doc.slides {
-        let title = find_title_text(&slide.shapes);
+    for slide in doc.slides.iter() {
+        let title_with_algn = find_title(&slide.shapes);
+        let title = title_with_algn.as_ref().map(|(t, _)| t.clone());
+        let title_alignment = title_with_algn.as_ref().and_then(|(_, a)| a.clone());
         let mut elements = Vec::new();
+
+        // Lead each slide with the title placeholder text as a
+        // heading so it has visible demarcation in the rendered
+        // PDF/HTML output. When the slide has no title we used to
+        // synthesise "Slide N" — that was useful for markdown anchors
+        // but pure visual noise in paginated output, where every
+        // slide already starts on its own page via the NextPage break.
+        // Worse, the synthesised heading rendered as 20 pt bold and
+        // contributed ~50 pt of fixed vertical overhead per section,
+        // which inflated PDF→PPTX→PDF round-trip page counts.
+        if let Some(ref t) = title {
+            elements.push(Element::Heading(Heading {
+                level: 2,
+                content: vec![InlineContent::Text(TextSpan::plain(t.clone()))],
+                alignment: title_alignment.clone(),
+                ..Default::default()
+            }));
+        }
 
         // Sort shapes spatially
         let mut shape_entries: Vec<(Option<&crate::pptx::ShapePosition>, &crate::pptx::Shape)> =
@@ -18,6 +48,11 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             convert_shape(shape, &mut elements);
         }
 
+        // Propagate slide background colour to the section so the
+        // PDF renderer can paint a full-slide rectangle before laying
+        // down shapes.
+        let background_rgb = slide.background_rgb;
+
         // Add notes as paragraphs at end
         if let Some(ref notes) = slide.notes {
             if !notes.is_empty() {
@@ -28,9 +63,21 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             }
         }
 
+        // Each PPTX slide is its own page when rendered to PDF or
+        // any paginated format. Default `Continuous` would let two
+        // slides share a page, which is wrong for slide content.
+        let break_type = if sections.is_empty() {
+            SectionBreakType::Continuous
+        } else {
+            SectionBreakType::NextPage
+        };
+
         sections.push(Section {
             title: title.clone(),
             elements,
+            break_type,
+            page_setup: page_setup.clone(),
+            background_rgb,
             ..Default::default()
         });
     }
@@ -86,7 +133,10 @@ fn is_title_placeholder(ph_type: Option<&str>) -> bool {
     matches!(ph_type, Some("title" | "ctrTitle"))
 }
 
-fn find_title_text(shapes: &[crate::pptx::Shape]) -> Option<String> {
+/// Locate the title placeholder and return its text together with the
+/// alignment of the first paragraph. Used by `pptx_to_ir` to seed both
+/// `Section.title` and the synthesised level-2 Heading's alignment.
+fn find_title(shapes: &[crate::pptx::Shape]) -> Option<(String, Option<ParagraphAlignment>)> {
     for shape in shapes {
         match shape {
             crate::pptx::Shape::AutoShape(auto)
@@ -98,13 +148,14 @@ fn find_title_text(shapes: &[crate::pptx::Shape]) -> Option<String> {
                 if let Some(ref tb) = auto.text_body {
                     let text = plain_text_from_body(tb);
                     if !text.is_empty() {
-                        return Some(text);
+                        let algn = tb.paragraphs.first().and_then(|p| p.alignment.clone());
+                        return Some((text, algn));
                     }
                 }
             },
             crate::pptx::Shape::Group(grp) => {
-                if let Some(title) = find_title_text(&grp.children) {
-                    return Some(title);
+                if let Some(t) = find_title(&grp.children) {
+                    return Some(t);
                 }
             },
             _ => {},
@@ -142,14 +193,36 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
             }
 
             if let Some(ref tb) = auto.text_body {
-                convert_text_body(tb, elements);
+                let mut inner = Vec::new();
+                convert_text_body(tb, &mut inner);
+                if inner.is_empty() {
+                    return;
+                }
+                push_positional_textbox(elements, inner, auto.position.as_ref());
             }
         },
         crate::pptx::Shape::Picture(pic) => {
-            elements.push(Element::Image(Image {
+            // Carry the resolved media bytes through so the PDF renderer
+            // (`render_pptx_textbox_content`) can paint the actual
+            // picture at its shape rectangle. `embed_rid` is preserved
+            // as alt-text fallback only when the relationship couldn't
+            // be resolved — we still want a placeholder element so the
+            // shape's position survives in plain-text / markdown output.
+            let format = pic.format.as_deref().and_then(image_format_from_ext);
+            let (display_w, display_h) = pic
+                .position
+                .as_ref()
+                .map(|p| (Some(p.cx.max(0) as u64), Some(p.cy.max(0) as u64)))
+                .unwrap_or((None, None));
+            let img_el = Element::Image(Image {
                 alt_text: pic.alt_text.clone(),
+                data: pic.data.clone(),
+                format,
+                display_width_emu: display_w,
+                display_height_emu: display_h,
                 ..Default::default()
-            }));
+            });
+            push_positional_textbox(elements, vec![img_el], pic.position.as_ref());
         },
         crate::pptx::Shape::Group(grp) => {
             for child in &grp.children {
@@ -158,10 +231,46 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
         },
         crate::pptx::Shape::GraphicFrame(gf) => {
             if let crate::pptx::GraphicContent::Table(ref tbl) = gf.content {
-                elements.push(convert_pptx_table(tbl));
+                let table_el = convert_pptx_table(tbl);
+                push_positional_textbox(elements, vec![table_el], gf.position.as_ref());
             }
         },
         crate::pptx::Shape::Connector(_) => {},
+    }
+}
+
+/// Wrap a shape's converted IR content in a `TextBox` carrying its
+/// absolute `(x, y, cx, cy)` EMU rectangle. The PPTX renderer uses
+/// these coordinates to paint each shape at its source position
+/// instead of flowing them as a single long page.
+///
+/// When the source shape has no `<a:xfrm>` (rare — placeholders that
+/// inherit geometry from a slide layout), the inner content is pushed
+/// as flow elements so plain-text / markdown rendering still sees it.
+fn push_positional_textbox(
+    elements: &mut Vec<Element>,
+    content: Vec<Element>,
+    position: Option<&crate::pptx::ShapePosition>,
+) {
+    // Wrap in `Element::TextBox` only when the source shape carried a
+    // *real* `<a:xfrm>`. Placeholders that inherit geometry from the
+    // slide layout parse as `ShapePosition { x: 0, y: 0, cx: 0, cy: 0 }`
+    // — wrapping those in TextBox tells the renderer "place this 0×0
+    // rectangle at (0, 0)" which collapses every paragraph onto the
+    // top-left corner. Treat all-zeros as "no position" so the
+    // content flows normally instead.
+    let real_position = position.filter(|p| p.cx > 0 && p.cy > 0);
+    if let Some(pos) = real_position {
+        elements.push(Element::TextBox(TextBox {
+            content,
+            x_emu: Some(pos.x),
+            y_emu: Some(pos.y),
+            width_emu: Some(pos.cx.max(0) as u64),
+            height_emu: Some(pos.cy.max(0) as u64),
+            ..Default::default()
+        }));
+    } else {
+        elements.extend(content);
     }
 }
 
@@ -175,13 +284,23 @@ fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) 
         for para in &body.paragraphs {
             items.push((para.level as u8, convert_text_paragraph_inline(para)));
         }
-        elements.push(Element::List(build_nested_list(false, &items, 0)));
+        elements.push(Element::List(crate::ir::build_nested_list(false, &items, 0)));
     } else {
         for para in &body.paragraphs {
             let content = convert_text_paragraph_inline(para);
-            if !content.is_empty() {
+            // Honour space_before from PPTX so spacer paragraphs
+            // emitted by pdf_to_ir round-trip with their full vertical
+            // gap. Convert hundredths-of-pt → twips: hundredths * 0.2
+            // (1pt = 20 twips, so pt*100 → twips = (pt*100)/5).
+            let space_before_twips = para.space_before_hundredths_pt.map(|h| h.div_ceil(5));
+            // Empty paragraphs serve as vertical spacers — keep them
+            // in the IR even when content is empty so the renderer
+            // can advance the cursor by the requested amount.
+            if !content.is_empty() || space_before_twips.is_some() {
                 elements.push(Element::Paragraph(Paragraph {
                     content,
+                    alignment: para.alignment.clone(),
+                    space_before_twips,
                     ..Default::default()
                 }));
             }
@@ -199,12 +318,19 @@ fn convert_text_paragraph_inline(para: &crate::pptx::TextParagraph) -> Vec<Inlin
                         crate::pptx::HyperlinkTarget::External(url) => Some(url.clone()),
                         crate::pptx::HyperlinkTarget::Internal(_) => None,
                     });
+                    let font_size_half_pt = run.font_size_hundredths_pt.map(|hp| {
+                        crate::core::units::HalfPoint::from_drawingml_sz(hp)
+                            .0
+                            .max(1)
+                    });
                     content.push(InlineContent::Text(TextSpan {
                         text: run.text.clone(),
                         bold: run.bold.unwrap_or(false),
                         italic: run.italic.unwrap_or(false),
                         strikethrough: run.strikethrough,
                         hyperlink,
+                        font_size_half_pt,
+                        color: run.color_rgb,
                         ..Default::default()
                     }));
                 }
@@ -220,59 +346,6 @@ fn convert_text_paragraph_inline(para: &crate::pptx::TextParagraph) -> Vec<Inlin
         }
     }
     content
-}
-
-fn inline_to_element(content: Vec<InlineContent>) -> Vec<Element> {
-    if content.is_empty() {
-        Vec::new()
-    } else {
-        vec![Element::Paragraph(Paragraph {
-            content,
-            ..Default::default()
-        })]
-    }
-}
-
-fn build_nested_list(ordered: bool, items: &[(u8, Vec<InlineContent>)], base_level: u8) -> List {
-    let mut list_items = Vec::new();
-    let mut idx = 0;
-
-    while idx < items.len() {
-        let (level, content) = &items[idx];
-        if *level <= base_level {
-            let nested_start = idx + 1;
-            let mut nested_end = nested_start;
-            while nested_end < items.len() && items[nested_end].0 > base_level {
-                nested_end += 1;
-            }
-            let nested = if nested_end > nested_start {
-                Some(build_nested_list(ordered, &items[nested_start..nested_end], base_level + 1))
-            } else {
-                None
-            };
-            list_items.push(ListItem {
-                content: inline_to_element(content.clone()),
-                nested,
-            });
-            idx = if nested_end > nested_start {
-                nested_end
-            } else {
-                idx + 1
-            };
-        } else {
-            list_items.push(ListItem {
-                content: inline_to_element(content.clone()),
-                nested: None,
-            });
-            idx += 1;
-        }
-    }
-
-    List {
-        ordered,
-        items: list_items,
-        ..Default::default()
-    }
 }
 
 fn convert_pptx_table(table: &crate::pptx::Table) -> Element {
@@ -294,6 +367,7 @@ fn convert_pptx_table(table: &crate::pptx::Table) -> Element {
                     if !content.is_empty() {
                         cell_elements.push(Element::Paragraph(Paragraph {
                             content,
+                            alignment: para.alignment.clone(),
                             ..Default::default()
                         }));
                     }
@@ -319,4 +393,21 @@ fn convert_pptx_table(table: &crate::pptx::Table) -> Element {
         rows: ir_rows,
         ..Default::default()
     })
+}
+
+/// Map a lowercase file extension (`"png"`, `"jpeg"`, `"emf"`, …) to
+/// the matching `ImageFormat` variant. Used by `convert_shape` when
+/// converting a parsed PPTX `<p:pic>` whose underlying media part the
+/// PPTX reader resolved into bytes + extension.
+fn image_format_from_ext(ext: &str) -> Option<ImageFormat> {
+    match ext {
+        "png" => Some(ImageFormat::Png),
+        "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
+        "gif" => Some(ImageFormat::Gif),
+        "tif" | "tiff" => Some(ImageFormat::Tiff),
+        "bmp" => Some(ImageFormat::Bmp),
+        "emf" => Some(ImageFormat::Emf),
+        "wmf" => Some(ImageFormat::Wmf),
+        _ => None,
+    }
 }

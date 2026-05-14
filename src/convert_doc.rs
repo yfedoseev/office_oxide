@@ -30,6 +30,7 @@ pub(crate) fn doc_to_ir(doc: &crate::doc::DocDocument) -> DocumentIR {
                     bold: true,
                     ..TextSpan::plain(trimmed)
                 })],
+                ..Default::default()
             }));
         } else {
             elements.push(Element::Paragraph(Paragraph {

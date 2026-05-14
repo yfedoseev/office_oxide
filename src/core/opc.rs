@@ -452,6 +452,20 @@ impl<W: Write + Seek> OpcWriter<W> {
         })
     }
 
+    /// Register a default `[Content_Types].xml` entry for a file
+    /// extension. Use this for parts whose content type is uniform
+    /// across the package (e.g. `ttf` for all embedded fonts, `png`
+    /// for all raster images). Default + Override is legal OOXML;
+    /// Override takes precedence at lookup time, so passing the same
+    /// content type to both is redundant but safe.
+    ///
+    /// Validators (Office Open XML SDK) flag packages that ship many
+    /// per-file overrides without a matching Default — emit defaults
+    /// for known-uniform extensions to satisfy them.
+    pub fn register_default_content_type(&mut self, extension: &str, content_type: &str) {
+        self.content_types.add_default(extension, content_type);
+    }
+
     /// Add a part to the package.
     pub fn add_part(&mut self, name: &PartName, content_type: &str, data: &[u8]) -> Result<()> {
         // Register content type override

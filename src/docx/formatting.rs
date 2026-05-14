@@ -45,6 +45,35 @@ pub struct ParagraphProperties {
     pub outline_level: Option<u8>,
     /// Paragraph-mark run properties (`w:rPr` inside `w:pPr`).
     pub run_properties: Option<RunProperties>,
+    /// Frame position from `<w:framePr>`. When present this paragraph is
+    /// absolutely positioned on the page (used by layout-preserving
+    /// PDF-derived DOCX, e.g. pdf_oxide's `to_docx_bytes_layout`).
+    pub frame_position: Option<FrameProps>,
+    /// Section properties from `<w:sectPr>` inside this paragraph's `<w:pPr>`.
+    /// When present this paragraph terminates a section — the properties
+    /// describe the section that ends here.
+    pub section_properties: Option<super::SectionProperties>,
+    /// True when the paragraph has a `<w:pBdr><w:bottom .../></w:pBdr>`.
+    /// Used to recover horizontal rules: pdf_to_ir emits
+    /// `Element::ThematicBreak` which round-trips through DOCX as an
+    /// empty paragraph with a single bottom border. Without
+    /// preserving this flag the rule would be silently dropped on
+    /// re-parse and turned into a plain empty paragraph.
+    #[allow(dead_code)]
+    pub has_bottom_border: bool,
+}
+
+/// `<w:framePr>` attributes — page-anchored frame coordinates in twips.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameProps {
+    /// X position in twips, anchored to the page (top-left).
+    pub x_twips: i32,
+    /// Y position in twips, anchored to the page (top-left).
+    pub y_twips: i32,
+    /// Frame width in twips.
+    pub width_twips: i32,
+    /// Frame height in twips.
+    pub height_twips: i32,
 }
 
 /// Underline style.
@@ -583,6 +612,44 @@ pub(crate) fn parse_paragraph_properties_fast(
                     b"rPr" => {
                         props.run_properties = Some(parse_run_properties_fast(reader)?);
                     },
+                    b"framePr" => {
+                        props.frame_position = parse_frame_pr(e);
+                        xml::skip_element_fast(reader)?;
+                    },
+                    b"sectPr" => {
+                        props.section_properties =
+                            Some(super::parse_section_properties(reader, e)?);
+                    },
+                    b"pBdr" => {
+                        // Scan for <w:bottom .../> inside pBdr to
+                        // detect horizontal-rule encoding (empty
+                        // paragraph + bottom border = the
+                        // conventional DOCX <hr/>). We don't capture
+                        // full border styling — just the presence
+                        // of a bottom edge.
+                        let mut depth = 1i32;
+                        loop {
+                            match reader.read_event()? {
+                                Event::Start(ref ee) | Event::Empty(ref ee)
+                                    if ee.local_name().as_ref() == b"bottom" =>
+                                {
+                                    props.has_bottom_border = true;
+                                    if matches!(reader.read_event()?, Event::Eof) {
+                                        break;
+                                    }
+                                },
+                                Event::Start(_) => depth += 1,
+                                Event::End(ref ee) => {
+                                    depth -= 1;
+                                    if depth <= 0 && ee.local_name().as_ref() == b"pBdr" {
+                                        break;
+                                    }
+                                },
+                                Event::Eof => break,
+                                _ => {},
+                            }
+                        }
+                    },
                     _ => {
                         xml::skip_element_fast(reader)?;
                     },
@@ -606,6 +673,9 @@ pub(crate) fn parse_paragraph_properties_fast(
                     },
                     b"spacing" => {
                         props.spacing = Some(parse_spacing(e)?);
+                    },
+                    b"framePr" => {
+                        props.frame_position = parse_frame_pr(e);
                     },
                     b"outlineLvl" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
@@ -774,6 +844,32 @@ pub(crate) fn parse_indent(e: &BytesStart) -> crate::core::Result<ParagraphInden
     Ok(indent)
 }
 
+/// Parse `<w:framePr>` attributes (`w:x`, `w:y`, `w:w`, `w:h`).
+/// Returns `None` if the element doesn't carry usable absolute coords —
+/// e.g. when only `wrap`/`anchor` modifiers are set without explicit
+/// position/size, which we can't reproduce as positional.
+fn parse_frame_pr(e: &BytesStart) -> Option<FrameProps> {
+    let read_int = |attr: &[u8]| -> Option<i32> {
+        xml::optional_attr_str(e, attr)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<i32>().ok())
+    };
+    let x = read_int(b"w:x");
+    let y = read_int(b"w:y");
+    let w = read_int(b"w:w");
+    let h = read_int(b"w:h");
+    match (x, y, w, h) {
+        (Some(x), Some(y), Some(w), Some(h)) => Some(FrameProps {
+            x_twips: x,
+            y_twips: y,
+            width_twips: w,
+            height_twips: h,
+        }),
+        _ => None,
+    }
+}
+
 fn parse_spacing(e: &BytesStart) -> crate::core::Result<ParagraphSpacing> {
     let mut spacing = ParagraphSpacing::default();
     if let Some(val) = xml::optional_attr_str(e, b"w:before")? {
@@ -932,5 +1028,102 @@ mod tests {
                 _ => {},
             }
         }
+    }
+
+    // Advance a fast reader past the opening <w:pPr> wrapper so the
+    // caller can drive parse_paragraph_properties_fast directly.
+    fn open_ppr_fast(xml: &[u8]) -> quick_xml::Reader<&[u8]> {
+        let mut reader = xml::make_fast_reader(xml);
+        loop {
+            match reader.read_event().unwrap() {
+                Event::Start(ref e) if e.local_name().as_ref() == b"pPr" => return reader,
+                Event::Eof => panic!("no <w:pPr> in test xml"),
+                _ => {},
+            }
+        }
+    }
+
+    // ── framePr ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_frame_pr_empty_element() {
+        let xml =
+            br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:framePr w:x="720" w:y="1080" w:w="3000" w:h="500"/>
+        </w:pPr>"#;
+        let mut reader = open_ppr_fast(xml);
+        let pp = parse_paragraph_properties_fast(&mut reader).unwrap();
+        let fp = pp.frame_position.expect("framePr parsed");
+        assert_eq!(fp.x_twips, 720);
+        assert_eq!(fp.y_twips, 1080);
+        assert_eq!(fp.width_twips, 3000);
+        assert_eq!(fp.height_twips, 500);
+    }
+
+    #[test]
+    fn parse_frame_pr_missing_attrs_returns_none() {
+        // Missing w:h → frame_position must be None.
+        let xml =
+            br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:framePr w:x="100" w:y="200" w:w="300"/>
+        </w:pPr>"#;
+        let mut reader = open_ppr_fast(xml);
+        let pp = parse_paragraph_properties_fast(&mut reader).unwrap();
+        assert!(pp.frame_position.is_none());
+    }
+
+    #[test]
+    fn parse_frame_pr_inside_start_form() {
+        // Start/End form (rather than Empty) — should still parse.
+        let xml =
+            br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:framePr w:x="10" w:y="20" w:w="30" w:h="40"></w:framePr>
+        </w:pPr>"#;
+        let mut reader = open_ppr_fast(xml);
+        let pp = parse_paragraph_properties_fast(&mut reader).unwrap();
+        let fp = pp.frame_position.expect("framePr parsed");
+        assert_eq!(fp.x_twips, 10);
+        assert_eq!(fp.width_twips, 30);
+    }
+
+    // ── pBdr / has_bottom_border ────────────────────────────────────────
+
+    #[test]
+    fn parse_p_bdr_with_bottom() {
+        let xml =
+            br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:pBdr>
+            <w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/>
+          </w:pBdr>
+        </w:pPr>"#;
+        let mut reader = open_ppr_fast(xml);
+        let pp = parse_paragraph_properties_fast(&mut reader).unwrap();
+        assert!(pp.has_bottom_border);
+    }
+
+    #[test]
+    fn parse_p_bdr_without_bottom() {
+        let xml =
+            br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:pBdr>
+            <w:top w:val="single" w:sz="6"/>
+            <w:left w:val="single" w:sz="6"/>
+          </w:pBdr>
+        </w:pPr>"#;
+        let mut reader = open_ppr_fast(xml);
+        let pp = parse_paragraph_properties_fast(&mut reader).unwrap();
+        assert!(!pp.has_bottom_border);
+    }
+
+    #[test]
+    fn paragraph_properties_default_has_no_frame_or_border() {
+        let xml =
+            br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:pStyle w:val="Normal"/>
+        </w:pPr>"#;
+        let mut reader = open_ppr_fast(xml);
+        let pp = parse_paragraph_properties_fast(&mut reader).unwrap();
+        assert!(pp.frame_position.is_none());
+        assert!(!pp.has_bottom_border);
     }
 }

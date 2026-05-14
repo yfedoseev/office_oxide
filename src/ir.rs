@@ -550,6 +550,12 @@ pub struct Section {
     pub even_page_header: Option<HeaderFooter>,
     /// Footer used on even-numbered pages of this section.
     pub even_page_footer: Option<HeaderFooter>,
+    /// Solid background colour for this section (RGB).
+    /// PPTX: parsed from `<p:cSld><p:bg><p:bgPr><a:solidFill>` on the slide.
+    /// Image / gradient backgrounds are intentionally skipped — only the
+    /// solid case round-trips through this minimal field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_rgb: Option<[u8; 3]>,
 }
 
 /// A block-level content element.
@@ -581,15 +587,77 @@ pub enum Element {
     Endnote(Note),
     /// A preformatted code block.
     CodeBlock(CodeBlock),
+    /// A vector shape (line / rectangle) anchored on the page. Used by
+    /// the layout-preserving DOCX path to round-trip rules and dividers.
+    Shape(Shape),
+}
+
+/// A vector shape anchored at absolute page coordinates.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct Shape {
+    /// Geometry kind.
+    pub kind: ShapeGeom,
+    /// X offset from the anchor in EMUs.
+    pub x_emu: i64,
+    /// Y offset from the anchor in EMUs.
+    pub y_emu: i64,
+    /// Width in EMUs.
+    pub width_emu: u64,
+    /// Height in EMUs.
+    pub height_emu: u64,
+    /// Horizontal anchor reference frame.
+    #[serde(default)]
+    pub h_anchor: FloatAnchor,
+    /// Vertical anchor reference frame.
+    #[serde(default)]
+    pub v_anchor: FloatAnchor,
+    /// Stroke colour as RGB (0..255).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke_rgb: Option<[u8; 3]>,
+    /// Fill colour as RGB (0..255).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_rgb: Option<[u8; 3]>,
+    /// Stroke width in EMUs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke_w_emu: Option<i64>,
+}
+
+/// Vector-shape geometry kinds we currently round-trip.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShapeGeom {
+    /// Straight line from `(x, y)` to `(x + width, y + height)`.
+    #[default]
+    Line,
+    /// Axis-aligned rectangle.
+    Rect,
 }
 
 /// A heading element with a nesting level.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Heading {
     /// Heading level 1–6 (1 = largest).
+    #[serde(default = "default_heading_level")]
     pub level: u8,
     /// Inline content of the heading.
+    #[serde(default)]
     pub content: Vec<InlineContent>,
+    /// Absolute frame position for layout-preserving DOCX
+    /// (mirrors `Paragraph::frame_position`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_position: Option<FramePosition>,
+    /// Horizontal alignment (mirrors `Paragraph::alignment`). PDF
+    /// title pages often centre their headings; without this the
+    /// round-trip flattens them to left-aligned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alignment: Option<ParagraphAlignment>,
+}
+
+fn default_heading_level() -> u8 {
+    1
 }
 
 /// A paragraph of inline content.
@@ -626,6 +694,27 @@ pub struct Paragraph {
     pub page_break_before: bool,
     /// Outline level (0 = body text, 1–9 = heading levels).
     pub outline_level: Option<u8>,
+    /// Absolute frame position (from `<w:framePr>`). Present when the
+    /// DOCX uses page-anchored frames for layout-preserving content
+    /// (see pdf_oxide's `to_docx_bytes_layout`). Twips relative to the
+    /// page origin (top-left).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_position: Option<FramePosition>,
+}
+
+/// Absolute frame position for a paragraph anchored to the page.
+/// Mirrors the OOXML `<w:framePr>` attribute set we care about for
+/// reproducing visual layout in downstream renderers.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FramePosition {
+    /// X position in twips, anchored to the page origin (top-left).
+    pub x_twips: i32,
+    /// Y position in twips, anchored to the page origin (top-left).
+    pub y_twips: i32,
+    /// Frame width in twips.
+    pub width_twips: i32,
+    /// Frame height in twips.
+    pub height_twips: i32,
 }
 
 /// Inline content within a paragraph or heading.
@@ -641,6 +730,26 @@ pub enum InlineContent {
     FootnoteRef(FootnoteRef),
     /// An inline endnote reference mark.
     EndnoteRef(FootnoteRef),
+}
+
+/// Pick the dominant font size (in points) for a paragraph's worth of
+/// inline content. Returns the *first* declared `font_size_half_pt`,
+/// converted from half-points to points (e.g. 18 half-pt → 9 pt).
+///
+/// Used by both renderers and writers when one paragraph-level size is
+/// needed: the IR groups runs into a paragraph by line clustering, so
+/// the size on the first span is representative of the body text.
+/// Mixed-size paragraphs (drop-caps, math marks mid-line) lose the
+/// variation — that's the deliberate trade-off.
+pub fn first_inline_font_size_pt(content: &[InlineContent]) -> Option<f32> {
+    for ic in content {
+        if let InlineContent::Text(span) = ic {
+            if let Some(half_pt) = span.font_size_half_pt {
+                return Some(half_pt as f32 / 2.0);
+            }
+        }
+    }
+    None
 }
 
 /// A styled run of text.
@@ -789,6 +898,69 @@ pub struct ListItem {
     pub nested: Option<List>,
 }
 
+/// Wrap a non-empty inline-content vector into a single-Paragraph
+/// block, or return an empty Vec if the inline content is empty.
+/// Used by list builders to turn each item's inline run into its
+/// `Vec<Element>` content slot.
+pub fn inline_to_element_block(content: Vec<InlineContent>) -> Vec<Element> {
+    if content.is_empty() {
+        Vec::new()
+    } else {
+        vec![Element::Paragraph(Paragraph {
+            content,
+            ..Default::default()
+        })]
+    }
+}
+
+/// Build a nested `List` from a flat `(level, inline)` sequence.
+///
+/// Items whose level matches `base_level` (or is shallower) become
+/// `ListItem`s at the current depth. Items whose level is *deeper*
+/// than `base_level` are recursively grouped into the most recent
+/// item's `nested` sub-list. Levels are 0-indexed.
+///
+/// Used by both `convert_docx` and `convert_pptx` to translate flat
+/// `<w:numPr w:ilvl=…>` / `<a:p lvl=…>` paragraph streams into the
+/// IR's tree-shaped `List`.
+pub fn build_nested_list(
+    ordered: bool,
+    items: &[(u8, Vec<InlineContent>)],
+    base_level: u8,
+) -> List {
+    let mut list_items = Vec::new();
+    let mut idx = 0;
+
+    while idx < items.len() {
+        let (level, content) = &items[idx];
+        let nested_start = idx + 1;
+        let mut nested_end = nested_start;
+        while nested_end < items.len() && items[nested_end].0 > base_level {
+            nested_end += 1;
+        }
+        let nested = if *level <= base_level && nested_end > nested_start {
+            Some(build_nested_list(ordered, &items[nested_start..nested_end], base_level + 1))
+        } else {
+            None
+        };
+        list_items.push(ListItem {
+            content: inline_to_element_block(content.clone()),
+            nested,
+        });
+        idx = if nested_end > nested_start {
+            nested_end
+        } else {
+            idx + 1
+        };
+    }
+
+    List {
+        ordered,
+        items: list_items,
+        ..Default::default()
+    }
+}
+
 /// An embedded image reference.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Image {
@@ -812,4 +984,195 @@ pub struct Image {
     /// Inline vs. floating positioning.
     #[serde(default)]
     pub positioning: ImagePositioning,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── first_inline_font_size_pt ────────────────────────────────────
+
+    #[test]
+    fn first_font_size_returns_half_pt_as_pt() {
+        let content = vec![InlineContent::Text(TextSpan {
+            text: "hi".into(),
+            font_size_half_pt: Some(24), // 12pt
+            ..Default::default()
+        })];
+        assert_eq!(first_inline_font_size_pt(&content), Some(12.0));
+    }
+
+    #[test]
+    fn first_font_size_picks_first_declared() {
+        // Second span's size is ignored — the first declared one wins.
+        let content = vec![
+            InlineContent::Text(TextSpan {
+                text: "a".into(),
+                font_size_half_pt: Some(20), // 10pt
+                ..Default::default()
+            }),
+            InlineContent::Text(TextSpan {
+                text: "b".into(),
+                font_size_half_pt: Some(48), // 24pt — ignored
+                ..Default::default()
+            }),
+        ];
+        assert_eq!(first_inline_font_size_pt(&content), Some(10.0));
+    }
+
+    #[test]
+    fn first_font_size_skips_unsized_runs() {
+        // First run has no size; second does → returns the second's size.
+        let content = vec![
+            InlineContent::Text(TextSpan {
+                text: "a".into(),
+                ..Default::default()
+            }),
+            InlineContent::Text(TextSpan {
+                text: "b".into(),
+                font_size_half_pt: Some(16), // 8pt
+                ..Default::default()
+            }),
+        ];
+        assert_eq!(first_inline_font_size_pt(&content), Some(8.0));
+    }
+
+    #[test]
+    fn first_font_size_empty_returns_none() {
+        assert_eq!(first_inline_font_size_pt(&[]), None);
+    }
+
+    #[test]
+    fn first_font_size_all_unsized_returns_none() {
+        let content = vec![
+            InlineContent::Text(TextSpan::plain("a")),
+            InlineContent::Text(TextSpan::plain("b")),
+        ];
+        assert_eq!(first_inline_font_size_pt(&content), None);
+    }
+
+    // ── inline_to_element_block ──────────────────────────────────────
+
+    #[test]
+    fn inline_to_element_block_empty_returns_empty() {
+        let result = inline_to_element_block(vec![]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn inline_to_element_block_wraps_in_paragraph() {
+        let inline = vec![InlineContent::Text(TextSpan::plain("hello"))];
+        let result = inline_to_element_block(inline);
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            Element::Paragraph(p) => {
+                assert_eq!(p.content.len(), 1);
+                assert!(matches!(
+                    &p.content[0],
+                    InlineContent::Text(s) if s.text == "hello"
+                ));
+            },
+            _ => panic!("expected Paragraph"),
+        }
+    }
+
+    // ── build_nested_list ────────────────────────────────────────────
+
+    fn item(level: u8, text: &str) -> (u8, Vec<InlineContent>) {
+        (level, vec![InlineContent::Text(TextSpan::plain(text))])
+    }
+
+    fn list_item_text(item: &ListItem) -> String {
+        let mut out = String::new();
+        for el in &item.content {
+            if let Element::Paragraph(p) = el {
+                for c in &p.content {
+                    if let InlineContent::Text(s) = c {
+                        out.push_str(&s.text);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn build_nested_list_flat() {
+        let items = vec![item(0, "A"), item(0, "B"), item(0, "C")];
+        let list = build_nested_list(false, &items, 0);
+        assert!(!list.ordered);
+        assert_eq!(list.items.len(), 3);
+        assert!(list.items.iter().all(|li| li.nested.is_none()));
+        assert_eq!(list_item_text(&list.items[1]), "B");
+    }
+
+    #[test]
+    fn build_nested_list_two_levels() {
+        // Top:   A
+        //   sub: A.1, A.2
+        // Top:   B
+        let items = vec![item(0, "A"), item(1, "A.1"), item(1, "A.2"), item(0, "B")];
+        let list = build_nested_list(true, &items, 0);
+        assert!(list.ordered);
+        assert_eq!(list.items.len(), 2);
+        let nested = list.items[0].nested.as_ref().expect("A has nested");
+        assert_eq!(nested.items.len(), 2);
+        assert_eq!(list_item_text(&nested.items[0]), "A.1");
+        assert_eq!(list_item_text(&nested.items[1]), "A.2");
+        // B has no nested children.
+        assert!(list.items[1].nested.is_none());
+    }
+
+    #[test]
+    fn build_nested_list_three_levels() {
+        let items = vec![item(0, "A"), item(1, "A.1"), item(2, "A.1.x"), item(0, "B")];
+        let list = build_nested_list(false, &items, 0);
+        let l1 = list.items[0].nested.as_ref().unwrap();
+        assert_eq!(l1.items.len(), 1);
+        let l2 = l1.items[0].nested.as_ref().unwrap();
+        assert_eq!(l2.items.len(), 1);
+        assert_eq!(list_item_text(&l2.items[0]), "A.1.x");
+    }
+
+    #[test]
+    fn build_nested_list_empty() {
+        let list = build_nested_list(false, &[], 0);
+        assert!(list.items.is_empty());
+    }
+
+    // ── TextSpan::plain ──────────────────────────────────────────────
+
+    #[test]
+    fn text_span_plain_has_default_styling() {
+        let s = TextSpan::plain("hi");
+        assert_eq!(s.text, "hi");
+        assert!(!s.bold);
+        assert!(!s.italic);
+        assert!(s.font_size_half_pt.is_none());
+        assert!(s.hyperlink.is_none());
+    }
+
+    // ── FramePosition / Shape defaults ───────────────────────────────
+
+    #[test]
+    fn shape_default_is_line_at_origin() {
+        let s = Shape::default();
+        assert!(matches!(s.kind, ShapeGeom::Line));
+        assert_eq!(s.x_emu, 0);
+        assert_eq!(s.width_emu, 0);
+        assert!(s.stroke_rgb.is_none());
+    }
+
+    #[test]
+    fn frame_position_round_trips_via_serde() {
+        let fp = FramePosition {
+            x_twips: 720,
+            y_twips: 1080,
+            width_twips: 5000,
+            height_twips: 400,
+        };
+        let json = serde_json::to_string(&fp).unwrap();
+        let back: FramePosition = serde_json::from_str(&json).unwrap();
+        assert_eq!(fp, back);
+    }
 }

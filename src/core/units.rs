@@ -100,6 +100,30 @@ impl HalfPoint {
     pub fn from_points(pt: f64) -> Self {
         Self((pt * 2.0) as u32)
     }
+
+    /// Round to the nearest half-point.
+    pub fn from_points_rounded(pt: f64) -> Self {
+        Self((pt * 2.0).round() as u32)
+    }
+
+    /// Construct from WordProcessingML's `<w:sz w:val="N"/>`. The
+    /// attribute value is already in half-points, so this is identity
+    /// modulo signed→unsigned.
+    pub fn from_word_sz(half_pt: u32) -> Self {
+        Self(half_pt)
+    }
+
+    /// Construct from DrawingML's `<a:rPr sz="N"/>`. The attribute
+    /// value is in *hundredths of a point* (sz=1200 → 12 pt). Half-pt
+    /// = hundredths / 50.
+    pub fn from_drawingml_sz(hundredths_pt: u32) -> Self {
+        Self(hundredths_pt / 50)
+    }
+
+    /// Reverse of [`Self::from_drawingml_sz`].
+    pub fn to_drawingml_sz(self) -> u32 {
+        self.0 * 50
+    }
 }
 
 /// Percentage * 1000 (e.g., 50% = 50_000, 100% = 100_000). ST_Percentage in OOXML.
@@ -182,6 +206,57 @@ mod tests {
 
         let from = HalfPoint::from_points(10.0);
         assert_eq!(from.0, 20);
+    }
+
+    #[test]
+    fn half_point_from_points_rounded() {
+        // 10.1pt → 20.2 half-pts → rounds to 20.
+        assert_eq!(HalfPoint::from_points_rounded(10.1).0, 20);
+        // 10.3pt → 20.6 half-pts → rounds to 21.
+        assert_eq!(HalfPoint::from_points_rounded(10.3).0, 21);
+        // Exact half-point boundary rounds with banker's rules; check whole-pt.
+        assert_eq!(HalfPoint::from_points_rounded(12.0).0, 24);
+        // Compare with truncating from_points: 10.49 → trunc 20, round 21.
+        assert_eq!(HalfPoint::from_points(10.49).0, 20);
+        assert_eq!(HalfPoint::from_points_rounded(10.49).0, 21);
+    }
+
+    #[test]
+    fn half_point_from_word_sz() {
+        // <w:sz w:val="24"/> means 24 half-points → 12pt.
+        let sz = HalfPoint::from_word_sz(24);
+        assert_eq!(sz.0, 24);
+        assert!((sz.to_points() - 12.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn half_point_from_drawingml_sz() {
+        // <a:rPr sz="1200"/> means 1200 hundredths of a point → 12pt → 24 half-pts.
+        let sz = HalfPoint::from_drawingml_sz(1200);
+        assert_eq!(sz.0, 24);
+        assert!((sz.to_points() - 12.0).abs() < f64::EPSILON);
+        // 1800 hundredths → 18pt → 36 half-pts.
+        assert_eq!(HalfPoint::from_drawingml_sz(1800).0, 36);
+        // Below half-point granularity (sz=125 → 2.5 half-pt) truncates.
+        assert_eq!(HalfPoint::from_drawingml_sz(125).0, 2);
+    }
+
+    #[test]
+    fn half_point_to_drawingml_sz() {
+        // 24 half-pts (=12pt) → 1200 hundredths.
+        assert_eq!(HalfPoint(24).to_drawingml_sz(), 1200);
+        assert_eq!(HalfPoint(36).to_drawingml_sz(), 1800);
+    }
+
+    #[test]
+    fn half_point_drawingml_round_trip() {
+        for hundredths in [100u32, 600, 1100, 1200, 1800, 2400, 3600] {
+            let hp = HalfPoint::from_drawingml_sz(hundredths);
+            // Round-trip is lossless when hundredths is divisible by 50.
+            if hundredths % 50 == 0 {
+                assert_eq!(hp.to_drawingml_sz(), hundredths, "input {hundredths}");
+            }
+        }
     }
 
     #[test]

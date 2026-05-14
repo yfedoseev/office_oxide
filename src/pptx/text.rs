@@ -431,6 +431,7 @@ mod tests {
             },
             slides,
             theme: None,
+            embedded_fonts: Vec::new(),
         }
     }
 
@@ -448,12 +449,15 @@ mod tests {
             text_body: Some(TextBody {
                 paragraphs: vec![TextParagraph {
                     level: 0,
+                    alignment: None,
+                    space_before_hundredths_pt: None,
                     content: vec![TextContent::Run(TextRun {
                         text: text.to_string(),
                         bold: None,
                         italic: None,
                         strikethrough: false,
                         hyperlink: None,
+                        font_size_hundredths_pt: None,
                     })],
                 }],
             }),
@@ -475,12 +479,15 @@ mod tests {
             text_body: Some(TextBody {
                 paragraphs: vec![TextParagraph {
                     level: 0,
+                    alignment: None,
+                    space_before_hundredths_pt: None,
                     content: vec![TextContent::Run(TextRun {
                         text: text.to_string(),
                         bold: None,
                         italic: None,
                         strikethrough: false,
                         hyperlink: None,
+                        font_size_hundredths_pt: None,
                     })],
                 }],
             }),
@@ -501,6 +508,7 @@ mod tests {
                 text_shape("Middle", "middle text", 50, 2500),
             ],
             notes: None,
+            background_rgb: None,
         }]);
 
         let text = doc.slide_plain_text(0).unwrap();
@@ -513,6 +521,7 @@ mod tests {
             name: String::new(),
             shapes: vec![text_shape("Text", "Hello", 0, 0)],
             notes: Some("Speaker notes".to_string()),
+            background_rgb: None,
         }]);
 
         let text = doc.slide_plain_text(0).unwrap();
@@ -526,11 +535,13 @@ mod tests {
                 name: String::new(),
                 shapes: vec![text_shape("A", "Slide one", 0, 0)],
                 notes: None,
+                background_rgb: None,
             },
             Slide {
                 name: String::new(),
                 shapes: vec![text_shape("B", "Slide two", 0, 0)],
                 notes: None,
+                background_rgb: None,
             },
         ]);
 
@@ -547,6 +558,7 @@ mod tests {
                 text_shape("Body", "Body text", 0, 2000),
             ],
             notes: None,
+            background_rgb: None,
         }]);
 
         let md = doc.slide_to_markdown(0).unwrap();
@@ -573,6 +585,8 @@ mod tests {
                 text_body: Some(TextBody {
                     paragraphs: vec![TextParagraph {
                         level: 0,
+                        alignment: None,
+                        space_before_hundredths_pt: None,
                         content: vec![
                             TextContent::Run(TextRun {
                                 text: "bold".to_string(),
@@ -580,6 +594,7 @@ mod tests {
                                 italic: None,
                                 strikethrough: false,
                                 hyperlink: None,
+                                font_size_hundredths_pt: None,
                             }),
                             TextContent::Run(TextRun {
                                 text: " and ".to_string(),
@@ -587,6 +602,7 @@ mod tests {
                                 italic: None,
                                 strikethrough: false,
                                 hyperlink: None,
+                                font_size_hundredths_pt: None,
                             }),
                             TextContent::Run(TextRun {
                                 text: "italic".to_string(),
@@ -594,6 +610,7 @@ mod tests {
                                 italic: Some(true),
                                 strikethrough: false,
                                 hyperlink: None,
+                                font_size_hundredths_pt: None,
                             }),
                         ],
                     }],
@@ -601,6 +618,7 @@ mod tests {
                 placeholder: None,
             })],
             notes: None,
+            background_rgb: None,
         }]);
 
         let md = doc.slide_to_markdown(0).unwrap();
@@ -613,6 +631,7 @@ mod tests {
             name: String::new(),
             shapes: vec![text_shape("Text", "Content", 0, 0)],
             notes: Some("Note line 1\nNote line 2".to_string()),
+            background_rgb: None,
         }]);
 
         let md = doc.slide_to_markdown(0).unwrap();
@@ -640,12 +659,15 @@ mod tests {
                                     text_body: Some(TextBody {
                                         paragraphs: vec![TextParagraph {
                                             level: 0,
+                                            alignment: None,
+                                            space_before_hundredths_pt: None,
                                             content: vec![TextContent::Run(TextRun {
                                                 text: "H1".to_string(),
                                                 bold: None,
                                                 italic: None,
                                                 strikethrough: false,
                                                 hyperlink: None,
+                                                font_size_hundredths_pt: None,
                                             })],
                                         }],
                                     }),
@@ -658,12 +680,15 @@ mod tests {
                                     text_body: Some(TextBody {
                                         paragraphs: vec![TextParagraph {
                                             level: 0,
+                                            alignment: None,
+                                            space_before_hundredths_pt: None,
                                             content: vec![TextContent::Run(TextRun {
                                                 text: "H2".to_string(),
                                                 bold: None,
                                                 italic: None,
                                                 strikethrough: false,
                                                 hyperlink: None,
+                                                font_size_hundredths_pt: None,
                                             })],
                                         }],
                                     }),
@@ -680,12 +705,15 @@ mod tests {
                                     text_body: Some(TextBody {
                                         paragraphs: vec![TextParagraph {
                                             level: 0,
+                                            alignment: None,
+                                            space_before_hundredths_pt: None,
                                             content: vec![TextContent::Run(TextRun {
                                                 text: "A".to_string(),
                                                 bold: None,
                                                 italic: None,
                                                 strikethrough: false,
                                                 hyperlink: None,
+                                                font_size_hundredths_pt: None,
                                             })],
                                         }],
                                     }),
@@ -698,12 +726,15 @@ mod tests {
                                     text_body: Some(TextBody {
                                         paragraphs: vec![TextParagraph {
                                             level: 0,
+                                            alignment: None,
+                                            space_before_hundredths_pt: None,
                                             content: vec![TextContent::Run(TextRun {
                                                 text: "B".to_string(),
                                                 bold: None,
                                                 italic: None,
                                                 strikethrough: false,
                                                 hyperlink: None,
+                                                font_size_hundredths_pt: None,
                                             })],
                                         }],
                                     }),
@@ -718,6 +749,7 @@ mod tests {
                 }),
             })],
             notes: None,
+            background_rgb: None,
         }]);
 
         let md = doc.slide_to_markdown(0).unwrap();
@@ -743,6 +775,8 @@ mod tests {
                 text_body: Some(TextBody {
                     paragraphs: vec![TextParagraph {
                         level: 0,
+                        alignment: None,
+                        space_before_hundredths_pt: None,
                         content: vec![TextContent::Run(TextRun {
                             text: "Click here".to_string(),
                             bold: None,
@@ -754,12 +788,14 @@ mod tests {
                                 ),
                                 tooltip: None,
                             }),
+                            font_size_hundredths_pt: None,
                         })],
                     }],
                 }),
                 placeholder: None,
             })],
             notes: None,
+            background_rgb: None,
         }]);
 
         let md = doc.slide_to_markdown(0).unwrap();

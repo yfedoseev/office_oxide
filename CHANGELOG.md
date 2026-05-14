@@ -5,6 +5,161 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-05-13
+
+> Round-trip fidelity, IR layout features, embedded fonts, XLSX number formatting, and an O(1) style-lookup perf win.
+
+### Performance
+
+- **XLSX styles**: cell-format lookups now use a `HashMap`, replacing
+  the linear `Vec` scan in `format_cell_value` / `is_date_cell`.
+  Per-cell formatting becomes O(1); large styled workbooks parse
+  noticeably faster with no API change.
+
+### Round-trip fidelity (PDF → office → PDF)
+
+- **Alignment, spacing, footers, and horizontal rules** preserved end-to-end
+  through both `to_docx` and `to_pptx` writers.
+- **Images, fonts, and column layouts** preserved across DOCX, PPTX, and
+  XLSX. Source-PDF font programs that previously registered as empty
+  subsets now embed correctly.
+- **`Element::ThematicBreak`** encoded in PPTX as a centered 30-char run
+  of `U+2500 BOX DRAWINGS LIGHT HORIZONTAL`. Downstream PDF renderers
+  detect the all-U+2500 content and re-emit a real horizontal rule.
+- **DOCX horizontal rules** recovered from the conventional encoding
+  (empty paragraph + `<w:pBdr><w:bottom/>`) back into `Element::ThematicBreak`.
+
+### DOCX
+
+- **`<w:framePr>` parsed into IR** as `FramePosition` (twips, page-anchored)
+  on both `Paragraph` and `Heading`. Used by layout-preserving paths
+  (e.g. pdf_oxide's `to_docx_bytes_layout`).
+- **Floating drawings and vector shapes**: `<wp:anchor>` images plus
+  `<wps:wsp>` preset shapes (line, rect) with stroke/fill RGB and
+  stroke width round-trip through `DrawingInfo`.
+- **Per-section page sizes** preserved through `to_ir`; multi-section IR
+  emits per-section `<w:sectPr>`.
+- **`<w:sz>` preserved** through to IR's `font_size_half_pt`.
+- **Headers and footers** now included in `to_markdown` and `to_ir`
+  (previously silently dropped).
+- **Embedded fonts** under `/word/fonts/` exposed on
+  `DocxDocument.embedded_fonts`. `strip_embedded_font_filename` recovers
+  the original face name from `font_<n>_<face>.<ext>` (fixes greedy
+  alphabetic-trim regression where `TeXGyreTermesX-` was returned
+  instead of `TeXGyreTermesX-Regular`).
+- **`parse_drawing` decomposed** into focused recursive helpers
+  (`parse_inline_or_anchor_body`, `parse_anchor_position`,
+  `parse_shape_properties`, etc.) for readability.
+- **Run-level `<w:rFonts w:ascii>` plumbed into `TextSpan.font_name`**;
+  `<w:cols>` propagated to `Section.columns`.
+
+### PPTX
+
+- **Pagination**: each slide forces a `SectionBreakType::NextPage` so two
+  slides never share a rendered page.
+- **Real Title+Body slide layout** emitted by the writer instead of a blank
+  layout, so PowerPoint shows placeholder hints in edit mode.
+- **Slide background**: `<p:cSld><p:bg><p:bgPr><a:solidFill><a:srgbClr>`
+  parsed into `Slide.background_rgb` and propagated to `Section.background_rgb`.
+- **Positioned text boxes**: shapes with explicit `<a:xfrm>` coordinates
+  wrap their content in `Element::TextBox` so downstream renderers can
+  place them at absolute EMU coordinates. Zero-size shapes skip the wrapper.
+- **Slide size → page setup**: `<p:sldSz cx=… cy=…>` propagated to each
+  section's `PageSetup`.
+- **Run font sizes preserved** via new `TextRun.font_size_hundredths_pt`
+  (parsed from `<a:rPr sz="…"/>`).
+- **Paragraph alignment** parsed from `<a:pPr algn="…"/>` (all five
+  variants: `l` / `ctr` / `r` / `just` / `dist`) into
+  `TextParagraph.alignment`. **Space-before** parsed from
+  `<a:spcBef><a:spcPts val=…/>`.
+- **Title alignment propagation**: `find_title` returns text + first
+  paragraph's alignment, seeding both `Section.title` and the synthesised
+  level-2 Heading's alignment.
+- **Picture shapes** now carry `embed_rid`, `data`, and `format`
+  (resolved via a pre-built media map at parse time, so the parallel
+  slide parser doesn't need the OPC reader).
+- **Font embedding** under `/ppt/fonts/`.
+- **Structured chart text extraction**: `<c:chart>` parts parsed into
+  per-chart text blocks rendered as `## Chart N` in markdown / search /
+  PDF without needing a graphical chart renderer.
+- **Compaction**: consecutive H1/H2 cover-page headings fold into one
+  slide instead of fragmenting; long XLSX paragraphs split across cells
+  to respect ~32k char-per-cell limits.
+- **Slide cap**: writer caps at ~250 slides (PowerPoint's hard limit).
+
+### XLSX
+
+- **Per-worksheet `page_setup`** round-trips via `<pageMargins>` (inches)
+  and `<pageSetup>` (paperWidth/paperHeight with mm/cm/in suffix or
+  `paperSize` enum 1–13). New `Worksheet.page_setup`.
+- **`numfmt` module** (`crate::xlsx::numfmt`): built-in IDs 0–44 (general,
+  fixed, commas, percent, currency, scientific, accounting) and a
+  simplified custom format-string parser (multi-section, `[Red]` color
+  directives stripped, currency prefix from `[$€-407]`, quoted literal
+  suffix, percent and thousands separators). Applied to numeric cells
+  during `format_cell_value` and `write_cell_value_fast`.
+- **Font sizes** preserved through IR; long-text single-column sheets
+  emit as paragraphs instead of a tall 1-column GFM table.
+- **Unique worksheet names** in `ir_to_xlsx` (duplicates suffixed with
+  `_2`, `_3`, …).
+- **Drawings**: `xl/drawings/drawingN.xml` parsed into
+  `Worksheet.images` (`WorksheetPicture` with EMU coords + bytes) and
+  `Worksheet.text_shapes` (`WorksheetTextShape` for layout-mode text
+  boxes from `to_xlsx_bytes_layout`).
+- **Embedded fonts** under `/xl/fonts/`.
+
+### IR enrichment
+
+- **New types**: `Shape` (vector shape anchored at absolute EMU coords),
+  `ShapeGeom` (`Line`, `Rect`), `FramePosition` (twip-anchored frame).
+- **`Heading`** gains `frame_position` + `alignment`.
+- **`Section`** gains `background_rgb`.
+- **`ParagraphAlignment`** gains the `Distribute` variant.
+- **`Element::Shape(Shape)`** variant for vector shapes.
+- **New helpers**: `first_inline_font_size_pt`, `inline_to_element_block`,
+  `build_nested_list` (flat / 2-level / 3-level recursion).
+- **Centralized defaults** in `ir_render::block_default`: ThematicBreak
+  renders as `"---"` / `<hr />`; PageBreak / ColumnBreak / Shape are
+  invisible in flow; TextBox / Footnote / Endnote recursively render
+  children. Adding a new `Element` variant forces a compile error
+  in `block_default::default_plain` instead of silent fallthrough.
+
+### Core
+
+- **`crate::core::core_properties`**: shared `docProps/core.xml` generator
+  used by all three writers. Emits `dc:title`, `dc:creator`, `dc:subject`,
+  `dc:description`, `cp:keywords`, `dcterms:created`, `dcterms:modified`
+  from the IR's `Metadata`. Empty fields are omitted entirely.
+- **`crate::core::embedded_fonts`**: unified font-embedding helper
+  (`write_embedded_fonts`, `sanitize_font_filename`). All three formats
+  share the layout `<prefix>font_<n>_<safe_name>.ttf`.
+- **`HalfPoint::from_word_sz` / `from_drawingml_sz` / `to_drawingml_sz` /
+  `from_points_rounded`**: cross-format font-size invariants
+  (DrawingML hundredths-of-a-point vs WML half-points).
+
+### Tests
+
+- **+98 unit tests** across the modules touched in this release:
+  `core::embedded_fonts`, `core::core_properties`, `core::units`,
+  `xlsx::numfmt`, `xlsx::worksheet`, `docx::formatting`, `docx::mod`,
+  `pptx::slide`, `ir`, `ir_render`.
+- **535 / 535 tests pass** across default, `--features parallel`,
+  `--features mmap`, and `--features parallel,mmap` builds.
+- `cargo fmt` clean. `cargo clippy --workspace --all-targets -- -D warnings`
+  clean.
+
+### Bindings
+
+- **Python wheel** (maturin, PyO3 0.28) builds cleanly and exposes
+  `Document`, `EditableDocument`, `XlsxWriter`, `PptxWriter`,
+  `OfficeOxideError`, `create_from_markdown`, `extract_text`,
+  `to_markdown`, `to_html`, `version`.
+- **WASM** package (`wasm-pack build --target web/node/bundler`) builds
+  cleanly with `--features wasm`.
+- **C#** package bumped to 0.1.2 (csproj only — no API changes).
+
+[0.1.2]: https://github.com/yfedoseev/office_oxide/compare/v0.1.1...v0.1.2
+
 ## [0.1.1] - 2026-04-30
 
 > Richer IR type system, DOCX writer output, improved PPTX/XLSX IR renderers, and writer APIs in all language bindings

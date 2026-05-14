@@ -1,6 +1,7 @@
 use super::XlsxDocument;
 use super::cell::{Cell, CellValue};
 use super::date;
+use super::numfmt;
 use super::worksheet::Row;
 
 impl XlsxDocument {
@@ -71,6 +72,14 @@ impl XlsxDocument {
                 }
             }
         }
+        // Charts: emit each chart's extracted text under a "## Chart N" heading
+        // so its words appear in markdown / search / PDF without needing a
+        // graphical chart renderer.
+        for (i, text) in self.chart_text.iter().enumerate() {
+            if !text.trim().is_empty() {
+                parts.push(format!("## Chart {}\n\n{}", i + 1, text));
+            }
+        }
         parts.join("\n\n")
     }
 
@@ -84,6 +93,33 @@ impl XlsxDocument {
         let col_count = compute_column_count(&ws.rows);
         if col_count == 0 {
             return Some(String::new());
+        }
+
+        // If the sheet is effectively single-column with prose-length cells
+        // (notes, single-column reports), emit each cell as its own paragraph
+        // instead of wrapping every line in a 1-column GFM table. The table
+        // form looks awful when rendered (tall, narrow, hard to read) and
+        // round-trips badly through markdown→IR→office.
+        if col_count == 1
+            && ws.rows.iter().any(|r| {
+                r.cells
+                    .first()
+                    .map(|c| self.format_cell_value(c).chars().count() > 20)
+                    .unwrap_or(false)
+            })
+        {
+            let mut out = String::new();
+            out.push_str(&format!("## {}\n\n", ws.name));
+            for row in &ws.rows {
+                if let Some(cell) = row.cells.first() {
+                    let text = self.format_cell_value(cell);
+                    if !text.trim().is_empty() {
+                        out.push_str(text.trim());
+                        out.push_str("\n\n");
+                    }
+                }
+            }
+            return Some(out.trim_end().to_string());
         }
 
         let mut lines = Vec::new();
@@ -143,12 +179,97 @@ impl XlsxDocument {
                         return;
                     }
                 }
+                if let Some(idx) = cell.style_index {
+                    if let Some(styles) = self.styles.as_ref() {
+                        if let Some(fmt_id) = styles.number_format_id_for(idx) {
+                            if fmt_id != 0 {
+                                let fmt_str = styles.number_format_for(idx);
+                                let formatted = numfmt::apply_format(*n, fmt_id, fmt_str);
+                                buf.push_str(&formatted);
+                                return;
+                            }
+                        }
+                    }
+                }
                 write_number(*n, buf);
             },
             CellValue::String(s) => buf.push_str(s),
             CellValue::SharedString(idx) => {
                 let s = self.shared_strings.get(*idx).unwrap_or("");
                 // Truncate to prevent DoS from crafted shared strings
+                if s.len() <= 32_768 {
+                    buf.push_str(s);
+                } else {
+                    let mut end = 32_768;
+                    while !s.is_char_boundary(end) && end > 0 {
+                        end -= 1;
+                    }
+                    buf.push_str(&s[..end]);
+                }
+            },
+            CellValue::Boolean(b) => buf.push_str(if *b { "TRUE" } else { "FALSE" }),
+            CellValue::Error(e) => buf.push_str(e),
+            CellValue::Date(dt) => buf.push_str(&dt.to_iso_string()),
+        }
+    }
+
+    /// Pre-compute the set of style indices that map to date formats.
+    /// Call once before iterating many cells; use with `write_cell_value_fast`.
+    pub fn date_style_indices(&self) -> std::collections::HashSet<u32> {
+        let Some(styles) = self.styles.as_ref() else {
+            return Default::default();
+        };
+        (0..styles.cell_formats.len() as u32)
+            .filter(|&idx| {
+                let Some(fmt_id) = styles.number_format_id_for(idx) else {
+                    return false;
+                };
+                date::is_date_format_id(fmt_id)
+                    || styles
+                        .number_format_for(idx)
+                        .is_some_and(date::is_date_format_string)
+            })
+            .collect()
+    }
+
+    /// Like `write_cell_value` but uses a pre-computed date style set instead
+    /// of calling `is_date_cell()` (which re-scans format strings) per cell.
+    pub fn write_cell_value_fast(
+        &self,
+        cell: &Cell,
+        buf: &mut String,
+        date_indices: &std::collections::HashSet<u32>,
+    ) {
+        match &cell.value {
+            CellValue::Empty => {},
+            CellValue::Number(n) => {
+                let is_date = cell
+                    .style_index
+                    .is_some_and(|i| date_indices.contains(&i));
+                if is_date {
+                    if let Some(dt) = date::DateTimeValue::from_serial(*n, self.workbook.date1904) {
+                        buf.push_str(&dt.to_iso_string());
+                        return;
+                    }
+                }
+                // Apply number format (thousands, decimals, %, currency, etc.)
+                if let Some(idx) = cell.style_index {
+                    if let Some(styles) = self.styles.as_ref() {
+                        if let Some(fmt_id) = styles.number_format_id_for(idx) {
+                            if fmt_id != 0 {
+                                let fmt_str = styles.number_format_for(idx);
+                                let formatted = numfmt::apply_format(*n, fmt_id, fmt_str);
+                                buf.push_str(&formatted);
+                                return;
+                            }
+                        }
+                    }
+                }
+                write_number(*n, buf);
+            },
+            CellValue::String(s) => buf.push_str(s),
+            CellValue::SharedString(idx) => {
+                let s = self.shared_strings.get(*idx).unwrap_or("");
                 if s.len() <= 32_768 {
                     buf.push_str(s);
                 } else {

@@ -24,19 +24,102 @@ impl DocxDocument {
     }
 
     /// Convert the document to Markdown.
+    ///
+    /// Includes headers and footers around the body so a downstream
+    /// renderer (PDF, HTML, search index) sees the full visible content
+    /// of every page. Without this, simple-but-meaningful artefacts like
+    /// `My header` / `My footer` are silently dropped.
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
         let ctx = MarkdownCtx {
             styles: self.styles.as_ref(),
             numbering: self.numbering.as_ref(),
         };
+
+        // Headers (deduped on text content — headers may be repeated for
+        // first-page / even / default variants but the text is usually the
+        // same; we only want one copy in flat markdown).
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for hf in &self.headers_footers {
+            if !matches!(
+                hf.hf_type,
+                super::HeaderFooterType::Default
+                    | super::HeaderFooterType::First
+                    | super::HeaderFooterType::Even
+            ) {
+                continue;
+            }
+            let mut buf = String::new();
+            markdown_blocks(&hf.content, &ctx, &mut buf, 0);
+            let trimmed = buf.trim();
+            // Skip empty headers/footers and duplicates.
+            if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
+                continue;
+            }
+            // We don't currently know which side (header vs footer) this
+            // came from at this layer — `HeaderFooter` carries only the
+            // type modifier (default/first/even). The body sits between
+            // the headers and footers we emit, so we put all headers
+            // before and all footers after the body.
+        }
+
+        // Decide header/footer split using each section's references.
+        let (header_texts, footer_texts) = split_headers_footers(self, &ctx);
+        for h in &header_texts {
+            out.push_str(h);
+            out.push_str("\n\n");
+        }
+
         markdown_blocks(&self.body.elements, &ctx, &mut out, 0);
+
+        for f in &footer_texts {
+            if !out.ends_with("\n\n") {
+                out.push_str("\n\n");
+            }
+            out.push_str(f);
+            out.push('\n');
+        }
+
         // Trim trailing newlines
         while out.ends_with('\n') {
             out.pop();
         }
+        let _ = seen; // silence
         out
     }
+}
+
+/// Split parsed `HeaderFooter` entries into headers vs footers using the
+/// section reference lists. Returns (headers, footers) as deduplicated
+/// markdown-string vectors. We don't currently retain the relationship
+/// IDs that map a section ref to a specific parsed `HeaderFooter`, so we
+/// approximate: header_refs.len() entries from the front go to headers,
+/// the rest go to footers. Correct for the common case (single section
+/// with one of each); on multi-variant documents some misclassification
+/// is possible but text is still preserved (just maybe in the wrong slot).
+fn split_headers_footers(doc: &DocxDocument, ctx: &MarkdownCtx) -> (Vec<String>, Vec<String>) {
+    let mut headers: Vec<String> = Vec::new();
+    let mut footers: Vec<String> = Vec::new();
+    let mut header_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut footer_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let n_header_refs: usize = doc.sections.iter().map(|s| s.header_refs.len()).sum();
+    for (idx, hf) in doc.headers_footers.iter().enumerate() {
+        let mut buf = String::new();
+        markdown_blocks(&hf.content, ctx, &mut buf, 0);
+        let t = buf.trim().to_string();
+        if t.is_empty() {
+            continue;
+        }
+        if idx < n_header_refs {
+            if header_seen.insert(t.clone()) {
+                headers.push(t);
+            }
+        } else if footer_seen.insert(t.clone()) {
+            footers.push(t);
+        }
+    }
+    (headers, footers)
 }
 
 fn plain_text_blocks(elements: &[BlockElement], out: &mut String) {

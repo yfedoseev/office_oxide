@@ -235,6 +235,7 @@ fn sample_ir(format: office_oxide::DocumentFormat) -> office_oxide::DocumentIR {
                 Element::Heading(Heading {
                     level: 1,
                     content: vec![InlineContent::Text(TextSpan::plain("Main Heading"))],
+                    ..Default::default()
                 }),
                 Element::Paragraph(Paragraph {
                     content: vec![InlineContent::Text(TextSpan::plain("Body text here"))],

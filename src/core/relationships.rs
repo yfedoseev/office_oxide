@@ -33,9 +33,19 @@ pub mod rel_types {
     /// Relationship type for the font table.
     pub const FONT_TABLE: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/fontTable";
+    /// Relationship type for an individual embedded font program (the
+    /// `<w:embedRegular r:id="…"/>` reference from `fontTable.xml` to a
+    /// `.ttf` part under `word/fonts/`).
+    pub const FONT: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/font";
     /// Relationship type for embedded images.
     pub const IMAGE: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
+    /// Relationship type for a SpreadsheetML / DrawingML drawing part
+    /// (`xl/drawings/drawingN.xml`). Worksheet-to-drawing rel; the
+    /// drawing itself owns IMAGE rels keyed by `<a:blip r:embed=...>`.
+    pub const DRAWING: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing";
     /// Relationship type for hyperlinks.
     pub const HYPERLINK: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";

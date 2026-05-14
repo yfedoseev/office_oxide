@@ -41,6 +41,14 @@ pub struct PictureShape {
     pub alt_text: Option<String>,
     /// Bounding box position and size in EMU.
     pub position: Option<ShapePosition>,
+    /// Relationship ID (`r:embed`) of the underlying media part, if any.
+    pub embed_rid: Option<String>,
+    /// Raw image bytes resolved via `embed_rid`, if the slide carried a
+    /// resolvable IMAGE relationship at parse time.
+    pub data: Option<Vec<u8>>,
+    /// Image format inferred from the relationship target extension or
+    /// byte signature (e.g. `"png"`, `"jpeg"`, `"gif"`, `"emf"`).
+    pub format: Option<String>,
 }
 
 /// A group of child shapes (`<p:grpSp>`).
@@ -123,10 +131,16 @@ pub struct TextBody {
 }
 
 /// A single paragraph within a text body (`<a:p>`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TextParagraph {
     /// Outline level (0 = top level).
     pub level: u32,
+    /// Paragraph alignment from `<a:pPr algn="…"/>`. None when the
+    /// attribute is absent (renderer-default left alignment).
+    pub alignment: Option<crate::ir::ParagraphAlignment>,
+    /// Space before the paragraph, in 100ths of a point — read from
+    /// `<a:pPr><a:spcBef><a:spcPts val="…"/></a:spcBef></a:pPr>`.
+    pub space_before_hundredths_pt: Option<u32>,
     /// Inline content items in this paragraph.
     pub content: Vec<TextContent>,
 }
@@ -143,7 +157,7 @@ pub enum TextContent {
 }
 
 /// A text run with optional character formatting (`<a:r>`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TextRun {
     /// The text content of this run.
     pub text: String,
@@ -155,6 +169,13 @@ pub struct TextRun {
     pub strikethrough: bool,
     /// Hyperlink attached to this run, if any.
     pub hyperlink: Option<HyperlinkInfo>,
+    /// Font size in hundredths of a point (`<a:rPr sz="1800"/>` → `Some(1800)` = 18 pt).
+    /// `None` when the run inherits its size from the placeholder/master.
+    pub font_size_hundredths_pt: Option<u32>,
+    /// Explicit run colour from `<a:rPr><a:solidFill><a:srgbClr val="…"/></a:solidFill></a:rPr>`.
+    /// `None` when the run inherits its colour from the placeholder /
+    /// theme, or when the fill is non-sRGB (gradient, scheme colour).
+    pub color_rgb: Option<[u8; 3]>,
 }
 
 /// An auto-updated field inside a paragraph (`<a:fld>`).
