@@ -11,7 +11,11 @@ pub fn apply_format(n: f64, fmt_id: u32, fmt_str: Option<&str>) -> String {
         return "NaN".to_string();
     }
     if n.is_infinite() {
-        return if n < 0.0 { "-Infinity".to_string() } else { "Infinity".to_string() };
+        return if n < 0.0 {
+            "-Infinity".to_string()
+        } else {
+            "Infinity".to_string()
+        };
     }
 
     // Built-in format IDs per OOXML spec §18.8.30.
@@ -232,11 +236,20 @@ fn apply_custom(n: f64, fmt: &str) -> String {
                 }
             },
             'E' | 'e' => {
-                has_scientific = true;
-                // Skip the +/- and exponent digits
-                chars.next(); // '+' or '-'
-                while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
-                    chars.next();
+                // Only treat this as scientific notation when followed by
+                // `+` or `-` (per ECMA-376 §18.8.31). Bare `E` is just
+                // a literal in formats like "000E" and must not consume
+                // the next character.
+                if matches!(chars.peek(), Some('+') | Some('-')) {
+                    has_scientific = true;
+                    chars.next(); // consume the sign
+                    while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                        chars.next();
+                    }
+                } else if !in_num_part {
+                    currency_prefix.push(c);
+                } else {
+                    suffix.push(c);
                 }
             },
             '$' => {

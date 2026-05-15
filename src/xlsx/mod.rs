@@ -924,7 +924,14 @@ fn parse_drawing_anchors(xml_data: &[u8]) -> crate::core::Result<DrawingAnchors>
                             cy_emu = v.parse().unwrap_or(0);
                         }
                     },
-                    b"off" if cx_emu == 0 && cy_emu == 0 => {
+                    b"off" if cx_emu == 0 && cy_emu == 0 && matches!(kind, AnchorKind::Unknown) => {
+                        // Honour `<off>` only at the outermost anchor level,
+                        // before we've descended into `<xdr:pic>` or
+                        // `<xdr:sp>`. Otherwise the `<a:off>` inside a
+                        // shape's `<a:xfrm>` (which expresses a transform
+                        // local to the shape, not the anchor origin) would
+                        // overwrite the absolute coordinates parsed from
+                        // `<xdr:pos>`.
                         if let Some(v) = crate::core::xml::optional_attr_str(e, b"x")? {
                             x_emu = v.parse().unwrap_or(x_emu);
                         }
@@ -1065,13 +1072,19 @@ mod tests {
 
     #[test]
     fn sheet_rels_path_top_level() {
-        assert_eq!(sheet_rels_path("xl/worksheets/sheet1.xml"), "xl/worksheets/_rels/sheet1.xml.rels");
+        assert_eq!(
+            sheet_rels_path("xl/worksheets/sheet1.xml"),
+            "xl/worksheets/_rels/sheet1.xml.rels"
+        );
         assert_eq!(sheet_rels_path("sheet1.xml"), "_rels/sheet1.xml.rels");
     }
 
     #[test]
     fn resolve_relative_zip_path_absolute() {
-        assert_eq!(resolve_relative_zip_path("xl/worksheets/sheet1.xml", "/xl/media/img1.png"), "xl/media/img1.png");
+        assert_eq!(
+            resolve_relative_zip_path("xl/worksheets/sheet1.xml", "/xl/media/img1.png"),
+            "xl/media/img1.png"
+        );
     }
 
     #[test]
