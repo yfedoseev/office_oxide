@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.2] - 2026-05-13
+## [0.1.2] - 2026-05-14
 
 > Round-trip fidelity, IR layout features, embedded fonts, XLSX number formatting, and an O(1) style-lookup perf win.
 
@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Per-section page sizes** preserved through `to_ir`; multi-section IR
   emits per-section `<w:sectPr>`.
 - **`<w:sz>` preserved** through to IR's `font_size_half_pt`.
+- **Run colour** from `<w:rPr><w:color w:val="RRGGBB"/>` propagated into
+  `TextSpan.color` during `to_ir`, so PDF→DOCX→PDF round-trips keep
+  coloured text. Only the `ColorRef::Rgb` variant is plumbed today;
+  theme / system / `auto` colours still fall through to the renderer
+  default (proper resolution needs `theme.xml` threaded into the
+  convert path).
 - **Headers and footers** now included in `to_markdown` and `to_ir`
   (previously silently dropped).
 - **Embedded fonts** under `/word/fonts/` exposed on
@@ -68,6 +74,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   section's `PageSetup`.
 - **Run font sizes preserved** via new `TextRun.font_size_hundredths_pt`
   (parsed from `<a:rPr sz="…"/>`).
+- **Run colour preserved** via new `TextRun.color_rgb: Option<[u8; 3]>`
+  parsed from `<a:rPr><a:solidFill><a:srgbClr val="RRGGBB"/></a:solidFill>`
+  and propagated to `TextSpan.color` in IR. The parser tracks an
+  `in_solid_fill` flag so sibling effects (e.g. `<a:hl><a:srgbClr/>`
+  for hyperlink colour) don't leak into the run's own fill; non-sRGB
+  fills (gradient, scheme colour) fall back to `None`.
 - **Paragraph alignment** parsed from `<a:pPr algn="…"/>` (all five
   variants: `l` / `ctr` / `r` / `just` / `dist`) into
   `TextParagraph.alignment`. **Space-before** parsed from
@@ -136,6 +148,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`HalfPoint::from_word_sz` / `from_drawingml_sz` / `to_drawingml_sz` /
   `from_points_rounded`**: cross-format font-size invariants
   (DrawingML hundredths-of-a-point vs WML half-points).
+
+### Dependencies
+
+- **`quick-xml` 0.37 → 0.40**: upstream removed `BytesText::unescape()`
+  and deprecated `Attribute::unescape_value()` (its replacement
+  `normalized_value()` has different semantics — no entity
+  unescaping). Migration added two helpers in `core::xml`:
+  `unescape_text(BytesText) -> Result<String>` (used by 6 call sites)
+  and `unescape_attr_value` (used by 6 call sites, with
+  `#[allow(deprecated)]` localised to the helper so call sites stay
+  deprecation-free). 535 / 535 tests still pass; clippy clean.
+- **`koffi` 2.16.1 → 2.16.2** in `js/` (patch bump).
+
+### Documentation
+
+- **CLI / MCP crate-level docs**: `office_oxide_cli` and
+  `office_oxide_mcp` previously opened with `mod commands;` /
+  `mod protocol;` and had no crate-level rustdoc. Added a short
+  `//!` block plus `#![warn(missing_docs)]` so future items in
+  either binary stay documented.
+  `RUSTDOCFLAGS="-D missing_docs" cargo doc --workspace --no-deps
+  --features parallel,mmap` now passes with zero errors.
 
 ### Tests
 
