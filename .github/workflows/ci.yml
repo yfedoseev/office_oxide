@@ -131,6 +131,15 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
 
+      # macos-latest images sometimes ship a Homebrew `rustup-init` that
+      # shadows the cargo shim rustup installs under $HOME/.cargo/bin.
+      # When that happens `cargo build` invokes `rustup-init build` and
+      # exits with "unexpected argument 'build' found". Pinning the
+      # rustup-managed bin to the front of PATH avoids the collision.
+      - name: Prepend rustup cargo to PATH (macOS)
+        if: runner.os == 'macOS'
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -204,6 +213,12 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # See note in the `test` job — macOS PATH workaround for the
+      # Homebrew rustup-init shim that shadows cargo.
+      - name: Prepend rustup cargo to PATH (macOS)
+        if: runner.os == 'macOS'
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
