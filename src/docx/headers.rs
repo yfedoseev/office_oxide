@@ -83,4 +83,9 @@ pub struct HeaderFooter {
     pub hf_type: HeaderFooterType,
     /// Block content within the header or footer.
     pub content: Vec<BlockElement>,
+    /// `true` if this came from a `<w:headerReference>`, `false` if
+    /// from a `<w:footerReference>`. Lets downstream consumers (e.g.
+    /// the markdown renderer) sort entries into headers vs footers
+    /// without trying to back-derive from cumulative ref counts.
+    pub is_header: bool,
 }

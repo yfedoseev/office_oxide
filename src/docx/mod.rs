@@ -175,23 +175,35 @@ impl DocxDocument {
         let doc_data = opc.read_part(&main_part)?;
         let (body, sections) = parse_document(&doc_data, &doc_rels)?;
 
-        // Parse headers and footers
+        // Parse headers and footers. Walk header refs and footer refs
+        // separately so each parsed `HeaderFooter` can record its own
+        // role; without that distinction, downstream consumers had to
+        // back-derive headers-vs-footers from cumulative ref counts,
+        // which silently misclassifies entries in multi-section docs.
         let mut headers_footers = Vec::new();
-        for section in &sections {
-            for hf_ref in section.header_refs.iter().chain(section.footer_refs.iter()) {
-                if let Some(rel) = doc_rels.get_by_id(&hf_ref.relationship_id) {
-                    if rel.target_mode == TargetMode::Internal {
-                        let part_name = main_part.resolve_relative(&rel.target)?;
-                        if opc.has_part(&part_name) {
-                            let data = opc.read_part(&part_name)?;
-                            let content = parse_body_elements(&data)?;
-                            headers_footers.push(HeaderFooter {
-                                hf_type: hf_ref.hf_type,
-                                content,
-                            });
-                        }
+        let mut parse_hf = |hf_ref: &HeaderFooterRef, is_header: bool| -> CoreResult<()> {
+            if let Some(rel) = doc_rels.get_by_id(&hf_ref.relationship_id) {
+                if rel.target_mode == TargetMode::Internal {
+                    let part_name = main_part.resolve_relative(&rel.target)?;
+                    if opc.has_part(&part_name) {
+                        let data = opc.read_part(&part_name)?;
+                        let content = parse_body_elements(&data)?;
+                        headers_footers.push(HeaderFooter {
+                            hf_type: hf_ref.hf_type,
+                            content,
+                            is_header,
+                        });
                     }
                 }
+            }
+            Ok(())
+        };
+        for section in &sections {
+            for hf_ref in &section.header_refs {
+                parse_hf(hf_ref, true)?;
+            }
+            for hf_ref in &section.footer_refs {
+                parse_hf(hf_ref, false)?;
             }
         }
 

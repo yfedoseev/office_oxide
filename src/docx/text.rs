@@ -59,29 +59,25 @@ impl DocxDocument {
     }
 }
 
-/// Split parsed `HeaderFooter` entries into headers vs footers using the
-/// section reference lists. Returns (headers, footers) as deduplicated
-/// markdown-string vectors. We don't currently retain the relationship
-/// IDs that map a section ref to a specific parsed `HeaderFooter`, so we
-/// approximate: header_refs.len() entries from the front go to headers,
-/// the rest go to footers. Correct for the common case (single section
-/// with one of each); on multi-variant documents some misclassification
-/// is possible but text is still preserved (just maybe in the wrong slot).
+/// Split parsed `HeaderFooter` entries into headers vs footers and
+/// return them as deduplicated markdown-string vectors. Role is read
+/// directly from each entry's `is_header` field (set at parse time),
+/// so this is correct regardless of how many sections the document
+/// has or how the entries are interleaved.
 fn split_headers_footers(doc: &DocxDocument, ctx: &MarkdownCtx) -> (Vec<String>, Vec<String>) {
     let mut headers: Vec<String> = Vec::new();
     let mut footers: Vec<String> = Vec::new();
     let mut header_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut footer_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    let n_header_refs: usize = doc.sections.iter().map(|s| s.header_refs.len()).sum();
-    for (idx, hf) in doc.headers_footers.iter().enumerate() {
+    for hf in &doc.headers_footers {
         let mut buf = String::new();
         markdown_blocks(&hf.content, ctx, &mut buf, 0);
         let t = buf.trim().to_string();
         if t.is_empty() {
             continue;
         }
-        if idx < n_header_refs {
+        if hf.is_header {
             if header_seen.insert(t.clone()) {
                 headers.push(t);
             }
