@@ -26,6 +26,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                             bold: true,
                             ..TextSpan::plain(text)
                         })],
+                        ..Default::default()
                     }));
                 },
                 TextType::Body | TextType::HalfBody | TextType::QuarterBody => {

@@ -1,5 +1,125 @@
 use crate::ir::*;
 
+mod block_default {
+    //! Default flow-rendering for [`Element`] variants that don't
+    //! carry a meaningful inline / paragraph / heading shape.
+    //!
+    //! Each `default_*` function is **exhaustive** over `Element`:
+    //! the compiler forces a decision when a new variant is added
+    //! ("is this variant invisible in flow output, or do specific
+    //! renderers need to handle it?"). Renderers in the parent
+    //! module keep arms only for variants where their output
+    //! differs from these defaults; everything else falls through
+    //! to the matching `default_*` here via `other => default_X(other)`.
+    use super::*;
+    use std::fmt::Write;
+
+    /// Plain-text default. Most invisible variants → `""`;
+    /// `ThematicBreak` → `"---"` (matches markdown); container
+    /// elements recursively render their children.
+    pub fn default_plain(element: &Element) -> String {
+        match element {
+            Element::ThematicBreak => "---".to_string(),
+            Element::TextBox(tb) => tb
+                .content
+                .iter()
+                .map(super::render_element_plain)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            Element::Footnote(n) | Element::Endnote(n) => n
+                .content
+                .iter()
+                .map(super::render_element_plain)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            // Invisible in flow: shapes are positioned, not flow content;
+            // page/column breaks have no plain-text counterpart; an
+            // unannotated image shows nothing in plain text.
+            Element::PageBreak | Element::ColumnBreak | Element::Shape(_) | Element::Image(_) => {
+                String::new()
+            },
+            // The variants below have rich flow output and shouldn't
+            // hit this default — `render_element_plain` handles them.
+            // Reaching here means a renderer forgot a real arm; we
+            // emit empty rather than panic so the document still
+            // renders, but the explicit arms below let the compiler
+            // catch added variants.
+            Element::Heading(_)
+            | Element::Paragraph(_)
+            | Element::Table(_)
+            | Element::List(_)
+            | Element::CodeBlock(_) => String::new(),
+        }
+    }
+
+    /// Markdown default. Same as plain except images get an alt-text
+    /// `![alt]()` form.
+    pub fn default_markdown(element: &Element) -> String {
+        match element {
+            Element::ThematicBreak => "---".to_string(),
+            Element::TextBox(tb) => tb
+                .content
+                .iter()
+                .map(super::render_element_markdown)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            Element::Footnote(n) | Element::Endnote(n) => n
+                .content
+                .iter()
+                .map(super::render_element_markdown)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            Element::PageBreak | Element::ColumnBreak | Element::Shape(_) => String::new(),
+            Element::Image(img) => {
+                let alt = img.alt_text.as_deref().unwrap_or("");
+                format!("![{alt}]()")
+            },
+            Element::Heading(_)
+            | Element::Paragraph(_)
+            | Element::Table(_)
+            | Element::List(_)
+            | Element::CodeBlock(_) => String::new(),
+        }
+    }
+
+    /// HTML default. `ThematicBreak` → `<hr />`; images render an
+    /// empty `<img alt="…"/>`; everything else mirrors `default_plain`
+    /// behaviour with HTML escaping.
+    pub fn default_html(element: &Element) -> String {
+        match element {
+            Element::ThematicBreak => "<hr />".to_string(),
+            Element::TextBox(tb) => tb
+                .content
+                .iter()
+                .map(super::render_element_html)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Element::Footnote(n) | Element::Endnote(n) => n
+                .content
+                .iter()
+                .map(super::render_element_html)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Element::PageBreak | Element::ColumnBreak | Element::Shape(_) => String::new(),
+            Element::Image(img) => {
+                let alt = img
+                    .alt_text
+                    .as_deref()
+                    .map(super::escape_html)
+                    .unwrap_or_default();
+                let mut out = String::with_capacity(20 + alt.len());
+                let _ = write!(out, "<img alt=\"{alt}\" />");
+                out
+            },
+            Element::Heading(_)
+            | Element::Paragraph(_)
+            | Element::Table(_)
+            | Element::List(_)
+            | Element::CodeBlock(_) => String::new(),
+        }
+    }
+}
+
 impl DocumentIR {
     /// Render the IR as plain text.
     pub fn plain_text(&self) -> String {
@@ -65,29 +185,15 @@ fn render_element_plain(element: &Element) -> String {
         Element::Paragraph(p) => render_inline_plain(&p.content),
         Element::Table(t) => render_table_plain(t),
         Element::List(l) => render_list_plain(l, 0),
-        Element::Image(img) => {
-            if let Some(ref alt) = img.alt_text {
-                format!("[{alt}]")
-            } else {
-                String::new()
-            }
+        Element::Image(img) => match &img.alt_text {
+            Some(alt) => format!("[{alt}]"),
+            None => String::new(),
         },
-        Element::ThematicBreak => "---".to_string(),
-        Element::TextBox(tb) => tb
-            .content
-            .iter()
-            .map(render_element_plain)
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-        Element::PageBreak => String::new(),
-        Element::ColumnBreak => String::new(),
-        Element::Footnote(n) | Element::Endnote(n) => n
-            .content
-            .iter()
-            .map(render_element_plain)
-            .collect::<Vec<_>>()
-            .join("\n\n"),
         Element::CodeBlock(cb) => cb.content.clone(),
+        // Invisible-in-flow / container variants delegated to the
+        // shared default. Adding a new `Element` variant forces a
+        // compile error in `block_default::default_plain`, not here.
+        other => block_default::default_plain(other),
     }
 }
 
@@ -170,29 +276,13 @@ fn render_element_markdown(element: &Element) -> String {
         Element::Paragraph(p) => render_inline_markdown(&p.content),
         Element::Table(t) => render_table_markdown(t),
         Element::List(l) => render_list_markdown(l, 0),
-        Element::Image(img) => {
-            let alt = img.alt_text.as_deref().unwrap_or("");
-            format!("![{alt}]()")
-        },
-        Element::ThematicBreak => "---".to_string(),
-        Element::TextBox(tb) => tb
-            .content
-            .iter()
-            .map(render_element_markdown)
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-        Element::PageBreak => String::new(),
-        Element::ColumnBreak => String::new(),
-        Element::Footnote(n) | Element::Endnote(n) => n
-            .content
-            .iter()
-            .map(render_element_markdown)
-            .collect::<Vec<_>>()
-            .join("\n\n"),
         Element::CodeBlock(cb) => {
             let lang = cb.language.as_deref().unwrap_or("");
             format!("```{lang}\n{}\n```", cb.content)
         },
+        // Invisible-in-flow / container / image variants delegated
+        // to the shared default — see `block_default::default_markdown`.
+        other => block_default::default_markdown(other),
     }
 }
 
@@ -358,29 +448,13 @@ fn render_element_html(element: &Element) -> String {
         },
         Element::Table(t) => render_table_html(t),
         Element::List(l) => render_list_html(l),
-        Element::Image(img) => {
-            let alt = img.alt_text.as_deref().map(escape_html).unwrap_or_default();
-            format!("<img alt=\"{alt}\" />")
-        },
-        Element::ThematicBreak => "<hr />".to_string(),
-        Element::TextBox(tb) => tb
-            .content
-            .iter()
-            .map(render_element_html)
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Element::PageBreak => String::new(),
-        Element::ColumnBreak => String::new(),
-        Element::Footnote(n) | Element::Endnote(n) => n
-            .content
-            .iter()
-            .map(render_element_html)
-            .collect::<Vec<_>>()
-            .join("\n"),
         Element::CodeBlock(cb) => {
             let escaped = escape_html(&cb.content);
             format!("<pre><code>{escaped}</code></pre>")
         },
+        // Invisible-in-flow / container / image variants delegated
+        // to the shared default — see `block_default::default_html`.
+        other => block_default::default_html(other),
     }
 }
 
@@ -500,6 +574,7 @@ mod tests {
         let ir = simple_ir(vec![Element::Heading(Heading {
             level: 2,
             content: vec![span("Title")],
+            ..Default::default()
         })]);
         assert_eq!(ir.to_markdown(), "## Title");
     }
@@ -693,5 +768,59 @@ mod tests {
         assert!(html.contains("<ol>"));
         assert!(html.contains("<li><p>First</p></li>"));
         assert!(html.contains("<li><p>Second</p></li>"));
+    }
+
+    // ── Defaults centralized in `block_default` ──────────────────────
+
+    #[test]
+    fn thematic_break_renders_as_hr_in_plain() {
+        let ir = simple_ir(vec![Element::ThematicBreak]);
+        assert_eq!(ir.plain_text(), "---");
+    }
+
+    #[test]
+    fn thematic_break_renders_in_markdown() {
+        let ir = simple_ir(vec![Element::ThematicBreak]);
+        assert!(ir.to_markdown().contains("---"));
+    }
+
+    #[test]
+    fn page_break_invisible_in_plain() {
+        // PageBreak/ColumnBreak/Shape/Image have no plain-text counterpart
+        // — they collapse to empty so plain_text shows only the surrounding
+        // content.
+        let ir = simple_ir(vec![para("before"), Element::PageBreak, para("after")]);
+        let plain = ir.plain_text();
+        assert!(plain.contains("before"));
+        assert!(plain.contains("after"));
+    }
+
+    #[test]
+    fn shape_invisible_in_plain() {
+        let ir = simple_ir(vec![
+            para("before"),
+            Element::Shape(Shape::default()),
+            para("after"),
+        ]);
+        let plain = ir.plain_text();
+        assert!(plain.contains("before"));
+        assert!(plain.contains("after"));
+    }
+
+    #[test]
+    fn text_box_recursively_renders_children() {
+        let ir = simple_ir(vec![Element::TextBox(TextBox {
+            content: vec![para("inside")],
+            ..Default::default()
+        })]);
+        let plain = ir.plain_text();
+        assert!(plain.contains("inside"), "plain: {plain}");
+    }
+
+    #[test]
+    fn html_thematic_break() {
+        let ir = simple_ir(vec![Element::ThematicBreak]);
+        let html = ir.to_html();
+        assert!(html.contains("<hr"), "html: {html}");
     }
 }

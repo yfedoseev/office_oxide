@@ -47,6 +47,8 @@ use super::Result;
 const CT_DOCUMENT: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml";
 const CT_STYLES: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml";
+const CT_FONT_TABLE: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml";
 const CT_NUMBERING: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml";
 const CT_HEADER: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml";
@@ -443,6 +445,11 @@ pub struct DocxWriter {
     endnotes: Vec<DocxNote>,
     core_props: Option<CoreProps>,
     next_num_id: u32,
+    /// Embedded font programs to ship inside the package under `word/fonts/`.
+    /// Each entry is `(font_name, ttf_or_otf_bytes)`. The reader recognizes
+    /// these and re-uses them to render any downstream conversion (notably
+    /// PDF) so a PDF→DOCX→PDF round-trip preserves typeface fidelity.
+    embedded_fonts: Vec<(String, Vec<u8>)>,
 }
 
 impl DocxWriter {
@@ -456,7 +463,19 @@ impl DocxWriter {
             endnotes: Vec::new(),
             core_props: None,
             next_num_id: 3,
+            embedded_fonts: Vec::new(),
         }
+    }
+
+    /// Embed a font program (TrueType / OpenType bytes) under `word/fonts/`.
+    /// `name` is used for the file name and as the human-readable font name.
+    /// Subsequent calls with the same name are deduplicated.
+    pub fn embed_font(&mut self, name: impl Into<String>, data: Vec<u8>) -> &mut Self {
+        let name = name.into();
+        if !self.embedded_fonts.iter().any(|(n, _)| n == &name) {
+            self.embedded_fonts.push((name, data));
+        }
+        self
     }
 
     /// Add a plain paragraph with the given text.
@@ -795,6 +814,42 @@ impl DocxWriter {
             });
         }
 
+        // --- Embed fonts ---
+        // Three pieces have to land together so Word/LibreOffice
+        // actually pick up the font programs:
+        //
+        //   1. The TTF/OTF parts under `/word/fonts/font_<n>_<safe>.ttf`.
+        //   2. `/word/fontTable.xml` listing each font name with an
+        //      `<w:embedRegular r:id="rIdN"/>` reference.
+        //   3. `/word/_rels/fontTable.xml.rels` mapping each rId from
+        //      step 2 to the matching font part.
+        //   4. A relationship in `word/_rels/document.xml.rels` of type
+        //      `…/fontTable` so Word knows where to find fontTable.xml.
+        //
+        // Without all four, the in-process reader still finds the TTFs
+        // by directory scan, but Word silently substitutes Calibri.
+        if !self.embedded_fonts.is_empty() {
+            let font_table_part = PartName::new("/word/fontTable.xml")?;
+            opc.add_part_rel(&doc_part, rel_types::FONT_TABLE, "fontTable.xml");
+
+            // Each font part + the fontTable→font rel.
+            let mut font_entries: Vec<(String, String)> =
+                Vec::with_capacity(self.embedded_fonts.len());
+            for (idx, (name, data)) in self.embedded_fonts.iter().enumerate() {
+                let n = idx + 1;
+                let safe = crate::core::embedded_fonts::sanitize_font_filename(name);
+                let target_rel = format!("fonts/font_{n}_{safe}.ttf");
+                let target_abs = format!("/word/fonts/font_{n}_{safe}.ttf");
+                let part = PartName::new(&target_abs)?;
+                opc.add_part(&part, "application/x-font-ttf", data)?;
+                let rid = opc.add_part_rel(&font_table_part, rel_types::FONT, &target_rel);
+                font_entries.push((name.clone(), rid));
+            }
+
+            let xml = generate_font_table_xml(&font_entries);
+            opc.add_part(&font_table_part, CT_FONT_TABLE, &xml)?;
+        }
+
         // --- Register headers/footers ---
         let mut hf_rids: Vec<(HfType, String)> = Vec::new();
         for (i, hf) in self.headers_footers.iter().enumerate() {
@@ -961,8 +1016,36 @@ impl DocxWriter {
         w.write_event(Event::Start(BytesStart::new("w:body")))
             .expect("write body start");
 
+        // Multi-section DOCX: each non-final `<w:sectPr>` lives inside the
+        // `<w:pPr>` of a paragraph that terminates that section. Only the
+        // final sectPr sits at body level. The previous implementation
+        // dropped every non-final SectPr on the floor, so a multi-section
+        // IR (e.g. one section per source PDF page from `pdf_to_ir`)
+        // collapsed into a single section on the read side and lost all
+        // per-page geometry.
+        //
+        // Find the last `DocxElement::SectPr` index — that's the final
+        // section, written at body level. Every earlier SectPr is emitted
+        // as a synthetic empty paragraph carrying just `<w:pPr><w:sectPr>…</w:sectPr></w:pPr>`,
+        // which `parse_paragraph_properties_fast` recognises and pushes
+        // into `body.section_breaks`. `docx_to_ir` then walks
+        // `section_breaks` to slice elements into per-section windows.
+        let last_sectpr_idx: Option<usize> = self
+            .elements
+            .iter()
+            .rposition(|e| matches!(e, DocxElement::SectPr(_)));
+
         let mut image_counter = 0u32;
-        for element in &self.elements {
+        for (idx, element) in self.elements.iter().enumerate() {
+            if let DocxElement::SectPr(sp) = element {
+                if Some(idx) == last_sectpr_idx {
+                    // Final section is rendered as the body-level sectPr
+                    // below (uses the `sect_pr` info already gathered).
+                    continue;
+                }
+                write_inline_section_break_paragraph(&mut w, sp);
+                continue;
+            }
             write_docx_element(&mut w, element, image_rids, &mut image_counter);
         }
 
@@ -1215,6 +1298,11 @@ fn convert_ir_element_to_docx_elements(elem: &crate::ir::Element, out: &mut Vec<
         },
         E::Footnote(_) | E::Endnote(_) => {},
         E::CodeBlock(cb) => out.push(DocxElement::CodeBlock(cb.content.clone())),
+        E::Shape(_) => {
+            // Vector shapes are emitted by the layout-preserving DOCX
+            // writer in pdf_oxide directly; the markdown-driven IR
+            // writer doesn't have anywhere to put them yet.
+        },
     }
 }
 
@@ -2624,6 +2712,114 @@ fn write_floating_image_run(
         .expect("write p end");
 }
 
+/// Emit a synthetic empty paragraph that carries an inline `<w:sectPr>`
+/// inside its `<w:pPr>`. Used for non-final section boundaries — the
+/// paragraph is what marks the section break for the reader; its
+/// `<w:sectPr>` describes the section ending at this point. We don't
+/// emit hf / footnote references on inline sectPr (they're document-wide
+/// and live on the body-level final sectPr only).
+fn write_inline_section_break_paragraph(w: &mut Writer<Vec<u8>>, sp: &DocxSectPr) {
+    w.write_event(Event::Start(BytesStart::new("w:p")))
+        .expect("write inline-section p start");
+    w.write_event(Event::Start(BytesStart::new("w:pPr")))
+        .expect("write inline-section pPr start");
+    write_section_pr_body(w, sp.page_setup.as_ref(), sp.columns.as_ref(), &sp.break_type);
+    w.write_event(Event::End(BytesEnd::new("w:pPr")))
+        .expect("write inline-section pPr end");
+    w.write_event(Event::End(BytesEnd::new("w:p")))
+        .expect("write inline-section p end");
+}
+
+/// Shared `<w:sectPr>...</w:sectPr>` body writer — used by both the
+/// body-level final sectPr and inline (per-paragraph) section breaks.
+/// Caller writes the surrounding `<w:sectPr>`/`</w:sectPr>` tags.
+fn write_section_pr_body(
+    w: &mut Writer<Vec<u8>>,
+    page_setup: Option<&PageSetup>,
+    columns: Option<&ColumnLayout>,
+    break_type: &SectionBreakType,
+) {
+    w.write_event(Event::Start(BytesStart::new("w:sectPr")))
+        .expect("write sectPr start");
+
+    match break_type {
+        SectionBreakType::Continuous => {
+            // Continuous is the default; emit it explicitly so the reader
+            // doesn't pick up a stale value from a sibling section.
+            let mut t = BytesStart::new("w:type");
+            t.push_attribute(("w:val", "continuous"));
+            w.write_event(Event::Empty(t)).expect("write sect type");
+        },
+        SectionBreakType::NextPage => {
+            let mut t = BytesStart::new("w:type");
+            t.push_attribute(("w:val", "nextPage"));
+            w.write_event(Event::Empty(t)).expect("write sect type");
+        },
+        SectionBreakType::EvenPage => {
+            let mut t = BytesStart::new("w:type");
+            t.push_attribute(("w:val", "evenPage"));
+            w.write_event(Event::Empty(t)).expect("write sect type");
+        },
+        SectionBreakType::OddPage => {
+            let mut t = BytesStart::new("w:type");
+            t.push_attribute(("w:val", "oddPage"));
+            w.write_event(Event::Empty(t)).expect("write sect type");
+        },
+    }
+
+    if let Some(ps) = page_setup {
+        let mut pg_sz = BytesStart::new("w:pgSz");
+        pg_sz.push_attribute(("w:w", ps.width_twips.to_string().as_str()));
+        pg_sz.push_attribute(("w:h", ps.height_twips.to_string().as_str()));
+        if ps.landscape {
+            pg_sz.push_attribute(("w:orient", "landscape"));
+        }
+        w.write_event(Event::Empty(pg_sz)).expect("write pgSz");
+
+        let mut pg_mar = BytesStart::new("w:pgMar");
+        pg_mar.push_attribute(("w:top", ps.margin_top_twips.to_string().as_str()));
+        pg_mar.push_attribute(("w:bottom", ps.margin_bottom_twips.to_string().as_str()));
+        pg_mar.push_attribute(("w:left", ps.margin_left_twips.to_string().as_str()));
+        pg_mar.push_attribute(("w:right", ps.margin_right_twips.to_string().as_str()));
+        pg_mar.push_attribute(("w:header", ps.header_distance_twips.to_string().as_str()));
+        pg_mar.push_attribute(("w:footer", ps.footer_distance_twips.to_string().as_str()));
+        w.write_event(Event::Empty(pg_mar)).expect("write pgMar");
+    }
+
+    if let Some(cols) = columns {
+        if cols.column_widths_twips.is_empty() {
+            let mut c = BytesStart::new("w:cols");
+            c.push_attribute(("w:num", cols.count.to_string().as_str()));
+            if let Some(sp) = cols.space_twips {
+                c.push_attribute(("w:space", sp.to_string().as_str()));
+            }
+            if cols.separator {
+                c.push_attribute(("w:sep", "1"));
+            }
+            w.write_event(Event::Empty(c)).expect("write cols");
+        } else {
+            let mut c = BytesStart::new("w:cols");
+            c.push_attribute(("w:num", cols.count.to_string().as_str()));
+            if cols.separator {
+                c.push_attribute(("w:sep", "1"));
+            }
+            w.write_event(Event::Start(c)).expect("write cols start");
+            let default_space = cols.space_twips.unwrap_or(720);
+            for &cw in &cols.column_widths_twips {
+                let mut col = BytesStart::new("w:col");
+                col.push_attribute(("w:w", cw.to_string().as_str()));
+                col.push_attribute(("w:space", default_space.to_string().as_str()));
+                w.write_event(Event::Empty(col)).expect("write col");
+            }
+            w.write_event(Event::End(BytesEnd::new("w:cols")))
+                .expect("write cols end");
+        }
+    }
+
+    w.write_event(Event::End(BytesEnd::new("w:sectPr")))
+        .expect("write sectPr end");
+}
+
 fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
     w.write_event(Event::Start(BytesStart::new("w:sectPr")))
         .expect("write sectPr start");
@@ -2896,6 +3092,53 @@ fn generate_core_props_xml(props: &CoreProps) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// fontTable.xml generator
+// ---------------------------------------------------------------------------
+
+/// Build `word/fontTable.xml` listing each embedded font with an
+/// `<w:embedRegular r:id="…"/>` reference. Word looks up `<w:rFonts
+/// w:ascii="…"/>` names against this table and uses the embedded
+/// program when there's a match. Without it, Word silently
+/// substitutes Calibri / Cambria for everything regardless of how
+/// many TTFs we ship under `/word/fonts/`.
+///
+/// **Known limitation**: each entry is emitted as `<w:embedRegular>`
+/// regardless of whether the underlying program is a regular, bold,
+/// italic, or bold-italic face — we don't introspect the font binary
+/// to detect the style. If a caller wants Word to pick up a bold-only
+/// face, they should embed it under a distinct family name (e.g.
+/// `Calibri-Bold`) and reference that name from runs explicitly.
+fn generate_font_table_xml(entries: &[(String, String)]) -> Vec<u8> {
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+    w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
+        .expect("decl");
+
+    let mut fonts = BytesStart::new("w:fonts");
+    fonts.push_attribute(("xmlns:w", crate::core::xml::ns::WML_STR));
+    fonts.push_attribute(("xmlns:r", crate::core::xml::ns::R_STR));
+    w.write_event(Event::Start(fonts)).expect("fonts start");
+
+    for (name, rid) in entries {
+        let mut font = BytesStart::new("w:font");
+        font.push_attribute(("w:name", name.as_str()));
+        w.write_event(Event::Start(font)).expect("font start");
+
+        // <w:embedRegular r:id="rIdN"/> — Word treats this as the regular-weight
+        // glyph source for the named font face.
+        let mut embed = BytesStart::new("w:embedRegular");
+        embed.push_attribute(("r:id", rid.as_str()));
+        w.write_event(Event::Empty(embed)).expect("embedRegular");
+
+        w.write_event(Event::End(BytesEnd::new("w:font")))
+            .expect("font end");
+    }
+
+    w.write_event(Event::End(BytesEnd::new("w:fonts")))
+        .expect("fonts end");
+    w.into_inner()
+}
+
+// ---------------------------------------------------------------------------
 // Styles and numbering generators
 // ---------------------------------------------------------------------------
 
@@ -2949,14 +3192,60 @@ fn write_paragraph_style(
     w.write_event(Event::Empty(name_elem))
         .expect("write style name");
 
+    // basedOn Normal so heading styles inherit body defaults.
+    if outline_level.is_some() {
+        let mut based = BytesStart::new("w:basedOn");
+        based.push_attribute(("w:val", "Normal"));
+        w.write_event(Event::Empty(based)).expect("write basedOn");
+    }
+
     if let Some(level) = outline_level {
         w.write_event(Event::Start(BytesStart::new("w:pPr")))
             .expect("write pPr start");
+        // Spacing-before for visual breathing room above the heading.
+        let mut sp = BytesStart::new("w:spacing");
+        sp.push_attribute(("w:before", "240")); // 12 pt
+        sp.push_attribute(("w:after", "120")); //  6 pt
+        w.write_event(Event::Empty(sp)).expect("write spacing");
         let mut lvl = BytesStart::new("w:outlineLvl");
         lvl.push_attribute(("w:val", level.to_string().as_str()));
         w.write_event(Event::Empty(lvl)).expect("write outlineLvl");
         w.write_event(Event::End(BytesEnd::new("w:pPr")))
             .expect("write pPr end");
+
+        // Run properties — size & bold per Word's default heading scale.
+        // Without this, every <w:pStyle val="HeadingN"/> in the body
+        // renders as plain Normal — the headings disappear visually.
+        let (sz_half_pt, bold, italic, color) = match level {
+            0 => (56, true, false, "2F5496"), // Heading 1: 28 pt
+            1 => (44, true, false, "2F5496"), // Heading 2: 22 pt
+            2 => (32, true, false, "1F3864"), // Heading 3: 16 pt
+            3 => (28, true, true, "2F5496"),  // Heading 4: 14 pt italic
+            4 => (24, true, false, "2F5496"), // Heading 5: 12 pt
+            _ => (22, true, true, "1F3864"),  // Heading 6: 11 pt italic
+        };
+        w.write_event(Event::Start(BytesStart::new("w:rPr")))
+            .expect("write rPr start");
+        if bold {
+            w.write_event(Event::Empty(BytesStart::new("w:b")))
+                .expect("write b");
+        }
+        if italic {
+            w.write_event(Event::Empty(BytesStart::new("w:i")))
+                .expect("write i");
+        }
+        let mut col = BytesStart::new("w:color");
+        col.push_attribute(("w:val", color));
+        w.write_event(Event::Empty(col)).expect("write color");
+        let sz_str = sz_half_pt.to_string();
+        let mut sz = BytesStart::new("w:sz");
+        sz.push_attribute(("w:val", sz_str.as_str()));
+        w.write_event(Event::Empty(sz)).expect("write sz");
+        let mut sz_cs = BytesStart::new("w:szCs");
+        sz_cs.push_attribute(("w:val", sz_str.as_str()));
+        w.write_event(Event::Empty(sz_cs)).expect("write szCs");
+        w.write_event(Event::End(BytesEnd::new("w:rPr")))
+            .expect("write rPr end");
     }
 
     w.write_event(Event::End(BytesEnd::new("w:style")))

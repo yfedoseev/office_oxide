@@ -24,19 +24,68 @@ impl DocxDocument {
     }
 
     /// Convert the document to Markdown.
+    ///
+    /// Includes headers and footers around the body so a downstream
+    /// renderer (PDF, HTML, search index) sees the full visible content
+    /// of every page. Without this, simple-but-meaningful artefacts like
+    /// `My header` / `My footer` are silently dropped.
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
         let ctx = MarkdownCtx {
             styles: self.styles.as_ref(),
             numbering: self.numbering.as_ref(),
         };
+
+        let (header_texts, footer_texts) = split_headers_footers(self, &ctx);
+        for h in &header_texts {
+            out.push_str(h);
+            out.push_str("\n\n");
+        }
+
         markdown_blocks(&self.body.elements, &ctx, &mut out, 0);
-        // Trim trailing newlines
+
+        for f in &footer_texts {
+            if !out.ends_with("\n\n") {
+                out.push_str("\n\n");
+            }
+            out.push_str(f);
+            out.push('\n');
+        }
+
         while out.ends_with('\n') {
             out.pop();
         }
         out
     }
+}
+
+/// Split parsed `HeaderFooter` entries into headers vs footers and
+/// return them as deduplicated markdown-string vectors. Role is read
+/// directly from each entry's `is_header` field (set at parse time),
+/// so this is correct regardless of how many sections the document
+/// has or how the entries are interleaved.
+fn split_headers_footers(doc: &DocxDocument, ctx: &MarkdownCtx) -> (Vec<String>, Vec<String>) {
+    let mut headers: Vec<String> = Vec::new();
+    let mut footers: Vec<String> = Vec::new();
+    let mut header_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut footer_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for hf in &doc.headers_footers {
+        let mut buf = String::new();
+        markdown_blocks(&hf.content, ctx, &mut buf, 0);
+        let t = buf.trim().to_string();
+        if t.is_empty() {
+            continue;
+        }
+        if hf.is_header {
+            if header_seen.insert(t.clone()) {
+                headers.push(t);
+            }
+        } else if footer_seen.insert(t.clone()) {
+            footers.push(t);
+        }
+    }
+    (headers, footers)
 }
 
 fn plain_text_blocks(elements: &[BlockElement], out: &mut String) {

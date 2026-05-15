@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use quick_xml::events::Event;
 
 use crate::core::theme::ColorRef;
@@ -8,8 +10,8 @@ use super::shared_strings::parse_color_ref;
 /// Parsed stylesheet from `xl/styles.xml`.
 #[derive(Debug, Clone)]
 pub struct StyleSheet {
-    /// Custom number formats (IDs ≥ 164).
-    pub number_formats: Vec<NumberFormat>,
+    /// Custom number formats: numFmtId → formatCode string (O(1) lookup).
+    pub number_formats: HashMap<u32, String>,
     /// Font definitions.
     pub fonts: Vec<Font>,
     /// Fill definitions.
@@ -20,15 +22,6 @@ pub struct StyleSheet {
     pub cell_formats: Vec<CellFormat>,
     /// Cell style formats (`cellStyleXfs` array).
     pub cell_style_formats: Vec<CellFormat>,
-}
-
-/// A custom number format (ID >= 164).
-#[derive(Debug, Clone)]
-pub struct NumberFormat {
-    /// Format ID (used by `CellFormat.number_format_id`).
-    pub id: u32,
-    /// Excel format code string (e.g., `"#,##0.00"`).
-    pub format_code: String,
 }
 
 /// A font definition.
@@ -105,7 +98,7 @@ impl StyleSheet {
     pub fn parse(xml_data: &[u8]) -> crate::core::Result<Self> {
         let mut reader = xml::make_fast_reader(xml_data);
 
-        let mut number_formats = Vec::new();
+        let mut number_formats = HashMap::new();
         let mut fonts = Vec::new();
         let mut fills = Vec::new();
         let mut borders = Vec::new();
@@ -116,7 +109,7 @@ impl StyleSheet {
             match reader.read_event()? {
                 Event::Start(ref e) => match e.local_name().as_ref() {
                     b"numFmts" => {
-                        number_formats = parse_num_fmts(&mut reader)?;
+                        number_formats = parse_num_fmts_map(&mut reader)?;
                     },
                     b"fonts" => {
                         fonts = parse_fonts(&mut reader)?;
@@ -154,10 +147,7 @@ impl StyleSheet {
     pub fn number_format_for(&self, style_index: u32) -> Option<&str> {
         let xf = self.cell_formats.get(style_index as usize)?;
         let fmt_id = xf.number_format_id;
-        self.number_formats
-            .iter()
-            .find(|nf| nf.id == fmt_id)
-            .map(|nf| nf.format_code.as_str())
+        self.number_formats.get(&fmt_id).map(|s| s.as_str())
     }
 
     /// Get the font for a cell format index.
@@ -175,16 +165,18 @@ impl StyleSheet {
     }
 }
 
-/// Parse `<numFmts>` — custom number formats.
-fn parse_num_fmts(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Vec<NumberFormat>> {
-    let mut formats = Vec::new();
+/// Parse `<numFmts>` — custom number formats into a HashMap for O(1) lookup.
+fn parse_num_fmts_map(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> crate::core::Result<HashMap<u32, String>> {
+    let mut map = HashMap::new();
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"numFmt" => {
                 let id: u32 = xml::required_attr_str(e, b"numFmtId")?.parse()?;
                 let format_code = xml::required_attr_str(e, b"formatCode")?.into_owned();
-                formats.push(NumberFormat { id, format_code });
+                map.insert(id, format_code);
             },
             Event::End(ref e) if e.local_name().as_ref() == b"numFmts" => {
                 break;
@@ -194,7 +186,7 @@ fn parse_num_fmts(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<
         }
     }
 
-    Ok(formats)
+    Ok(map)
 }
 
 /// Parse `<fonts>` collection.
@@ -538,8 +530,7 @@ mod tests {
 
         // Number formats
         assert_eq!(ss.number_formats.len(), 1);
-        assert_eq!(ss.number_formats[0].id, 164);
-        assert_eq!(ss.number_formats[0].format_code, "yyyy-mm-dd");
+        assert_eq!(ss.number_formats.get(&164).map(|s| s.as_str()), Some("yyyy-mm-dd"));
 
         // Fonts
         assert_eq!(ss.fonts.len(), 2);
@@ -561,10 +552,7 @@ mod tests {
     #[test]
     fn number_format_lookup() {
         let ss = StyleSheet {
-            number_formats: vec![NumberFormat {
-                id: 164,
-                format_code: "yyyy-mm-dd".to_string(),
-            }],
+            number_formats: [(164u32, "yyyy-mm-dd".to_string())].into_iter().collect(),
             fonts: vec![],
             fills: vec![],
             borders: vec![],
@@ -598,7 +586,7 @@ mod tests {
     #[test]
     fn font_lookup() {
         let ss = StyleSheet {
-            number_formats: vec![],
+            number_formats: std::collections::HashMap::new(),
             fonts: vec![
                 Font {
                     bold: false,

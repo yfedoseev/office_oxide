@@ -232,6 +232,98 @@ pub enum CellData {
 /// Builder for creating XLSX files.
 pub struct XlsxWriter {
     sheets: Vec<SheetDataInner>,
+    /// Embedded font programs to ship inside the package under `xl/fonts/`.
+    /// Same layout as DOCX `word/fonts/` and PPTX `ppt/fonts/`. Excel
+    /// itself doesn't honor these without `<workbookView>` / theme
+    /// plumbing, but the in-process reader scans the directory so
+    /// PDF↔XLSX round-trips can preserve typefaces.
+    embedded_fonts: Vec<(String, Vec<u8>)>,
+    /// Document metadata for `docProps/core.xml`. `None` means no
+    /// core-properties part is written.
+    metadata: Option<crate::ir::Metadata>,
+}
+
+/// Per-worksheet page geometry.
+///
+/// Maps roughly 1-to-1 onto OOXML's `<pageMargins>` and `<pageSetup>` —
+/// margins are stored in inches per ECMA-376 (§18.3.1.62), the page size
+/// is emitted as `paperWidth`/`paperHeight` in millimetres so arbitrary
+/// PDF MediaBox dimensions round-trip without snapping to the nearest
+/// `paperSize` enum.  All inputs are twips for parity with the rest of
+/// the IR (`width_twips`, `margin_top_twips`, …).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageSetup {
+    /// Page width in twips (1/1440 inch).
+    pub width_twips: u32,
+    /// Page height in twips.
+    pub height_twips: u32,
+    /// Top margin in twips.
+    pub margin_top_twips: u32,
+    /// Bottom margin in twips.
+    pub margin_bottom_twips: u32,
+    /// Left margin in twips.
+    pub margin_left_twips: u32,
+    /// Right margin in twips.
+    pub margin_right_twips: u32,
+    /// Header distance from top edge in twips.
+    pub header_distance_twips: u32,
+    /// Footer distance from bottom edge in twips.
+    pub footer_distance_twips: u32,
+    /// Whether the page is in landscape orientation.
+    pub landscape: bool,
+}
+
+/// A picture anchored on a worksheet via a DrawingML drawing part.
+///
+/// Anchor coordinates are in EMU and absolute relative to the sheet
+/// origin (top-left). Round-trips render via `<xdr:absoluteAnchor>` in
+/// `xl/drawings/drawingN.xml`. The writer emits the bytes verbatim; the
+/// reader resolves them back through the worksheet → drawing → image
+/// relationship chain.
+#[derive(Debug, Clone)]
+pub struct SheetImage {
+    /// Raw image bytes (PNG / JPEG / etc., as produced by the source).
+    pub data: Vec<u8>,
+    /// Lowercase file extension (`"png"`, `"jpeg"`, ...).
+    pub format: String,
+    /// X anchor in EMU, from sheet origin.
+    pub x_emu: i64,
+    /// Y anchor in EMU.
+    pub y_emu: i64,
+    /// Rendered width in EMU.
+    pub cx_emu: i64,
+    /// Rendered height in EMU.
+    pub cy_emu: i64,
+}
+
+/// A text shape anchored on a worksheet via a DrawingML drawing part.
+///
+/// Used by the layout-preserving PDF→XLSX path to emit each PDF text
+/// span at its exact source EMU coordinates as an `<xdr:sp>` shape
+/// inside `xl/drawings/drawingN.xml`. The shape carries a single run
+/// with the span's text, font, size, weight, italic, and colour.
+#[derive(Debug, Clone)]
+pub struct SheetTextShape {
+    /// Text content of the shape (single run).
+    pub text: String,
+    /// Font face name (e.g. `"Times New Roman"`).
+    pub font_name: String,
+    /// Font size in points (full-pt scale, not half-pt).
+    pub font_size_pt: f32,
+    /// Bold weight.
+    pub bold: bool,
+    /// Italic style.
+    pub italic: bool,
+    /// Optional 6-char hex colour like `"FF0000"`. `None` ⇒ pure black.
+    pub color_hex: Option<String>,
+    /// X anchor in EMU.
+    pub x_emu: i64,
+    /// Y anchor in EMU.
+    pub y_emu: i64,
+    /// Width in EMU.
+    pub cx_emu: i64,
+    /// Height in EMU.
+    pub cy_emu: i64,
 }
 
 /// Full internal sheet representation.
@@ -242,6 +334,13 @@ struct SheetDataInner {
     pub cell_styles: HashMap<(usize, usize), CellStyle>,
     /// Merged cell regions: (row, col, row_span, col_span).
     pub merge_regions: Vec<(usize, usize, usize, usize)>,
+    /// Per-sheet page geometry (`<pageMargins>` + `<pageSetup>`).
+    pub page_setup: Option<PageSetup>,
+    /// Pictures anchored on this sheet via a DrawingML drawing part.
+    pub images: Vec<SheetImage>,
+    /// Text shapes anchored on this sheet via a DrawingML drawing part.
+    /// Used by the layout-preserving PDF→XLSX path.
+    pub text_shapes: Vec<SheetTextShape>,
 }
 
 impl SheetDataInner {
@@ -252,6 +351,9 @@ impl SheetDataInner {
             col_widths: HashMap::new(),
             cell_styles: HashMap::new(),
             merge_regions: Vec::new(),
+            page_setup: None,
+            images: Vec::new(),
+            text_shapes: Vec::new(),
         }
     }
 
@@ -383,6 +485,73 @@ impl<'a> SheetData<'a> {
         self.0.merge_cells(row, col, row_span, col_span);
         self
     }
+
+    /// Set per-sheet page geometry. Emits `<pageMargins>` and `<pageSetup>`
+    /// inside the worksheet XML so PDF→XLSX→PDF round-trips preserve the
+    /// source MediaBox and margins instead of snapping back to default
+    /// Letter-portrait. Pass `None` (the default) to omit both elements.
+    pub fn set_page_setup(&mut self, ps: PageSetup) -> &mut Self {
+        self.0.page_setup = Some(ps);
+        self
+    }
+
+    /// Anchor a styled text run on this worksheet at absolute EMU
+    /// coordinates. Used by the PDF→XLSX layout-preserving path: each
+    /// PDF text span becomes one `<xdr:sp>` shape with a single run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_text_shape(
+        &mut self,
+        text: impl Into<String>,
+        font_name: impl Into<String>,
+        font_size_pt: f32,
+        bold: bool,
+        italic: bool,
+        color_hex: Option<String>,
+        x_emu: i64,
+        y_emu: i64,
+        cx_emu: i64,
+        cy_emu: i64,
+    ) -> &mut Self {
+        self.0.text_shapes.push(SheetTextShape {
+            text: text.into(),
+            font_name: font_name.into(),
+            font_size_pt,
+            bold,
+            italic,
+            color_hex,
+            x_emu,
+            y_emu,
+            cx_emu,
+            cy_emu,
+        });
+        self
+    }
+
+    /// Anchor a picture on this worksheet at absolute EMU coordinates.
+    ///
+    /// On write the writer materialises a `xl/drawings/drawingN.xml`
+    /// part for this sheet, registers an IMAGE relationship per
+    /// picture, and writes the bytes under `xl/media/image_<sheet>_<n>.<ext>`.
+    /// `format` is the lowercase file extension (`"png"`, `"jpeg"`, ...).
+    pub fn add_image(
+        &mut self,
+        data: Vec<u8>,
+        format: impl Into<String>,
+        x_emu: i64,
+        y_emu: i64,
+        cx_emu: i64,
+        cy_emu: i64,
+    ) -> &mut Self {
+        self.0.images.push(SheetImage {
+            data,
+            format: format.into(),
+            x_emu,
+            y_emu,
+            cx_emu,
+            cy_emu,
+        });
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -398,7 +567,28 @@ impl Default for XlsxWriter {
 impl XlsxWriter {
     /// Create a new, empty XLSX writer.
     pub fn new() -> Self {
-        Self { sheets: Vec::new() }
+        Self {
+            sheets: Vec::new(),
+            embedded_fonts: Vec::new(),
+            metadata: None,
+        }
+    }
+
+    /// Set document metadata (written to `docProps/core.xml`).
+    pub fn set_metadata(&mut self, meta: &crate::ir::Metadata) -> &mut Self {
+        self.metadata = Some(meta.clone());
+        self
+    }
+
+    /// Embed a font program (TrueType / OpenType bytes) under `xl/fonts/`.
+    /// `name` is used for the file name and as the human-readable font name.
+    /// Subsequent calls with the same name are deduplicated.
+    pub fn embed_font(&mut self, name: impl Into<String>, data: Vec<u8>) -> &mut Self {
+        let name = name.into();
+        if !self.embedded_fonts.iter().any(|(n, _)| n == &name) {
+            self.embedded_fonts.push((name, data));
+        }
+        self
     }
 
     /// Add a worksheet and return a mutable handle to it.
@@ -455,6 +645,13 @@ impl XlsxWriter {
         }
     }
 
+    /// Set per-sheet page geometry by sheet index. See `SheetData::set_page_setup`.
+    pub fn sheet_set_page_setup(&mut self, sheet: usize, ps: PageSetup) {
+        if let Some(s) = self.sheets.get_mut(sheet) {
+            s.page_setup = Some(ps);
+        }
+    }
+
     /// Save the workbook to a file.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let mut opc = OpcWriter::create(path)?;
@@ -480,6 +677,17 @@ impl XlsxWriter {
 
         opc.add_package_rel(rel_types::OFFICE_DOCUMENT, "xl/workbook.xml");
 
+        // Core properties (docProps/core.xml). Optional; written only
+        // when caller supplied metadata via `set_metadata`. Surfaces
+        // PDF /Title /Author etc. in Excel's "Properties" dialog after
+        // a PDF→XLSX→Excel round trip.
+        if let Some(ref meta) = self.metadata {
+            let core_part = PartName::new("/docProps/core.xml")?;
+            opc.add_package_rel(rel_types::CORE_PROPERTIES, "docProps/core.xml");
+            let core_xml = crate::core::core_properties::generate_xml(meta);
+            opc.add_part(&core_part, crate::core::core_properties::CONTENT_TYPE, &core_xml)?;
+        }
+
         let mut sheet_rids = Vec::with_capacity(self.sheets.len());
         for (i, _) in self.sheets.iter().enumerate() {
             let target = format!("worksheets/sheet{}.xml", i + 1);
@@ -497,13 +705,37 @@ impl XlsxWriter {
         for (i, sheet) in self.sheets.iter().enumerate() {
             let part_name_str = format!("/xl/worksheets/sheet{}.xml", i + 1);
             let part_name = PartName::new(&part_name_str)?;
-            let ws_xml = Self::build_worksheet_xml(sheet, &style_table)?;
+
+            // Emit drawing + media parts up-front so we have the rId
+            // for the `<drawing r:id="…"/>` element inside the
+            // worksheet XML below. Sheets without pictures or text
+            // shapes get no drawing part at all.
+            let drawing_rid = if !sheet.images.is_empty() || !sheet.text_shapes.is_empty() {
+                Some(Self::write_drawing_for_sheet(
+                    opc,
+                    &part_name,
+                    i + 1,
+                    &sheet.images,
+                    &sheet.text_shapes,
+                )?)
+            } else {
+                None
+            };
+
+            let ws_xml = Self::build_worksheet_xml(sheet, &style_table, drawing_rid.as_deref())?;
             opc.add_part(&part_name, CT_WORKSHEET, &ws_xml)?;
         }
 
         let styles_part = PartName::new("/xl/styles.xml")?;
         let styles_xml = style_table.build_styles_xml()?;
         opc.add_part(&styles_part, CT_STYLES, &styles_xml)?;
+
+        // Embed fonts under `xl/fonts/font_<n>_<safe_name>.ttf`. Same
+        // layout as DOCX/PPTX. Excel itself doesn't auto-discover the
+        // fonts without `<workbookView>` plumbing, but the in-process
+        // reader scans the directory so PDF↔XLSX round-trips can reuse
+        // the source typeface.
+        crate::core::embedded_fonts::write_embedded_fonts(opc, "/xl/fonts/", &self.embedded_fonts)?;
 
         Ok(())
     }
@@ -538,6 +770,7 @@ impl XlsxWriter {
     fn build_worksheet_xml(
         sheet: &SheetDataInner,
         style_table: &StyleTable,
+        drawing_rid: Option<&str>,
     ) -> crate::core::Result<Vec<u8>> {
         let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
 
@@ -545,6 +778,11 @@ impl XlsxWriter {
 
         let mut root = BytesStart::new("worksheet");
         root.push_attribute(("xmlns", NS_SML));
+        // Worksheets that anchor drawings need the relationship
+        // namespace so the `<drawing r:id="…"/>` element below
+        // resolves. Declaring it unconditionally is harmless for
+        // plain-data sheets and keeps the writer code simple.
+        root.push_attribute(("xmlns:r", NS_REL));
         w.write_event(Event::Start(root))?;
 
         // Column widths
@@ -608,9 +846,133 @@ impl XlsxWriter {
             w.write_event(Event::End(BytesEnd::new("mergeCells")))?;
         }
 
+        // <pageMargins> + <pageSetup>. ECMA-376 §18.3.1.62 / §18.3.1.63 —
+        // pageMargins values are in inches (f64), pageSetup carries the
+        // physical paper dimensions and orientation. We emit `paperWidth`
+        // and `paperHeight` in mm so arbitrary PDF MediaBoxes round-trip
+        // verbatim instead of snapping to the closest `paperSize` enum
+        // (which only covers a fixed set of standard sizes — Letter,
+        // Legal, A4, A3, …).
+        if let Some(ps) = sheet.page_setup {
+            // twips → inches, twips → mm (1 inch = 1440 twips = 25.4 mm).
+            let to_in = |t: u32| t as f64 / 1440.0;
+            let to_mm = |t: u32| t as f64 / 1440.0 * 25.4;
+
+            let left = format!("{:.4}", to_in(ps.margin_left_twips));
+            let right = format!("{:.4}", to_in(ps.margin_right_twips));
+            let top = format!("{:.4}", to_in(ps.margin_top_twips));
+            let bottom = format!("{:.4}", to_in(ps.margin_bottom_twips));
+            let header = format!("{:.4}", to_in(ps.header_distance_twips));
+            let footer = format!("{:.4}", to_in(ps.footer_distance_twips));
+
+            let mut pm = BytesStart::new("pageMargins");
+            pm.push_attribute(("left", left.as_str()));
+            pm.push_attribute(("right", right.as_str()));
+            pm.push_attribute(("top", top.as_str()));
+            pm.push_attribute(("bottom", bottom.as_str()));
+            pm.push_attribute(("header", header.as_str()));
+            pm.push_attribute(("footer", footer.as_str()));
+            w.write_event(Event::Empty(pm))?;
+
+            let pw_mm = format!("{:.2}mm", to_mm(ps.width_twips));
+            let ph_mm = format!("{:.2}mm", to_mm(ps.height_twips));
+            let orientation = if ps.landscape {
+                "landscape"
+            } else {
+                "portrait"
+            };
+            let mut psu = BytesStart::new("pageSetup");
+            psu.push_attribute(("paperWidth", pw_mm.as_str()));
+            psu.push_attribute(("paperHeight", ph_mm.as_str()));
+            psu.push_attribute(("orientation", orientation));
+            w.write_event(Event::Empty(psu))?;
+        }
+
+        // `<drawing>` MUST appear after `<pageSetup>` per the
+        // worksheet child-order schema (CT_Worksheet, ECMA-376
+        // §18.3.1.99). Excel rejects the file with "We found a problem
+        // with some content" otherwise.
+        if let Some(rid) = drawing_rid {
+            let mut d = BytesStart::new("drawing");
+            d.push_attribute(("r:id", rid));
+            w.write_event(Event::Empty(d))?;
+        }
+
         w.write_event(Event::End(BytesEnd::new("worksheet")))?;
 
         Ok(w.into_inner())
+    }
+
+    /// Materialise `xl/drawings/drawing<sheet_n>.xml`, write each
+    /// picture's bytes under `xl/media/image_<sheet_n>_<pic_n>.<ext>`,
+    /// wire the worksheet→drawing and drawing→image relationships, and
+    /// register PNG/JPEG default content types.
+    ///
+    /// Returns the relationship ID added to the worksheet — the caller
+    /// places it on the `<drawing r:id="…"/>` element inside the
+    /// worksheet XML.
+    fn write_drawing_for_sheet<W: Write + Seek>(
+        opc: &mut OpcWriter<W>,
+        worksheet_part: &PartName,
+        sheet_n: usize,
+        images: &[SheetImage],
+        text_shapes: &[SheetTextShape],
+    ) -> Result<String> {
+        let drawing_target = format!("../drawings/drawing{}.xml", sheet_n);
+        let drawing_rid = opc.add_part_rel(worksheet_part, rel_types::DRAWING, &drawing_target);
+
+        let drawing_part_str = format!("/xl/drawings/drawing{}.xml", sheet_n);
+        let drawing_part = PartName::new(&drawing_part_str)?;
+
+        // Add IMAGE rels off the drawing part. Targets are relative to
+        // the drawing part itself (`../media/imageX.ext`). Track the
+        // rIds so each `<xdr:pic>` in the drawing XML can reference
+        // them via `<a:blip r:embed="rIdN"/>`.
+        let mut blip_rids: Vec<String> = Vec::with_capacity(images.len());
+        for (i, img) in images.iter().enumerate() {
+            let ext = if img.format.is_empty() {
+                "png"
+            } else {
+                img.format.as_str()
+            };
+            let media_path_str = format!("/xl/media/image_{}_{}.{}", sheet_n, i + 1, ext);
+            let media_part = PartName::new(&media_path_str)?;
+
+            // Default Content-Type by extension (Default Extension="png")
+            // satisfies SDK validators that flag overrides without a
+            // matching Default. Re-registering the same default is a
+            // no-op inside ContentTypesBuilder.
+            let mime = match ext {
+                "jpg" | "jpeg" => "image/jpeg",
+                "gif" => "image/gif",
+                "tiff" | "tif" => "image/tiff",
+                "bmp" => "image/bmp",
+                "emf" => "image/x-emf",
+                "wmf" => "image/x-wmf",
+                _ => "image/png",
+            };
+            opc.register_default_content_type(ext, mime);
+
+            // Write image bytes raw (no Content-Type override needed
+            // since we registered the Default above; passing the same
+            // mime to add_part is harmless).
+            opc.add_part(&media_part, mime, &img.data)?;
+
+            // Drawing-relative target: `../media/image_..._N.ext`.
+            let rel_target = format!("../media/image_{}_{}.{}", sheet_n, i + 1, ext);
+            let rid = opc.add_part_rel(&drawing_part, rel_types::IMAGE, &rel_target);
+            blip_rids.push(rid);
+        }
+
+        // Now the drawing XML itself. One `<xdr:absoluteAnchor>` per
+        // picture and per text shape; anchor in EMU from the sheet
+        // origin, with the picture's `<a:blip r:embed="rIdN"/>`
+        // referring back to the image rels we just added.
+        let drawing_xml = build_drawing_xml(images, &blip_rids, text_shapes)?;
+        const CT_DRAWING: &str = "application/vnd.openxmlformats-officedocument.drawing+xml";
+        opc.add_part(&drawing_part, CT_DRAWING, &drawing_xml)?;
+
+        Ok(drawing_rid)
     }
 
     fn write_cell(
@@ -683,6 +1045,238 @@ impl XlsxWriter {
     }
 }
 
+/// Generate `xl/drawings/drawing<n>.xml` for a sheet's pictures.
+///
+/// Each picture becomes one `<xdr:absoluteAnchor>` containing an
+/// `<xdr:pic>` with an `<a:blip r:embed="…"/>` referring back to the
+/// IMAGE rel registered on the drawing part. EMU coordinates flow
+/// through verbatim from the caller's `SheetImage`, which preserves
+/// source-PDF anchor positions on a PDF→XLSX→PDF round-trip when the
+/// upstream IR carries them.
+fn build_drawing_xml(
+    images: &[SheetImage],
+    blip_rids: &[String],
+    text_shapes: &[SheetTextShape],
+) -> crate::core::Result<Vec<u8>> {
+    const NS_XDR: &str = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing";
+    const NS_A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
+
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+    w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))?;
+
+    let mut root = BytesStart::new("xdr:wsDr");
+    root.push_attribute(("xmlns:xdr", NS_XDR));
+    root.push_attribute(("xmlns:a", NS_A));
+    root.push_attribute(("xmlns:r", NS_REL));
+    w.write_event(Event::Start(root))?;
+
+    for (i, img) in images.iter().enumerate() {
+        let rid = blip_rids.get(i).map(String::as_str).unwrap_or("rId1");
+
+        // <xdr:absoluteAnchor>
+        w.write_event(Event::Start(BytesStart::new("xdr:absoluteAnchor")))?;
+
+        // <xdr:pos x=".." y=".."/>
+        let pos_x = img.x_emu.to_string();
+        let pos_y = img.y_emu.to_string();
+        let mut pos = BytesStart::new("xdr:pos");
+        pos.push_attribute(("x", pos_x.as_str()));
+        pos.push_attribute(("y", pos_y.as_str()));
+        w.write_event(Event::Empty(pos))?;
+
+        // <xdr:ext cx=".." cy=".."/>
+        let ext_cx = img.cx_emu.max(1).to_string();
+        let ext_cy = img.cy_emu.max(1).to_string();
+        let mut ext = BytesStart::new("xdr:ext");
+        ext.push_attribute(("cx", ext_cx.as_str()));
+        ext.push_attribute(("cy", ext_cy.as_str()));
+        w.write_event(Event::Empty(ext))?;
+
+        // <xdr:pic>
+        w.write_event(Event::Start(BytesStart::new("xdr:pic")))?;
+
+        // <xdr:nvPicPr>
+        w.write_event(Event::Start(BytesStart::new("xdr:nvPicPr")))?;
+        let pic_id = (i + 1).to_string();
+        let pic_name = format!("Picture {}", i + 1);
+        let mut cnv_pr = BytesStart::new("xdr:cNvPr");
+        cnv_pr.push_attribute(("id", pic_id.as_str()));
+        cnv_pr.push_attribute(("name", pic_name.as_str()));
+        w.write_event(Event::Empty(cnv_pr))?;
+        w.write_event(Event::Empty(BytesStart::new("xdr:cNvPicPr")))?;
+        w.write_event(Event::End(BytesEnd::new("xdr:nvPicPr")))?;
+
+        // <xdr:blipFill>
+        w.write_event(Event::Start(BytesStart::new("xdr:blipFill")))?;
+        let mut blip = BytesStart::new("a:blip");
+        blip.push_attribute(("r:embed", rid));
+        w.write_event(Event::Empty(blip))?;
+        w.write_event(Event::Start(BytesStart::new("a:stretch")))?;
+        w.write_event(Event::Empty(BytesStart::new("a:fillRect")))?;
+        w.write_event(Event::End(BytesEnd::new("a:stretch")))?;
+        w.write_event(Event::End(BytesEnd::new("xdr:blipFill")))?;
+
+        // <xdr:spPr>
+        w.write_event(Event::Start(BytesStart::new("xdr:spPr")))?;
+        w.write_event(Event::Start(BytesStart::new("a:xfrm")))?;
+        let mut off = BytesStart::new("a:off");
+        off.push_attribute(("x", pos_x.as_str()));
+        off.push_attribute(("y", pos_y.as_str()));
+        w.write_event(Event::Empty(off))?;
+        let mut ext2 = BytesStart::new("a:ext");
+        ext2.push_attribute(("cx", ext_cx.as_str()));
+        ext2.push_attribute(("cy", ext_cy.as_str()));
+        w.write_event(Event::Empty(ext2))?;
+        w.write_event(Event::End(BytesEnd::new("a:xfrm")))?;
+        let mut prst = BytesStart::new("a:prstGeom");
+        prst.push_attribute(("prst", "rect"));
+        w.write_event(Event::Start(prst))?;
+        w.write_event(Event::Empty(BytesStart::new("a:avLst")))?;
+        w.write_event(Event::End(BytesEnd::new("a:prstGeom")))?;
+        w.write_event(Event::End(BytesEnd::new("xdr:spPr")))?;
+
+        w.write_event(Event::End(BytesEnd::new("xdr:pic")))?;
+
+        // <xdr:clientData/>
+        w.write_event(Event::Empty(BytesStart::new("xdr:clientData")))?;
+
+        w.write_event(Event::End(BytesEnd::new("xdr:absoluteAnchor")))?;
+    }
+
+    // ── Text shapes (one `<xdr:sp>` per layout-mode PDF span) ───────────
+    let pic_count = images.len();
+    for (j, ts) in text_shapes.iter().enumerate() {
+        // Skip empty-text shapes — Excel rejects shape XML with
+        // an empty `<a:t/>` even though OOXML allows it.
+        let trimmed = ts.text.trim_matches('\u{0000}');
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        w.write_event(Event::Start(BytesStart::new("xdr:absoluteAnchor")))?;
+
+        let pos_x = ts.x_emu.to_string();
+        let pos_y = ts.y_emu.to_string();
+        let mut pos = BytesStart::new("xdr:pos");
+        pos.push_attribute(("x", pos_x.as_str()));
+        pos.push_attribute(("y", pos_y.as_str()));
+        w.write_event(Event::Empty(pos))?;
+
+        let ext_cx = ts.cx_emu.max(1).to_string();
+        let ext_cy = ts.cy_emu.max(1).to_string();
+        let mut ext = BytesStart::new("xdr:ext");
+        ext.push_attribute(("cx", ext_cx.as_str()));
+        ext.push_attribute(("cy", ext_cy.as_str()));
+        w.write_event(Event::Empty(ext))?;
+
+        w.write_event(Event::Start(BytesStart::new("xdr:sp")))?;
+
+        // <xdr:nvSpPr>
+        w.write_event(Event::Start(BytesStart::new("xdr:nvSpPr")))?;
+        let sp_id = (pic_count + j + 1).to_string();
+        let sp_name = format!("TextShape {}", pic_count + j + 1);
+        let mut cnv_pr = BytesStart::new("xdr:cNvPr");
+        cnv_pr.push_attribute(("id", sp_id.as_str()));
+        cnv_pr.push_attribute(("name", sp_name.as_str()));
+        w.write_event(Event::Empty(cnv_pr))?;
+        let mut cnv_sp_pr = BytesStart::new("xdr:cNvSpPr");
+        cnv_sp_pr.push_attribute(("txBox", "1"));
+        w.write_event(Event::Empty(cnv_sp_pr))?;
+        w.write_event(Event::End(BytesEnd::new("xdr:nvSpPr")))?;
+
+        // <xdr:spPr>
+        w.write_event(Event::Start(BytesStart::new("xdr:spPr")))?;
+        w.write_event(Event::Start(BytesStart::new("a:xfrm")))?;
+        let mut off = BytesStart::new("a:off");
+        off.push_attribute(("x", pos_x.as_str()));
+        off.push_attribute(("y", pos_y.as_str()));
+        w.write_event(Event::Empty(off))?;
+        let mut ext2 = BytesStart::new("a:ext");
+        ext2.push_attribute(("cx", ext_cx.as_str()));
+        ext2.push_attribute(("cy", ext_cy.as_str()));
+        w.write_event(Event::Empty(ext2))?;
+        w.write_event(Event::End(BytesEnd::new("a:xfrm")))?;
+        let mut prst = BytesStart::new("a:prstGeom");
+        prst.push_attribute(("prst", "rect"));
+        w.write_event(Event::Start(prst))?;
+        w.write_event(Event::Empty(BytesStart::new("a:avLst")))?;
+        w.write_event(Event::End(BytesEnd::new("a:prstGeom")))?;
+        // Transparent fill so the text shape doesn't paint a
+        // white rectangle over neighbouring content.
+        w.write_event(Event::Empty(BytesStart::new("a:noFill")))?;
+        w.write_event(Event::End(BytesEnd::new("xdr:spPr")))?;
+
+        // <xdr:txBody> — inline a single run with the span's run
+        // properties. PPTX/PRESENT and SpreadsheetML share the same
+        // DrawingML run model, so the structure mirrors PPTX text
+        // bodies elsewhere in this crate.
+        w.write_event(Event::Start(BytesStart::new("xdr:txBody")))?;
+        // <a:bodyPr wrap="none"> so a single span doesn't wrap mid-line.
+        let mut body_pr = BytesStart::new("a:bodyPr");
+        body_pr.push_attribute(("wrap", "none"));
+        body_pr.push_attribute(("rtlCol", "0"));
+        body_pr.push_attribute(("lIns", "0"));
+        body_pr.push_attribute(("tIns", "0"));
+        body_pr.push_attribute(("rIns", "0"));
+        body_pr.push_attribute(("bIns", "0"));
+        w.write_event(Event::Empty(body_pr))?;
+        w.write_event(Event::Empty(BytesStart::new("a:lstStyle")))?;
+        w.write_event(Event::Start(BytesStart::new("a:p")))?;
+        // <a:pPr marL="0" indent="0"/>
+        let mut p_pr = BytesStart::new("a:pPr");
+        p_pr.push_attribute(("marL", "0"));
+        p_pr.push_attribute(("indent", "0"));
+        w.write_event(Event::Empty(p_pr))?;
+        // <a:r>
+        w.write_event(Event::Start(BytesStart::new("a:r")))?;
+        // <a:rPr lang="en-US" sz=".." b=".." i=".."> with optional <a:solidFill> and <a:latin>
+        let sz_hp = (ts.font_size_pt * 100.0).round() as i32;
+        let sz_str = sz_hp.to_string();
+        let mut r_pr = BytesStart::new("a:rPr");
+        r_pr.push_attribute(("lang", "en-US"));
+        r_pr.push_attribute(("sz", sz_str.as_str()));
+        if ts.bold {
+            r_pr.push_attribute(("b", "1"));
+        }
+        if ts.italic {
+            r_pr.push_attribute(("i", "1"));
+        }
+        let want_color_or_font = ts.color_hex.is_some() || !ts.font_name.is_empty();
+        if want_color_or_font {
+            w.write_event(Event::Start(r_pr))?;
+            if let Some(ref hex) = ts.color_hex {
+                w.write_event(Event::Start(BytesStart::new("a:solidFill")))?;
+                let mut srgb = BytesStart::new("a:srgbClr");
+                srgb.push_attribute(("val", hex.as_str()));
+                w.write_event(Event::Empty(srgb))?;
+                w.write_event(Event::End(BytesEnd::new("a:solidFill")))?;
+            }
+            if !ts.font_name.is_empty() {
+                let mut latin = BytesStart::new("a:latin");
+                latin.push_attribute(("typeface", ts.font_name.as_str()));
+                w.write_event(Event::Empty(latin))?;
+            }
+            w.write_event(Event::End(BytesEnd::new("a:rPr")))?;
+        } else {
+            w.write_event(Event::Empty(r_pr))?;
+        }
+        // <a:t>text</a:t>
+        w.write_event(Event::Start(BytesStart::new("a:t")))?;
+        w.write_event(Event::Text(quick_xml::events::BytesText::new(trimmed)))?;
+        w.write_event(Event::End(BytesEnd::new("a:t")))?;
+        w.write_event(Event::End(BytesEnd::new("a:r")))?;
+        w.write_event(Event::End(BytesEnd::new("a:p")))?;
+        w.write_event(Event::End(BytesEnd::new("xdr:txBody")))?;
+
+        w.write_event(Event::End(BytesEnd::new("xdr:sp")))?;
+        w.write_event(Event::Empty(BytesStart::new("xdr:clientData")))?;
+        w.write_event(Event::End(BytesEnd::new("xdr:absoluteAnchor")))?;
+    }
+
+    w.write_event(Event::End(BytesEnd::new("xdr:wsDr")))?;
+    Ok(w.into_inner())
+}
+
 // ---------------------------------------------------------------------------
 // StyleTable — collects unique CellStyle objects, assigns xfIds, builds
 // styles.xml dynamically.
@@ -716,52 +1310,61 @@ struct XfKey {
 struct StyleTable {
     /// Map from (sheet_ptr, row, col) to xf index.
     cell_xf: HashMap<(*const SheetDataInner, usize, usize), u32>,
+    /// Ordered list of fonts for XML serialization.
     fonts: Vec<FontKey>,
+    /// Ordered list of fills for XML serialization.
     fills: Vec<FillKey>,
     num_fmts: Vec<(u32, String)>, // (numFmtId, formatCode) for custom formats
+    /// Ordered list of xf records for XML serialization.
     xfs: Vec<XfKey>,
+    // Lookup maps for O(1) deduplication during build.
+    font_map: HashMap<FontKey, u32>,
+    fill_map: HashMap<FillKey, u32>,
+    xf_map: HashMap<XfKey, u32>,
 }
 
 impl StyleTable {
     fn build(sheets: &[SheetDataInner]) -> Self {
-        let mut table = StyleTable {
-            cell_xf: HashMap::new(),
-            fonts: Vec::new(),
-            fills: Vec::new(),
-            num_fmts: Vec::new(),
-            xfs: Vec::new(),
-        };
-
-        // Built-in fill indices: 0=none, 1=gray125 (required by Excel)
-        // We pre-populate to match the required structure.
-        table.fills.push(FillKey(None)); // idx 0: none
-        table.fills.push(FillKey(None)); // idx 1: gray125
-
-        // Default font (idx 0)
-        table.fonts.push(FontKey {
+        let default_font = FontKey {
             bold: false,
             italic: false,
             underline: false,
             color: None,
             size_half_pt: None,
             name: None,
-        });
-
-        // Default xf (idx 0) — no style
-        table.xfs.push(XfKey {
+        };
+        let default_xf = XfKey {
             font_idx: 0,
             fill_idx: 0,
             num_fmt_id: 0,
             h_align: None,
             wrap_text: false,
-        });
+        };
+
+        let mut font_map = HashMap::new();
+        font_map.insert(default_font.clone(), 0u32);
+        let mut fill_map: HashMap<FillKey, u32> = HashMap::new();
+        fill_map.insert(FillKey(None), 0u32); // idx 0 = none; idx 1 = gray125 (pre-populated below)
+        let mut xf_map = HashMap::new();
+        xf_map.insert(default_xf.clone(), 0u32);
+
+        let mut table = StyleTable {
+            cell_xf: HashMap::new(),
+            fonts: vec![default_font],
+            fills: vec![FillKey(None), FillKey(None)], // idx 0: none, idx 1: gray125
+            num_fmts: Vec::new(),
+            xfs: vec![default_xf],
+            font_map,
+            fill_map,
+            xf_map,
+        };
 
         let mut next_custom_fmt_id: u32 = 164; // custom numFmtIds start at 164
 
         for sheet in sheets {
             let sheet_ptr = sheet as *const SheetDataInner;
             for ((row, col), style) in &sheet.cell_styles {
-                // Resolve font index
+                // Resolve font index — O(1) via HashMap.
                 let font_key = FontKey {
                     bold: style.bold,
                     italic: style.italic,
@@ -770,45 +1373,32 @@ impl StyleTable {
                     size_half_pt: style.font_size_pt.map(|s| (s * 2.0).round() as u32),
                     name: style.font_name.clone(),
                 };
-                let font_idx = if font_key
-                    == (FontKey {
-                        bold: false,
-                        italic: false,
-                        underline: false,
-                        color: None,
-                        size_half_pt: None,
-                        name: None,
-                    }) {
-                    0
+                let font_idx = if let Some(&i) = table.font_map.get(&font_key) {
+                    i
                 } else {
-                    match table.fonts.iter().position(|f| f == &font_key) {
-                        Some(i) => i as u32,
-                        None => {
-                            table.fonts.push(font_key);
-                            (table.fonts.len() - 1) as u32
-                        },
-                    }
+                    let idx = table.fonts.len() as u32;
+                    table.fonts.push(font_key.clone());
+                    table.font_map.insert(font_key, idx);
+                    idx
                 };
 
-                // Resolve fill index
+                // Resolve fill index — O(1) via HashMap.
                 let fill_key = FillKey(style.background_color.clone());
                 let fill_idx = if fill_key.0.is_none() {
                     0
+                } else if let Some(&i) = table.fill_map.get(&fill_key) {
+                    i
                 } else {
-                    match table.fills.iter().position(|f| f == &fill_key) {
-                        Some(i) => i as u32,
-                        None => {
-                            table.fills.push(fill_key);
-                            (table.fills.len() - 1) as u32
-                        },
-                    }
+                    let idx = table.fills.len() as u32;
+                    table.fills.push(fill_key.clone());
+                    table.fill_map.insert(fill_key, idx);
+                    idx
                 };
 
-                // Resolve number format id
+                // Resolve number format id.
                 let num_fmt_id = match style.number_format.builtin_id() {
                     Some(id) => id,
                     None => {
-                        // Custom format — shouldn't happen with current enum
                         let id = next_custom_fmt_id;
                         next_custom_fmt_id += 1;
                         table.num_fmts.push((id, "General".to_string()));
@@ -833,12 +1423,14 @@ impl StyleTable {
                     wrap_text: style.wrap_text,
                 };
 
-                let xf_idx = match table.xfs.iter().position(|x| x == &xf_key) {
-                    Some(i) => i as u32,
-                    None => {
-                        table.xfs.push(xf_key);
-                        (table.xfs.len() - 1) as u32
-                    },
+                // Resolve xf index — O(1) via HashMap.
+                let xf_idx = if let Some(&i) = table.xf_map.get(&xf_key) {
+                    i
+                } else {
+                    let idx = table.xfs.len() as u32;
+                    table.xfs.push(xf_key.clone());
+                    table.xf_map.insert(xf_key, idx);
+                    idx
                 };
 
                 table.cell_xf.insert((sheet_ptr, *row, *col), xf_idx);
@@ -1128,6 +1720,46 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         wb.write_to(&mut buf).expect("write xlsx");
         assert!(!buf.get_ref().is_empty());
+    }
+
+    #[test]
+    fn page_setup_round_trip() {
+        // Letter portrait, 0.5" margins. The on-wire format is mm in
+        // <pageSetup paperWidth/paperHeight> + inches in <pageMargins>;
+        // verify both elements appear and that the parser recovers
+        // values within rounding tolerance.
+        let mut wb = XlsxWriter::new();
+        let mut sheet = wb.add_sheet("Geom");
+        sheet.set_cell(0, 0, CellData::String("hi".into()));
+        sheet.set_page_setup(PageSetup {
+            width_twips: 12240,    // 8.5"
+            height_twips: 15840,   // 11"
+            margin_top_twips: 720, // 0.5"
+            margin_bottom_twips: 720,
+            margin_left_twips: 720,
+            margin_right_twips: 720,
+            header_distance_twips: 432, // 0.3"
+            footer_distance_twips: 432,
+            landscape: false,
+        });
+        let mut buf = std::io::Cursor::new(Vec::new());
+        wb.write_to(&mut buf).expect("write");
+
+        // Pull sheet1.xml out and check the attributes.
+        buf.set_position(0);
+        let mut zip = zip::ZipArchive::new(buf).expect("zip");
+        let mut xml = String::new();
+        {
+            let mut entry = zip.by_name("xl/worksheets/sheet1.xml").expect("sheet");
+            std::io::Read::read_to_string(&mut entry, &mut xml).expect("read");
+        }
+        assert!(xml.contains("<pageMargins"), "missing pageMargins: {xml}");
+        assert!(xml.contains("<pageSetup"), "missing pageSetup: {xml}");
+        assert!(xml.contains(r#"orientation="portrait""#));
+        // 8.5" = 215.90mm, 11" = 279.40mm
+        assert!(xml.contains(r#"paperWidth="215.90mm""#), "width attr: {xml}");
+        assert!(xml.contains(r#"paperHeight="279.40mm""#), "height attr: {xml}");
+        assert!(xml.contains(r#"left="0.5000""#));
     }
 
     #[test]

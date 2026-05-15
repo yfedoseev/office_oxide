@@ -87,7 +87,7 @@ impl CoreProperties {
                     };
                 },
                 Event::Text(ref e) => {
-                    let text = e.unescape()?.into_owned();
+                    let text = crate::core::xml::unescape_text(e)?;
                     if text.is_empty() {
                         continue;
                     }
@@ -234,7 +234,7 @@ impl AppProperties {
                     current_tag = Some(String::from_utf8_lossy(local_bytes).into_owned());
                 },
                 Event::Text(ref e) => {
-                    let text = e.unescape()?.into_owned();
+                    let text = crate::core::xml::unescape_text(e)?;
                     if let Some(ref tag) = current_tag {
                         match tag.as_str() {
                             "Application" => props.application = Some(text),

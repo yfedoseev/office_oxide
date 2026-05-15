@@ -21,7 +21,7 @@ name = "office-oxide"
 path = "src/main.rs"
 
 [dependencies]
-office_oxide = { version = "0.1.1", path = "../.." }
+office_oxide = { version = "0.1.2", path = "../.." }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 

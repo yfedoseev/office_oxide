@@ -1,6 +1,6 @@
 {
   "name": "office-oxide-wasm",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Fast Office document processing (DOCX/XLSX/PPTX/DOC/XLS/PPT) compiled to WebAssembly. Rust core, zero JS dependencies. Works in Node.js, bundlers, and browsers.",
   "license": "MIT OR Apache-2.0",
   "author": "Yury Fedoseev",

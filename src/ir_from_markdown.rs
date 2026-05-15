@@ -123,6 +123,7 @@ impl<'a> MarkdownParser<'a> {
                     current.elements.push(Element::Heading(Heading {
                         level,
                         content: parse_inline(&text),
+                        ..Default::default()
                     }));
                 }
                 continue;

@@ -56,6 +56,10 @@ pub struct PptxDocument {
     pub slides: Vec<Slide>,
     /// Theme data (colors, fonts), if present.
     pub theme: Option<Theme>,
+    /// Font programs found under `ppt/fonts/`. Each entry is
+    /// `(font_name, ttf_or_otf_bytes)`. PDF→PPTX→PDF round-trips use
+    /// these to preserve the source typeface (mirrors the DOCX side).
+    pub embedded_fonts: Vec<(String, Vec<u8>)>,
 }
 
 impl PptxDocument {
@@ -101,6 +105,10 @@ impl PptxDocument {
             slide_data: Vec<u8>,
             slide_rels: Relationships,
             notes_data: Option<Vec<u8>>,
+            /// rId → (raw bytes, format-extension lowercase like "png" / "jpeg").
+            /// Pre-resolved here in Phase 1 so the parallel slide parser
+            /// (Phase 2) doesn't need access to the OPC reader.
+            media: std::collections::HashMap<String, (Vec<u8>, String)>,
         }
         let mut bundles = Vec::with_capacity(presentation.slides.len());
         for (slide_idx, slide_id) in presentation.slides.iter().enumerate() {
@@ -136,28 +144,87 @@ impl PptxDocument {
                     None
                 };
 
+            // Pre-load all IMAGE-relationship parts the slide references.
+            // PPTX picture frames carry `<a:blip r:embed="rIdN"/>`; the
+            // relationship resolves to a part like `/ppt/media/image3.png`.
+            // Parsing happens in parallel below and can't use the OPC
+            // reader, so we materialise the bytes here keyed by rId.
+            let mut media = std::collections::HashMap::new();
+            for rel in slide_rels.all() {
+                if rel.rel_type != rel_types::IMAGE {
+                    continue;
+                }
+                let target = match part_name.resolve_relative(&rel.target) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if !opc.has_part(&target) {
+                    continue;
+                }
+                let bytes = match opc.read_part(&target) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let ext = std::path::Path::new(&rel.target)
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_ascii_lowercase())
+                    .unwrap_or_else(|| guess_format_from_bytes(&bytes).to_string());
+                media.insert(rel.id.clone(), (bytes, ext));
+            }
+
             bundles.push(SlideBundle {
                 slide_data,
                 slide_rels,
                 notes_data,
+                media,
             });
         }
 
         // Phase 2: parse slides (parallel when feature enabled)
         let slides = crate::core::parallel::map_collect(bundles, |b| -> Result<Slide> {
             let name = xml_csl_name(&b.slide_data);
-            let mut parsed = Slide::parse(&b.slide_data, name, &b.slide_rels)?;
+            let mut parsed = Slide::parse(&b.slide_data, name, &b.slide_rels, &b.media)?;
             if let Some(notes_data) = &b.notes_data {
                 parsed.notes = extract_notes_text(notes_data);
             }
             Ok(parsed)
         })?;
 
-        debug!("PptxDocument: {} slides parsed", slides.len());
+        // Scan `ppt/fonts/` for embedded font programs. Mirrors the DOCX
+        // reader (`word/fonts/`).
+        let mut embedded_fonts: Vec<(String, Vec<u8>)> = Vec::new();
+        for name in opc.part_names() {
+            let s = name.to_string();
+            if !s.starts_with("/ppt/fonts/") {
+                continue;
+            }
+            let lower = s.to_lowercase();
+            if !(lower.ends_with(".ttf") || lower.ends_with(".otf")) {
+                continue;
+            }
+            if let Ok(data) = opc.read_part(&name) {
+                let basename = s.rsplit('/').next().unwrap_or("font");
+                let face = crate::docx::strip_embedded_font_filename(basename);
+                let font_name = if face.is_empty() {
+                    basename.to_string()
+                } else {
+                    face
+                };
+                embedded_fonts.push((font_name, data));
+            }
+        }
+
+        debug!(
+            "PptxDocument: {} slides parsed, {} embedded fonts",
+            slides.len(),
+            embedded_fonts.len()
+        );
         Ok(PptxDocument {
             presentation,
             slides,
             theme,
+            embedded_fonts,
         })
     }
 }
@@ -190,6 +257,32 @@ fn xml_csl_name(xml_data: &[u8]) -> String {
 /// Finds the body placeholder (type="body") and extracts its text.
 fn extract_notes_text(xml_data: &[u8]) -> Option<String> {
     slide::extract_notes_text(xml_data)
+}
+
+/// Best-effort image-format detection from the raw bytes.
+///
+/// Used as a fallback when the relationship target has no recognisable
+/// extension (rare — DrawingML images almost always carry one). Returns
+/// a lowercase extension string suitable for round-tripping back into
+/// `office_oxide::ir::ImageFormat::extension()`.
+fn guess_format_from_bytes(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "png"
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "jpeg"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "gif"
+    } else if bytes.starts_with(b"BM") {
+        "bmp"
+    } else if bytes.len() >= 4 && bytes.starts_with(&[0xD7, 0xCD, 0xC6, 0x9A]) {
+        "wmf"
+    } else if bytes.len() >= 4 && bytes.starts_with(&[0x01, 0x00, 0x00, 0x00]) {
+        "emf"
+    } else if bytes.len() >= 4 && (bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*")) {
+        "tiff"
+    } else {
+        "png"
+    }
 }
 
 impl crate::core::OfficeDocument for PptxDocument {

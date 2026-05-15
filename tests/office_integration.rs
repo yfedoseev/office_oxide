@@ -534,15 +534,23 @@ fn pptx_to_ir_slides_as_sections() {
     assert_eq!(ir.sections.len(), 1);
     assert_eq!(ir.sections[0].title.as_deref(), Some("Intro"));
 
-    // Body content should be a paragraph (title is used as section title, not element)
-    assert!(
-        ir.sections[0]
-            .elements
+    // Body content should be a paragraph (title is used as section title, not element).
+    // PPTX shapes with positions wrap their content in `Element::TextBox` so the
+    // renderer can place them at absolute coordinates — look inside the
+    // wrapper as well as at the top level.
+    let has_welcome = ir.sections[0].elements.iter().any(|e| match e {
+        Element::Paragraph(p) => p
+            .content
             .iter()
-            .any(|e| matches!(e, Element::Paragraph(p) if
+            .any(|c| matches!(c, InlineContent::Text(s) if s.text == "Welcome")),
+        Element::TextBox(tb) => tb.content.iter().any(|inner| {
+            matches!(inner, Element::Paragraph(p) if
                 p.content.iter().any(|c| matches!(c, InlineContent::Text(s) if s.text == "Welcome"))
-            ))
-    );
+            )
+        }),
+        _ => false,
+    });
+    assert!(has_welcome);
 }
 
 // ===========================================================================
@@ -939,9 +947,18 @@ fn pptx_image_to_ir() {
     let doc = Document::from_reader(Cursor::new(data), DocumentFormat::Pptx).unwrap();
     let ir = doc.to_ir();
 
-    assert!(ir.sections[0].elements.iter().any(
-        |e| matches!(e, Element::Image(img) if img.alt_text.as_deref() == Some("A scenic view"))
-    ));
+    // PPTX picture shapes are wrapped in a positional `Element::TextBox`
+    // so the renderer knows where to draw the picture frame.
+    let has_pic = ir.sections[0].elements.iter().any(|e| {
+        match e {
+        Element::Image(img) => img.alt_text.as_deref() == Some("A scenic view"),
+        Element::TextBox(tb) => tb.content.iter().any(|inner| {
+            matches!(inner, Element::Image(img) if img.alt_text.as_deref() == Some("A scenic view"))
+        }),
+        _ => false,
+    }
+    });
+    assert!(has_pic);
 }
 
 // ===========================================================================

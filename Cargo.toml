@@ -20,7 +20,7 @@ match_like_matches_macro = "allow"
 manual_find = "allow"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yfedoseev/office_oxide"
@@ -65,7 +65,7 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
 # Core parsing
-quick-xml = { version = "0.37", features = ["serialize"] }
+quick-xml = { version = "0.40", features = ["serialize"] }
 zip = { version = "8.1", default-features = false, features = ["deflate"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

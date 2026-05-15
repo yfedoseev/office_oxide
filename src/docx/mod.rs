@@ -48,9 +48,11 @@ pub use formatting::{
     Justification, ParagraphIndent, ParagraphProperties, ParagraphSpacing, RunProperties,
     UnderlineType, VerticalAlign,
 };
-pub use headers::{HeaderFooter, HeaderFooterType, PageMargins, PageSize, SectionProperties};
+pub use headers::{
+    HeaderFooter, HeaderFooterType, PageMargins, PageOrientation, PageSize, SectionProperties,
+};
 pub use hyperlink::{Hyperlink, HyperlinkTarget};
-pub use image::DrawingInfo;
+pub use image::{AnchorFrame, AnchorPosition, DrawingInfo, ShapeInfo, ShapeKind};
 pub use numbering::{NumberFormat, NumberingDefinitions};
 pub use paragraph::{BreakType, Paragraph, ParagraphContent, Run, RunContent};
 pub use styles::{Style, StyleSheet, StyleType};
@@ -69,7 +71,7 @@ use crate::core::units::Emu;
 use crate::core::xml;
 
 use self::formatting::{parse_paragraph_properties_fast, parse_run_properties_fast};
-use self::headers::{HeaderFooterRef, PageOrientation};
+use self::headers::HeaderFooterRef;
 use self::table::{
     MergeType, Shading, TableCellProperties, TableRowProperties, TableWidth, TableWidthType,
 };
@@ -102,6 +104,17 @@ pub struct DocxDocument {
     pub sections: Vec<SectionProperties>,
     /// Parsed headers and footers.
     pub headers_footers: Vec<HeaderFooter>,
+    /// Font programs found under `word/fonts/`. Each entry is
+    /// `(font_name, ttf_or_otf_bytes)`. PDF→DOCX→PDF round-trips use these
+    /// to preserve typeface fidelity (e.g. CJK / math fonts beyond
+    /// pdf_oxide's bundled DejaVu fallback).
+    pub embedded_fonts: Vec<(String, Vec<u8>)>,
+    /// Image parts referenced from the main document, keyed by the
+    /// relationship id used in `<a:blip r:embed="rIdN"/>`. Lets the
+    /// IR converter populate `Image::data` so downstream renderers
+    /// (the positional PDF reader, plain-text export with alt-text,
+    /// etc.) can place actual bitmap content.
+    pub images: std::collections::HashMap<String, (Vec<u8>, Option<String>)>,
 }
 
 impl DocxDocument {
@@ -162,30 +175,107 @@ impl DocxDocument {
         let doc_data = opc.read_part(&main_part)?;
         let (body, sections) = parse_document(&doc_data, &doc_rels)?;
 
-        // Parse headers and footers
+        // Parse headers and footers. Walk header refs and footer refs
+        // separately so each parsed `HeaderFooter` can record its own
+        // role; without that distinction, downstream consumers had to
+        // back-derive headers-vs-footers from cumulative ref counts,
+        // which silently misclassifies entries in multi-section docs.
         let mut headers_footers = Vec::new();
-        for section in &sections {
-            for hf_ref in section.header_refs.iter().chain(section.footer_refs.iter()) {
-                if let Some(rel) = doc_rels.get_by_id(&hf_ref.relationship_id) {
-                    if rel.target_mode == TargetMode::Internal {
-                        let part_name = main_part.resolve_relative(&rel.target)?;
-                        if opc.has_part(&part_name) {
-                            let data = opc.read_part(&part_name)?;
-                            let content = parse_body_elements(&data)?;
-                            headers_footers.push(HeaderFooter {
-                                hf_type: hf_ref.hf_type,
-                                content,
-                            });
-                        }
+        let mut parse_hf = |hf_ref: &HeaderFooterRef, is_header: bool| -> CoreResult<()> {
+            if let Some(rel) = doc_rels.get_by_id(&hf_ref.relationship_id) {
+                if rel.target_mode == TargetMode::Internal {
+                    let part_name = main_part.resolve_relative(&rel.target)?;
+                    if opc.has_part(&part_name) {
+                        let data = opc.read_part(&part_name)?;
+                        let content = parse_body_elements(&data)?;
+                        headers_footers.push(HeaderFooter {
+                            hf_type: hf_ref.hf_type,
+                            content,
+                            is_header,
+                        });
                     }
                 }
             }
+            Ok(())
+        };
+        for section in &sections {
+            for hf_ref in &section.header_refs {
+                parse_hf(hf_ref, true)?;
+            }
+            for hf_ref in &section.footer_refs {
+                parse_hf(hf_ref, false)?;
+            }
+        }
+
+        // Scan `word/fonts/` for embedded font programs. Files there are
+        // typically `font_<n>_<name>.ttf` (written by our own `DocxWriter`)
+        // but the loop accepts any `.ttf`/`.otf` for forward-compat.
+        let mut embedded_fonts: Vec<(String, Vec<u8>)> = Vec::new();
+        for name in opc.part_names() {
+            let s = name.to_string();
+            if !s.starts_with("/word/fonts/") {
+                continue;
+            }
+            let lower = s.to_lowercase();
+            if !(lower.ends_with(".ttf") || lower.ends_with(".otf")) {
+                continue;
+            }
+            if let Ok(data) = opc.read_part(&name) {
+                // Extract a usable face name from the OPC part. Writers
+                // ship fonts as `font_<n>_<face_name>.<ext>` (the
+                // `embedded_fonts` writer convention used by all three
+                // PDF→office paths) — strip the leading `font_<n>_`
+                // prefix and the trailing `.ttf`/`.otf` so the
+                // registered name matches what the IR carries on each
+                // run's `font_name` (e.g. `TeXGyreTermesX-Regular`).
+                // Falls back to the basename for files that don't
+                // follow the convention.
+                let basename = s.rsplit('/').next().unwrap_or("font");
+                let face = strip_embedded_font_filename(basename);
+                let font_name = if face.is_empty() {
+                    basename.to_string()
+                } else {
+                    face
+                };
+                embedded_fonts.push((font_name, data));
+            }
+        }
+
+        // Pull image parts referenced by the main document
+        // relationships. We capture the raw bytes plus the lower-cased
+        // file extension so downstream code can decide on the format
+        // without re-sniffing magic bytes.
+        let mut images: std::collections::HashMap<String, (Vec<u8>, Option<String>)> =
+            std::collections::HashMap::new();
+        for rel in doc_rels.get_by_type(rel_types::IMAGE) {
+            if rel.target_mode != TargetMode::Internal {
+                continue;
+            }
+            let part_name = match main_part.resolve_relative(&rel.target) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if !opc.has_part(&part_name) {
+                continue;
+            }
+            let data = match opc.read_part(&part_name) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let ext = part_name
+                .as_str()
+                .rsplit('.')
+                .next()
+                .map(|s| s.to_lowercase());
+            images.insert(rel.id.clone(), (data, ext));
         }
 
         debug!(
-            "DocxDocument: {} block elements, {} sections",
+            "DocxDocument: {} block elements, {} sections, {} embedded fonts, {} images",
             body.elements.len(),
-            sections.len()
+            sections.len(),
+            embedded_fonts.len(),
+            images.len()
         );
         Ok(DocxDocument {
             body,
@@ -194,6 +284,8 @@ impl DocxDocument {
             theme,
             sections,
             headers_footers,
+            embedded_fonts,
+            images,
         })
     }
 }
@@ -259,8 +351,33 @@ fn parse_document(
     // Resolve hyperlink targets using relationships
     resolve_hyperlinks(&mut elements, rels);
 
-    let body = Body { elements };
-    Ok((body, sections))
+    // Detect mid-document section breaks: paragraphs whose <w:pPr>
+    // carries a <w:sectPr>. Each such paragraph terminates a section,
+    // and its sectPr describes the section that ends there. Trailing
+    // elements after the last break belong to a final section
+    // described by the body-level sectPr (already in `sections`).
+    let mut section_breaks: Vec<usize> = Vec::new();
+    let mut break_sections: Vec<SectionProperties> = Vec::new();
+    for (idx, el) in elements.iter().enumerate() {
+        if let BlockElement::Paragraph(p) = el {
+            if let Some(props) = &p.properties {
+                if let Some(sp) = &props.section_properties {
+                    section_breaks.push(idx + 1);
+                    break_sections.push(sp.clone());
+                }
+            }
+        }
+    }
+    // Stitch break-derived section_properties in front of the
+    // body-level final sectPr so the section list is in document order.
+    let mut all_sections = break_sections;
+    all_sections.extend(sections);
+
+    let body = Body {
+        elements,
+        section_breaks,
+    };
+    Ok((body, all_sections))
 }
 
 /// Walk the element tree and resolve hyperlink rIds to actual URLs.
@@ -443,53 +560,239 @@ fn parse_hyperlink(
 // Drawing / image parsing
 // ---------------------------------------------------------------------------
 
+/// Parse a `<w:drawing>` element. The opening tag has already been
+/// consumed by the caller, so we drive forward until the matching
+/// `</w:drawing>` End event.
+///
+/// A drawing wraps either `<wp:inline>` or `<wp:anchor>` (anchor =
+/// floating). Everything we care about lives inside that single
+/// wrapper, so we delegate to `parse_inline_or_anchor_body` and treat
+/// any other top-level event as ignorable filler.
 fn parse_drawing(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<DrawingInfo>> {
-    let mut inline = true;
+    let mut info: Option<DrawingInfo> = None;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"inline" => {
+                    info = parse_inline_or_anchor_body(reader, /*inline=*/ true, b"inline")?;
+                },
+                b"anchor" => {
+                    info = parse_inline_or_anchor_body(reader, /*inline=*/ false, b"anchor")?;
+                },
+                _ => {
+                    xml::skip_element_fast(reader)?;
+                },
+            },
+            Event::End(ref e) if e.local_name().as_ref() == b"drawing" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+
+    Ok(info)
+}
+
+/// Parse the body of `<wp:inline>` or `<wp:anchor>` until the matching
+/// closing tag (`end_local`). Collects extent, docPr, position, and the
+/// graphic payload (image or shape) into a `DrawingInfo`.
+fn parse_inline_or_anchor_body(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    inline: bool,
+    end_local: &[u8],
+) -> CoreResult<Option<DrawingInfo>> {
+    use crate::docx::image::{AnchorFrame, AnchorPosition};
+
     let mut width = Emu(0);
     let mut height = Emu(0);
     let mut description: Option<String> = None;
     let mut relationship_id: Option<String> = None;
-    let mut depth = 1u32;
+    let mut shape: Option<crate::docx::image::ShapeInfo> = None;
+
+    let mut anchor_x: Option<i64> = None;
+    let mut anchor_y: Option<i64> = None;
+    let mut h_frame = AnchorFrame::default();
+    let mut v_frame = AnchorFrame::default();
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"extent" => {
+                    parse_extent_attrs(e, &mut width, &mut height);
+                    xml::skip_element_fast(reader)?;
+                },
+                b"docPr" => {
+                    if let Some(desc) = xml::optional_attr_str(e, b"descr")? {
+                        description = Some(desc.into_owned());
+                    }
+                    xml::skip_element_fast(reader)?;
+                },
+                b"positionH" => {
+                    if let Some(rf) = xml::optional_attr_str(e, b"relativeFrom")? {
+                        h_frame = parse_anchor_frame(&rf);
+                    }
+                    anchor_x = parse_position_offset(reader, b"positionH")?;
+                },
+                b"positionV" => {
+                    if let Some(rf) = xml::optional_attr_str(e, b"relativeFrom")? {
+                        v_frame = parse_anchor_frame(&rf);
+                    }
+                    anchor_y = parse_position_offset(reader, b"positionV")?;
+                },
+                b"graphic" => {
+                    let g = parse_graphic(reader)?;
+                    if let Some(rid) = g.relationship_id {
+                        relationship_id = Some(rid);
+                    }
+                    if let Some(s) = g.shape {
+                        shape = Some(s);
+                    }
+                },
+                _ => {
+                    xml::skip_element_fast(reader)?;
+                },
+            },
+            Event::Empty(ref e) => match e.local_name().as_ref() {
+                b"extent" => parse_extent_attrs(e, &mut width, &mut height),
+                b"docPr" => {
+                    if let Some(desc) = xml::optional_attr_str(e, b"descr")? {
+                        description = Some(desc.into_owned());
+                    }
+                },
+                _ => {},
+            },
+            Event::End(ref e) if e.local_name().as_ref() == end_local => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+
+    let anchor_position = if !inline && (anchor_x.is_some() || anchor_y.is_some()) {
+        Some(AnchorPosition {
+            x_emu: anchor_x.unwrap_or(0),
+            y_emu: anchor_y.unwrap_or(0),
+            h_relative_from: h_frame,
+            v_relative_from: v_frame,
+        })
+    } else {
+        None
+    };
+
+    if relationship_id.is_some() || shape.is_some() {
+        Ok(Some(DrawingInfo {
+            relationship_id: relationship_id.unwrap_or_default(),
+            description,
+            width,
+            height,
+            inline,
+            anchor_position,
+            shape,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Parse the inside of `<wp:positionH>` or `<wp:positionV>` looking for
+/// the nested `<wp:posOffset>` text value. Reads through the matching
+/// closing tag (`end_local`).
+fn parse_position_offset(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    end_local: &[u8],
+) -> CoreResult<Option<i64>> {
+    let mut offset: Option<i64> = None;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) if e.local_name().as_ref() == b"posOffset" => {
+                let text = xml::read_text_content_fast(reader)?;
+                if let Ok(v) = text.trim().parse::<i64>() {
+                    offset = Some(v);
+                }
+            },
+            Event::Start(_) => {
+                xml::skip_element_fast(reader)?;
+            },
+            Event::End(ref e) if e.local_name().as_ref() == end_local => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+
+    Ok(offset)
+}
+
+/// Result of parsing an `<a:graphic>` element: at most one of an
+/// embedded picture (`relationship_id`) or a vector shape (`shape`).
+struct GraphicPayload {
+    relationship_id: Option<String>,
+    shape: Option<crate::docx::image::ShapeInfo>,
+}
+
+/// Parse `<a:graphic>` and any contained `<pic:pic>` (image) or
+/// `<wps:wsp>` (vector shape). Reads through `</a:graphic>`.
+fn parse_graphic(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<GraphicPayload> {
+    let mut relationship_id: Option<String> = None;
+    let mut shape: Option<crate::docx::image::ShapeInfo> = None;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"pic" => {
+                    if let Some(rid) = parse_pic(reader)? {
+                        relationship_id = Some(rid);
+                    }
+                },
+                b"wsp" => {
+                    if let Some(s) = parse_wsp(reader)? {
+                        shape = Some(s);
+                    }
+                },
+                // <a:graphicData> is just a wrapper; descend into it.
+                b"graphicData" => continue,
+                _ => {
+                    xml::skip_element_fast(reader)?;
+                },
+            },
+            Event::End(ref e) if e.local_name().as_ref() == b"graphic" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+
+    Ok(GraphicPayload {
+        relationship_id,
+        shape,
+    })
+}
+
+/// Parse `<pic:pic>` looking for the embedded `<a:blip r:embed="…"/>`.
+/// Reads through `</pic:pic>`. The blip lives inside `<pic:blipFill>`,
+/// so we descend through whatever wrappers we encounter rather than
+/// skipping siblings.
+fn parse_pic(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<String>> {
+    let mut rid: Option<String> = None;
+    // Track depth relative to <pic:pic>: we entered after its Start was
+    // consumed by the caller, so we are at depth 1. Exit when we close
+    // back out.
+    let mut depth: u32 = 1;
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                depth += 1;
-                let local = e.local_name();
-                let local_bytes = local.as_ref();
-                match local_bytes {
-                    b"inline" => inline = true,
-                    b"anchor" => inline = false,
-                    b"extent" => parse_extent_attrs(e, &mut width, &mut height),
-                    b"docPr" => {
-                        if let Ok(Some(desc)) = xml::optional_attr_str(e, b"descr") {
-                            description = Some(desc.into_owned());
-                        }
-                    },
-                    b"blip" => {
-                        if let Ok(Some(embed)) = xml::optional_attr_str(e, b"r:embed") {
-                            relationship_id = Some(embed.into_owned());
-                        }
-                    },
-                    _ => {},
+                if e.local_name().as_ref() == b"blip" {
+                    if let Some(embed) = xml::optional_attr_str(e, b"r:embed")? {
+                        rid = Some(embed.into_owned());
+                    }
+                    // Skip over blip's own children (e.g. <a:extLst>).
+                    xml::skip_element_fast(reader)?;
+                } else {
+                    depth += 1;
                 }
             },
-            Event::Empty(ref e) => {
-                let local = e.local_name();
-                let local_bytes = local.as_ref();
-                match local_bytes {
-                    b"extent" => parse_extent_attrs(e, &mut width, &mut height),
-                    b"docPr" => {
-                        if let Ok(Some(desc)) = xml::optional_attr_str(e, b"descr") {
-                            description = Some(desc.into_owned());
-                        }
-                    },
-                    b"blip" => {
-                        if let Ok(Some(embed)) = xml::optional_attr_str(e, b"r:embed") {
-                            relationship_id = Some(embed.into_owned());
-                        }
-                    },
-                    _ => {},
+            Event::Empty(ref e) if e.local_name().as_ref() == b"blip" => {
+                if let Some(embed) = xml::optional_attr_str(e, b"r:embed")? {
+                    rid = Some(embed.into_owned());
                 }
             },
             Event::End(_) => {
@@ -503,17 +806,209 @@ fn parse_drawing(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<Dra
         }
     }
 
-    if let Some(rid) = relationship_id {
-        Ok(Some(DrawingInfo {
-            relationship_id: rid,
-            description,
-            width,
-            height,
-            inline,
-        }))
-    } else {
-        Ok(None)
+    Ok(rid)
+}
+
+/// Parse `<wps:wsp>` (a DrawingML vector shape). Reads through
+/// `</wps:wsp>` and returns the assembled `ShapeInfo`, or `None` if no
+/// `<a:prstGeom>` was seen.
+fn parse_wsp(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> CoreResult<Option<crate::docx::image::ShapeInfo>> {
+    use crate::docx::image::{ShapeInfo, ShapeKind};
+
+    let mut kind: Option<ShapeKind> = None;
+    let mut stroke_rgb: Option<(u8, u8, u8)> = None;
+    let mut fill_rgb: Option<(u8, u8, u8)> = None;
+    let mut stroke_w_emu: Option<i64> = None;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"spPr" => {
+                    parse_sp_pr(
+                        reader,
+                        &mut kind,
+                        &mut stroke_rgb,
+                        &mut fill_rgb,
+                        &mut stroke_w_emu,
+                    )?;
+                },
+                _ => {
+                    xml::skip_element_fast(reader)?;
+                },
+            },
+            Event::End(ref e) if e.local_name().as_ref() == b"wsp" => break,
+            Event::Eof => break,
+            _ => {},
+        }
     }
+
+    Ok(kind.map(|k| ShapeInfo {
+        kind: k,
+        stroke_rgb,
+        fill_rgb,
+        stroke_w_emu,
+    }))
+}
+
+/// Parse `<wps:spPr>`: contains the geometry preset, an optional fill,
+/// and an optional `<a:ln>` (line/stroke) sub-element. Reads through
+/// `</wps:spPr>`.
+fn parse_sp_pr(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    kind: &mut Option<crate::docx::image::ShapeKind>,
+    stroke_rgb: &mut Option<(u8, u8, u8)>,
+    fill_rgb: &mut Option<(u8, u8, u8)>,
+    stroke_w_emu: &mut Option<i64>,
+) -> CoreResult<()> {
+    use crate::docx::image::ShapeKind;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"prstGeom" => {
+                    if let Some(prst) = xml::optional_attr_str(e, b"prst")? {
+                        *kind = match prst.as_ref() {
+                            "line" | "straightConnector1" => Some(ShapeKind::Line),
+                            "rect" => Some(ShapeKind::Rect),
+                            _ => *kind,
+                        };
+                    }
+                    xml::skip_element_fast(reader)?;
+                },
+                b"ln" => {
+                    if let Some(w) = xml::optional_attr_str(e, b"w")? {
+                        *stroke_w_emu = w.parse().ok();
+                    }
+                    *stroke_rgb = parse_line_color(reader)?.or(*stroke_rgb);
+                },
+                b"solidFill" => {
+                    *fill_rgb = parse_solid_fill_color(reader)?.or(*fill_rgb);
+                },
+                _ => {
+                    xml::skip_element_fast(reader)?;
+                },
+            },
+            Event::Empty(ref e) => match e.local_name().as_ref() {
+                b"prstGeom" => {
+                    if let Some(prst) = xml::optional_attr_str(e, b"prst")? {
+                        *kind = match prst.as_ref() {
+                            "line" | "straightConnector1" => Some(ShapeKind::Line),
+                            "rect" => Some(ShapeKind::Rect),
+                            _ => *kind,
+                        };
+                    }
+                },
+                b"ln" => {
+                    if let Some(w) = xml::optional_attr_str(e, b"w")? {
+                        *stroke_w_emu = w.parse().ok();
+                    }
+                },
+                _ => {},
+            },
+            Event::End(ref e) if e.local_name().as_ref() == b"spPr" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse `<a:ln>` looking for an inner `<a:solidFill><a:srgbClr/>`.
+/// Reads through `</a:ln>`.
+fn parse_line_color(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<(u8, u8, u8)>> {
+    let mut rgb: Option<(u8, u8, u8)> = None;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"solidFill" => {
+                    if let Some(c) = parse_solid_fill_color(reader)? {
+                        rgb = Some(c);
+                    }
+                },
+                _ => {
+                    xml::skip_element_fast(reader)?;
+                },
+            },
+            Event::End(ref e) if e.local_name().as_ref() == b"ln" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+
+    Ok(rgb)
+}
+
+/// Parse `<a:solidFill>` looking for an inner `<a:srgbClr val="…"/>`.
+/// Reads through `</a:solidFill>`.
+fn parse_solid_fill_color(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> CoreResult<Option<(u8, u8, u8)>> {
+    let mut rgb: Option<(u8, u8, u8)> = None;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => {
+                if e.local_name().as_ref() == b"srgbClr" {
+                    if let Some(val) = xml::optional_attr_str(e, b"val")? {
+                        if let Some(parsed) = parse_hex_rgb(&val) {
+                            rgb = Some(parsed);
+                        }
+                    }
+                }
+                xml::skip_element_fast(reader)?;
+            },
+            Event::Empty(ref e) if e.local_name().as_ref() == b"srgbClr" => {
+                if let Some(val) = xml::optional_attr_str(e, b"val")? {
+                    if let Some(parsed) = parse_hex_rgb(&val) {
+                        rgb = Some(parsed);
+                    }
+                }
+            },
+            Event::End(ref e) if e.local_name().as_ref() == b"solidFill" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+
+    Ok(rgb)
+}
+
+fn parse_anchor_frame(s: &str) -> crate::docx::image::AnchorFrame {
+    use crate::docx::image::AnchorFrame;
+    match s {
+        "page" => AnchorFrame::Page,
+        "margin" | "leftMargin" | "rightMargin" | "topMargin" | "bottomMargin" | "insideMargin"
+        | "outsideMargin" => AnchorFrame::Margin,
+        "column" => AnchorFrame::Column,
+        "paragraph" => AnchorFrame::Paragraph,
+        "line" => AnchorFrame::Line,
+        "character" => AnchorFrame::Character,
+        _ => AnchorFrame::Page,
+    }
+}
+
+fn parse_hex_rgb(s: &str) -> Option<(u8, u8, u8)> {
+    let bytes = s.trim().as_bytes();
+    if bytes.len() != 6 {
+        return None;
+    }
+    fn hex_pair(a: u8, b: u8) -> Option<u8> {
+        let h = |c: u8| match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(10 + c - b'a'),
+            b'A'..=b'F' => Some(10 + c - b'A'),
+            _ => None,
+        };
+        Some((h(a)? << 4) | h(b)?)
+    }
+    let r = hex_pair(bytes[0], bytes[1])?;
+    let g = hex_pair(bytes[2], bytes[3])?;
+    let b = hex_pair(bytes[4], bytes[5])?;
+    Some((r, g, b))
 }
 
 fn parse_extent_attrs(e: &quick_xml::events::BytesStart, width: &mut Emu, height: &mut Emu) {
@@ -822,7 +1317,7 @@ fn parse_table_width(e: &quick_xml::events::BytesStart) -> CoreResult<Option<Tab
 // Section properties parsing
 // ---------------------------------------------------------------------------
 
-fn parse_section_properties(
+pub(crate) fn parse_section_properties(
     reader: &mut quick_xml::Reader<&[u8]>,
     _start: &quick_xml::events::BytesStart,
 ) -> CoreResult<SectionProperties> {
@@ -915,6 +1410,36 @@ fn parse_section_properties(
         }
     }
     Ok(props)
+}
+
+/// Recover the original face name from an embedded-font filename
+/// produced by `core::embedded_fonts::write_embedded_fonts`. The
+/// writer ships fonts as `font_<n>_<face>.<ext>` where `<face>` is
+/// the original face name (with `/`, `?`, `*` etc. sanitized to `_`
+/// — but NOT alphabetic characters, which earlier callers' naive
+/// `trim_end_matches(alphabetic)` was greedily eating).
+///
+/// Examples:
+///   `font_4_TeXGyreTermesX-Regular.ttf` → `TeXGyreTermesX-Regular`
+///   `font_1_NewTXBMI.ttf`               → `NewTXBMI`
+///   `font.otf`                          → `` (caller falls back to basename)
+pub(crate) fn strip_embedded_font_filename(basename: &str) -> String {
+    // Drop extension.
+    let stem = match basename.rfind('.') {
+        Some(i) => &basename[..i],
+        None => basename,
+    };
+    // Strip the `font_<digits>_` prefix when present.
+    if let Some(rest) = stem.strip_prefix("font_") {
+        if let Some(under_idx) = rest.find('_') {
+            // Everything before the underscore must be digits;
+            // otherwise treat the whole stem as the face name.
+            if rest[..under_idx].chars().all(|c| c.is_ascii_digit()) {
+                return rest[under_idx + 1..].to_string();
+            }
+        }
+    }
+    stem.to_string()
 }
 
 fn parse_hf_type(e: &quick_xml::events::BytesStart) -> CoreResult<HeaderFooterType> {
@@ -1172,6 +1697,86 @@ mod tests {
     }
 
     #[test]
+    fn parse_drawing_anchor_position() {
+        let xml =
+            br#"<w:drawing xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+                xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+            <wp:anchor>
+                <wp:positionH relativeFrom="page"><wp:posOffset>914400</wp:posOffset></wp:positionH>
+                <wp:positionV relativeFrom="page"><wp:posOffset>457200</wp:posOffset></wp:positionV>
+                <wp:extent cx="2000000" cy="1500000"/>
+                <a:graphic><a:graphicData uri="">
+                    <pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
+                        <pic:blipFill><a:blip r:embed="rId7"/></pic:blipFill>
+                    </pic:pic>
+                </a:graphicData></a:graphic>
+            </wp:anchor>
+        </w:drawing>"#;
+        let mut reader = make_content_reader(xml);
+        // Advance past the outer <w:drawing> Start so parse_drawing
+        // sees the inner contents (it expects to be entered with
+        // depth=1 already accounting for that wrapper).
+        loop {
+            match reader.read_event().unwrap() {
+                quick_xml::events::Event::Start(ref e) if e.local_name().as_ref() == b"drawing" => {
+                    break;
+                },
+                quick_xml::events::Event::Eof => panic!("no drawing"),
+                _ => {},
+            }
+        }
+        let info = parse_drawing(&mut reader).unwrap().expect("drawing");
+        assert!(!info.inline);
+        let pos = info.anchor_position.expect("anchor position");
+        assert_eq!(pos.x_emu, 914400);
+        assert_eq!(pos.y_emu, 457200);
+        assert_eq!(pos.h_relative_from, crate::docx::AnchorFrame::Page);
+        assert_eq!(info.relationship_id, "rId7");
+    }
+
+    #[test]
+    fn parse_drawing_wsp_line_shape() {
+        let xml =
+            br#"<w:drawing xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+                xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+                xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+            <wp:anchor>
+                <wp:positionH relativeFrom="page"><wp:posOffset>100000</wp:posOffset></wp:positionH>
+                <wp:positionV relativeFrom="page"><wp:posOffset>200000</wp:posOffset></wp:positionV>
+                <wp:extent cx="500000" cy="0"/>
+                <a:graphic><a:graphicData>
+                    <wps:wsp>
+                        <wps:spPr>
+                            <a:prstGeom prst="line"/>
+                            <a:ln w="9525">
+                                <a:solidFill><a:srgbClr val="FF0000"/></a:solidFill>
+                            </a:ln>
+                        </wps:spPr>
+                    </wps:wsp>
+                </a:graphicData></a:graphic>
+            </wp:anchor>
+        </w:drawing>"#;
+        let mut reader = make_content_reader(xml);
+        loop {
+            match reader.read_event().unwrap() {
+                quick_xml::events::Event::Start(ref e) if e.local_name().as_ref() == b"drawing" => {
+                    break;
+                },
+                quick_xml::events::Event::Eof => panic!("no drawing"),
+                _ => {},
+            }
+        }
+        let info = parse_drawing(&mut reader).unwrap().expect("drawing");
+        let shape = info.shape.expect("shape");
+        assert_eq!(shape.kind, crate::docx::ShapeKind::Line);
+        assert_eq!(shape.stroke_rgb, Some((0xFF, 0x00, 0x00)));
+        assert_eq!(shape.stroke_w_emu, Some(9525));
+    }
+
+    #[test]
     fn section_properties() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -1192,5 +1797,61 @@ mod tests {
         assert_eq!(ps.height.0, 15840);
         let margins = sect.margins.as_ref().unwrap();
         assert_eq!(margins.left.0, 1800);
+    }
+
+    // ── strip_embedded_font_filename ────────────────────────────────────
+
+    #[test]
+    fn strip_embedded_font_writer_convention() {
+        // Writer convention: font_<n>_<face>.<ext>
+        assert_eq!(
+            strip_embedded_font_filename("font_4_TeXGyreTermesX-Regular.ttf"),
+            "TeXGyreTermesX-Regular"
+        );
+        assert_eq!(strip_embedded_font_filename("font_1_NewTXBMI.ttf"), "NewTXBMI");
+        assert_eq!(strip_embedded_font_filename("font_12_DejaVuSans.otf"), "DejaVuSans");
+    }
+
+    #[test]
+    fn strip_embedded_font_no_prefix_keeps_stem() {
+        // No `font_<n>_` prefix → return the stem unchanged.
+        assert_eq!(strip_embedded_font_filename("Arial.ttf"), "Arial");
+        assert_eq!(strip_embedded_font_filename("MyFont.otf"), "MyFont");
+    }
+
+    #[test]
+    fn strip_embedded_font_no_extension() {
+        // No extension → use the whole input.
+        assert_eq!(strip_embedded_font_filename("font_1_Calibri"), "Calibri");
+        assert_eq!(strip_embedded_font_filename("Calibri"), "Calibri");
+    }
+
+    #[test]
+    fn strip_embedded_font_non_digit_prefix_keeps_stem() {
+        // `font_xxx_<face>` where xxx isn't digits → don't strip.
+        assert_eq!(strip_embedded_font_filename("font_abc_Foo.ttf"), "font_abc_Foo");
+    }
+
+    #[test]
+    fn strip_embedded_font_alphabetic_face_preserved() {
+        // Regression: greedy trim_end_matches(alphabetic) used to eat
+        // the face name. Verify a face with trailing alphabetic chars
+        // survives intact.
+        assert_eq!(
+            strip_embedded_font_filename("font_4_TeXGyreTermesX-Bold.ttf"),
+            "TeXGyreTermesX-Bold"
+        );
+    }
+
+    #[test]
+    fn strip_embedded_font_empty() {
+        assert_eq!(strip_embedded_font_filename(""), "");
+    }
+
+    #[test]
+    fn strip_embedded_font_no_face_after_prefix() {
+        // `font_<n>_` with nothing after the underscore → empty face.
+        // Caller of this helper falls back to the full basename.
+        assert_eq!(strip_embedded_font_filename("font_5_.ttf"), "");
     }
 }

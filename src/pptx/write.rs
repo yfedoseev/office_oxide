@@ -158,10 +158,23 @@ impl From<String> for Run {
 // Internal body content model
 // ---------------------------------------------------------------------------
 
+/// Paragraph-level properties carried through a `BodyItem::RichText`.
+/// Present so the writer can emit `<a:pPr>` attributes (alignment,
+/// space-before) that don't fit on per-run `<a:rPr>`.
+#[derive(Debug, Clone, Default)]
+pub struct ParaProps {
+    /// Paragraph alignment written as `<a:pPr algn="…"/>`. `None`
+    /// leaves the renderer-default left alignment in place.
+    pub alignment: Option<crate::ir::ParagraphAlignment>,
+    /// Space before the paragraph in points × 100. 1250 = 12.5pt.
+    /// When set, written as `<a:spcBef><a:spcPts val="…"/></a:spcBef>`.
+    pub space_before_hundredths_pt: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 enum BodyItem {
     Text(String),
-    RichText(Vec<Run>),
+    RichText(Vec<Run>, ParaProps),
     BulletList(Vec<String>),
     /// Free-floating text box: (runs, x_emu, y_emu, cx_emu, cy_emu)
     TextBox(Vec<Run>, i64, i64, i64, i64),
@@ -178,6 +191,10 @@ enum BodyItem {
 pub struct SlideData {
     /// The slide title (if set).
     pub title: Option<String>,
+    /// Optional explicit alignment for the title placeholder. None
+    /// leaves alignment to the slide layout default (typically
+    /// centered for title placeholders).
+    pub title_alignment: Option<crate::ir::ParagraphAlignment>,
     body_items: Vec<BodyItem>,
 }
 
@@ -185,6 +202,7 @@ impl SlideData {
     fn new() -> Self {
         Self {
             title: None,
+            title_alignment: None,
             body_items: Vec::new(),
         }
     }
@@ -192,6 +210,18 @@ impl SlideData {
     /// Set the slide title. Overwrites any previously set title.
     pub fn set_title(&mut self, title: &str) -> &mut Self {
         self.title = Some(title.to_string());
+        self
+    }
+
+    /// Set the slide title and its alignment. Overwrites any
+    /// previously set title.
+    pub fn set_title_aligned(
+        &mut self,
+        title: &str,
+        alignment: Option<crate::ir::ParagraphAlignment>,
+    ) -> &mut Self {
+        self.title = Some(title.to_string());
+        self.title_alignment = alignment;
         self
     }
 
@@ -203,7 +233,32 @@ impl SlideData {
 
     /// Add a paragraph of styled [`Run`]s to the body area.
     pub fn add_rich_text(&mut self, runs: &[Run]) -> &mut Self {
-        self.body_items.push(BodyItem::RichText(runs.to_vec()));
+        self.body_items
+            .push(BodyItem::RichText(runs.to_vec(), ParaProps::default()));
+        self
+    }
+
+    /// Add a paragraph of styled [`Run`]s with an explicit alignment.
+    pub fn add_rich_text_aligned(
+        &mut self,
+        runs: &[Run],
+        alignment: Option<crate::ir::ParagraphAlignment>,
+    ) -> &mut Self {
+        self.body_items.push(BodyItem::RichText(
+            runs.to_vec(),
+            ParaProps {
+                alignment,
+                ..Default::default()
+            },
+        ));
+        self
+    }
+
+    /// Add a paragraph of styled [`Run`]s with full paragraph
+    /// properties (alignment, space-before).
+    pub fn add_rich_text_with_props(&mut self, runs: &[Run], props: ParaProps) -> &mut Self {
+        self.body_items
+            .push(BodyItem::RichText(runs.to_vec(), props));
         self
     }
 
@@ -273,6 +328,14 @@ pub struct PptxWriter {
     cx: u64,
     /// Presentation height in EMU (default: 6 858 000 — standard 16:9).
     cy: u64,
+    /// Embedded font programs to ship inside the package under `ppt/fonts/`.
+    /// Mirrors `DocxWriter::embed_font` semantics: each `(name, bytes)` pair
+    /// becomes one font part, used by PDF↔PPTX round-trips to preserve the
+    /// source typeface.
+    embedded_fonts: Vec<(String, Vec<u8>)>,
+    /// Document metadata for `docProps/core.xml`. `None` means no
+    /// core-properties part is written.
+    metadata: Option<crate::ir::Metadata>,
 }
 
 impl PptxWriter {
@@ -282,7 +345,30 @@ impl PptxWriter {
             slides: Vec::new(),
             cx: 12_192_000,
             cy: 6_858_000,
+            embedded_fonts: Vec::new(),
+            metadata: None,
         }
+    }
+
+    /// Set document metadata (written to `docProps/core.xml`).
+    pub fn set_metadata(&mut self, meta: &crate::ir::Metadata) -> &mut Self {
+        self.metadata = Some(meta.clone());
+        self
+    }
+
+    /// Embed a font program (TrueType / OpenType bytes) under `ppt/fonts/`.
+    ///
+    /// `name` is used for both the on-disk file name and the human-readable
+    /// font name in the presentation's font table. Deduplication is by
+    /// `name` only — supplying different bytes for an already-registered
+    /// name is a no-op. Pass distinct names (e.g. `Calibri-Bold` vs
+    /// `Calibri`) when you need to ship multiple faces of the same family.
+    pub fn embed_font(&mut self, name: impl Into<String>, data: Vec<u8>) -> &mut Self {
+        let name = name.into();
+        if !self.embedded_fonts.iter().any(|(n, _)| n == &name) {
+            self.embedded_fonts.push((name, data));
+        }
+        self
     }
 
     /// Override the presentation canvas size (in EMU).
@@ -358,6 +444,17 @@ impl PptxWriter {
         opc.add_package_rel(rel_types::OFFICE_DOCUMENT, "ppt/presentation.xml");
         opc.add_part_rel(&pres_part, rel_types::SLIDE_MASTER, "slideMasters/slideMaster1.xml");
 
+        // Core properties (docProps/core.xml). Written only when the
+        // caller supplied metadata so files generated through the
+        // existing `add_slide` API stay byte-identical when no
+        // metadata was set.
+        if let Some(ref meta) = self.metadata {
+            let core_part = PartName::new("/docProps/core.xml")?;
+            opc.add_package_rel(rel_types::CORE_PROPERTIES, "docProps/core.xml");
+            let core_xml = crate::core::core_properties::generate_xml(meta);
+            opc.add_part(&core_part, crate::core::core_properties::CONTENT_TYPE, &core_xml)?;
+        }
+
         let mut slide_parts = Vec::with_capacity(self.slides.len());
         for i in 0..self.slides.len() {
             let idx = i + 1;
@@ -410,6 +507,17 @@ impl PptxWriter {
             let slide_xml = generate_slide_xml(slide, &img_rids);
             opc.add_part(slide_part, CT_SLIDE, &slide_xml)?;
         }
+
+        // Embed fonts under `ppt/fonts/font_<n>_<safe_name>.ttf`. Mirrors
+        // the DOCX `word/fonts/` layout. Other PowerPoint software may not
+        // honor this without the full presentation-relationship machinery
+        // for `<p:embeddedFontLst>`, but the in-process reader scans the
+        // directory directly so PDF↔PPTX round-trips preserve fonts.
+        crate::core::embedded_fonts::write_embedded_fonts(
+            &mut opc,
+            "/ppt/fonts/",
+            &self.embedded_fonts,
+        )?;
 
         opc.finish()?;
         Ok(())
@@ -562,6 +670,21 @@ fn generate_presentation_xml(slide_count: usize, cx: u64, cy: u64) -> Vec<u8> {
     sld_sz.push_attribute(("cy", cy.to_string().as_str()));
     w.write_event(Event::Empty(sld_sz)).expect("write");
 
+    // notesSz: PowerPoint expects this even when there are no notes
+    // pages. Standard default is the same dimensions as the slide.
+    let mut notes_sz = BytesStart::new("p:notesSz");
+    notes_sz.push_attribute(("cx", cx.to_string().as_str()));
+    notes_sz.push_attribute(("cy", cy.to_string().as_str()));
+    w.write_event(Event::Empty(notes_sz)).expect("write");
+
+    // defaultTextStyle: empty list of paragraph-level defaults is
+    // legal and silences PowerPoint's "Reset Layout" command failure
+    // when the user opens the deck.
+    w.write_event(Event::Start(BytesStart::new("p:defaultTextStyle")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:defaultTextStyle")))
+        .expect("write");
+
     w.write_event(Event::End(BytesEnd::new("p:presentation")))
         .expect("write");
     w.into_inner()
@@ -610,8 +733,14 @@ fn generate_slide_layout_xml() -> Vec<u8> {
     let mut w = Writer::new(Vec::new());
     write_decl(&mut w);
 
+    // Type "obj" = "Title and Content" — PowerPoint's standard
+    // layout. Slides referencing this layout get a sized title
+    // placeholder at the top and a body placeholder filling the
+    // rest. Was `type="blank"` with empty spTree; that left
+    // PowerPoint guessing at placeholder geometry.
     let mut root = pml_root("p:sldLayout");
-    root.push_attribute(("type", "blank"));
+    root.push_attribute(("type", "obj"));
+    root.push_attribute(("preserve", "1"));
     w.write_event(Event::Start(root)).expect("write");
     w.write_event(Event::Start(BytesStart::new("p:cSld")))
         .expect("write");
@@ -619,6 +748,30 @@ fn generate_slide_layout_xml() -> Vec<u8> {
         .expect("write");
     write_nv_grp_sp_pr(&mut w);
     write_empty(&mut w, "p:grpSpPr");
+
+    // Title placeholder — top of slide, ~5 % top inset, full width minus margin.
+    write_layout_placeholder(
+        &mut w,
+        2,
+        "Title 1",
+        "title",
+        None,
+        // Geometry in EMU. Standard 16:9 @ 12 192 000 × 6 858 000:
+        // place title at (914 400, 685 800) ≈ 1 in × 0.75 in,
+        // size 10 363 200 × 1 143 000 ≈ 11.3 in × 1.25 in.
+        Some((914_400, 685_800, 10_363_200, 1_143_000)),
+    );
+
+    // Body placeholder — fills the area below the title.
+    write_layout_placeholder(
+        &mut w,
+        3,
+        "Body 2",
+        "body",
+        Some(1),
+        Some((914_400, 1_905_000, 10_363_200, 4_343_400)),
+    );
+
     w.write_event(Event::End(BytesEnd::new("p:spTree")))
         .expect("write");
     w.write_event(Event::End(BytesEnd::new("p:cSld")))
@@ -626,6 +779,93 @@ fn generate_slide_layout_xml() -> Vec<u8> {
     w.write_event(Event::End(BytesEnd::new("p:sldLayout")))
         .expect("write");
     w.into_inner()
+}
+
+/// Emit one placeholder `<p:sp>` inside the slide layout: an empty
+/// shape carrying the placeholder type/idx + its xfrm rectangle.
+/// Slides that reference this layout's `type` and `idx` inherit the
+/// geometry — without it PowerPoint falls back to bare-default
+/// positioning that often pushes content off the slide canvas.
+fn write_layout_placeholder(
+    w: &mut Writer<Vec<u8>>,
+    id: u32,
+    name: &str,
+    ph_type: &str,
+    ph_idx: Option<u32>,
+    geometry_emu: Option<(i64, i64, i64, i64)>, // (x, y, cx, cy)
+) {
+    let id_str = id.to_string();
+    w.write_event(Event::Start(BytesStart::new("p:sp")))
+        .expect("sp start");
+
+    w.write_event(Event::Start(BytesStart::new("p:nvSpPr")))
+        .expect("nvSpPr start");
+    let mut cnv_pr = BytesStart::new("p:cNvPr");
+    cnv_pr.push_attribute(("id", id_str.as_str()));
+    cnv_pr.push_attribute(("name", name));
+    w.write_event(Event::Empty(cnv_pr)).expect("cNvPr");
+    w.write_event(Event::Start(BytesStart::new("p:cNvSpPr")))
+        .expect("cNvSpPr start");
+    let mut locks = BytesStart::new("a:spLocks");
+    locks.push_attribute(("noGrp", "1"));
+    w.write_event(Event::Empty(locks)).expect("spLocks");
+    w.write_event(Event::End(BytesEnd::new("p:cNvSpPr")))
+        .expect("cNvSpPr end");
+    w.write_event(Event::Start(BytesStart::new("p:nvPr")))
+        .expect("nvPr start");
+    let mut ph = BytesStart::new("p:ph");
+    ph.push_attribute(("type", ph_type));
+    let idx_buf;
+    if let Some(idx) = ph_idx {
+        idx_buf = idx.to_string();
+        ph.push_attribute(("idx", idx_buf.as_str()));
+    }
+    w.write_event(Event::Empty(ph)).expect("ph");
+    w.write_event(Event::End(BytesEnd::new("p:nvPr")))
+        .expect("nvPr end");
+    w.write_event(Event::End(BytesEnd::new("p:nvSpPr")))
+        .expect("nvSpPr end");
+
+    // spPr with optional xfrm geometry
+    if let Some((x, y, cx, cy)) = geometry_emu {
+        w.write_event(Event::Start(BytesStart::new("p:spPr")))
+            .expect("spPr start");
+        w.write_event(Event::Start(BytesStart::new("a:xfrm")))
+            .expect("xfrm start");
+        let mut off = BytesStart::new("a:off");
+        let xs = x.to_string();
+        let ys = y.to_string();
+        off.push_attribute(("x", xs.as_str()));
+        off.push_attribute(("y", ys.as_str()));
+        w.write_event(Event::Empty(off)).expect("off");
+        let mut ext = BytesStart::new("a:ext");
+        let cxs = cx.to_string();
+        let cys = cy.to_string();
+        ext.push_attribute(("cx", cxs.as_str()));
+        ext.push_attribute(("cy", cys.as_str()));
+        w.write_event(Event::Empty(ext)).expect("ext");
+        w.write_event(Event::End(BytesEnd::new("a:xfrm")))
+            .expect("xfrm end");
+        w.write_event(Event::End(BytesEnd::new("p:spPr")))
+            .expect("spPr end");
+    } else {
+        write_empty(w, "p:spPr");
+    }
+
+    // Empty txBody — slides supply their own text.
+    w.write_event(Event::Start(BytesStart::new("p:txBody")))
+        .expect("txBody start");
+    write_empty(w, "a:bodyPr");
+    write_empty(w, "a:lstStyle");
+    w.write_event(Event::Start(BytesStart::new("a:p")))
+        .expect("a:p start");
+    w.write_event(Event::End(BytesEnd::new("a:p")))
+        .expect("a:p end");
+    w.write_event(Event::End(BytesEnd::new("p:txBody")))
+        .expect("txBody end");
+
+    w.write_event(Event::End(BytesEnd::new("p:sp")))
+        .expect("sp end");
 }
 
 // ---------------------------------------------------------------------------
@@ -649,7 +889,7 @@ fn generate_slide_xml(slide: &SlideData, img_rids: &[(String, i64, i64, u64, u64
     let mut next_id: u32 = 2;
 
     if let Some(ref title) = slide.title {
-        write_title_shape(&mut w, next_id, title);
+        write_title_shape(&mut w, next_id, title, slide.title_alignment.as_ref());
         next_id += 1;
     }
 
@@ -687,7 +927,12 @@ fn generate_slide_xml(slide: &SlideData, img_rids: &[(String, i64, i64, u64, u64
     w.into_inner()
 }
 
-fn write_title_shape(w: &mut Writer<Vec<u8>>, id: u32, title: &str) {
+fn write_title_shape(
+    w: &mut Writer<Vec<u8>>,
+    id: u32,
+    title: &str,
+    alignment: Option<&crate::ir::ParagraphAlignment>,
+) {
     let id_str = id.to_string();
     w.write_event(Event::Start(BytesStart::new("p:sp")))
         .expect("write");
@@ -720,7 +965,16 @@ fn write_title_shape(w: &mut Writer<Vec<u8>>, id: u32, title: &str) {
     w.write_event(Event::Start(BytesStart::new("p:txBody")))
         .expect("write");
     write_empty(w, "a:bodyPr");
-    write_plain_paragraph(w, title);
+    if let Some(a) = alignment {
+        let runs = vec![Run::new(title)];
+        let props = ParaProps {
+            alignment: Some(a.clone()),
+            ..Default::default()
+        };
+        write_rich_paragraph(w, &runs, &props);
+    } else {
+        write_plain_paragraph(w, title);
+    }
     w.write_event(Event::End(BytesEnd::new("p:txBody")))
         .expect("write");
 
@@ -761,12 +1015,20 @@ fn write_body_shape(w: &mut Writer<Vec<u8>>, id: u32, items: &[&BodyItem]) {
 
     w.write_event(Event::Start(BytesStart::new("p:txBody")))
         .expect("write");
-    write_empty(w, "a:bodyPr");
+    // <a:bodyPr><a:normAutofit/></a:bodyPr>: tell PowerPoint to
+    // shrink-to-fit the body text. Without this, dense PDF pages
+    // imported as slides overflow the placeholder and content
+    // renders off-slide.
+    w.write_event(Event::Start(BytesStart::new("a:bodyPr")))
+        .expect("write bodyPr start");
+    write_empty(w, "a:normAutofit");
+    w.write_event(Event::End(BytesEnd::new("a:bodyPr")))
+        .expect("write bodyPr end");
 
     for item in items {
         match item {
             BodyItem::Text(text) => write_plain_paragraph(w, text),
-            BodyItem::RichText(runs) => write_rich_paragraph(w, runs),
+            BodyItem::RichText(runs, props) => write_rich_paragraph(w, runs, props),
             BodyItem::BulletList(bullets) => {
                 for bullet in bullets {
                     write_bullet_paragraph(w, bullet);
@@ -838,13 +1100,21 @@ fn write_text_box_shape(
     w.write_event(Event::End(BytesEnd::new("p:spPr")))
         .expect("write");
 
-    // txBody
+    // txBody — `wrap="none"` plus explicit zero insets so callers
+    // sizing the shape rectangle to the exact text bbox (e.g. the
+    // PDF→PPTX layout path) get the text rendered without
+    // PowerPoint's default ~0.1" left/right padding silently eating
+    // shape width and forcing visible glyph re-wrapping.
     w.write_event(Event::Start(BytesStart::new("p:txBody")))
         .expect("write");
     let mut body_pr = BytesStart::new("a:bodyPr");
-    body_pr.push_attribute(("wrap", "square"));
+    body_pr.push_attribute(("wrap", "none"));
+    body_pr.push_attribute(("lIns", "0"));
+    body_pr.push_attribute(("tIns", "0"));
+    body_pr.push_attribute(("rIns", "0"));
+    body_pr.push_attribute(("bIns", "0"));
     w.write_event(Event::Empty(body_pr)).expect("write");
-    write_rich_paragraph(w, runs);
+    write_rich_paragraph(w, runs, &ParaProps::default());
     w.write_event(Event::End(BytesEnd::new("p:txBody")))
         .expect("write");
 
@@ -922,9 +1192,39 @@ fn write_plain_paragraph(w: &mut Writer<Vec<u8>>, text: &str) {
         .expect("write");
 }
 
-fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, runs: &[Run]) {
+fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, runs: &[Run], props: &ParaProps) {
+    use crate::ir::ParagraphAlignment;
     w.write_event(Event::Start(BytesStart::new("a:p")))
         .expect("write");
+    let algn = props.alignment.as_ref().map(|a| match a {
+        ParagraphAlignment::Left => "l",
+        ParagraphAlignment::Center => "ctr",
+        ParagraphAlignment::Right => "r",
+        ParagraphAlignment::Justify => "just",
+        ParagraphAlignment::Distribute => "dist",
+    });
+    let need_ppr = algn.is_some() || props.space_before_hundredths_pt.is_some();
+    if need_ppr {
+        let mut p_pr = BytesStart::new("a:pPr");
+        if let Some(v) = algn {
+            p_pr.push_attribute(("algn", v));
+        }
+        if let Some(spc) = props.space_before_hundredths_pt {
+            // <a:pPr ...><a:spcBef><a:spcPts val="N"/></a:spcBef></a:pPr>
+            w.write_event(Event::Start(p_pr)).expect("write pPr start");
+            w.write_event(Event::Start(BytesStart::new("a:spcBef")))
+                .expect("write spcBef");
+            let mut spc_pts = BytesStart::new("a:spcPts");
+            spc_pts.push_attribute(("val", spc.to_string().as_str()));
+            w.write_event(Event::Empty(spc_pts)).expect("write spcPts");
+            w.write_event(Event::End(BytesEnd::new("a:spcBef")))
+                .expect("write spcBef end");
+            w.write_event(Event::End(BytesEnd::new("a:pPr")))
+                .expect("write pPr end");
+        } else {
+            w.write_event(Event::Empty(p_pr)).expect("write pPr");
+        }
+    }
     for run in runs {
         write_dml_run(w, run);
     }

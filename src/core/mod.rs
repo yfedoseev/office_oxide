@@ -8,8 +8,13 @@
 
 /// `[Content_Types].xml` parsing and writing.
 pub mod content_types;
+/// Shared `docProps/core.xml` generator used by DOCX, PPTX, XLSX writers.
+pub mod core_properties;
 /// In-place editing of OPC packages (preserves unchanged parts).
 pub mod editable;
+/// Helpers for embedding TrueType / OpenType font programs in DOCX,
+/// PPTX, and XLSX packages.
+pub mod embedded_fonts;
 /// Core error type and `Result` alias used throughout OOXML parsing.
 pub mod error;
 /// OPC (Open Packaging Conventions) reader and writer for ZIP-based packages.

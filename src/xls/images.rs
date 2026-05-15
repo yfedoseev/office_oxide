@@ -93,3 +93,96 @@ fn to_format(rt: u16) -> ImageFormat {
         other => ImageFormat::Unknown(other),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blip_type_recognition() {
+        assert!(is_blip_type(0xF01D));
+        assert!(is_blip_type(0xF01E));
+        assert!(is_blip_type(0xF02A));
+        assert!(!is_blip_type(0xF000));
+        assert!(!is_blip_type(0xF020));
+    }
+
+    #[test]
+    fn uid_size_secondary_uid() {
+        // Bit 0 of inst signals a secondary UID — adds 16 bytes.
+        assert_eq!(uid_size(0xF01D, 0b00), 17);
+        assert_eq!(uid_size(0xF01D, 0b01), 33);
+        // 0xF01A..=0xF01C use the metafile-style header layout (base 16).
+        assert_eq!(uid_size(0xF01A, 0b00), 16);
+        assert_eq!(uid_size(0xF01A, 0b01), 32);
+    }
+
+    #[test]
+    fn metafile_header_only_for_metafile_types() {
+        assert_eq!(metafile_header_size(0xF01A), 34);
+        assert_eq!(metafile_header_size(0xF01B), 34);
+        assert_eq!(metafile_header_size(0xF01C), 34);
+        assert_eq!(metafile_header_size(0xF01D), 0);
+        assert_eq!(metafile_header_size(0xF01E), 0);
+    }
+
+    #[test]
+    fn signature_validation() {
+        // JPEG starts with FFD8.
+        assert!(has_valid_signature(0xF01D, &[0xFF, 0xD8, 0x00]));
+        assert!(!has_valid_signature(0xF01D, &[0x00, 0x00]));
+        // PNG starts with 89 50 4E 47.
+        assert!(has_valid_signature(0xF01E, b"\x89PNG\r\n"));
+        assert!(!has_valid_signature(0xF01E, b"WRONG"));
+        // EMF: 01 00 00 00 prefix.
+        assert!(has_valid_signature(0xF01A, &[0x01, 0x00, 0x00, 0x00, 0xAA]));
+        assert!(!has_valid_signature(0xF01A, &[0x00, 0x00, 0x00, 0x00]));
+        // Empty payload always invalid.
+        assert!(!has_valid_signature(0xF01D, &[]));
+    }
+
+    #[test]
+    fn to_format_mapping() {
+        assert!(matches!(to_format(0xF01A), ImageFormat::Emf));
+        assert!(matches!(to_format(0xF01B), ImageFormat::Wmf));
+        assert!(matches!(to_format(0xF01C), ImageFormat::Pict));
+        assert!(matches!(to_format(0xF01D), ImageFormat::Jpeg));
+        assert!(matches!(to_format(0xF02A), ImageFormat::Jpeg));
+        assert!(matches!(to_format(0xF01E), ImageFormat::Png));
+        assert!(matches!(to_format(0xF01F), ImageFormat::Dib));
+        assert!(matches!(to_format(0xF029), ImageFormat::Tiff));
+        assert!(matches!(to_format(0xABCD), ImageFormat::Unknown(0xABCD)));
+    }
+
+    #[test]
+    fn extract_images_skips_non_blip_bytes() {
+        // Random non-BLIP bytes produce no images and never crash.
+        let data = vec![0u8; 64];
+        assert!(extract_images(&data).is_empty());
+    }
+
+    #[test]
+    fn extract_images_finds_embedded_png() {
+        // Synthesize a record header followed by a PNG signature so the
+        // scanner descends into a valid BLIP payload.
+        let rec_type: u16 = 0xF01E; // PNG
+        let inst: u16 = 0; // no secondary UID
+        let ver_inst: u16 = inst << 4;
+        let uid = 17usize; // base for non-metafile
+        let png_body = b"\x89PNG\r\n\x1a\nIHDRfakebody";
+        let payload_len = uid + png_body.len();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&ver_inst.to_le_bytes());
+        data.extend_from_slice(&rec_type.to_le_bytes());
+        data.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        data.extend_from_slice(&[0u8; 17]); // skipped UID bytes
+        data.extend_from_slice(png_body);
+
+        let images = extract_images(&data);
+        assert_eq!(images.len(), 1);
+        assert!(matches!(images[0].format, ImageFormat::Png));
+        assert_eq!(images[0].data, png_body);
+        assert_eq!(images[0].index, 0);
+    }
+}
