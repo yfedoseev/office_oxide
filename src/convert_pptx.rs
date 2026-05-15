@@ -290,9 +290,11 @@ fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) 
             let content = convert_text_paragraph_inline(para);
             // Honour space_before from PPTX so spacer paragraphs
             // emitted by pdf_to_ir round-trip with their full vertical
-            // gap. Convert hundredths-of-pt → twips: hundredths * 0.2
-            // (1pt = 20 twips, so pt*100 → twips = (pt*100)/5).
-            let space_before_twips = para.space_before_hundredths_pt.map(|h| h.div_ceil(5));
+            // gap. Convert hundredths-of-pt → twips: 1pt = 20 twips,
+            // so pt*100 → twips = (pt*100)/5. Plain division keeps the
+            // round-trip exact for values that are multiples of 5;
+            // div_ceil would inflate every non-multiple by 1 twip.
+            let space_before_twips = para.space_before_hundredths_pt.map(|h| h / 5);
             // Empty paragraphs serve as vertical spacers — keep them
             // in the IR even when content is empty so the renderer
             // can advance the cursor by the requested amount.

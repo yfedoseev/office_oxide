@@ -1058,3 +1058,158 @@ fn guess_image_format_from_bytes(bytes: &[u8]) -> &'static str {
         "png"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sheet_rels_path_top_level() {
+        assert_eq!(sheet_rels_path("xl/worksheets/sheet1.xml"), "xl/worksheets/_rels/sheet1.xml.rels");
+        assert_eq!(sheet_rels_path("sheet1.xml"), "_rels/sheet1.xml.rels");
+    }
+
+    #[test]
+    fn resolve_relative_zip_path_absolute() {
+        assert_eq!(resolve_relative_zip_path("xl/worksheets/sheet1.xml", "/xl/media/img1.png"), "xl/media/img1.png");
+    }
+
+    #[test]
+    fn resolve_relative_zip_path_dotdot() {
+        assert_eq!(
+            resolve_relative_zip_path("xl/worksheets/sheet1.xml", "../drawings/drawing1.xml"),
+            "xl/drawings/drawing1.xml"
+        );
+    }
+
+    #[test]
+    fn resolve_relative_zip_path_dot_segment() {
+        assert_eq!(
+            resolve_relative_zip_path("xl/worksheets/sheet1.xml", "./local.xml"),
+            "xl/worksheets/local.xml"
+        );
+    }
+
+    #[test]
+    fn resolve_relative_zip_path_source_at_root() {
+        assert_eq!(resolve_relative_zip_path("file.xml", "sub/x.xml"), "sub/x.xml");
+    }
+
+    #[test]
+    fn guess_image_format_signatures() {
+        assert_eq!(guess_image_format_from_bytes(&[0x89, b'P', b'N', b'G', 13, 10, 26, 10]), "png");
+        assert_eq!(guess_image_format_from_bytes(&[0xFF, 0xD8, 0xFF, 0xE0]), "jpeg");
+        assert_eq!(guess_image_format_from_bytes(b"GIF89a..."), "gif");
+        assert_eq!(guess_image_format_from_bytes(b"GIF87a..."), "gif");
+        assert_eq!(guess_image_format_from_bytes(b"BM\0\0\0"), "bmp");
+        assert_eq!(guess_image_format_from_bytes(b"II*\0\x08\0"), "tiff");
+        assert_eq!(guess_image_format_from_bytes(b"MM\0*\0\x08"), "tiff");
+        assert_eq!(guess_image_format_from_bytes(&[0xD7, 0xCD, 0xC6, 0x9A]), "wmf");
+        assert_eq!(guess_image_format_from_bytes(&[0x01, 0x00, 0x00, 0x00, 0x58]), "emf");
+        // Fall back to png for unknown payloads.
+        assert_eq!(guess_image_format_from_bytes(&[0, 0, 0]), "png");
+    }
+
+    #[test]
+    fn extract_chart_text_minimal_title() {
+        let xml = br#"<?xml version="1.0"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:chart>
+    <c:title>
+      <c:tx>
+        <c:rich>
+          <a:p><a:r><a:t>Quarterly Sales</a:t></a:r></a:p>
+        </c:rich>
+      </c:tx>
+    </c:title>
+  </c:chart>
+</c:chartSpace>"#;
+        let out = extract_chart_text(xml);
+        assert!(out.contains("Title: Quarterly Sales"), "got: {out}");
+    }
+
+    #[test]
+    fn extract_chart_text_series_and_categories() {
+        let xml = br#"<?xml version="1.0"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:chart><c:plotArea>
+    <c:barChart>
+      <c:ser>
+        <c:tx><c:strRef><c:f>Sheet1!$B$1</c:f><c:strCache><c:pt><c:v>Budget</c:v></c:pt></c:strCache></c:strRef></c:tx>
+        <c:cat><c:strRef><c:strCache>
+          <c:pt><c:v>Q1</c:v></c:pt>
+          <c:pt><c:v>Q2</c:v></c:pt>
+        </c:strCache></c:strRef></c:cat>
+        <c:val><c:numRef><c:numCache>
+          <c:pt><c:v>1000</c:v></c:pt>
+          <c:pt><c:v>2000</c:v></c:pt>
+        </c:numCache></c:numRef></c:val>
+      </c:ser>
+    </c:barChart>
+  </c:plotArea></c:chart>
+</c:chartSpace>"#;
+        let out = extract_chart_text(xml);
+        assert!(out.contains("Categories: Q1, Q2"), "got: {out}");
+        assert!(out.contains("Budget: 1000, 2000"), "got: {out}");
+    }
+
+    #[test]
+    fn parse_drawing_anchors_picture_one_cell() {
+        let xml = br#"<?xml version="1.0"?>
+<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+          xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <xdr:oneCellAnchor>
+    <xdr:from><xdr:col>0</xdr:col><xdr:colOff>914400</xdr:colOff>
+              <xdr:row>0</xdr:row><xdr:rowOff>457200</xdr:rowOff></xdr:from>
+    <xdr:ext cx="2000000" cy="1500000"/>
+    <xdr:pic>
+      <xdr:nvPicPr>
+        <xdr:cNvPr id="2" name="Image1" descr="my-alt"/>
+      </xdr:nvPicPr>
+      <xdr:blipFill>
+        <a:blip r:embed="rId4"/>
+      </xdr:blipFill>
+    </xdr:pic>
+  </xdr:oneCellAnchor>
+</xdr:wsDr>"#;
+        let parsed = parse_drawing_anchors(xml).expect("parse ok");
+        assert_eq!(parsed.pictures.len(), 1);
+        assert_eq!(parsed.pictures[0].embed_rid, "rId4");
+        assert_eq!(parsed.pictures[0].cx_emu, 2_000_000);
+        assert_eq!(parsed.pictures[0].cy_emu, 1_500_000);
+        assert_eq!(parsed.pictures[0].alt_text.as_deref(), Some("my-alt"));
+    }
+
+    #[test]
+    fn parse_drawing_anchors_text_shape() {
+        let xml = br#"<?xml version="1.0"?>
+<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+          xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <xdr:absoluteAnchor>
+    <xdr:pos x="100000" y="200000"/>
+    <xdr:ext cx="3000000" cy="500000"/>
+    <xdr:sp>
+      <xdr:txBody>
+        <a:p><a:r><a:t>Hello shape</a:t></a:r></a:p>
+      </xdr:txBody>
+    </xdr:sp>
+  </xdr:absoluteAnchor>
+</xdr:wsDr>"#;
+        let parsed = parse_drawing_anchors(xml).expect("parse ok");
+        assert_eq!(parsed.text_shapes.len(), 1);
+        assert_eq!(parsed.text_shapes[0].text, "Hello shape");
+        assert_eq!(parsed.text_shapes[0].cx_emu, 3_000_000);
+    }
+
+    #[test]
+    fn parse_drawing_anchors_empty_doc_is_ok() {
+        let xml = br#"<?xml version="1.0"?>
+<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>"#;
+        let parsed = parse_drawing_anchors(xml).expect("parse ok");
+        assert!(parsed.pictures.is_empty());
+        assert!(parsed.text_shapes.is_empty());
+    }
+}

@@ -7,8 +7,11 @@
 
 /// Apply an Excel number format to a numeric value.
 pub fn apply_format(n: f64, fmt_id: u32, fmt_str: Option<&str>) -> String {
-    if n.is_nan() || n.is_infinite() {
-        return String::new();
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
+    if n.is_infinite() {
+        return if n < 0.0 { "-Infinity".to_string() } else { "Infinity".to_string() };
     }
 
     // Built-in format IDs per OOXML spec §18.8.30.
@@ -67,26 +70,44 @@ fn format_fixed(n: f64, decimals: u8) -> String {
 pub fn format_commas(n: f64, decimals: u8) -> String {
     let negative = n < 0.0;
     let abs = n.abs();
-
-    // Round to the required number of decimal places first.
-    let factor = 10f64.powi(decimals as i32);
-    let rounded = (abs * factor).round() / factor;
-
-    let int_part = rounded.trunc() as u64;
-    let int_str = insert_commas(int_part);
-
     let sign = if negative { "-" } else { "" };
 
+    let factor = 10f64.powi(decimals as i32);
+    let scaled = (abs * factor).round();
+
+    // Fall back to the locale-free Rust formatter for magnitudes that
+    // overflow u64 — better to lose the thousands separators than to
+    // emit a silently-wrapped integer.
+    if !scaled.is_finite() || scaled >= u64::MAX as f64 {
+        return format!("{}{:.prec$}", sign, abs, prec = decimals as usize);
+    }
+
+    let scaled_int = scaled as u64;
+
     if decimals == 0 {
-        format!("{}{}", sign, int_str)
+        format!("{}{}", sign, insert_commas(scaled_int))
     } else {
-        let frac = ((rounded.fract()) * factor).round() as u64;
-        format!("{}{}.{:0>width$}", sign, int_str, frac, width = decimals as usize)
+        let divisor = factor as u64;
+        let int_part = scaled_int / divisor;
+        let frac = scaled_int % divisor;
+        format!(
+            "{}{}.{:0>width$}",
+            sign,
+            insert_commas(int_part),
+            frac,
+            width = decimals as usize
+        )
     }
 }
 
 fn format_currency(n: f64, symbol: &str, decimals: u8) -> String {
-    format!("{}{}", symbol, format_commas(n, decimals))
+    // Put any minus sign before the currency symbol so callers see
+    // "-$99.50" rather than "$-99.50".
+    if n < 0.0 {
+        format!("-{}{}", symbol, format_commas(n.abs(), decimals))
+    } else {
+        format!("{}{}", symbol, format_commas(n, decimals))
+    }
 }
 
 /// Format a number as a percentage (multiplied by 100, with optional decimal places).
@@ -349,14 +370,17 @@ mod tests {
     // ── Edge cases ──────────────────────────────────────────────────────
 
     #[test]
-    fn nan_returns_empty() {
-        assert_eq!(apply_format(f64::NAN, 0, None), "");
+    fn nan_renders_as_label() {
+        // Returning the literal "NaN" rather than an empty string keeps
+        // anomalous cells visible in extracted text so they're not
+        // mistaken for empty data.
+        assert_eq!(apply_format(f64::NAN, 0, None), "NaN");
     }
 
     #[test]
-    fn infinity_returns_empty() {
-        assert_eq!(apply_format(f64::INFINITY, 0, None), "");
-        assert_eq!(apply_format(f64::NEG_INFINITY, 0, None), "");
+    fn infinity_renders_as_label() {
+        assert_eq!(apply_format(f64::INFINITY, 0, None), "Infinity");
+        assert_eq!(apply_format(f64::NEG_INFINITY, 0, None), "-Infinity");
     }
 
     #[test]
@@ -374,7 +398,7 @@ mod tests {
 
     #[test]
     fn negative_currency() {
-        assert_eq!(apply_format(-99.5, 7, None), "$-99.50");
+        assert_eq!(apply_format(-99.5, 7, None), "-$99.50");
     }
 
     #[test]

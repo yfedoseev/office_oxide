@@ -247,6 +247,20 @@ struct PageMarginsIn {
     footer: f64,
 }
 
+impl PageMarginsIn {
+    /// ECMA-376 default margins (inches). Single source of truth used by
+    /// both `parse_page_margins` (when an attribute is absent) and
+    /// `build_page_setup` (when no `<pageMargins>` element was present).
+    const DEFAULTS: PageMarginsIn = PageMarginsIn {
+        left: 0.7,
+        right: 0.7,
+        top: 0.75,
+        bottom: 0.75,
+        header: 0.3,
+        footer: 0.3,
+    };
+}
+
 /// Raw `<pageSetup>` shape — physical dimensions in twips plus orientation.
 #[derive(Debug, Clone, Copy, Default)]
 struct PageSetupRaw {
@@ -271,13 +285,14 @@ fn parse_page_margins(
     if left.is_none() && right.is_none() && top.is_none() && bottom.is_none() {
         return Ok(None);
     }
+    let d = PageMarginsIn::DEFAULTS;
     Ok(Some(PageMarginsIn {
-        left: left.unwrap_or(0.7),
-        right: right.unwrap_or(0.7),
-        top: top.unwrap_or(0.75),
-        bottom: bottom.unwrap_or(0.75),
-        header: header.unwrap_or(0.3),
-        footer: footer.unwrap_or(0.3),
+        left: left.unwrap_or(d.left),
+        right: right.unwrap_or(d.right),
+        top: top.unwrap_or(d.top),
+        bottom: bottom.unwrap_or(d.bottom),
+        header: header.unwrap_or(d.header),
+        footer: footer.unwrap_or(d.footer),
     }))
 }
 
@@ -360,14 +375,7 @@ fn build_page_setup(
         return None;
     }
     let in_to_twips = |v: f64| (v * 1440.0).round().max(0.0) as u32;
-    let m = margins.unwrap_or(PageMarginsIn {
-        left: 0.7,
-        right: 0.7,
-        top: 0.75,
-        bottom: 0.75,
-        header: 0.3,
-        footer: 0.3,
-    });
+    let m = margins.unwrap_or(PageMarginsIn::DEFAULTS);
     let r = raw.unwrap_or_default();
     let ps = PageSetup {
         width_twips: r.width_twips,
