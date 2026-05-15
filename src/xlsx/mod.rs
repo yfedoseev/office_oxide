@@ -580,10 +580,6 @@ fn extract_chart_text(xml: &[u8]) -> String {
                     let top = stack.last().map(|v| v.as_slice());
                     match top {
                         Some(b"t") => {
-                            // Rich-text run — append to current_title.
-                            if !current_title.is_empty() {
-                                current_title.push_str("");
-                            }
                             current_title.push_str(trimmed);
                         },
                         Some(b"v") => {

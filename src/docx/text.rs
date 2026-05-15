@@ -36,34 +36,6 @@ impl DocxDocument {
             numbering: self.numbering.as_ref(),
         };
 
-        // Headers (deduped on text content — headers may be repeated for
-        // first-page / even / default variants but the text is usually the
-        // same; we only want one copy in flat markdown).
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for hf in &self.headers_footers {
-            if !matches!(
-                hf.hf_type,
-                super::HeaderFooterType::Default
-                    | super::HeaderFooterType::First
-                    | super::HeaderFooterType::Even
-            ) {
-                continue;
-            }
-            let mut buf = String::new();
-            markdown_blocks(&hf.content, &ctx, &mut buf, 0);
-            let trimmed = buf.trim();
-            // Skip empty headers/footers and duplicates.
-            if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
-                continue;
-            }
-            // We don't currently know which side (header vs footer) this
-            // came from at this layer — `HeaderFooter` carries only the
-            // type modifier (default/first/even). The body sits between
-            // the headers and footers we emit, so we put all headers
-            // before and all footers after the body.
-        }
-
-        // Decide header/footer split using each section's references.
         let (header_texts, footer_texts) = split_headers_footers(self, &ctx);
         for h in &header_texts {
             out.push_str(h);
@@ -80,11 +52,9 @@ impl DocxDocument {
             out.push('\n');
         }
 
-        // Trim trailing newlines
         while out.ends_with('\n') {
             out.pop();
         }
-        let _ = seen; // silence
         out
     }
 }

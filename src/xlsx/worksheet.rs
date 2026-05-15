@@ -317,7 +317,7 @@ fn paper_size_enum_to_twips(id: u32) -> (u32, u32) {
         1 => (12240, 15840),  // Letter 8.5 × 11"
         5 => (12240, 20160),  // Legal 8.5 × 14"
         7 => (10440, 15120),  // Executive 7.25 × 10.5"
-        8 => (16840, 23820),  // A3 297 × 420 mm
+        8 => (16838, 23811),  // A3 297 × 420 mm
         9 => (11906, 16838),  // A4 210 × 297 mm
         11 => (8392, 11906),  // A5 148 × 210 mm
         12 => (14171, 20012), // B4 250 × 353 mm
@@ -369,7 +369,7 @@ fn build_page_setup(
         footer: 0.3,
     });
     let r = raw.unwrap_or_default();
-    let mut ps = PageSetup {
+    let ps = PageSetup {
         width_twips: r.width_twips,
         height_twips: r.height_twips,
         margin_top_twips: in_to_twips(m.top),
@@ -380,13 +380,6 @@ fn build_page_setup(
         footer_distance_twips: in_to_twips(m.footer),
         landscape: r.landscape,
     };
-    // If we only saw <pageMargins> (no <pageSetup>), leave dimensions
-    // unset so the caller can fall back to the IR default; otherwise
-    // downstream renderers would draw onto a 0×0 page.
-    if ps.width_twips == 0 || ps.height_twips == 0 {
-        ps.width_twips = 0;
-        ps.height_twips = 0;
-    }
     Some(ps)
 }
 

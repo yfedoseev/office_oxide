@@ -220,16 +220,23 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         // had no <pageMargins> — Excel's default 0.7"/0.75" is wider than
         // we want for a tight PDF round-trip and would shrink the usable
         // text area.
-        let page_setup = ws.page_setup.and_then(|wsp| {
-            // A worksheet that only had <pageMargins> (no dimensions) is
-            // treated as "no geometry" so the renderer keeps its
-            // OfficeConfig default page size.
-            if wsp.width_twips == 0 || wsp.height_twips == 0 {
-                return None;
-            }
-            Some(PageSetup {
-                width_twips: wsp.width_twips,
-                height_twips: wsp.height_twips,
+        let page_setup = ws.page_setup.map(|wsp| {
+            // When <pageMargins> was present but <pageSetup> was not,
+            // wsp's width/height come through as 0. Fall back to the
+            // IR PageSetup default geometry rather than dropping the
+            // parsed margins on the floor.
+            let default = PageSetup::default();
+            PageSetup {
+                width_twips: if wsp.width_twips == 0 {
+                    default.width_twips
+                } else {
+                    wsp.width_twips
+                },
+                height_twips: if wsp.height_twips == 0 {
+                    default.height_twips
+                } else {
+                    wsp.height_twips
+                },
                 margin_top_twips: wsp.margin_top_twips,
                 margin_bottom_twips: wsp.margin_bottom_twips,
                 margin_left_twips: wsp.margin_left_twips,
@@ -237,7 +244,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 header_distance_twips: wsp.header_distance_twips,
                 footer_distance_twips: wsp.footer_distance_twips,
                 landscape: wsp.landscape,
-            })
+            }
         });
 
         // Each XLSX worksheet renders to its own PDF page sequence, so
