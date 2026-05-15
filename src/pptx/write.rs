@@ -357,8 +357,12 @@ impl PptxWriter {
     }
 
     /// Embed a font program (TrueType / OpenType bytes) under `ppt/fonts/`.
-    /// `name` is used for the file name and the human-readable font name.
-    /// Subsequent calls with the same name are deduplicated.
+    ///
+    /// `name` is used for both the on-disk file name and the human-readable
+    /// font name in the presentation's font table. Deduplication is by
+    /// `name` only — supplying different bytes for an already-registered
+    /// name is a no-op. Pass distinct names (e.g. `Calibri-Bold` vs
+    /// `Calibri`) when you need to ship multiple faces of the same family.
     pub fn embed_font(&mut self, name: impl Into<String>, data: Vec<u8>) -> &mut Self {
         let name = name.into();
         if !self.embedded_fonts.iter().any(|(n, _)| n == &name) {

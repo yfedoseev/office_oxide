@@ -671,7 +671,10 @@ fn read_drawing_for_sheet<R: Read + Seek>(
 
     let drawing_xml = match XlsxDocument::read_xml_entry(archive, &drawing_path) {
         Ok(d) => d,
-        Err(_) => return (Vec::new(), Vec::new()),
+        Err(e) => {
+            debug!("XlsxDocument: drawing part {} unreadable ({}); skipping", drawing_path, e);
+            return (Vec::new(), Vec::new());
+        },
     };
 
     let drawing_rels_path = sheet_rels_path(&drawing_path);
@@ -682,7 +685,13 @@ fn read_drawing_for_sheet<R: Read + Seek>(
 
     let parsed = match parse_drawing_anchors(&drawing_xml) {
         Ok(a) => a,
-        Err(_) => return (Vec::new(), Vec::new()),
+        Err(e) => {
+            debug!(
+                "XlsxDocument: drawing {} failed to parse ({}); dropping anchors",
+                drawing_path, e
+            );
+            return (Vec::new(), Vec::new());
+        },
     };
 
     // Resolve picture anchors → bytes.

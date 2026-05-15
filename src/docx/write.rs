@@ -3101,6 +3101,13 @@ fn generate_core_props_xml(props: &CoreProps) -> Vec<u8> {
 /// program when there's a match. Without it, Word silently
 /// substitutes Calibri / Cambria for everything regardless of how
 /// many TTFs we ship under `/word/fonts/`.
+///
+/// **Known limitation**: each entry is emitted as `<w:embedRegular>`
+/// regardless of whether the underlying program is a regular, bold,
+/// italic, or bold-italic face — we don't introspect the font binary
+/// to detect the style. If a caller wants Word to pick up a bold-only
+/// face, they should embed it under a distinct family name (e.g.
+/// `Calibri-Bold`) and reference that name from runs explicitly.
 fn generate_font_table_xml(entries: &[(String, String)]) -> Vec<u8> {
     let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
     w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
