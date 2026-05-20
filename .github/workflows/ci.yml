@@ -318,7 +318,7 @@ jobs:
       # upload-artifact uses the LCA (target/release/) as the archive root,
       # so we must specify path: target/release to restore files there.
       - name: Download cdylib artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: native-lib-${{ matrix.os }}
           path: target/release
@@ -368,7 +368,7 @@ jobs:
             10.0.x
 
       - name: Download cdylib artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: native-lib-${{ matrix.os }}
           path: target/release
@@ -413,7 +413,7 @@ jobs:
           node-version: '20'
 
       - name: Download cdylib artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: native-lib-${{ matrix.os }}
           path: target/release
