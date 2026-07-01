@@ -40,7 +40,7 @@
     "test": "node --test test/*.mjs"
   },
   "dependencies": {
-    "koffi": "^2.9.0"
+    "koffi": "^3.1.0"
   },
   "keywords": [
     "docx",
