@@ -386,6 +386,60 @@ jobs:
           path: dist/*.whl
           retention-days: 7
 
+  # Build the Linux aarch64 wheel separately: it must be cross-compiled inside a
+  # manylinux container (via maturin-action) rather than with a bare
+  # `maturin build`, which can't produce a manylinux-compliant arm64 wheel on an
+  # x86_64 runner. Without this, Apple-Silicon dev containers (linux/arm64) have
+  # no installable wheel and `uv sync` fails to resolve office-oxide.
+  build-python-wheel-linux-aarch64:
+    name: Build Python wheel (aarch64-unknown-linux-gnu)
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          target: aarch64
+          manylinux: manylinux_2_28
+          args: --release --features python --out dist
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheels-linux-aarch64
+          path: dist/*.whl
+          retention-days: 7
+
+  # Build a source distribution as a universal fallback: any Rust-capable
+  # platform can build office-oxide from source when no prebuilt wheel matches.
+  # Named wheels-* so the publish-pypi download glob picks it up.
+  build-python-sdist:
+    name: Build Python sdist
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheels-sdist
+          path: dist/*.tar.gz
+          retention-days: 7
+
   # Package Node-native npm package with prebuilt native libs
   package-node-native:
     name: Package node-native npm (office-oxide)
@@ -682,6 +736,8 @@ jobs:
       - validate
       - build-binaries
       - build-python-wheels
+      - build-python-wheel-linux-aarch64
+      - build-python-sdist
       - build-wasm
       - build-native-libs
       - verify-python-wheel
@@ -803,7 +859,7 @@ jobs:
   # Publish to PyPI
   publish-pypi:
     name: Publish to PyPI
-    needs: [validate, build-python-wheels, create-release]
+    needs: [validate, build-python-wheels, build-python-wheel-linux-aarch64, build-python-sdist, create-release]
     runs-on: ubuntu-latest
     permissions:
       contents: read
