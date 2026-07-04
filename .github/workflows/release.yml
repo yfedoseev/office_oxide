@@ -417,6 +417,40 @@ jobs:
           path: dist/*.whl
           retention-days: 7
 
+  # Build musllinux wheels (x86_64 + aarch64) so Alpine-based images and other
+  # musl libc distros get a prebuilt wheel instead of a source build. Same
+  # abi3 cross-compile path as the manylinux aarch64 job; artifacts are named
+  # wheels-* so the publish-pypi download glob picks them up.
+  build-python-wheels-linux-musl:
+    name: Build Python wheel (musllinux ${{ matrix.target }})
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: musllinux_1_2
+          args: --release --features python --out dist
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheels-linux-musl-${{ matrix.target }}
+          path: dist/*.whl
+          retention-days: 7
+
   # Build a source distribution as a universal fallback: any Rust-capable
   # platform can build office-oxide from source when no prebuilt wheel matches.
   # Named wheels-* so the publish-pypi download glob picks it up.
@@ -737,6 +771,7 @@ jobs:
       - build-binaries
       - build-python-wheels
       - build-python-wheel-linux-aarch64
+      - build-python-wheels-linux-musl
       - build-python-sdist
       - build-wasm
       - build-native-libs
@@ -859,7 +894,7 @@ jobs:
   # Publish to PyPI
   publish-pypi:
     name: Publish to PyPI
-    needs: [validate, build-python-wheels, build-python-wheel-linux-aarch64, build-python-sdist, create-release]
+    needs: [validate, build-python-wheels, build-python-wheel-linux-aarch64, build-python-wheels-linux-musl, build-python-sdist, create-release]
     runs-on: ubuntu-latest
     permissions:
       contents: read
