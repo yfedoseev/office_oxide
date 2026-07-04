@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-07-04
+
+> Security patch: clears every open RustSec advisory in the dependency tree — an untrusted-XML DoS (quick-xml), two pyo3 soundness/OOB fixes, and a memmap2 unsound-pointer fix — plus Linux aarch64 wheels on PyPI.
+
+### Security
+
+- **quick-xml 0.40 → 0.41 (RUSTSEC-2026-0194 / RUSTSEC-2026-0195)** — quick-xml 0.40's `NamespaceResolver::push` performs an unbounded per-`xmlns` heap allocation inside `NsReader` *before* the parse event is returned, so a crafted Office document (DOCX/XLSX/PPTX) declaring many namespaces could exhaust memory and crash the reader — a denial-of-service on untrusted input. Upgraded to quick-xml 0.41, which bounds the allocation. Thanks @smissingham (#58); tracked in #59.
+- **pyo3 0.28 → 0.29 (RUSTSEC-2026-0176 / RUSTSEC-2026-0177)** — fixes an out-of-bounds read in `nth` / `nth_back` for `PyList` and `PyTuple` iterators, and a missing `Sync` bound on `PyCFunction::new_closure` closures, in the Python binding. Via Dependabot (#52).
+- **memmap2 0.9.10 → 0.9.11 (RUSTSEC-2026-0186)** — fixes an unchecked pointer offset (unsoundness). Via Dependabot (#55).
+
+### Packaging
+
+- **Linux aarch64 wheels + source distribution on PyPI (#51)** — `pip install office-oxide` on Linux/arm64 (AWS Graviton, Apple-Silicon Docker, Raspberry Pi) failed with "no compatible wheel"; the release workflow now builds `manylinux` aarch64 wheels and an sdist alongside the existing x86_64/macOS wheels. Thanks @regularkevvv.
+
 ## [0.1.2] - 2026-05-14
 
 > Round-trip fidelity, IR layout features, embedded fonts, XLSX number formatting, and an O(1) style-lookup perf win.
