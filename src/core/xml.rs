@@ -260,9 +260,14 @@ pub fn unescape_text(e: &quick_xml::events::BytesText<'_>) -> Result<String> {
 ///
 /// OOXML documents are always UTF-8, so we decode the raw attribute bytes
 /// as UTF-8 and unescape XML entities (`&amp;`, `&lt;`, …) explicitly. This
-/// mirrors `unescape_text` above and is behaviourally identical to the old
-/// `unescape_value()` for UTF-8 input, while being independent of the
-/// `encoding` feature flag.
+/// mirrors `unescape_text` above and is independent of the `encoding` feature.
+///
+/// One deliberate difference from `unescape_value()`: that method additionally
+/// applied XML attribute-value whitespace normalization (a *literal* tab/CR/LF
+/// inside a value collapses to a space), which `escape::unescape` does not do.
+/// This never affects real OOXML — attribute values do not contain literal
+/// control whitespace, and character references (`&#9;`, `&#10;`) are unescaped
+/// identically either way.
 pub fn unescape_attr_value(attr: &quick_xml::events::attributes::Attribute<'_>) -> Result<String> {
     let decoded = std::str::from_utf8(&attr.value)?;
     let unescaped = quick_xml::escape::unescape(decoded).map_err(quick_xml::Error::from)?;
@@ -384,4 +389,39 @@ pub fn ensure_utf8(data: &[u8]) -> Option<Vec<u8>> {
     }
 
     Some(utf8)
+}
+
+#[cfg(test)]
+mod attr_tests {
+    use super::unescape_attr_value;
+    use quick_xml::events::BytesStart;
+
+    /// Parse `<e {attrs}>` and unescape the value of attribute `key`.
+    fn attr_value(attrs: &str, key: &str) -> String {
+        let start = BytesStart::from_content(format!("e {attrs}"), 1);
+        let attr = start
+            .attributes()
+            .map(|a| a.unwrap())
+            .find(|a| a.key.as_ref() == key.as_bytes())
+            .expect("attribute present");
+        unescape_attr_value(&attr).unwrap()
+    }
+
+    #[test]
+    fn unescapes_predefined_and_numeric_entities() {
+        assert_eq!(attr_value(r#"v="a &amp; b &lt;x&gt; &#65;""#, "v"), "a & b <x> A");
+    }
+
+    #[test]
+    fn passes_plain_value_through_unchanged() {
+        assert_eq!(attr_value(r#"r:id="rId7""#, "r:id"), "rId7");
+    }
+
+    #[test]
+    fn unescapes_ampersand_in_hyperlink_target() {
+        assert_eq!(
+            attr_value(r#"Target="https://x/?a=1&amp;b=2""#, "Target"),
+            "https://x/?a=1&b=2"
+        );
+    }
 }
