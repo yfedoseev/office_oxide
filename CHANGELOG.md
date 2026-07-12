@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.4] - 2026-07-12
+## [0.1.4] - 2026-07-13
 
 > Build-compatibility fix that unblocks downstream crates from moving to quick-xml ≥ 0.41 (and clearing RUSTSEC-2026-0194 / RUSTSEC-2026-0195) when office_oxide shares a dependency tree with a crate that enables quick-xml's `encoding` feature.
 
