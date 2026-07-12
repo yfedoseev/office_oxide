@@ -251,16 +251,17 @@ pub fn unescape_text(e: &quick_xml::events::BytesText<'_>) -> Result<String> {
 
 /// Decode and unescape an `Attribute` value into an owned string.
 ///
-/// quick-xml 0.40 deprecated `Attribute::unescape_value()` in favor of
-/// `normalized_value()`, but the suggested replacement doesn't unescape
-/// XML entities (`&amp;`, `&lt;`, …) — only whitespace-normalizes. OOXML
-/// attribute values frequently contain hyperlinks and other content that
-/// need real entity unescaping, so we keep the old behaviour for now and
-/// centralise the deprecation suppression in one place.
-#[allow(deprecated)]
+/// `Attribute::unescape_value()` is compiled out when quick-xml's `encoding`
+/// feature is enabled (it is `cfg(not(feature = "encoding"))`), which happens
+/// through cross-crate feature unification whenever another dependency pulls
+/// quick-xml with `encoding` (e.g. `calamine`). Decoding UTF-8 explicitly and
+/// expanding entities via `escape::unescape` keeps the exact behaviour — OOXML
+/// attribute values are always UTF-8 — while remaining feature-independent.
+/// Mirrors [`unescape_text`].
 pub fn unescape_attr_value(attr: &quick_xml::events::attributes::Attribute<'_>) -> Result<String> {
-    let cow = attr.unescape_value()?;
-    Ok(cow.into_owned())
+    let decoded = std::str::from_utf8(attr.value.as_ref())?;
+    let unescaped = quick_xml::escape::unescape(decoded).map_err(quick_xml::Error::from)?;
+    Ok(unescaped.into_owned())
 }
 
 /// Create a plain Reader (no namespace resolution) configured for OOXML parsing.
