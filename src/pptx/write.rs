@@ -504,7 +504,7 @@ impl PptxWriter {
                 }
             }
 
-            let slide_xml = generate_slide_xml(slide, &img_rids);
+            let slide_xml = generate_slide_xml(slide, &img_rids, self.cx, self.cy);
             opc.add_part(slide_part, CT_SLIDE, &slide_xml)?;
         }
 
@@ -872,7 +872,12 @@ fn write_layout_placeholder(
 // slides/slideN.xml
 // ---------------------------------------------------------------------------
 
-fn generate_slide_xml(slide: &SlideData, img_rids: &[(String, i64, i64, u64, u64)]) -> Vec<u8> {
+fn generate_slide_xml(
+    slide: &SlideData,
+    img_rids: &[(String, i64, i64, u64, u64)],
+    pres_cx: u64,
+    pres_cy: u64,
+) -> Vec<u8> {
     let mut w = Writer::new(Vec::new());
     write_decl(&mut w);
 
@@ -889,7 +894,7 @@ fn generate_slide_xml(slide: &SlideData, img_rids: &[(String, i64, i64, u64, u64
     let mut next_id: u32 = 2;
 
     if let Some(ref title) = slide.title {
-        write_title_shape(&mut w, next_id, title, slide.title_alignment.as_ref());
+        write_title_shape(&mut w, next_id, title, slide.title_alignment.as_ref(), pres_cx, pres_cy);
         next_id += 1;
     }
 
@@ -899,7 +904,7 @@ fn generate_slide_xml(slide: &SlideData, img_rids: &[(String, i64, i64, u64, u64
             .iter()
             .filter(|i| !matches!(i, BodyItem::TextBox(..) | BodyItem::Image(..)))
             .collect();
-        write_body_shape(&mut w, next_id, &placeholder_items);
+        write_body_shape(&mut w, next_id, &placeholder_items, pres_cx, pres_cy);
         next_id += 1;
     }
 
@@ -927,11 +932,51 @@ fn generate_slide_xml(slide: &SlideData, img_rids: &[(String, i64, i64, u64, u64
     w.into_inner()
 }
 
+// Default placeholder geometry as fractions of slide width/height, derived from
+// PowerPoint's default 16:9 Office theme (title/body rects on a 12192000×6858000
+// slide). We emit these explicitly in each slide's `<p:spPr>` so renderers that
+// don't resolve placeholder geometry from the slide layout — notably LibreOffice
+// Impress — still position title/body text correctly. PowerPoint already resolves
+// from the layout, so this is a no-op there. Fractions keep the geometry correct
+// when the slide size is customised via `set_presentation_size`. See issue #69.
+const TITLE_X_FRAC: f64 = 838_200.0 / 12_192_000.0;
+const TITLE_Y_FRAC: f64 = 365_125.0 / 6_858_000.0;
+const TITLE_CX_FRAC: f64 = 10_515_600.0 / 12_192_000.0;
+const TITLE_CY_FRAC: f64 = 1_325_563.0 / 6_858_000.0;
+const BODY_X_FRAC: f64 = 838_200.0 / 12_192_000.0;
+const BODY_Y_FRAC: f64 = 1_825_625.0 / 6_858_000.0;
+const BODY_CX_FRAC: f64 = 10_515_600.0 / 12_192_000.0;
+const BODY_CY_FRAC: f64 = 4_351_338.0 / 6_858_000.0;
+
+/// Write `<p:spPr>` containing an explicit `<a:xfrm>` with the given EMU
+/// offset/extent. Used for placeholder shapes so their position/size are
+/// self-contained rather than inherited from the layout (see issue #69).
+fn write_sp_pr_with_xfrm(w: &mut Writer<Vec<u8>>, x: i64, y: i64, cx: i64, cy: i64) {
+    w.write_event(Event::Start(BytesStart::new("p:spPr")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("a:xfrm")))
+        .expect("write");
+    let mut off = BytesStart::new("a:off");
+    off.push_attribute(("x", x.to_string().as_str()));
+    off.push_attribute(("y", y.to_string().as_str()));
+    w.write_event(Event::Empty(off)).expect("write");
+    let mut ext = BytesStart::new("a:ext");
+    ext.push_attribute(("cx", cx.to_string().as_str()));
+    ext.push_attribute(("cy", cy.to_string().as_str()));
+    w.write_event(Event::Empty(ext)).expect("write");
+    w.write_event(Event::End(BytesEnd::new("a:xfrm")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:spPr")))
+        .expect("write");
+}
+
 fn write_title_shape(
     w: &mut Writer<Vec<u8>>,
     id: u32,
     title: &str,
     alignment: Option<&crate::ir::ParagraphAlignment>,
+    pres_cx: u64,
+    pres_cy: u64,
 ) {
     let id_str = id.to_string();
     w.write_event(Event::Start(BytesStart::new("p:sp")))
@@ -960,7 +1005,13 @@ fn write_title_shape(
     w.write_event(Event::End(BytesEnd::new("p:nvSpPr")))
         .expect("write");
 
-    write_empty(w, "p:spPr");
+    write_sp_pr_with_xfrm(
+        w,
+        (pres_cx as f64 * TITLE_X_FRAC) as i64,
+        (pres_cy as f64 * TITLE_Y_FRAC) as i64,
+        (pres_cx as f64 * TITLE_CX_FRAC) as i64,
+        (pres_cy as f64 * TITLE_CY_FRAC) as i64,
+    );
 
     w.write_event(Event::Start(BytesStart::new("p:txBody")))
         .expect("write");
@@ -982,7 +1033,13 @@ fn write_title_shape(
         .expect("write");
 }
 
-fn write_body_shape(w: &mut Writer<Vec<u8>>, id: u32, items: &[&BodyItem]) {
+fn write_body_shape(
+    w: &mut Writer<Vec<u8>>,
+    id: u32,
+    items: &[&BodyItem],
+    pres_cx: u64,
+    pres_cy: u64,
+) {
     let id_str = id.to_string();
     w.write_event(Event::Start(BytesStart::new("p:sp")))
         .expect("write");
@@ -1011,7 +1068,13 @@ fn write_body_shape(w: &mut Writer<Vec<u8>>, id: u32, items: &[&BodyItem]) {
     w.write_event(Event::End(BytesEnd::new("p:nvSpPr")))
         .expect("write");
 
-    write_empty(w, "p:spPr");
+    write_sp_pr_with_xfrm(
+        w,
+        (pres_cx as f64 * BODY_X_FRAC) as i64,
+        (pres_cy as f64 * BODY_Y_FRAC) as i64,
+        (pres_cx as f64 * BODY_CX_FRAC) as i64,
+        (pres_cy as f64 * BODY_CY_FRAC) as i64,
+    );
 
     w.write_event(Event::Start(BytesStart::new("p:txBody")))
         .expect("write");
@@ -1306,6 +1369,53 @@ mod tests {
         let mut xml = String::new();
         std::io::Read::read_to_string(&mut entry, &mut xml).unwrap();
         assert!(xml.contains("cx=\"9144000\""), "expected cx in presentation.xml");
+    }
+
+    /// Read `ppt/slides/slide1.xml` from a written presentation.
+    fn slide1_xml(writer: PptxWriter) -> String {
+        let mut buf = Cursor::new(Vec::new());
+        writer.write_to(&mut buf).unwrap();
+        buf.set_position(0);
+        let mut zip = zip::ZipArchive::new(buf).unwrap();
+        let mut entry = zip.by_name("ppt/slides/slide1.xml").unwrap();
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut xml).unwrap();
+        xml
+    }
+
+    /// Regression for issue #69: placeholder title/body shapes must carry an
+    /// explicit `<a:xfrm>` (off + ext) so LibreOffice, which doesn't resolve
+    /// placeholder geometry from the layout, renders their text.
+    #[test]
+    fn placeholders_have_explicit_xfrm() {
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("Hello").add_text("World");
+        let xml = slide1_xml(writer);
+
+        // No empty <p:spPr/> — every shape now carries geometry.
+        assert!(
+            !xml.contains("<p:spPr/>") && !xml.contains("<p:spPr></p:spPr>"),
+            "placeholder shapes must not have empty spPr:\n{xml}"
+        );
+        // Title + body placeholders present, each with an xfrm.
+        assert!(xml.contains(r#"<p:ph type="title"/>"#));
+        assert!(xml.contains(r#"<p:ph type="body""#));
+        assert_eq!(xml.matches("<a:xfrm>").count(), 2, "one xfrm per placeholder");
+        // Default 16:9 title offset/extent (from PowerPoint Office theme).
+        assert!(xml.contains(r#"<a:off x="838200" y="365125"/>"#), "title off:\n{xml}");
+        assert!(xml.contains(r#"<a:ext cx="10515600" cy="1325563"/>"#), "title ext");
+    }
+
+    /// Placeholder geometry scales with a custom presentation size.
+    #[test]
+    fn placeholder_xfrm_scales_with_presentation_size() {
+        let mut writer = PptxWriter::new();
+        writer.set_presentation_size(9_144_000, 6_858_000); // 4:3
+        writer.add_slide().set_title("T").add_text("B");
+        let xml = slide1_xml(writer);
+        // Title x = 9144000 * (838200/12192000) = 628650
+        assert!(xml.contains(r#"<a:off x="628650""#), "scaled title off:\n{xml}");
+        assert!(!xml.contains("<p:spPr/>"));
     }
 
     #[test]

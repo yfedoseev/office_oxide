@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-07-13
+
+> Fixes PPTX slides created by `PptxWriter` / `create_from_markdown` rendering blank in LibreOffice Impress.
+
+### Fixed
+
+- **PPTX placeholder shapes now carry explicit geometry ([#69](https://github.com/yfedoseev/office_oxide/issues/69)).** The generated title and body placeholders previously emitted an empty `<p:spPr/>` with no `<a:xfrm>`, relying on the slide layout for position/size. PowerPoint resolves that from the layout, but LibreOffice Impress does not — so slides rendered blank. The writer now emits an explicit `<a:xfrm>` (offset + extent) on each placeholder, derived from PowerPoint's default Office-theme rectangles and scaled to the presentation size (`set_presentation_size`). Thanks @holgerreppert for the detailed report.
+
 ## [0.1.5] - 2026-07-13
 
 > Dependency-maintenance release. No API or behavior changes — all 424 tests pass and every feature build (default, `parallel`, `mmap`, `python`, `wasm`) compiles clean.
