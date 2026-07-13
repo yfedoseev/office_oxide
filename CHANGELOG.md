@@ -14,10 +14,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Refreshed all Rust dependencies to their latest semver-compatible versions** (lockfile): `clap` 4.5 → 4.6.1, `wasm-bindgen` 0.2.114 → 0.2.126, `js-sys` 0.3.91 → 0.3.103, `libc` 0.2.182 → 0.2.186, `serde_json` 1.0.149 → 1.0.150, `crossbeam-deque` 0.8.6 → 0.8.7, `crossbeam-utils` 0.8.21 → 0.8.22, plus `quote`/`syn`/`itoa`/`either` and others. The crate's version requirements were already broad enough to permit these — intentionally kept loose so downstreams aren't over-constrained.
 - **JS binding: `koffi` 2.9 → 3.1.1** (major). Uses only stable core APIs (`load`, `decode`, `disposable`, `func`); koffi 3.x ships native binaries as platform-specific optional packages. Node engine requirement (`>=18`) unchanged.
 
+### CI / tooling (dev-only, not shipped)
+
+- **Pinned GitHub Actions bumped to latest (SHA-pinned):** `checkout` v4 → v7.0.0, `codecov-action` v5 → v7.0.0, `codeql-action` v3 → v4.37.0, `attest-build-provenance` v2 → v4.1.1, `setup-go` v5 → v6.5.0, `setup-dotnet` v4 → v5.4.0, `setup-python` v6.2 → v6.3.0, `setup-uv` v8.1 → v8.3.2, `cargo-deny-action` → v2.0.20, `scorecard-action` → v2.4.3, `action-gh-release` v2 → v3.0.1, `rust-cache` → v2.9.1, `install-action` → v2.83.2, and `actions/cache` moved from a `@v5` tag to a SHA-pinned v6.1.0. Also unified a stray `download-artifact@v4` to v8.0.1 and corrected a stale `github-script` version comment. Subsumes Dependabot #40/#41/#43/#44/#45.
+- **pre-commit hooks:** `cargo-deny` 0.19.0 → 0.20.2, `ruff-pre-commit` v0.15.5 → v0.15.21, `ty-pre-commit` v0.0.18 → v0.0.59.
+- **C# test deps (test-only):** `Microsoft.NET.Test.Sdk` 17.10 → 18.7.0, `xunit` 2.9.0 → 2.9.3, `xunit.runner.visualstudio` 2.8.2 → 3.1.5.
+
 ### Notes
 
 - No new advisories (`cargo audit` / `cargo deny` clean, 81 deps).
-- CI GitHub Actions are SHA-pinned and are updated via their own Dependabot PRs (not bundled here). Benchmark competitor pins in `scripts/bench-requirements.txt` are intentionally frozen until the next full benchmark re-run.
+- Benchmark competitor pins in `scripts/bench-requirements.txt` are intentionally frozen until the next full benchmark re-run (bumping them would desync the numbers in BENCHMARKS.md), so Dependabot #53/#54 are out of scope here.
+- `download-artifact` v4 → v8 and `attest-build-provenance` v2 → v4 run in the release workflow, which only fully executes on a tag; they are validated when v0.1.5 is tagged.
 
 ## [0.1.4] - 2026-07-13
 
