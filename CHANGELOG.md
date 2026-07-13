@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-07-13
+
+> Dependency-maintenance release. No API or behavior changes — all 424 tests pass and every feature build (default, `parallel`, `mmap`, `python`, `wasm`) compiles clean.
+
+### Changed
+
+- **Refreshed all Rust dependencies to their latest semver-compatible versions** (lockfile): `clap` 4.5 → 4.6.1, `wasm-bindgen` 0.2.114 → 0.2.126, `js-sys` 0.3.91 → 0.3.103, `libc` 0.2.182 → 0.2.186, `serde_json` 1.0.149 → 1.0.150, `crossbeam-deque` 0.8.6 → 0.8.7, `crossbeam-utils` 0.8.21 → 0.8.22, plus `quote`/`syn`/`itoa`/`either` and others. The crate's version requirements were already broad enough to permit these — intentionally kept loose so downstreams aren't over-constrained.
+- **JS binding: `koffi` 2.9 → 3.1.1** (major). Uses only stable core APIs (`load`, `decode`, `disposable`, `func`); koffi 3.x ships native binaries as platform-specific optional packages. Node engine requirement (`>=18`) unchanged.
+
+### Notes
+
+- No new advisories (`cargo audit` / `cargo deny` clean, 81 deps).
+- CI GitHub Actions are SHA-pinned and are updated via their own Dependabot PRs (not bundled here). Benchmark competitor pins in `scripts/bench-requirements.txt` are intentionally frozen until the next full benchmark re-run.
+
 ## [0.1.4] - 2026-07-13
 
 > Build-compatibility fix that unblocks downstream crates from moving to quick-xml ≥ 0.41 (and clearing RUSTSEC-2026-0194 / RUSTSEC-2026-0195) when office_oxide shares a dependency tree with a crate that enables quick-xml's `encoding` feature.

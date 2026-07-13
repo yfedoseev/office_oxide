@@ -21,7 +21,7 @@ name = "office-oxide-mcp"
 path = "src/main.rs"
 
 [dependencies]
-office_oxide = { version = "0.1.4", path = "../.." }
+office_oxide = { version = "0.1.5", path = "../.." }
 serde_json = "1"
 
 [package.metadata.binstall]

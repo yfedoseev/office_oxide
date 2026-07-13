@@ -65,7 +65,7 @@ string md   = OfficeOxide.ToMarkdown("file.pptx");
 string html = OfficeOxide.ToHtml("file.xlsx");
 
 string? fmt = Document.DetectFormat("mystery.bin"); // null if unsupported
-Console.WriteLine(Document.Version);                // "0.1.4"
+Console.WriteLine(Document.Version);                // "0.1.5"
 ```
 
 ### `EditableDocument`

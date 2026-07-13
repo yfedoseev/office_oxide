@@ -92,7 +92,7 @@ extractText('file.docx');      // string
 toMarkdown('file.pptx');       // string
 toHtml('file.xlsx');           // string
 detectFormat('mystery.bin');   // "docx" | ... | null
-version();                     // "0.1.4"
+version();                     // "0.1.5"
 ```
 
 ### `EditableDocument`
