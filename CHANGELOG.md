@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-07-13
+
+> Build-compatibility fix that unblocks downstream crates from moving to quick-xml ≥ 0.41 (and clearing RUSTSEC-2026-0194 / RUSTSEC-2026-0195) when office_oxide shares a dependency tree with a crate that enables quick-xml's `encoding` feature.
+
+### Fixed
+
+- **quick-xml `encoding`-feature build break** — `unescape_attr_value` called `Attribute::unescape_value()`, which quick-xml gates behind `#[cfg(not(feature = "encoding"))]`. Cargo feature unification turns `encoding` on transitively whenever another crate in the tree enables it (e.g. `calamine ≥ 0.36`), so office_oxide failed to compile with `error[E0599]: no method named unescape_value`. This forced downstreams (e.g. `kreuzberg`) to pin `calamine 0.35`, keeping a vulnerable quick-xml < 0.41 in the tree. The helper now decodes the raw attribute bytes as UTF-8 and expands entities via `escape::unescape`, which is feature-independent. Thanks @waxzce (#63) and @Goldziher (#64).
+
+### Changed
+
+- **`zip` 8.1 → 8.6** and assorted transitive dependency refreshes. Via #64 (@Goldziher).
+
 ## [0.1.3] - 2026-07-04
 
 > Security patch: clears every open RustSec advisory in the dependency tree — an untrusted-XML DoS (quick-xml), two pyo3 soundness/OOB fixes, and a memmap2 unsound-pointer fix — plus Linux aarch64 wheels on PyPI.

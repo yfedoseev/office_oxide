@@ -32,7 +32,7 @@ import (
 )
 
 // Bumped in lockstep with the Rust crate.
-const defaultVersion = "0.1.3"
+const defaultVersion = "0.1.4"
 
 const releaseBase = "https://github.com/yfedoseev/office_oxide/releases/download"
 
