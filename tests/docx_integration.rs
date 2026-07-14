@@ -604,6 +604,64 @@ fn complex_document_with_everything() {
 }
 
 // ---------------------------------------------------------------------------
+// Regression: issue #71 — pBdr horizontal-rule paragraph truncates the body
+// ---------------------------------------------------------------------------
+
+// A paragraph whose <w:pPr> carries a bottom-border-only <w:pBdr> (Word's
+// conventional horizontal-rule encoding) must NOT swallow the rest of the
+// document body. Prior to the fix, the self-closing <w:bottom/> edge caused
+// the pBdr scanner to over-read past </w:pBdr>, desyncing the reader and
+// running it to EOF — silently dropping every subsequent paragraph and table.
+#[test]
+fn pbdr_horizontal_rule_does_not_truncate_body() {
+    // Compact XML with no inter-tag whitespace, exactly as Word writes
+    // document.xml: <w:bottom/> is immediately followed by </w:pBdr> with
+    // no whitespace Text event in between to absorb the stray extra read.
+    let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Before the rule</w:t></w:r></w:p><w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr></w:pPr></w:p><w:p><w:r><w:t>After the rule</w:t></w:r></w:p><w:tbl><w:tr><w:tc><w:p><w:r><w:t>Cell content</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>Final paragraph</w:t></w:r></w:p></w:body></w:document>"#;
+    let data = DocxBuilder::new().with_document(xml).build();
+    let doc = parse(&data);
+
+    // 3 paragraphs + 1 table + 1 paragraph = 5 body elements, none dropped.
+    assert_eq!(
+        doc.body.elements.len(),
+        5,
+        "body truncated after pBdr paragraph: {:#?}",
+        doc.body.elements
+    );
+
+    // The bottom-border edge is still detected (HR feature preserved).
+    if let BlockElement::Paragraph(hr) = &doc.body.elements[1] {
+        assert!(
+            hr.properties.as_ref().unwrap().has_bottom_border,
+            "bottom border flag lost — HR detection regressed"
+        );
+    } else {
+        panic!("expected paragraph at index 1");
+    }
+
+    let md = doc.to_markdown();
+    assert!(md.contains("Before the rule"), "markdown was: {md}");
+    assert!(md.contains("After the rule"), "markdown was: {md}");
+    assert!(md.contains("Cell content"), "markdown was: {md}");
+    assert!(md.contains("Final paragraph"), "markdown was: {md}");
+}
+
+// Guard the multi-border variant: a <w:pBdr> with several edges where
+// <w:bottom> is NOT the last child must also leave the reader correctly
+// positioned at </w:pBdr>.
+#[test]
+fn pbdr_with_multiple_borders_does_not_truncate() {
+    let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pBdr><w:top w:val="single" w:sz="6" w:space="1" w:color="auto"/><w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/><w:right w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr></w:pPr><w:r><w:t>Bordered paragraph</w:t></w:r></w:p><w:p><w:r><w:t>Trailing paragraph</w:t></w:r></w:p></w:body></w:document>"#;
+    let data = DocxBuilder::new().with_document(xml).build();
+    let doc = parse(&data);
+
+    assert_eq!(doc.body.elements.len(), 2, "{:#?}", doc.body.elements);
+    let md = doc.to_markdown();
+    assert!(md.contains("Bordered paragraph"), "markdown was: {md}");
+    assert!(md.contains("Trailing paragraph"), "markdown was: {md}");
+}
+
+// ---------------------------------------------------------------------------
 // Error handling
 // ---------------------------------------------------------------------------
 

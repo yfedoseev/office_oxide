@@ -5,7 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.6] - 2026-07-13
+## [Unreleased]
+
+### Fixed
+
+- **DOCX: `to_markdown()` / `docx_to_ir` no longer silently truncate the body on paragraphs with a bordered `<w:pBdr>` ([#71](https://github.com/yfedoseev/office_oxide/issues/71)).** A paragraph carrying Word's horizontal-rule idiom (an empty paragraph whose `pPr` holds a bottom-border-only `<w:pBdr>`) desynced the reader: after detecting the self-closing `<w:bottom/>` edge, the `pBdr` scanner issued a stray extra read that swallowed the `</w:pBdr>` close tag when no whitespace separated them (i.e. in real, non-pretty-printed Word output). With the border's end tag consumed and the loop keyed to break only on `</w:pBdr>`, the shared reader ran to EOF — dropping every subsequent paragraph and table and returning `Ok` with a partial document. The scanner now walks the `<w:pBdr>` subtree with a balanced depth counter and exits at the matching close, so trailing content is preserved. Thanks to the reporter for the precise measurements.
 
 > Fixes PPTX slides created by `PptxWriter` / `create_from_markdown` rendering blank in LibreOffice Impress.
 
