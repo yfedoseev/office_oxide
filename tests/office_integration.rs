@@ -120,6 +120,20 @@ impl XlsxBuilder {
         self
     }
 
+    fn with_styles(mut self, xml: &[u8]) -> Self {
+        let part = PartName::new("/xl/styles.xml").unwrap();
+        self.writer
+            .add_part(
+                &part,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml",
+                xml,
+            )
+            .unwrap();
+        self.writer
+            .add_part_rel(&self.workbook_part, rel_types::STYLES, "styles.xml");
+        self
+    }
+
     fn build(self) -> Vec<u8> {
         self.writer.finish().unwrap().into_inner()
     }
@@ -477,6 +491,111 @@ fn xlsx_to_ir_sheets_as_sections() {
     // Each section should have a table element
     assert!(matches!(&ir.sections[0].elements[0], Element::Table(_)));
     assert!(matches!(&ir.sections[1].elements[0], Element::Table(_)));
+}
+
+// ===========================================================================
+// 8b. Regression: issue #72 — XLSX to_ir() cells carry semantic type + format
+// ===========================================================================
+
+// Before the fix, every IR TableCell was a plain text span with no way to
+// tell a number or date cell from text (WASM `toIr()` "always says text").
+// The grid path now populates data_type / raw_number / number_format(_id).
+#[test]
+fn xlsx_to_ir_cell_data_types_and_formats() {
+    let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="Data" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>"#;
+
+    let styles_xml = br##"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <numFmts count="1">
+    <numFmt numFmtId="164" formatCode="#,##0.00"/>
+  </numFmts>
+  <fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+  <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+  <borders count="1"><border><left/><right/><top/><bottom/></border></borders>
+  <cellXfs count="3">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+    <xf numFmtId="164" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/>
+    <xf numFmtId="14" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/>
+  </cellXfs>
+</styleSheet>"##;
+
+    // Multi-column rows force a genuine grid (Table), not prose mode.
+    // Row 2: text, number (custom #,##0.00), date (builtin fmt 14), boolean.
+    // 45306 = 2024-01-15 in the 1900 date system.
+    let ws_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is><t>Name</t></is></c>
+      <c r="B1" t="inlineStr"><is><t>Amount</t></is></c>
+      <c r="C1" t="inlineStr"><is><t>When</t></is></c>
+      <c r="D1" t="inlineStr"><is><t>Active</t></is></c>
+    </row>
+    <row r="2">
+      <c r="A2" t="inlineStr"><is><t>Widget</t></is></c>
+      <c r="B2" s="1"><v>1234.5</v></c>
+      <c r="C2" s="2"><v>45306</v></c>
+      <c r="D2" t="b"><v>1</v></c>
+    </row>
+    <row r="3">
+      <c r="A3" t="inlineStr"><is><t>Gadget</t></is></c>
+      <c r="B3" s="1"><v>10</v></c>
+      <c r="C3" s="2"><v>45307</v></c>
+      <c r="D3" t="b"><v>0</v></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+
+    let data = XlsxBuilder::new()
+        .with_workbook(wb_xml)
+        .with_worksheet("worksheets/sheet1.xml", ws_xml)
+        .with_styles(styles_xml)
+        .build();
+
+    let doc = Document::from_reader(Cursor::new(data), DocumentFormat::Xlsx).unwrap();
+    let ir = doc.to_ir();
+
+    let Element::Table(table) = &ir.sections[0].elements[0] else {
+        panic!("expected a table, got {:#?}", ir.sections[0].elements[0]);
+    };
+    assert_eq!(table.rows.len(), 3, "row count");
+
+    // Header row cells are text.
+    for cell in &table.rows[0].cells {
+        assert_eq!(cell.data_type, Some(CellDataType::Text));
+    }
+
+    // Data row 2.
+    let data_row = &table.rows[1].cells;
+    assert_eq!(data_row.len(), 4, "column count");
+
+    // Text cell.
+    assert_eq!(data_row[0].data_type, Some(CellDataType::Text));
+    assert_eq!(data_row[0].raw_number, None);
+
+    // Number cell with a custom format.
+    assert_eq!(data_row[1].data_type, Some(CellDataType::Number));
+    assert_eq!(data_row[1].raw_number, Some(1234.5));
+    assert_eq!(data_row[1].number_format.as_deref(), Some("#,##0.00"));
+    assert_eq!(data_row[1].number_format_id, Some(164));
+
+    // Date cell (builtin format 14): typed Date, raw serial preserved.
+    assert_eq!(data_row[2].data_type, Some(CellDataType::Date));
+    assert_eq!(data_row[2].raw_number, Some(45306.0));
+    assert_eq!(data_row[2].number_format_id, Some(14));
+
+    // Boolean cell.
+    assert_eq!(data_row[3].data_type, Some(CellDataType::Boolean));
+    assert_eq!(data_row[3].raw_number, Some(1.0));
+
+    // Row 3 boolean is false → 0.0.
+    assert_eq!(table.rows[2].cells[3].raw_number, Some(0.0));
 }
 
 // ===========================================================================
