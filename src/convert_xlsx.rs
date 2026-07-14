@@ -347,12 +347,23 @@ struct CellData {
 /// preserves the structured facts instead of collapsing them to a string, so
 /// `to_ir()` consumers (e.g. the WASM `toIr()` surface) can distinguish a
 /// number or date cell from a text cell.
+///
+/// Format metadata is surfaced for every non-empty cell — not just numbers —
+/// so a caller can tell, for instance, that a *text* cell sits in a
+/// date-formatted column (issue #72's "is it a date/number column, and
+/// formatting?"). The format string prefers the workbook's custom `<numFmts>`
+/// entry and falls back to the canonical code for built-in IDs, which never
+/// appear in `<numFmts>`.
 fn cell_semantics(
     doc: &crate::xlsx::XlsxDocument,
     cell: &crate::xlsx::Cell,
     date_indices: &std::collections::HashSet<u32>,
 ) -> (Option<CellDataType>, Option<f64>, Option<String>, Option<u32>) {
     use crate::xlsx::CellValue;
+
+    if matches!(cell.value, CellValue::Empty) {
+        return (None, None, None, None);
+    }
 
     // Number-format metadata (skip General / id 0 — carries no information).
     let fmt_id = cell
@@ -362,10 +373,13 @@ fn cell_semantics(
     let fmt_str = cell
         .style_index
         .and_then(|idx| doc.styles.as_ref()?.number_format_for(idx))
-        .map(|s| s.to_string());
+        .map(|s| s.to_string())
+        .or_else(|| {
+            fmt_id.and_then(|id| crate::xlsx::numfmt::builtin_format_code(id).map(str::to_string))
+        });
 
-    match &cell.value {
-        CellValue::Empty => (None, None, None, None),
+    let (data_type, raw_number) = match &cell.value {
+        CellValue::Empty => unreachable!("handled above"),
         CellValue::Number(n) => {
             let is_date = cell.style_index.is_some_and(|i| date_indices.contains(&i));
             let ty = if is_date {
@@ -373,19 +387,17 @@ fn cell_semantics(
             } else {
                 CellDataType::Number
             };
-            (Some(ty), Some(*n), fmt_str, fmt_id)
+            (Some(ty), Some(*n))
         },
         // Dates almost always arrive as Number + a date format (handled above);
         // this variant is a defensive fallback and carries no serial to expose.
-        CellValue::Date(_) => (Some(CellDataType::Date), None, fmt_str, fmt_id),
-        CellValue::Boolean(b) => {
-            (Some(CellDataType::Boolean), Some(if *b { 1.0 } else { 0.0 }), None, None)
-        },
-        CellValue::Error(_) => (Some(CellDataType::Error), None, None, None),
-        CellValue::String(_) | CellValue::SharedString(_) => {
-            (Some(CellDataType::Text), None, None, None)
-        },
-    }
+        CellValue::Date(_) => (Some(CellDataType::Date), None),
+        CellValue::Boolean(b) => (Some(CellDataType::Boolean), Some(if *b { 1.0 } else { 0.0 })),
+        CellValue::Error(_) => (Some(CellDataType::Error), None),
+        CellValue::String(_) | CellValue::SharedString(_) => (Some(CellDataType::Text), None),
+    };
+
+    (data_type, raw_number, fmt_str, fmt_id)
 }
 
 /// Look up a cell's font through the workbook's stylesheet (if loaded).

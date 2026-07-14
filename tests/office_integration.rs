@@ -598,6 +598,91 @@ fn xlsx_to_ir_cell_data_types_and_formats() {
     assert_eq!(table.rows[2].cells[3].raw_number, Some(0.0));
 }
 
+// Mirrors the real-world layout from issue #72's attachment (a text/@ column,
+// a number/#,##0.00 column, and a date-formatted column that actually holds
+// text) using synthetic values — NOT the reporter's data. Locks in two
+// behaviours: format metadata is surfaced on *text* cells (so a date-formatted
+// text column is identifiable), and built-in format IDs resolve to a code
+// string even though they never appear in <numFmts>.
+#[test]
+fn xlsx_to_ir_format_metadata_on_text_and_builtin_ids() {
+    let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Grid" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#;
+
+    // xf 0 = @ (text, id 49), xf 1 = #,##0.00 (number, builtin id 4),
+    // xf 2 = m/d/yyyy (date, builtin id 14). All built-in — no <numFmts>.
+    let styles_xml = br##"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+  <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+  <borders count="1"><border><left/><right/><top/><bottom/></border></borders>
+  <cellXfs count="3">
+    <xf numFmtId="49" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/>
+    <xf numFmtId="4" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/>
+    <xf numFmtId="14" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/>
+  </cellXfs>
+</styleSheet>"##;
+
+    // Col A: text (@). Col B: numbers (#,##0.00). Col C: TEXT in a date column.
+    let ws_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" s="0" t="inlineStr"><is><t>Name</t></is></c>
+      <c r="B1" s="1" t="inlineStr"><is><t>Count</t></is></c>
+      <c r="C1" s="2" t="inlineStr"><is><t>When</t></is></c>
+    </row>
+    <row r="2">
+      <c r="A2" s="0" t="inlineStr"><is><t>alpha</t></is></c>
+      <c r="B2" s="1"><v>1</v></c>
+      <c r="C2" s="2" t="inlineStr"><is><t>not-a-date</t></is></c>
+    </row>
+    <row r="3">
+      <c r="A3" s="0" t="inlineStr"><is><t>beta</t></is></c>
+      <c r="B3" s="1"><v>2.5</v></c>
+      <c r="C3" s="2" t="inlineStr"><is><t>text</t></is></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+
+    let data = XlsxBuilder::new()
+        .with_workbook(wb_xml)
+        .with_worksheet("worksheets/sheet1.xml", ws_xml)
+        .with_styles(styles_xml)
+        .build();
+
+    let doc = Document::from_reader(Cursor::new(data), DocumentFormat::Xlsx).unwrap();
+    let ir = doc.to_ir();
+    let Element::Table(table) = &ir.sections[0].elements[0] else {
+        panic!("expected a table");
+    };
+
+    let data_row = &table.rows[1].cells;
+
+    // Text cell in a text-formatted (@) column: format surfaced on text.
+    assert_eq!(data_row[0].data_type, Some(CellDataType::Text));
+    assert_eq!(data_row[0].number_format.as_deref(), Some("@"));
+    assert_eq!(data_row[0].number_format_id, Some(49));
+
+    // Number cell with a built-in format id (4): code resolved from the id.
+    assert_eq!(data_row[1].data_type, Some(CellDataType::Number));
+    assert_eq!(data_row[1].raw_number, Some(1.0));
+    assert_eq!(data_row[1].number_format.as_deref(), Some("#,##0.00"));
+    assert_eq!(data_row[1].number_format_id, Some(4));
+
+    // Text cell in a DATE-formatted column: still text, but the caller can
+    // now see the column is date-formatted (built-in id 14).
+    assert_eq!(data_row[2].data_type, Some(CellDataType::Text));
+    assert_eq!(data_row[2].number_format.as_deref(), Some("m/d/yyyy"));
+    assert_eq!(data_row[2].number_format_id, Some(14));
+
+    // Sanity on row 3's number.
+    assert_eq!(table.rows[2].cells[1].raw_number, Some(2.5));
+}
+
 // ===========================================================================
 // 9. to_ir() → PPTX — slides as sections, shapes as elements
 // ===========================================================================
