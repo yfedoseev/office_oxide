@@ -661,6 +661,59 @@ fn pbdr_with_multiple_borders_does_not_truncate() {
     assert!(md.contains("Trailing paragraph"), "markdown was: {md}");
 }
 
+// A pBdr with a top edge but NO bottom edge (as last child) must neither
+// truncate nor set the horizontal-rule flag.
+#[test]
+fn pbdr_top_border_only_no_hr_flag() {
+    let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pBdr><w:top w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr></w:pPr><w:r><w:t>Top bordered</w:t></w:r></w:p><w:p><w:r><w:t>Next paragraph</w:t></w:r></w:p></w:body></w:document>"#;
+    let data = DocxBuilder::new().with_document(xml).build();
+    let doc = parse(&data);
+
+    assert_eq!(doc.body.elements.len(), 2, "{:#?}", doc.body.elements);
+    if let BlockElement::Paragraph(p) = &doc.body.elements[0] {
+        assert!(
+            !p.properties.as_ref().unwrap().has_bottom_border,
+            "top-only border must not set has_bottom_border"
+        );
+    } else {
+        panic!("expected paragraph");
+    }
+    assert!(doc.to_markdown().contains("Next paragraph"));
+}
+
+// Several consecutive horizontal-rule paragraphs — each pBdr must be
+// consumed cleanly so nothing between or after them is dropped.
+#[test]
+fn pbdr_multiple_consecutive_rules_do_not_truncate() {
+    let hr = r#"<w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr></w:pPr></w:p>"#;
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Start</w:t></w:r></w:p>{hr}{hr}{hr}<w:p><w:r><w:t>End</w:t></w:r></w:p></w:body></w:document>"#
+    );
+    let data = DocxBuilder::new().with_document(xml.as_bytes()).build();
+    let doc = parse(&data);
+
+    // Start + 3 HR paragraphs + End = 5 elements.
+    assert_eq!(doc.body.elements.len(), 5, "{:#?}", doc.body.elements);
+    let md = doc.to_markdown();
+    assert!(md.contains("Start"), "markdown was: {md}");
+    assert!(md.contains("End"), "markdown was: {md}");
+}
+
+// A horizontal-rule paragraph INSIDE a table cell must not desync the cell /
+// row / table parse — content after the table must survive.
+#[test]
+fn pbdr_hr_inside_table_cell_does_not_truncate() {
+    let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl><w:tr><w:tc><w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr></w:pPr></w:p><w:p><w:r><w:t>After rule in cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>After table</w:t></w:r></w:p></w:body></w:document>"#;
+    let data = DocxBuilder::new().with_document(xml).build();
+    let doc = parse(&data);
+
+    // Table + trailing paragraph.
+    assert_eq!(doc.body.elements.len(), 2, "{:#?}", doc.body.elements);
+    let md = doc.to_markdown();
+    assert!(md.contains("After rule in cell"), "markdown was: {md}");
+    assert!(md.contains("After table"), "markdown was: {md}");
+}
+
 // ---------------------------------------------------------------------------
 // Error handling
 // ---------------------------------------------------------------------------
