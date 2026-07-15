@@ -848,6 +848,29 @@ impl Default for TableRow {
     }
 }
 
+/// Semantic data type of a spreadsheet cell.
+///
+/// Populated only for cells derived from a spreadsheet (XLSX); cells from
+/// prose formats (DOCX/PPTX tables) leave `TableCell::data_type` as `None`.
+/// This lets consumers distinguish a numeric or date cell from a text cell —
+/// the rendered display string in `TableCell::content` alone cannot convey
+/// that (e.g. `"42"` may be a number, and `"2026-07-14"` may be a date serial
+/// under a date format).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CellDataType {
+    /// Text / string cell (`t="s"`, `t="str"`, `t="inlineStr"`).
+    Text,
+    /// Numeric cell with no date format applied.
+    Number,
+    /// Numeric cell whose number format is a date/time format.
+    Date,
+    /// Boolean cell (`t="b"`).
+    Boolean,
+    /// Error cell (`t="e"`, e.g. `#DIV/0!`).
+    Error,
+}
+
 /// A single cell within a table row.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TableCell {
@@ -871,6 +894,23 @@ pub struct TableCell {
     pub padding: Option<CellPadding>,
     /// Text direction within the cell.
     pub text_direction: Option<TextDirection>,
+    /// Spreadsheet cell semantic type (XLSX only; `None` for prose formats).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_type: Option<CellDataType>,
+    /// Underlying numeric value for `Number`/`Date`/`Boolean` cells (dates as
+    /// an Excel serial number; booleans as `1.0`/`0.0`). `None` for text,
+    /// error, and prose cells. Lets consumers recover the raw value behind a
+    /// formatted display string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_number: Option<f64>,
+    /// Number-format code applied to the cell (e.g. `"0.00"`, `"yyyy-mm-dd"`).
+    /// `None` when the cell uses the General format or carries no style.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number_format: Option<String>,
+    /// Number-format ID (a built-in id such as `14` for a date, or a custom
+    /// `numFmtId`). `None` when the cell carries no style.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number_format_id: Option<u32>,
 }
 
 /// An ordered or unordered list.

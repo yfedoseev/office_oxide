@@ -24,13 +24,13 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     let mut sections = Vec::new();
 
     for (ws_idx, ws) in doc.worksheets.iter().enumerate() {
-        // First pass: parse all rows into (cells, style-indices).
-        // Each entry is a Vec of (text, style_index_for_first_non_empty_cell)
-        // — we keep style index for the first non-empty cell in each row
-        // because that's what carries the font info we want to recover.
-        let mut parsed_rows: Vec<Vec<(String, Option<u32>)>> = Vec::with_capacity(ws.rows.len());
+        // First pass: parse all rows into `CellData` — the rendered display
+        // string plus the structured facts (semantic type, raw value, number
+        // format) that the grid path threads into the IR so `to_ir()`
+        // consumers can tell numbers/dates from text (issue #72).
+        let mut parsed_rows: Vec<Vec<CellData>> = Vec::with_capacity(ws.rows.len());
         for row in &ws.rows {
-            let mut cells: Vec<(String, Option<u32>)> = Vec::with_capacity(row.cells.len());
+            let mut cells: Vec<CellData> = Vec::with_capacity(row.cells.len());
             for cell in &row.cells {
                 buf.clear();
                 doc.write_cell_value_fast(cell, &mut buf, &date_indices);
@@ -39,10 +39,19 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 } else {
                     std::mem::take(&mut buf)
                 };
-                cells.push((text, cell.style_index));
+                let (data_type, raw_number, number_format, number_format_id) =
+                    cell_semantics(doc, cell, &date_indices);
+                cells.push(CellData {
+                    text,
+                    style_index: cell.style_index,
+                    data_type,
+                    raw_number,
+                    number_format,
+                    number_format_id,
+                });
             }
             // Drop trailing empty cells.
-            while cells.last().is_some_and(|(t, _)| t.is_empty()) {
+            while cells.last().is_some_and(|cd| cd.text.is_empty()) {
                 cells.pop();
             }
             parsed_rows.push(cells);
@@ -61,7 +70,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         let mut prose_score = 0usize;
         let mut nonempty_rows = 0usize;
         for cells in &parsed_rows {
-            let nc = cells.iter().filter(|(t, _)| !t.is_empty()).count();
+            let nc = cells.iter().filter(|cd| !cd.text.is_empty()).count();
             if nc == 0 {
                 continue;
             }
@@ -150,12 +159,11 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             let mut out: Vec<Element> = Vec::new();
             for cells in &parsed_rows {
                 // Find the first non-empty cell.
-                let Some((text, style_idx)) = cells.iter().find(|(t, _)| !t.is_empty()).cloned()
-                else {
+                let Some(cd) = cells.iter().find(|cd| !cd.text.is_empty()) else {
                     continue;
                 };
-                let mut span = TextSpan::plain(text);
-                if let Some(idx) = style_idx {
+                let mut span = TextSpan::plain(cd.text.clone());
+                if let Some(idx) = cd.style_index {
                     if let Some(font) = font_for(doc, idx) {
                         if let Some(size_pt) = font.size {
                             // XLSX cell font size is in points (`<font><sz val="N"/>`
@@ -183,11 +191,11 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             let mut rows: Vec<TableRow> = Vec::with_capacity(parsed_rows.len());
             for (row_idx, cells) in parsed_rows.iter().enumerate() {
                 let mut tcells: Vec<TableCell> = Vec::with_capacity(cells.len());
-                for (text, _) in cells {
-                    let content = if text.is_empty() {
+                for cd in cells {
+                    let content = if cd.text.is_empty() {
                         Vec::new()
                     } else {
-                        vec![InlineContent::Text(TextSpan::plain(text.clone()))]
+                        vec![InlineContent::Text(TextSpan::plain(cd.text.clone()))]
                     };
                     tcells.push(TableCell {
                         content: vec![Element::Paragraph(Paragraph {
@@ -196,6 +204,10 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                         })],
                         col_span: 1,
                         row_span: 1,
+                        data_type: cd.data_type,
+                        raw_number: cd.raw_number,
+                        number_format: cd.number_format.clone(),
+                        number_format_id: cd.number_format_id,
                         ..Default::default()
                     });
                 }
@@ -310,6 +322,82 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         },
         sections,
     }
+}
+
+/// A parsed spreadsheet cell carried through `xlsx_to_ir`: the rendered
+/// display string plus the structured facts needed to populate the IR's
+/// semantic `TableCell` fields (issue #72).
+struct CellData {
+    /// Rendered display string (same text `write_cell_value_fast` produces).
+    text: String,
+    /// Cell format index (`s` attribute) — used for prose-mode font recovery.
+    style_index: Option<u32>,
+    /// Semantic type, or `None` for empty cells.
+    data_type: Option<CellDataType>,
+    /// Underlying numeric value for number/date/boolean cells.
+    raw_number: Option<f64>,
+    /// Number-format code, when the cell has a non-General custom format.
+    number_format: Option<String>,
+    /// Number-format ID, when the cell has a non-General format.
+    number_format_id: Option<u32>,
+}
+
+/// Derive a cell's semantic type, raw numeric value, and number-format
+/// metadata. Mirrors the type/date decisions in `write_cell_value_fast` but
+/// preserves the structured facts instead of collapsing them to a string, so
+/// `to_ir()` consumers (e.g. the WASM `toIr()` surface) can distinguish a
+/// number or date cell from a text cell.
+///
+/// Format metadata is surfaced for every non-empty cell — not just numbers —
+/// so a caller can tell, for instance, that a *text* cell sits in a
+/// date-formatted column (issue #72's "is it a date/number column, and
+/// formatting?"). The format string prefers the workbook's custom `<numFmts>`
+/// entry and falls back to the canonical code for built-in IDs, which never
+/// appear in `<numFmts>`.
+fn cell_semantics(
+    doc: &crate::xlsx::XlsxDocument,
+    cell: &crate::xlsx::Cell,
+    date_indices: &std::collections::HashSet<u32>,
+) -> (Option<CellDataType>, Option<f64>, Option<String>, Option<u32>) {
+    use crate::xlsx::CellValue;
+
+    if matches!(cell.value, CellValue::Empty) {
+        return (None, None, None, None);
+    }
+
+    // Number-format metadata (skip General / id 0 — carries no information).
+    let fmt_id = cell
+        .style_index
+        .and_then(|idx| doc.styles.as_ref()?.number_format_id_for(idx))
+        .filter(|&id| id != 0);
+    let fmt_str = cell
+        .style_index
+        .and_then(|idx| doc.styles.as_ref()?.number_format_for(idx))
+        .map(|s| s.to_string())
+        .or_else(|| {
+            fmt_id.and_then(|id| crate::xlsx::numfmt::builtin_format_code(id).map(str::to_string))
+        });
+
+    let (data_type, raw_number) = match &cell.value {
+        CellValue::Empty => unreachable!("handled above"),
+        CellValue::Number(n) => {
+            let is_date = cell.style_index.is_some_and(|i| date_indices.contains(&i));
+            let ty = if is_date {
+                CellDataType::Date
+            } else {
+                CellDataType::Number
+            };
+            (Some(ty), Some(*n))
+        },
+        // Dates almost always arrive as Number + a date format (handled above);
+        // this variant is a defensive fallback and carries no serial to expose.
+        CellValue::Date(_) => (Some(CellDataType::Date), None),
+        CellValue::Boolean(b) => (Some(CellDataType::Boolean), Some(if *b { 1.0 } else { 0.0 })),
+        CellValue::Error(_) => (Some(CellDataType::Error), None),
+        CellValue::String(_) | CellValue::SharedString(_) => (Some(CellDataType::Text), None),
+    };
+
+    (data_type, raw_number, fmt_str, fmt_id)
 }
 
 /// Look up a cell's font through the workbook's stylesheet (if loaded).

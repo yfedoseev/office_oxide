@@ -5,6 +5,51 @@
 //! integers, fixed decimals, thousands separators, percentages, currency,
 //! and scientific notation. Complex conditions/colors are stripped gracefully.
 
+/// Return the canonical format code for a built-in number-format ID
+/// (OOXML §18.8.30 reserved IDs 0–49). Custom formats (ID ≥ 164) are not
+/// built-in and are looked up from the workbook's `<numFmts>` table instead,
+/// so this returns `None` for them. Used to surface a human-readable format
+/// string in the IR even when a cell uses a built-in date/number format that
+/// never appears in `<numFmts>`.
+pub fn builtin_format_code(fmt_id: u32) -> Option<&'static str> {
+    let code = match fmt_id {
+        0 => "General",
+        1 => "0",
+        2 => "0.00",
+        3 => "#,##0",
+        4 => "#,##0.00",
+        5 => "$#,##0",
+        6 => "$#,##0;[Red]$#,##0",
+        7 => "$#,##0.00",
+        8 => "$#,##0.00;[Red]$#,##0.00",
+        9 => "0%",
+        10 => "0.00%",
+        11 => "0.00E+00",
+        12 => "# ?/?",
+        13 => "# ??/??",
+        14 => "m/d/yyyy",
+        15 => "d-mmm-yy",
+        16 => "d-mmm",
+        17 => "mmm-yy",
+        18 => "h:mm AM/PM",
+        19 => "h:mm:ss AM/PM",
+        20 => "h:mm",
+        21 => "h:mm:ss",
+        22 => "m/d/yyyy h:mm",
+        37 => "#,##0 ;(#,##0)",
+        38 => "#,##0 ;[Red](#,##0)",
+        39 => "#,##0.00;(#,##0.00)",
+        40 => "#,##0.00;[Red](#,##0.00)",
+        45 => "mm:ss",
+        46 => "[h]:mm:ss",
+        47 => "mm:ss.0",
+        48 => "##0.0E+0",
+        49 => "@",
+        _ => return None,
+    };
+    Some(code)
+}
+
 /// Apply an Excel number format to a numeric value.
 pub fn apply_format(n: f64, fmt_id: u32, fmt_str: Option<&str>) -> String {
     if n.is_nan() {
@@ -296,6 +341,17 @@ mod tests {
     fn builtin_general() {
         assert_eq!(apply_format(42.0, 0, None), "42");
         assert_eq!(apply_format(4.25, 0, None), "4.25");
+    }
+
+    #[test]
+    fn builtin_format_code_lookup() {
+        assert_eq!(builtin_format_code(0), Some("General"));
+        assert_eq!(builtin_format_code(4), Some("#,##0.00"));
+        assert_eq!(builtin_format_code(14), Some("m/d/yyyy"));
+        assert_eq!(builtin_format_code(49), Some("@"));
+        // Custom-format ID range has no built-in code.
+        assert_eq!(builtin_format_code(164), None);
+        assert_eq!(builtin_format_code(200), None);
     }
 
     #[test]
