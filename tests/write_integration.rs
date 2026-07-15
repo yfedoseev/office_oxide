@@ -415,6 +415,134 @@ fn xlsx_edit_set_cell_round_trip() {
     assert!(text.contains("Modified"), "text: {text}");
 }
 
+/// Regression: `set_cell` used to rebuild the `<c>` element from scratch, dropping
+/// every attribute of the cell it wrote — including `s`, the style index. A cell that
+/// carried a number format came back naked.
+///
+/// Reproduce on `main` by dropping the `s="5"` assertion's negation: the written cell
+/// is emitted as `<c r="A1"><v>99</v></c>`.
+#[test]
+fn xlsx_edit_set_cell_preserves_cell_style() {
+    let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData><row r="1"><c r="A1" s="5" t="n"><v>42</v></c></row></sheetData></worksheet>"#;
+
+    let bytes = workbook_with_sheet(sheet_xml);
+    let mut editable = office_oxide::xlsx::edit::EditableXlsx::from_reader(Cursor::new(bytes))
+        .expect("open workbook");
+    editable
+        .set_cell(0, "A1", office_oxide::xlsx::edit::CellValue::Number(99.0))
+        .expect("set cell");
+
+    let mut out = Cursor::new(Vec::new());
+    editable.write_to(&mut out).expect("write");
+    let sheet = read_sheet_xml(out.into_inner());
+
+    assert!(sheet.contains("<v>99</v>"), "sheet: {sheet}");
+    assert!(
+        sheet.contains(r#"s="5""#),
+        "the cell's style index must survive the write; sheet: {sheet}"
+    );
+}
+
+/// Regression: an empty but *styled* cell is self-closing — `<c r="A1" s="5"/>`, with
+/// no `</c>`. `set_cell` searched for `</c>` first, found the **next** cell's closing
+/// tag, and the replacement swallowed the cell in between.
+///
+/// A pre-formatted spreadsheet template is made entirely of such cells, so the nominal
+/// "inject data into a template" case silently destroyed data.
+///
+/// Reproduce on `main`: `B1` is absent from the output.
+#[test]
+fn xlsx_edit_set_self_closing_cell_does_not_delete_the_next_cell() {
+    let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData><row r="1"><c r="A1" s="5"/><c r="B1" s="6"><v>7</v></c></row></sheetData></worksheet>"#;
+
+    let bytes = workbook_with_sheet(sheet_xml);
+    let mut editable = office_oxide::xlsx::edit::EditableXlsx::from_reader(Cursor::new(bytes))
+        .expect("open workbook");
+    editable
+        .set_cell(0, "A1", office_oxide::xlsx::edit::CellValue::Number(1.0))
+        .expect("set cell");
+
+    let mut out = Cursor::new(Vec::new());
+    editable.write_to(&mut out).expect("write");
+    let sheet = read_sheet_xml(out.into_inner());
+
+    assert!(sheet.contains(r#"<c r="A1" s="5"><v>1</v></c>"#), "sheet: {sheet}");
+    assert!(
+        sheet.contains(r#"<c r="B1" s="6"><v>7</v></c>"#),
+        "the neighbouring cell must survive; sheet: {sheet}"
+    );
+}
+
+/// Minimal OPC package carrying a single worksheet, so the tests above can control the
+/// exact `<c>` shapes they exercise.
+fn workbook_with_sheet(sheet_xml: &str) -> Vec<u8> {
+    use std::io::Write as _;
+    use zip::write::SimpleFileOptions;
+
+    let mut buf = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let opts = SimpleFileOptions::default();
+
+        let parts = [
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#,
+            ),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>"#,
+            ),
+            ("xl/worksheets/sheet1.xml", sheet_xml),
+        ];
+
+        for (name, body) in parts {
+            zip.start_file(name, opts).expect("start part");
+            zip.write_all(body.as_bytes()).expect("write part");
+        }
+        zip.finish().expect("finish zip");
+    }
+    buf.into_inner()
+}
+
+fn read_sheet_xml(bytes: Vec<u8>) -> String {
+    use std::io::Read as _;
+
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("open zip");
+    let mut sheet = String::new();
+    zip.by_name("xl/worksheets/sheet1.xml")
+        .expect("sheet part")
+        .read_to_string(&mut sheet)
+        .expect("read sheet");
+    sheet
+}
+
 #[test]
 fn pptx_edit_replace_text_round_trip() {
     let mut writer = office_oxide::pptx::write::PptxWriter::new();
