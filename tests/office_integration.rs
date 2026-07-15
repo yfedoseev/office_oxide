@@ -426,6 +426,29 @@ fn docx_to_ir_headings_and_formatting() {
     }
 }
 
+// Regression (issue #71): a horizontal-rule paragraph (empty paragraph with a
+// bottom-only pBdr) must (a) not truncate the document and (b) still convert
+// to Element::ThematicBreak via the unified to_ir() path.
+#[test]
+fn docx_to_ir_pbdr_hr_becomes_thematic_break() {
+    // Compact XML (no inter-tag whitespace), as real Word output — this is
+    // what triggers the truncation bug the fix addresses.
+    let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Above</w:t></w:r></w:p><w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr></w:pPr></w:p><w:p><w:r><w:t>Below</w:t></w:r></w:p></w:body></w:document>"#;
+    let data = make_minimal_docx(xml);
+    let doc = Document::from_reader(Cursor::new(data), DocumentFormat::Docx).unwrap();
+    let ir = doc.to_ir();
+
+    let elements = &ir.sections[0].elements;
+    assert!(
+        elements.iter().any(|e| matches!(e, Element::ThematicBreak)),
+        "expected a ThematicBreak, got {elements:#?}"
+    );
+    // Trailing content survived the HR paragraph.
+    let text = doc.to_markdown();
+    assert!(text.contains("Above"), "text was: {text}");
+    assert!(text.contains("Below"), "text was: {text}");
+}
+
 // ===========================================================================
 // 8. to_ir() → XLSX — sheets as sections, cell grid as table
 // ===========================================================================

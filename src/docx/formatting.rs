@@ -621,27 +621,32 @@ pub(crate) fn parse_paragraph_properties_fast(
                             Some(super::parse_section_properties(reader, e)?);
                     },
                     b"pBdr" => {
-                        // Scan for <w:bottom .../> inside pBdr to
-                        // detect horizontal-rule encoding (empty
-                        // paragraph + bottom border = the
-                        // conventional DOCX <hr/>). We don't capture
-                        // full border styling — just the presence
-                        // of a bottom edge.
+                        // Walk the <w:pBdr> subtree to its matching
+                        // </w:pBdr>, noting whether a <w:bottom> edge
+                        // appears (empty paragraph + bottom border = the
+                        // conventional DOCX <hr/>). We don't capture full
+                        // border styling — just the presence of a bottom
+                        // edge. Border edges are self-closing (Event::Empty),
+                        // so depth only moves on non-empty Start/End; the
+                        // loop exits at the first depth-0 End, which the
+                        // balanced counter guarantees is </w:pBdr>.
                         let mut depth = 1i32;
                         loop {
                             match reader.read_event()? {
-                                Event::Start(ref ee) | Event::Empty(ref ee)
-                                    if ee.local_name().as_ref() == b"bottom" =>
-                                {
-                                    props.has_bottom_border = true;
-                                    if matches!(reader.read_event()?, Event::Eof) {
-                                        break;
+                                Event::Empty(ref ee) => {
+                                    if ee.local_name().as_ref() == b"bottom" {
+                                        props.has_bottom_border = true;
                                     }
                                 },
-                                Event::Start(_) => depth += 1,
-                                Event::End(ref ee) => {
+                                Event::Start(ref ee) => {
+                                    if ee.local_name().as_ref() == b"bottom" {
+                                        props.has_bottom_border = true;
+                                    }
+                                    depth += 1;
+                                },
+                                Event::End(_) => {
                                     depth -= 1;
-                                    if depth <= 0 && ee.local_name().as_ref() == b"pBdr" {
+                                    if depth <= 0 {
                                         break;
                                     }
                                 },
