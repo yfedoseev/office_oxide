@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **XLSX edit: `set_cell` no longer strips a cell's attributes, and no longer deletes the next cell when writing into an empty-but-styled one.** `set_cell_in_xml` rebuilt the `<c>` element from scratch — emitting only `r` and `t` — so every other attribute of the overwritten cell was discarded, most importantly `s`, the style index: a currency or date cell came back with no number format. Worse, the replacement located the end of the cell by searching for `</c>` *before* checking whether the opening tag was self-closing; an empty-but-styled cell is written `<c r="A1" s="5"/>` with no `</c>`, so the search ran on and found the **next** cell's closing tag, and the splice swallowed the cell in between. Both defects converge on the same real workflow — injecting values into a pre-formatted spreadsheet template, whose data rows are made entirely of styled, empty cells: the write silently destroyed a neighbouring cell and stripped the formatting off the one it wrote. `set_cell` now carries every attribute of the existing cell through verbatim (except `r` and `t`, which it owns) and delimits the opening tag before deciding how the element ends.
+
 ## [0.1.6] - 2026-07-13
 
 > Fixes PPTX slides created by `PptxWriter` / `create_from_markdown` rendering blank in LibreOffice Impress.

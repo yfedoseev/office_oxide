@@ -79,41 +79,111 @@ fn parse_cell_ref(cell_ref: &str) -> Option<(u32, &str)> {
     Some((row, col_str))
 }
 
-/// Set a cell value in worksheet XML by string manipulation.
-/// If the cell already exists, its value is replaced. Otherwise, a new cell is inserted.
-fn set_cell_in_xml(xml: &str, cell_ref: &str, value: &CellValue) -> String {
-    let cell_xml = match value {
-        CellValue::Empty => format!(r#"<c r="{cell_ref}"/>"#),
+/// Collect the attributes of a `<c ...>` opening tag, minus the ones we re-emit.
+///
+/// `r` (the reference) and `t` (the type) are always rewritten from the new value.
+/// Everything else — crucially `s`, the style index, but also `cm`, `vm` and `ph` —
+/// is carried through verbatim, so a written cell keeps its number format, fill and
+/// font instead of coming back unstyled.
+fn preserved_attrs(open_tag: &str) -> String {
+    let body = open_tag
+        .trim_start_matches("<c")
+        .trim_end_matches('>')
+        .trim_end_matches('/');
+
+    let mut out = String::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let name_start = i;
+        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let name = &body[name_start..i];
+
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'=') {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'"' {
+            break;
+        }
+        i += 1;
+
+        let value_start = i;
+        while i < bytes.len() && bytes[i] != b'"' {
+            i += 1;
+        }
+        let value = &body[value_start..i.min(body.len())];
+        i += 1;
+
+        if !name.is_empty() && name != "r" && name != "t" {
+            out.push_str(&format!(r#" {name}="{value}""#));
+        }
+    }
+
+    out
+}
+
+/// Render a `<c>` element, carrying the original cell's preserved attributes.
+fn render_cell(cell_ref: &str, attrs: &str, value: &CellValue) -> String {
+    match value {
+        CellValue::Empty => format!(r#"<c r="{cell_ref}"{attrs}/>"#),
         CellValue::String(s) => {
             let escaped = escape_xml(s);
-            format!(r#"<c r="{cell_ref}" t="inlineStr"><is><t>{escaped}</t></is></c>"#)
+            format!(r#"<c r="{cell_ref}"{attrs} t="inlineStr"><is><t>{escaped}</t></is></c>"#)
         },
-        CellValue::Number(n) => format!(r#"<c r="{cell_ref}"><v>{n}</v></c>"#),
+        CellValue::Number(n) => format!(r#"<c r="{cell_ref}"{attrs}><v>{n}</v></c>"#),
         CellValue::Boolean(b) => {
             let v = if *b { "1" } else { "0" };
-            format!(r#"<c r="{cell_ref}" t="b"><v>{v}</v></c>"#)
+            format!(r#"<c r="{cell_ref}"{attrs} t="b"><v>{v}</v></c>"#)
         },
+    }
+}
+
+/// Replace an existing `<c>` element in place, preserving its attributes.
+///
+/// Returns `None` if the cell is not present in `xml`.
+fn replace_existing_cell(xml: &str, cell_ref: &str, value: &CellValue) -> Option<String> {
+    let start = xml.find(&format!(r#"<c r="{cell_ref}""#))?;
+    let rest = &xml[start..];
+
+    // Delimit the OPENING tag first. A cell may be self-closing — `<c r="A1" s="5"/>`,
+    // an empty but styled cell, which is what a pre-formatted template row is made of.
+    // Searching for `</c>` first would run past such a cell and land on the NEXT cell's
+    // closing tag, and the replacement would silently delete the cell in between.
+    let tag_end = rest.find('>')?;
+    let open_tag = &rest[..=tag_end];
+
+    let end = if open_tag.ends_with("/>") {
+        start + tag_end + 1
+    } else {
+        start + rest.find("</c>")? + 4
     };
 
-    // Try to find existing cell with this reference
-    let cell_pattern = format!(r#"<c r="{cell_ref}""#);
-    if let Some(start) = xml.find(&cell_pattern) {
-        // Find end of this cell element
-        let rest = &xml[start..];
-        let end = if let Some(close) = rest.find("</c>") {
-            start + close + 4
-        } else if let Some(close) = rest.find("/>") {
-            start + close + 2
-        } else {
-            return xml.to_string();
-        };
+    let attrs = preserved_attrs(open_tag);
+    let cell_xml = render_cell(cell_ref, &attrs, value);
 
-        let mut result = String::with_capacity(xml.len());
-        result.push_str(&xml[..start]);
-        result.push_str(&cell_xml);
-        result.push_str(&xml[end..]);
-        return result;
+    let mut result = String::with_capacity(xml.len());
+    result.push_str(&xml[..start]);
+    result.push_str(&cell_xml);
+    result.push_str(&xml[end..]);
+    Some(result)
+}
+
+/// Set a cell value in worksheet XML by string manipulation.
+///
+/// If the cell already exists, its value is replaced and its attributes (style, etc.)
+/// are preserved. Otherwise, a new cell is inserted.
+fn set_cell_in_xml(xml: &str, cell_ref: &str, value: &CellValue) -> String {
+    if let Some(replaced) = replace_existing_cell(xml, cell_ref, value) {
+        return replaced;
     }
+
+    let cell_xml = render_cell(cell_ref, "", value);
 
     // Cell doesn't exist — find the right row or create one
     let Some((row, _col)) = parse_cell_ref(cell_ref) else {
@@ -186,6 +256,67 @@ mod tests {
         let xml = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#;
         let result = set_cell_in_xml(xml, "A1", &CellValue::Boolean(true));
         assert!(result.contains(r#"<c r="A1" t="b"><v>1</v></c>"#));
+    }
+
+    #[test]
+    fn set_existing_cell_preserves_style_index() {
+        // `s="5"` is the cell's style: its number format, fill and font. Rebuilding the
+        // <c> element from scratch dropped it, and the written cell came back unstyled.
+        let xml = r#"<sheetData><row r="1"><c r="A1" s="5" t="n"><v>42</v></c></row></sheetData>"#;
+        let result = set_cell_in_xml(xml, "A1", &CellValue::Number(99.0));
+        assert!(result.contains(r#"<c r="A1" s="5"><v>99</v></c>"#), "result: {result}");
+    }
+
+    #[test]
+    fn set_existing_string_cell_preserves_style_index() {
+        let xml = r#"<sheetData><row r="1"><c r="A1" s="3" t="inlineStr"><is><t>old</t></is></c></row></sheetData>"#;
+        let result = set_cell_in_xml(xml, "A1", &CellValue::String("new".into()));
+        assert!(
+            result.contains(r#"<c r="A1" s="3" t="inlineStr"><is><t>new</t></is></c>"#),
+            "result: {result}"
+        );
+    }
+
+    #[test]
+    fn set_existing_cell_preserves_unrelated_attributes() {
+        let xml =
+            r#"<sheetData><row r="1"><c r="A1" s="2" cm="1" vm="4"><v>1</v></c></row></sheetData>"#;
+        let result = set_cell_in_xml(xml, "A1", &CellValue::Number(2.0));
+        assert!(result.contains(r#"s="2""#), "result: {result}");
+        assert!(result.contains(r#"cm="1""#), "result: {result}");
+        assert!(result.contains(r#"vm="4""#), "result: {result}");
+    }
+
+    #[test]
+    fn set_self_closing_cell_does_not_swallow_the_next_cell() {
+        // An empty but STYLED cell is self-closing: `<c r="A1" s="5"/>` — no `</c>`.
+        // Searching for `</c>` first found B1's closing tag instead, and the
+        // replacement deleted B1 along the way. A pre-formatted template row is made
+        // entirely of such cells, so the nominal case triggered the data loss.
+        let xml = r#"<sheetData><row r="1"><c r="A1" s="5"/><c r="B1" s="6"><v>7</v></c></row></sheetData>"#;
+        let result = set_cell_in_xml(xml, "A1", &CellValue::Number(1.0));
+
+        assert!(result.contains(r#"<c r="A1" s="5"><v>1</v></c>"#), "result: {result}");
+        assert!(
+            result.contains(r#"<c r="B1" s="6"><v>7</v></c>"#),
+            "the neighbouring cell must survive; result: {result}"
+        );
+    }
+
+    #[test]
+    fn set_self_closing_cell_to_empty_stays_self_closing() {
+        let xml =
+            r#"<sheetData><row r="1"><c r="A1" s="5"/><c r="B1"><v>7</v></c></row></sheetData>"#;
+        let result = set_cell_in_xml(xml, "A1", &CellValue::Empty);
+        assert!(result.contains(r#"<c r="A1" s="5"/>"#), "result: {result}");
+        assert!(result.contains(r#"<c r="B1"><v>7</v></c>"#), "result: {result}");
+    }
+
+    #[test]
+    fn set_new_cell_carries_no_borrowed_attributes() {
+        let xml = r#"<sheetData><row r="1"><c r="A1" s="9"><v>1</v></c></row></sheetData>"#;
+        let result = set_cell_in_xml(xml, "B1", &CellValue::Number(2.0));
+        assert!(result.contains(r#"<c r="B1"><v>2</v></c>"#), "result: {result}");
     }
 
     #[test]
