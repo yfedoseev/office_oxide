@@ -102,9 +102,20 @@ pub fn ir_to_docx(ir: &DocumentIR) -> crate::docx::write::DocxWriter {
     writer.set_metadata(&ir.metadata);
 
     for section in &ir.sections {
-        // Section title becomes H1
+        // Section title becomes H1 — but skip it when the title is already
+        // carried by the section's leading heading element. The DOCX parser
+        // derives `section.title` FROM the first heading (which it also keeps
+        // in `elements`), so re-emitting the title here would materialise a
+        // duplicate H1 on every write→parse cycle, breaking round-trip
+        // idempotence. Only emit a standalone title-H1 for a title that is
+        // NOT already represented as the leading heading.
+        let title_is_leading_heading = matches!(
+            section.elements.first(),
+            Some(Element::Heading(h))
+                if section.title.as_deref().is_some_and(|t| inline_to_text(&h.content) == t)
+        );
         if let Some(ref title) = section.title {
-            if !title.is_empty() {
+            if !title.is_empty() && !title_is_leading_heading {
                 let runs = [Run::new(title)];
                 let props = IrParaProps {
                     style: Some("Heading1".to_string()),
@@ -754,7 +765,22 @@ fn emit_pptx_slide_from_section(writer: &mut crate::pptx::write::PptxWriter, sec
         }
     }
 
-    for elem in &section.elements {
+    // The PPTX parser surfaces the slide-title placeholder as BOTH
+    // `section.title` and a leading Heading element. The title placeholder is
+    // already set above, so re-emitting that heading as body text would both
+    // pollute the body and cause the real body content to be dropped on a
+    // write→parse cycle (breaking round-trip idempotence). Skip the leading
+    // heading when it merely duplicates the section title.
+    let skip_leading_title_heading = matches!(
+        section.elements.first(),
+        Some(Element::Heading(h))
+            if section.title.as_deref().is_some_and(|t| inline_to_text(&h.content) == t)
+    );
+
+    for (i, elem) in section.elements.iter().enumerate() {
+        if i == 0 && skip_leading_title_heading {
+            continue;
+        }
         emit_pptx_element(slide, elem);
     }
 }
@@ -854,6 +880,15 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
         Element::CodeBlock(cb) => {
             let run = crate::pptx::write::Run::new(&cb.content).font("Courier New");
             slide.add_rich_text(&[run]);
+        },
+        Element::TextBox(tb) => {
+            // The PPTX parser wraps a slide's body placeholder content in a
+            // TextBox. Emit its inner block content back into the slide body;
+            // without this arm the body (bullets, paragraphs) was silently
+            // dropped on a write→parse cycle.
+            for inner in &tb.content {
+                emit_pptx_element(slide, inner);
+            }
         },
         _ => {},
     }
