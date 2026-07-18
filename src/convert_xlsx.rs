@@ -1,6 +1,15 @@
 use crate::format::DocumentFormat;
 use crate::ir::*;
 
+/// Maximum worksheet rows materialised into the IR per sheet. A worksheet is
+/// converted eagerly into an in-memory `Table` (or one `Paragraph` per row),
+/// and downstream a single table cannot render to an unbounded PDF, so an
+/// uncapped sheet (e.g. a 200k-row stress fixture) explodes memory and stalls
+/// rendering. Beyond this many rows the remainder is dropped and a visible
+/// truncation notice is appended, rather than hanging. Chosen to preserve
+/// ordinary large spreadsheets while bounding pathological ones.
+const MAX_ROWS_PER_SHEET: usize = 10_000;
+
 /// Parse a 6-char hex colour like `"FFA500"` into `[r, g, b]`.
 fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
     let s = s.trim_start_matches('#');
@@ -28,8 +37,13 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         // string plus the structured facts (semantic type, raw value, number
         // format) that the grid path threads into the IR so `to_ir()`
         // consumers can tell numbers/dates from text (issue #72).
-        let mut parsed_rows: Vec<Vec<CellData>> = Vec::with_capacity(ws.rows.len());
-        for row in &ws.rows {
+        // Cap eager row materialisation: an unbounded sheet would build
+        // millions of IR cell allocations and then stall the single-table
+        // render downstream. Excess rows are dropped and flagged below.
+        let total_rows = ws.rows.len();
+        let mut parsed_rows: Vec<Vec<CellData>> =
+            Vec::with_capacity(total_rows.min(MAX_ROWS_PER_SHEET));
+        for row in ws.rows.iter().take(MAX_ROWS_PER_SHEET) {
             let mut cells: Vec<CellData> = Vec::with_capacity(row.cells.len());
             for cell in &row.cells {
                 buf.clear();
@@ -275,6 +289,20 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         // first). Empty `image_elements` means no drawing on this sheet.
         let mut combined: Vec<Element> = image_elements;
         combined.extend(elements);
+
+        // Graceful truncation notice: when the sheet exceeded the row cap,
+        // the dropped rows are not silently lost — a visible paragraph records
+        // how many rows were omitted so downstream text/markdown/PDF makes the
+        // truncation obvious rather than appearing complete.
+        if total_rows > MAX_ROWS_PER_SHEET {
+            let omitted = total_rows - MAX_ROWS_PER_SHEET;
+            combined.push(Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(format!(
+                    "[{omitted} of {total_rows} rows not shown — worksheet truncated at {MAX_ROWS_PER_SHEET} rows]"
+                )))],
+                ..Default::default()
+            }));
+        }
 
         sections.push(Section {
             title: Some(ws.name.clone()),
