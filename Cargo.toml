@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [".", "crates/office_oxide_cli", "crates/office_oxide_mcp"]
-exclude = ["bench_rust"]
+exclude = ["bench_rust", "fuzz"]
 
 # Clippy lint configuration shared by every workspace member and every target
 # (lib, bin, test, example, bench). Centralises the allow-list so new crates
@@ -49,6 +49,8 @@ include = [
     "/CHANGELOG.md",
     "/LICENSE-MIT",
     "/LICENSE-APACHE",
+    "/NOTICE",
+    "/TRADEMARKS.md",
     "/include/**/*",
     "/cbindgen.toml",
 ]

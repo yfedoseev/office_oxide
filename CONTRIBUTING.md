@@ -339,11 +339,13 @@ git commit -s -m "feat(docx): add heading extraction"
 # Produces: Signed-off-by: Your Name <you@example.com>
 ```
 
-This is checked automatically on every pull request by the DCO CI job. There is no CLA to sign — the sign-off is all that's required.
+This is checked automatically on every pull request by the DCO CI job.
+
+**CLA** — non-trivial contributions are also accepted under the project's [Contributor License Agreement](CLA.md). It is a *licence, not an assignment*: you keep ownership and grant the project a broad copyright + patent licence including the right to relicense future versions. Trivial changes (typos, formatting, docs) are exempt. Once the CLA bot is enabled it records your one-click sign-off on your first PR; until then the DCO sign-off above is the operative requirement.
 
 ## License
 
-By contributing, you agree that your contributions will be dual licensed under **MIT OR Apache-2.0**, without any additional terms or conditions.
+By contributing, you agree that the **outbound licence for released code is MIT OR Apache-2.0** (inbound = outbound for what ships to users). In addition, **non-trivial contributions are made under the project's [Contributor License Agreement](CLA.md)**, which grants the Maintainer a broader, sub-licensable copyright and patent licence so the project can relicense *future* versions if needed. The CLA does not change the licence of any already-published release. Trivial changes are exempt and remain inbound = outbound only.
 
 This means:
 - Your code will be available under permissive open-source licenses
