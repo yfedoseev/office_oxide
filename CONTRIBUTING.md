@@ -2,6 +2,36 @@
 
 Thank you for your interest in contributing! This document provides guidelines and information for contributors.
 
+## The rules that matter most
+
+These apply to **everyone, including the maintainer** — office_oxide is a
+correctness-critical parser, and a subtle regression can silently corrupt output
+for many documents.
+
+1. **Open or find an accepted issue before non-trivial work**, and agree the
+   approach there first. **Drive-by pull requests with no linked, accepted issue
+   may be closed without detailed review.** Bug/typo/docs fixes are exempt.
+2. **Any change to parsing, extraction, or the document IR must be proven not to
+   regress on real Office files.** These paths are heuristic and fail silently.
+   Ship a minimal synthetic reproducer (in code) for every bug fix, and run your
+   **own** corpus of real `.docx/.xlsx/.pptx/.doc/.xls/.ppt` (the project corpus
+   is private, not distributed) — report what you tested in the PR, vs both
+   `main` and the latest release.
+
+### Contribution quality & AI-assisted work
+Maintainer review time is the scarcest resource — a contribution must be worth
+more than the time it takes to review it. We are not anti-AI; we are anti-slop.
+- **You are responsible for everything you submit**, including code an AI wrote —
+  licence, correctness, provenance. You must be able to **explain every line**.
+- **Write issues, PR descriptions, and replies yourself.** Autonomous agents must
+  not open issues/PRs; such PRs may be closed. **Disclose AI assistance** (tool +
+  extent). We do not accept fully or predominantly AI-generated PRs.
+- **No third-party/customer documents committed as fixtures** — build minimal
+  synthetic ones in code. Name tests by defect class, not issue/PR number.
+- **Fill in the templates.** Issues and PRs opened without filling in their
+  template are **closed automatically** (edit + reopen). Maintainers, drafts, and
+  `skip-template-check` are exempt.
+
 ## Table of Contents
 
 - [Code of Conduct](#code-of-conduct)
@@ -339,11 +369,13 @@ git commit -s -m "feat(docx): add heading extraction"
 # Produces: Signed-off-by: Your Name <you@example.com>
 ```
 
-This is checked automatically on every pull request by the DCO CI job. There is no CLA to sign — the sign-off is all that's required.
+Sign-off (`-s`) certifies your right to contribute. A strict DCO CI check is currently disabled for this repo; the **CLA check** (below) is the enforced gate on pull requests.
+
+**CLA** — non-trivial contributions are also accepted under the project's [Contributor License Agreement](CLA.md). It is a *licence, not an assignment*: you keep ownership and grant the project a broad copyright + patent licence including the right to relicense future versions. Trivial changes (typos, formatting, docs) are exempt. Once the CLA bot is enabled it records your one-click sign-off on your first PR; until then the DCO sign-off above is the operative requirement.
 
 ## License
 
-By contributing, you agree that your contributions will be dual licensed under **MIT OR Apache-2.0**, without any additional terms or conditions.
+By contributing, you agree that the **outbound licence for released code is MIT OR Apache-2.0** (inbound = outbound for what ships to users). In addition, **non-trivial contributions are made under the project's [Contributor License Agreement](CLA.md)**, which grants the Maintainer a broader, sub-licensable copyright and patent licence so the project can relicense *future* versions if needed. The CLA does not change the licence of any already-published release. Trivial changes are exempt and remain inbound = outbound only.
 
 This means:
 - Your code will be available under permissive open-source licenses

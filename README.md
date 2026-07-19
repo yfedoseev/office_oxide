@@ -423,9 +423,13 @@ If it saves you a dependency, a license audit, or a weekend, consider leaving a 
 
 — Yury
 
-## License
+## License & trademark
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option. No AGPL, no GPL, no copyleft restrictions. Use freely in commercial and open-source projects.
+The **code** is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option. No AGPL, no GPL, no copyleft restrictions. Use freely in commercial and open-source projects.
+
+The **name and brand** are not covered by the code license: **"OfficeOxide"** (the product name) and **"office_oxide"** (the package name), together with any associated logo, are trademarks of Yury Fedoseev. You may say your product "uses OfficeOxide"; please don't name a different or modified product "OfficeOxide" or "office_oxide". See [TRADEMARKS.md](TRADEMARKS.md).
+
+© 2026 Yury Fedoseev and the OfficeOxide contributors. Contributions are accepted under the project's [DCO](CONTRIBUTING.md#developer-certificate-of-origin-dco) and [CLA](CLA.md); contributors retain ownership of their work.
 
 ## Contributing
 

@@ -1,0 +1,34 @@
+# cargo-fuzz targets for office_oxide.
+#
+# Office parsers consume fully untrusted bytes (OOXML zip/XML for Docx/Xlsx/Pptx,
+# CFB compound files for the legacy Doc/Xls/Ppt) — a prime fuzzing surface.
+# Targets must never panic on any input; malformed documents return `Err`.
+#
+# Standalone workspace (own `[workspace]`, and excluded from the root workspace)
+# so the nightly + sanitizer toolchain cargo-fuzz needs never affects the normal
+# build/test matrix.
+#
+# Run locally:  cargo +nightly fuzz run fuzz_parse -- -max_total_time=300
+[package]
+name = "office-oxide-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.office_oxide]
+path = ".."
+
+[[bin]]
+name = "fuzz_parse"
+path = "fuzz_targets/fuzz_parse.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
