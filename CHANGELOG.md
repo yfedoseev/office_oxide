@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-07-22
+
+> PPT97 (legacy binary `.ppt`) text-extraction correctness release. No breaking API changes.
+
+### Fixed
+
+- **PPT: `PlainText()` / `ToMarkdown()` / `ToIRJSON()` no longer return stale or embedded-metadata text instead of real slide content on legacy binary `.ppt` files ([#85](https://github.com/yfedoseev/office_oxide/issues/85)).** PPT97 uses incremental ("fast") saves — each save appends new/changed records to the end of the "PowerPoint Document" stream, leaving superseded copies of earlier records (e.g. a pre-edit `Slide` container) behind in the stream with nothing to compact them away. The extractor scanned front-to-back and trusted whichever slide-shaped data it found first, so stale leftovers could win over current content, and in the worst case a corrupted/oversized declared record length (the record iterator bounded child data against the whole stream rather than its own enclosing container) could derail the scan and swallow unrelated later records. Slide content is now resolved through the PPT97 persist object directory instead — `Current User` stream → `UserEditAtom` chain (`offsetLastEdit`) → merged `PersistDirectoryAtom` entries, per [MS-PPT] 2.1.2 — so the *current* copy of each slide's records is used regardless of scan order, and the record iterator now bounds each record against its own container. Also resolves `OutlineTextRefAtom` indirection, where a placeholder shape stores text only as an index back into the slide's outline-text cache rather than embedding it directly — needed for correctness against a real-world corpus, not just the reported bug. Verified against 176 real-world `.ppt` files (LibreOffice QA data, Apache POI/Tika test resources, OSS-Fuzz regression cases): zero crashes either side vs. v0.1.7, and every file with changed output gained previously-missing content (stale duplicates collapsed, indexed placeholder text now resolved) with no garbled output observed. Thanks to the reporter of #85.
+
 ## [0.1.7] - 2026-07-19
 
 > Round-trip and robustness release: the write↔parse IR cycle is now a fixed point for DOCX/PPTX, oversized XLSX sheets are bounded instead of stalling, plus the earlier XLSX cell-type/DOCX-truncation/XLSX-edit fixes, a dependency refresh, and CI-hardening + IP-governance groundwork. No breaking API changes.
