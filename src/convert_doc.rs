@@ -22,6 +22,45 @@ fn image_element(img: &crate::doc::DocImage) -> Element {
     })
 }
 
+/// Reconstructs a flattened .doc table line into IR table rows. In binary Word a
+/// table cell ends with a cell mark (0x07) and each row is terminated by a
+/// table-terminating paragraph whose mark is also 0x07 — both surface as tabs in
+/// the extracted text. So within a row cells are separated by a single tab, and a
+/// row ends with "\t\t" (the last cell's mark + the row-end mark). Splitting on
+/// "\t\t" therefore yields rows, and splitting each row on "\t" yields its cells.
+/// (Heuristic: office_oxide's .doc reader has no PAPX layer to read the real
+/// fInTable/fTtp flags, but this reproduces the row/cell structure for typical
+/// tables. Tables containing adjacent empty cells can't be disambiguated this way.)
+fn doc_table_rows(line: &str) -> Vec<TableRow> {
+    let mut rows: Vec<TableRow> = Vec::new();
+    for row_str in line.split("\t\t") {
+        let mut cells_txt: Vec<&str> = row_str.split('\t').collect();
+        while cells_txt.last().is_some_and(|c| c.trim().is_empty()) {
+            cells_txt.pop();
+        }
+        if cells_txt.is_empty() {
+            continue;
+        }
+        let cells: Vec<TableCell> = cells_txt
+            .iter()
+            .map(|c| {
+                let t = c.replace('\u{FFFC}', ""); // drop any stray object marker
+                TableCell {
+                    content: vec![Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan::plain(t.trim()))],
+                        ..Default::default()
+                    })],
+                    col_span: 1,
+                    row_span: 1,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        rows.push(TableRow { cells, ..Default::default() });
+    }
+    rows
+}
+
 fn text_element(text: &str, is_first: bool) -> Element {
     // Heuristic: short lines in ALL CAPS, or the first line if short, are headings.
     let trimmed = text.trim();
@@ -58,6 +97,16 @@ pub(crate) fn doc_to_ir(doc: &crate::doc::DocDocument) -> DocumentIR {
     let mut elements: Vec<Element> = Vec::new();
 
     for line in text.lines() {
+        // A "\t\t" run marks a flattened table (cell mark + row-end mark). Emit a
+        // real IR table so it renders as a bordered grid instead of tab text.
+        if line.contains("\t\t") {
+            let rows = doc_table_rows(line);
+            if !rows.is_empty() {
+                elements.push(Element::Table(Table { rows, ..Default::default() }));
+                continue;
+            }
+        }
+
         if line.contains('\u{FFFC}') {
             for (i, seg) in line.split('\u{FFFC}').enumerate() {
                 if i > 0 && img_idx < images.len() {
