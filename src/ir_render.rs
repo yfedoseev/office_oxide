@@ -128,24 +128,28 @@ mod block_default {
                 // When the IR carries the decoded image bytes, inline them as a
                 // self-contained data: URI so the HTML is directly renderable.
                 // Vector metafiles (EMF/WMF) are kept as empty <img> because most
-                // renderers can't display them.
+                // renderers can't display them. The <img> is wrapped in its own
+                // <p> block: a bare inline <img> between two paragraphs gets folded
+                // into the preceding block by flow renderers (e.g. Qt's
+                // QTextBrowser), which then baseline-aligns a large image and
+                // leaves big vertical gaps around the neighbouring text.
                 match (&img.data, &img.format) {
                     (Some(bytes), Some(fmt))
                         if !bytes.is_empty()
                             && !matches!(fmt, ImageFormat::Emf | ImageFormat::Wmf) =>
                     {
-                        let mut out = String::with_capacity(48 + alt.len() + bytes.len() * 4 / 3);
+                        let mut out = String::with_capacity(56 + alt.len() + bytes.len() * 4 / 3);
                         let _ = write!(
                             out,
-                            "<img alt=\"{alt}\" src=\"data:{};base64,{}\" />",
+                            "<p><img alt=\"{alt}\" src=\"data:{};base64,{}\" /></p>",
                             fmt.content_type(),
                             super::base64_encode(bytes)
                         );
                         out
                     },
                     _ => {
-                        let mut out = String::with_capacity(20 + alt.len());
-                        let _ = write!(out, "<img alt=\"{alt}\" />");
+                        let mut out = String::with_capacity(28 + alt.len());
+                        let _ = write!(out, "<p><img alt=\"{alt}\" /></p>");
                         out
                     },
                 }
