@@ -40,6 +40,29 @@ pub(crate) fn doc_to_ir(doc: &crate::doc::DocDocument) -> DocumentIR {
         }
     }
 
+    // Surface embedded images extracted from the Data stream. .doc text
+    // extraction discards the picture placeholder (\x01), so the exact inline
+    // position is not known here; the images are appended in document (BLIP
+    // scan) order so they aren't lost. Emitting Element::Image with the decoded
+    // bytes lets the HTML/markdown renderers inline them (see ir_render.rs).
+    use crate::cfb::blip::BlipFormat;
+    for img in doc.images() {
+        let format = match img.format {
+            BlipFormat::Png => Some(ImageFormat::Png),
+            BlipFormat::Jpeg => Some(ImageFormat::Jpeg),
+            BlipFormat::Dib => Some(ImageFormat::Bmp),
+            BlipFormat::Tiff => Some(ImageFormat::Tiff),
+            BlipFormat::Emf => Some(ImageFormat::Emf),
+            BlipFormat::Wmf => Some(ImageFormat::Wmf),
+            BlipFormat::Pict | BlipFormat::Unknown(_) => None,
+        };
+        elements.push(Element::Image(Image {
+            data: Some(img.data.clone()),
+            format,
+            ..Default::default()
+        }));
+    }
+
     let title = elements.iter().find_map(|e| match e {
         Element::Heading(h) => h.content.first().and_then(|c| match c {
             InlineContent::Text(t) => Some(t.text.clone()),

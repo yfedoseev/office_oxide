@@ -1,5 +1,23 @@
 use crate::ir::*;
 
+/// Minimal standard-base64 encoder (no dependency), used to inline embedded
+/// image bytes into HTML as `data:` URIs.
+pub(crate) fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { TABLE[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
 mod block_default {
     //! Default flow-rendering for [`Element`] variants that don't
     //! carry a meaningful inline / paragraph / heading shape.
@@ -107,9 +125,30 @@ mod block_default {
                     .as_deref()
                     .map(super::escape_html)
                     .unwrap_or_default();
-                let mut out = String::with_capacity(20 + alt.len());
-                let _ = write!(out, "<img alt=\"{alt}\" />");
-                out
+                // When the IR carries the decoded image bytes, inline them as a
+                // self-contained data: URI so the HTML is directly renderable.
+                // Vector metafiles (EMF/WMF) are kept as empty <img> because most
+                // renderers can't display them.
+                match (&img.data, &img.format) {
+                    (Some(bytes), Some(fmt))
+                        if !bytes.is_empty()
+                            && !matches!(fmt, ImageFormat::Emf | ImageFormat::Wmf) =>
+                    {
+                        let mut out = String::with_capacity(48 + alt.len() + bytes.len() * 4 / 3);
+                        let _ = write!(
+                            out,
+                            "<img alt=\"{alt}\" src=\"data:{};base64,{}\" />",
+                            fmt.content_type(),
+                            super::base64_encode(bytes)
+                        );
+                        out
+                    },
+                    _ => {
+                        let mut out = String::with_capacity(20 + alt.len());
+                        let _ = write!(out, "<img alt=\"{alt}\" />");
+                        out
+                    },
+                }
             },
             Element::Heading(_)
             | Element::Paragraph(_)
