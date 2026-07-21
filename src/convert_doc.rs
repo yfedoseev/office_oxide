@@ -31,9 +31,22 @@ fn image_element(img: &crate::doc::DocImage) -> Element {
 /// (Heuristic: office_oxide's .doc reader has no PAPX layer to read the real
 /// fInTable/fTtp flags, but this reproduces the row/cell structure for typical
 /// tables. Tables containing adjacent empty cells can't be disambiguated this way.)
-fn doc_table_rows(line: &str) -> Vec<TableRow> {
+fn doc_table(line: &str) -> (Vec<TableRow>, Option<String>) {
+    let mut segs: Vec<&str> = line.split("\t\t").collect();
+    // Every real table row ends with the row-end mark, so a clean table produces an
+    // empty final segment. A NON-empty final segment is the paragraph that follows
+    // the table on the same text line (e.g. an introductory sentence) — pull it out
+    // so it isn't mistaken for a one-cell row.
+    let trailing = match segs.last() {
+        Some(s) if !s.trim().is_empty() => segs.pop().map(|s| s.to_string()),
+        _ => {
+            segs.pop();
+            None
+        },
+    };
+
     let mut rows: Vec<TableRow> = Vec::new();
-    for row_str in line.split("\t\t") {
+    for row_str in segs {
         let mut cells_txt: Vec<&str> = row_str.split('\t').collect();
         while cells_txt.last().is_some_and(|c| c.trim().is_empty()) {
             cells_txt.pop();
@@ -58,7 +71,7 @@ fn doc_table_rows(line: &str) -> Vec<TableRow> {
             .collect();
         rows.push(TableRow { cells, ..Default::default() });
     }
-    rows
+    (rows, trailing)
 }
 
 fn text_element(text: &str, is_first: bool) -> Element {
@@ -100,9 +113,19 @@ pub(crate) fn doc_to_ir(doc: &crate::doc::DocDocument) -> DocumentIR {
         // A "\t\t" run marks a flattened table (cell mark + row-end mark). Emit a
         // real IR table so it renders as a bordered grid instead of tab text.
         if line.contains("\t\t") {
-            let rows = doc_table_rows(line);
+            let (rows, trailing) = doc_table(line);
+            let handled = !rows.is_empty() || trailing.is_some();
             if !rows.is_empty() {
                 elements.push(Element::Table(Table { rows, ..Default::default() }));
+            }
+            // The sentence that followed the table on the same line becomes its
+            // own paragraph rather than a stray one-cell row.
+            if let Some(t) = trailing {
+                if !t.trim().is_empty() {
+                    elements.push(text_element(&t, elements.is_empty()));
+                }
+            }
+            if handled {
                 continue;
             }
         }
