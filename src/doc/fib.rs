@@ -13,6 +13,8 @@ pub struct Fib {
     pub version: u16,
     /// Which table stream to use: true = "1Table", false = "0Table".
     pub use_table1: bool,
+    /// fEncrypted: the document is encrypted / password-protected.
+    pub encrypted: bool,
     /// Offset of the CLX (piece table) in the Table stream.
     pub clx_offset: u32,
     /// Size of the CLX in the Table stream.
@@ -51,8 +53,9 @@ impl Fib {
 
         let version = u16::from_le_bytes([data[2], data[3]]);
 
-        // Flags at offset 0x0A (u16): bit 9 = fWhichTblStm
+        // Flags at offset 0x0A (u16): bit 8 = fEncrypted, bit 9 = fWhichTblStm
         let flags = u16::from_le_bytes([data[0x0A], data[0x0B]]);
+        let encrypted = (flags & (1 << 8)) != 0;
         let use_table1 = (flags & (1 << 9)) != 0;
 
         // FibRgLw97 starts at offset 0x22, its size field at 0x22 (u16, should be 0x16).
@@ -90,6 +93,7 @@ impl Fib {
         Ok(Self {
             version,
             use_table1,
+            encrypted,
             clx_offset,
             clx_size,
             text_len,

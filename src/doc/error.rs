@@ -24,6 +24,10 @@ pub enum DocError {
     /// Underlying I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The document is encrypted / password-protected and cannot be read.
+    #[error("document is encrypted")]
+    Encrypted,
 }
 
 /// Convenience `Result` alias using `DocError`.

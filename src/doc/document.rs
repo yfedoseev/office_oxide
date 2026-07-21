@@ -37,6 +37,12 @@ impl DocDocument {
             }, // Unsupported Word version
         };
 
+        // Password-protected documents can't be read (office_oxide has no
+        // decryption); surface a clear error rather than empty/garbage text.
+        if fib.encrypted {
+            return Err(DocError::Encrypted);
+        }
+
         // Open the appropriate table stream; try preferred first, then fallback.
         let table_stream = if fib.use_table1 {
             cfb.open_stream("1Table")
