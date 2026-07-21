@@ -19,6 +19,11 @@ pub const RT_SLIDE_BASE: u16 = 0x03EC;
 pub const RT_NOTES: u16 = 0x03F0;
 pub const RT_SLIDE_LIST_WITH_TEXT: u16 = 0x0FF0;
 pub const RT_TEXT_HEADER: u16 = 0x0F9F;
+/// OutlineTextRefAtom ([MS-PPT] 2.4.15.6) — a shape's text stored *by
+/// reference* as a zero-based index into the TextHeaderAtom sequence that
+/// follows its slide's SlidePersistAtom in SlideListWithTextContainer,
+/// instead of embedded directly in the shape.
+pub const RT_OUTLINE_TEXT_REF_ATOM: u16 = 0x0F9E;
 pub const RT_TEXT_CHARS: u16 = 0x0FA0;
 pub const RT_TEXT_BYTES: u16 = 0x0FA8;
 pub const RT_SLIDE_PERSIST_ATOM: u16 = 0x03F3;

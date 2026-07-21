@@ -68,7 +68,13 @@ pub struct TextRun {
 pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<SlideText> {
     if let Some(dir) = persist::build(stream, current_user) {
         if let Some(slides) = extract_slides_via_persist(stream, &dir) {
-            if !slides.is_empty() {
+            // A resolved-but-entirely-textless result is ambiguous: it's the
+            // correct answer for a genuinely text-free deck (image-only
+            // slides), but it's also what a corrupted persist chain that
+            // resolved to the wrong offsets looks like. Fall through to the
+            // weaker heuristics below rather than committing to it — if they
+            // also come up empty, this was the right answer all along.
+            if !slides.is_empty() && slides.iter().any(|s| !s.text_runs.is_empty()) {
                 return slides;
             }
         }
@@ -84,7 +90,7 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
     // Last resort: no resolvable structure at all — dump whatever text atoms
     // exist anywhere in the stream as a single slide.
     let mut runs = Vec::new();
-    extract_shape_text(stream, 0, &mut runs);
+    extract_shape_text(stream, 0, &[], &mut runs);
     if runs.is_empty() {
         Vec::new()
     } else {
@@ -95,6 +101,14 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
 /// Resolve the current "Slides" list through the persist directory and
 /// extract each slide's shape text from its resolved `Slide` container.
 ///
+/// Also collects each slide's own outline-text sequence — the
+/// `TextHeaderAtom`/`TextCharsAtom`/`TextBytesAtom` runs that directly follow
+/// its `SlidePersistAtom` in `SlideListWithTextContainer` — because many
+/// placeholder shapes don't embed their text directly at all: they hold only
+/// an `OutlineTextRefAtom`, an index into that same per-slide sequence
+/// ([MS-PPT] 2.4.15.6). Resolving text purely from the `Slide` container's own
+/// records, without this table, silently drops that text.
+///
 /// Returns `None` if the `DocumentContainer` or its slide list can't be
 /// resolved at all (directory present but unusable); returns `Some(vec![])`
 /// if the slide list resolves but is empty.
@@ -104,39 +118,94 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
     let slide_list = find_child(&doc_children, RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES)?;
 
     let mut slides = Vec::new();
+    let mut current_persist_id: Option<u32> = None;
+    let mut outline_texts: Vec<TextRun> = Vec::new();
+    let mut current_type = TextType::Other;
+
     for rec in RecordIter::new(&slide_list) {
         let Ok(rec) = rec else { break };
-        if rec.header.rec_type != RT_SLIDE_PERSIST_ATOM || rec.data.len() < 4 {
-            continue;
+        match rec.header.rec_type {
+            RT_SLIDE_PERSIST_ATOM if rec.data.len() >= 4 => {
+                if let Some(persist_id_ref) = current_persist_id.take() {
+                    slides.push(resolve_slide(stream, dir, persist_id_ref, &outline_texts));
+                }
+                current_persist_id =
+                    Some(u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]));
+                outline_texts.clear();
+                current_type = TextType::Other;
+            },
+            RT_TEXT_HEADER if rec.data.len() >= 4 => {
+                let t = u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]);
+                current_type = TextType::from_u32(t);
+            },
+            RT_TEXT_CHARS => {
+                // Positional index into this list is meaningful (it's what
+                // OutlineTextRefAtom references) — an empty run still
+                // occupies a slot and must not be skipped here.
+                outline_texts.push(TextRun {
+                    text_type: current_type,
+                    text: decode_utf16le(&rec.data),
+                });
+            },
+            RT_TEXT_BYTES => {
+                outline_texts.push(TextRun {
+                    text_type: current_type,
+                    text: rec.data.iter().map(|&b| b as char).collect(),
+                });
+            },
+            _ => {},
         }
-        let persist_id_ref =
-            u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]);
-
-        let mut text_runs = Vec::new();
-        if let Some(offset) = dir.resolve(persist_id_ref) {
-            if let Some(children) = bounded_container_children(stream, offset, RT_SLIDE) {
-                extract_shape_text(&children, 0, &mut text_runs);
-            }
-        }
-
-        // Every persist-directory-resolved slide is kept regardless of
-        // whether text was found — an image-only slide is still a slide,
-        // and the presentation's true slide count matters for numbering.
-        slides.push(SlideText { text_runs });
+    }
+    if let Some(persist_id_ref) = current_persist_id.take() {
+        slides.push(resolve_slide(stream, dir, persist_id_ref, &outline_texts));
     }
 
     Some(slides)
 }
 
-/// Recursively collect `TextHeaderAtom` + `TextCharsAtom`/`TextBytesAtom`
-/// pairs from a bounded record region (a resolved `Slide`/`Notes`/`MainMaster`
-/// container's own children), in document order.
+/// Resolve one slide's shape text: locate its `Slide` container via the
+/// persist directory and walk its shape tree, resolving any
+/// `OutlineTextRefAtom` references against `outline_texts`.
+///
+/// Every persist-directory-resolved slide is kept regardless of whether text
+/// was found — an image-only slide is still a slide, and the presentation's
+/// true slide count matters for numbering.
+fn resolve_slide(
+    stream: &[u8],
+    dir: &PersistDirectory,
+    persist_id_ref: u32,
+    outline_texts: &[TextRun],
+) -> SlideText {
+    let mut text_runs = Vec::new();
+    if let Some(offset) = dir.resolve(persist_id_ref) {
+        if let Some(children) = bounded_container_children(stream, offset, RT_SLIDE) {
+            extract_shape_text(&children, 0, outline_texts, &mut text_runs);
+        }
+    }
+    SlideText { text_runs }
+}
+
+/// Recursively collect a shape tree's text, in document order, from a bounded
+/// record region (a resolved `Slide`/`Notes`/`MainMaster` container's own
+/// children).
+///
+/// Text comes from two places: `TextHeaderAtom` + `TextCharsAtom`/
+/// `TextBytesAtom` pairs embedded directly in a shape, or an
+/// `OutlineTextRefAtom` resolved against `outline_texts` (see
+/// [`extract_slides_via_persist`]) for shapes that store their text there
+/// instead. Pass `&[]` when no outline-text table applies (e.g. the
+/// no-persist-directory fallback).
 ///
 /// Bounded per [`RecordIter`]'s container semantics: a corrupted/oversized
 /// length on one shape can, at worst, truncate the remaining shapes within
 /// that *same* container — it can never affect anything outside the region
 /// this function was called with.
-fn extract_shape_text(data: &[u8], depth: usize, out: &mut Vec<TextRun>) {
+fn extract_shape_text(
+    data: &[u8],
+    depth: usize,
+    outline_texts: &[TextRun],
+    out: &mut Vec<TextRun>,
+) {
     if depth > MAX_SHAPE_DEPTH {
         return;
     }
@@ -167,8 +236,19 @@ fn extract_shape_text(data: &[u8], depth: usize, out: &mut Vec<TextRun>) {
                     });
                 }
             },
+            RT_OUTLINE_TEXT_REF_ATOM if rec.data.len() >= 4 => {
+                let index =
+                    i32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]);
+                if index >= 0 {
+                    if let Some(run) = outline_texts.get(index as usize) {
+                        if !run.text.is_empty() {
+                            out.push(run.clone());
+                        }
+                    }
+                }
+            },
             _ if rec.header.is_container() => {
-                extract_shape_text(&rec.data, depth + 1, out);
+                extract_shape_text(&rec.data, depth + 1, outline_texts, out);
             },
             _ => {},
         }
@@ -177,12 +257,11 @@ fn extract_shape_text(data: &[u8], depth: usize, out: &mut Vec<TextRun>) {
 
 /// Fallback used only when the persist directory can't be resolved at all:
 /// derive slide boundaries from a `SlideListWithText`'s own inline text cache
-/// — a `SlidePersistAtom` optionally followed directly by up to 8
-/// `TextHeaderAtom` + `TextCharsAtom`/`TextBytesAtom` pairs ([MS-PPT]
-/// 2.4.14.3). This cache is optional, capped, and not authoritative (the
-/// resolved `Slide` container is the source of truth) — real-world files
-/// routinely leave it empty, which is why this is a fallback and not the
-/// primary path.
+/// — a `SlidePersistAtom` followed directly by `TextHeaderAtom` +
+/// `TextCharsAtom`/`TextBytesAtom` pairs ([MS-PPT] 2.4.14.3). The resolved
+/// `Slide` container (primary path above) additionally resolves
+/// `OutlineTextRefAtom` indirection against this same sequence; this fallback
+/// is only reached when persist resolution isn't available at all.
 fn extract_slides_from_slide_list_cache(slide_list: &[u8]) -> Vec<SlideText> {
     let mut slides: Vec<SlideText> = Vec::new();
     let mut current: Option<SlideText> = None;
@@ -334,7 +413,7 @@ mod tests {
         // "Hi" in UTF-16LE
         stream.extend(make_atom(RT_TEXT_CHARS, 0, &[0x48, 0x00, 0x69, 0x00]));
         let mut runs = Vec::new();
-        extract_shape_text(&stream, 0, &mut runs);
+        extract_shape_text(&stream, 0, &[], &mut runs);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "Hi");
         assert_eq!(runs[0].text_type, TextType::Title);
@@ -345,7 +424,7 @@ mod tests {
         let mut stream = make_atom(RT_TEXT_HEADER, 0, &1u32.to_le_bytes()); // Body
         stream.extend(make_atom(RT_TEXT_BYTES, 0, b"Hello World"));
         let mut runs = Vec::new();
-        extract_shape_text(&stream, 0, &mut runs);
+        extract_shape_text(&stream, 0, &[], &mut runs);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "Hello World");
         assert_eq!(runs[0].text_type, TextType::Body);
@@ -358,7 +437,7 @@ mod tests {
         stream.extend(make_atom(RT_TEXT_HEADER, 0, &1u32.to_le_bytes()));
         stream.extend(make_atom(RT_TEXT_BYTES, 0, b"Body text"));
         let mut runs = Vec::new();
-        extract_shape_text(&stream, 0, &mut runs);
+        extract_shape_text(&stream, 0, &[], &mut runs);
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].text, "Title");
         assert_eq!(runs[1].text, "Body text");
@@ -375,7 +454,7 @@ mod tests {
         let shape = make_container(0xF004, 0, &textbox); // shape container
 
         let mut runs = Vec::new();
-        extract_shape_text(&shape, 0, &mut runs);
+        extract_shape_text(&shape, 0, &[], &mut runs);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "Nested");
     }
@@ -592,5 +671,99 @@ mod tests {
             slides[0].text_runs[0].text, "REAL SLIDE TEXT",
             "a corrupted record's length must not prevent later real content from being found"
         );
+    }
+
+    #[test]
+    fn outline_text_ref_atom_resolves_indexed_placeholder_text() {
+        // A shape whose ClientTextbox holds only an OutlineTextRefAtom
+        // (index 1) instead of embedding its own TextHeaderAtom/TextChars —
+        // the placeholder-text-by-reference pattern real PPT97 title/body
+        // placeholders commonly use ([MS-PPT] 2.4.15.6).
+        let outline_texts = vec![
+            TextRun {
+                text_type: TextType::Title,
+                text: "first".into(),
+            },
+            TextRun {
+                text_type: TextType::Body,
+                text: "second".into(),
+            },
+        ];
+
+        let mut index_bytes = Vec::new();
+        index_bytes.extend_from_slice(&1i32.to_le_bytes());
+        let outline_ref = make_atom(RT_OUTLINE_TEXT_REF_ATOM, 0, &index_bytes);
+        let textbox = make_container(0xF00D, 0, &outline_ref);
+        let shape = make_container(0xF004, 0, &textbox);
+
+        let mut runs = Vec::new();
+        extract_shape_text(&shape, 0, &outline_texts, &mut runs);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "second");
+        assert_eq!(runs[0].text_type, TextType::Body);
+    }
+
+    #[test]
+    fn persist_resolution_follows_outline_text_ref_atom() {
+        // A Slide container whose only shape holds an OutlineTextRefAtom, with
+        // the actual text living in the SlideListWithText's per-slide outline
+        // cache rather than embedded in the shape itself.
+        let mut stream = Vec::new();
+
+        let doc_offset = stream.len() as u32;
+        let mut slide_list_children = slide_persist_atom_bytes(2, 256);
+        slide_list_children.extend(make_atom(RT_TEXT_HEADER, 0, &0u32.to_le_bytes()));
+        slide_list_children.extend(make_atom(RT_TEXT_BYTES, 0, b"OUTLINE-REFERENCED TEXT"));
+        let slide_list = make_container(RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES, &slide_list_children);
+        stream.extend(make_container(RT_DOCUMENT, 0, &slide_list));
+
+        let real_slide_offset = stream.len() as u32;
+        let mut index_bytes = Vec::new();
+        index_bytes.extend_from_slice(&0i32.to_le_bytes());
+        let outline_ref = make_atom(RT_OUTLINE_TEXT_REF_ATOM, 0, &index_bytes);
+        let textbox = make_container(0xF00D, 0, &outline_ref);
+        let shape = make_container(0xF004, 0, &textbox);
+        stream.extend(make_container(RT_SLIDE, 0, &shape));
+
+        let pd_offset = stream.len() as u32;
+        stream.extend(persist_directory_bytes(&[(1, doc_offset), (2, real_slide_offset)]));
+        let edit_offset = stream.len() as u32;
+        stream.extend(user_edit_atom_bytes(0, pd_offset, 1));
+        let current_user = current_user_bytes(edit_offset);
+
+        let slides = extract_slides_text(&stream, Some(&current_user));
+        assert_eq!(slides.len(), 1);
+        assert_eq!(slides[0].text_runs[0].text, "OUTLINE-REFERENCED TEXT");
+    }
+
+    #[test]
+    fn falls_back_to_inline_cache_when_persist_resolved_slides_are_all_textless() {
+        // Persist resolution structurally succeeds (valid directory, valid
+        // Slide offset) but the resolved Slide container has no extractable
+        // text at all — as happens when directory corruption points at the
+        // wrong offset. The SlideListWithText's own inline cache does have
+        // real text, so it must be used instead of returning nothing.
+        let mut stream = Vec::new();
+
+        let doc_offset = stream.len() as u32;
+        let mut slide_list_children = slide_persist_atom_bytes(2, 256);
+        slide_list_children.extend(make_atom(RT_TEXT_HEADER, 0, &0u32.to_le_bytes()));
+        slide_list_children.extend(make_atom(RT_TEXT_BYTES, 0, b"FALLBACK CACHE TEXT"));
+        let slide_list = make_container(RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES, &slide_list_children);
+        stream.extend(make_container(RT_DOCUMENT, 0, &slide_list));
+
+        // A resolvable but genuinely empty Slide container (no shapes at all).
+        let real_slide_offset = stream.len() as u32;
+        stream.extend(make_container(RT_SLIDE, 0, &[]));
+
+        let pd_offset = stream.len() as u32;
+        stream.extend(persist_directory_bytes(&[(1, doc_offset), (2, real_slide_offset)]));
+        let edit_offset = stream.len() as u32;
+        stream.extend(user_edit_atom_bytes(0, pd_offset, 1));
+        let current_user = current_user_bytes(edit_offset);
+
+        let slides = extract_slides_text(&stream, Some(&current_user));
+        assert_eq!(slides.len(), 1);
+        assert_eq!(slides[0].text_runs[0].text, "FALLBACK CACHE TEXT");
     }
 }
