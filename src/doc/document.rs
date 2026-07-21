@@ -105,12 +105,14 @@ impl DocDocument {
         &self.images
     }
 
-    /// Get the extracted plain text.
+    /// Get the extracted plain text. Picture markers (U+FFFC) are removed.
     pub fn plain_text(&self) -> String {
-        self.text.clone()
+        self.text.replace('\u{FFFC}', "")
     }
 
-    /// Get a reference to the extracted plain text.
+    /// Get a reference to the extracted plain text. Retains U+FFFC picture
+    /// markers (used by the IR conversion to position images); the public
+    /// plain_text()/to_markdown() getters strip them.
     pub fn plain_text_ref(&self) -> &str {
         &self.text
     }
@@ -120,7 +122,8 @@ impl DocDocument {
         let mut result = String::new();
         let mut prev_empty = false;
 
-        for line in self.text.lines() {
+        let clean = self.text.replace('\u{FFFC}', "");
+        for line in clean.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 if !prev_empty {

@@ -210,7 +210,11 @@ pub fn sanitize_text(text: &str) -> String {
             '\x07' => result.push('\t'),                      // Cell/row mark → tab
             '\x0C' => result.push('\n'),                      // Page break / section break
             '\x0B' => result.push('\n'),                      // Vertical tab → newline
-            '\x01' | '\x08' | '\x13' | '\x14' | '\x15' => {}, // Field codes, picture, etc. — skip
+            // Picture / embedded-object placeholder: keep it as U+FFFC (OBJECT
+            // REPLACEMENT CHARACTER) so downstream conversion knows where images
+            // sit in the text flow. Plain-text / markdown getters strip it.
+            '\x01' => result.push('\u{FFFC}'),
+            '\x08' | '\x13' | '\x14' | '\x15' => {}, // Field codes — skip
             _ => result.push(ch),
         }
     }
