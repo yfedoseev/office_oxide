@@ -197,6 +197,7 @@ fn parse_auto_shape(
     let mut position = None;
     let mut text_body = None;
     let mut placeholder = None;
+    let mut hidden = false;
 
     loop {
         match reader.read_event()? {
@@ -207,6 +208,7 @@ fn parse_auto_shape(
                     name = props.1;
                     alt_text = props.2;
                     placeholder = props.3;
+                    hidden = props.4;
                 },
                 b"spPr" => {
                     position = parse_shape_properties(reader)?;
@@ -233,6 +235,7 @@ fn parse_auto_shape(
         position,
         text_body,
         placeholder,
+        hidden,
     }))
 }
 
@@ -249,6 +252,7 @@ fn parse_picture(
     let mut alt_text = None;
     let mut position = None;
     let mut embed_rid: Option<String> = None;
+    let mut hidden = false;
 
     loop {
         match reader.read_event()? {
@@ -258,6 +262,7 @@ fn parse_picture(
                     id = props.0;
                     name = props.1;
                     alt_text = props.2;
+                    hidden = props.3;
                 },
                 b"blipFill" => {
                     embed_rid = parse_blip_fill_embed(reader)?;
@@ -290,6 +295,7 @@ fn parse_picture(
         embed_rid,
         data,
         format,
+        hidden,
     }))
 }
 
@@ -541,11 +547,12 @@ fn parse_connector(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Shape> {
 /// ```
 fn parse_nv_common_props(
     reader: &mut quick_xml::Reader<&[u8]>,
-) -> CoreResult<(u32, String, Option<String>, Option<PlaceholderInfo>)> {
+) -> CoreResult<(u32, String, Option<String>, Option<PlaceholderInfo>, bool)> {
     let mut id = 0u32;
     let mut name = String::new();
     let mut alt_text = None;
     let mut placeholder = None;
+    let mut hidden = false;
 
     loop {
         match reader.read_event()? {
@@ -560,6 +567,7 @@ fn parse_nv_common_props(
                                 .map(|v| v.into_owned())
                                 .unwrap_or_default();
                             alt_text = xml::optional_attr_str(e, b"descr")?.map(|v| v.into_owned());
+                            hidden = attr_is_true(e, b"hidden")?;
                             xml::skip_element_fast(reader)?;
                         },
                         // p:nvPr contains p:ph — don't skip, keep parsing
@@ -579,6 +587,7 @@ fn parse_nv_common_props(
                         .map(|v| v.into_owned())
                         .unwrap_or_default();
                     alt_text = xml::optional_attr_str(e, b"descr")?.map(|v| v.into_owned());
+                    hidden = attr_is_true(e, b"hidden")?;
                 },
                 b"ph" => {
                     placeholder = Some(PlaceholderInfo {
@@ -596,16 +605,27 @@ fn parse_nv_common_props(
         }
     }
 
-    Ok((id, name, alt_text, placeholder))
+    Ok((id, name, alt_text, placeholder, hidden))
 }
 
-/// Parse `p:nvPicPr` → (id, name, alt_text)
+/// Read an OOXML boolean attribute (`xsd:boolean`: `1`/`true`/`on` = true),
+/// defaulting to `false` when the attribute is absent. Used for
+/// `<p:cNvPr hidden="…">`, where — unlike a toggle element — a missing
+/// attribute means "not hidden".
+fn attr_is_true(e: &quick_xml::events::BytesStart, name: &[u8]) -> CoreResult<bool> {
+    Ok(xml::optional_attr_str(e, name)?
+        .map(|v| matches!(v.as_ref(), "1" | "true" | "on"))
+        .unwrap_or(false))
+}
+
+/// Parse `p:nvPicPr` → (id, name, alt_text, hidden)
 fn parse_nv_pic_props(
     reader: &mut quick_xml::Reader<&[u8]>,
-) -> CoreResult<(u32, String, Option<String>)> {
+) -> CoreResult<(u32, String, Option<String>, bool)> {
     let mut id = 0u32;
     let mut name = String::new();
     let mut alt_text = None;
+    let mut hidden = false;
 
     loop {
         match reader.read_event()? {
@@ -617,6 +637,7 @@ fn parse_nv_pic_props(
                     .map(|v| v.into_owned())
                     .unwrap_or_default();
                 alt_text = xml::optional_attr_str(e, b"descr")?.map(|v| v.into_owned());
+                hidden = attr_is_true(e, b"hidden")?;
             },
             Event::End(ref e) if e.local_name().as_ref() == b"nvPicPr" => {
                 break;
@@ -626,7 +647,7 @@ fn parse_nv_pic_props(
         }
     }
 
-    Ok((id, name, alt_text))
+    Ok((id, name, alt_text, hidden))
 }
 
 /// Parse `p:nvGrpSpPr` → (id, name)

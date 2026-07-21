@@ -28,6 +28,10 @@ pub struct AutoShape {
     pub text_body: Option<TextBody>,
     /// Placeholder role, if this shape is a slide placeholder.
     pub placeholder: Option<PlaceholderInfo>,
+    /// `true` when `<p:cNvPr hidden="1">` marks the shape as not rendered.
+    /// Such shapes (e.g. off-slide fingerprint/watermark text boxes) must be
+    /// omitted from output, exactly as PowerPoint hides them.
+    pub hidden: bool,
 }
 
 /// An image or picture shape (`<p:pic>`).
@@ -49,6 +53,8 @@ pub struct PictureShape {
     /// Image format inferred from the relationship target extension or
     /// byte signature (e.g. `"png"`, `"jpeg"`, `"gif"`, `"emf"`).
     pub format: Option<String>,
+    /// `true` when `<p:cNvPr hidden="1">` marks the picture as not rendered.
+    pub hidden: bool,
 }
 
 /// A group of child shapes (`<p:grpSp>`).

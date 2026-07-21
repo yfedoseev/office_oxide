@@ -140,10 +140,11 @@ fn find_title(shapes: &[crate::pptx::Shape]) -> Option<(String, Option<Paragraph
     for shape in shapes {
         match shape {
             crate::pptx::Shape::AutoShape(auto)
-                if auto
-                    .placeholder
-                    .as_ref()
-                    .is_some_and(|ph| is_title_placeholder(ph.ph_type.as_deref())) =>
+                if !auto.hidden
+                    && auto
+                        .placeholder
+                        .as_ref()
+                        .is_some_and(|ph| is_title_placeholder(ph.ph_type.as_deref())) =>
             {
                 if let Some(ref tb) = auto.text_body {
                     let text = plain_text_from_body(tb);
@@ -183,6 +184,12 @@ fn plain_text_from_body(body: &crate::pptx::TextBody) -> String {
 fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
     match shape {
         crate::pptx::Shape::AutoShape(auto) => {
+            // Skip shapes PowerPoint hides (`<p:cNvPr hidden="1">`), e.g. off-slide
+            // fingerprint/watermark text boxes — they aren't part of the visible
+            // presentation and would otherwise leak into the text preview.
+            if auto.hidden {
+                return;
+            }
             // Skip title placeholder — used as section title
             if auto
                 .placeholder
@@ -202,6 +209,9 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
             }
         },
         crate::pptx::Shape::Picture(pic) => {
+            if pic.hidden {
+                return;
+            }
             // Carry the resolved media bytes through so the PDF renderer
             // (`render_pptx_textbox_content`) can paint the actual
             // picture at its shape rectangle. `embed_rid` is preserved

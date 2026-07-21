@@ -463,6 +463,7 @@ mod tests {
                 }],
             }),
             placeholder: None,
+            hidden: false,
         })
     }
 
@@ -497,6 +498,7 @@ mod tests {
                 ph_type: Some("title".to_string()),
                 idx: Some(0),
             }),
+            hidden: false,
         })
     }
 
@@ -621,6 +623,7 @@ mod tests {
                     }],
                 }),
                 placeholder: None,
+                hidden: false,
             })],
             notes: None,
             background_rgb: None,
@@ -803,6 +806,7 @@ mod tests {
                     }],
                 }),
                 placeholder: None,
+                hidden: false,
             })],
             notes: None,
             background_rgb: None,
