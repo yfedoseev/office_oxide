@@ -34,7 +34,8 @@ impl PptDocument {
             },
         };
 
-        let slides = extract_slides_text(&stream);
+        let current_user = cfb.open_stream("Current User").ok();
+        let slides = extract_slides_text(&stream, current_user.as_deref());
 
         // Extract images from Pictures stream (if present).
         let images = match cfb.open_stream("Pictures") {

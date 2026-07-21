@@ -12,6 +12,7 @@
 mod document;
 mod error;
 pub mod images;
+mod persist;
 mod records;
 mod text;
 
