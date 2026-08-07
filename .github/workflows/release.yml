@@ -702,13 +702,17 @@ jobs:
         with:
           name: native-linux-x86_64
           path: release-assets
-      - name: Stage the native-linux-x86_64 archive where the installer expects it
+      - name: Stage the native-linux-x86_64 archive under its published name
         run: |
           set -euo pipefail
           VERSION="${{ needs.validate.outputs.version }}"
           mkdir -p /tmp/simulated-releases/v${VERSION}
+          # Serve the artifact under exactly the name create-release publishes.
+          # This step used to rename it to native-linux-x86_64-${VERSION}.tar.gz
+          # to match the URL the installer built, which meant the fixture agreed
+          # with the bug and the job passed against a filename no release has.
           cp release-assets/native-linux-x86_64.tar.gz \
-             /tmp/simulated-releases/v${VERSION}/native-linux-x86_64-${VERSION}.tar.gz
+             /tmp/simulated-releases/v${VERSION}/native-linux-x86_64.tar.gz
       - name: Serve the archive via a local HTTP server + patch the installer URL
         run: |
           set -euo pipefail

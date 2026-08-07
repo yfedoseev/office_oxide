@@ -82,7 +82,11 @@ func main() {
 	if runtime.GOOS == "windows" {
 		ext = ".zip"
 	}
-	url := fmt.Sprintf("%s/v%s/%s-%s%s", releaseBase, version, tgt.assetBase, version, ext)
+	// The version appears in the tag directory only. Release assets are named
+	// `native-<os>-<arch>.<ext>` — tgt.assetBase is already the full published
+	// name, so interpolating the version into the filename too asks for an
+	// asset no release contains.
+	url := fmt.Sprintf("%s/v%s/%s%s", releaseBase, version, tgt.assetBase, ext)
 	fmt.Fprintf(os.Stderr, "Fetching %s\n", url)
 
 	body, err := httpGet(url)
