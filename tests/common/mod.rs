@@ -39,6 +39,18 @@ pub fn prose_grpprl() -> Vec<u8> {
     Vec::new()
 }
 
+/// List-item grpprl: `sprmPIlvl` (0x260A, 1-byte operand) — the MS-DOC-correct
+/// opcode (not 0x460B, which is `sprmPIlfo`).
+///
+/// The walker groups a paragraph into a list when `ilvl` is set and `ilfo`
+/// is not the `2047` "not in any list" sentinel; a `None` `ilfo` (which is
+/// what a bare `sprmPIlvl` yields here) satisfies that, so emitting only the
+/// level SPRM is sufficient and keeps the `grpprl` byte-aligned.
+#[allow(dead_code)]
+pub fn list_grpprl(ilvl: u8) -> Vec<u8> {
+    vec![0x0A, 0x26, ilvl]
+}
+
 /// Cell paragraph grpprl: `sprmPFInTable` (0x2416)=1, `sprmPItap` (0x6649)=1.
 #[allow(dead_code)]
 pub fn cell_grpprl() -> Vec<u8> {

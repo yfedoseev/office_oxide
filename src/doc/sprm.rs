@@ -25,7 +25,7 @@
 //! list/tab-stop PR, not here. The fixtures pass either way only because their
 //! `cb < 256`, so a ≥12-column table is what exposes the difference.
 
-use crate::ir::TabStop;
+use crate::ir::{TabAlignment, TabLeader, TabStop};
 
 /// A single decoded SPRM: opcode plus its operand bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +80,32 @@ fn is_two_byte_len_prefix(opcode: u16) -> bool {
     opcode == 0xD608
 }
 
+/// `sprmPChgTabsPapx` (`0xC60D`) carries **no** length prefix; its operand
+/// length is derived from the structure's own `cDel` / `cAdd` fields (see
+/// `pchg_tabs_operand_len`). `sprmPChgTabs` (`0xC615`) is *not* matched here:
+/// it carries a 1-byte `cb` (with a `255` escape) and is handled by its own
+/// branch in `parse_grpprl`.
+fn is_pchg_tabs_papx(opcode: u16) -> bool {
+    opcode == 0xC60D
+}
+
+/// Length of a `PChgTabsOperand` (the operand of `sprmPChgTabs` /
+/// `sprmPChgTabsPapx`) beginning at `start`: `cDel` (1 byte) + `4*cDel`
+/// (rgdxaDel + rgdxaClose) + `cAdd` (1 byte) + `2*cAdd` (rgdxaAdd) +
+/// `cAdd` (rgtbdAdd) = `2 + 4*cDel + 3*cAdd`.
+fn pchg_tabs_operand_len(grpprl: &[u8], start: usize) -> usize {
+    if start >= grpprl.len() {
+        return 0;
+    }
+    let c_del = grpprl[start] as usize;
+    let add_pos = start + 1 + 4 * c_del;
+    if add_pos >= grpprl.len() {
+        return grpprl.len() - start;
+    }
+    let c_add = grpprl[add_pos] as usize;
+    1 + 4 * c_del + 1 + 3 * c_add
+}
+
 /// Walk a `grpprl` and decode every SPRM it contains.
 ///
 /// Truncated operands are returned with whatever bytes remain; a truncated
@@ -111,6 +137,39 @@ pub fn parse_grpprl(grpprl: &[u8]) -> Vec<Sprm> {
                     let start = p + 4;
                     let end = (start + cb.saturating_sub(1)).min(len);
                     (grpprl[start..end].to_vec(), start + cb.saturating_sub(1))
+                } else if opcode == 0xC615 {
+                    // sprmPChgTabs: a **1-byte** `cb` length prefix (NOT the
+                    // 2-byte `cb` of `sprmTDefTable`, and NOT no-prefix like
+                    // `sprmPChgTabsPapx`). Per [MS-DOC] §2.9.182 the operand is a
+                    // `PChgTabsOperand` whose byte length is normally the literal
+                    // `cb` read at `p + 2`. The single escape value `cb == 255`
+                    // does not mean 255 bytes; it means the length is instead
+                    // derived from the payload's own `cDel` / `cAdd` counts (see
+                    // `pchg_tabs_operand_len`). The 1-byte `cb` is always
+                    // consumed; the operand starts at `p + 3` either way.
+                    if p + 3 > len {
+                        break;
+                    }
+                    let cb = grpprl[p + 2] as usize;
+                    let start = p + 3;
+                    let n = if cb == 255 {
+                        pchg_tabs_operand_len(grpprl, start)
+                    } else {
+                        cb
+                    };
+                    let end = (start + n).min(len);
+                    (grpprl[start..end].to_vec(), start + n)
+                } else if is_pchg_tabs_papx(opcode) {
+                    // sprmPChgTabsPapx (0xC60D): no length prefix; the operand
+                    // length is derived from its own `cDel` / `cAdd` (see
+                    // `pchg_tabs_operand_len`).
+                    let start = p + 2;
+                    if start >= len {
+                        break;
+                    }
+                    let n = pchg_tabs_operand_len(grpprl, start);
+                    let end = (start + n).min(len);
+                    (grpprl[start..end].to_vec(), start + n)
                 } else {
                     if p + 3 > len {
                         // Length prefix itself is truncated — stop.
@@ -132,7 +191,7 @@ pub fn parse_grpprl(grpprl: &[u8]) -> Vec<Sprm> {
 
 /// Paragraph-property flags distilled from a PAP grpprl.
 ///
-/// Only the SPRMs needed for table reconstruction are tracked; every
+/// Only the SPRMs needed for table / list reconstruction are tracked; every
 /// other SPRM is walked over and discarded.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PapProps {
@@ -144,6 +203,12 @@ pub struct PapProps {
     pub is_table_trailing_mark: bool,
     /// `sprmPItap` (0x6649): table nesting depth (1 = top-level table).
     pub itap: u8,
+    /// List level (0-based) when the paragraph is a list item. `None` when
+    /// the paragraph carries no list SPRM. (Reserved for list support; the
+    /// `table.doc` fixture has no in-body lists to verify this against.)
+    pub ilvl: Option<u8>,
+    /// List format override id (`ilfo`). `None` when absent.
+    pub ilfo: Option<u32>,
     /// Parsed row definition (`sprmTDefTable` operand) for row-terminator
     /// paragraphs. `None` when the paragraph is not a row mark or the TAP
     /// is malformed.
@@ -219,6 +284,88 @@ pub fn parse_tdef_table(operand: &[u8]) -> Option<TapInfo> {
     })
 }
 
+/// Decode a `sprmPChgTabs` (`0xC615`) / `sprmPChgTabsPapx` (`0xC60D`) operand
+/// into tab stops, returning the *effective* (added) stops.
+///
+/// Both use the modern `PChgTabsOperand` (per [MS-DOC] §2.9.182): a
+/// `PchgTabsDelClose` list (tabs to ignore) followed by a `PchgTabsAdd` list
+/// (tabs to add). Positions are 16-bit signed twips; the `TBD` descriptor
+/// (§2.9.310) is 1 byte carrying `jc` (bits 0..2, justification) and `tlc`
+/// (bits 3..5, leader). By the time `parse_grpprl` hands the operand here, any
+/// length prefix has already been stripped: `0xC615` flows through the 1-byte
+/// `cb` branch (with the `255` escape handled by `pchg_tabs_operand_len`) and
+/// `0xC60D` through the no-prefix branch, so `operand` is always the raw
+/// structure body.
+///
+/// Malformed input yields an empty vector rather than panicking — tab stops
+/// are formatting metadata, so a bad operand degrades to "no tabs" instead of
+/// corrupting the paragraph.
+pub fn decode_pchg_tabs(opcode: u16, operand: &[u8]) -> Vec<TabStop> {
+    match opcode {
+        0xC615 | 0xC60D => decode_pchg_tabs_operand(operand),
+        _ => Vec::new(),
+    }
+}
+
+/// `PChgTabsOperand` (sprmPChgTabs 0xC615): `PchgTabsDelClose` then `PchgTabsAdd`.
+fn decode_pchg_tabs_operand(operand: &[u8]) -> Vec<TabStop> {
+    let mut tabs = Vec::new();
+    // PchgTabsDelClose (§2.9.181): cTabs (u8), rgdxaDel (cTabs × 2 bytes),
+    // rgdxaClose (cTabs × 2 bytes). Skip the whole block to reach PchgTabsAdd.
+    let Some(c_del) = operand.first().copied() else {
+        return tabs;
+    };
+    let mut pos = 1 + (c_del as usize).saturating_mul(4);
+    // PchgTabsAdd (§2.9.180): cTabs (u8), rgdxaAdd (cTabs × 2-byte XAS),
+    // rgtbdAdd (cTabs × 1-byte TBD).
+    let Some(c_add) = operand.get(pos).copied() else {
+        return tabs;
+    };
+    pos += 1;
+    let positions_base = pos;
+    let tbd_base = pos + (c_add as usize).saturating_mul(2);
+    for i in 0..c_add {
+        let xas_at = positions_base + 2 * i as usize;
+        if xas_at + 2 > operand.len() {
+            break;
+        }
+        let dxp = i16::from_le_bytes([operand[xas_at], operand[xas_at + 1]]) as i32;
+        let tbd_at = tbd_base + i as usize;
+        if tbd_at >= operand.len() {
+            break;
+        }
+        tabs.push(tab_from_tbd(dxp, operand[tbd_at]));
+    }
+    tabs
+}
+
+/// Build a `TabStop` from a twips position and a 1-byte `TBD` descriptor
+/// (`jc` in bits 0..2, `tlc` in bits 3..5).
+fn tab_from_tbd(position_twips: i32, tbd: u8) -> TabStop {
+    let jc = tbd & 0x7;
+    let tlc = (tbd >> 3) & 0x7;
+    TabStop {
+        position_twips,
+        alignment: match jc {
+            0 => TabAlignment::Left,
+            1 => TabAlignment::Center,
+            2 => TabAlignment::Right,
+            3 => TabAlignment::Decimal,
+            4 => TabAlignment::Bar,
+            _ => TabAlignment::Left,
+        },
+        leader: match tlc {
+            0 => TabLeader::None,
+            1 => TabLeader::Dot,
+            2 => TabLeader::Hyphen,
+            3 => TabLeader::Underscore,
+            4 => TabLeader::Heavy,
+            5 => TabLeader::MiddleDot,
+            _ => TabLeader::None,
+        },
+    }
+}
+
 /// Decode a PAP `grpprl` into the paragraph flags we care about.
 ///
 /// Unknown SPRMs are ignored. An empty `grpprl` yields the default
@@ -251,6 +398,25 @@ pub fn extract_pap_props(grpprl: &[u8]) -> PapProps {
             0xD608 => {
                 props.is_table_trailing_mark = true;
                 props.tap = parse_tdef_table(&sprm.operand);
+            },
+            // sprmPIlfo (0x460B) — 2-byte operand, the list format override id.
+            0x460B => {
+                if sprm.operand.len() >= 2 {
+                    props.ilfo =
+                        Some(u16::from_le_bytes([sprm.operand[0], sprm.operand[1]]) as u32);
+                }
+            },
+            // sprmPIlvl (0x260A) — 1-byte operand, the list level (0-based).
+            0x260A => {
+                if let Some(&b) = sprm.operand.first() {
+                    props.ilvl = Some(b);
+                }
+            },
+            // sprmPChgTabs (0xC615) / sprmPChgTabsPapx (0xC60D): tab stops.
+            0xC615 | 0xC60D => {
+                if !sprm.operand.is_empty() {
+                    props.tabs = decode_pchg_tabs(sprm.opcode, &sprm.operand);
+                }
             },
             _ => {},
         }
@@ -388,7 +554,39 @@ mod tests {
         assert!(!props.f_in_table);
         assert!(!props.is_table_trailing_mark);
         assert_eq!(props.itap, 0);
+        assert!(props.ilvl.is_none());
+        assert!(props.ilfo.is_none());
         assert!(props.tap.is_none());
+    }
+
+    #[test]
+    fn decodes_pchg_tabs_new_stops() {
+        // PChgTabsOperand (0xC615): PchgTabsDelClose (cDel=0) then PchgTabsAdd
+        // (cAdd=2). Positions are 2-byte XAS (signed twips); each TBD is 1
+        // byte with `jc` in bits 0..2. new[0]: jc=2 (Right), pos=2000;
+        // new[1]: jc=1 (Center), pos=1000.
+        let mut operand = vec![0x00]; // cDel = 0 (no deletes)
+        operand.push(2); // cAdd = 2
+        operand.extend_from_slice(&[0xD0, 0x07]); // rgdxaAdd[0] = 2000
+        operand.extend_from_slice(&[0xE8, 0x03]); // rgdxaAdd[1] = 1000
+        operand.push(0x02); // rgtbdAdd[0]: jc=2 (Right)
+        operand.push(0x01); // rgtbdAdd[1]: jc=1 (Center)
+
+        let tabs = decode_pchg_tabs(0xC615, &operand);
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].position_twips, 2000);
+        assert_eq!(tabs[0].alignment, TabAlignment::Right);
+        assert_eq!(tabs[1].position_twips, 1000);
+        assert_eq!(tabs[1].alignment, TabAlignment::Center);
+    }
+
+    #[test]
+    fn pchg_tabs_malformed_operand_is_empty() {
+        // Truncated operand: cDel=2 but no rgdxaDel/rgdxaClose bytes, so the
+        // Add list is unreachable — must degrade to empty, not panic.
+        assert!(decode_pchg_tabs(0xC615, &[0x02]).is_empty());
+        // PchgTabsPapx: cDel=2 but no following bytes.
+        assert!(decode_pchg_tabs(0xC60D, &[0x02, 0x00]).is_empty());
     }
 
     fn hex(s: &str) -> Vec<u8> {
@@ -463,5 +661,169 @@ mod tests {
         };
         assert_eq!(tdef.spra(), 6); // variable
         assert_eq!(tdef.sgc(), 5); // TAP
+    }
+
+    // --------------------------------------------------------------------
+    // Regression tests for the opcode-identity defects in `extract_pap_props`
+    // (PR #116 blind review). Every fixture uses the opcode *as Word writes it
+    // per [MS-DOC]*, not the project's own constants, so the tests fail while
+    // the decoder mislabels opcodes and turn green once dispatch is corrected.
+    // --------------------------------------------------------------------
+
+    /// `0x460B` is `sprmPIlfo` (2-byte operand). The decoder must populate
+    /// `ilfo`. Today it is dispatched as `sprmPIlvl`, so `ilfo` stays `None`.
+    #[test]
+    fn sprm_pilfo_opcode_460b_populates_ilfo() {
+        // sprmPIlfo (0x460B), operand = 0x0005 (ilfo index 5).
+        let grpprl = [0x0B, 0x46, 0x05, 0x00];
+        let props = extract_pap_props(&grpprl);
+        assert_eq!(props.ilfo, Some(5), "0x460B is sprmPIlfo: must set ilfo");
+        assert_eq!(props.ilvl, None, "0x460B must not be read as ilvl");
+    }
+
+    /// `0x260A` is `sprmPIlvl` (1-byte operand). The decoder must populate
+    /// `ilvl`. Today it is never read (falls through to `_`).
+    #[test]
+    fn sprm_pilvl_opcode_260a_populates_ilvl() {
+        // sprmPIlvl (0x260A), operand = 0x01 (level 1).
+        let grpprl = [0x0A, 0x26, 0x01];
+        let props = extract_pap_props(&grpprl);
+        assert_eq!(props.ilvl, Some(1), "0x260A is sprmPIlvl: must set ilvl");
+    }
+
+    /// `0xC615` is `sprmPChgTabs`. The decoder must populate tab stops from it.
+    #[test]
+    fn sprm_pchg_tabs_opcode_c615_populates_tabs() {
+        // Per [MS-DOC] §2.9.182 the operand is a `PChgTabsOperand`:
+        // `PchgTabsDelClose` (cDel, then 4 bytes per delete) followed by
+        // `PchgTabsAdd` (cAdd, then 2-byte positions + 1-byte TBD per add).
+        // `0xC615` carries a **1-byte** `cb` (not the 2-byte `cb` of 0xD608), so
+        // the grpprl layout is opcode(2) + cb(1) + body(cb bytes).
+        //
+        // The fixture uses cDel = 1 (one delete entry) on purpose: a 1-byte-cb
+        // off-by-one that shifted the operand by one byte would misread `cDel`
+        // and land the add list at the wrong offset, so only a non-zero `cDel`
+        // exposes the bug. cAdd = 2; positions 2000 & 1000, TBD jc=2 / jc=1.
+        let body: Vec<u8> = vec![
+            1, // cDel = 1 (one delete entry — exercises the skip)
+            0x00, 0x00, // rgdxaDel[0]
+            0x00, 0x00, // rgdxaClose[0]
+            2,    // cAdd = 2
+            0xD0, 0x07, // rgdxaAdd[0] = 2000
+            0xE8, 0x03, // rgdxaAdd[1] = 1000
+            0x02, // rgtbdAdd[0]: jc=2 (Right)
+            0x01, // rgtbdAdd[1]: jc=1 (Center)
+        ];
+        let cb = body.len() as u8; // 1-byte cb = body length
+        let mut grpprl = vec![0x15, 0xC6]; // sprmPChgTabs (0xC615)
+        grpprl.push(cb);
+        grpprl.extend_from_slice(&body);
+
+        let props = extract_pap_props(&grpprl);
+        assert!(!props.tabs.is_empty(), "0xC615 is sprmPChgTabs: must populate tabs");
+        assert_eq!(props.tabs.len(), 2, "cDel must be skipped, cAdd=2 adds remain");
+        assert_eq!(props.tabs[0].position_twips, 2000);
+        assert_eq!(props.tabs[0].alignment, TabAlignment::Right);
+        assert_eq!(props.tabs[1].position_twips, 1000);
+        assert_eq!(props.tabs[1].alignment, TabAlignment::Center);
+    }
+
+    /// `0xC615` in the `cb == 255` escape form: the literal byte count is not
+    /// 255, the length is derived from the payload's own `cDel`/`cAdd`. A naive
+    /// "255-byte operand" read would overrun and desync the rest of the grpprl;
+    /// the byte-level round trip must reproduce the input exactly.
+    #[test]
+    fn sprm_pchg_tabs_c615_cb_255_escape_round_trips() {
+        // cDel = 1 (delete block = 1 + 4*1 = 5 bytes), cAdd = 2 (add block =
+        // 1 + 2*2 + 2 = 7 bytes). Total body = 12 bytes.
+        let body: Vec<u8> = vec![
+            1, 0x00, 0x00, 0x00, 0x00, // PchgTabsDelClose: cDel=1 + 4 bytes
+            2, 0x64, 0x00, 0xC8, 0x00, 0x03, 0x01, // PchgTabsAdd: cAdd=2 + positions + TBDs
+        ];
+        let mut grpprl = vec![0x15, 0xC6, 0xFF]; // opcode + cb == 255 escape
+        grpprl.extend_from_slice(&body);
+
+        let sprms = parse_grpprl(&grpprl);
+        assert_eq!(sprms.len(), 1, "must decode exactly one SPRM");
+        let s = &sprms[0];
+        assert_eq!(s.opcode, 0xC615);
+        // The 1-byte cb (0xFF) is consumed; operand is the raw body.
+        assert_eq!(s.operand, body, "operand must be the body without the cb");
+
+        // Round-trip: rebuild the grpprl from the walked SPRM.
+        let rebuilt = {
+            let mut v = vec![(s.opcode & 0xFF) as u8, (s.opcode >> 8) as u8];
+            v.push(0xFF); // cb escape
+            v.extend_from_slice(&s.operand);
+            v
+        };
+        assert_eq!(rebuilt, grpprl, "walker must consume every byte exactly");
+
+        let props = extract_pap_props(&grpprl);
+        assert_eq!(props.tabs.len(), 2);
+        assert_eq!(props.tabs[0].position_twips, 100); // 0x64
+        assert_eq!(props.tabs[1].position_twips, 200); // 0xC8
+    }
+
+    /// `0xC60D` (`sprmPChgTabsPapx`) carries no length prefix; the operand is a
+    /// `PChgTabsOperand` whose length is derived from `cDel`/`cAdd`. It must
+    /// populate tab stops with a 1-byte-cb-style body that is NOT prefixed.
+    #[test]
+    fn sprm_pchg_tabs_papx_c60d_populates_tabs() {
+        // No length prefix: opcode(2) + PChgTabsOperand directly. cDel=1, cAdd=2.
+        let body: Vec<u8> = vec![
+            1, 0x00, 0x00, 0x00, 0x00, // PchgTabsDelClose: cDel=1 + 4 bytes
+            2, 0xD0, 0x07, 0xE8, 0x03, 0x02, 0x01, // PchgTabsAdd: cAdd=2 + positions + TBDs
+        ];
+        let mut grpprl = vec![0x0D, 0xC6]; // sprmPChgTabsPapx (0xC60D)
+        grpprl.extend_from_slice(&body);
+
+        let props = extract_pap_props(&grpprl);
+        assert_eq!(props.tabs.len(), 2, "0xC60D has no prefix; cDel skipped, cAdd=2");
+        assert_eq!(props.tabs[0].position_twips, 2000);
+        assert_eq!(props.tabs[0].alignment, TabAlignment::Right);
+        assert_eq!(props.tabs[1].position_twips, 1000);
+        assert_eq!(props.tabs[1].alignment, TabAlignment::Center);
+    }
+
+    /// `0xD632` is `sprmTCellPadding` (NOT `sprmPChgTabs`). It must not be read
+    /// as tab stops. Today it is dispatched as `sprmPChgTabs`, so `tabs` is
+    /// populated — the inverse of the correct behaviour.
+    #[test]
+    fn sprm_tcell_padding_opcode_d632_does_not_populate_tabs() {
+        // PChgTabsOperand-style bytes tagged with the TCellPadding opcode
+        // (0xD632): 1-byte length prefix = 8, then cDel=0, cAdd=2, two
+        // positions, two TBDs.
+        let grpprl = [
+            0x32, 0xD6, 8, 0x00, 0x02, 0xD0, 0x07, 0xE8, 0x03, 0x02, 0x01,
+        ];
+        let props = extract_pap_props(&grpprl);
+        assert!(
+            props.tabs.is_empty(),
+            "0xD632 is sprmTCellPadding, not sprmPChgTabs: must not populate tabs"
+        );
+    }
+
+    /// Consolidated opcode-conformance gate: every dispatched opcode must name
+    /// the property [MS-DOC] assigns it. Fails today because the decoder
+    /// misroutes `0x460B` (as `ilvl`) and `0xD632` (as tabs) and never reads
+    /// `0x260A` / `0xC615`.
+    #[test]
+    fn opcode_conformance_gate() {
+        // 0x460B = sprmPIlfo -> ilfo
+        assert_eq!(
+            extract_pap_props(&[0x0B, 0x46, 0x03, 0x00]).ilfo,
+            Some(3),
+            "0x460B = sprmPIlfo"
+        );
+        // 0x260A = sprmPIlvl -> ilvl
+        assert_eq!(extract_pap_props(&[0x0A, 0x26, 0x02]).ilvl, Some(2), "0x260A = sprmPIlvl");
+        // 0xD632 = sprmTCellPadding -> no tabs
+        assert!(
+            extract_pap_props(&[0x32, 0xD6, 4, 0x00, 0x01, 0x64, 0x00])
+                .tabs
+                .is_empty(),
+            "0xD632 = sprmTCellPadding"
+        );
     }
 }

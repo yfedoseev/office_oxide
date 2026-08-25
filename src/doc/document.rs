@@ -144,7 +144,7 @@ impl DocDocument {
         &self.text
     }
 
-    /// Structured main-text paragraphs with PAP flags (table).
+    /// Structured main-text paragraphs with PAP flags (table / list).
     ///
     /// Empty when the document has no PAPX FKP, in which case callers fall
     /// back to the line-based heuristic on [`Self::plain_text_ref`].
@@ -224,6 +224,81 @@ mod tests {
         }
     }
 
+    /// Build a `DocDocument` whose IR comes from structured paragraphs
+    /// (the PAPX path) rather than the line heuristic. Used to TDD the
+    /// table / list walkers without a binary `.doc` fixture.
+    fn make_doc_with_paragraphs(paras: Vec<DocParagraph>) -> DocDocument {
+        DocDocument {
+            images: Vec::new(),
+            text: String::new(),
+            paragraphs: paras,
+        }
+    }
+
+    /// Construct a paragraph with the given PAP flags and terminator.
+    fn pap(text: &str, props: crate::doc::sprm::PapProps) -> DocParagraph {
+        DocParagraph {
+            text: text.to_string(),
+            terminator: '\r',
+            props,
+        }
+    }
+
+    fn list_props(level: u8) -> crate::doc::sprm::PapProps {
+        crate::doc::sprm::PapProps {
+            ilvl: Some(level),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ir_list_emits_nested_list_from_ilvl_paragraphs() {
+        use crate::ir::Element;
+        let doc = make_doc_with_paragraphs(vec![
+            pap("Intro.", Default::default()),
+            pap("First", list_props(0)),
+            pap("Second", list_props(0)),
+            pap("Nested", list_props(1)),
+            pap("After.", Default::default()),
+        ]);
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        let elements = &ir.sections[0].elements;
+
+        // [Paragraph, List, Paragraph]
+        assert_eq!(elements.len(), 3, "expected intro, list, outro");
+        assert!(matches!(elements[0], Element::Paragraph(_)));
+        assert!(matches!(elements[2], Element::Paragraph(_)));
+
+        let list = match &elements[1] {
+            Element::List(l) => l,
+            _ => panic!("expected a List element"),
+        };
+        assert_eq!(list.items.len(), 2, "two top-level items");
+        // Second item nests the level-1 paragraph.
+        assert!(list.items[1].nested.is_some(), "second item must nest");
+        let nested = list.items[1].nested.as_ref().unwrap();
+        assert_eq!(nested.items.len(), 1);
+    }
+
+    #[test]
+    fn ir_consecutive_list_runs_split_on_prose() {
+        use crate::ir::Element;
+        let doc = make_doc_with_paragraphs(vec![
+            pap("A1", list_props(0)),
+            pap("A2", list_props(0)),
+            pap("gap", Default::default()),
+            pap("B1", list_props(0)),
+        ]);
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        let elements = &ir.sections[0].elements;
+        // [List(A), Paragraph(gap), List(B)]
+        let lists: Vec<_> = elements
+            .iter()
+            .filter(|e| matches!(e, Element::List(_)))
+            .collect();
+        assert_eq!(lists.len(), 2, "the prose gap must split the run");
+    }
+
     #[test]
     fn ir_empty_doc_produces_empty_section() {
         let ir = crate::convert_doc::doc_to_ir(&make_doc(""));
@@ -264,6 +339,28 @@ mod tests {
     fn ir_blank_lines_are_skipped() {
         let ir = crate::convert_doc::doc_to_ir(&make_doc("Title\n\n\nText"));
         assert_eq!(ir.sections[0].elements.len(), 2);
+    }
+
+    #[test]
+    fn ir_list_run_with_nonzero_base_level_keeps_every_item() {
+        // Regression: `.doc` list levels are not guaranteed to start at 0.
+        // Word's `simple-list.doc` fixture writes `ilvl = 1` for a flat list,
+        // which used to collapse the run to a single item because
+        // `build_nested_list` was called with `base_level = 0`.
+        use crate::ir::Element;
+        let doc = make_doc_with_paragraphs(vec![
+            pap("First", list_props(1)),
+            pap("Second", list_props(1)),
+            pap("Third", list_props(1)),
+        ]);
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        let elements = &ir.sections[0].elements;
+        assert_eq!(elements.len(), 1, "a single list run");
+        let list = match &elements[0] {
+            Element::List(l) => l,
+            _ => panic!("expected a List element"),
+        };
+        assert_eq!(list.items.len(), 3, "all three items must survive");
     }
 
     #[test]
