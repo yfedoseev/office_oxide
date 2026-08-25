@@ -7,6 +7,7 @@ use crate::cfb::CfbReader;
 use super::error::{DocError, Result};
 use super::fib::Fib;
 use super::images::{DocImage, extract_images};
+use super::papx::{DocParagraph, build_paragraphs, parse_papx_paragraphs};
 use super::piece_table::{extract_text, parse_clx, sanitize_text};
 
 /// A parsed legacy Word document.
@@ -16,6 +17,11 @@ pub struct DocDocument {
     text: String,
     /// Extracted images from the Data stream.
     images: Vec<DocImage>,
+    /// Structured main-text paragraphs with PAP (paragraph property) flags.
+    /// Populated only when the FIB advertises a PlcfBtePapx (PAPX FKP index);
+    /// empty for very old or minimal files, in which case `doc_to_ir` falls
+    /// back to the line-based heuristic on `text`.
+    paragraphs: Vec<DocParagraph>,
 }
 
 impl DocDocument {
@@ -33,6 +39,7 @@ impl DocDocument {
                 return Ok(Self {
                     text: String::new(),
                     images: Vec::new(),
+                    paragraphs: Vec::new(),
                 });
             }, // Unsupported Word version
         };
@@ -51,6 +58,7 @@ impl DocDocument {
                 return Ok(Self {
                     text: String::new(),
                     images: Vec::new(),
+                    paragraphs: Vec::new(),
                 });
             }, // Word 6/95 or corrupted
         };
@@ -66,6 +74,7 @@ impl DocDocument {
             return Ok(Self {
                 text: String::new(),
                 images: Vec::new(),
+                paragraphs: Vec::new(),
             });
         }
 
@@ -77,6 +86,7 @@ impl DocDocument {
                 return Ok(Self {
                     text: String::new(),
                     images: Vec::new(),
+                    paragraphs: Vec::new(),
                 });
             },
         };
@@ -85,13 +95,32 @@ impl DocDocument {
         let raw_text = extract_text(&word_doc, &pieces, fib.text_len);
         let text = sanitize_text(&raw_text);
 
+        // Build structured paragraphs (with table / list PAP flags) from the
+        // PAPX FKP, when the FIB advertises one. Without it we cannot detect
+        // tables or lists, so `doc_to_ir` falls back to the line heuristic.
+        let paragraphs = if fib.fc_plcf_bte_papx != 0 && fib.lcb_plcf_bte_papx != 0 {
+            let fkp = parse_papx_paragraphs(
+                &word_doc,
+                &table_stream,
+                fib.fc_plcf_bte_papx,
+                fib.lcb_plcf_bte_papx,
+            );
+            build_paragraphs(&word_doc, &pieces, &fkp, fib.text_len)
+        } else {
+            Vec::new()
+        };
+
         // Extract images from the Data stream (if present).
         let images = match cfb.open_stream("Data") {
             Ok(data_stream) => extract_images(&data_stream),
             Err(_) => Vec::new(),
         };
 
-        Ok(Self { text, images })
+        Ok(Self {
+            text,
+            images,
+            paragraphs,
+        })
     }
 
     /// Open a DOC file from a path.
@@ -113,6 +142,14 @@ impl DocDocument {
     /// Get a reference to the extracted plain text.
     pub fn plain_text_ref(&self) -> &str {
         &self.text
+    }
+
+    /// Structured main-text paragraphs with PAP flags (table).
+    ///
+    /// Empty when the document has no PAPX FKP, in which case callers fall
+    /// back to the line-based heuristic on [`Self::plain_text_ref`].
+    pub(crate) fn paragraphs(&self) -> &[DocParagraph] {
+        &self.paragraphs
     }
 
     /// Convert to markdown (basic: paragraphs separated by blank lines).
@@ -161,6 +198,7 @@ mod tests {
         let doc = DocDocument {
             images: Vec::new(),
             text: "First paragraph\nSecond paragraph\n\nAfter gap".into(),
+            paragraphs: Vec::new(),
         };
         let md = doc.to_markdown();
         assert!(md.contains("First paragraph\n\n"));
@@ -173,6 +211,7 @@ mod tests {
         let doc = DocDocument {
             images: Vec::new(),
             text: "Hello World".into(),
+            paragraphs: Vec::new(),
         };
         assert_eq!(doc.plain_text(), "Hello World");
     }
@@ -181,6 +220,7 @@ mod tests {
         DocDocument {
             images: Vec::new(),
             text: text.to_string(),
+            paragraphs: Vec::new(),
         }
     }
 

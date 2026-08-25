@@ -113,6 +113,13 @@ fn parse_plc_pcd(data: &[u8]) -> Result<Vec<Piece>> {
         // Bit 30 of fc indicates compressed encoding.
         let is_compressed = (fc & 0x40000000) != 0;
 
+        // A non-monotonic CP range would underflow later subtractions
+        // (extract_text / decode_cp_range / fc_to_cp). Reject it here so the
+        // malformed piece table surfaces as `Err`, not a panic (AGENTS.md #6).
+        if cp_end < cp_start {
+            return Err(DocError::InvalidPieceTable("non-monotonic piece CP range".into()));
+        }
+
         pieces.push(Piece {
             cp_start,
             cp_end,
@@ -164,6 +171,94 @@ pub fn extract_text(word_doc: &[u8], pieces: &[Piece], max_chars: u32) -> String
     }
 
     text
+}
+
+/// The largest CP of `piece` that is actually backed by bytes in a stream of
+/// `word_doc_len` bytes.
+///
+/// A malformed piece can declare a CP range whose bytes lie outside the
+/// stream. Decoding must clamp to this bound so the work stays proportional to
+/// the backed range, not the (possibly huge) declared range — a DoS guard
+/// (AGENTS.md rule 6). `decode_cp_range` uses this to bound each segment; it is
+/// exposed as a pure helper so the bound itself can be asserted directly (the
+/// output is identical with or without the clamp, so only the bound pins it).
+pub(crate) fn piece_backed_cp_end(piece: &Piece, word_doc_len: usize) -> u32 {
+    let base = if piece.is_compressed {
+        (piece.fc & !0x4000_0000) as u64 / 2
+    } else {
+        piece.fc as u64
+    };
+    let avail = (word_doc_len as u64).saturating_sub(base);
+    let extra = if piece.is_compressed {
+        avail
+    } else {
+        // Each Unicode char is 2 bytes; `avail` bytes hold `avail / 2` full
+        // chars (a trailing lone byte is not a complete char and is skipped,
+        // matching the per-cp `off + 1 < len` check in `decode_cp_range`).
+        avail / 2
+    };
+    piece
+        .cp_start
+        .saturating_add(extra.min(u64::from(u32::MAX)) as u32)
+}
+
+/// Decode the text in character-position range `[cp_start, cp_end)` straight
+/// from `word_doc`, walking the piece table.
+///
+/// Unlike [`extract_text`] this is *per range*: callers slice by CP without
+/// first collapsing the whole document into a flat `String`, so a surrogate
+/// pair (2 UTF-16 code units) in a Unicode piece is decoded into one `char`
+/// exactly where it belongs, and compressed (CP1252) pieces are decoded by
+/// their own stride. A truncated/out-of-range segment is skipped per-CP
+/// rather than dropping the entire piece, which keeps later ranges aligned.
+pub(crate) fn decode_cp_range(
+    word_doc: &[u8],
+    pieces: &[Piece],
+    cp_start: u32,
+    cp_end: u32,
+) -> String {
+    let mut out = String::new();
+    if cp_end <= cp_start {
+        return out;
+    }
+    for piece in pieces {
+        if piece.cp_end <= cp_start || piece.cp_start >= cp_end {
+            continue;
+        }
+        let seg_start = cp_start.max(piece.cp_start);
+        let mut seg_end = cp_end.min(piece.cp_end);
+        // Clamp the segment to the bytes that are actually present in the
+        // stream. A malformed piece can declare a CP range whose bytes are not
+        // in `word_doc`; without this clamp the loop would iterate the entire
+        // (possibly huge) declared range while producing nothing — a DoS
+        // (AGENTS.md rule 6). The clamp preserves output (unbacked CPs yield no
+        // characters) while bounding the work to the backed range.
+        let backed_cp = piece_backed_cp_end(piece, word_doc.len());
+        seg_end = seg_end.min(backed_cp);
+        if seg_end <= seg_start {
+            continue;
+        }
+        if piece.is_compressed {
+            let base = ((piece.fc & !0x4000_0000) / 2) as usize;
+            for cp in seg_start..seg_end {
+                let off = base + (cp - piece.cp_start) as usize;
+                if off < word_doc.len() {
+                    out.push(cp1252_to_char(word_doc[off]));
+                }
+            }
+        } else {
+            let base = piece.fc as usize;
+            let mut u16s: Vec<u16> = Vec::with_capacity((seg_end - seg_start) as usize);
+            for cp in seg_start..seg_end {
+                let off = base + (cp - piece.cp_start) as usize * 2;
+                if off + 1 < word_doc.len() {
+                    u16s.push(u16::from_le_bytes([word_doc[off], word_doc[off + 1]]));
+                }
+            }
+            out.push_str(&String::from_utf16_lossy(&u16s));
+        }
+    }
+    out
 }
 
 /// Convert a CP1252 byte to a Unicode char.
@@ -367,5 +462,99 @@ mod tests {
 
         let text = extract_text(&word_doc, &pieces, 3);
         assert_eq!(text, "Hel");
+    }
+
+    // --------------------------------------------------------------------
+    // Regression tests for malformed-input robustness defects (AGENTS.md rule 6:
+    // no panic / overflow / hang on untrusted input). Each fixture is a minimal
+    // synthetic piece table, no third-party document.
+    // --------------------------------------------------------------------
+
+    /// A non-monotonic CP array (`CP[1] < CP[0]`) must surface as `Err`, not
+    /// trigger a subtraction-with-overflow panic when the range is later
+    /// walked. `parse_plc_pcd` validates CP ordering (piece_table.rs:119) and
+    /// returns `Err` on a reversed range, so the later subtraction is always
+    /// on a well-ordered piece.
+    #[test]
+    fn parse_clx_rejects_nonmonotonic_cps() {
+        // CLX: Pcdt marker, PlcPcd size 16, CP[0]=10, CP[1]=5 (reversed), one PCD.
+        let mut clx = Vec::new();
+        clx.push(0x02); // Pcdt marker
+        clx.extend_from_slice(&16u32.to_le_bytes()); // PlcPcd size = (n+1)*4 + n*8, n=1
+        clx.extend_from_slice(&10u32.to_le_bytes()); // CP[0]
+        clx.extend_from_slice(&5u32.to_le_bytes()); // CP[1]  (CP[1] < CP[0]!)
+        clx.extend_from_slice(&0u16.to_le_bytes()); // PCD: unused u16
+        clx.extend_from_slice(&0u32.to_le_bytes()); // PCD: fc
+        clx.extend_from_slice(&0u16.to_le_bytes()); // PCD: prm
+
+        let pieces = parse_clx(&clx);
+        assert!(
+            pieces.is_err(),
+            "non-monotonic CP array must surface as Err, not panic on subtraction"
+        );
+    }
+
+    /// The backing clamp must bound the *work* (the CP range actually walked),
+    /// not merely the output. The decoded text is identical with or without the
+    /// clamp (the loop has its own bounds checks), so the output alone cannot
+    /// catch a regression. These assertions pin `piece_backed_cp_end` directly —
+    /// that value changes the moment the clamp is dropped.
+    #[test]
+    fn decode_cp_range_backing_is_clamped_not_just_output() {
+        let word_doc = vec![0u8; 64];
+
+        // Fully unbacked: declared range starts at fc=4096 but the stream is
+        // only 64 bytes, so nothing is backed → backed end collapses to cp_start.
+        let unbacked = Piece {
+            cp_start: 0,
+            cp_end: 20_000_000,
+            fc: 4096,
+            is_compressed: false,
+        };
+        assert_eq!(
+            piece_backed_cp_end(&unbacked, word_doc.len()),
+            0,
+            "fully unbacked piece must clamp to cp_start (no iteration)"
+        );
+        assert_eq!(
+            decode_cp_range(&word_doc, &[unbacked], 0, 20_000_000),
+            "",
+            "CP range with no backing bytes yields empty text"
+        );
+
+        // Partially backed: fc=0 with a 64-byte stream backs exactly 32 Unicode
+        // chars (2 bytes each), even though the declared range spans 20M CPs.
+        let backed = Piece {
+            cp_start: 0,
+            cp_end: 20_000_000,
+            fc: 0,
+            is_compressed: false,
+        };
+        assert_eq!(
+            piece_backed_cp_end(&backed, word_doc.len()),
+            32,
+            "partially backed Unicode piece must clamp to 32, not 20M"
+        );
+        assert_eq!(
+            decode_cp_range(&word_doc, &[backed], 0, 20_000_000)
+                .chars()
+                .count(),
+            32,
+            "only the 32 Unicode chars that are actually backed are decoded"
+        );
+
+        // Compressed (CP1252) piece: 1 byte per char, so 64 bytes back exactly
+        // 64 CPs. The helper must use the compressed stride, not the 2-byte one.
+        let compressed = Piece {
+            cp_start: 0,
+            cp_end: 20_000_000,
+            fc: 0,
+            is_compressed: true,
+        };
+        assert_eq!(
+            piece_backed_cp_end(&compressed, word_doc.len()),
+            64,
+            "compressed piece must clamp to 64 CPs (1 byte each), not 32"
+        );
     }
 }

@@ -660,6 +660,50 @@ fn default_heading_level() -> u8 {
     1
 }
 
+/// Alignment of a tab stop (`jc` from a TBC descriptor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TabAlignment {
+    /// Text starts at the tab stop.
+    Left,
+    /// Text is centred on the tab stop.
+    Center,
+    /// Text ends at the tab stop.
+    Right,
+    /// Decimal-aligned on the tab stop.
+    Decimal,
+    /// A vertical bar at the tab stop (no positioning of text).
+    Bar,
+}
+
+/// Leader character drawn in the gap before a tab stop (`tlc` from a TBC
+/// descriptor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TabLeader {
+    /// No leader.
+    None,
+    /// Dotted leader.
+    Dot,
+    /// Hyphenated leader.
+    Hyphen,
+    /// Underlined leader.
+    Underscore,
+    /// Heavy line leader.
+    Heavy,
+    /// Middle-dot leader.
+    MiddleDot,
+}
+
+/// A paragraph tab stop, decoded from `sprmPChgTabs`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TabStop {
+    /// Position from the paragraph start, in twips.
+    pub position_twips: i32,
+    /// Alignment of text at the tab stop.
+    pub alignment: TabAlignment,
+    /// Leader character drawn in the gap before the tab stop.
+    pub leader: TabLeader,
+}
+
 /// A paragraph of inline content.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Paragraph {
@@ -683,6 +727,10 @@ pub struct Paragraph {
     pub background_color: Option<[u8; 3]>,
     /// Paragraph borders.
     pub border: Option<ParagraphBorder>,
+    /// Tab stops set by `sprmPChgTabs` (positions in twips). Empty when the
+    /// paragraph carries no tab-stop SPRM.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tabs: Vec<TabStop>,
     /// Keep this paragraph on the same page as the next paragraph.
     #[serde(default)]
     pub keep_with_next: bool,
