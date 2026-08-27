@@ -804,6 +804,52 @@ mod tests {
         );
     }
 
+    /// `0xC615` with a truncated length prefix must stop cleanly, never panic
+    /// (AGENTS.md rule 6). A grpprl holding only the opcode (no cb byte) and one
+    /// holding the cb but no body are both malformed inputs.
+    #[test]
+    fn sprm_pchg_tabs_c615_truncated_cb_is_empty() {
+        // Opcode only, no cb byte: the 1-byte cb read is out of bounds -> stop.
+        let sprms = parse_grpprl(&[0x15, 0xC6]);
+        assert!(sprms.is_empty(), "truncated 0xC615 (no cb) must yield no SPRM, not panic");
+        // cb present but body absent: cb == 4 claims 4 body bytes that do not
+        // exist; the operand must clamp to empty, not read past the buffer.
+        let sprms = parse_grpprl(&[0x15, 0xC6, 0x04]);
+        assert_eq!(sprms.len(), 1, "opcode is present so one SPRM is produced");
+        assert!(
+            sprms[0].operand.is_empty(),
+            "0xC615 cb with no body must clamp the operand to empty"
+        );
+    }
+
+    /// `0xC615` in the `cb == 255` escape form must be consumed exactly so the
+    /// following SPRM is reached. This is the exact off-by-one the 2-byte-cb
+    /// misreading caused: a one-byte shift would desync the rest of the grpprl
+    /// and either drop or mis-parse the trailing SPRM.
+    #[test]
+    fn sprm_pchg_tabs_c615_255_escape_followed_by_sprm() {
+        // cDel=1, cAdd=2 (12-byte body), then a trailing sprmPFInTable
+        // (0x2416, 1-byte operand 0x01).
+        let body: Vec<u8> = vec![
+            1, 0x00, 0x00, 0x00, 0x00, // PchgTabsDelClose: cDel=1 + 4 bytes
+            2, 0x64, 0x00, 0xC8, 0x00, 0x03, 0x01, // PchgTabsAdd: cAdd=2 + positions + TBDs
+        ];
+        let mut grpprl = vec![0x15, 0xC6, 0xFF]; // opcode + cb == 255 escape
+        grpprl.extend_from_slice(&body);
+        grpprl.extend_from_slice(&[0x16, 0x24, 0x01]); // sprmPFInTable, operand 0x01
+
+        let sprms = parse_grpprl(&grpprl);
+        assert_eq!(sprms.len(), 2, "must decode both the 0xC615 and the trailing SPRM (no desync)");
+        assert_eq!(sprms[0].opcode, 0xC615);
+        assert_eq!(sprms[0].operand, body, "0xC615 operand must be the raw body");
+        assert_eq!(sprms[1].opcode, 0x2416);
+        assert_eq!(sprms[1].operand, vec![0x01]);
+
+        let props = extract_pap_props(&grpprl);
+        assert_eq!(props.tabs.len(), 2, "tabs from 0xC615 must be present");
+        assert!(props.f_in_table, "trailing sprmPFInTable must be reached and applied");
+    }
+
     /// Consolidated opcode-conformance gate: every dispatched opcode must name
     /// the property [MS-DOC] assigns it. Fails today because the decoder
     /// misroutes `0x460B` (as `ilvl`) and `0xD632` (as tabs) and never reads
