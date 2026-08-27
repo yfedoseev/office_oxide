@@ -557,4 +557,80 @@ mod tests {
             "compressed piece must clamp to 64 CPs (1 byte each), not 32"
         );
     }
+
+    /// `piece_backed_cp_end` must add a non-zero `cp_start` to the backed
+    /// length, and must apply the compressed-piece `fc` mask
+    /// (`& !0x4000_0000`, then `/ 2`) when the piece actually has an offset.
+    /// The unbacked/partial tests above all use `cp_start == 0` and `fc == 0`,
+    /// so neither the `saturating_add` nor the offset mask was exercised there.
+    #[test]
+    fn piece_backed_cp_end_nonzero_cp_start_and_offset() {
+        let word_doc = vec![0u8; 64];
+
+        // Unicode piece with cp_start=100: backed end = 100 + 32.
+        let unicode = Piece {
+            cp_start: 100,
+            cp_end: 20_000_000,
+            fc: 0,
+            is_compressed: false,
+        };
+        assert_eq!(
+            piece_backed_cp_end(&unicode, word_doc.len()),
+            132,
+            "non-zero cp_start must be added to the backed length (100 + 32)"
+        );
+
+        // Compressed piece whose base offset exceeds the stream: fc=0x40000100
+        // -> base = (0x40000100 & !0x40000000)/2 = 0x80 = 128, stream is only
+        // 64 bytes, so nothing is backed. cp_start=5 still applies.
+        let compressed_unbacked = Piece {
+            cp_start: 5,
+            cp_end: 20_000_000,
+            fc: 0x40000100,
+            is_compressed: true,
+        };
+        assert_eq!(
+            piece_backed_cp_end(&compressed_unbacked, word_doc.len()),
+            5,
+            "compressed offset beyond the stream must clamp to cp_start only"
+        );
+
+        // Compressed piece with an offset that IS backed: fc=0x40000010 ->
+        // base = (0x40000010 & !0x40000000)/2 = 8; stream 64 bytes backs
+        // 56 chars, plus cp_start=7 -> 63. Exercises the mask + non-zero start.
+        let compressed_backed = Piece {
+            cp_start: 7,
+            cp_end: 20_000_000,
+            fc: 0x40000010,
+            is_compressed: true,
+        };
+        assert_eq!(
+            piece_backed_cp_end(&compressed_backed, word_doc.len()),
+            7 + 56,
+            "compressed backing = cp_start + (stream_len - base_offset)"
+        );
+    }
+
+    /// `decode_cp_range` must decode a *mid-range* request inside a backed
+    /// piece, exercising the per-cp offset `base + (cp - piece.cp_start)`. The
+    /// other tests only decode from `cp_start` (offset 0), so the in-range
+    /// offset arithmetic was never directly asserted.
+    #[test]
+    fn decode_cp_range_mid_range_into_backed_piece() {
+        // "HelloWorld" in UTF-16LE (10 chars = 20 bytes) at fc=0.
+        let mut word_doc = vec![0u8; 20];
+        let text = b"HelloWorld";
+        for (i, &b) in text.iter().enumerate() {
+            word_doc[2 * i] = b;
+        }
+        let piece = Piece {
+            cp_start: 0,
+            cp_end: 10,
+            fc: 0,
+            is_compressed: false,
+        };
+        // Request only CP 4..7 -> "oWo".
+        let out = decode_cp_range(&word_doc, &[piece], 4, 7);
+        assert_eq!(out, "oWo", "mid-range decode must use cp - cp_start offset");
+    }
 }
