@@ -646,6 +646,39 @@ mod tests {
         assert_eq!(par.tabs[0].position_twips, 1440);
     }
 
+    /// A table cell's content is a paragraph flagged `f_in_table` (but not a row
+    /// terminator). `walk_paragraphs` must route it through
+    /// `table.add_cell_paragraph` (convert_doc.rs:362-363), the `f_in_table`
+    /// dispatch branch. A lone cell paragraph makes no row, so wrap it between
+    /// two row-terminators the way a real `.doc` lays out a one-cell table.
+    #[test]
+    fn in_table_paragraph_becomes_cell() {
+        let mark = |itap: u8| DocParagraph {
+            text: String::new(),
+            terminator: '\r',
+            props: PapProps {
+                is_table_trailing_mark: true,
+                itap,
+                ..PapProps::default()
+            },
+        };
+        let cell = DocParagraph {
+            text: "cell text".into(),
+            terminator: '\u{7}', // closes the cell
+            props: PapProps {
+                f_in_table: true,
+                ..PapProps::default()
+            },
+        };
+        let paragraphs = [mark(1), cell, mark(1)];
+        let mut els = Vec::new();
+        walk_paragraphs(&paragraphs, &mut els);
+        assert!(
+            els.iter().any(|e| matches!(e, Element::Table(_))),
+            "f_in_table cell paragraph must be emitted inside a table"
+        );
+    }
+
     /// Build a single-column `PendingRow` whose cell carries the given `rgf`
     /// (the MS-DOC 2-bit `TCGRF` vertical-merge field) and renders "cell".
     fn vmerge_row(rgf: u16) -> PendingRow {
