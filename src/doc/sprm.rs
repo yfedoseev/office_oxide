@@ -850,6 +850,37 @@ mod tests {
         assert!(props.f_in_table, "trailing sprmPFInTable must be reached and applied");
     }
 
+    /// A variable-length SPRM whose length prefix / body is truncated must stop
+    /// the walk cleanly, never panic (AGENTS.md rule 6). Covers the truncation
+    /// `break` for each special variable encoding: 0xD608 (2-byte cb), 0xC615
+    /// (1-byte cb), and 0xC60D (no prefix).
+    #[test]
+    fn parse_grpprl_truncated_variable_sprm_prefixes() {
+        assert!(
+            parse_grpprl(&[0x08, 0xD6]).is_empty(),
+            "0xD608 with no 2-byte cb must stop, not panic"
+        );
+        assert!(
+            parse_grpprl(&[0x15, 0xC6]).is_empty(),
+            "0xC615 with no 1-byte cb must stop, not panic"
+        );
+        assert!(
+            parse_grpprl(&[0x0D, 0xC6]).is_empty(),
+            "0xC60D with no body must stop, not panic"
+        );
+    }
+
+    /// `pchg_tabs_operand_len` must bound itself against a short buffer instead
+    /// of indexing out of range (AGENTS.md rule 6).
+    #[test]
+    fn pchg_tabs_operand_len_truncated() {
+        // start beyond the buffer -> 0.
+        assert_eq!(pchg_tabs_operand_len(&[], 0), 0);
+        // cDel present but its rgdxa/rgdxaClose block runs past the end -> the
+        // remaining bytes are returned, not a panic.
+        assert_eq!(pchg_tabs_operand_len(&[0x02], 0), 1);
+    }
+
     /// Consolidated opcode-conformance gate: every dispatched opcode must name
     /// the property [MS-DOC] assigns it. Fails today because the decoder
     /// misroutes `0x460B` (as `ilvl`) and `0xD632` (as tabs) and never reads
