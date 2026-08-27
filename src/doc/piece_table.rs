@@ -633,4 +633,55 @@ mod tests {
         let out = decode_cp_range(&word_doc, &[piece], 4, 7);
         assert_eq!(out, "oWo", "mid-range decode must use cp - cp_start offset");
     }
+
+    /// Malformed CLX inputs must surface as `Err`, never panic (AGENTS.md rule 6).
+    /// Each fixture exercises one of the truncation / wrong-marker branches in
+    /// `parse_clx` that the happy-path fixtures never reach.
+    #[test]
+    fn parse_clx_truncation_is_err() {
+        // Grpprl marker (0x01) with no size bytes at all -> "Grpprl truncated".
+        assert!(parse_clx(&[0x01]).is_err());
+        // Marker that is neither Grpprl nor Pcdt -> "expected Pcdt".
+        assert!(parse_clx(&[0x03]).is_err());
+        // Pcdt marker (0x02) with no size field -> "Pcdt size truncated".
+        assert!(parse_clx(&[0x02]).is_err());
+        // Pcdt present but its PlcPcd payload shorter than the minimum 8 bytes
+        // -> "PlcPcd too small".
+        let mut clx = vec![0x02u8];
+        clx.extend_from_slice(&8u32.to_le_bytes()); // Pcdt size = 8
+        clx.extend_from_slice(&[0u8; 3]); // only 3 payload bytes follow
+        assert!(parse_clx(&clx).is_err());
+    }
+
+    /// Every CP1252 special byte (0x80..=0x9F) must resolve without panic, and
+    /// the documented multi-byte code points must be correct. The conversion
+    /// table's individual arms are otherwise only partially exercised.
+    #[test]
+    fn cp1252_special_bytes_all_covered() {
+        for b in 0x80u8..=0x9F {
+            let _ = cp1252_to_char(b);
+        }
+        assert_eq!(cp1252_to_char(0x80), '€');
+        assert_eq!(cp1252_to_char(0x85), '\u{2026}'); // …
+        assert_eq!(cp1252_to_char(0x91), '\u{2018}'); // '
+        assert_eq!(cp1252_to_char(0x92), '\u{2019}'); // '
+        assert_eq!(cp1252_to_char(0x93), '\u{201C}'); // "
+        assert_eq!(cp1252_to_char(0x94), '\u{201D}'); // "
+        assert_eq!(cp1252_to_char(0x95), '\u{2022}'); // •
+        assert_eq!(cp1252_to_char(0x96), '\u{2013}'); // –
+        assert_eq!(cp1252_to_char(0x97), '\u{2014}'); // —
+        assert_eq!(cp1252_to_char(0x99), '\u{2122}'); // ™
+    }
+
+    /// `sanitize_text` must map every classified control character to its
+    /// documented replacement, including the field-code markers it strips.
+    #[test]
+    fn sanitize_all_control_marks() {
+        assert_eq!(sanitize_text("A\x01B"), "AB"); // field begin stripped
+        assert_eq!(sanitize_text("A\x08B"), "AB"); // field separator stripped
+        assert_eq!(sanitize_text("A\x13B"), "AB"); // field begin
+        assert_eq!(sanitize_text("A\x14B"), "AB"); // field separator
+        assert_eq!(sanitize_text("A\x15B"), "AB"); // field end
+        assert_eq!(sanitize_text("A\x0BB"), "A\nB"); // vertical tab -> newline
+    }
 }
