@@ -4,16 +4,17 @@ These stubs cover the public API exposed by the Rust ``_native`` module.
 Every `path` argument accepts ``str`` or any ``os.PathLike[str]``.
 """
 
-from __future__ import annotations
-
 from os import PathLike
-from typing import Any, Literal, Optional, Type, Union
+from types import TracebackType
+from typing import Any, Literal
+
+from typing_extensions import Self, TypeAlias
 
 __version__: str
 
-FormatName = Literal["docx", "xlsx", "pptx", "doc", "xls", "ppt"]
-_Path = Union[str, PathLike[str]]
-_CellValue = Union[None, str, bool, int, float]
+FormatName: TypeAlias = Literal["docx", "xlsx", "pptx", "doc", "xls", "ppt"]
+_Path: TypeAlias = str | PathLike[str]
+_CellValue: TypeAlias = str | bool | int | float | None
 
 class OfficeOxideError(Exception):
     """Raised for any parse, IO, or conversion failure inside office_oxide."""
@@ -28,9 +29,9 @@ class Document:
     """
 
     @staticmethod
-    def open(path: _Path, /) -> "Document": ...
+    def open(path: _Path, /) -> Document: ...
     @staticmethod
-    def from_bytes(data: bytes, format: FormatName, /) -> "Document": ...
+    def from_bytes(data: bytes, format: FormatName, /) -> Document: ...
     @property
     def format(self) -> FormatName: ...
     def format_name(self) -> FormatName: ...
@@ -41,31 +42,31 @@ class Document:
     def to_ir_json(self) -> str: ...
     def save_as(self, path: _Path, /) -> None: ...
     def close(self) -> None: ...
-    def __enter__(self) -> "Document": ...
+    def __enter__(self) -> Self: ...
     def __exit__(
         self,
-        exc_type: Optional[Type[BaseException]],
-        exc_val: Optional[BaseException],
-        exc_tb: Optional[Any],
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
     ) -> bool: ...
 
 class EditableDocument:
     """An editable Office document (DOCX, XLSX, PPTX)."""
 
     @staticmethod
-    def open(path: _Path, /) -> "EditableDocument": ...
+    def open(path: _Path, /) -> EditableDocument: ...
     def replace_text(self, find: str, replace: str, /) -> int: ...
     def set_cell(
         self, sheet_index: int, cell_ref: str, value: _CellValue, /
     ) -> None: ...
     def save(self, path: _Path, /) -> None: ...
     def close(self) -> None: ...
-    def __enter__(self) -> "EditableDocument": ...
+    def __enter__(self) -> Self: ...
     def __exit__(
         self,
-        exc_type: Optional[Type[BaseException]],
-        exc_val: Optional[BaseException],
-        exc_tb: Optional[Any],
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
     ) -> bool: ...
 
 class XlsxWriter:
@@ -81,7 +82,7 @@ class XlsxWriter:
         col: int,
         value: _CellValue,
         bold: bool,
-        bg_color: Optional[str] = None,
+        bg_color: str | None = None,
     ) -> None: ...
     def merge_cells(
         self, sheet: int, row: int, col: int, row_span: int, col_span: int
