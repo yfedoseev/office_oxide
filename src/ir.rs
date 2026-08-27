@@ -955,10 +955,16 @@ pub fn inline_to_element_block(content: Vec<InlineContent>) -> Vec<Element> {
 
 /// Build a nested `List` from a flat `(level, inline)` sequence.
 ///
-/// Items whose level matches `base_level` (or is shallower) become
-/// `ListItem`s at the current depth. Items whose level is *deeper*
-/// than `base_level` are recursively grouped into the most recent
-/// item's `nested` sub-list. Levels are 0-indexed.
+/// Each item becomes a `ListItem` at the current depth; the run of items
+/// immediately following it whose level is *deeper than that item's own
+/// level* becomes its `nested` sub-list, recursively. Levels are 0-indexed.
+///
+/// `base_level` is the shallowest level treated as "current depth": an item
+/// at or above it is a `ListItem` here rather than a child. Grouping keys off
+/// each item's own level, so a run whose items are all deeper than
+/// `base_level` (a list that starts indented — `<a:p lvl="1">` throughout, for
+/// example) yields one `ListItem` per item rather than collapsing into the
+/// first one.
 ///
 /// Used by both `convert_docx` and `convert_pptx` to translate flat
 /// `<w:numPr w:ilvl=…>` / `<a:p lvl=…>` paragraph streams into the
@@ -973,13 +979,22 @@ pub fn build_nested_list(
 
     while idx < items.len() {
         let (level, content) = &items[idx];
+        // Children are the items deeper than *this* item, not deeper than
+        // `base_level`: keying off `base_level` drops every item of a run that
+        // is uniformly deeper than it, because the run is claimed as a child
+        // range and then discarded for not having a shallow-enough parent.
+        let depth = (*level).max(base_level);
         let nested_start = idx + 1;
         let mut nested_end = nested_start;
-        while nested_end < items.len() && items[nested_end].0 > base_level {
+        while nested_end < items.len() && items[nested_end].0 > depth {
             nested_end += 1;
         }
-        let nested = if *level <= base_level && nested_end > nested_start {
-            Some(build_nested_list(ordered, &items[nested_start..nested_end], base_level + 1))
+        let nested = if nested_end > nested_start {
+            Some(build_nested_list(
+                ordered,
+                &items[nested_start..nested_end],
+                depth.saturating_add(1),
+            ))
         } else {
             None
         };
@@ -987,11 +1002,8 @@ pub fn build_nested_list(
             content: inline_to_element_block(content.clone()),
             nested,
         });
-        idx = if nested_end > nested_start {
-            nested_end
-        } else {
-            idx + 1
-        };
+        // `nested_end` is always at least `idx + 1`, so this makes progress.
+        idx = nested_end;
     }
 
     List {
@@ -1214,5 +1226,45 @@ mod tests {
         let json = serde_json::to_string(&fp).unwrap();
         let back: FramePosition = serde_json::from_str(&json).unwrap();
         assert_eq!(fp, back);
+    }
+
+    /// A list whose items all sit deeper than `base_level` — a list that starts
+    /// indented, e.g. a PowerPoint placeholder whose bullets are all
+    /// `<a:p lvl="1">`. Every item must survive; grouping keyed off
+    /// `base_level` used to keep only the first and silently drop the rest.
+    #[test]
+    fn uniformly_indented_run_keeps_every_item() {
+        let items = vec![item(1, "A"), item(1, "B"), item(1, "C")];
+        let list = build_nested_list(false, &items, 0);
+        assert_eq!(list.items.len(), 3, "no item may be dropped");
+        assert_eq!(list_item_text(&list.items[0]), "A");
+        assert_eq!(list_item_text(&list.items[1]), "B");
+        assert_eq!(list_item_text(&list.items[2]), "C");
+        assert!(list.items.iter().all(|li| li.nested.is_none()));
+    }
+
+    /// A shallower item following a deeper run must close the run rather than
+    /// be absorbed into it.
+    #[test]
+    fn deeper_run_closes_when_a_shallower_item_follows() {
+        let items = vec![item(1, "A"), item(2, "A.1"), item(1, "B")];
+        let list = build_nested_list(false, &items, 0);
+        assert_eq!(list.items.len(), 2, "A and B are siblings");
+        assert_eq!(list_item_text(&list.items[0]), "A");
+        assert_eq!(list_item_text(&list.items[1]), "B");
+        let nested = list.items[0].nested.as_ref().expect("A has a child");
+        assert_eq!(nested.items.len(), 1);
+        assert_eq!(list_item_text(&nested.items[0]), "A.1");
+    }
+
+    /// Levels that skip a depth (0 then 2) must not lose the deeper item.
+    #[test]
+    fn skipped_depth_keeps_the_deeper_item() {
+        let items = vec![item(0, "A"), item(2, "A.1"), item(0, "B")];
+        let list = build_nested_list(false, &items, 0);
+        assert_eq!(list.items.len(), 2);
+        let nested = list.items[0].nested.as_ref().expect("A has a child");
+        assert_eq!(nested.items.len(), 1);
+        assert_eq!(list_item_text(&nested.items[0]), "A.1");
     }
 }
