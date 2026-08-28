@@ -350,6 +350,26 @@ fn count_grid_edges(centers: &[i16], col: usize, grid: &[i32]) -> u32 {
 /// level as stored in the list definition, which may begin at 1), so each
 /// run's base level is taken as the minimum `ilvl` in that run — see
 /// `flush_list`.
+///
+/// A paragraph is a list item iff its `ilfo` (sprmPIlfo, `0x460B`) is a valid
+/// list index, per [MS-DOC] §2.4.6.3 ("If iLfoCur is zero, the paragraph is not
+/// part of a list"). The operand is decoded as a signed `i16`:
+/// `0x0000` / `0xF801` mean "not in a list"; `0x0001`–`0x07FE` are 1-based
+/// indices into `PlfLfo.rgLfo`; `0xF802`–`0xFFFF` are the negation of a 1-based
+/// index and are still list items. `None` (no sprmPIlfo) defaults to prose.
+fn is_doc_list_item(ilfo: Option<i16>) -> bool {
+    match ilfo {
+        None | Some(0) | Some(-2047) => false, // 0x0000 / 0xF801: not in a list
+        // TODO(ilfo-negated): 0xF802..=0xFFFF (i16 -2046..=-1) are list items
+        // whose `ilfo` is the negation of a 1-based index; resolve to the
+        // positive index when list-id grouping is implemented. Until then they
+        // must still be emitted as list items, not dropped to prose.
+        Some(v) if (1..=0x07FE).contains(&v) => true, // 0x0001..0x07FE normal
+        Some(v) if (-0x07FE..=-1).contains(&v) => true, // 0xF802..0xFFFF negated
+        _ => false,                                   // 0x07FF and other non-spec
+    }
+}
+
 fn walk_paragraphs(paragraphs: &[DocParagraph], elements: &mut Vec<Element>) {
     let mut table = TableBuilder::new();
     let mut list_items: Vec<(u8, Vec<InlineContent>)> = Vec::new();
@@ -361,10 +381,10 @@ fn walk_paragraphs(paragraphs: &[DocParagraph], elements: &mut Vec<Element>) {
         } else if p.props.f_in_table {
             flush_list(&mut list_items, elements);
             table.add_cell_paragraph(p);
-        } else if p.props.ilvl.is_some() && p.props.ilfo != Some(2047) {
-            // `ilfo == 2047` marks a paragraph that is explicitly *not* in any
-            // list (the "list exclusion" sentinels) — even when an `ilvl` SPRM
-            // is present, such a paragraph is ordinary prose.
+        } else if is_doc_list_item(p.props.ilfo) {
+            // List membership is keyed on `ilfo` (sprmPIlfo, `0x460B`), not on
+            // `ilvl`: per [MS-DOC] §2.4.6.3 a paragraph is a list item only when
+            // its `ilfo` is a valid list index. `ilvl` still drives nesting.
             table.flush(elements);
             let ilvl = p.props.ilvl.unwrap_or(0);
             list_items.push((ilvl, inline_content_for(&p.text)));
@@ -542,7 +562,7 @@ mod tests {
         let mut els = Vec::new();
         walk_paragraphs(&[p], &mut els);
         let Element::Paragraph(par) = &els[0] else {
-            panic!("expected a paragraph, got {:?}", &els[0]);
+            panic!("expected a paragraph, got {:?}", els[0]);
         };
         assert!(
             par.content
@@ -599,27 +619,49 @@ mod tests {
         );
     }
 
-    /// List exclusion: `ilfo == 2047` means "not in any list", even when an
-    /// `ilvl` SPRM is present — the paragraph must be ordinary prose.
+    /// List membership is keyed on `ilfo` (`sprmPIlfo`, `0x460B`), per
+    /// [MS-DOC] §2.4.6.3. `0x0000` and `0xF801` mean "not in a list" and the
+    /// paragraph must be ordinary prose even when an `ilvl` SPRM is present.
     #[test]
-    fn ilfo_2047_not_treated_as_list() {
+    fn ilfo_not_in_list_bands_are_prose() {
+        // `0x0000` (0) and `0xF801` (-2047 as signed i16) are the two
+        // documented "not in a list" markers. A non-spec value (2047) is also
+        // prose because it falls outside every valid band.
+        for ilfo in [0i16, -2047, 2047] {
+            let props = PapProps {
+                ilvl: Some(0),
+                ilfo: Some(ilfo),
+                ..PapProps::default()
+            };
+            let p = para("Not a list item.", props);
+            let mut els = Vec::new();
+            walk_paragraphs(&[p], &mut els);
+            assert!(
+                !els.iter().any(|e| matches!(e, Element::List(_))),
+                "ilfo {ilfo:#06x} must not build a list"
+            );
+            assert!(
+                els.iter().any(|e| matches!(e, Element::Paragraph(_))),
+                "ilfo {ilfo:#06x} must be emitted as ordinary prose"
+            );
+        }
+    }
+
+    /// `0xF802`–`0xFFFF` is the negation of a 1-based index and is still a list
+    /// item (see TODO(ilfo-negated)); it must not be dropped to prose.
+    #[test]
+    fn ilfo_negated_band_is_list() {
         let props = PapProps {
             ilvl: Some(0),
-            ilfo: Some(2047),
+            ilfo: Some(-2046), // 0xF802
             ..PapProps::default()
         };
-        let p = para("Not a list item.", props);
-
+        let p = para("A list item via the negated band.", props);
         let mut els = Vec::new();
         walk_paragraphs(&[p], &mut els);
-
         assert!(
-            !els.iter().any(|e| matches!(e, Element::List(_))),
-            "ilfo == 2047 must not build a list"
-        );
-        assert!(
-            els.iter().any(|e| matches!(e, Element::Paragraph(_))),
-            "must be emitted as ordinary prose"
+            els.iter().any(|e| matches!(e, Element::List(_))),
+            "0xF802 (negated index) must still be a list item"
         );
     }
 
@@ -640,7 +682,7 @@ mod tests {
         let mut els = Vec::new();
         walk_paragraphs(&[p], &mut els);
         let Element::Paragraph(par) = &els[0] else {
-            panic!("expected a paragraph, got {:?}", &els[0]);
+            panic!("expected a paragraph, got {:?}", els[0]);
         };
         assert_eq!(par.tabs.len(), 1, "decoded tab stops must reach the IR");
         assert_eq!(par.tabs[0].position_twips, 1440);

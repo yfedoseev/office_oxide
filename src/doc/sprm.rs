@@ -80,19 +80,23 @@ fn is_two_byte_len_prefix(opcode: u16) -> bool {
     opcode == 0xD608
 }
 
-/// `sprmPChgTabsPapx` (`0xC60D`) carries **no** length prefix; its operand
-/// length is derived from the structure's own `cDel` / `cAdd` fields (see
-/// `pchg_tabs_operand_len`). `sprmPChgTabs` (`0xC615`) is *not* matched here:
-/// it carries a 1-byte `cb` (with a `255` escape) and is handled by its own
-/// branch in `parse_grpprl`.
-fn is_pchg_tabs_papx(opcode: u16) -> bool {
-    opcode == 0xC60D
-}
+// NOTE: `sprmPChgTabsPapx` (`0xC60D`) carries a normal 1-byte `cb` length
+// prefix (per [MS-DOC] its `PChgTabsPapxOperand.cb` is 2..=255), so it flows
+// through the default variable-length branch below — it is *not* a no-prefix
+// opcode. Its delete block is `PChgTabsDel` (`1 + 2·cDel`, one XAS per tab),
+// unlike `sprmPChgTabs` (`0xC615`) whose `PchgTabsDelClose` is `1 + 4·cDel`;
+// the stride is selected in `decode_pchg_tabs_operand` by opcode.
 
-/// Length of a `PChgTabsOperand` (the operand of `sprmPChgTabs` /
-/// `sprmPChgTabsPapx`) beginning at `start`: `cDel` (1 byte) + `4*cDel`
-/// (rgdxaDel + rgdxaClose) + `cAdd` (1 byte) + `2*cAdd` (rgdxaAdd) +
-/// `cAdd` (rgtbdAdd) = `2 + 4*cDel + 3*cAdd`.
+/// Length of the `sprmPChgTabs` (`0xC615`) `PChgTabsOperand` when its `cb`
+/// byte is the `255` escape (the normal `cb != 255` case uses the literal
+/// `cb` and never reaches here). The `PchgTabsDelClose` form is `cDel` (1
+/// byte) + `4*cDel` (rgdxaDel + rgdxaClose) + `cAdd` (1 byte) + `2*cAdd`
+/// (rgdxaAdd) + `cAdd` (rgtbdAdd) = `2 + 4*cDel + 3*cAdd`.
+///
+/// The quoted [MS-DOC] formula `4 × PChgTabsDelClose.cTabs + 3 ×
+/// PChgTabsAdd.cTabs` omits the two `cTabs` count bytes; the `+2` here is a
+/// deliberate correction — real parsers (and Word) store the `cDel`/`cAdd`
+/// counts, so do not "simplify" this back to the spec text.
 fn pchg_tabs_operand_len(grpprl: &[u8], start: usize) -> usize {
     if start >= grpprl.len() {
         return 0;
@@ -159,17 +163,6 @@ pub fn parse_grpprl(grpprl: &[u8]) -> Vec<Sprm> {
                     };
                     let end = (start + n).min(len);
                     (grpprl[start..end].to_vec(), start + n)
-                } else if is_pchg_tabs_papx(opcode) {
-                    // sprmPChgTabsPapx (0xC60D): no length prefix; the operand
-                    // length is derived from its own `cDel` / `cAdd` (see
-                    // `pchg_tabs_operand_len`).
-                    let start = p + 2;
-                    if start >= len {
-                        break;
-                    }
-                    let n = pchg_tabs_operand_len(grpprl, start);
-                    let end = (start + n).min(len);
-                    (grpprl[start..end].to_vec(), start + n)
                 } else {
                     if p + 3 > len {
                         // Length prefix itself is truncated — stop.
@@ -207,8 +200,12 @@ pub struct PapProps {
     /// the paragraph carries no list SPRM. (Reserved for list support; the
     /// `table.doc` fixture has no in-body lists to verify this against.)
     pub ilvl: Option<u8>,
-    /// List format override id (`ilfo`). `None` when absent.
-    pub ilfo: Option<u32>,
+    /// List format override id (`ilfo`, `sprmPIlfo` `0x460B`), read as the
+    /// *signed* `i16` [MS-DOC] specifies. `None` when the SPRM is absent
+    /// (defaults to "not in a list"). Bands: `0`/`0xF801` = not in a list;
+    /// `0x0001`–`0x07FE` = 1-based index; `0xF802`–`0xFFFF` = negated index
+    /// (still a list item — see TODO(ilfo-negated) in `convert_doc.rs`).
+    pub ilfo: Option<i16>,
     /// Parsed row definition (`sprmTDefTable` operand) for row-terminator
     /// paragraphs. `None` when the paragraph is not a row mark or the TAP
     /// is malformed.
@@ -287,35 +284,43 @@ pub fn parse_tdef_table(operand: &[u8]) -> Option<TapInfo> {
 /// Decode a `sprmPChgTabs` (`0xC615`) / `sprmPChgTabsPapx` (`0xC60D`) operand
 /// into tab stops, returning the *effective* (added) stops.
 ///
-/// Both use the modern `PChgTabsOperand` (per [MS-DOC] §2.9.182): a
-/// `PchgTabsDelClose` list (tabs to ignore) followed by a `PchgTabsAdd` list
-/// (tabs to add). Positions are 16-bit signed twips; the `TBD` descriptor
+/// Both carry a delete list (tabs to ignore) followed by an add list (tabs
+/// to add); the delete block shape differs by opcode (see below). Positions are
+/// 16-bit signed twips; the `TBD` descriptor
 /// (§2.9.310) is 1 byte carrying `jc` (bits 0..2, justification) and `tlc`
-/// (bits 3..5, leader). By the time `parse_grpprl` hands the operand here, any
-/// length prefix has already been stripped: `0xC615` flows through the 1-byte
-/// `cb` branch (with the `255` escape handled by `pchg_tabs_operand_len`) and
-/// `0xC60D` through the no-prefix branch, so `operand` is always the raw
-/// structure body.
+/// (bits 3..5, leader). By the time `parse_grpprl` hands the operand here the
+/// 1-byte `cb` prefix has already been stripped, so `operand` is always the
+/// raw structure body.
+///
+/// The two opcodes differ only in their *delete* block: `0xC615` uses
+/// `PchgTabsDelClose` (`1 + 4·cDel` — `rgdxaDel` + `rgdxaClose`, two XAS each),
+/// while `0xC60D` uses `PchgTabsDel` (`1 + 2·cDel` — `rgdxaDel` only, one XAS).
+/// The stride is selected by `opcode` in `decode_pchg_tabs_operand`.
 ///
 /// Malformed input yields an empty vector rather than panicking — tab stops
 /// are formatting metadata, so a bad operand degrades to "no tabs" instead of
 /// corrupting the paragraph.
 pub fn decode_pchg_tabs(opcode: u16, operand: &[u8]) -> Vec<TabStop> {
     match opcode {
-        0xC615 | 0xC60D => decode_pchg_tabs_operand(operand),
+        0xC615 | 0xC60D => decode_pchg_tabs_operand(opcode, operand),
         _ => Vec::new(),
     }
 }
 
-/// `PChgTabsOperand` (sprmPChgTabs 0xC615): `PchgTabsDelClose` then `PchgTabsAdd`.
-fn decode_pchg_tabs_operand(operand: &[u8]) -> Vec<TabStop> {
+/// `PChgTabsOperand` delete list then `PchgTabsAdd`. The delete stride in bytes
+/// per tab depends on the opcode: `4·cDel` for `0xC615` (`PchgTabsDelClose`),
+/// `2·cDel` for `0xC60D` (`PchgTabsDel`).
+fn decode_pchg_tabs_operand(opcode: u16, operand: &[u8]) -> Vec<TabStop> {
     let mut tabs = Vec::new();
-    // PchgTabsDelClose (§2.9.181): cTabs (u8), rgdxaDel (cTabs × 2 bytes),
-    // rgdxaClose (cTabs × 2 bytes). Skip the whole block to reach PchgTabsAdd.
+    // Delete stride: rgdxaDel+rgdxaClose (2 XAS) for 0xC615, rgdxaDel only
+    // (1 XAS) for 0xC60D.
+    let del_stride = if opcode == 0xC615 { 4 } else { 2 };
+    // Delete block (§2.9.181 / §2.9.178): cTabs (u8) then `del_stride` bytes
+    // per tab. Skip the whole block to reach the add list.
     let Some(c_del) = operand.first().copied() else {
         return tabs;
     };
-    let mut pos = 1 + (c_del as usize).saturating_mul(4);
+    let mut pos = 1 + (c_del as usize).saturating_mul(del_stride);
     // PchgTabsAdd (§2.9.180): cTabs (u8), rgdxaAdd (cTabs × 2-byte XAS),
     // rgtbdAdd (cTabs × 1-byte TBD).
     let Some(c_add) = operand.get(pos).copied() else {
@@ -399,11 +404,14 @@ pub fn extract_pap_props(grpprl: &[u8]) -> PapProps {
                 props.is_table_trailing_mark = true;
                 props.tap = parse_tdef_table(&sprm.operand);
             },
-            // sprmPIlfo (0x460B) — 2-byte operand, the list format override id.
+            // sprmPIlfo (0x460B) — 2-byte operand read as *signed* `i16` per
+            // [MS-DOC] §2.9.150: `0x0000`/`0xF801` mean "not in a list",
+            // `0x0001`–`0x07FE` are 1-based indices into `PlfLfo.rgLfo`, and
+            // `0xF802`–`0xFFFF` are the negation of a 1-based index (still in a
+            // list). Storing it signed keeps the negation explicit.
             0x460B => {
                 if sprm.operand.len() >= 2 {
-                    props.ilfo =
-                        Some(u16::from_le_bytes([sprm.operand[0], sprm.operand[1]]) as u32);
+                    props.ilfo = Some(i16::from_le_bytes([sprm.operand[0], sprm.operand[1]]));
                 }
             },
             // sprmPIlvl (0x260A) — 1-byte operand, the list level (0-based).
@@ -765,25 +773,37 @@ mod tests {
         assert_eq!(props.tabs[1].position_twips, 200); // 0xC8
     }
 
-    /// `0xC60D` (`sprmPChgTabsPapx`) carries no length prefix; the operand is a
-    /// `PChgTabsOperand` whose length is derived from `cDel`/`cAdd`. It must
-    /// populate tab stops with a 1-byte-cb-style body that is NOT prefixed.
+    /// `0xC60D` (`sprmPChgTabsPapx`) carries a normal 1-byte `cb` prefix (not a
+    /// no-prefix opcode), and its delete block is `PChgTabsDel` (`1 + 2·cDel`,
+    /// one XAS per tab) rather than `PchgTabsDelClose` (`1 + 4·cDel`). Build the
+    /// grpprl straight from [MS-DOC]: opcode + `cb = 7` + `PChgTabsDel{cTabs=1,
+    /// rgdxaDel=[16]}` + `PChgTabsAdd{cTabs=1, pos=2000, TBD jc=2}`, followed by
+    /// a `sprmPFInTable` so we can prove the walker does NOT swallow it.
     #[test]
     fn sprm_pchg_tabs_papx_c60d_populates_tabs() {
-        // No length prefix: opcode(2) + PChgTabsOperand directly. cDel=1, cAdd=2.
+        // PchgTabsDel: cTabs=1, rgdxaDel=[16] (2-byte XAS) -> 3 bytes.
+        // PchgTabsAdd: cTabs=1, rgdxaAdd=[2000], rgtbdAdd=[jc=2] -> 4 bytes.
+        // Body = 7 bytes, so the 1-byte cb prefix is 7.
         let body: Vec<u8> = vec![
-            1, 0x00, 0x00, 0x00, 0x00, // PchgTabsDelClose: cDel=1 + 4 bytes
-            2, 0xD0, 0x07, 0xE8, 0x03, 0x02, 0x01, // PchgTabsAdd: cAdd=2 + positions + TBDs
+            1, 0x10, 0x00, // PchgTabsDel: cTabs=1, rgdxaDel=[16]
+            1, 0xD0, 0x07, 0x02, // PchgTabsAdd: cTabs=1, rgdxaAdd=[2000], TBD jc=2
         ];
-        let mut grpprl = vec![0x0D, 0xC6]; // sprmPChgTabsPapx (0xC60D)
+        let mut grpprl = vec![0x0D, 0xC6, 7]; // opcode + 1-byte cb
         grpprl.extend_from_slice(&body);
+        grpprl.extend_from_slice(&[0x16, 0x24, 0x01]); // sprmPFInTable, operand 0x01
+
+        // The trailing SPRM must be decoded, not swallowed by a bad length.
+        let sprms = parse_grpprl(&grpprl);
+        assert_eq!(sprms.len(), 2, "0xC60D must decode AND leave the trailing SPRM intact");
+        assert_eq!(sprms[0].opcode, 0xC60D);
+        assert_eq!(sprms[0].operand, body);
+        assert_eq!(sprms[1].opcode, 0x2416);
 
         let props = extract_pap_props(&grpprl);
-        assert_eq!(props.tabs.len(), 2, "0xC60D has no prefix; cDel skipped, cAdd=2");
+        assert_eq!(props.tabs.len(), 1, "0xC60D PChgTabsDel is 1 + 2·cDel");
         assert_eq!(props.tabs[0].position_twips, 2000);
         assert_eq!(props.tabs[0].alignment, TabAlignment::Right);
-        assert_eq!(props.tabs[1].position_twips, 1000);
-        assert_eq!(props.tabs[1].alignment, TabAlignment::Center);
+        assert!(props.f_in_table, "trailing sprmPFInTable must be reached and applied");
     }
 
     /// `0xD632` is `sprmTCellPadding` (NOT `sprmPChgTabs`). It must not be read
@@ -853,7 +873,7 @@ mod tests {
     /// A variable-length SPRM whose length prefix / body is truncated must stop
     /// the walk cleanly, never panic (AGENTS.md rule 6). Covers the truncation
     /// `break` for each special variable encoding: 0xD608 (2-byte cb), 0xC615
-    /// (1-byte cb), and 0xC60D (no prefix).
+    /// (1-byte cb), and 0xC60D (1-byte cb).
     #[test]
     fn parse_grpprl_truncated_variable_sprm_prefixes() {
         assert!(

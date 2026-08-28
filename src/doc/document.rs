@@ -247,6 +247,9 @@ mod tests {
     fn list_props(level: u8) -> crate::doc::sprm::PapProps {
         crate::doc::sprm::PapProps {
             ilvl: Some(level),
+            // A real list item carries a valid `ilfo` (0x0001–0x07FE); without
+            // it the paragraph is not in a list per [MS-DOC] §2.4.6.3.
+            ilfo: Some(1),
             ..Default::default()
         }
     }
