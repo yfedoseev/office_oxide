@@ -565,7 +565,7 @@ mod tests {
     /// so neither the `saturating_add` nor the offset mask was exercised there.
     #[test]
     fn piece_backed_cp_end_nonzero_cp_start_and_offset() {
-        let word_doc = vec![0u8; 64];
+        let word_doc = [0u8; 64];
 
         // Unicode piece with cp_start=100: backed end = 100 + 32.
         let unicode = Piece {
