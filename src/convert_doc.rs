@@ -504,7 +504,7 @@ mod tests {
         let mut els = Vec::new();
         walk_paragraphs(&[p], &mut els);
         let Element::Paragraph(par) = &els[0] else {
-            panic!("expected a paragraph, got {:?}", &els[0]);
+            panic!("expected a paragraph, got {:?}", els[0]);
         };
         assert!(
             par.content
