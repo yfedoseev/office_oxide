@@ -375,10 +375,8 @@ pub struct SlideText {
 }
 
 fn decode_utf16le(data: &[u8]) -> String {
-    let chars: Vec<u16> = data
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
+    let (pairs, _rest) = data.as_chunks::<2>();
+    let chars: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
     String::from_utf16_lossy(&chars)
 }
 
