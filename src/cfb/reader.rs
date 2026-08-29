@@ -39,10 +39,8 @@ impl<R: Read + Seek> CfbReader<R> {
         let mini_fat = if header.first_mini_fat_sector <= MAX_REG_SECT {
             let mini_fat_data =
                 Self::read_chain(&mut reader, &header, &fat, header.first_mini_fat_sector)?;
-            mini_fat_data
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect()
+            let (quads, _rest) = mini_fat_data.as_chunks::<4>();
+            quads.iter().copied().map(u32::from_le_bytes).collect()
         } else {
             Vec::new()
         };
