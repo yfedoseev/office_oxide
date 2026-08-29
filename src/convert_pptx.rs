@@ -413,3 +413,62 @@ fn image_format_from_ext(ext: &str) -> Option<ImageFormat> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pptx::shape::{TextBody, TextContent, TextParagraph, TextRun};
+
+    fn bullet(level: u32, text: &str) -> TextParagraph {
+        TextParagraph {
+            level,
+            content: vec![TextContent::Run(TextRun {
+                text: text.to_string(),
+                ..Default::default()
+            })],
+            ..Default::default()
+        }
+    }
+
+    fn list_texts(list: &crate::ir::List) -> Vec<String> {
+        list.items
+            .iter()
+            .map(|li| {
+                let mut out = String::new();
+                for el in &li.content {
+                    if let Element::Paragraph(p) = el {
+                        for c in &p.content {
+                            if let crate::ir::InlineContent::Text(t) = c {
+                                out.push_str(&t.text);
+                            }
+                        }
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
+    /// A placeholder whose bullets all sit at outline level 1 — ordinary
+    /// PowerPoint, and the shape that used to lose every bullet after the
+    /// first when the flat run was folded into the IR list tree.
+    #[test]
+    fn uniformly_indented_bullets_all_survive() {
+        let body = TextBody {
+            paragraphs: vec![bullet(1, "first"), bullet(1, "second"), bullet(1, "third")],
+        };
+
+        let mut elements = Vec::new();
+        convert_text_body(&body, &mut elements);
+
+        let list = elements
+            .iter()
+            .find_map(|el| match el {
+                Element::List(l) => Some(l),
+                _ => None,
+            })
+            .expect("a list is produced");
+
+        assert_eq!(list_texts(list), vec!["first", "second", "third"], "no bullet may be dropped");
+    }
+}
