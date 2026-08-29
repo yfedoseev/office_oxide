@@ -28,7 +28,7 @@ jobs:
     name: PR title (Conventional Commits)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const title = context.payload.pull_request.title || '';
@@ -44,7 +44,7 @@ jobs:
     name: No compiled / binary artifacts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             // Compiled libraries / bytecode / executables — build from source,
@@ -71,7 +71,7 @@ jobs:
     name: Label AI-assisted contributions
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             // Label (never block) — disclosed AI co-authorship is legitimate;
