@@ -31,6 +31,16 @@ pub struct Fib {
     pub textbox_len: u32,
     /// Length of header textbox text.
     pub header_textbox_len: u32,
+    /// Offset of the PlcfBtePapx (PAPX FKP index) in the Table stream.
+    /// FIB absolute offset 0x0102. Zero when the file has no PAPX FKP.
+    pub fc_plcf_bte_papx: u32,
+    /// Byte length of the PlcfBtePapx in the Table stream (0x0106).
+    pub lcb_plcf_bte_papx: u32,
+    /// Offset of the PlcfLst (list definitions) in the Table stream (0x02E2).
+    /// Zero when the file defines no lists.
+    pub fc_plcf_lst: u32,
+    /// Byte length of the PlcfLst in the Table stream (0x02E6).
+    pub lcb_plcf_lst: u32,
 }
 
 impl Fib {
@@ -66,24 +76,32 @@ impl Fib {
         let textbox_len = read_u32(data, 0x60);
         let header_textbox_len = read_u32(data, 0x64);
 
-        // FibRgFcLcb starts at variable offset. For Word 97 (nFib=0x00C1),
-        // the CLX is stored as fcClx/lcbClx.
+        // FibRgFcLcb97 is laid out at a fixed set of absolute offsets within
+        // the WordDocument stream for Word 97+ (nFib = 0x00C1). The offsets
+        // below are absolute (measured from the start of the stream), which
+        // matches what the on-disk FIB stores. See [MS-DOC] §2.5.5.
         //
-        // In practice, the FibRgFcLcb97 starts at offset 0x9A.
-        // fcClx is at FibRgFcLcb97 offset 0x01A2 (relative to 0x9A).
-        // = absolute offset 0x9A + 0x01A2 = 0x023C
-        // lcbClx is at 0x9A + 0x01A6 = 0x0240
-        //
-        // But these offsets vary by nFib. Let's use the standard approach:
-        // FibRgFcLcb97 starts at 0x9A.
-        // fcClx = FibRgFcLcb[0x1A2..0x1A6] relative = absolute 0x23C
-        // lcbClx = FibRgFcLcb[0x1A6..0x1AA] relative = absolute 0x240
-
-        // CLX offset varies by FIB version. Try standard Word 97+ location first.
+        // fcClx / lcbClx — piece table pointer (absolute 0x01A2 / 0x01A6).
         let (clx_offset, clx_size) = if data.len() > 0x01AA {
             (read_u32(data, 0x01A2), read_u32(data, 0x01A6))
         } else {
-            // FIB too short for standard CLX location — return zeros.
+            (0, 0)
+        };
+
+        // fcPlcfBtePapx / lcbPlcfBtePapx — PAPX FKP index (0x0102 / 0x0106).
+        // Used to locate paragraph property (PAPX) pages, which carry the
+        // fInTable / TAP (table) SPRMs needed for table reconstruction.
+        let (fc_plcf_bte_papx, lcb_plcf_bte_papx) = if data.len() > 0x010A {
+            (read_u32(data, 0x0102), read_u32(data, 0x0106))
+        } else {
+            (0, 0)
+        };
+
+        // fcPlcfLst / lcbPlcfLst — list definitions (0x02E2 / 0x02E6).
+        // Zero when the document defines no lists.
+        let (fc_plcf_lst, lcb_plcf_lst) = if data.len() > 0x02EA {
+            (read_u32(data, 0x02E2), read_u32(data, 0x02E6))
+        } else {
             (0, 0)
         };
 
@@ -99,6 +117,10 @@ impl Fib {
             endnote_len,
             textbox_len,
             header_textbox_len,
+            fc_plcf_bte_papx,
+            lcb_plcf_bte_papx,
+            fc_plcf_lst,
+            lcb_plcf_lst,
         })
     }
 }
@@ -134,6 +156,12 @@ mod tests {
         data[0x01A2..0x01A6].copy_from_slice(&512u32.to_le_bytes());
         // lcbClx
         data[0x01A6..0x01AA].copy_from_slice(&64u32.to_le_bytes());
+        // fcPlcfBtePapx = 300, lcbPlcfBtePapx = 28
+        data[0x0102..0x0106].copy_from_slice(&300u32.to_le_bytes());
+        data[0x0106..0x010A].copy_from_slice(&28u32.to_le_bytes());
+        // fcPlcfLst = 400, lcbPlcfLst = 12
+        data[0x02E2..0x02E6].copy_from_slice(&400u32.to_le_bytes());
+        data[0x02E6..0x02EA].copy_from_slice(&12u32.to_le_bytes());
         data
     }
 
@@ -146,6 +174,10 @@ mod tests {
         assert_eq!(fib.text_len, 100);
         assert_eq!(fib.clx_offset, 512);
         assert_eq!(fib.clx_size, 64);
+        assert_eq!(fib.fc_plcf_bte_papx, 300);
+        assert_eq!(fib.lcb_plcf_bte_papx, 28);
+        assert_eq!(fib.fc_plcf_lst, 400);
+        assert_eq!(fib.lcb_plcf_lst, 12);
     }
 
     #[test]
