@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.9] - 2026-08-31
+## [0.1.9] - 2026-09-01
 
 > Legacy binary `.doc` structure release: tables, lists, and tab stops are now recovered into the IR, closing the long-standing fidelity gap against the `.docx` path. Plus an IR list-nesting fix, green lint gates, and a dependency refresh. No breaking API changes.
 >
