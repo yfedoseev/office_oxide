@@ -38,6 +38,7 @@ more than the time it takes to review it. We are not anti-AI; we are anti-slop.
 - [Getting Started](#getting-started)
 - [Development Setup](#development-setup)
 - [Project Structure](#project-structure)
+- [Where Help Is Wanted](#where-help-is-wanted)
 - [Development Workflow](#development-workflow)
 - [Coding Standards](#coding-standards)
 - [Testing](#testing)
@@ -144,13 +145,40 @@ office_oxide/
 └── docs/                  # Architecture, per-language getting-started guides
 ```
 
+## Where Help Is Wanted
+
+Individual issues come and go; these areas are durably open. Pick one, then open an
+issue describing what you intend to do **before** writing non-trivial code — see
+[the rules that matter most](#the-rules-that-matter-most).
+
+| Area | What it looks like | Extra bar for this area |
+| --- | --- | --- |
+| **Legacy binary formats** (`src/doc/`, `src/xls/`, `src/ppt/`) | Structures the parsers don't read yet — outline levels, fields, embedded objects, legacy code-page decode. Every claim traced to the MS-DOC / MS-XLS / MS-PPT spec section it comes from. | A **real** file that exercises the new path, not only a synthetic one. A parser change whose new branches are reached by no real document is not yet proven. |
+| **IR and renderers** (`src/ir.rs`, `src/ir_render.rs`) | Fidelity gaps in `plain_text` / `markdown` / `html` — spacing, nesting, list numbering, table shape. | Before/after output for the affected documents, and confirmation the other two renderers didn't shift. |
+| **Binding parity** (`go/`, `js/`, `csharp/`, `src/wasm.rs`) | The Python surface leads and the others lag. Closing one specific gap is a well-scoped task. | An example under `examples/<lang>/` plus a test in that binding's CI job. |
+| **Robustness** | Malformed, truncated or hostile files must return an error — never panic, hang, or allocate unboundedly. | A synthetic malformed input as a test, and a statement that it fails before your fix. |
+| **Docs and examples** (`docs/`, `examples/`) | Getting-started guides, per-language examples, corrections. | Exempt from the accepted-issue rule — just open the PR. |
+
+Smaller entry points are labelled
+[`good first issue`](https://github.com/yfedoseev/office_oxide/labels/good%20first%20issue)
+and [`help wanted`](https://github.com/yfedoseev/office_oxide/labels/help%20wanted).
+They are applied sparingly, so an empty list is normal rather than a sign that
+nothing needs doing — the table above is the better starting point.
+
 ## Development Workflow
 
 ### 1. Pick a Task
 
-- Check [Issues](https://github.com/yfedoseev/office_oxide/issues)
-- Look for issues labeled `help-wanted` or `good-first-issue`
-- Comment on the issue to claim it
+- Browse [open issues](https://github.com/yfedoseev/office_oxide/issues), or pick an
+  area from [Where Help Is Wanted](#where-help-is-wanted).
+- Comment on the issue to claim it, and **wait for a maintainer to accept the
+  approach** before writing non-trivial code. Work that arrives as a finished pull
+  request with no agreed issue may be closed without detailed review, however good
+  it is — agreeing the shape first is what protects your time, not just ours.
+- No issue that fits? Open one. The
+  [Feature Request](https://github.com/yfedoseev/office_oxide/issues/new?template=feature_request.yml)
+  template asks for the problem before the solution; if your work is one step of a
+  larger plan, describe the whole plan there so the scope is agreed once.
 
 ### 2. Create a Branch
 
@@ -208,9 +236,9 @@ make check-all
 Follow [Conventional Commits](https://www.conventionalcommits.org/):
 
 ```bash
-git commit -m "feat: add PDF object parser"
-git commit -m "fix: correct unicode mapping in ToUnicode CMap"
-git commit -m "docs: update API documentation"
+git commit -m "feat(xlsx): expand shared formulas on read"
+git commit -m "fix(doc): correct code-page decode for legacy text runs"
+git commit -m "docs: document the DocumentIR table model"
 ```
 
 Commit types:
@@ -289,19 +317,33 @@ pub fn open(path: &Path) -> Result<Document> {
 
 ### Unit Tests
 
+Build the input **in code**. No third-party or customer document is committed as
+a fixture, so tests construct the bytes they need and parse them from memory:
+
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
-    fn test_parse_document() {
-        let doc = Document::open("tests/fixtures/simple.docx").unwrap();
-        let text = doc.plain_text();
-        assert!(text.contains("Hello"));
+    fn heading_style_becomes_a_heading() {
+        let bytes = build_minimal_docx(/* the one construct under test */);
+        let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+        assert!(doc.plain_text().contains("Hello"));
     }
 }
 ```
+
+Name the test after the **defect class** it guards (`heading_style_becomes_a_heading`),
+not after an issue or PR number.
+
+Ready-made builders already exist — reuse them rather than writing another:
+
+- `tests/common/mod.rs` — a synthetic `.doc` writer (`build_doc`, `open_doc`,
+  `prose_grpprl`, `row_grpprl`, `cell_grpprl`) that emits a real CFB/OLE2 container.
+- `tests/docx_integration.rs` — `DocxBuilder`, which assembles a minimal OPC package
+  part by part.
 
 ### Integration Tests
 
