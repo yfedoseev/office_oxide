@@ -269,7 +269,7 @@ fn render_section_markdown(section: &Section) -> String {
 fn render_element_markdown(element: &Element) -> String {
     match element {
         Element::Heading(h) => {
-            let hashes = "#".repeat(h.level.min(6) as usize);
+            let hashes = "#".repeat(h.level.min(MAX_HEADING_DEPTH) as usize);
             let text = render_inline_markdown(&h.content);
             format!("{hashes} {text}")
         },

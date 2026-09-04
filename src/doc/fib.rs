@@ -41,6 +41,11 @@ pub struct Fib {
     pub fc_plcf_lst: u32,
     /// Byte length of the PlcfLst in the Table stream (0x02E6).
     pub lcb_plcf_lst: u32,
+    /// Offset of the style sheet (`stshf`, an `STSH`) in the Table stream
+    /// (absolute 0x00A2). Zero when the file has no style sheet.
+    pub fc_stshf: u32,
+    /// Byte length of the style sheet in the Table stream (0x00A6).
+    pub lcb_stshf: u32,
 }
 
 impl Fib {
@@ -105,6 +110,14 @@ impl Fib {
             (0, 0)
         };
 
+        // fcStshf / lcbStshf — style sheet (STSH) in the Table stream
+        // (absolute 0x00A2 / 0x00A6). Zero when the file has no style sheet.
+        let (fc_stshf, lcb_stshf) = if data.len() > 0x00A9 {
+            (read_u32(data, 0x00A2), read_u32(data, 0x00A6))
+        } else {
+            (0, 0)
+        };
+
         Ok(Self {
             version,
             use_table1,
@@ -121,6 +134,8 @@ impl Fib {
             lcb_plcf_bte_papx,
             fc_plcf_lst,
             lcb_plcf_lst,
+            fc_stshf,
+            lcb_stshf,
         })
     }
 }

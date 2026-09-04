@@ -636,10 +636,16 @@ pub enum ShapeGeom {
     Rect,
 }
 
+/// The deepest heading level the IR can express: `Heading::level` is 1–
+/// `MAX_HEADING_DEPTH`, a markdown-style depth. Format readers whose native
+/// heading range is deeper (MS-DOC outline levels run to 9) clamp to this when
+/// they build the IR, so every consumer can rely on the bound.
+pub const MAX_HEADING_DEPTH: u8 = 6;
+
 /// A heading element with a nesting level.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Heading {
-    /// Heading level 1–6 (1 = largest).
+    /// Heading level 1–[`MAX_HEADING_DEPTH`] (1 = largest).
     #[serde(default = "default_heading_level")]
     pub level: u8,
     /// Inline content of the heading.

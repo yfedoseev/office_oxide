@@ -16,6 +16,14 @@ pub mod images;
 mod papx;
 mod piece_table;
 mod sprm;
+pub mod styles;
+
+/// The deepest outline level MS-DOC stores: `Heading 1`–`Heading 9`. The
+/// `sprmPOutlineLvl` (0x6412) operand, `StdfBase.sti`, and a user-defined
+/// `Heading N` style name all use this range, so it lives here — at the
+/// `.doc` format root rather than in any one submodule — and every site that
+/// validates or derives an outline level reads this same bound.
+pub const MAX_OUTLINE_LEVEL: u8 = 9;
 
 pub use crate::core::OfficeDocument;
 pub use document::DocDocument;

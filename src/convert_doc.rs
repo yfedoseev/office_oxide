@@ -1,5 +1,6 @@
 use crate::doc::{DocDocument, DocParagraph, TapCellInfo, TapInfo};
 use crate::format::DocumentFormat;
+use crate::ir::MAX_HEADING_DEPTH;
 use crate::ir::*;
 
 /// Convert a parsed legacy `.doc` into the intermediate representation.
@@ -391,7 +392,7 @@ fn walk_paragraphs(paragraphs: &[DocParagraph], elements: &mut Vec<Element>) {
         } else {
             table.flush(elements);
             flush_list(&mut list_items, elements);
-            emit_prose(&p.text, &p.props.tabs, elements);
+            emit_prose(&p.text, &p.props.tabs, p.props.heading_level, elements);
         }
     }
     table.flush(elements);
@@ -442,11 +443,38 @@ fn inline_content_for(text: &str) -> Vec<InlineContent> {
 
 /// Classify a prose paragraph as a heading or paragraph and push it.
 ///
-/// Mirrors the line-based heuristic so a PAPX-bearing document keeps the same
-/// heading/title detection as the fallback path.
-fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>) {
+/// When `heading_level` is `Some`, the paragraph is a styled heading and its
+/// real level is used directly (resolved from `sprmPOutlineLvl` or the
+/// paragraph's style in the document style sheet — see `crate::doc::styles`).
+/// Otherwise the line-based heuristic is applied, keeping a PAPX-bearing
+/// document's heading/title detection identical to the fallback path.
+fn emit_prose(
+    text: &str,
+    tabs: &[TabStop],
+    heading_level: Option<u8>,
+    elements: &mut Vec<Element>,
+) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
+        return;
+    }
+
+    // A styled heading uses its real level, overriding the heuristic.
+    if let Some(level) = heading_level {
+        let mut content = inline_content_for(trimmed);
+        for ic in &mut content {
+            if let InlineContent::Text(t) = ic {
+                t.bold = true;
+            }
+        }
+        elements.push(Element::Heading(Heading {
+            // MS-DOC outline levels are 1-based and run to 9, but
+            // `Heading::level` is a 1–6 markdown-style depth; clamp, matching
+            // the DOCX path's `(outline_level + 1).min(6)`.
+            level: level.min(MAX_HEADING_DEPTH),
+            content,
+            ..Default::default()
+        }));
         return;
     }
 
@@ -488,7 +516,7 @@ fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>) {
 
 fn line_heuristic(text: &str, elements: &mut Vec<Element>) {
     for line in text.lines() {
-        emit_prose(line, &[], elements);
+        emit_prose(line, &[], None, elements);
     }
 }
 
@@ -718,6 +746,97 @@ mod tests {
         assert!(
             els.iter().any(|e| matches!(e, Element::Table(_))),
             "f_in_table cell paragraph must be emitted inside a table"
+        );
+    }
+
+    /// A paragraph inside a table whose style resolves to a heading must stay a
+    /// table cell. `walk_paragraphs` routes table paragraphs before `emit_prose`,
+    /// so a styled heading can neither leak into the table structure nor escape
+    /// it as a top-level `Heading`.
+    #[test]
+    fn styled_heading_inside_table_stays_a_cell() {
+        let mark = DocParagraph {
+            text: String::new(),
+            terminator: '\r',
+            props: PapProps {
+                is_table_trailing_mark: true,
+                itap: 1,
+                heading_level: Some(3),
+                ..PapProps::default()
+            },
+        };
+        let cell = DocParagraph {
+            text: "cell text".into(),
+            terminator: '\u{7}', // closes the cell
+            props: PapProps {
+                f_in_table: true,
+                heading_level: Some(3),
+                ..PapProps::default()
+            },
+        };
+        let paragraphs = [mark.clone(), cell, mark];
+        let mut els = Vec::new();
+        walk_paragraphs(&paragraphs, &mut els);
+        assert!(
+            els.iter().any(|e| matches!(e, Element::Table(_))),
+            "the cell must still be emitted inside a table"
+        );
+        assert!(
+            !els.iter().any(|e| matches!(e, Element::Heading(_))),
+            "a styled heading inside a table must not become a Heading"
+        );
+    }
+
+    /// A row-terminator paragraph that also carries a heading style must end the
+    /// row, not emit a `Heading` into the element stream.
+    #[test]
+    fn styled_heading_on_row_terminator_is_not_a_heading() {
+        let row = DocParagraph {
+            // A row terminator can carry the trailing cell's text; keeping it
+            // non-empty is what makes this test meaningful — an empty text
+            // would be dropped by `emit_prose` whether or not the routing is
+            // correct, so the test could not tell the two apart.
+            text: "row text".into(),
+            terminator: '\r',
+            props: PapProps {
+                is_table_trailing_mark: true,
+                itap: 1,
+                heading_level: Some(2),
+                ..PapProps::default()
+            },
+        };
+        let mut els = Vec::new();
+        walk_paragraphs(&[row], &mut els);
+        assert!(
+            !els.iter().any(|e| matches!(e, Element::Heading(_))),
+            "a row-terminator paragraph must end a row, not emit a Heading"
+        );
+    }
+
+    /// A paragraph that is a list member and whose style resolves to a heading
+    /// stays a list item: `walk_paragraphs` routes list membership (keyed on
+    /// `ilfo`) before `emit_prose`.
+    #[test]
+    fn styled_heading_list_item_stays_a_list_item() {
+        let item = DocParagraph {
+            text: "item".into(),
+            terminator: '\r',
+            props: PapProps {
+                ilfo: Some(1),
+                ilvl: Some(0),
+                heading_level: Some(4),
+                ..PapProps::default()
+            },
+        };
+        let mut els = Vec::new();
+        walk_paragraphs(&[item], &mut els);
+        assert!(
+            els.iter().any(|e| matches!(e, Element::List(_))),
+            "a list member must be emitted as a List"
+        );
+        assert!(
+            !els.iter().any(|e| matches!(e, Element::Heading(_))),
+            "a styled heading that is a list item must not become a Heading"
         );
     }
 

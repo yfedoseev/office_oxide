@@ -27,6 +27,8 @@
 
 use crate::ir::{TabAlignment, TabLeader, TabStop};
 
+use super::MAX_OUTLINE_LEVEL;
+
 /// A single decoded SPRM: opcode plus its operand bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sprm {
@@ -215,6 +217,32 @@ pub struct PapProps {
     /// list/tab-stop PR; in the tables-only PR this field is always empty, but
     /// it is cloned through the IR so the `Paragraph.tabs` shape stays uniform.
     pub tabs: Vec<TabStop>,
+    /// The style index this paragraph is restyled to by a direct `sprmPStyle`
+    /// (0x640A) in the grpprl, if any. It overrides the PAPX header's own
+    /// `istd` when resolving the style (see `crate::doc::styles`); `None` means
+    /// the PAPX header `istd` applies unchanged.
+    pub style_istd: Option<u16>,
+    /// True when the grpprl carries a `sprmPOutlineLvl` (0x6412) whose operand
+    /// is a valid outline level (0–[`MAX_OUTLINE_LEVEL`]).
+    ///
+    /// This distinguishes "the SPRM is absent" from "the SPRM is present with
+    /// level 0": level 0 is an explicit *body text* marker, so when this flag
+    /// is set `heading_level` is final and the paragraph's style must not be
+    /// consulted. An operand outside 0–`MAX_OUTLINE_LEVEL` (e.g. 0x68) is not a
+    /// valid outline level at all, leaves this flag false, and is ignored.
+    pub outline_lvl_explicit: bool,
+    /// Resolved heading level (1–9) when this paragraph is a heading.
+    ///
+    /// This is a **derived** value, not a raw SPRM property, and it is filled in
+    /// two stages: `extract_pap_props` sets it from `sprmPOutlineLvl` (0x6412)
+    /// when that SPRM is present; otherwise it stays `None` until
+    /// `build_paragraphs` falls back to the paragraph's style via
+    /// `resolve_heading_level`. So the value returned by `extract_pap_props`
+    /// alone is *not* necessarily final.
+    ///
+    /// `None` means "not a heading" (body text), and the `.doc` walk then falls
+    /// back to the line-based heading heuristic.
+    pub heading_level: Option<u8>,
 }
 
 /// One table cell descriptor (TKBKTAP, 20 bytes) distilled from a row's
@@ -420,6 +448,39 @@ pub fn extract_pap_props(grpprl: &[u8]) -> PapProps {
                     props.ilvl = Some(b);
                 }
             },
+            // sprmPStyle (0x640A) — the 4-byte operand's low word is the style
+            // index (`istd`) this paragraph is restyled to. Read here rather
+            // than in a separate pass so the grpprl is walked only once; it
+            // overrides the PAPX header `istd` when the style is resolved.
+            0x640A => {
+                if sprm.operand.len() >= 2 {
+                    props.style_istd = Some(u16::from_le_bytes([sprm.operand[0], sprm.operand[1]]));
+                }
+            },
+            // sprmPOutlineLvl (0x6412) — the 4-byte operand's low byte is the
+            // outline level: `0` = body text, `1`–`9` = Heading 1–9 (MS-DOC
+            // §2.9.138). This is the authoritative heading marker and wins over
+            // any style-derived level resolved later in `build_paragraphs`.
+            //
+            // Use the raw low byte and validate the `1..=9` range. A coincidental
+            // byte pattern that merely *contains* the opcode must not be turned
+            // into a heading: e.g. an operand low byte of 0x68 (104) is not a
+            // valid outline level and must be rejected, not masked to `8`.
+            0x6412 => {
+                if let Some(&b) = sprm.operand.first() {
+                    // A valid outline level is 0–MAX_OUTLINE_LEVEL; anything else
+                    // is a coincidental byte pattern, not an outline level, and
+                    // must leave the paragraph's status untouched.
+                    if b <= MAX_OUTLINE_LEVEL {
+                        // The level is now settled by direct formatting: 0 is an
+                        // explicit body-text marker, 1–MAX_OUTLINE_LEVEL a heading.
+                        props.outline_lvl_explicit = true;
+                        if b >= 1 {
+                            props.heading_level = Some(b);
+                        }
+                    }
+                }
+            },
             // sprmPChgTabs (0xC615) / sprmPChgTabsPapx (0xC60D): tab stops.
             0xC615 | 0xC60D => {
                 if !sprm.operand.is_empty() {
@@ -467,6 +528,62 @@ mod tests {
         assert_eq!(sprms[0].operand, vec![0x01]);
         assert_eq!(sprms[1].opcode, 0x6649);
         assert_eq!(sprms[1].operand, vec![0x01, 0x00, 0x00, 0x00]);
+    }
+
+    /// `sprmPOutlineLvl` (0x6412) is a spra-3 (4-byte) SPRM whose low byte is the
+    /// outline level: `1`–`9` = Heading 1–9. The level must surface on
+    /// `PapProps.heading_level`.
+    #[test]
+    fn sprm_p_outline_lvl_sets_heading_level() {
+        // opcode 0x6412 (LE) + 4-byte operand, low byte = 2 (valid level).
+        let grpprl = vec![0x12, 0x64, 0x02, 0x00, 0x00, 0x00];
+        let props = extract_pap_props(&grpprl);
+        assert_eq!(props.heading_level, Some(2), "outline level 2 -> Heading 2");
+        assert!(props.outline_lvl_explicit, "a valid level settles the outline level");
+    }
+
+    #[test]
+    fn sprm_p_outline_lvl_body_is_none() {
+        // outline level 0 means body text, not a heading — and it is *explicit*,
+        // so `resolve_heading_level` must not fall back to the style.
+        let grpprl = vec![0x12, 0x64, 0x00, 0x00, 0x00, 0x00];
+        let props = extract_pap_props(&grpprl);
+        assert_eq!(props.heading_level, None, "outline level 0 -> not a heading");
+        assert!(
+            props.outline_lvl_explicit,
+            "level 0 is an explicit body-text marker, not an absent SPRM"
+        );
+    }
+
+    /// A `sprmPOutlineLvl` operand whose low byte is outside 1–9 (here 0x68 =
+    /// 104) is not a valid outline level and must be ignored, even though the
+    /// opcode byte pattern appears in the grpprl. This guards against
+    /// coincidental byte sequences fabricating spurious headings.
+    #[test]
+    fn sprm_p_outline_lvl_rejects_invalid_byte() {
+        let grpprl = vec![0x12, 0x64, 0x68, 0x01, 0x01, 0x00];
+        let props = extract_pap_props(&grpprl);
+        assert_eq!(props.heading_level, None, "0x68 is not a valid outline level");
+        assert!(
+            !props.outline_lvl_explicit,
+            "an invalid operand is not an outline level at all, so the status stays unset"
+        );
+    }
+
+    /// `sprmPStyle` (0x640A) overrides the PAPX `istd`; the 2-byte istd is the
+    /// low word of the (spra-3, 4-byte) operand. It surfaces on
+    /// `PapProps.style_istd` from the same grpprl walk that decodes the other
+    /// paragraph properties.
+    #[test]
+    fn pap_props_read_sprm_p_style_override() {
+        // opcode 0x640A (LE) + 4-byte operand, low word = istd 5.
+        let grpprl = vec![0x0A, 0x64, 0x05, 0x00, 0x00, 0x00];
+        assert_eq!(extract_pap_props(&grpprl).style_istd, Some(5));
+    }
+
+    #[test]
+    fn pap_props_style_istd_absent_when_no_sprm() {
+        assert_eq!(extract_pap_props(&[0x16, 0x24, 0x01]).style_istd, None);
     }
 
     #[test]
