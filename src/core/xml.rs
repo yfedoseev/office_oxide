@@ -462,12 +462,29 @@ pub fn sanitize_xml_text(s: &str) -> std::borrow::Cow<'_, str> {
 
 /// Maximum element-nesting depth accepted by the recursive-descent parsers.
 ///
-/// Real documents nest a handful of levels; 64 is far beyond anything a
-/// human authoring tool produces. Without a cap, a 1.6 KB `.docx` holding
-/// several thousand nested `<w:tbl>` elements drove the parser into a
-/// stack overflow, which aborts the process — an uncatchable crash that no
-/// consumer of this library, in any binding, can defend against.
-pub const MAX_NESTING_DEPTH: usize = 64;
+/// Without a cap, a small `.docx` holding a few thousand nested `<w:tbl>`
+/// elements drives the parser into a stack overflow, which aborts the
+/// process — an uncatchable crash no consumer of this library, in any
+/// binding, can defend against.
+///
+/// The value is empirical, and the measurement that matters is the *worst*
+/// stack a caller might have, not the best. Nested-table documents built at
+/// increasing depths overflow at:
+///
+/// | build | stack | cliff |
+/// |---|---|---|
+/// | release | 16 MB parse stack | 3,000-4,000 |
+/// | debug | default 2 MiB thread | 512-1,024 |
+///
+/// A binding, a test harness or any caller that does not trip
+/// `needs_stack_thread` runs on the ambient thread stack, so 256 is chosen
+/// against the 2 MiB figure with a 2x margin — still ~50x deeper than any
+/// document a human authoring tool produces.
+///
+/// Re-measure if the parser structs grow: the release cliff was
+/// 5,000-10,000 before this release's fields were added, so it moves with
+/// the frame size.
+pub const MAX_NESTING_DEPTH: usize = 256;
 
 thread_local! {
     static NESTING_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

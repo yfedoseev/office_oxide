@@ -856,6 +856,16 @@ fn para_text(p: &Paragraph) -> String {
 }
 
 #[test]
+fn a_soft_hyphen_does_not_split_a_word() {
+    // `<w:softHyphen/>` is a discretionary line-break hint. Emitting U+00AD
+    // for it splits the word for every word-level consumer — one real corpus
+    // file carries 68, turning `Fähigkeit` into `Fähig` + `keit`.
+    let ir =
+        Docx::new(r#"<w:p><w:r><w:t>Fähig</w:t><w:softHyphen/><w:t>keit</w:t></w:r></w:p>"#).ir();
+    assert_eq!(para_text(para(&ir, 0)), "Fähigkeit");
+}
+
+#[test]
 fn non_breaking_hyphen_is_not_dropped() {
     // "e-mail" used to extract as "email".
     let ir =

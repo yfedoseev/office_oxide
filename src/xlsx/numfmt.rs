@@ -86,7 +86,11 @@ pub fn apply_format(n: f64, fmt_id: u32, fmt_str: Option<&str>) -> String {
     // Custom format string (IDs 164+).
     if let Some(fmt) = fmt_str {
         let fmt = fmt.trim();
-        if !fmt.is_empty() && fmt != "General" && fmt != "@" {
+        // The General/text sentinels are matched case-insensitively: real
+        // workbooks declare a custom `numFmt formatCode="GENERAL"`, and
+        // treating that as a literal format code rendered every numeric
+        // cell in the sheet as empty.
+        if !fmt.is_empty() && !fmt.eq_ignore_ascii_case("General") && fmt != "@" {
             return apply_custom(n, fmt);
         }
     }
@@ -369,8 +373,12 @@ fn apply_custom(n: f64, fmt: &str) -> String {
     // A section with no digit placeholder at all is pure literal text —
     // `"yes";"no"` names two strings, not two numbers. Emitting the number
     // alongside them produced "1yes".
+    //
+    // Unquoted literal characters accumulate in `currency_prefix`, so they
+    // must be included: dropping them turned an unrecognised format code
+    // into an empty cell, losing the value entirely.
     if !in_num_part {
-        return format!("{prefix_literal}{suffix}");
+        return format!("{currency_prefix}{prefix_literal}{suffix}");
     }
 
     let value = if has_percent { n * 100.0 } else { n } / scale_divisor;

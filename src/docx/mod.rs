@@ -956,8 +956,16 @@ fn parse_run(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Run> {
                     run.content.push(RunContent::Text("\u{2011}".to_string()));
                     xml::skip_element_fast(reader)?;
                 },
+                // `<w:softHyphen/>` is a *discretionary* line-break hint, not
+                // content: Word draws it only when the line happens to break
+                // there. Emitting U+00AD splits the word for every consumer
+                // doing word-level work — search, RAG, the uses this library
+                // exists for — turning `Fähigkeit` into `Fähig` + `keit`.
+                // One real corpus file carries 68 of them. Dropped, which is
+                // what every mainstream extractor does. `w:noBreakHyphen`
+                // above is the opposite case: a hyphen the document actually
+                // draws, so it is kept.
                 b"softHyphen" => {
-                    run.content.push(RunContent::Text("\u{00AD}".to_string()));
                     xml::skip_element_fast(reader)?;
                 },
                 b"delText" => {
@@ -989,9 +997,8 @@ fn parse_run(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Run> {
                 b"noBreakHyphen" => {
                     run.content.push(RunContent::Text("\u{2011}".to_string()));
                 },
-                b"softHyphen" => {
-                    run.content.push(RunContent::Text("\u{00AD}".to_string()));
-                },
+                // See the Start arm: a discretionary hyphen is not content.
+                b"softHyphen" => {},
                 b"sym" => {
                     if let Some(c) = parse_sym_char(e) {
                         run.content.push(RunContent::Text(c.to_string()));
@@ -1551,11 +1558,32 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Table> {
     // skipped rather than recursed into: a stack overflow aborts the whole
     // process and no caller in any binding can catch it.
     let Some(_depth) = xml::DepthGuard::enter() else {
+        // Past the cap the subtree is skipped rather than recursed into.
+        // Say so in the content: silent truncation is the defect class this
+        // release exists to remove, and a reader cannot otherwise tell a
+        // truncated document from a shallow one. Mirrors the visible notice
+        // the XLSX row cap emits.
         xml::skip_element_fast(reader)?;
         return Ok(Table {
             properties: None,
             grid: Vec::new(),
-            rows: Vec::new(),
+            rows: vec![TableRow {
+                properties: None,
+                cells: vec![TableCell {
+                    properties: None,
+                    content: vec![BlockElement::Paragraph(Paragraph {
+                        properties: None,
+                        content: vec![ParagraphContent::Run(Run {
+                            properties: None,
+                            content: vec![RunContent::Text(format!(
+                                "[nested tables deeper than {} levels not shown \
+                                 — document truncated]",
+                                xml::MAX_NESTING_DEPTH
+                            ))],
+                        })],
+                    })],
+                }],
+            }],
         });
     };
     let mut properties = None;

@@ -195,11 +195,41 @@ fn deeply_nested_tables_do_not_abort_the_process() {
     }
     // Either outcome is acceptable — a clean parse or a clean error. What
     // must not happen is a crash, which this test would fail to reach.
+    //
+    // This runs on the harness thread's default 2 MiB stack, which is the
+    // worst case `MAX_NESTING_DEPTH` is calibrated against: the constant was
+    // briefly raised to 1,024 during the 0.1.9 -> 0.1.10 regression sweep and
+    // this test aborted, which is exactly what it exists to catch.
     let _ = open_docx(docx_with(&body));
 }
 
 #[test]
+fn a_document_nested_past_the_cap_says_so_rather_than_truncating_silently() {
+    use office_oxide::ir::Element;
+
+    let depth = office_oxide::core::xml::MAX_NESTING_DEPTH + 50;
+    let mut body = String::new();
+    for _ in 0..depth {
+        body.push_str("<w:tbl><w:tr><w:tc>");
+    }
+    body.push_str("<w:p><w:r><w:t>BURIED</w:t></w:r></w:p>");
+    for _ in 0..depth {
+        body.push_str("</w:tc></w:tr></w:tbl>");
+    }
+    let doc = open_docx(docx_with(&body)).expect("parse");
+    let text = doc.plain_text();
+    assert!(
+        text.contains("document truncated"),
+        "truncation must be visible in the content, got {:?}",
+        &text[..text.len().min(300)]
+    );
+    // And the structure above the cap must still be there.
+    assert!(matches!(doc.to_ir().sections[0].elements.first(), Some(Element::Table(_))));
+}
+
+#[test]
 fn deeply_nested_tables_stay_within_the_depth_limit() {
+    // Below `MAX_NESTING_DEPTH`, so the document parses in full.
     let depth = 200;
     let mut body = String::new();
     for _ in 0..depth {
