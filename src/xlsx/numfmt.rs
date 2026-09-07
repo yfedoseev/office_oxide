@@ -263,6 +263,9 @@ fn apply_custom(n: f64, fmt: &str) -> String {
     let mut in_num_part = false;
     // Divisor accumulated from commas trailing the digit placeholders.
     let mut scale_divisor = 1.0f64;
+    // Whether the integer part contains a `0` placeholder, which forces a
+    // digit to be shown even when the value rounds to zero.
+    let mut has_forced_integer_digit = false;
     // Literal text collected before any digit placeholder appears.
     let mut prefix_literal = String::new();
 
@@ -328,13 +331,17 @@ fn apply_custom(n: f64, fmt: &str) -> String {
                 in_decimal = true;
                 in_num_part = true;
             },
+            // `0` forces a digit; `#` and `?` are *optional* digit
+            // placeholders (`?` pads with a space instead of nothing).
             '0' => {
                 in_num_part = true;
                 if in_decimal {
                     decimal_zeros += 1;
+                } else {
+                    has_forced_integer_digit = true;
                 }
             },
-            '#' => {
+            '#' | '?' => {
                 in_num_part = true;
                 if in_decimal {
                     _decimal_hashes += 1;
@@ -411,8 +418,15 @@ fn apply_custom(n: f64, fmt: &str) -> String {
 
     let value = if has_percent { n * 100.0 } else { n } / scale_divisor;
 
+    // A value that rounds to zero renders as *nothing* when the integer part
+    // has only optional placeholders (`#`/`?`) — which is exactly how the
+    // accounting formats' zero section, `_-* "-"??_-`, shows a bare dash.
+    // Forcing a digit there printed `0` where Excel prints nothing.
+    let rounds_to_zero = decimals == 0 && value.round() == 0.0;
     let body = if has_scientific {
         format_scientific(value)
+    } else if rounds_to_zero && !has_forced_integer_digit && in_num_part {
+        String::new()
     } else if has_comma_in_num {
         format_commas(value, decimals)
     } else if in_decimal && decimals > 0 {
@@ -526,6 +540,34 @@ mod tests {
         assert_eq!(apply_format(1021.02, 164, fmt), "1K");
         assert_eq!(apply_format(102102.102, 164, fmt), "102K");
         assert_eq!(apply_format(1_500_000.0, 164, fmt), "2M");
+    }
+
+    /// The accounting formats are the most common custom code in real
+    /// spreadsheets, and their zero section is `_-* "-"??_-`: `?` is an
+    /// *optional* digit placeholder, so a zero renders as a bare dash.
+    /// Not handling `?` sent the section down the literal path and printed
+    /// `??-` — 3,950 cells in one corpus file.
+    #[test]
+    fn the_accounting_zero_section_renders_a_bare_dash() {
+        let fmt = Some(r#"_-* #,##0.00_-;-* #,##0.00_-;_-* "-"??_-;_-@_-"#);
+        let out = apply_format(0.0, 164, fmt);
+        assert!(!out.contains('?'), "digit placeholders leaked into the value: {out}");
+        assert!(out.contains('-'), "expected the dash literal: {out}");
+    }
+
+    /// `?` is a digit placeholder wherever it appears, not a literal.
+    #[test]
+    fn question_mark_is_a_digit_placeholder() {
+        assert_eq!(apply_format(42.0, 164, Some("??")), "42");
+        assert_eq!(apply_format(7.0, 164, Some("???")), "7");
+    }
+
+    /// A value that rounds to zero shows nothing when the integer part has
+    /// only optional placeholders, and shows `0` when a `0` forces it.
+    #[test]
+    fn optional_placeholders_suppress_a_zero_that_a_forced_digit_keeps() {
+        assert_eq!(apply_format(0.0, 164, Some("#")), "");
+        assert_eq!(apply_format(0.0, 164, Some("0")), "0");
     }
 
     #[test]
