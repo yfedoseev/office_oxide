@@ -20,8 +20,14 @@ impl From<OfficeError> for PyErr {
 ///
 /// Supports use as a context manager:
 ///
-///     with Document.open("report.docx") as doc:
-///         print(doc.plain_text())
+/// ```text
+/// with Document.open("report.docx") as doc:
+///     print(doc.plain_text())
+/// ```
+///
+/// (The block is marked `text` because it is Python shown to Python users;
+/// an indented block here is collected as a Rust doctest and fails to
+/// compile under `cargo test --all-features --doc`.)
 #[pyclass(name = "Document", module = "office_oxide")]
 struct PyDocument {
     inner: Option<Document>,
