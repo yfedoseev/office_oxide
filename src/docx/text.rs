@@ -340,9 +340,9 @@ fn flush_run(pending: &mut Option<(RunStyle, String)>, out: &mut String) {
     } else if style.italic {
         body = format!("*{body}*");
     }
-    out.push_str(&lead);
+    out.push_str(lead);
     out.push_str(&body);
-    out.push_str(&trail);
+    out.push_str(trail);
 }
 
 /// Collect a run's text content (no emphasis delimiters).
