@@ -82,6 +82,11 @@ pub struct GraphicFrame {
 pub enum GraphicContent {
     /// A DrawingML table.
     Table(Table),
+    /// Flattened text from a graphic whose structure we do not model —
+    /// a SmartArt diagram or an embedded chart. The graphic is not drawn,
+    /// but its words are real document content and used to be dropped
+    /// entirely: a deck built out of SmartArt extracted as empty.
+    Text(Vec<String>),
     /// Unsupported or unrecognised graphic type.
     Unknown,
 }
@@ -135,6 +140,10 @@ pub struct TextBody {
 pub struct TextParagraph {
     /// Outline level (0 = top level).
     pub level: u32,
+    /// Bullet style declared by `<a:pPr>`: `buNone`, `buChar` or
+    /// `buAutoNum`. `None` means the paragraph inherits from the
+    /// placeholder, which for a body placeholder means "bulleted".
+    pub bullet: Option<BulletStyle>,
     /// Paragraph alignment from `<a:pPr algn="…"/>`. None when the
     /// attribute is absent (renderer-default left alignment).
     pub alignment: Option<crate::ir::ParagraphAlignment>,
@@ -143,6 +152,22 @@ pub struct TextParagraph {
     pub space_before_hundredths_pt: Option<u32>,
     /// Inline content items in this paragraph.
     pub content: Vec<TextContent>,
+}
+
+/// How a paragraph's bullet marker is produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BulletStyle {
+    /// `<a:buNone/>` — explicitly not a list item.
+    None,
+    /// `<a:buChar char="•"/>` — an unordered marker.
+    Char(String),
+    /// `<a:buAutoNum type="arabicPeriod" startAt="3"/>` — an ordered list.
+    AutoNum {
+        /// The `type` attribute, e.g. `arabicPeriod`, `alphaLcParenR`.
+        scheme: String,
+        /// `startAt`, when the numbering does not begin at 1.
+        start_at: Option<u32>,
+    },
 }
 
 /// An inline content item inside a paragraph.
@@ -176,6 +201,18 @@ pub struct TextRun {
     /// `None` when the run inherits its colour from the placeholder /
     /// theme, or when the fill is non-sRGB (gradient, scheme colour).
     pub color_rgb: Option<[u8; 3]>,
+    /// Underline style from `<a:rPr u="sng"/>`. `None` = inherit,
+    /// `Some("none")` = explicitly off.
+    pub underline: Option<String>,
+    /// Font face from `<a:rPr><a:latin typeface="…"/></a:rPr>`.
+    pub font_name: Option<String>,
+    /// Baseline shift in thousandths of a percent (`baseline="30000"` is
+    /// superscript, a negative value is subscript).
+    pub baseline: Option<i32>,
+    /// Capitalisation from `<a:rPr cap="all"|"small"/>`.
+    pub caps: Option<String>,
+    /// Character spacing in hundredths of a point (`spc="-50"`).
+    pub char_spacing_hundredths_pt: Option<i32>,
 }
 
 /// An auto-updated field inside a paragraph (`<a:fld>`).
@@ -214,6 +251,12 @@ pub enum HyperlinkTarget {
 pub struct Table {
     /// Ordered rows of the table.
     pub rows: Vec<TableRow>,
+    /// `<a:tblPr firstRow="1">` — the first row is a header row. Absent
+    /// means the table declares no header, which is not the same as the
+    /// first row being one.
+    pub first_row_header: bool,
+    /// `<a:tblPr lastRow="1">` — the last row is a totals row.
+    pub last_row_header: bool,
 }
 
 /// A single row within a `Table`.

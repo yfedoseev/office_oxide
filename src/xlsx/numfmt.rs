@@ -195,9 +195,38 @@ fn insert_commas(n: u64) -> String {
 /// thousands separators, decimal places, percentages, currency symbols,
 /// and scientific notation. Strips color/condition brackets and literals.
 fn apply_custom(n: f64, fmt: &str) -> String {
-    // Multi-section: take the first section (positive numbers).
-    // Second section = negatives, third = zero, fourth = text.
-    let section = fmt.split(';').next().unwrap_or(fmt);
+    // Sections are positive;negative;zero;text. Pick the one that applies
+    // to this value: a format like `#,##0;[Red](#,##0)` renders -1234 with
+    // the *second* section, and a two-section `"yes";"no"` is how a boolean
+    // flag column is written.
+    let sections = split_format_sections(fmt);
+    let section = match sections.len() {
+        0 => fmt,
+        1 => sections[0],
+        2 => {
+            if n < 0.0 {
+                sections[1]
+            } else {
+                sections[0]
+            }
+        },
+        _ => {
+            if n < 0.0 {
+                sections[1]
+            } else if n == 0.0 {
+                sections[2]
+            } else {
+                sections[0]
+            }
+        },
+    };
+    // The negative section supplies its own sign (usually parentheses or a
+    // literal '-'), so format its magnitude.
+    let n = if sections.len() >= 2 && n < 0.0 {
+        n.abs()
+    } else {
+        n
+    };
 
     // ── Parse the section ────────────────────────────────────────────────
     let mut currency_prefix = String::new();
@@ -209,6 +238,10 @@ fn apply_custom(n: f64, fmt: &str) -> String {
     let mut has_scientific = false;
     let mut in_decimal = false;
     let mut in_num_part = false;
+    // Divisor accumulated from commas trailing the digit placeholders.
+    let mut scale_divisor = 1.0f64;
+    // Literal text collected before any digit placeholder appears.
+    let mut prefix_literal = String::new();
 
     let mut chars = section.chars().peekable();
     while let Some(c) = chars.next() {
@@ -231,18 +264,29 @@ fn apply_custom(n: f64, fmt: &str) -> String {
                 }
                 // Colour directives ignored.
             },
-            // Quoted literal text — collect as suffix
+            // Quoted literal text. Before any digit placeholder it is a
+            // prefix; after one it is a suffix.
             '"' => {
                 for ch in chars.by_ref() {
                     if ch == '"' {
                         break;
                     }
-                    suffix.push(ch);
+                    if in_num_part {
+                        suffix.push(ch);
+                    } else {
+                        prefix_literal.push(ch);
+                    }
                 }
             },
             // Escape: next char is literal
             '\\' => {
-                chars.next();
+                if let Some(ch) = chars.next() {
+                    if in_num_part {
+                        suffix.push(ch);
+                    } else {
+                        prefix_literal.push(ch);
+                    }
+                }
             },
             // _X = pad with X (alignment) — skip X
             '_' => {
@@ -274,10 +318,20 @@ fn apply_custom(n: f64, fmt: &str) -> String {
                 }
             },
             ',' => {
-                // Comma between '#'/'0' chars = thousands separator.
-                // Comma at end of number part = scale-by-1000 (rare, skip for now).
+                // A comma *between* digit placeholders is the thousands
+                // separator; a comma *after* the last placeholder scales the
+                // value down by 1000 each. `#,##0,," M"` is how a
+                // finance sheet renders 12,500,000 as "12 M" — treating the
+                // trailing commas as separators printed the full number.
                 if in_num_part {
-                    has_comma_in_num = true;
+                    if chars
+                        .peek()
+                        .is_some_and(|c| matches!(c, '0' | '#' | '?' | '.'))
+                    {
+                        has_comma_in_num = true;
+                    } else {
+                        scale_divisor *= 1000.0;
+                    }
                 }
             },
             'E' | 'e' => {
@@ -312,7 +366,14 @@ fn apply_custom(n: f64, fmt: &str) -> String {
     let decimals = decimal_zeros; // treat '0' decimals as the required precision
 
     // ── Format the value ─────────────────────────────────────────────────
-    let value = if has_percent { n * 100.0 } else { n };
+    // A section with no digit placeholder at all is pure literal text —
+    // `"yes";"no"` names two strings, not two numbers. Emitting the number
+    // alongside them produced "1yes".
+    if !in_num_part {
+        return format!("{prefix_literal}{suffix}");
+    }
+
+    let value = if has_percent { n * 100.0 } else { n } / scale_divisor;
 
     let body = if has_scientific {
         format_scientific(value)
@@ -328,7 +389,36 @@ fn apply_custom(n: f64, fmt: &str) -> String {
 
     let pct_suffix = if has_percent { "%" } else { "" };
 
-    format!("{}{}{}{}", currency_prefix, body, suffix, pct_suffix)
+    format!("{currency_prefix}{prefix_literal}{body}{suffix}{pct_suffix}")
+}
+
+/// Split a number-format code into its `;`-separated sections, ignoring
+/// semicolons inside quoted literals, `\`-escapes and `[...]` directives.
+fn split_format_sections(fmt: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut in_quotes = false;
+    let mut in_bracket = false;
+    let mut escaped = false;
+    for (i, c) in fmt.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '"' if !in_bracket => in_quotes = !in_quotes,
+            '[' if !in_quotes => in_bracket = true,
+            ']' if in_bracket => in_bracket = false,
+            ';' if !in_quotes && !in_bracket => {
+                out.push(&fmt[start..i]);
+                start = i + 1;
+            },
+            _ => {},
+        }
+    }
+    out.push(&fmt[start..]);
+    out
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

@@ -393,20 +393,41 @@ impl PptxWriter {
     }
 
     /// Set the slide title by slide index.
-    pub fn slide_set_title(&mut self, slide: usize, title: &str) {
-        if let Some(s) = self.slides.get_mut(slide) {
-            s.set_title(title);
+    ///
+    /// Returns `false` — and logs a warning — when `slide` names no slide.
+    /// A silent no-op meant a loop with an off-by-one index discarded every
+    /// value it wrote while reporting success.
+    pub fn slide_set_title(&mut self, slide: usize, title: &str) -> bool {
+        match self.slides.get_mut(slide) {
+            Some(s) => {
+                s.set_title(title);
+                true
+            },
+            None => {
+                log::warn!("pptx: no slide at index {slide}; the title was not set");
+                false
+            },
         }
     }
 
-    /// Add a plain text paragraph to the slide body by slide index.
-    pub fn slide_add_text(&mut self, slide: usize, text: &str) {
-        if let Some(s) = self.slides.get_mut(slide) {
-            s.add_text(text);
+    /// Add a plain text paragraph to the slide body by slide index. See
+    /// [`Self::slide_set_title`] for the return value.
+    pub fn slide_add_text(&mut self, slide: usize, text: &str) -> bool {
+        match self.slides.get_mut(slide) {
+            Some(s) => {
+                s.add_text(text);
+                true
+            },
+            None => {
+                log::warn!("pptx: no slide at index {slide}; the text was not added");
+                false
+            },
         }
     }
 
-    /// Embed an image on a slide by slide index.
+    /// Embed an image on a slide by slide index. See
+    /// [`Self::slide_set_title`] for the return value.
+    #[allow(clippy::too_many_arguments)]
     pub fn slide_add_image(
         &mut self,
         slide: usize,
@@ -416,9 +437,16 @@ impl PptxWriter {
         y: i64,
         cx: u64,
         cy: u64,
-    ) {
-        if let Some(s) = self.slides.get_mut(slide) {
-            s.add_image(data, format, x, y, cx, cy);
+    ) -> bool {
+        match self.slides.get_mut(slide) {
+            Some(s) => {
+                s.add_image(data, format, x, y, cx, cy);
+                true
+            },
+            None => {
+                log::warn!("pptx: no slide at index {slide}; the image was not added");
+                false
+            },
         }
     }
 

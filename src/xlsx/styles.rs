@@ -25,7 +25,7 @@ pub struct StyleSheet {
 }
 
 /// A font definition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Font {
     /// Bold toggle.
     pub bold: bool,
@@ -44,7 +44,7 @@ pub struct Font {
 }
 
 /// A fill definition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Fill {
     /// Fill pattern type (e.g., `"solid"`).
     pub pattern_type: Option<String>,
@@ -55,7 +55,7 @@ pub struct Fill {
 }
 
 /// A border definition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Border {
     /// Left border.
     pub left: Option<BorderSide>,
@@ -202,6 +202,12 @@ fn parse_fonts(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Vec
                     xml::skip_element_fast(reader)?;
                 }
             },
+            // `<font/>` — Excel writes the default entry self-closing.
+            // Skipping it shifted every later index by one, so cells
+            // silently picked up a neighbour's formatting.
+            Event::Empty(ref e) if e.local_name().as_ref() == b"font" => {
+                fonts.push(Font::default());
+            },
             Event::End(ref e) if e.local_name().as_ref() == b"fonts" => {
                 break;
             },
@@ -279,6 +285,12 @@ fn parse_fills(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Vec
                     xml::skip_element_fast(reader)?;
                 }
             },
+            // `<fill/>` — Excel writes the default entry self-closing.
+            // Skipping it shifted every later index by one, so cells
+            // silently picked up a neighbour's formatting.
+            Event::Empty(ref e) if e.local_name().as_ref() == b"fill" => {
+                fills.push(Fill::default());
+            },
             Event::End(ref e) if e.local_name().as_ref() == b"fills" => {
                 break;
             },
@@ -338,6 +350,12 @@ fn parse_borders(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<V
                 } else {
                     xml::skip_element_fast(reader)?;
                 }
+            },
+            // `<border/>` — Excel writes the default entry self-closing.
+            // Skipping it shifted every later index by one, so cells
+            // silently picked up a neighbour's formatting.
+            Event::Empty(ref e) if e.local_name().as_ref() == b"border" => {
+                borders.push(Border::default());
             },
             Event::End(ref e) if e.local_name().as_ref() == b"borders" => {
                 break;

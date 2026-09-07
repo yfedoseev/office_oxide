@@ -118,13 +118,25 @@ pub fn required_attr<'a>(event: &'a BytesStart, key: &[u8]) -> Result<Cow<'a, [u
     }
 }
 
-/// Get a required attribute as a UTF-8 string.
+/// Get a required attribute as a UTF-8 string, with XML entity references
+/// resolved. See [`optional_attr_str`] for why the unescape matters.
 pub fn required_attr_str<'a>(event: &'a BytesStart, key: &[u8]) -> Result<Cow<'a, str>> {
     let value = required_attr(event, key)?;
-    match value {
-        Cow::Borrowed(b) => Ok(Cow::Borrowed(std::str::from_utf8(b)?)),
-        Cow::Owned(v) => Ok(Cow::Owned(String::from_utf8(v).map_err(|e| e.utf8_error())?)),
+    let text: Cow<'a, str> = match value {
+        Cow::Borrowed(b) => Cow::Borrowed(std::str::from_utf8(b)?),
+        Cow::Owned(v) => Cow::Owned(String::from_utf8(v).map_err(|e| e.utf8_error())?),
+    };
+    unescape_cow(text)
+}
+
+/// Resolve XML entity references in an attribute value, borrowing when the
+/// value contains none (the overwhelmingly common case).
+fn unescape_cow(text: Cow<'_, str>) -> Result<Cow<'_, str>> {
+    if !text.contains('&') {
+        return Ok(text);
     }
+    let unescaped = quick_xml::escape::unescape(&text).map_err(quick_xml::Error::from)?;
+    Ok(Cow::Owned(unescaped.into_owned()))
 }
 
 /// Get an optional attribute value.
@@ -132,12 +144,22 @@ pub fn optional_attr<'a>(event: &'a BytesStart, key: &[u8]) -> Result<Option<Cow
     Ok(event.try_get_attribute(key)?.map(|a| a.value))
 }
 
-/// Get an optional attribute as a UTF-8 string.
+/// Get an optional attribute as a UTF-8 string, with XML entity references
+/// resolved.
+///
+/// The raw bytes quick-xml hands back are still escaped: a `formatCode`
+/// written as `#,##0,,&quot; M&quot;` arrives with the six literal
+/// characters `&quot;` in place of each `"`. Every consumer that inspects
+/// the value then sees text that is not in the document — the number-format
+/// scanner read the `M` of `&quot; M&quot;` as a month token and rendered
+/// 12,500,000 as the date 36123-11-01 — and every URL, alt text and style
+/// name kept its `&amp;` verbatim.
 pub fn optional_attr_str<'a>(event: &'a BytesStart, key: &[u8]) -> Result<Option<Cow<'a, str>>> {
     match optional_attr(event, key)? {
-        Some(Cow::Borrowed(b)) => Ok(Some(Cow::Borrowed(std::str::from_utf8(b)?))),
+        Some(Cow::Borrowed(b)) => Ok(Some(unescape_cow(Cow::Borrowed(std::str::from_utf8(b)?))?)),
         Some(Cow::Owned(v)) => {
-            Ok(Some(Cow::Owned(String::from_utf8(v).map_err(|e| e.utf8_error())?)))
+            let text = String::from_utf8(v).map_err(|e| e.utf8_error())?;
+            Ok(Some(Cow::Owned(unescape_cow(Cow::Owned(text))?.into_owned())))
         },
         None => Ok(None),
     }

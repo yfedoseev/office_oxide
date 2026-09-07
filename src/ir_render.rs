@@ -273,17 +273,20 @@ fn render_inline_plain(content: &[InlineContent]) -> String {
 }
 
 fn render_table_plain(table: &Table) -> String {
+    // Tab-separated output is column-aligned, so a spanned cell must leave
+    // the positions it covers empty rather than shifting its neighbours.
     let mut rows = Vec::new();
-    for row in &table.rows {
+    for row in table_grid(table) {
         let cells: Vec<String> = row
-            .cells
             .iter()
-            .map(|cell| {
-                cell.content
+            .map(|slot| match slot {
+                Some(cell) => cell
+                    .content
                     .iter()
                     .map(render_element_plain)
                     .collect::<Vec<_>>()
-                    .join(" ")
+                    .join(" "),
+                None => String::new(),
             })
             .collect();
         rows.push(cells.join("\t"));
@@ -396,31 +399,75 @@ fn render_inline_markdown(content: &[InlineContent]) -> String {
     out
 }
 
+/// Lay a table out on a grid, resolving `col_span` and `row_span` into the
+/// positions each cell actually occupies.
+///
+/// Markdown has no cell-spanning syntax, so a spanned cell's text goes in
+/// its top-left position and the positions it covers render empty. Indexing
+/// `row.cells` positionally instead — which is what this did — shifted every
+/// cell to the right of a rowspan one column left, because the covered
+/// position has no cell of its own in the IR.
+fn table_grid(table: &Table) -> Vec<Vec<Option<&TableCell>>> {
+    // Width is the widest row measured in grid columns, not cell count.
+    let width = table
+        .rows
+        .iter()
+        .map(|r| r.cells.iter().map(|c| c.col_span.max(1) as usize).sum())
+        .max()
+        .unwrap_or(0);
+    let mut grid: Vec<Vec<Option<&TableCell>>> = vec![vec![None; width]; table.rows.len()];
+    // Positions already claimed by a cell spanning down from an earlier row.
+    let mut covered: Vec<Vec<bool>> = vec![vec![false; width]; table.rows.len()];
+
+    for (r, row) in table.rows.iter().enumerate() {
+        let mut c = 0usize;
+        for cell in &row.cells {
+            while c < width && covered[r][c] {
+                c += 1;
+            }
+            if c >= width {
+                break;
+            }
+            grid[r][c] = Some(cell);
+            let cs = cell.col_span.max(1) as usize;
+            let rs = cell.row_span.max(1) as usize;
+            for dr in 0..rs {
+                for dc in 0..cs {
+                    if r + dr < covered.len() && c + dc < width {
+                        covered[r + dr][c + dc] = true;
+                    }
+                }
+            }
+            c += cs;
+        }
+    }
+    grid
+}
+
 fn render_table_markdown(table: &Table) -> String {
     if table.rows.is_empty() {
         return String::new();
     }
 
-    let col_count = table.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0);
+    let grid = table_grid(table);
+    let col_count = grid.first().map(|r| r.len()).unwrap_or(0);
     if col_count == 0 {
         return String::new();
     }
 
     let mut result = String::new();
 
-    let first_row = &table.rows[0];
-    result.push('|');
-    for i in 0..col_count {
-        let text = first_row
-            .cells
-            .get(i)
-            .map(render_cell_markdown)
-            .unwrap_or_default();
-        result.push(' ');
-        result.push_str(&text);
-        result.push_str(" |");
-    }
-    result.push('\n');
+    let write_row = |cells: &[Option<&TableCell>], out: &mut String| {
+        out.push('|');
+        for slot in cells.iter().take(col_count) {
+            out.push(' ');
+            out.push_str(&slot.map(render_cell_markdown).unwrap_or_default());
+            out.push_str(" |");
+        }
+        out.push('\n');
+    };
+
+    write_row(&grid[0], &mut result);
 
     // Separator
     result.push('|');
@@ -429,20 +476,8 @@ fn render_table_markdown(table: &Table) -> String {
     }
     result.push('\n');
 
-    // Remaining rows
-    for row in table.rows.iter().skip(1) {
-        result.push('|');
-        for i in 0..col_count {
-            let text = row
-                .cells
-                .get(i)
-                .map(render_cell_markdown)
-                .unwrap_or_default();
-            result.push(' ');
-            result.push_str(&text);
-            result.push_str(" |");
-        }
-        result.push('\n');
+    for row in grid.iter().skip(1) {
+        write_row(row, &mut result);
     }
 
     // Remove trailing newline

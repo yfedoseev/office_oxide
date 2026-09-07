@@ -556,6 +556,14 @@ pub struct Section {
     /// solid case round-trips through this minimal field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_rgb: Option<[u8; 3]>,
+    /// `true` when the source marks this section as hidden — an XLSX sheet
+    /// with `state="hidden"`/`"veryHidden"`, or a PPTX slide with
+    /// `show="0"`. The content is still extracted (a consumer indexing a
+    /// workbook usually wants it) but a renderer can now tell that the
+    /// author did not intend it to be seen, which extracting it silently
+    /// made impossible.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 /// A block-level content element.

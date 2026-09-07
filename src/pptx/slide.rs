@@ -4,9 +4,9 @@ use crate::core::relationships::{Relationships, TargetMode};
 use crate::core::xml;
 
 use super::shape::{
-    AutoShape, ConnectorShape, GraphicContent, GraphicFrame, GroupShape, HyperlinkInfo,
-    HyperlinkTarget, PictureShape, PlaceholderInfo, Shape, ShapePosition, Table, TableCell,
-    TableRow, TextBody, TextContent, TextField, TextParagraph, TextRun,
+    AutoShape, BulletStyle, ConnectorShape, GraphicContent, GraphicFrame, GroupShape,
+    HyperlinkInfo, HyperlinkTarget, PictureShape, PlaceholderInfo, Shape, ShapePosition, Table,
+    TableCell, TableRow, TextBody, TextContent, TextField, TextParagraph, TextRun,
 };
 
 type CoreResult<T> = crate::core::Result<T>;
@@ -18,17 +18,43 @@ type CoreResult<T> = crate::core::Result<T>;
 /// keeps PDF→PPTX→PDF round-trips from defaulting every paragraph to
 /// the writer's 12 pt fallback (which inflated 8-page A4 sources to
 /// ~30 pages).
-type RunProps = (
-    Option<bool>,
-    Option<bool>,
-    bool,
-    Option<HyperlinkInfo>,
-    Option<u32>,
-    Option<[u8; 3]>,
-);
+#[derive(Default)]
+struct RunProps {
+    bold: Option<bool>,
+    italic: Option<bool>,
+    strikethrough: bool,
+    hyperlink: Option<HyperlinkInfo>,
+    font_size_hundredths_pt: Option<u32>,
+    color_rgb: Option<[u8; 3]>,
+    underline: Option<String>,
+    font_name: Option<String>,
+    baseline: Option<i32>,
+    caps: Option<String>,
+    char_spacing_hundredths_pt: Option<i32>,
+}
+
+/// Read the `<a:rPr>` attributes shared by the Start and Empty forms.
+fn run_props_from_attrs(e: &quick_xml::events::BytesStart) -> CoreResult<RunProps> {
+    let strike = xml::optional_attr_str(e, b"strike")?;
+    Ok(RunProps {
+        bold: parse_bool_attr(e, b"b")?,
+        italic: parse_bool_attr(e, b"i")?,
+        strikethrough: strike.as_deref().is_some_and(|v| v != "noStrike"),
+        font_size_hundredths_pt: parse_u32_attr(e, b"sz")?,
+        // `u`, `baseline`, `cap` and `spc` were parsed by no one, so
+        // underline in particular — the third most common piece of direct
+        // formatting — never reached the IR from PPTX even though it did
+        // from DOCX.
+        underline: xml::optional_attr_str(e, b"u")?.map(|v| v.into_owned()),
+        baseline: xml::optional_attr_str(e, b"baseline")?.and_then(|v| v.parse().ok()),
+        caps: xml::optional_attr_str(e, b"cap")?.map(|v| v.into_owned()),
+        char_spacing_hundredths_pt: xml::optional_attr_str(e, b"spc")?.and_then(|v| v.parse().ok()),
+        ..Default::default()
+    })
+}
 
 /// A parsed PPTX slide.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Slide {
     /// Slide name from the `<p:cSld name="...">` attribute.
     pub name: String,
@@ -41,6 +67,22 @@ pub struct Slide {
     /// case is parsed; gradient / image / theme-reference fills are
     /// dropped silently and surface as `None`.
     pub background_rgb: Option<[u8; 3]>,
+    /// `<p:sld show="0">` — the slide is hidden from the slideshow. Its
+    /// content is still extracted, but a consumer can now tell that the
+    /// author excluded it, which was impossible before.
+    pub hidden: bool,
+    /// Comments attached to this slide, from `ppt/comments/*.xml`.
+    pub comments: Vec<SlideComment>,
+}
+
+/// A comment attached to a slide (`ppt/comments/modernComment*.xml` or the
+/// legacy `ppt/comments/comment*.xml`).
+#[derive(Debug, Clone)]
+pub struct SlideComment {
+    /// Author name, when the deck's author list resolves the id.
+    pub author: Option<String>,
+    /// Comment body text.
+    pub text: String,
 }
 
 /// Create a fast reader that does NOT trim text content.
@@ -62,9 +104,14 @@ impl Slide {
         let mut reader = make_content_reader(xml_data);
         let mut shapes = Vec::new();
         let mut background_rgb = None;
+        let mut hidden = false;
 
         loop {
             match reader.read_event()? {
+                Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"sld" => {
+                    hidden = xml::optional_attr_str(e, b"show")?
+                        .is_some_and(|v| matches!(v.as_ref(), "0" | "false"));
+                },
                 Event::Start(ref e) if e.local_name().as_ref() == b"bg" => {
                     background_rgb = parse_slide_bg(&mut reader)?;
                 },
@@ -81,6 +128,8 @@ impl Slide {
             shapes,
             notes: None,
             background_rgb,
+            hidden,
+            comments: Vec::new(),
         })
     }
 }
@@ -395,6 +444,44 @@ fn parse_group_shape(
 // GraphicFrame (p:graphicFrame)
 // ---------------------------------------------------------------------------
 
+/// Collect every `<a:t>` text value inside a subtree, reading through the
+/// matching `</end_local>`. Used for graphic payloads we don't model
+/// structurally (SmartArt, charts) so their words still reach the IR.
+fn collect_a_t_text(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    end_local: &[u8],
+) -> CoreResult<Vec<String>> {
+    let mut out = Vec::new();
+    let mut depth = 1i32;
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => {
+                if e.local_name().as_ref() == b"t" {
+                    let t = xml::read_text_content_fast(reader)?;
+                    let t = t.trim();
+                    if !t.is_empty() {
+                        out.push(t.to_string());
+                    }
+                } else {
+                    depth += 1;
+                }
+            },
+            Event::End(ref e) => {
+                if e.local_name().as_ref() == end_local && depth <= 1 {
+                    break;
+                }
+                depth -= 1;
+                if depth <= 0 {
+                    break;
+                }
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(out)
+}
+
 fn parse_graphic_frame(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
@@ -425,7 +512,16 @@ fn parse_graphic_frame(
                         {
                             content = parse_graphic_data_table(reader, rels)?;
                         } else {
-                            xml::skip_element_fast(reader)?;
+                            // Everything that is not a table — SmartArt
+                            // diagrams, charts, embedded objects — used to be
+                            // skipped wholesale. We can't render them, but
+                            // their `<a:t>` runs are document text.
+                            let texts = collect_a_t_text(reader, b"graphicData")?;
+                            content = if texts.is_empty() {
+                                GraphicContent::Unknown
+                            } else {
+                                GraphicContent::Text(texts)
+                            };
                         }
                     },
                     _ => {
@@ -844,6 +940,7 @@ fn parse_text_paragraph(
     let mut level = 0u32;
     let mut alignment: Option<ParagraphAlignment> = None;
     let mut space_before_hundredths_pt: Option<u32> = None;
+    let mut bullet: Option<BulletStyle> = None;
     let mut content = Vec::new();
 
     let parse_algn = |e: &quick_xml::events::BytesStart| -> CoreResult<Option<ParagraphAlignment>> {
@@ -865,7 +962,8 @@ fn parse_text_paragraph(
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0);
                     alignment = parse_algn(e)?;
-                    // <a:pPr> with body — scan for <a:spcBef><a:spcPts/>
+                    // <a:pPr> with body — scan for <a:spcBef><a:spcPts/> and
+                    // the bullet declaration.
                     let depth_start = 1i32;
                     let mut depth = depth_start;
                     let mut in_spc_bef = false;
@@ -876,6 +974,9 @@ fn parse_text_paragraph(
                                 if ee.local_name().as_ref() == b"spcBef" {
                                     in_spc_bef = true;
                                 }
+                                if let Some(b) = parse_bullet(ee)? {
+                                    bullet = Some(b);
+                                }
                             },
                             Event::Empty(ref ee) => {
                                 if in_spc_bef && ee.local_name().as_ref() == b"spcPts" {
@@ -884,6 +985,9 @@ fn parse_text_paragraph(
                                             space_before_hundredths_pt = Some(n);
                                         }
                                     }
+                                }
+                                if let Some(b) = parse_bullet(ee)? {
+                                    bullet = Some(b);
                                 }
                             },
                             Event::End(ref ee) => {
@@ -935,6 +1039,7 @@ fn parse_text_paragraph(
     }
 
     Ok(TextParagraph {
+        bullet,
         level,
         alignment,
         space_before_hundredths_pt,
@@ -948,24 +1053,13 @@ fn parse_text_run(
     rels: &Relationships,
 ) -> CoreResult<TextRun> {
     let mut text = String::new();
-    let mut bold = None;
-    let mut italic = None;
-    let mut strikethrough = false;
-    let mut hyperlink = None;
-    let mut font_size_hundredths_pt = None;
-    let mut color_rgb: Option<[u8; 3]> = None;
+    let mut props = RunProps::default();
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
                 b"rPr" => {
-                    let props = parse_run_properties(reader, e, rels)?;
-                    bold = props.0;
-                    italic = props.1;
-                    strikethrough = props.2;
-                    hyperlink = props.3;
-                    font_size_hundredths_pt = props.4;
-                    color_rgb = props.5;
+                    props = parse_run_properties(reader, e, rels)?;
                 },
                 b"t" => {
                     text = xml::read_text_content_fast(reader)?;
@@ -975,13 +1069,7 @@ fn parse_text_run(
                 },
             },
             Event::Empty(ref e) if e.local_name().as_ref() == b"rPr" => {
-                let props = parse_run_properties_empty(e, rels)?;
-                bold = props.0;
-                italic = props.1;
-                strikethrough = props.2;
-                hyperlink = props.3;
-                font_size_hundredths_pt = props.4;
-                color_rgb = props.5;
+                props = run_props_from_attrs(e)?;
             },
             Event::End(ref e) if e.local_name().as_ref() == b"r" => {
                 break;
@@ -993,12 +1081,17 @@ fn parse_text_run(
 
     Ok(TextRun {
         text,
-        bold,
-        italic,
-        strikethrough,
-        hyperlink,
-        font_size_hundredths_pt,
-        color_rgb,
+        bold: props.bold,
+        italic: props.italic,
+        strikethrough: props.strikethrough,
+        hyperlink: props.hyperlink,
+        font_size_hundredths_pt: props.font_size_hundredths_pt,
+        color_rgb: props.color_rgb,
+        underline: props.underline,
+        font_name: props.font_name,
+        baseline: props.baseline,
+        caps: props.caps,
+        char_spacing_hundredths_pt: props.char_spacing_hundredths_pt,
     })
 }
 
@@ -1008,13 +1101,10 @@ fn parse_run_properties(
     start: &quick_xml::events::BytesStart,
     rels: &Relationships,
 ) -> CoreResult<RunProps> {
-    let bold = parse_bool_attr(start, b"b")?;
-    let italic = parse_bool_attr(start, b"i")?;
-    let strike = xml::optional_attr_str(start, b"strike")?;
-    let strikethrough = strike.as_deref().is_some_and(|v| v != "noStrike");
-    let font_size_hundredths_pt = parse_u32_attr(start, b"sz")?;
+    let mut props = run_props_from_attrs(start)?;
     let mut hyperlink = None;
     let mut color_rgb: Option<[u8; 3]> = None;
+    let mut font_name: Option<String> = None;
     // Track whether we are inside `<a:solidFill>` so we only pick up
     // the inner `<a:srgbClr>` (the fill colour proper) and not
     // unrelated `<a:srgbClr>` elements that may appear in sibling
@@ -1033,6 +1123,8 @@ fn parse_run_properties(
             Event::Empty(ref e) => {
                 if e.local_name().as_ref() == b"hlinkClick" {
                     hyperlink = parse_hlink_click(e, rels)?;
+                } else if e.local_name().as_ref() == b"latin" && font_name.is_none() {
+                    font_name = xml::optional_attr_str(e, b"typeface")?.map(|v| v.into_owned());
                 } else if in_solid_fill
                     && e.local_name().as_ref() == b"srgbClr"
                     && color_rgb.is_none()
@@ -1052,22 +1144,10 @@ fn parse_run_properties(
         }
     }
 
-    Ok((bold, italic, strikethrough, hyperlink, font_size_hundredths_pt, color_rgb))
-}
-
-/// Parse run properties from an `<a:rPr/>` Empty element. Empty
-/// elements cannot carry a `<a:solidFill>` child so `color_rgb`
-/// is always `None` on this path.
-fn parse_run_properties_empty(
-    e: &quick_xml::events::BytesStart,
-    _rels: &Relationships,
-) -> CoreResult<RunProps> {
-    let bold = parse_bool_attr(e, b"b")?;
-    let italic = parse_bool_attr(e, b"i")?;
-    let strike = xml::optional_attr_str(e, b"strike")?;
-    let strikethrough = strike.as_deref().is_some_and(|v| v != "noStrike");
-    let font_size_hundredths_pt = parse_u32_attr(e, b"sz")?;
-    Ok((bold, italic, strikethrough, None, font_size_hundredths_pt, None))
+    props.hyperlink = hyperlink;
+    props.color_rgb = color_rgb;
+    props.font_name = font_name;
+    Ok(props)
 }
 
 /// Decode a 6-hex-digit `val="RRGGBB"` attribute from `<a:srgbClr/>`
@@ -1156,9 +1236,23 @@ fn parse_text_field(
 /// Parse `<a:tbl>`.
 fn parse_table(reader: &mut quick_xml::Reader<&[u8]>, rels: &Relationships) -> CoreResult<Table> {
     let mut rows = Vec::new();
+    let mut first_row_header = false;
+    let mut last_row_header = false;
 
     loop {
         match reader.read_event()? {
+            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"tblPr" => {
+                // `firstRow` is how a DrawingML table declares a header row.
+                // Assuming row 0 is always a header labelled data rows as
+                // headers in every table that does not have one.
+                first_row_header = xml::optional_attr_str(e, b"firstRow")?
+                    .is_some_and(|v| v.as_ref() == "1" || v.as_ref() == "true");
+                last_row_header = xml::optional_attr_str(e, b"lastRow")?
+                    .is_some_and(|v| v.as_ref() == "1" || v.as_ref() == "true");
+                if matches!(reader.read_event()?, Event::Eof) {
+                    break;
+                }
+            },
             Event::Start(ref e) => match e.local_name().as_ref() {
                 b"tr" => {
                     rows.push(parse_table_row(reader, rels)?);
@@ -1175,7 +1269,31 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>, rels: &Relationships) -> C
         }
     }
 
-    Ok(Table { rows })
+    Ok(Table {
+        rows,
+        first_row_header,
+        last_row_header,
+    })
+}
+
+/// Parse `<a:buNone/>`, `<a:buChar char="•"/>` or
+/// `<a:buAutoNum type="…" startAt="…"/>`.
+fn parse_bullet(e: &quick_xml::events::BytesStart) -> CoreResult<Option<BulletStyle>> {
+    Ok(match e.local_name().as_ref() {
+        b"buNone" => Some(BulletStyle::None),
+        b"buChar" => Some(BulletStyle::Char(
+            xml::optional_attr_str(e, b"char")?
+                .map(|v| v.into_owned())
+                .unwrap_or_else(|| "\u{2022}".to_string()),
+        )),
+        b"buAutoNum" => Some(BulletStyle::AutoNum {
+            scheme: xml::optional_attr_str(e, b"type")?
+                .map(|v| v.into_owned())
+                .unwrap_or_else(|| "arabicPeriod".to_string()),
+            start_at: xml::optional_attr_str(e, b"startAt")?.and_then(|v| v.parse().ok()),
+        }),
+        _ => None,
+    })
 }
 
 /// Parse `<a:tr>`.
@@ -1245,6 +1363,54 @@ fn parse_table_cell(
 // ---------------------------------------------------------------------------
 // Notes text extraction (used by lib.rs)
 // ---------------------------------------------------------------------------
+
+/// Parse a slide comments part.
+///
+/// Handles both shapes PowerPoint writes: the legacy
+/// `<p:cmLst><p:cm authorId="…"><p:text>…` and the modern
+/// `<p188:cmLst><p188:cm><p188:txBody><a:p><a:r><a:t>…`. Author names live
+/// in a separate `commentAuthors` part, so only ids present in the same
+/// file resolve; the text is what matters.
+pub(crate) fn parse_comments(xml_data: &[u8]) -> Vec<SlideComment> {
+    let mut reader = make_content_reader(xml_data);
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut depth_in_comment = 0i32;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => match e.local_name().as_ref() {
+                b"cm" => {
+                    depth_in_comment = 1;
+                    current.clear();
+                },
+                b"text" | b"t" if depth_in_comment > 0 => {
+                    if let Ok(t) = xml::read_text_content_fast(&mut reader) {
+                        if !t.trim().is_empty() {
+                            if !current.is_empty() {
+                                current.push(' ');
+                            }
+                            current.push_str(t.trim());
+                        }
+                    }
+                },
+                _ => {},
+            },
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"cm" => {
+                depth_in_comment = 0;
+                if !current.is_empty() {
+                    out.push(SlideComment {
+                        author: None,
+                        text: std::mem::take(&mut current),
+                    });
+                }
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {},
+        }
+    }
+    out
+}
 
 /// Extract speaker notes plain text from a notes slide XML.
 /// Finds the body placeholder (type="body") and extracts its text.

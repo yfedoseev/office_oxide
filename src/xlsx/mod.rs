@@ -197,6 +197,7 @@ impl XlsxDocument {
             rels: Relationships,
             images: Vec<crate::xlsx::worksheet::WorksheetPicture>,
             text_shapes: Vec<crate::xlsx::worksheet::WorksheetTextShape>,
+            comments: Vec<crate::xlsx::worksheet::SheetComment>,
         }
         let mut bundles = Vec::with_capacity(workbook.sheets.len());
         for sheet in &workbook.sheets {
@@ -248,12 +249,22 @@ impl XlsxDocument {
             // the archive.
             let (images, text_shapes) = read_drawing_for_sheet(&mut archive, &sheet_path, &ws_rels);
 
+            // Cell comments live in a separate part reached through the
+            // sheet's own relationships.
+            let comments = ws_rels
+                .first_by_type(rel_types::COMMENTS)
+                .map(|rel| resolve_relative_zip_path(&sheet_path, &rel.target))
+                .and_then(|path| Self::read_xml_entry(&mut archive, &path).ok())
+                .and_then(|data| worksheet::parse_comments(&data).ok())
+                .unwrap_or_default();
+
             bundles.push(SheetBundle {
                 name: sheet.name.clone(),
                 data: ws_data,
                 rels: ws_rels,
                 images,
                 text_shapes,
+                comments,
             });
         }
 
@@ -262,6 +273,7 @@ impl XlsxDocument {
             let mut ws = Worksheet::parse(&b.data, b.name, &b.rels)?;
             ws.images = b.images;
             ws.text_shapes = b.text_shapes;
+            ws.comments = b.comments;
             Ok(ws)
         })?;
 
@@ -365,6 +377,7 @@ impl XlsxDocument {
             name: String,
             data: Vec<u8>,
             rels: Relationships,
+            comments: Vec<crate::xlsx::worksheet::SheetComment>,
         }
         let mut bundles = Vec::with_capacity(workbook.sheets.len());
         for sheet in &workbook.sheets {
@@ -399,10 +412,18 @@ impl XlsxDocument {
                 Ok(data) => data,
                 Err(_) => continue,
             };
+            let comments = ws_rels
+                .first_by_type(rel_types::COMMENTS)
+                .and_then(|rel| part_name.resolve_relative(&rel.target).ok())
+                .filter(|pn| opc.has_part(pn))
+                .and_then(|pn| opc.read_part(&pn).ok())
+                .and_then(|data| worksheet::parse_comments(&data).ok())
+                .unwrap_or_default();
             bundles.push(SheetBundle {
                 name: sheet.name.clone(),
                 data: ws_data,
                 rels: ws_rels,
+                comments,
             });
         }
 
@@ -412,7 +433,8 @@ impl XlsxDocument {
             bundles
                 .into_par_iter()
                 .map(|b| {
-                    let ws = Worksheet::parse(&b.data, b.name, &b.rels)?;
+                    let mut ws = Worksheet::parse(&b.data, b.name, &b.rels)?;
+                    ws.comments = b.comments;
                     Ok(ws)
                 })
                 .collect()
@@ -421,7 +443,8 @@ impl XlsxDocument {
         let worksheets: Result<Vec<Worksheet>> = bundles
             .into_iter()
             .map(|b| {
-                let ws = Worksheet::parse(&b.data, b.name, &b.rels)?;
+                let mut ws = Worksheet::parse(&b.data, b.name, &b.rels)?;
+                ws.comments = b.comments;
                 Ok(ws)
             })
             .collect();
