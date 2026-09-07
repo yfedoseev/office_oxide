@@ -29,6 +29,9 @@ const CT_FOOTNOTES: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml";
 const CT_COMMENTS: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml";
+const CT_HTML: &str = "text/html";
+const REL_ALT_CHUNK: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/aFChunk";
 
 struct Docx {
     w: OpcWriter<Cursor<Vec<u8>>>,
@@ -112,6 +115,16 @@ impl Docx {
         );
         self.w.add_part(&part, ct, xml.as_bytes()).unwrap();
         self.w.add_part_rel(&self.doc_part, rel_type, file);
+        self
+    }
+
+    /// Add an `altChunk` target part and substitute its relationship id
+    /// into the body's `placeholder` token.
+    fn alt_chunk(mut self, file: &str, ct: &str, placeholder: &str, body: &str) -> Self {
+        let part = PartName::new(&format!("/word/{file}")).unwrap();
+        self.w.add_part(&part, ct, body.as_bytes()).unwrap();
+        let rid = self.w.add_part_rel(&self.doc_part, REL_ALT_CHUNK, file);
+        self.body = self.body.replace(placeholder, &rid);
         self
     }
 
@@ -1054,4 +1067,63 @@ fn image_alt_text_is_not_duplicated_as_body_text() {
         !body.contains("ALT TEXT"),
         "alt text must not appear as body text, got {body:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #155 — altChunk embedded content
+// ---------------------------------------------------------------------------
+
+#[test]
+fn html_alt_chunk_content_is_extracted_at_its_position() {
+    // `altChunk` is how mail merge, report generators and CMS exporters
+    // inject content — often the whole body, with document.xml holding only
+    // a shell. Such a document extracted as almost nothing.
+    let ir = Docx::new(
+        r#"<w:p><w:r><w:t>BEFORE</w:t></w:r></w:p>
+           <w:altChunk r:id="RID_A"/>
+           <w:p><w:r><w:t>AFTER</w:t></w:r></w:p>"#,
+    )
+    .alt_chunk(
+        "chunk1.html",
+        CT_HTML,
+        "RID_A",
+        "<html><body><p>CHUNK ONE</p><p>CHUNK &amp; TWO</p>\
+         <script>ignored()</script></body></html>",
+    )
+    .ir();
+
+    let text = ir.plain_text();
+    assert!(text.contains("CHUNK ONE"), "chunk text missing from {text:?}");
+    assert!(text.contains("CHUNK & TWO"), "entity not resolved: {text:?}");
+    assert!(!text.contains("ignored()"), "script body leaked: {text:?}");
+
+    // And it must land between the two paragraphs.
+    let before = text.find("BEFORE").expect("BEFORE");
+    let chunk = text.find("CHUNK ONE").expect("chunk");
+    let after = text.find("AFTER").expect("AFTER");
+    assert!(before < chunk && chunk < after, "wrong position: {text:?}");
+}
+
+#[test]
+fn a_plain_text_alt_chunk_is_extracted() {
+    let ir = Docx::new(r#"<w:altChunk r:id="RID_A"/>"#)
+        .alt_chunk("chunk1.txt", "text/plain", "RID_A", "LINE ONE\nLINE TWO")
+        .ir();
+    let text = ir.plain_text();
+    assert!(text.contains("LINE ONE") && text.contains("LINE TWO"), "{text:?}");
+}
+
+#[test]
+fn an_unsupported_alt_chunk_type_inserts_nothing_rather_than_garbage() {
+    // A nested `.docx` chunk is a whole package; reading it is a bigger job
+    // and is deliberately not attempted.
+    let ir = Docx::new(r#"<w:p><w:r><w:t>ONLY</w:t></w:r></w:p><w:altChunk r:id="RID_A"/>"#)
+        .alt_chunk(
+            "chunk1.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "RID_A",
+            "PK not really a package",
+        )
+        .ir();
+    assert_eq!(ir.plain_text().trim(), "ONLY");
 }

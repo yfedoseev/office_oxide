@@ -339,6 +339,103 @@ pub fn check_root_closed(data: &[u8], part: &str, root_local: &str) -> Result<()
     }
 }
 
+/// The prefixes bound to an expected namespace by a part's root element.
+///
+/// Element dispatch throughout this crate matches on *local name* only, so
+/// an element from any namespace whose local name happens to match is
+/// parsed as if it were the real thing: a `<evil:p><evil:r><evil:t>` inside
+/// a `w:body` extracted as ordinary document text that Word never renders.
+/// This records which prefixes the root actually bound to the format's
+/// namespace so the content parsers can skip everything else.
+#[derive(Debug, Clone, Default)]
+pub struct NsGuard {
+    /// Prefixes bound to the expected namespace. An empty `Vec` with
+    /// `permissive` set means "accept everything".
+    prefixes: Vec<Vec<u8>>,
+    /// Set when the part declared no usable namespace at all, in which case
+    /// filtering would reject the whole document. Hand-written and minimal
+    /// fixtures do this routinely.
+    permissive: bool,
+}
+
+impl NsGuard {
+    /// A guard that accepts every element. Used where a part's root has not
+    /// been inspected.
+    pub fn permissive() -> Self {
+        Self {
+            prefixes: Vec::new(),
+            permissive: true,
+        }
+    }
+
+    /// Build a guard from a part's root start tag.
+    ///
+    /// `expected` are the namespace URIs that count as the format's own
+    /// (Transitional and Strict). Returns `Err` when the root binds its own
+    /// prefix to something else entirely — a document claiming to be
+    /// WordprocessingML while its `w:` prefix points elsewhere is not the
+    /// format it says it is.
+    pub fn from_root(root: &BytesStart, expected: &[&[u8]], format: &str) -> Result<Self> {
+        let root_prefix = root
+            .name()
+            .as_ref()
+            .split(|&b| b == b':')
+            .next()
+            .filter(|p| p.len() < root.name().as_ref().len())
+            .map(|p| p.to_vec());
+
+        let mut prefixes = Vec::new();
+        let mut root_prefix_bound_elsewhere = false;
+        for attr in root.attributes().flatten() {
+            let key = attr.key.as_ref();
+            let (prefix, is_ns) = if key == b"xmlns" {
+                (Vec::new(), true)
+            } else if let Some(rest) = key.strip_prefix(b"xmlns:") {
+                (rest.to_vec(), true)
+            } else {
+                (Vec::new(), false)
+            };
+            if !is_ns {
+                continue;
+            }
+            if expected.iter().any(|e| *e == attr.value.as_ref()) {
+                prefixes.push(prefix);
+            } else if root_prefix.as_deref() == Some(prefix.as_slice()) {
+                root_prefix_bound_elsewhere = true;
+            }
+        }
+
+        if prefixes.is_empty() {
+            if root_prefix_bound_elsewhere {
+                return Err(Error::MalformedXml(format!(
+                    "root element's namespace is not {format}"
+                )));
+            }
+            // No namespace declaration at all — accept, so minimal
+            // hand-written parts keep working.
+            return Ok(Self::permissive());
+        }
+        Ok(Self {
+            prefixes,
+            permissive: false,
+        })
+    }
+
+    /// Whether an element belongs to the expected namespace.
+    pub fn accepts(&self, e: &BytesStart) -> bool {
+        if self.permissive {
+            return true;
+        }
+        let name = e.name();
+        let qname = name.as_ref();
+        let prefix: &[u8] = match qname.iter().position(|&b| b == b':') {
+            Some(i) => &qname[..i],
+            None => b"",
+        };
+        self.prefixes.iter().any(|p| p.as_slice() == prefix)
+    }
+}
+
 /// Strip characters XML 1.0 forbids from a text value.
 ///
 /// XML 1.0 §2.2 permits only tab, LF, CR and `U+0020..` (minus the

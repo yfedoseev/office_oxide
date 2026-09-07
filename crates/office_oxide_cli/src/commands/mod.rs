@@ -17,6 +17,11 @@ pub enum Command {
     Markdown {
         /// Path to the document file
         file: String,
+        /// Embed each image inline as `[image-base64:<data>]` at its
+        /// position in the document flow. Images are otherwise dropped
+        /// from markdown entirely.
+        #[arg(long)]
+        embed_images: bool,
     },
     /// Convert a document to HTML
     Html {
@@ -38,7 +43,7 @@ pub enum Command {
 pub fn run(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         Command::Text { file } => text::run(&file),
-        Command::Markdown { file } => markdown::run(&file),
+        Command::Markdown { file, embed_images } => markdown::run(&file, embed_images),
         Command::Html { file } => html::run(&file),
         Command::Info { file } => info::run(&file),
         Command::Ir { file } => ir::run(&file),

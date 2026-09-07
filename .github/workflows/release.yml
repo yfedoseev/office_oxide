@@ -707,8 +707,12 @@ jobs:
           set -euo pipefail
           VERSION="${{ needs.validate.outputs.version }}"
           mkdir -p /tmp/simulated-releases/v${VERSION}
+          # Stage the artifact under the name the release actually publishes.
+          # Renaming it to the name the installer expected made the fixture
+          # agree with the bug, so the job passed against a filename no
+          # release contains.
           cp release-assets/native-linux-x86_64.tar.gz \
-             /tmp/simulated-releases/v${VERSION}/native-linux-x86_64-${VERSION}.tar.gz
+             /tmp/simulated-releases/v${VERSION}/native-linux-x86_64.tar.gz
       - name: Serve the archive via a local HTTP server + patch the installer URL
         run: |
           set -euo pipefail

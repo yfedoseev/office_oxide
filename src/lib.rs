@@ -66,7 +66,9 @@ pub mod format;
 /// Format-agnostic intermediate representation (IR) of a document.
 pub mod ir;
 mod ir_from_markdown;
-mod ir_render;
+/// Format-agnostic renderers over [`DocumentIR`] — plain text, markdown
+/// and HTML — plus the options that steer them.
+pub mod ir_render;
 
 #[cfg(not(target_family = "wasm"))]
 pub mod ffi;
@@ -348,6 +350,15 @@ impl Document {
     /// Convert to markdown using the format-specific implementation.
     pub fn to_markdown(&self) -> String {
         dispatch_inner!(self, to_markdown)
+    }
+
+    /// Convert to markdown with explicit rendering options.
+    ///
+    /// Unlike [`Self::to_markdown`], which uses the format-specific
+    /// renderer, this goes through the IR so that options such as
+    /// [`ir_render::ImageEmbed::Base64`] apply uniformly to every format.
+    pub fn to_markdown_with(&self, options: ir_render::MarkdownOptions) -> String {
+        self.to_ir().to_markdown_with(options)
     }
 
     /// Convert to an HTML fragment.

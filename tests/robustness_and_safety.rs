@@ -443,3 +443,243 @@ fn a_sections_first_heading_is_not_rendered_twice() {
     );
     assert!(md.contains("# Introduction"));
 }
+
+// ---------------------------------------------------------------------------
+// #162 — namespace-aware dispatch
+// ---------------------------------------------------------------------------
+
+#[test]
+fn text_from_a_foreign_namespace_is_not_document_content() {
+    // Element dispatch matches on local name, so a `<evil:p>` inside the
+    // body used to be parsed as a WordprocessingML paragraph and its text
+    // extracted as content Word never renders.
+    let mut w = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
+    let part = PartName::new("/word/document.xml").unwrap();
+    w.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+    w.add_part(
+        &part,
+        CT_DOC,
+        br#"<?xml version="1.0"?><w:document
+             xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+             xmlns:evil="http://attacker.example/ns">
+           <w:body>
+             <w:p><w:r><w:t>REAL_WORD_TEXT</w:t></w:r></w:p>
+             <evil:p><evil:r><evil:t>FOREIGN_NS_TEXT</evil:t></evil:r></evil:p>
+           </w:body></w:document>"#,
+    )
+    .unwrap();
+    let doc = open_docx(w.finish().unwrap().into_inner()).expect("parse");
+    let text = doc.plain_text();
+    assert!(text.contains("REAL_WORD_TEXT"));
+    assert!(
+        !text.contains("FOREIGN_NS_TEXT"),
+        "foreign-namespace text was extracted: {text:?}"
+    );
+}
+
+#[test]
+fn a_rebound_prefix_means_the_package_is_not_what_it_claims() {
+    // Binding `w` to something that is not WordprocessingML must not leave
+    // the document parsing exactly as before.
+    let mut w = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
+    let part = PartName::new("/word/document.xml").unwrap();
+    w.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+    w.add_part(
+        &part,
+        CT_DOC,
+        br#"<?xml version="1.0"?><w:document xmlns:w="http://attacker.example/notword">
+           <w:body><w:p><w:r><w:t>REBOUND_PREFIX_TEXT</w:t></w:r></w:p></w:body>
+         </w:document>"#,
+    )
+    .unwrap();
+    match open_docx(w.finish().unwrap().into_inner()) {
+        Ok(doc) => assert!(
+            !doc.plain_text().contains("REBOUND_PREFIX_TEXT"),
+            "a rebound prefix must not yield document text"
+        ),
+        Err(e) => assert!(e.to_string().contains("namespace"), "got {e}"),
+    }
+}
+
+#[test]
+fn a_document_with_no_namespace_declaration_still_parses() {
+    // Minimal, hand-written parts declare nothing; filtering them out would
+    // reject far more than it protects.
+    let mut w = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
+    let part = PartName::new("/word/document.xml").unwrap();
+    w.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+    w.add_part(
+        &part,
+        CT_DOC,
+        br#"<?xml version="1.0"?><document><body>
+             <p><r><t>PLAIN</t></r></p>
+           </body></document>"#,
+    )
+    .unwrap();
+    let doc = open_docx(w.finish().unwrap().into_inner()).expect("parse");
+    assert!(doc.plain_text().contains("PLAIN"));
+}
+
+// ---------------------------------------------------------------------------
+// #153 — markdown emphasis
+// ---------------------------------------------------------------------------
+
+#[test]
+fn adjacent_runs_with_the_same_formatting_are_merged() {
+    use office_oxide::ir::*;
+
+    // Word splits one visually-bold phrase into several runs routinely.
+    // Wrapping each separately produced `**BOLD_A****BOLD_B**`, and
+    // CommonMark reads that `****` as four literal asterisks.
+    let bold = |t: &str| {
+        InlineContent::Text(TextSpan {
+            text: t.to_string(),
+            bold: true,
+            ..Default::default()
+        })
+    };
+    let ir = DocumentIR {
+        metadata: Metadata {
+            format: DocumentFormat::Docx,
+            ..Default::default()
+        },
+        sections: vec![Section {
+            elements: vec![Element::Paragraph(Paragraph {
+                content: vec![bold("BOLD_A"), bold("BOLD_B")],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+    };
+    let md = ir.to_markdown();
+    assert_eq!(md, "**BOLD_ABOLD_B**", "got {md}");
+    assert!(!md.contains("****"));
+}
+
+#[test]
+fn superscript_survives_the_markdown_renderer() {
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        metadata: Metadata {
+            format: DocumentFormat::Docx,
+            ..Default::default()
+        },
+        sections: vec![Section {
+            elements: vec![Element::Paragraph(Paragraph {
+                content: vec![
+                    InlineContent::Text(TextSpan::plain("E=mc")),
+                    InlineContent::Text(TextSpan {
+                        text: "2".to_string(),
+                        vertical_align: Some(VerticalAlign::Superscript),
+                        ..Default::default()
+                    }),
+                ],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+    };
+    assert_eq!(ir.to_markdown(), "E=mc<sup>2</sup>");
+}
+
+#[test]
+fn emphasis_delimiters_do_not_wrap_leading_or_trailing_spaces() {
+    use office_oxide::ir::*;
+
+    // CommonMark does not open emphasis on `** text**`.
+    let ir = DocumentIR {
+        metadata: Metadata {
+            format: DocumentFormat::Docx,
+            ..Default::default()
+        },
+        sections: vec![Section {
+            elements: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    text: " padded ".to_string(),
+                    bold: true,
+                    ..Default::default()
+                })],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+    };
+    assert_eq!(ir.to_markdown(), " **padded** ");
+}
+
+// ---------------------------------------------------------------------------
+// #100 — base64 image embedding
+// ---------------------------------------------------------------------------
+
+#[test]
+fn images_can_be_embedded_as_base64_at_their_position_in_the_flow() {
+    use office_oxide::ir::*;
+    use office_oxide::ir_render::{ImageEmbed, MarkdownOptions};
+
+    let ir = DocumentIR {
+        metadata: Metadata {
+            format: DocumentFormat::Docx,
+            ..Default::default()
+        },
+        sections: vec![Section {
+            elements: vec![
+                Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain("before"))],
+                    ..Default::default()
+                }),
+                Element::Image(Image {
+                    data: Some(b"Man".to_vec()),
+                    ..Default::default()
+                }),
+                Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain("after"))],
+                    ..Default::default()
+                }),
+            ],
+            ..Default::default()
+        }],
+    };
+
+    // Without the option, images stay out of the markdown entirely.
+    assert!(!ir.to_markdown().contains("image-base64"));
+
+    let md = ir.to_markdown_with(MarkdownOptions {
+        image_embed: ImageEmbed::Base64,
+    });
+    // "Man" is the canonical RFC 4648 example: no padding.
+    assert!(md.contains("[image-base64:TWFu]"), "got {md}");
+    // And it must land between the two paragraphs, not at the end.
+    let img = md.find("image-base64").unwrap();
+    assert!(md.find("before").unwrap() < img && img < md.find("after").unwrap());
+}
+
+#[test]
+fn base64_padding_is_correct_for_every_input_length() {
+    use office_oxide::ir::*;
+    use office_oxide::ir_render::{ImageEmbed, MarkdownOptions};
+
+    for (input, expected) in [
+        (&b"M"[..], "TQ=="),
+        (&b"Ma"[..], "TWE="),
+        (&b"Man"[..], "TWFu"),
+    ] {
+        let ir = DocumentIR {
+            metadata: Metadata {
+                format: DocumentFormat::Docx,
+                ..Default::default()
+            },
+            sections: vec![Section {
+                elements: vec![Element::Image(Image {
+                    data: Some(input.to_vec()),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            }],
+        };
+        let md = ir.to_markdown_with(MarkdownOptions {
+            image_embed: ImageEmbed::Base64,
+        });
+        assert_eq!(md, format!("[image-base64:{expected}]"));
+    }
+}

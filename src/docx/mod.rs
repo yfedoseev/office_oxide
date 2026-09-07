@@ -223,7 +223,42 @@ impl DocxDocument {
         // A part cut off mid-element parses to whatever was read before the
         // cut and reports success; check the root actually closed.
         xml::check_root_closed(&doc_data, main_part.as_str(), "document")?;
-        let (body, sections) = parse_document(&doc_data, &doc_rels)?;
+        let (mut body, sections, alt_chunk_rids, alt_chunk_positions) =
+            parse_document(&doc_data, &doc_rels)?;
+
+        // Resolve each `<w:altChunk>` and splice its text in at the point
+        // the document references it. HTML and plain-text chunks are read;
+        // a nested package chunk is left alone rather than guessed at.
+        if !alt_chunk_rids.is_empty() {
+            let mut inserts: Vec<(usize, Vec<BlockElement>)> = Vec::new();
+            for (rid, pos) in alt_chunk_rids.iter().zip(alt_chunk_positions.iter()) {
+                let Some(rel) = doc_rels.get_by_id(rid) else {
+                    continue;
+                };
+                if rel.target_mode != TargetMode::Internal {
+                    continue;
+                }
+                let Ok(part) = main_part.resolve_relative(&rel.target) else {
+                    continue;
+                };
+                if !opc.has_part(&part) {
+                    continue;
+                }
+                let Ok(data) = opc.read_part(&part) else {
+                    continue;
+                };
+                let paras = parse_alt_chunk(&data, part.as_str());
+                if !paras.is_empty() {
+                    inserts.push((*pos, paras));
+                }
+            }
+            // Splice back-to-front so earlier indices stay valid.
+            inserts.sort_by_key(|(pos, _)| std::cmp::Reverse(*pos));
+            for (pos, paras) in inserts {
+                let at = pos.min(body.elements.len());
+                body.elements.splice(at..at, paras);
+            }
+        }
 
         // Parse headers and footers. Walk header refs and footer refs
         // separately so each parsed `HeaderFooter` can record its own
@@ -389,6 +424,100 @@ fn parse_body_elements(xml_data: &[u8]) -> CoreResult<Vec<BlockElement>> {
     Ok(elements)
 }
 
+/// Read a `<w:altChunk>` target part into block elements.
+///
+/// HTML and plain-text chunks are handled: both are trivial to read, and
+/// together they cover what mail-merge and report generators emit. A nested
+/// `.docx` package chunk is deliberately left unread rather than guessed
+/// at — it returns no paragraphs, so the caller inserts nothing.
+fn parse_alt_chunk(data: &[u8], part_name: &str) -> Vec<BlockElement> {
+    let lower = part_name.to_ascii_lowercase();
+    let text = if lower.ends_with(".html") || lower.ends_with(".htm") || lower.ends_with(".xhtml") {
+        strip_html_tags(&String::from_utf8_lossy(data))
+    } else if lower.ends_with(".txt") {
+        String::from_utf8_lossy(data).into_owned()
+    } else {
+        // A `.docx` chunk is a whole nested package; not supported.
+        return Vec::new();
+    };
+
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|line| {
+            BlockElement::Paragraph(Paragraph {
+                properties: None,
+                content: vec![ParagraphContent::Run(Run {
+                    properties: None,
+                    content: vec![RunContent::Text(line.to_string())],
+                })],
+            })
+        })
+        .collect()
+}
+
+/// Flatten an HTML fragment to text: drop tags and `<script>`/`<style>`
+/// bodies, resolve the handful of entities that matter, and put a line
+/// break where a block element ends.
+fn strip_html_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut chars = html.char_indices().peekable();
+    let mut skip_until: Option<&str> = None;
+
+    while let Some((i, c)) = chars.next() {
+        if let Some(end) = skip_until {
+            if html[i..].to_ascii_lowercase().starts_with(end) {
+                for _ in 0..end.len() - 1 {
+                    chars.next();
+                }
+                skip_until = None;
+            }
+            continue;
+        }
+        if c != '<' {
+            out.push(c);
+            continue;
+        }
+        let rest = html[i..].to_ascii_lowercase();
+        if rest.starts_with("<script") {
+            skip_until = Some("</script>");
+            continue;
+        }
+        if rest.starts_with("<style") {
+            skip_until = Some("</style>");
+            continue;
+        }
+        // Consume through the closing '>'.
+        let mut tag = String::new();
+        for (_, tc) in chars.by_ref() {
+            if tc == '>' {
+                break;
+            }
+            tag.push(tc);
+        }
+        let name = tag
+            .trim_start_matches('/')
+            .split(|c: char| c.is_whitespace())
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "p" | "div" | "br" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+        ) {
+            out.push('\n');
+        }
+    }
+
+    // Resolve the entities an HTML chunk actually uses.
+    out.replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
 /// Parse a `footnotes.xml` / `endnotes.xml` / `comments.xml` part.
 ///
 /// `end` is the per-part item element name (`footnote`, `endnote` or
@@ -526,31 +655,77 @@ fn parse_sym_char(e: &quick_xml::events::BytesStart) -> Option<char> {
 }
 
 /// Parse `word/document.xml` and return the Body and SectionProperties.
+type ParsedDocument = (Body, Vec<SectionProperties>, Vec<String>, Vec<usize>);
+
 fn parse_document(
     xml_data: &[u8],
     rels: &crate::core::relationships::Relationships,
-) -> CoreResult<(Body, Vec<SectionProperties>)> {
+) -> CoreResult<ParsedDocument> {
     let mut reader = make_content_reader(xml_data);
     let mut elements = Vec::new();
     let mut sections = Vec::new();
     let mut in_body = false;
+    // Element dispatch below matches on local name only, so a `<evil:p>`
+    // inside the body would be parsed as a WordprocessingML paragraph and
+    // its text extracted as document content Word never renders. The guard
+    // records which prefixes the root bound to WML and rejects the rest;
+    // a root that binds its own prefix to something else is refused
+    // outright, because such a document is not the format it claims.
+    let mut guard = xml::NsGuard::permissive();
+    let mut saw_root = false;
+    // `<w:altChunk>` references a part holding content injected into the
+    // document — mail merge, report generators and CMS exporters all use
+    // it, often for the entire body with `document.xml` holding only a
+    // shell. Such a document extracted as almost nothing.
+    let mut alt_chunk_rids: Vec<String> = Vec::new();
+    let mut alt_chunk_positions: Vec<usize> = Vec::new();
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => match e.local_name().as_ref() {
-                b"body" => {
-                    in_body = true;
-                },
-                b"p" if in_body => {
-                    elements.push(BlockElement::Paragraph(parse_paragraph(&mut reader)?));
-                },
-                b"tbl" if in_body => {
-                    elements.push(BlockElement::Table(parse_table(&mut reader)?));
-                },
-                b"sectPr" if in_body => {
-                    sections.push(parse_section_properties(&mut reader, e)?);
-                },
-                _ => {},
+            Event::Start(ref e) => {
+                if !saw_root {
+                    saw_root = true;
+                    guard = xml::NsGuard::from_root(
+                        e,
+                        &[xml::ns::WML, xml::ns::STRICT_WML],
+                        "WordprocessingML",
+                    )?;
+                }
+                if !guard.accepts(e) {
+                    xml::skip_element_fast(&mut reader)?;
+                    continue;
+                }
+                match e.local_name().as_ref() {
+                    b"body" => {
+                        in_body = true;
+                    },
+                    b"p" if in_body => {
+                        elements.push(BlockElement::Paragraph(parse_paragraph(&mut reader)?));
+                    },
+                    b"tbl" if in_body => {
+                        elements.push(BlockElement::Table(parse_table(&mut reader)?));
+                    },
+                    b"sectPr" if in_body => {
+                        sections.push(parse_section_properties(&mut reader, e)?);
+                    },
+                    b"altChunk" if in_body => {
+                        if let Ok(Some(rid)) = xml::optional_attr_str(e, b"r:id") {
+                            alt_chunk_rids.push(rid.into_owned());
+                            // Record the insertion point so the chunk's
+                            // content lands where the document puts it.
+                            alt_chunk_positions.push(elements.len());
+                        }
+                    },
+                    _ => {},
+                }
+            },
+            Event::Empty(ref e) if in_body && e.local_name().as_ref() == b"altChunk" => {
+                if guard.accepts(e) {
+                    if let Ok(Some(rid)) = xml::optional_attr_str(e, b"r:id") {
+                        alt_chunk_rids.push(rid.into_owned());
+                        alt_chunk_positions.push(elements.len());
+                    }
+                }
             },
             Event::End(ref e) if e.local_name().as_ref() == b"body" => {
                 in_body = false;
@@ -589,7 +764,7 @@ fn parse_document(
         elements,
         section_breaks,
     };
-    Ok((body, all_sections))
+    Ok((body, all_sections, alt_chunk_rids, alt_chunk_positions))
 }
 
 /// Walk the element tree and resolve hyperlink rIds to actual URLs.

@@ -43,6 +43,19 @@ impl WasmDocument {
         self.inner.to_markdown()
     }
 
+    /// Convert to markdown, embedding each image inline as
+    /// `[image-base64:<data>]` at its position in the document flow.
+    ///
+    /// Images are otherwise dropped from markdown entirely, which loses
+    /// both their content and their position.
+    #[wasm_bindgen(js_name = toMarkdownWithImages)]
+    pub fn to_markdown_with_images(&self) -> String {
+        use crate::ir_render::{ImageEmbed, MarkdownOptions};
+        self.inner.to_markdown_with(MarkdownOptions {
+            image_embed: ImageEmbed::Base64,
+        })
+    }
+
     /// Convert the document to an HTML fragment.
     #[wasm_bindgen(js_name = "toHtml")]
     pub fn to_html(&self) -> String {

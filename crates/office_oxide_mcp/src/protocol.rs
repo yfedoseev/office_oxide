@@ -86,6 +86,14 @@ fn call_extract(id: &Value, args: &Value) -> Value {
     let content = match format {
         "text" => doc.plain_text(),
         "markdown" => doc.to_markdown(),
+        // Images are dropped from plain markdown entirely; this keeps both
+        // their content and their position in one self-contained string.
+        "markdown-with-images" => {
+            use office_oxide::ir_render::{ImageEmbed, MarkdownOptions};
+            doc.to_markdown_with(MarkdownOptions {
+                image_embed: ImageEmbed::Base64,
+            })
+        },
         "html" => doc.to_html(),
         "ir" => match serde_json::to_string_pretty(&doc.to_ir()) {
             Ok(s) => s,

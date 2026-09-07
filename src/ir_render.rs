@@ -1,5 +1,66 @@
 use crate::ir::*;
 
+/// How `to_markdown_with` should represent embedded images.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ImageEmbed {
+    /// Render the image's description, or nothing when it has none.
+    /// This is what plain `to_markdown` does.
+    #[default]
+    None,
+    /// Emit `[image-base64:<data>]` at the image's position in the flow.
+    ///
+    /// Keeps both the position and the content in one self-contained
+    /// string, which is what a vision-capable model consuming the markdown
+    /// needs — images were otherwise dropped entirely.
+    Base64,
+}
+
+/// Options for [`DocumentIR::to_markdown_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MarkdownOptions {
+    /// How to represent embedded images.
+    pub image_embed: ImageEmbed,
+}
+
+thread_local! {
+    /// Rendering options for the current `to_markdown_with` call.
+    ///
+    /// The renderer is a tree of free functions taking only the node; a
+    /// thread-local avoids threading an options parameter through every one
+    /// of them purely to reach the single `Element::Image` arm.
+    static MARKDOWN_OPTIONS: std::cell::Cell<MarkdownOptions> =
+        const { std::cell::Cell::new(MarkdownOptions {
+            image_embed: ImageEmbed::None,
+        }) };
+}
+
+/// Standard base64 (RFC 4648) with padding, no line breaks.
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// Plain-text marker for a page, slide or thematic boundary.
 ///
 /// A form feed is the conventional plain-text page separator (and what
@@ -81,13 +142,21 @@ mod block_default {
                 .collect::<Vec<_>>()
                 .join("\n\n"),
             Element::PageBreak | Element::ColumnBreak | Element::Shape(_) => String::new(),
-            // An `![alt]()` with an empty target renders as a broken
-            // image. With no addressable source in the IR, emit the alt
-            // text as ordinary italic text instead, and nothing at all when
-            // there is no alt text.
-            Element::Image(img) => match img.alt_text.as_deref() {
-                Some(alt) if !alt.is_empty() => format!("*{}*", escape_markdown(alt)),
-                _ => String::new(),
+            Element::Image(img) => {
+                // With `ImageEmbed::Base64` the bytes go inline at the
+                // image's position in the flow.
+                if super::MARKDOWN_OPTIONS.with(|o| o.get().image_embed) == ImageEmbed::Base64 {
+                    if let Some(ref data) = img.data {
+                        return format!("[image-base64:{}]", super::base64_encode(data));
+                    }
+                }
+                // An `![alt]()` with an empty target renders as a broken
+                // image. With no addressable source, emit the description
+                // as ordinary italic text, and nothing when there is none.
+                match img.alt_text.as_deref() {
+                    Some(alt) if !alt.is_empty() => format!("*{}*", escape_markdown(alt)),
+                    _ => String::new(),
+                }
             },
             Element::Heading(_)
             | Element::Paragraph(_)
@@ -169,12 +238,19 @@ impl DocumentIR {
 
     /// Render the IR as markdown.
     pub fn to_markdown(&self) -> String {
+        self.to_markdown_with(MarkdownOptions::default())
+    }
+
+    /// Render the IR as markdown with explicit options.
+    pub fn to_markdown_with(&self, options: MarkdownOptions) -> String {
+        MARKDOWN_OPTIONS.with(|o| o.set(options));
         let section_texts: Vec<String> = self
             .sections
             .iter()
             .map(render_section_markdown)
             .filter(|s| !s.is_empty())
             .collect();
+        MARKDOWN_OPTIONS.with(|o| o.set(MarkdownOptions::default()));
         section_texts.join("\n\n---\n\n")
     }
 }
@@ -392,34 +468,113 @@ fn render_element_markdown(element: &Element) -> String {
     }
 }
 
+/// The formatting that decides which markdown delimiters wrap a span.
+///
+/// Word splits a single visually-bold phrase into several runs constantly —
+/// a spell-check boundary, a language attribute or a revision id is enough
+/// — so adjacent runs must be merged before delimiters are emitted.
+/// Wrapping each run separately produced `**BOLD_A****BOLD_B**`, and
+/// CommonMark reads that `****` as four literal asterisks rather than as
+/// the end of one emphasis span and the start of another.
+#[derive(PartialEq)]
+struct MarkdownStyle {
+    bold: bool,
+    italic: bool,
+    strikethrough: bool,
+    vertical_align: Option<VerticalAlign>,
+    hyperlink: Option<String>,
+}
+
+impl MarkdownStyle {
+    fn of(span: &TextSpan) -> Self {
+        Self {
+            bold: span.bold,
+            italic: span.italic,
+            strikethrough: span.strikethrough,
+            vertical_align: span.vertical_align.clone(),
+            hyperlink: span.hyperlink.as_deref().and_then(safe_url),
+        }
+    }
+
+    /// Wrap already-escaped text in this style's delimiters.
+    fn wrap(&self, text: &str) -> String {
+        if text.is_empty() {
+            return String::new();
+        }
+        // Leading/trailing spaces must sit outside the delimiters: CommonMark
+        // does not open emphasis on `** text**`.
+        let lead: String = text.chars().take_while(|c| c.is_whitespace()).collect();
+        let trail: String = text
+            .chars()
+            .rev()
+            .take_while(|c| c.is_whitespace())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let core = &text[lead.len()..text.len() - trail.len()];
+        if core.is_empty() {
+            return text.to_string();
+        }
+
+        let mut out = core.to_string();
+        // Super/subscript have no markdown syntax; HTML is the conventional
+        // fallback and is what every markdown flavour renders.
+        match self.vertical_align {
+            Some(VerticalAlign::Superscript) => out = format!("<sup>{out}</sup>"),
+            Some(VerticalAlign::Subscript) => out = format!("<sub>{out}</sub>"),
+            _ => {},
+        }
+        if self.strikethrough {
+            out = format!("~~{out}~~");
+        }
+        if self.bold && self.italic {
+            out = format!("***{out}***");
+        } else if self.bold {
+            out = format!("**{out}**");
+        } else if self.italic {
+            out = format!("*{out}*");
+        }
+        if let Some(ref url) = self.hyperlink {
+            out = format!("[{out}]({})", escape_markdown_url(url));
+        }
+        format!("{lead}{out}{trail}")
+    }
+}
+
 fn render_inline_markdown(content: &[InlineContent]) -> String {
     let mut out = String::new();
+    // Accumulate consecutive spans that share formatting, and emit the run
+    // once with a single pair of delimiters.
+    let mut pending: Option<(MarkdownStyle, String)> = None;
+
+    let flush = |pending: &mut Option<(MarkdownStyle, String)>, out: &mut String| {
+        if let Some((style, text)) = pending.take() {
+            out.push_str(&style.wrap(&text));
+        }
+    };
+
     for item in content {
         match item {
             InlineContent::Text(span) => {
-                let mut text = escape_markdown(&span.text);
-
-                if span.strikethrough {
-                    text = format!("~~{text}~~");
+                let style = MarkdownStyle::of(span);
+                let text = escape_markdown(&span.text);
+                match pending.as_mut() {
+                    Some((cur, buf)) if *cur == style => buf.push_str(&text),
+                    _ => {
+                        flush(&mut pending, &mut out);
+                        pending = Some((style, text));
+                    },
                 }
-                if span.bold && span.italic {
-                    text = format!("***{text}***");
-                } else if span.bold {
-                    text = format!("**{text}**");
-                } else if span.italic {
-                    text = format!("*{text}*");
-                }
-
-                if let Some(url) = span.hyperlink.as_deref().and_then(safe_url) {
-                    text = format!("[{text}]({})", escape_markdown_url(&url));
-                }
-
-                out.push_str(&text);
             },
-            InlineContent::LineBreak => out.push_str("  \n"),
+            InlineContent::LineBreak => {
+                flush(&mut pending, &mut out);
+                out.push_str("  \n");
+            },
             InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
         }
     }
+    flush(&mut pending, &mut out);
     out
 }
 
