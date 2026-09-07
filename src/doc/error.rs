@@ -9,6 +9,16 @@ pub enum DocError {
     #[error("invalid FIB: {0}")]
     InvalidFib(String),
 
+    /// The document is encrypted or password-protected. Extraction cannot
+    /// proceed, and returning an empty string with `Ok` told the caller the
+    /// document simply had no text.
+    #[error("document is encrypted or password-protected")]
+    Encrypted,
+
+    /// The file uses a Word version this reader does not support.
+    #[error("unsupported Word version: {0}")]
+    UnsupportedVersion(String),
+
     /// The piece table (CLX/PCD) is malformed.
     #[error("invalid piece table: {0}")]
     InvalidPieceTable(String),

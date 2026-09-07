@@ -23,6 +23,12 @@ pub struct XlsDocument {
 pub struct Sheet {
     /// Sheet display name.
     pub name: String,
+    /// Rendered display text per cell, mirroring `rows`.
+    ///
+    /// XLS stores dates as plain numbers whose *format* makes them a date;
+    /// `FORMAT` and `XF` were never parsed, so `38971` came out as `38971`
+    /// rather than `2006-09-05`. `rows` still carries the raw values.
+    pub display: Vec<Vec<String>>,
     /// Cell values, indexed as `rows[row][col]`.
     pub rows: Vec<Vec<CellValue>>,
 }
@@ -67,6 +73,9 @@ impl XlsDocument {
         let mut sheet_infos: Vec<SheetInfo> = Vec::new();
         let mut sst: Vec<String> = Vec::new();
         let mut sheets = Vec::new();
+        // Number-format tables from the globals substream.
+        let mut formats: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
+        let mut xf_numfmt: Vec<u16> = Vec::new();
 
         // Quick check: if the first BOF indicates BIFF5 or earlier, limit processing.
         let biff8 = data.len() >= 6 && {
@@ -95,11 +104,12 @@ impl XlsDocument {
             match phase {
                 Phase::Globals => match rec.record_type {
                     RT_FILEPASS => {
-                        // File is encrypted — we can't read it.
-                        return Ok(Self {
-                            sheets: Vec::new(),
-                            images: Vec::new(),
-                        });
+                        // A FILEPASS record means every following record is
+                        // encrypted. Returning an empty workbook with `Ok`
+                        // told the caller the file simply had no data, which
+                        // is indistinguishable from a genuinely empty
+                        // spreadsheet.
+                        return Err(XlsError::Encrypted);
                     },
                     RT_BOUNDSHEET => {
                         if let Ok(info) = parse_boundsheet(&rec.data) {
@@ -108,6 +118,22 @@ impl XlsDocument {
                     },
                     RT_SST => {
                         sst = parse_sst(&rec.data)?;
+                    },
+                    // `FORMAT` maps a format id to its code string; `XF`
+                    // maps a cell's `ixfe` to a format id. Both are needed
+                    // to tell a date from any other number.
+                    RT_FORMAT => {
+                        if let Some((id, code)) = parse_format_record(&rec.data) {
+                            formats.insert(id, code);
+                        }
+                    },
+                    RT_XF => {
+                        // [MS-XLS] §2.4.353: `ifmt` is a u16 at offset 2.
+                        xf_numfmt.push(if rec.data.len() >= 4 {
+                            u16::from_le_bytes([rec.data[2], rec.data[3]])
+                        } else {
+                            0
+                        });
                     },
                     RT_EOF => {
                         phase = Phase::BetweenSheets;
@@ -130,8 +156,13 @@ impl XlsDocument {
                         };
                         let hidden = sheet_idx < sheet_infos.len() && sheet_infos[sheet_idx].hidden;
                         if !hidden {
+                            let display = build_display(&cells, &formats, &xf_numfmt);
                             let rows = build_grid(&mut cells);
-                            sheets.push(Sheet { name, rows });
+                            sheets.push(Sheet {
+                                name,
+                                display,
+                                rows,
+                            });
                         }
                         sheet_idx += 1;
                         phase = Phase::BetweenSheets;
@@ -143,6 +174,7 @@ impl XlsDocument {
                                     cells.push(Cell {
                                         row,
                                         col,
+                                        xf_index: 0,
                                         value: CellValue::String(s),
                                     });
                                 }
@@ -181,6 +213,7 @@ impl XlsDocument {
                                 cells.push(Cell {
                                     row,
                                     col,
+                                    xf_index: u16::from_le_bytes([rec.data[4], rec.data[5]]),
                                     value: CellValue::String(s),
                                 });
                             }
@@ -303,6 +336,74 @@ fn parse_boundsheet(data: &[u8]) -> Result<SheetInfo> {
 /// Build a 2D grid from sparse cells.
 ///
 /// Takes ownership of cell values via `std::mem::take` to avoid cloning.
+/// Parse a `FORMAT` record: `ifmt` (u16) then the format code as a
+/// BIFF8 unicode string.
+fn parse_format_record(data: &[u8]) -> Option<(u16, String)> {
+    if data.len() < 4 {
+        return None;
+    }
+    let id = u16::from_le_bytes([data[0], data[1]]);
+    let (code, _) = read_unicode_string(data, 2).ok()?;
+    Some((id, code))
+}
+
+/// Render each cell's display text, applying the workbook's number formats.
+///
+/// Mirrors the XLSX side: a number whose format is a date format renders as
+/// an ISO date, and any other non-General format is applied to the value.
+/// Everything else falls back to `CellValue::as_text`.
+fn build_display(
+    cells: &[Cell],
+    formats: &std::collections::HashMap<u16, String>,
+    xf_numfmt: &[u16],
+) -> Vec<Vec<String>> {
+    use crate::xlsx::{date, numfmt};
+
+    let format_for = |xf: u16| -> Option<(u16, Option<&str>)> {
+        let fmt_id = *xf_numfmt.get(xf as usize)?;
+        Some((fmt_id, formats.get(&fmt_id).map(|s| s.as_str())))
+    };
+
+    let mut grid: Vec<Vec<String>> = Vec::new();
+    for cell in cells {
+        let text = match &cell.value {
+            CellValue::Number(n) => match format_for(cell.xf_index) {
+                Some((fmt_id, code)) => {
+                    let is_date = date::is_date_format_id(fmt_id as u32)
+                        || code.is_some_and(date::is_date_format_string);
+                    if is_date {
+                        // XLS predates the 1904 option being common; the
+                        // date-system flag lives in `DATEMODE`, which the
+                        // reader does not track, so assume the 1900 system.
+                        match date::DateTimeValue::from_serial(*n, false) {
+                            Some(dt) => dt.to_iso_string(),
+                            None => cell.value.as_text(),
+                        }
+                    } else if fmt_id != 0 {
+                        numfmt::apply_format(*n, fmt_id as u32, code)
+                    } else {
+                        cell.value.as_text()
+                    }
+                },
+                None => cell.value.as_text(),
+            },
+            other => other.as_text(),
+        };
+        let (r, c) = (cell.row as usize, cell.col as usize);
+        if r > 65535 || c > 255 {
+            continue;
+        }
+        if grid.len() <= r {
+            grid.resize(r + 1, Vec::new());
+        }
+        if grid[r].len() <= c {
+            grid[r].resize(c + 1, String::new());
+        }
+        grid[r][c] = text;
+    }
+    grid
+}
+
 fn build_grid(cells: &mut [Cell]) -> Vec<Vec<CellValue>> {
     if cells.is_empty() {
         return Vec::new();
@@ -397,16 +498,19 @@ mod tests {
     fn build_grid_from_cells() {
         let mut cells = vec![
             Cell {
+                xf_index: 0,
                 row: 0,
                 col: 0,
                 value: CellValue::String("A1".into()),
             },
             Cell {
+                xf_index: 0,
                 row: 0,
                 col: 1,
                 value: CellValue::Number(42.0),
             },
             Cell {
+                xf_index: 0,
                 row: 1,
                 col: 0,
                 value: CellValue::String("A2".into()),
@@ -448,6 +552,7 @@ mod tests {
         let doc = XlsDocument {
             images: Vec::new(),
             sheets: vec![Sheet {
+                display: Vec::new(),
                 name: "Sheet1".into(),
                 rows: vec![
                     vec![
@@ -469,6 +574,7 @@ mod tests {
         let doc = XlsDocument {
             images: Vec::new(),
             sheets: vec![Sheet {
+                display: Vec::new(),
                 name: "Data".into(),
                 rows: vec![
                     vec![CellValue::String("X".into()), CellValue::String("Y".into())],
@@ -500,6 +606,7 @@ mod tests {
     #[test]
     fn ir_empty_sheet_has_no_table() {
         let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![Sheet {
+            display: Vec::new(),
             name: "Empty".into(),
             rows: vec![],
         }]));
@@ -518,6 +625,7 @@ mod tests {
             vec![CellValue::String("Alice".into()), CellValue::Number(95.0)],
         ];
         let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![Sheet {
+            display: Vec::new(),
             name: "Results".into(),
             rows,
         }]));
@@ -533,6 +641,7 @@ mod tests {
     fn ir_empty_cell_value_produces_empty_paragraph_content() {
         use crate::ir::Element;
         let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![Sheet {
+            display: Vec::new(),
             name: "S".into(),
             rows: vec![vec![CellValue::Empty]],
         }]));
@@ -547,10 +656,12 @@ mod tests {
     fn ir_multiple_sheets_produce_multiple_sections() {
         let doc = make_doc(vec![
             Sheet {
+                display: Vec::new(),
                 name: "A".into(),
                 rows: vec![vec![CellValue::Number(1.0)]],
             },
             Sheet {
+                display: Vec::new(),
                 name: "B".into(),
                 rows: vec![vec![CellValue::String("x".into())]],
             },

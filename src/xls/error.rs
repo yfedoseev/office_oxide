@@ -9,6 +9,12 @@ pub enum XlsError {
     #[error("invalid BIFF record: {0}")]
     InvalidRecord(String),
 
+    /// The file is encrypted or password-protected. Extraction cannot
+    /// proceed, and returning an empty string with `Ok` told the caller the
+    /// file simply had no text.
+    #[error("file is encrypted or password-protected")]
+    Encrypted,
+
     /// The file uses a BIFF version that is not supported.
     #[error("unsupported BIFF version: {0}")]
     UnsupportedVersion(u16),

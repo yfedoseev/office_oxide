@@ -55,6 +55,11 @@ pub struct Cell {
     pub row: u16,
     /// 0-based column index.
     pub col: u16,
+    /// Index into the workbook's `XF` (extended format) table. Needed to
+    /// resolve the cell's number format: without it a date cell is
+    /// indistinguishable from any other number and extracts as its raw
+    /// serial (`38971` instead of a date).
+    pub xf_index: u16,
     /// The parsed cell value.
     pub value: CellValue,
 }
@@ -83,6 +88,8 @@ fn parse_labelsst(data: &[u8], sst: &[String]) -> Result<Vec<Cell>> {
     }
     let row = u16::from_le_bytes([data[0], data[1]]);
     let col = u16::from_le_bytes([data[2], data[3]]);
+    // `ixfe` — index into the workbook's XF table.
+    let xf_index = u16::from_le_bytes([data[4], data[5]]);
     let sst_index = u32::from_le_bytes([data[6], data[7], data[8], data[9]]) as usize;
 
     let value = if sst_index < sst.len() {
@@ -91,7 +98,12 @@ fn parse_labelsst(data: &[u8], sst: &[String]) -> Result<Vec<Cell>> {
         CellValue::String(String::new())
     };
 
-    Ok(vec![Cell { row, col, value }])
+    Ok(vec![Cell {
+        xf_index,
+        row,
+        col,
+        value,
+    }])
 }
 
 fn parse_number(data: &[u8]) -> Result<Vec<Cell>> {
@@ -100,10 +112,13 @@ fn parse_number(data: &[u8]) -> Result<Vec<Cell>> {
     }
     let row = u16::from_le_bytes([data[0], data[1]]);
     let col = u16::from_le_bytes([data[2], data[3]]);
+    // `ixfe` — index into the workbook's XF table.
+    let xf_index = u16::from_le_bytes([data[4], data[5]]);
     let value = f64::from_le_bytes([
         data[6], data[7], data[8], data[9], data[10], data[11], data[12], data[13],
     ]);
     Ok(vec![Cell {
+        xf_index,
         row,
         col,
         value: CellValue::Number(value),
@@ -116,9 +131,12 @@ fn parse_rk_record(data: &[u8]) -> Result<Vec<Cell>> {
     }
     let row = u16::from_le_bytes([data[0], data[1]]);
     let col = u16::from_le_bytes([data[2], data[3]]);
+    // `ixfe` — index into the workbook's XF table.
+    let xf_index = u16::from_le_bytes([data[4], data[5]]);
     let rk_val = u32::from_le_bytes([data[6], data[7], data[8], data[9]]);
     let value = decode_rk(rk_val);
     Ok(vec![Cell {
+        xf_index,
         row,
         col,
         value: CellValue::Number(value),
@@ -139,6 +157,8 @@ fn parse_mulrk(data: &[u8]) -> Result<Vec<Cell>> {
     let mut cells = Vec::with_capacity(count);
     for i in 0..count {
         let off = i * 6;
+        // Each MULRK entry carries its own `ixfe`.
+        let xf_index = u16::from_le_bytes([rk_data[off], rk_data[off + 1]]);
         let rk_val = u32::from_le_bytes([
             rk_data[off + 2],
             rk_data[off + 3],
@@ -146,6 +166,7 @@ fn parse_mulrk(data: &[u8]) -> Result<Vec<Cell>> {
             rk_data[off + 5],
         ]);
         cells.push(Cell {
+            xf_index,
             row,
             col: first_col + i as u16,
             value: CellValue::Number(decode_rk(rk_val)),
@@ -160,6 +181,8 @@ fn parse_boolerr(data: &[u8]) -> Result<Vec<Cell>> {
     }
     let row = u16::from_le_bytes([data[0], data[1]]);
     let col = u16::from_le_bytes([data[2], data[3]]);
+    // `ixfe` — index into the workbook's XF table.
+    let xf_index = u16::from_le_bytes([data[4], data[5]]);
     let val = data[6];
     let is_error = data[7];
     let value = if is_error != 0 {
@@ -167,7 +190,12 @@ fn parse_boolerr(data: &[u8]) -> Result<Vec<Cell>> {
     } else {
         CellValue::Bool(val != 0)
     };
-    Ok(vec![Cell { row, col, value }])
+    Ok(vec![Cell {
+        xf_index,
+        row,
+        col,
+        value,
+    }])
 }
 
 fn parse_label(data: &[u8]) -> Result<Vec<Cell>> {
@@ -176,6 +204,8 @@ fn parse_label(data: &[u8]) -> Result<Vec<Cell>> {
     }
     let row = u16::from_le_bytes([data[0], data[1]]);
     let col = u16::from_le_bytes([data[2], data[3]]);
+    // `ixfe` — index into the workbook's XF table.
+    let xf_index = u16::from_le_bytes([data[4], data[5]]);
     // Try BIFF8 unicode string first; fall back to raw bytes for BIFF5.
     let s = match read_unicode_string(data, 6) {
         Ok((s, end)) if end <= data.len() + 4 => s,
@@ -188,6 +218,7 @@ fn parse_label(data: &[u8]) -> Result<Vec<Cell>> {
         },
     };
     Ok(vec![Cell {
+        xf_index,
         row,
         col,
         value: CellValue::String(s),
@@ -200,7 +231,10 @@ fn parse_blank(data: &[u8]) -> Result<Vec<Cell>> {
     }
     let row = u16::from_le_bytes([data[0], data[1]]);
     let col = u16::from_le_bytes([data[2], data[3]]);
+    // `ixfe` — index into the workbook's XF table.
+    let xf_index = u16::from_le_bytes([data[4], data[5]]);
     Ok(vec![Cell {
+        xf_index,
         row,
         col,
         value: CellValue::Empty,
@@ -214,9 +248,14 @@ fn parse_mulblank(data: &[u8]) -> Result<Vec<Cell>> {
     let row = u16::from_le_bytes([data[0], data[1]]);
     let first_col = u16::from_le_bytes([data[2], data[3]]);
     let last_col = u16::from_le_bytes([data[data.len() - 2], data[data.len() - 1]]);
-    let count = (last_col - first_col + 1) as usize;
+    let count = (last_col.saturating_sub(first_col) + 1) as usize;
+    let ixfe = &data[4..data.len().saturating_sub(2)];
     let cells = (0..count)
         .map(|i| Cell {
+            xf_index: ixfe
+                .get(i * 2..i * 2 + 2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .unwrap_or(0),
             row,
             col: first_col + i as u16,
             value: CellValue::Empty,
@@ -232,6 +271,8 @@ fn parse_formula(data: &[u8]) -> Result<Vec<Cell>> {
     }
     let row = u16::from_le_bytes([data[0], data[1]]);
     let col = u16::from_le_bytes([data[2], data[3]]);
+    // `ixfe` — index into the workbook's XF table.
+    let xf_index = u16::from_le_bytes([data[4], data[5]]);
     // Cached result is at bytes 6..14 (8 bytes).
     // If byte 6 == 0xFF and byte 7 == 0xFF, it's a special type:
     //   byte 6 = value type: 0=string(in following STRING record), 1=bool, 2=error, 3=empty
@@ -245,27 +286,32 @@ fn parse_formula(data: &[u8]) -> Result<Vec<Cell>> {
                 // String follows in a STRING record — we'll handle this at a higher level.
                 // For now, return empty.
                 Ok(vec![Cell {
+                    xf_index,
                     row,
                     col,
                     value: CellValue::String(String::new()),
                 }])
             },
             1 => Ok(vec![Cell {
+                xf_index,
                 row,
                 col,
                 value: CellValue::Bool(val_bytes[2] != 0),
             }]),
             2 => Ok(vec![Cell {
+                xf_index,
                 row,
                 col,
                 value: CellValue::Error(val_bytes[2]),
             }]),
             3 => Ok(vec![Cell {
+                xf_index,
                 row,
                 col,
                 value: CellValue::Empty,
             }]),
             _ => Ok(vec![Cell {
+                xf_index,
                 row,
                 col,
                 value: CellValue::Empty,
@@ -284,6 +330,7 @@ fn parse_formula(data: &[u8]) -> Result<Vec<Cell>> {
             val_bytes[7],
         ]);
         Ok(vec![Cell {
+            xf_index,
             row,
             col,
             value: CellValue::Number(value),

@@ -1089,6 +1089,26 @@ pub fn build_nested_list(
     }
 }
 
+impl ImageFormat {
+    /// Map an OfficeArt BLIP format onto the IR's image format.
+    ///
+    /// Legacy `.doc`/`.xls`/`.ppt` images are extracted as BLIPs and were
+    /// then dropped at the IR boundary, so every picture in a legacy file
+    /// vanished on conversion even though the bytes were already in hand.
+    pub fn from_blip(f: &crate::cfb::blip::BlipFormat) -> Option<Self> {
+        use crate::cfb::blip::BlipFormat;
+        Some(match f {
+            BlipFormat::Emf => ImageFormat::Emf,
+            BlipFormat::Wmf => ImageFormat::Wmf,
+            BlipFormat::Jpeg => ImageFormat::Jpeg,
+            BlipFormat::Png => ImageFormat::Png,
+            BlipFormat::Dib => ImageFormat::Bmp,
+            BlipFormat::Tiff => ImageFormat::Tiff,
+            BlipFormat::Pict | BlipFormat::Unknown(_) => return None,
+        })
+    }
+}
+
 /// An embedded image reference.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Image {

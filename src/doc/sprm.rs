@@ -215,6 +215,13 @@ pub struct PapProps {
     /// list/tab-stop PR; in the tables-only PR this field is always empty, but
     /// it is cloned through the IR so the `Paragraph.tabs` shape stays uniform.
     pub tabs: Vec<TabStop>,
+    /// Outline level from `sprmPOutLvl` (0x2640), in [MS-DOC]'s value space:
+    /// `0` = Heading 1 … `8` = Heading 9, and `9` = body text. Stored only
+    /// for real heading levels (0–8); `9` and absent both leave this `None`.
+    ///
+    /// This is the evidence that a document has *real* heading structure,
+    /// which is what gates the line-shape heading guess in `convert_doc`.
+    pub outline_level: Option<u8>,
 }
 
 /// One table cell descriptor (TKBKTAP, 20 bytes) distilled from a row's
@@ -380,6 +387,16 @@ pub fn extract_pap_props(grpprl: &[u8]) -> PapProps {
 
     for sprm in parse_grpprl(grpprl) {
         match sprm.opcode {
+            // sprmPOutLvl — 1-byte operand, 0..=8 are Heading 1..9 and 9 is
+            // body text ([MS-DOC] §2.6.2). Note the opcode is 0x2640, not
+            // the 0x6412 that a byte-swapped reading suggests.
+            0x2640 => {
+                if let Some(&lvl) = sprm.operand.first() {
+                    if lvl <= 8 {
+                        props.outline_level = Some(lvl);
+                    }
+                }
+            },
             // sprmPFInTable — 1-byte operand, bit 0 = fInTable.
             0x2416 => {
                 if let Some(&b) = sprm.operand.first() {

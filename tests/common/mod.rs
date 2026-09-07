@@ -91,6 +91,42 @@ pub fn row_grpprl(centers: &[i16], rgfs: &[u16]) -> Vec<u8> {
 
 /// Build a complete synthetic `.doc` from the given paragraphs.
 pub fn build_doc(paras: &[Para]) -> Vec<u8> {
+    build_doc_full(paras, &Subdocs::default(), FibTweaks::default())
+}
+
+/// Character counts for the subdocuments that follow the main text in the
+/// piece table's character space. Each string is appended, in the order
+/// [MS-DOC] fixes, and its length written to the matching `ccp*` field.
+#[derive(Default)]
+#[allow(dead_code)]
+pub struct Subdocs {
+    /// `ccpFtn` — footnote bodies.
+    pub footnotes: &'static str,
+    /// `ccpHdd` — header and footer bodies.
+    pub headers: &'static str,
+    /// `ccpAtn` — comment bodies.
+    pub comments: &'static str,
+    /// `ccpEdn` — endnote bodies.
+    pub endnotes: &'static str,
+    /// `ccpTxbx` — text-box bodies.
+    pub textboxes: &'static str,
+}
+
+/// FIB fields a test wants to set to something other than the valid default.
+#[derive(Default)]
+#[allow(dead_code)]
+pub struct FibTweaks {
+    /// Override `wIdent` (0xA5DC selects the unsupported Word 6.0/95 layout).
+    pub wident: Option<u16>,
+    /// Set `fEncrypted` (flags bit 8).
+    pub encrypted: bool,
+    /// Override `fcClx`, to point the piece table outside the table stream.
+    pub clx_offset: Option<u32>,
+}
+
+/// Build a synthetic `.doc`, optionally with subdocuments and FIB tweaks.
+#[allow(dead_code)]
+pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> Vec<u8> {
     let n = paras.len();
 
     // Build the main text (UTF-16LE) and the CP range of each paragraph.
@@ -104,13 +140,35 @@ pub fn build_doc(paras: &[Para]) -> Vec<u8> {
         units.push(p.terminator as u16);
     }
     let text_len = units.len() as u32;
+
+    // Subdocument text follows the main text in the same character space.
+    let subdoc_specs = [
+        subdocs.footnotes,
+        subdocs.headers,
+        subdocs.comments,
+        subdocs.endnotes,
+        subdocs.textboxes,
+    ];
+    let mut ccps = [0u32; 5];
+    for (i, text) in subdoc_specs.iter().enumerate() {
+        if text.is_empty() {
+            continue;
+        }
+        let start = units.len();
+        for ch in text.chars() {
+            units.push(ch as u16);
+        }
+        units.push('\r' as u16);
+        ccps[i] = (units.len() - start) as u32;
+    }
     let text_bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    let total_chars = units.len() as u32;
 
     // Text lives after the FIB page (page 0) and the N FKP pages (pages 1..N).
     let text_offset = ((n as u32) + 1) * 512;
 
     // ── 0Table stream: CLX (piece table) followed by PlcfBtePapx. ──
-    let mut table = build_clx(text_offset, text_len);
+    let mut table = build_clx(text_offset, total_chars);
     let fc_plcf = table.len() as u32;
     table.extend_from_slice(&build_plcf_bte_papx(n, &cp_starts, text_len));
     let lcb_plcf = (table.len() as u32) - fc_plcf;
@@ -120,6 +178,19 @@ pub fn build_doc(paras: &[Para]) -> Vec<u8> {
     let wd_sectors = wd_len.div_ceil(512);
     let mut word_doc = vec![0u8; wd_sectors * 512];
     write_fib(&mut word_doc, text_len, fc_plcf, lcb_plcf);
+    for (i, &ccp) in ccps.iter().enumerate() {
+        let off = 0x50 + i * 4;
+        word_doc[off..off + 4].copy_from_slice(&ccp.to_le_bytes());
+    }
+    if let Some(w) = tweaks.wident {
+        word_doc[0..2].copy_from_slice(&w.to_le_bytes());
+    }
+    if tweaks.encrypted {
+        word_doc[0x0A..0x0C].copy_from_slice(&(1u16 << 8).to_le_bytes());
+    }
+    if let Some(off) = tweaks.clx_offset {
+        word_doc[0x01A2..0x01A6].copy_from_slice(&off.to_le_bytes());
+    }
     for (i, p) in paras.iter().enumerate() {
         let cp0 = cp_starts[i];
         let cp1 = if i + 1 < n {
@@ -140,6 +211,7 @@ pub fn build_doc(paras: &[Para]) -> Vec<u8> {
 }
 
 /// Open a synthetic `.doc` byte buffer through the public API.
+#[allow(dead_code)]
 pub fn open_doc(bytes: &[u8]) -> Document {
     Document::from_reader(Cursor::new(bytes.to_vec()), DocumentFormat::Doc)
         .expect("synthetic .doc must parse")

@@ -22,6 +22,39 @@ pub struct DocDocument {
     /// empty for very old or minimal files, in which case `doc_to_ir` falls
     /// back to the line-based heuristic on `text`.
     paragraphs: Vec<DocParagraph>,
+    /// Text of the subdocuments that follow the main document in the piece
+    /// table's character space: footnotes, headers/footers, comments,
+    /// endnotes and text boxes. The FIB's `ccp*` lengths that delimit them
+    /// were parsed and then never used, so none of this reached any
+    /// consumer.
+    subdocuments: Vec<SubDocument>,
+}
+
+/// One of the subdocuments stored after the main text in a `.doc`.
+#[derive(Debug, Clone)]
+pub struct SubDocument {
+    /// Which subdocument this is.
+    pub kind: SubDocumentKind,
+    /// Sanitised text of the subdocument.
+    pub text: String,
+}
+
+/// The subdocument kinds `.doc` stores after the main text, in the fixed
+/// order [MS-DOC] §2.5.1 defines for the `ccp*` lengths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubDocumentKind {
+    /// Footnote bodies (`ccpFtn`).
+    Footnotes,
+    /// Header and footer bodies (`ccpHdd`).
+    HeadersFooters,
+    /// Comment bodies (`ccpAtn`).
+    Comments,
+    /// Endnote bodies (`ccpEdn`).
+    Endnotes,
+    /// Text-box bodies (`ccpTxbx`).
+    TextBoxes,
+    /// Header text-box bodies (`ccpHdrTxbx`).
+    HeaderTextBoxes,
 }
 
 impl DocDocument {
@@ -33,16 +66,10 @@ impl DocDocument {
             .open_stream("WordDocument")
             .map_err(|_| DocError::MissingStream("WordDocument stream not found".into()))?;
 
-        let fib = match Fib::parse(&word_doc) {
-            Ok(f) => f,
-            Err(_) => {
-                return Ok(Self {
-                    text: String::new(),
-                    images: Vec::new(),
-                    paragraphs: Vec::new(),
-                });
-            }, // Unsupported Word version
-        };
+        // Propagate FIB errors. Swallowing them into an empty document with
+        // `Ok` is what made an encrypted file and a Word 6.0/95 file both
+        // look like documents that simply had no text.
+        let fib = Fib::parse(&word_doc)?;
 
         // Open the appropriate table stream; try preferred first, then fallback.
         let table_stream = if fib.use_table1 {
@@ -52,16 +79,12 @@ impl DocDocument {
             cfb.open_stream("0Table")
                 .or_else(|_| cfb.open_stream("1Table"))
         };
-        let table_stream = match table_stream {
-            Ok(s) => s,
-            Err(_) => {
-                return Ok(Self {
-                    text: String::new(),
-                    images: Vec::new(),
-                    paragraphs: Vec::new(),
-                });
-            }, // Word 6/95 or corrupted
-        };
+        // Each of the three failures below used to return an empty document
+        // with `Ok`, which is indistinguishable from a document that has no
+        // text. A file that cannot be read must say so.
+        let table_stream = table_stream.map_err(|_| {
+            DocError::MissingStream("neither 0Table nor 1Table stream is present".into())
+        })?;
 
         // Extract CLX from the table stream.
         let clx_start = fib.clx_offset as usize;
@@ -70,30 +93,43 @@ impl DocDocument {
         if clx_start >= table_stream.len()
             || clx_size_zero_or_oob(fib.clx_size, clx_start, table_stream.len())
         {
-            // CLX not available — return empty document.
-            return Ok(Self {
-                text: String::new(),
-                images: Vec::new(),
-                paragraphs: Vec::new(),
-            });
+            return Err(DocError::InvalidPieceTable(format!(
+                "CLX at offset {clx_start} size {} is outside the {}-byte table stream",
+                fib.clx_size,
+                table_stream.len()
+            )));
         }
 
         let clx_end = clx_end.min(table_stream.len());
         let clx_data = &table_stream[clx_start..clx_end];
-        let pieces = match parse_clx(clx_data) {
-            Ok(p) => p,
-            Err(_) => {
-                return Ok(Self {
-                    text: String::new(),
-                    images: Vec::new(),
-                    paragraphs: Vec::new(),
-                });
-            },
-        };
+        let pieces = parse_clx(clx_data)?;
 
-        // Extract main document text only (not footnotes, headers, etc.).
         let raw_text = extract_text(&word_doc, &pieces, fib.text_len);
         let text = sanitize_text(&raw_text);
+
+        // The subdocuments follow the main text contiguously in the piece
+        // table's character space, each delimited by its own `ccp*` length.
+        let mut subdocuments = Vec::new();
+        let mut cp = fib.text_len;
+        for (kind, len) in [
+            (SubDocumentKind::Footnotes, fib.footnote_len),
+            (SubDocumentKind::HeadersFooters, fib.header_len),
+            (SubDocumentKind::Comments, fib.comment_len),
+            (SubDocumentKind::Endnotes, fib.endnote_len),
+            (SubDocumentKind::TextBoxes, fib.textbox_len),
+            (SubDocumentKind::HeaderTextBoxes, fib.header_textbox_len),
+        ] {
+            if len == 0 {
+                continue;
+            }
+            let end = cp.saturating_add(len);
+            let raw = super::piece_table::extract_text_range(&word_doc, &pieces, cp, end);
+            let sub = sanitize_text(&raw);
+            if !sub.trim().is_empty() {
+                subdocuments.push(SubDocument { kind, text: sub });
+            }
+            cp = end;
+        }
 
         // Build structured paragraphs (with table / list PAP flags) from the
         // PAPX FKP, when the FIB advertises one. Without it we cannot detect
@@ -120,6 +156,7 @@ impl DocDocument {
             text,
             images,
             paragraphs,
+            subdocuments,
         })
     }
 
@@ -132,6 +169,12 @@ impl DocDocument {
     /// Get all extracted images.
     pub fn images(&self) -> &[DocImage] {
         &self.images
+    }
+
+    /// Footnotes, headers, comments, endnotes and text boxes, in the order
+    /// the file stores them.
+    pub fn subdocuments(&self) -> &[SubDocument] {
+        &self.subdocuments
     }
 
     /// Get the extracted plain text.
@@ -196,6 +239,7 @@ mod tests {
     #[test]
     fn markdown_double_spacing() {
         let doc = DocDocument {
+            subdocuments: Vec::new(),
             images: Vec::new(),
             text: "First paragraph\nSecond paragraph\n\nAfter gap".into(),
             paragraphs: Vec::new(),
@@ -209,6 +253,7 @@ mod tests {
     #[test]
     fn plain_text_access() {
         let doc = DocDocument {
+            subdocuments: Vec::new(),
             images: Vec::new(),
             text: "Hello World".into(),
             paragraphs: Vec::new(),
@@ -218,6 +263,7 @@ mod tests {
 
     fn make_doc(text: &str) -> DocDocument {
         DocDocument {
+            subdocuments: Vec::new(),
             images: Vec::new(),
             text: text.to_string(),
             paragraphs: Vec::new(),
@@ -229,6 +275,7 @@ mod tests {
     /// table / list walkers without a binary `.doc` fixture.
     fn make_doc_with_paragraphs(paras: Vec<DocParagraph>) -> DocDocument {
         DocDocument {
+            subdocuments: Vec::new(),
             images: Vec::new(),
             text: String::new(),
             paragraphs: paras,

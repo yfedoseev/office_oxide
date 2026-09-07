@@ -54,15 +54,32 @@ impl Fib {
         }
 
         let wident = u16::from_le_bytes([data[0], data[1]]);
-        // 0xA5EC = Word 97 and later. 0xA5DC = Word 6/95. Others may appear.
-        if wident != 0xA5EC && wident != 0xA5DC {
+        // 0xA5EC = Word 97 and later. 0xA5DC = Word 6.0/95, whose FIB has a
+        // completely different layout: every FibRgFcLcb97 offset below is
+        // wrong for it. Accepting the file and then reading Word 97 offsets
+        // out of it produced a confident empty result — a 426 KB document
+        // extracted as the empty string with `Ok`. Say what it is instead.
+        if wident == 0xA5DC {
+            return Err(DocError::UnsupportedVersion(
+                "Word 6.0/95 (wIdent 0xA5DC); only Word 97 and later are supported".into(),
+            ));
+        }
+        if wident != 0xA5EC {
             return Err(DocError::InvalidFib(format!("unknown wIdent: 0x{wident:04X}")));
         }
 
         let version = u16::from_le_bytes([data[2], data[3]]);
 
-        // Flags at offset 0x0A (u16): bit 9 = fWhichTblStm
+        // Flags at offset 0x0A (u16): [MS-DOC] §2.5.1 FibBase.
+        //   bit 8  = fEncrypted
+        //   bit 9  = fWhichTblStm
         let flags = u16::from_le_bytes([data[0x0A], data[0x0B]]);
+        // An encrypted document's text is ciphertext. Walking the piece
+        // table over it yields either nothing or mojibake, both reported as
+        // a successful extraction of a document that "has no text".
+        if (flags & (1 << 8)) != 0 {
+            return Err(DocError::Encrypted);
+        }
         let use_table1 = (flags & (1 << 9)) != 0;
 
         // FibRgLw97 starts at offset 0x22, its size field at 0x22 (u16, should be 0x16).

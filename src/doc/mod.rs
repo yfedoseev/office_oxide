@@ -18,7 +18,7 @@ mod piece_table;
 mod sprm;
 
 pub use crate::core::OfficeDocument;
-pub use document::DocDocument;
+pub use document::{DocDocument, SubDocument, SubDocumentKind};
 pub use error::{DocError, Result};
 pub use images::{DocImage, ImageFormat};
 pub(crate) use papx::DocParagraph;
