@@ -15,6 +15,40 @@ pub struct SectionProperties {
     pub footer_refs: Vec<HeaderFooterRef>,
     /// Number of text columns (if multi-column layout).
     pub columns: Option<u32>,
+    /// Full `<w:cols>` layout: spacing, separator line and per-column widths.
+    pub column_layout: Option<ColumnDefs>,
+    /// Section break kind from `<w:type w:val="...">`. `None` means the
+    /// element was absent, which ECMA-376 defines as `nextPage`.
+    pub break_type: Option<SectionBreakKind>,
+    /// `<w:titlePg/>` — this section uses a distinct first-page header/footer.
+    pub title_page: bool,
+}
+
+/// `<w:cols>` layout details beyond the bare column count.
+#[derive(Debug, Clone, Default)]
+pub struct ColumnDefs {
+    /// Default spacing between columns, in twips (`w:space`).
+    pub space: Option<u32>,
+    /// Whether a separator line is drawn between columns (`w:sep`).
+    pub separator: bool,
+    /// Per-column widths in twips from `<w:col w:w="..."/>`. Empty when the
+    /// columns are equal-width (`w:equalWidth="1"` or no `<w:col>` children).
+    pub widths: Vec<u32>,
+}
+
+/// Section break kind (`<w:type>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionBreakKind {
+    /// No page break — the section continues on the same page.
+    Continuous,
+    /// Section starts on the next page.
+    NextPage,
+    /// Section starts on the next even-numbered page.
+    EvenPage,
+    /// Section starts on the next odd-numbered page.
+    OddPage,
+    /// Section starts in the next column.
+    NextColumn,
 }
 
 /// Page dimensions.

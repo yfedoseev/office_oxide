@@ -60,6 +60,9 @@ pub struct PptxDocument {
     /// `(font_name, ttf_or_otf_bytes)`. PDF→PPTX→PDF round-trips use
     /// these to preserve the source typeface (mirrors the DOCX side).
     pub embedded_fonts: Vec<(String, Vec<u8>)>,
+    /// Parsed `docProps/core.xml`. `None` when the package carries no
+    /// core-properties part.
+    pub core_properties: Option<crate::core::properties::CoreProperties>,
 }
 
 impl PptxDocument {
@@ -84,6 +87,7 @@ impl PptxDocument {
 
     fn from_opc<R: Read + Seek>(mut opc: OpcReader<R>) -> Result<Self> {
         debug!("PptxDocument: parsing started");
+        let core_properties = crate::core::properties::read_core_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let pres_rels = opc.read_rels_for(&main_part)?;
 
@@ -225,6 +229,7 @@ impl PptxDocument {
             slides,
             theme,
             embedded_fonts,
+            core_properties,
         })
     }
 }

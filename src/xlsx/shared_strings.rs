@@ -196,6 +196,7 @@ pub(crate) fn parse_color_ref(
                     slot,
                     tint,
                     shade: None,
+                    fallback: None,
                 }));
             }
         }

@@ -84,6 +84,9 @@ pub struct XlsxDocument {
     /// renderer; without this hop XLSX-mediated round-trips lost
     /// every typeface to the base 14 fallback.
     pub embedded_fonts: Vec<(String, Vec<u8>)>,
+    /// Parsed `docProps/core.xml`. `None` when the package carries no
+    /// core-properties part.
+    pub core_properties: Option<crate::core::properties::CoreProperties>,
     // Raw bytes for lazy parsing (None after parsing or if not present)
     styles_data: Option<Vec<u8>>,
     theme_data: Option<Vec<u8>>,
@@ -154,6 +157,13 @@ impl XlsxDocument {
     /// bypassing OPC content-types and package-level relationships.
     fn from_zip<R: Read + Seek>(mut archive: ZipArchive<R>) -> Result<Self> {
         debug!("XlsxDocument: fast path parsing started ({} ZIP entries)", archive.len());
+
+        // Document metadata lives at the conventional path in every package
+        // Excel writes; the fast path doesn't consult package relationships,
+        // so read it by name here.
+        let core_properties = Self::read_xml_entry(&mut archive, "docProps/core.xml")
+            .ok()
+            .and_then(|d| crate::core::properties::CoreProperties::parse(&d).ok());
 
         // Read workbook relationships to resolve sheet targets
         let wb_rels = match Self::read_xml_entry(&mut archive, "xl/_rels/workbook.xml.rels") {
@@ -311,6 +321,7 @@ impl XlsxDocument {
             theme: None,
             chart_text,
             embedded_fonts,
+            core_properties,
             styles_data: None,
             theme_data,
         })
@@ -320,6 +331,7 @@ impl XlsxDocument {
     #[allow(dead_code)]
     pub(crate) fn from_opc<R: Read + Seek>(mut opc: OpcReader<R>) -> Result<Self> {
         debug!("XlsxDocument: OPC parsing started");
+        let core_properties = crate::core::properties::read_core_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let wb_rels = opc.read_rels_for(&main_part)?;
 
@@ -457,6 +469,7 @@ impl XlsxDocument {
             // added if a use case appears.
             chart_text: Vec::new(),
             embedded_fonts,
+            core_properties,
             styles_data: None,
             theme_data,
         })

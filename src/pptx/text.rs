@@ -425,6 +425,7 @@ mod tests {
 
     fn make_doc(slides: Vec<Slide>) -> PptxDocument {
         PptxDocument {
+            core_properties: None,
             presentation: PresentationInfo {
                 slides: Vec::new(),
                 slide_size: None,

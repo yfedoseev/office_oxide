@@ -380,6 +380,12 @@ pub enum ColorRef {
         tint: Option<f64>,
         /// Shade adjustment (0.0–1.0), darkens the color when positive.
         shade: Option<f64>,
+        /// The literal `w:val` / `val` colour written alongside the theme
+        /// reference. OOXML producers emit it as the last-resort value for
+        /// consumers that cannot resolve the theme; keeping it means a
+        /// document with a missing or unreadable theme part still renders
+        /// its colours instead of falling back to black.
+        fallback: Option<RgbColor>,
     },
     /// System color (e.g., "windowText", "window").
     System(String),
@@ -392,10 +398,16 @@ impl ColorRef {
     pub fn resolve(&self, theme: &Theme) -> RgbColor {
         match self {
             Self::Rgb(rgb) => rgb.clone(),
-            Self::Theme { slot, tint, shade } => {
+            Self::Theme {
+                slot,
+                tint,
+                shade,
+                fallback,
+            } => {
                 let base = theme
                     .resolve_color(*slot)
                     .cloned()
+                    .or_else(|| fallback.clone())
                     .unwrap_or(RgbColor([0, 0, 0]));
                 apply_tint_shade(&base, *tint, *shade)
             },
@@ -410,6 +422,33 @@ impl ColorRef {
                 }
             },
             Self::Auto => RgbColor([0, 0, 0]),
+        }
+    }
+
+    /// Resolve to an explicit RGB value, or `None` when the reference
+    /// carries no colour of its own (`auto`, or an unresolvable theme slot
+    /// with no `w:val` fallback). Unlike [`Self::resolve`] this never
+    /// invents black, so callers can leave the renderer's default in place.
+    pub fn resolve_opt(&self, theme: Option<&Theme>) -> Option<RgbColor> {
+        match self {
+            Self::Rgb(rgb) => Some(rgb.clone()),
+            Self::Theme {
+                slot,
+                tint,
+                shade,
+                fallback,
+            } => {
+                let base = theme
+                    .and_then(|t| t.resolve_color(*slot).cloned())
+                    .or_else(|| fallback.clone())?;
+                Some(apply_tint_shade(&base, *tint, *shade))
+            },
+            Self::System(name) => Some(match name.as_str() {
+                "window" | "highlightText" => RgbColor([255, 255, 255]),
+                "highlight" => RgbColor([0, 120, 215]),
+                _ => RgbColor([0, 0, 0]),
+            }),
+            Self::Auto => None,
         }
     }
 }
@@ -536,6 +575,7 @@ mod tests {
     fn color_ref_resolve_theme() {
         let theme = Theme::parse(SAMPLE_THEME).unwrap();
         let color = ColorRef::Theme {
+            fallback: None,
             slot: ThemeColorSlot::Accent1,
             tint: None,
             shade: None,
@@ -547,6 +587,7 @@ mod tests {
     fn color_ref_resolve_theme_with_tint() {
         let theme = Theme::parse(SAMPLE_THEME).unwrap();
         let color = ColorRef::Theme {
+            fallback: None,
             slot: ThemeColorSlot::Dk1,
             tint: Some(0.5),
             shade: None,

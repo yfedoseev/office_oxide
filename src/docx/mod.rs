@@ -45,18 +45,23 @@ pub mod write;
 pub use document::{BlockElement, Body};
 pub use error::{DocxError, Result};
 pub use formatting::{
-    Justification, ParagraphIndent, ParagraphProperties, ParagraphSpacing, RunProperties,
-    UnderlineType, VerticalAlign,
+    BorderEdge, Justification, LineSpacingRule, ParagraphBorders, ParagraphIndent,
+    ParagraphProperties, ParagraphSpacing, RunProperties, TabStopDef, TableBorders, UnderlineType,
+    VerticalAlign,
 };
 pub use headers::{
-    HeaderFooter, HeaderFooterType, PageMargins, PageOrientation, PageSize, SectionProperties,
+    ColumnDefs, HeaderFooter, HeaderFooterType, PageMargins, PageOrientation, PageSize,
+    SectionBreakKind, SectionProperties,
 };
 pub use hyperlink::{Hyperlink, HyperlinkTarget};
 pub use image::{AnchorFrame, AnchorPosition, DrawingInfo, ShapeInfo, ShapeKind};
 pub use numbering::{NumberFormat, NumberingDefinitions};
 pub use paragraph::{BreakType, Paragraph, ParagraphContent, Run, RunContent};
 pub use styles::{Style, StyleSheet, StyleType};
-pub use table::{Table, TableCell, TableProperties, TableRow};
+pub use table::{
+    CellMargins, CellVAlign, RowHeightRule, Table, TableCell, TableProperties, TableRow,
+    TableWidth, TableWidthType,
+};
 
 use std::io::{Read, Seek};
 use std::path::Path;
@@ -72,9 +77,7 @@ use crate::core::xml;
 
 use self::formatting::{parse_paragraph_properties_fast, parse_run_properties_fast};
 use self::headers::HeaderFooterRef;
-use self::table::{
-    MergeType, Shading, TableCellProperties, TableRowProperties, TableWidth, TableWidthType,
-};
+use self::table::{MergeType, Shading, TableCellProperties, TableRowProperties};
 
 // Use crate::core::Result internally for all XML parsing (it has From<quick_xml::Error>).
 // DocxError wraps crate::core::Error, so conversion at the public boundary is automatic via `?`.
@@ -115,6 +118,9 @@ pub struct DocxDocument {
     /// (the positional PDF reader, plain-text export with alt-text,
     /// etc.) can place actual bitmap content.
     pub images: std::collections::HashMap<String, (Vec<u8>, Option<String>)>,
+    /// Parsed `docProps/core.xml`. `None` when the package carries no
+    /// core-properties part.
+    pub core_properties: Option<crate::core::properties::CoreProperties>,
 }
 
 impl DocxDocument {
@@ -139,6 +145,7 @@ impl DocxDocument {
 
     fn from_opc<R: Read + Seek>(mut opc: OpcReader<R>) -> Result<Self> {
         debug!("DocxDocument: parsing started");
+        let core_properties = crate::core::properties::read_core_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let doc_rels = opc.read_rels_for(&main_part)?;
 
@@ -286,6 +293,7 @@ impl DocxDocument {
             headers_footers,
             embedded_fonts,
             images,
+            core_properties,
         })
     }
 }
@@ -1083,11 +1091,36 @@ fn parse_table_properties(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<T
                     }
                     xml::skip_element_fast(reader)?;
                 },
+                b"tblBorders" => {
+                    props.borders =
+                        Some(self::formatting::parse_table_borders_fast(reader, b"tblBorders")?);
+                },
+                b"tblCellMar" => {
+                    props.cell_margins = Some(parse_cell_margins(reader, b"tblCellMar")?);
+                },
+                b"tblInd" => {
+                    props.indent = parse_measure_w(e);
+                    xml::skip_element_fast(reader)?;
+                },
+                b"tblCaption" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                        props.caption = Some(val.into_owned());
+                    }
+                    xml::skip_element_fast(reader)?;
+                },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
             Event::Empty(ref e) => match e.local_name().as_ref() {
+                b"tblInd" => {
+                    props.indent = parse_measure_w(e);
+                },
+                b"tblCaption" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                        props.caption = Some(val.into_owned());
+                    }
+                },
                 b"tblW" => {
                     props.width = parse_table_width(e)?;
                 },
@@ -1172,10 +1205,29 @@ fn parse_table_row_properties(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e)
-                if e.local_name().as_ref() == b"tblHeader" =>
-            {
-                props.is_header = true;
+            Event::Start(ref e) | Event::Empty(ref e) => match e.local_name().as_ref() {
+                b"tblHeader" => {
+                    props.is_header = xml::parse_toggle(e, b"w:val");
+                },
+                b"cantSplit" => {
+                    props.cant_split = xml::parse_toggle(e, b"w:val");
+                },
+                b"trHeight" => {
+                    props.height = xml::optional_attr_str(e, b"w:val")
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.parse().ok());
+                    props.height_rule =
+                        xml::optional_attr_str(e, b"w:hRule")
+                            .ok()
+                            .flatten()
+                            .map(|v| match v.as_ref() {
+                                "exact" => RowHeightRule::Exact,
+                                "auto" => RowHeightRule::Auto,
+                                _ => RowHeightRule::AtLeast,
+                            });
+                },
+                _ => {},
             },
             Event::End(ref e) if e.local_name().as_ref() == b"trPr" => {
                 break;
@@ -1255,6 +1307,23 @@ fn parse_table_cell_properties(
                     });
                     xml::skip_element_fast(reader)?;
                 },
+                b"tcBorders" => {
+                    props.borders =
+                        Some(self::formatting::parse_table_borders_fast(reader, b"tcBorders")?);
+                },
+                b"tcMar" => {
+                    props.margins = Some(parse_cell_margins(reader, b"tcMar")?);
+                },
+                b"vAlign" => {
+                    props.v_align = parse_cell_v_align(e);
+                    xml::skip_element_fast(reader)?;
+                },
+                b"textDirection" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                        props.text_direction = Some(val.into_owned());
+                    }
+                    xml::skip_element_fast(reader)?;
+                },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
@@ -1282,6 +1351,14 @@ fn parse_table_cell_properties(
                         pattern: xml::optional_attr_str(e, b"w:val")?.map(|v| v.into_owned()),
                     });
                 },
+                b"vAlign" => {
+                    props.v_align = parse_cell_v_align(e);
+                },
+                b"textDirection" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                        props.text_direction = Some(val.into_owned());
+                    }
+                },
                 _ => {},
             },
             Event::End(ref e) if e.local_name().as_ref() == b"tcPr" => {
@@ -1292,6 +1369,54 @@ fn parse_table_cell_properties(
         }
     }
     Ok(props)
+}
+
+/// Read a `w:w` twip measure off an element (`w:tblInd`, `w:top` in
+/// `w:tblCellMar`, …).
+fn parse_measure_w(e: &quick_xml::events::BytesStart) -> Option<crate::core::units::Twip> {
+    xml::optional_attr_str(e, b"w:w")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .map(crate::core::units::Twip)
+}
+
+fn parse_cell_v_align(e: &quick_xml::events::BytesStart) -> Option<CellVAlign> {
+    xml::optional_attr_str(e, b"w:val")
+        .ok()
+        .flatten()
+        .map(|v| match v.as_ref() {
+            "center" => CellVAlign::Center,
+            "bottom" => CellVAlign::Bottom,
+            _ => CellVAlign::Top,
+        })
+}
+
+/// Parse the children of `w:tblCellMar` / `w:tcMar`. The caller has consumed
+/// the start tag; `end` names the closing element to stop at.
+fn parse_cell_margins(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    end: &[u8],
+) -> CoreResult<CellMargins> {
+    let mut m = CellMargins::default();
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) | Event::Empty(ref e) => {
+                let v = parse_measure_w(e).map(|t| t.0);
+                match e.local_name().as_ref() {
+                    b"top" => m.top = v,
+                    b"bottom" => m.bottom = v,
+                    b"left" | b"start" => m.left = v,
+                    b"right" | b"end" => m.right = v,
+                    _ => {},
+                }
+            },
+            Event::End(ref e) if e.local_name().as_ref() == end => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(m)
 }
 
 fn parse_table_width(e: &quick_xml::events::BytesStart) -> CoreResult<Option<TableWidth>> {
@@ -1399,6 +1524,44 @@ pub(crate) fn parse_section_properties(
                     if let Ok(Some(num)) = xml::optional_attr_str(e, b"w:num") {
                         props.columns = num.parse().ok();
                     }
+                    props.column_layout = Some(ColumnDefs {
+                        space: xml::optional_attr_str(e, b"w:space")
+                            .ok()
+                            .flatten()
+                            .and_then(|v| v.parse().ok()),
+                        // Absent `w:sep` means no separator; present-with-no-val
+                        // means true, which is what `parse_toggle` gives us.
+                        separator: xml::optional_attr_str(e, b"w:sep")
+                            .ok()
+                            .flatten()
+                            .is_some_and(|v| matches!(v.as_ref(), "1" | "true" | "on")),
+                        widths: Vec::new(),
+                    });
+                },
+                // `<w:col>` children of a non-self-closing `<w:cols>` arrive
+                // through this same loop; `</w:cols>` is ignored and only
+                // `</w:sectPr>` ends it.
+                b"col" => {
+                    if let Some(layout) = props.column_layout.as_mut() {
+                        if let Ok(Some(w)) = xml::optional_attr_str(e, b"w:w") {
+                            if let Ok(v) = w.parse::<u32>() {
+                                layout.widths.push(v);
+                            }
+                        }
+                    }
+                },
+                b"type" => {
+                    props.break_type =
+                        xml::optional_attr_str(e, b"w:val")?.map(|v| match v.as_ref() {
+                            "continuous" => SectionBreakKind::Continuous,
+                            "evenPage" => SectionBreakKind::EvenPage,
+                            "oddPage" => SectionBreakKind::OddPage,
+                            "nextColumn" => SectionBreakKind::NextColumn,
+                            _ => SectionBreakKind::NextPage,
+                        });
+                },
+                b"titlePg" => {
+                    props.title_page = xml::parse_toggle(e, b"w:val");
                 },
                 _ => {},
             },

@@ -182,6 +182,32 @@ fn write_datetime_element(w: &mut Writer<Vec<u8>>, tag: &str, value: &str) {
         .expect("write end");
 }
 
+/// Read and parse `docProps/core.xml` from an open OPC package.
+///
+/// Resolves the part through the package-level `core-properties`
+/// relationship and falls back to the conventional `/docProps/core.xml`
+/// path for packages that omit the relationship. Returns `None` when the
+/// part is absent or unparseable — document metadata is decoration, never
+/// a reason to fail opening a file.
+pub fn read_core_properties<R: std::io::Read + std::io::Seek>(
+    opc: &mut super::opc::OpcReader<R>,
+) -> Option<CoreProperties> {
+    let part = opc
+        .package_rels()
+        .first_by_type(super::relationships::rel_types::CORE_PROPERTIES)
+        .and_then(|rel| {
+            super::opc::PartName::new(&format!("/{}", rel.target.trim_start_matches('/'))).ok()
+        })
+        .filter(|p| opc.has_part(p))
+        .or_else(|| {
+            super::opc::PartName::new("/docProps/core.xml")
+                .ok()
+                .filter(|p| opc.has_part(p))
+        })?;
+    let data = opc.read_part(&part).ok()?;
+    CoreProperties::parse(&data).ok()
+}
+
 // ---------------------------------------------------------------------------
 // App (Extended) Properties — docProps/app.xml
 // ---------------------------------------------------------------------------
