@@ -683,3 +683,37 @@ fn base64_padding_is_correct_for_every_input_length() {
         assert_eq!(md, format!("[image-base64:{expected}]"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// #119 — password-protected OOXML
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_encrypted_ooxml_package_says_so_rather_than_failing_as_a_bad_zip() {
+    // Office wraps a password-protected package in a CFB container, so
+    // opening one as a zip failed with an archive error that said nothing
+    // about the real reason.
+    let mut data = vec![0u8; 1536];
+    data[..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+    data[0x1A] = 3;
+    data[0x1C] = 0xFE;
+    data[0x1D] = 0xFF;
+    data[0x1E] = 9; // 512-byte sectors
+    data[0x20] = 6; // 64-byte mini sectors
+
+    for fmt in [
+        DocumentFormat::Docx,
+        DocumentFormat::Xlsx,
+        DocumentFormat::Pptx,
+    ] {
+        let err = expect_err(
+            Document::from_reader(Cursor::new(data.clone()), fmt),
+            "an encrypted package must not report a zip error",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("password-protected") || msg.contains("encrypted"),
+            "{fmt:?}: the error must name the reason, got {msg}"
+        );
+    }
+}

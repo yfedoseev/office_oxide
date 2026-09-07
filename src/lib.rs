@@ -155,6 +155,32 @@ where
     }
 }
 
+/// Whether a reader's first bytes are the CFB (compound file) signature.
+///
+/// Leaves the reader rewound to the start.
+fn is_cfb_container<R: Read + Seek>(reader: &mut R) -> Result<bool> {
+    use std::io::SeekFrom;
+    let mut magic = [0u8; 8];
+    reader.seek(SeekFrom::Start(0)).map_err(core::Error::from)?;
+    let n = read_up_to(reader, &mut magic)?;
+    reader.seek(SeekFrom::Start(0)).map_err(core::Error::from)?;
+    Ok(n == 8 && magic == crate::cfb::CFB_SIGNATURE)
+}
+
+/// Read up to `buf.len()` bytes, tolerating short reads.
+fn read_up_to<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {},
+            Err(e) => return Err(core::Error::from(e).into()),
+        }
+    }
+    Ok(filled)
+}
+
 /// Dispatch a method call to the inner document type across all variants.
 macro_rules! dispatch_inner {
     ($self:expr, $method:ident) => {
@@ -289,7 +315,20 @@ impl Document {
         with_parse_stack(move || Self::from_reader_inner(reader, format))
     }
 
-    fn from_reader_inner<R: Read + Seek>(reader: R, format: DocumentFormat) -> Result<Self> {
+    fn from_reader_inner<R: Read + Seek>(mut reader: R, format: DocumentFormat) -> Result<Self> {
+        // A password-protected OOXML file is not a zip at all: Office wraps
+        // the encrypted package in a CFB container. Opening one as a zip
+        // fails with an unhelpful archive error that says nothing about the
+        // real reason, so name it here.
+        if matches!(format, DocumentFormat::Docx | DocumentFormat::Xlsx | DocumentFormat::Pptx)
+            && is_cfb_container(&mut reader)?
+        {
+            return Err(OfficeError::UnsupportedFormat(
+                "the file is a password-protected (encrypted) OOXML package; \
+                 decryption is not supported"
+                    .into(),
+            ));
+        }
         match format {
             DocumentFormat::Docx => {
                 let doc = docx::DocxDocument::from_reader(reader)?;
