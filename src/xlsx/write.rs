@@ -1103,7 +1103,9 @@ impl XlsxWriter {
                 w.write_event(Event::Start(c))?;
                 w.write_event(Event::Start(BytesStart::new("is")))?;
                 w.write_event(Event::Start(BytesStart::new("t")))?;
-                w.write_event(Event::Text(BytesText::new(s)))?;
+                w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(
+                    s,
+                ))))?;
                 w.write_event(Event::End(BytesEnd::new("t")))?;
                 w.write_event(Event::End(BytesEnd::new("is")))?;
                 w.write_event(Event::End(BytesEnd::new("c")))?;
@@ -1133,7 +1135,9 @@ impl XlsxWriter {
                 }
                 w.write_event(Event::Start(c))?;
                 w.write_event(Event::Start(BytesStart::new("v")))?;
-                w.write_event(Event::Text(BytesText::new(&format_number(*n))))?;
+                w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(
+                    &format_number(*n),
+                ))))?;
                 w.write_event(Event::End(BytesEnd::new("v")))?;
                 w.write_event(Event::End(BytesEnd::new("c")))?;
             },
@@ -1146,7 +1150,9 @@ impl XlsxWriter {
                 }
                 w.write_event(Event::Start(c))?;
                 w.write_event(Event::Start(BytesStart::new("v")))?;
-                w.write_event(Event::Text(BytesText::new(if *b { "1" } else { "0" })))?;
+                w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(
+                    if *b { "1" } else { "0" },
+                ))))?;
                 w.write_event(Event::End(BytesEnd::new("v")))?;
                 w.write_event(Event::End(BytesEnd::new("c")))?;
             },
@@ -1158,7 +1164,9 @@ impl XlsxWriter {
                 }
                 w.write_event(Event::Start(c))?;
                 w.write_event(Event::Start(BytesStart::new("f")))?;
-                w.write_event(Event::Text(BytesText::new(f)))?;
+                w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(
+                    f,
+                ))))?;
                 w.write_event(Event::End(BytesEnd::new("f")))?;
                 w.write_event(Event::End(BytesEnd::new("c")))?;
             },
@@ -1385,7 +1393,9 @@ fn build_drawing_xml(
         }
         // <a:t>text</a:t>
         w.write_event(Event::Start(BytesStart::new("a:t")))?;
-        w.write_event(Event::Text(quick_xml::events::BytesText::new(trimmed)))?;
+        w.write_event(Event::Text(quick_xml::events::BytesText::new(
+            &crate::core::xml::sanitize_xml_text(trimmed),
+        )))?;
         w.write_event(Event::End(BytesEnd::new("a:t")))?;
         w.write_event(Event::End(BytesEnd::new("a:r")))?;
         w.write_event(Event::End(BytesEnd::new("a:p")))?;

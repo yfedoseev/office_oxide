@@ -163,18 +163,40 @@ impl DocxDocument {
 
     fn from_opc<R: Read + Seek>(mut opc: OpcReader<R>) -> Result<Self> {
         debug!("DocxDocument: parsing started");
+        // Refuse a package whose primary part is not WordprocessingML — an
+        // XLSX opened as a DOCX used to parse to an empty document with no
+        // diagnostic at all.
+        opc.verify_main_content_type(
+            &[
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml",
+                "application/vnd.ms-word.document.macroEnabled.main+xml",
+                "application/vnd.ms-word.template.macroEnabledTemplate.main+xml",
+            ],
+            "a WordprocessingML document",
+        )?;
         let core_properties = crate::core::properties::read_core_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let doc_rels = opc.read_rels_for(&main_part)?;
 
         // Parse theme
-        let theme = if let Some(rel) = doc_rels.first_by_type(rel_types::THEME) {
-            let part_name = main_part.resolve_relative(&rel.target)?;
-            let data = opc.read_part(&part_name)?;
-            Some(Theme::parse(&data)?)
-        } else {
-            None
-        };
+        // A theme is decoration: it supplies colour-scheme lookups and
+        // nothing more. A malformed or missing theme part used to fail the
+        // whole open, so one bad ancillary part made an otherwise readable
+        // document unreadable — while a *missing* theme was fine, which is
+        // the inconsistency that gave it away.
+        let theme = doc_rels
+            .first_by_type(rel_types::THEME)
+            .and_then(|rel| main_part.resolve_relative(&rel.target).ok())
+            .filter(|pn| opc.has_part(pn))
+            .and_then(|pn| opc.read_part(&pn).ok())
+            .and_then(|data| match Theme::parse(&data) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    debug!("DocxDocument: ignoring unreadable theme part: {e}");
+                    None
+                },
+            });
 
         // Parse styles
         let styles = if let Some(rel) = doc_rels.first_by_type(rel_types::STYLES) {
@@ -198,6 +220,9 @@ impl DocxDocument {
 
         // Parse main document
         let doc_data = opc.read_part(&main_part)?;
+        // A part cut off mid-element parses to whatever was read before the
+        // cut and reports success; check the root actually closed.
+        xml::check_root_closed(&doc_data, main_part.as_str(), "document")?;
         let (body, sections) = parse_document(&doc_data, &doc_rels)?;
 
         // Parse headers and footers. Walk header refs and footer refs
@@ -1346,6 +1371,18 @@ fn parse_extent_attrs(e: &quick_xml::events::BytesStart, width: &mut Emu, height
 // ---------------------------------------------------------------------------
 
 fn parse_table(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Table> {
+    // Tables nest (a cell may hold another table), so this is the recursion
+    // an adversarial file drives. Past the depth limit the subtree is
+    // skipped rather than recursed into: a stack overflow aborts the whole
+    // process and no caller in any binding can catch it.
+    let Some(_depth) = xml::DepthGuard::enter() else {
+        xml::skip_element_fast(reader)?;
+        return Ok(Table {
+            properties: None,
+            grid: Vec::new(),
+            rows: Vec::new(),
+        });
+    };
     let mut properties = None;
     let mut grid = Vec::new();
     let mut rows = Vec::new();

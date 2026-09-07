@@ -570,7 +570,7 @@ fn write_decl(w: &mut Writer<Vec<u8>>) {
 fn write_text_element(w: &mut Writer<Vec<u8>>, tag: &str, text: &str) {
     w.write_event(Event::Start(BytesStart::new(tag)))
         .expect("write start");
-    w.write_event(Event::Text(BytesText::new(text)))
+    w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(text))))
         .expect("write text");
     w.write_event(Event::End(BytesEnd::new(tag)))
         .expect("write end");

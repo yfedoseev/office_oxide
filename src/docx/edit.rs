@@ -65,53 +65,7 @@ impl EditableDocx {
 /// Replace text within `<w:t>...</w:t>` elements in a WML XML string.
 /// Returns the new string and the count of replacements.
 fn replace_in_wt_elements(xml: &str, find: &str, replace: &str) -> (String, usize) {
-    let mut result = String::with_capacity(xml.len());
-    let mut count = 0;
-    let mut pos = 0;
-
-    while pos < xml.len() {
-        // Find next <w:t> or <w:t ...>
-        if let Some(tag_start) = xml[pos..].find("<w:t") {
-            let tag_start = pos + tag_start;
-
-            // Find the end of the opening tag
-            let Some(tag_end_offset) = xml[tag_start..].find('>') else {
-                result.push_str(&xml[pos..]);
-                break;
-            };
-            let tag_end = tag_start + tag_end_offset + 1;
-
-            // Check if it's a self-closing tag
-            if xml[tag_start..tag_end].ends_with("/>") {
-                result.push_str(&xml[pos..tag_end]);
-                pos = tag_end;
-                continue;
-            }
-
-            // Find closing </w:t>
-            let Some(close_offset) = xml[tag_end..].find("</w:t>") else {
-                result.push_str(&xml[pos..]);
-                break;
-            };
-            let close_start = tag_end + close_offset;
-
-            // Extract text content between tags
-            let text_content = &xml[tag_end..close_start];
-            count += text_content.matches(find).count();
-            let replaced = text_content.replace(find, replace);
-
-            // Write: everything before this tag + tag + replaced text + close tag
-            result.push_str(&xml[pos..tag_end]);
-            result.push_str(&replaced);
-
-            pos = close_start;
-        } else {
-            result.push_str(&xml[pos..]);
-            break;
-        }
-    }
-
-    (result, count)
+    crate::core::editable::replace_in_text_elements(xml, "w:t", find, replace)
 }
 
 #[cfg(test)]

@@ -299,6 +299,112 @@ pub fn unescape_attr_value(attr: &quick_xml::events::attributes::Attribute<'_>) 
     Ok(unescaped.into_owned())
 }
 
+/// Fail when an XML part ends before its root element is closed.
+///
+/// A parse loop that breaks on `Event::Eof` returns whatever it read, so a
+/// `document.xml` cut off mid-element by a failed download or a truncated
+/// upload produced a document that looked complete and was not, with no
+/// signal at all. Checking that the closing tag is present is cheap — the
+/// root close is always the last markup in the part, so only the tail is
+/// scanned — and catches exactly that case without a second full parse.
+pub fn check_root_closed(data: &[u8], part: &str, root_local: &str) -> Result<()> {
+    // The root close is always the last markup in the part, so only the
+    // tail is scanned. Small parts are scanned whole.
+    const TAIL: usize = 64 * 1024;
+    let tail = &data[data.len().saturating_sub(TAIL)..];
+    let needle = format!("{root_local}>");
+    let needle = needle.as_bytes();
+
+    // Accept `</root>` and `</prefix:root>`: find the local-name-plus-`>`
+    // and require a `</` at most one short prefix earlier.
+    let found = tail
+        .windows(needle.len())
+        .enumerate()
+        .filter(|(_, w)| *w == needle)
+        .any(|(i, _)| {
+            let before = &tail[i.saturating_sub(24)..i];
+            match before.iter().rposition(|&b| b == b'<') {
+                Some(lt) => {
+                    let between = &before[lt..];
+                    between.starts_with(b"</")
+                        && between[2..].iter().all(|&b| b != b'<' && b != b'>')
+                },
+                None => false,
+            }
+        });
+    if found {
+        Ok(())
+    } else {
+        Err(Error::TruncatedPart(part.to_string()))
+    }
+}
+
+/// Strip characters XML 1.0 forbids from a text value.
+///
+/// XML 1.0 §2.2 permits only tab, LF, CR and `U+0020..` (minus the
+/// surrogate and non-character ranges) — every other C0 control is
+/// unrepresentable, *including* as a numeric character reference. Writing
+/// one produces a file that Word, Excel and LibreOffice all reject as
+/// corrupt, and such characters arrive routinely from PDF text extraction
+/// and from database exports. Dropping them is the only lossless-enough
+/// option: there is no escape that would round-trip.
+pub fn sanitize_xml_text(s: &str) -> std::borrow::Cow<'_, str> {
+    fn allowed(c: char) -> bool {
+        matches!(c,
+            '\u{09}' | '\u{0A}' | '\u{0D}'
+            | '\u{20}'..='\u{D7FF}'
+            | '\u{E000}'..='\u{FFFD}'
+            | '\u{10000}'..='\u{10FFFF}'
+        )
+    }
+    if s.chars().all(allowed) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(s.chars().filter(|&c| allowed(c)).collect())
+}
+
+/// Maximum element-nesting depth accepted by the recursive-descent parsers.
+///
+/// Real documents nest a handful of levels; 64 is far beyond anything a
+/// human authoring tool produces. Without a cap, a 1.6 KB `.docx` holding
+/// several thousand nested `<w:tbl>` elements drove the parser into a
+/// stack overflow, which aborts the process — an uncatchable crash that no
+/// consumer of this library, in any binding, can defend against.
+pub const MAX_NESTING_DEPTH: usize = 64;
+
+thread_local! {
+    static NESTING_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard tracking recursion depth in the parsers.
+///
+/// [`DepthGuard::enter`] returns `None` once [`MAX_NESTING_DEPTH`] is
+/// reached; the caller then skips the over-deep subtree instead of
+/// recursing into it. The counter is thread-local, so parallel worksheet
+/// and slide parsing each get their own budget.
+pub struct DepthGuard(());
+
+impl DepthGuard {
+    /// Enter one level of nesting, or return `None` when the limit is hit.
+    pub fn enter() -> Option<Self> {
+        NESTING_DEPTH.with(|d| {
+            let cur = d.get();
+            if cur >= MAX_NESTING_DEPTH {
+                None
+            } else {
+                d.set(cur + 1);
+                Some(DepthGuard(()))
+            }
+        })
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        NESTING_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// Create a plain Reader (no namespace resolution) configured for OOXML parsing.
 /// Use this for format-specific hot paths (worksheets, slides, document body)
 /// where all elements are in a single known namespace.

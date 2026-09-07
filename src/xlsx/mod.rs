@@ -343,6 +343,15 @@ impl XlsxDocument {
     #[allow(dead_code)]
     pub(crate) fn from_opc<R: Read + Seek>(mut opc: OpcReader<R>) -> Result<Self> {
         debug!("XlsxDocument: OPC parsing started");
+        opc.verify_main_content_type(
+            &[
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
+                "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+                "application/vnd.ms-excel.template.macroEnabled.main+xml",
+            ],
+            "a SpreadsheetML workbook",
+        )?;
         let core_properties = crate::core::properties::read_core_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let wb_rels = opc.read_rels_for(&main_part)?;

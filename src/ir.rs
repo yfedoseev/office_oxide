@@ -648,6 +648,12 @@ pub enum ShapeGeom {
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Heading {
     /// Heading level 1–6 (1 = largest).
+    ///
+    /// The field is not type-constrained, and `Default`/`serde` can both
+    /// produce a `0`. Read it through [`Heading::clamped_level`] rather
+    /// than directly: the five consumers used to normalise it two
+    /// different ways, so the same IR rendered as `<h1>` in HTML and as a
+    /// body line with a leading space in markdown.
     #[serde(default = "default_heading_level")]
     pub level: u8,
     /// Inline content of the heading.
@@ -662,6 +668,15 @@ pub struct Heading {
     /// round-trip flattens them to left-aligned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alignment: Option<ParagraphAlignment>,
+}
+
+impl Heading {
+    /// The heading level as a renderer should use it: clamped into the
+    /// documented 1–6 range. This is the single definition of that range;
+    /// every renderer and writer calls it.
+    pub fn clamped_level(&self) -> u8 {
+        self.level.clamp(1, 6)
+    }
 }
 
 fn default_heading_level() -> u8 {
@@ -748,7 +763,12 @@ pub struct Paragraph {
     /// Force a page break before this paragraph.
     #[serde(default)]
     pub page_break_before: bool,
-    /// Outline level (0 = body text, 1–9 = heading levels).
+    /// Outline level, using ECMA-376 §17.3.1.20's value space: `0` is
+    /// Heading 1, `1` is Heading 2, … and `9` means *no* outline level (body
+    /// text), which is also the value assumed when `<w:outlineLvl>` is
+    /// absent. This comment used to state the range backwards, so a caller
+    /// following it set `Some(0)` for body text and Word read every
+    /// paragraph in the document as a Heading 1.
     pub outline_level: Option<u8>,
     /// Absolute frame position (from `<w:framePr>`). Present when the
     /// DOCX uses page-anchored frames for layout-preserving content

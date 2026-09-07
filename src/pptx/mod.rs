@@ -87,18 +87,35 @@ impl PptxDocument {
 
     fn from_opc<R: Read + Seek>(mut opc: OpcReader<R>) -> Result<Self> {
         debug!("PptxDocument: parsing started");
+        opc.verify_main_content_type(
+            &[
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
+                "application/vnd.openxmlformats-officedocument.presentationml.slideshow.main+xml",
+                "application/vnd.openxmlformats-officedocument.presentationml.template.main+xml",
+                "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml",
+                "application/vnd.ms-powerpoint.slideshow.macroEnabled.main+xml",
+            ],
+            "a PresentationML presentation",
+        )?;
         let core_properties = crate::core::properties::read_core_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let pres_rels = opc.read_rels_for(&main_part)?;
 
         // Parse theme
-        let theme = if let Some(rel) = pres_rels.first_by_type(rel_types::THEME) {
-            let part_name = main_part.resolve_relative(&rel.target)?;
-            let data = opc.read_part(&part_name)?;
-            Some(Theme::parse(&data)?)
-        } else {
-            None
-        };
+        // See the DOCX reader: a malformed theme is not a reason to refuse
+        // the whole presentation.
+        let theme = pres_rels
+            .first_by_type(rel_types::THEME)
+            .and_then(|rel| main_part.resolve_relative(&rel.target).ok())
+            .filter(|pn| opc.has_part(pn))
+            .and_then(|pn| opc.read_part(&pn).ok())
+            .and_then(|data| match Theme::parse(&data) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    debug!("PptxDocument: ignoring unreadable theme part: {e}");
+                    None
+                },
+            });
 
         // Parse presentation.xml
         let pres_data = opc.read_part(&main_part)?;

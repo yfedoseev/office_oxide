@@ -188,7 +188,7 @@ fn add_element_to_docx(writer: &mut crate::docx::write::DocxWriter, elem: &Eleme
 
     match elem {
         Element::Heading(h) => {
-            let level = h.level.clamp(1, 6);
+            let level = h.clamped_level();
             let runs: Vec<Run> = ir_inline_to_runs(&h.content);
             let props = IrParaProps {
                 style: Some(format!("Heading{level}")),

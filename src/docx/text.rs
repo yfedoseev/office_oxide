@@ -203,7 +203,10 @@ fn markdown_blocks(elements: &[BlockElement], ctx: &MarkdownCtx, out: &mut Strin
 
                 // Heading prefix
                 if let Some(level) = heading_level {
-                    let hashes = "#".repeat(level.min(9));
+                    // One definition of the valid heading range, shared with the IR
+                    // renderers: `min(9)` emitted up to nine `#`, which no
+                    // markdown reader treats as a heading at all.
+                    let hashes = "#".repeat(level.clamp(1, 6));
                     out.push_str(&hashes);
                     out.push(' ');
                 } else if let Some(ref prefix) = list_prefix {

@@ -44,6 +44,20 @@ pub struct CfbHeader {
     pub header_difat: Vec<u32>,
 }
 
+/// Convert a CFB sector shift into a byte size, rejecting shifts that
+/// cannot produce a valid sector.
+///
+/// [MS-CFB] §2.2 permits only 9 (512-byte sectors, v3) and 12 (4096-byte,
+/// v4) for the sector shift and 6 for the mini sector shift. Anything else
+/// is malformed, and evaluating `1usize << shift` for it overflows: a
+/// fuzzed header with `shift = 255` panicked the process.
+fn shift_to_size(shift: u16) -> Option<usize> {
+    if shift as u32 >= usize::BITS {
+        return None;
+    }
+    Some(1usize << shift)
+}
+
 impl CfbHeader {
     /// Parse a CFB header from a 512-byte buffer.
     pub fn parse(buf: &[u8]) -> Result<Self> {
@@ -72,8 +86,15 @@ impl CfbHeader {
             )));
         }
 
+        // `1 << shift` overflows — and panics in a debug build, or wraps to
+        // a nonsense size in release — for any shift a malformed file cares
+        // to write. The spec only permits 9 (512 bytes) and 12 (4096), and
+        // the version checks below enforce exactly that, so reject anything
+        // that cannot even be shifted before shifting it.
         let sector_power = u16::from_le_bytes([buf[0x1E], buf[0x1F]]);
-        let sector_size = 1usize << sector_power;
+        let sector_size = shift_to_size(sector_power).ok_or_else(|| {
+            CfbError::InvalidHeader(format!("invalid sector shift: {sector_power}"))
+        })?;
 
         // v3 must be 512, v4 must be 4096
         if major_version == 3 && sector_size != 512 {
@@ -84,7 +105,15 @@ impl CfbHeader {
         }
 
         let mini_sector_power = u16::from_le_bytes([buf[0x20], buf[0x21]]);
-        let mini_sector_size = 1usize << mini_sector_power;
+        let mini_sector_size = shift_to_size(mini_sector_power).ok_or_else(|| {
+            CfbError::InvalidHeader(format!("invalid mini sector shift: {mini_sector_power}"))
+        })?;
+        // [MS-CFB] §2.2 fixes the mini sector shift at 6 (64 bytes).
+        if mini_sector_size != 64 {
+            return Err(CfbError::InvalidHeader(format!(
+                "mini sector size must be 64, got {mini_sector_size}"
+            )));
+        }
 
         let fat_sector_count = u32::from_le_bytes([buf[0x2C], buf[0x2D], buf[0x2E], buf[0x2F]]);
         let first_dir_sector = u32::from_le_bytes([buf[0x30], buf[0x31], buf[0x32], buf[0x33]]);

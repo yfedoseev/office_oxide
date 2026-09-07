@@ -190,6 +190,25 @@ impl DocumentIR {
 /// document" means. Previously only the DOCX markdown path emitted
 /// headers and footers, so a consumer's word count changed depending on
 /// which method they called.
+/// Whether `Section::title` merely repeats the section's own first
+/// heading.
+///
+/// The DOCX and PPTX converters set `Section.title` from the text of the
+/// first `Element::Heading` and leave that heading in `elements`. Rendering
+/// both printed every section's opening heading twice — once as a
+/// synthesised `## {title}` at a fixed level, then again at its real level.
+/// The title still exists for consumers that want a section label; it just
+/// must not be rendered as body content when it is a copy.
+fn section_title_is_redundant(section: &Section) -> bool {
+    let Some(title) = section.title.as_deref().filter(|t| !t.is_empty()) else {
+        return false;
+    };
+    match section.elements.first() {
+        Some(Element::Heading(h)) => render_inline_plain(&h.content).trim() == title.trim(),
+        _ => false,
+    }
+}
+
 fn section_headers(section: &Section) -> impl Iterator<Item = &HeaderFooter> {
     [
         section.first_page_header.as_ref(),
@@ -220,7 +239,10 @@ fn render_section_plain(section: &Section) -> String {
             }
         }
     }
-    if let Some(ref title) = section.title {
+    if section_title_is_redundant(section) {
+        // The title was lifted out of the section's own first heading; the
+        // heading is still in `elements`, so emitting both prints it twice.
+    } else if let Some(ref title) = section.title {
         if !title.is_empty() {
             parts.push(title.clone());
         }
@@ -326,7 +348,9 @@ fn render_section_markdown(section: &Section) -> String {
             }
         }
     }
-    if let Some(ref title) = section.title {
+    if section_title_is_redundant(section) {
+        // See `section_title_is_redundant`.
+    } else if let Some(ref title) = section.title {
         if !title.is_empty() {
             parts.push(format!("## {title}"));
         }
@@ -351,7 +375,7 @@ fn render_section_markdown(section: &Section) -> String {
 fn render_element_markdown(element: &Element) -> String {
     match element {
         Element::Heading(h) => {
-            let hashes = "#".repeat(h.level.min(6) as usize);
+            let hashes = "#".repeat(h.clamped_level() as usize);
             let text = render_inline_markdown(&h.content);
             format!("{hashes} {text}")
         },
@@ -598,7 +622,9 @@ fn render_section_html(section: &Section) -> String {
             }
         }
     }
-    if let Some(ref title) = section.title {
+    if section_title_is_redundant(section) {
+        // See `section_title_is_redundant`.
+    } else if let Some(ref title) = section.title {
         if !title.is_empty() {
             parts.push(format!("<h2>{}</h2>", escape_html(title)));
         }
@@ -623,7 +649,7 @@ fn render_section_html(section: &Section) -> String {
 fn render_element_html(element: &Element) -> String {
     match element {
         Element::Heading(h) => {
-            let level = h.level.clamp(1, 6);
+            let level = h.clamped_level();
             let content = render_inline_html(&h.content);
             format!("<h{level}>{content}</h{level}>")
         },

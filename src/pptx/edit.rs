@@ -66,49 +66,7 @@ impl EditablePptx {
 
 /// Replace text within `<a:t>...</a:t>` elements in DrawingML XML.
 fn replace_in_at_elements(xml: &str, find: &str, replace: &str) -> (String, usize) {
-    let mut result = String::with_capacity(xml.len());
-    let mut count = 0;
-    let mut pos = 0;
-
-    while pos < xml.len() {
-        if let Some(tag_start) = xml[pos..].find("<a:t") {
-            let tag_start = pos + tag_start;
-
-            let Some(tag_end_offset) = xml[tag_start..].find('>') else {
-                result.push_str(&xml[pos..]);
-                break;
-            };
-            let tag_end = tag_start + tag_end_offset + 1;
-
-            // Self-closing tag
-            if xml[tag_start..tag_end].ends_with("/>") {
-                result.push_str(&xml[pos..tag_end]);
-                pos = tag_end;
-                continue;
-            }
-
-            let Some(close_offset) = xml[tag_end..].find("</a:t>") else {
-                result.push_str(&xml[pos..]);
-                break;
-            };
-            let close_start = tag_end + close_offset;
-
-            let text_content = &xml[tag_end..close_start];
-            let occ = text_content.matches(find).count();
-            count += occ;
-
-            let replaced = text_content.replace(find, replace);
-            result.push_str(&xml[pos..tag_end]);
-            result.push_str(&replaced);
-
-            pos = close_start;
-        } else {
-            result.push_str(&xml[pos..]);
-            break;
-        }
-    }
-
-    (result, count)
+    crate::core::editable::replace_in_text_elements(xml, "a:t", find, replace)
 }
 
 #[cfg(test)]

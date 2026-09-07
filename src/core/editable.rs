@@ -154,3 +154,92 @@ impl EditablePackage {
         Ok(())
     }
 }
+
+/// Replace text inside every `<{tag}>…</{tag}>` element of an OOXML part.
+///
+/// `tag` is the fully-prefixed element name (`w:t`, `a:t`). Returns the
+/// rewritten XML and the number of substitutions.
+///
+/// Two properties this must have, and previously did not:
+///
+/// * The bytes between the tags are **escaped** XML, so both the search and
+///   the substitution happen on the decoded text and the result is
+///   re-escaped. Matching the raw bytes meant `find` never matched text
+///   containing `&`, `<` or `>` — the document holds `AT&amp;T`, not
+///   `AT&T` — and a replacement containing any of them injected raw markup
+///   and produced a file the Office applications refuse to open.
+/// * The opening-tag search must match the element, not a prefix of it. A
+///   bare `find("<w:t")` also matches `<w:tbl>`, `<w:tab/>`, `<w:tc>` and
+///   `<w:trPr>`; `<a:t` likewise matches `<a:tbl>` and `<a:tc>`. Each of
+///   those would then have its "text content" rewritten and its structure
+///   mangled.
+pub fn replace_in_text_elements(
+    xml: &str,
+    tag: &str,
+    find: &str,
+    replace: &str,
+) -> (String, usize) {
+    let open_prefix = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut result = String::with_capacity(xml.len());
+    let mut count = 0usize;
+    let mut pos = 0usize;
+
+    while pos < xml.len() {
+        let Some(tag_start) = find_open_tag(xml, pos, &open_prefix) else {
+            result.push_str(&xml[pos..]);
+            break;
+        };
+        let Some(tag_end_offset) = xml[tag_start..].find('>') else {
+            result.push_str(&xml[pos..]);
+            break;
+        };
+        let tag_end = tag_start + tag_end_offset + 1;
+
+        if xml[tag_start..tag_end].ends_with("/>") {
+            result.push_str(&xml[pos..tag_end]);
+            pos = tag_end;
+            continue;
+        }
+
+        let Some(close_offset) = xml[tag_end..].find(&close) else {
+            result.push_str(&xml[pos..]);
+            break;
+        };
+        let close_start = tag_end + close_offset;
+
+        let raw = &xml[tag_end..close_start];
+        let decoded = quick_xml::escape::unescape(raw)
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| raw.to_string());
+        let hits = decoded.matches(find).count();
+        result.push_str(&xml[pos..tag_end]);
+        if hits == 0 {
+            // Nothing changed — keep the source bytes byte-for-byte rather
+            // than round-tripping them through the escaper.
+            result.push_str(raw);
+        } else {
+            count += hits;
+            result.push_str(&quick_xml::escape::escape(decoded.replace(find, replace)));
+        }
+        pos = close_start;
+    }
+
+    (result, count)
+}
+
+/// Find the next occurrence of `prefix` that is a complete element name —
+/// i.e. followed by `>`, `/` or whitespace.
+fn find_open_tag(xml: &str, from: usize, prefix: &str) -> Option<usize> {
+    let mut pos = from;
+    while let Some(off) = xml[pos..].find(prefix) {
+        let at = pos + off;
+        match xml[at + prefix.len()..].chars().next() {
+            Some('>') | Some('/') | Some(' ') | Some('\t') | Some('\n') | Some('\r') => {
+                return Some(at);
+            },
+            _ => pos = at + prefix.len(),
+        }
+    }
+    None
+}

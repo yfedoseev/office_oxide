@@ -135,7 +135,19 @@ where
             .spawn(f)
             .map_err(|e| OfficeError::UnsupportedFormat(format!("thread spawn failed: {e}")))?
             .join()
-            .unwrap_or_else(|_| Err(OfficeError::UnsupportedFormat("parsing panicked".into())))
+            .unwrap_or_else(|payload| {
+                // Surface the panic as itself. Reporting it as
+                // `UnsupportedFormat` made every internal bug look like an
+                // unreadable file, so real defects went unreported and the
+                // fuzz target could not distinguish a crash from a clean
+                // rejection.
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic payload".to_string());
+                Err(OfficeError::Panic(msg))
+            })
     } else {
         f()
     }

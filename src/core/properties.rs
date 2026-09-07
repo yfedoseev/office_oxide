@@ -139,7 +139,7 @@ fn write_optional_element(w: &mut Writer<Vec<u8>>, tag: &str, value: Option<&str
     if let Some(text) = value {
         w.write_event(Event::Start(BytesStart::new(tag)))
             .expect("write start");
-        w.write_event(Event::Text(BytesText::new(text)))
+        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(text))))
             .expect("write text");
         w.write_event(Event::End(BytesEnd::new(tag)))
             .expect("write end");
@@ -150,7 +150,7 @@ fn write_datetime_element(w: &mut Writer<Vec<u8>>, tag: &str, value: &str) {
     let mut elem = BytesStart::new(tag);
     elem.push_attribute(("xsi:type", "dcterms:W3CDTF"));
     w.write_event(Event::Start(elem)).expect("write start");
-    w.write_event(Event::Text(BytesText::new(value)))
+    w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(value))))
         .expect("write text");
     w.write_event(Event::End(BytesEnd::new(tag)))
         .expect("write end");
@@ -358,7 +358,7 @@ fn write_optional_u32(w: &mut Writer<Vec<u8>>, tag: &str, value: Option<u32>) {
         let s = v.to_string();
         w.write_event(Event::Start(BytesStart::new(tag)))
             .expect("write start");
-        w.write_event(Event::Text(BytesText::new(&s)))
+        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(&s))))
             .expect("write text");
         w.write_event(Event::End(BytesEnd::new(tag)))
             .expect("write end");

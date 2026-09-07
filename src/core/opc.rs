@@ -234,9 +234,31 @@ impl OpcReader<std::io::Cursor<memmap2::Mmap>> {
 
 impl<R: Read + Seek> OpcReader<R> {
     /// Create an OPC reader from any `Read + Seek` source.
-    pub fn new(reader: R) -> Result<Self> {
+    pub fn new(mut reader: R) -> Result<Self> {
+        // Count the central-directory records *before* handing the reader to
+        // the zip crate, which collapses duplicate names into one entry.
+        let declared_entries = central_directory_entry_count(&mut reader)?;
+        reader.seek(std::io::SeekFrom::Start(0))?;
+
         let mut archive = ZipArchive::new(reader)?;
         debug!("OPC package opened, {} entries", archive.len());
+
+        // Reject packages with duplicate entry names.
+        //
+        // A ZIP may hold two entries with the same name; which one a reader
+        // returns is unspecified, so two implementations reading the same
+        // bytes can see two different documents. That is the shape of
+        // CVE-2025-31672 and of every "scanner reads one copy, renderer
+        // reads the other" bypass. Whichever copy we picked would be
+        // accidental, so refuse the package.
+        if let Some(declared) = declared_entries {
+            if declared > archive.len() {
+                return Err(Error::DuplicatePart(format!(
+                    "{declared} central-directory entries collapse to {} unique names",
+                    archive.len()
+                )));
+            }
+        }
 
         // Eagerly parse [Content_Types].xml
         let ct_data = read_zip_entry(&mut archive, "[Content_Types].xml")?;
@@ -260,6 +282,32 @@ impl<R: Read + Seek> OpcReader<R> {
     /// Return the parsed `[Content_Types].xml` table.
     pub fn content_types(&self) -> &ContentTypes {
         &self.content_types
+    }
+
+    /// Fail unless the package's primary part carries one of `expected`
+    /// content types.
+    ///
+    /// Opening an XLSX as a DOCX used to succeed and produce an empty
+    /// document — a caller who guessed the format wrong got silence rather
+    /// than "this is not a WordprocessingML package". The corpus has 16
+    /// files of exactly this shape (ODT stored as `.docx`, XLSB stored as
+    /// `.xls`, and so on).
+    pub fn verify_main_content_type(&self, expected: &[&str], label: &str) -> Result<()> {
+        let Ok(main) = self.main_document_part() else {
+            // No primary part at all is a different (already reported) error.
+            return Ok(());
+        };
+        let Some(found) = self.content_types.overrides().get(&main) else {
+            // No override entry — nothing to contradict.
+            return Ok(());
+        };
+        if expected.iter().any(|e| found == e) {
+            return Ok(());
+        }
+        Err(Error::FormatMismatch {
+            found: found.clone(),
+            expected: label.to_string(),
+        })
     }
 
     /// Return the package-level relationships from `_rels/.rels`.
@@ -375,6 +423,53 @@ impl<R: Read + Seek> OpcReader<R> {
 
 /// Read a ZIP entry by name, returning its bytes.
 /// Falls back to case-insensitive and backslash-normalized lookup if exact match fails.
+/// Read the "total number of entries in the central directory" field from a
+/// ZIP's End of Central Directory record.
+///
+/// Returns `None` when the record cannot be located or the archive uses the
+/// ZIP64 sentinel, in which case the caller simply skips the duplicate check
+/// rather than guessing. The field is the only way to see duplicates at all:
+/// the zip crate keys its entries by name, so two records with the same name
+/// collapse into one before any caller can notice.
+fn central_directory_entry_count<R: Read + Seek>(reader: &mut R) -> Result<Option<usize>> {
+    const EOCD_SIG: [u8; 4] = [b'P', b'K', 5, 6];
+    // The EOCD is at most 22 bytes plus a 64 KiB comment.
+    const MAX_SCAN: u64 = 22 + 0xFFFF;
+
+    let len = reader.seek(std::io::SeekFrom::End(0))?;
+    if len < 22 {
+        return Ok(None);
+    }
+    let scan = MAX_SCAN.min(len);
+    reader.seek(std::io::SeekFrom::End(-(scan as i64)))?;
+    let mut buf = vec![0u8; scan as usize];
+    reader.read_exact(&mut buf)?;
+
+    // Scan backwards for the signature; the last match is the real EOCD.
+    let Some(pos) = buf
+        .windows(4)
+        .rposition(|w| w == EOCD_SIG)
+        .filter(|&p| p + 12 <= buf.len())
+    else {
+        return Ok(None);
+    };
+    let total = u16::from_le_bytes([buf[pos + 10], buf[pos + 11]]);
+    // 0xFFFF is the ZIP64 sentinel: the real count lives elsewhere.
+    if total == u16::MAX {
+        return Ok(None);
+    }
+    Ok(Some(total as usize))
+}
+
+/// Maximum uncompressed size accepted for a single OPC part.
+///
+/// Real documents do not have half-gigabyte parts; a file that claims to
+/// is either corrupt or a decompression bomb. Refusing it with an error is
+/// the difference between a failed parse and an out-of-memory kill of the
+/// host process — and every binding (Python, Go, C#, WASM) inherits that
+/// difference.
+pub const MAX_PART_SIZE: u64 = 512 * 1024 * 1024;
+
 pub(crate) fn read_zip_entry<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     name: &str,
@@ -403,9 +498,24 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
     let mut file = archive
         .by_index(index)
         .map_err(|_| Error::MissingPart(name.to_string()))?;
-    let mut buf = Vec::with_capacity(file.size() as usize);
-    match file.read_to_end(&mut buf) {
-        Ok(_) => Ok(buf),
+
+    // Reject decompression bombs before allocating for them. A ZIP entry
+    // declares its uncompressed size in the central directory; a 2 MB
+    // `.docx` whose `document.xml` claims to expand to 2 GiB is a
+    // deliberate memory-exhaustion payload (the OOXML analogue of
+    // CVE-2014-3574). The declared size is attacker-controlled, so it is
+    // used only to refuse early — the read below is separately capped so a
+    // lying header cannot get past it either.
+    if file.size() > MAX_PART_SIZE {
+        return Err(Error::DecompressionLimit {
+            part: name.to_string(),
+            limit: MAX_PART_SIZE,
+        });
+    }
+    let mut buf = Vec::with_capacity((file.size() as usize).min(1 << 20));
+    let mut capped = (&mut file).take(MAX_PART_SIZE + 1);
+    match capped.read_to_end(&mut buf) {
+        Ok(_) => {},
         Err(e)
             if e.kind() == std::io::ErrorKind::InvalidData
                 && e.to_string().contains("checksum")
@@ -415,10 +525,16 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
             // doesn't match. Accept the data anyway for tolerance of real-world
             // files with minor corruption (e.g., re-saved without recomputing CRC).
             trace!("read_zip_entry '{}': ignoring CRC mismatch", name);
-            Ok(buf)
         },
-        Err(e) => Err(e.into()),
+        Err(e) => return Err(e.into()),
     }
+    if buf.len() as u64 > MAX_PART_SIZE {
+        return Err(Error::DecompressionLimit {
+            part: name.to_string(),
+            limit: MAX_PART_SIZE,
+        });
+    }
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------

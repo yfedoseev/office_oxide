@@ -557,9 +557,7 @@ pub(crate) fn parse_paragraph_properties(
                         },
                         b"outlineLvl" => {
                             if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                                if let Ok(lvl) = val.parse::<u8>() {
-                                    props.outline_level = Some(lvl);
-                                }
+                                props.outline_level = parse_outline_level(&val);
                             }
                             xml::skip_element(reader)?;
                         },
@@ -595,9 +593,7 @@ pub(crate) fn parse_paragraph_properties(
                     },
                     b"outlineLvl" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                            if let Ok(lvl) = val.parse::<u8>() {
-                                props.outline_level = Some(lvl);
-                            }
+                            props.outline_level = parse_outline_level(&val);
                         }
                     },
                     _ => {},
@@ -810,9 +806,7 @@ pub(crate) fn parse_paragraph_properties_fast(
                     },
                     b"outlineLvl" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                            if let Ok(lvl) = val.parse::<u8>() {
-                                props.outline_level = Some(lvl);
-                            }
+                            props.outline_level = parse_outline_level(&val);
                         }
                         xml::skip_element_fast(reader)?;
                     },
@@ -890,9 +884,7 @@ pub(crate) fn parse_paragraph_properties_fast(
                     },
                     b"outlineLvl" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                            if let Ok(lvl) = val.parse::<u8>() {
-                                props.outline_level = Some(lvl);
-                            }
+                            props.outline_level = parse_outline_level(&val);
                         }
                     },
                     _ => {},
@@ -1052,6 +1044,27 @@ fn parse_num_pr_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Resu
         }
     }
     Ok(NumberingRef { num_id, ilvl })
+}
+
+/// Parse a `<w:outlineLvl w:val="N"/>` value.
+///
+/// ECMA-376 §17.3.1.20 defines the range as 0–9, where `9` "specifically
+/// indicates that there is no outline level specifically applied to this
+/// paragraph" — i.e. body text — and is also the value assumed when the
+/// element is absent. Returning `Some(9)` made every consumer treat a
+/// paragraph explicitly marked as body text as a heading: the IR converter
+/// produced an H6, and the markdown renderer emitted nine `#` characters,
+/// which no markdown reader treats as a heading at all. Word writes
+/// `w:val="9"` for "Outline level: Body Text", and the built-in
+/// `TOCHeading` style uses it to cancel the level it inherits, so any
+/// document with a generated table of contents was affected.
+///
+/// Out-of-range values are also rejected rather than passed through.
+pub(crate) fn parse_outline_level(val: &str) -> Option<u8> {
+    match val.trim().parse::<u8>() {
+        Ok(lvl) if lvl <= 8 => Some(lvl),
+        _ => None,
+    }
 }
 
 /// Parse a boolean toggle attribute. `<w:b/>` = true, `<w:b w:val="0"/>` = false.

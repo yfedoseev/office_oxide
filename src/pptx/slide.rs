@@ -399,6 +399,18 @@ fn parse_group_shape(
     rels: &Relationships,
     media: &std::collections::HashMap<String, (Vec<u8>, String)>,
 ) -> CoreResult<Shape> {
+    // Groups nest, so this is the recursion an adversarial deck drives.
+    // Past the limit the subtree is skipped: a stack overflow aborts the
+    // process and no caller can catch it.
+    let Some(_depth) = xml::DepthGuard::enter() else {
+        xml::skip_element_fast(reader)?;
+        return Ok(Shape::Group(GroupShape {
+            id: 0,
+            name: String::new(),
+            position: None,
+            children: Vec::new(),
+        }));
+    };
     let mut id = 0u32;
     let mut name = String::new();
     let mut position = None;
