@@ -204,33 +204,50 @@ fn apply_custom(n: f64, fmt: &str) -> String {
     // the *second* section, and a two-section `"yes";"no"` is how a boolean
     // flag column is written.
     let sections = split_format_sections(fmt);
-    let section = match sections.len() {
-        0 => fmt,
-        1 => sections[0],
-        2 => {
-            if n < 0.0 {
-                sections[1]
-            } else {
-                sections[0]
-            }
-        },
-        _ => {
-            if n < 0.0 {
-                sections[1]
-            } else if n == 0.0 {
-                sections[2]
-            } else {
-                sections[0]
-            }
-        },
-    };
-    // The negative section supplies its own sign (usually parentheses or a
-    // literal '-'), so format its magnitude.
-    let n = if sections.len() >= 2 && n < 0.0 {
-        n.abs()
+
+    // A format whose sections carry `[<op><number>]` conditions is a
+    // *conditional* format, not positive;negative;zero: sections are tested
+    // in order and the first match wins, with an unconditioned section as
+    // the fallback (ECMA-376 §18.8.31). `[>999999]#,,"M";[>999]#,"K";#` is
+    // how a sheet renders 1.02 as `1` and 102102 as `102K`; reading it
+    // positionally scaled every value by 1e6 and produced `0M`.
+    let conditional = sections.iter().any(|s| section_condition(s).is_some());
+    let (section, use_magnitude) = if conditional {
+        let chosen = sections
+            .iter()
+            .find(|s| match section_condition(s) {
+                Some((op, v)) => condition_holds(n, op, v),
+                None => true,
+            })
+            .copied()
+            .unwrap_or(fmt);
+        (chosen, false)
     } else {
-        n
+        let chosen = match sections.len() {
+            0 => fmt,
+            1 => sections[0],
+            2 => {
+                if n < 0.0 {
+                    sections[1]
+                } else {
+                    sections[0]
+                }
+            },
+            _ => {
+                if n < 0.0 {
+                    sections[1]
+                } else if n == 0.0 {
+                    sections[2]
+                } else {
+                    sections[0]
+                }
+            },
+        };
+        // The negative section supplies its own sign (usually parentheses or
+        // a literal '-'), so format its magnitude.
+        (chosen, sections.len() >= 2 && n < 0.0)
     };
+    let n = if use_magnitude { n.abs() } else { n };
 
     // ── Parse the section ────────────────────────────────────────────────
     let mut currency_prefix = String::new();
@@ -400,6 +417,44 @@ fn apply_custom(n: f64, fmt: &str) -> String {
     format!("{currency_prefix}{prefix_literal}{body}{suffix}{pct_suffix}")
 }
 
+/// Read a leading `[<op><number>]` comparison condition off a section.
+///
+/// Only comparisons count: `[Red]` is a colour and `[$-409]` a locale, and
+/// neither selects a section.
+fn section_condition(section: &str) -> Option<(&'static str, f64)> {
+    let rest = section.trim_start().strip_prefix('[')?;
+    let end = rest.find(']')?;
+    let inner = &rest[..end];
+    for op in ["<=", ">=", "<>", "<", ">", "="] {
+        if let Some(num) = inner.strip_prefix(op) {
+            if let Ok(v) = num.trim().parse::<f64>() {
+                // `op` is one of the literals above, so it outlives the call.
+                let op: &'static str = match op {
+                    "<=" => "<=",
+                    ">=" => ">=",
+                    "<>" => "<>",
+                    "<" => "<",
+                    ">" => ">",
+                    _ => "=",
+                };
+                return Some((op, v));
+            }
+        }
+    }
+    None
+}
+
+fn condition_holds(n: f64, op: &str, v: f64) -> bool {
+    match op {
+        "<" => n < v,
+        ">" => n > v,
+        "<=" => n <= v,
+        ">=" => n >= v,
+        "<>" => n != v,
+        _ => n == v,
+    }
+}
+
 /// Split a number-format code into its `;`-separated sections, ignoring
 /// semicolons inside quoted literals, `\`-escapes and `[...]` directives.
 fn split_format_sections(fmt: &str) -> Vec<&str> {
@@ -434,6 +489,48 @@ fn split_format_sections(fmt: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `[>999999]#,,"M";[>999]#,"K";#` is how a sheet renders large numbers
+    /// compactly. The sections carry *conditions*, not positive/negative
+    /// roles: reading them positionally scaled every value by 1e6 and
+    /// rendered 1.02 as `0M`.
+    #[test]
+    fn conditional_sections_select_by_comparison_not_by_position() {
+        let fmt = Some(r#"[>999999]#,,"M";[>999]#,"K";#"#);
+        assert_eq!(apply_format(1.02, 164, fmt), "1");
+        assert_eq!(apply_format(102.0, 164, fmt), "102");
+        assert_eq!(apply_format(1021.02, 164, fmt), "1K");
+        assert_eq!(apply_format(102102.102, 164, fmt), "102K");
+        assert_eq!(apply_format(1_500_000.0, 164, fmt), "2M");
+    }
+
+    #[test]
+    fn a_colour_or_locale_directive_is_not_a_condition() {
+        // `[Red]` and `[$-409]` must leave the positional
+        // positive;negative;zero reading intact.
+        let fmt = Some(r#"#,##0;[Red]-#,##0"#);
+        assert_eq!(apply_format(1234.0, 164, fmt), "1,234");
+        assert_eq!(apply_format(-1234.0, 164, fmt), "-1,234");
+    }
+
+    /// A custom `numFmt` whose code is `GENERAL` is the General format, not
+    /// a literal. Matching it case-sensitively sent it down the custom path,
+    /// where it produced no digit placeholder and rendered every numeric
+    /// cell in the sheet as an empty string.
+    #[test]
+    fn a_general_format_code_is_not_a_literal() {
+        for code in ["GENERAL", "General", "general"] {
+            assert_eq!(apply_format(70.0, 164, Some(code)), "70");
+            assert_eq!(apply_format(3.5, 164, Some(code)), "3.5");
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_literal_format_keeps_its_text() {
+        // Unquoted literal characters accumulate separately from quoted
+        // ones; dropping them turned the cell into an empty string.
+        assert_eq!(apply_format(1.0, 164, Some("ABC")), "ABC");
+    }
 
     #[test]
     fn builtin_general() {
