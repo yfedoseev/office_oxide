@@ -2,6 +2,7 @@ mod html;
 mod info;
 mod ir;
 mod markdown;
+mod replace;
 mod text;
 
 use clap::Subcommand;
@@ -38,6 +39,18 @@ pub enum Command {
         /// Path to the document file
         file: String,
     },
+    /// Replace text in a document, preserving every other part of the file
+    Replace {
+        /// Path to the document file
+        file: String,
+        /// Text to search for
+        find: String,
+        /// Replacement text
+        replace: String,
+        /// Where to write the result (default: overwrite the input file)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
 }
 
 pub fn run(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
@@ -47,5 +60,11 @@ pub fn run(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Html { file } => html::run(&file),
         Command::Info { file } => info::run(&file),
         Command::Ir { file } => ir::run(&file),
+        Command::Replace {
+            file,
+            find,
+            replace,
+            output,
+        } => replace::run(&file, &find, &replace, output.as_deref()),
     }
 }

@@ -69,3 +69,46 @@ impl WasmDocument {
         serde_wasm_bindgen::to_value(&ir).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 }
+
+/// An Office document opened for editing from JavaScript/WASM.
+///
+/// WASM had no file-editing API at all, so an agent could read a document
+/// but never change one. The document is held in memory with every OPC part
+/// preserved, so parts this crate does not model (images, charts, custom
+/// XML) survive the round-trip untouched.
+#[wasm_bindgen]
+pub struct WasmEditableDocument {
+    inner: crate::edit::EditableDocument,
+}
+
+#[wasm_bindgen]
+impl WasmEditableDocument {
+    /// Open a document for editing from raw bytes and a format string
+    /// ("docx", "xlsx", "pptx").
+    #[wasm_bindgen(constructor)]
+    pub fn new(data: &[u8], format: &str) -> Result<WasmEditableDocument, JsValue> {
+        let fmt = DocumentFormat::from_extension(format)
+            .ok_or_else(|| JsValue::from_str(&format!("unsupported format: {format}")))?;
+        let cursor = Cursor::new(data.to_vec());
+        let inner = crate::edit::EditableDocument::from_reader(cursor, fmt)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(WasmEditableDocument { inner })
+    }
+
+    /// Replace every occurrence of `find` with `replace` in the document's
+    /// text, returning how many replacements were made.
+    #[wasm_bindgen(js_name = replaceText)]
+    pub fn replace_text(&mut self, find: &str, replace: &str) -> usize {
+        self.inner.replace_text(find, replace)
+    }
+
+    /// Serialise the edited document back to bytes.
+    #[wasm_bindgen(js_name = toBytes)]
+    pub fn to_bytes(&self) -> Result<Vec<u8>, JsValue> {
+        let mut buf = Cursor::new(Vec::new());
+        self.inner
+            .write_to(&mut buf)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(buf.into_inner())
+    }
+}

@@ -15,9 +15,21 @@ const ext =
   process.platform === 'darwin' ? '.dylib' : '.so';
 const prefix = process.platform === 'win32' ? '' : 'lib';
 
+const resolveNative = require('./resolve-native.cjs');
+
 function candidatePaths() {
   const paths = [];
   if (process.env.OFFICE_OXIDE_LIB) paths.push(process.env.OFFICE_OXIDE_LIB);
+  // The platform package (`office-oxide-<platform>-<arch>`), when installed.
+  // The six libraries used to ship inside this package, so every install
+  // downloaded all of them and could load only one.
+  try {
+    paths.push(require.resolve(
+      `${resolveNative.platformPackageName()}/${resolveNative.libFileName()}`,
+    ));
+  } catch {
+    // Optional dependency absent — fall through to the bundled layout.
+  }
   const hereDir = path.dirname(require.resolve('../package.json'));
   paths.push(path.join(
     hereDir, 'prebuilds',
