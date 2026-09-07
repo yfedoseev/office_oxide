@@ -1056,13 +1056,19 @@ fn convert_list_group(
     let mut start_number: Option<u32> = None;
     let mut style: Option<ListStyle> = None;
 
+    let start_index = *i;
+
     while *i < blocks.len() {
         if let crate::docx::BlockElement::Paragraph(p) = &blocks[*i] {
-            if let Some(nr) = p
-                .properties
-                .as_ref()
-                .and_then(|pp| pp.numbering_ref.as_ref())
-            {
+            // Membership must be decided on the *effective* properties, the
+            // same set the caller used to decide this run is a list.
+            // Testing the direct `w:pPr` here instead meant a paragraph
+            // whose `w:numPr` comes from its style matched at the call site
+            // and not here: the group consumed nothing, `*i` never advanced,
+            // and the caller looped forever appending empty lists until the
+            // process was killed.
+            let eff = effective_paragraph_props(p, doc);
+            if let Some(nr) = eff.as_ref().and_then(|pp| pp.numbering_ref.as_ref()) {
                 if nr.num_id != num_id {
                     break;
                 }
@@ -1091,6 +1097,14 @@ fn convert_list_group(
             }
         }
         break;
+    }
+
+    // Guarantee forward progress. The caller advances only through this
+    // function, so a group that consumes nothing is an infinite loop; make
+    // that impossible here rather than relying on the two membership tests
+    // agreeing forever.
+    if *i == start_index {
+        *i += 1;
     }
 
     // Build nested list structure from flat (ilvl, content) pairs

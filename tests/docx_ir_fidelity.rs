@@ -1127,3 +1127,70 @@ fn an_unsupported_alt_chunk_type_inserts_nothing_rather_than_garbage() {
         .ir();
     assert_eq!(ir.plain_text().trim(), "ONLY");
 }
+
+// ---------------------------------------------------------------------------
+// Regression: numbering inherited from a style
+// ---------------------------------------------------------------------------
+
+#[test]
+fn numbering_inherited_from_a_style_forms_a_list_and_terminates() {
+    // The caller decides "this is a list" from the *effective* properties,
+    // which include a `w:numPr` inherited from the paragraph style. The
+    // group loop used to test the *direct* `w:pPr`, so it matched nothing,
+    // consumed no paragraphs, and the caller looped forever appending empty
+    // lists until the process was OOM-killed. Found on 8 real corpus files
+    // in the 0.1.9 -> 0.1.10 sweep.
+    let ir = Docx::new(
+        r#"<w:p><w:pPr><w:pStyle w:val="ListPara"/></w:pPr>
+             <w:r><w:t>one</w:t></w:r></w:p>
+           <w:p><w:pPr><w:pStyle w:val="ListPara"/></w:pPr>
+             <w:r><w:t>two</w:t></w:r></w:p>
+           <w:p><w:r><w:t>after</w:t></w:r></w:p>"#,
+    )
+    .styles(
+        r#"<w:style w:type="paragraph" w:styleId="ListPara">
+             <w:name w:val="List Paragraph"/>
+             <w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr>
+           </w:style>"#,
+    )
+    .numbering(NUMBERING)
+    .ir();
+
+    let els = &ir.sections[0].elements;
+    // Exactly one list holding both items, then the trailing paragraph.
+    let lists: Vec<&List> = els
+        .iter()
+        .filter_map(|e| match e {
+            Element::List(l) => Some(l),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lists.len(), 1, "expected one list, got {} in {els:?}", lists.len());
+    assert_eq!(lists[0].items.len(), 2, "both style-numbered paragraphs join the list");
+    assert!(
+        els.iter().any(|e| matches!(e, Element::Paragraph(_))),
+        "the trailing non-list paragraph must survive"
+    );
+}
+
+#[test]
+fn a_list_group_that_matches_nothing_still_advances() {
+    // Belt-and-braces for the same defect: even if the two membership tests
+    // ever disagree again, conversion must terminate. A `w:numPr` with no
+    // resolvable numbering definition is the shape that gets closest.
+    let ir = Docx::new(
+        r#"<w:p><w:pPr><w:pStyle w:val="Ghost"/></w:pPr>
+             <w:r><w:t>alpha</w:t></w:r></w:p>
+           <w:p><w:r><w:t>beta</w:t></w:r></w:p>"#,
+    )
+    .styles(
+        r#"<w:style w:type="paragraph" w:styleId="Ghost">
+             <w:name w:val="Ghost"/>
+             <w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="77"/></w:numPr></w:pPr>
+           </w:style>"#,
+    )
+    .ir();
+    // The assertion that matters is that we got here at all.
+    let text = ir.plain_text();
+    assert!(text.contains("alpha") && text.contains("beta"), "got {text:?}");
+}

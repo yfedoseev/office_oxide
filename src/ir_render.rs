@@ -502,20 +502,18 @@ impl MarkdownStyle {
             return String::new();
         }
         // Leading/trailing spaces must sit outside the delimiters: CommonMark
-        // does not open emphasis on `** text**`.
-        let lead: String = text.chars().take_while(|c| c.is_whitespace()).collect();
-        let trail: String = text
-            .chars()
-            .rev()
-            .take_while(|c| c.is_whitespace())
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        let core = &text[lead.len()..text.len() - trail.len()];
-        if core.is_empty() {
+        // does not open emphasis on `** text**`. An all-whitespace span has
+        // no core to emphasise — and computing the two spans independently
+        // makes them overlap, which inverts the slice range and panics, so
+        // take the trailing span from what is left after the leading one.
+        let core_str = text.trim();
+        if core_str.is_empty() {
             return text.to_string();
         }
+        let lead_len = text.len() - text.trim_start().len();
+        let lead = &text[..lead_len];
+        let trail = &text[lead_len + core_str.len()..];
+        let core = core_str;
 
         let mut out = core.to_string();
         // Super/subscript have no markdown syntax; HTML is the conventional

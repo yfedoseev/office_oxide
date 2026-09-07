@@ -190,3 +190,55 @@ fn an_image_with_neither_source_nor_alt_text_renders_nothing() {
     assert_eq!(ir.to_markdown().trim(), "");
     assert_eq!(ir.to_html().trim(), "");
 }
+
+// ---------------------------------------------------------------------------
+// Regression: an all-whitespace span must not panic
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_all_whitespace_span_does_not_panic() {
+    // Leading and trailing whitespace are split out of the emphasis
+    // delimiters. Computing the two spans independently makes them overlap
+    // on an all-whitespace run, which inverts the slice range and aborts the
+    // process. Found on 14 real corpus files in the 0.1.9 -> 0.1.10 sweep.
+    for text in ["   ", "\t", "\n", " \t \n ", ""] {
+        for (bold, italic, strike) in [(true, false, false), (false, true, true)] {
+            let ir = ir_with(vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    text: text.to_string(),
+                    bold,
+                    italic,
+                    strikethrough: strike,
+                    ..Default::default()
+                })],
+                ..Default::default()
+            })]);
+            // Must not panic, and must not invent emphasis around nothing.
+            let md = ir.to_markdown();
+            assert!(!md.contains("**") && !md.contains("~~"), "emphasised empty text: {md:?}");
+        }
+    }
+}
+
+#[test]
+fn whitespace_between_two_emphasised_runs_survives() {
+    // The whitespace-only run sits between two bold runs; it must neither
+    // panic nor swallow the space that separates the words.
+    let bold = |t: &str| {
+        InlineContent::Text(TextSpan {
+            text: t.to_string(),
+            bold: true,
+            ..Default::default()
+        })
+    };
+    let ir = ir_with(vec![Element::Paragraph(Paragraph {
+        content: vec![
+            bold("ONE"),
+            InlineContent::Text(TextSpan::plain("   ")),
+            bold("TWO"),
+        ],
+        ..Default::default()
+    })]);
+    let md = ir.to_markdown();
+    assert_eq!(md, "**ONE**   **TWO**", "got {md}");
+}
