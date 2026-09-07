@@ -185,6 +185,9 @@ pub fn read_text_content(reader: &mut NsReader<&[u8]>) -> Result<String> {
             Event::Text(e) => {
                 text.push_str(&unescape_text(&e)?);
             },
+            Event::GeneralRef(e) => {
+                text.push_str(&resolve_general_ref(&e)?);
+            },
             Event::CData(e) => {
                 text.push_str(std::str::from_utf8(&e)?);
             },
@@ -286,6 +289,31 @@ pub fn make_fast_reader(xml: &[u8]) -> quick_xml::Reader<&[u8]> {
     reader
 }
 
+/// Resolve an `Event::GeneralRef` — an `&name;` or `&#NN;` reference — into
+/// the text it stands for.
+///
+/// quick-xml reports every entity reference as its own event rather than
+/// folding it into the surrounding `Event::Text`, so a reader that only
+/// handles `Event::Text` silently *deletes* them: `AT&amp;T` came out as
+/// `ATT` and `&#8212;` vanished. Character references resolve numerically,
+/// the five XML predefined entities resolve from the spec, and anything
+/// else (a DTD-declared entity we cannot expand) is preserved verbatim as
+/// `&name;` so no characters are lost.
+pub fn resolve_general_ref(e: &quick_xml::events::BytesRef<'_>) -> Result<String> {
+    if let Some(ch) = e.resolve_char_ref()? {
+        return Ok(ch.to_string());
+    }
+    let name = e.decode().map_err(quick_xml::Error::from)?;
+    Ok(match name.as_ref() {
+        "lt" => "<".to_string(),
+        "gt" => ">".to_string(),
+        "amp" => "&".to_string(),
+        "apos" => "'".to_string(),
+        "quot" => "\"".to_string(),
+        other => format!("&{other};"),
+    })
+}
+
 /// Read text content between start and end tags using fast Reader.
 pub fn read_text_content_fast(reader: &mut quick_xml::Reader<&[u8]>) -> Result<String> {
     use quick_xml::events::Event;
@@ -295,6 +323,9 @@ pub fn read_text_content_fast(reader: &mut quick_xml::Reader<&[u8]>) -> Result<S
         match reader.read_event()? {
             Event::Text(e) => {
                 text.push_str(&unescape_text(&e)?);
+            },
+            Event::GeneralRef(e) => {
+                text.push_str(&resolve_general_ref(&e)?);
             },
             Event::CData(e) => {
                 text.push_str(&String::from_utf8_lossy(&e));

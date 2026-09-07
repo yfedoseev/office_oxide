@@ -1,5 +1,13 @@
 use crate::ir::*;
 
+/// Plain-text marker for a page, slide or thematic boundary.
+///
+/// A form feed is the conventional plain-text page separator (and what
+/// this crate's own `.ppt` handling looks for). The previous marker was
+/// markdown's `---`, which reached plain-text consumers as literal text
+/// that appears nowhere in the source document.
+pub const PLAIN_BREAK: &str = "\u{000C}";
+
 mod block_default {
     //! Default flow-rendering for [`Element`] variants that don't
     //! carry a meaningful inline / paragraph / heading shape.
@@ -15,11 +23,14 @@ mod block_default {
     use std::fmt::Write;
 
     /// Plain-text default. Most invisible variants → `""`;
-    /// `ThematicBreak` → `"---"` (matches markdown); container
+    /// `ThematicBreak` → a form feed (`U+000C`), the conventional
+    /// plain-text page/rule separator — `---` is markdown syntax and has
+    /// no business in the plain-text renderer, where it arrives at the
+    /// consumer as literal text that is not in the document. Container
     /// elements recursively render their children.
     pub fn default_plain(element: &Element) -> String {
         match element {
-            Element::ThematicBreak => "---".to_string(),
+            Element::ThematicBreak => PLAIN_BREAK.to_string(),
             Element::TextBox(tb) => tb
                 .content
                 .iter()
@@ -32,12 +43,12 @@ mod block_default {
                 .map(super::render_element_plain)
                 .collect::<Vec<_>>()
                 .join("\n\n"),
+            // A page or column break is a real boundary in the source, so
+            // it gets the same form-feed marker a thematic break does.
+            Element::PageBreak | Element::ColumnBreak => PLAIN_BREAK.to_string(),
             // Invisible in flow: shapes are positioned, not flow content;
-            // page/column breaks have no plain-text counterpart; an
-            // unannotated image shows nothing in plain text.
-            Element::PageBreak | Element::ColumnBreak | Element::Shape(_) | Element::Image(_) => {
-                String::new()
-            },
+            // an unannotated image shows nothing in plain text.
+            Element::Shape(_) | Element::Image(_) => String::new(),
             // The variants below have rich flow output and shouldn't
             // hit this default — `render_element_plain` handles them.
             // Reaching here means a renderer forgot a real arm; we
@@ -70,9 +81,13 @@ mod block_default {
                 .collect::<Vec<_>>()
                 .join("\n\n"),
             Element::PageBreak | Element::ColumnBreak | Element::Shape(_) => String::new(),
-            Element::Image(img) => {
-                let alt = img.alt_text.as_deref().unwrap_or("");
-                format!("![{alt}]()")
+            // An `![alt]()` with an empty target renders as a broken
+            // image. With no addressable source in the IR, emit the alt
+            // text as ordinary italic text instead, and nothing at all when
+            // there is no alt text.
+            Element::Image(img) => match img.alt_text.as_deref() {
+                Some(alt) if !alt.is_empty() => format!("*{}*", escape_markdown(alt)),
+                _ => String::new(),
             },
             Element::Heading(_)
             | Element::Paragraph(_)
@@ -101,15 +116,20 @@ mod block_default {
                 .collect::<Vec<_>>()
                 .join("\n"),
             Element::PageBreak | Element::ColumnBreak | Element::Shape(_) => String::new(),
-            Element::Image(img) => {
-                let alt = img
-                    .alt_text
-                    .as_deref()
-                    .map(super::escape_html)
-                    .unwrap_or_default();
-                let mut out = String::with_capacity(20 + alt.len());
-                let _ = write!(out, "<img alt=\"{alt}\" />");
-                out
+            // `src` is required on `<img>`; an element without one is
+            // invalid HTML. With no addressable source in the IR, describe
+            // the image with its alt text instead.
+            Element::Image(img) => match img.alt_text.as_deref() {
+                Some(alt) if !alt.is_empty() => {
+                    let mut out = String::new();
+                    let _ = write!(
+                        out,
+                        "<figure><figcaption>{}</figcaption></figure>",
+                        super::escape_html(alt)
+                    );
+                    out
+                },
+                _ => String::new(),
             },
             Element::Heading(_)
             | Element::Paragraph(_)
@@ -132,7 +152,7 @@ impl DocumentIR {
         if section_texts.len() <= 1 {
             section_texts.into_iter().next().unwrap_or_default()
         } else {
-            section_texts.join("\n\n---\n\n")
+            section_texts.join(&format!("\n\n{PLAIN_BREAK}\n\n"))
         }
     }
 
@@ -163,8 +183,43 @@ impl DocumentIR {
 // Plain text rendering
 // ---------------------------------------------------------------------------
 
+/// The header/footer parts of a section, in the order they should be
+/// rendered around the body: headers first, footers last.
+///
+/// All three renderers use this so they agree on what "the text of this
+/// document" means. Previously only the DOCX markdown path emitted
+/// headers and footers, so a consumer's word count changed depending on
+/// which method they called.
+fn section_headers(section: &Section) -> impl Iterator<Item = &HeaderFooter> {
+    [
+        section.first_page_header.as_ref(),
+        section.header.as_ref(),
+        section.even_page_header.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+}
+
+fn section_footers(section: &Section) -> impl Iterator<Item = &HeaderFooter> {
+    [
+        section.first_page_footer.as_ref(),
+        section.footer.as_ref(),
+        section.even_page_footer.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+}
+
 fn render_section_plain(section: &Section) -> String {
     let mut parts = Vec::new();
+    for hf in section_headers(section) {
+        for elem in &hf.content {
+            let text = render_element_plain(elem);
+            if !text.is_empty() {
+                parts.push(text);
+            }
+        }
+    }
     if let Some(ref title) = section.title {
         if !title.is_empty() {
             parts.push(title.clone());
@@ -174,6 +229,14 @@ fn render_section_plain(section: &Section) -> String {
         let text = render_element_plain(elem);
         if !text.is_empty() {
             parts.push(text);
+        }
+    }
+    for hf in section_footers(section) {
+        for elem in &hf.content {
+            let text = render_element_plain(elem);
+            if !text.is_empty() {
+                parts.push(text);
+            }
         }
     }
     parts.join("\n\n")
@@ -252,6 +315,14 @@ fn render_list_plain(list: &List, indent: usize) -> String {
 
 fn render_section_markdown(section: &Section) -> String {
     let mut parts = Vec::new();
+    for hf in section_headers(section) {
+        for elem in &hf.content {
+            let text = render_element_markdown(elem);
+            if !text.is_empty() {
+                parts.push(text);
+            }
+        }
+    }
     if let Some(ref title) = section.title {
         if !title.is_empty() {
             parts.push(format!("## {title}"));
@@ -261,6 +332,14 @@ fn render_section_markdown(section: &Section) -> String {
         let text = render_element_markdown(elem);
         if !text.is_empty() {
             parts.push(text);
+        }
+    }
+    for hf in section_footers(section) {
+        for elem in &hf.content {
+            let text = render_element_markdown(elem);
+            if !text.is_empty() {
+                parts.push(text);
+            }
         }
     }
     parts.join("\n\n")
@@ -291,7 +370,7 @@ fn render_inline_markdown(content: &[InlineContent]) -> String {
     for item in content {
         match item {
             InlineContent::Text(span) => {
-                let mut text = span.text.clone();
+                let mut text = escape_markdown(&span.text);
 
                 if span.strikethrough {
                     text = format!("~~{text}~~");
@@ -304,8 +383,8 @@ fn render_inline_markdown(content: &[InlineContent]) -> String {
                     text = format!("*{text}*");
                 }
 
-                if let Some(ref url) = span.hyperlink {
-                    text = format!("[{text}]({url})");
+                if let Some(url) = span.hyperlink.as_deref().and_then(safe_url) {
+                    text = format!("[{text}]({})", escape_markdown_url(&url));
                 }
 
                 out.push_str(&text);
@@ -412,6 +491,61 @@ fn render_list_markdown(list: &List, indent: usize) -> String {
 // HTML rendering
 // ---------------------------------------------------------------------------
 
+/// Reject URL schemes that execute when a rendered document is opened.
+///
+/// A document is untrusted input: a `javascript:` or `data:text/html`
+/// hyperlink copied verbatim into generated HTML or markdown becomes an
+/// XSS vector in whatever viewer displays it. Relative URLs, fragments and
+/// the ordinary network schemes pass through; anything with an unknown
+/// scheme is dropped so the link text still renders as plain text.
+fn safe_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // A scheme is everything before the first ':' when that prefix contains
+    // no '/', '?' or '#'. Control characters are stripped first: browsers
+    // ignore them, so `java\0script:` would otherwise slip through.
+    let cleaned: String = trimmed.chars().filter(|c| !c.is_control()).collect();
+    let scheme_end = cleaned
+        .find(':')
+        .filter(|&i| !cleaned[..i].contains(['/', '?', '#']));
+    match scheme_end {
+        None => Some(cleaned),
+        Some(i) => {
+            let scheme = cleaned[..i].to_ascii_lowercase();
+            const ALLOWED: &[&str] = &[
+                "http", "https", "mailto", "tel", "ftp", "ftps", "sms", "callto", "file",
+            ];
+            ALLOWED.contains(&scheme.as_str()).then_some(cleaned)
+        },
+    }
+}
+
+/// Escape the markdown metacharacters that would otherwise let document
+/// text inject structure into the rendered output — a cell containing
+/// `|` splitting a table row, or a literal `[x](y)` becoming a link.
+fn escape_markdown(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        // `_` is deliberately absent: CommonMark does not treat intra-word
+        // `_` as emphasis, and escaping it turns ordinary identifiers like
+        // `HEADER_TEXT` into unreadable `HEADER\_TEXT`.
+        if matches!(c, '\\' | '`' | '*' | '[' | ']' | '<' | '>' | '|' | '~') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Escape the characters that would terminate a markdown link target early.
+fn escape_markdown_url(s: &str) -> String {
+    s.replace('(', "%28")
+        .replace(')', "%29")
+        .replace(' ', "%20")
+}
+
 fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -421,6 +555,14 @@ fn escape_html(s: &str) -> String {
 
 fn render_section_html(section: &Section) -> String {
     let mut parts = Vec::new();
+    for hf in section_headers(section) {
+        for elem in &hf.content {
+            let html = render_element_html(elem);
+            if !html.is_empty() {
+                parts.push(format!("<header>{html}</header>"));
+            }
+        }
+    }
     if let Some(ref title) = section.title {
         if !title.is_empty() {
             parts.push(format!("<h2>{}</h2>", escape_html(title)));
@@ -430,6 +572,14 @@ fn render_section_html(section: &Section) -> String {
         let html = render_element_html(elem);
         if !html.is_empty() {
             parts.push(html);
+        }
+    }
+    for hf in section_footers(section) {
+        for elem in &hf.content {
+            let html = render_element_html(elem);
+            if !html.is_empty() {
+                parts.push(format!("<footer>{html}</footer>"));
+            }
         }
     }
     parts.join("\n")
@@ -474,8 +624,8 @@ fn render_inline_html(content: &[InlineContent]) -> String {
                 if span.strikethrough {
                     text = format!("<del>{text}</del>");
                 }
-                if let Some(ref url) = span.hyperlink {
-                    text = format!("<a href=\"{}\">{text}</a>", escape_html(url));
+                if let Some(url) = span.hyperlink.as_deref().and_then(safe_url) {
+                    text = format!("<a href=\"{}\">{text}</a>", escape_html(&url));
                 }
 
                 out.push_str(&text);
@@ -691,7 +841,9 @@ mod tests {
         let plain = ir.plain_text();
         assert!(plain.contains("Sheet1"));
         assert!(plain.contains("Data A"));
-        assert!(plain.contains("---"));
+        // A form feed, not markdown's `---`: this is the plain-text renderer.
+        assert!(plain.contains(PLAIN_BREAK));
+        assert!(!plain.contains("---"));
         assert!(plain.contains("Data B"));
     }
 
@@ -773,9 +925,9 @@ mod tests {
     // ── Defaults centralized in `block_default` ──────────────────────
 
     #[test]
-    fn thematic_break_renders_as_hr_in_plain() {
+    fn thematic_break_renders_as_a_form_feed_in_plain() {
         let ir = simple_ir(vec![Element::ThematicBreak]);
-        assert_eq!(ir.plain_text(), "---");
+        assert_eq!(ir.plain_text(), PLAIN_BREAK);
     }
 
     #[test]

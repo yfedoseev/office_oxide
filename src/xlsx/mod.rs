@@ -584,6 +584,18 @@ fn extract_chart_text(xml: &[u8]) -> String {
                     _ => {},
                 }
             },
+            // Entity references are separate events; folding them in here
+            // keeps `&amp;` in a chart title from disappearing.
+            Ok(quick_xml::events::Event::GeneralRef(ref r)) => {
+                if let Ok(s) = crate::core::xml::resolve_general_ref(r) {
+                    let top = stack.last().map(|v| v.as_slice());
+                    match top {
+                        Some(b"t") => current_title.push_str(&s),
+                        Some(b"v") => cur_v.push_str(&s),
+                        _ => {},
+                    }
+                }
+            },
             Ok(quick_xml::events::Event::Text(t)) => {
                 if let Ok(s) = crate::core::xml::unescape_text(&t) {
                     let trimmed = s.trim();
@@ -1009,6 +1021,9 @@ fn parse_drawing_anchors(xml_data: &[u8]) -> crate::core::Result<DrawingAnchors>
             Event::Text(ref e) if in_a_t => {
                 let s = crate::core::xml::unescape_text(e)?;
                 text_buf.push_str(&s);
+            },
+            Event::GeneralRef(ref e) if in_a_t => {
+                text_buf.push_str(&crate::core::xml::resolve_general_ref(e)?);
             },
             Event::End(ref e) => {
                 let local = e.local_name().as_ref().to_vec();

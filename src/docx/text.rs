@@ -13,9 +13,19 @@ use super::table::Table;
 
 impl DocxDocument {
     /// Extract all text as a plain string. Paragraphs are separated by newlines.
+    ///
+    /// Headers and footers are included, matching `to_markdown` and the IR
+    /// renderers. All three used to disagree, so a consumer's word count
+    /// changed depending on which method they called.
     pub fn plain_text(&self) -> String {
         let mut out = String::new();
+        for hf in self.headers_footers.iter().filter(|h| h.is_header) {
+            plain_text_blocks(&hf.content, &mut out);
+        }
         plain_text_blocks(&self.body.elements, &mut out);
+        for hf in self.headers_footers.iter().filter(|h| !h.is_header) {
+            plain_text_blocks(&hf.content, &mut out);
+        }
         // Trim trailing newlines
         while out.ends_with('\n') {
             out.pop();
@@ -119,6 +129,13 @@ fn plain_text_run(run: &Run, out: &mut String) {
             RunContent::Break(BreakType::Page | BreakType::Column) => out.push('\n'),
             RunContent::Tab => out.push('\t'),
             RunContent::Drawing(_) => {},
+            // Text-box prose is document content — in some real files it is
+            // most of the document (issue #102).
+            RunContent::TextBox(blocks) => {
+                let mut inner = String::new();
+                plain_text_blocks(blocks, &mut inner);
+                out.push_str(inner.trim_end_matches('\n'));
+            },
         }
     }
 }
@@ -196,7 +213,7 @@ fn markdown_blocks(elements: &[BlockElement], ctx: &MarkdownCtx, out: &mut Strin
                 // Render paragraph content with inline formatting
                 for content in &p.content {
                     match content {
-                        ParagraphContent::Run(run) => markdown_run(run, out),
+                        ParagraphContent::Run(run) => markdown_run(run, ctx, out),
                         ParagraphContent::Hyperlink(hl) => {
                             let text = runs_to_plain_text(&hl.runs);
                             match &hl.target {
@@ -232,7 +249,7 @@ fn markdown_blocks(elements: &[BlockElement], ctx: &MarkdownCtx, out: &mut Strin
     }
 }
 
-fn markdown_run(run: &Run, out: &mut String) {
+fn markdown_run(run: &Run, ctx: &MarkdownCtx, out: &mut String) {
     let bold = run
         .properties
         .as_ref()
@@ -261,6 +278,11 @@ fn markdown_run(run: &Run, out: &mut String) {
             RunContent::Tab => text.push('\t'),
             RunContent::Drawing(drawing) => {
                 markdown_drawing(drawing, &mut text);
+            },
+            RunContent::TextBox(blocks) => {
+                let mut inner = String::new();
+                markdown_blocks(blocks, ctx, &mut inner, 0);
+                text.push_str(inner.trim_end_matches('\n'));
             },
         }
     }

@@ -47,21 +47,6 @@ impl CoreProperties {
         // State: which element are we inside?
         // Since we no longer have namespace resolution, we match on local name only.
         // The element names are unique enough across namespaces to be unambiguous.
-        enum Ctx {
-            None,
-            Title,
-            Subject,
-            Creator,
-            Keywords,
-            Description,
-            LastModifiedBy,
-            Revision,
-            Created,
-            Modified,
-            Category,
-            ContentStatus,
-            Language,
-        }
         let mut ctx = Ctx::None;
 
         loop {
@@ -86,26 +71,15 @@ impl CoreProperties {
                         _ => Ctx::None,
                     };
                 },
+                // Entity references arrive as their own event; a property
+                // value like `Smith &amp; Co` would otherwise lose the `&`.
+                Event::GeneralRef(ref e) => {
+                    let text = crate::core::xml::resolve_general_ref(e)?;
+                    append_ctx(&mut props, ctx, &text);
+                },
                 Event::Text(ref e) => {
                     let text = crate::core::xml::unescape_text(e)?;
-                    if text.is_empty() {
-                        continue;
-                    }
-                    match ctx {
-                        Ctx::Title => props.title = Some(text),
-                        Ctx::Subject => props.subject = Some(text),
-                        Ctx::Creator => props.creator = Some(text),
-                        Ctx::Keywords => props.keywords = Some(text),
-                        Ctx::Description => props.description = Some(text),
-                        Ctx::LastModifiedBy => props.last_modified_by = Some(text),
-                        Ctx::Revision => props.revision = Some(text),
-                        Ctx::Created => props.created = Some(text),
-                        Ctx::Modified => props.modified = Some(text),
-                        Ctx::Category => props.category = Some(text),
-                        Ctx::ContentStatus => props.content_status = Some(text),
-                        Ctx::Language => props.language = Some(text),
-                        Ctx::None => {},
-                    }
+                    append_ctx(&mut props, ctx, &text);
                 },
                 Event::End(_) => {
                     ctx = Ctx::None;
@@ -180,6 +154,51 @@ fn write_datetime_element(w: &mut Writer<Vec<u8>>, tag: &str, value: &str) {
         .expect("write text");
     w.write_event(Event::End(BytesEnd::new(tag)))
         .expect("write end");
+}
+
+/// Which `docProps/core.xml` element the reader is currently inside.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ctx {
+    None,
+    Title,
+    Subject,
+    Creator,
+    Keywords,
+    Description,
+    LastModifiedBy,
+    Revision,
+    Created,
+    Modified,
+    Category,
+    ContentStatus,
+    Language,
+}
+
+/// Append a text fragment to the core property named by `ctx`.
+///
+/// A single property value can arrive as several events — text split around
+/// an entity reference, for example — so fragments accumulate rather than
+/// overwrite.
+fn append_ctx(props: &mut CoreProperties, ctx: Ctx, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let slot = match ctx {
+        Ctx::Title => &mut props.title,
+        Ctx::Subject => &mut props.subject,
+        Ctx::Creator => &mut props.creator,
+        Ctx::Keywords => &mut props.keywords,
+        Ctx::Description => &mut props.description,
+        Ctx::LastModifiedBy => &mut props.last_modified_by,
+        Ctx::Revision => &mut props.revision,
+        Ctx::Created => &mut props.created,
+        Ctx::Modified => &mut props.modified,
+        Ctx::Category => &mut props.category,
+        Ctx::ContentStatus => &mut props.content_status,
+        Ctx::Language => &mut props.language,
+        Ctx::None => return,
+    };
+    slot.get_or_insert_with(String::new).push_str(text);
 }
 
 /// Read and parse `docProps/core.xml` from an open OPC package.

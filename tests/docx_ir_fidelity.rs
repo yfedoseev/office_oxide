@@ -25,6 +25,10 @@ const CT_NUMBERING: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml";
 const CT_CORE: &str = "application/vnd.openxmlformats-package.core-properties+xml";
 const CT_HF: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml";
+const CT_FOOTNOTES: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml";
+const CT_COMMENTS: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml";
 
 struct Docx {
     w: OpcWriter<Cursor<Vec<u8>>>,
@@ -94,6 +98,20 @@ impl Docx {
         };
         let rid = self.w.add_part_rel(&self.doc_part, rel_type, file);
         self.body = self.body.replace(placeholder, &rid);
+        self
+    }
+
+    /// Add `word/footnotes.xml` / `endnotes.xml` / `comments.xml` with the
+    /// given item elements already written out.
+    fn notes(mut self, file: &str, rel_type: &str, ct: &str, inner: &str) -> Self {
+        let root = file.trim_end_matches(".xml");
+        let part = PartName::new(&format!("/word/{file}")).unwrap();
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:{root} xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{inner}</w:{root}>"#
+        );
+        self.w.add_part(&part, ct, xml.as_bytes()).unwrap();
+        self.w.add_part_rel(&self.doc_part, rel_type, file);
         self
     }
 
@@ -787,4 +805,253 @@ fn internal_anchor_hyperlinks_become_fragment_links() {
     )
     .ir();
     assert_eq!(first_span(para(&ir, 0)).hyperlink.as_deref(), Some("#section2"));
+}
+
+// ---------------------------------------------------------------------------
+// #156 — XML entities and character references
+// ---------------------------------------------------------------------------
+
+#[test]
+fn entity_and_character_references_survive_extraction() {
+    // quick-xml reports `&amp;` and `&#8212;` as their own events, so a
+    // reader that only handled Event::Text deleted them outright.
+    let ir =
+        Docx::new(r#"<w:p><w:r><w:t>AT&amp;T &#8212; &lt;tag&gt; &#x2764;</w:t></w:r></w:p>"#).ir();
+    assert_eq!(first_span(para(&ir, 0)).text, "AT&T — <tag> ❤");
+}
+
+#[test]
+fn an_unresolvable_entity_is_preserved_verbatim() {
+    // A DTD-declared entity we cannot expand must not silently vanish.
+    let ir = Docx::new(r#"<w:p><w:r><w:t>a&nbsp;b</w:t></w:r></w:p>"#).ir();
+    assert_eq!(first_span(para(&ir, 0)).text, "a&nbsp;b");
+}
+
+// ---------------------------------------------------------------------------
+// #152 — w:cr, w:noBreakHyphen, w:softHyphen, w:sym
+// ---------------------------------------------------------------------------
+
+/// Concatenate a paragraph's text spans, ignoring breaks.
+fn para_text(p: &Paragraph) -> String {
+    p.content
+        .iter()
+        .filter_map(|c| match c {
+            InlineContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn non_breaking_hyphen_is_not_dropped() {
+    // "e-mail" used to extract as "email".
+    let ir =
+        Docx::new(r#"<w:p><w:r><w:t>e</w:t><w:noBreakHyphen/><w:t>mail</w:t></w:r></w:p>"#).ir();
+    assert_eq!(para_text(para(&ir, 0)), "e\u{2011}mail");
+}
+
+#[test]
+fn carriage_return_is_a_line_break() {
+    let ir = Docx::new(r#"<w:p><w:r><w:t>a</w:t><w:cr/><w:t>b</w:t></w:r></w:p>"#).ir();
+    assert!(
+        para(&ir, 0)
+            .content
+            .iter()
+            .any(|c| matches!(c, InlineContent::LineBreak)),
+        "expected a LineBreak, got {:?}",
+        para(&ir, 0).content
+    );
+}
+
+#[test]
+fn symbol_runs_produce_a_character() {
+    // The Wingdings bullet lives in the private-use area; map it to U+2022
+    // rather than emitting an unrenderable code point.
+    let ir = Docx::new(
+        r#"<w:p><w:r><w:sym w:font="Wingdings" w:char="F0B7"/><w:t> item</w:t></w:r></w:p>"#,
+    )
+    .ir();
+    assert_eq!(para_text(para(&ir, 0)), "\u{2022} item");
+}
+
+// ---------------------------------------------------------------------------
+// #141 — transparent paragraph wrappers
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tracked_insertions_and_field_results_are_extracted() {
+    let ir = Docx::new(
+        r#"<w:p>
+             <w:ins w:id="1" w:author="A"><w:r><w:t>INSERTED </w:t></w:r></w:ins>
+             <w:fldSimple w:instr="PAGE"><w:r><w:t>7</w:t></w:r></w:fldSimple>
+             <w:smartTag w:element="place"><w:r><w:t> Paris</w:t></w:r></w:smartTag>
+             <w:sdt><w:sdtContent><w:r><w:t> SDT</w:t></w:r></w:sdtContent></w:sdt>
+           </w:p>"#,
+    )
+    .ir();
+    assert_eq!(para_text(para(&ir, 0)), "INSERTED 7 Paris SDT");
+}
+
+#[test]
+fn tracked_deletions_are_not_document_content() {
+    let ir = Docx::new(
+        r#"<w:p>
+             <w:r><w:t>kept</w:t></w:r>
+             <w:del w:id="2" w:author="A"><w:r><w:delText> removed</w:delText></w:r></w:del>
+           </w:p>"#,
+    )
+    .ir();
+    assert_eq!(para_text(para(&ir, 0)), "kept");
+}
+
+// ---------------------------------------------------------------------------
+// #140 / #163 — text boxes, and AlternateContent taken once
+// ---------------------------------------------------------------------------
+
+/// A shape carrying a text box, wrapped in the compatibility element Word
+/// emits. Both branches describe the same shape and the same text.
+const ALTERNATE_TEXTBOX: &str = r#"<w:p><w:r>
+  <mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">
+    <mc:Choice Requires="wps">
+      <w:drawing><wp:anchor xmlns:wp="x">
+        <a:graphic xmlns:a="y"><a:graphicData>
+          <wps:wsp xmlns:wps="z"><wps:txbx><w:txbxContent>
+            <w:p><w:r><w:t>BOXED TEXT</w:t></w:r></w:p>
+          </w:txbxContent></wps:txbx></wps:wsp>
+        </a:graphicData></a:graphic>
+      </wp:anchor></w:drawing>
+    </mc:Choice>
+    <mc:Fallback>
+      <w:pict><v:shape xmlns:v="urn:schemas-microsoft-com:vml"><v:textbox><w:txbxContent>
+        <w:p><w:r><w:t>BOXED TEXT</w:t></w:r></w:p>
+      </w:txbxContent></v:textbox></v:shape></w:pict>
+    </mc:Fallback>
+  </mc:AlternateContent>
+</w:r></w:p>"#;
+
+fn text_box_texts(ir: &DocumentIR) -> Vec<String> {
+    ir.sections[0]
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            Element::TextBox(tb) => Some(
+                tb.content
+                    .iter()
+                    .map(|e| match e {
+                        Element::Paragraph(p) => para_text(p),
+                        _ => String::new(),
+                    })
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn vml_text_box_content_is_extracted() {
+    let ir = Docx::new(
+        r#"<w:p><w:r><w:pict>
+             <v:shape xmlns:v="urn:schemas-microsoft-com:vml"><v:textbox><w:txbxContent>
+               <w:p><w:r><w:t>SIDEBAR</w:t></w:r></w:p>
+             </w:txbxContent></v:textbox></v:shape>
+           </w:pict></w:r></w:p>"#,
+    )
+    .ir();
+    assert_eq!(text_box_texts(&ir), vec!["SIDEBAR"]);
+}
+
+#[test]
+fn drawingml_text_box_content_is_extracted_exactly_once() {
+    // Extracting both branches duplicated the text; extracting neither
+    // dropped it. This was 90% of the text in the file behind issue #102.
+    let ir = Docx::new(ALTERNATE_TEXTBOX).ir();
+    assert_eq!(text_box_texts(&ir), vec!["BOXED TEXT"]);
+}
+
+// ---------------------------------------------------------------------------
+// #142 — footnotes, endnotes and comments
+// ---------------------------------------------------------------------------
+
+#[test]
+fn footnote_bodies_reach_the_ir() {
+    let ir = Docx::new(r#"<w:p><w:r><w:t>body</w:t></w:r></w:p>"#)
+        .notes(
+            "footnotes.xml",
+            rel_types::FOOTNOTES,
+            CT_FOOTNOTES,
+            r#"<w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:t>SEP</w:t></w:r></w:p></w:footnote>
+               <w:footnote w:id="1"><w:p><w:r><w:t>NOTE ONE</w:t></w:r></w:p></w:footnote>"#,
+        )
+        .ir();
+    let notes: Vec<&Note> = ir.sections[0]
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            Element::Footnote(n) => Some(n),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes.len(), 1, "separator pseudo-notes must be filtered out");
+    assert_eq!(notes[0].id, 1);
+    let text = ir.plain_text();
+    assert!(text.contains("NOTE ONE"));
+    assert!(!text.contains("SEP"));
+}
+
+#[test]
+fn comment_bodies_reach_the_ir_with_their_author() {
+    let ir = Docx::new(r#"<w:p><w:r><w:t>body</w:t></w:r></w:p>"#)
+        .notes(
+            "comments.xml",
+            rel_types::COMMENTS,
+            CT_COMMENTS,
+            r#"<w:comment w:id="3" w:author="Reviewer"><w:p><w:r><w:t>Please check</w:t></w:r></w:p></w:comment>"#,
+        )
+        .ir();
+    let note = ir.sections[0]
+        .elements
+        .iter()
+        .find_map(|e| match e {
+            Element::Endnote(n) => Some(n),
+            _ => None,
+        })
+        .expect("comment reached the IR");
+    assert_eq!(note.marker.as_deref(), Some("Reviewer"));
+}
+
+// ---------------------------------------------------------------------------
+// #171 — image alt text must not also become body text
+// ---------------------------------------------------------------------------
+
+#[test]
+fn image_alt_text_is_not_duplicated_as_body_text() {
+    // Emitting the alt text as a run *and* on the Image made the IR
+    // round-trip unbounded: the document grew on every read/write cycle.
+    let ir = Docx::new(
+        r#"<w:p><w:r><w:drawing>
+             <wp:inline xmlns:wp="x">
+               <wp:extent cx="100" cy="100"/>
+               <wp:docPr id="1" name="Pic" descr="ALT TEXT"/>
+               <a:graphic xmlns:a="y"><a:graphicData>
+                 <pic:pic xmlns:pic="p"><pic:blipFill>
+                   <a:blip r:embed="rIdImg"/>
+                 </pic:blipFill></pic:pic>
+               </a:graphicData></a:graphic>
+             </wp:inline>
+           </w:drawing></w:r></w:p>"#,
+    )
+    .ir();
+    let body: String = ir.sections[0]
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            Element::Paragraph(p) => Some(para_text(p)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !body.contains("ALT TEXT"),
+        "alt text must not appear as body text, got {body:?}"
+    );
 }

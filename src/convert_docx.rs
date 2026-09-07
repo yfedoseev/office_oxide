@@ -147,6 +147,49 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         });
     }
 
+    // Footnote, endnote and comment bodies are block-level content that
+    // belongs to the document as a whole. Append them to the last section so
+    // they reach every renderer instead of being dropped on the floor —
+    // `Element::Footnote` / `Element::Endnote` were produced by no converter
+    // before this.
+    if let Some(last) = ir_sections.last_mut() {
+        for n in &doc.footnotes {
+            let mut content = Vec::new();
+            convert_block_elements(&n.content, &mut content, doc);
+            if !content.is_empty() {
+                last.elements.push(Element::Footnote(Note {
+                    id: n.id,
+                    content,
+                    marker: None,
+                }));
+            }
+        }
+        for n in &doc.endnotes {
+            let mut content = Vec::new();
+            convert_block_elements(&n.content, &mut content, doc);
+            if !content.is_empty() {
+                last.elements.push(Element::Endnote(Note {
+                    id: n.id,
+                    content,
+                    marker: None,
+                }));
+            }
+        }
+        // Comments are annotations rather than body text; carry them as
+        // endnotes with the author kept in the marker so nothing is lost.
+        for n in &doc.comments {
+            let mut content = Vec::new();
+            convert_block_elements(&n.content, &mut content, doc);
+            if !content.is_empty() {
+                last.elements.push(Element::Endnote(Note {
+                    id: n.id,
+                    content,
+                    marker: n.author.clone(),
+                }));
+            }
+        }
+    }
+
     // Real document metadata beats a title guessed from the first heading,
     // but the guess stays as the fallback for files with no core properties.
     let cp = doc.core_properties.as_ref();
@@ -477,6 +520,10 @@ fn convert_block_elements(
                 // variant, so hoisting to a sibling Element is the
                 // only way to carry the bitmap forward.
                 collect_paragraph_inline_images(p, doc, elements);
+                // Text-box bodies are ordinary block content drawn in a
+                // frame. Leaving them unread silently dropped most of the
+                // prose in documents that lay text out with shapes.
+                collect_paragraph_text_boxes(p, doc, elements);
                 i += 1;
             },
             crate::docx::BlockElement::Table(t) => {
@@ -541,6 +588,34 @@ fn collect_paragraph_inline_images(
                         display_width_emu: Some(d.width.0.max(0) as u64),
                         display_height_emu: Some(d.height.0.max(0) as u64),
                         positioning: ImagePositioning::Inline,
+                        ..Default::default()
+                    }));
+                }
+            }
+        }
+    }
+}
+
+fn collect_paragraph_text_boxes(
+    p: &crate::docx::Paragraph,
+    doc: &crate::docx::DocxDocument,
+    out: &mut Vec<Element>,
+) {
+    for pc in &p.content {
+        let runs: &[crate::docx::Run] = match pc {
+            crate::docx::ParagraphContent::Run(r) => std::slice::from_ref(r),
+            crate::docx::ParagraphContent::Hyperlink(hl) => &hl.runs,
+        };
+        for run in runs {
+            for rc in &run.content {
+                if let crate::docx::RunContent::TextBox(blocks) = rc {
+                    let mut content = Vec::new();
+                    convert_block_elements(blocks, &mut content, doc);
+                    if content.is_empty() {
+                        continue;
+                    }
+                    out.push(Element::TextBox(TextBox {
+                        content,
                         ..Default::default()
                     }));
                 }
@@ -898,18 +973,18 @@ fn convert_run(
             crate::docx::RunContent::Tab => {
                 content.push(InlineContent::Text(TextSpan::plain("\t")));
             },
-            crate::docx::RunContent::Drawing(drawing) => {
-                // Inline drawings handled at the paragraph level via
-                // `collect_paragraph_inline_images`. The inline-content
-                // model has no Image variant; hoisting here would
-                // require splitting paragraphs around each drawing,
-                // which loses spans. Just record alt text so the
-                // run's surrounding text doesn't lose semantic continuity.
-                if let Some(alt) = drawing.description.clone() {
-                    if !alt.is_empty() {
-                        content.push(InlineContent::Text(TextSpan::plain(alt)));
-                    }
-                }
+            // Text boxes are hoisted to paragraph-sibling `Element::TextBox`
+            // nodes by `collect_paragraph_text_boxes`; the inline-content
+            // model has no block-container variant.
+            crate::docx::RunContent::TextBox(_) => {},
+            crate::docx::RunContent::Drawing(_) => {
+                // Inline drawings are hoisted to paragraph-sibling
+                // `Element::Image` nodes by `collect_paragraph_inline_images`,
+                // which carries `alt_text` with them. Also emitting the alt
+                // text here as a body-text span made the IR round-trip
+                // unbounded: each generation wrote the alt text as a real
+                // run *and* re-attached it to the image, so the document
+                // grew every time it was read and written back.
             },
         }
     }
