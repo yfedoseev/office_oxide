@@ -111,6 +111,27 @@ jobs:
       - name: Run Clippy on full workspace
         run: cargo clippy --all-targets --workspace -- -D warnings
 
+  # Revert-check: the tests a PR adds must actually cover the production
+  # code it adds. A test that still passes with its own production hunk
+  # reverted is testing nothing, and that has shipped twice.
+  revert-check:
+    name: Revert Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Revert production changes and require the suite to fail
+        run: scripts/revert-check.sh "origin/${{ github.base_ref }}"
+
   # Build and test
   test:
     name: Test
