@@ -1,13 +1,24 @@
 use crate::format::DocumentFormat;
 use crate::ir::*;
 
+/// Maximum worksheet rows materialised into the IR per sheet.
+///
+/// The same cap `convert_xlsx` applies, and for the same reason: a sheet is
+/// converted eagerly into in-memory IR, so an unbounded one builds millions
+/// of cell allocations. `convert_xls` had no cap, and a 31 KB `.xls`
+/// declaring a huge used range reached 8.5 GB and was killed by the OOM
+/// killer — a crash no caller can catch. Excess rows are dropped and
+/// flagged with a visible notice.
+const MAX_ROWS_PER_SHEET: usize = 10_000;
+
 pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
     let mut sections = Vec::new();
 
     for sheet in &doc.sheets {
         let mut rows = Vec::new();
+        let total_rows = sheet.rows.len();
 
-        for (row_idx, row) in sheet.rows.iter().enumerate() {
+        for (row_idx, row) in sheet.rows.iter().take(MAX_ROWS_PER_SHEET).enumerate() {
             let mut cells = Vec::new();
             for (col_idx, cell_value) in row.iter().enumerate() {
                 // `display` carries the number-format-aware rendering: a
@@ -36,6 +47,15 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
                 });
             }
 
+            // Drop trailing empty cells. A BIFF sheet reports the whole
+            // declared grid — one file here is 65,536 x 256, essentially all
+            // empty — and materialising the padding built 16.7M IR cells and
+            // ran the process out of memory. `convert_xlsx` has always
+            // trimmed; this path never did.
+            while cells.last().is_some_and(|c: &TableCell| cell_is_empty(c)) {
+                cells.pop();
+            }
+
             rows.push(TableRow {
                 cells,
                 is_header: row_idx == 0,
@@ -43,7 +63,12 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
             });
         }
 
-        let elements = if rows.is_empty() {
+        // Trailing all-empty rows go the same way as trailing empty cells.
+        while rows.last().is_some_and(|r| r.cells.is_empty()) {
+            rows.pop();
+        }
+
+        let mut elements = if rows.is_empty() {
             Vec::new()
         } else {
             vec![Element::Table(Table {
@@ -51,6 +76,19 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
                 ..Default::default()
             })]
         };
+
+        // Truncation is stated in the content rather than left silent,
+        // matching the XLSX path.
+        if total_rows > MAX_ROWS_PER_SHEET {
+            let omitted = total_rows - MAX_ROWS_PER_SHEET;
+            elements.push(Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(format!(
+                    "[{omitted} of {total_rows} rows not shown — worksheet truncated at \
+                     {MAX_ROWS_PER_SHEET} rows]"
+                )))],
+                ..Default::default()
+            }));
+        }
 
         sections.push(Section {
             title: Some(sheet.name.clone()),
@@ -96,4 +134,15 @@ pub(crate) fn append_legacy_images(
             ..Default::default()
         }));
     }
+}
+
+/// Whether a converted cell carries no text.
+fn cell_is_empty(cell: &TableCell) -> bool {
+    cell.content.iter().all(|e| match e {
+        Element::Paragraph(p) => p.content.iter().all(|c| match c {
+            InlineContent::Text(t) => t.text.is_empty(),
+            _ => false,
+        }),
+        _ => false,
+    })
 }

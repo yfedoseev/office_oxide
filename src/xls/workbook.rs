@@ -637,19 +637,65 @@ mod tests {
         }
     }
 
+    /// An empty cell *between* populated ones keeps its column position and
+    /// renders as an empty paragraph. Only trailing empties are trimmed.
     #[test]
     fn ir_empty_cell_value_produces_empty_paragraph_content() {
         use crate::ir::Element;
         let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![Sheet {
             display: Vec::new(),
             name: "S".into(),
-            rows: vec![vec![CellValue::Empty]],
+            rows: vec![vec![
+                CellValue::String("a".into()),
+                CellValue::Empty,
+                CellValue::String("b".into()),
+            ]],
         }]));
-        if let Element::Table(ref t) = ir.sections[0].elements[0] {
-            if let Element::Paragraph(ref p) = t.rows[0].cells[0].content[0] {
-                assert!(p.content.is_empty());
-            }
-        }
+        let Element::Table(ref t) = ir.sections[0].elements[0] else {
+            panic!("expected a table");
+        };
+        assert_eq!(t.rows[0].cells.len(), 3, "the interior empty keeps its column");
+        let Element::Paragraph(ref p) = t.rows[0].cells[1].content[0] else {
+            panic!("expected a paragraph");
+        };
+        assert!(p.content.is_empty());
+    }
+
+    /// A BIFF sheet reports its whole declared grid, which for one real file
+    /// is 65,536 x 256 and essentially all empty. Materialising that padding
+    /// built 16.7M IR cells and ran the process out of memory, so trailing
+    /// empty cells and rows are dropped — the same trim `convert_xlsx` has
+    /// always done.
+    #[test]
+    fn ir_trailing_empty_cells_and_rows_are_trimmed() {
+        use crate::ir::Element;
+        let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![Sheet {
+            display: Vec::new(),
+            name: "S".into(),
+            rows: vec![
+                vec![
+                    CellValue::String("x".into()),
+                    CellValue::Empty,
+                    CellValue::Empty,
+                ],
+                vec![CellValue::Empty, CellValue::Empty],
+            ],
+        }]));
+        let Element::Table(ref t) = ir.sections[0].elements[0] else {
+            panic!("expected a table");
+        };
+        assert_eq!(t.rows.len(), 1, "the all-empty trailing row is dropped");
+        assert_eq!(t.rows[0].cells.len(), 1, "trailing empty cells are dropped");
+    }
+
+    #[test]
+    fn ir_a_wholly_empty_sheet_produces_no_table() {
+        let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![Sheet {
+            display: Vec::new(),
+            name: "S".into(),
+            rows: vec![vec![CellValue::Empty; 8]; 4],
+        }]));
+        assert!(ir.sections[0].elements.is_empty(), "an empty grid must not materialise a table");
     }
 
     #[test]
