@@ -86,11 +86,13 @@ pub fn apply_format(n: f64, fmt_id: u32, fmt_str: Option<&str>) -> String {
     // Custom format string (IDs 164+).
     if let Some(fmt) = fmt_str {
         let fmt = fmt.trim();
-        // The General/text sentinels are matched case-insensitively: real
-        // workbooks declare a custom `numFmt formatCode="GENERAL"`, and
-        // treating that as a literal format code rendered every numeric
-        // cell in the sheet as empty.
-        if !fmt.is_empty() && !fmt.eq_ignore_ascii_case("General") && fmt != "@" {
+        // The General/text sentinels are matched case-insensitively, and
+        // after leading `[...]` directives are stripped: real workbooks
+        // declare `numFmt formatCode="GENERAL"` and
+        // `"[DBNum1][$-804]General"`, and treating either as a literal
+        // format code dropped the cell's value and printed the code.
+        let bare = strip_leading_directives(fmt);
+        if !fmt.is_empty() && !bare.eq_ignore_ascii_case("General") && fmt != "@" {
             return apply_custom(n, fmt);
         }
     }
@@ -394,7 +396,16 @@ fn apply_custom(n: f64, fmt: &str) -> String {
     // Unquoted literal characters accumulate in `currency_prefix`, so they
     // must be included: dropping them turned an unrecognised format code
     // into an empty cell, losing the value entirely.
+    //
+    // A date/time code (`h"时"mm"分"ss"秒"`) also has no digit placeholder,
+    // but it denotes a *value*, not a literal — echoing its letters back
+    // prints the format code where the data should be. Such a cell should
+    // have been rendered by the date path; if it reaches here, fall back to
+    // the plain number rather than inventing text.
     if !in_num_part {
+        if super::date::is_date_format_string(section) {
+            return format_general(n);
+        }
         return format!("{currency_prefix}{prefix_literal}{suffix}");
     }
 
@@ -415,6 +426,19 @@ fn apply_custom(n: f64, fmt: &str) -> String {
     let pct_suffix = if has_percent { "%" } else { "" };
 
     format!("{currency_prefix}{prefix_literal}{body}{suffix}{pct_suffix}")
+}
+
+/// Strip leading `[...]` directives — `[DBNum1]`, `[$-804]`, `[Red]` — from
+/// a format code, leaving the code proper.
+fn strip_leading_directives(fmt: &str) -> &str {
+    let mut rest = fmt.trim_start();
+    while let Some(inner) = rest.strip_prefix('[') {
+        match inner.find(']') {
+            Some(i) => rest = inner[i + 1..].trim_start(),
+            None => break,
+        }
+    }
+    rest
 }
 
 /// Read a leading `[<op><number>]` comparison condition off a section.
@@ -523,6 +547,28 @@ mod tests {
             assert_eq!(apply_format(70.0, 164, Some(code)), "70");
             assert_eq!(apply_format(3.5, 164, Some(code)), "3.5");
         }
+    }
+
+    /// `[DBNum1][$-804]General` is the General format behind two directives.
+    /// Treating the whole code as a literal printed `General` and dropped
+    /// the cell's value.
+    #[test]
+    fn general_behind_bracket_directives_is_still_general() {
+        assert_eq!(apply_format(12323.0, 180, Some("[DBNum1][$-804]General")), "12323");
+        assert_eq!(apply_format(1.5, 180, Some("[$-409]General")), "1.5");
+    }
+
+    /// A date/time code has no digit placeholder either, but it denotes a
+    /// value rather than a literal: echoing its letters printed the format
+    /// code where the data should be.
+    #[test]
+    fn a_time_format_does_not_echo_its_own_code() {
+        let out = apply_format(0.5555671296296296, 179, Some(r#"h"时"mm"分"ss"秒";@"#));
+        assert!(
+            !out.contains('h') && !out.contains('时'),
+            "the format code leaked into the value: {out}"
+        );
+        assert!(out.starts_with("0.55"), "expected the numeric value, got {out}");
     }
 
     #[test]
