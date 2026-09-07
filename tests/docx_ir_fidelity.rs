@@ -1204,3 +1204,43 @@ fn a_list_group_that_matches_nothing_still_advances() {
     let text = ir.plain_text();
     assert!(text.contains("alpha") && text.contains("beta"), "got {text:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Regression: text-box content must not fuse with the run after it
+// ---------------------------------------------------------------------------
+
+#[test]
+fn text_box_content_does_not_fuse_with_the_following_run() {
+    // Text-box prose is *block* content. Pasting it into the inline stream
+    // bare glued the last word of the box to the first word after it —
+    // `Linz` + `ANTRAG` became `LinzANTRAG` on a real corpus file.
+    use office_oxide::{Document, DocumentFormat};
+
+    let bytes = {
+        let mut w = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
+        let part = PartName::new("/word/document.xml").unwrap();
+        w.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let xml = r#"<?xml version="1.0"?><w:document
+             xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+           <w:body><w:p>
+             <w:r><w:pict><v:shape xmlns:v="urn:schemas-microsoft-com:vml"><v:textbox>
+               <w:txbxContent><w:p><w:r><w:t>BOXEND</w:t></w:r></w:p></w:txbxContent>
+             </v:textbox></v:shape></w:pict></w:r>
+             <w:r><w:t>NEXTWORD</w:t></w:r>
+           </w:p></w:body></w:document>"#;
+        w.add_part(&part, CT_DOC, xml.as_bytes()).unwrap();
+        w.finish().unwrap().into_inner()
+    };
+
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).expect("parse");
+    for (name, out) in [("plain", doc.plain_text()), ("markdown", doc.to_markdown())] {
+        assert!(
+            out.contains("BOXEND") && out.contains("NEXTWORD"),
+            "{name} lost content: {out:?}"
+        );
+        assert!(
+            !out.contains("BOXENDNEXTWORD"),
+            "{name} fused the text box to the next run: {out:?}"
+        );
+    }
+}

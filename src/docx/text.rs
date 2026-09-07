@@ -130,11 +130,21 @@ fn plain_text_run(run: &Run, out: &mut String) {
             RunContent::Tab => out.push('\t'),
             RunContent::Drawing(_) => {},
             // Text-box prose is document content — in some real files it is
-            // most of the document (issue #102).
+            // most of the document (issue #102). It is *block* content, so
+            // it must be separated from the surrounding run: pasting it in
+            // bare fused the last word of a text box to the first word after
+            // it (`Linz` + `ANTRAG` -> `LinzANTRAG`).
             RunContent::TextBox(blocks) => {
                 let mut inner = String::new();
                 plain_text_blocks(blocks, &mut inner);
-                out.push_str(inner.trim_end_matches('\n'));
+                let inner = inner.trim();
+                if !inner.is_empty() {
+                    if !out.is_empty() && !out.ends_with(['\n', ' ', '\t']) {
+                        out.push('\n');
+                    }
+                    out.push_str(inner);
+                    out.push('\n');
+                }
             },
         }
     }
@@ -358,10 +368,19 @@ fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, text: &mut String) {
             RunContent::Drawing(drawing) => {
                 markdown_drawing(drawing, text);
             },
+            // See `plain_text_run`: block content needs a separator or it
+            // fuses with the run that follows it.
             RunContent::TextBox(blocks) => {
                 let mut inner = String::new();
                 markdown_blocks(blocks, ctx, &mut inner, 0);
-                text.push_str(inner.trim_end_matches('\n'));
+                let inner = inner.trim();
+                if !inner.is_empty() {
+                    if !text.is_empty() && !text.ends_with(['\n', ' ', '\t']) {
+                        text.push('\n');
+                    }
+                    text.push_str(inner);
+                    text.push('\n');
+                }
             },
         }
     }
