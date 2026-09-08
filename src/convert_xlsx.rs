@@ -96,9 +96,12 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
 
         // Widest column actually used, so every emitted row is the same
         // length and each value sits under its own header.
+        // Widest index seen anywhere in the row, not the index of its last
+        // cell: cells are not guaranteed to arrive in ascending column order,
+        // and a short grid truncates every row laid out against it.
         let grid_width = parsed_rows
             .iter()
-            .filter_map(|cells| cells.last().map(|cd| cd.col as usize + 1))
+            .filter_map(|cells| cells.iter().map(|cd| cd.col as usize + 1).max())
             .max()
             .unwrap_or(0);
 
@@ -222,14 +225,6 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 // stays under the `B` header even when `A2` is absent.
                 let mut tcells: Vec<TableCell> = Vec::with_capacity(grid_width);
                 for cd in cells {
-                    while tcells.len() < cd.col as usize {
-                        tcells.push(empty_cell());
-                    }
-                    if tcells.len() > cd.col as usize {
-                        // Duplicate reference in a malformed file — keep the
-                        // first value rather than shifting the rest.
-                        continue;
-                    }
                     let content = if cd.text.is_empty() {
                         Vec::new()
                     } else {
@@ -238,7 +233,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                         // depending on the shape of the sheet around it.
                         vec![InlineContent::Text(cell_span(doc, cd))]
                     };
-                    tcells.push(TableCell {
+                    let cell = TableCell {
                         content: vec![Element::Paragraph(Paragraph {
                             content,
                             ..Default::default()
@@ -250,7 +245,22 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                         number_format: cd.number_format.clone(),
                         number_format_id: cd.number_format_id,
                         ..Default::default()
-                    });
+                    };
+                    while tcells.len() < cd.col as usize {
+                        tcells.push(empty_cell());
+                    }
+                    match tcells.get_mut(cd.col as usize) {
+                        // The column is already occupied: cells arrived out of
+                        // order, or two of them share a reference. Fill the
+                        // slot if it is still blank, otherwise keep the first
+                        // value — either way, never drop the rest of the row.
+                        Some(slot) => {
+                            if cell_is_blank(slot) {
+                                *slot = cell;
+                            }
+                        },
+                        None => tcells.push(cell),
+                    }
                 }
                 while tcells.len() < grid_width {
                     tcells.push(empty_cell());
@@ -422,6 +432,15 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
 }
 
 /// A grid position with no cell in the source.
+/// True when a laid-out cell still holds nothing, so a later cell claiming
+/// the same column may take the slot rather than be discarded.
+fn cell_is_blank(cell: &TableCell) -> bool {
+    cell.content.iter().all(|el| match el {
+        Element::Paragraph(p) => p.content.is_empty(),
+        _ => false,
+    })
+}
+
 fn empty_cell() -> TableCell {
     TableCell {
         content: vec![Element::Paragraph(Paragraph::default())],

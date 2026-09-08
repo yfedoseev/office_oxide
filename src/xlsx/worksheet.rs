@@ -229,7 +229,11 @@ impl Worksheet {
                         reader.read_to_end(e.to_end().name())?;
                     },
                     b"row" => {
-                        rows.push(parse_row_fast(&mut reader, e)?);
+                        // A <row> without r= is implicitly the one after the
+                        // previous row (ECMA-376 18.3.1.73); some writers omit
+                        // it throughout the sheet.
+                        let implied = rows.last().map_or(1, |r: &Row| r.index + 1);
+                        rows.push(parse_row_fast(&mut reader, e, implied)?);
                     },
                     b"mergeCell" => {
                         if let Some(range) = xml::optional_attr_str(e, b"ref")? {
@@ -496,23 +500,31 @@ fn parse_hyperlink(
 fn parse_row_fast(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
+    implied_index: u32,
 ) -> crate::core::Result<Row> {
     let index: u32 = xml::optional_attr_str(start, b"r")?
         .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok())
-        .unwrap_or(1);
+        .unwrap_or(implied_index);
     let mut cells = Vec::new();
+    // Likewise a <c> without r= sits in the column after its predecessor.
+    // Defaulting these to column 0 collapses the whole row onto one cell.
+    let mut next_col: u32 = 0;
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
                 if e.local_name().as_ref() == b"c" {
-                    cells.push(parse_cell_fast(reader, e)?);
+                    let cell = parse_cell_fast(reader, e, index, next_col)?;
+                    next_col = cell.reference.col.saturating_add(1);
+                    cells.push(cell);
                 } else {
                     reader.read_to_end(e.to_end().name())?;
                 }
             },
             Event::Empty(ref e) if e.local_name().as_ref() == b"c" => {
-                cells.push(parse_empty_cell(e)?);
+                let cell = parse_empty_cell(e, index, next_col)?;
+                next_col = cell.reference.col.saturating_add(1);
+                cells.push(cell);
             },
             Event::End(ref e) if e.local_name().as_ref() == b"row" => {
                 break;
@@ -525,11 +537,18 @@ fn parse_row_fast(
     Ok(Row { index, cells })
 }
 
-fn parse_empty_cell(e: &quick_xml::events::BytesStart) -> crate::core::Result<Cell> {
+fn parse_empty_cell(
+    e: &quick_xml::events::BytesStart,
+    row: u32,
+    implied_col: u32,
+) -> crate::core::Result<Cell> {
     let ref_str = xml::optional_attr_str(e, b"r")?
         .map(|v| v.into_owned())
         .unwrap_or_default();
-    let reference = CellRef::parse(&ref_str).unwrap_or(CellRef { col: 0, row: 0 });
+    let reference = CellRef::parse(&ref_str).unwrap_or(CellRef {
+        col: implied_col,
+        row,
+    });
     let style_index = xml::optional_attr_str(e, b"s")?
         .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok());
 
@@ -545,11 +564,16 @@ fn parse_empty_cell(e: &quick_xml::events::BytesStart) -> crate::core::Result<Ce
 fn parse_cell_fast(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
+    row: u32,
+    implied_col: u32,
 ) -> crate::core::Result<Cell> {
     let ref_str = xml::optional_attr_str(start, b"r")?
         .map(|v| v.into_owned())
         .unwrap_or_default();
-    let reference = CellRef::parse(&ref_str).unwrap_or(CellRef { col: 0, row: 0 });
+    let reference = CellRef::parse(&ref_str).unwrap_or(CellRef {
+        col: implied_col,
+        row,
+    });
 
     let cell_type = xml::optional_attr_str(start, b"t")?.map(|v| v.into_owned());
     let style_index = xml::optional_attr_str(start, b"s")?

@@ -968,3 +968,115 @@ fn a_deck_title_is_not_the_first_slides_title_when_core_properties_exist() {
     let ir = pptx_ir(vec![Slide::new(&tree)]);
     assert!(ir.metadata.author.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Implicit row and column indices (ECMA-376 18.3.1.4 / 18.3.1.73)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cells_without_a_reference_take_the_next_column() {
+    // `r` is optional on both <row> and <c>; several writers omit it for the
+    // whole sheet. Defaulting the missing reference to column 0 put every
+    // cell of a row in the same slot, so laying the row out on the grid kept
+    // one value and dropped the rest.
+    let ir = Xlsx::new(vec![Sheet::new(
+        "S",
+        r#"<row>
+             <c t="inlineStr"><is><t>Checked</t></is></c>
+             <c t="inlineStr"><is><t>Ion</t></is></c>
+             <c t="inlineStr"><is><t>Charge</t></is></c>
+           </row>
+           <row>
+             <c t="inlineStr"><is><t>yes</t></is></c>
+             <c t="inlineStr"><is><t>Na+</t></is></c>
+             <c><v>1</v></c>
+           </row>"#,
+    )])
+    .ir();
+    let t = only_table(&ir, 0);
+    assert_eq!(t.rows.len(), 2);
+    let head: Vec<String> = t.rows[0].cells.iter().map(cell_text).collect();
+    assert_eq!(head, ["Checked", "Ion", "Charge"]);
+    let body: Vec<String> = t.rows[1].cells.iter().map(cell_text).collect();
+    assert_eq!(body, ["yes", "Na+", "1"]);
+}
+
+#[test]
+fn an_explicit_reference_resets_the_implied_column() {
+    // A sheet may mix the two forms: the cell after an explicit `r` continues
+    // from that column, not from wherever the implicit run had reached.
+    let ir = Xlsx::new(vec![Sheet::new(
+        "S",
+        r#"<row r="1">
+             <c t="inlineStr"><is><t>a</t></is></c>
+             <c r="D1" t="inlineStr"><is><t>d</t></is></c>
+             <c t="inlineStr"><is><t>e</t></is></c>
+           </row>"#,
+    )])
+    .ir();
+    let t = only_table(&ir, 0);
+    let row: Vec<String> = t.rows[0].cells.iter().map(cell_text).collect();
+    assert_eq!(row, ["a", "", "", "d", "e"]);
+}
+
+#[test]
+fn rows_without_a_reference_are_numbered_in_document_order() {
+    // Every row defaulting to index 1 collapsed the sheet's addressing; the
+    // grid still has to report one row per <row> element, in order.
+    let ir = Xlsx::new(vec![Sheet::new(
+        "S",
+        r#"<row><c t="inlineStr"><is><t>one</t></is></c><c><v>1</v></c></row>
+           <row><c t="inlineStr"><is><t>two</t></is></c><c><v>2</v></c></row>
+           <row><c t="inlineStr"><is><t>three</t></is></c><c><v>3</v></c></row>"#,
+    )])
+    .ir();
+    let text: Vec<String> = only_table(&ir, 0)
+        .rows
+        .iter()
+        .map(|r| format!("{}{}", cell_text(&r.cells[0]), cell_text(&r.cells[1])))
+        .collect();
+    assert_eq!(text, ["one1", "two2", "three3"]);
+}
+
+#[test]
+fn cells_out_of_column_order_are_all_kept() {
+    // A malformed sheet can list columns unordered. Bailing out of the row on
+    // the first backwards reference discarded every cell after it; the values
+    // belong in their own columns instead.
+    let ir = Xlsx::new(vec![Sheet::new(
+        "S",
+        r#"<row r="1">
+             <c r="C1" t="inlineStr"><is><t>c</t></is></c>
+             <c r="A1" t="inlineStr"><is><t>a</t></is></c>
+             <c r="B1" t="inlineStr"><is><t>b</t></is></c>
+           </row>"#,
+    )])
+    .ir();
+    let row: Vec<String> = only_table(&ir, 0).rows[0]
+        .cells
+        .iter()
+        .map(cell_text)
+        .collect();
+    assert_eq!(row, ["a", "b", "c"]);
+}
+
+#[test]
+fn a_duplicate_reference_keeps_the_first_value() {
+    // Two cells claiming one column is corruption either way; the first wins,
+    // and — the part that regressed — the rest of the row survives.
+    let ir = Xlsx::new(vec![Sheet::new(
+        "S",
+        r#"<row r="1">
+             <c r="A1" t="inlineStr"><is><t>first</t></is></c>
+             <c r="A1" t="inlineStr"><is><t>second</t></is></c>
+             <c r="B1" t="inlineStr"><is><t>b</t></is></c>
+           </row>"#,
+    )])
+    .ir();
+    let row: Vec<String> = only_table(&ir, 0).rows[0]
+        .cells
+        .iter()
+        .map(cell_text)
+        .collect();
+    assert_eq!(row, ["first", "b"]);
+}
