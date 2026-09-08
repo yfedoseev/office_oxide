@@ -210,7 +210,10 @@ impl Document {
 
     fn open_inner(path: &Path) -> Result<Self> {
         let format = DocumentFormat::from_path(path);
-        info!("Document::open: {:?} format, path '{}'", format, path.display());
+        // The path is deliberately not logged: it routinely carries a
+        // username and a document name, and this runs at info level on every
+        // open. The caller already knows which path it passed.
+        info!("Document::open: {format:?} format");
         let format = format.ok_or_else(|| {
             OfficeError::UnsupportedFormat(
                 path.extension()
@@ -273,7 +276,7 @@ impl Document {
                     .to_string(),
             )
         })?;
-        info!("Document::open_mmap: {:?} format, path '{}'", format, path.display());
+        info!("Document::open_mmap: {format:?} format");
         match format {
             DocumentFormat::Docx => {
                 let doc = docx::DocxDocument::open_mmap(path)?;

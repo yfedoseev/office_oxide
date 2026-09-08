@@ -404,7 +404,7 @@ impl PptxWriter {
                 true
             },
             None => {
-                log::warn!("pptx: no slide at index {slide}; the title was not set");
+                log::warn!("pptx: slide index out of range; the title was not set");
                 false
             },
         }
@@ -419,7 +419,7 @@ impl PptxWriter {
                 true
             },
             None => {
-                log::warn!("pptx: no slide at index {slide}; the text was not added");
+                log::warn!("pptx: slide index out of range; the text was not added");
                 false
             },
         }
@@ -444,7 +444,7 @@ impl PptxWriter {
                 true
             },
             None => {
-                log::warn!("pptx: no slide at index {slide}; the image was not added");
+                log::warn!("pptx: slide index out of range; the image was not added");
                 false
             },
         }

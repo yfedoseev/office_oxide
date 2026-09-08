@@ -700,7 +700,7 @@ impl XlsxWriter {
                 true
             },
             None => {
-                log::warn!("xlsx: no sheet at index {sheet}; the value was not written");
+                log::warn!("xlsx: sheet index out of range; the value was not written");
                 false
             },
         }
@@ -725,7 +725,7 @@ impl XlsxWriter {
                 true
             },
             None => {
-                log::warn!("xlsx: no sheet at index {sheet}; the value was not written");
+                log::warn!("xlsx: sheet index out of range; the value was not written");
                 false
             },
         }
