@@ -52,6 +52,19 @@ Closes #
       regressions (no dropped content, garbled text, or crashes).
 - [ ] Checked against the **latest release** as well.
 
+**Files in my corpus that reach the new code path:** ______
+
+<!-- A count of zero blocks the PR. For a change that only *adds*
+     classification, "no diff against main" and "the code never ran" are the
+     same observation: one PR reported byte-identical output over 160 files as
+     evidence of safety, and it was evidence the feature was switched off by
+     its own guard. Instrument the new branch and count. -->
+
+**Revert-check:** <!-- For each test this PR adds, revert the production hunk it
+     covers and confirm the test goes red. `scripts/revert-check.sh` does this
+     mechanically; paste its summary line. A test that passes with its own
+     production code reverted is testing nothing. -->
+
 **Diff summary:** <!-- what changed, and confirmation it's only the intended fix -->
 
 <!-- N/A only if this PR touches no parsing/extraction/IR code. -->

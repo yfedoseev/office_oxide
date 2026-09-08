@@ -87,15 +87,70 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
         }
     }
 
+    // Weaker fallback: walk only `Slide` containers found anywhere in the
+    // stream. A whole-stream scan also picks up `MainMaster` containers,
+    // whose placeholder prompts ("Click to edit Master title style", the
+    // `*` bullet placeholders) are PowerPoint's own UI strings and never
+    // render on a slide — in two POI corpus files they were 116 of the 137
+    // and 121 extracted characters respectively.
+    let mut slides = Vec::new();
+    collect_slide_containers(stream, 0, &mut slides);
+    if slides.iter().any(|s| !s.text_runs.is_empty()) {
+        return slides;
+    }
+
     // Last resort: no resolvable structure at all — dump whatever text atoms
-    // exist anywhere in the stream as a single slide.
+    // exist anywhere in the stream, minus the master boilerplate.
     let mut runs = Vec::new();
     extract_shape_text(stream, 0, &[], &mut runs);
+    runs.retain(|r| !is_master_placeholder_prompt(&r.text));
     if runs.is_empty() {
         Vec::new()
     } else {
         vec![SlideText { text_runs: runs }]
     }
+}
+
+/// Walk the record tree collecting one `SlideText` per `Slide` container.
+fn collect_slide_containers(data: &[u8], depth: usize, out: &mut Vec<SlideText>) {
+    if depth > MAX_SHAPE_DEPTH {
+        return;
+    }
+    for rec in RecordIter::new(data) {
+        let Ok(rec) = rec else { break };
+        if rec.header.rec_type == RT_SLIDE {
+            let mut runs = Vec::new();
+            extract_shape_text(&rec.data, 0, &[], &mut runs);
+            runs.retain(|r| !is_master_placeholder_prompt(&r.text));
+            out.push(SlideText { text_runs: runs });
+            continue;
+        }
+        if rec.header.is_container() {
+            collect_slide_containers(&rec.data, depth + 1, out);
+        }
+    }
+}
+
+/// Whether a text run is a slide-master placeholder prompt rather than
+/// document content.
+///
+/// PowerPoint stores the master's prompt strings as ordinary text atoms.
+/// They are shown in master view and never rendered on a slide, so a
+/// consumer that receives them gets a document whose "content" is the
+/// application's own UI strings.
+fn is_master_placeholder_prompt(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // The English prompts PowerPoint 97–2003 writes, plus the bare bullet
+    // placeholders that accompany them.
+    t.starts_with("Click to edit Master")
+        || t.starts_with("Click to edit the outline text format")
+        || t.starts_with("Click to add title")
+        || t.starts_with("Click to add text")
+        || t.starts_with("Click to add notes")
+        || t.chars().all(|c| c == '*' || c.is_whitespace())
 }
 
 /// Resolve the current "Slides" list through the persist directory and

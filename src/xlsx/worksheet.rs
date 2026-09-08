@@ -24,12 +24,71 @@ pub struct Worksheet {
     /// into this `Vec` so consumers don't need to re-walk the OPC
     /// reader. Empty when the worksheet has no drawing rel.
     pub images: Vec<WorksheetPicture>,
+    /// Cell comments from the sheet's `xl/comments*.xml` part, in document
+    /// order. Empty when the sheet has no comments.
+    pub comments: Vec<SheetComment>,
     /// Layout-preserving text shapes anchored on this worksheet via a
     /// DrawingML drawing part. Each entry is one `<xdr:sp>` carrying a
     /// single styled run — populated by the round-trip from
     /// `to_xlsx_bytes_layout`. Empty when the worksheet has no
     /// `<xdr:sp>` shapes (the common XLSX case).
     pub text_shapes: Vec<WorksheetTextShape>,
+}
+
+/// One cell comment from `xl/comments*.xml`.
+#[derive(Debug, Clone)]
+pub struct SheetComment {
+    /// Cell reference the comment is attached to, e.g. `"B2"`.
+    pub cell_ref: String,
+    /// Comment author, resolved through the part's `<authors>` list.
+    pub author: Option<String>,
+    /// Comment body text.
+    pub text: String,
+}
+
+/// Parse an `xl/comments*.xml` part.
+///
+/// Comments are real document content — review notes, data provenance,
+/// caveats on a figure — and were never read at all, so they reached no
+/// consumer.
+pub fn parse_comments(xml_data: &[u8]) -> crate::core::Result<Vec<SheetComment>> {
+    use quick_xml::events::Event;
+    let mut reader = xml::make_fast_reader(xml_data);
+    let mut authors: Vec<String> = Vec::new();
+    let mut out: Vec<SheetComment> = Vec::new();
+    let mut in_authors = false;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"authors" => in_authors = true,
+                b"author" if in_authors => {
+                    authors.push(xml::read_text_content_fast(&mut reader)?);
+                },
+                b"comment" => {
+                    let cell_ref = xml::optional_attr_str(e, b"ref")?
+                        .map(|v| v.into_owned())
+                        .unwrap_or_default();
+                    let author_id = xml::optional_attr_str(e, b"authorId")?
+                        .and_then(|v| v.parse::<usize>().ok());
+                    let text = xml::read_text_content_fast(&mut reader)?;
+                    let text = text.trim().to_string();
+                    if !text.is_empty() {
+                        out.push(SheetComment {
+                            cell_ref,
+                            author: author_id.and_then(|i| authors.get(i).cloned()),
+                            text,
+                        });
+                    }
+                },
+                _ => {},
+            },
+            Event::End(ref e) if e.local_name().as_ref() == b"authors" => in_authors = false,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(out)
 }
 
 /// A text shape anchored on a worksheet via a DrawingML drawing part.
@@ -170,7 +229,11 @@ impl Worksheet {
                         reader.read_to_end(e.to_end().name())?;
                     },
                     b"row" => {
-                        rows.push(parse_row_fast(&mut reader, e)?);
+                        // A <row> without r= is implicitly the one after the
+                        // previous row (ECMA-376 18.3.1.73); some writers omit
+                        // it throughout the sheet.
+                        let implied = rows.last().map_or(1, |r: &Row| r.index + 1);
+                        rows.push(parse_row_fast(&mut reader, e, implied)?);
                     },
                     b"mergeCell" => {
                         if let Some(range) = xml::optional_attr_str(e, b"ref")? {
@@ -224,6 +287,7 @@ impl Worksheet {
         let page_setup = build_page_setup(margins_in, page_setup_raw);
 
         Ok(Worksheet {
+            comments: Vec::new(),
             name,
             dimension,
             rows,
@@ -355,7 +419,15 @@ fn parse_page_setup_attrs(
     let (width_twips, height_twips) = match (pw, ph) {
         (Some(w), Some(h)) => (w, h),
         _ => match paper_size {
-            Some(id) => paper_size_enum_to_twips(id),
+            Some(id) => {
+                // `paperSize` names a *portrait* stock; `orientation` then
+                // rotates it. Reporting the portrait width for a landscape
+                // sheet handed the consumer a page narrower than the one
+                // Excel prints, which is a confidently wrong measurement
+                // rather than a missing one.
+                let (w, h) = paper_size_enum_to_twips(id);
+                if landscape { (h, w) } else { (w, h) }
+            },
             None => return Ok(None),
         },
     };
@@ -428,23 +500,31 @@ fn parse_hyperlink(
 fn parse_row_fast(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
+    implied_index: u32,
 ) -> crate::core::Result<Row> {
     let index: u32 = xml::optional_attr_str(start, b"r")?
         .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok())
-        .unwrap_or(1);
+        .unwrap_or(implied_index);
     let mut cells = Vec::new();
+    // Likewise a <c> without r= sits in the column after its predecessor.
+    // Defaulting these to column 0 collapses the whole row onto one cell.
+    let mut next_col: u32 = 0;
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
                 if e.local_name().as_ref() == b"c" {
-                    cells.push(parse_cell_fast(reader, e)?);
+                    let cell = parse_cell_fast(reader, e, index, next_col)?;
+                    next_col = cell.reference.col.saturating_add(1);
+                    cells.push(cell);
                 } else {
                     reader.read_to_end(e.to_end().name())?;
                 }
             },
             Event::Empty(ref e) if e.local_name().as_ref() == b"c" => {
-                cells.push(parse_empty_cell(e)?);
+                let cell = parse_empty_cell(e, index, next_col)?;
+                next_col = cell.reference.col.saturating_add(1);
+                cells.push(cell);
             },
             Event::End(ref e) if e.local_name().as_ref() == b"row" => {
                 break;
@@ -457,11 +537,18 @@ fn parse_row_fast(
     Ok(Row { index, cells })
 }
 
-fn parse_empty_cell(e: &quick_xml::events::BytesStart) -> crate::core::Result<Cell> {
+fn parse_empty_cell(
+    e: &quick_xml::events::BytesStart,
+    row: u32,
+    implied_col: u32,
+) -> crate::core::Result<Cell> {
     let ref_str = xml::optional_attr_str(e, b"r")?
         .map(|v| v.into_owned())
         .unwrap_or_default();
-    let reference = CellRef::parse(&ref_str).unwrap_or(CellRef { col: 0, row: 0 });
+    let reference = CellRef::parse(&ref_str).unwrap_or(CellRef {
+        col: implied_col,
+        row,
+    });
     let style_index = xml::optional_attr_str(e, b"s")?
         .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok());
 
@@ -477,11 +564,16 @@ fn parse_empty_cell(e: &quick_xml::events::BytesStart) -> crate::core::Result<Ce
 fn parse_cell_fast(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
+    row: u32,
+    implied_col: u32,
 ) -> crate::core::Result<Cell> {
     let ref_str = xml::optional_attr_str(start, b"r")?
         .map(|v| v.into_owned())
         .unwrap_or_default();
-    let reference = CellRef::parse(&ref_str).unwrap_or(CellRef { col: 0, row: 0 });
+    let reference = CellRef::parse(&ref_str).unwrap_or(CellRef {
+        col: implied_col,
+        row,
+    });
 
     let cell_type = xml::optional_attr_str(start, b"t")?.map(|v| v.into_owned());
     let style_index = xml::optional_attr_str(start, b"s")?
@@ -664,7 +756,8 @@ mod tests {
 
     #[test]
     fn parse_worksheet_page_setup_paper_enum() {
-        // paperSize=9 = A4 → 11906x16838 twips.
+        // paperSize=9 = A4 (11906x16838 twips portrait), rotated because
+        // orientation="landscape" — `paperSize` names a portrait stock.
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <sheetData/>
@@ -673,8 +766,8 @@ mod tests {
 </worksheet>"#;
         let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
         let ps = ws.page_setup.expect("page_setup parsed");
-        assert_eq!(ps.width_twips, 11906);
-        assert_eq!(ps.height_twips, 16838);
+        assert_eq!(ps.width_twips, 16838);
+        assert_eq!(ps.height_twips, 11906);
         assert!(ps.landscape);
     }
 
@@ -839,7 +932,9 @@ mod tests {
 </worksheet>"#;
         let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
         let ps = ws.page_setup.expect("page_setup");
-        assert_eq!(ps.width_twips, 12240); // Letter
+        // Letter is 12240x15840 portrait; landscape swaps the two.
+        assert_eq!(ps.width_twips, 15840);
+        assert_eq!(ps.height_twips, 12240);
         assert!(ps.landscape);
     }
 

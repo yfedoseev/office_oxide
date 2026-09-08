@@ -84,6 +84,9 @@ pub struct XlsxDocument {
     /// renderer; without this hop XLSX-mediated round-trips lost
     /// every typeface to the base 14 fallback.
     pub embedded_fonts: Vec<(String, Vec<u8>)>,
+    /// Parsed `docProps/core.xml`. `None` when the package carries no
+    /// core-properties part.
+    pub core_properties: Option<crate::core::properties::CoreProperties>,
     // Raw bytes for lazy parsing (None after parsing or if not present)
     styles_data: Option<Vec<u8>>,
     theme_data: Option<Vec<u8>>,
@@ -155,6 +158,13 @@ impl XlsxDocument {
     fn from_zip<R: Read + Seek>(mut archive: ZipArchive<R>) -> Result<Self> {
         debug!("XlsxDocument: fast path parsing started ({} ZIP entries)", archive.len());
 
+        // Document metadata lives at the conventional path in every package
+        // Excel writes; the fast path doesn't consult package relationships,
+        // so read it by name here.
+        let core_properties = Self::read_xml_entry(&mut archive, "docProps/core.xml")
+            .ok()
+            .and_then(|d| crate::core::properties::CoreProperties::parse(&d).ok());
+
         // Read workbook relationships to resolve sheet targets
         let wb_rels = match Self::read_xml_entry(&mut archive, "xl/_rels/workbook.xml.rels") {
             Ok(data) => Relationships::parse(&data)?,
@@ -187,6 +197,7 @@ impl XlsxDocument {
             rels: Relationships,
             images: Vec<crate::xlsx::worksheet::WorksheetPicture>,
             text_shapes: Vec<crate::xlsx::worksheet::WorksheetTextShape>,
+            comments: Vec<crate::xlsx::worksheet::SheetComment>,
         }
         let mut bundles = Vec::with_capacity(workbook.sheets.len());
         for sheet in &workbook.sheets {
@@ -238,12 +249,22 @@ impl XlsxDocument {
             // the archive.
             let (images, text_shapes) = read_drawing_for_sheet(&mut archive, &sheet_path, &ws_rels);
 
+            // Cell comments live in a separate part reached through the
+            // sheet's own relationships.
+            let comments = ws_rels
+                .first_by_type(rel_types::COMMENTS)
+                .map(|rel| resolve_relative_zip_path(&sheet_path, &rel.target))
+                .and_then(|path| Self::read_xml_entry(&mut archive, &path).ok())
+                .and_then(|data| worksheet::parse_comments(&data).ok())
+                .unwrap_or_default();
+
             bundles.push(SheetBundle {
                 name: sheet.name.clone(),
                 data: ws_data,
                 rels: ws_rels,
                 images,
                 text_shapes,
+                comments,
             });
         }
 
@@ -252,6 +273,7 @@ impl XlsxDocument {
             let mut ws = Worksheet::parse(&b.data, b.name, &b.rels)?;
             ws.images = b.images;
             ws.text_shapes = b.text_shapes;
+            ws.comments = b.comments;
             Ok(ws)
         })?;
 
@@ -311,6 +333,7 @@ impl XlsxDocument {
             theme: None,
             chart_text,
             embedded_fonts,
+            core_properties,
             styles_data: None,
             theme_data,
         })
@@ -320,6 +343,16 @@ impl XlsxDocument {
     #[allow(dead_code)]
     pub(crate) fn from_opc<R: Read + Seek>(mut opc: OpcReader<R>) -> Result<Self> {
         debug!("XlsxDocument: OPC parsing started");
+        opc.verify_main_content_type(
+            &[
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
+                "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+                "application/vnd.ms-excel.template.macroEnabled.main+xml",
+            ],
+            "a SpreadsheetML workbook",
+        )?;
+        let core_properties = crate::core::properties::read_core_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let wb_rels = opc.read_rels_for(&main_part)?;
 
@@ -353,6 +386,7 @@ impl XlsxDocument {
             name: String,
             data: Vec<u8>,
             rels: Relationships,
+            comments: Vec<crate::xlsx::worksheet::SheetComment>,
         }
         let mut bundles = Vec::with_capacity(workbook.sheets.len());
         for sheet in &workbook.sheets {
@@ -387,10 +421,18 @@ impl XlsxDocument {
                 Ok(data) => data,
                 Err(_) => continue,
             };
+            let comments = ws_rels
+                .first_by_type(rel_types::COMMENTS)
+                .and_then(|rel| part_name.resolve_relative(&rel.target).ok())
+                .filter(|pn| opc.has_part(pn))
+                .and_then(|pn| opc.read_part(&pn).ok())
+                .and_then(|data| worksheet::parse_comments(&data).ok())
+                .unwrap_or_default();
             bundles.push(SheetBundle {
                 name: sheet.name.clone(),
                 data: ws_data,
                 rels: ws_rels,
+                comments,
             });
         }
 
@@ -400,7 +442,8 @@ impl XlsxDocument {
             bundles
                 .into_par_iter()
                 .map(|b| {
-                    let ws = Worksheet::parse(&b.data, b.name, &b.rels)?;
+                    let mut ws = Worksheet::parse(&b.data, b.name, &b.rels)?;
+                    ws.comments = b.comments;
                     Ok(ws)
                 })
                 .collect()
@@ -409,7 +452,8 @@ impl XlsxDocument {
         let worksheets: Result<Vec<Worksheet>> = bundles
             .into_iter()
             .map(|b| {
-                let ws = Worksheet::parse(&b.data, b.name, &b.rels)?;
+                let mut ws = Worksheet::parse(&b.data, b.name, &b.rels)?;
+                ws.comments = b.comments;
                 Ok(ws)
             })
             .collect();
@@ -457,6 +501,7 @@ impl XlsxDocument {
             // added if a use case appears.
             chart_text: Vec::new(),
             embedded_fonts,
+            core_properties,
             styles_data: None,
             theme_data,
         })
@@ -569,6 +614,18 @@ fn extract_chart_text(xml: &[u8]) -> String {
                         }
                     },
                     _ => {},
+                }
+            },
+            // Entity references are separate events; folding them in here
+            // keeps `&amp;` in a chart title from disappearing.
+            Ok(quick_xml::events::Event::GeneralRef(ref r)) => {
+                if let Ok(s) = crate::core::xml::resolve_general_ref(r) {
+                    let top = stack.last().map(|v| v.as_slice());
+                    match top {
+                        Some(b"t") => current_title.push_str(&s),
+                        Some(b"v") => cur_v.push_str(&s),
+                        _ => {},
+                    }
                 }
             },
             Ok(quick_xml::events::Event::Text(t)) => {
@@ -996,6 +1053,9 @@ fn parse_drawing_anchors(xml_data: &[u8]) -> crate::core::Result<DrawingAnchors>
             Event::Text(ref e) if in_a_t => {
                 let s = crate::core::xml::unescape_text(e)?;
                 text_buf.push_str(&s);
+            },
+            Event::GeneralRef(ref e) if in_a_t => {
+                text_buf.push_str(&crate::core::xml::resolve_general_ref(e)?);
             },
             Event::End(ref e) => {
                 let local = e.local_name().as_ref().to_vec();

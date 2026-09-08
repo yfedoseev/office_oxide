@@ -42,5 +42,18 @@ proposing changes. The essentials that apply to agent-assisted work:
 - **OOXML** — ECMA-376 / ISO/IEC 29500 (Office Open XML): the `.docx/.xlsx/.pptx`
   package is an OPC (Open Packaging Conventions) zip of parts + relationships.
 - **CFB** — MS-CFB (Compound File Binary) underlies the legacy `.doc/.xls/.ppt`.
+- **MS-DOC** — the legacy `.doc` binary format: the FIB, the piece table, PAPX
+  FKPs and the SPRM opcode tables (§2.6.2 paragraph, §2.6.3 table).
+- **MS-XLS** — the legacy `.xls` BIFF record stream: BOF/EOF, BOUNDSHEET, SST,
+  FORMAT/XF, FILEPASS.
+- **MS-PPT** — the legacy `.ppt` record stream: the persist directory,
+  `Slide`/`Notes`/`MainMaster` containers, `TextCharsAtom`/`TextBytesAtom`.
+- Every opcode constant must cite its spec section *inline, at the point it is
+  declared*. The recurring defect in this area is "the constant is right but
+  names a different property" — `0x6412` is `sprmPDyaLine` (line spacing) and
+  was once decoded as an outline level. `src/doc/sprm.rs` generates its opcode
+  registry from the dispatch itself and checks it against a transcribed spec
+  table, so a new arm that names the wrong property fails a test rather than a
+  review.
 - Prefer spec-accurate parsing over guessing; when a document violates the spec,
   degrade gracefully with a warning rather than a panic.

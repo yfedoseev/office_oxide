@@ -26,6 +26,18 @@ pub struct RunProperties {
     pub vertical_align: Option<VerticalAlign>,
     /// Character style ID.
     pub style_id: Option<String>,
+    /// All-caps toggle (`<w:caps/>`).
+    pub caps: Option<bool>,
+    /// Small-caps toggle (`<w:smallCaps/>`).
+    pub small_caps: Option<bool>,
+    /// Character spacing from `<w:spacing w:val="N"/>` inside `w:rPr`.
+    /// Signed, in the same units the writer emits (twentieths of a point).
+    pub char_spacing: Option<i32>,
+    /// Run shading fill from `<w:shd w:fill="RRGGBB"/>` inside `w:rPr`.
+    /// The writer uses this (not `<w:highlight>`) to encode
+    /// `TextSpan::highlight`, so reading it back is what closes the
+    /// write→read loop for highlighted text.
+    pub shading_fill: Option<String>,
 }
 
 /// Paragraph-level formatting properties (`w:pPr`).
@@ -61,6 +73,173 @@ pub struct ParagraphProperties {
     /// re-parse and turned into a plain empty paragraph.
     #[allow(dead_code)]
     pub has_bottom_border: bool,
+    /// Full `<w:pBdr>` edge styling. `has_bottom_border` stays as the
+    /// cheap horizontal-rule probe; this carries the actual widths,
+    /// colours and styles so they survive a read.
+    pub borders: Option<ParagraphBorders>,
+    /// `<w:keepNext/>` — keep with the following paragraph. `None` when the
+    /// element is absent, so a style-inherited value is distinguishable from
+    /// an explicit `w:val="0"` that turns it off.
+    pub keep_next: Option<bool>,
+    /// `<w:keepLines/>` — keep all lines of this paragraph together.
+    pub keep_lines: Option<bool>,
+    /// `<w:pageBreakBefore/>` — force a page break before this paragraph.
+    pub page_break_before: Option<bool>,
+    /// Paragraph shading (`<w:shd>`) — background fill.
+    pub shading: Option<super::table::Shading>,
+    /// Custom tab stops from `<w:tabs>`.
+    pub tabs: Vec<TabStopDef>,
+}
+
+/// One `<w:tab>` entry inside `<w:tabs>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabStopDef {
+    /// Position in twips (`w:pos`).
+    pub position_twips: i32,
+    /// Alignment (`w:val`): left/center/right/decimal/bar.
+    pub alignment: String,
+    /// Leader character style (`w:leader`).
+    pub leader: Option<String>,
+}
+
+/// A single border edge (`<w:top>`, `<w:left>`, …) as it appears
+/// inside `<w:pBdr>`, `<w:tblBorders>` and `<w:tcBorders>`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BorderEdge {
+    /// `w:val` — the line style name (`single`, `double`, `dotted`, …).
+    pub style: Option<String>,
+    /// `w:color` — `RRGGBB` or `auto`.
+    pub color: Option<String>,
+    /// `w:sz` — line width in eighths of a point.
+    pub size: Option<u32>,
+    /// `w:space` — padding between border and text, in points.
+    pub space: Option<u32>,
+}
+
+/// The five paragraph border edges (`<w:pBdr>`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParagraphBorders {
+    /// Top edge.
+    pub top: Option<BorderEdge>,
+    /// Bottom edge.
+    pub bottom: Option<BorderEdge>,
+    /// Left edge.
+    pub left: Option<BorderEdge>,
+    /// Right edge.
+    pub right: Option<BorderEdge>,
+    /// Edge drawn between consecutive paragraphs sharing this border set.
+    pub between: Option<BorderEdge>,
+}
+
+/// Table / cell border edges (`<w:tblBorders>`, `<w:tcBorders>`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableBorders {
+    /// Top edge.
+    pub top: Option<BorderEdge>,
+    /// Bottom edge.
+    pub bottom: Option<BorderEdge>,
+    /// Left (`w:left` / `w:start`) edge.
+    pub left: Option<BorderEdge>,
+    /// Right (`w:right` / `w:end`) edge.
+    pub right: Option<BorderEdge>,
+    /// Interior horizontal edges.
+    pub inside_h: Option<BorderEdge>,
+    /// Interior vertical edges.
+    pub inside_v: Option<BorderEdge>,
+}
+
+/// Parse one border edge element's attributes.
+pub(crate) fn parse_border_edge(e: &BytesStart) -> BorderEdge {
+    BorderEdge {
+        style: xml::optional_attr_str(e, b"w:val")
+            .ok()
+            .flatten()
+            .map(|v| v.into_owned()),
+        color: xml::optional_attr_str(e, b"w:color")
+            .ok()
+            .flatten()
+            .map(|v| v.into_owned()),
+        size: xml::optional_attr_str(e, b"w:sz")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok()),
+        space: xml::optional_attr_str(e, b"w:space")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok()),
+    }
+}
+
+impl RunProperties {
+    /// Overlay `src` on top of `self`: every field `src` states explicitly
+    /// wins, everything else is left alone. Used to fold a style chain
+    /// (document defaults → style → parent style → direct `w:rPr`) into one
+    /// effective property set.
+    pub fn overlay(&mut self, src: &RunProperties) {
+        macro_rules! take {
+            ($($f:ident),* $(,)?) => {$(
+                if src.$f.is_some() { self.$f = src.$f.clone(); }
+            )*};
+        }
+        take!(
+            bold,
+            italic,
+            underline,
+            strike,
+            dstrike,
+            font_size,
+            font_name,
+            color,
+            highlight,
+            vertical_align,
+            style_id,
+            caps,
+            small_caps,
+            char_spacing,
+            shading_fill,
+        );
+    }
+}
+
+impl ParagraphProperties {
+    /// Overlay `src` on top of `self`. See [`RunProperties::overlay`].
+    ///
+    /// `run_properties` is merged recursively rather than replaced, so a
+    /// paragraph style that sets only the font does not wipe out the bold
+    /// flag its parent style set.
+    pub fn overlay(&mut self, src: &ParagraphProperties) {
+        macro_rules! take {
+            ($($f:ident),* $(,)?) => {$(
+                if src.$f.is_some() { self.$f = src.$f.clone(); }
+            )*};
+        }
+        take!(
+            style_id,
+            justification,
+            indent,
+            spacing,
+            numbering_ref,
+            outline_level,
+            frame_position,
+            section_properties,
+            borders,
+            keep_next,
+            keep_lines,
+            page_break_before,
+            shading,
+        );
+        if !src.tabs.is_empty() {
+            self.tabs = src.tabs.clone();
+        }
+        if src.has_bottom_border {
+            self.has_bottom_border = true;
+        }
+        match (self.run_properties.as_mut(), src.run_properties.as_ref()) {
+            (Some(dst), Some(s)) => dst.overlay(s),
+            (None, Some(s)) => self.run_properties = Some(s.clone()),
+            _ => {},
+        }
+    }
 }
 
 /// `<w:framePr>` attributes — page-anchored frame coordinates in twips.
@@ -378,9 +557,7 @@ pub(crate) fn parse_paragraph_properties(
                         },
                         b"outlineLvl" => {
                             if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                                if let Ok(lvl) = val.parse::<u8>() {
-                                    props.outline_level = Some(lvl);
-                                }
+                                props.outline_level = parse_outline_level(&val);
                             }
                             xml::skip_element(reader)?;
                         },
@@ -416,9 +593,7 @@ pub(crate) fn parse_paragraph_properties(
                     },
                     b"outlineLvl" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                            if let Ok(lvl) = val.parse::<u8>() {
-                                props.outline_level = Some(lvl);
-                            }
+                            props.outline_level = parse_outline_level(&val);
                         }
                     },
                     _ => {},
@@ -509,6 +684,25 @@ pub(crate) fn parse_run_properties_fast(
                         }
                         xml::skip_element_fast(reader)?;
                     },
+                    b"caps" => {
+                        props.caps = Some(parse_toggle(e));
+                        xml::skip_element_fast(reader)?;
+                    },
+                    b"smallCaps" => {
+                        props.small_caps = Some(parse_toggle(e));
+                        xml::skip_element_fast(reader)?;
+                    },
+                    b"spacing" => {
+                        props.char_spacing = parse_signed_val(e);
+                        xml::skip_element_fast(reader)?;
+                    },
+                    b"shd" => {
+                        props.shading_fill = xml::optional_attr_str(e, b"w:fill")
+                            .ok()
+                            .flatten()
+                            .map(|v| v.into_owned());
+                        xml::skip_element_fast(reader)?;
+                    },
                     _ => {
                         xml::skip_element_fast(reader)?;
                     },
@@ -517,6 +711,15 @@ pub(crate) fn parse_run_properties_fast(
             Event::Empty(ref e) => {
                 let local = e.local_name();
                 match local.as_ref() {
+                    b"caps" => props.caps = Some(parse_toggle(e)),
+                    b"smallCaps" => props.small_caps = Some(parse_toggle(e)),
+                    b"spacing" => props.char_spacing = parse_signed_val(e),
+                    b"shd" => {
+                        props.shading_fill = xml::optional_attr_str(e, b"w:fill")
+                            .ok()
+                            .flatten()
+                            .map(|v| v.into_owned());
+                    },
                     b"b" => props.bold = Some(parse_toggle(e)),
                     b"i" => props.italic = Some(parse_toggle(e)),
                     b"strike" => props.strike = Some(parse_toggle(e)),
@@ -603,9 +806,7 @@ pub(crate) fn parse_paragraph_properties_fast(
                     },
                     b"outlineLvl" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                            if let Ok(lvl) = val.parse::<u8>() {
-                                props.outline_level = Some(lvl);
-                            }
+                            props.outline_level = parse_outline_level(&val);
                         }
                         xml::skip_element_fast(reader)?;
                     },
@@ -621,39 +822,34 @@ pub(crate) fn parse_paragraph_properties_fast(
                             Some(super::parse_section_properties(reader, e)?);
                     },
                     b"pBdr" => {
-                        // Walk the <w:pBdr> subtree to its matching
-                        // </w:pBdr>, noting whether a <w:bottom> edge
-                        // appears (empty paragraph + bottom border = the
-                        // conventional DOCX <hr/>). We don't capture full
-                        // border styling — just the presence of a bottom
-                        // edge. Border edges are self-closing (Event::Empty),
-                        // so depth only moves on non-empty Start/End; the
-                        // loop exits at the first depth-0 End, which the
-                        // balanced counter guarantees is </w:pBdr>.
-                        let mut depth = 1i32;
-                        loop {
-                            match reader.read_event()? {
-                                Event::Empty(ref ee) => {
-                                    if ee.local_name().as_ref() == b"bottom" {
-                                        props.has_bottom_border = true;
-                                    }
-                                },
-                                Event::Start(ref ee) => {
-                                    if ee.local_name().as_ref() == b"bottom" {
-                                        props.has_bottom_border = true;
-                                    }
-                                    depth += 1;
-                                },
-                                Event::End(_) => {
-                                    depth -= 1;
-                                    if depth <= 0 {
-                                        break;
-                                    }
-                                },
-                                Event::Eof => break,
-                                _ => {},
-                            }
-                        }
+                        // Capture every `<w:pBdr>` edge with its full
+                        // styling. `has_bottom_border` stays the cheap
+                        // horizontal-rule probe (empty paragraph + bottom
+                        // border = the conventional DOCX `<hr/>`), but the
+                        // widths, colours and styles now survive the read
+                        // instead of being narrowed to that one boolean.
+                        let borders = parse_paragraph_borders_fast(reader)?;
+                        props.has_bottom_border = borders.bottom.is_some();
+                        props.borders = Some(borders);
+                    },
+                    b"keepNext" => {
+                        props.keep_next = Some(parse_toggle(e));
+                        xml::skip_element_fast(reader)?;
+                    },
+                    b"keepLines" => {
+                        props.keep_lines = Some(parse_toggle(e));
+                        xml::skip_element_fast(reader)?;
+                    },
+                    b"pageBreakBefore" => {
+                        props.page_break_before = Some(parse_toggle(e));
+                        xml::skip_element_fast(reader)?;
+                    },
+                    b"shd" => {
+                        props.shading = Some(parse_shading(e));
+                        xml::skip_element_fast(reader)?;
+                    },
+                    b"tabs" => {
+                        props.tabs = parse_tabs_fast(reader)?;
                     },
                     _ => {
                         xml::skip_element_fast(reader)?;
@@ -663,6 +859,10 @@ pub(crate) fn parse_paragraph_properties_fast(
             Event::Empty(ref e) => {
                 let local = e.local_name();
                 match local.as_ref() {
+                    b"keepNext" => props.keep_next = Some(parse_toggle(e)),
+                    b"keepLines" => props.keep_lines = Some(parse_toggle(e)),
+                    b"pageBreakBefore" => props.page_break_before = Some(parse_toggle(e)),
+                    b"shd" => props.shading = Some(parse_shading(e)),
                     b"pStyle" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             props.style_id = Some(val.into_owned());
@@ -684,9 +884,7 @@ pub(crate) fn parse_paragraph_properties_fast(
                     },
                     b"outlineLvl" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
-                            if let Ok(lvl) = val.parse::<u8>() {
-                                props.outline_level = Some(lvl);
-                            }
+                            props.outline_level = parse_outline_level(&val);
                         }
                     },
                     _ => {},
@@ -700,6 +898,120 @@ pub(crate) fn parse_paragraph_properties_fast(
         }
     }
     Ok(props)
+}
+
+/// Parse a signed `w:val` integer attribute (used by `<w:spacing>` in `w:rPr`).
+fn parse_signed_val(e: &BytesStart) -> Option<i32> {
+    xml::optional_attr_str(e, b"w:val")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+}
+
+/// Parse a `<w:shd>` element's attributes.
+pub(crate) fn parse_shading(e: &BytesStart) -> super::table::Shading {
+    super::table::Shading {
+        fill: xml::optional_attr_str(e, b"w:fill")
+            .ok()
+            .flatten()
+            .map(|v| v.into_owned()),
+        color: xml::optional_attr_str(e, b"w:color")
+            .ok()
+            .flatten()
+            .map(|v| v.into_owned()),
+        pattern: xml::optional_attr_str(e, b"w:val")
+            .ok()
+            .flatten()
+            .map(|v| v.into_owned()),
+    }
+}
+
+/// Parse the children of `<w:pBdr>`. The caller has consumed the start tag.
+fn parse_paragraph_borders_fast(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> crate::core::Result<ParagraphBorders> {
+    let mut b = ParagraphBorders::default();
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) | Event::Empty(ref e) => {
+                let edge = parse_border_edge(e);
+                match e.local_name().as_ref() {
+                    b"top" => b.top = Some(edge),
+                    b"bottom" => b.bottom = Some(edge),
+                    b"left" | b"start" => b.left = Some(edge),
+                    b"right" | b"end" => b.right = Some(edge),
+                    b"between" => b.between = Some(edge),
+                    _ => {},
+                }
+            },
+            Event::End(ref e) if e.local_name().as_ref() == b"pBdr" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(b)
+}
+
+/// Parse the children of `<w:tblBorders>` / `<w:tcBorders>`. The caller has
+/// consumed the start tag; `end` names the closing element to stop at.
+pub(crate) fn parse_table_borders_fast(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    end: &[u8],
+) -> crate::core::Result<TableBorders> {
+    let mut b = TableBorders::default();
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) | Event::Empty(ref e) => {
+                let edge = parse_border_edge(e);
+                match e.local_name().as_ref() {
+                    b"top" => b.top = Some(edge),
+                    b"bottom" => b.bottom = Some(edge),
+                    b"left" | b"start" => b.left = Some(edge),
+                    b"right" | b"end" => b.right = Some(edge),
+                    b"insideH" => b.inside_h = Some(edge),
+                    b"insideV" => b.inside_v = Some(edge),
+                    _ => {},
+                }
+            },
+            Event::End(ref e) if e.local_name().as_ref() == end => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(b)
+}
+
+/// Parse the children of `<w:tabs>`. The caller has consumed the start tag.
+fn parse_tabs_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Vec<TabStopDef>> {
+    let mut tabs = Vec::new();
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"tab" => {
+                let pos = xml::optional_attr_str(e, b"w:pos")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse::<i32>().ok());
+                if let Some(position_twips) = pos {
+                    tabs.push(TabStopDef {
+                        position_twips,
+                        alignment: xml::optional_attr_str(e, b"w:val")
+                            .ok()
+                            .flatten()
+                            .map(|v| v.into_owned())
+                            .unwrap_or_else(|| "left".to_string()),
+                        leader: xml::optional_attr_str(e, b"w:leader")
+                            .ok()
+                            .flatten()
+                            .map(|v| v.into_owned()),
+                    });
+                }
+            },
+            Event::End(ref e) if e.local_name().as_ref() == b"tabs" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(tabs)
 }
 
 fn parse_num_pr_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<NumberingRef> {
@@ -732,6 +1044,27 @@ fn parse_num_pr_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Resu
         }
     }
     Ok(NumberingRef { num_id, ilvl })
+}
+
+/// Parse a `<w:outlineLvl w:val="N"/>` value.
+///
+/// ECMA-376 §17.3.1.20 defines the range as 0–9, where `9` "specifically
+/// indicates that there is no outline level specifically applied to this
+/// paragraph" — i.e. body text — and is also the value assumed when the
+/// element is absent. Returning `Some(9)` made every consumer treat a
+/// paragraph explicitly marked as body text as a heading: the IR converter
+/// produced an H6, and the markdown renderer emitted nine `#` characters,
+/// which no markdown reader treats as a heading at all. Word writes
+/// `w:val="9"` for "Outline level: Body Text", and the built-in
+/// `TOCHeading` style uses it to cancel the level it inherits, so any
+/// document with a generated table of contents was affected.
+///
+/// Out-of-range values are also rejected rather than passed through.
+pub(crate) fn parse_outline_level(val: &str) -> Option<u8> {
+    match val.trim().parse::<u8>() {
+        Ok(lvl) if lvl <= 8 => Some(lvl),
+        _ => None,
+    }
 }
 
 /// Parse a boolean toggle attribute. `<w:b/>` = true, `<w:b w:val="0"/>` = false.
@@ -797,6 +1130,14 @@ fn parse_color_ref(e: &BytesStart) -> crate::core::Result<Option<ColorRef>> {
     let val = xml::optional_attr_str(e, b"w:val")?;
     let theme_color = xml::optional_attr_str(e, b"w:themeColor")?;
 
+    // The literal `w:val` doubles as the fallback for consumers that
+    // cannot resolve the theme, so parse it before branching on
+    // `w:themeColor` and carry it into the theme reference.
+    let literal = val
+        .as_deref()
+        .filter(|v| v.len() == 6)
+        .and_then(|v| RgbColor::from_hex(v).ok());
+
     if let Some(ref tc) = theme_color {
         if let Some(slot) = ThemeColorSlot::from_scheme_val(tc) {
             let tint = xml::optional_attr_str(e, b"w:themeTint")?
@@ -805,7 +1146,12 @@ fn parse_color_ref(e: &BytesStart) -> crate::core::Result<Option<ColorRef>> {
             let shade = xml::optional_attr_str(e, b"w:themeShade")?
                 .and_then(|v| u8::from_str_radix(&v, 16).ok())
                 .map(|v| v as f64 / 255.0);
-            return Ok(Some(ColorRef::Theme { slot, tint, shade }));
+            return Ok(Some(ColorRef::Theme {
+                slot,
+                tint,
+                shade,
+                fallback: literal,
+            }));
         }
     }
 

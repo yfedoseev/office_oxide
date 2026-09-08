@@ -215,6 +215,13 @@ pub struct PapProps {
     /// list/tab-stop PR; in the tables-only PR this field is always empty, but
     /// it is cloned through the IR so the `Paragraph.tabs` shape stays uniform.
     pub tabs: Vec<TabStop>,
+    /// Outline level from `sprmPOutLvl` (0x2640), in [MS-DOC]'s value space:
+    /// `0` = Heading 1 … `8` = Heading 9, and `9` = body text. Stored only
+    /// for real heading levels (0–8); `9` and absent both leave this `None`.
+    ///
+    /// This is the evidence that a document has *real* heading structure,
+    /// which is what gates the line-shape heading guess in `convert_doc`.
+    pub outline_level: Option<u8>,
 }
 
 /// One table cell descriptor (TKBKTAP, 20 bytes) distilled from a row's
@@ -371,6 +378,119 @@ fn tab_from_tbd(position_twips: i32, tbd: u8) -> TabStop {
     }
 }
 
+/// Declare the paragraph SPRM dispatch and its identity registry from one
+/// source.
+///
+/// The recurring defect this closes is "the constant is right but names a
+/// different property": `0x6412` is `sprmPDyaLine` (line spacing, 758
+/// occurrences in a 246-file corpus) and was once read as an outline level.
+/// Per-opcode inline assertions cannot catch a *new* wrong arm, because
+/// nobody writes an assertion for an arm they believe is correct.
+///
+/// Generating both the `match` and [`PAP_SPRM_REGISTRY`] from the same
+/// invocation makes the check fail closed: an arm added without naming the
+/// property and its [MS-DOC] section does not compile, and one that names
+/// the wrong property fails `registry_matches_the_spec_table`.
+macro_rules! pap_sprm_dispatch {
+    (
+        $(
+            $(#[$meta:meta])*
+            $spec_name:literal @ $section:literal => [$($opcode:literal),+ $(,)?]
+                ($props:ident, $operand:ident) $body:block
+        )*
+    ) => {
+        /// Every paragraph SPRM this crate decodes: `(opcode, spec name,
+        /// [MS-DOC] section)`. Derived from the dispatch below, never
+        /// maintained alongside it.
+        ///
+        /// Consumed by the identity tests; the value of enumerating it is
+        /// that the enumeration cannot drift from the dispatch.
+        #[allow(dead_code)]
+        pub const PAP_SPRM_REGISTRY: &[(u16, &str, &str)] = &[
+            $($(($opcode, $spec_name, $section),)+)*
+        ];
+
+        fn dispatch_pap_sprm(props: &mut PapProps, opcode: u16, operand: &[u8]) {
+            match opcode {
+                $(
+                    $($opcode)|+ => {
+                        let $props = props;
+                        let $operand = operand;
+                        $body
+                    },
+                )*
+                _ => {},
+            }
+        }
+    };
+}
+
+pap_sprm_dispatch! {
+    /// 1-byte operand: 0..=8 are Heading 1..9 and 9 is body text.
+    /// The opcode is 0x2640 — *not* the 0x6412 a byte-swapped reading
+    /// suggests, which is `sprmPDyaLine`.
+    "sprmPOutLvl" @ "2.6.2" => [0x2640] (props, operand) {
+        if let Some(&lvl) = operand.first() {
+            if lvl <= 8 {
+                props.outline_level = Some(lvl);
+            }
+        }
+    }
+
+    /// 1-byte operand, bit 0 = fInTable.
+    "sprmPFInTable" @ "2.6.2" => [0x2416] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.f_in_table = (b & 1) != 0;
+        }
+    }
+
+    /// 4-byte operand: the table nesting depth.
+    "sprmPItap" @ "2.6.2" => [0x6649] (props, operand) {
+        if operand.len() >= 4 {
+            let v = u32::from_le_bytes([operand[0], operand[1], operand[2], operand[3]]);
+            props.itap = v as u8;
+        }
+    }
+
+    /// Presence marks a row-terminator paragraph; the operand carries the
+    /// row definition (cells, boundaries).
+    "sprmTDefTable" @ "2.6.3" => [0xD608] (props, operand) {
+        props.is_table_trailing_mark = true;
+        props.tap = parse_tdef_table(operand);
+    }
+
+    /// 2-byte operand read as a *signed* `i16`: `0x0000`/`0xF801` mean "not
+    /// in a list", `0x0001`–`0x07FE` are 1-based indices into
+    /// `PlfLfo.rgLfo`, and `0xF802`–`0xFFFF` are the negation of a 1-based
+    /// index (still in a list). Storing it signed keeps the negation
+    /// explicit.
+    "sprmPIlfo" @ "2.6.2" => [0x460B] (props, operand) {
+        if operand.len() >= 2 {
+            props.ilfo = Some(i16::from_le_bytes([operand[0], operand[1]]));
+        }
+    }
+
+    /// 1-byte operand: the list level (0-based).
+    "sprmPIlvl" @ "2.6.2" => [0x260A] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.ilvl = Some(b);
+        }
+    }
+
+    /// Tab stops. Decoding needs the opcode itself — `sprmPChgTabsPapx`
+    /// (0xC60D) frames the same payload differently — so
+    /// `extract_pap_props` handles both directly. The entries are declared
+    /// here so the registry still enumerates every opcode the crate claims.
+    "sprmPChgTabs" @ "2.6.2" => [0xC615] (props, operand) {
+        let _ = (props, operand);
+    }
+
+    /// See `sprmPChgTabs`.
+    "sprmPChgTabsPapx" @ "2.6.2" => [0xC60D] (props, operand) {
+        let _ = (props, operand);
+    }
+}
+
 /// Decode a PAP `grpprl` into the paragraph flags we care about.
 ///
 /// Unknown SPRMs are ignored. An empty `grpprl` yields the default
@@ -379,55 +499,15 @@ pub fn extract_pap_props(grpprl: &[u8]) -> PapProps {
     let mut props = PapProps::default();
 
     for sprm in parse_grpprl(grpprl) {
-        match sprm.opcode {
-            // sprmPFInTable — 1-byte operand, bit 0 = fInTable.
-            0x2416 => {
-                if let Some(&b) = sprm.operand.first() {
-                    props.f_in_table = (b & 1) != 0;
-                }
-            },
-            // sprmPItap — 4-byte operand, the table nesting depth.
-            0x6649 => {
-                if sprm.operand.len() >= 4 {
-                    let v = u32::from_le_bytes([
-                        sprm.operand[0],
-                        sprm.operand[1],
-                        sprm.operand[2],
-                        sprm.operand[3],
-                    ]);
-                    props.itap = v as u8;
-                }
-            },
-            // sprmTDefTable — presence marks a row-terminator paragraph;
-            // the operand carries the row definition (cells, boundaries).
-            0xD608 => {
-                props.is_table_trailing_mark = true;
-                props.tap = parse_tdef_table(&sprm.operand);
-            },
-            // sprmPIlfo (0x460B) — 2-byte operand read as *signed* `i16` per
-            // [MS-DOC] §2.9.150: `0x0000`/`0xF801` mean "not in a list",
-            // `0x0001`–`0x07FE` are 1-based indices into `PlfLfo.rgLfo`, and
-            // `0xF802`–`0xFFFF` are the negation of a 1-based index (still in a
-            // list). Storing it signed keeps the negation explicit.
-            0x460B => {
-                if sprm.operand.len() >= 2 {
-                    props.ilfo = Some(i16::from_le_bytes([sprm.operand[0], sprm.operand[1]]));
-                }
-            },
-            // sprmPIlvl (0x260A) — 1-byte operand, the list level (0-based).
-            0x260A => {
-                if let Some(&b) = sprm.operand.first() {
-                    props.ilvl = Some(b);
-                }
-            },
-            // sprmPChgTabs (0xC615) / sprmPChgTabsPapx (0xC60D): tab stops.
-            0xC615 | 0xC60D => {
-                if !sprm.operand.is_empty() {
-                    props.tabs = decode_pchg_tabs(sprm.opcode, &sprm.operand);
-                }
-            },
-            _ => {},
+        // `sprmPChgTabs` needs the opcode itself to know how its operand is
+        // framed, so it is handled here rather than in the dispatch table.
+        if matches!(sprm.opcode, 0xC615 | 0xC60D) {
+            if !sprm.operand.is_empty() {
+                props.tabs = decode_pchg_tabs(sprm.opcode, &sprm.operand);
+            }
+            continue;
         }
+        dispatch_pap_sprm(&mut props, sprm.opcode, &sprm.operand);
     }
 
     props
@@ -436,6 +516,97 @@ pub fn extract_pap_props(grpprl: &[u8]) -> PapProps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Opcode → property name, transcribed from [MS-DOC] §2.6.2 (paragraph
+    /// SPRMs) and §2.6.3 (table SPRMs).
+    ///
+    /// This exists to be *disagreed with*. The dispatch registry is
+    /// generated from the match arms, so an arm whose constant names a
+    /// different property than its comment claims shows up here as a
+    /// mismatch — which per-opcode inline assertions cannot do, because
+    /// nobody writes an assertion for an arm they believe is correct.
+    ///
+    /// Entries beyond what the crate decodes are deliberate: they are the
+    /// opcodes that have been mistaken for the ones above.
+    const MS_DOC_SPRM_TABLE: &[(u16, &str)] = &[
+        (0x2416, "sprmPFInTable"),
+        (0x2417, "sprmPFTtp"),
+        (0x260A, "sprmPIlvl"),
+        (0x2640, "sprmPOutLvl"),
+        (0x460B, "sprmPIlfo"),
+        (0x6412, "sprmPDyaLine"),
+        (0x6649, "sprmPItap"),
+        (0xC60D, "sprmPChgTabsPapx"),
+        (0xC615, "sprmPChgTabs"),
+        (0xD608, "sprmTDefTable"),
+    ];
+
+    /// Every opcode the dispatch claims must name the property [MS-DOC]
+    /// gives it, and must cite a section.
+    #[test]
+    fn registry_matches_the_spec_table() {
+        for &(opcode, name, section) in PAP_SPRM_REGISTRY {
+            let expected = MS_DOC_SPRM_TABLE
+                .iter()
+                .find(|(o, _)| *o == opcode)
+                .map(|(_, n)| *n);
+            assert_eq!(
+                expected,
+                Some(name),
+                "opcode 0x{opcode:04X} is decoded as {name}, but [MS-DOC] calls it {expected:?}"
+            );
+            assert!(
+                section.starts_with("2.6"),
+                "0x{opcode:04X} ({name}) must cite its [MS-DOC] §2.6.x section, got {section:?}"
+            );
+        }
+    }
+
+    /// No opcode may be dispatched twice — two arms claiming the same
+    /// constant means one of them never runs.
+    #[test]
+    fn registry_has_no_duplicate_opcodes() {
+        let mut seen: Vec<u16> = PAP_SPRM_REGISTRY.iter().map(|(o, _, _)| *o).collect();
+        seen.sort_unstable();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(before, seen.len(), "duplicate opcode in the dispatch");
+    }
+
+    /// The opcodes that have actually been confused for the ones we decode
+    /// must not be decoded as something else. `0x6412` is line spacing and
+    /// occurs 758 times in a 246-file corpus; reading it as an outline
+    /// level marked most of those paragraphs as headings.
+    #[test]
+    fn known_confusable_opcodes_are_not_claimed() {
+        for confusable in [0x6412u16, 0x640A] {
+            assert!(
+                !PAP_SPRM_REGISTRY.iter().any(|(o, _, _)| *o == confusable),
+                "0x{confusable:04X} is not a paragraph property this crate decodes"
+            );
+        }
+    }
+
+    /// The registry must actually be reachable from the decoder, so a
+    /// registry that drifts away from the dispatch cannot pass silently.
+    #[test]
+    fn every_registered_opcode_changes_the_decoded_props() {
+        // A one-byte operand is enough for the flag/level SPRMs; the
+        // multi-byte ones get four bytes.
+        for &(opcode, name, _) in PAP_SPRM_REGISTRY {
+            if matches!(opcode, 0xC615 | 0xC60D | 0xD608) {
+                continue; // variable-length payloads, covered by their own tests
+            }
+            let mut grpprl = opcode.to_le_bytes().to_vec();
+            grpprl.extend_from_slice(&[1u8, 0, 0, 0]);
+            let props = extract_pap_props(&grpprl);
+            assert_ne!(
+                format!("{props:?}"),
+                format!("{:?}", PapProps::default()),
+                "0x{opcode:04X} ({name}) is registered but decoding it changes nothing"
+            );
+        }
+    }
 
     /// Cell-paragraph grpprl: `sprmPFInTable(0x2416)=1`, `sprmPItap(0x6649)=1`.
     fn cell_grpprl() -> Vec<u8> {

@@ -28,6 +28,14 @@ node -e "
   for (const f of ['wasm-pkg/package.json', 'js/package.json']) {
     const j = JSON.parse(require('fs').readFileSync(f));
     j.version = '${NEW}';
+    // The per-platform native packages are published from this same release
+    // at the same version, so pin them exactly — a range would let npm pick
+    // a library built from different source than the JS that loads it.
+    if (j.optionalDependencies) {
+      for (const dep of Object.keys(j.optionalDependencies)) {
+        j.optionalDependencies[dep] = '${NEW}';
+      }
+    }
     require('fs').writeFileSync(f, JSON.stringify(j, null, 2) + '\n');
   }
 "

@@ -376,6 +376,9 @@ impl SheetDataInner {
     }
 
     pub fn set_cell(&mut self, row: usize, col: usize, value: CellData) -> &mut Self {
+        if !in_grid(row, col) {
+            return self;
+        }
         self.ensure_cell(row, col);
         self.rows[row][col] = Some(StoredCellInner { value });
         self
@@ -388,6 +391,9 @@ impl SheetDataInner {
         value: CellData,
         style: CellStyle,
     ) -> &mut Self {
+        if !in_grid(row, col) {
+            return self;
+        }
         self.ensure_cell(row, col);
         self.rows[row][col] = Some(StoredCellInner { value });
         self.cell_styles.insert((row, col), style);
@@ -418,6 +424,63 @@ impl SheetDataInner {
 
 struct StoredCellInner {
     value: CellData,
+}
+
+/// Excel's grid is 1,048,576 rows by 16,384 columns; the last addressable
+/// cell is `XFD1048576`.
+const MAX_ROWS: usize = 1_048_576;
+const MAX_COLS: usize = 16_384;
+
+/// Whether a 0-based (row, col) is addressable in Excel. Writing outside it
+/// emitted references like `XFE1048577` that name a cell which does not
+/// exist, so Excel repairs (i.e. discards) the sheet on open.
+fn in_grid(row: usize, col: usize) -> bool {
+    if row < MAX_ROWS && col < MAX_COLS {
+        return true;
+    }
+    log::warn!(
+        "xlsx: cell ({row}, {col}) is outside Excel's {MAX_ROWS}x{MAX_COLS} grid; \
+         the value was not written"
+    );
+    false
+}
+
+/// Make a worksheet name Excel will accept: 1-31 characters, none of
+/// `[ ] : * ? / \`, and unique within the workbook.
+///
+/// Names were previously written verbatim, so a 40-character name or one
+/// containing `/` produced a workbook Excel refuses to open. Sanitising is
+/// preferred to failing: the caller's data still reaches the file.
+fn sanitize_sheet_name(name: &str, existing: &[String]) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if matches!(c, '[' | ']' | ':' | '*' | '?' | '/' | '\\') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    // Excel also rejects a leading or trailing apostrophe.
+    let cleaned = cleaned.trim_matches('\'').to_string();
+    let mut base: String = cleaned.chars().take(31).collect();
+    if base.trim().is_empty() {
+        base = format!("Sheet{}", existing.len() + 1);
+    }
+    if !existing.iter().any(|e| e.eq_ignore_ascii_case(&base)) {
+        return base;
+    }
+    // Disambiguate with a numeric suffix, keeping within the 31-char limit.
+    for n in 2..1000 {
+        let suffix = format!(" ({n})");
+        let keep = 31usize.saturating_sub(suffix.len());
+        let candidate = format!("{}{}", base.chars().take(keep).collect::<String>(), suffix);
+        if !existing.iter().any(|e| e.eq_ignore_ascii_case(&candidate)) {
+            return candidate;
+        }
+    }
+    base
 }
 
 // ---------------------------------------------------------------------------
@@ -592,25 +655,59 @@ impl XlsxWriter {
     }
 
     /// Add a worksheet and return a mutable handle to it.
+    ///
+    /// The name is normalised to what Excel accepts — at most 31 characters,
+    /// no `[ ] : * ? / \\`, non-empty and unique in the workbook. A name that
+    /// collides with an existing sheet gains a numeric suffix rather than
+    /// silently replacing it.
     pub fn add_sheet(&mut self, name: &str) -> SheetData<'_> {
-        self.sheets.push(SheetDataInner::new(name));
+        let name = self.unique_sheet_name(name);
+        self.sheets.push(SheetDataInner::new(&name));
         SheetData(self.sheets.last_mut().unwrap())
     }
 
     /// Add a sheet and return its 0-based index (for use with index-based API).
     pub fn add_sheet_get_index(&mut self, name: &str) -> usize {
-        self.sheets.push(SheetDataInner::new(name));
+        let name = self.unique_sheet_name(name);
+        self.sheets.push(SheetDataInner::new(&name));
         self.sheets.len() - 1
     }
 
+    fn unique_sheet_name(&self, name: &str) -> String {
+        let existing: Vec<String> = self.sheets.iter().map(|s| s.name.clone()).collect();
+        sanitize_sheet_name(name, &existing)
+    }
+
     /// Set a cell value by sheet index.
-    pub fn sheet_set_cell(&mut self, sheet: usize, row: usize, col: usize, value: CellData) {
-        if let Some(s) = self.sheets.get_mut(sheet) {
-            s.set_cell(row, col, value);
+    ///
+    /// Returns `false` — and logs a warning — when `sheet` names no sheet or
+    /// the coordinates fall outside Excel's grid, so a loop with an
+    /// off-by-one sheet index no longer writes a whole column into nothing
+    /// while reporting success.
+    pub fn sheet_set_cell(
+        &mut self,
+        sheet: usize,
+        row: usize,
+        col: usize,
+        value: CellData,
+    ) -> bool {
+        if !in_grid(row, col) {
+            return false;
+        }
+        match self.sheets.get_mut(sheet) {
+            Some(s) => {
+                s.set_cell(row, col, value);
+                true
+            },
+            None => {
+                log::warn!("xlsx: sheet index out of range; the value was not written");
+                false
+            },
         }
     }
 
-    /// Set a cell value with styling by sheet index.
+    /// Set a cell value with styling by sheet index. See [`Self::sheet_set_cell`]
+    /// for the return value.
     pub fn sheet_set_cell_styled(
         &mut self,
         sheet: usize,
@@ -618,9 +715,19 @@ impl XlsxWriter {
         col: usize,
         value: CellData,
         style: CellStyle,
-    ) {
-        if let Some(s) = self.sheets.get_mut(sheet) {
-            s.set_cell_styled(row, col, value, style);
+    ) -> bool {
+        if !in_grid(row, col) {
+            return false;
+        }
+        match self.sheets.get_mut(sheet) {
+            Some(s) => {
+                s.set_cell_styled(row, col, value, style);
+                true
+            },
+            None => {
+                log::warn!("xlsx: sheet index out of range; the value was not written");
+                false
+            },
         }
     }
 
@@ -997,7 +1104,9 @@ impl XlsxWriter {
                 w.write_event(Event::Start(c))?;
                 w.write_event(Event::Start(BytesStart::new("is")))?;
                 w.write_event(Event::Start(BytesStart::new("t")))?;
-                w.write_event(Event::Text(BytesText::new(s)))?;
+                w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(
+                    s,
+                ))))?;
                 w.write_event(Event::End(BytesEnd::new("t")))?;
                 w.write_event(Event::End(BytesEnd::new("is")))?;
                 w.write_event(Event::End(BytesEnd::new("c")))?;
@@ -1005,12 +1114,31 @@ impl XlsxWriter {
             CellData::Number(n) => {
                 let mut c = BytesStart::new("c");
                 c.push_attribute(("r", cell_ref.as_str()));
+                // SpreadsheetML's cell value is an `xsd:double`, which has
+                // no lexical form for NaN or infinity — `<v>inf</v>` and
+                // `<v>NaN</v>` are schema-invalid and Excel refuses to open
+                // the workbook. Write the error value Excel itself produces
+                // for an undefined result instead.
+                if !n.is_finite() {
+                    c.push_attribute(("t", "e"));
+                    if let Some(ref s_val) = s_attr {
+                        c.push_attribute(("s", s_val.as_str()));
+                    }
+                    w.write_event(Event::Start(c))?;
+                    w.write_event(Event::Start(BytesStart::new("v")))?;
+                    w.write_event(Event::Text(BytesText::new("#NUM!")))?;
+                    w.write_event(Event::End(BytesEnd::new("v")))?;
+                    w.write_event(Event::End(BytesEnd::new("c")))?;
+                    return Ok(());
+                }
                 if let Some(ref s_val) = s_attr {
                     c.push_attribute(("s", s_val.as_str()));
                 }
                 w.write_event(Event::Start(c))?;
                 w.write_event(Event::Start(BytesStart::new("v")))?;
-                w.write_event(Event::Text(BytesText::new(&format_number(*n))))?;
+                w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(
+                    &format_number(*n),
+                ))))?;
                 w.write_event(Event::End(BytesEnd::new("v")))?;
                 w.write_event(Event::End(BytesEnd::new("c")))?;
             },
@@ -1023,7 +1151,9 @@ impl XlsxWriter {
                 }
                 w.write_event(Event::Start(c))?;
                 w.write_event(Event::Start(BytesStart::new("v")))?;
-                w.write_event(Event::Text(BytesText::new(if *b { "1" } else { "0" })))?;
+                w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(
+                    if *b { "1" } else { "0" },
+                ))))?;
                 w.write_event(Event::End(BytesEnd::new("v")))?;
                 w.write_event(Event::End(BytesEnd::new("c")))?;
             },
@@ -1035,7 +1165,9 @@ impl XlsxWriter {
                 }
                 w.write_event(Event::Start(c))?;
                 w.write_event(Event::Start(BytesStart::new("f")))?;
-                w.write_event(Event::Text(BytesText::new(f)))?;
+                w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(
+                    f,
+                ))))?;
                 w.write_event(Event::End(BytesEnd::new("f")))?;
                 w.write_event(Event::End(BytesEnd::new("c")))?;
             },
@@ -1262,7 +1394,9 @@ fn build_drawing_xml(
         }
         // <a:t>text</a:t>
         w.write_event(Event::Start(BytesStart::new("a:t")))?;
-        w.write_event(Event::Text(quick_xml::events::BytesText::new(trimmed)))?;
+        w.write_event(Event::Text(quick_xml::events::BytesText::new(
+            &crate::core::xml::sanitize_xml_text(trimmed),
+        )))?;
         w.write_event(Event::End(BytesEnd::new("a:t")))?;
         w.write_event(Event::End(BytesEnd::new("a:r")))?;
         w.write_event(Event::End(BytesEnd::new("a:p")))?;

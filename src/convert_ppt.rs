@@ -70,6 +70,10 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
         });
     }
 
+    // Extracted pictures never reached the IR, so every image in a legacy
+    // deck was silently dropped on conversion.
+    crate::convert_xls::append_legacy_images(&mut sections, doc.images());
+
     let title = sections.first().and_then(|s| s.title.clone());
 
     DocumentIR {

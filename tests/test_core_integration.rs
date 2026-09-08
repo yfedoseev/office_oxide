@@ -321,6 +321,7 @@ fn theme_color_ref_with_shade() {
 
     // Accent1 = pure red (255,0,0), with 50% shade = (128,0,0)
     let color = ColorRef::Theme {
+        fallback: None,
         slot: ThemeColorSlot::Accent1,
         tint: None,
         shade: Some(0.5),
@@ -330,6 +331,7 @@ fn theme_color_ref_with_shade() {
 
     // White (255,255,255) with 50% tint = still white (tint lightens)
     let color = ColorRef::Theme {
+        fallback: None,
         slot: ThemeColorSlot::Lt1,
         tint: Some(0.5),
         shade: None,

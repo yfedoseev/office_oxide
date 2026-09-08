@@ -133,19 +133,45 @@ fn parse_plc_pcd(data: &[u8]) -> Result<Vec<Piece>> {
 
 /// Extract text from the WordDocument stream using the piece table.
 pub fn extract_text(word_doc: &[u8], pieces: &[Piece], max_chars: u32) -> String {
+    extract_text_range(word_doc, pieces, 0, max_chars)
+}
+
+/// Extract the text for a character-position range `[cp_start, cp_end)`.
+///
+/// The piece table addresses one contiguous character space that holds the
+/// main document *and* every subdocument in a fixed order: main (`ccpText`),
+/// footnotes (`ccpFtn`), headers/footers (`ccpHdd`), comments (`ccpAtn`),
+/// endnotes (`ccpEdn`), text boxes (`ccpTxbx`) and header text boxes
+/// (`ccpHdrTxbx`). Reading only `[0, ccpText)` — which is all
+/// [`extract_text`] does — leaves every one of those unread, which is why
+/// the FIB's `ccp*` lengths were parsed and then never used.
+pub fn extract_text_range(
+    word_doc: &[u8],
+    pieces: &[Piece],
+    range_start: u32,
+    range_end: u32,
+) -> String {
     let mut text = String::new();
+    if range_end <= range_start {
+        return text;
+    }
+    let max_chars = range_end;
 
     for piece in pieces {
         if piece.cp_start >= max_chars {
             break;
         }
-
-        let char_count = piece.cp_end.min(max_chars) - piece.cp_start;
+        if piece.cp_end <= range_start {
+            continue;
+        }
+        // Clip the piece to the requested range.
+        let skip = range_start.saturating_sub(piece.cp_start);
+        let char_count = piece.cp_end.min(max_chars) - piece.cp_start - skip;
 
         if piece.is_compressed {
             // Compressed: 1 byte per character, CP1252.
             // Actual byte offset = (fc & ~0x40000000) / 2
-            let byte_offset = ((piece.fc & !0x40000000) / 2) as usize;
+            let byte_offset = ((piece.fc & !0x40000000) / 2) as usize + skip as usize;
             let byte_count = char_count as usize;
 
             if byte_offset + byte_count <= word_doc.len() {
@@ -155,7 +181,7 @@ pub fn extract_text(word_doc: &[u8], pieces: &[Piece], max_chars: u32) -> String
             }
         } else {
             // Unicode: 2 bytes per character, UTF-16LE.
-            let byte_offset = piece.fc as usize;
+            let byte_offset = piece.fc as usize + skip as usize * 2;
             let byte_count = char_count as usize * 2;
 
             if byte_offset + byte_count <= word_doc.len() {
@@ -683,5 +709,63 @@ mod tests {
         assert_eq!(sanitize_text("A\x14B"), "AB"); // field separator
         assert_eq!(sanitize_text("A\x15B"), "AB"); // field end
         assert_eq!(sanitize_text("A\x0BB"), "A\nB"); // vertical tab -> newline
+    }
+}
+
+#[cfg(test)]
+mod multi_piece_tests {
+    use super::*;
+
+    /// Build a CLX holding `n` pieces over a Unicode text buffer.
+    fn clx(pieces: &[(u32, u32, u32)]) -> Vec<u8> {
+        let mut plc = Vec::new();
+        for (cp, _, _) in pieces {
+            plc.extend_from_slice(&cp.to_le_bytes());
+        }
+        plc.extend_from_slice(&pieces.last().unwrap().1.to_le_bytes());
+        for (_, _, fc) in pieces {
+            plc.extend_from_slice(&0u16.to_le_bytes());
+            plc.extend_from_slice(&fc.to_le_bytes());
+            plc.extend_from_slice(&0u16.to_le_bytes());
+        }
+        let mut out = vec![0x02];
+        out.extend_from_slice(&(plc.len() as u32).to_le_bytes());
+        out.extend_from_slice(&plc);
+        out
+    }
+
+    /// A document acquires multiple pieces through ordinary editing
+    /// history, so this is a common shape rather than an exotic one.
+    /// `lcbClx = 45` is exactly the three-piece size from issue #168.
+    #[test]
+    fn a_three_piece_table_extracts_every_piece() {
+        let text: Vec<u8> = "ABCDEF"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        let mut word_doc = vec![0u8; 512];
+        word_doc.extend_from_slice(&text);
+        let base = 512u32;
+        let c = clx(&[(0, 2, base), (2, 4, base + 4), (4, 6, base + 8)]);
+        assert_eq!(c.len(), 45, "the three-piece CLX size from the report");
+
+        let pieces = parse_clx(&c).expect("parse");
+        assert_eq!(pieces.len(), 3);
+        assert_eq!(extract_text(&word_doc, &pieces, 6), "ABCDEF");
+    }
+
+    /// Ranges must be clipped at both ends, which is what lets the
+    /// subdocuments be read out of the same character space.
+    #[test]
+    fn a_range_starting_mid_piece_is_clipped_at_both_ends() {
+        let text: Vec<u8> = "ABCDEF"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        let mut word_doc = vec![0u8; 512];
+        word_doc.extend_from_slice(&text);
+        let c = clx(&[(0, 6, 512)]);
+        let pieces = parse_clx(&c).expect("parse");
+        assert_eq!(extract_text_range(&word_doc, &pieces, 2, 5), "CDE");
     }
 }

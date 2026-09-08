@@ -47,21 +47,6 @@ impl CoreProperties {
         // State: which element are we inside?
         // Since we no longer have namespace resolution, we match on local name only.
         // The element names are unique enough across namespaces to be unambiguous.
-        enum Ctx {
-            None,
-            Title,
-            Subject,
-            Creator,
-            Keywords,
-            Description,
-            LastModifiedBy,
-            Revision,
-            Created,
-            Modified,
-            Category,
-            ContentStatus,
-            Language,
-        }
         let mut ctx = Ctx::None;
 
         loop {
@@ -86,26 +71,15 @@ impl CoreProperties {
                         _ => Ctx::None,
                     };
                 },
+                // Entity references arrive as their own event; a property
+                // value like `Smith &amp; Co` would otherwise lose the `&`.
+                Event::GeneralRef(ref e) => {
+                    let text = crate::core::xml::resolve_general_ref(e)?;
+                    append_ctx(&mut props, ctx, &text);
+                },
                 Event::Text(ref e) => {
                     let text = crate::core::xml::unescape_text(e)?;
-                    if text.is_empty() {
-                        continue;
-                    }
-                    match ctx {
-                        Ctx::Title => props.title = Some(text),
-                        Ctx::Subject => props.subject = Some(text),
-                        Ctx::Creator => props.creator = Some(text),
-                        Ctx::Keywords => props.keywords = Some(text),
-                        Ctx::Description => props.description = Some(text),
-                        Ctx::LastModifiedBy => props.last_modified_by = Some(text),
-                        Ctx::Revision => props.revision = Some(text),
-                        Ctx::Created => props.created = Some(text),
-                        Ctx::Modified => props.modified = Some(text),
-                        Ctx::Category => props.category = Some(text),
-                        Ctx::ContentStatus => props.content_status = Some(text),
-                        Ctx::Language => props.language = Some(text),
-                        Ctx::None => {},
-                    }
+                    append_ctx(&mut props, ctx, &text);
                 },
                 Event::End(_) => {
                     ctx = Ctx::None;
@@ -165,7 +139,7 @@ fn write_optional_element(w: &mut Writer<Vec<u8>>, tag: &str, value: Option<&str
     if let Some(text) = value {
         w.write_event(Event::Start(BytesStart::new(tag)))
             .expect("write start");
-        w.write_event(Event::Text(BytesText::new(text)))
+        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(text))))
             .expect("write text");
         w.write_event(Event::End(BytesEnd::new(tag)))
             .expect("write end");
@@ -176,10 +150,81 @@ fn write_datetime_element(w: &mut Writer<Vec<u8>>, tag: &str, value: &str) {
     let mut elem = BytesStart::new(tag);
     elem.push_attribute(("xsi:type", "dcterms:W3CDTF"));
     w.write_event(Event::Start(elem)).expect("write start");
-    w.write_event(Event::Text(BytesText::new(value)))
+    w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(value))))
         .expect("write text");
     w.write_event(Event::End(BytesEnd::new(tag)))
         .expect("write end");
+}
+
+/// Which `docProps/core.xml` element the reader is currently inside.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ctx {
+    None,
+    Title,
+    Subject,
+    Creator,
+    Keywords,
+    Description,
+    LastModifiedBy,
+    Revision,
+    Created,
+    Modified,
+    Category,
+    ContentStatus,
+    Language,
+}
+
+/// Append a text fragment to the core property named by `ctx`.
+///
+/// A single property value can arrive as several events — text split around
+/// an entity reference, for example — so fragments accumulate rather than
+/// overwrite.
+fn append_ctx(props: &mut CoreProperties, ctx: Ctx, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let slot = match ctx {
+        Ctx::Title => &mut props.title,
+        Ctx::Subject => &mut props.subject,
+        Ctx::Creator => &mut props.creator,
+        Ctx::Keywords => &mut props.keywords,
+        Ctx::Description => &mut props.description,
+        Ctx::LastModifiedBy => &mut props.last_modified_by,
+        Ctx::Revision => &mut props.revision,
+        Ctx::Created => &mut props.created,
+        Ctx::Modified => &mut props.modified,
+        Ctx::Category => &mut props.category,
+        Ctx::ContentStatus => &mut props.content_status,
+        Ctx::Language => &mut props.language,
+        Ctx::None => return,
+    };
+    slot.get_or_insert_with(String::new).push_str(text);
+}
+
+/// Read and parse `docProps/core.xml` from an open OPC package.
+///
+/// Resolves the part through the package-level `core-properties`
+/// relationship and falls back to the conventional `/docProps/core.xml`
+/// path for packages that omit the relationship. Returns `None` when the
+/// part is absent or unparseable — document metadata is decoration, never
+/// a reason to fail opening a file.
+pub fn read_core_properties<R: std::io::Read + std::io::Seek>(
+    opc: &mut super::opc::OpcReader<R>,
+) -> Option<CoreProperties> {
+    let part = opc
+        .package_rels()
+        .first_by_type(super::relationships::rel_types::CORE_PROPERTIES)
+        .and_then(|rel| {
+            super::opc::PartName::new(&format!("/{}", rel.target.trim_start_matches('/'))).ok()
+        })
+        .filter(|p| opc.has_part(p))
+        .or_else(|| {
+            super::opc::PartName::new("/docProps/core.xml")
+                .ok()
+                .filter(|p| opc.has_part(p))
+        })?;
+    let data = opc.read_part(&part).ok()?;
+    CoreProperties::parse(&data).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -313,7 +358,7 @@ fn write_optional_u32(w: &mut Writer<Vec<u8>>, tag: &str, value: Option<u32>) {
         let s = v.to_string();
         w.write_event(Event::Start(BytesStart::new(tag)))
             .expect("write start");
-        w.write_event(Event::Text(BytesText::new(&s)))
+        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(&s))))
             .expect("write text");
         w.write_event(Event::End(BytesEnd::new(tag)))
             .expect("write end");

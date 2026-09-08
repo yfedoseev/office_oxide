@@ -63,6 +63,19 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             }
         }
 
+        // Slide comments are review content that reached no consumer at
+        // all. Carry them as endnotes so every renderer sees them.
+        for (i, c) in slide.comments.iter().enumerate() {
+            elements.push(Element::Endnote(Note {
+                id: i as u32,
+                marker: c.author.clone(),
+                content: vec![Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(c.text.clone()))],
+                    ..Default::default()
+                })],
+            }));
+        }
+
         // Each PPTX slide is its own page when rendered to PDF or
         // any paginated format. Default `Continuous` would let two
         // slides share a page, which is wrong for slide content.
@@ -78,17 +91,32 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             break_type,
             page_setup: page_setup.clone(),
             background_rgb,
+            hidden: slide.hidden,
             ..Default::default()
         });
     }
 
-    let title = sections.first().and_then(|s| s.title.clone());
+    // The first slide's *title* is not the deck's title. Read the real one
+    // from `docProps/core.xml`, falling back to the slide title.
+    let cp = doc.core_properties.as_ref();
+    let title = cp
+        .and_then(|c| c.title.clone())
+        .filter(|t| !t.is_empty())
+        .or_else(|| sections.first().and_then(|s| s.title.clone()));
 
     DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Pptx,
             title,
-            ..Default::default()
+            author: cp.and_then(|c| c.creator.clone()),
+            subject: cp.and_then(|c| c.subject.clone()),
+            keywords: cp
+                .and_then(|c| c.keywords.as_deref())
+                .map(crate::convert_docx::split_keywords)
+                .unwrap_or_default(),
+            created: cp.and_then(|c| c.created.clone()),
+            modified: cp.and_then(|c| c.modified.clone()),
+            description: cp.and_then(|c| c.description.clone()),
         },
         sections,
     }
@@ -229,11 +257,29 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
                 convert_shape(child, elements);
             }
         },
-        crate::pptx::Shape::GraphicFrame(gf) => {
-            if let crate::pptx::GraphicContent::Table(ref tbl) = gf.content {
+        crate::pptx::Shape::GraphicFrame(gf) => match gf.content {
+            crate::pptx::GraphicContent::Table(ref tbl) => {
                 let table_el = convert_pptx_table(tbl);
                 push_positional_textbox(elements, vec![table_el], gf.position.as_ref());
-            }
+            },
+            // SmartArt / chart text. We don't draw the graphic, but its
+            // words are document content and used to be dropped entirely —
+            // a deck built out of SmartArt extracted as empty.
+            crate::pptx::GraphicContent::Text(ref lines) => {
+                let paras: Vec<Element> = lines
+                    .iter()
+                    .map(|t| {
+                        Element::Paragraph(Paragraph {
+                            content: vec![InlineContent::Text(TextSpan::plain(t.clone()))],
+                            ..Default::default()
+                        })
+                    })
+                    .collect();
+                if !paras.is_empty() {
+                    push_positional_textbox(elements, paras, gf.position.as_ref());
+                }
+            },
+            crate::pptx::GraphicContent::Unknown => {},
         },
         crate::pptx::Shape::Connector(_) => {},
     }
@@ -275,16 +321,51 @@ fn push_positional_textbox(
 }
 
 fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) {
-    // Check if any paragraph has level > 0 — treat as list
-    let has_levels = body.paragraphs.iter().any(|p| p.level > 0);
+    use crate::pptx::BulletStyle;
+
+    // A paragraph is a list item when it is indented *or* when it declares
+    // a bullet. Keying only off `level > 0` meant a body placeholder whose
+    // bullets all sit at level 0 — the ordinary single-level bullet list —
+    // came out as plain paragraphs with no markers, and `<a:buAutoNum>`
+    // numbering was lost entirely.
+    let declares_bullet = body
+        .paragraphs
+        .iter()
+        .any(|p| matches!(p.bullet, Some(BulletStyle::Char(_) | BulletStyle::AutoNum { .. })));
+    let has_levels = body.paragraphs.iter().any(|p| p.level > 0) || declares_bullet;
 
     if has_levels {
-        // Convert paragraphs with levels to list items
+        // The shallowest bulleted paragraph decides the list's marker
+        // style and start value.
         let mut items = Vec::new();
+        let mut top_level: Option<u32> = None;
+        let mut ordered = false;
+        let mut style: Option<ListStyle> = None;
+        let mut start_number: Option<u32> = None;
         for para in &body.paragraphs {
+            if top_level.is_none_or(|t| para.level < t) {
+                if let Some(b) = para.bullet.as_ref() {
+                    top_level = Some(para.level);
+                    match b {
+                        BulletStyle::AutoNum { scheme, start_at } => {
+                            ordered = true;
+                            style = Some(auto_num_style(scheme));
+                            start_number = start_at.filter(|&n| n != 1);
+                        },
+                        BulletStyle::Char(_) => {
+                            ordered = false;
+                            style = Some(ListStyle::Bullet);
+                        },
+                        BulletStyle::None => {},
+                    }
+                }
+            }
             items.push((para.level as u8, convert_text_paragraph_inline(para)));
         }
-        elements.push(Element::List(crate::ir::build_nested_list(false, &items, 0)));
+        let mut list = crate::ir::build_nested_list(ordered, &items, 0);
+        list.style = style;
+        list.start_number = start_number;
+        elements.push(Element::List(list));
     } else {
         for para in &body.paragraphs {
             let content = convert_text_paragraph_inline(para);
@@ -318,12 +399,38 @@ fn convert_text_paragraph_inline(para: &crate::pptx::TextParagraph) -> Vec<Inlin
                 if !run.text.is_empty() {
                     let hyperlink = run.hyperlink.as_ref().and_then(|h| match &h.target {
                         crate::pptx::HyperlinkTarget::External(url) => Some(url.clone()),
+                        crate::pptx::HyperlinkTarget::Internal(loc) if !loc.is_empty() => {
+                            Some(format!("#{loc}"))
+                        },
                         crate::pptx::HyperlinkTarget::Internal(_) => None,
                     });
                     let font_size_half_pt = run.font_size_hundredths_pt.map(|hp| {
                         crate::core::units::HalfPoint::from_drawingml_sz(hp)
                             .0
                             .max(1)
+                    });
+                    // `u`, `latin@typeface`, `baseline`, `cap` and `spc`
+                    // all reach the IR from DOCX; they used to stop here
+                    // for PPTX, so the same formatting survived one format
+                    // and not the other.
+                    let underline = run.underline.as_deref().map(|u| match u {
+                        "none" => UnderlineStyle::None,
+                        "dbl" => UnderlineStyle::Double,
+                        "heavy" | "wavyHeavy" => UnderlineStyle::Thick,
+                        "dotted" | "dottedHeavy" => UnderlineStyle::Dotted,
+                        "dash" | "dashHeavy" | "dashLong" | "dashLongHeavy" => UnderlineStyle::Dash,
+                        "dotDash" | "dotDashHeavy" => UnderlineStyle::DotDash,
+                        "dotDotDash" | "dotDotDashHeavy" => UnderlineStyle::DotDotDash,
+                        "wavy" | "wavyDbl" => UnderlineStyle::Wave,
+                        "words" => UnderlineStyle::Words,
+                        _ => UnderlineStyle::Single,
+                    });
+                    // `baseline` is in thousandths of a percent of the font
+                    // size: positive raises (superscript), negative lowers.
+                    let vertical_align = run.baseline.map(|b| match b {
+                        0 => VerticalAlign::Baseline,
+                        b if b > 0 => VerticalAlign::Superscript,
+                        _ => VerticalAlign::Subscript,
                     });
                     content.push(InlineContent::Text(TextSpan {
                         text: run.text.clone(),
@@ -333,6 +440,15 @@ fn convert_text_paragraph_inline(para: &crate::pptx::TextParagraph) -> Vec<Inlin
                         hyperlink,
                         font_size_half_pt,
                         color: run.color_rgb,
+                        underline,
+                        font_name: run.font_name.clone(),
+                        vertical_align,
+                        all_caps: run.caps.as_deref() == Some("all"),
+                        small_caps: run.caps.as_deref() == Some("small"),
+                        // DrawingML `spc` is hundredths of a point; the IR
+                        // field uses the twentieths-of-a-point units the
+                        // DOCX writer emits, so scale by 1/5.
+                        char_spacing_half_pt: run.char_spacing_hundredths_pt.map(|s| s / 5),
                         ..Default::default()
                     }));
                 }
@@ -350,8 +466,20 @@ fn convert_text_paragraph_inline(para: &crate::pptx::TextParagraph) -> Vec<Inlin
     content
 }
 
+/// Map an `<a:buAutoNum type="…">` scheme onto the IR's marker style.
+fn auto_num_style(scheme: &str) -> ListStyle {
+    match scheme {
+        s if s.starts_with("alphaLc") => ListStyle::LowerAlpha,
+        s if s.starts_with("alphaUc") => ListStyle::UpperAlpha,
+        s if s.starts_with("romanLc") => ListStyle::LowerRoman,
+        s if s.starts_with("romanUc") => ListStyle::UpperRoman,
+        _ => ListStyle::Decimal,
+    }
+}
+
 fn convert_pptx_table(table: &crate::pptx::Table) -> Element {
     let mut ir_rows = Vec::new();
+    let last_idx = table.rows.len().saturating_sub(1);
 
     for (row_idx, row) in table.rows.iter().enumerate() {
         let mut ir_cells = Vec::new();
@@ -384,9 +512,14 @@ fn convert_pptx_table(table: &crate::pptx::Table) -> Element {
             });
         }
 
+        // `<a:tblPr firstRow="1">` is how a DrawingML table declares a
+        // header row. Assuming row 0 is always one labelled ordinary data
+        // as headers in every table that declares none.
         ir_rows.push(TableRow {
             cells: ir_cells,
-            is_header: row_idx == 0,
+            is_header: (row_idx == 0 && table.first_row_header)
+                || (row_idx == last_idx && row_idx != 0 && table.last_row_header),
+            repeat_as_header: row_idx == 0 && table.first_row_header,
             ..Default::default()
         });
     }

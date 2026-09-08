@@ -261,7 +261,8 @@ pub struct IrParaProps {
     pub page_break_before: bool,
     /// Background shading color as `[R, G, B]`.
     pub background_color: Option<[u8; 3]>,
-    /// Outline level (0 = body text, 1–9 = heading levels).
+    /// Outline level in ECMA-376 §17.3.1.20's value space: `0` = Heading 1,
+    /// … `9` = no outline level (body text).
     pub outline_level: Option<u8>,
     /// Paragraph border definition.
     pub border: Option<crate::ir::ParagraphBorder>,
@@ -1250,7 +1251,7 @@ fn convert_ir_element_to_docx_elements(elem: &crate::ir::Element, out: &mut Vec<
             out.push(DocxElement::RichParagraph(DocxRichParagraph { runs, props }));
         },
         E::Heading(h) => {
-            let level = h.level.clamp(1, 6);
+            let level = h.clamped_level();
             let runs = ir_inline_to_runs(&h.content);
             let props = IrParaProps {
                 style: Some(format!("Heading{level}")),
@@ -1755,7 +1756,7 @@ fn write_field_run(w: &mut Writer<Vec<u8>>, run: &Run, instr: &str) {
     it.push_attribute(("xml:space", "preserve"));
     w.write_event(Event::Start(it))
         .expect("write instrText start");
-    w.write_event(Event::Text(BytesText::new(instr)))
+    w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(instr))))
         .expect("write instrText");
     w.write_event(Event::End(BytesEnd::new("w:instrText")))
         .expect("write instrText end");
@@ -1809,7 +1810,7 @@ fn write_run(w: &mut Writer<Vec<u8>>, run: &Run) {
             t_elem.push_attribute(("xml:space", "preserve"));
         }
         w.write_event(Event::Start(t_elem)).expect("write t start");
-        w.write_event(Event::Text(BytesText::new(text)))
+        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(text))))
             .expect("write text");
         w.write_event(Event::End(BytesEnd::new("w:t")))
             .expect("write t end");
@@ -2286,7 +2287,7 @@ fn write_text_box(
     let x_str = tb.x_emu.to_string();
     w.write_event(Event::Start(BytesStart::new("wp:posOffset")))
         .expect("write posOffset start");
-    w.write_event(Event::Text(BytesText::new(&x_str)))
+    w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(&x_str))))
         .expect("write posOffset text");
     w.write_event(Event::End(BytesEnd::new("wp:posOffset")))
         .expect("write posOffset end");
@@ -2300,7 +2301,7 @@ fn write_text_box(
     let y_str = tb.y_emu.to_string();
     w.write_event(Event::Start(BytesStart::new("wp:posOffset")))
         .expect("write posOffset start");
-    w.write_event(Event::Text(BytesText::new(&y_str)))
+    w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(&y_str))))
         .expect("write posOffset text");
     w.write_event(Event::End(BytesEnd::new("wp:posOffset")))
         .expect("write posOffset end");
@@ -2574,7 +2575,7 @@ fn write_floating_image_run(
     let x_str = fi.x_emu.to_string();
     w.write_event(Event::Start(BytesStart::new("wp:posOffset")))
         .expect("write posOffset start");
-    w.write_event(Event::Text(BytesText::new(&x_str)))
+    w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(&x_str))))
         .expect("write posOffset text");
     w.write_event(Event::End(BytesEnd::new("wp:posOffset")))
         .expect("write posOffset end");
@@ -2588,7 +2589,7 @@ fn write_floating_image_run(
     let y_str = fi.y_emu.to_string();
     w.write_event(Event::Start(BytesStart::new("wp:posOffset")))
         .expect("write posOffset start");
-    w.write_event(Event::Text(BytesText::new(&y_str)))
+    w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(&y_str))))
         .expect("write posOffset text");
     w.write_event(Event::End(BytesEnd::new("wp:posOffset")))
         .expect("write posOffset end");
@@ -3028,7 +3029,7 @@ fn generate_core_props_xml(props: &CoreProps) -> Vec<u8> {
     if let Some(ref v) = props.title {
         w.write_event(Event::Start(BytesStart::new("dc:title")))
             .expect("write title start");
-        w.write_event(Event::Text(BytesText::new(v)))
+        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
             .expect("write title text");
         w.write_event(Event::End(BytesEnd::new("dc:title")))
             .expect("write title end");
@@ -3036,7 +3037,7 @@ fn generate_core_props_xml(props: &CoreProps) -> Vec<u8> {
     if let Some(ref v) = props.subject {
         w.write_event(Event::Start(BytesStart::new("dc:subject")))
             .expect("write subject start");
-        w.write_event(Event::Text(BytesText::new(v)))
+        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
             .expect("write subject text");
         w.write_event(Event::End(BytesEnd::new("dc:subject")))
             .expect("write subject end");
@@ -3044,7 +3045,7 @@ fn generate_core_props_xml(props: &CoreProps) -> Vec<u8> {
     if let Some(ref v) = props.author {
         w.write_event(Event::Start(BytesStart::new("dc:creator")))
             .expect("write creator start");
-        w.write_event(Event::Text(BytesText::new(v)))
+        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
             .expect("write creator text");
         w.write_event(Event::End(BytesEnd::new("dc:creator")))
             .expect("write creator end");
@@ -3052,7 +3053,7 @@ fn generate_core_props_xml(props: &CoreProps) -> Vec<u8> {
     if let Some(ref v) = props.description {
         w.write_event(Event::Start(BytesStart::new("dc:description")))
             .expect("write desc start");
-        w.write_event(Event::Text(BytesText::new(v)))
+        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
             .expect("write desc text");
         w.write_event(Event::End(BytesEnd::new("dc:description")))
             .expect("write desc end");
@@ -3060,7 +3061,7 @@ fn generate_core_props_xml(props: &CoreProps) -> Vec<u8> {
     if let Some(ref v) = props.keywords {
         w.write_event(Event::Start(BytesStart::new("cp:keywords")))
             .expect("write kw start");
-        w.write_event(Event::Text(BytesText::new(v)))
+        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
             .expect("write kw text");
         w.write_event(Event::End(BytesEnd::new("cp:keywords")))
             .expect("write kw end");
@@ -3070,7 +3071,7 @@ fn generate_core_props_xml(props: &CoreProps) -> Vec<u8> {
         elem.push_attribute(("xsi:type", "dcterms:W3CDTF"));
         w.write_event(Event::Start(elem))
             .expect("write created start");
-        w.write_event(Event::Text(BytesText::new(v)))
+        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
             .expect("write created text");
         w.write_event(Event::End(BytesEnd::new("dcterms:created")))
             .expect("write created end");
@@ -3080,7 +3081,7 @@ fn generate_core_props_xml(props: &CoreProps) -> Vec<u8> {
         elem.push_attribute(("xsi:type", "dcterms:W3CDTF"));
         w.write_event(Event::Start(elem))
             .expect("write modified start");
-        w.write_event(Event::Text(BytesText::new(v)))
+        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
             .expect("write modified text");
         w.write_event(Event::End(BytesEnd::new("dcterms:modified")))
             .expect("write modified end");

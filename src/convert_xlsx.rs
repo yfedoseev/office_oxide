@@ -40,6 +40,25 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         // Cap eager row materialisation: an unbounded sheet would build
         // millions of IR cell allocations and then stall the single-table
         // render downstream. Excess rows are dropped and flagged below.
+        // `Worksheet::hyperlinks` was parsed and then never rendered, so
+        // every clickable cell in a workbook lost its target — DOCX and
+        // PPTX both emit links. Index by (row, col) for O(1) lookup.
+        let links: std::collections::HashMap<(u32, u32), String> = ws
+            .hyperlinks
+            .iter()
+            .filter_map(|h| {
+                let r = crate::xlsx::CellRef::parse(&h.cell_ref)?;
+                let target = match &h.target {
+                    crate::xlsx::HyperlinkTarget::External(u) => u.clone(),
+                    crate::xlsx::HyperlinkTarget::Internal(loc) if !loc.is_empty() => {
+                        format!("#{loc}")
+                    },
+                    crate::xlsx::HyperlinkTarget::Internal(_) => return None,
+                };
+                Some(((r.row, r.col), target))
+            })
+            .collect();
+
         let total_rows = ws.rows.len();
         let mut parsed_rows: Vec<Vec<CellData>> =
             Vec::with_capacity(total_rows.min(MAX_ROWS_PER_SHEET));
@@ -56,6 +75,10 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 let (data_type, raw_number, number_format, number_format_id) =
                     cell_semantics(doc, cell, &date_indices);
                 cells.push(CellData {
+                    col: cell.reference.col,
+                    hyperlink: links
+                        .get(&(cell.reference.row, cell.reference.col))
+                        .cloned(),
                     text,
                     style_index: cell.style_index,
                     data_type,
@@ -70,6 +93,17 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             }
             parsed_rows.push(cells);
         }
+
+        // Widest column actually used, so every emitted row is the same
+        // length and each value sits under its own header.
+        // Widest index seen anywhere in the row, not the index of its last
+        // cell: cells are not guaranteed to arrive in ascending column order,
+        // and a short grid truncates every row laid out against it.
+        let grid_width = parsed_rows
+            .iter()
+            .filter_map(|cells| cells.iter().map(|cd| cd.col as usize + 1).max())
+            .max()
+            .unwrap_or(0);
 
         // Decide row layout: a worksheet whose rows mostly have at most one
         // non-empty cell is "document style" — flowing text laid out one
@@ -176,26 +210,8 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 let Some(cd) = cells.iter().find(|cd| !cd.text.is_empty()) else {
                     continue;
                 };
-                let mut span = TextSpan::plain(cd.text.clone());
-                if let Some(idx) = cd.style_index {
-                    if let Some(font) = font_for(doc, idx) {
-                        if let Some(size_pt) = font.size {
-                            // XLSX cell font size is in points (`<font><sz val="N"/>`
-                            // where N is f32). IR uses half-points; same
-                            // half-pt convention as DOCX/PPTX read paths.
-                            span.font_size_half_pt =
-                                Some(crate::core::units::HalfPoint::from_points_rounded(size_pt).0);
-                        }
-                        if font.bold {
-                            span.bold = true;
-                        }
-                        if font.italic {
-                            span.italic = true;
-                        }
-                    }
-                }
                 out.push(Element::Paragraph(Paragraph {
-                    content: vec![InlineContent::Text(span)],
+                    content: vec![InlineContent::Text(cell_span(doc, cd))],
                     ..Default::default()
                 }));
             }
@@ -204,14 +220,20 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             // Genuine grid → emit a Table.
             let mut rows: Vec<TableRow> = Vec::with_capacity(parsed_rows.len());
             for (row_idx, cells) in parsed_rows.iter().enumerate() {
-                let mut tcells: Vec<TableCell> = Vec::with_capacity(cells.len());
+                // Lay the row out on the grid: a cell goes at its own column
+                // index and skipped columns become empty cells, so `B2`
+                // stays under the `B` header even when `A2` is absent.
+                let mut tcells: Vec<TableCell> = Vec::with_capacity(grid_width);
                 for cd in cells {
                     let content = if cd.text.is_empty() {
                         Vec::new()
                     } else {
-                        vec![InlineContent::Text(TextSpan::plain(cd.text.clone()))]
+                        // Cell font formatting reached the IR in prose mode
+                        // but not here, so the same cell rendered differently
+                        // depending on the shape of the sheet around it.
+                        vec![InlineContent::Text(cell_span(doc, cd))]
                     };
-                    tcells.push(TableCell {
+                    let cell = TableCell {
                         content: vec![Element::Paragraph(Paragraph {
                             content,
                             ..Default::default()
@@ -223,7 +245,25 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                         number_format: cd.number_format.clone(),
                         number_format_id: cd.number_format_id,
                         ..Default::default()
-                    });
+                    };
+                    while tcells.len() < cd.col as usize {
+                        tcells.push(empty_cell());
+                    }
+                    match tcells.get_mut(cd.col as usize) {
+                        // The column is already occupied: cells arrived out of
+                        // order, or two of them share a reference. Fill the
+                        // slot if it is still blank, otherwise keep the first
+                        // value — either way, never drop the rest of the row.
+                        Some(slot) => {
+                            if cell_is_blank(slot) {
+                                *slot = cell;
+                            }
+                        },
+                        None => tcells.push(cell),
+                    }
+                }
+                while tcells.len() < grid_width {
+                    tcells.push(empty_cell());
                 }
                 rows.push(TableRow {
                     cells: tcells,
@@ -290,6 +330,25 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         let mut combined: Vec<Element> = image_elements;
         combined.extend(elements);
 
+        // Cell comments are document content — review notes, provenance,
+        // caveats on a figure — and were never surfaced anywhere. Append
+        // them as endnotes so every renderer sees them, with the author and
+        // cell in the marker.
+        for (i, c) in ws.comments.iter().enumerate() {
+            let marker = match c.author.as_deref() {
+                Some(a) => format!("{} ({a})", c.cell_ref),
+                None => c.cell_ref.clone(),
+            };
+            combined.push(Element::Endnote(Note {
+                id: i as u32,
+                marker: Some(marker),
+                content: vec![Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(c.text.clone()))],
+                    ..Default::default()
+                })],
+            }));
+        }
+
         // Graceful truncation notice: when the sheet exceeded the row cap,
         // the dropped rows are not silently lost — a visible paragraph records
         // how many rows were omitted so downstream text/markdown/PDF makes the
@@ -309,6 +368,11 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             elements: combined,
             page_setup,
             break_type,
+            hidden: doc
+                .workbook
+                .sheets
+                .get(ws_idx)
+                .is_some_and(|s| s.state != crate::xlsx::SheetState::Visible),
             ..Default::default()
         });
     }
@@ -340,22 +404,83 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         });
     }
 
-    let title = sections.first().and_then(|s| s.title.clone());
+    // The first sheet's *name* is not the workbook's title. Read the real
+    // one from `docProps/core.xml` and fall back to the sheet name only
+    // when the package carries no core properties.
+    let cp = doc.core_properties.as_ref();
+    let title = cp
+        .and_then(|c| c.title.clone())
+        .filter(|t| !t.is_empty())
+        .or_else(|| sections.first().and_then(|s| s.title.clone()));
 
     DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Xlsx,
             title,
-            ..Default::default()
+            author: cp.and_then(|c| c.creator.clone()),
+            subject: cp.and_then(|c| c.subject.clone()),
+            keywords: cp
+                .and_then(|c| c.keywords.as_deref())
+                .map(crate::convert_docx::split_keywords)
+                .unwrap_or_default(),
+            created: cp.and_then(|c| c.created.clone()),
+            modified: cp.and_then(|c| c.modified.clone()),
+            description: cp.and_then(|c| c.description.clone()),
         },
         sections,
     }
+}
+
+/// A grid position with no cell in the source.
+/// True when a laid-out cell still holds nothing, so a later cell claiming
+/// the same column may take the slot rather than be discarded.
+fn cell_is_blank(cell: &TableCell) -> bool {
+    cell.content.iter().all(|el| match el {
+        Element::Paragraph(p) => p.content.is_empty(),
+        _ => false,
+    })
+}
+
+fn empty_cell() -> TableCell {
+    TableCell {
+        content: vec![Element::Paragraph(Paragraph::default())],
+        col_span: 1,
+        row_span: 1,
+        ..Default::default()
+    }
+}
+
+/// Build the styled span for a cell: display text, the cell font's size and
+/// weight from the workbook stylesheet, and the sheet's hyperlink target if
+/// the cell has one.
+fn cell_span(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> TextSpan {
+    let mut span = TextSpan::plain(cd.text.clone());
+    span.hyperlink = cd.hyperlink.clone();
+    let Some(font) = cd.style_index.and_then(|idx| font_for(doc, idx)) else {
+        return span;
+    };
+    if let Some(size_pt) = font.size {
+        // XLSX cell font size is in points (`<font><sz val="N"/>` where N is
+        // f32). IR uses half-points; same convention as the DOCX/PPTX paths.
+        span.font_size_half_pt =
+            Some(crate::core::units::HalfPoint::from_points_rounded(size_pt).0);
+    }
+    span.bold = font.bold;
+    span.italic = font.italic;
+    span
 }
 
 /// A parsed spreadsheet cell carried through `xlsx_to_ir`: the rendered
 /// display string plus the structured facts needed to populate the IR's
 /// semantic `TableCell` fields (issue #72).
 struct CellData {
+    /// 0-based grid column this cell occupies. Without it, cells were
+    /// emitted in encounter order, so a row that skips a column (perfectly
+    /// legal — XLSX stores only non-empty cells) shifted every later value
+    /// one column left and filed it under the wrong header.
+    col: u32,
+    /// Hyperlink target for this cell, when the sheet declares one.
+    hyperlink: Option<String>,
     /// Rendered display string (same text `write_cell_value_fast` produces).
     text: String,
     /// Cell format index (`s` attribute) — used for prose-mode font recovery.

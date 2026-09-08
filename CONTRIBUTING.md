@@ -338,12 +338,26 @@ mod tests {
 Name the test after the **defect class** it guards (`heading_style_becomes_a_heading`),
 not after an issue or PR number.
 
+#### File naming
+
+Every file in `tests/` is named `test_<area>.rs` — `test_docx_integration.rs`,
+`test_robustness_and_safety.rs`. The prefix makes test files sort together and
+makes it unambiguous, in a diff or a grep, that a file is a test rather than a
+fixture or a helper.
+
+The one exception is `tests/common/`, which holds shared builders rather than
+tests; Cargo would otherwise compile it as its own test binary.
+
+Tests in the other bindings keep their own ecosystem's convention, which is
+mandatory or idiomatic there and not ours to override: `*_test.go` (Go
+requires it), `*.test.mjs` (Node), `*Tests.cs` (.NET).
+
 Ready-made builders already exist — reuse them rather than writing another:
 
 - `tests/common/mod.rs` — a synthetic `.doc` writer (`build_doc`, `open_doc`,
   `prose_grpprl`, `row_grpprl`, `cell_grpprl`) that emits a real CFB/OLE2 container.
-- `tests/docx_integration.rs` — `DocxBuilder`, which assembles a minimal OPC package
-  part by part.
+- `tests/test_docx_integration.rs` — `DocxBuilder`, which assembles a minimal OPC
+  package part by part.
 
 ### Integration Tests
 

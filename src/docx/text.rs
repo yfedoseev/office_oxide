@@ -13,9 +13,19 @@ use super::table::Table;
 
 impl DocxDocument {
     /// Extract all text as a plain string. Paragraphs are separated by newlines.
+    ///
+    /// Headers and footers are included, matching `to_markdown` and the IR
+    /// renderers. All three used to disagree, so a consumer's word count
+    /// changed depending on which method they called.
     pub fn plain_text(&self) -> String {
         let mut out = String::new();
+        for hf in self.headers_footers.iter().filter(|h| h.is_header) {
+            plain_text_blocks(&hf.content, &mut out);
+        }
         plain_text_blocks(&self.body.elements, &mut out);
+        for hf in self.headers_footers.iter().filter(|h| !h.is_header) {
+            plain_text_blocks(&hf.content, &mut out);
+        }
         // Trim trailing newlines
         while out.ends_with('\n') {
             out.pop();
@@ -119,6 +129,23 @@ fn plain_text_run(run: &Run, out: &mut String) {
             RunContent::Break(BreakType::Page | BreakType::Column) => out.push('\n'),
             RunContent::Tab => out.push('\t'),
             RunContent::Drawing(_) => {},
+            // Text-box prose is document content — in some real files it is
+            // most of the document (issue #102). It is *block* content, so
+            // it must be separated from the surrounding run: pasting it in
+            // bare fused the last word of a text box to the first word after
+            // it (`Linz` + `ANTRAG` -> `LinzANTRAG`).
+            RunContent::TextBox(blocks) => {
+                let mut inner = String::new();
+                plain_text_blocks(blocks, &mut inner);
+                let inner = inner.trim();
+                if !inner.is_empty() {
+                    if !out.is_empty() && !out.ends_with(['\n', ' ', '\t']) {
+                        out.push('\n');
+                    }
+                    out.push_str(inner);
+                    out.push('\n');
+                }
+            },
         }
     }
 }
@@ -186,18 +213,41 @@ fn markdown_blocks(elements: &[BlockElement], ctx: &MarkdownCtx, out: &mut Strin
 
                 // Heading prefix
                 if let Some(level) = heading_level {
-                    let hashes = "#".repeat(level.min(9));
+                    // One definition of the valid heading range, shared with the IR
+                    // renderers: `min(9)` emitted up to nine `#`, which no
+                    // markdown reader treats as a heading at all.
+                    let hashes = "#".repeat(level.clamp(1, 6));
                     out.push_str(&hashes);
                     out.push(' ');
                 } else if let Some(ref prefix) = list_prefix {
                     out.push_str(prefix);
                 }
 
-                // Render paragraph content with inline formatting
+                // Render paragraph content with inline formatting.
+                // Consecutive runs sharing formatting are merged, because
+                // Word splits one visually-bold phrase into several runs
+                // routinely and wrapping each separately emits `****`,
+                // which CommonMark reads as four literal asterisks.
+                let mut pending: Option<(RunStyle, String)> = None;
                 for content in &p.content {
                     match content {
-                        ParagraphContent::Run(run) => markdown_run(run, out),
+                        ParagraphContent::Run(run) => {
+                            let style = RunStyle::of(run);
+                            let mut text = String::new();
+                            markdown_run_text(run, ctx, &mut text);
+                            if text.is_empty() {
+                                continue;
+                            }
+                            match pending.as_mut() {
+                                Some((cur, buf)) if *cur == style => buf.push_str(&text),
+                                _ => {
+                                    flush_run(&mut pending, out);
+                                    pending = Some((style, text));
+                                },
+                            }
+                        },
                         ParagraphContent::Hyperlink(hl) => {
+                            flush_run(&mut pending, out);
                             let text = runs_to_plain_text(&hl.runs);
                             match &hl.target {
                                 HyperlinkTarget::External(url) => {
@@ -218,6 +268,7 @@ fn markdown_blocks(elements: &[BlockElement], ctx: &MarkdownCtx, out: &mut Strin
                         },
                     }
                 }
+                flush_run(&mut pending, out);
                 out.push('\n');
 
                 // Add extra newline after headings for readability
@@ -232,25 +283,80 @@ fn markdown_blocks(elements: &[BlockElement], ctx: &MarkdownCtx, out: &mut Strin
     }
 }
 
-fn markdown_run(run: &Run, out: &mut String) {
-    let bold = run
-        .properties
-        .as_ref()
-        .and_then(|rp| rp.bold)
-        .unwrap_or(false);
-    let italic = run
-        .properties
-        .as_ref()
-        .and_then(|rp| rp.italic)
-        .unwrap_or(false);
-    let strike = run
-        .properties
-        .as_ref()
-        .and_then(|rp| rp.strike.or(rp.dstrike))
-        .unwrap_or(false);
+/// The run formatting that decides which markdown delimiters apply.
+#[derive(PartialEq)]
+struct RunStyle {
+    bold: bool,
+    italic: bool,
+    strike: bool,
+    vertical_align: Option<super::formatting::VerticalAlign>,
+}
 
-    // Collect text content
-    let mut text = String::new();
+impl RunStyle {
+    fn of(run: &Run) -> Self {
+        let rp = run.properties.as_ref();
+        Self {
+            bold: rp.and_then(|rp| rp.bold).unwrap_or(false),
+            italic: rp.and_then(|rp| rp.italic).unwrap_or(false),
+            strike: rp.and_then(|rp| rp.strike.or(rp.dstrike)).unwrap_or(false),
+            vertical_align: rp.and_then(|rp| rp.vertical_align),
+        }
+    }
+}
+
+/// Emit an accumulated run group with one set of delimiters.
+fn flush_run(pending: &mut Option<(RunStyle, String)>, out: &mut String) {
+    let Some((style, text)) = pending.take() else {
+        return;
+    };
+    if text.is_empty() {
+        return;
+    }
+    // Leading/trailing whitespace must sit outside the delimiters:
+    // CommonMark does not open emphasis on `** text**`. An all-whitespace
+    // run has no core to emphasise — and computing the two spans
+    // independently makes them overlap, which inverts the slice range and
+    // panics, so take the trailing span from what is left after the
+    // leading one.
+    let core_str = text.trim();
+    if core_str.is_empty() {
+        out.push_str(&text);
+        return;
+    }
+    let lead_len = text.len() - text.trim_start().len();
+    let lead = &text[..lead_len];
+    let trail = &text[lead_len + core_str.len()..];
+    let core = core_str;
+
+    let mut body = core.to_string();
+    // Super/subscript have no markdown syntax; HTML is the conventional
+    // fallback. `vertAlign` was previously dropped entirely here.
+    match style.vertical_align {
+        Some(super::formatting::VerticalAlign::Superscript) => {
+            body = format!("<sup>{body}</sup>");
+        },
+        Some(super::formatting::VerticalAlign::Subscript) => {
+            body = format!("<sub>{body}</sub>");
+        },
+        _ => {},
+    }
+    if style.strike {
+        body = format!("~~{body}~~");
+    }
+    if style.bold && style.italic {
+        body = format!("***{body}***");
+    } else if style.bold {
+        body = format!("**{body}**");
+    } else if style.italic {
+        body = format!("*{body}*");
+    }
+    out.push_str(lead);
+    out.push_str(&body);
+    out.push_str(trail);
+}
+
+/// Collect a run's text content (no emphasis delimiters).
+fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, text: &mut String) {
     for content in &run.content {
         match content {
             RunContent::Text(t) => text.push_str(t),
@@ -260,38 +366,23 @@ fn markdown_run(run: &Run, out: &mut String) {
             },
             RunContent::Tab => text.push('\t'),
             RunContent::Drawing(drawing) => {
-                markdown_drawing(drawing, &mut text);
+                markdown_drawing(drawing, text);
+            },
+            // See `plain_text_run`: block content needs a separator or it
+            // fuses with the run that follows it.
+            RunContent::TextBox(blocks) => {
+                let mut inner = String::new();
+                markdown_blocks(blocks, ctx, &mut inner, 0);
+                let inner = inner.trim();
+                if !inner.is_empty() {
+                    if !text.is_empty() && !text.ends_with(['\n', ' ', '\t']) {
+                        text.push('\n');
+                    }
+                    text.push_str(inner);
+                    text.push('\n');
+                }
             },
         }
-    }
-
-    if text.is_empty() {
-        return;
-    }
-
-    // Apply inline formatting wrappers
-    if strike {
-        out.push_str("~~");
-    }
-    if bold && italic {
-        out.push_str("***");
-    } else if bold {
-        out.push_str("**");
-    } else if italic {
-        out.push('*');
-    }
-
-    out.push_str(&text);
-
-    if bold && italic {
-        out.push_str("***");
-    } else if bold {
-        out.push_str("**");
-    } else if italic {
-        out.push('*');
-    }
-    if strike {
-        out.push_str("~~");
     }
 }
 

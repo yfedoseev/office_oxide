@@ -40,6 +40,12 @@ pub enum RunContent {
     Tab,
     /// A `w:drawing` inline or anchored image.
     Drawing(DrawingInfo),
+    /// A `w:txbxContent` text-box body found inside a `w:pict` /
+    /// `w:drawing` / `mc:AlternateContent` shape. Text boxes are ordinary
+    /// block content that happens to be drawn in a frame; leaving them
+    /// unread dropped whole documents' worth of prose (issue #102: 90% of
+    /// the reporter's text lived here).
+    TextBox(Vec<super::document::BlockElement>),
 }
 
 /// Types of breaks.

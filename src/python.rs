@@ -20,8 +20,14 @@ impl From<OfficeError> for PyErr {
 ///
 /// Supports use as a context manager:
 ///
-///     with Document.open("report.docx") as doc:
-///         print(doc.plain_text())
+/// ```text
+/// with Document.open("report.docx") as doc:
+///     print(doc.plain_text())
+/// ```
+///
+/// (The block is marked `text` because it is Python shown to Python users;
+/// an indented block here is collected as a Rust doctest and fails to
+/// compile under `cargo test --all-features --doc`.)
 #[pyclass(name = "Document", module = "office_oxide")]
 struct PyDocument {
     inner: Option<Document>,
@@ -95,6 +101,18 @@ impl PyDocument {
     /// Convert the document to Markdown.
     fn to_markdown(&self) -> PyResult<String> {
         Ok(self.get()?.to_markdown())
+    }
+
+    /// Convert to markdown, embedding each image inline as
+    /// `[image-base64:<data>]` at its position in the document flow.
+    ///
+    /// Images are otherwise dropped from markdown entirely, which loses
+    /// both their content and their position.
+    fn to_markdown_with_images(&self) -> PyResult<String> {
+        use crate::ir_render::{ImageEmbed, MarkdownOptions};
+        Ok(self.get()?.to_markdown_with(MarkdownOptions {
+            image_embed: ImageEmbed::Base64,
+        }))
     }
 
     /// Convert the document to an HTML fragment.

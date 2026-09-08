@@ -9,6 +9,12 @@ pub enum PptError {
     #[error("invalid record: {0}")]
     InvalidRecord(String),
 
+    /// The file is encrypted or password-protected. Extraction cannot
+    /// proceed, and returning an empty string with `Ok` told the caller the
+    /// file simply had no text.
+    #[error("file is encrypted or password-protected")]
+    Encrypted,
+
     /// A required CFB stream is absent from the file.
     #[error("missing stream: {0}")]
     MissingStream(String),

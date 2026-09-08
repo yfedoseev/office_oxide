@@ -519,10 +519,52 @@ jobs:
             done
           done
           ls -R js/prebuilds
+      - name: Build one npm package per platform
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.validate.outputs.version }}"
+          # The six libraries used to ship inside the main package, so every
+          # install downloaded all of them and could load only one. Each now
+          # goes in its own package, pulled in through optionalDependencies
+          # with `os`/`cpu` so npm installs only the matching one.
+          mkdir -p npm-platform
+          for dir in js/prebuilds/*/; do
+            triple=$(basename "$dir")
+            os="${triple%%-*}"
+            cpu="${triple##*-}"
+            out="npm-platform/office-oxide-${triple}"
+            mkdir -p "$out"
+            cp "$dir"/* "$out/"
+            cat > "$out/package.json" <<JSON
+          {
+            "name": "office-oxide-${triple}",
+            "version": "${VERSION}",
+            "description": "Prebuilt office_oxide native library for ${os}-${cpu}.",
+            "license": "MIT OR Apache-2.0",
+            "author": "Yury Fedoseev",
+            "repository": {
+              "type": "git",
+              "url": "git+https://github.com/yfedoseev/office_oxide.git"
+            },
+            "homepage": "https://oxide.fyi",
+            "os": ["${os}"],
+            "cpu": ["${cpu}"],
+            "files": ["*.so", "*.dylib", "*.dll", "README.md"]
+          }
+          JSON
+            printf '# office-oxide-%s\n\nPrebuilt native library for `%s`. Installed automatically as an optional dependency of [`office-oxide`](https://www.npmjs.com/package/office-oxide); do not depend on it directly.\n' \
+              "$triple" "$triple" > "$out/README.md"
+          done
+          ls -R npm-platform
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: node-native-package
           path: js/
+          retention-days: 7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-platform-packages
+          path: npm-platform/
           retention-days: 7
 
   # ─── Smoke tests on built artifacts ────────────────────────────────────────
@@ -707,8 +749,12 @@ jobs:
           set -euo pipefail
           VERSION="${{ needs.validate.outputs.version }}"
           mkdir -p /tmp/simulated-releases/v${VERSION}
+          # Stage the artifact under the name the release actually publishes.
+          # Renaming it to the name the installer expected made the fixture
+          # agree with the bug, so the job passed against a filename no
+          # release contains.
           cp release-assets/native-linux-x86_64.tar.gz \
-             /tmp/simulated-releases/v${VERSION}/native-linux-x86_64-${VERSION}.tar.gz
+             /tmp/simulated-releases/v${VERSION}/native-linux-x86_64.tar.gz
       - name: Serve the archive via a local HTTP server + patch the installer URL
         run: |
           set -euo pipefail
@@ -949,10 +995,39 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+  # Publish one npm package per platform. These must land *before* the main
+  # package, which declares them in optionalDependencies at the same version.
+  publish-npm-platform:
+    name: Publish npm (per-platform native)
+    needs: [validate, package-node-native, create-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    if: ${{ !contains(needs.validate.outputs.version, '-') }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-platform-packages
+          path: npm-platform
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Publish each platform package
+        run: |
+          set -euo pipefail
+          for dir in npm-platform/*/; do
+            echo "Publishing $dir"
+            (cd "$dir" && npm publish --provenance --access public)
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
   # Publish Node-native package (office-oxide) with prebuilt native libs
   publish-npm-native:
     name: Publish npm (office-oxide native)
-    needs: [validate, package-node-native, create-release]
+    needs: [validate, package-node-native, create-release, publish-npm-platform]
     runs-on: ubuntu-latest
     permissions:
       contents: read

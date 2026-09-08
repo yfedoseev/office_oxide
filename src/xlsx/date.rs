@@ -101,9 +101,13 @@ fn serial_to_date_1900(serial: i64) -> Option<(i32, u32, u32)> {
     if serial < 1 {
         return None;
     }
-    // Handle the Lotus 1-2-3 bug: serial 60 = Feb 29, 1900 (fictitious)
+    // Serial 60 is Excel's phantom "29 February 1900", kept for Lotus 1-2-3
+    // compatibility. That date does not exist — 1900 was not a leap year —
+    // and emitting it produces a string that any strict date parser
+    // downstream (chrono, Python `datetime`) rejects. Refuse it instead;
+    // callers fall back to rendering the raw serial, which is at least true.
     if serial == 60 {
-        return Some((1900, 2, 29));
+        return None;
     }
 
     // Adjust for the bug: serials >= 61 are one day ahead
@@ -276,12 +280,13 @@ mod tests {
     }
 
     #[test]
-    fn serial_to_date_1900_bug_feb29() {
-        // Serial 60 = Feb 29, 1900 (the Lotus 1-2-3 bug)
-        let dt = DateTimeValue::from_serial(60.0, false).unwrap();
-        assert_eq!(dt.year, 1900);
-        assert_eq!(dt.month, 2);
-        assert_eq!(dt.day, 29);
+    fn serial_60_is_refused_rather_than_emitting_an_impossible_date() {
+        // Excel's phantom leap day. 1900-02-29 never existed, so returning
+        // it hands downstream date parsers a string they must reject.
+        assert!(DateTimeValue::from_serial(60.0, false).is_none());
+        // The serials on either side are unaffected.
+        assert!(DateTimeValue::from_serial(59.0, false).is_some());
+        assert!(DateTimeValue::from_serial(61.0, false).is_some());
     }
 
     #[test]

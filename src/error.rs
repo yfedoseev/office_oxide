@@ -29,6 +29,13 @@ pub enum OfficeError {
     #[error(transparent)]
     Ppt(#[from] crate::ppt::PptError),
 
+    /// A parser panicked. Reported honestly rather than as "unsupported
+    /// format": conflating a bug in this library with a file we simply do
+    /// not read hid real defects from users and blinded the fuzz target,
+    /// which could not tell a caught panic from a clean rejection.
+    #[error("internal error: parsing panicked: {0}")]
+    Panic(String),
+
     /// The file extension or format is not supported.
     #[error("unsupported format: {0}")]
     UnsupportedFormat(String),

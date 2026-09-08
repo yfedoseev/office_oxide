@@ -51,7 +51,8 @@ fn write_text(w: &mut Writer<Vec<u8>>, tag: &str, value: Option<&str>) {
         }
         w.write_event(Event::Start(BytesStart::new(tag.to_string())))
             .expect("open");
-        w.write_event(Event::Text(BytesText::new(v))).expect("text");
+        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
+            .expect("text");
         w.write_event(Event::End(BytesEnd::new(tag.to_string())))
             .expect("close");
     }
@@ -65,7 +66,8 @@ fn write_dcterms(w: &mut Writer<Vec<u8>>, tag: &str, value: Option<&str>) {
         let mut elem = BytesStart::new(tag.to_string());
         elem.push_attribute(("xsi:type", "dcterms:W3CDTF"));
         w.write_event(Event::Start(elem)).expect("open");
-        w.write_event(Event::Text(BytesText::new(v))).expect("text");
+        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
+            .expect("text");
         w.write_event(Event::End(BytesEnd::new(tag.to_string())))
             .expect("close");
     }

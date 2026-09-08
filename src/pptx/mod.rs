@@ -33,9 +33,9 @@ pub mod write;
 pub use error::{PptxError, Result};
 pub use presentation::{PresentationInfo, SlideId, SlideSize};
 pub use shape::{
-    AutoShape, ConnectorShape, GraphicContent, GraphicFrame, GroupShape, HyperlinkInfo,
-    HyperlinkTarget, PictureShape, PlaceholderInfo, Shape, ShapePosition, Table, TableCell,
-    TableRow, TextBody, TextContent, TextField, TextParagraph, TextRun,
+    AutoShape, BulletStyle, ConnectorShape, GraphicContent, GraphicFrame, GroupShape,
+    HyperlinkInfo, HyperlinkTarget, PictureShape, PlaceholderInfo, Shape, ShapePosition, Table,
+    TableCell, TableRow, TextBody, TextContent, TextField, TextParagraph, TextRun,
 };
 pub use slide::Slide;
 
@@ -60,6 +60,9 @@ pub struct PptxDocument {
     /// `(font_name, ttf_or_otf_bytes)`. PDF→PPTX→PDF round-trips use
     /// these to preserve the source typeface (mirrors the DOCX side).
     pub embedded_fonts: Vec<(String, Vec<u8>)>,
+    /// Parsed `docProps/core.xml`. `None` when the package carries no
+    /// core-properties part.
+    pub core_properties: Option<crate::core::properties::CoreProperties>,
 }
 
 impl PptxDocument {
@@ -84,17 +87,35 @@ impl PptxDocument {
 
     fn from_opc<R: Read + Seek>(mut opc: OpcReader<R>) -> Result<Self> {
         debug!("PptxDocument: parsing started");
+        opc.verify_main_content_type(
+            &[
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
+                "application/vnd.openxmlformats-officedocument.presentationml.slideshow.main+xml",
+                "application/vnd.openxmlformats-officedocument.presentationml.template.main+xml",
+                "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml",
+                "application/vnd.ms-powerpoint.slideshow.macroEnabled.main+xml",
+            ],
+            "a PresentationML presentation",
+        )?;
+        let core_properties = crate::core::properties::read_core_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let pres_rels = opc.read_rels_for(&main_part)?;
 
         // Parse theme
-        let theme = if let Some(rel) = pres_rels.first_by_type(rel_types::THEME) {
-            let part_name = main_part.resolve_relative(&rel.target)?;
-            let data = opc.read_part(&part_name)?;
-            Some(Theme::parse(&data)?)
-        } else {
-            None
-        };
+        // See the DOCX reader: a malformed theme is not a reason to refuse
+        // the whole presentation.
+        let theme = pres_rels
+            .first_by_type(rel_types::THEME)
+            .and_then(|rel| main_part.resolve_relative(&rel.target).ok())
+            .filter(|pn| opc.has_part(pn))
+            .and_then(|pn| opc.read_part(&pn).ok())
+            .and_then(|data| match Theme::parse(&data) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    debug!("PptxDocument: ignoring unreadable theme part: {e}");
+                    None
+                },
+            });
 
         // Parse presentation.xml
         let pres_data = opc.read_part(&main_part)?;
@@ -105,6 +126,7 @@ impl PptxDocument {
             slide_data: Vec<u8>,
             slide_rels: Relationships,
             notes_data: Option<Vec<u8>>,
+            comments_data: Vec<Vec<u8>>,
             /// rId → (raw bytes, format-extension lowercase like "png" / "jpeg").
             /// Pre-resolved here in Phase 1 so the parallel slide parser
             /// (Phase 2) doesn't need access to the OPC reader.
@@ -173,10 +195,29 @@ impl PptxDocument {
                 media.insert(rel.id.clone(), (bytes, ext));
             }
 
+            // Comments hang off the slide's own relationships, both in the
+            // legacy `comments` form and the newer `authors`+`modernComment`
+            // pair. Neither part was ever read, so review notes on a deck
+            // reached no consumer at all.
+            let comment_parts: Vec<_> = slide_rels
+                .all()
+                .iter()
+                .filter(|rel| rel.rel_type.ends_with("/comments"))
+                .filter_map(|rel| part_name.resolve_relative(&rel.target).ok())
+                .filter(|pn| opc.has_part(pn))
+                .collect();
+            let mut comments_data: Vec<Vec<u8>> = Vec::new();
+            for pn in comment_parts {
+                if let Ok(data) = opc.read_part(&pn) {
+                    comments_data.push(data);
+                }
+            }
+
             bundles.push(SlideBundle {
                 slide_data,
                 slide_rels,
                 notes_data,
+                comments_data,
                 media,
             });
         }
@@ -187,6 +228,9 @@ impl PptxDocument {
             let mut parsed = Slide::parse(&b.slide_data, name, &b.slide_rels, &b.media)?;
             if let Some(notes_data) = &b.notes_data {
                 parsed.notes = extract_notes_text(notes_data);
+            }
+            for data in &b.comments_data {
+                parsed.comments.extend(slide::parse_comments(data));
             }
             Ok(parsed)
         })?;
@@ -225,6 +269,7 @@ impl PptxDocument {
             slides,
             theme,
             embedded_fonts,
+            core_properties,
         })
     }
 }

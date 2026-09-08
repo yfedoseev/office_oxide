@@ -85,6 +85,87 @@ impl StyleSheet {
         Ok(sheet)
     }
 
+    /// Return the inheritance chain for `style_id`, **root ancestor first**,
+    /// so callers can overlay each style in turn and have the most specific
+    /// one win. Cycles and pathological `w:basedOn` chains are cut off at 20
+    /// links.
+    fn chain(&self, style_id: &str) -> Vec<&Style> {
+        let mut out = Vec::new();
+        let mut current = self.styles.get(style_id);
+        while let Some(style) = current {
+            if out.len() >= 20 {
+                break;
+            }
+            out.push(style);
+            current = style.based_on.as_deref().and_then(|id| self.styles.get(id));
+        }
+        out.reverse();
+        out
+    }
+
+    /// Fold the effective run formatting for a run: document defaults, then
+    /// the paragraph style chain's run properties, then the character style
+    /// chain, then the run's own `w:rPr`. Later stages win field by field.
+    ///
+    /// Without this, only direct `w:rPr` reached the IR — so a document that
+    /// puts all of its formatting in styles (which is what Word's built-in
+    /// styles and every template do) read back as unformatted text.
+    pub fn effective_run_properties(
+        &self,
+        paragraph_style_id: Option<&str>,
+        direct: Option<&RunProperties>,
+    ) -> RunProperties {
+        let mut out = self
+            .doc_defaults
+            .as_ref()
+            .and_then(|d| d.run_properties.clone())
+            .unwrap_or_default();
+        if let Some(pid) = paragraph_style_id {
+            for style in self.chain(pid) {
+                if let Some(rp) = style.run_properties.as_ref() {
+                    out.overlay(rp);
+                }
+            }
+        }
+        // `w:rStyle` on the run names a character style, which sits above
+        // the paragraph style but below the run's own direct formatting.
+        if let Some(cid) = direct.and_then(|d| d.style_id.as_deref()) {
+            for style in self.chain(cid) {
+                if let Some(rp) = style.run_properties.as_ref() {
+                    out.overlay(rp);
+                }
+            }
+        }
+        if let Some(d) = direct {
+            out.overlay(d);
+        }
+        out
+    }
+
+    /// Fold the effective paragraph formatting: document defaults, then the
+    /// style chain, then the paragraph's own `w:pPr`.
+    pub fn effective_paragraph_properties(
+        &self,
+        direct: Option<&ParagraphProperties>,
+    ) -> ParagraphProperties {
+        let mut out = self
+            .doc_defaults
+            .as_ref()
+            .and_then(|d| d.paragraph_properties.clone())
+            .unwrap_or_default();
+        if let Some(pid) = direct.and_then(|d| d.style_id.as_deref()) {
+            for style in self.chain(pid) {
+                if let Some(pp) = style.paragraph_properties.as_ref() {
+                    out.overlay(pp);
+                }
+            }
+        }
+        if let Some(d) = direct {
+            out.overlay(d);
+        }
+        out
+    }
+
     /// Resolve the effective outline level for a given style ID, walking the inheritance chain.
     pub fn resolve_outline_level(&self, style_id: &str) -> Option<u8> {
         let mut current = self.styles.get(style_id);

@@ -425,6 +425,7 @@ mod tests {
 
     fn make_doc(slides: Vec<Slide>) -> PptxDocument {
         PptxDocument {
+            core_properties: None,
             presentation: PresentationInfo {
                 slides: Vec::new(),
                 slide_size: None,
@@ -459,7 +460,9 @@ mod tests {
                         hyperlink: None,
                         font_size_hundredths_pt: None,
                         color_rgb: None,
+                        ..Default::default()
                     })],
+                    ..Default::default()
                 }],
             }),
             placeholder: None,
@@ -490,7 +493,9 @@ mod tests {
                         hyperlink: None,
                         font_size_hundredths_pt: None,
                         color_rgb: None,
+                        ..Default::default()
                     })],
+                    ..Default::default()
                 }],
             }),
             placeholder: Some(PlaceholderInfo {
@@ -511,6 +516,7 @@ mod tests {
             ],
             notes: None,
             background_rgb: None,
+            ..Default::default()
         }]);
 
         let text = doc.slide_plain_text(0).unwrap();
@@ -524,6 +530,7 @@ mod tests {
             shapes: vec![text_shape("Text", "Hello", 0, 0)],
             notes: Some("Speaker notes".to_string()),
             background_rgb: None,
+            ..Default::default()
         }]);
 
         let text = doc.slide_plain_text(0).unwrap();
@@ -538,12 +545,14 @@ mod tests {
                 shapes: vec![text_shape("A", "Slide one", 0, 0)],
                 notes: None,
                 background_rgb: None,
+                ..Default::default()
             },
             Slide {
                 name: String::new(),
                 shapes: vec![text_shape("B", "Slide two", 0, 0)],
                 notes: None,
                 background_rgb: None,
+                ..Default::default()
             },
         ]);
 
@@ -561,6 +570,7 @@ mod tests {
             ],
             notes: None,
             background_rgb: None,
+            ..Default::default()
         }]);
 
         let md = doc.slide_to_markdown(0).unwrap();
@@ -598,6 +608,7 @@ mod tests {
                                 hyperlink: None,
                                 font_size_hundredths_pt: None,
                                 color_rgb: None,
+                                ..Default::default()
                             }),
                             TextContent::Run(TextRun {
                                 text: " and ".to_string(),
@@ -607,6 +618,7 @@ mod tests {
                                 hyperlink: None,
                                 font_size_hundredths_pt: None,
                                 color_rgb: None,
+                                ..Default::default()
                             }),
                             TextContent::Run(TextRun {
                                 text: "italic".to_string(),
@@ -616,14 +628,17 @@ mod tests {
                                 hyperlink: None,
                                 font_size_hundredths_pt: None,
                                 color_rgb: None,
+                                ..Default::default()
                             }),
                         ],
+                        ..Default::default()
                     }],
                 }),
                 placeholder: None,
             })],
             notes: None,
             background_rgb: None,
+            ..Default::default()
         }]);
 
         let md = doc.slide_to_markdown(0).unwrap();
@@ -637,6 +652,7 @@ mod tests {
             shapes: vec![text_shape("Text", "Content", 0, 0)],
             notes: Some("Note line 1\nNote line 2".to_string()),
             background_rgb: None,
+            ..Default::default()
         }]);
 
         let md = doc.slide_to_markdown(0).unwrap();
@@ -657,6 +673,8 @@ mod tests {
                     cy: 3000,
                 }),
                 content: GraphicContent::Table(Table {
+                    first_row_header: true,
+                    last_row_header: false,
                     rows: vec![
                         TableRow {
                             cells: vec![
@@ -674,7 +692,9 @@ mod tests {
                                                 hyperlink: None,
                                                 font_size_hundredths_pt: None,
                                                 color_rgb: None,
+                                                ..Default::default()
                                             })],
+                                            ..Default::default()
                                         }],
                                     }),
                                     grid_span: 1,
@@ -696,7 +716,9 @@ mod tests {
                                                 hyperlink: None,
                                                 font_size_hundredths_pt: None,
                                                 color_rgb: None,
+                                                ..Default::default()
                                             })],
+                                            ..Default::default()
                                         }],
                                     }),
                                     grid_span: 1,
@@ -722,7 +744,9 @@ mod tests {
                                                 hyperlink: None,
                                                 font_size_hundredths_pt: None,
                                                 color_rgb: None,
+                                                ..Default::default()
                                             })],
+                                            ..Default::default()
                                         }],
                                     }),
                                     grid_span: 1,
@@ -744,7 +768,9 @@ mod tests {
                                                 hyperlink: None,
                                                 font_size_hundredths_pt: None,
                                                 color_rgb: None,
+                                                ..Default::default()
                                             })],
+                                            ..Default::default()
                                         }],
                                     }),
                                     grid_span: 1,
@@ -759,6 +785,7 @@ mod tests {
             })],
             notes: None,
             background_rgb: None,
+            ..Default::default()
         }]);
 
         let md = doc.slide_to_markdown(0).unwrap();
@@ -799,13 +826,16 @@ mod tests {
                             }),
                             font_size_hundredths_pt: None,
                             color_rgb: None,
+                            ..Default::default()
                         })],
+                        ..Default::default()
                     }],
                 }),
                 placeholder: None,
             })],
             notes: None,
             background_rgb: None,
+            ..Default::default()
         }]);
 
         let md = doc.slide_to_markdown(0).unwrap();

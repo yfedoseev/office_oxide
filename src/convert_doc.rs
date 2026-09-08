@@ -12,8 +12,19 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     let mut elements: Vec<Element> = Vec::new();
 
     let paragraphs = doc.paragraphs();
+    // One whole-document decision, taken before the walk, gated on the
+    // *outcome*: run the line-shape heading guess only when no paragraph
+    // resolved a real outline level.
+    //
+    // Gating on "the document has a stylesheet" instead would be wrong —
+    // a parsed style sheet is not evidence a document uses headings, and
+    // letters, memos and forms with a valid STSH containing no heading
+    // styles would silently lose their headings, and with them
+    // `metadata.title` and `Section.title`, both of which are derived from
+    // the first `Element::Heading` below.
+    let has_structured_headings = paragraphs.iter().any(|p| p.props.outline_level.is_some());
     if !paragraphs.is_empty() {
-        walk_paragraphs(paragraphs, &mut elements);
+        walk_paragraphs(paragraphs, has_structured_headings, &mut elements);
     } else {
         line_heuristic(doc.plain_text_ref(), &mut elements);
     }
@@ -26,17 +37,60 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
         _ => None,
     });
 
+    let mut sections = vec![Section {
+        title: title.clone(),
+        elements,
+        ..Default::default()
+    }];
+
+    // Footnotes, headers, comments, endnotes and text boxes live after the
+    // main text in the same character space. Their `ccp*` lengths were
+    // parsed and never used, so none of this reached a consumer.
+    if let Some(section) = sections.last_mut() {
+        for (i, sub) in doc.subdocuments().iter().enumerate() {
+            let content: Vec<Element> = sub
+                .text
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| {
+                    Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan::plain(l))],
+                        ..Default::default()
+                    })
+                })
+                .collect();
+            if content.is_empty() {
+                continue;
+            }
+            let note = Note {
+                id: i as u32,
+                marker: Some(subdocument_label(sub.kind).to_string()),
+                content,
+            };
+            section.elements.push(match sub.kind {
+                crate::doc::SubDocumentKind::Footnotes => Element::Footnote(note),
+                crate::doc::SubDocumentKind::HeadersFooters
+                | crate::doc::SubDocumentKind::TextBoxes
+                | crate::doc::SubDocumentKind::HeaderTextBoxes => Element::TextBox(TextBox {
+                    content: note.content,
+                    ..Default::default()
+                }),
+                _ => Element::Endnote(note),
+            });
+        }
+    }
+    // Extracted pictures never reached the IR, so every image in a legacy
+    // document was silently dropped on conversion even though the bytes
+    // were already in hand.
+    crate::convert_xls::append_legacy_images(&mut sections, doc.images());
+
     DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Doc,
-            title: title.clone(),
+            title,
             ..Default::default()
         },
-        sections: vec![Section {
-            title,
-            elements,
-            ..Default::default()
-        }],
+        sections,
     }
 }
 
@@ -370,7 +424,11 @@ fn is_doc_list_item(ilfo: Option<i16>) -> bool {
     }
 }
 
-fn walk_paragraphs(paragraphs: &[DocParagraph], elements: &mut Vec<Element>) {
+fn walk_paragraphs(
+    paragraphs: &[DocParagraph],
+    has_structured_headings: bool,
+    elements: &mut Vec<Element>,
+) {
     let mut table = TableBuilder::new();
     let mut list_items: Vec<(u8, Vec<InlineContent>)> = Vec::new();
 
@@ -391,7 +449,18 @@ fn walk_paragraphs(paragraphs: &[DocParagraph], elements: &mut Vec<Element>) {
         } else {
             table.flush(elements);
             flush_list(&mut list_items, elements);
-            emit_prose(&p.text, &p.props.tabs, elements);
+            match p.props.outline_level {
+                // A real outline level: use it, and never guess alongside it.
+                Some(lvl) => emit_heading(&p.text, lvl + 1, elements),
+                None if has_structured_headings => {
+                    elements.push(Element::Paragraph(Paragraph {
+                        content: inline_content_for(&p.text),
+                        tabs: p.props.tabs.clone(),
+                        ..Default::default()
+                    }));
+                },
+                None => emit_prose(&p.text, &p.props.tabs, elements),
+            }
         }
     }
     table.flush(elements);
@@ -444,6 +513,31 @@ fn inline_content_for(text: &str) -> Vec<InlineContent> {
 ///
 /// Mirrors the line-based heuristic so a PAPX-bearing document keeps the same
 /// heading/title detection as the fallback path.
+/// Emit a heading at an explicit level, honouring soft line breaks.
+fn emit_heading(text: &str, level: u8, elements: &mut Vec<Element>) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let mut content = inline_content_for(trimmed);
+    for ic in &mut content {
+        if let InlineContent::Text(t) = ic {
+            t.bold = true;
+        }
+    }
+    elements.push(Element::Heading(Heading {
+        level: level.clamp(1, 6),
+        content,
+        ..Default::default()
+    }));
+}
+
+/// Guess headings from line shape — short, non-sentence, ALL-CAPS lines, or
+/// a short opening line.
+///
+/// This is a guess and is only reached for documents that carry no
+/// `sprmPOutLvl` at all. Running it alongside real outline levels produced
+/// two disagreeing answers for the same paragraphs in one document.
 fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -489,6 +583,19 @@ fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>) {
 fn line_heuristic(text: &str, elements: &mut Vec<Element>) {
     for line in text.lines() {
         emit_prose(line, &[], elements);
+    }
+}
+
+/// Human-readable label for a `.doc` subdocument, used as the note marker.
+fn subdocument_label(kind: crate::doc::SubDocumentKind) -> &'static str {
+    use crate::doc::SubDocumentKind as K;
+    match kind {
+        K::Footnotes => "footnote",
+        K::HeadersFooters => "header/footer",
+        K::Comments => "comment",
+        K::Endnotes => "endnote",
+        K::TextBoxes => "text box",
+        K::HeaderTextBoxes => "header text box",
     }
 }
 
@@ -560,7 +667,7 @@ mod tests {
             PapProps::default(),
         );
         let mut els = Vec::new();
-        walk_paragraphs(&[p], &mut els);
+        walk_paragraphs(&[p], false, &mut els);
         let Element::Paragraph(par) = &els[0] else {
             panic!("expected a paragraph, got {:?}", els[0]);
         };
@@ -600,7 +707,7 @@ mod tests {
         let row = para("", props);
 
         let mut els = Vec::new();
-        walk_paragraphs(&[row], &mut els);
+        walk_paragraphs(&[row], false, &mut els);
 
         assert!(
             els.iter().any(|e| matches!(e, Element::Table(_))),
@@ -635,7 +742,7 @@ mod tests {
             };
             let p = para("Not a list item.", props);
             let mut els = Vec::new();
-            walk_paragraphs(&[p], &mut els);
+            walk_paragraphs(&[p], false, &mut els);
             assert!(
                 !els.iter().any(|e| matches!(e, Element::List(_))),
                 "ilfo {ilfo:#06x} must not build a list"
@@ -658,7 +765,7 @@ mod tests {
         };
         let p = para("A list item via the negated band.", props);
         let mut els = Vec::new();
-        walk_paragraphs(&[p], &mut els);
+        walk_paragraphs(&[p], false, &mut els);
         assert!(
             els.iter().any(|e| matches!(e, Element::List(_))),
             "0xF802 (negated index) must still be a list item"
@@ -680,7 +787,7 @@ mod tests {
         let p = para("Indented text carrying tab stops.", props);
 
         let mut els = Vec::new();
-        walk_paragraphs(&[p], &mut els);
+        walk_paragraphs(&[p], false, &mut els);
         let Element::Paragraph(par) = &els[0] else {
             panic!("expected a paragraph, got {:?}", els[0]);
         };
@@ -714,7 +821,7 @@ mod tests {
         };
         let paragraphs = [mark(1), cell, mark(1)];
         let mut els = Vec::new();
-        walk_paragraphs(&paragraphs, &mut els);
+        walk_paragraphs(&paragraphs, false, &mut els);
         assert!(
             els.iter().any(|e| matches!(e, Element::Table(_))),
             "f_in_table cell paragraph must be emitted inside a table"

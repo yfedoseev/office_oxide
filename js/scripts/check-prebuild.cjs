@@ -14,19 +14,30 @@ const ext =
   process.platform === 'win32' ? '.dll' :
   process.platform === 'darwin' ? '.dylib' : '.so';
 const prefix = process.platform === 'win32' ? '' : 'lib';
-const candidate = path.join(
+
+// The platform package installed via optionalDependencies is the normal
+// source; `prebuilds/` inside this package is the previous layout, kept so
+// an existing install or a repo checkout still works.
+const platformPackage = `office-oxide-${process.platform}-${process.arch}`;
+const candidates = [];
+try {
+  candidates.push(require.resolve(`${platformPackage}/${prefix}office_oxide${ext}`));
+} catch {
+  // Optional dependency absent for this platform.
+}
+candidates.push(path.join(
   __dirname, '..', 'prebuilds',
   `${process.platform}-${process.arch}`,
   `${prefix}office_oxide${ext}`,
-);
+));
 
-if (fs.existsSync(candidate)) {
+if (candidates.some((c) => fs.existsSync(c))) {
   process.exit(0);
 }
 
 process.stderr.write(
   `\n[office-oxide] No prebuilt native library for ${process.platform}-${process.arch}.\n` +
-  `  Tried: ${candidate}\n` +
+  `  Tried:\n    ${candidates.join('\n    ')}\n` +
   `  Set OFFICE_OXIDE_LIB=/path/to/liboffice_oxide.{so,dylib,dll}\n` +
   `  or build from source in the office_oxide monorepo:\n` +
   `    cargo build --release --lib\n` +

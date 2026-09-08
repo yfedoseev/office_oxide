@@ -66,7 +66,9 @@ pub mod format;
 /// Format-agnostic intermediate representation (IR) of a document.
 pub mod ir;
 mod ir_from_markdown;
-mod ir_render;
+/// Format-agnostic renderers over [`DocumentIR`] — plain text, markdown
+/// and HTML — plus the options that steer them.
+pub mod ir_render;
 
 #[cfg(not(target_family = "wasm"))]
 pub mod ffi;
@@ -89,41 +91,32 @@ use log::info;
 /// Stack size for parsing threads (16 MB).
 const PARSE_STACK_SIZE: usize = 16 * 1024 * 1024;
 
-/// Minimum stack size to run inline without spawning a thread (12 MB).
-/// Below this, we spawn a thread with PARSE_STACK_SIZE.
-#[cfg(unix)]
-const MIN_STACK_INLINE: usize = 12 * 1024 * 1024;
-
-/// Check once whether the current environment has a large enough stack.
-/// Caches the result for subsequent calls.
+/// Whether the parse must run on a thread whose stack size we control.
+///
+/// This used to infer the answer from `RLIMIT_STACK`, and the inference was
+/// unsound: that limit describes the process's *main* thread and says nothing
+/// about the stack of whichever thread is actually running. The worst case was
+/// `RLIM_INFINITY`, which took the "assume enough" branch and then ran inline
+/// on an ordinary spawned thread with a 2 MiB stack — a 256-deep document
+/// overflowed it and aborted the process, which is the uncatchable crash
+/// `MAX_NESTING_DEPTH` exists to prevent. It reproduced on both Linux and
+/// Windows CI while passing on a developer machine, purely because the two
+/// had different `ulimit -s` values.
+///
+/// So we no longer guess: wherever threads exist, the parse gets
+/// `PARSE_STACK_SIZE`. The cost is one spawn per top-level parse, which is
+/// microseconds against a document parse, and in exchange the depth cap is
+/// calibrated against a stack we own rather than the caller's.
 fn needs_stack_thread() -> bool {
-    use std::sync::OnceLock;
-    static NEEDS_THREAD: OnceLock<bool> = OnceLock::new();
-    *NEEDS_THREAD.get_or_init(|| {
-        // Check RLIMIT_STACK on Unix
-        #[cfg(unix)]
-        {
-            let mut rlim = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            let ret = unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut rlim) };
-            if ret == 0 && rlim.rlim_cur != libc::RLIM_INFINITY {
-                return (rlim.rlim_cur as usize) < MIN_STACK_INLINE;
-            }
-            false // unlimited or error → assume enough
-        }
-        #[cfg(not(unix))]
-        {
-            false // On Windows/WASM, default is usually enough or handled differently
-        }
-    })
+    // wasm32 has no threads; the host bounds the stack itself.
+    !cfg!(target_arch = "wasm32")
 }
 
-/// Run a parsing closure, spawning a thread with large stack only when needed.
-/// On environments with sufficient stack (Rust programs, large-stack threads),
-/// runs inline with zero overhead. On Python/constrained environments, spawns
-/// a thread once and detects this via RLIMIT_STACK check (cached, O(1) after first call).
+/// Run a parsing closure on a stack whose size we control.
+///
+/// Every caller gets `PARSE_STACK_SIZE`, so a deeply nested document meets the
+/// same headroom whether it arrives from a Rust binary, a Python binding or a
+/// test harness. Only wasm32, which has no threads, runs inline.
 fn with_parse_stack<F, T>(f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
@@ -135,10 +128,48 @@ where
             .spawn(f)
             .map_err(|e| OfficeError::UnsupportedFormat(format!("thread spawn failed: {e}")))?
             .join()
-            .unwrap_or_else(|_| Err(OfficeError::UnsupportedFormat("parsing panicked".into())))
+            .unwrap_or_else(|payload| {
+                // Surface the panic as itself. Reporting it as
+                // `UnsupportedFormat` made every internal bug look like an
+                // unreadable file, so real defects went unreported and the
+                // fuzz target could not distinguish a crash from a clean
+                // rejection.
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic payload".to_string());
+                Err(OfficeError::Panic(msg))
+            })
     } else {
         f()
     }
+}
+
+/// Whether a reader's first bytes are the CFB (compound file) signature.
+///
+/// Leaves the reader rewound to the start.
+fn is_cfb_container<R: Read + Seek>(reader: &mut R) -> Result<bool> {
+    use std::io::SeekFrom;
+    let mut magic = [0u8; 8];
+    reader.seek(SeekFrom::Start(0)).map_err(core::Error::from)?;
+    let n = read_up_to(reader, &mut magic)?;
+    reader.seek(SeekFrom::Start(0)).map_err(core::Error::from)?;
+    Ok(n == 8 && magic == crate::cfb::CFB_SIGNATURE)
+}
+
+/// Read up to `buf.len()` bytes, tolerating short reads.
+fn read_up_to<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {},
+            Err(e) => return Err(core::Error::from(e).into()),
+        }
+    }
+    Ok(filled)
 }
 
 /// Dispatch a method call to the inner document type across all variants.
@@ -179,7 +210,10 @@ impl Document {
 
     fn open_inner(path: &Path) -> Result<Self> {
         let format = DocumentFormat::from_path(path);
-        info!("Document::open: {:?} format, path '{}'", format, path.display());
+        // The path is deliberately not logged: it routinely carries a
+        // username and a document name, and this runs at info level on every
+        // open. The caller already knows which path it passed.
+        info!("Document::open: {format:?} format");
         let format = format.ok_or_else(|| {
             OfficeError::UnsupportedFormat(
                 path.extension()
@@ -242,7 +276,7 @@ impl Document {
                     .to_string(),
             )
         })?;
-        info!("Document::open_mmap: {:?} format, path '{}'", format, path.display());
+        info!("Document::open_mmap: {format:?} format");
         match format {
             DocumentFormat::Docx => {
                 let doc = docx::DocxDocument::open_mmap(path)?;
@@ -275,7 +309,20 @@ impl Document {
         with_parse_stack(move || Self::from_reader_inner(reader, format))
     }
 
-    fn from_reader_inner<R: Read + Seek>(reader: R, format: DocumentFormat) -> Result<Self> {
+    fn from_reader_inner<R: Read + Seek>(mut reader: R, format: DocumentFormat) -> Result<Self> {
+        // A password-protected OOXML file is not a zip at all: Office wraps
+        // the encrypted package in a CFB container. Opening one as a zip
+        // fails with an unhelpful archive error that says nothing about the
+        // real reason, so name it here.
+        if matches!(format, DocumentFormat::Docx | DocumentFormat::Xlsx | DocumentFormat::Pptx)
+            && is_cfb_container(&mut reader)?
+        {
+            return Err(OfficeError::UnsupportedFormat(
+                "the file is a password-protected (encrypted) OOXML package; \
+                 decryption is not supported"
+                    .into(),
+            ));
+        }
         match format {
             DocumentFormat::Docx => {
                 let doc = docx::DocxDocument::from_reader(reader)?;
@@ -336,6 +383,15 @@ impl Document {
     /// Convert to markdown using the format-specific implementation.
     pub fn to_markdown(&self) -> String {
         dispatch_inner!(self, to_markdown)
+    }
+
+    /// Convert to markdown with explicit rendering options.
+    ///
+    /// Unlike [`Self::to_markdown`], which uses the format-specific
+    /// renderer, this goes through the IR so that options such as
+    /// [`ir_render::ImageEmbed::Base64`] apply uniformly to every format.
+    pub fn to_markdown_with(&self, options: ir_render::MarkdownOptions) -> String {
+        self.to_ir().to_markdown_with(options)
     }
 
     /// Convert to an HTML fragment.
