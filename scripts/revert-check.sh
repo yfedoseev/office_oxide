@@ -25,25 +25,46 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 fi
 
 MERGE_BASE=$(git merge-base "$BASE" HEAD)
-CHANGED_SRC=$(git diff --name-only "$MERGE_BASE"..HEAD -- 'src/**/*.rs' 'crates/*/src/**/*.rs' || true)
 
-if [ -z "$CHANGED_SRC" ]; then
+# Match on the directory, not on `src/**/*.rs`. In a git pathspec `*` spans
+# directory separators, so `src/**/*.rs` still requires a second `/` and never
+# matched a top-level file: `src/lib.rs`, `src/ir_render.rs` and every
+# `src/convert_*.rs` were silently excluded from the revert, and the gate
+# reported PASS having left the largest production files in place.
+#
+# `--no-renames` keeps the status vocabulary to A/M/D, so a rename arrives as
+# a delete plus an add and each half is handled by the rule below.
+CHANGED=$(git diff --no-renames --name-status "$MERGE_BASE"..HEAD \
+            -- 'src/' 'crates/*/src/' | awk '$2 ~ /\.rs$/')
+
+if [ -z "$CHANGED" ]; then
   echo "revert-check: no production changes against $BASE — nothing to check"
   exit 0
 fi
+
+CHANGED_SRC=$(echo "$CHANGED" | cut -f2-)
 
 echo "revert-check: reverting production changes against $MERGE_BASE:"
 echo "$CHANGED_SRC" | sed 's/^/  /'
 
 cleanup() {
+  # Restores modified files, re-creates ones we deleted, and drops ones we
+  # restored that HEAD does not have — every case comes back from the index.
+  # shellcheck disable=SC2086
   git checkout -- $CHANGED_SRC 2>/dev/null || true
 }
 trap cleanup EXIT
 
-# Restore the base version of every changed production file, leaving the
-# branch's tests in place.
-# shellcheck disable=SC2086
-git checkout "$MERGE_BASE" -- $CHANGED_SRC
+# Reverting an *added* file means removing it; `git checkout <base> -- <path>`
+# cannot, because the path does not exist at the base and git errors out. That
+# aborted the whole check the first time this branch added a CLI command.
+while IFS=$'\t' read -r status path; do
+  [ -z "$path" ] && continue
+  case "$status" in
+    A) rm -f "$path" ;;
+    *) git checkout "$MERGE_BASE" -- "$path" ;;
+  esac
+done <<< "$CHANGED"
 
 set +e
 cargo test --quiet >/tmp/revert-check.log 2>&1
