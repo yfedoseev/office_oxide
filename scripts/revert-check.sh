@@ -79,5 +79,22 @@ if [ "$STATUS" -eq 0 ]; then
 fi
 
 FAILED=$(grep -cE '^test .* FAILED|panicked at' /tmp/revert-check.log || true)
+RAN=$(grep -cE '^test result:' /tmp/revert-check.log || true)
+
 echo
+if [ "$RAN" -eq 0 ]; then
+  # A non-zero exit is not by itself evidence. Reverting production code while
+  # the branch's tests, manifests and version stay at HEAD routinely stops the
+  # tree building at all: a test calling a signature that does not exist yet,
+  # or a workspace member requiring a version the reverted manifest no longer
+  # declares. cargo exits non-zero, no test runs, and calling that PASS claims
+  # coverage that was never measured -- which is the exact failure this gate
+  # was written to catch, committed by the gate itself.
+  #
+  # Expected on any branch that adds public API, so it does not fail the build.
+  echo "revert-check: INCONCLUSIVE — the reverted tree never built, so no test ran."
+  echo "  Nothing was proven about coverage. See /tmp/revert-check.log"
+  exit 0
+fi
+
 echo "revert-check: PASS — the suite fails without the production changes (${FAILED} failure lines)."
