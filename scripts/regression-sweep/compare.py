@@ -18,8 +18,10 @@ def load(p):
     return d
 
 SC = os.path.dirname(os.path.abspath(__file__))
-prev = load(os.path.join(SC, "prev.jsonl"))
-nxt = load(os.path.join(SC, "next.jsonl"))
+# Named on the command line so a re-run after a fix compares the new sweep
+# rather than silently re-reading the first one.
+prev = load(sys.argv[1] if len(sys.argv) > 1 else os.path.join(SC, "prev.jsonl"))
+nxt = load(sys.argv[2] if len(sys.argv) > 2 else os.path.join(SC, "next.jsonl"))
 
 keys = sorted(set(prev) | set(nxt))
 trans = collections.Counter()

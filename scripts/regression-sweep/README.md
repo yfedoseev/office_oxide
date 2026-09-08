@@ -73,3 +73,29 @@ construction. Adding an external panel — LibreOffice, Tika/POI, pandoc,
 python-docx/openpyxl/python-pptx — is the next step; note that Tika wraps
 POI, so those two are one opinion, and pandoc deliberately drops
 headers/footers, which this release deliberately adds.
+
+## `vanished.py` — the check that actually decides content loss
+
+Byte counts and hash equality answer the wrong question. A release that
+restores a dropped `&` makes output *longer*; one that stops emitting
+65,536 rows of grid padding makes it dramatically shorter. Neither is
+content loss, and both dominate any byte total.
+
+`vanished.py` compares word multisets and reports only words that are
+absent from the new arm *and* cannot be explained as re-tokenisation —
+the word is not contained in a new token (a join), and is not built from
+new tokens (a split). Both directions are things a fix legitimately does:
+restoring `&` turns `Ramp` back into `R` and `amp`; restoring an
+apostrophe turns `its` into `it` and `s`.
+
+    PREV_BIN=/path/to/old REPO=$PWD python3 vanished.py > vanished.txt
+
+Every surviving entry still needs a human read. In the 0.1.10 sweep all
+183 resolved to five deliberate classes (PowerPoint master placeholder
+prompts, entity resolution, `General`/number-format rendering, the nesting
+depth cap) or to the new arm recovering *more* text than the old one.
+
+**Both scripts take their inputs on the command line.** An earlier version
+of `compare.py` hardcoded `next.jsonl`, so re-running it after a fix
+silently re-read the pre-fix sweep and reported the old numbers as though
+nothing had changed.
