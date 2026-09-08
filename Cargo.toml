@@ -76,7 +76,6 @@ log = "0.4"
 encoding_rs = "0.8"
 atoi_simd = "0.18"
 fast-float2 = "0.2"
-libc = "0.2"
 
 # Optional
 memmap2 = { version = "0.9", optional = true }

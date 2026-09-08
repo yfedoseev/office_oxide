@@ -91,41 +91,32 @@ use log::info;
 /// Stack size for parsing threads (16 MB).
 const PARSE_STACK_SIZE: usize = 16 * 1024 * 1024;
 
-/// Minimum stack size to run inline without spawning a thread (12 MB).
-/// Below this, we spawn a thread with PARSE_STACK_SIZE.
-#[cfg(unix)]
-const MIN_STACK_INLINE: usize = 12 * 1024 * 1024;
-
-/// Check once whether the current environment has a large enough stack.
-/// Caches the result for subsequent calls.
+/// Whether the parse must run on a thread whose stack size we control.
+///
+/// This used to infer the answer from `RLIMIT_STACK`, and the inference was
+/// unsound: that limit describes the process's *main* thread and says nothing
+/// about the stack of whichever thread is actually running. The worst case was
+/// `RLIM_INFINITY`, which took the "assume enough" branch and then ran inline
+/// on an ordinary spawned thread with a 2 MiB stack — a 256-deep document
+/// overflowed it and aborted the process, which is the uncatchable crash
+/// `MAX_NESTING_DEPTH` exists to prevent. It reproduced on both Linux and
+/// Windows CI while passing on a developer machine, purely because the two
+/// had different `ulimit -s` values.
+///
+/// So we no longer guess: wherever threads exist, the parse gets
+/// `PARSE_STACK_SIZE`. The cost is one spawn per top-level parse, which is
+/// microseconds against a document parse, and in exchange the depth cap is
+/// calibrated against a stack we own rather than the caller's.
 fn needs_stack_thread() -> bool {
-    use std::sync::OnceLock;
-    static NEEDS_THREAD: OnceLock<bool> = OnceLock::new();
-    *NEEDS_THREAD.get_or_init(|| {
-        // Check RLIMIT_STACK on Unix
-        #[cfg(unix)]
-        {
-            let mut rlim = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            let ret = unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut rlim) };
-            if ret == 0 && rlim.rlim_cur != libc::RLIM_INFINITY {
-                return (rlim.rlim_cur as usize) < MIN_STACK_INLINE;
-            }
-            false // unlimited or error → assume enough
-        }
-        #[cfg(not(unix))]
-        {
-            false // On Windows/WASM, default is usually enough or handled differently
-        }
-    })
+    // wasm32 has no threads; the host bounds the stack itself.
+    !cfg!(target_arch = "wasm32")
 }
 
-/// Run a parsing closure, spawning a thread with large stack only when needed.
-/// On environments with sufficient stack (Rust programs, large-stack threads),
-/// runs inline with zero overhead. On Python/constrained environments, spawns
-/// a thread once and detects this via RLIMIT_STACK check (cached, O(1) after first call).
+/// Run a parsing closure on a stack whose size we control.
+///
+/// Every caller gets `PARSE_STACK_SIZE`, so a deeply nested document meets the
+/// same headroom whether it arrives from a Rust binary, a Python binding or a
+/// test harness. Only wasm32, which has no threads, runs inline.
 fn with_parse_stack<F, T>(f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,

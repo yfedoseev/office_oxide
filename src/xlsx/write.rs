@@ -657,8 +657,9 @@ impl XlsxWriter {
     /// Add a worksheet and return a mutable handle to it.
     ///
     /// The name is normalised to what Excel accepts — at most 31 characters,
-    /// no `[ ] : * ? / \\`, non-empty and unique in the workbook. See
-    /// [`sanitize_sheet_name`].
+    /// no `[ ] : * ? / \\`, non-empty and unique in the workbook. A name that
+    /// collides with an existing sheet gains a numeric suffix rather than
+    /// silently replacing it.
     pub fn add_sheet(&mut self, name: &str) -> SheetData<'_> {
         let name = self.unique_sheet_name(name);
         self.sheets.push(SheetDataInner::new(&name));

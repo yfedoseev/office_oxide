@@ -476,10 +476,18 @@ pub fn sanitize_xml_text(s: &str) -> std::borrow::Cow<'_, str> {
 /// | release | 16 MB parse stack | 3,000-4,000 |
 /// | debug | default 2 MiB thread | 512-1,024 |
 ///
-/// A binding, a test harness or any caller that does not trip
-/// `needs_stack_thread` runs on the ambient thread stack, so 256 is chosen
-/// against the 2 MiB figure with a 2x margin — still ~50x deeper than any
-/// document a human authoring tool produces.
+/// 256 is chosen against the 2 MiB figure with a 2x margin — still ~50x
+/// deeper than any document a human authoring tool produces, and now with the
+/// 16 MB parse stack beneath it rather than whatever the caller happened to
+/// have.
+///
+/// That 2x margin only ever held where the parse actually got the stack it was
+/// measured against, and it often did not: `needs_stack_thread` inferred the
+/// answer from `RLIMIT_STACK`, which describes the main thread rather than the
+/// running one, so an unlimited limit ran the parse inline on an ordinary
+/// 2 MiB thread and 256 levels aborted the process. Every threaded platform
+/// now parses on a `PARSE_STACK_SIZE` stack, so this constant is calibrated
+/// against a stack the library owns.
 ///
 /// Re-measure if the parser structs grow: the release cliff was
 /// 5,000-10,000 before this release's fields were added, so it moves with

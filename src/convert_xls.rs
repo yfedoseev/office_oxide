@@ -15,7 +15,14 @@ use crate::ir::*;
 /// grid loses it. Trailing empty cells are trimmed before anything counts
 /// against this, so a 65,536-row sheet of padding costs almost nothing and
 /// only genuinely dense sheets can reach the cap.
+#[cfg(not(test))]
 const MAX_CELLS_PER_SHEET: usize = 1_000_000;
+/// Unit tests exercise the behaviour around the cap, not the constant, and a
+/// fixture large enough to reach a million cells costs hundreds of megabytes
+/// in a debug build — enough to exhaust a CI runner once the harness runs
+/// tests in parallel.
+#[cfg(test)]
+const MAX_CELLS_PER_SHEET: usize = 5_000;
 
 pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
     let mut sections = Vec::new();
@@ -247,11 +254,12 @@ mod tests {
     #[test]
     fn a_grid_of_padding_emits_no_rows_and_claims_no_truncation() {
         // Every row empty: there is nothing to show and nothing was dropped,
-        // so a truncation notice would be a false report.
+        // so a truncation notice would be a false report. The real files that
+        // motivated this are 65,536 x 256; the shape is what matters here.
         let ir = xls_to_ir(&XlsDocument::from_sheets(vec![Sheet {
             name: "S".into(),
             display: Vec::new(),
-            rows: vec![vec![CellValue::Empty; 256]; 65_536],
+            rows: vec![vec![CellValue::Empty; 64]; 2_000],
         }]));
         assert!(ir.sections[0].elements.is_empty());
     }
