@@ -18,6 +18,18 @@ pub struct XlsDocument {
     images: Vec<XlsImage>,
 }
 
+#[cfg(test)]
+impl XlsDocument {
+    /// Build a document from sheets alone, so conversion can be exercised on
+    /// a grid shape without a BIFF fixture to encode it in.
+    pub(crate) fn from_sheets(sheets: Vec<Sheet>) -> Self {
+        Self {
+            sheets,
+            images: Vec::new(),
+        }
+    }
+}
+
 /// A worksheet from an XLS workbook.
 #[derive(Debug)]
 pub struct Sheet {

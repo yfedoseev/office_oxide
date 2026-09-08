@@ -9,16 +9,49 @@ use crate::ir::*;
 /// declaring a huge used range reached 8.5 GB and was killed by the OOM
 /// killer — a crash no caller can catch. Excess rows are dropped and
 /// flagged with a visible notice.
-const MAX_ROWS_PER_SHEET: usize = 10_000;
+/// Budget in materialised cells, not rows. The declared grid is padded to
+/// the used range, so a row limit is measured against padding rather than
+/// content: a sheet whose real data sits past the limit in a mostly-empty
+/// grid loses it. Trailing empty cells are trimmed before anything counts
+/// against this, so a 65,536-row sheet of padding costs almost nothing and
+/// only genuinely dense sheets can reach the cap.
+const MAX_CELLS_PER_SHEET: usize = 1_000_000;
 
 pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
     let mut sections = Vec::new();
 
     for sheet in &doc.sheets {
         let mut rows = Vec::new();
-        let total_rows = sheet.rows.len();
+        // Rows past the last one carrying data are padding; measuring the
+        // sheet against them would report a truncation that dropped nothing.
+        let total_rows = sheet
+            .rows
+            .iter()
+            .enumerate()
+            .rposition(|(row_idx, row)| {
+                row.iter().enumerate().any(|(col_idx, cell_value)| {
+                    // Matches the emptiness test the emit loop applies, but
+                    // without rendering every cell of the declared grid.
+                    let has_display = sheet
+                        .display
+                        .get(row_idx)
+                        .and_then(|r| r.get(col_idx))
+                        .is_some_and(|s| !s.is_empty());
+                    has_display || !matches!(cell_value, crate::xls::CellValue::Empty)
+                })
+            })
+            .map_or(0, |i| i + 1);
+        let mut budget = MAX_CELLS_PER_SHEET;
+        // Rows reached before the budget ran out, counted separately from
+        // `rows` so that trimming an all-empty tail is not reported as
+        // truncation.
+        let mut rows_scanned = 0usize;
 
-        for (row_idx, row) in sheet.rows.iter().take(MAX_ROWS_PER_SHEET).enumerate() {
+        for (row_idx, row) in sheet.rows.iter().take(total_rows).enumerate() {
+            if budget == 0 {
+                break;
+            }
+            rows_scanned += 1;
             let mut cells = Vec::new();
             for (col_idx, cell_value) in row.iter().enumerate() {
                 // `display` carries the number-format-aware rendering: a
@@ -55,6 +88,7 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
             while cells.last().is_some_and(|c: &TableCell| cell_is_empty(c)) {
                 cells.pop();
             }
+            budget = budget.saturating_sub(cells.len());
 
             rows.push(TableRow {
                 cells,
@@ -79,12 +113,12 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
 
         // Truncation is stated in the content rather than left silent,
         // matching the XLSX path.
-        if total_rows > MAX_ROWS_PER_SHEET {
-            let omitted = total_rows - MAX_ROWS_PER_SHEET;
+        if rows_scanned < total_rows {
+            let omitted = total_rows - rows_scanned;
             elements.push(Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain(format!(
                     "[{omitted} of {total_rows} rows not shown — worksheet truncated at \
-                     {MAX_ROWS_PER_SHEET} rows]"
+                     {rows_scanned} rows]"
                 )))],
                 ..Default::default()
             }));
@@ -145,4 +179,98 @@ fn cell_is_empty(cell: &TableCell) -> bool {
         }),
         _ => false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::xls::{CellValue, Sheet, XlsDocument};
+
+    /// A sheet `rows` tall whose only populated row is `data_row`.
+    fn sparse_sheet(rows: usize, cols: usize, data_row: usize, text: &str) -> Sheet {
+        let mut grid = vec![vec![CellValue::Empty; cols]; rows];
+        grid[data_row][0] = CellValue::String(text.to_string());
+        Sheet {
+            name: "S".into(),
+            display: Vec::new(),
+            rows: grid,
+        }
+    }
+
+    fn cell_texts(ir: &DocumentIR) -> Vec<String> {
+        ir.sections[0]
+            .elements
+            .iter()
+            .flat_map(|el| match el {
+                Element::Table(t) => t
+                    .rows
+                    .iter()
+                    .flat_map(|r| r.cells.iter())
+                    .flat_map(|c| c.content.iter())
+                    .filter_map(|e| match e {
+                        Element::Paragraph(p) => Some(p),
+                        _ => None,
+                    })
+                    .flat_map(|p| p.content.iter())
+                    .filter_map(|c| match c {
+                        InlineContent::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                Element::Paragraph(p) => p
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        InlineContent::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn data_past_the_old_row_limit_survives_in_a_mostly_empty_grid() {
+        // A BIFF sheet is padded to its declared used range, so a row limit
+        // was measured against padding: a value at row 20,000 of an
+        // otherwise-empty 30,000-row grid was dropped by a cap that exists
+        // only to bound the padding.
+        let ir =
+            xls_to_ir(&XlsDocument::from_sheets(vec![sparse_sheet(30_000, 4, 20_000, "deep")]));
+        assert!(
+            cell_texts(&ir).iter().any(|t| t == "deep"),
+            "the one populated row must survive"
+        );
+    }
+
+    #[test]
+    fn a_grid_of_padding_emits_no_rows_and_claims_no_truncation() {
+        // Every row empty: there is nothing to show and nothing was dropped,
+        // so a truncation notice would be a false report.
+        let ir = xls_to_ir(&XlsDocument::from_sheets(vec![Sheet {
+            name: "S".into(),
+            display: Vec::new(),
+            rows: vec![vec![CellValue::Empty; 256]; 65_536],
+        }]));
+        assert!(ir.sections[0].elements.is_empty());
+    }
+
+    #[test]
+    fn a_sheet_denser_than_the_budget_is_capped_and_says_so() {
+        // The cap still has to exist: an unbounded grid built 16.7M IR cells
+        // and ran the process out of memory.
+        let rows = MAX_CELLS_PER_SHEET / 100 + 50;
+        let grid = vec![vec![CellValue::Number(1.0); 100]; rows];
+        let ir = xls_to_ir(&XlsDocument::from_sheets(vec![Sheet {
+            name: "S".into(),
+            display: Vec::new(),
+            rows: grid,
+        }]));
+        let notice = cell_texts(&ir)
+            .into_iter()
+            .find(|t| t.contains("not shown"))
+            .expect("a truncation notice");
+        assert!(notice.contains(&rows.to_string()), "notice: {notice}");
+    }
 }
