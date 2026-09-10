@@ -1073,17 +1073,24 @@ impl DocxWriter {
         w.write_event(Event::Start(root))
             .expect("write numbering start");
 
+        // CT_Numbering is `numPicBullet*, abstractNum*, num*`: every abstract
+        // definition must precede every instance, so these run as two passes
+        // rather than one pair per list.
         write_abstract_num(&mut w, 0, "bullet", "\u{2022}");
         write_abstract_num(&mut w, 1, "decimal", "%1.");
-        write_num(&mut w, 1, 0, None);
-        write_num(&mut w, 2, 1, None);
-
-        // Custom list styles for add_ir_list
         for elem in &self.elements {
             if let DocxElement::RichList(rl) = elem {
                 let abstract_id = rl.num_id - 3 + 2;
                 let (fmt, lvl_text) = list_style_to_fmt(rl.style.as_ref(), rl.ordered);
                 write_abstract_num(&mut w, abstract_id, fmt, lvl_text);
+            }
+        }
+
+        write_num(&mut w, 1, 0, None);
+        write_num(&mut w, 2, 1, None);
+        for elem in &self.elements {
+            if let DocxElement::RichList(rl) = elem {
+                let abstract_id = rl.num_id - 3 + 2;
                 write_num(&mut w, rl.num_id, abstract_id, rl.start_number);
             }
         }
@@ -1528,32 +1535,23 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph) {
                 .expect("write pageBreakBefore");
         }
 
-        if let Some(align) = &props.alignment {
-            let mut elem = BytesStart::new("w:jc");
-            elem.push_attribute(("w:val", para_align_val(align)));
-            w.write_event(Event::Empty(elem)).expect("write jc");
+        // CT_PPrBase is a strict sequence. The order below follows it:
+        // numPr, pBdr, shd, spacing, ind, jc, outlineLvl. Emitting these
+        // in a different order produces a schema-invalid document.
+        if let Some((num_id, ilvl)) = props.numbering {
+            write_num_pr(w, num_id, ilvl);
         }
 
-        // Indent
-        let has_indent = props.indent_left_twips.is_some()
-            || props.indent_right_twips.is_some()
-            || props.first_line_indent_twips.is_some();
-        if has_indent {
-            let mut ind = BytesStart::new("w:ind");
-            if let Some(v) = props.indent_left_twips {
-                ind.push_attribute(("w:left", v.to_string().as_str()));
-            }
-            if let Some(v) = props.indent_right_twips {
-                ind.push_attribute(("w:right", v.to_string().as_str()));
-            }
-            if let Some(v) = props.first_line_indent_twips {
-                if v >= 0 {
-                    ind.push_attribute(("w:firstLine", v.to_string().as_str()));
-                } else {
-                    ind.push_attribute(("w:hanging", (-v).to_string().as_str()));
-                }
-            }
-            w.write_event(Event::Empty(ind)).expect("write ind");
+        if let Some(ref pbdr) = props.border {
+            write_paragraph_borders(w, pbdr);
+        }
+
+        if let Some(ref color) = props.background_color {
+            let mut shd = BytesStart::new("w:shd");
+            shd.push_attribute(("w:val", "clear"));
+            shd.push_attribute(("w:fill", rgb_to_hex(*color).as_str()));
+            shd.push_attribute(("w:color", "auto"));
+            w.write_event(Event::Empty(shd)).expect("write pShd");
         }
 
         // Spacing
@@ -1586,20 +1584,32 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph) {
             w.write_event(Event::Empty(sp)).expect("write spacing");
         }
 
-        if let Some(ref pbdr) = props.border {
-            write_paragraph_borders(w, pbdr);
+        // Indent
+        let has_indent = props.indent_left_twips.is_some()
+            || props.indent_right_twips.is_some()
+            || props.first_line_indent_twips.is_some();
+        if has_indent {
+            let mut ind = BytesStart::new("w:ind");
+            if let Some(v) = props.indent_left_twips {
+                ind.push_attribute(("w:left", v.to_string().as_str()));
+            }
+            if let Some(v) = props.indent_right_twips {
+                ind.push_attribute(("w:right", v.to_string().as_str()));
+            }
+            if let Some(v) = props.first_line_indent_twips {
+                if v >= 0 {
+                    ind.push_attribute(("w:firstLine", v.to_string().as_str()));
+                } else {
+                    ind.push_attribute(("w:hanging", (-v).to_string().as_str()));
+                }
+            }
+            w.write_event(Event::Empty(ind)).expect("write ind");
         }
 
-        if let Some(ref color) = props.background_color {
-            let mut shd = BytesStart::new("w:shd");
-            shd.push_attribute(("w:val", "clear"));
-            shd.push_attribute(("w:fill", rgb_to_hex(*color).as_str()));
-            shd.push_attribute(("w:color", "auto"));
-            w.write_event(Event::Empty(shd)).expect("write pShd");
-        }
-
-        if let Some((num_id, ilvl)) = props.numbering {
-            write_num_pr(w, num_id, ilvl);
+        if let Some(align) = &props.alignment {
+            let mut elem = BytesStart::new("w:jc");
+            elem.push_attribute(("w:val", para_align_val(align)));
+            w.write_event(Event::Empty(elem)).expect("write jc");
         }
 
         if let Some(level) = props.outline_level {
@@ -1607,7 +1617,6 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph) {
             lvl.push_attribute(("w:val", level.to_string().as_str()));
             w.write_event(Event::Empty(lvl)).expect("write outlineLvl");
         }
-
         w.write_event(Event::End(BytesEnd::new("w:pPr")))
             .expect("write pPr end");
     }
@@ -1875,9 +1884,42 @@ fn write_column_break(w: &mut Writer<Vec<u8>>) {
         .expect("write p end");
 }
 
+/// Write `w:tblGrid`, which `CT_Tbl` requires. Uses `widths` when known and
+/// otherwise emits `col_count` auto-width columns.
+fn write_tbl_grid(w: &mut Writer<Vec<u8>>, widths: &[u32], col_count: usize) {
+    w.write_event(Event::Start(BytesStart::new("w:tblGrid")))
+        .expect("write tblGrid start");
+    if widths.is_empty() {
+        for _ in 0..col_count {
+            let mut gc = BytesStart::new("w:gridCol");
+            gc.push_attribute(("w:w", "0"));
+            w.write_event(Event::Empty(gc)).expect("write gridCol");
+        }
+    } else {
+        for &cw in widths {
+            let mut gc = BytesStart::new("w:gridCol");
+            gc.push_attribute(("w:w", cw.to_string().as_str()));
+            w.write_event(Event::Empty(gc)).expect("write gridCol");
+        }
+    }
+    w.write_event(Event::End(BytesEnd::new("w:tblGrid")))
+        .expect("write tblGrid end");
+}
+
 fn write_table(w: &mut Writer<Vec<u8>>, table: &DocxTable) {
     w.write_event(Event::Start(BytesStart::new("w:tbl")))
         .expect("write tbl start");
+
+    // CT_Tbl requires tblPr and tblGrid before the rows.
+    w.write_event(Event::Start(BytesStart::new("w:tblPr")))
+        .expect("write tblPr start");
+    let mut tbl_w = BytesStart::new("w:tblW");
+    tbl_w.push_attribute(("w:w", "0"));
+    tbl_w.push_attribute(("w:type", "auto"));
+    w.write_event(Event::Empty(tbl_w)).expect("write tblW");
+    w.write_event(Event::End(BytesEnd::new("w:tblPr")))
+        .expect("write tblPr end");
+    write_tbl_grid(w, &[], table.rows.iter().map(|r| r.len()).max().unwrap_or(0));
 
     for row in &table.rows {
         w.write_event(Event::Start(BytesStart::new("w:tr")))
@@ -1968,18 +2010,14 @@ fn write_rich_table(
     w.write_event(Event::End(BytesEnd::new("w:tblPr")))
         .expect("write tblPr end");
 
-    // tblGrid
-    if !table.column_widths_twips.is_empty() {
-        w.write_event(Event::Start(BytesStart::new("w:tblGrid")))
-            .expect("write tblGrid start");
-        for &cw in &table.column_widths_twips {
-            let mut gc = BytesStart::new("w:gridCol");
-            gc.push_attribute(("w:w", cw.to_string().as_str()));
-            w.write_event(Event::Empty(gc)).expect("write gridCol");
-        }
-        w.write_event(Event::End(BytesEnd::new("w:tblGrid")))
-            .expect("write tblGrid end");
-    }
+    // tblGrid is required by CT_Tbl (minOccurs=1), so it is written even when
+    // no explicit widths are known — markdown tables carry none. A zero width
+    // means "auto", which is what Word writes for an unsized column.
+    write_tbl_grid(
+        w,
+        &table.column_widths_twips,
+        table.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0),
+    );
 
     for row in &table.rows {
         w.write_event(Event::Start(BytesStart::new("w:tr")))
@@ -2314,10 +2352,6 @@ fn write_text_box(
     w.write_event(Event::Empty(extent)).expect("write extent");
 
     *image_counter += 1;
-    let mut doc_pr = BytesStart::new("wp:docPr");
-    doc_pr.push_attribute(("id", image_counter.to_string().as_str()));
-    doc_pr.push_attribute(("name", format!("TextBox{}", *image_counter).as_str()));
-    w.write_event(Event::Empty(doc_pr)).expect("write docPr");
 
     match &tb.wrap {
         crate::ir::TextWrap::Square => {
@@ -2342,6 +2376,13 @@ fn write_text_box(
                 .expect("write wrapThrough");
         },
     }
+
+    // CT_Anchor orders EG_WrapType before docPr; emitting docPr first
+    // produces a schema-invalid drawing.
+    let mut doc_pr = BytesStart::new("wp:docPr");
+    doc_pr.push_attribute(("id", image_counter.to_string().as_str()));
+    doc_pr.push_attribute(("name", format!("TextBox{}", *image_counter).as_str()));
+    w.write_event(Event::Empty(doc_pr)).expect("write docPr");
 
     w.write_event(Event::Start(BytesStart::new("a:graphic")))
         .expect("write graphic start");
@@ -2601,14 +2642,6 @@ fn write_floating_image_run(
     extent.push_attribute(("cy", fi.height_emu.to_string().as_str()));
     w.write_event(Event::Empty(extent)).expect("write extent");
 
-    let mut doc_pr = BytesStart::new("wp:docPr");
-    doc_pr.push_attribute(("id", pic_id.to_string().as_str()));
-    doc_pr.push_attribute(("name", format!("Image{pic_id}").as_str()));
-    if let Some(alt) = alt_text {
-        doc_pr.push_attribute(("descr", alt));
-    }
-    w.write_event(Event::Empty(doc_pr)).expect("write docPr");
-
     match &fi.text_wrap {
         crate::ir::TextWrap::Square => {
             let mut ws = BytesStart::new("wp:wrapSquare");
@@ -2636,6 +2669,16 @@ fn write_floating_image_run(
                 .expect("write wrapThrough");
         },
     }
+
+    // CT_Anchor orders EG_WrapType before docPr; emitting docPr first
+    // produces a schema-invalid drawing.
+    let mut doc_pr = BytesStart::new("wp:docPr");
+    doc_pr.push_attribute(("id", pic_id.to_string().as_str()));
+    doc_pr.push_attribute(("name", format!("Image{pic_id}").as_str()));
+    if let Some(alt) = alt_text {
+        doc_pr.push_attribute(("descr", alt));
+    }
+    w.write_event(Event::Empty(doc_pr)).expect("write docPr");
 
     // a:graphic (same pic:pic structure as inline)
     w.write_event(Event::Start(BytesStart::new("a:graphic")))
@@ -2784,6 +2827,8 @@ fn write_section_pr_body(
         pg_mar.push_attribute(("w:right", ps.margin_right_twips.to_string().as_str()));
         pg_mar.push_attribute(("w:header", ps.header_distance_twips.to_string().as_str()));
         pg_mar.push_attribute(("w:footer", ps.footer_distance_twips.to_string().as_str()));
+        // CT_PageMar declares all seven attributes as use="required".
+        pg_mar.push_attribute(("w:gutter", "0"));
         w.write_event(Event::Empty(pg_mar)).expect("write pgMar");
     }
 
@@ -2881,6 +2926,8 @@ fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
         pg_mar.push_attribute(("w:right", ps.margin_right_twips.to_string().as_str()));
         pg_mar.push_attribute(("w:header", ps.header_distance_twips.to_string().as_str()));
         pg_mar.push_attribute(("w:footer", ps.footer_distance_twips.to_string().as_str()));
+        // CT_PageMar declares all seven attributes as use="required".
+        pg_mar.push_attribute(("w:gutter", "0"));
         w.write_event(Event::Empty(pg_mar)).expect("write pgMar");
     }
 
@@ -3466,6 +3513,158 @@ mod tests {
         doc.write_to(&mut buf).unwrap();
         buf.set_position(0);
         DocxDocument::from_reader(buf).unwrap()
+    }
+
+    /// Read a part from a written package.
+    fn part_xml(doc: DocxWriter, name: &str) -> String {
+        let mut buf = Cursor::new(Vec::new());
+        doc.write_to(&mut buf).unwrap();
+        buf.set_position(0);
+        let mut zip = zip::ZipArchive::new(buf).unwrap();
+        let mut entry = zip.by_name(name).unwrap();
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut xml).unwrap();
+        xml
+    }
+
+    fn ir_cell(text: &str) -> crate::ir::TableCell {
+        crate::ir::TableCell {
+            content: vec![crate::ir::Element::Paragraph(crate::ir::Paragraph {
+                content: vec![crate::ir::InlineContent::Text(crate::ir::TextSpan {
+                    text: text.into(),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }
+    }
+
+    /// `CT_Tbl` is `tblPr, tblGrid, rows` — `tblGrid` has `minOccurs=1`. It was
+    /// emitted only when explicit column widths were known, so every table
+    /// built from markdown (which carries none) was schema-invalid.
+    #[test]
+    fn table_without_explicit_widths_still_carries_a_grid() {
+        let mut doc = DocxWriter::new();
+        let table = crate::ir::Table {
+            rows: vec![crate::ir::TableRow {
+                cells: vec![ir_cell("a"), ir_cell("b")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        doc.add_ir_table(&table);
+        let xml = part_xml(doc, "word/document.xml");
+
+        let grid = xml
+            .find("<w:tblGrid")
+            .expect("w:tblGrid is required by CT_Tbl");
+        let tr = xml.find("<w:tr").expect("table must have a row");
+        assert!(grid < tr, "tblGrid must precede the rows");
+        assert_eq!(xml.matches("<w:gridCol").count(), 2, "one gridCol per column");
+    }
+
+    /// The simple `add_table` writer emitted neither `tblPr` nor `tblGrid`.
+    #[test]
+    fn simple_table_carries_properties_and_grid() {
+        let mut doc = DocxWriter::new();
+        doc.add_table(&[vec!["a", "b"], vec!["c", "d"]]);
+        let xml = part_xml(doc, "word/document.xml");
+
+        let pr = xml.find("<w:tblPr").expect("w:tblPr is required by CT_Tbl");
+        let grid = xml
+            .find("<w:tblGrid")
+            .expect("w:tblGrid is required by CT_Tbl");
+        let tr = xml.find("<w:tr").expect("table must have a row");
+        assert!(pr < grid && grid < tr, "order must be tblPr, tblGrid, rows");
+        assert_eq!(xml.matches("<w:gridCol").count(), 2);
+    }
+
+    /// `CT_Numbering` is `numPicBullet*, abstractNum*, num*` — every
+    /// `abstractNum` must precede every `num`. Emitting them interleaved,
+    /// one pair per list, put an `abstractNum` after a `num`.
+    #[test]
+    fn numbering_puts_every_abstract_definition_before_every_instance() {
+        let mut doc = DocxWriter::new();
+        for ordered in [true, false, true] {
+            doc.add_ir_list(&crate::ir::List {
+                ordered,
+                items: vec![crate::ir::ListItem {
+                    content: crate::ir::inline_to_element_block(vec![
+                        crate::ir::InlineContent::Text(crate::ir::TextSpan {
+                            text: "item".into(),
+                            ..Default::default()
+                        }),
+                    ]),
+                    nested: None,
+                }],
+                ..Default::default()
+            });
+        }
+        let xml = part_xml(doc, "word/numbering.xml");
+
+        let last_abstract = xml.rfind("<w:abstractNum ").expect("abstractNum");
+        let first_num = xml.find("<w:num ").expect("num");
+        assert!(
+            last_abstract < first_num,
+            "every abstractNum must precede every num; got:\n{xml}"
+        );
+    }
+
+    /// `CT_Anchor` orders the wrap group before `docPr`. Both anchor writers
+    /// emitted `docPr` first.
+    #[test]
+    fn floating_anchor_puts_the_wrap_before_doc_pr() {
+        let mut doc = DocxWriter::new();
+        doc.add_text_box(&crate::ir::TextBox::default());
+        let xml = part_xml(doc, "word/document.xml");
+
+        let wrap = xml
+            .find("<wp:wrap")
+            .expect("CT_Anchor requires an EG_WrapType element");
+        let doc_pr = xml.find("<wp:docPr").expect("CT_Anchor requires docPr");
+        assert!(wrap < doc_pr, "the wrap element must precede docPr");
+    }
+
+    /// `CT_PageMar` declares seven attributes, all `use="required"`.
+    #[test]
+    fn page_margins_carry_every_required_attribute() {
+        let mut doc = DocxWriter::new();
+        doc.add_paragraph("x");
+        doc.set_section_props(
+            Some(crate::ir::PageSetup::default()),
+            None,
+            crate::ir::SectionBreakType::NextPage,
+        );
+        let xml = part_xml(doc, "word/document.xml");
+
+        let mar = xml.find("<w:pgMar").expect("w:pgMar");
+        let end = xml[mar..].find("/>").unwrap() + mar;
+        let tag = &xml[mar..end];
+        for attr in [
+            "w:top", "w:right", "w:bottom", "w:left", "w:header", "w:footer", "w:gutter",
+        ] {
+            assert!(tag.contains(attr), "pgMar missing required {attr}: {tag}");
+        }
+    }
+
+    /// `CT_PPrBase` orders `spacing` before `ind`.
+    #[test]
+    fn paragraph_properties_put_spacing_before_indent() {
+        let mut doc = DocxWriter::new();
+        doc.add_ir_paragraph(
+            &[Run::new("x")],
+            Some(IrParaProps {
+                indent_left_twips: Some(720),
+                space_after_twips: Some(240),
+                ..Default::default()
+            }),
+        );
+        let xml = part_xml(doc, "word/document.xml");
+
+        let spacing = xml.find("<w:spacing").expect("w:spacing");
+        let ind = xml.find("<w:ind").expect("w:ind");
+        assert!(spacing < ind, "CT_PPrBase requires spacing before ind");
     }
 
     #[test]
