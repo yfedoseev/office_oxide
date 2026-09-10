@@ -41,6 +41,9 @@ const CT_PRESENTATION: &str =
 const CT_SLIDE: &str = "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
 const CT_SLIDE_LAYOUT: &str =
     "application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml";
+const CT_THEME: &str = "application/vnd.openxmlformats-officedocument.theme+xml";
+const CT_PRES_PROPS: &str =
+    "application/vnd.openxmlformats-officedocument.presentationml.presProps+xml";
 const CT_SLIDE_MASTER: &str =
     "application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml";
 
@@ -492,6 +495,17 @@ impl PptxWriter {
         }
 
         opc.add_part_rel(&master_part, rel_types::SLIDE_LAYOUT, "../slideLayouts/slideLayout1.xml");
+        // A master MUST reach a theme — every clrMap slot names a theme colour.
+        opc.add_part_rel(&master_part, rel_types::THEME, "../theme/theme1.xml");
+        // [ISO/IEC 29500-1] §13.3.9: a slide layout SHALL relate to its master.
+        opc.add_part_rel(&layout_part, rel_types::SLIDE_MASTER, "../slideMasters/slideMaster1.xml");
+        // §13.3.7: exactly one presentation-properties part, from the presentation.
+        opc.add_part_rel(&pres_part, rel_types::PRES_PROPS, "presProps.xml");
+
+        let theme_part = PartName::new("/ppt/theme/theme1.xml")?;
+        opc.add_part(&theme_part, CT_THEME, &generate_theme_xml())?;
+        let pres_props_part = PartName::new("/ppt/presProps.xml")?;
+        opc.add_part(&pres_props_part, CT_PRES_PROPS, &generate_pres_props_xml())?;
 
         let pres_xml = generate_presentation_xml(self.slides.len(), self.cx, self.cy);
         opc.add_part(&pres_part, CT_PRESENTATION, &pres_xml)?;
@@ -716,6 +730,89 @@ fn generate_presentation_xml(slide_count: usize, cx: u64, cy: u64) -> Vec<u8> {
     w.write_event(Event::End(BytesEnd::new("p:presentation")))
         .expect("write");
     w.into_inner()
+}
+
+// ---------------------------------------------------------------------------
+// theme/theme1.xml and presProps.xml
+// ---------------------------------------------------------------------------
+
+/// The Office theme, trimmed to what a conformant `CT_OfficeStyleSheet`
+/// requires: a full `clrScheme` (every slot the master's `clrMap` names), a
+/// `fontScheme`, and an `fmtScheme` whose four style lists carry the three
+/// entries the schema mandates. Static — the writer exposes no theming API,
+/// but a package without a theme leaves `clrMap` pointing at nothing and
+/// leaves every renderer to invent its own fonts.
+fn generate_theme_xml() -> Vec<u8> {
+    const SCHEME: &[(&str, &str)] = &[
+        ("dk1", "000000"),
+        ("lt1", "FFFFFF"),
+        ("dk2", "44546A"),
+        ("lt2", "E7E6E6"),
+        ("accent1", "4472C4"),
+        ("accent2", "ED7D31"),
+        ("accent3", "A5A5A5"),
+        ("accent4", "FFC000"),
+        ("accent5", "5B9BD5"),
+        ("accent6", "70AD47"),
+        ("hlink", "0563C1"),
+        ("folHlink", "954F72"),
+    ];
+
+    let mut clr = String::from("<a:clrScheme name=\"Office\">");
+    for (slot, rgb) in SCHEME {
+        // dk1/lt1 are system colours in a PowerPoint-authored theme, but
+        // srgbClr is valid for every slot and keeps this self-contained.
+        clr.push_str(&format!("<a:{slot}><a:srgbClr val=\"{rgb}\"/></a:{slot}>"));
+    }
+    clr.push_str("</a:clrScheme>");
+
+    let fill = "<a:solidFill><a:schemeClr val=\"phClr\"/></a:solidFill>";
+    let line = concat!(
+        "<a:ln w=\"6350\" cap=\"flat\" cmpd=\"sng\" algn=\"ctr\">",
+        "<a:solidFill><a:schemeClr val=\"phClr\"/></a:solidFill>",
+        "<a:prstDash val=\"solid\"/></a:ln>"
+    );
+    let effect = "<a:effectStyle><a:effectLst/></a:effectStyle>";
+
+    let xml = format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
+            "<a:theme xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" name=\"Office\">",
+            "<a:themeElements>",
+            "{clr}",
+            "<a:fontScheme name=\"Office\">",
+            "<a:majorFont><a:latin typeface=\"Calibri Light\"/><a:ea typeface=\"\"/><a:cs typeface=\"\"/></a:majorFont>",
+            "<a:minorFont><a:latin typeface=\"Calibri\"/><a:ea typeface=\"\"/><a:cs typeface=\"\"/></a:minorFont>",
+            "</a:fontScheme>",
+            "<a:fmtScheme name=\"Office\">",
+            "<a:fillStyleLst>{fill}{fill}{fill}</a:fillStyleLst>",
+            "<a:lnStyleLst>{line}{line}{line}</a:lnStyleLst>",
+            "<a:effectStyleLst>{effect}{effect}{effect}</a:effectStyleLst>",
+            "<a:bgFillStyleLst>{fill}{fill}{fill}</a:bgFillStyleLst>",
+            "</a:fmtScheme>",
+            "</a:themeElements>",
+            "<a:objectDefaults/><a:extraClrSchemeLst/>",
+            "</a:theme>"
+        ),
+        clr = clr,
+        fill = fill,
+        line = line,
+        effect = effect
+    );
+    xml.into_bytes()
+}
+
+/// `ppt/presProps.xml`. [ISO/IEC 29500-1] §13.3.7 requires exactly one
+/// Presentation Properties part per package; an empty element is valid.
+fn generate_pres_props_xml() -> Vec<u8> {
+    concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
+        "<p:presentationPr xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"",
+        " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"",
+        " xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\"/>"
+    )
+    .as_bytes()
+    .to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -1473,6 +1570,78 @@ mod tests {
         ] {
             assert!(xml.contains(attr), "clrMap missing required attribute {attr}");
         }
+    }
+
+    /// List every part name in a written presentation.
+    fn part_names(writer: PptxWriter) -> Vec<String> {
+        let mut buf = Cursor::new(Vec::new());
+        writer.write_to(&mut buf).unwrap();
+        buf.set_position(0);
+        let mut zip = zip::ZipArchive::new(buf).unwrap();
+        (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect()
+    }
+
+    /// [ISO/IEC 29500-1] §13.3.9: a Slide Layout part **shall** have an
+    /// implicit relationship to a Slide Master part. Without it the layout is
+    /// orphaned, which is what defeats PowerPoint's repair.
+    #[test]
+    fn slide_layout_relates_back_to_the_slide_master() {
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("Hello");
+        let names = part_names(writer);
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "ppt/slideLayouts/_rels/slideLayout1.xml.rels"),
+            "slide layout has no _rels part; got {names:?}"
+        );
+
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("Hello");
+        let rels = part_xml(writer, "ppt/slideLayouts/_rels/slideLayout1.xml.rels");
+        assert!(rels.contains("slideMaster"), "layout rels must target the master: {rels}");
+    }
+
+    /// A `clrMap` naming theme slots is meaningless without a theme, and the
+    /// spec lists the theme among the minimum parts of a presentation.
+    #[test]
+    fn package_carries_a_theme_reachable_from_the_master() {
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("Hello");
+        let names = part_names(writer);
+        assert!(names.iter().any(|n| n == "ppt/theme/theme1.xml"), "no theme part: {names:?}");
+
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("Hello");
+        let rels = part_xml(writer, "ppt/slideMasters/_rels/slideMaster1.xml.rels");
+        assert!(rels.contains("theme"), "master must relate to the theme: {rels}");
+
+        // Every clrMap slot must resolve to a slot the theme actually defines.
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("Hello");
+        let theme = part_xml(writer, "ppt/theme/theme1.xml");
+        for slot in [
+            "lt1", "dk1", "lt2", "dk2", "accent1", "accent6", "hlink", "folHlink",
+        ] {
+            assert!(theme.contains(&format!("<a:{slot}>")), "theme missing colour slot {slot}");
+        }
+    }
+
+    /// [ISO/IEC 29500-1] §13.3.7: a package **shall contain exactly one**
+    /// Presentation Properties part, targeted from the presentation part.
+    #[test]
+    fn package_carries_presentation_properties() {
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("Hello");
+        let names = part_names(writer);
+        assert!(names.iter().any(|n| n == "ppt/presProps.xml"), "no presProps part: {names:?}");
+
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("Hello");
+        let rels = part_xml(writer, "ppt/_rels/presentation.xml.rels");
+        assert!(rels.contains("presProps.xml"), "presentation must relate to presProps: {rels}");
     }
 
     /// Read `ppt/slides/slide1.xml` from a written presentation.

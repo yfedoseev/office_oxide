@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **PPTX packages were missing the theme, `presProps.xml` and the layout→master relationship ([#202](https://github.com/yfedoseev/office_oxide/issues/202)).** The slide layout had no `_rels` part at all, so it was orphaned from its master — a hard `shall` in [ISO/IEC 29500-1] §13.3.9 and a likely reason PowerPoint's repair failed rather than succeeded. There was also no theme, which left [#199](https://github.com/yfedoseev/office_oxide/issues/199)'s colour map naming slots that did not exist.
+
 - **PPTX slide masters were missing the required `p:clrMap` ([#199](https://github.com/yfedoseev/office_oxide/issues/199)).** `CT_SlideMaster` is a strict sequence — `cSld`, `clrMap`, `sldLayoutIdLst` — and the colour map was never written at all, so every deck this library produced was schema-invalid and PowerPoint's repair had no colour mapping to recover.
 
 ## [0.1.10] - 2026-09-09
