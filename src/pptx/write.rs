@@ -722,6 +722,23 @@ fn generate_presentation_xml(slide_count: usize, cx: u64, cy: u64) -> Vec<u8> {
 // slideMasters/slideMaster1.xml
 // ---------------------------------------------------------------------------
 
+/// The twelve `CT_ColorMapping` attributes, all of which are required.
+/// Identity mapping: each master colour slot maps to the same theme slot.
+const COLOR_MAP: &[(&str, &str)] = &[
+    ("bg1", "lt1"),
+    ("tx1", "dk1"),
+    ("bg2", "lt2"),
+    ("tx2", "dk2"),
+    ("accent1", "accent1"),
+    ("accent2", "accent2"),
+    ("accent3", "accent3"),
+    ("accent4", "accent4"),
+    ("accent5", "accent5"),
+    ("accent6", "accent6"),
+    ("hlink", "hlink"),
+    ("folHlink", "folHlink"),
+];
+
 fn generate_slide_master_xml() -> Vec<u8> {
     let mut w = Writer::new(Vec::new());
     write_decl(&mut w);
@@ -738,6 +755,15 @@ fn generate_slide_master_xml() -> Vec<u8> {
         .expect("write");
     w.write_event(Event::End(BytesEnd::new("p:cSld")))
         .expect("write");
+
+    // clrMap is a REQUIRED child of CT_SlideMaster and must sit between cSld
+    // and sldLayoutIdLst. Identity mapping, matching what PowerPoint writes
+    // for a default master; every value names a slot in the theme's clrScheme.
+    let mut clr_map = BytesStart::new("p:clrMap");
+    for (slot, colour) in COLOR_MAP {
+        clr_map.push_attribute((*slot, *colour));
+    }
+    w.write_event(Event::Empty(clr_map)).expect("write");
 
     w.write_event(Event::Start(BytesStart::new("p:sldLayoutIdLst")))
         .expect("write");
@@ -1397,6 +1423,56 @@ mod tests {
         let mut xml = String::new();
         std::io::Read::read_to_string(&mut entry, &mut xml).unwrap();
         assert!(xml.contains("cx=\"9144000\""), "expected cx in presentation.xml");
+    }
+
+    /// Read an arbitrary part from a written presentation.
+    fn part_xml(writer: PptxWriter, name: &str) -> String {
+        let mut buf = Cursor::new(Vec::new());
+        writer.write_to(&mut buf).unwrap();
+        buf.set_position(0);
+        let mut zip = zip::ZipArchive::new(buf).unwrap();
+        let mut entry = zip.by_name(name).unwrap();
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut xml).unwrap();
+        xml
+    }
+
+    /// `CT_SlideMaster` is a strict sequence: `cSld`, then the **required**
+    /// `clrMap`, then `sldLayoutIdLst`. Omitting `clrMap` makes every deck we
+    /// write schema-invalid and leaves PowerPoint with no colour mapping to
+    /// recover, so its repair fails.
+    #[test]
+    fn slide_master_carries_required_colour_map_before_the_layout_list() {
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("Hello");
+        let xml = part_xml(writer, "ppt/slideMasters/slideMaster1.xml");
+
+        let clr = xml
+            .find("<p:clrMap")
+            .expect("slide master must carry <p:clrMap>");
+        let lst = xml
+            .find("<p:sldLayoutIdLst")
+            .expect("slide master must carry the layout list");
+        let csld = xml.find("</p:cSld>").expect("slide master must carry cSld");
+        assert!(csld < clr && clr < lst, "clrMap must sit between cSld and sldLayoutIdLst");
+
+        // All twelve CT_ColorMapping attributes are required.
+        for attr in [
+            "bg1=\"lt1\"",
+            "tx1=\"dk1\"",
+            "bg2=\"lt2\"",
+            "tx2=\"dk2\"",
+            "accent1=\"accent1\"",
+            "accent2=\"accent2\"",
+            "accent3=\"accent3\"",
+            "accent4=\"accent4\"",
+            "accent5=\"accent5\"",
+            "accent6=\"accent6\"",
+            "hlink=\"hlink\"",
+            "folHlink=\"folHlink\"",
+        ] {
+            assert!(xml.contains(attr), "clrMap missing required attribute {attr}");
+        }
     }
 
     /// Read `ppt/slides/slide1.xml` from a written presentation.

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **PPTX slide masters were missing the required `p:clrMap` ([#199](https://github.com/yfedoseev/office_oxide/issues/199)).** `CT_SlideMaster` is a strict sequence — `cSld`, `clrMap`, `sldLayoutIdLst` — and the colour map was never written at all, so every deck this library produced was schema-invalid and PowerPoint's repair had no colour mapping to recover.
+
 ## [0.1.10] - 2026-09-09
 
 > Correctness release. 69 issues closed, concentrated in one defect shape: **the parser read a value correctly and the converter then dropped it**. Every format is affected; DOCX most of all. Also closes six security-relevant robustness gaps, adds editing to the WASM/MCP/CLI surfaces, and replaces several silent empty-successes with named errors. No breaking API changes; some previously-empty fields are now populated, and some previously-`Ok(empty)` reads are now `Err`.
