@@ -49,6 +49,8 @@ const CT_DOCUMENT: &str =
 const CT_STYLES: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml";
 const CT_FONT_TABLE: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml";
+const CT_SETTINGS: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml";
 const CT_NUMBERING: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml";
 const CT_HEADER: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml";
@@ -962,14 +964,36 @@ impl DocxWriter {
             opc.add_part(&numbering_part, CT_NUMBERING, &numbering_xml)?;
         }
 
+        // settings.xml carries two switches other parts depend on:
+        // w:evenAndOddHeaders, without which a w:type="even" header is never
+        // shown, and w:embedTrueTypeFonts, without which fontTable.xml's
+        // embedded font references are inert.
+        let has_even_hf = self
+            .headers_footers
+            .iter()
+            .any(|hf| matches!(hf.hf_type, HfType::EvenPageHeader | HfType::EvenPageFooter));
+        let has_fonts = !self.embedded_fonts.is_empty();
+        if has_even_hf || has_fonts {
+            let settings_part = PartName::new("/word/settings.xml")?;
+            opc.add_part_rel(&doc_part, rel_types::SETTINGS, "settings.xml");
+            let xml = generate_settings_xml(has_even_hf, has_fonts);
+            opc.add_part(&settings_part, CT_SETTINGS, &xml)?;
+        }
+
         opc.finish()?;
         Ok(())
     }
 
     fn has_text_boxes(&self) -> bool {
-        self.elements
-            .iter()
-            .any(|e| matches!(e, DocxElement::TextBox(_)))
+        fn check(elements: &[DocxElement]) -> bool {
+            elements
+                .iter()
+                .any(|e| matches!(e, DocxElement::TextBox(_)))
+        }
+        check(&self.elements)
+            || self.headers_footers.iter().any(|hf| check(&hf.elements))
+            || self.footnotes.iter().any(|n| check(&n.elements))
+            || self.endnotes.iter().any(|n| check(&n.elements))
     }
 
     fn has_lists(&self) -> bool {
@@ -986,7 +1010,17 @@ impl DocxWriter {
                 _ => false,
             })
         }
+        // A list in a header, footer, footnote or endnote emits ListParagraph
+        // and numId=1 just like one in the body. Checking only `elements`
+        // meant those parts referenced a numbering part that was never
+        // written and a style that was never defined.
         check_elements(&self.elements)
+            || self
+                .headers_footers
+                .iter()
+                .any(|hf| check_elements(&hf.elements))
+            || self.footnotes.iter().any(|n| check_elements(&n.elements))
+            || self.endnotes.iter().any(|n| check_elements(&n.elements))
     }
 
     fn generate_document_xml(
@@ -1268,7 +1302,11 @@ fn convert_ir_element_to_docx_elements(elem: &crate::ir::Element, out: &mut Vec<
         },
         E::Table(t) => out.push(DocxElement::RichTable(convert_ir_table(t))),
         E::List(l) => {
-            let num_id = 1u32;
+            // numId 1 -> abstract 0 (bullet), numId 2 -> abstract 1 (decimal).
+            // Hardcoding 1 made every ordered list nested in a cell, text box
+            // or header render as bullets, disagreeing with the same list at
+            // top level.
+            let num_id = if l.ordered { 2u32 } else { 1u32 };
             for item in &l.items {
                 for content_elem in &item.content {
                     if let E::Paragraph(p) = content_elem {
@@ -2870,7 +2908,20 @@ fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
     w.write_event(Event::Start(BytesStart::new("w:sectPr")))
         .expect("write sectPr start");
 
+    // ECMA-376 §17.10.5 allows at most one reference of each type per
+    // section. headers_footers is a single flat list shared by every
+    // section, so without this a multi-section document emitted duplicate
+    // w:type values in the final sectPr.
+    let mut seen_types: Vec<HfType> = Vec::new();
+    let mut has_first_page = false;
     for (hf_type, rid) in &sp.hf_rids {
+        if seen_types.contains(hf_type) {
+            continue;
+        }
+        seen_types.push(*hf_type);
+        if matches!(hf_type, HfType::FirstPageHeader | HfType::FirstPageFooter) {
+            has_first_page = true;
+        }
         let (tag, type_val) = match hf_type {
             HfType::DefaultHeader => ("w:headerReference", "default"),
             HfType::FirstPageHeader => ("w:headerReference", "first"),
@@ -2883,6 +2934,13 @@ fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
         elem.push_attribute(("w:type", type_val));
         elem.push_attribute(("r:id", rid.as_str()));
         w.write_event(Event::Empty(elem)).expect("write hfRef");
+    }
+
+    // A w:type="first" reference does nothing without w:titlePg — the
+    // distinct first-page header is simply never shown.
+    if has_first_page {
+        w.write_event(Event::Empty(BytesStart::new("w:titlePg")))
+            .expect("write titlePg");
     }
 
     if let Some(ref rid) = sp.footnote_rid {
@@ -3008,6 +3066,28 @@ fn generate_endnotes_xml(notes: &[DocxNote], image_rids: &[ImageInfo]) -> Vec<u8
     generate_notes_xml(notes, image_rids, true)
 }
 
+/// `word/settings.xml`, written only when a part depends on it.
+fn generate_settings_xml(even_and_odd_headers: bool, embed_fonts: bool) -> Vec<u8> {
+    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+    w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
+        .expect("write decl");
+    let mut root = BytesStart::new("w:settings");
+    root.push_attribute(("xmlns:w", WML_NS));
+    w.write_event(Event::Start(root)).expect("write settings");
+    // CT_Settings is a sequence; embedTrueTypeFonts precedes evenAndOddHeaders.
+    if embed_fonts {
+        w.write_event(Event::Empty(BytesStart::new("w:embedTrueTypeFonts")))
+            .expect("write embedTrueTypeFonts");
+    }
+    if even_and_odd_headers {
+        w.write_event(Event::Empty(BytesStart::new("w:evenAndOddHeaders")))
+            .expect("write evenAndOddHeaders");
+    }
+    w.write_event(Event::End(BytesEnd::new("w:settings")))
+        .expect("write settings end");
+    w.into_inner()
+}
+
 fn generate_notes_xml(notes: &[DocxNote], image_rids: &[ImageInfo], is_endnote: bool) -> Vec<u8> {
     let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
     w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
@@ -3027,6 +3107,39 @@ fn generate_notes_xml(notes: &[DocxNote], image_rids: &[ImageInfo], is_endnote: 
     let mut root = BytesStart::new(root_tag);
     root.push_attribute(("xmlns:w", WML_NS));
     w.write_event(Event::Start(root)).expect("write notes root");
+
+    // Word expects the separator (id -1) and continuationSeparator (id 0)
+    // notes in every notes part; sectPr's footnotePr refers to them
+    // implicitly. Without them there is no rule above the notes.
+    for (id, kind) in [("-1", "separator"), ("0", "continuationSeparator")] {
+        let mut sep = BytesStart::new(note_tag);
+        sep.push_attribute(("w:type", kind));
+        sep.push_attribute(("w:id", id));
+        w.write_event(Event::Start(sep))
+            .expect("write separator note");
+        w.write_event(Event::Start(BytesStart::new("w:p")))
+            .expect("write p");
+        w.write_event(Event::Start(BytesStart::new("w:r")))
+            .expect("write r");
+        let mark = if is_endnote {
+            "w:endnoteRef"
+        } else {
+            "w:footnoteRef"
+        };
+        let _ = mark;
+        w.write_event(Event::Empty(BytesStart::new(if kind == "separator" {
+            "w:separator"
+        } else {
+            "w:continuationSeparator"
+        })))
+        .expect("write separator mark");
+        w.write_event(Event::End(BytesEnd::new("w:r")))
+            .expect("write r end");
+        w.write_event(Event::End(BytesEnd::new("w:p")))
+            .expect("write p end");
+        w.write_event(Event::End(BytesEnd::new(note_tag)))
+            .expect("write separator note end");
+    }
 
     for note in notes {
         let mut note_elem = BytesStart::new(note_tag);
@@ -3212,10 +3325,12 @@ fn generate_styles_xml(has_numbering: bool, has_notes: bool) -> Vec<u8> {
     }
     write_code_style(&mut w);
 
-    if has_notes {
-        write_character_style(&mut w, "FootnoteReference", "footnote reference");
-        write_character_style(&mut w, "EndnoteReference", "endnote reference");
-    }
+    // These are written unconditionally: a run may carry a footnote_ref
+    // without a matching note part, and a dangling w:rStyle is exactly the
+    // kind of unresolved reference Word refuses to open.
+    let _ = has_notes;
+    write_character_style(&mut w, "FootnoteReference", "footnote reference");
+    write_character_style(&mut w, "EndnoteReference", "endnote reference");
 
     w.write_event(Event::End(BytesEnd::new("w:styles")))
         .expect("write styles end");
@@ -3665,6 +3780,179 @@ mod tests {
         let spacing = xml.find("<w:spacing").expect("w:spacing");
         let ind = xml.find("<w:ind").expect("w:ind");
         assert!(spacing < ind, "CT_PPrBase requires spacing before ind");
+    }
+
+    fn ir_list(ordered: bool, text: &str) -> crate::ir::Element {
+        crate::ir::Element::List(crate::ir::List {
+            ordered,
+            items: vec![crate::ir::ListItem {
+                content: crate::ir::inline_to_element_block(vec![crate::ir::InlineContent::Text(
+                    crate::ir::TextSpan {
+                        text: text.into(),
+                        ..Default::default()
+                    },
+                )]),
+                nested: None,
+            }],
+            ..Default::default()
+        })
+    }
+
+    fn all_parts(doc: DocxWriter) -> std::collections::HashMap<String, String> {
+        let mut buf = Cursor::new(Vec::new());
+        doc.write_to(&mut buf).unwrap();
+        buf.set_position(0);
+        let mut zip = zip::ZipArchive::new(buf).unwrap();
+        let mut out = std::collections::HashMap::new();
+        for i in 0..zip.len() {
+            let mut e = zip.by_index(i).unwrap();
+            let name = e.name().to_string();
+            let mut xml = String::new();
+            if std::io::Read::read_to_string(&mut e, &mut xml).is_ok() {
+                out.insert(name, xml);
+            }
+        }
+        out
+    }
+
+    /// A list in a header, footer or note emits `ListParagraph` and
+    /// `numId=1` exactly like one in the body, but the numbering part and
+    /// the style were gated on the body alone. The result is schema-valid
+    /// and has a `w:numId` pointing at a part that does not exist.
+    #[test]
+    fn a_list_outside_the_body_still_gets_its_numbering_and_style() {
+        let mut doc = DocxWriter::new();
+        doc.add_paragraph("body text, no lists at top level");
+        doc.add_section_header(HfType::DefaultHeader, vec![ir_list(false, "hdr item")]);
+        let parts = all_parts(doc);
+
+        let header = parts
+            .iter()
+            .find(|(k, _)| k.starts_with("word/header"))
+            .map(|(_, v)| v.clone())
+            .expect("header part");
+        assert!(header.contains("w:numId"), "the header list should carry numbering");
+        assert!(
+            parts.contains_key("word/numbering.xml"),
+            "a numId with no numbering.xml is a dangling reference; parts: {:?}",
+            parts.keys().collect::<Vec<_>>()
+        );
+        let styles = &parts["word/styles.xml"];
+        assert!(
+            styles.contains(r#"w:styleId="ListParagraph""#),
+            "ListParagraph referenced but not defined"
+        );
+    }
+
+    /// A run may carry a footnote reference with no matching note part, so
+    /// the reference character styles must always be defined.
+    #[test]
+    fn note_reference_styles_are_always_defined() {
+        let mut doc = DocxWriter::new();
+        doc.add_ir_paragraph(
+            &[
+                Run::new("dangling"),
+                Run {
+                    footnote_ref: Some(7),
+                    ..Default::default()
+                },
+            ],
+            None,
+        );
+        let parts = all_parts(doc);
+        let body = &parts["word/document.xml"];
+        let styles = &parts["word/styles.xml"];
+        if body.contains("FootnoteReference") {
+            assert!(
+                styles.contains(r#"w:styleId="FootnoteReference""#),
+                "FootnoteReference referenced but not defined"
+            );
+        }
+    }
+
+    /// Word expects the separator and continuationSeparator notes.
+    #[test]
+    fn notes_part_carries_the_separator_notes() {
+        let mut doc = DocxWriter::new();
+        doc.add_footnote(1, &[crate::ir::Element::Paragraph(Default::default())]);
+        let parts = all_parts(doc);
+        let notes = &parts["word/footnotes.xml"];
+        assert!(notes.contains(r#"w:type="separator""#), "missing separator note: {notes}");
+        assert!(
+            notes.contains(r#"w:type="continuationSeparator""#),
+            "missing continuationSeparator note: {notes}"
+        );
+    }
+
+    /// An ordered list nested in a cell must not silently become bullets.
+    #[test]
+    fn a_nested_ordered_list_uses_the_ordered_numbering_definition() {
+        let mut doc = DocxWriter::new();
+        let table = crate::ir::Table {
+            rows: vec![crate::ir::TableRow {
+                cells: vec![crate::ir::TableCell {
+                    content: vec![ir_list(true, "first")],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        doc.add_ir_table(&table);
+        let xml = part_xml(doc, "word/document.xml");
+        assert!(
+            xml.contains(r#"<w:numId w:val="2"/>"#),
+            "an ordered list must not use the bullet definition: {xml}"
+        );
+    }
+
+    /// `w:type="first"` does nothing without `w:titlePg`; a `w:type="even"`
+    /// header does nothing without `w:evenAndOddHeaders` in settings.xml.
+    #[test]
+    fn first_and_even_page_headers_carry_the_switches_that_enable_them() {
+        let mut doc = DocxWriter::new();
+        doc.add_paragraph("x");
+        doc.add_section_header(HfType::FirstPageHeader, vec![]);
+        doc.add_section_header(HfType::EvenPageHeader, vec![]);
+        doc.set_section_props(
+            Some(crate::ir::PageSetup::default()),
+            None,
+            crate::ir::SectionBreakType::NextPage,
+        );
+        let parts = all_parts(doc);
+        assert!(
+            parts["word/document.xml"].contains("<w:titlePg/>"),
+            "a first-page header needs w:titlePg"
+        );
+        let settings = parts
+            .get("word/settings.xml")
+            .expect("an even-page header needs settings.xml");
+        assert!(
+            settings.contains("<w:evenAndOddHeaders/>"),
+            "settings.xml must enable even/odd headers: {settings}"
+        );
+    }
+
+    /// At most one header/footer reference of each type per section.
+    #[test]
+    fn section_properties_carry_one_reference_per_type() {
+        let mut doc = DocxWriter::new();
+        doc.add_paragraph("x");
+        for _ in 0..3 {
+            doc.add_section_header(HfType::DefaultHeader, vec![]);
+        }
+        doc.set_section_props(
+            Some(crate::ir::PageSetup::default()),
+            None,
+            crate::ir::SectionBreakType::NextPage,
+        );
+        let xml = part_xml(doc, "word/document.xml");
+        assert_eq!(
+            xml.matches(r#"<w:headerReference w:type="default""#)
+                .count(),
+            1,
+            "duplicate header references of one type: {xml}"
+        );
     }
 
     #[test]
