@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Verified
+
+Swept **6,062 real Office documents** (LibreOffice QA, Apache POI, OpenXML SDK, python-pptx, ClosedXML, calamine, PhpSpreadsheet and others) arm-to-arm against v0.1.10, on two axes.
+
+**Extraction — no regressions.** 6,062 files × 4 surfaces = 24,248 observations per arm. **0 ok→not-ok**, 3 recoveries. The only text change is one file where a time that rounded up to a whole day now carries into the date instead of rendering hour 24. Three anomalous status transitions were re-measured quiescently and were load artifacts, not regressions — the sweep README warns about exactly that.
+
+**Conversion — the axis this release changes.** Every file through `Document::save_as`, then schema-validated:
+
+| source | v0.1.10 | v0.1.11 |
+|---|---|---|
+| `.doc` → `.docx` | 92 / 201 | **201 / 201** |
+| `.docx` → `.docx` | 60 / 2509 | **2507 / 2509** |
+| `.ppt` → `.pptx` | 0 / 176 | **176 / 176** |
+| `.pptx` → `.pptx` | 0 / 791 | **791 / 791** |
+| `.xls` → `.xlsx` | 469 / 475 | **475 / 475** |
+| `.xlsx` → `.xlsx` | 1766 / 1769 | **1768 / 1769** |
+| **total** | **2387 / 5921 (40.3%)** | **5918 / 5921 (99.9%)** |
+
+Zero regressions. The three remaining files fail identically under v0.1.10: two carry a malformed `dcterms:modified` in the source (`2015sss-06-20T07:40:00Z`) that is copied through verbatim, and one is a deeply nested table.
+
+The sweep found **nine defects the unit suite could not see**, all fixed here — including three element-ordering defects of the same shape (`w:pPr`, `w:tblPr`, `w:tcPr`), two namespace declarations missing from parts that use them, and one duplicate attribute I introduced while fixing a missing one.
+
 ### Added
 
 - **An OOXML validation gate ([#201](https://github.com/yfedoseev/office_oxide/issues/201)).** Nothing checked that the documents this library *writes* are valid — generated files were only round-tripped through our own lenient parser, so a document Word refuses to open passed the whole suite. `scripts/ooxml-validate/` now fetches the ISO/IEC 29500-4 schemas (not committed, per CONTRIBUTING #4), `cargo run --example gen_validation_corpus` produces 30 packages across the markdown path, the builder APIs, all nine `save_as` conversion pairs and out-of-range values, and both validators run in CI. Writing it immediately found three more defects: `w:titlePg` emitted in the wrong `CT_SectPr` position, `xml:space` on an XLSX `<t>` where it is not allowed, and an empty `p:txBody` on a slide whose only content was a table.
