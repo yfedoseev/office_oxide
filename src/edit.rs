@@ -91,7 +91,7 @@ impl EditableDocument {
     ///
     /// # Errors
     ///
-    /// Returns [`OfficeError::UnsupportedFormat`] for XLSX, which has no text
+    /// Returns [`crate::OfficeError::UnsupportedFormat`] for XLSX, which has no text
     /// replacement — use [`Self::set_cell`]. Returning `0` instead was
     /// indistinguishable from "the text was not present", so a caller (and
     /// every agent driving the CLI or MCP server) was told the edit
