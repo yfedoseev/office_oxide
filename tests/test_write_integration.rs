@@ -2253,3 +2253,52 @@ fn table_properties_follow_the_schema_sequence() {
     assert!(ind < mar, "tblInd must precede tblCellMar");
     assert!(mar < cap, "tblCellMar must precede tblCaption");
 }
+
+/// A drawing nested inside a table cell is not reached by the top-level
+/// content scan, so gating the drawing namespaces on that scan left
+/// `document.xml` using undeclared prefixes.
+#[test]
+fn a_drawing_nested_in_a_table_keeps_document_xml_well_formed() {
+    use office_oxide::docx::write::DocxWriter;
+    use office_oxide::ir::*;
+
+    let mut w = DocxWriter::new();
+    w.add_ir_table(&Table {
+        rows: vec![TableRow {
+            cells: vec![TableCell {
+                content: vec![Element::TextBox(TextBox {
+                    content: vec![Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan {
+                            text: "in a cell".into(),
+                            ..Default::default()
+                        })],
+                        ..Default::default()
+                    })],
+                    ..Default::default()
+                })],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    w.write_to(&mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut xml = String::new();
+    let mut e = zip.by_name("word/document.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut xml).unwrap();
+
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let mut b = Vec::new();
+    loop {
+        match reader.read_event_into(&mut b) {
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {},
+            Err(err) => panic!("document.xml is not well-formed: {err}\n{xml}"),
+        }
+        b.clear();
+    }
+}

@@ -1135,14 +1135,16 @@ impl DocxWriter {
         let mut root = BytesStart::new("w:document");
         root.push_attribute(("xmlns:w", WML_NS));
         root.push_attribute(("xmlns:r", R_NS));
-        if has_images || has_text_boxes {
-            root.push_attribute(("xmlns:wp", DRAWING_NS));
-            root.push_attribute(("xmlns:a", DML_NS));
-            root.push_attribute(("xmlns:pic", PIC_NS));
-        }
-        if has_text_boxes {
-            root.push_attribute(("xmlns:wps", WPS_NS));
-        }
+        // Declared unconditionally. Gating these on has_images/has_text_boxes
+        // meant a drawing the scan did not reach — one nested in a table cell,
+        // for instance — emitted wp:/a:/pic:/wps: with no declaration, making
+        // document.xml not well-formed. A content scan that has to stay in
+        // step with every nesting site is the wrong shape for this.
+        let _ = (has_images, has_text_boxes);
+        root.push_attribute(("xmlns:wp", DRAWING_NS));
+        root.push_attribute(("xmlns:a", DML_NS));
+        root.push_attribute(("xmlns:pic", PIC_NS));
+        root.push_attribute(("xmlns:wps", WPS_NS));
         w.write_event(Event::Start(root))
             .expect("write document start");
 
@@ -2340,6 +2342,27 @@ fn write_rich_table(
                     write_table_borders(w, border, "w:tcBorders");
                 }
 
+                // CT_TcPrBase orders tcMar before textDirection and vAlign.
+                if let Some(ref pad) = cell.padding {
+                    w.write_event(Event::Start(BytesStart::new("w:tcMar")))
+                        .expect("write tcMar start");
+                    for (side, val) in [
+                        ("w:top", pad.top_twips),
+                        ("w:left", pad.left_twips),
+                        ("w:bottom", pad.bottom_twips),
+                        ("w:right", pad.right_twips),
+                    ] {
+                        if let Some(v) = val {
+                            let mut elem = BytesStart::new(side);
+                            elem.push_attribute(("w:w", v.to_string().as_str()));
+                            elem.push_attribute(("w:type", "dxa"));
+                            w.write_event(Event::Empty(elem)).expect("write tcMar side");
+                        }
+                    }
+                    w.write_event(Event::End(BytesEnd::new("w:tcMar")))
+                        .expect("write tcMar end");
+                }
+
                 if let Some(ref va) = cell.vertical_align {
                     let val = match va {
                         CellVerticalAlign::Top => "top",
@@ -2361,26 +2384,6 @@ fn write_rich_table(
                     td_elem.push_attribute(("w:val", val));
                     w.write_event(Event::Empty(td_elem))
                         .expect("write textDirection");
-                }
-
-                if let Some(ref pad) = cell.padding {
-                    w.write_event(Event::Start(BytesStart::new("w:tcMar")))
-                        .expect("write tcMar start");
-                    for (side, val) in [
-                        ("w:top", pad.top_twips),
-                        ("w:left", pad.left_twips),
-                        ("w:bottom", pad.bottom_twips),
-                        ("w:right", pad.right_twips),
-                    ] {
-                        if let Some(v) = val {
-                            let mut elem = BytesStart::new(side);
-                            elem.push_attribute(("w:w", v.to_string().as_str()));
-                            elem.push_attribute(("w:type", "dxa"));
-                            w.write_event(Event::Empty(elem)).expect("write tcMar side");
-                        }
-                    }
-                    w.write_event(Event::End(BytesEnd::new("w:tcMar")))
-                        .expect("write tcMar end");
                 }
 
                 w.write_event(Event::End(BytesEnd::new("w:tcPr")))
@@ -2846,6 +2849,18 @@ fn write_floating_image_run(
     anchor.push_attribute(("distR", "114300"));
     anchor.push_attribute(("simplePos", "0"));
     anchor.push_attribute(("relativeHeight", "251659264"));
+    // behindDoc and layoutInCell are required by CT_Anchor. The text box
+    // writer sets them; this one never did.
+    anchor.push_attribute((
+        "behindDoc",
+        if matches!(fi.text_wrap, crate::ir::TextWrap::Behind) {
+            "1"
+        } else {
+            "0"
+        },
+    ));
+    anchor.push_attribute(("locked", "0"));
+    anchor.push_attribute(("layoutInCell", "1"));
     anchor.push_attribute(("allowOverlap", if fi.allow_overlap { "1" } else { "0" }));
     w.write_event(Event::Start(anchor))
         .expect("write anchor start");
