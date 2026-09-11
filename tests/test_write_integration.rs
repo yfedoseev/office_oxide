@@ -2302,3 +2302,62 @@ fn a_drawing_nested_in_a_table_keeps_document_xml_well_formed() {
         b.clear();
     }
 }
+
+/// Every anchor attribute must appear exactly once. A duplicate makes the
+/// part not well-formed, which no schema check reaches — the parse fails
+/// first.
+#[test]
+fn a_floating_image_anchor_has_no_duplicate_attributes() {
+    use office_oxide::docx::write::DocxWriter;
+    use office_oxide::ir::*;
+
+    const PNG: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut w = DocxWriter::new();
+    w.add_ir_image(&Image {
+        data: Some(PNG.to_vec()),
+        format: Some(ImageFormat::Png),
+        display_width_emu: Some(500_000),
+        display_height_emu: Some(500_000),
+        positioning: ImagePositioning::Floating(FloatingImage {
+            x_emu: 0,
+            y_emu: 0,
+            width_emu: 500_000,
+            height_emu: 500_000,
+            h_anchor: FloatAnchor::Page,
+            v_anchor: FloatAnchor::Page,
+            text_wrap: TextWrap::Square,
+            allow_overlap: true,
+        }),
+        ..Default::default()
+    });
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    w.write_to(&mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut xml = String::new();
+    let mut e = zip.by_name("word/document.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut xml).unwrap();
+
+    if let Some(start) = xml.find("<wp:anchor") {
+        let tag = &xml[start..start + xml[start..].find('>').unwrap()];
+        for attr in ["behindDoc", "locked", "layoutInCell", "simplePos", "distT"] {
+            assert_eq!(
+                tag.matches(&format!("{attr}=")).count(),
+                1,
+                "wp:anchor repeats {attr}: {tag}"
+            );
+        }
+    }
+
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let mut b = Vec::new();
+    loop {
+        match reader.read_event_into(&mut b) {
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {},
+            Err(err) => panic!("document.xml is not well-formed: {err}"),
+        }
+        b.clear();
+    }
+}

@@ -2842,15 +2842,6 @@ fn write_floating_image_run(
         .expect("write drawing start");
 
     let mut anchor = BytesStart::new("wp:anchor");
-    anchor.push_attribute(("behindDoc", "0"));
-    anchor.push_attribute(("distT", "0"));
-    anchor.push_attribute(("distB", "0"));
-    anchor.push_attribute(("distL", "114300"));
-    anchor.push_attribute(("distR", "114300"));
-    anchor.push_attribute(("simplePos", "0"));
-    anchor.push_attribute(("relativeHeight", "251659264"));
-    // behindDoc and layoutInCell are required by CT_Anchor. The text box
-    // writer sets them; this one never did.
     anchor.push_attribute((
         "behindDoc",
         if matches!(fi.text_wrap, crate::ir::TextWrap::Behind) {
@@ -2859,6 +2850,16 @@ fn write_floating_image_run(
             "0"
         },
     ));
+    anchor.push_attribute(("distT", "0"));
+    anchor.push_attribute(("distB", "0"));
+    anchor.push_attribute(("distL", "114300"));
+    anchor.push_attribute(("distR", "114300"));
+    anchor.push_attribute(("simplePos", "0"));
+    anchor.push_attribute(("relativeHeight", "251659264"));
+    // locked and layoutInCell are required by CT_Anchor. The text box writer
+    // sets them; this one never did. behindDoc is already set above — adding
+    // it a second time makes the element not well-formed, which no schema
+    // check can even reach because the parse fails first.
     anchor.push_attribute(("locked", "0"));
     anchor.push_attribute(("layoutInCell", "1"));
     anchor.push_attribute(("allowOverlap", if fi.allow_overlap { "1" } else { "0" }));
