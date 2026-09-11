@@ -44,10 +44,28 @@ public sealed class XlsxWriter : IDisposable
             case float fv: t = 2; n = fv; break;
             case int iv: t = 2; n = iv; break;
             case long lv: t = 2; n = lv; break;
-            case bool bv: t = 2; n = bv ? 1 : 0; break;
-            default: t = 1; s = value.ToString(); break;
+            case decimal mv: t = 2; n = (double)mv; break;
+            case short hv: t = 2; n = hv; break;
+            case ushort uhv: t = 2; n = uhv; break;
+            case uint uiv: t = 2; n = uiv; break;
+            case ulong ulv: t = 2; n = ulv; break;
+            case byte byv: t = 2; n = byv; break;
+            case sbyte sbv: t = 2; n = sbv; break;
+            case bool bv: t = 3; n = bv ? 1 : 0; break;
+            // Anything else is rendered with the invariant culture: the
+            // default ToString() made output depend on the host locale, so a
+            // decimal became "1,5" under de-DE.
+            default: t = 1; s = System.Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture); break;
         }
-        NativeMethods.OfficeXlsxSheetSetCell(_handle, sheet, row, col, t, s, n);
+        // A non-zero status means the value was NOT written — an out-of-grid
+        // row/column or a bad sheet index. Ignoring it silently discarded the
+        // caller's data while reporting success.
+        int rc = NativeMethods.OfficeXlsxSheetSetCell(_handle, sheet, row, col, t, s, n);
+        if (rc != 0)
+        {
+            throw new InvalidOperationException(
+                $"SetCell({sheet},{row},{col}) wrote nothing (status {rc})");
+        }
     }
 
     /// <summary>
@@ -65,9 +83,26 @@ public sealed class XlsxWriter : IDisposable
             case float fv: t = 2; n = fv; break;
             case int iv: t = 2; n = iv; break;
             case long lv: t = 2; n = lv; break;
-            default: t = 1; s = value?.ToString(); break;
+            case decimal mv: t = 2; n = (double)mv; break;
+            case short hv: t = 2; n = hv; break;
+            case ushort uhv: t = 2; n = uhv; break;
+            case uint uiv: t = 2; n = uiv; break;
+            case ulong ulv: t = 2; n = ulv; break;
+            case byte byv: t = 2; n = byv; break;
+            case sbyte sbv: t = 2; n = sbv; break;
+            case bool bv: t = 3; n = bv ? 1 : 0; break;
+            // Anything else is rendered with the invariant culture: the
+            // default ToString() made output depend on the host locale, so a
+            // decimal became "1,5" under de-DE.
+            default: t = 1; s = System.Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture); break;
         }
-        NativeMethods.OfficeXlsxSheetSetCellStyled(_handle, sheet, row, col, t, s, n, bold, bgColor);
+        int rc = NativeMethods.OfficeXlsxSheetSetCellStyled(
+            _handle, sheet, row, col, t, s, n, bold, bgColor);
+        if (rc != 0)
+        {
+            throw new InvalidOperationException(
+                $"SetCellStyled({sheet},{row},{col}) wrote nothing (status {rc})");
+        }
     }
 
     /// <summary>Merge a rectangular range. rowSpan and colSpan must be >= 1.</summary>

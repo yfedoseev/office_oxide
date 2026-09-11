@@ -464,16 +464,50 @@ func (w *XlsxWriter) SetCell(sheet, row, col uint32, value any) {
 	case float64:
 		vtype = 2
 		vnum = C.double(v)
+	case float32:
+		vtype = 2
+		vnum = C.double(v)
 	case int:
 		vtype = 2
 		vnum = C.double(v)
-	case bool:
+	case int8:
 		vtype = 2
+		vnum = C.double(v)
+	case int16:
+		vtype = 2
+		vnum = C.double(v)
+	case int32:
+		vtype = 2
+		vnum = C.double(v)
+	case int64:
+		vtype = 2
+		vnum = C.double(v)
+	case uint:
+		vtype = 2
+		vnum = C.double(v)
+	case uint8:
+		vtype = 2
+		vnum = C.double(v)
+	case uint16:
+		vtype = 2
+		vnum = C.double(v)
+	case uint32:
+		vtype = 2
+		vnum = C.double(v)
+	case uint64:
+		vtype = 2
+		vnum = C.double(v)
+	case bool:
+		vtype = 3
 		if v {
 			vnum = 1.0
 		}
 	default:
-		vtype = 0
+		// Anything else is rendered rather than discarded: `vtype = 0` wrote
+		// an EMPTY cell, so an int64 or a float32 silently vanished.
+		vtype = 1
+		vstr = C.CString(fmt.Sprintf("%v", v))
+		defer C.free(unsafe.Pointer(vstr))
 	}
 	C.office_xlsx_sheet_set_cell(w.handle, C.uint32_t(sheet), C.uint32_t(row), C.uint32_t(col), vtype, vstr, vnum)
 }
@@ -497,11 +531,50 @@ func (w *XlsxWriter) SetCellStyled(sheet, row, col uint32, value any, bold bool,
 	case float64:
 		vtype = 2
 		vnum = C.double(v)
+	case float32:
+		vtype = 2
+		vnum = C.double(v)
 	case int:
 		vtype = 2
 		vnum = C.double(v)
+	case int8:
+		vtype = 2
+		vnum = C.double(v)
+	case int16:
+		vtype = 2
+		vnum = C.double(v)
+	case int32:
+		vtype = 2
+		vnum = C.double(v)
+	case int64:
+		vtype = 2
+		vnum = C.double(v)
+	case uint:
+		vtype = 2
+		vnum = C.double(v)
+	case uint8:
+		vtype = 2
+		vnum = C.double(v)
+	case uint16:
+		vtype = 2
+		vnum = C.double(v)
+	case uint32:
+		vtype = 2
+		vnum = C.double(v)
+	case uint64:
+		vtype = 2
+		vnum = C.double(v)
+	case bool:
+		vtype = 3
+		if v {
+			vnum = 1.0
+		}
 	default:
-		vtype = 0
+		// Anything else is rendered rather than discarded: `vtype = 0` wrote
+		// an EMPTY cell, so an int64 or a float32 silently vanished.
+		vtype = 1
+		vstr = C.CString(fmt.Sprintf("%v", v))
+		defer C.free(unsafe.Pointer(vstr))
 	}
 	var cbg *C.char
 	if bgColor != "" {

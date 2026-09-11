@@ -118,12 +118,12 @@ internal static partial class NativeMethods
     internal static partial uint OfficeXlsxWriterAddSheet(IntPtr handle, string name);
 
     [LibraryImport(Lib, EntryPoint = "office_xlsx_sheet_set_cell", StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial void OfficeXlsxSheetSetCell(
+    internal static partial int OfficeXlsxSheetSetCell(
         IntPtr handle, uint sheet, uint row, uint col,
         int valueType, string? valueStr, double valueNum);
 
     [LibraryImport(Lib, EntryPoint = "office_xlsx_sheet_set_cell_styled", StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial void OfficeXlsxSheetSetCellStyled(
+    internal static partial int OfficeXlsxSheetSetCellStyled(
         IntPtr handle, uint sheet, uint row, uint col,
         int valueType, string? valueStr, double valueNum,
         [MarshalAs(UnmanagedType.U1)] bool bold, string? bgColor);

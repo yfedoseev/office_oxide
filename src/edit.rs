@@ -88,12 +88,21 @@ impl EditableDocument {
     ///
     /// For DOCX: replaces text in `<w:t>` elements.
     /// For PPTX: replaces text in `<a:t>` elements across all slides.
-    /// For XLSX: not applicable (use `set_cell` instead) — returns 0.
-    pub fn replace_text(&mut self, find: &str, replace: &str) -> usize {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::OfficeError::UnsupportedFormat`] for XLSX, which has no text
+    /// replacement — use [`Self::set_cell`]. Returning `0` instead was
+    /// indistinguishable from "the text was not present", so a caller (and
+    /// every agent driving the CLI or MCP server) was told the edit
+    /// succeeded when the operation is not implemented at all.
+    pub fn replace_text(&mut self, find: &str, replace: &str) -> Result<usize> {
         match &mut self.inner {
-            EditableInner::Docx(doc) => doc.replace_text(find, replace),
-            EditableInner::Pptx(doc) => doc.replace_text(find, replace),
-            EditableInner::Xlsx(_) => 0,
+            EditableInner::Docx(doc) => Ok(doc.replace_text(find, replace)),
+            EditableInner::Pptx(doc) => Ok(doc.replace_text(find, replace)),
+            EditableInner::Xlsx(_) => Err(crate::OfficeError::UnsupportedFormat(
+                "replace_text is not supported for XLSX; use set_cell".to_string(),
+            )),
         }
     }
 
@@ -176,7 +185,9 @@ mod tests {
         let data = make_docx_bytes();
         let mut doc =
             EditableDocument::from_reader(Cursor::new(data), DocumentFormat::Docx).unwrap();
-        let count = doc.replace_text("Hello", "Hi");
+        let count = doc
+            .replace_text("Hello", "Hi")
+            .expect("docx supports replace");
         assert!(count >= 1);
         let mut out = Cursor::new(Vec::new());
         doc.write_to(&mut out).unwrap();
@@ -200,18 +211,29 @@ mod tests {
         let data = make_pptx_bytes();
         let mut doc =
             EditableDocument::from_reader(Cursor::new(data), DocumentFormat::Pptx).unwrap();
-        doc.replace_text("Slide 1", "Updated");
+        doc.replace_text("Slide 1", "Updated")
+            .expect("pptx supports replace");
         let mut out = Cursor::new(Vec::new());
         doc.write_to(&mut out).unwrap();
         assert!(!out.into_inner().is_empty());
     }
 
     #[test]
-    fn xlsx_replace_text_returns_zero() {
+    fn xlsx_replace_text_is_an_error_not_a_silent_zero() {
+        // Returning 0 was indistinguishable from "the text was not present",
+        // so the CLI and MCP server reported success and rewrote the file for
+        // an operation that cannot work at all.
         let data = make_xlsx_bytes();
         let mut doc =
             EditableDocument::from_reader(Cursor::new(data), DocumentFormat::Xlsx).unwrap();
-        assert_eq!(doc.replace_text("anything", "other"), 0);
+        let err = doc
+            .replace_text("anything", "other")
+            .expect_err("XLSX has no text replacement and must say so");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("xlsx") || msg.contains("unsupported"),
+            "the error must name the unsupported format: {err}"
+        );
     }
 
     #[test]

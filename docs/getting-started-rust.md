@@ -8,7 +8,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-office_oxide = "0.1.10"
+office_oxide = "0.1.11"
 ```
 
 ### Feature Flags
@@ -16,7 +16,7 @@ office_oxide = "0.1.10"
 ```toml
 [dependencies]
 # Default build — full read/write/edit support for all six formats.
-office_oxide = "0.1.10"
+office_oxide = "0.1.11"
 
 # Memory-mapped opens for large OOXML files.
 office_oxide = { version = "0.1.10", features = ["mmap"] }

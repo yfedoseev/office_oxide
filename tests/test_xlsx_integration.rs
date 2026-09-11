@@ -822,3 +822,46 @@ fn missing_workbook_part() {
     let result = XlsxDocument::from_reader(Cursor::new(data));
     assert!(result.is_err());
 }
+
+/// [ECMA-376] §18.8.30 lets a workbook redefine a built-in `numFmt` id. The
+/// date check consulted the id before the workbook's own declaration, so a
+/// number formatted `0.00" kg"` under id 14 was rendered as a 1900 date.
+#[test]
+fn an_explicit_num_fmt_overrides_the_builtin_meaning_of_its_id() {
+    let styles = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <numFmts count="1"><numFmt numFmtId="14" formatCode="0.00&quot; kg&quot;"/></numFmts>
+  <fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+  <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+  <borders count="1"><border><left/><right/><top/><bottom/></border></borders>
+  <cellXfs count="2">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+    <xf numFmtId="14" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/>
+  </cellXfs>
+</styleSheet>"#;
+    let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1" s="1"><v>2</v></c></row></sheetData>
+</worksheet>"#;
+
+    let wb = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#;
+
+    // Worksheet rel must be added first so it takes rId1, matching the
+    // workbook above.
+    let data = XlsxBuilder::new()
+        .with_workbook(wb)
+        .with_worksheet("worksheets/sheet1.xml", sheet.as_bytes())
+        .with_styles(styles.as_bytes())
+        .build();
+
+    let text = parse(&data).plain_text();
+    assert!(
+        !text.contains("1900-"),
+        "an overridden numFmt id must not render as a date: {text}"
+    );
+    assert!(text.contains('2'), "the number itself must survive: {text}");
+}

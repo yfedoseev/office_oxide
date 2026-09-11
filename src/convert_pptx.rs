@@ -53,15 +53,11 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         // down shapes.
         let background_rgb = slide.background_rgb;
 
-        // Add notes as paragraphs at end
-        if let Some(ref notes) = slide.notes {
-            if !notes.is_empty() {
-                elements.push(Element::Paragraph(Paragraph {
-                    content: vec![InlineContent::Text(TextSpan::plain(notes.clone()))],
-                    ..Default::default()
-                }));
-            }
-        }
+        // Speaker notes are carried in their own field, never appended to
+        // `elements`. Putting them in the element list made every writer treat
+        // them as ordinary body text, so a round trip promoted a presenter's
+        // private note onto the visible slide.
+        let speaker_notes = slide.notes.as_ref().filter(|n| !n.is_empty()).cloned();
 
         // Slide comments are review content that reached no consumer at
         // all. Carry them as endnotes so every renderer sees them.
@@ -92,6 +88,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             page_setup: page_setup.clone(),
             background_rgb,
             hidden: slide.hidden,
+            speaker_notes,
             ..Default::default()
         });
     }

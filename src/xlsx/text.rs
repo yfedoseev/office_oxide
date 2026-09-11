@@ -183,7 +183,11 @@ impl XlsxDocument {
                     if let Some(styles) = self.styles.as_ref() {
                         if let Some(fmt_id) = styles.number_format_id_for(idx) {
                             if fmt_id != 0 {
-                                let fmt_str = styles.number_format_for(idx);
+                                // The explicit declaration only: apply_format's fmt_str branch is
+                                // for custom codes, and feeding it a resolved
+                                // built-in makes apply_custom mangle it
+                                // (id 47 "mm:ss.0" rendered as "mm:ss0.6").
+                                let fmt_str = styles.number_format_override_for(idx);
                                 let formatted = numfmt::apply_format(*n, fmt_id, fmt_str);
                                 buf.push_str(&formatted);
                                 return;
@@ -226,7 +230,7 @@ impl XlsxDocument {
                 };
                 date::is_date_format_id(fmt_id)
                     || styles
-                        .number_format_for(idx)
+                        .number_format_override_for(idx)
                         .is_some_and(date::is_date_format_string)
             })
             .collect()
@@ -255,7 +259,11 @@ impl XlsxDocument {
                     if let Some(styles) = self.styles.as_ref() {
                         if let Some(fmt_id) = styles.number_format_id_for(idx) {
                             if fmt_id != 0 {
-                                let fmt_str = styles.number_format_for(idx);
+                                // The explicit declaration only: apply_format's fmt_str branch is
+                                // for custom codes, and feeding it a resolved
+                                // built-in makes apply_custom mangle it
+                                // (id 47 "mm:ss.0" rendered as "mm:ss0.6").
+                                let fmt_str = styles.number_format_override_for(idx);
                                 let formatted = numfmt::apply_format(*n, fmt_id, fmt_str);
                                 buf.push_str(&formatted);
                                 return;

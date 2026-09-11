@@ -101,6 +101,10 @@ pub fn ir_to_docx(ir: &DocumentIR) -> crate::docx::write::DocxWriter {
     // Write metadata
     writer.set_metadata(&ir.metadata);
 
+    if let Some(rgb) = ir.sections.first().and_then(|s| s.background_rgb) {
+        writer.set_background_rgb(rgb);
+    }
+
     for section in &ir.sections {
         // Section title becomes H1 — but skip it when the title is already
         // carried by the section's leading heading element. The DOCX parser
@@ -211,6 +215,8 @@ fn add_element_to_docx(writer: &mut crate::docx::write::DocxWriter, elem: &Eleme
                     space_before_twips: p.space_before_twips,
                     space_after_twips: p.space_after_twips,
                     line_spacing: p.line_spacing.clone(),
+                    tabs: p.tabs.clone(),
+                    frame_position: p.frame_position.clone(),
                     keep_with_next: p.keep_with_next,
                     keep_together: p.keep_together,
                     page_break_before: p.page_break_before,
@@ -293,6 +299,7 @@ fn ir_inline_to_runs(content: &[InlineContent]) -> Vec<crate::docx::write::Run> 
                 run.italic = span.italic;
                 run.strikethrough = span.strikethrough;
                 run.font_name = span.font_name.clone();
+                run.hyperlink = span.hyperlink.clone();
                 run.font_size_half_pt = span.font_size_half_pt;
                 run.color_rgb = span.color;
                 run.underline_style = span.underline.clone();
@@ -361,7 +368,10 @@ fn coalesce_runs(runs: Vec<crate::docx::write::Run>) -> Vec<crate::docx::write::
 /// Compare two runs' style properties (everything except `text`,
 /// `footnote_ref`, `endnote_ref`) for byte-equality.
 fn run_props_equal(a: &crate::docx::write::Run, b: &crate::docx::write::Run) -> bool {
-    a.bold == b.bold
+    // hyperlink is part of a run's identity: merging a linked run with an
+    // unlinked one silently swallows the link.
+    a.hyperlink == b.hyperlink
+        && a.bold == b.bold
         && a.italic == b.italic
         && a.underline == b.underline
         && a.underline_style == b.underline_style
@@ -491,10 +501,12 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                         let mut col = 0usize;
                         for cell in &row.cells {
                             let text = cell_text(cell);
-                            let data = text_to_cell_data(&text);
-                            if let Some(style) =
-                                xlsx_cell_style(row.is_header, cell.background_color)
-                            {
+                            let data = ir_cell_to_cell_data(cell, &text);
+                            if let Some(style) = xlsx_cell_style(
+                                row.is_header,
+                                cell.background_color,
+                                cell.number_format.as_deref(),
+                            ) {
                                 sheet.set_cell_styled(row_cursor, col, data, style);
                             } else {
                                 sheet.set_cell(row_cursor, col, data);
@@ -576,6 +588,19 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                             }
                         }
                     }
+                    // Everything in the box that is not an image still has
+                    // text; the arm used to look for images and nothing else.
+                    let mut rows = Vec::new();
+                    for inner in &tb.content {
+                        if !matches!(inner, Element::Image(_)) {
+                            xlsx_text_rows(inner, &mut rows);
+                        }
+                    }
+                    for line in rows {
+                        body_paragraphs_seen = true;
+                        sheet.set_cell(row_cursor, 0, CellData::String(line));
+                        row_cursor += 1;
+                    }
                 },
                 Element::Heading(h) => {
                     let text = inline_to_text(&h.content);
@@ -592,7 +617,22 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                         row_cursor += 1;
                     }
                 },
-                _ => {},
+                Element::ThematicBreak
+                | Element::PageBreak
+                | Element::ColumnBreak
+                | Element::Shape(_) => {},
+                // Everything else has no native spreadsheet shape but does
+                // have text, and dropping it silently is how a PPTX → XLSX
+                // conversion lost 96% of its words.
+                other => {
+                    let mut rows = Vec::new();
+                    xlsx_text_rows(other, &mut rows);
+                    for line in rows {
+                        body_paragraphs_seen = true;
+                        sheet.set_cell(row_cursor, 0, CellData::String(line));
+                        row_cursor += 1;
+                    }
+                },
             }
         }
 
@@ -759,6 +799,13 @@ pub fn ir_to_pptx(ir: &DocumentIR) -> crate::pptx::write::PptxWriter {
 fn emit_pptx_slide_from_section(writer: &mut crate::pptx::write::PptxWriter, section: &Section) {
     let slide = writer.add_slide();
 
+    // Speaker notes round-trip into ppt/notesSlides/, never onto the slide.
+    if let Some(ref notes) = section.speaker_notes {
+        if !notes.is_empty() {
+            slide.set_notes(notes);
+        }
+    }
+
     if let Some(ref title) = section.title {
         if !title.is_empty() {
             slide.set_title(title);
@@ -836,45 +883,54 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
             slide.add_rich_text_with_props(&runs, props);
         },
         Element::List(l) => {
-            let items: Vec<String> = l
-                .items
-                .iter()
-                .map(|i| {
-                    i.content
+            // Flatten the whole tree: `ListItem::nested` was read by no
+            // writer, so every item below level 0 was silently dropped.
+            fn flatten(list: &crate::ir::List, level: u8, out: &mut Vec<(u8, String)>) {
+                for item in &list.items {
+                    let text = item
+                        .content
                         .iter()
                         .map(|e| match e {
                             Element::Paragraph(p) => inline_to_text(&p.content),
                             _ => String::new(),
                         })
                         .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .collect();
-            let item_refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
-            slide.add_bullet_list(&item_refs);
+                        .join(" ");
+                    if !text.is_empty() {
+                        out.push((level, text));
+                    }
+                    if let Some(ref nested) = item.nested {
+                        flatten(nested, level.saturating_add(1), out);
+                    }
+                }
+            }
+            let mut items: Vec<(u8, String)> = Vec::new();
+            flatten(l, l.level, &mut items);
+            slide.add_nested_bullet_list(&items);
         },
         Element::Table(t) => {
-            let text = t
+            // A real a:tbl, not tab-joined text: the previous form lost the
+            // grid, every cell boundary and all per-cell formatting.
+            let rows: Vec<Vec<String>> = t
                 .rows
                 .iter()
-                .map(|row| {
-                    row.cells
-                        .iter()
-                        .map(cell_text)
-                        .collect::<Vec<_>>()
-                        .join("\t")
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !text.is_empty() {
-                slide.add_text(&text);
-            }
+                .map(|row| row.cells.iter().map(cell_text).collect())
+                .collect();
+            slide.add_table(rows);
         },
         Element::Image(img) => {
             if let (Some(data), Some(fmt)) = (&img.data, &img.format) {
                 let cx = img.display_width_emu.unwrap_or(3_000_000);
                 let cy = img.display_height_emu.unwrap_or(2_000_000);
-                slide.add_image(data.clone(), fmt.clone(), 0, 0, cx, cy);
+                slide.add_image_with_alt(
+                    data.clone(),
+                    fmt.clone(),
+                    0,
+                    0,
+                    cx,
+                    cy,
+                    img.alt_text.clone(),
+                );
             }
         },
         Element::CodeBlock(cb) => {
@@ -890,7 +946,14 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
                 emit_pptx_element(slide, inner);
             }
         },
-        _ => {},
+        // Footnote and endnote bodies have no slide equivalent, but their
+        // text is unambiguous content — the catch-all used to drop it.
+        Element::Footnote(n) | Element::Endnote(n) => {
+            for inner in &n.content {
+                emit_pptx_element(slide, inner);
+            }
+        },
+        Element::PageBreak | Element::ColumnBreak | Element::Shape(_) => {},
     }
 }
 
@@ -1108,6 +1171,46 @@ fn cell_text(cell: &TableCell) -> String {
         .join(" ")
 }
 
+/// Convert an IR cell to writer data, honouring the type the parser recorded.
+///
+/// Re-parsing the *rendered* string threw away `data_type`, `raw_number` and
+/// `number_format`: "007" became the number 7, a currency cell became text,
+/// and a cell whose text happens to read "inf" or "NaN" became an Excel error
+/// cell. The typed fields are only populated by the XLSX reader; prose formats
+/// leave them `None` and still fall back to sniffing the text.
+fn ir_cell_to_cell_data(cell: &TableCell, text: &str) -> crate::xlsx::write::CellData {
+    use crate::ir::CellDataType;
+    use crate::xlsx::write::CellData;
+
+    match cell.data_type {
+        Some(CellDataType::Number) | Some(CellDataType::Date) => {
+            if let Some(n) = cell.raw_number {
+                return CellData::Number(n);
+            }
+        },
+        Some(CellDataType::Boolean) => {
+            let t = text.trim();
+            if t.eq_ignore_ascii_case("true") || t == "1" {
+                return CellData::Boolean(true);
+            }
+            if t.eq_ignore_ascii_case("false") || t == "0" {
+                return CellData::Boolean(false);
+            }
+        },
+        // Text and Error cells keep their rendered form verbatim; sniffing
+        // would re-introduce the "007" and "inf" corruption.
+        Some(CellDataType::Text) | Some(CellDataType::Error) => {
+            return if text.is_empty() {
+                CellData::Empty
+            } else {
+                CellData::String(text.to_string())
+            };
+        },
+        None => {},
+    }
+    text_to_cell_data(text)
+}
+
 fn text_to_cell_data(text: &str) -> crate::xlsx::write::CellData {
     use crate::xlsx::write::CellData;
     if text.is_empty() {
@@ -1154,13 +1257,97 @@ fn first_inline_font_name(content: &[InlineContent]) -> Option<String> {
     None
 }
 
-fn xlsx_cell_style(is_header: bool, bg: Option<[u8; 3]>) -> Option<crate::xlsx::write::CellStyle> {
+/// Flatten an element the XLSX writer has no native shape for into one text
+/// row per logical line.
+///
+/// `ir_to_xlsx` used to end in `_ => {}`, silently swallowing `List`,
+/// `CodeBlock`, `Footnote`, `Endnote` and everything inside a `TextBox` that
+/// was not an image. Converting a presentation to a spreadsheet lost almost
+/// all of its text that way.
+fn xlsx_text_rows(elem: &Element, out: &mut Vec<String>) {
+    match elem {
+        Element::Paragraph(p) => {
+            let t = inline_to_text(&p.content);
+            if !t.is_empty() {
+                out.push(t);
+            }
+        },
+        Element::Heading(h) => {
+            let t = inline_to_text(&h.content);
+            if !t.is_empty() {
+                out.push(t);
+            }
+        },
+        Element::List(l) => {
+            fn walk(list: &crate::ir::List, out: &mut Vec<String>) {
+                for item in &list.items {
+                    for e in &item.content {
+                        xlsx_text_rows(e, out);
+                    }
+                    if let Some(ref nested) = item.nested {
+                        walk(nested, out);
+                    }
+                }
+            }
+            walk(l, out);
+        },
+        Element::CodeBlock(cb) => {
+            for line in cb.content.lines() {
+                out.push(line.to_string());
+            }
+        },
+        Element::Footnote(n) | Element::Endnote(n) => {
+            for e in &n.content {
+                xlsx_text_rows(e, out);
+            }
+        },
+        Element::Table(t) => {
+            for row in &t.rows {
+                let line = row
+                    .cells
+                    .iter()
+                    .map(cell_text)
+                    .collect::<Vec<_>>()
+                    .join("\t");
+                if !line.trim().is_empty() {
+                    out.push(line);
+                }
+            }
+        },
+        Element::TextBox(tb) => {
+            for e in &tb.content {
+                xlsx_text_rows(e, out);
+            }
+        },
+        Element::Image(_)
+        | Element::ThematicBreak
+        | Element::PageBreak
+        | Element::ColumnBreak
+        | Element::Shape(_) => {},
+    }
+}
+
+fn xlsx_cell_style(
+    is_header: bool,
+    bg: Option<[u8; 3]>,
+    number_format: Option<&str>,
+) -> Option<crate::xlsx::write::CellStyle> {
     use crate::xlsx::write::CellStyle;
+    // A cell's number format is what makes a currency or date cell render as
+    // one; dropping it turned every formatted number into a bare value.
+    let with_fmt = |style: CellStyle| match number_format {
+        Some(code) if !code.is_empty() => style.number_format_code(code),
+        _ => style,
+    };
     if is_header {
         let bg_hex = bg.map(rgb_to_hex).unwrap_or_else(|| "D3D3D3".to_string());
-        Some(CellStyle::new().bold().background(bg_hex))
+        Some(with_fmt(CellStyle::new().bold().background(bg_hex)))
+    } else if let Some(c) = bg {
+        Some(with_fmt(CellStyle::new().background(rgb_to_hex(c))))
+    } else if number_format.is_some_and(|c| !c.is_empty()) {
+        Some(with_fmt(CellStyle::new()))
     } else {
-        bg.map(|c| CellStyle::new().background(rgb_to_hex(c)))
+        None
     }
 }
 
@@ -1169,6 +1356,13 @@ fn inline_to_pptx_runs(content: &[InlineContent]) -> Vec<crate::pptx::write::Run
     content
         .iter()
         .filter_map(|item| {
+            match item {
+                // A dropped line break silently joins the words on either
+                // side of it ("LINEA" + "LINEB" renders as "LINEALINEB").
+                InlineContent::LineBreak => return Some(Run::line_break()),
+                InlineContent::Text(_) => {},
+                _ => return None,
+            }
             if let InlineContent::Text(span) = item {
                 if span.text.is_empty() {
                     return None;
@@ -1179,6 +1373,12 @@ fn inline_to_pptx_runs(content: &[InlineContent]) -> Vec<crate::pptx::write::Run
                 }
                 if span.italic {
                     run = run.italic();
+                }
+                if span.underline.is_some() {
+                    run = run.underline();
+                }
+                if span.strikethrough {
+                    run = run.strikethrough();
                 }
                 if let Some(half_pt) = span.font_size_half_pt {
                     run = run.font_size(half_pt as f64 / 2.0);

@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-09-11
+
+> Write-path correctness. 16 issues closed and the OOXML validation gate that found them.
+>
+> v0.1.10 shipped with a green suite and a write path that produced documents Word and PowerPoint refuse to open: nothing checked that the files we *write* are valid OOXML, because generated output was only round-tripped through our own deliberately lenient parser. #199 came in from a user; chasing it with a schema validator turned up fifteen more.
+>
+> Verified against 6,062 real Office documents arm-to-arm with v0.1.10 — **0 extraction regressions**, and `save_as` conversions that schema-validate go from **2,387/5,921 (40.3%) to 5,918/5,921 (99.9%)**. The sweep itself found nine further defects the unit suite could not see, four of them introduced by fixes in this release.
+
+### Verified
+
+Swept **6,062 real Office documents** (LibreOffice QA, Apache POI, OpenXML SDK, python-pptx, ClosedXML, calamine, PhpSpreadsheet and others) arm-to-arm against v0.1.10, on two axes.
+
+**Extraction — no regressions.** 6,062 files × 4 surfaces = 24,248 observations per arm. **0 ok→not-ok**, 3 recoveries. The only text change is one file where a time that rounded up to a whole day now carries into the date instead of rendering hour 24. Three anomalous status transitions were re-measured quiescently and were load artifacts, not regressions — the sweep README warns about exactly that.
+
+**Conversion — the axis this release changes.** Every file through `Document::save_as`, then schema-validated:
+
+| source | v0.1.10 | v0.1.11 |
+|---|---|---|
+| `.doc` → `.docx` | 92 / 201 | **201 / 201** |
+| `.docx` → `.docx` | 60 / 2509 | **2507 / 2509** |
+| `.ppt` → `.pptx` | 0 / 176 | **176 / 176** |
+| `.pptx` → `.pptx` | 0 / 791 | **791 / 791** |
+| `.xls` → `.xlsx` | 469 / 475 | **475 / 475** |
+| `.xlsx` → `.xlsx` | 1766 / 1769 | **1768 / 1769** |
+| **total** | **2387 / 5921 (40.3%)** | **5918 / 5921 (99.9%)** |
+
+Zero regressions. The three remaining files fail identically under v0.1.10: two carry a malformed `dcterms:modified` in the source (`2015sss-06-20T07:40:00Z`) that is copied through verbatim, and one is a deeply nested table.
+
+The sweep found **nine defects the unit suite could not see**, all fixed here — including three element-ordering defects of the same shape (`w:pPr`, `w:tblPr`, `w:tcPr`), two namespace declarations missing from parts that use them, and one duplicate attribute I introduced while fixing a missing one.
+
+### Added
+
+- **An OOXML validation gate ([#201](https://github.com/yfedoseev/office_oxide/issues/201)).** Nothing checked that the documents this library *writes* are valid — generated files were only round-tripped through our own lenient parser, so a document Word refuses to open passed the whole suite. `scripts/ooxml-validate/` now fetches the ISO/IEC 29500-4 schemas (not committed, per CONTRIBUTING #4), `cargo run --example gen_validation_corpus` produces 30 packages across the markdown path, the builder APIs, all nine `save_as` conversion pairs and out-of-range values, and both validators run in CI. Writing it immediately found three more defects: `w:titlePg` emitted in the wrong `CT_SectPr` position, `xml:space` on an XLSX `<t>` where it is not allowed, and an empty `p:txBody` on a slide whose only content was a table.
+
+### Security
+
+- **A sub-1 KB `.docx` could abort the process (`CWE-770`).** `w:gridSpan` was parsed as an unbounded `u32` and summed straight into an allocation, so a 978-byte file could request 34 GB and abort. Measured: 1e6 → 11 MB, 8e6 → 64 MB, `u32::MAX` → abort, i.e. ~35,000,000× amplification. This ran on `to_ir()`, which backs `save_as`, `to_markdown`, the MCP `extract` tool and every binding, and an `abort()` is not catchable — no caller could defend against it. Spans are now clamped where the IR cell is built, in the converter's column count, and defensively in `ir_render::table_grid`, since `DocumentIR` is `Deserialize` and can arrive from an untrusted source.
+- **A hostile `.pptx` could hang `save_as` indefinitely.** `col_span`/`row_span` drove the DOCX writer's grid loop with the bounds check *inside* the loop body, so the iteration still ran `row_span × col_span` times — up to 1.8×10¹⁹ — doing nothing. Nothing allocated, so nothing ever stopped it. The check is now hoisted and the spans clamped, and PPTX spans are clamped at parse time.
+- **A deeply nested IR overflowed the writer's stack.** The readers have bounded nesting via `DepthGuard`/`MAX_NESTING_DEPTH`; the writers had no equivalent, so nesting past a few thousand levels aborted. The same guard now covers both DOCX writer recursions.
+
+- **A negate overflow panicked the writer.** `first_line_indent_twips = i32::MIN` reached `(-v).to_string()` and `-i32::MIN` overflows; the reader had the mirror problem on `w:hanging="-2147483648"`. Both now use the magnitude, which is what `ST_TwipsMeasure` wants — the attribute is unsigned.
+
+Known and not fixed: dropping a deeply nested `Element` is itself recursive and can overflow a small stack independently of the writers. That affects any consumer deserialising such an IR and needs an iterative `Drop`.
+
+### Fixed
+
+- **Two regressions caught by the v0.1.10 → v0.1.11 corpus sweep**, both introduced by fixes in this release. Speaker notes reached `plain_text` and markdown but not HTML, because moving them out of `Section::elements` for [#203](https://github.com/yfedoseev/office_oxide/issues/203) dropped them from the one renderer that was never updated; HTML now emits them in a labelled `<aside class="speaker-notes">`, which is better than v0.1.10, where they were indistinguishable from slide body text. And [#207](https://github.com/yfedoseev/office_oxide/issues/207)'s built-in format resolution widened `apply_format`'s custom-code branch, so a built-in code was fed to `apply_custom` and rendered literally — a cell formatted `mm:ss.0` came out as `mm:ss0.6`. The render paths now pass the workbook's *declared* code only.
+
+- **The PPTX writer flattened structure into text ([#214](https://github.com/yfedoseev/office_oxide/issues/214)).** Tables were joined with literal tabs and newlines into a single run, losing the grid and every cell boundary; they are now written as a real `a:tbl` in a `p:graphicFrame`. Bullet lists were emitted at level 0 with no `marL`/`indent`, so nesting was invisible and the glyph sat at the same x as its text. Footnote and endnote bodies fell into a catch-all and were dropped entirely.
+
+- **The markdown front end dropped fenced code blocks and list nesting ([#215](https://github.com/yfedoseev/office_oxide/issues/215)).** A ` ```rust ` fence produced no `Element::CodeBlock` at all — the language leaked into the text as an ordinary paragraph — and `ListItem::nested` was hardcoded to `None`, so every bullet flattened to level 0. The second of those is also why the earlier "3-level nested lists" coverage could not have caught [#211](https://github.com/yfedoseev/office_oxide/issues/211): the markdown path never populated the field.
+
+- **Every binding discarded the writer's "value not written" signal ([#209](https://github.com/yfedoseev/office_oxide/issues/209)).** `sheet_set_cell` and the PPTX slide setters return `bool` precisely so a silent no-op is detectable — the Rust API was fixed for that regression and all six bindings reintroduced it. The C FFI entry points now return a status, Python raises `IndexError`, and C# throws; an unrecognised FFI `value_type` is rejected instead of erasing the existing cell; and `CellData::Boolean`/`Formula`, previously unreachable from any binding, have `value_type` 3 and 4. Go silently wrote an **empty** cell for `int64`, `float32`, `uint` and a styled `bool`, and C# used a locale-dependent `ToString()` that turned a `decimal` into text (`"1,5"` under `de-DE`); both now cover the full numeric set, with C# using the invariant culture.
+
+- **`replace_text` reported success for XLSX, where it is not implemented ([#210](https://github.com/yfedoseev/office_oxide/issues/210)).** It returned `0`, which is indistinguishable from "the text was not present", so the CLI exited 0, the MCP tool returned a non-error result, and the file was rewritten anyway — with the MCP schema advertising XLSX support. It now returns an error naming the unsupported format, and the MCP tool description no longer claims XLSX. The edit path is also byte-deterministic again: parts, part relationships and content-type overrides were iterated out of `HashMap`s, so saving an unchanged document produced a different byte stream every time.
+
+- **IR fields the API accepted were never emitted ([#213](https://github.com/yfedoseev/office_oxide/issues/213)).** `TextSpan::hyperlink` was read and explicitly discarded, so a markdown link's URL was not recoverable from the output at all — DOCX now emits `w:hyperlink` with an external relationship, and run coalescing treats the URL as part of a run's identity so a link is no longer swallowed by an adjacent plain run. PPTX dropped `InlineContent::LineBreak` (joining the words on either side), underline and strikethrough, and image alt text; XLSX and PPTX omitted `xml:space="preserve"`, so leading and trailing spaces were stripped by conformant consumers; `Paragraph::tabs` reached no writer, costing dot-leader tables of contents both their leaders and their alignment; and `frame_position`, `Section::background_rgb` and `Table::caption` were likewise dropped — the caption was emitted only as a `Caption`-styled paragraph, so it was lost on round-trip while accumulating a phantom body paragraph on every cycle.
+
+- **The XLSX write bridge discarded typed cell data ([#212](https://github.com/yfedoseev/office_oxide/issues/212)).** It re-parsed the *rendered* string instead of using the `data_type`, `raw_number` and `number_format` the reader had recorded, so on any XLSX round trip `"007"` became `7`, currency and date cells became text, and a cell whose text reads `inf` or `NaN` became an Excel error cell. `ir_to_xlsx` also ended in a catch-all that swallowed lists, code blocks, notes and everything inside a text box — and since PPTX wraps slide bodies in a text box, PPTX → XLSX lost almost all of its text. `CellStyle::number_format_code` is new, so a format read from a source document is carried through instead of flattened to `General`.
+
+- **Nested content was silently dropped on write ([#211](https://github.com/yfedoseev/office_oxide/issues/211)).** `ListItem::nested` was consumed by the renderers but by no writer, so every list item below level 0 vanished from the output while the API reported success — on any document opened and re-saved. A heading nested in a table cell, text box, header or note also lost its alignment, unlike the identical heading at top level.
+
+- **Generated DOCX carried dangling cross-part references ([#208](https://github.com/yfedoseev/office_oxide/issues/208)).** These are schema-valid and still make Word report unreadable content, so neither the XSDs nor any existing test caught them. A list in a header, footer or note emitted `w:numId`/`ListParagraph` while the numbering part and the style were gated on the body alone; the note-reference character styles were gated on a note part existing, though a run can carry a reference without one; `footnotes.xml` never contained the separator notes Word expects; a `w:type="first"` header was written without `w:titlePg` and a `w:type="even"` one without `settings.xml`, so neither was ever shown; a multi-section document emitted duplicate `w:type` values in the final `sectPr`; and an ordered list nested in a cell, text box or header used the bullet definition, disagreeing with the same list at top level.
+
+- **A workbook's own `numFmt` override was ignored for built-in ids ([#207](https://github.com/yfedoseev/office_oxide/issues/207)).** [ECMA-376] §18.8.30 lets a workbook redefine ids 0-163, but the date check consulted the id before the declaration, so a number formatted `0.00" kg"` under id 14 was read back as `1900-01-02`. `StyleSheet::number_format_for` now also resolves built-in ids instead of returning `None` for the majority of real formatted cells, with `number_format_override_for` exposing the explicit declaration alone. Separately, a time fraction that rounds up to a whole day now carries into the date rather than producing hour 24, which no date library accepts.
+
+- **The XLSX writer produced unparseable, invalid or silently wrong output on unusual input ([#206](https://github.com/yfedoseev/office_oxide/issues/206)).** A control character in a sheet name made `xl/workbook.xml` unparseable — `sanitize_xml_text` guarded element text but had never been applied to an attribute. `merge_cells` overflowed `usize` and panicked inside `save()`. `add_row` bypassed the grid check `set_cell` enforces and wrote cells past column XFD. Colours, column widths and font sizes were written through unvalidated (`inf`, `FFred`, `sz="0"`); half-point font sizes were truncated by integer division; a zero-sheet workbook emitted an invalid empty `<sheets/>`; a styled empty cell silently dropped its style; a formula kept a caller's leading `=`; and `styles.xml` was non-deterministic because it iterated a `HashMap`.
+
+- **The XLSX edit path corrupted workbooks ([#205](https://github.com/yfedoseev/office_oxide/issues/205)).** A self-closing `<row .../>` — what Excel writes for a row carrying only a custom height — made `set_cell` insert the new cell into the **next** row, so a cell whose reference said row 1 ended up inside row 2. The same fix class had already been applied to self-closing `<c>` and was never carried over to `<row>`. Cells and rows are now also inserted in ascending order as [ECMA-376] §18.3.1.73 requires, control characters are stripped, and non-finite numbers become error cells instead of raw `NaN`/`inf` — both guards the writer already had and the editor lacked.
+
+- **PPTX attribute values were written without range validation ([#204](https://github.com/yfedoseev/office_oxide/issues/204)).** `p:sldSz`, `a:rPr/@sz`, `a:srgbClr/@val` and `a:ext` all took caller input straight into restricted XSD types. `font_size(f64::NAN)` became `sz="0"` through a saturating float cast, and `.color("#FF0000")` — the form every CSS-adjacent API accepts — produced an invalid file. The slide-size case needed no explicit API call: the IR bridge converts a source page size straight to EMU, so any page under an inch produced an invalid deck.
+
+- **Speaker notes were promoted onto the visible slide ([#203](https://github.com/yfedoseev/office_oxide/issues/203)).** The PPTX converter appended notes to the slide's `elements` as an ordinary paragraph, so every writer treated them as body text and a round trip published a presenter's private notes to the audience with no marker. Notes now live in `Section::speaker_notes` and round-trip into `ppt/notesSlides/`; the renderers still surface them, labelled.
+
+- **DOCX documents were schema-invalid in six ways ([#200](https://github.com/yfedoseev/office_oxide/issues/200)).** `w:tblGrid` was written only when explicit column widths were known, so every markdown table was invalid; the simple `add_table` writer emitted neither `w:tblPr` nor `w:tblGrid`; `numbering.xml` interleaved `w:abstractNum` and `w:num` instead of writing all of the former first; both floating-anchor writers put `wp:docPr` before the wrap element; `w:pgMar` omitted the required `w:gutter`; and `w:pPr` children were emitted in the wrong order. The `w:pPr` fix covers more than the reported `spacing`/`ind` pair — `w:numPr`, `w:pBdr` and `w:shd` were also misplaced, and the whole block now follows the `CT_PPrBase` sequence.
+
+- **PPTX packages were missing the theme, `presProps.xml` and the layout→master relationship ([#202](https://github.com/yfedoseev/office_oxide/issues/202)).** The slide layout had no `_rels` part at all, so it was orphaned from its master — a hard `shall` in [ISO/IEC 29500-1] §13.3.9 and a likely reason PowerPoint's repair failed rather than succeeded. There was also no theme, which left [#199](https://github.com/yfedoseev/office_oxide/issues/199)'s colour map naming slots that did not exist.
+
+- **PPTX slide masters were missing the required `p:clrMap` ([#199](https://github.com/yfedoseev/office_oxide/issues/199)).** `CT_SlideMaster` is a strict sequence — `cSld`, `clrMap`, `sldLayoutIdLst` — and the colour map was never written at all, so every deck this library produced was schema-invalid and PowerPoint's repair had no colour mapping to recover.
+
 ## [0.1.10] - 2026-09-09
 
 > Correctness release. 69 issues closed, concentrated in one defect shape: **the parser read a value correctly and the converter then dropped it**. Every format is affected; DOCX most of all. Also closes six security-relevant robustness gaps, adds editing to the WASM/MCP/CLI surfaces, and replaces several silent empty-successes with named errors. No breaking API changes; some previously-empty fields are now populated, and some previously-`Ok(empty)` reads are now `Err`.

@@ -41,6 +41,13 @@ const CT_PRESENTATION: &str =
 const CT_SLIDE: &str = "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
 const CT_SLIDE_LAYOUT: &str =
     "application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml";
+const CT_NOTES_SLIDE: &str =
+    "application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml";
+const CT_NOTES_MASTER: &str =
+    "application/vnd.openxmlformats-officedocument.presentationml.notesMaster+xml";
+const CT_THEME: &str = "application/vnd.openxmlformats-officedocument.theme+xml";
+const CT_PRES_PROPS: &str =
+    "application/vnd.openxmlformats-officedocument.presentationml.presProps+xml";
 const CT_SLIDE_MASTER: &str =
     "application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml";
 
@@ -81,9 +88,22 @@ pub struct Run {
     pub font_size_pt: Option<f64>,
     /// Font name, e.g. `"Calibri"`.
     pub font_name: Option<String>,
+    /// When set, this run is a hard line break (`<a:br/>`) rather than text.
+    pub line_break: bool,
 }
 
 impl Run {
+    /// Create a hard line break. DrawingML has no in-text newline, so a
+    /// break must be its own `<a:br/>` element; dropping it joins the
+    /// surrounding words together.
+    #[must_use]
+    pub fn line_break() -> Self {
+        Self {
+            line_break: true,
+            ..Self::new("")
+        }
+    }
+
     /// Create a plain text run.
     pub fn new(text: impl Into<String>) -> Self {
         Self {
@@ -175,11 +195,15 @@ pub struct ParaProps {
 enum BodyItem {
     Text(String),
     RichText(Vec<Run>, ParaProps),
-    BulletList(Vec<String>),
+    /// Bullet list items paired with their nesting level (0 = top level).
+    BulletList(Vec<(u8, String)>),
+    /// A real table: rows of cell text. Flattening a table into tab-joined
+    /// text lost the grid entirely.
+    Table(Vec<Vec<String>>),
     /// Free-floating text box: (runs, x_emu, y_emu, cx_emu, cy_emu)
     TextBox(Vec<Run>, i64, i64, i64, i64),
     /// Embedded image: (data, format, x_emu, y_emu, cx_emu, cy_emu)
-    Image(Vec<u8>, crate::ir::ImageFormat, i64, i64, u64, u64),
+    Image(Vec<u8>, crate::ir::ImageFormat, i64, i64, u64, u64, Option<String>),
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +219,9 @@ pub struct SlideData {
     /// leaves alignment to the slide layout default (typically
     /// centered for title placeholders).
     pub title_alignment: Option<crate::ir::ParagraphAlignment>,
+    /// Speaker notes for this slide. Written to `ppt/notesSlides/`, never
+    /// onto the slide surface.
+    pub notes: Option<String>,
     body_items: Vec<BodyItem>,
 }
 
@@ -203,8 +230,16 @@ impl SlideData {
         Self {
             title: None,
             title_alignment: None,
+            notes: None,
             body_items: Vec::new(),
         }
+    }
+
+    /// Attach speaker notes to this slide. They are written to a notes slide
+    /// part and never appear on the slide surface.
+    pub fn set_notes(&mut self, notes: &str) -> &mut Self {
+        self.notes = Some(notes.to_string());
+        self
     }
 
     /// Set the slide title. Overwrites any previously set title.
@@ -264,8 +299,25 @@ impl SlideData {
 
     /// Add a bullet list to the body area.
     pub fn add_bullet_list(&mut self, items: &[&str]) -> &mut Self {
-        let owned: Vec<String> = items.iter().map(|s| s.to_string()).collect();
+        let owned: Vec<(u8, String)> = items.iter().map(|s| (0, (*s).to_string())).collect();
         self.body_items.push(BodyItem::BulletList(owned));
+        self
+    }
+
+    /// Add a bullet list whose items carry an explicit nesting level.
+    ///
+    /// Every item used to be emitted at level 0 with no `marL`/`indent`, so
+    /// nesting was lost and the bullet glyph sat at the same x as its text.
+    pub fn add_nested_bullet_list(&mut self, items: &[(u8, String)]) -> &mut Self {
+        self.body_items.push(BodyItem::BulletList(items.to_vec()));
+        self
+    }
+
+    /// Add a table as a real `a:tbl`, not tab-joined text.
+    pub fn add_table(&mut self, rows: Vec<Vec<String>>) -> &mut Self {
+        if !rows.is_empty() {
+            self.body_items.push(BodyItem::Table(rows));
+        }
         self
     }
 
@@ -296,6 +348,25 @@ impl SlideData {
     /// Embed an image at an absolute position on the slide.
     ///
     /// All coordinates are in EMU (English Metric Units; 914 400 EMU = 1 inch).
+    /// Attach an image with alt text. Alt text is what a screen reader
+    /// announces; without it the picture is invisible to assistive tech.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_image_with_alt(
+        &mut self,
+        data: Vec<u8>,
+        format: crate::ir::ImageFormat,
+        x: i64,
+        y: i64,
+        cx: u64,
+        cy: u64,
+        alt: Option<String>,
+    ) -> &mut Self {
+        self.body_items
+            .push(BodyItem::Image(data, format, x, y, cx, cy, alt));
+        self
+    }
+
+    /// Attach an image to this slide at an absolute position, in EMU.
     pub fn add_image(
         &mut self,
         data: Vec<u8>,
@@ -306,7 +377,7 @@ impl SlideData {
         cy: u64,
     ) -> &mut Self {
         self.body_items
-            .push(BodyItem::Image(data, format, x, y, cx, cy));
+            .push(BodyItem::Image(data, format, x, y, cx, cy, None));
         self
     }
 
@@ -375,8 +446,8 @@ impl PptxWriter {
     ///
     /// Call before adding slides. 914 400 EMU = 1 inch.
     pub fn set_presentation_size(&mut self, cx: u64, cy: u64) -> &mut Self {
-        self.cx = cx;
-        self.cy = cy;
+        self.cx = clamp_slide_size(cx);
+        self.cy = clamp_slide_size(cy);
         self
     }
 
@@ -492,6 +563,29 @@ impl PptxWriter {
         }
 
         opc.add_part_rel(&master_part, rel_types::SLIDE_LAYOUT, "../slideLayouts/slideLayout1.xml");
+        // A master MUST reach a theme — every clrMap slot names a theme colour.
+        opc.add_part_rel(&master_part, rel_types::THEME, "../theme/theme1.xml");
+        // [ISO/IEC 29500-1] §13.3.9: a slide layout SHALL relate to its master.
+        opc.add_part_rel(&layout_part, rel_types::SLIDE_MASTER, "../slideMasters/slideMaster1.xml");
+        // §13.3.7: exactly one presentation-properties part, from the presentation.
+        opc.add_part_rel(&pres_part, rel_types::PRES_PROPS, "presProps.xml");
+
+        // Notes slides. Speaker notes live here, never on the slide surface.
+        let has_notes = self
+            .slides
+            .iter()
+            .any(|s| s.notes.as_ref().map(|n| !n.is_empty()).unwrap_or(false));
+        if has_notes {
+            let nm_part = PartName::new("/ppt/notesMasters/notesMaster1.xml")?;
+            opc.add_part_rel(&pres_part, rel_types::NOTES_MASTER, "notesMasters/notesMaster1.xml");
+            opc.add_part_rel(&nm_part, rel_types::THEME, "../theme/theme1.xml");
+            opc.add_part(&nm_part, CT_NOTES_MASTER, &generate_notes_master_xml())?;
+        }
+
+        let theme_part = PartName::new("/ppt/theme/theme1.xml")?;
+        opc.add_part(&theme_part, CT_THEME, &generate_theme_xml())?;
+        let pres_props_part = PartName::new("/ppt/presProps.xml")?;
+        opc.add_part(&pres_props_part, CT_PRES_PROPS, &generate_pres_props_xml())?;
 
         let pres_xml = generate_presentation_xml(self.slides.len(), self.cx, self.cy);
         opc.add_part(&pres_part, CT_PRESENTATION, &pres_xml)?;
@@ -514,9 +608,9 @@ impl PptxWriter {
             );
 
             // rId2+ = one per embedded image
-            let mut img_rids: Vec<(String, i64, i64, u64, u64)> = Vec::new();
+            let mut img_rids: Vec<(String, i64, i64, u64, u64, Option<String>)> = Vec::new();
             for item in &slide.body_items {
-                if let BodyItem::Image(data, fmt, x, y, cx, cy) = item {
+                if let BodyItem::Image(data, fmt, x, y, cx, cy, alt) = item {
                     let rid = format!("rId{}", img_rids.len() + 2);
                     let ext = fmt.extension();
                     opc.add_part_rel(
@@ -527,9 +621,30 @@ impl PptxWriter {
                     let media_part =
                         PartName::new(&format!("/ppt/media/image{global_img_idx}.{ext}"))?;
                     opc.add_part(&media_part, fmt.content_type(), data)?;
-                    img_rids.push((rid, *x, *y, *cx, *cy));
+                    img_rids.push((rid, *x, *y, *cx, *cy, alt.clone()));
                     global_img_idx += 1;
                 }
+            }
+
+            if let Some(notes) = slide.notes.as_ref().filter(|n| !n.is_empty()) {
+                let idx = i + 1;
+                let notes_part = PartName::new(&format!("/ppt/notesSlides/notesSlide{idx}.xml"))?;
+                opc.add_part_rel(
+                    slide_part,
+                    rel_types::NOTES_SLIDE,
+                    &format!("../notesSlides/notesSlide{idx}.xml"),
+                );
+                opc.add_part_rel(
+                    &notes_part,
+                    rel_types::SLIDE,
+                    &format!("../slides/slide{idx}.xml"),
+                );
+                opc.add_part_rel(
+                    &notes_part,
+                    rel_types::NOTES_MASTER,
+                    "../notesMasters/notesMaster1.xml",
+                );
+                opc.add_part(&notes_part, CT_NOTES_SLIDE, &generate_notes_slide_xml(notes))?;
             }
 
             let slide_xml = generate_slide_xml(slide, &img_rids, self.cx, self.cy);
@@ -568,6 +683,8 @@ fn write_decl(w: &mut Writer<Vec<u8>>) {
 }
 
 fn write_text_element(w: &mut Writer<Vec<u8>>, tag: &str, text: &str) {
+    // No xml:space here: DrawingML's a:t is an xsd:string that preserves
+    // whitespace already, and the attribute is not permitted on it.
     w.write_event(Event::Start(BytesStart::new(tag)))
         .expect("write start");
     w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(text))))
@@ -604,6 +721,11 @@ fn write_nv_grp_sp_pr(w: &mut Writer<Vec<u8>>) {
 
 // Write a DrawingML run (<a:r>) with optional rPr.
 fn write_dml_run(w: &mut Writer<Vec<u8>>, run: &Run) {
+    if run.line_break {
+        w.write_event(Event::Empty(BytesStart::new("a:br")))
+            .expect("write br");
+        return;
+    }
     w.write_event(Event::Start(BytesStart::new("a:r")))
         .expect("write");
 
@@ -623,16 +745,15 @@ fn write_dml_run(w: &mut Writer<Vec<u8>>, run: &Run) {
         if run.strikethrough {
             rpr.push_attribute(("strike", "sngStrike"));
         }
-        if let Some(pt) = run.font_size_pt {
+        if let Some(hundredths) = run.font_size_pt.and_then(font_size_hundredths) {
             // DrawingML stores size in hundredths of a point
-            let hundredths = (pt * 100.0).round() as u32;
             rpr.push_attribute(("sz", hundredths.to_string().as_str()));
         }
 
         if run.color.is_some() || run.font_name.is_some() {
             w.write_event(Event::Start(rpr)).expect("write rPr start");
 
-            if let Some(ref hex) = run.color {
+            if let Some(hex) = run.color.as_deref().and_then(normalize_hex_rgb) {
                 w.write_event(Event::Start(BytesStart::new("a:solidFill")))
                     .expect("write");
                 let mut clr = BytesStart::new("a:srgbClr");
@@ -719,8 +840,266 @@ fn generate_presentation_xml(slide_count: usize, cx: u64, cy: u64) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Attribute-value clamping
+// ---------------------------------------------------------------------------
+
+/// `ST_SlideSizeCoordinate` bounds, in EMU (1 inch to 56 inches).
+const SLIDE_SIZE_MIN: u64 = 914_400;
+const SLIDE_SIZE_MAX: u64 = 51_206_400;
+
+/// `ST_TextFontSize` bounds, in hundredths of a point (1pt to 4000pt).
+const FONT_SIZE_MIN: u32 = 100;
+const FONT_SIZE_MAX: u32 = 400_000;
+
+/// Clamp a slide dimension into `ST_SlideSizeCoordinate`. Reached without any
+/// explicit API call by the IR bridge, which converts a source page size
+/// straight to EMU — a page under an inch would otherwise emit an invalid deck.
+fn clamp_slide_size(v: u64) -> u64 {
+    v.clamp(SLIDE_SIZE_MIN, SLIDE_SIZE_MAX)
+}
+
+/// Convert a point size to `ST_TextFontSize` hundredths, clamped.
+///
+/// A plain `as u32` cast saturates, so `NaN` and negatives both became `0`,
+/// which is below the schema minimum. `NaN` has no sensible size, so it is
+/// dropped rather than guessed at.
+fn font_size_hundredths(pt: f64) -> Option<u32> {
+    if pt.is_nan() {
+        return None;
+    }
+    let scaled = (pt * 100.0).round();
+    let v = if scaled <= 0.0 {
+        FONT_SIZE_MIN
+    } else if scaled >= f64::from(FONT_SIZE_MAX) {
+        FONT_SIZE_MAX
+    } else {
+        scaled as u32
+    };
+    Some(v.clamp(FONT_SIZE_MIN, FONT_SIZE_MAX))
+}
+
+/// `ST_HexColorRGB` is exactly six hex digits. Accept a leading `#` (the
+/// mistake every CSS-adjacent API invites) and reject anything else rather
+/// than splicing it into the file.
+fn normalize_hex_rgb(hex: &str) -> Option<String> {
+    let t = hex.strip_prefix('#').unwrap_or(hex);
+    if t.len() == 6 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(t.to_ascii_uppercase())
+    } else {
+        None
+    }
+}
+
+/// `a:ext` uses `ST_PositiveCoordinate`; negatives are invalid. Offsets are
+/// signed and are deliberately left alone.
+fn clamp_extent(v: i64) -> i64 {
+    v.max(0)
+}
+
+// ---------------------------------------------------------------------------
+// theme/theme1.xml and presProps.xml
+// ---------------------------------------------------------------------------
+
+/// The Office theme, trimmed to what a conformant `CT_OfficeStyleSheet`
+/// requires: a full `clrScheme` (every slot the master's `clrMap` names), a
+/// `fontScheme`, and an `fmtScheme` whose four style lists carry the three
+/// entries the schema mandates. Static — the writer exposes no theming API,
+/// but a package without a theme leaves `clrMap` pointing at nothing and
+/// leaves every renderer to invent its own fonts.
+fn generate_theme_xml() -> Vec<u8> {
+    const SCHEME: &[(&str, &str)] = &[
+        ("dk1", "000000"),
+        ("lt1", "FFFFFF"),
+        ("dk2", "44546A"),
+        ("lt2", "E7E6E6"),
+        ("accent1", "4472C4"),
+        ("accent2", "ED7D31"),
+        ("accent3", "A5A5A5"),
+        ("accent4", "FFC000"),
+        ("accent5", "5B9BD5"),
+        ("accent6", "70AD47"),
+        ("hlink", "0563C1"),
+        ("folHlink", "954F72"),
+    ];
+
+    let mut clr = String::from("<a:clrScheme name=\"Office\">");
+    for (slot, rgb) in SCHEME {
+        // dk1/lt1 are system colours in a PowerPoint-authored theme, but
+        // srgbClr is valid for every slot and keeps this self-contained.
+        clr.push_str(&format!("<a:{slot}><a:srgbClr val=\"{rgb}\"/></a:{slot}>"));
+    }
+    clr.push_str("</a:clrScheme>");
+
+    let fill = "<a:solidFill><a:schemeClr val=\"phClr\"/></a:solidFill>";
+    let line = concat!(
+        "<a:ln w=\"6350\" cap=\"flat\" cmpd=\"sng\" algn=\"ctr\">",
+        "<a:solidFill><a:schemeClr val=\"phClr\"/></a:solidFill>",
+        "<a:prstDash val=\"solid\"/></a:ln>"
+    );
+    let effect = "<a:effectStyle><a:effectLst/></a:effectStyle>";
+
+    let xml = format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
+            "<a:theme xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" name=\"Office\">",
+            "<a:themeElements>",
+            "{clr}",
+            "<a:fontScheme name=\"Office\">",
+            "<a:majorFont><a:latin typeface=\"Calibri Light\"/><a:ea typeface=\"\"/><a:cs typeface=\"\"/></a:majorFont>",
+            "<a:minorFont><a:latin typeface=\"Calibri\"/><a:ea typeface=\"\"/><a:cs typeface=\"\"/></a:minorFont>",
+            "</a:fontScheme>",
+            "<a:fmtScheme name=\"Office\">",
+            "<a:fillStyleLst>{fill}{fill}{fill}</a:fillStyleLst>",
+            "<a:lnStyleLst>{line}{line}{line}</a:lnStyleLst>",
+            "<a:effectStyleLst>{effect}{effect}{effect}</a:effectStyleLst>",
+            "<a:bgFillStyleLst>{fill}{fill}{fill}</a:bgFillStyleLst>",
+            "</a:fmtScheme>",
+            "</a:themeElements>",
+            "<a:objectDefaults/><a:extraClrSchemeLst/>",
+            "</a:theme>"
+        ),
+        clr = clr,
+        fill = fill,
+        line = line,
+        effect = effect
+    );
+    xml.into_bytes()
+}
+
+/// A notes slide: the speaker-notes body for one slide. `CT_NotesSlide` is
+/// `cSld, clrMapOvr?, ...`; the body placeholder carries the note text.
+fn generate_notes_slide_xml(notes: &str) -> Vec<u8> {
+    let mut w = Writer::new(Vec::new());
+    write_decl(&mut w);
+    w.write_event(Event::Start(pml_root("p:notes")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:cSld")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:spTree")))
+        .expect("write");
+    write_nv_grp_sp_pr(&mut w);
+    write_empty(&mut w, "p:grpSpPr");
+
+    w.write_event(Event::Start(BytesStart::new("p:sp")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:nvSpPr")))
+        .expect("write");
+    let mut c_nv_pr = BytesStart::new("p:cNvPr");
+    c_nv_pr.push_attribute(("id", "2"));
+    c_nv_pr.push_attribute(("name", "Notes Placeholder"));
+    w.write_event(Event::Empty(c_nv_pr)).expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:cNvSpPr")))
+        .expect("write");
+    let mut locks = BytesStart::new("a:spLocks");
+    locks.push_attribute(("noGrp", "1"));
+    w.write_event(Event::Empty(locks)).expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:cNvSpPr")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:nvPr")))
+        .expect("write");
+    let mut ph = BytesStart::new("p:ph");
+    ph.push_attribute(("type", "body"));
+    ph.push_attribute(("idx", "1"));
+    w.write_event(Event::Empty(ph)).expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:nvPr")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:nvSpPr")))
+        .expect("write");
+    write_empty(&mut w, "p:spPr");
+
+    w.write_event(Event::Start(BytesStart::new("p:txBody")))
+        .expect("write");
+    write_empty(&mut w, "a:bodyPr");
+    for line in notes.split('\n') {
+        w.write_event(Event::Start(BytesStart::new("a:p")))
+            .expect("write");
+        w.write_event(Event::Start(BytesStart::new("a:r")))
+            .expect("write");
+        write_empty(&mut w, "a:rPr");
+        w.write_event(Event::Start(BytesStart::new("a:t")))
+            .expect("write");
+        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(line))))
+            .expect("write");
+        w.write_event(Event::End(BytesEnd::new("a:t")))
+            .expect("write");
+        w.write_event(Event::End(BytesEnd::new("a:r")))
+            .expect("write");
+        w.write_event(Event::End(BytesEnd::new("a:p")))
+            .expect("write");
+    }
+    w.write_event(Event::End(BytesEnd::new("p:txBody")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:sp")))
+        .expect("write");
+
+    w.write_event(Event::End(BytesEnd::new("p:spTree")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:cSld")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:notes")))
+        .expect("write");
+    w.into_inner()
+}
+
+/// The notes master. PowerPoint expects one whenever notes slides exist.
+fn generate_notes_master_xml() -> Vec<u8> {
+    let mut w = Writer::new(Vec::new());
+    write_decl(&mut w);
+    w.write_event(Event::Start(pml_root("p:notesMaster")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:cSld")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:spTree")))
+        .expect("write");
+    write_nv_grp_sp_pr(&mut w);
+    write_empty(&mut w, "p:grpSpPr");
+    w.write_event(Event::End(BytesEnd::new("p:spTree")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:cSld")))
+        .expect("write");
+    let mut clr_map = BytesStart::new("p:clrMap");
+    for (slot, colour) in COLOR_MAP {
+        clr_map.push_attribute((*slot, *colour));
+    }
+    w.write_event(Event::Empty(clr_map)).expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:notesMaster")))
+        .expect("write");
+    w.into_inner()
+}
+
+/// `ppt/presProps.xml`. [ISO/IEC 29500-1] §13.3.7 requires exactly one
+/// Presentation Properties part per package; an empty element is valid.
+fn generate_pres_props_xml() -> Vec<u8> {
+    concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>",
+        "<p:presentationPr xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"",
+        " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"",
+        " xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\"/>"
+    )
+    .as_bytes()
+    .to_vec()
+}
+
+// ---------------------------------------------------------------------------
 // slideMasters/slideMaster1.xml
 // ---------------------------------------------------------------------------
+
+/// The twelve `CT_ColorMapping` attributes, all of which are required.
+/// Identity mapping: each master colour slot maps to the same theme slot.
+const COLOR_MAP: &[(&str, &str)] = &[
+    ("bg1", "lt1"),
+    ("tx1", "dk1"),
+    ("bg2", "lt2"),
+    ("tx2", "dk2"),
+    ("accent1", "accent1"),
+    ("accent2", "accent2"),
+    ("accent3", "accent3"),
+    ("accent4", "accent4"),
+    ("accent5", "accent5"),
+    ("accent6", "accent6"),
+    ("hlink", "hlink"),
+    ("folHlink", "folHlink"),
+];
 
 fn generate_slide_master_xml() -> Vec<u8> {
     let mut w = Writer::new(Vec::new());
@@ -738,6 +1117,15 @@ fn generate_slide_master_xml() -> Vec<u8> {
         .expect("write");
     w.write_event(Event::End(BytesEnd::new("p:cSld")))
         .expect("write");
+
+    // clrMap is a REQUIRED child of CT_SlideMaster and must sit between cSld
+    // and sldLayoutIdLst. Identity mapping, matching what PowerPoint writes
+    // for a default master; every value names a slot in the theme's clrScheme.
+    let mut clr_map = BytesStart::new("p:clrMap");
+    for (slot, colour) in COLOR_MAP {
+        clr_map.push_attribute((*slot, *colour));
+    }
+    w.write_event(Event::Empty(clr_map)).expect("write");
 
     w.write_event(Event::Start(BytesStart::new("p:sldLayoutIdLst")))
         .expect("write");
@@ -867,8 +1255,8 @@ fn write_layout_placeholder(
         off.push_attribute(("y", ys.as_str()));
         w.write_event(Event::Empty(off)).expect("off");
         let mut ext = BytesStart::new("a:ext");
-        let cxs = cx.to_string();
-        let cys = cy.to_string();
+        let cxs = clamp_extent(cx).to_string();
+        let cys = clamp_extent(cy).to_string();
         ext.push_attribute(("cx", cxs.as_str()));
         ext.push_attribute(("cy", cys.as_str()));
         w.write_event(Event::Empty(ext)).expect("ext");
@@ -902,7 +1290,7 @@ fn write_layout_placeholder(
 
 fn generate_slide_xml(
     slide: &SlideData,
-    img_rids: &[(String, i64, i64, u64, u64)],
+    img_rids: &[(String, i64, i64, u64, u64, Option<String>)],
     pres_cx: u64,
     pres_cy: u64,
 ) -> Vec<u8> {
@@ -930,10 +1318,24 @@ fn generate_slide_xml(
         let placeholder_items: Vec<&BodyItem> = slide
             .body_items
             .iter()
-            .filter(|i| !matches!(i, BodyItem::TextBox(..) | BodyItem::Image(..)))
+            .filter(|i| {
+                !matches!(i, BodyItem::TextBox(..) | BodyItem::Image(..) | BodyItem::Table(..))
+            })
             .collect();
         write_body_shape(&mut w, next_id, &placeholder_items, pres_cx, pres_cy);
         next_id += 1;
+    }
+
+    // Tables, as real graphic frames rather than tab-joined text.
+    for item in &slide.body_items {
+        if let BodyItem::Table(rows) = item {
+            let margin = (pres_cx as f64 * BODY_X_FRAC) as u64;
+            let cx = pres_cx.saturating_sub(2 * margin).max(914_400);
+            let cy = (rows.len() as u64 * 457_200).min(pres_cy / 2).max(457_200);
+            let y = (pres_cy as f64 * BODY_Y_FRAC) as i64;
+            write_table_frame(&mut w, next_id, rows, margin as i64, y, cx, cy);
+            next_id += 1;
+        }
     }
 
     // Free-floating text boxes
@@ -945,8 +1347,8 @@ fn generate_slide_xml(
     }
 
     // Embedded images
-    for (rid, x, y, cx, cy) in img_rids {
-        write_pic_shape(&mut w, next_id, rid, *x, *y, *cx, *cy);
+    for (rid, x, y, cx, cy, alt) in img_rids {
+        write_pic_shape(&mut w, next_id, rid, *x, *y, *cx, *cy, alt.as_deref());
         next_id += 1;
     }
 
@@ -989,8 +1391,8 @@ fn write_sp_pr_with_xfrm(w: &mut Writer<Vec<u8>>, x: i64, y: i64, cx: i64, cy: i
     off.push_attribute(("y", y.to_string().as_str()));
     w.write_event(Event::Empty(off)).expect("write");
     let mut ext = BytesStart::new("a:ext");
-    ext.push_attribute(("cx", cx.to_string().as_str()));
-    ext.push_attribute(("cy", cy.to_string().as_str()));
+    ext.push_attribute(("cx", clamp_extent(cx).to_string().as_str()));
+    ext.push_attribute(("cy", clamp_extent(cy).to_string().as_str()));
     w.write_event(Event::Empty(ext)).expect("write");
     w.write_event(Event::End(BytesEnd::new("a:xfrm")))
         .expect("write");
@@ -1116,22 +1518,147 @@ fn write_body_shape(
     w.write_event(Event::End(BytesEnd::new("a:bodyPr")))
         .expect("write bodyPr end");
 
+    let mut wrote_paragraph = false;
     for item in items {
         match item {
-            BodyItem::Text(text) => write_plain_paragraph(w, text),
-            BodyItem::RichText(runs, props) => write_rich_paragraph(w, runs, props),
+            BodyItem::Text(text) => {
+                write_plain_paragraph(w, text);
+                wrote_paragraph = true;
+            },
+            BodyItem::RichText(runs, props) => {
+                write_rich_paragraph(w, runs, props);
+                wrote_paragraph = true;
+            },
             BodyItem::BulletList(bullets) => {
                 for bullet in bullets {
-                    write_bullet_paragraph(w, bullet);
+                    write_bullet_paragraph(w, bullet.0, &bullet.1);
+                    wrote_paragraph = true;
                 }
             },
-            BodyItem::TextBox(..) | BodyItem::Image(..) => {}, // handled separately
+            // Tables, text boxes and images are separate shapes, not body text.
+            BodyItem::Table(..) | BodyItem::TextBox(..) | BodyItem::Image(..) => {},
         }
+    }
+    // CT_TextBody requires at least one a:p. A placeholder whose only items
+    // were tables or images produced an empty body, which is invalid.
+    if !wrote_paragraph {
+        write_empty(w, "a:p");
     }
 
     w.write_event(Event::End(BytesEnd::new("p:txBody")))
         .expect("write");
     w.write_event(Event::End(BytesEnd::new("p:sp")))
+        .expect("write");
+}
+
+/// A real `a:tbl` inside a `p:graphicFrame`.
+///
+/// The bridge used to join cells with tabs and rows with newlines into a
+/// single text run, which loses the grid, every cell boundary and any hope of
+/// a renderer laying it out as a table.
+fn write_table_frame(
+    w: &mut Writer<Vec<u8>>,
+    id: u32,
+    rows: &[Vec<String>],
+    x: i64,
+    y: i64,
+    cx: u64,
+    cy: u64,
+) {
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if cols == 0 {
+        return;
+    }
+    let col_w = (cx / cols as u64).max(1);
+    let row_h = (cy / rows.len() as u64).max(1);
+
+    w.write_event(Event::Start(BytesStart::new("p:graphicFrame")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:nvGraphicFramePr")))
+        .expect("write");
+    let mut c_nv_pr = BytesStart::new("p:cNvPr");
+    let id_str = id.to_string();
+    let name = format!("Table {id}");
+    c_nv_pr.push_attribute(("id", id_str.as_str()));
+    c_nv_pr.push_attribute(("name", name.as_str()));
+    w.write_event(Event::Empty(c_nv_pr)).expect("write");
+    write_empty(w, "p:cNvGraphicFramePr");
+    write_empty(w, "p:nvPr");
+    w.write_event(Event::End(BytesEnd::new("p:nvGraphicFramePr")))
+        .expect("write");
+
+    w.write_event(Event::Start(BytesStart::new("p:xfrm")))
+        .expect("write");
+    let mut off = BytesStart::new("a:off");
+    off.push_attribute(("x", x.to_string().as_str()));
+    off.push_attribute(("y", y.to_string().as_str()));
+    w.write_event(Event::Empty(off)).expect("write");
+    let mut ext = BytesStart::new("a:ext");
+    ext.push_attribute(("cx", cx.to_string().as_str()));
+    ext.push_attribute(("cy", cy.to_string().as_str()));
+    w.write_event(Event::Empty(ext)).expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:xfrm")))
+        .expect("write");
+
+    w.write_event(Event::Start(BytesStart::new("a:graphic")))
+        .expect("write");
+    let mut gd = BytesStart::new("a:graphicData");
+    gd.push_attribute(("uri", "http://schemas.openxmlformats.org/drawingml/2006/table"));
+    w.write_event(Event::Start(gd)).expect("write");
+
+    w.write_event(Event::Start(BytesStart::new("a:tbl")))
+        .expect("write");
+    let mut tbl_pr = BytesStart::new("a:tblPr");
+    tbl_pr.push_attribute(("firstRow", "1"));
+    tbl_pr.push_attribute(("bandRow", "1"));
+    w.write_event(Event::Empty(tbl_pr)).expect("write");
+
+    w.write_event(Event::Start(BytesStart::new("a:tblGrid")))
+        .expect("write");
+    for _ in 0..cols {
+        let mut gc = BytesStart::new("a:gridCol");
+        gc.push_attribute(("w", col_w.to_string().as_str()));
+        w.write_event(Event::Empty(gc)).expect("write");
+    }
+    w.write_event(Event::End(BytesEnd::new("a:tblGrid")))
+        .expect("write");
+
+    for row in rows {
+        let mut tr = BytesStart::new("a:tr");
+        tr.push_attribute(("h", row_h.to_string().as_str()));
+        w.write_event(Event::Start(tr)).expect("write");
+        for c in 0..cols {
+            w.write_event(Event::Start(BytesStart::new("a:tc")))
+                .expect("write");
+            w.write_event(Event::Start(BytesStart::new("a:txBody")))
+                .expect("write");
+            write_empty(w, "a:bodyPr");
+            w.write_event(Event::Start(BytesStart::new("a:p")))
+                .expect("write");
+            w.write_event(Event::Start(BytesStart::new("a:r")))
+                .expect("write");
+            write_text_element(w, "a:t", row.get(c).map_or("", String::as_str));
+            w.write_event(Event::End(BytesEnd::new("a:r")))
+                .expect("write");
+            w.write_event(Event::End(BytesEnd::new("a:p")))
+                .expect("write");
+            w.write_event(Event::End(BytesEnd::new("a:txBody")))
+                .expect("write");
+            write_empty(w, "a:tcPr");
+            w.write_event(Event::End(BytesEnd::new("a:tc")))
+                .expect("write");
+        }
+        w.write_event(Event::End(BytesEnd::new("a:tr")))
+            .expect("write");
+    }
+
+    w.write_event(Event::End(BytesEnd::new("a:tbl")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("a:graphicData")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("a:graphic")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:graphicFrame")))
         .expect("write");
 }
 
@@ -1175,8 +1702,8 @@ fn write_text_box_shape(
     off.push_attribute(("y", y.to_string().as_str()));
     w.write_event(Event::Empty(off)).expect("write");
     let mut ext = BytesStart::new("a:ext");
-    ext.push_attribute(("cx", cx.to_string().as_str()));
-    ext.push_attribute(("cy", cy.to_string().as_str()));
+    ext.push_attribute(("cx", clamp_extent(cx).to_string().as_str()));
+    ext.push_attribute(("cy", clamp_extent(cy).to_string().as_str()));
     w.write_event(Event::Empty(ext)).expect("write");
     w.write_event(Event::End(BytesEnd::new("a:xfrm")))
         .expect("write");
@@ -1213,7 +1740,16 @@ fn write_text_box_shape(
         .expect("write");
 }
 
-fn write_pic_shape(w: &mut Writer<Vec<u8>>, id: u32, rid: &str, x: i64, y: i64, cx: u64, cy: u64) {
+fn write_pic_shape(
+    w: &mut Writer<Vec<u8>>,
+    id: u32,
+    rid: &str,
+    x: i64,
+    y: i64,
+    cx: u64,
+    cy: u64,
+    alt: Option<&str>,
+) {
     let id_str = id.to_string();
     let name = format!("Image {id}");
 
@@ -1225,6 +1761,11 @@ fn write_pic_shape(w: &mut Writer<Vec<u8>>, id: u32, rid: &str, x: i64, y: i64, 
     let mut cnv_pr = BytesStart::new("p:cNvPr");
     cnv_pr.push_attribute(("id", id_str.as_str()));
     cnv_pr.push_attribute(("name", name.as_str()));
+    // descr is the alt text a screen reader announces; without it the
+    // picture is invisible to assistive technology.
+    if let Some(text) = alt.filter(|t| !t.is_empty()) {
+        cnv_pr.push_attribute(("descr", text));
+    }
     w.write_event(Event::Empty(cnv_pr)).expect("write");
     write_empty(w, "p:cNvPicPr");
     write_empty(w, "p:nvPr");
@@ -1323,11 +1864,23 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, runs: &[Run], props: &ParaProps
         .expect("write");
 }
 
-fn write_bullet_paragraph(w: &mut Writer<Vec<u8>>, text: &str) {
+/// One level of hanging indent, in EMU — the value PowerPoint uses.
+const BULLET_INDENT_EMU: u32 = 342_900;
+
+fn write_bullet_paragraph(w: &mut Writer<Vec<u8>>, level: u8, text: &str) {
     w.write_event(Event::Start(BytesStart::new("a:p")))
         .expect("write");
-    w.write_event(Event::Start(BytesStart::new("a:pPr")))
-        .expect("write");
+    let level = level.min(8);
+    let mut p_pr = BytesStart::new("a:pPr");
+    if level > 0 {
+        p_pr.push_attribute(("lvl", level.to_string().as_str()));
+    }
+    // A hanging indent per level: without marL/indent the bullet glyph and
+    // its text start at the same x, so nesting is invisible.
+    let mar_l = BULLET_INDENT_EMU * (u32::from(level) + 1);
+    p_pr.push_attribute(("marL", mar_l.to_string().as_str()));
+    p_pr.push_attribute(("indent", format!("-{BULLET_INDENT_EMU}").as_str()));
+    w.write_event(Event::Start(p_pr)).expect("write");
     let mut bu = BytesStart::new("a:buChar");
     bu.push_attribute(("char", "\u{2022}"));
     w.write_event(Event::Empty(bu)).expect("write");
@@ -1397,6 +1950,233 @@ mod tests {
         let mut xml = String::new();
         std::io::Read::read_to_string(&mut entry, &mut xml).unwrap();
         assert!(xml.contains("cx=\"9144000\""), "expected cx in presentation.xml");
+    }
+
+    /// Read an arbitrary part from a written presentation.
+    fn part_xml(writer: PptxWriter, name: &str) -> String {
+        let mut buf = Cursor::new(Vec::new());
+        writer.write_to(&mut buf).unwrap();
+        buf.set_position(0);
+        let mut zip = zip::ZipArchive::new(buf).unwrap();
+        let mut entry = zip.by_name(name).unwrap();
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut xml).unwrap();
+        xml
+    }
+
+    /// `CT_SlideMaster` is a strict sequence: `cSld`, then the **required**
+    /// `clrMap`, then `sldLayoutIdLst`. Omitting `clrMap` makes every deck we
+    /// write schema-invalid and leaves PowerPoint with no colour mapping to
+    /// recover, so its repair fails.
+    #[test]
+    fn slide_master_carries_required_colour_map_before_the_layout_list() {
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("Hello");
+        let xml = part_xml(writer, "ppt/slideMasters/slideMaster1.xml");
+
+        let clr = xml
+            .find("<p:clrMap")
+            .expect("slide master must carry <p:clrMap>");
+        let lst = xml
+            .find("<p:sldLayoutIdLst")
+            .expect("slide master must carry the layout list");
+        let csld = xml.find("</p:cSld>").expect("slide master must carry cSld");
+        assert!(csld < clr && clr < lst, "clrMap must sit between cSld and sldLayoutIdLst");
+
+        // All twelve CT_ColorMapping attributes are required.
+        for attr in [
+            "bg1=\"lt1\"",
+            "tx1=\"dk1\"",
+            "bg2=\"lt2\"",
+            "tx2=\"dk2\"",
+            "accent1=\"accent1\"",
+            "accent2=\"accent2\"",
+            "accent3=\"accent3\"",
+            "accent4=\"accent4\"",
+            "accent5=\"accent5\"",
+            "accent6=\"accent6\"",
+            "hlink=\"hlink\"",
+            "folHlink=\"folHlink\"",
+        ] {
+            assert!(xml.contains(attr), "clrMap missing required attribute {attr}");
+        }
+    }
+
+    /// List every part name in a written presentation.
+    fn part_names(writer: PptxWriter) -> Vec<String> {
+        let mut buf = Cursor::new(Vec::new());
+        writer.write_to(&mut buf).unwrap();
+        buf.set_position(0);
+        let mut zip = zip::ZipArchive::new(buf).unwrap();
+        (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect()
+    }
+
+    /// [ISO/IEC 29500-1] §13.3.9: a Slide Layout part **shall** have an
+    /// implicit relationship to a Slide Master part. Without it the layout is
+    /// orphaned, which is what defeats PowerPoint's repair.
+    #[test]
+    fn slide_layout_relates_back_to_the_slide_master() {
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("Hello");
+        let names = part_names(writer);
+        assert!(
+            names
+                .iter()
+                .any(|n| n == "ppt/slideLayouts/_rels/slideLayout1.xml.rels"),
+            "slide layout has no _rels part; got {names:?}"
+        );
+
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("Hello");
+        let rels = part_xml(writer, "ppt/slideLayouts/_rels/slideLayout1.xml.rels");
+        assert!(rels.contains("slideMaster"), "layout rels must target the master: {rels}");
+    }
+
+    /// A `clrMap` naming theme slots is meaningless without a theme, and the
+    /// spec lists the theme among the minimum parts of a presentation.
+    #[test]
+    fn package_carries_a_theme_reachable_from_the_master() {
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("Hello");
+        let names = part_names(writer);
+        assert!(names.iter().any(|n| n == "ppt/theme/theme1.xml"), "no theme part: {names:?}");
+
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("Hello");
+        let rels = part_xml(writer, "ppt/slideMasters/_rels/slideMaster1.xml.rels");
+        assert!(rels.contains("theme"), "master must relate to the theme: {rels}");
+
+        // Every clrMap slot must resolve to a slot the theme actually defines.
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("Hello");
+        let theme = part_xml(writer, "ppt/theme/theme1.xml");
+        for slot in [
+            "lt1", "dk1", "lt2", "dk2", "accent1", "accent6", "hlink", "folHlink",
+        ] {
+            assert!(theme.contains(&format!("<a:{slot}>")), "theme missing colour slot {slot}");
+        }
+    }
+
+    /// [ISO/IEC 29500-1] §13.3.7: a package **shall contain exactly one**
+    /// Presentation Properties part, targeted from the presentation part.
+    #[test]
+    fn package_carries_presentation_properties() {
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("Hello");
+        let names = part_names(writer);
+        assert!(names.iter().any(|n| n == "ppt/presProps.xml"), "no presProps part: {names:?}");
+
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("Hello");
+        let rels = part_xml(writer, "ppt/_rels/presentation.xml.rels");
+        assert!(rels.contains("presProps.xml"), "presentation must relate to presProps: {rels}");
+    }
+
+    /// Speaker notes are presenter-private. They must reach the notes slide
+    /// part and must never appear on the slide surface, where an audience
+    /// would see them.
+    #[test]
+    fn speaker_notes_go_to_the_notes_part_and_never_onto_the_slide() {
+        const SECRET: &str = "CONFIDENTIAL do not read aloud";
+
+        let mut writer = PptxWriter::new();
+        {
+            let slide = writer.add_slide();
+            slide.set_title("Public Title");
+            slide.add_text("Visible body");
+            slide.set_notes(SECRET);
+        }
+        let names = part_names(writer);
+        assert!(
+            names.iter().any(|n| n == "ppt/notesSlides/notesSlide1.xml"),
+            "notes must be written to a notes slide part; got {names:?}"
+        );
+
+        let mut writer = PptxWriter::new();
+        {
+            let slide = writer.add_slide();
+            slide.set_title("Public Title");
+            slide.add_text("Visible body");
+            slide.set_notes(SECRET);
+        }
+        let slide_xml = part_xml(writer, "ppt/slides/slide1.xml");
+        assert!(slide_xml.contains("Visible body"), "body text must survive");
+        assert!(
+            !slide_xml.contains(SECRET),
+            "speaker notes leaked onto the visible slide:\n{slide_xml}"
+        );
+
+        let mut writer = PptxWriter::new();
+        {
+            let slide = writer.add_slide();
+            slide.set_notes(SECRET);
+        }
+        let notes_xml = part_xml(writer, "ppt/notesSlides/notesSlide1.xml");
+        assert!(notes_xml.contains(SECRET), "notes part must carry the text");
+    }
+
+    /// A deck with no notes gains no notes parts.
+    #[test]
+    fn deck_without_notes_has_no_notes_parts() {
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("x");
+        let names = part_names(writer);
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains("notesSlide") || n.contains("notesMaster")),
+            "unexpected notes parts: {names:?}"
+        );
+    }
+
+    /// Every value the writer splices into a restricted XSD simple type must
+    /// be clamped or dropped — never written through and left invalid.
+    #[test]
+    fn out_of_range_values_are_clamped_not_written_through() {
+        // ST_SlideSizeCoordinate: 914400..=51206400
+        let mut writer = PptxWriter::new();
+        writer.set_presentation_size(1000, 99_000_000);
+        writer.add_slide().add_text("x");
+        let xml = part_xml(writer, "ppt/presentation.xml");
+        assert!(xml.contains("cx=\"914400\""), "tiny cx must clamp up: {xml}");
+        assert!(xml.contains("cy=\"51206400\""), "huge cy must clamp down: {xml}");
+
+        // ST_TextFontSize: 100..=400000, and NaN has no size at all.
+        let mut writer = PptxWriter::new();
+        {
+            let s = writer.add_slide();
+            s.add_rich_text(&[Run::new("tiny").font_size(0.05)]);
+            s.add_rich_text(&[Run::new("huge").font_size(9999.0)]);
+            s.add_rich_text(&[Run::new("neg").font_size(-10.0)]);
+            s.add_rich_text(&[Run::new("nan").font_size(f64::NAN)]);
+        }
+        let xml = slide1_xml(writer);
+        assert!(!xml.contains("sz=\"0\""), "font size must never be 0: {xml}");
+        assert!(!xml.contains("sz=\"5\""), "font size must clamp to the minimum");
+        assert!(xml.contains("sz=\"100\""), "below-minimum sizes clamp to 100");
+        assert!(xml.contains("sz=\"400000\""), "above-maximum sizes clamp to 400000");
+        assert_eq!(xml.matches("sz=\"").count(), 3, "NaN must emit no sz at all");
+
+        // ST_HexColorRGB: exactly six hex digits; a leading # is forgiven.
+        let mut writer = PptxWriter::new();
+        {
+            let s = writer.add_slide();
+            s.add_rich_text(&[Run::new("hash").color("#FF0000")]);
+            s.add_rich_text(&[Run::new("bad").color("nothex")]);
+        }
+        let xml = slide1_xml(writer);
+        assert!(xml.contains("val=\"FF0000\""), "a leading # must be stripped: {xml}");
+        assert!(!xml.contains("nothex"), "invalid hex must not be written: {xml}");
+        assert!(!xml.contains("#FF0000"), "raw # must not reach the file");
+
+        // a:ext is ST_PositiveCoordinate.
+        let mut writer = PptxWriter::new();
+        writer.add_slide().add_text_box("neg", 0, 0, -100, -100);
+        let xml = slide1_xml(writer);
+        assert!(!xml.contains("cx=\"-"), "negative extent written: {xml}");
+        assert!(!xml.contains("cy=\"-"), "negative extent written: {xml}");
     }
 
     /// Read `ppt/slides/slide1.xml` from a written presentation.

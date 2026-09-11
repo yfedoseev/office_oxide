@@ -1,0 +1,2052 @@
+diff --git a/src/convert_doc.rs b/src/convert_doc.rs
+index 0bfd80a..746d180 100644
+--- a/src/convert_doc.rs
++++ b/src/convert_doc.rs
+@@ -1,5 +1,6 @@
+ use crate::doc::{DocDocument, DocParagraph, TapCellInfo, TapInfo};
+ use crate::format::DocumentFormat;
++use crate::ir::MAX_HEADING_DEPTH;
+ use crate::ir::*;
+ 
+ /// Convert a parsed legacy `.doc` into the intermediate representation.
+@@ -391,7 +392,7 @@ fn walk_paragraphs(paragraphs: &[DocParagraph], elements: &mut Vec<Element>) {
+         } else {
+             table.flush(elements);
+             flush_list(&mut list_items, elements);
+-            emit_prose(&p.text, &p.props.tabs, elements);
++            emit_prose(&p.text, &p.props.tabs, p.props.heading_level, elements);
+         }
+     }
+     table.flush(elements);
+@@ -442,14 +443,41 @@ fn inline_content_for(text: &str) -> Vec<InlineContent> {
+ 
+ /// Classify a prose paragraph as a heading or paragraph and push it.
+ ///
+-/// Mirrors the line-based heuristic so a PAPX-bearing document keeps the same
+-/// heading/title detection as the fallback path.
+-fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>) {
++/// When `heading_level` is `Some`, the paragraph is a styled heading and its
++/// real level is used directly (resolved from `sprmPOutlineLvl` or the
++/// paragraph's style in the document style sheet — see `crate::doc::styles`).
++/// Otherwise the line-based heuristic is applied, keeping a PAPX-bearing
++/// document's heading/title detection identical to the fallback path.
++fn emit_prose(
++    text: &str,
++    tabs: &[TabStop],
++    heading_level: Option<u8>,
++    elements: &mut Vec<Element>,
++) {
+     let trimmed = text.trim();
+     if trimmed.is_empty() {
+         return;
+     }
+ 
++    // A styled heading uses its real level, overriding the heuristic.
++    if let Some(level) = heading_level {
++        let mut content = inline_content_for(trimmed);
++        for ic in &mut content {
++            if let InlineContent::Text(t) = ic {
++                t.bold = true;
++            }
++        }
++        elements.push(Element::Heading(Heading {
++            // MS-DOC outline levels are 1-based and run to 9, but
++            // `Heading::level` is a 1–6 markdown-style depth; clamp, matching
++            // the DOCX path's `(outline_level + 1).min(6)`.
++            level: level.min(MAX_HEADING_DEPTH),
++            content,
++            ..Default::default()
++        }));
++        return;
++    }
++
+     let is_heading = trimmed.len() < 100
+         && !trimmed.ends_with('.')
+         && !trimmed.ends_with(',')
+@@ -488,7 +516,7 @@ fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>) {
+ 
+ fn line_heuristic(text: &str, elements: &mut Vec<Element>) {
+     for line in text.lines() {
+-        emit_prose(line, &[], elements);
++        emit_prose(line, &[], None, elements);
+     }
+ }
+ 
+@@ -721,6 +749,97 @@ mod tests {
+         );
+     }
+ 
++    /// A paragraph inside a table whose style resolves to a heading must stay a
++    /// table cell. `walk_paragraphs` routes table paragraphs before `emit_prose`,
++    /// so a styled heading can neither leak into the table structure nor escape
++    /// it as a top-level `Heading`.
++    #[test]
++    fn styled_heading_inside_table_stays_a_cell() {
++        let mark = DocParagraph {
++            text: String::new(),
++            terminator: '\r',
++            props: PapProps {
++                is_table_trailing_mark: true,
++                itap: 1,
++                heading_level: Some(3),
++                ..PapProps::default()
++            },
++        };
++        let cell = DocParagraph {
++            text: "cell text".into(),
++            terminator: '\u{7}', // closes the cell
++            props: PapProps {
++                f_in_table: true,
++                heading_level: Some(3),
++                ..PapProps::default()
++            },
++        };
++        let paragraphs = [mark.clone(), cell, mark];
++        let mut els = Vec::new();
++        walk_paragraphs(&paragraphs, &mut els);
++        assert!(
++            els.iter().any(|e| matches!(e, Element::Table(_))),
++            "the cell must still be emitted inside a table"
++        );
++        assert!(
++            !els.iter().any(|e| matches!(e, Element::Heading(_))),
++            "a styled heading inside a table must not become a Heading"
++        );
++    }
++
++    /// A row-terminator paragraph that also carries a heading style must end the
++    /// row, not emit a `Heading` into the element stream.
++    #[test]
++    fn styled_heading_on_row_terminator_is_not_a_heading() {
++        let row = DocParagraph {
++            // A row terminator can carry the trailing cell's text; keeping it
++            // non-empty is what makes this test meaningful — an empty text
++            // would be dropped by `emit_prose` whether or not the routing is
++            // correct, so the test could not tell the two apart.
++            text: "row text".into(),
++            terminator: '\r',
++            props: PapProps {
++                is_table_trailing_mark: true,
++                itap: 1,
++                heading_level: Some(2),
++                ..PapProps::default()
++            },
++        };
++        let mut els = Vec::new();
++        walk_paragraphs(&[row], &mut els);
++        assert!(
++            !els.iter().any(|e| matches!(e, Element::Heading(_))),
++            "a row-terminator paragraph must end a row, not emit a Heading"
++        );
++    }
++
++    /// A paragraph that is a list member and whose style resolves to a heading
++    /// stays a list item: `walk_paragraphs` routes list membership (keyed on
++    /// `ilfo`) before `emit_prose`.
++    #[test]
++    fn styled_heading_list_item_stays_a_list_item() {
++        let item = DocParagraph {
++            text: "item".into(),
++            terminator: '\r',
++            props: PapProps {
++                ilfo: Some(1),
++                ilvl: Some(0),
++                heading_level: Some(4),
++                ..PapProps::default()
++            },
++        };
++        let mut els = Vec::new();
++        walk_paragraphs(&[item], &mut els);
++        assert!(
++            els.iter().any(|e| matches!(e, Element::List(_))),
++            "a list member must be emitted as a List"
++        );
++        assert!(
++            !els.iter().any(|e| matches!(e, Element::Heading(_))),
++            "a styled heading that is a list item must not become a Heading"
++        );
++    }
++
+     /// Build a single-column `PendingRow` whose cell carries the given `rgf`
+     /// (the MS-DOC 2-bit `TCGRF` vertical-merge field) and renders "cell".
+     fn vmerge_row(rgf: u16) -> PendingRow {
+diff --git a/src/doc/document.rs b/src/doc/document.rs
+index ff0d733..47118ef 100644
+--- a/src/doc/document.rs
++++ b/src/doc/document.rs
+@@ -9,6 +9,7 @@ use super::fib::Fib;
+ use super::images::{DocImage, extract_images};
+ use super::papx::{DocParagraph, build_paragraphs, parse_papx_paragraphs};
+ use super::piece_table::{extract_text, parse_clx, sanitize_text};
++use super::styles::{StyleDef, parse_style_sheet};
+ 
+ /// A parsed legacy Word document.
+ #[derive(Debug)]
+@@ -105,7 +106,12 @@ impl DocDocument {
+                 fib.fc_plcf_bte_papx,
+                 fib.lcb_plcf_bte_papx,
+             );
+-            build_paragraphs(&word_doc, &pieces, &fkp, fib.text_len)
++            // Parse the style sheet so paragraph styles (incl. built-in
++            // Heading 1-9 and user-defined "Heading N") can be resolved to a
++            // real heading level. A malformed/absent sheet yields an empty
++            // list and headings fall back to the line heuristic.
++            let styles: Vec<StyleDef> = parse_style_sheet(&table_stream, &fib);
++            build_paragraphs(&word_doc, &pieces, &fkp, fib.text_len, &styles)
+         } else {
+             Vec::new()
+         };
+@@ -331,6 +337,61 @@ mod tests {
+         assert!(matches!(ir.sections[0].elements[1], Element::Heading(ref h) if h.level == 2));
+     }
+ 
++    #[test]
++    fn ir_styled_heading_uses_real_level() {
++        use crate::ir::Element;
++        // A styled "Heading 3" paragraph that is NOT the first element must
++        // keep its real level (3) instead of collapsing to the heuristic level
++        // 2 (the `elements.is_empty() ? 1 : 2` rule in `emit_prose`). This is
++        // the regression test for deriving heading levels from paragraph style
++        // rather than the line heuristic.
++        let doc = make_doc_with_paragraphs(vec![
++            pap("Intro paragraph.", Default::default()),
++            pap(
++                "Subsection",
++                crate::doc::sprm::PapProps {
++                    heading_level: Some(3),
++                    ..Default::default()
++                },
++            ),
++        ]);
++        let ir = crate::convert_doc::doc_to_ir(&doc);
++        let elements = &ir.sections[0].elements;
++        assert!(matches!(elements[0], Element::Paragraph(_)));
++        match &elements[1] {
++            Element::Heading(h) => {
++                assert_eq!(h.level, 3, "styled heading must keep its real level")
++            },
++            other => panic!("expected a Heading, got {:?}", other),
++        }
++    }
++
++    /// Regression: MS-DOC outline levels run to `MAX_OUTLINE_LEVEL` but
++    /// `Heading::level` is a 1..=MAX_HEADING_DEPTH markdown depth, so a
++    /// deeply-nested heading must clamp at the IR boundary rather than emitting
++    /// an out-of-contract level.
++    #[test]
++    fn ir_deep_outline_level_clamps_to_ir_max_depth() {
++        use crate::doc::MAX_OUTLINE_LEVEL;
++        use crate::ir::Element;
++        use crate::ir::MAX_HEADING_DEPTH;
++        let doc = make_doc_with_paragraphs(vec![pap(
++            "Deep section",
++            crate::doc::sprm::PapProps {
++                heading_level: Some(MAX_OUTLINE_LEVEL),
++                ..Default::default()
++            },
++        )]);
++        let ir = crate::convert_doc::doc_to_ir(&doc);
++        match &ir.sections[0].elements[0] {
++            Element::Heading(h) => assert_eq!(
++                h.level, MAX_HEADING_DEPTH,
++                "outline level {MAX_OUTLINE_LEVEL} must clamp to {MAX_HEADING_DEPTH}"
++            ),
++            other => panic!("expected a Heading, got {:?}", other),
++        }
++    }
++
+     #[test]
+     fn ir_line_ending_with_period_becomes_paragraph() {
+         use crate::ir::Element;
+@@ -371,4 +432,441 @@ mod tests {
+         let ir = crate::convert_doc::doc_to_ir(&make_doc("content"));
+         assert_eq!(ir.metadata.format, crate::format::DocumentFormat::Doc);
+     }
++
++    // --------------------------------------------------------------------
++    // End-to-end regression for the style-sheet heading path.
++    //
++    // Every real `.doc` in the POI / Tika / LibreOffice corpora reports
++    // `fc_stshf == 0` (no style sheet), so the new path that resolves a
++    // heading's *real* level from the paragraph style (see `build_paragraphs`
++    // → `heading_level_for_istd`) is never exercised by a corpus run. This test
++    // synthesises a complete CFB `.doc` in code — per AGENTS.md #4 no
++    // third-party fixture is committed — whose `1Table` carries a style sheet
++    // mapping a paragraph's `istd` to built-in `Heading 3`, and asserts the IR
++    // heading keeps level 3. The line heuristic tops out at level 2, so a
++    // level-3 heading can ONLY come from the style sheet: the output
++    // simultaneously proves the path fires and that it is not silently
++    // collapsing to the heuristic level.
++    // --------------------------------------------------------------------
++
++    // CFB v3 sector sentinels (mirror `cfb::header`).
++    const CFB_EOC: u32 = 0xFFFF_FFFE;
++    const CFB_FREE: u32 = 0xFFFF_FFFF;
++    const CFB_FATSECT: u32 = 0xFFFF_FFFD;
++
++    /// Build a complete, minimal CFB `.doc` driving the style-sheet heading
++    /// path end to end: an "Introduction." body paragraph (Normal style)
++    /// followed by a "Subsection Three" paragraph styled `Heading 3`. The bytes
++    /// are synthesised here, not read from any document file.
++    fn build_synthetic_styled_doc() -> Vec<u8> {
++        const SECTOR: usize = 512;
++        const WORD_DOC_SECTORS: usize = 4; // 2048 bytes
++        const TABLE_SECTORS: usize = 2; // 1024 bytes
++        const TOTAL_SECTORS: usize = 1 + 1 + WORD_DOC_SECTORS + TABLE_SECTORS;
++
++        let mut file = vec![0u8; SECTOR + TOTAL_SECTORS * SECTOR];
++
++        // ── Header ──
++        file[0..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
++        file[0x18..0x1A].copy_from_slice(&0x003Eu16.to_le_bytes());
++        file[0x1A..0x1C].copy_from_slice(&3u16.to_le_bytes());
++        file[0x1C..0x1E].copy_from_slice(&0xFFFEu16.to_le_bytes());
++        file[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
++        file[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
++        file[0x2C..0x30].copy_from_slice(&1u32.to_le_bytes()); // FAT count = 1
++        file[0x30..0x34].copy_from_slice(&0u32.to_le_bytes()); // first dir = 0
++        file[0x38..0x3C].copy_from_slice(&4096u32.to_le_bytes()); // mini cutoff
++        file[0x3C..0x40].copy_from_slice(&CFB_EOC.to_le_bytes()); // no mini-FAT
++        file[0x40..0x44].copy_from_slice(&0u32.to_le_bytes());
++        file[0x44..0x48].copy_from_slice(&CFB_EOC.to_le_bytes()); // no DIFAT chain
++        file[0x48..0x4C].copy_from_slice(&0u32.to_le_bytes());
++        file[0x4C..0x50].copy_from_slice(&1u32.to_le_bytes()); // DIFAT[0] = FAT sector 1
++        for i in 1..109 {
++            let off = 0x4C + i * 4;
++            file[off..off + 4].copy_from_slice(&CFB_FREE.to_le_bytes());
++        }
++
++        // ── Directory (sector 0): Root Entry -> {WordDocument, 1Table} ──
++        let dir = SECTOR;
++        write_dir_entry(&mut file[dir..dir + 128], "Root Entry", 5, 1, CFB_EOC, 0);
++        write_dir_entry(
++            &mut file[dir + 128..dir + 256],
++            "WordDocument",
++            2,
++            CFB_FREE,
++            2,
++            (WORD_DOC_SECTORS * SECTOR) as u32,
++        );
++        write_dir_entry(
++            &mut file[dir + 256..dir + 384],
++            "1Table",
++            2,
++            CFB_FREE,
++            6,
++            (TABLE_SECTORS * SECTOR) as u32,
++        );
++        // Entry 3: empty (type 0) — fills out the 512-byte directory sector.
++
++        // ── FAT (sector 1) ──
++        let fat = SECTOR + SECTOR; // byte offset 1024
++        let mut fat_entry = |idx: usize, val: u32| {
++            let off = fat + idx * 4;
++            file[off..off + 4].copy_from_slice(&val.to_le_bytes());
++        };
++        fat_entry(0, CFB_EOC); // directory, single sector
++        fat_entry(1, CFB_FATSECT); // this sector is a FAT sector
++        fat_entry(2, 3); // WordDocument chain: 2 -> 3 -> 4 -> 5 -> EOC
++        fat_entry(3, 4);
++        fat_entry(4, 5);
++        fat_entry(5, CFB_EOC);
++        fat_entry(6, 7); // 1Table chain: 6 -> 7 -> EOC
++        fat_entry(7, CFB_EOC);
++        for i in 8..128 {
++            fat_entry(i, CFB_FREE);
++        }
++
++        // ── WordDocument stream (sectors 2..5) ──
++        let wd_off = SECTOR + 2 * SECTOR; // byte offset 1536
++        let mut wd = vec![0u8; WORD_DOC_SECTORS * SECTOR];
++
++        // FIB.
++        wd[0..2].copy_from_slice(&0xA5ECu16.to_le_bytes()); // wIdent (Word 97+)
++        wd[2..4].copy_from_slice(&0x00C1u16.to_le_bytes()); // nFib
++        wd[0x0A..0x0C].copy_from_slice(&(1u16 << 9).to_le_bytes()); // flags: use 1Table
++
++        let raw = "Introduction.\rSubsection Three\r";
++        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
++        let ccp = (text_bytes.len() / 2) as u32; // main-text character count
++        wd[0x4C..0x50].copy_from_slice(&ccp.to_le_bytes()); // ccpText
++
++        let clx = build_clx(ccp);
++        let stsh = build_stsh_heading3();
++        wd[0xA2..0xA6].copy_from_slice(&288u32.to_le_bytes()); // fcStshf = 0x120
++        wd[0xA6..0xAA].copy_from_slice(&(stsh.len() as u32).to_le_bytes()); // lcbStshf
++        wd[0x102..0x106].copy_from_slice(&256u32.to_le_bytes()); // fcPlcfBtePapx
++        wd[0x106..0x10A].copy_from_slice(&12u32.to_le_bytes()); // lcbPlcfBtePapx
++        wd[0x1A2..0x1A6].copy_from_slice(&0u32.to_le_bytes()); // fcClx
++        wd[0x1A6..0x1AA].copy_from_slice(&(clx.len() as u32).to_le_bytes()); // lcbClx
++
++        // Document text at fc 0x300 (Unicode).
++        wd[0x300..0x300 + text_bytes.len()].copy_from_slice(&text_bytes);
++
++        // PAPX FKP page at page number 2 (byte offset 0x400). Two paragraphs:
++        // a Normal body paragraph and a Heading-3 paragraph.
++        let para0_end_fc = 0x300 + ("Introduction.\r".encode_utf16().count() * 2) as u32;
++        let para1_end_fc = 0x300 + (raw.encode_utf16().count() * 2) as u32;
++        wd[0x400..0x404].copy_from_slice(&0x300u32.to_le_bytes()); // rgfc[0]
++        wd[0x404..0x408].copy_from_slice(&para0_end_fc.to_le_bytes()); // rgfc[1]
++        wd[0x408..0x40C].copy_from_slice(&para1_end_fc.to_le_bytes()); // rgfc[2]
++        // rgbx: byte 0 of each BX is the word offset of that paragraph's PAPX.
++        wd[0x40C] = 19; // para0 PAPX at byte 38 (word 19)
++        wd[0x419] = 21; // para1 PAPX at byte 42 (word 21)
++        // para0 PAPX: cw=2, istd=0 (Normal), empty grpprl.
++        wd[0x426] = 0x02; // cw
++        // 0x427..0x429 = istd 0x0000, 0x429 = grpprl (0x00)
++        // para1 PAPX: cw=2, istd=3 (Heading 3), empty grpprl.
++        wd[0x42A] = 0x02; // cw
++        wd[0x42B..0x42D].copy_from_slice(&0x0003u16.to_le_bytes()); // istd = 3
++        // 0x42D = grpprl (0x00)
++        wd[0x5FF] = 2; // crun = 2
++
++        file[wd_off..wd_off + wd.len()].copy_from_slice(&wd);
++
++        // ── 1Table stream (sectors 6..7) ──
++        let tbl_off = SECTOR + 6 * SECTOR; // byte offset 3584
++        let mut tbl = vec![0u8; TABLE_SECTORS * SECTOR];
++        tbl[0..clx.len()].copy_from_slice(&clx); // CLX at offset 0
++        // PlcfBtePapx at 0x100: n=1 -> [FC0=0][FC1=ccp][BTE=pn 2].
++        tbl[0x100..0x104].copy_from_slice(&0u32.to_le_bytes());
++        tbl[0x104..0x108].copy_from_slice(&ccp.to_le_bytes());
++        tbl[0x108..0x10C].copy_from_slice(&2u32.to_le_bytes());
++        // STSH at 0x120 (0x300 would overflow the 2-sector table stream).
++        tbl[0x120..0x120 + stsh.len()].copy_from_slice(&stsh);
++
++        file[tbl_off..tbl_off + tbl.len()].copy_from_slice(&tbl);
++
++        file
++    }
++
++    /// Like `build_synthetic_styled_doc`, but paragraph 1 carries
++    /// `sprmPOutlineLvl` (0x6412) in its PAPX grpprl (level 5) instead of
++    /// relying on a style. Its PAPX `istd` is 0 (Normal), so the Heading level
++    /// comes solely from the outline SPRM — exercising the SPRM path end to end
++    /// (CFB → FKP → `build_paragraphs` → `doc_to_ir`).
++    fn build_synthetic_outline_doc() -> Vec<u8> {
++        const SECTOR: usize = 512;
++        const WORD_DOC_SECTORS: usize = 4; // 2048 bytes
++        const TABLE_SECTORS: usize = 2; // 1024 bytes
++        const TOTAL_SECTORS: usize = 1 + 1 + WORD_DOC_SECTORS + TABLE_SECTORS;
++
++        let mut file = vec![0u8; SECTOR + TOTAL_SECTORS * SECTOR];
++
++        // ── Header ──
++        file[0..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
++        file[0x18..0x1A].copy_from_slice(&0x003Eu16.to_le_bytes());
++        file[0x1A..0x1C].copy_from_slice(&3u16.to_le_bytes());
++        file[0x1C..0x1E].copy_from_slice(&0xFFFEu16.to_le_bytes());
++        file[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
++        file[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
++        file[0x2C..0x30].copy_from_slice(&1u32.to_le_bytes()); // FAT count = 1
++        file[0x30..0x34].copy_from_slice(&0u32.to_le_bytes()); // first dir = 0
++        file[0x38..0x3C].copy_from_slice(&4096u32.to_le_bytes()); // mini cutoff
++        file[0x3C..0x40].copy_from_slice(&CFB_EOC.to_le_bytes()); // no mini-FAT
++        file[0x40..0x44].copy_from_slice(&0u32.to_le_bytes());
++        file[0x44..0x48].copy_from_slice(&CFB_EOC.to_le_bytes()); // no DIFAT chain
++        file[0x48..0x4C].copy_from_slice(&0u32.to_le_bytes());
++        file[0x4C..0x50].copy_from_slice(&1u32.to_le_bytes()); // DIFAT[0] = FAT sector 1
++        for i in 1..109 {
++            let off = 0x4C + i * 4;
++            file[off..off + 4].copy_from_slice(&CFB_FREE.to_le_bytes());
++        }
++
++        // ── Directory (sector 0): Root Entry -> {WordDocument, 1Table} ──
++        let dir = SECTOR;
++        write_dir_entry(&mut file[dir..dir + 128], "Root Entry", 5, 1, CFB_EOC, 0);
++        write_dir_entry(
++            &mut file[dir + 128..dir + 256],
++            "WordDocument",
++            2,
++            CFB_FREE,
++            2,
++            (WORD_DOC_SECTORS * SECTOR) as u32,
++        );
++        write_dir_entry(
++            &mut file[dir + 256..dir + 384],
++            "1Table",
++            2,
++            CFB_FREE,
++            6,
++            (TABLE_SECTORS * SECTOR) as u32,
++        );
++
++        // ── FAT (sector 1) ──
++        let fat = SECTOR + SECTOR; // byte offset 1024
++        let mut fat_entry = |idx: usize, val: u32| {
++            let off = fat + idx * 4;
++            file[off..off + 4].copy_from_slice(&val.to_le_bytes());
++        };
++        fat_entry(0, CFB_EOC); // directory, single sector
++        fat_entry(1, CFB_FATSECT); // this sector is a FAT sector
++        fat_entry(2, 3); // WordDocument chain: 2 -> 3 -> 4 -> 5 -> EOC
++        fat_entry(3, 4);
++        fat_entry(4, 5);
++        fat_entry(5, CFB_EOC);
++        fat_entry(6, 7); // 1Table chain: 6 -> 7 -> EOC
++        fat_entry(7, CFB_EOC);
++        for i in 8..128 {
++            fat_entry(i, CFB_FREE);
++        }
++
++        // ── WordDocument stream (sectors 2..5) ──
++        let wd_off = SECTOR + 2 * SECTOR; // byte offset 1536
++        let mut wd = vec![0u8; WORD_DOC_SECTORS * SECTOR];
++
++        // FIB.
++        wd[0..2].copy_from_slice(&0xA5ECu16.to_le_bytes()); // wIdent (Word 97+)
++        wd[2..4].copy_from_slice(&0x00C1u16.to_le_bytes()); // nFib
++        wd[0x0A..0x0C].copy_from_slice(&(1u16 << 9).to_le_bytes()); // flags: use 1Table
++
++        let raw = "Introduction.\rSubsection Three\r";
++        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
++        let ccp = (text_bytes.len() / 2) as u32; // main-text character count
++        wd[0x4C..0x50].copy_from_slice(&ccp.to_le_bytes()); // ccpText
++
++        let clx = build_clx(ccp);
++        let stsh = build_stsh_heading3();
++        wd[0xA2..0xA6].copy_from_slice(&288u32.to_le_bytes()); // fcStshf = 0x120
++        wd[0xA6..0xAA].copy_from_slice(&(stsh.len() as u32).to_le_bytes()); // lcbStshf
++        wd[0x102..0x106].copy_from_slice(&256u32.to_le_bytes()); // fcPlcfBtePapx
++        wd[0x106..0x10A].copy_from_slice(&12u32.to_le_bytes()); // lcbPlcfBtePapx
++        wd[0x1A2..0x1A6].copy_from_slice(&0u32.to_le_bytes()); // fcClx
++        wd[0x1A6..0x1AA].copy_from_slice(&(clx.len() as u32).to_le_bytes()); // lcbClx
++
++        // Document text at fc 0x300 (Unicode).
++        wd[0x300..0x300 + text_bytes.len()].copy_from_slice(&text_bytes);
++
++        // PAPX FKP page at page number 2 (byte offset 0x400). Two paragraphs:
++        // a Normal body paragraph and an outline-SPRM Heading-5 paragraph.
++        let para0_end_fc = 0x300 + ("Introduction.\r".encode_utf16().count() * 2) as u32;
++        let para1_end_fc = 0x300 + (raw.encode_utf16().count() * 2) as u32;
++        wd[0x400..0x404].copy_from_slice(&0x300u32.to_le_bytes()); // rgfc[0]
++        wd[0x404..0x408].copy_from_slice(&para0_end_fc.to_le_bytes()); // rgfc[1]
++        wd[0x408..0x40C].copy_from_slice(&para1_end_fc.to_le_bytes()); // rgfc[2]
++        // rgbx: byte 0 of each BX is the word offset of that paragraph's PAPX.
++        wd[0x40C] = 19; // para0 PAPX at byte 38 (word 19)
++        wd[0x419] = 21; // para1 PAPX at byte 42 (word 21)
++        // para0 PAPX: cw=2, istd=0 (Normal), empty grpprl.
++        wd[0x426] = 0x02; // cw
++        // 0x427..0x429 = istd 0x0000, 0x429 = grpprl (0x00)
++        // para1 PAPX: cw=5, istd=0 (Normal) — but the grpprl carries
++        // `sprmPOutlineLvl` (0x6412, spra-3 => 4-byte operand) with outline
++        // level 5. The PAPX is 1 (cw) + 2 (istd) + 7 (grpprl) = 10 bytes = cb.
++        wd[0x42A] = 0x05; // cw
++        wd[0x42B..0x42D].copy_from_slice(&0x0000u16.to_le_bytes()); // istd = 0 (Normal)
++        // grpprl: 0x6412 (LE) + 4-byte operand (low byte = 5) + 1 pad byte.
++        wd[0x42D..0x434].copy_from_slice(&[0x12, 0x64, 0x05, 0x00, 0x00, 0x00, 0x00]);
++        wd[0x5FF] = 2; // crun = 2
++
++        file[wd_off..wd_off + wd.len()].copy_from_slice(&wd);
++
++        // ── 1Table stream (sectors 6..7) ──
++        let tbl_off = SECTOR + 6 * SECTOR; // byte offset 3584
++        let mut tbl = vec![0u8; TABLE_SECTORS * SECTOR];
++        tbl[0..clx.len()].copy_from_slice(&clx); // CLX at offset 0
++        // PlcfBtePapx at 0x100: n=1 -> [FC0=0][FC1=ccp][BTE=pn 2].
++        tbl[0x100..0x104].copy_from_slice(&0u32.to_le_bytes());
++        tbl[0x104..0x108].copy_from_slice(&ccp.to_le_bytes());
++        tbl[0x108..0x10C].copy_from_slice(&2u32.to_le_bytes());
++        // STSH at 0x120 (0x300 would overflow the 2-sector table stream).
++        tbl[0x120..0x120 + stsh.len()].copy_from_slice(&stsh);
++
++        file[tbl_off..tbl_off + tbl.len()].copy_from_slice(&tbl);
++
++        file
++    }
++
++    /// Write a 128-byte CFB directory entry.
++    fn write_dir_entry(
++        buf: &mut [u8],
++        name: &str,
++        entry_type: u8,
++        child: u32,
++        start_sector: u32,
++        stream_size: u32,
++    ) {
++        let utf16: Vec<u16> = name.encode_utf16().collect();
++        for (i, &ch) in utf16.iter().enumerate() {
++            let bytes = ch.to_le_bytes();
++            buf[i * 2] = bytes[0];
++            buf[i * 2 + 1] = bytes[1];
++        }
++        let name_size = ((utf16.len() + 1) * 2) as u16;
++        buf[0x40..0x42].copy_from_slice(&name_size.to_le_bytes());
++        buf[0x42] = entry_type;
++        buf[0x43] = 1; // color: black
++        buf[0x44..0x48].copy_from_slice(&CFB_FREE.to_le_bytes()); // left sibling
++        buf[0x48..0x4C].copy_from_slice(&CFB_FREE.to_le_bytes()); // right sibling
++        buf[0x4C..0x50].copy_from_slice(&child.to_le_bytes()); // child
++        buf[0x74..0x78].copy_from_slice(&start_sector.to_le_bytes()); // start sector
++        buf[0x78..0x7C].copy_from_slice(&stream_size.to_le_bytes()); // stream size
++    }
++
++    /// Build a CLX with a single Unicode piece whose `fc` points at 0x300 in the
++    /// WordDocument stream (where the document text is placed). `ccp` is the
++    /// total main-text character count.
++    fn build_clx(ccp: u32) -> Vec<u8> {
++        let mut clx = Vec::new();
++        clx.push(0x02); // Pcdt marker
++        clx.extend_from_slice(&16u32.to_le_bytes()); // PlcPcd size = 16
++        clx.extend_from_slice(&0u32.to_le_bytes()); // CP[0]
++        clx.extend_from_slice(&ccp.to_le_bytes()); // CP[1]
++        clx.extend_from_slice(&0u16.to_le_bytes()); // PCD: unused u16
++        clx.extend_from_slice(&0x300u32.to_le_bytes()); // PCD: fc = 0x300 (Unicode)
++        clx.extend_from_slice(&0u16.to_le_bytes()); // PCD: prm
++        clx
++    }
++
++    /// Build one `LPStd` (`cbStd` + `STD` = `StdfBase` + `xstzName`), per
++    /// MS-DOC §2.9.135 / §2.9.258 / §2.9.354.
++    fn lpstd(sti: u16, name: &str) -> Vec<u8> {
++        let mut std = vec![0u8; 10]; // StdfBase
++        std[0..2].copy_from_slice(&sti.to_le_bytes());
++        let units: Vec<u16> = name.encode_utf16().collect();
++        std.extend_from_slice(&(units.len() as u16).to_le_bytes()); // cch
++        for u in &units {
++            std.extend_from_slice(&u.to_le_bytes());
++        }
++        std.extend_from_slice(&0u16.to_le_bytes()); // chTerm
++        let mut out = (std.len() as u16).to_le_bytes().to_vec(); // cbStd
++        out.extend_from_slice(&std);
++        out
++    }
++
++    /// A spec-conformant 15-style STSH (§2.9.271): `cbStshi`(18) then `Stshif`(18),
++    /// followed directly by `rglpstd`, using the fixed-index table — istd 0 is
++    /// Normal (sti 0), istd 1–9 are Heading 1–9 (sti 1–9), and istd 10–14 are
++    /// empty. So `istd 3` is `Heading 3`. Built from the spec, not from our
++    /// parser.
++    fn build_stsh_heading3() -> Vec<u8> {
++        let mut d = 18u16.to_le_bytes().to_vec(); // cbStshi
++        d.extend_from_slice(&15u16.to_le_bytes()); // cstd
++        d.extend_from_slice(&0x000Au16.to_le_bytes()); // cbSTDBaseInFile
++        d.extend_from_slice(&[0u8; 14]); // remainder of the 18-byte Stshif
++        d.extend_from_slice(&lpstd(0, "Normal"));
++        for lvl in 1..=9u16 {
++            d.extend_from_slice(&lpstd(lvl, &format!("Heading {lvl}")));
++        }
++        for _ in 0..5 {
++            d.extend_from_slice(&[0u8; 2]); // empty LPStd (cbStd = 0)
++        }
++        d
++    }
++
++    #[test]
++    fn synthetic_doc_styled_heading_uses_style_sheet_level() {
++        use crate::ir::Element;
++
++        let doc_bytes = build_synthetic_styled_doc();
++        // Round-trip through the full DOC pipeline: CFB parse → FIB → piece
++        // table → PAPX FKP → style sheet → IR. No third-party fixture.
++        let doc = DocDocument::from_reader(std::io::Cursor::new(doc_bytes))
++            .expect("synthetic .doc must parse");
++        let ir = crate::convert_doc::doc_to_ir(&doc);
++
++        let elements = &ir.sections[0].elements;
++        assert_eq!(elements.len(), 2, "expected intro paragraph + styled heading");
++        assert!(
++            matches!(elements[0], Element::Paragraph(_)),
++            "first element must be ordinary body prose"
++        );
++        match &elements[1] {
++            Element::Heading(h) => {
++                // Heading 3 can ONLY come from the style sheet: the line
++                // heuristic tops out at level 2, so level 3 proves the real
++                // style-sheet level reached the IR.
++                assert_eq!(h.level, 3, "styled Heading 3 must keep its real level");
++            },
++            other => panic!("second element must be a Heading, got {:?}", other),
++        }
++        assert_eq!(
++            ir.metadata.title.as_deref(),
++            Some("Subsection Three"),
++            "the styled heading becomes the document title"
++        );
++    }
++
++    #[test]
++    fn synthetic_doc_outline_sprm_heading() {
++        use crate::ir::Element;
++
++        let doc_bytes = build_synthetic_outline_doc();
++        // Full DOC pipeline: CFB → FIB → piece table → PAPX FKP → IR. The
++        // second paragraph's PAPX carries `sprmPOutlineLvl` (0x6412, level 5)
++        // in its grpprl with `istd` 0 (Normal), so the Heading level comes
++        // solely from the SPRM — the style-sheet path would resolve istd 0
++        // (Normal) to no heading at all, and the line heuristic tops out at
++        // level 2. Level 5 therefore proves the `sprmPOutlineLvl` path reached
++        // the IR end to end.
++        let doc = DocDocument::from_reader(std::io::Cursor::new(doc_bytes))
++            .expect("synthetic .doc must parse");
++        let ir = crate::convert_doc::doc_to_ir(&doc);
++
++        let elements = &ir.sections[0].elements;
++        assert_eq!(elements.len(), 2, "expected intro paragraph + SPRM heading");
++        assert!(
++            matches!(elements[0], Element::Paragraph(_)),
++            "first element must be ordinary body prose"
++        );
++        match &elements[1] {
++            Element::Heading(h) => {
++                assert_eq!(h.level, 5, "outline SPRM must set the real level 5");
++            },
++            other => panic!("second element must be a Heading, got {:?}", other),
++        }
++        assert_eq!(
++            ir.metadata.title.as_deref(),
++            Some("Subsection Three"),
++            "the SPRM heading becomes the document title"
++        );
++    }
+ }
+diff --git a/src/doc/fib.rs b/src/doc/fib.rs
+index 4b09e20..355b70c 100644
+--- a/src/doc/fib.rs
++++ b/src/doc/fib.rs
+@@ -41,6 +41,11 @@ pub struct Fib {
+     pub fc_plcf_lst: u32,
+     /// Byte length of the PlcfLst in the Table stream (0x02E6).
+     pub lcb_plcf_lst: u32,
++    /// Offset of the style sheet (`stshf`, an `STSH`) in the Table stream
++    /// (absolute 0x00A2). Zero when the file has no style sheet.
++    pub fc_stshf: u32,
++    /// Byte length of the style sheet in the Table stream (0x00A6).
++    pub lcb_stshf: u32,
+ }
+ 
+ impl Fib {
+@@ -105,6 +110,14 @@ impl Fib {
+             (0, 0)
+         };
+ 
++        // fcStshf / lcbStshf — style sheet (STSH) in the Table stream
++        // (absolute 0x00A2 / 0x00A6). Zero when the file has no style sheet.
++        let (fc_stshf, lcb_stshf) = if data.len() > 0x00A9 {
++            (read_u32(data, 0x00A2), read_u32(data, 0x00A6))
++        } else {
++            (0, 0)
++        };
++
+         Ok(Self {
+             version,
+             use_table1,
+@@ -121,6 +134,8 @@ impl Fib {
+             lcb_plcf_bte_papx,
+             fc_plcf_lst,
+             lcb_plcf_lst,
++            fc_stshf,
++            lcb_stshf,
+         })
+     }
+ }
+diff --git a/src/doc/mod.rs b/src/doc/mod.rs
+index 277883a..8e90df5 100644
+--- a/src/doc/mod.rs
++++ b/src/doc/mod.rs
+@@ -16,6 +16,14 @@ pub mod images;
+ mod papx;
+ mod piece_table;
+ mod sprm;
++pub mod styles;
++
++/// The deepest outline level MS-DOC stores: `Heading 1`–`Heading 9`. The
++/// `sprmPOutlineLvl` (0x6412) operand, `StdfBase.sti`, and a user-defined
++/// `Heading N` style name all use this range, so it lives here — at the
++/// `.doc` format root rather than in any one submodule — and every site that
++/// validates or derives an outline level reads this same bound.
++pub const MAX_OUTLINE_LEVEL: u8 = 9;
+ 
+ pub use crate::core::OfficeDocument;
+ pub use document::DocDocument;
+diff --git a/src/doc/papx.rs b/src/doc/papx.rs
+index 420ce7d..356ee63 100644
+--- a/src/doc/papx.rs
++++ b/src/doc/papx.rs
+@@ -18,6 +18,7 @@
+ 
+ use super::piece_table::{Piece, decode_cp_range, sanitize_text};
+ use super::sprm::PapProps;
++use super::styles::{StyleDef, heading_level_for_istd};
+ 
+ /// A paragraph descriptor recovered from a PAPX FKP page.
+ #[derive(Debug, Clone)]
+@@ -28,6 +29,15 @@ pub struct FkpParagraph {
+     pub fc_end: u32,
+     /// The PAP `grpprl` bytes (without the `cw`/`istd` header).
+     pub grpprl: Vec<u8>,
++    /// The paragraph style index (`istd`) from the PAPX header, before any
++    /// `sprmPStyle` (0x640A) override carried in the `grpprl`.
++    pub istd: u16,
++}
++
++/// Result of decoding one PAPX: its `grpprl` and the header `istd`.
++struct PapxData {
++    grpprl: Vec<u8>,
++    istd: u16,
+ }
+ 
+ /// A fully-resolved main-text paragraph: its raw text, the terminating
+@@ -130,28 +140,36 @@ fn parse_fkp_page(page: &[u8], out: &mut Vec<FkpParagraph>) {
+         let word_off = page[bx_off] as usize;
+         let fc_start = rgfc[i];
+         let fc_end = rgfc[i + 1];
+-        let grpprl = if word_off == 0 {
+-            Vec::new()
++        let papx = if word_off == 0 {
++            PapxData {
++                grpprl: Vec::new(),
++                istd: 0,
++            }
+         } else {
+             extract_grpprl(page, word_off)
+         };
+         out.push(FkpParagraph {
+             fc_start,
+             fc_end,
+-            grpprl,
++            grpprl: papx.grpprl,
++            istd: papx.istd,
+         });
+     }
+ }
+ 
+-/// Extract the PAP `grpprl` from a page at the given word offset.
++/// Extract the PAP `grpprl` (and header `istd`) from a page at the given word
++/// offset.
+ ///
+ /// Layout: `[cw:1][istd:2][grpprl: cb-3]`, `cb = cw * 2`. The Word8 re-read
+ /// (`cw == 0` → use the next byte) is applied so row-terminator paragraphs,
+ /// which carry the full TAP, are not mistaken for empty PAPXs.
+-fn extract_grpprl(page: &[u8], word_off: usize) -> Vec<u8> {
++fn extract_grpprl(page: &[u8], word_off: usize) -> PapxData {
+     let mut p = word_off * 2;
+     if p >= page.len() {
+-        return Vec::new();
++        return PapxData {
++            grpprl: Vec::new(),
++            istd: 0,
++        };
+     }
+     let mut cw = page[p] as usize;
+     let reread = cw == 0;
+@@ -159,14 +177,26 @@ fn extract_grpprl(page: &[u8], word_off: usize) -> Vec<u8> {
+         // Word8 re-read: the real cw is the following byte.
+         p += 1;
+         if p >= page.len() {
+-            return Vec::new();
++            return PapxData {
++                grpprl: Vec::new(),
++                istd: 0,
++            };
+         }
+         cw = page[p] as usize;
+     }
+     let cb = cw * 2; // total PAPX bytes for the istd+grpprl block
+     if cb < 3 {
+-        return Vec::new(); // only cw + istd, no grpprl
++        return PapxData {
++            grpprl: Vec::new(),
++            istd: 0,
++        }; // only cw + istd, no grpprl
+     }
++    // `istd` is the 2 bytes immediately after `cw` (post-reread), before grpprl.
++    let istd = if p + 3 <= page.len() {
++        u16::from_le_bytes([page[p + 1], page[p + 2]])
++    } else {
++        0
++    };
+     let grpprl_start = p + 3; // skip cw (1) + istd (2)
+     // Per MS-DOC §2.9.175 (PapxInFkp) the grpprl length differs by form:
+     //  • cw != 0: grpprlInPapx *is* a GrpPrlAndIstd of `2*cw - 1` bytes, so the
+@@ -177,9 +207,15 @@ fn extract_grpprl(page: &[u8], word_off: usize) -> Vec<u8> {
+     //    truncate the trailing SPRM (e.g. the row's TAP).
+     let grpprl_end = (p + cb + if reread { 1 } else { 0 }).min(page.len());
+     if grpprl_start >= grpprl_end {
+-        return Vec::new();
++        return PapxData {
++            grpprl: Vec::new(),
++            istd,
++        };
++    }
++    PapxData {
++        grpprl: page[grpprl_start..grpprl_end].to_vec(),
++        istd,
+     }
+-    page[grpprl_start..grpprl_end].to_vec()
+ }
+ 
+ /// Convert a character position to a real byte offset in the WordDocument
+@@ -262,6 +298,31 @@ fn piece_byte_base(p: &Piece) -> (u32, u32) {
+     }
+ }
+ 
++/// Resolve a paragraph's heading level (1–[`MAX_OUTLINE_LEVEL`]), or `None`
++/// when it is body text.
++///
++/// The precedence is one documented rule. Direct formatting overrides the style
++/// in Word, so `sprmPOutlineLvl` (0x6412) settles the question whenever the
++/// grpprl carries a valid one:
++///
++/// - present with a level of 1–[`MAX_OUTLINE_LEVEL`] → that level, and the style
++///   is never consulted;
++/// - present with level `0` → an explicit body-text marker: `None`, and again
++///   the style is never consulted (a paragraph styled `Heading 3` but demoted to
++///   body text stays body text);
++/// - absent, or carrying an operand that is not a valid outline level → fall
++///   back to the paragraph's style, `istd`, which the caller has already
++///   resolved from the PAPX header and any `sprmPStyle` (0x640A) override.
++fn resolve_heading_level(props: &PapProps, istd: u16, styles: &[StyleDef]) -> Option<u8> {
++    if props.outline_lvl_explicit {
++        // Settled by direct formatting: either a real level or an explicit
++        // body-text marker (`None`).
++        props.heading_level
++    } else {
++        heading_level_for_istd(styles, istd)
++    }
++}
++
+ /// Build the main-text paragraph list for `doc_to_ir`.
+ ///
+ /// Walks the PAPX FKP paragraphs, keeps only those whose start CP falls in
+@@ -280,6 +341,7 @@ pub fn build_paragraphs(
+     pieces: &[Piece],
+     fkp: &[FkpParagraph],
+     text_len: u32,
++    styles: &[StyleDef],
+ ) -> Vec<DocParagraph> {
+     let mut keyed: Vec<(u32, &FkpParagraph)> = fkp
+         .iter()
+@@ -304,7 +366,12 @@ pub fn build_paragraphs(
+         }
+         let terminator = chars[chars.len() - 1];
+         let content: String = sanitize_text(&chars[..chars.len() - 1].iter().collect::<String>());
+-        let props = super::sprm::extract_pap_props(&fp.grpprl);
++        // `extract_pap_props` walks the grpprl once, decoding every PAP SPRM —
++        // including `sprmPStyle` (0x640A) into `style_istd` and
++        // `sprmPOutlineLvl` (0x6412) into `heading_level`.
++        let mut props = super::sprm::extract_pap_props(&fp.grpprl);
++        let istd = props.style_istd.unwrap_or(fp.istd);
++        props.heading_level = resolve_heading_level(&props, istd, styles);
+         out.push(DocParagraph {
+             text: content,
+             terminator,
+@@ -317,8 +384,11 @@ pub fn build_paragraphs(
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::doc::MAX_OUTLINE_LEVEL;
++    use crate::doc::fib::Fib;
+     use crate::doc::piece_table::Piece;
+     use crate::doc::sprm::extract_pap_props;
++    use crate::doc::styles::{StyleDef, parse_style_sheet};
+ 
+     fn unicode_piece(fc: u32, cp_end: u32) -> Piece {
+         Piece {
+@@ -410,6 +480,7 @@ mod tests {
+             fc_start: 0x800 + cp0 * 2,
+             fc_end: 0x800 + cp1 * 2,
+             grpprl: grpprl.to_vec(),
++            istd: 0,
+         };
+         let cell = [0x16, 0x24, 0x01, 0x49, 0x66, 0x01, 0x00, 0x00, 0x00];
+         let rowmark = [
+@@ -423,7 +494,7 @@ mod tests {
+             mk(5, 6, &rowmark), // "\u{7}" row mark
+         ];
+ 
+-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 6);
++        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 6, &[]);
+         assert_eq!(paras.len(), 4);
+         // leading mark
+         assert_eq!(paras[0].text, "");
+@@ -460,10 +531,11 @@ mod tests {
+             fc_start: 0x800 + cp0 * 2,
+             fc_end: 0x800 + cp1 * 2,
+             grpprl: Vec::new(),
++            istd: 0,
+         };
+         let fkp = vec![mk(0, 6), mk(6, 12)];
+ 
+-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 12);
++        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 12, &[]);
+         assert_eq!(paras.len(), 2);
+         assert_eq!(paras[0].text, "Hi 😀", "emoji must not desync the range");
+         assert_eq!(paras[0].terminator, '\r');
+@@ -486,9 +558,10 @@ mod tests {
+             fc_start: 0x800 + cp0 * 2,
+             fc_end: 0x800 + cp1 * 2,
+             grpprl: Vec::new(),
++            istd: 0,
+         };
+         let fkp = vec![mk(0, raw.chars().count() as u32)];
+-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32);
++        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &[]);
+         assert_eq!(paras.len(), 1);
+         assert_eq!(paras[0].terminator, '\r');
+         let t = &paras[0].text;
+@@ -499,6 +572,424 @@ mod tests {
+         assert_eq!(t, "SeeHYPERLINKresulthere");
+     }
+ 
++    /// Regression: a paragraph whose PAPX `istd` points at a built-in `Heading N`
++    /// style (sti 1..9) must resolve to `heading_level == Some(N)` via the style
++    /// sheet, even when no `sprmPOutlineLvl` (0x6412) is present. This is the
++    /// style-sheet fallback path that replaces the line heuristic for styled
++    /// headings.
++    #[test]
++    fn build_paragraphs_resolves_heading_from_style_istd() {
++        let styles = vec![
++            StyleDef::default(), // istd 0: Normal
++            StyleDef::default(), // istd 1
++            StyleDef::default(), // istd 2
++            StyleDef {
++                sti: 3,
++                name: "Heading 3".into(),
++            }, // istd 3: built-in Heading 3
++        ];
++        let raw = "Subsection\r";
++        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
++        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
++        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
++        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
++        let fkp = [FkpParagraph {
++            fc_start: 0x800,
++            fc_end: 0x800 + raw.chars().count() as u32 * 2,
++            grpprl: Vec::new(),
++            istd: 3,
++        }];
++        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
++        assert_eq!(paras.len(), 1);
++        assert_eq!(
++            paras[0].props.heading_level,
++            Some(3),
++            "built-in Heading style must resolve to its level"
++        );
++    }
++
++    /// Regression: a `sprmPStyle` (0x640A) carried in the grpprl must override
++    /// the PAPX `istd` when resolving the style sheet. A paragraph whose PAPX
++    /// header says `Normal` (istd 0) but whose grpprl re-styles it to
++    /// `Heading 3` must resolve to level 3 — not `None`, and not whatever the
++    /// PAPX `istd` alone would have resolved to (which here is nothing).
++    #[test]
++    fn build_paragraphs_prefers_sprm_style_over_papx_istd() {
++        let styles = vec![
++            StyleDef::default(), // istd 0: Normal
++            StyleDef::default(), // istd 1
++            StyleDef::default(), // istd 2
++            StyleDef {
++                sti: 3,
++                name: "Heading 3".into(),
++            }, // istd 3: built-in Heading 3
++        ];
++        let raw = "Subsection\r";
++        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
++        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
++        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
++        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
++        // PAPX `istd` = 0 (Normal), but the grpprl carries `sprmPStyle` (0x640A,
++        // spra-3 => 4-byte operand) re-pointing at istd 3. The low two operand
++        // bytes are the target istd.
++        let grpprl = vec![0x0A, 0x64, 0x03, 0x00, 0x00, 0x00];
++        let fkp = [FkpParagraph {
++            fc_start: 0x800,
++            fc_end: 0x800 + raw.chars().count() as u32 * 2,
++            grpprl,
++            istd: 0,
++        }];
++        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
++        assert_eq!(paras.len(), 1);
++        assert_eq!(
++            paras[0].props.heading_level,
++            Some(3),
++            "`sprmPStyle` override must win over the PAPX `istd`"
++        );
++    }
++
++    /// Regression: a user-defined heading style (sti 0x0FFE, name carries the
++    /// level) must resolve via its name, case-insensitively, through the full
++    /// `build_paragraphs` pipeline. Here the style name is lowercase
++    /// `"heading 3"` to prove the lookup is not case-sensitive.
++    #[test]
++    fn build_paragraphs_resolves_user_heading_name_case_insensitive() {
++        let styles = vec![
++            StyleDef::default(), // istd 0: Normal
++            StyleDef::default(), // istd 1
++            StyleDef {
++                sti: 0x0FFE,
++                name: "heading 3".into(),
++            }, // istd 2: user-defined, name carries level
++        ];
++        let raw = "Subsection\r";
++        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
++        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
++        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
++        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
++        let fkp = [FkpParagraph {
++            fc_start: 0x800,
++            fc_end: 0x800 + raw.chars().count() as u32 * 2,
++            grpprl: Vec::new(),
++            istd: 2,
++        }];
++        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
++        assert_eq!(paras.len(), 1);
++        assert_eq!(
++            paras[0].props.heading_level,
++            Some(3),
++            "user-defined `heading N` name must resolve to its level"
++        );
++    }
++
++    /// Regression: `sprmPOutlineLvl` (0x6412) carried in the grpprl must set the
++    /// heading level directly, with no style sheet involved. The opcode is
++    /// 0x6412 (LE) + a 4-byte operand whose low byte is the outline level; here
++    /// `5` must surface as Heading 5. This is the headline "outline SPRM" path
++    /// and was previously only covered at the `extract_pap_props` layer — this
++    /// test proves it flows through `FKP → build_paragraphs → props.heading_level`.
++    #[test]
++    fn build_paragraphs_resolves_heading_from_sprm_outline_lvl() {
++        let styles = vec![StyleDef::default()]; // istd 0: Normal
++        let raw = "Section Five\r";
++        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
++        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
++        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
++        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
++        // grpprl = 0x6412 (LE) + 4-byte operand, low byte = 5.
++        let grpprl = vec![0x12, 0x64, 0x05, 0x00, 0x00, 0x00];
++        let fkp = [FkpParagraph {
++            fc_start: 0x800,
++            fc_end: 0x800 + raw.chars().count() as u32 * 2,
++            grpprl,
++            istd: 0, // PAPX says Normal; the SPRM overrides it to Heading 5
++        }];
++        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
++        assert_eq!(paras.len(), 1);
++        assert_eq!(
++            paras[0].props.heading_level,
++            Some(5),
++            "`sprmPOutlineLvl` must set the heading level directly"
++        );
++    }
++
++    /// Regression: when both a heading style and `sprmPOutlineLvl` are present,
++    /// the SPRM is authoritative and wins. Here the style (istd 3, built-in
++    /// Heading 3) would resolve to level 3, but the grpprl's `sprmPOutlineLvl`
++    /// level 5 must take precedence — proving the documented precedence
++    /// (`props.heading_level` is only filled from the style when the SPRM left
++    /// it `None`).
++    #[test]
++    fn build_paragraphs_sprm_outline_lvl_overrides_style() {
++        let styles = vec![
++            StyleDef::default(), // istd 0: Normal
++            StyleDef::default(), // istd 1
++            StyleDef::default(), // istd 2
++            StyleDef {
++                sti: 3,
++                name: "Heading 3".into(),
++            }, // istd 3: built-in Heading 3
++        ];
++        let raw = "Section Five\r";
++        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
++        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
++        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
++        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
++        let grpprl = vec![0x12, 0x64, 0x05, 0x00, 0x00, 0x00];
++        let fkp = [FkpParagraph {
++            fc_start: 0x800,
++            fc_end: 0x800 + raw.chars().count() as u32 * 2,
++            grpprl,
++            istd: 3, // would resolve to Heading 3 on its own
++        }];
++        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
++        assert_eq!(paras.len(), 1);
++        assert_eq!(
++            paras[0].props.heading_level,
++            Some(5),
++            "`sprmPOutlineLvl` must override the style-derived level"
++        );
++    }
++
++    /// Build one `LPStd` for a synthetic style sheet: `cbStd(u16)` + `STD`,
++    /// where `STD` = `StdfBase` (10 bytes, `sti` in its low 12 bits) +
++    /// `xstzName` (`cch` + code units + 2-byte null) — MS-DOC §2.9.135,
++    /// §2.9.258, §2.9.354.
++    /// With a style sheet present but no heading signal on the paragraph, the
++    /// level must stay `None` so the `.doc` walk falls back to the line-based
++    /// heuristic. The other tests in this file mostly pass `&[]` for `styles`;
++    /// this one pins the behaviour with a *populated* style sheet, which is the
++    /// case a real document with a style sheet hits for its body text.
++    #[test]
++    fn build_paragraphs_leaves_body_text_unheaded_with_styles_present() {
++        let styles = vec![
++            StyleDef::default(), // istd 0: Normal
++            StyleDef {
++                sti: 3,
++                name: "Heading 3".into(),
++            }, // istd 1: a heading style exists in the document
++        ];
++        let raw = "Ordinary body prose.\r";
++        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
++        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
++        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
++        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
++        let fkp = [FkpParagraph {
++            fc_start: 0x800,
++            fc_end: 0x800 + raw.chars().count() as u32 * 2,
++            grpprl: Vec::new(),
++            istd: 0, // Normal
++        }];
++        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
++        assert_eq!(paras.len(), 1);
++        assert_eq!(
++            paras[0].props.heading_level, None,
++            "body text stays unheaded even when the style sheet contains heading styles, \
++             so the caller falls back to the heuristic"
++        );
++    }
++
++    /// The `sprmPStyle` override must work in **both** directions. The existing
++    /// test covers restyling a `Normal` paragraph up to `Heading 3`; this covers
++    /// restyling a `Heading 3` paragraph down to `Normal`, which must *remove*
++    /// the heading rather than leaving the PAPX `istd`'s level in place.
++    #[test]
++    fn build_paragraphs_sprm_style_override_can_remove_a_heading() {
++        let styles = vec![
++            StyleDef::default(), // istd 0: Normal
++            StyleDef::default(), // istd 1
++            StyleDef::default(), // istd 2
++            StyleDef {
++                sti: 3,
++                name: "Heading 3".into(),
++            }, // istd 3: built-in Heading 3
++        ];
++        let raw = "Restyled to body text\r";
++        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
++        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
++        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
++        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
++        // PAPX `istd` = 3 (Heading 3) but `sprmPStyle` (0x640A) restyles it to
++        // istd 0 (Normal), so the heading must go away.
++        let grpprl = vec![0x0A, 0x64, 0x00, 0x00, 0x00, 0x00];
++        let fkp = [FkpParagraph {
++            fc_start: 0x800,
++            fc_end: 0x800 + raw.chars().count() as u32 * 2,
++            grpprl,
++            istd: 3,
++        }];
++        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
++        assert_eq!(paras.len(), 1);
++        assert_eq!(
++            paras[0].props.heading_level, None,
++            "`sprmPStyle` restyling a heading down to Normal must drop the heading"
++        );
++    }
++
++    /// An explicit `sprmPOutlineLvl` of 0 marks the paragraph as **body text**.
++    /// Direct formatting overrides the style in Word, so such a paragraph must
++    /// not fall back to its style: a paragraph whose style is `Heading 3` but
++    /// which is explicitly marked body text is body text.
++    ///
++    /// This pins the difference between "the SPRM is absent" (consult the
++    /// style) and "the SPRM is present with level 0" (settle it as body text).
++    #[test]
++    fn build_paragraphs_sprm_outline_lvl_zero_suppresses_styled_heading() {
++        let styles = vec![
++            StyleDef::default(), // istd 0: Normal
++            StyleDef::default(), // istd 1
++            StyleDef::default(), // istd 2
++            StyleDef {
++                sti: 3,
++                name: "Heading 3".into(),
++            }, // istd 3: built-in Heading 3
++        ];
++        let raw = "Not a heading\r";
++        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
++        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
++        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
++        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
++        // 0x6412 (LE) + 4-byte operand whose low byte is 0 (explicit body text).
++        let grpprl = vec![0x12, 0x64, 0x00, 0x00, 0x00, 0x00];
++        let fkp = [FkpParagraph {
++            fc_start: 0x800,
++            fc_end: 0x800 + raw.chars().count() as u32 * 2,
++            grpprl,
++            istd: 3, // the style alone would resolve to Heading 3
++        }];
++        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
++        assert_eq!(paras.len(), 1);
++        assert_eq!(
++            paras[0].props.heading_level, None,
++            "an explicit outline level 0 must suppress the style-derived heading"
++        );
++    }
++
++    /// MS-DOC outline levels run to `MAX_OUTLINE_LEVEL` and `sprmPOutlineLvl`
++    /// accepts that whole range; the clamp to the IR's 1..=MAX_HEADING_DEPTH
++    /// depth happens later, at `emit_prose`. This pins the boundary: the SPRM
++    /// path must neither reject the deepest level nor pre-clamp it.
++    #[test]
++    fn build_paragraphs_sprm_outline_lvl_accepts_deepest_level() {
++        let styles = vec![StyleDef::default()]; // istd 0: Normal
++        let raw = "Deep section\r";
++        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
++        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
++        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
++        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
++        // 0x6412 (LE) + 4-byte operand whose low byte is the deepest level.
++        let grpprl = vec![0x12, 0x64, MAX_OUTLINE_LEVEL, 0x00, 0x00, 0x00];
++        let fkp = [FkpParagraph {
++            fc_start: 0x800,
++            fc_end: 0x800 + raw.chars().count() as u32 * 2,
++            grpprl,
++            istd: 0,
++        }];
++        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
++        assert_eq!(paras.len(), 1);
++        assert_eq!(
++            paras[0].props.heading_level,
++            Some(MAX_OUTLINE_LEVEL),
++            "the outline SPRM accepts the full 1..=MAX_OUTLINE_LEVEL range; clamping to \
++             MAX_HEADING_DEPTH is the IR boundary's job, not this one"
++        );
++    }
++
++    fn lpstd(sti: u16, name: &str) -> Vec<u8> {
++        let mut std = vec![0u8; 10]; // StdfBase
++        std[0..2].copy_from_slice(&sti.to_le_bytes());
++        let units: Vec<u16> = name.encode_utf16().collect();
++        std.extend_from_slice(&(units.len() as u16).to_le_bytes()); // cch
++        for u in &units {
++            std.extend_from_slice(&u.to_le_bytes());
++        }
++        std.extend_from_slice(&0u16.to_le_bytes()); // chTerm
++        let mut out = (std.len() as u16).to_le_bytes().to_vec(); // cbStd
++        out.extend_from_slice(&std);
++        out
++    }
++
++    /// A spec-conformant 15-style STSH (§2.9.271): `cbStshi`(18) then `Stshif`(18),
++    /// followed directly by `rglpstd`, using the fixed-index table — istd 0 is
++    /// Normal (sti 0), istd 1–9 are Heading 1–9 (sti 1–9), and istd 10–14 are
++    /// empty. So `istd 3` is `Heading 3`. Built from the spec, not from our
++    /// parser.
++    fn stsh_with_heading_3() -> Vec<u8> {
++        let mut d = 18u16.to_le_bytes().to_vec(); // cbStshi
++        d.extend_from_slice(&15u16.to_le_bytes()); // cstd
++        d.extend_from_slice(&0x000Au16.to_le_bytes()); // cbSTDBaseInFile
++        d.extend_from_slice(&[0u8; 14]); // remainder of the 18-byte Stshif
++        d.extend_from_slice(&lpstd(0, "Normal"));
++        for lvl in 1..=9u16 {
++            d.extend_from_slice(&lpstd(lvl, &format!("Heading {lvl}")));
++        }
++        for _ in 0..5 {
++            d.extend_from_slice(&[0u8; 2]); // empty LPStd (cbStd = 0)
++        }
++        d
++    }
++
++    fn fib_with_stsh(start: u32, len: u32) -> Fib {
++        Fib {
++            version: 0,
++            use_table1: false,
++            clx_offset: 0,
++            clx_size: 0,
++            text_len: 0,
++            footnote_len: 0,
++            header_len: 0,
++            comment_len: 0,
++            endnote_len: 0,
++            textbox_len: 0,
++            header_textbox_len: 0,
++            fc_plcf_bte_papx: 0,
++            lcb_plcf_bte_papx: 0,
++            fc_plcf_lst: 0,
++            lcb_plcf_lst: 0,
++            fc_stshf: start,
++            lcb_stshf: len,
++        }
++    }
++
++    /// Integration: drive the FIB-aware `parse_style_sheet` (the call
++    /// `document.rs` makes) and feed its result into `build_paragraphs`, exactly
++    /// as the real `.doc` walk does — but with a synthetic Table stream instead
++    /// of a parsed CFB. The POI corpus cannot exercise this (every file reports
++    /// `fc_stshf == 0`), so this is the regression guard that stands in for a
++    /// "real .doc with a style sheet": a paragraph styled `Heading 3` (istd 3)
++    /// must resolve to level 3 through the full byte-to-IR pipeline.
++    #[test]
++    fn build_paragraphs_resolves_heading_from_parsed_style_sheet() {
++        let stsh = stsh_with_heading_3();
++        let start = 64usize;
++        let mut table_stream = vec![0u8; start + stsh.len()];
++        table_stream[start..start + stsh.len()].copy_from_slice(&stsh);
++        let fib = fib_with_stsh(start as u32, stsh.len() as u32);
++        let styles = parse_style_sheet(&table_stream, &fib);
++        assert_eq!(styles.len(), 15, "the 15 fixed-index LPStd entries");
++        assert_eq!(styles[3].sti, 3);
++        assert_eq!(styles[3].name, "Heading 3");
++
++        let raw = "Subsection\r";
++        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
++        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
++        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
++        let pieces = [unicode_piece(0x800, raw.chars().count() as u32)];
++        let fkp = [FkpParagraph {
++            fc_start: 0x800,
++            fc_end: 0x800 + raw.chars().count() as u32 * 2,
++            grpprl: Vec::new(),
++            istd: 3,
++        }];
++        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, &styles);
++        assert_eq!(paras.len(), 1);
++        assert_eq!(
++            paras[0].props.heading_level,
++            Some(3),
++            "heading must resolve from a style sheet obtained via parse_style_sheet"
++        );
++    }
++
+     /// Regression: the `cw == 0` Word8 re-read branch must not drop the trailing
+     /// byte of the grpprl. Per [MS-DOC] §2.9.175 (PapxInFkp), the
+     /// re-read form is `[cb':1][GrpPrlAndIstd: 2*cb']`, so the grpprl is
+@@ -532,7 +1023,7 @@ mod tests {
+         page[4..4 + 32].copy_from_slice(&grpprl);
+ 
+         let extracted = extract_grpprl(&page, 0);
+-        let props = extract_pap_props(&extracted);
++        let props = extract_pap_props(&extracted.grpprl);
+         assert!(
+             props.tap.is_some(),
+             "cw==0 re-read must keep the full grpprl so the trailing TAP parses"
+diff --git a/src/doc/sprm.rs b/src/doc/sprm.rs
+index 3342c72..247f70f 100644
+--- a/src/doc/sprm.rs
++++ b/src/doc/sprm.rs
+@@ -27,6 +27,8 @@
+ 
+ use crate::ir::{TabAlignment, TabLeader, TabStop};
+ 
++use super::MAX_OUTLINE_LEVEL;
++
+ /// A single decoded SPRM: opcode plus its operand bytes.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct Sprm {
+@@ -215,6 +217,32 @@ pub struct PapProps {
+     /// list/tab-stop PR; in the tables-only PR this field is always empty, but
+     /// it is cloned through the IR so the `Paragraph.tabs` shape stays uniform.
+     pub tabs: Vec<TabStop>,
++    /// The style index this paragraph is restyled to by a direct `sprmPStyle`
++    /// (0x640A) in the grpprl, if any. It overrides the PAPX header's own
++    /// `istd` when resolving the style (see `crate::doc::styles`); `None` means
++    /// the PAPX header `istd` applies unchanged.
++    pub style_istd: Option<u16>,
++    /// True when the grpprl carries a `sprmPOutlineLvl` (0x6412) whose operand
++    /// is a valid outline level (0–[`MAX_OUTLINE_LEVEL`]).
++    ///
++    /// This distinguishes "the SPRM is absent" from "the SPRM is present with
++    /// level 0": level 0 is an explicit *body text* marker, so when this flag
++    /// is set `heading_level` is final and the paragraph's style must not be
++    /// consulted. An operand outside 0–`MAX_OUTLINE_LEVEL` (e.g. 0x68) is not a
++    /// valid outline level at all, leaves this flag false, and is ignored.
++    pub outline_lvl_explicit: bool,
++    /// Resolved heading level (1–9) when this paragraph is a heading.
++    ///
++    /// This is a **derived** value, not a raw SPRM property, and it is filled in
++    /// two stages: `extract_pap_props` sets it from `sprmPOutlineLvl` (0x6412)
++    /// when that SPRM is present; otherwise it stays `None` until
++    /// `build_paragraphs` falls back to the paragraph's style via
++    /// `resolve_heading_level`. So the value returned by `extract_pap_props`
++    /// alone is *not* necessarily final.
++    ///
++    /// `None` means "not a heading" (body text), and the `.doc` walk then falls
++    /// back to the line-based heading heuristic.
++    pub heading_level: Option<u8>,
+ }
+ 
+ /// One table cell descriptor (TKBKTAP, 20 bytes) distilled from a row's
+@@ -420,6 +448,39 @@ pub fn extract_pap_props(grpprl: &[u8]) -> PapProps {
+                     props.ilvl = Some(b);
+                 }
+             },
++            // sprmPStyle (0x640A) — the 4-byte operand's low word is the style
++            // index (`istd`) this paragraph is restyled to. Read here rather
++            // than in a separate pass so the grpprl is walked only once; it
++            // overrides the PAPX header `istd` when the style is resolved.
++            0x640A => {
++                if sprm.operand.len() >= 2 {
++                    props.style_istd = Some(u16::from_le_bytes([sprm.operand[0], sprm.operand[1]]));
++                }
++            },
++            // sprmPOutlineLvl (0x6412) — the 4-byte operand's low byte is the
++            // outline level: `0` = body text, `1`–`9` = Heading 1–9 (MS-DOC
++            // §2.9.138). This is the authoritative heading marker and wins over
++            // any style-derived level resolved later in `build_paragraphs`.
++            //
++            // Use the raw low byte and validate the `1..=9` range. A coincidental
++            // byte pattern that merely *contains* the opcode must not be turned
++            // into a heading: e.g. an operand low byte of 0x68 (104) is not a
++            // valid outline level and must be rejected, not masked to `8`.
++            0x6412 => {
++                if let Some(&b) = sprm.operand.first() {
++                    // A valid outline level is 0–MAX_OUTLINE_LEVEL; anything else
++                    // is a coincidental byte pattern, not an outline level, and
++                    // must leave the paragraph's status untouched.
++                    if b <= MAX_OUTLINE_LEVEL {
++                        // The level is now settled by direct formatting: 0 is an
++                        // explicit body-text marker, 1–MAX_OUTLINE_LEVEL a heading.
++                        props.outline_lvl_explicit = true;
++                        if b >= 1 {
++                            props.heading_level = Some(b);
++                        }
++                    }
++                }
++            },
+             // sprmPChgTabs (0xC615) / sprmPChgTabsPapx (0xC60D): tab stops.
+             0xC615 | 0xC60D => {
+                 if !sprm.operand.is_empty() {
+@@ -469,6 +530,62 @@ mod tests {
+         assert_eq!(sprms[1].operand, vec![0x01, 0x00, 0x00, 0x00]);
+     }
+ 
++    /// `sprmPOutlineLvl` (0x6412) is a spra-3 (4-byte) SPRM whose low byte is the
++    /// outline level: `1`–`9` = Heading 1–9. The level must surface on
++    /// `PapProps.heading_level`.
++    #[test]
++    fn sprm_p_outline_lvl_sets_heading_level() {
++        // opcode 0x6412 (LE) + 4-byte operand, low byte = 2 (valid level).
++        let grpprl = vec![0x12, 0x64, 0x02, 0x00, 0x00, 0x00];
++        let props = extract_pap_props(&grpprl);
++        assert_eq!(props.heading_level, Some(2), "outline level 2 -> Heading 2");
++        assert!(props.outline_lvl_explicit, "a valid level settles the outline level");
++    }
++
++    #[test]
++    fn sprm_p_outline_lvl_body_is_none() {
++        // outline level 0 means body text, not a heading — and it is *explicit*,
++        // so `resolve_heading_level` must not fall back to the style.
++        let grpprl = vec![0x12, 0x64, 0x00, 0x00, 0x00, 0x00];
++        let props = extract_pap_props(&grpprl);
++        assert_eq!(props.heading_level, None, "outline level 0 -> not a heading");
++        assert!(
++            props.outline_lvl_explicit,
++            "level 0 is an explicit body-text marker, not an absent SPRM"
++        );
++    }
++
++    /// A `sprmPOutlineLvl` operand whose low byte is outside 1–9 (here 0x68 =
++    /// 104) is not a valid outline level and must be ignored, even though the
++    /// opcode byte pattern appears in the grpprl. This guards against
++    /// coincidental byte sequences fabricating spurious headings.
++    #[test]
++    fn sprm_p_outline_lvl_rejects_invalid_byte() {
++        let grpprl = vec![0x12, 0x64, 0x68, 0x01, 0x01, 0x00];
++        let props = extract_pap_props(&grpprl);
++        assert_eq!(props.heading_level, None, "0x68 is not a valid outline level");
++        assert!(
++            !props.outline_lvl_explicit,
++            "an invalid operand is not an outline level at all, so the status stays unset"
++        );
++    }
++
++    /// `sprmPStyle` (0x640A) overrides the PAPX `istd`; the 2-byte istd is the
++    /// low word of the (spra-3, 4-byte) operand. It surfaces on
++    /// `PapProps.style_istd` from the same grpprl walk that decodes the other
++    /// paragraph properties.
++    #[test]
++    fn pap_props_read_sprm_p_style_override() {
++        // opcode 0x640A (LE) + 4-byte operand, low word = istd 5.
++        let grpprl = vec![0x0A, 0x64, 0x05, 0x00, 0x00, 0x00];
++        assert_eq!(extract_pap_props(&grpprl).style_istd, Some(5));
++    }
++
++    #[test]
++    fn pap_props_style_istd_absent_when_no_sprm() {
++        assert_eq!(extract_pap_props(&[0x16, 0x24, 0x01]).style_istd, None);
++    }
++
+     #[test]
+     fn row_mark_walk_consumes_every_byte() {
+         let grpprl = row_mark_grpprl();
+diff --git a/src/doc/styles.rs b/src/doc/styles.rs
+new file mode 100644
+index 0000000..3984d67
+--- /dev/null
++++ b/src/doc/styles.rs
+@@ -0,0 +1,441 @@
++//! Style sheet (STSH) parsing for legacy binary `.doc` (MS-DOC §2.7.1).
++//!
++//! The style sheet maps a paragraph's style index (`istd`) to a built-in
++//! style id (`sti`) and a name. Built-in heading styles carry `sti` 1–9
++//! (Heading 1–9); user-defined heading styles are named `Heading N`. Both let
++//! us derive a paragraph's real heading level instead of the line heuristic in
++//! `convert_doc.rs`.
++//!
++//! Every parse step is bounds-checked: a malformed or truncated style sheet
++//! yields an empty `Vec`, so callers degrade to "no style" (and the heuristic)
++//! rather than panicking (AGENTS.md rule 6).
++
++use super::{MAX_OUTLINE_LEVEL, fib::Fib};
++
++/// One style definition, indexed by `istd`.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct StyleDef {
++    /// Built-in style id (`StdfBase.sti`). `0x0FFE` means user-defined.
++    pub sti: u16,
++    /// Style name (from the style-name STTB).
++    pub name: String,
++}
++
++/// Parse the document style sheet (STSH) from the Table stream.
++///
++/// Returns an empty vector when the style sheet is absent (`fcStshf == 0`),
++/// out of bounds, or malformed.
++pub fn parse_style_sheet(table_stream: &[u8], fib: &Fib) -> Vec<StyleDef> {
++    if fib.fc_stshf == 0 || fib.lcb_stshf == 0 {
++        return Vec::new();
++    }
++    let start = fib.fc_stshf as usize;
++    // `saturating_add` so a malformed `fc_stshf`/`lcb_stshf` (e.g. near
++    // `u32::MAX`) cannot overflow the pointer arithmetic on 32-bit targets;
++    // on 64-bit the sum already fits, but the contract is "no overflow, ever"
++    // (AGENTS.md rule 6).
++    let end = start
++        .saturating_add(fib.lcb_stshf as usize)
++        .min(table_stream.len());
++    if start >= table_stream.len() || end <= start {
++        return Vec::new();
++    }
++    parse_stsh(&table_stream[start..end])
++}
++
++/// Resolve a paragraph's `istd` (optionally overridden by `sprmPStyle`) to a
++/// heading level (1–9), or `None` when the style is not a heading.
++pub fn heading_level_for_istd(styles: &[StyleDef], istd: u16) -> Option<u8> {
++    let s = styles.get(istd as usize)?;
++    // Built-in heading styles: `sti` 1..9 == Heading 1..9.
++    if (1..=u16::from(MAX_OUTLINE_LEVEL)).contains(&s.sti) {
++        return Some(s.sti as u8);
++    }
++    // User-defined heading styles are named "Heading N".
++    if let Some(level) = heading_level_from_name(&s.name) {
++        return Some(level);
++    }
++    None
++}
++
++fn heading_level_from_name(name: &str) -> Option<u8> {
++    // Real Word style names are "Heading N" (capital H); match case-insensitively
++    // so "heading 2" / "HEADING 2" also resolve.
++    //
++    // `xstzName` may carry aliases as "primary,alias,alias" (MS-DOC §2.9.258);
++    // a heading level is always carried by the primary name, so look at the
++    // segment before the first comma.
++    let lowered: String = name.trim().to_ascii_lowercase();
++    let primary = lowered.split(',').next().unwrap_or("");
++    let rest = primary.trim().strip_prefix("heading ")?;
++    let level: u8 = rest.trim().parse().ok()?;
++    if (1..=MAX_OUTLINE_LEVEL).contains(&level) {
++        Some(level)
++    } else {
++        None
++    }
++}
++
++/// `data` is the `stshf` slice (the STSH). Layout (MS-DOC §2.9.271):
++/// `LPStshi` = `cbStshi(u16)` + `Stshif(cbStshi bytes)`, immediately followed by
++/// `rglpstd`, an array of `cstd` `LPStd` entries (`cbStd(u16)` + `STD`).
++///
++/// There is **no** style-name table between `Stshif` and `rglpstd`: `Stshif` is
++/// exactly 18 bytes and carries no names (§2.9.274). Each style's name lives
++/// inside its own `STD`, which is `stdf` + `xstzName` + `grLPUpxSw` (§2.9.258),
++/// and `stdf` occupies `cbSTDBaseInFile` bytes.
++fn parse_stsh(data: &[u8]) -> Vec<StyleDef> {
++    if data.len() < 2 {
++        return Vec::new();
++    }
++    let cb_stshi = u16::from_le_bytes([data[0], data[1]]) as usize;
++    let mut pos = 2;
++    if cb_stshi < 18 || pos + cb_stshi > data.len() {
++        return Vec::new();
++    }
++    // Stshif (§2.9.274): `cstd` at 0 (u16), `cbSTDBaseInFile` at 2 (u16).
++    let cstd = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
++    let cb_std_base = u16::from_le_bytes([data[pos + 2], data[pos + 3]]) as usize;
++    pos += cb_stshi;
++
++    // `cbSTDBaseInFile` MUST be 0x000A (`StdfBase` alone) or 0x0012 (`StdfBase`
++    // + `StdfPost2000OrNone`) per §2.9.274. Anything else is malformed: slicing
++    // `xstzName` at a bogus offset would yield plausible-but-wrong names, and
++    // hence plausible-but-wrong heading levels, so reject and let the caller
++    // degrade to the line heuristic rather than guess (AGENTS.md rule: fail
++    // loudly, never fall back to a silent plausible-but-wrong result).
++    if cb_std_base != 0x000A && cb_std_base != 0x0012 {
++        return Vec::new();
++    }
++
++    // `rglpstd`: `cstd` `LPStd` entries (§2.9.135).
++    let cap = cstd.min(4096);
++    let mut styles = Vec::with_capacity(cap);
++    for _ in 0..cap {
++        if pos + 2 > data.len() {
++            break;
++        }
++        let cb_std = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
++        pos += 2;
++        if cb_std == 0 {
++            // Empty style (fixed-index slots MAY be empty, §2.9.271).
++            styles.push(StyleDef::default());
++            continue;
++        }
++        if pos + cb_std > data.len() {
++            break;
++        }
++        let std = &data[pos..pos + cb_std];
++        // `StdfBase.sti` is the low 12 bits of the first u16 (§2.9.260).
++        let sti = if std.len() >= 2 {
++            u16::from_le_bytes([std[0], std[1]]) & 0x0FFF
++        } else {
++            0
++        };
++        // The name follows `stdf`, which occupies `cbSTDBaseInFile` bytes.
++        let name = if std.len() > cb_std_base {
++            parse_xstz(&std[cb_std_base..]).unwrap_or_default()
++        } else {
++            String::new()
++        };
++        styles.push(StyleDef { sti, name });
++        pos += cb_std;
++        // LPStd entries are stored on even-byte boundaries and `cbStd` does NOT
++        // include that padding byte (§2.9.135).
++        if !cb_std.is_multiple_of(2) {
++            pos += 1;
++        }
++    }
++    styles
++}
++
++/// Parse an `Xstz` (§2.9.354) — a style name: an `Xst` (a `cch: u16` followed
++/// by `cch` UTF-16 code units) plus a 2-byte null terminator.
++///
++/// Per §2.9.258 the name may be `"primary,alias,alias"`; callers that want only
++/// the primary name split on `','` themselves (`heading_level_from_name` does).
++fn parse_xstz(data: &[u8]) -> Option<String> {
++    if data.len() < 2 {
++        return None;
++    }
++    let cch = u16::from_le_bytes([data[0], data[1]]) as usize;
++    let end = 2usize.saturating_add(cch.saturating_mul(2));
++    if end > data.len() {
++        return None;
++    }
++    let units: Vec<u16> = (0..cch)
++        .map(|i| u16::from_le_bytes([data[2 + 2 * i], data[3 + 2 * i]]))
++        .collect();
++    Some(String::from_utf16_lossy(&units))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Build one `LPStd` for a style sheet: `cbStd(u16)` + `STD`.
++    ///
++    /// `STD` = `stdf` (`cbSTDBaseInFile` bytes, here `StdfBase` alone) +
++    /// `xstzName`, per MS-DOC §2.9.258. `xstzName` is an `Xstz`: `cch(u16)` +
++    /// `cch` UTF-16 code units + a 2-byte null terminator (§2.9.354).
++    fn lpstd(sti: u16, name: &str) -> Vec<u8> {
++        const CB_STD_BASE: usize = 0x000A;
++        // `StdfBase` (10 bytes): `sti` is the low 12 bits of the first u16.
++        let mut std = vec![0u8; CB_STD_BASE];
++        std[0..2].copy_from_slice(&sti.to_le_bytes());
++        // `xstzName`.
++        let units: Vec<u16> = name.encode_utf16().collect();
++        std.extend_from_slice(&(units.len() as u16).to_le_bytes()); // cch
++        for u in &units {
++            std.extend_from_slice(&u.to_le_bytes());
++        }
++        std.extend_from_slice(&0u16.to_le_bytes()); // chTerm
++
++        let mut out = Vec::new();
++        out.extend_from_slice(&(std.len() as u16).to_le_bytes()); // cbStd
++        out.extend_from_slice(&std);
++        out
++    }
++
++    /// An empty `LPStd` (`cbStd` = 0). Fixed-index slots 13–14 MUST be empty
++    /// (§2.9.271) and 0–12 MAY be.
++    fn empty_lpstd() -> Vec<u8> {
++        vec![0, 0]
++    }
++
++    /// Build a spec-conformant STSH (§2.9.271 / §2.9.274): `LPStshi`
++    /// (`cbStshi` = 18 + an 18-byte `Stshif`) followed directly by `rglpstd`.
++    ///
++    /// The 16 entries follow the fixed-index table: istd 0 = Normal (sti 0),
++    /// istd 1–9 = Heading 1–9 (sti 1–9), istd 10–12 = sti 65/105/107, istd
++    /// 13–14 empty, and istd 15 a user-defined style (sti 0x0FFE) whose name
++    /// carries its level. Deliberately built from the spec, not from our
++    /// parser, so it cannot merely re-encode our own bugs.
++    fn synthetic_stsh() -> Vec<u8> {
++        let mut d = Vec::new();
++        // ── LPStshi: cbStshi, then Stshif (18 bytes total, no names) ──
++        d.extend_from_slice(&18u16.to_le_bytes()); // cbStshi = 18
++        d.extend_from_slice(&16u16.to_le_bytes()); // cstd
++        d.extend_from_slice(&0x000Au16.to_le_bytes()); // cbSTDBaseInFile = 10
++        d.extend_from_slice(&[0u8; 2]); // fStdStylenamesWritten + fReserved
++        d.extend_from_slice(&108u16.to_le_bytes()); // stiMaxWhenSaved
++        d.extend_from_slice(&0x000Fu16.to_le_bytes()); // istdMaxFixedWhenSaved
++        d.extend_from_slice(&0u16.to_le_bytes()); // nVerBuiltInNamesWhenSaved
++        d.extend_from_slice(&[0u8; 6]); // ftcAsci, ftcFE, ftcOther
++
++        // ── rglpstd ──
++        d.extend_from_slice(&lpstd(0, "Normal")); // istd 0
++        for lvl in 1..=9u16 {
++            d.extend_from_slice(&lpstd(lvl, &format!("Heading {lvl}"))); // 1–9
++        }
++        d.extend_from_slice(&lpstd(65, "Fixed Ten")); // istd 10
++        d.extend_from_slice(&lpstd(105, "Fixed Eleven")); // istd 11
++        d.extend_from_slice(&lpstd(107, "Fixed Twelve")); // istd 12
++        d.extend_from_slice(&empty_lpstd()); // istd 13 — MUST be empty
++        d.extend_from_slice(&empty_lpstd()); // istd 14 — MUST be empty
++        d.extend_from_slice(&lpstd(0x0FFE, "heading 7")); // istd 15: user style
++        d
++    }
++
++    #[test]
++    fn parse_stsh_reads_sti_and_names() {
++        let styles = parse_stsh(&synthetic_stsh());
++        assert_eq!(styles.len(), 16, "all 16 LPStd entries must be decoded");
++        // istd 0: Normal.
++        assert_eq!(styles[0].sti, 0);
++        assert_eq!(styles[0].name, "Normal");
++        // istd 1..9: built-in Heading 1..9 — names come from each STD, not
++        // from any shared table.
++        assert_eq!(styles[1].sti, 1);
++        assert_eq!(styles[1].name, "Heading 1");
++        assert_eq!(styles[3].sti, 3);
++        assert_eq!(styles[3].name, "Heading 3");
++        assert_eq!(styles[9].sti, 9);
++        assert_eq!(styles[9].name, "Heading 9");
++        // istd 13/14 are empty.
++        assert_eq!(styles[13], StyleDef::default());
++        assert_eq!(styles[14], StyleDef::default());
++        // istd 15: user-defined (sti 0x0FFE), name carries the level.
++        assert_eq!(styles[15].sti, 0x0FFE);
++        assert_eq!(styles[15].name, "heading 7");
++    }
++
++    /// Regression guard: an earlier revision decoded the style sheet as
++    /// `cbStshi + Stshif + a style-name STTB + rglpstd`. That is wrong —
++    /// `Stshif` is exactly 18 bytes and carries no names, and `rglpstd`
++    /// follows immediately (§2.9.271); names live in each `STD.xstzName`.
++    /// A style sheet laid out the old way must not be silently decoded into
++    /// plausible-but-wrong style names: it must yield nothing, so the caller
++    /// degrades to the line heuristic instead of inventing heading levels.
++    #[test]
++    fn parse_stsh_rejects_spurious_name_table_layout() {
++        let mut d = Vec::new();
++        d.extend_from_slice(&18u16.to_le_bytes()); // cbStshi
++        d.extend_from_slice(&4u16.to_le_bytes()); // cstd
++        d.extend_from_slice(&0x000Au16.to_le_bytes()); // cbSTDBaseInFile
++        d.extend_from_slice(&[0u8; 14]); // rest of Stshif
++        // The spurious style-name "STTB" that the old revision expected.
++        d.push(1); // f2
++        d.extend_from_slice(&4u16.to_le_bytes()); // cData
++        d.extend_from_slice(&0u16.to_le_bytes()); // cbData
++        for name in ["Normal", "", "", "Heading 3"] {
++            let units: Vec<u16> = name.encode_utf16().collect();
++            d.extend_from_slice(&(units.len() as u16).to_le_bytes());
++            for u in units {
++                d.extend_from_slice(&u.to_le_bytes());
++            }
++        }
++        d.extend_from_slice(&0u16.to_le_bytes()); // trailing null cch
++        for &sti in &[0u16, 0u16, 0u16, 3u16] {
++            d.extend_from_slice(&10u16.to_le_bytes()); // cbStd
++            d.extend_from_slice(&sti.to_le_bytes());
++            d.extend_from_slice(&[0u8; 8]);
++        }
++
++        let styles = parse_stsh(&d);
++        assert!(
++            styles.iter().all(|s| s.name.is_empty()),
++            "a spurious name table must not yield plausible style names; got {styles:?}"
++        );
++    }
++
++    /// The name must be read from `STD.xstzName`, i.e. at `cbSTDBaseInFile`
++    /// bytes into each `STD`. A fixture that shifts the name by even one byte
++    /// must not silently produce a plausible-but-wrong name.
++    #[test]
++    fn parse_stsh_rejects_unexpected_cb_std_base_in_file() {
++        let mut stsh = synthetic_stsh();
++        // `cbSTDBaseInFile` is the u16 at offset 4 (cbStshi + cstd). Spec allows
++        // only 0x000A / 0x0012; anything else is malformed.
++        stsh[4..6].copy_from_slice(&0x0020u16.to_le_bytes());
++        assert!(
++            parse_stsh(&stsh).is_empty(),
++            "a bogus cbSTDBaseInFile must be rejected, not guess a name offset"
++        );
++    }
++
++    /// `LPStd` entries sit on even-byte boundaries and `cbStd` excludes the
++    /// padding byte (§2.9.135), so an odd-sized `STD` must not desynchronise the
++    /// following entries.
++    #[test]
++    fn parse_stsh_skips_odd_sized_lpstd_padding() {
++        let mut stsh = synthetic_stsh();
++        // Rebuild rglpstd: one odd-sized entry, then a normal one.
++        let mut rglpstd = Vec::new();
++        let mut odd = lpstd(2, "Heading 2");
++        // Trim one byte off `STD` (and fix up cbStd) to make cbStd odd.
++        let cb = u16::from_le_bytes([odd[0], odd[1]]) as usize;
++        odd.truncate(cb + 1); // 2 (cbStd) + cb-1 bytes of STD
++        let new_cb = (cb - 1) as u16;
++        odd[0..2].copy_from_slice(&new_cb.to_le_bytes());
++        rglpstd.extend_from_slice(&odd);
++        rglpstd.push(0x00); // the padding byte `cbStd` does not count
++        rglpstd.extend_from_slice(&lpstd(3, "Heading 3"));
++        stsh.truncate(20); // keep cbStshi + Stshif
++        stsh.extend_from_slice(&rglpstd);
++
++        let styles = parse_stsh(&stsh);
++        assert_eq!(styles.len(), 2, "both entries must be read");
++        assert_eq!(styles[0].sti, 2, "odd-sized entry decodes normally");
++        assert_eq!(
++            styles[1].name, "Heading 3",
++            "the padding byte must not desynchronise the next entry"
++        );
++    }
++
++    #[test]
++    fn heading_level_resolves_builtin_and_user() {
++        let styles = parse_stsh(&synthetic_stsh());
++        // Built-in: sti 1..9 resolve directly (istd 1..9).
++        assert_eq!(heading_level_for_istd(&styles, 1), Some(1));
++        assert_eq!(heading_level_for_istd(&styles, 3), Some(3));
++        assert_eq!(heading_level_for_istd(&styles, 9), Some(9));
++        // User-defined: sti 0x0FFE named "heading 7" resolves via name.
++        assert_eq!(heading_level_for_istd(&styles, 15), Some(7));
++        // sti 0 (Normal) is not a heading.
++        assert_eq!(heading_level_for_istd(&styles, 0), None);
++        // Empty fixed-index slots are not headings.
++        assert_eq!(heading_level_for_istd(&styles, 13), None);
++        // out-of-range istd.
++        assert_eq!(heading_level_for_istd(&styles, 99), None);
++    }
++
++    /// `xstzName` may carry aliases as "primary,alias" (§2.9.258); the level is
++    /// carried by the primary name, so a comma-suffixed name must still resolve.
++    #[test]
++    fn heading_level_uses_primary_name_before_aliases() {
++        let styles = vec![
++            StyleDef::default(),
++            StyleDef {
++                sti: 0x0FFE,
++                name: "Heading 4,Title 4".into(),
++            },
++        ];
++        assert_eq!(heading_level_for_istd(&styles, 1), Some(4));
++    }
++
++    #[test]
++    fn truncated_style_sheet_is_empty() {
++        assert!(parse_stsh(&[0u8; 4]).is_empty());
++        assert!(parse_stsh(&[18, 0, 0, 0]).is_empty());
++    }
++
++    /// Build a `Fib` whose only non-zero fields are `fc_stshf` / `lcb_stshf`,
++    /// pointing at a style sheet in the Table stream.
++    fn fib_with_stsh(start: u32, len: u32) -> Fib {
++        Fib {
++            version: 0,
++            use_table1: false,
++            clx_offset: 0,
++            clx_size: 0,
++            text_len: 0,
++            footnote_len: 0,
++            header_len: 0,
++            comment_len: 0,
++            endnote_len: 0,
++            textbox_len: 0,
++            header_textbox_len: 0,
++            fc_plcf_bte_papx: 0,
++            lcb_plcf_bte_papx: 0,
++            fc_plcf_lst: 0,
++            lcb_plcf_lst: 0,
++            fc_stshf: start,
++            lcb_stshf: len,
++        }
++    }
++
++    /// `parse_style_sheet` is the FIB-aware wrapper that `document.rs` calls: it
++    /// must slice the STSH out of the Table stream at `fc_stshf` (bounds-checked)
++    /// and hand the bytes to `parse_stsh`. This exercises the wrapper end-to-end
++    /// with real STSH bytes placed at a non-zero offset — the path the POI corpus
++    /// never reaches (every file reports `fc_stshf == 0`).
++    #[test]
++    fn parse_style_sheet_reads_stsh_at_fib_offset() {
++        let stsh = synthetic_stsh();
++        let start = 64usize;
++        let mut table_stream = vec![0u8; start + stsh.len()];
++        table_stream[start..start + stsh.len()].copy_from_slice(&stsh);
++        let fib = fib_with_stsh(start as u32, stsh.len() as u32);
++        let styles = parse_style_sheet(&table_stream, &fib);
++        assert_eq!(styles.len(), 16);
++        assert_eq!(styles[0].sti, 0);
++        assert_eq!(styles[0].name, "Normal");
++        assert_eq!(styles[3].sti, 3);
++        assert_eq!(styles[3].name, "Heading 3");
++        assert_eq!(styles[15].sti, 0x0FFE);
++        assert_eq!(styles[15].name, "heading 7");
++    }
++
++    #[test]
++    fn parse_style_sheet_absent_is_empty() {
++        let table_stream = vec![0u8; 64];
++        assert!(parse_style_sheet(&table_stream, &fib_with_stsh(0, 0)).is_empty());
++    }
++
++    #[test]
++    fn parse_style_sheet_out_of_bounds_is_empty() {
++        let stsh = synthetic_stsh();
++        // Point `fc_stshf` past the end of the table stream.
++        assert!(parse_style_sheet(&stsh, &fib_with_stsh(1000, stsh.len() as u32)).is_empty());
++    }
++}
+diff --git a/src/ir.rs b/src/ir.rs
+index fc52108..2b6095a 100644
+--- a/src/ir.rs
++++ b/src/ir.rs
+@@ -636,10 +636,16 @@ pub enum ShapeGeom {
+     Rect,
+ }
+ 
++/// The deepest heading level the IR can express: `Heading::level` is 1–
++/// `MAX_HEADING_DEPTH`, a markdown-style depth. Format readers whose native
++/// heading range is deeper (MS-DOC outline levels run to 9) clamp to this when
++/// they build the IR, so every consumer can rely on the bound.
++pub const MAX_HEADING_DEPTH: u8 = 6;
++
+ /// A heading element with a nesting level.
+ #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+ pub struct Heading {
+-    /// Heading level 1–6 (1 = largest).
++    /// Heading level 1–[`MAX_HEADING_DEPTH`] (1 = largest).
+     #[serde(default = "default_heading_level")]
+     pub level: u8,
+     /// Inline content of the heading.
+diff --git a/src/ir_render.rs b/src/ir_render.rs
+index 3b9c8f8..bf571b9 100644
+--- a/src/ir_render.rs
++++ b/src/ir_render.rs
+@@ -269,7 +269,7 @@ fn render_section_markdown(section: &Section) -> String {
+ fn render_element_markdown(element: &Element) -> String {
+     match element {
+         Element::Heading(h) => {
+-            let hashes = "#".repeat(h.level.min(6) as usize);
++            let hashes = "#".repeat(h.level.min(MAX_HEADING_DEPTH) as usize);
+             let text = render_inline_markdown(&h.content);
+             format!("{hashes} {text}")
+         },

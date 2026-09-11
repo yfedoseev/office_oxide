@@ -50,7 +50,7 @@ pub fn handle_tools_list(id: &Value) -> Value {
                 {
                     "name": "replace_text",
                     "description":
-                        "Replace text in an Office document (DOCX, XLSX, PPTX), preserving \
+                        "Replace text in an Office document (DOCX or PPTX), preserving \
                          every other part of the file. Writes to output_path, or in place \
                          when output_path is omitted.",
                     "inputSchema": {
@@ -163,7 +163,13 @@ fn call_replace_text(id: &Value, args: &Value) -> Value {
         Ok(d) => d,
         Err(e) => return tool_error(id, &e.to_string()),
     };
-    let count = doc.replace_text(find, replace);
+    // Report an unsupported format as an error rather than "0 occurrences":
+    // an agent cannot tell a no-match from an unimplemented operation, and
+    // the file was rewritten either way.
+    let count = match doc.replace_text(find, replace) {
+        Ok(n) => n,
+        Err(e) => return tool_error(id, &e.to_string()),
+    };
     if let Err(e) = doc.save(output_path) {
         return tool_error(id, &e.to_string());
     }

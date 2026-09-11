@@ -17,8 +17,12 @@ fn ir_to_json(ir: &office_oxide::DocumentIR) -> serde_json::Value {
             "title": ir.metadata.title,
         },
         "sections": ir.sections.iter().map(|s| {
+            // speaker_notes is a sibling of `elements`, not one of them.
+            // Projecting only `elements` dropped a slide's notes from this
+            // surface entirely once they stopped being a paragraph.
             json!({
                 "title": s.title,
+                "speaker_notes": s.speaker_notes,
                 "elements": s.elements.iter().map(element_to_json).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>(),

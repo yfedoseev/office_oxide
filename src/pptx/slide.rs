@@ -1337,12 +1337,19 @@ fn parse_table_cell(
     start: &quick_xml::events::BytesStart,
     rels: &Relationships,
 ) -> CoreResult<TableCell> {
+    // Spans are clamped at parse time. Unbounded, they reach the DOCX
+    // writer's grid loop through the IR and make it iterate
+    // gridSpan * rowSpan times, so a hostile deck could hang save_as
+    // indefinitely without allocating anything.
+    const MAX_SPAN: u32 = 1_000;
     let grid_span: u32 = xml::optional_attr_str(start, b"gridSpan")?
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
+        .unwrap_or(1)
+        .clamp(1, MAX_SPAN);
     let row_span: u32 = xml::optional_attr_str(start, b"rowSpan")?
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
+        .unwrap_or(1)
+        .clamp(1, MAX_SPAN);
     let h_merge = xml::optional_attr_str(start, b"hMerge")?
         .is_some_and(|v| v.as_ref() == "1" || v.as_ref() == "true");
     let v_merge = xml::optional_attr_str(start, b"vMerge")?

@@ -8,6 +8,22 @@ use crate::edit::EditableDocument;
 use crate::error::OfficeError;
 use crate::format::DocumentFormat;
 
+/// Turn a writer's "did the value actually land" flag into a Python error.
+///
+/// The Rust API returns `bool` from these calls specifically so a silent
+/// no-op is detectable — an off-by-one sheet or row index used to discard
+/// every value it wrote while reporting success. Every binding dropped that
+/// flag, reintroducing the regression the Rust side was fixed for.
+fn require_written(ok: bool, what: &str) -> PyResult<()> {
+    if ok {
+        Ok(())
+    } else {
+        Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "{what}: the target is out of range, so nothing was written"
+        )))
+    }
+}
+
 pyo3::create_exception!(office_oxide, OfficeOxideError, pyo3::exceptions::PyException);
 
 impl From<OfficeError> for PyErr {
@@ -212,7 +228,9 @@ impl PyEditable {
     /// Returns the number of replacements.
     #[pyo3(signature = (find, replace, /))]
     fn replace_text(&mut self, find: &str, replace: &str) -> PyResult<usize> {
-        Ok(self.get_mut()?.replace_text(find, replace))
+        self.get_mut()?
+            .replace_text(find, replace)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     /// Set a cell value in an XLSX document.
@@ -351,12 +369,11 @@ impl PyXlsxWriter {
         } else if let Ok(i) = value.extract::<i64>() {
             CellData::Number(i as f64)
         } else if let Ok(b) = value.extract::<bool>() {
-            CellData::Number(if b { 1.0 } else { 0.0 })
+            CellData::Boolean(b)
         } else {
             CellData::String(value.str()?.to_string())
         };
-        self.writer.sheet_set_cell(sheet, row, col, data);
-        Ok(())
+        require_written(self.writer.sheet_set_cell(sheet, row, col, data), "set_cell")
     }
 
     /// Set a cell with styling. bg_color is a 6-char hex string or None.
@@ -388,9 +405,11 @@ impl PyXlsxWriter {
         if let Some(bg) = bg_color {
             style = style.background(bg.to_string());
         }
-        self.writer
-            .sheet_set_cell_styled(sheet, row, col, data, style);
-        Ok(())
+        require_written(
+            self.writer
+                .sheet_set_cell_styled(sheet, row, col, data, style),
+            "set_cell_styled",
+        )
     }
 
     /// Merge a rectangular range. row_span and col_span must be >= 1.
@@ -458,13 +477,13 @@ impl PyPptxWriter {
     }
 
     /// Set the slide title.
-    fn set_slide_title(&mut self, slide: usize, title: &str) {
-        self.writer.slide_set_title(slide, title);
+    fn set_slide_title(&mut self, slide: usize, title: &str) -> PyResult<()> {
+        require_written(self.writer.slide_set_title(slide, title), "set_slide_title")
     }
 
     /// Add a plain text paragraph to the slide body.
-    fn add_slide_text(&mut self, slide: usize, text: &str) {
-        self.writer.slide_add_text(slide, text);
+    fn add_slide_text(&mut self, slide: usize, text: &str) -> PyResult<()> {
+        require_written(self.writer.slide_add_text(slide, text), "add_slide_text")
     }
 
     /// Embed an image. format: "png" | "jpeg" | "gif". x,y,cx,cy in EMU.
@@ -488,9 +507,11 @@ impl PyPptxWriter {
                 )));
             },
         };
-        self.writer
-            .slide_add_image(slide, data.to_vec(), fmt, x, y, cx, cy);
-        Ok(())
+        require_written(
+            self.writer
+                .slide_add_image(slide, data.to_vec(), fmt, x, y, cx, cy),
+            "add_slide_image",
+        )
     }
 
     /// Save to file.

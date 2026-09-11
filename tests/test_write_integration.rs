@@ -1665,3 +1665,769 @@ fn convenience_functions_round_trip() {
     let ir2 = doc.to_ir();
     assert!(!ir2.sections.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Nested content must reach the file
+// ---------------------------------------------------------------------------
+
+fn nested_list_ir() -> office_oxide::ir::DocumentIR {
+    use office_oxide::ir::*;
+    fn item(text: &str, nested: Option<List>) -> ListItem {
+        ListItem {
+            content: inline_to_element_block(vec![InlineContent::Text(TextSpan {
+                text: text.into(),
+                ..Default::default()
+            })]),
+            nested,
+        }
+    }
+    let deep = List {
+        ordered: false,
+        items: vec![item("DeepItem", None)],
+        ..Default::default()
+    };
+    let inner = List {
+        ordered: true,
+        items: vec![item("NestedItemA", Some(deep))],
+        ..Default::default()
+    };
+    let outer = List {
+        ordered: true,
+        items: vec![item("ItemOne", Some(inner)), item("ItemTwo", None)],
+        ..Default::default()
+    };
+    DocumentIR {
+        sections: vec![Section {
+            elements: vec![Element::List(outer)],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// `ListItem::nested` was consumed by the renderers but by no writer, so every
+/// item below level 0 vanished on write while the API reported success.
+#[test]
+fn nested_list_items_reach_every_format() {
+    use office_oxide::format::DocumentFormat;
+
+    let ir = nested_list_ir();
+    for (fmt, label) in [
+        (DocumentFormat::Docx, "docx"),
+        (DocumentFormat::Pptx, "pptx"),
+    ] {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        office_oxide::create::create_from_ir_to_writer(&ir, fmt, &mut buf).unwrap();
+        buf.set_position(0);
+        let mut zip = zip::ZipArchive::new(buf).unwrap();
+        let mut all = String::new();
+        for i in 0..zip.len() {
+            let mut e = zip.by_index(i).unwrap();
+            let mut s = String::new();
+            if std::io::Read::read_to_string(&mut e, &mut s).is_ok() {
+                all.push_str(&s);
+            }
+        }
+        for expected in ["ItemOne", "ItemTwo", "NestedItemA", "DeepItem"] {
+            assert!(all.contains(expected), "{label}: {expected} never reached the package");
+        }
+    }
+}
+
+/// The XLSX bridge re-parsed the *rendered* cell string instead of using the
+/// type the reader recorded, so "007" became 7, a currency cell became text,
+/// and a cell reading "inf" became an Excel error cell.
+#[test]
+fn xlsx_cells_keep_the_type_and_format_the_reader_recorded() {
+    use office_oxide::format::DocumentFormat;
+    use office_oxide::ir::*;
+
+    fn cell(
+        text: &str,
+        dt: Option<CellDataType>,
+        raw: Option<f64>,
+        fmt: Option<&str>,
+    ) -> TableCell {
+        TableCell {
+            content: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    text: text.into(),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            })],
+            data_type: dt,
+            raw_number: raw,
+            number_format: fmt.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    let ir = DocumentIR {
+        sections: vec![Section {
+            elements: vec![Element::Table(Table {
+                rows: vec![TableRow {
+                    cells: vec![
+                        cell("007", Some(CellDataType::Text), None, None),
+                        cell("inf", Some(CellDataType::Text), None, None),
+                        cell(
+                            "$1,234.50",
+                            Some(CellDataType::Number),
+                            Some(1234.5),
+                            Some("$#,##0.00"),
+                        ),
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(&ir, DocumentFormat::Xlsx, &mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+
+    let mut sheet = String::new();
+    {
+        let mut e = zip.by_name("xl/worksheets/sheet1.xml").unwrap();
+        std::io::Read::read_to_string(&mut e, &mut sheet).unwrap();
+    }
+    assert!(sheet.contains("007"), "leading zeros destroyed: {sheet}");
+    assert!(!sheet.contains("#NUM!"), "a text cell became an error cell: {sheet}");
+    assert!(sheet.contains("1234.5"), "the number must be written as a number: {sheet}");
+
+    let mut styles = String::new();
+    {
+        let mut e = zip.by_name("xl/styles.xml").unwrap();
+        std::io::Read::read_to_string(&mut e, &mut styles).unwrap();
+    }
+    // "$#,##0.00" is built-in id 7, so it is referenced rather than redeclared.
+    // What matters is that the cell resolves to that format, not to General.
+    assert!(
+        styles.contains(r#"numFmtId="7""#),
+        "the cell's number format was dropped: {styles}"
+    );
+}
+
+/// `ir_to_xlsx` ended in `_ => {}`, so lists, code blocks, notes and the
+/// contents of a text box were discarded. PPTX wraps slide bodies in a text
+/// box, which made PPTX → XLSX near-total text loss.
+#[test]
+fn xlsx_conversion_keeps_list_and_text_box_content() {
+    use office_oxide::format::DocumentFormat;
+    use office_oxide::ir::*;
+
+    let para = |t: &str| {
+        Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan {
+                text: t.into(),
+                ..Default::default()
+            })],
+            ..Default::default()
+        })
+    };
+    let ir = DocumentIR {
+        sections: vec![Section {
+            elements: vec![
+                Element::List(List {
+                    items: vec![ListItem {
+                        content: vec![para("ListWord")],
+                        nested: None,
+                    }],
+                    ..Default::default()
+                }),
+                Element::CodeBlock(CodeBlock {
+                    content: "CodeWord".into(),
+                    ..Default::default()
+                }),
+                Element::TextBox(TextBox {
+                    content: vec![para("BoxedWord")],
+                    ..Default::default()
+                }),
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(&ir, DocumentFormat::Xlsx, &mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut sheet = String::new();
+    let mut e = zip.by_name("xl/worksheets/sheet1.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut sheet).unwrap();
+
+    for word in ["ListWord", "CodeWord", "BoxedWord"] {
+        assert!(sheet.contains(word), "{word} was dropped: {sheet}");
+    }
+}
+
+/// `TextSpan::hyperlink` was read and explicitly discarded, so the URL was not
+/// recoverable from the output at all.
+#[test]
+fn hyperlinks_survive_the_write_path() {
+    use office_oxide::format::DocumentFormat;
+
+    let md = "See [the docs](https://example.com/a?b=1&c=2) for details.\n";
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_markdown_to_writer(md, DocumentFormat::Docx, &mut buf)
+        .unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+
+    let mut body = String::new();
+    {
+        let mut e = zip.by_name("word/document.xml").unwrap();
+        std::io::Read::read_to_string(&mut e, &mut body).unwrap();
+    }
+    assert!(body.contains("<w:hyperlink"), "no w:hyperlink emitted: {body}");
+
+    let mut rels = String::new();
+    {
+        let mut e = zip.by_name("word/_rels/document.xml.rels").unwrap();
+        std::io::Read::read_to_string(&mut e, &mut rels).unwrap();
+    }
+    assert!(
+        rels.contains("https://example.com/a?b=1&amp;c=2"),
+        "the URL never reached a relationship: {rels}"
+    );
+    assert!(
+        rels.contains(r#"TargetMode="External""#),
+        "a hyperlink relationship must be external: {rels}"
+    );
+}
+
+/// DrawingML has no in-text newline: a dropped break joins the words on
+/// either side of it.
+#[test]
+fn pptx_line_breaks_are_emitted_as_br_elements() {
+    use office_oxide::format::DocumentFormat;
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        sections: vec![Section {
+            elements: vec![Element::Paragraph(Paragraph {
+                content: vec![
+                    InlineContent::Text(TextSpan {
+                        text: "LINEA".into(),
+                        ..Default::default()
+                    }),
+                    InlineContent::LineBreak,
+                    InlineContent::Text(TextSpan {
+                        text: "LINEB".into(),
+                        underline: Some(UnderlineStyle::Single),
+                        ..Default::default()
+                    }),
+                ],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(&ir, DocumentFormat::Pptx, &mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut slide = String::new();
+    let mut e = zip.by_name("ppt/slides/slide1.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut slide).unwrap();
+
+    assert!(slide.contains("<a:br/>"), "no <a:br/> emitted: {slide}");
+    assert!(slide.contains(r#"u="sng""#), "underline was dropped: {slide}");
+}
+
+/// Tab stops were accepted by the API and emitted nowhere, so a dot-leader
+/// table of contents lost both its leaders and its alignment.
+#[test]
+fn paragraph_tab_stops_are_emitted() {
+    use office_oxide::format::DocumentFormat;
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        sections: vec![Section {
+            elements: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    text: "Chapter 1".into(),
+                    ..Default::default()
+                })],
+                tabs: vec![TabStop {
+                    position_twips: 8640,
+                    alignment: TabAlignment::Right,
+                    leader: TabLeader::Dot,
+                }],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(&ir, DocumentFormat::Docx, &mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut body = String::new();
+    let mut e = zip.by_name("word/document.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut body).unwrap();
+
+    assert!(body.contains("<w:tabs>"), "no w:tabs emitted: {body}");
+    assert!(body.contains(r#"w:pos="8640""#), "tab position lost: {body}");
+    assert!(body.contains(r#"w:leader="dot""#), "dot leader lost: {body}");
+}
+
+/// The markdown front end produced neither `Element::CodeBlock` nor nested
+/// lists, so the fence language leaked into the text and every bullet
+/// flattened to level 0.
+#[test]
+fn markdown_produces_code_blocks_and_nested_lists() {
+    use office_oxide::{DocumentIR, format::DocumentFormat, ir::Element};
+
+    let md = "```rust\nlet x = 1;\n```\n\n- one\n  - one-a\n    - one-a-i\n- two\n";
+    let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
+    let elements = &ir.sections[0].elements;
+
+    let code = elements
+        .iter()
+        .find_map(|e| match e {
+            Element::CodeBlock(c) => Some(c),
+            _ => None,
+        })
+        .expect("a fenced block must become Element::CodeBlock");
+    assert_eq!(code.language.as_deref(), Some("rust"), "fence language lost");
+    assert_eq!(code.content, "let x = 1;", "fence body wrong: {:?}", code.content);
+
+    let list = elements
+        .iter()
+        .find_map(|e| match e {
+            Element::List(l) => Some(l),
+            _ => None,
+        })
+        .expect("a list");
+    assert_eq!(list.items.len(), 2, "top level should hold two items");
+    let level1 = list.items[0]
+        .nested
+        .as_ref()
+        .expect("one-a must nest under one");
+    assert_eq!(level1.items.len(), 1);
+    let level2 = level1.items[0]
+        .nested
+        .as_ref()
+        .expect("one-a-i must nest under one-a");
+    assert_eq!(level2.items.len(), 1);
+}
+
+/// A table flattened into tab-joined text loses the grid entirely, and every
+/// bullet emitted at level 0 loses the nesting the IR carries.
+#[test]
+fn pptx_writes_real_tables_and_nested_bullets() {
+    use office_oxide::format::DocumentFormat;
+
+    let md = "# Deck\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n- one\n  - one-a\n    - one-a-i\n";
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_markdown_to_writer(md, DocumentFormat::Pptx, &mut buf)
+        .unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut slide = String::new();
+    let mut e = zip.by_name("ppt/slides/slide1.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut slide).unwrap();
+
+    assert!(slide.contains("<a:tbl>"), "no real table emitted: {slide}");
+    assert!(slide.contains("<a:gridCol"), "table has no grid: {slide}");
+    assert_eq!(slide.matches("<a:tr ").count(), 2, "expected two table rows");
+    assert!(!slide.contains('\t'), "a raw tab means the table was flattened");
+
+    assert!(slide.contains(r#"lvl="1""#), "second-level bullet lost: {slide}");
+    assert!(slide.contains(r#"lvl="2""#), "third-level bullet lost: {slide}");
+    assert!(slide.contains("marL="), "bullets need a hanging indent: {slide}");
+}
+
+/// Frame position, page background and the table caption were all IR fields
+/// with no writer behind them.
+#[test]
+fn frame_position_background_and_table_caption_are_emitted() {
+    use office_oxide::format::DocumentFormat;
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        sections: vec![Section {
+            background_rgb: Some([0x11, 0x22, 0x33]),
+            elements: vec![
+                Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan {
+                        text: "framed".into(),
+                        ..Default::default()
+                    })],
+                    frame_position: Some(FramePosition {
+                        x_twips: 100,
+                        y_twips: 200,
+                        width_twips: 3000,
+                        height_twips: 400,
+                    }),
+                    ..Default::default()
+                }),
+                Element::Table(Table {
+                    caption: Some("TableCaptionText".into()),
+                    rows: vec![TableRow {
+                        cells: vec![TableCell::default()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(&ir, DocumentFormat::Docx, &mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut body = String::new();
+    let mut e = zip.by_name("word/document.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut body).unwrap();
+
+    assert!(body.contains("<w:framePr"), "frame position lost: {body}");
+    assert!(body.contains(r#"w:color="112233""#), "page background lost: {body}");
+    assert!(
+        body.contains(r#"<w:tblCaption w:val="TableCaptionText"/>"#),
+        "table caption not written as w:tblCaption: {body}"
+    );
+}
+
+/// A hyperlink inside a footnote emits `r:id` into `footnotes.xml`. Without
+/// `xmlns:r` on that part's root it is not well-formed XML at all — found by
+/// converting a real document, not by any unit test.
+#[test]
+fn a_hyperlink_in_a_footnote_keeps_the_part_well_formed() {
+    use office_oxide::docx::write::{DocxWriter, Run};
+    use office_oxide::ir::*;
+
+    let mut w = DocxWriter::new();
+    w.add_paragraph("body");
+    w.add_footnote(
+        1,
+        &[Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan {
+                text: "see here".into(),
+                hyperlink: Some("https://example.com/x".into()),
+                ..Default::default()
+            })],
+            ..Default::default()
+        })],
+    );
+    let _ = Run::new("");
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    w.write_to(&mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut xml = String::new();
+    let mut e = zip.by_name("word/footnotes.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut xml).unwrap();
+
+    if xml.contains("r:id") {
+        assert!(
+            xml.contains("xmlns:r="),
+            "footnotes.xml uses the r: prefix without declaring it:\n{xml}"
+        );
+    }
+    // Well-formedness: every prefix used must be declared on the root.
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let mut buf2 = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf2) {
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {},
+            Err(err) => panic!("footnotes.xml is not well-formed: {err}\n{xml}"),
+        }
+        buf2.clear();
+    }
+}
+
+/// A drawing inside a header emits the `wp:`/`a:`/`pic:`/`wps:` prefixes. The
+/// header root declared only `w:` and `r:`, so the part was not well-formed
+/// XML. Pre-existing in v0.1.10; found by converting real documents.
+#[test]
+fn a_drawing_in_a_header_keeps_the_part_well_formed() {
+    use office_oxide::docx::write::{DocxWriter, HfType};
+    use office_oxide::ir::*;
+
+    let mut w = DocxWriter::new();
+    w.add_paragraph("body");
+    w.add_section_header(
+        HfType::DefaultHeader,
+        vec![Element::TextBox(TextBox {
+            content: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    text: "in header".into(),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            })],
+            ..Default::default()
+        })],
+    );
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    w.write_to(&mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let name = (0..zip.len())
+        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .find(|n| n.starts_with("word/header"))
+        .expect("a header part");
+    let mut xml = String::new();
+    let mut e = zip.by_name(&name).unwrap();
+    std::io::Read::read_to_string(&mut e, &mut xml).unwrap();
+
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let mut b = Vec::new();
+    loop {
+        match reader.read_event_into(&mut b) {
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {},
+            Err(err) => panic!("{name} is not well-formed: {err}\n{xml}"),
+        }
+        b.clear();
+    }
+    if xml.contains("<wp:") {
+        assert!(xml.contains("xmlns:wp="), "wp: used without a declaration:\n{xml}");
+    }
+}
+
+/// `CT_TblPrBase` is a strict sequence: tblW, jc, tblInd, tblBorders, shd,
+/// tblCellMar, tblCaption. A table carrying an alignment or a caption was
+/// invalid — 183 corpus conversions failed on this alone.
+#[test]
+fn table_properties_follow_the_schema_sequence() {
+    use office_oxide::format::DocumentFormat;
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        sections: vec![Section {
+            elements: vec![Element::Table(Table {
+                caption: Some("Cap".into()),
+                alignment: Some(TableAlignment::Center),
+                indent_left_twips: Some(100),
+                cell_padding_twips: Some(50),
+                rows: vec![TableRow {
+                    cells: vec![TableCell::default()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(&ir, DocumentFormat::Docx, &mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut xml = String::new();
+    let mut e = zip.by_name("word/document.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut xml).unwrap();
+
+    let pos = |needle: &str| {
+        xml.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}: {xml}"))
+    };
+    let (w, jc, ind, mar, cap) = (
+        pos("<w:tblW"),
+        pos("<w:jc"),
+        pos("<w:tblInd"),
+        pos("<w:tblCellMar"),
+        pos("<w:tblCaption"),
+    );
+    assert!(w < jc, "tblW must precede jc");
+    assert!(jc < ind, "jc must precede tblInd");
+    assert!(ind < mar, "tblInd must precede tblCellMar");
+    assert!(mar < cap, "tblCellMar must precede tblCaption");
+}
+
+/// A drawing nested inside a table cell is not reached by the top-level
+/// content scan, so gating the drawing namespaces on that scan left
+/// `document.xml` using undeclared prefixes.
+#[test]
+fn a_drawing_nested_in_a_table_keeps_document_xml_well_formed() {
+    use office_oxide::docx::write::DocxWriter;
+    use office_oxide::ir::*;
+
+    let mut w = DocxWriter::new();
+    w.add_ir_table(&Table {
+        rows: vec![TableRow {
+            cells: vec![TableCell {
+                content: vec![Element::TextBox(TextBox {
+                    content: vec![Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan {
+                            text: "in a cell".into(),
+                            ..Default::default()
+                        })],
+                        ..Default::default()
+                    })],
+                    ..Default::default()
+                })],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    w.write_to(&mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut xml = String::new();
+    let mut e = zip.by_name("word/document.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut xml).unwrap();
+
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let mut b = Vec::new();
+    loop {
+        match reader.read_event_into(&mut b) {
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {},
+            Err(err) => panic!("document.xml is not well-formed: {err}\n{xml}"),
+        }
+        b.clear();
+    }
+}
+
+/// Every anchor attribute must appear exactly once. A duplicate makes the
+/// part not well-formed, which no schema check reaches — the parse fails
+/// first.
+#[test]
+fn a_floating_image_anchor_has_no_duplicate_attributes() {
+    use office_oxide::docx::write::DocxWriter;
+    use office_oxide::ir::*;
+
+    const PNG: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut w = DocxWriter::new();
+    w.add_ir_image(&Image {
+        data: Some(PNG.to_vec()),
+        format: Some(ImageFormat::Png),
+        display_width_emu: Some(500_000),
+        display_height_emu: Some(500_000),
+        positioning: ImagePositioning::Floating(FloatingImage {
+            x_emu: 0,
+            y_emu: 0,
+            width_emu: 500_000,
+            height_emu: 500_000,
+            h_anchor: FloatAnchor::Page,
+            v_anchor: FloatAnchor::Page,
+            text_wrap: TextWrap::Square,
+            allow_overlap: true,
+        }),
+        ..Default::default()
+    });
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    w.write_to(&mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut xml = String::new();
+    let mut e = zip.by_name("word/document.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut xml).unwrap();
+
+    if let Some(start) = xml.find("<wp:anchor") {
+        let tag = &xml[start..start + xml[start..].find('>').unwrap()];
+        for attr in ["behindDoc", "locked", "layoutInCell", "simplePos", "distT"] {
+            assert_eq!(
+                tag.matches(&format!("{attr}=")).count(),
+                1,
+                "wp:anchor repeats {attr}: {tag}"
+            );
+        }
+    }
+
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let mut b = Vec::new();
+    loop {
+        match reader.read_event_into(&mut b) {
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {},
+            Err(err) => panic!("document.xml is not well-formed: {err}"),
+        }
+        b.clear();
+    }
+}
+
+/// `CT_TcPrBase` sequence: tcW, gridSpan, vMerge, tcBorders, shd, tcMar,
+/// textDirection, vAlign. A cell carrying borders plus shading plus padding
+/// was invalid; 53 corpus conversions failed on this alone.
+#[test]
+fn table_cell_properties_follow_the_schema_sequence() {
+    use office_oxide::format::DocumentFormat;
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        sections: vec![Section {
+            elements: vec![Element::Table(Table {
+                rows: vec![TableRow {
+                    cells: vec![TableCell {
+                        width_twips: Some(1000),
+                        background_color: Some([1, 2, 3]),
+                        border: Some(TableBorder {
+                            top: Some(BorderLine {
+                                style: BorderStyle::Single,
+                                color: Some([0, 0, 0]),
+                                size: Some(4),
+                                space: Some(0),
+                            }),
+                            bottom: None,
+                            left: None,
+                            right: None,
+                            inside_h: None,
+                            inside_v: None,
+                        }),
+                        padding: Some(CellPadding {
+                            top_twips: Some(10),
+                            left_twips: Some(10),
+                            bottom_twips: Some(10),
+                            right_twips: Some(10),
+                        }),
+                        vertical_align: Some(CellVerticalAlign::Center),
+                        text_direction: Some(TextDirection::TbRl),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(&ir, DocumentFormat::Docx, &mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut xml = String::new();
+    let mut e = zip.by_name("word/document.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut xml).unwrap();
+
+    let pos = |n: &str| xml.find(n).unwrap_or_else(|| panic!("missing {n}:\n{xml}"));
+    let (w, bdr, shd, mar, td, va) = (
+        pos("<w:tcW"),
+        pos("<w:tcBorders"),
+        pos("<w:shd"),
+        pos("<w:tcMar"),
+        pos("<w:textDirection"),
+        pos("<w:vAlign"),
+    );
+    assert!(w < bdr, "tcW must precede tcBorders");
+    assert!(bdr < shd, "tcBorders must precede shd");
+    assert!(shd < mar, "shd must precede tcMar");
+    assert!(mar < td, "tcMar must precede textDirection");
+    assert!(td < va, "textDirection must precede vAlign");
+}

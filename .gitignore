@@ -91,3 +91,6 @@ tests/fixtures/real/
 # SBOM generated files
 *.cdx.json
 sbom.json
+
+# Fetched by scripts/ooxml-validate/fetch_schemas.py, not committed.
+scripts/ooxml-validate/xsd/

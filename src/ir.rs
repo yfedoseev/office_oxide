@@ -550,6 +550,14 @@ pub struct Section {
     pub even_page_header: Option<HeaderFooter>,
     /// Footer used on even-numbered pages of this section.
     pub even_page_footer: Option<HeaderFooter>,
+    /// Speaker notes attached to this section (PPTX notes slides).
+    ///
+    /// Notes are **not** part of the visible surface. They are kept in their
+    /// own field rather than in `elements` so that writing a document back
+    /// out cannot promote a presenter's private note into audience-visible
+    /// body text. Renderers label them explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_notes: Option<String>,
     /// Solid background colour for this section (RGB).
     /// PPTX: parsed from `<p:cSld><p:bg><p:bgPr><a:solidFill>` on the slide.
     /// Image / gradient backgrounds are intentionally skipped — only the

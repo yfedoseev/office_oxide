@@ -76,6 +76,13 @@ pub mod rel_types {
     /// Relationship type for slide master parts.
     pub const SLIDE_MASTER: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster";
+    /// Relationship type for the presentation properties part
+    /// (`ppt/presProps.xml`).
+    pub const PRES_PROPS: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/presProps";
+    /// Relationship type for the notes master part.
+    pub const NOTES_MASTER: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesMaster";
     /// Relationship type for notes slide parts.
     pub const NOTES_SLIDE: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide";

@@ -92,6 +92,29 @@ impl<'a> MarkdownParser<'a> {
                 continue;
             }
 
+            // Fenced code block. Without this the fence's language leaked
+            // into the text as an ordinary paragraph ("rust let x = 1;") and
+            // no Element::CodeBlock was ever produced from markdown.
+            if let Some(lang) = fence_language(line) {
+                self.advance();
+                let mut body: Vec<String> = Vec::new();
+                while let Some(l) = self.peek() {
+                    if fence_language(l).is_some() {
+                        self.advance();
+                        break;
+                    }
+                    body.push(l.to_string());
+                    self.advance();
+                }
+                current
+                    .elements
+                    .push(Element::CodeBlock(crate::ir::CodeBlock {
+                        content: body.join("\n"),
+                        language: lang,
+                    }));
+                continue;
+            }
+
             // Thematic break `---` / `***` / `___` starts a new section
             if is_thematic_break(line) {
                 self.advance();
@@ -260,28 +283,50 @@ impl<'a> MarkdownParser<'a> {
     }
 
     fn parse_list(&mut self, ordered: bool) -> List {
+        self.parse_list_at(ordered, indent_width(self.peek().unwrap_or("")))
+    }
+
+    /// Parse a list whose markers sit at `base_indent` columns.
+    ///
+    /// A more-indented marker starts a sub-list hanging off the previous item.
+    /// `nested` used to be hardcoded to `None`, which flattened every level
+    /// into one — and meant the markdown path could never exercise the
+    /// nested-list handling in the writers.
+    fn parse_list_at(&mut self, ordered: bool, base_indent: usize) -> List {
         let mut items: Vec<ListItem> = Vec::new();
-        loop {
-            match self.peek() {
-                None => break,
-                Some(line) => {
-                    if ordered && !is_ordered_list_marker(line) {
-                        break;
-                    }
-                    if !ordered && !is_unordered_list_marker(line) {
-                        break;
-                    }
-                    self.advance();
-                    let content_str = strip_list_marker(line);
-                    items.push(ListItem {
-                        content: vec![Element::Paragraph(Paragraph {
-                            content: parse_inline(content_str),
-                            ..Default::default()
-                        })],
-                        nested: None,
-                    });
-                },
+        while let Some(line) = self.peek() {
+            let is_marker = if ordered {
+                is_ordered_list_marker(line)
+            } else {
+                is_unordered_list_marker(line)
+            };
+            let nested_ordered = is_ordered_list_marker(line);
+            let nested_unordered = is_unordered_list_marker(line);
+            if !is_marker && !nested_ordered && !nested_unordered {
+                break;
             }
+            let indent = indent_width(line);
+            if indent > base_indent {
+                // Deeper marker: attach a sub-list to the item just parsed.
+                let sub = self.parse_list_at(nested_ordered, indent);
+                if let Some(last) = items.last_mut() {
+                    last.nested = Some(sub);
+                    continue;
+                }
+                break;
+            }
+            if indent < base_indent || !is_marker {
+                break;
+            }
+            self.advance();
+            let content_str = strip_list_marker(line);
+            items.push(ListItem {
+                content: vec![Element::Paragraph(Paragraph {
+                    content: parse_inline(content_str),
+                    ..Default::default()
+                })],
+                nested: None,
+            });
         }
         List {
             ordered,
@@ -426,6 +471,27 @@ fn parse_atx_heading(line: &str) -> Option<(u8, String)> {
     } else {
         None
     }
+}
+
+/// Leading-whitespace width of `line`, with a tab counted as four columns.
+fn indent_width(line: &str) -> usize {
+    line.chars()
+        .take_while(|c| c.is_whitespace())
+        .map(|c| if c == '\t' { 4 } else { 1 })
+        .sum()
+}
+
+/// `Some(language)` when `line` opens or closes a fenced code block.
+/// The language is `None` for a bare fence.
+fn fence_language(line: &str) -> Option<Option<String>> {
+    let t = line.trim_start();
+    let rest = t.strip_prefix("```").or_else(|| t.strip_prefix("~~~"))?;
+    let lang = rest.trim();
+    Some(if lang.is_empty() {
+        None
+    } else {
+        Some(lang.to_string())
+    })
 }
 
 fn is_thematic_break(line: &str) -> bool {

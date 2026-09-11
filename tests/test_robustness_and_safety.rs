@@ -338,7 +338,9 @@ fn replace_text_matches_and_writes_escaped_characters_correctly() {
     let bytes = docx_with(r#"<w:p><w:r><w:t>AT&amp;T is here</w:t></w:r></w:p>"#);
     let mut doc = EditableDocument::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
         .expect("open for editing");
-    let n = doc.replace_text("AT&T", "M & S <Ltd>");
+    let n = doc
+        .replace_text("AT&T", "M & S <Ltd>")
+        .expect("docx supports replace");
     assert_eq!(n, 1, "the decoded text must match");
 
     let mut out = Cursor::new(Vec::new());
@@ -359,7 +361,11 @@ fn replace_text_does_not_rewrite_table_elements() {
     );
     let mut doc = EditableDocument::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
         .expect("open for editing");
-    assert_eq!(doc.replace_text("cell", "CELL"), 1);
+    assert_eq!(
+        doc.replace_text("cell", "CELL")
+            .expect("docx supports replace"),
+        1
+    );
 
     let mut out = Cursor::new(Vec::new());
     doc.write_to(&mut out).expect("save");
@@ -746,4 +752,228 @@ fn an_encrypted_ooxml_package_says_so_rather_than_failing_as_a_bad_zip() {
             "{fmt:?}: the error must name the reason, got {msg}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Attacker-controlled spans must not become allocations or unbounded loops
+// ---------------------------------------------------------------------------
+
+/// `w:gridSpan` is parsed as an unbounded `u32` and was summed straight into
+/// `vec![vec![1; num_cols]; num_rows]`. A sub-1 KB document could therefore
+/// ask for tens of gigabytes and abort the process — on `to_ir()`, which
+/// backs `save_as`, `to_markdown`, the MCP extract tool and every binding.
+/// An abort is not catchable, so no caller could defend against it.
+#[test]
+fn a_huge_grid_span_does_not_become_a_huge_allocation() {
+    let doc_xml = format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+            r#"<w:body><w:tbl><w:tblPr/><w:tblGrid><w:gridCol w:w="100"/></w:tblGrid>"#,
+            r#"<w:tr><w:tc><w:tcPr><w:gridSpan w:val="{span}"/></w:tcPr>"#,
+            r#"<w:p><w:r><w:t>a</w:t></w:r></w:p></w:tc></w:tr>"#,
+            r#"<w:tr><w:tc><w:p><w:r><w:t>b</w:t></w:r></w:p></w:tc></w:tr>"#,
+            r#"</w:tbl></w:body></w:document>"#
+        ),
+        span = u32::MAX
+    );
+    let data = build_minimal_docx(doc_xml.as_bytes());
+    assert!(data.len() < 4096, "the reproducer must stay tiny: {} bytes", data.len());
+
+    let doc = office_oxide::Document::from_reader(
+        std::io::Cursor::new(data),
+        office_oxide::format::DocumentFormat::Docx,
+    )
+    .expect("open");
+
+    // The point is that this returns at all.
+    let ir = doc.to_ir();
+    let text = ir.plain_text();
+    assert!(text.contains('a') && text.contains('b'), "cell text must survive: {text}");
+}
+
+/// Build the smallest DOCX that carries `document_xml`.
+fn build_minimal_docx(document_xml: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let opts: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, body) in [
+            (
+                "[Content_Types].xml",
+                concat!(
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+                    r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">"#,
+                    r#"<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>"#,
+                    r#"<Default Extension="xml" ContentType="application/xml"/>"#,
+                    r#"<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>"#,
+                    r#"</Types>"#
+                )
+                .as_bytes(),
+            ),
+            (
+                "_rels/.rels",
+                concat!(
+                    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
+                    r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+                    r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>"#,
+                    r#"</Relationships>"#
+                )
+                .as_bytes(),
+            ),
+        ] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.start_file("word/document.xml", opts).unwrap();
+        zip.write_all(document_xml).unwrap();
+        zip.finish().unwrap();
+    }
+    buf.into_inner()
+}
+
+/// `a:gridSpan`/`a:rowSpan` on a PPTX table reach the DOCX writer's grid loop
+/// through the IR. The bounds check sat *inside* the loop body, so the
+/// iteration still ran `gridSpan * rowSpan` times — up to 1.8e19 — doing
+/// nothing. No allocation, so nothing ever stopped it: `save_as` simply never
+/// returned.
+#[test]
+fn huge_table_spans_do_not_hang_the_writer() {
+    use office_oxide::ir::*;
+
+    let cell = |span: u32| TableCell {
+        content: vec![Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan {
+                text: "x".into(),
+                ..Default::default()
+            })],
+            ..Default::default()
+        })],
+        col_span: span,
+        row_span: span,
+        ..Default::default()
+    };
+    let ir = DocumentIR {
+        sections: vec![Section {
+            elements: vec![Element::Table(Table {
+                rows: vec![TableRow {
+                    cells: vec![cell(u32::MAX)],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let started = std::time::Instant::now();
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(
+        &ir,
+        office_oxide::format::DocumentFormat::Docx,
+        &mut buf,
+    )
+    .expect("write");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "writing took {:?} — the span loop is unbounded again",
+        started.elapsed()
+    );
+    assert!(!buf.into_inner().is_empty());
+}
+
+/// The readers bound nesting with `DepthGuard`; the writers had no equivalent,
+/// so a deeply nested IR overflowed the stack and aborted. `DocumentIR` is
+/// `Deserialize`, so such an IR can arrive from an untrusted source, and an
+/// abort is not catchable.
+///
+/// Runs on an explicitly large stack so that what is measured is the *writer*.
+/// Dropping a 20,000-deep `Element` is itself recursive and overflows a 2 MiB
+/// test thread regardless of the writer — a separate, still-unbounded problem
+/// that any consumer deserialising such an IR would hit. Sizing the stack here
+/// keeps this test about the thing it is named for.
+#[test]
+fn deeply_nested_ir_does_not_overflow_the_writer_stack() {
+    let handle = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            use office_oxide::ir::*;
+
+            let mut inner = Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    text: "deep".into(),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            });
+            for _ in 0..20_000 {
+                inner = Element::TextBox(TextBox {
+                    content: vec![inner],
+                    ..Default::default()
+                });
+            }
+            let ir = DocumentIR {
+                sections: vec![Section {
+                    elements: vec![inner],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+
+            // The point is that this returns rather than aborting the process.
+            let mut buf = std::io::Cursor::new(Vec::new());
+            office_oxide::create::create_from_ir_to_writer(
+                &ir,
+                office_oxide::format::DocumentFormat::Docx,
+                &mut buf,
+            )
+            .expect("write");
+            assert!(!buf.into_inner().is_empty());
+        })
+        .expect("spawn");
+    handle
+        .join()
+        .expect("the writer must not overflow the stack");
+}
+
+/// `-i32::MIN` overflows. `first_line_indent_twips = i32::MIN` reached
+/// `(-v).to_string()` in the writer and panicked; the reader had the mirror
+/// problem on `w:hanging="-2147483648"`. `w:hanging` is `ST_TwipsMeasure`
+/// (unsigned), so the magnitude is what the attribute wants anyway.
+#[test]
+fn an_extreme_hanging_indent_does_not_overflow() {
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        sections: vec![Section {
+            elements: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    text: "x".into(),
+                    ..Default::default()
+                })],
+                first_line_indent_twips: Some(i32::MIN),
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(
+        &ir,
+        office_oxide::format::DocumentFormat::Docx,
+        &mut buf,
+    )
+    .expect("write");
+
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut xml = String::new();
+    let mut e = zip.by_name("word/document.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut xml).unwrap();
+    assert!(!xml.contains(r#"w:hanging="-"#), "w:hanging must not be negative: {xml}");
 }
