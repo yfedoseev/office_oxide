@@ -907,3 +907,84 @@ fn outline_levels_markdown() {
     assert!(md.contains("  - Sub item"));
     assert!(md.contains("    - Sub sub item"));
 }
+
+// ---------------------------------------------------------------------------
+// Speaker notes must never reach the visible slide surface
+// ---------------------------------------------------------------------------
+
+/// Speaker notes are presenter-private. The converter used to append them to
+/// the slide's `elements` as an ordinary paragraph, so every writer treated
+/// them as body text and a round trip published them to the audience.
+#[test]
+fn speaker_notes_stay_off_the_slide_surface_through_a_round_trip() {
+    const SECRET: &str = "CONFIDENTIAL do not read aloud";
+
+    let deck = PptxBuilder::new()
+        .with_presentation(&pres_xml(&[(256, "rId1")]))
+        .with_slide(&slide_xml(&auto_shape(
+            2,
+            "TextBox 1",
+            "Visible body",
+            457200,
+            1600200,
+            8229600,
+            4525963,
+        )))
+        .with_slide_notes(1, &notes_xml(SECRET))
+        .build();
+
+    let doc = office_oxide::Document::from_reader(
+        Cursor::new(deck),
+        office_oxide::format::DocumentFormat::Pptx,
+    )
+    .unwrap();
+
+    // The note is carried, but in its own field — not among the elements.
+    let ir = doc.to_ir();
+    let section = &ir.sections[0];
+    assert_eq!(
+        section.speaker_notes.as_deref(),
+        Some(SECRET),
+        "notes must be carried in Section::speaker_notes"
+    );
+    let elements_only = office_oxide::ir::DocumentIR {
+        sections: vec![office_oxide::ir::Section {
+            elements: section.elements.clone(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let rendered_elements = elements_only.plain_text();
+    assert!(
+        !rendered_elements.contains(SECRET),
+        "notes leaked into section.elements: {rendered_elements}"
+    );
+
+    // ...and writing the deck back out puts them in the notes part, not the slide.
+    let mut out = Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(
+        &ir,
+        office_oxide::format::DocumentFormat::Pptx,
+        &mut out,
+    )
+    .unwrap();
+    out.set_position(0);
+    let mut zip = zip::ZipArchive::new(out).unwrap();
+
+    let mut slide = String::new();
+    {
+        let mut e = zip.by_name("ppt/slides/slide1.xml").unwrap();
+        std::io::Read::read_to_string(&mut e, &mut slide).unwrap();
+    }
+    assert!(slide.contains("Visible body"), "body text must survive");
+    assert!(!slide.contains(SECRET), "notes leaked onto the written slide:\n{slide}");
+
+    let mut notes = String::new();
+    {
+        let mut e = zip
+            .by_name("ppt/notesSlides/notesSlide1.xml")
+            .expect("notes must round-trip into a notes slide part");
+        std::io::Read::read_to_string(&mut e, &mut notes).unwrap();
+    }
+    assert!(notes.contains(SECRET), "notes part must carry the text");
+}

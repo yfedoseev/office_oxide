@@ -759,6 +759,13 @@ pub fn ir_to_pptx(ir: &DocumentIR) -> crate::pptx::write::PptxWriter {
 fn emit_pptx_slide_from_section(writer: &mut crate::pptx::write::PptxWriter, section: &Section) {
     let slide = writer.add_slide();
 
+    // Speaker notes round-trip into ppt/notesSlides/, never onto the slide.
+    if let Some(ref notes) = section.speaker_notes {
+        if !notes.is_empty() {
+            slide.set_notes(notes);
+        }
+    }
+
     if let Some(ref title) = section.title {
         if !title.is_empty() {
             slide.set_title(title);

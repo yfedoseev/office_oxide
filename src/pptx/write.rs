@@ -41,6 +41,10 @@ const CT_PRESENTATION: &str =
 const CT_SLIDE: &str = "application/vnd.openxmlformats-officedocument.presentationml.slide+xml";
 const CT_SLIDE_LAYOUT: &str =
     "application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml";
+const CT_NOTES_SLIDE: &str =
+    "application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml";
+const CT_NOTES_MASTER: &str =
+    "application/vnd.openxmlformats-officedocument.presentationml.notesMaster+xml";
 const CT_THEME: &str = "application/vnd.openxmlformats-officedocument.theme+xml";
 const CT_PRES_PROPS: &str =
     "application/vnd.openxmlformats-officedocument.presentationml.presProps+xml";
@@ -198,6 +202,9 @@ pub struct SlideData {
     /// leaves alignment to the slide layout default (typically
     /// centered for title placeholders).
     pub title_alignment: Option<crate::ir::ParagraphAlignment>,
+    /// Speaker notes for this slide. Written to `ppt/notesSlides/`, never
+    /// onto the slide surface.
+    pub notes: Option<String>,
     body_items: Vec<BodyItem>,
 }
 
@@ -206,8 +213,16 @@ impl SlideData {
         Self {
             title: None,
             title_alignment: None,
+            notes: None,
             body_items: Vec::new(),
         }
+    }
+
+    /// Attach speaker notes to this slide. They are written to a notes slide
+    /// part and never appear on the slide surface.
+    pub fn set_notes(&mut self, notes: &str) -> &mut Self {
+        self.notes = Some(notes.to_string());
+        self
     }
 
     /// Set the slide title. Overwrites any previously set title.
@@ -502,6 +517,18 @@ impl PptxWriter {
         // §13.3.7: exactly one presentation-properties part, from the presentation.
         opc.add_part_rel(&pres_part, rel_types::PRES_PROPS, "presProps.xml");
 
+        // Notes slides. Speaker notes live here, never on the slide surface.
+        let has_notes = self
+            .slides
+            .iter()
+            .any(|s| s.notes.as_ref().map(|n| !n.is_empty()).unwrap_or(false));
+        if has_notes {
+            let nm_part = PartName::new("/ppt/notesMasters/notesMaster1.xml")?;
+            opc.add_part_rel(&pres_part, rel_types::NOTES_MASTER, "notesMasters/notesMaster1.xml");
+            opc.add_part_rel(&nm_part, rel_types::THEME, "../theme/theme1.xml");
+            opc.add_part(&nm_part, CT_NOTES_MASTER, &generate_notes_master_xml())?;
+        }
+
         let theme_part = PartName::new("/ppt/theme/theme1.xml")?;
         opc.add_part(&theme_part, CT_THEME, &generate_theme_xml())?;
         let pres_props_part = PartName::new("/ppt/presProps.xml")?;
@@ -544,6 +571,27 @@ impl PptxWriter {
                     img_rids.push((rid, *x, *y, *cx, *cy));
                     global_img_idx += 1;
                 }
+            }
+
+            if let Some(notes) = slide.notes.as_ref().filter(|n| !n.is_empty()) {
+                let idx = i + 1;
+                let notes_part = PartName::new(&format!("/ppt/notesSlides/notesSlide{idx}.xml"))?;
+                opc.add_part_rel(
+                    slide_part,
+                    rel_types::NOTES_SLIDE,
+                    &format!("../notesSlides/notesSlide{idx}.xml"),
+                );
+                opc.add_part_rel(
+                    &notes_part,
+                    rel_types::SLIDE,
+                    &format!("../slides/slide{idx}.xml"),
+                );
+                opc.add_part_rel(
+                    &notes_part,
+                    rel_types::NOTES_MASTER,
+                    "../notesMasters/notesMaster1.xml",
+                );
+                opc.add_part(&notes_part, CT_NOTES_SLIDE, &generate_notes_slide_xml(notes))?;
             }
 
             let slide_xml = generate_slide_xml(slide, &img_rids, self.cx, self.cy);
@@ -800,6 +848,107 @@ fn generate_theme_xml() -> Vec<u8> {
         effect = effect
     );
     xml.into_bytes()
+}
+
+/// A notes slide: the speaker-notes body for one slide. `CT_NotesSlide` is
+/// `cSld, clrMapOvr?, ...`; the body placeholder carries the note text.
+fn generate_notes_slide_xml(notes: &str) -> Vec<u8> {
+    let mut w = Writer::new(Vec::new());
+    write_decl(&mut w);
+    w.write_event(Event::Start(pml_root("p:notes")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:cSld")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:spTree")))
+        .expect("write");
+    write_nv_grp_sp_pr(&mut w);
+    write_empty(&mut w, "p:grpSpPr");
+
+    w.write_event(Event::Start(BytesStart::new("p:sp")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:nvSpPr")))
+        .expect("write");
+    let mut c_nv_pr = BytesStart::new("p:cNvPr");
+    c_nv_pr.push_attribute(("id", "2"));
+    c_nv_pr.push_attribute(("name", "Notes Placeholder"));
+    w.write_event(Event::Empty(c_nv_pr)).expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:cNvSpPr")))
+        .expect("write");
+    let mut locks = BytesStart::new("a:spLocks");
+    locks.push_attribute(("noGrp", "1"));
+    w.write_event(Event::Empty(locks)).expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:cNvSpPr")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:nvPr")))
+        .expect("write");
+    let mut ph = BytesStart::new("p:ph");
+    ph.push_attribute(("type", "body"));
+    ph.push_attribute(("idx", "1"));
+    w.write_event(Event::Empty(ph)).expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:nvPr")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:nvSpPr")))
+        .expect("write");
+    write_empty(&mut w, "p:spPr");
+
+    w.write_event(Event::Start(BytesStart::new("p:txBody")))
+        .expect("write");
+    write_empty(&mut w, "a:bodyPr");
+    for line in notes.split('\n') {
+        w.write_event(Event::Start(BytesStart::new("a:p")))
+            .expect("write");
+        w.write_event(Event::Start(BytesStart::new("a:r")))
+            .expect("write");
+        write_empty(&mut w, "a:rPr");
+        w.write_event(Event::Start(BytesStart::new("a:t")))
+            .expect("write");
+        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(line))))
+            .expect("write");
+        w.write_event(Event::End(BytesEnd::new("a:t")))
+            .expect("write");
+        w.write_event(Event::End(BytesEnd::new("a:r")))
+            .expect("write");
+        w.write_event(Event::End(BytesEnd::new("a:p")))
+            .expect("write");
+    }
+    w.write_event(Event::End(BytesEnd::new("p:txBody")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:sp")))
+        .expect("write");
+
+    w.write_event(Event::End(BytesEnd::new("p:spTree")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:cSld")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:notes")))
+        .expect("write");
+    w.into_inner()
+}
+
+/// The notes master. PowerPoint expects one whenever notes slides exist.
+fn generate_notes_master_xml() -> Vec<u8> {
+    let mut w = Writer::new(Vec::new());
+    write_decl(&mut w);
+    w.write_event(Event::Start(pml_root("p:notesMaster")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:cSld")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:spTree")))
+        .expect("write");
+    write_nv_grp_sp_pr(&mut w);
+    write_empty(&mut w, "p:grpSpPr");
+    w.write_event(Event::End(BytesEnd::new("p:spTree")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:cSld")))
+        .expect("write");
+    let mut clr_map = BytesStart::new("p:clrMap");
+    for (slot, colour) in COLOR_MAP {
+        clr_map.push_attribute((*slot, *colour));
+    }
+    w.write_event(Event::Empty(clr_map)).expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:notesMaster")))
+        .expect("write");
+    w.into_inner()
 }
 
 /// `ppt/presProps.xml`. [ISO/IEC 29500-1] §13.3.7 requires exactly one
@@ -1642,6 +1791,63 @@ mod tests {
         writer.add_slide().set_title("Hello");
         let rels = part_xml(writer, "ppt/_rels/presentation.xml.rels");
         assert!(rels.contains("presProps.xml"), "presentation must relate to presProps: {rels}");
+    }
+
+    /// Speaker notes are presenter-private. They must reach the notes slide
+    /// part and must never appear on the slide surface, where an audience
+    /// would see them.
+    #[test]
+    fn speaker_notes_go_to_the_notes_part_and_never_onto_the_slide() {
+        const SECRET: &str = "CONFIDENTIAL do not read aloud";
+
+        let mut writer = PptxWriter::new();
+        {
+            let slide = writer.add_slide();
+            slide.set_title("Public Title");
+            slide.add_text("Visible body");
+            slide.set_notes(SECRET);
+        }
+        let names = part_names(writer);
+        assert!(
+            names.iter().any(|n| n == "ppt/notesSlides/notesSlide1.xml"),
+            "notes must be written to a notes slide part; got {names:?}"
+        );
+
+        let mut writer = PptxWriter::new();
+        {
+            let slide = writer.add_slide();
+            slide.set_title("Public Title");
+            slide.add_text("Visible body");
+            slide.set_notes(SECRET);
+        }
+        let slide_xml = part_xml(writer, "ppt/slides/slide1.xml");
+        assert!(slide_xml.contains("Visible body"), "body text must survive");
+        assert!(
+            !slide_xml.contains(SECRET),
+            "speaker notes leaked onto the visible slide:\n{slide_xml}"
+        );
+
+        let mut writer = PptxWriter::new();
+        {
+            let slide = writer.add_slide();
+            slide.set_notes(SECRET);
+        }
+        let notes_xml = part_xml(writer, "ppt/notesSlides/notesSlide1.xml");
+        assert!(notes_xml.contains(SECRET), "notes part must carry the text");
+    }
+
+    /// A deck with no notes gains no notes parts.
+    #[test]
+    fn deck_without_notes_has_no_notes_parts() {
+        let mut writer = PptxWriter::new();
+        writer.add_slide().set_title("x");
+        let names = part_names(writer);
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains("notesSlide") || n.contains("notesMaster")),
+            "unexpected notes parts: {names:?}"
+        );
     }
 
     /// Read `ppt/slides/slide1.xml` from a written presentation.

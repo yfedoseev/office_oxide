@@ -329,6 +329,13 @@ fn render_section_plain(section: &Section) -> String {
             parts.push(text);
         }
     }
+    // Speaker notes are not part of the visible surface; label them so a
+    // consumer can tell them apart from slide body text.
+    if let Some(ref notes) = section.speaker_notes {
+        if !notes.is_empty() {
+            parts.push(format!("[Notes]\n{notes}"));
+        }
+    }
     for hf in section_footers(section) {
         for elem in &hf.content {
             let text = render_element_plain(elem);
@@ -435,6 +442,11 @@ fn render_section_markdown(section: &Section) -> String {
         let text = render_element_markdown(elem);
         if !text.is_empty() {
             parts.push(text);
+        }
+    }
+    if let Some(ref notes) = section.speaker_notes {
+        if !notes.is_empty() {
+            parts.push(format!("> **Notes:** {notes}"));
         }
     }
     for hf in section_footers(section) {
