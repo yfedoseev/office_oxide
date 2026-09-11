@@ -3096,13 +3096,6 @@ fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
         w.write_event(Event::Empty(elem)).expect("write hfRef");
     }
 
-    // A w:type="first" reference does nothing without w:titlePg — the
-    // distinct first-page header is simply never shown.
-    if has_first_page {
-        w.write_event(Event::Empty(BytesStart::new("w:titlePg")))
-            .expect("write titlePg");
-    }
-
     if let Some(ref rid) = sp.footnote_rid {
         let elem = BytesStart::new("w:footnotePr");
         let _ = rid;
@@ -3177,6 +3170,14 @@ fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
             w.write_event(Event::End(BytesEnd::new("w:cols")))
                 .expect("write cols end");
         }
+    }
+
+    // CT_SectPr puts titlePg after cols, not next to the header
+    // references. A w:type="first" reference does nothing without it — the
+    // distinct first-page header is simply never shown.
+    if has_first_page {
+        w.write_event(Event::Empty(BytesStart::new("w:titlePg")))
+            .expect("write titlePg");
     }
 
     w.write_event(Event::End(BytesEnd::new("w:sectPr")))

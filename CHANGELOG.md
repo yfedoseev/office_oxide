@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **An OOXML validation gate ([#201](https://github.com/yfedoseev/office_oxide/issues/201)).** Nothing checked that the documents this library *writes* are valid — generated files were only round-tripped through our own lenient parser, so a document Word refuses to open passed the whole suite. `scripts/ooxml-validate/` now fetches the ISO/IEC 29500-4 schemas (not committed, per CONTRIBUTING #4), `cargo run --example gen_validation_corpus` produces 30 packages across the markdown path, the builder APIs, all nine `save_as` conversion pairs and out-of-range values, and both validators run in CI. Writing it immediately found three more defects: `w:titlePg` emitted in the wrong `CT_SectPr` position, `xml:space` on an XLSX `<t>` where it is not allowed, and an empty `p:txBody` on a slide whose only content was a table.
+
 ### Fixed
 
 - **The PPTX writer flattened structure into text ([#214](https://github.com/yfedoseev/office_oxide/issues/214)).** Tables were joined with literal tabs and newlines into a single run, losing the grid and every cell boundary; they are now written as a real `a:tbl` in a `p:graphicFrame`. Bullet lists were emitted at level 0 with no `marL`/`indent`, so nesting was invisible and the glyph sat at the same x as its text. Footnote and endnote bodies fell into a catch-all and were dropped entirely.

@@ -132,6 +132,39 @@ jobs:
       - name: Revert production changes and require the suite to fail
         run: scripts/revert-check.sh "origin/${{ github.base_ref }}"
 
+  ooxml-validate:
+    name: OOXML Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install lxml
+        run: python3 -m pip install --user lxml
+
+      # Third-party schemas are fetched, not committed (CONTRIBUTING #4).
+      - name: Fetch OOXML schemas
+        run: python3 scripts/ooxml-validate/fetch_schemas.py
+
+      - name: Generate the validation corpus
+        run: |
+          cargo run --quiet --example gen_validation_corpus -- "${RUNNER_TEMP}/corpus"
+
+      # Schema validity: catches missing required elements and wrong element
+      # order, the class behind #199, #200 and #202.
+      - name: Validate every part against ISO/IEC 29500-4
+        run: python3 scripts/ooxml-validate/validate.py "${RUNNER_TEMP}"/corpus/*
+
+      # OPC rules the XSDs cannot express: content-type coverage and
+      # relationship targets that resolve.
+      - name: Check the OPC layer
+        run: python3 scripts/ooxml-validate/opccheck.py "${RUNNER_TEMP}"/corpus/*
+
   # Build and test
   test:
     name: Test

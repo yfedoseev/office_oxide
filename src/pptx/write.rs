@@ -1518,18 +1518,31 @@ fn write_body_shape(
     w.write_event(Event::End(BytesEnd::new("a:bodyPr")))
         .expect("write bodyPr end");
 
+    let mut wrote_paragraph = false;
     for item in items {
         match item {
-            BodyItem::Text(text) => write_plain_paragraph(w, text),
-            BodyItem::RichText(runs, props) => write_rich_paragraph(w, runs, props),
+            BodyItem::Text(text) => {
+                write_plain_paragraph(w, text);
+                wrote_paragraph = true;
+            },
+            BodyItem::RichText(runs, props) => {
+                write_rich_paragraph(w, runs, props);
+                wrote_paragraph = true;
+            },
             BodyItem::BulletList(bullets) => {
                 for bullet in bullets {
                     write_bullet_paragraph(w, bullet.0, &bullet.1);
+                    wrote_paragraph = true;
                 }
             },
             // Tables, text boxes and images are separate shapes, not body text.
             BodyItem::Table(..) | BodyItem::TextBox(..) | BodyItem::Image(..) => {},
         }
+    }
+    // CT_TextBody requires at least one a:p. A placeholder whose only items
+    // were tables or images produced an empty body, which is invalid.
+    if !wrote_paragraph {
+        write_empty(w, "a:p");
     }
 
     w.write_event(Event::End(BytesEnd::new("p:txBody")))
