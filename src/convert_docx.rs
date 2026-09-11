@@ -1132,20 +1132,43 @@ fn number_format_to_list_style(f: &crate::docx::NumberFormat) -> Option<ListStyl
 // Table conversion
 // ---------------------------------------------------------------------------
 
+/// Upper bound for a single `w:gridSpan`. Word's own table limit is 63
+/// columns; this leaves generous headroom while keeping the value bounded.
+const MAX_GRID_SPAN: u32 = 1_000;
+
+/// Upper bound for a table's column count after spans are resolved.
+const MAX_TABLE_COLS: usize = 10_000;
+
 fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) -> Element {
     // First pass: compute row_span from vMerge patterns
     let num_rows = table.rows.len();
+    // `w:gridSpan` is attacker-controlled and parsed as an unbounded u32.
+    // Summing it straight into an allocation let a sub-1 KB document ask for
+    // 34 GB (u32::MAX * 2 rows * 4 bytes) and abort the process — and this
+    // runs on `to_ir()`, which backs save_as, to_markdown, the MCP extract
+    // tool and every binding. Clamp each span to the real grid, and the
+    // total to the number of cells actually present: a span cannot
+    // legitimately describe more columns than the table has cells.
+    let cell_total: usize = table.rows.iter().map(|r| r.cells.len()).sum();
     let num_cols = table
         .rows
         .iter()
         .map(|r| {
             r.cells
                 .iter()
-                .map(|c| c.properties.as_ref().and_then(|p| p.grid_span).unwrap_or(1) as usize)
+                .map(|c| {
+                    c.properties
+                        .as_ref()
+                        .and_then(|p| p.grid_span)
+                        .unwrap_or(1)
+                        .clamp(1, MAX_GRID_SPAN) as usize
+                })
                 .sum::<usize>()
         })
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .min(cell_total.max(1).saturating_mul(MAX_GRID_SPAN as usize))
+        .min(MAX_TABLE_COLS);
 
     // Build a grid of (is_continue, row_span) for vMerge tracking
     let mut row_spans: Vec<Vec<u32>> = vec![vec![1; num_cols]; num_rows];
@@ -1193,11 +1216,16 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
         let mut grid_col = 0;
 
         for cell in &row.cells {
+            // Clamped here, where the IR cell is built, so every consumer is
+            // covered: ir_render sizes a grid from the summed col_spans, and
+            // the DOCX writer loops over them. An unbounded value from the
+            // file reached both.
             let col_span = cell
                 .properties
                 .as_ref()
                 .and_then(|p| p.grid_span)
-                .unwrap_or(1);
+                .unwrap_or(1)
+                .clamp(1, MAX_GRID_SPAN);
 
             // Skip vMerge continue cells
             let is_continue = cell

@@ -1324,15 +1324,16 @@ fn convert_ir_table(table: &crate::ir::Table) -> DocxRichTable {
             }
 
             // Mark occupied cells
-            let col_span = cell.col_span.max(1) as usize;
-            let row_span = cell.row_span.max(1) as usize;
+            // Clamp to the grid BEFORE looping. col_span/row_span are u32 and
+            // come straight from a parsed document, so with the bounds check
+            // inside the loop body the iteration still ran row_span * col_span
+            // times — up to 1.8e19 — doing nothing. No allocation, so nothing
+            // ever stopped it: the writer simply never returned.
+            let col_span = (cell.col_span.max(1) as usize).min(num_cols.saturating_sub(col_cursor));
+            let row_span = (cell.row_span.max(1) as usize).min(num_rows.saturating_sub(row_idx));
             for dr in 0..row_span {
                 for dc in 0..col_span {
-                    let r = row_idx + dr;
-                    let c = col_cursor + dc;
-                    if r < num_rows && c < num_cols {
-                        grid[r][c] = true;
-                    }
+                    grid[row_idx + dr][col_cursor + dc] = true;
                 }
             }
 
@@ -1393,6 +1394,14 @@ fn convert_ir_table(table: &crate::ir::Table) -> DocxRichTable {
 }
 
 fn convert_ir_element_to_docx_elements(elem: &crate::ir::Element, out: &mut Vec<DocxElement>) {
+    // The readers bound nesting with DepthGuard (MAX_NESTING_DEPTH); the
+    // writers never did, so a deeply nested IR — and DocumentIR is
+    // Deserialize, so it can come from anywhere — overflowed the stack and
+    // aborted. An abort is not catchable, so no caller could defend.
+    let Some(_guard) = crate::core::xml::DepthGuard::enter() else {
+        log::warn!("docx: element nesting exceeds the depth limit; subtree skipped");
+        return;
+    };
     use crate::ir::Element as E;
     match elem {
         E::Paragraph(p) => {
@@ -1568,6 +1577,10 @@ fn write_docx_element(
     image_counter: &mut u32,
     links: &HyperlinkRids,
 ) {
+    let Some(_guard) = crate::core::xml::DepthGuard::enter() else {
+        log::warn!("docx: element nesting exceeds the depth limit; subtree skipped");
+        return;
+    };
     match elem {
         DocxElement::Paragraph(p) => write_paragraph(w, p),
         DocxElement::RichParagraph(p) => write_rich_paragraph(w, p, links),

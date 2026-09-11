@@ -598,12 +598,23 @@ fn render_inline_markdown(content: &[InlineContent]) -> String {
 /// position has no cell of its own in the IR.
 fn table_grid(table: &Table) -> Vec<Vec<Option<&TableCell>>> {
     // Width is the widest row measured in grid columns, not cell count.
+    // Defence in depth: the converters clamp spans, but an IR built by a
+    // caller (it is Deserialize) can still carry anything, and this sizes an
+    // allocation. Cap against the cells actually present — a span cannot
+    // legitimately describe more columns than the table has content for.
+    let cell_total: usize = table.rows.iter().map(|r| r.cells.len()).sum();
     let width = table
         .rows
         .iter()
-        .map(|r| r.cells.iter().map(|c| c.col_span.max(1) as usize).sum())
+        .map(|r| {
+            r.cells
+                .iter()
+                .map(|c| c.col_span.max(1) as usize)
+                .sum::<usize>()
+        })
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .min(cell_total.saturating_mul(1_000).max(1));
     let mut grid: Vec<Vec<Option<&TableCell>>> = vec![vec![None; width]; table.rows.len()];
     // Positions already claimed by a cell spanning down from an earlier row.
     let mut covered: Vec<Vec<bool>> = vec![vec![false; width]; table.rows.len()];
