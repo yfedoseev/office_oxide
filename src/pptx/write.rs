@@ -393,8 +393,8 @@ impl PptxWriter {
     ///
     /// Call before adding slides. 914 400 EMU = 1 inch.
     pub fn set_presentation_size(&mut self, cx: u64, cy: u64) -> &mut Self {
-        self.cx = cx;
-        self.cy = cy;
+        self.cx = clamp_slide_size(cx);
+        self.cy = clamp_slide_size(cy);
         self
     }
 
@@ -685,16 +685,15 @@ fn write_dml_run(w: &mut Writer<Vec<u8>>, run: &Run) {
         if run.strikethrough {
             rpr.push_attribute(("strike", "sngStrike"));
         }
-        if let Some(pt) = run.font_size_pt {
+        if let Some(hundredths) = run.font_size_pt.and_then(font_size_hundredths) {
             // DrawingML stores size in hundredths of a point
-            let hundredths = (pt * 100.0).round() as u32;
             rpr.push_attribute(("sz", hundredths.to_string().as_str()));
         }
 
         if run.color.is_some() || run.font_name.is_some() {
             w.write_event(Event::Start(rpr)).expect("write rPr start");
 
-            if let Some(ref hex) = run.color {
+            if let Some(hex) = run.color.as_deref().and_then(normalize_hex_rgb) {
                 w.write_event(Event::Start(BytesStart::new("a:solidFill")))
                     .expect("write");
                 let mut clr = BytesStart::new("a:srgbClr");
@@ -778,6 +777,63 @@ fn generate_presentation_xml(slide_count: usize, cx: u64, cy: u64) -> Vec<u8> {
     w.write_event(Event::End(BytesEnd::new("p:presentation")))
         .expect("write");
     w.into_inner()
+}
+
+// ---------------------------------------------------------------------------
+// Attribute-value clamping
+// ---------------------------------------------------------------------------
+
+/// `ST_SlideSizeCoordinate` bounds, in EMU (1 inch to 56 inches).
+const SLIDE_SIZE_MIN: u64 = 914_400;
+const SLIDE_SIZE_MAX: u64 = 51_206_400;
+
+/// `ST_TextFontSize` bounds, in hundredths of a point (1pt to 4000pt).
+const FONT_SIZE_MIN: u32 = 100;
+const FONT_SIZE_MAX: u32 = 400_000;
+
+/// Clamp a slide dimension into `ST_SlideSizeCoordinate`. Reached without any
+/// explicit API call by the IR bridge, which converts a source page size
+/// straight to EMU — a page under an inch would otherwise emit an invalid deck.
+fn clamp_slide_size(v: u64) -> u64 {
+    v.clamp(SLIDE_SIZE_MIN, SLIDE_SIZE_MAX)
+}
+
+/// Convert a point size to `ST_TextFontSize` hundredths, clamped.
+///
+/// A plain `as u32` cast saturates, so `NaN` and negatives both became `0`,
+/// which is below the schema minimum. `NaN` has no sensible size, so it is
+/// dropped rather than guessed at.
+fn font_size_hundredths(pt: f64) -> Option<u32> {
+    if pt.is_nan() {
+        return None;
+    }
+    let scaled = (pt * 100.0).round();
+    let v = if scaled <= 0.0 {
+        FONT_SIZE_MIN
+    } else if scaled >= f64::from(FONT_SIZE_MAX) {
+        FONT_SIZE_MAX
+    } else {
+        scaled as u32
+    };
+    Some(v.clamp(FONT_SIZE_MIN, FONT_SIZE_MAX))
+}
+
+/// `ST_HexColorRGB` is exactly six hex digits. Accept a leading `#` (the
+/// mistake every CSS-adjacent API invites) and reject anything else rather
+/// than splicing it into the file.
+fn normalize_hex_rgb(hex: &str) -> Option<String> {
+    let t = hex.strip_prefix('#').unwrap_or(hex);
+    if t.len() == 6 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(t.to_ascii_uppercase())
+    } else {
+        None
+    }
+}
+
+/// `a:ext` uses `ST_PositiveCoordinate`; negatives are invalid. Offsets are
+/// signed and are deliberately left alone.
+fn clamp_extent(v: i64) -> i64 {
+    v.max(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1139,8 +1195,8 @@ fn write_layout_placeholder(
         off.push_attribute(("y", ys.as_str()));
         w.write_event(Event::Empty(off)).expect("off");
         let mut ext = BytesStart::new("a:ext");
-        let cxs = cx.to_string();
-        let cys = cy.to_string();
+        let cxs = clamp_extent(cx).to_string();
+        let cys = clamp_extent(cy).to_string();
         ext.push_attribute(("cx", cxs.as_str()));
         ext.push_attribute(("cy", cys.as_str()));
         w.write_event(Event::Empty(ext)).expect("ext");
@@ -1261,8 +1317,8 @@ fn write_sp_pr_with_xfrm(w: &mut Writer<Vec<u8>>, x: i64, y: i64, cx: i64, cy: i
     off.push_attribute(("y", y.to_string().as_str()));
     w.write_event(Event::Empty(off)).expect("write");
     let mut ext = BytesStart::new("a:ext");
-    ext.push_attribute(("cx", cx.to_string().as_str()));
-    ext.push_attribute(("cy", cy.to_string().as_str()));
+    ext.push_attribute(("cx", clamp_extent(cx).to_string().as_str()));
+    ext.push_attribute(("cy", clamp_extent(cy).to_string().as_str()));
     w.write_event(Event::Empty(ext)).expect("write");
     w.write_event(Event::End(BytesEnd::new("a:xfrm")))
         .expect("write");
@@ -1447,8 +1503,8 @@ fn write_text_box_shape(
     off.push_attribute(("y", y.to_string().as_str()));
     w.write_event(Event::Empty(off)).expect("write");
     let mut ext = BytesStart::new("a:ext");
-    ext.push_attribute(("cx", cx.to_string().as_str()));
-    ext.push_attribute(("cy", cy.to_string().as_str()));
+    ext.push_attribute(("cx", clamp_extent(cx).to_string().as_str()));
+    ext.push_attribute(("cy", clamp_extent(cy).to_string().as_str()));
     w.write_event(Event::Empty(ext)).expect("write");
     w.write_event(Event::End(BytesEnd::new("a:xfrm")))
         .expect("write");
@@ -1848,6 +1904,54 @@ mod tests {
                 .any(|n| n.contains("notesSlide") || n.contains("notesMaster")),
             "unexpected notes parts: {names:?}"
         );
+    }
+
+    /// Every value the writer splices into a restricted XSD simple type must
+    /// be clamped or dropped — never written through and left invalid.
+    #[test]
+    fn out_of_range_values_are_clamped_not_written_through() {
+        // ST_SlideSizeCoordinate: 914400..=51206400
+        let mut writer = PptxWriter::new();
+        writer.set_presentation_size(1000, 99_000_000);
+        writer.add_slide().add_text("x");
+        let xml = part_xml(writer, "ppt/presentation.xml");
+        assert!(xml.contains("cx=\"914400\""), "tiny cx must clamp up: {xml}");
+        assert!(xml.contains("cy=\"51206400\""), "huge cy must clamp down: {xml}");
+
+        // ST_TextFontSize: 100..=400000, and NaN has no size at all.
+        let mut writer = PptxWriter::new();
+        {
+            let s = writer.add_slide();
+            s.add_rich_text(&[Run::new("tiny").font_size(0.05)]);
+            s.add_rich_text(&[Run::new("huge").font_size(9999.0)]);
+            s.add_rich_text(&[Run::new("neg").font_size(-10.0)]);
+            s.add_rich_text(&[Run::new("nan").font_size(f64::NAN)]);
+        }
+        let xml = slide1_xml(writer);
+        assert!(!xml.contains("sz=\"0\""), "font size must never be 0: {xml}");
+        assert!(!xml.contains("sz=\"5\""), "font size must clamp to the minimum");
+        assert!(xml.contains("sz=\"100\""), "below-minimum sizes clamp to 100");
+        assert!(xml.contains("sz=\"400000\""), "above-maximum sizes clamp to 400000");
+        assert_eq!(xml.matches("sz=\"").count(), 3, "NaN must emit no sz at all");
+
+        // ST_HexColorRGB: exactly six hex digits; a leading # is forgiven.
+        let mut writer = PptxWriter::new();
+        {
+            let s = writer.add_slide();
+            s.add_rich_text(&[Run::new("hash").color("#FF0000")]);
+            s.add_rich_text(&[Run::new("bad").color("nothex")]);
+        }
+        let xml = slide1_xml(writer);
+        assert!(xml.contains("val=\"FF0000\""), "a leading # must be stripped: {xml}");
+        assert!(!xml.contains("nothex"), "invalid hex must not be written: {xml}");
+        assert!(!xml.contains("#FF0000"), "raw # must not reach the file");
+
+        // a:ext is ST_PositiveCoordinate.
+        let mut writer = PptxWriter::new();
+        writer.add_slide().add_text_box("neg", 0, 0, -100, -100);
+        let xml = slide1_xml(writer);
+        assert!(!xml.contains("cx=\"-"), "negative extent written: {xml}");
+        assert!(!xml.contains("cy=\"-"), "negative extent written: {xml}");
     }
 
     /// Read `ppt/slides/slide1.xml` from a written presentation.
