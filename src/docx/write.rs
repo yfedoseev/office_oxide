@@ -1823,7 +1823,10 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph, links: &
                 if v >= 0 {
                     ind.push_attribute(("w:firstLine", v.to_string().as_str()));
                 } else {
-                    ind.push_attribute(("w:hanging", (-v).to_string().as_str()));
+                    // unsigned_abs, not -v: negating i32::MIN overflows, and
+                    // w:hanging is ST_TwipsMeasure (unsigned) anyway, so the
+                    // magnitude is what the attribute wants.
+                    ind.push_attribute(("w:hanging", v.unsigned_abs().to_string().as_str()));
                 }
             }
             w.write_event(Event::Empty(ind)).expect("write ind");

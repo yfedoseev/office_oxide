@@ -47,6 +47,8 @@ The sweep found **nine defects the unit suite could not see**, all fixed here �
 - **A hostile `.pptx` could hang `save_as` indefinitely.** `col_span`/`row_span` drove the DOCX writer's grid loop with the bounds check *inside* the loop body, so the iteration still ran `row_span × col_span` times — up to 1.8×10¹⁹ — doing nothing. Nothing allocated, so nothing ever stopped it. The check is now hoisted and the spans clamped, and PPTX spans are clamped at parse time.
 - **A deeply nested IR overflowed the writer's stack.** The readers have bounded nesting via `DepthGuard`/`MAX_NESTING_DEPTH`; the writers had no equivalent, so nesting past a few thousand levels aborted. The same guard now covers both DOCX writer recursions.
 
+- **A negate overflow panicked the writer.** `first_line_indent_twips = i32::MIN` reached `(-v).to_string()` and `-i32::MIN` overflows; the reader had the mirror problem on `w:hanging="-2147483648"`. Both now use the magnitude, which is what `ST_TwipsMeasure` wants — the attribute is unsigned.
+
 Known and not fixed: dropping a deeply nested `Element` is itself recursive and can overflow a small stack independently of the writers. That affects any consumer deserialising such an IR and needs an iterative `Drop`.
 
 ### Fixed

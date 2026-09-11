@@ -336,7 +336,9 @@ fn apply_paragraph_properties(pp: &crate::docx::ParagraphProperties, out: &mut P
         out.indent_right_twips = ind.right.map(|t| t.0);
         // A hanging indent is a negative first-line indent in the IR.
         out.first_line_indent_twips = match (ind.first_line, ind.hanging) {
-            (_, Some(h)) if h.0 != 0 => Some(-h.0),
+            // saturating_neg: -i32::MIN overflows, and a hanging indent that
+            // large is nonsense anyway.
+            (_, Some(h)) if h.0 != 0 => Some(h.0.saturating_neg()),
             (Some(f), _) => Some(f.0),
             _ => None,
         };

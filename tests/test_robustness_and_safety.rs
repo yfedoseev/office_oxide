@@ -938,3 +938,42 @@ fn deeply_nested_ir_does_not_overflow_the_writer_stack() {
         .join()
         .expect("the writer must not overflow the stack");
 }
+
+/// `-i32::MIN` overflows. `first_line_indent_twips = i32::MIN` reached
+/// `(-v).to_string()` in the writer and panicked; the reader had the mirror
+/// problem on `w:hanging="-2147483648"`. `w:hanging` is `ST_TwipsMeasure`
+/// (unsigned), so the magnitude is what the attribute wants anyway.
+#[test]
+fn an_extreme_hanging_indent_does_not_overflow() {
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        sections: vec![Section {
+            elements: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    text: "x".into(),
+                    ..Default::default()
+                })],
+                first_line_indent_twips: Some(i32::MIN),
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(
+        &ir,
+        office_oxide::format::DocumentFormat::Docx,
+        &mut buf,
+    )
+    .expect("write");
+
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut xml = String::new();
+    let mut e = zip.by_name("word/document.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut xml).unwrap();
+    assert!(!xml.contains(r#"w:hanging="-"#), "w:hanging must not be negative: {xml}");
+}
