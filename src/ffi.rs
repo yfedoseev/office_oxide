@@ -656,7 +656,35 @@ pub extern "C" fn office_xlsx_writer_add_sheet(
     h.writer.add_sheet_get_index(name) as u32
 }
 
-/// Set a cell value. value_type: 0=empty, 1=string (value_str), 2=number (value_num).
+/// Decode an FFI cell value.
+///
+/// Returns `None` for an unrecognised `value_type`. Mapping it to `Empty`
+/// meant a caller passing a bad type erased whatever was already in the cell,
+/// while the function returned nothing to say so.
+fn ffi_cell_data(
+    value_type: i32,
+    value_str: *const c_char,
+    value_num: f64,
+) -> Option<crate::xlsx::write::CellData> {
+    use crate::xlsx::write::CellData;
+    match value_type {
+        0 => Some(CellData::Empty),
+        1 => Some(CellData::String(cstr_to_str(value_str)?.to_string())),
+        2 => Some(CellData::Number(value_num)),
+        3 => Some(CellData::Boolean(value_num != 0.0)),
+        4 => Some(CellData::Formula(cstr_to_str(value_str)?.to_string())),
+        _ => None,
+    }
+}
+
+/// Set a cell value.
+///
+/// `value_type`: 0=empty, 1=string (`value_str`), 2=number (`value_num`),
+/// 3=boolean (`value_num` != 0), 4=formula (`value_str`, no leading `=`).
+///
+/// Returns `OFFICE_OK`, `OFFICE_ERR_INVALID_ARG` for a bad handle or type, or
+/// `OFFICE_ERR_UNSUPPORTED` when the target cell is outside Excel's grid and
+/// nothing was written.
 #[unsafe(no_mangle)]
 pub extern "C" fn office_xlsx_sheet_set_cell(
     handle: *mut OfficeXlsxWriterHandle,
@@ -666,19 +694,21 @@ pub extern "C" fn office_xlsx_sheet_set_cell(
     value_type: i32,
     value_str: *const c_char,
     value_num: f64,
-) {
+) -> i32 {
     if handle.is_null() {
-        return;
+        return OFFICE_ERR_INVALID_ARG;
     }
-    use crate::xlsx::write::CellData;
-    let data = match value_type {
-        1 => CellData::String(cstr_to_str(value_str).unwrap_or("").to_string()),
-        2 => CellData::Number(value_num),
-        _ => CellData::Empty,
+    let Some(data) = ffi_cell_data(value_type, value_str, value_num) else {
+        return OFFICE_ERR_INVALID_ARG;
     };
     let h = unsafe { &mut *handle };
-    h.writer
-        .sheet_set_cell(sheet as usize, row as usize, col as usize, data);
+    if h.writer
+        .sheet_set_cell(sheet as usize, row as usize, col as usize, data)
+    {
+        OFFICE_OK
+    } else {
+        OFFICE_ERR_UNSUPPORTED
+    }
 }
 
 /// Set a cell with styling. bold applies bold weight; bg_color is a 6-char hex
@@ -694,15 +724,13 @@ pub extern "C" fn office_xlsx_sheet_set_cell_styled(
     value_num: f64,
     bold: bool,
     bg_color: *const c_char,
-) {
+) -> i32 {
     if handle.is_null() {
-        return;
+        return OFFICE_ERR_INVALID_ARG;
     }
-    use crate::xlsx::write::{CellData, CellStyle};
-    let data = match value_type {
-        1 => CellData::String(cstr_to_str(value_str).unwrap_or("").to_string()),
-        2 => CellData::Number(value_num),
-        _ => CellData::Empty,
+    use crate::xlsx::write::CellStyle;
+    let Some(data) = ffi_cell_data(value_type, value_str, value_num) else {
+        return OFFICE_ERR_INVALID_ARG;
     };
     let mut style = CellStyle::new();
     if bold {
@@ -714,8 +742,13 @@ pub extern "C" fn office_xlsx_sheet_set_cell_styled(
         }
     }
     let h = unsafe { &mut *handle };
-    h.writer
-        .sheet_set_cell_styled(sheet as usize, row as usize, col as usize, data, style);
+    if h.writer
+        .sheet_set_cell_styled(sheet as usize, row as usize, col as usize, data, style)
+    {
+        OFFICE_OK
+    } else {
+        OFFICE_ERR_UNSUPPORTED
+    }
 }
 
 /// Merge a rectangular range. row_span / col_span must be >= 1.
@@ -869,13 +902,19 @@ pub extern "C" fn office_pptx_slide_set_title(
     handle: *mut OfficePptxWriterHandle,
     slide: u32,
     title: *const c_char,
-) {
+) -> i32 {
     if handle.is_null() {
-        return;
+        return OFFICE_ERR_INVALID_ARG;
     }
-    let title = cstr_to_str(title).unwrap_or("");
+    let Some(title) = cstr_to_str(title) else {
+        return OFFICE_ERR_INVALID_ARG;
+    };
     let h = unsafe { &mut *handle };
-    h.writer.slide_set_title(slide as usize, title);
+    if h.writer.slide_set_title(slide as usize, title) {
+        OFFICE_OK
+    } else {
+        OFFICE_ERR_UNSUPPORTED
+    }
 }
 
 /// Add a plain text paragraph to the slide body.
@@ -884,13 +923,19 @@ pub extern "C" fn office_pptx_slide_add_text(
     handle: *mut OfficePptxWriterHandle,
     slide: u32,
     text: *const c_char,
-) {
+) -> i32 {
     if handle.is_null() {
-        return;
+        return OFFICE_ERR_INVALID_ARG;
     }
-    let text = cstr_to_str(text).unwrap_or("");
+    let Some(text) = cstr_to_str(text) else {
+        return OFFICE_ERR_INVALID_ARG;
+    };
     let h = unsafe { &mut *handle };
-    h.writer.slide_add_text(slide as usize, text);
+    if h.writer.slide_add_text(slide as usize, text) {
+        OFFICE_OK
+    } else {
+        OFFICE_ERR_UNSUPPORTED
+    }
 }
 
 fn parse_image_format(s: &str) -> Option<crate::ir::ImageFormat> {
@@ -1035,5 +1080,61 @@ pub extern "C" fn office_create_from_markdown(
             set_err(error_code, code);
             code
         },
+    }
+}
+
+#[cfg(test)]
+mod write_status_tests {
+    use super::*;
+
+    /// The writer returns `bool` so a silent no-op is detectable. Reporting
+    /// nothing across the FFI reintroduced the exact regression the Rust API
+    /// was fixed for: an out-of-range index discarded every value it wrote
+    /// while the caller saw success.
+    #[test]
+    fn an_out_of_range_write_reports_a_status_instead_of_vanishing() {
+        let h = office_xlsx_writer_new();
+        assert!(!h.is_null());
+        let name = std::ffi::CString::new("Data").unwrap();
+        assert_eq!(office_xlsx_writer_add_sheet(h, name.as_ptr()), 0);
+
+        let text = std::ffi::CString::new("LOST").unwrap();
+        // Sheet 1 does not exist.
+        assert_ne!(
+            office_xlsx_sheet_set_cell(h, 1, 0, 0, 1, text.as_ptr(), 0.0),
+            OFFICE_OK,
+            "writing to a missing sheet must not report success"
+        );
+        // Row past the end of Excel's grid.
+        assert_ne!(
+            office_xlsx_sheet_set_cell(h, 0, 1_048_576, 0, 1, text.as_ptr(), 0.0),
+            OFFICE_OK,
+            "writing outside the grid must not report success"
+        );
+        // A valid write still succeeds.
+        assert_eq!(office_xlsx_sheet_set_cell(h, 0, 0, 0, 1, text.as_ptr(), 0.0), OFFICE_OK);
+
+        // An unrecognised value_type must be rejected, not silently written
+        // as Empty over the existing value.
+        assert_ne!(
+            office_xlsx_sheet_set_cell(h, 0, 0, 0, 7, text.as_ptr(), 0.0),
+            OFFICE_OK,
+            "an unknown value_type must be an error, not an erase"
+        );
+
+        unsafe { office_xlsx_writer_free(h) };
+    }
+
+    /// `CellData::Boolean` and `CellData::Formula` were unreachable from any
+    /// binding: no `value_type` mapped to them.
+    #[test]
+    fn booleans_and_formulas_are_reachable_over_the_ffi() {
+        let h = office_xlsx_writer_new();
+        let name = std::ffi::CString::new("S").unwrap();
+        office_xlsx_writer_add_sheet(h, name.as_ptr());
+        let f = std::ffi::CString::new("SUM(A1:A2)").unwrap();
+        assert_eq!(office_xlsx_sheet_set_cell(h, 0, 0, 0, 3, std::ptr::null(), 1.0), OFFICE_OK);
+        assert_eq!(office_xlsx_sheet_set_cell(h, 0, 1, 0, 4, f.as_ptr(), 0.0), OFFICE_OK);
+        unsafe { office_xlsx_writer_free(h) };
     }
 }

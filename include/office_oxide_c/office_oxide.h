@@ -215,7 +215,7 @@ uint32_t office_xlsx_writer_add_sheet(OfficeXlsxWriterHandle* handle, const char
  * value_type: OFFICE_CELL_EMPTY=0, OFFICE_CELL_STRING=1, OFFICE_CELL_NUMBER=2.
  * value_str used when value_type==1; value_num used when value_type==2.
  */
-void office_xlsx_sheet_set_cell(
+int32_t office_xlsx_sheet_set_cell(
     OfficeXlsxWriterHandle* handle,
     uint32_t sheet, uint32_t row, uint32_t col,
     int32_t value_type, const char* value_str, double value_num);
@@ -225,7 +225,7 @@ void office_xlsx_sheet_set_cell(
  * bold: apply bold weight.
  * bg_color: 6-char hex string ("D3D3D3") or NULL for no fill.
  */
-void office_xlsx_sheet_set_cell_styled(
+int32_t office_xlsx_sheet_set_cell_styled(
     OfficeXlsxWriterHandle* handle,
     uint32_t sheet, uint32_t row, uint32_t col,
     int32_t value_type, const char* value_str, double value_num,
@@ -280,12 +280,12 @@ void office_pptx_writer_set_presentation_size(
 uint32_t office_pptx_writer_add_slide(OfficePptxWriterHandle* handle);
 
 /** Set the slide title. */
-void office_pptx_slide_set_title(
+int32_t office_pptx_slide_set_title(
     OfficePptxWriterHandle* handle,
     uint32_t slide, const char* title);
 
 /** Add a plain text paragraph to the slide body. */
-void office_pptx_slide_add_text(
+int32_t office_pptx_slide_add_text(
     OfficePptxWriterHandle* handle,
     uint32_t slide, const char* text);
 
