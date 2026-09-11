@@ -645,11 +645,19 @@ impl DocxWriter {
 
     /// Add an IR list with rich style information.
     pub fn add_ir_list(&mut self, list: &crate::ir::List) -> &mut Self {
+        self.add_ir_list_at(list, list.level);
+        self
+    }
+
+    /// Emit `list` and, recursively, every sub-list hanging off its items.
+    ///
+    /// `ListItem::nested` was read by no writer at all, so everything below
+    /// level 0 vanished from the output while the API reported success.
+    fn add_ir_list_at(&mut self, list: &crate::ir::List, level: u8) {
         let num_id = self.next_num_id;
         self.next_num_id += 1;
         let start_number = list.start_number.unwrap_or(1);
         let style = list.style.clone();
-        let level = list.level;
 
         let items: Vec<Vec<DocxElement>> = list
             .items
@@ -675,7 +683,12 @@ impl DocxWriter {
             level,
             num_id,
         }));
-        self
+
+        for item in &list.items {
+            if let Some(ref nested) = item.nested {
+                self.add_ir_list_at(nested, level.saturating_add(1).min(8));
+            }
+        }
     }
 
     /// Add a code block.
@@ -1296,6 +1309,10 @@ fn convert_ir_element_to_docx_elements(elem: &crate::ir::Element, out: &mut Vec<
             let runs = ir_inline_to_runs(&h.content);
             let props = IrParaProps {
                 style: Some(format!("Heading{level}")),
+                // A heading nested in a cell, text box, header or note kept
+                // its style but lost its alignment, unlike the same heading
+                // at top level.
+                alignment: h.alignment.clone(),
                 ..Default::default()
             };
             out.push(DocxElement::RichParagraph(DocxRichParagraph { runs, props }));
@@ -1316,6 +1333,11 @@ fn convert_ir_element_to_docx_elements(elem: &crate::ir::Element, out: &mut Vec<
                         props.numbering = Some((num_id, l.level));
                         out.push(DocxElement::RichParagraph(DocxRichParagraph { runs, props }));
                     }
+                }
+                // Sub-lists were dropped entirely: everything below level 0
+                // never reached the file.
+                if let Some(ref nested) = item.nested {
+                    convert_ir_element_to_docx_elements(&E::List(nested.clone()), out);
                 }
             }
         },

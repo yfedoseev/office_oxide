@@ -1665,3 +1665,71 @@ fn convenience_functions_round_trip() {
     let ir2 = doc.to_ir();
     assert!(!ir2.sections.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Nested content must reach the file
+// ---------------------------------------------------------------------------
+
+fn nested_list_ir() -> office_oxide::ir::DocumentIR {
+    use office_oxide::ir::*;
+    fn item(text: &str, nested: Option<List>) -> ListItem {
+        ListItem {
+            content: inline_to_element_block(vec![InlineContent::Text(TextSpan {
+                text: text.into(),
+                ..Default::default()
+            })]),
+            nested,
+        }
+    }
+    let deep = List {
+        ordered: false,
+        items: vec![item("DeepItem", None)],
+        ..Default::default()
+    };
+    let inner = List {
+        ordered: true,
+        items: vec![item("NestedItemA", Some(deep))],
+        ..Default::default()
+    };
+    let outer = List {
+        ordered: true,
+        items: vec![item("ItemOne", Some(inner)), item("ItemTwo", None)],
+        ..Default::default()
+    };
+    DocumentIR {
+        sections: vec![Section {
+            elements: vec![Element::List(outer)],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// `ListItem::nested` was consumed by the renderers but by no writer, so every
+/// item below level 0 vanished on write while the API reported success.
+#[test]
+fn nested_list_items_reach_every_format() {
+    use office_oxide::format::DocumentFormat;
+
+    let ir = nested_list_ir();
+    for (fmt, label) in [
+        (DocumentFormat::Docx, "docx"),
+        (DocumentFormat::Pptx, "pptx"),
+    ] {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        office_oxide::create::create_from_ir_to_writer(&ir, fmt, &mut buf).unwrap();
+        buf.set_position(0);
+        let mut zip = zip::ZipArchive::new(buf).unwrap();
+        let mut all = String::new();
+        for i in 0..zip.len() {
+            let mut e = zip.by_index(i).unwrap();
+            let mut s = String::new();
+            if std::io::Read::read_to_string(&mut e, &mut s).is_ok() {
+                all.push_str(&s);
+            }
+        }
+        for expected in ["ItemOne", "ItemTwo", "NestedItemA", "DeepItem"] {
+            assert!(all.contains(expected), "{label}: {expected} never reached the package");
+        }
+    }
+}

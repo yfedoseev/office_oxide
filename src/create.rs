@@ -843,20 +843,29 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
             slide.add_rich_text_with_props(&runs, props);
         },
         Element::List(l) => {
-            let items: Vec<String> = l
-                .items
-                .iter()
-                .map(|i| {
-                    i.content
+            // Flatten the whole tree: `ListItem::nested` was read by no
+            // writer, so every item below level 0 was silently dropped.
+            fn flatten(list: &crate::ir::List, out: &mut Vec<String>) {
+                for item in &list.items {
+                    let text = item
+                        .content
                         .iter()
                         .map(|e| match e {
                             Element::Paragraph(p) => inline_to_text(&p.content),
                             _ => String::new(),
                         })
                         .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .collect();
+                        .join(" ");
+                    if !text.is_empty() {
+                        out.push(text);
+                    }
+                    if let Some(ref nested) = item.nested {
+                        flatten(nested, out);
+                    }
+                }
+            }
+            let mut items: Vec<String> = Vec::new();
+            flatten(l, &mut items);
             let item_refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
             slide.add_bullet_list(&item_refs);
         },
