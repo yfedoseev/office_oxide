@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-09-11
+
+> Write-path correctness. 16 issues closed and the OOXML validation gate that found them.
+>
+> v0.1.10 shipped with a green suite and a write path that produced documents Word and PowerPoint refuse to open: nothing checked that the files we *write* are valid OOXML, because generated output was only round-tripped through our own deliberately lenient parser. #199 came in from a user; chasing it with a schema validator turned up fifteen more.
+>
+> Verified against 6,062 real Office documents arm-to-arm with v0.1.10 — **0 extraction regressions**, and `save_as` conversions that schema-validate go from **2,387/5,921 (40.3%) to 5,918/5,921 (99.9%)**. The sweep itself found nine further defects the unit suite could not see, four of them introduced by fixes in this release.
+
 ### Verified
 
 Swept **6,062 real Office documents** (LibreOffice QA, Apache POI, OpenXML SDK, python-pptx, ClosedXML, calamine, PhpSpreadsheet and others) arm-to-arm against v0.1.10, on two axes.
