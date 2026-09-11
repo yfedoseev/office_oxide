@@ -37,9 +37,19 @@ missing element hides everything after it, so a finding count is a lower
 bound. Re-run after each fix rather than assuming the count is the defect
 count.
 
-**Vary combinations, not one property at a time.** The `w:pPr` ordering defect
-needed an indent *and* spacing on the same paragraph. A matrix that sets one
-property per document cannot find an ordering bug.
+**Vary combinations, not one property at a time.** All four schema-invalid
+element orders in 0.1.11 needed *two* properties on the same element — an
+indent and spacing on one paragraph, borders and shading on one cell. A matrix
+that sets one property per document cannot find an ordering bug, and the first
+version of this gate missed three of the four for exactly that reason; a
+6,000-file real corpus found them instead.
+
+`maximal_properties_corpus` in the generator now sets every child of every
+order-sensitive group at once. In WML that surface is closed and enumerable:
+`CT_PPrBase`, `CT_TblPrBase`, `CT_TcPrBase` and `CT_SectPr` are sequences;
+`EG_RPrBase` and `CT_TrPrBase` are *choices* and therefore order-free. Check the
+compositor in the XSD before assuming an ordering bug — I chased a fourth one
+in `w:rPr` that does not exist.
 
 **Cover conversion, not just creation.** The `w:pgMar` missing-`w:gutter`
 defect was only reachable through `Document::save_as`, because it needs a

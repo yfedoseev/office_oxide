@@ -73,6 +73,140 @@ fn cell(text: &str) -> TableCell {
     }
 }
 
+/// A document that sets *every* property of the three order-sensitive
+/// property groups at once.
+///
+/// The schema-invalid element orders in 0.1.11 (`w:pPr`, `w:tblPr`, `w:tcPr`)
+/// were all found by a 6,000-file real corpus, not by this gate — because a
+/// generator that sets one property at a time can never produce the pair that
+/// trips an ordering rule. Only `CT_PPrBase`, `CT_TblPrBase`, `CT_TcPrBase`
+/// and `CT_SectPr` are sequences in WML; `EG_RPrBase` and `CT_TrPrBase` are
+/// choices and order-free. So this covers the whole order-sensitive surface.
+fn maximal_properties_corpus(out: &str) {
+    let border = || {
+        Some(TableBorder {
+            top: Some(BorderLine {
+                style: BorderStyle::Single,
+                color: Some([0, 0, 0]),
+                size: Some(4),
+                space: Some(0),
+            }),
+            bottom: None,
+            left: None,
+            right: None,
+            inside_h: None,
+            inside_v: None,
+        })
+    };
+
+    // Every CT_TcPrBase child we can emit, on one cell.
+    let cell = TableCell {
+        content: vec![Element::Paragraph(Paragraph {
+            content: vec![span("cell")],
+            ..Default::default()
+        })],
+        col_span: 2,
+        row_span: 2,
+        width_twips: Some(1000),
+        background_color: Some([0xEE, 0xEE, 0xEE]),
+        border: border(),
+        padding: Some(CellPadding {
+            top_twips: Some(10),
+            left_twips: Some(10),
+            bottom_twips: Some(10),
+            right_twips: Some(10),
+        }),
+        vertical_align: Some(CellVerticalAlign::Center),
+        text_direction: Some(TextDirection::TbRl),
+        text_align: Some(ParagraphAlignment::Center),
+        ..Default::default()
+    };
+
+    // Every CT_TblPrBase child we can emit, on one table.
+    let table = Table {
+        caption: Some("Caption".into()),
+        alignment: Some(TableAlignment::Center),
+        indent_left_twips: Some(120),
+        cell_padding_twips: Some(60),
+        width_twips: Some(8000),
+        border: border(),
+        column_widths_twips: vec![4000, 4000],
+        rows: vec![
+            TableRow {
+                cells: vec![cell.clone(), cell.clone()],
+                is_header: true,
+                height_twips: Some(400),
+                repeat_as_header: true,
+                allow_break: false,
+            },
+            TableRow {
+                cells: vec![cell.clone(), cell],
+                ..Default::default()
+            },
+        ],
+    };
+
+    // Every CT_PPrBase child we can emit, on one paragraph.
+    let para = Paragraph {
+        content: vec![span("para")],
+        alignment: Some(ParagraphAlignment::Justify),
+        indent_left_twips: Some(720),
+        indent_right_twips: Some(360),
+        first_line_indent_twips: Some(-360),
+        space_before_twips: Some(120),
+        space_after_twips: Some(240),
+        line_spacing: Some(LineSpacing::Exact(360)),
+        background_color: Some([0xFF, 0xFF, 0xCC]),
+        border: Some(ParagraphBorder {
+            top: Some(BorderLine {
+                style: BorderStyle::Single,
+                color: Some([0, 0, 0]),
+                size: Some(4),
+                space: Some(1),
+            }),
+            bottom: None,
+            left: None,
+            right: None,
+            between: None,
+        }),
+        tabs: vec![TabStop {
+            position_twips: 8640,
+            alignment: TabAlignment::Right,
+            leader: TabLeader::Dot,
+        }],
+        keep_with_next: true,
+        keep_together: true,
+        page_break_before: true,
+        outline_level: Some(1),
+        frame_position: Some(FramePosition {
+            x_twips: 100,
+            y_twips: 200,
+            width_twips: 3000,
+            height_twips: 400,
+        }),
+    };
+
+    let ir = DocumentIR {
+        sections: vec![Section {
+            title: Some("Maximal".into()),
+            elements: vec![Element::Paragraph(para), Element::Table(table)],
+            page_setup: Some(PageSetup::default()),
+            background_rgb: Some([0x11, 0x22, 0x33]),
+            speaker_notes: Some("notes".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    for (fmt, ext) in [
+        (DocumentFormat::Docx, "docx"),
+        (DocumentFormat::Xlsx, "xlsx"),
+        (DocumentFormat::Pptx, "pptx"),
+    ] {
+        create_from_ir(&ir, fmt, format!("{out}/maximal.{ext}")).unwrap();
+    }
+}
+
 fn markdown_corpus(out: &str) {
     for (name, md) in [
         ("minimal", "# Slide one\n\nHello world.\n"),
@@ -264,6 +398,7 @@ fn main() {
     xlsx_builder_corpus(&out);
     conversion_corpus(&out);
     extremes_corpus(&out);
+    maximal_properties_corpus(&out);
     let n = std::fs::read_dir(&out).unwrap().count();
     println!("wrote {n} packages to {out}");
 }
