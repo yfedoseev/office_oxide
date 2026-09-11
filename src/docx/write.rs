@@ -2192,15 +2192,9 @@ fn write_rich_table(
     w.write_event(Event::Start(BytesStart::new("w:tblPr")))
         .expect("write tblPr start");
 
-    // w:tblCaption is what the reader looks for. Emitting the caption only as
-    // a Caption-styled paragraph lost it on round-trip and accumulated a
-    // phantom body paragraph on every cycle.
-    if let Some(ref caption) = table.caption {
-        let mut cap = BytesStart::new("w:tblCaption");
-        cap.push_attribute(("w:val", caption.as_str()));
-        w.write_event(Event::Empty(cap)).expect("write tblCaption");
-    }
-
+    // CT_TblPrBase is a strict sequence: tblW, jc, tblInd, tblBorders,
+    // shd, tblCellMar, tblCaption. Emitting tblCaption first and jc after
+    // the borders made every table carrying either one invalid.
     let mut tbl_w = BytesStart::new("w:tblW");
     if let Some(w_twips) = table.width_twips {
         tbl_w.push_attribute(("w:w", w_twips.to_string().as_str()));
@@ -2211,17 +2205,6 @@ fn write_rich_table(
     }
     w.write_event(Event::Empty(tbl_w)).expect("write tblW");
 
-    if let Some(ind) = table.indent_left_twips {
-        let mut tbl_ind = BytesStart::new("w:tblInd");
-        tbl_ind.push_attribute(("w:w", ind.to_string().as_str()));
-        tbl_ind.push_attribute(("w:type", "dxa"));
-        w.write_event(Event::Empty(tbl_ind)).expect("write tblInd");
-    }
-
-    if let Some(ref border) = table.border {
-        write_table_borders(w, border, "w:tblBorders");
-    }
-
     if let Some(align) = &table.alignment {
         let val = match align {
             TableAlignment::Left => "left",
@@ -2231,6 +2214,17 @@ fn write_rich_table(
         let mut jc = BytesStart::new("w:jc");
         jc.push_attribute(("w:val", val));
         w.write_event(Event::Empty(jc)).expect("write tbl jc");
+    }
+
+    if let Some(ind) = table.indent_left_twips {
+        let mut tbl_ind = BytesStart::new("w:tblInd");
+        tbl_ind.push_attribute(("w:w", ind.to_string().as_str()));
+        tbl_ind.push_attribute(("w:type", "dxa"));
+        w.write_event(Event::Empty(tbl_ind)).expect("write tblInd");
+    }
+
+    if let Some(ref border) = table.border {
+        write_table_borders(w, border, "w:tblBorders");
     }
 
     if let Some(pad) = table.cell_padding_twips {
@@ -2247,7 +2241,14 @@ fn write_rich_table(
         w.write_event(Event::End(BytesEnd::new("w:tblCellMar")))
             .expect("write tblCellMar end");
     }
-
+    // w:tblCaption is what the reader looks for. Emitting the caption only as
+    // a Caption-styled paragraph lost it on round-trip and accumulated a
+    // phantom body paragraph on every cycle.
+    if let Some(ref caption) = table.caption {
+        let mut cap = BytesStart::new("w:tblCaption");
+        cap.push_attribute(("w:val", caption.as_str()));
+        w.write_event(Event::Empty(cap)).expect("write tblCaption");
+    }
     w.write_event(Event::End(BytesEnd::new("w:tblPr")))
         .expect("write tblPr end");
 
@@ -2849,8 +2850,11 @@ fn write_floating_image_run(
     w.write_event(Event::Start(anchor))
         .expect("write anchor start");
 
-    w.write_event(Event::Empty(BytesStart::new("wp:simplePos")))
-        .expect("write simplePos");
+    // CT_Point2D requires both x and y; a bare element is invalid.
+    let mut spos = BytesStart::new("wp:simplePos");
+    spos.push_attribute(("x", "0"));
+    spos.push_attribute(("y", "0"));
+    w.write_event(Event::Empty(spos)).expect("write simplePos");
 
     let mut pos_h = BytesStart::new("wp:positionH");
     pos_h.push_attribute(("relativeFrom", float_anchor_val(&fi.h_anchor)));

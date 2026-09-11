@@ -2203,3 +2203,53 @@ fn a_drawing_in_a_header_keeps_the_part_well_formed() {
         assert!(xml.contains("xmlns:wp="), "wp: used without a declaration:\n{xml}");
     }
 }
+
+/// `CT_TblPrBase` is a strict sequence: tblW, jc, tblInd, tblBorders, shd,
+/// tblCellMar, tblCaption. A table carrying an alignment or a caption was
+/// invalid — 183 corpus conversions failed on this alone.
+#[test]
+fn table_properties_follow_the_schema_sequence() {
+    use office_oxide::format::DocumentFormat;
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        sections: vec![Section {
+            elements: vec![Element::Table(Table {
+                caption: Some("Cap".into()),
+                alignment: Some(TableAlignment::Center),
+                indent_left_twips: Some(100),
+                cell_padding_twips: Some(50),
+                rows: vec![TableRow {
+                    cells: vec![TableCell::default()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(&ir, DocumentFormat::Docx, &mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut xml = String::new();
+    let mut e = zip.by_name("word/document.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut xml).unwrap();
+
+    let pos = |needle: &str| {
+        xml.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}: {xml}"))
+    };
+    let (w, jc, ind, mar, cap) = (
+        pos("<w:tblW"),
+        pos("<w:jc"),
+        pos("<w:tblInd"),
+        pos("<w:tblCellMar"),
+        pos("<w:tblCaption"),
+    );
+    assert!(w < jc, "tblW must precede jc");
+    assert!(jc < ind, "jc must precede tblInd");
+    assert!(ind < mar, "tblInd must precede tblCellMar");
+    assert!(mar < cap, "tblCellMar must precede tblCaption");
+}
