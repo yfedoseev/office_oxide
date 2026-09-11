@@ -51,7 +51,12 @@ def validate_pkg(path):
                 continue
             data = z.read(n)
             try:
-                doc = etree.fromstring(data)
+                # huge_tree: libxml2 caps nesting at 256 by default and reports a
+                # *parse* failure past it. Our own writer bounds nesting at 256
+                # and emits balanced XML, so without this the validator invents
+                # a malformed-output finding for a legitimately deep document.
+                parser = etree.XMLParser(huge_tree=True)
+                doc = etree.fromstring(data, parser)
             except Exception as e:
                 out.append((n, "PARSE", str(e)))
                 continue

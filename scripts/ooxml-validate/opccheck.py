@@ -25,7 +25,7 @@ def check(path):
         names=set(z.namelist())
         if "[Content_Types].xml" not in names:
             return [("FATAL","", "no [Content_Types].xml")]
-        ct=etree.fromstring(z.read("[Content_Types].xml"))
+        ct=etree.fromstring(z.read("[Content_Types].xml"), etree.XMLParser(huge_tree=True))
         defaults={e.get("Extension").lower():e.get("ContentType") for e in ct.findall(f"{{{CT_NS}}}Default")}
         overrides={e.get("PartName").lstrip("/"):e.get("ContentType") for e in ct.findall(f"{{{CT_NS}}}Override")}
 
@@ -47,7 +47,7 @@ def check(path):
         for n in sorted(names):
             if not n.endswith(".rels"): continue
             base=posixpath.dirname(posixpath.dirname(n))  # strip _rels
-            try: r=etree.fromstring(z.read(n))
+            try: r=etree.fromstring(z.read(n), etree.XMLParser(huge_tree=True))
             except Exception as e:
                 f.append(("RELS-PARSE",n,str(e))); continue
             for rel in r.findall(f"{{{R_NS}}}Relationship"):

@@ -59,6 +59,12 @@ section that carries a page setup.
 colour, and a slide under an inch wide are all reachable through the public
 API and all produced invalid files.
 
+**libxml2 caps nesting at 256.** Past that it reports a *parse* failure, which
+reads as "we wrote malformed XML". Our writers bound nesting at 256 and emit
+balanced XML, so the finding was the validator's, not the library's. Both
+scripts pass `huge_tree=True`; without it the gate invents a defect for any
+legitimately deep document.
+
 **`a:graphicData` uses a strict wildcard.** 2010-era extension content
 (`wps:wsp` inside a text box) has no global declaration in the 29500-4 set and
 fails validation even though real Word files contain it. `validate.py`
