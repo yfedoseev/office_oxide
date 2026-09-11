@@ -2102,3 +2102,104 @@ fn frame_position_background_and_table_caption_are_emitted() {
         "table caption not written as w:tblCaption: {body}"
     );
 }
+
+/// A hyperlink inside a footnote emits `r:id` into `footnotes.xml`. Without
+/// `xmlns:r` on that part's root it is not well-formed XML at all — found by
+/// converting a real document, not by any unit test.
+#[test]
+fn a_hyperlink_in_a_footnote_keeps_the_part_well_formed() {
+    use office_oxide::docx::write::{DocxWriter, Run};
+    use office_oxide::ir::*;
+
+    let mut w = DocxWriter::new();
+    w.add_paragraph("body");
+    w.add_footnote(
+        1,
+        &[Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan {
+                text: "see here".into(),
+                hyperlink: Some("https://example.com/x".into()),
+                ..Default::default()
+            })],
+            ..Default::default()
+        })],
+    );
+    let _ = Run::new("");
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    w.write_to(&mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut xml = String::new();
+    let mut e = zip.by_name("word/footnotes.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut xml).unwrap();
+
+    if xml.contains("r:id") {
+        assert!(
+            xml.contains("xmlns:r="),
+            "footnotes.xml uses the r: prefix without declaring it:\n{xml}"
+        );
+    }
+    // Well-formedness: every prefix used must be declared on the root.
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let mut buf2 = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf2) {
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {},
+            Err(err) => panic!("footnotes.xml is not well-formed: {err}\n{xml}"),
+        }
+        buf2.clear();
+    }
+}
+
+/// A drawing inside a header emits the `wp:`/`a:`/`pic:`/`wps:` prefixes. The
+/// header root declared only `w:` and `r:`, so the part was not well-formed
+/// XML. Pre-existing in v0.1.10; found by converting real documents.
+#[test]
+fn a_drawing_in_a_header_keeps_the_part_well_formed() {
+    use office_oxide::docx::write::{DocxWriter, HfType};
+    use office_oxide::ir::*;
+
+    let mut w = DocxWriter::new();
+    w.add_paragraph("body");
+    w.add_section_header(
+        HfType::DefaultHeader,
+        vec![Element::TextBox(TextBox {
+            content: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    text: "in header".into(),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            })],
+            ..Default::default()
+        })],
+    );
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    w.write_to(&mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let name = (0..zip.len())
+        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .find(|n| n.starts_with("word/header"))
+        .expect("a header part");
+    let mut xml = String::new();
+    let mut e = zip.by_name(&name).unwrap();
+    std::io::Read::read_to_string(&mut e, &mut xml).unwrap();
+
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let mut b = Vec::new();
+    loop {
+        match reader.read_event_into(&mut b) {
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {},
+            Err(err) => panic!("{name} is not well-formed: {err}\n{xml}"),
+        }
+        b.clear();
+    }
+    if xml.contains("<wp:") {
+        assert!(xml.contains("xmlns:wp="), "wp: used without a declaration:\n{xml}");
+    }
+}

@@ -3247,6 +3247,15 @@ fn generate_hf_xml(
     let mut root = BytesStart::new(tag);
     root.push_attribute(("xmlns:w", WML_NS));
     root.push_attribute(("xmlns:r", R_NS));
+    // A header or footer can hold a drawing (a text box or an image), which
+    // emits the wp:/a:/pic:/wps: prefixes. The document root declares these
+    // and this one never did, so such a part was not well-formed XML at all.
+    // Declared unconditionally: the cost is four attributes, and gating them
+    // on a content scan is what left the gap in the first place.
+    root.push_attribute(("xmlns:wp", DRAWING_NS));
+    root.push_attribute(("xmlns:a", DML_NS));
+    root.push_attribute(("xmlns:pic", PIC_NS));
+    root.push_attribute(("xmlns:wps", WPS_NS));
     w.write_event(Event::Start(root)).expect("write hf root");
 
     let mut ic = 0u32;
@@ -3330,6 +3339,9 @@ fn generate_notes_xml(
 
     let mut root = BytesStart::new(root_tag);
     root.push_attribute(("xmlns:w", WML_NS));
+    // A note can carry a hyperlink, which emits r:id. Without xmlns:r the
+    // part is not even well-formed XML.
+    root.push_attribute(("xmlns:r", R_NS));
     w.write_event(Event::Start(root)).expect("write notes root");
 
     // Word expects the separator (id -1) and continuationSeparator (id 0)
