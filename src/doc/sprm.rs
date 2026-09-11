@@ -707,6 +707,44 @@ mod tests {
         );
     }
 
+    /// The `sprmPOutLvl` operand is **zero-based**: `0x00`–`0x08` are Heading
+    /// 1–9 and `0x09` is body text. Each edge is pinned separately, because an
+    /// off-by-one here is invisible in aggregate counts — it silently re-labels
+    /// every heading in every document by one level.
+    #[test]
+    fn sprm_p_out_lvl_zero_is_heading_one() {
+        let props = extract_pap_props(&[0x40, 0x26, 0x00]);
+        assert_eq!(props.outline_level, Some(0), "0x00 is Heading 1, not body text");
+        assert!(props.outline_lvl_explicit);
+    }
+
+    #[test]
+    fn sprm_p_out_lvl_eight_is_heading_nine() {
+        let props = extract_pap_props(&[0x40, 0x26, 0x08]);
+        assert_eq!(props.outline_level, Some(8), "0x08 is Heading 9");
+        assert!(props.outline_lvl_explicit);
+    }
+
+    #[test]
+    fn sprm_p_out_lvl_nine_is_body_text() {
+        let props = extract_pap_props(&[0x40, 0x26, 0x09]);
+        assert_eq!(props.outline_level, None, "0x09 means body text, not Heading 9");
+        assert!(
+            props.outline_lvl_explicit,
+            "body text must still settle the question, so the style is never consulted"
+        );
+    }
+
+    #[test]
+    fn sprm_p_out_lvl_above_nine_is_not_an_outline_level() {
+        let props = extract_pap_props(&[0x40, 0x26, 0x0A]);
+        assert_eq!(props.outline_level, None);
+        assert!(
+            !props.outline_lvl_explicit,
+            "an operand above 0x09 is not an outline level and must not settle anything"
+        );
+    }
+
     /// `sprmPIstd` (0x4600) overrides the PAPX `istd`; its operand is the 2-byte
     /// istd. It surfaces on `PapProps.style_istd` from the same grpprl walk that
     /// decodes the other paragraph properties.

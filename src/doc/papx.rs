@@ -840,7 +840,9 @@ mod tests {
     /// which is explicitly marked body text is body text.
     ///
     /// This pins the difference between "the SPRM is absent" (consult the
-    /// style) and "the SPRM is present with level 0" (settle it as body text).
+    /// style) and "the SPRM is present with operand `0x09`", the body-text
+    /// marker (settle it as body text). The marker is `0x09`, *not* `0x00`:
+    /// `0x00` is Heading 1.
     #[test]
     fn build_paragraphs_sprm_out_lvl_body_marker_suppresses_styled_heading() {
         let styles = vec![
@@ -869,7 +871,7 @@ mod tests {
         assert_eq!(paras.len(), 1);
         assert_eq!(
             paras[0].props.outline_level, None,
-            "an explicit outline level 0 must suppress the style-derived heading"
+            "an explicit body-text marker (operand 0x09) must suppress the style-derived heading"
         );
     }
 
