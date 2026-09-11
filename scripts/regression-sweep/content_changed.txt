@@ -1,166 +1,162 @@
-basic__lo_bnc862510_7.pptx	html	112	41	-71
+basic__lo_bnc862510_7.pptx	html	112	142	+30
 basic__lo_bnc862510_7.pptx	ir	1336	970	-366
-basic__lo_smartart-snake-rows.pptx	html	10	0	-10
+basic__lo_smartart-snake-rows.pptx	html	10	40	+30
 basic__lo_smartart-snake-rows.pptx	ir	470	160	-310
-basic__lo_tdf104788.pptx	html	795	139	-656
+basic__lo_tdf104788.pptx	html	795	855	+60
 basic__lo_tdf104788.pptx	ir	3186	1942	-1244
-basic__lo_tdf89064.pptx	html	26	14	-12
+basic__lo_tdf89064.pptx	html	26	56	+30
 basic__lo_tdf89064.pptx	ir	914	609	-305
-basic__npoi_SampleShow.pptx	html	395	292	-103
+basic__npoi_SampleShow.pptx	html	395	455	+60
 basic__npoi_SampleShow.pptx	ir	3317	2627	-690
-basic__openxml-sdk_AutoShapes_2D_Reflection (full).pptx	html	121	92	-29
+basic__openxml-sdk_AutoShapes_2D_Reflection (full).pptx	html	121	151	+30
 basic__openxml-sdk_AutoShapes_2D_Reflection (full).pptx	ir	1799	1477	-322
-basic__openxml-sdk_AutoShapes_2D_Shadow (Offset, Diagonal).pptx	html	126	97	-29
+basic__openxml-sdk_AutoShapes_2D_Shadow (Offset, Diagonal).pptx	html	126	156	+30
 basic__openxml-sdk_AutoShapes_2D_Shadow (Offset, Diagonal).pptx	ir	1809	1487	-322
-basic__openxml-sdk_AutoShapes_3D_Bevel (Circle)+Shadow (Offset, Diagonal).pptx	html	138	109	-29
+basic__openxml-sdk_AutoShapes_3D_Bevel (Circle)+Shadow (Offset, Diagonal).pptx	html	138	168	+30
 basic__openxml-sdk_AutoShapes_3D_Bevel (Circle)+Shadow (Offset, Diagonal).pptx	ir	1833	1511	-322
-basic__openxml-sdk_AutoShapes_3D_Bevel (Circle).pptx	html	106	77	-29
+basic__openxml-sdk_AutoShapes_3D_Bevel (Circle).pptx	html	106	136	+30
 basic__openxml-sdk_AutoShapes_3D_Bevel (Circle).pptx	ir	1769	1447	-322
-basic__openxml-sdk_AutoShapes_3D_Bevel (Riblet)+Reflection (full).pptx	html	132	103	-29
+basic__openxml-sdk_AutoShapes_3D_Bevel (Riblet)+Reflection (full).pptx	html	132	162	+30
 basic__openxml-sdk_AutoShapes_3D_Bevel (Riblet)+Reflection (full).pptx	ir	1821	1499	-322
-basic__openxml-sdk_AutoShapes_3D_Rotation_Parallel (Isometric Right Up).pptx	html	120	91	-29
+basic__openxml-sdk_AutoShapes_3D_Rotation_Parallel (Isometric Right Up).pptx	html	120	150	+30
 basic__openxml-sdk_AutoShapes_3D_Rotation_Parallel (Isometric Right Up).pptx	ir	1797	1475	-322
-basic__openxml-sdk_Bug571679_Brownbag.pptx	html	6874	5026	-1848
+basic__openxml-sdk_Bug571679_Brownbag.pptx	html	6874	7114	+240
 basic__openxml-sdk_Bug571679_Brownbag.pptx	ir	63134	58941	-4193
-basic__openxml-sdk_Text_100chars+Animation (Fly In, all at once).pptx	html	197	138	-59
+basic__openxml-sdk_Text_100chars+Animation (Fly In, all at once).pptx	html	197	227	+30
 basic__openxml-sdk_Text_100chars+Animation (Fly In, all at once).pptx	ir	1569	1217	-352
-basic__openxml-sdk_Text_100chars+Animation (Fly In, by letter).pptx	html	195	138	-57
+basic__openxml-sdk_Text_100chars+Animation (Fly In, by letter).pptx	html	195	225	+30
 basic__openxml-sdk_Text_100chars+Animation (Fly In, by letter).pptx	ir	1567	1217	-350
-basic__openxml-sdk_Text_100chars.pptx	html	167	138	-29
+basic__openxml-sdk_Text_100chars.pptx	html	167	197	+30
 basic__openxml-sdk_Text_100chars.pptx	ir	1539	1217	-322
-basic__openxml-sdk_Text_200chars.pptx	html	292	263	-29
+basic__openxml-sdk_Text_200chars.pptx	html	292	322	+30
 basic__openxml-sdk_Text_200chars.pptx	ir	1957	1635	-322
-basic__openxml-sdk_Text_withEffects_100chars+Animation (Fly In, all at once).pptx	html	265	172	-93
+basic__openxml-sdk_Text_withEffects_100chars+Animation (Fly In, all at once).pptx	html	265	295	+30
 basic__openxml-sdk_Text_withEffects_100chars+Animation (Fly In, all at once).pptx	ir	1601	1215	-386
-basic__openxml-sdk_Text_withEffects_100chars+Animation (Fly In, by letter).pptx	html	263	172	-91
+basic__openxml-sdk_Text_withEffects_100chars+Animation (Fly In, by letter).pptx	html	263	293	+30
 basic__openxml-sdk_Text_withEffects_100chars+Animation (Fly In, by letter).pptx	ir	1599	1215	-384
-basic__openxml-sdk_Text_withEffects_100chars.pptx	html	201	172	-29
+basic__openxml-sdk_Text_withEffects_100chars.pptx	html	201	231	+30
 basic__openxml-sdk_Text_withEffects_100chars.pptx	ir	1537	1215	-322
-basic__openxml-sdk_Text_withEffects_200chars.pptx	html	343	314	-29
+basic__openxml-sdk_Text_withEffects_200chars.pptx	html	343	373	+30
 basic__openxml-sdk_Text_withEffects_200chars.pptx	ir	1954	1632	-322
-basic__openxml-sdk_Text_withExtrusion_100chars+Animation (Fly In, all at once).pptx	html	354	138	-216
+basic__openxml-sdk_Text_withExtrusion_100chars+Animation (Fly In, all at once).pptx	html	354	384	+30
 basic__openxml-sdk_Text_withExtrusion_100chars+Animation (Fly In, all at once).pptx	ir	1732	1217	-515
-basic__openxml-sdk_Text_withExtrusion_100chars+Animation (Fly In, by letter).pptx	html	351	138	-213
+basic__openxml-sdk_Text_withExtrusion_100chars+Animation (Fly In, by letter).pptx	html	351	381	+30
 basic__openxml-sdk_Text_withExtrusion_100chars+Animation (Fly In, by letter).pptx	ir	1729	1217	-512
-basic__openxml-sdk_Text_withExtrusion_100chars.pptx	html	287	138	-149
+basic__openxml-sdk_Text_withExtrusion_100chars.pptx	html	287	317	+30
 basic__openxml-sdk_Text_withExtrusion_100chars.pptx	ir	1665	1217	-448
-basic__openxml-sdk_Text_withExtrusion_200chars+Animation (Fly In, all at once).pptx	html	478	263	-215
+basic__openxml-sdk_Text_withExtrusion_200chars+Animation (Fly In, all at once).pptx	html	478	508	+30
 basic__openxml-sdk_Text_withExtrusion_200chars+Animation (Fly In, all at once).pptx	ir	2149	1635	-514
-basic__openxml-sdk_Text_withExtrusion_200chars+Animation (Fly In, by letter).pptx	html	476	263	-213
+basic__openxml-sdk_Text_withExtrusion_200chars+Animation (Fly In, by letter).pptx	html	476	506	+30
 basic__openxml-sdk_Text_withExtrusion_200chars+Animation (Fly In, by letter).pptx	ir	2147	1635	-512
-basic__openxml-sdk_Text_withExtrusion_200chars.pptx	html	412	263	-149
+basic__openxml-sdk_Text_withExtrusion_200chars.pptx	html	412	442	+30
 basic__openxml-sdk_Text_withExtrusion_200chars.pptx	ir	2083	1635	-448
-basic__openxml-sdk_Text_withShadow_100chars+Animation (Fly In, all at once).pptx	html	327	138	-189
+basic__openxml-sdk_Text_withShadow_100chars+Animation (Fly In, all at once).pptx	html	327	357	+30
 basic__openxml-sdk_Text_withShadow_100chars+Animation (Fly In, all at once).pptx	ir	1703	1217	-486
-basic__openxml-sdk_Text_withShadow_100chars+Animation (Fly In, by letter).pptx	html	327	138	-189
+basic__openxml-sdk_Text_withShadow_100chars+Animation (Fly In, by letter).pptx	html	327	357	+30
 basic__openxml-sdk_Text_withShadow_100chars+Animation (Fly In, by letter).pptx	ir	1703	1217	-486
-basic__openxml-sdk_Text_withShadow_100chars.pptx	html	327	138	-189
+basic__openxml-sdk_Text_withShadow_100chars.pptx	html	327	357	+30
 basic__openxml-sdk_Text_withShadow_100chars.pptx	ir	1703	1217	-486
-basic__openxml-sdk_Text_withShadow_200chars+Animation (Fly In, all at once).pptx	html	544	272	-272
+basic__openxml-sdk_Text_withShadow_200chars+Animation (Fly In, all at once).pptx	html	544	574	+30
 basic__openxml-sdk_Text_withShadow_200chars+Animation (Fly In, all at once).pptx	ir	2635	2064	-571
-basic__openxml-sdk_Text_withShadow_200chars+Animation (Fly In, by letter).pptx	html	544	272	-272
+basic__openxml-sdk_Text_withShadow_200chars+Animation (Fly In, by letter).pptx	html	544	574	+30
 basic__openxml-sdk_Text_withShadow_200chars+Animation (Fly In, by letter).pptx	ir	2635	2064	-571
-basic__openxml-sdk_Text_withShadow_200chars.pptx	html	544	272	-272
+basic__openxml-sdk_Text_withShadow_200chars.pptx	html	544	574	+30
 basic__openxml-sdk_Text_withShadow_200chars.pptx	ir	2635	2064	-571
-basic__pandoc_deleted.pptx	html	542	506	-36
+basic__pandoc_deleted.pptx	html	542	572	+30
 basic__pandoc_deleted.pptx	ir	6117	5789	-328
-basic__pandoc_moved.pptx	html	542	506	-36
+basic__pandoc_moved.pptx	html	542	572	+30
 basic__pandoc_moved.pptx	ir	6117	5789	-328
-basic__poi_60810.pptx	html	26146	20530	-5616
+basic__poi_60810.pptx	html	26146	26326	+180
 basic__poi_60810.pptx	ir	172759	165363	-7396
-basic__poi_SampleShow.pptx	html	395	292	-103
+basic__poi_SampleShow.pptx	html	395	455	+60
 basic__poi_SampleShow.pptx	ir	3317	2627	-690
-basic__poi_aptia.pptx	html	3636	3584	-52
+basic__poi_aptia.pptx	html	3636	3666	+30
 basic__poi_aptia.pptx	ir	41446	41101	-345
-basic__poi_at.ecodesign.www_downloads_Vertiefungsvortrag_elektronik.pptx	html	11135	9991	-1144
+basic__poi_at.ecodesign.www_downloads_Vertiefungsvortrag_elektronik.pptx	html	11135	11495	+360
 basic__poi_at.ecodesign.www_downloads_Vertiefungsvortrag_elektronik.pptx	ir	84421	79756	-4665
-basic__poi_au.asn.aes.www_conferences_2011_presentations_Fri_20Room4Level4_20930_20Maloney.pptx	html	24149	19323	-4826
+basic__poi_au.asn.aes.www_conferences_2011_presentations_Fri_20Room4Level4_20930_20Maloney.pptx	html	24149	24479	+330
 basic__poi_au.asn.aes.www_conferences_2011_presentations_Fri_20Room4Level4_20930_20Maloney.pptx	ir	249751	241663	-8088
-basic__poi_bug65551.pptx	html	14	0	-14
+basic__poi_bug65551.pptx	html	14	44	+30
 basic__poi_bug65551.pptx	ir	474	160	-314
-basic__poi_ca.ubc.cs.people_~emhill_presentations_HowWeRefactor.pptx	html	16252	14316	-1936
+basic__poi_ca.ubc.cs.people_~emhill_presentations_HowWeRefactor.pptx	html	16252	16612	+360
 basic__poi_ca.ubc.cs.people_~emhill_presentations_HowWeRefactor.pptx	ir	385551	380061	-5490
-basic__poi_customGeo.pptx	html	29947	19117	-10830
+basic__poi_customGeo.pptx	html	29947	30907	+960
 basic__poi_customGeo.pptx	ir	195312	175081	-20231
-basic__python-pptx_ph-inherit-props.pptx	html	132	36	-96
+basic__python-pptx_ph-inherit-props.pptx	html	132	192	+60
 basic__python-pptx_ph-inherit-props.pptx	ir	1678	997	-681
-basic__python-pptx_prs-notes.pptx	html	12	0	-12
+basic__python-pptx_prs-notes.pptx	html	12	42	+30
 basic__python-pptx_prs-notes.pptx	ir	461	149	-312
-basic__python-pptx_sld-notes.pptx	html	12	0	-12
+basic__python-pptx_sld-notes.pptx	html	12	42	+30
 basic__python-pptx_sld-notes.pptx	ir	516	204	-312
-basic__tika_testPPT_various2.pptx	html	1133	1086	-47
+basic__tika_testPPT_various2.pptx	html	1133	1193	+60
 basic__tika_testPPT_various2.pptx	ir	20600	19967	-633
 basic__umya_issue_296.xlsx	html	17338	17302	-36
 basic__umya_issue_296.xlsx	ir	353707	353671	-36
 basic__umya_issue_296.xlsx	markdown	4925	4889	-36
 basic__umya_issue_296.xlsx	text	2182	2146	-36
-charts__openxml-sdk_Chart_2D+Animation (Box In, as one object).pptx	html	82	44	-38
+charts__openxml-sdk_Chart_2D+Animation (Box In, as one object).pptx	html	82	112	+30
 charts__openxml-sdk_Chart_2D+Animation (Box In, as one object).pptx	ir	873	542	-331
-charts__openxml-sdk_Chart_2D+Animation (Box In, by element in category).pptx	html	91	53	-38
+charts__openxml-sdk_Chart_2D+Animation (Box In, by element in category).pptx	html	91	121	+30
 charts__openxml-sdk_Chart_2D+Animation (Box In, by element in category).pptx	ir	891	560	-331
-charts__openxml-sdk_Chart_2D+Animation (Fly In, as one object).pptx	html	82	44	-38
+charts__openxml-sdk_Chart_2D+Animation (Fly In, as one object).pptx	html	82	112	+30
 charts__openxml-sdk_Chart_2D+Animation (Fly In, as one object).pptx	ir	873	542	-331
-charts__openxml-sdk_Chart_2D+Animation (Fly In, by element in category).pptx	html	91	53	-38
+charts__openxml-sdk_Chart_2D+Animation (Fly In, by element in category).pptx	html	91	121	+30
 charts__openxml-sdk_Chart_2D+Animation (Fly In, by element in category).pptx	ir	891	560	-331
-charts__openxml-sdk_Chart_2D.pptx	html	48	19	-29
+charts__openxml-sdk_Chart_2D.pptx	html	48	78	+30
 charts__openxml-sdk_Chart_2D.pptx	ir	814	492	-322
-charts__openxml-sdk_Chart_3D (Column)+Animation (Box In, as one object).pptx	html	88	51	-37
+charts__openxml-sdk_Chart_3D (Column)+Animation (Box In, as one object).pptx	html	88	118	+30
 charts__openxml-sdk_Chart_3D (Column)+Animation (Box In, as one object).pptx	ir	886	556	-330
-charts__openxml-sdk_Chart_3D (Column)+Animation (Box Out, as one object).pptx	html	147	61	-86
+charts__openxml-sdk_Chart_3D (Column)+Animation (Box Out, as one object).pptx	html	147	177	+30
 charts__openxml-sdk_Chart_3D (Column)+Animation (Box Out, as one object).pptx	ir	963	583	-380
-charts__openxml-sdk_Chart_3D (Column)+Animation (Fly In, as one object).pptx	html	88	51	-37
+charts__openxml-sdk_Chart_3D (Column)+Animation (Fly In, as one object).pptx	html	88	118	+30
 charts__openxml-sdk_Chart_3D (Column)+Animation (Fly In, as one object).pptx	ir	886	556	-330
-charts__openxml-sdk_Chart_3D (Column)+Animation (Fly Out, as one object).pptx	html	147	61	-86
+charts__openxml-sdk_Chart_3D (Column)+Animation (Fly Out, as one object).pptx	html	147	177	+30
 charts__openxml-sdk_Chart_3D (Column)+Animation (Fly Out, as one object).pptx	ir	963	583	-380
-charts__openxml-sdk_Chart_3D (Column).pptx	html	55	26	-29
+charts__openxml-sdk_Chart_3D (Column).pptx	html	55	85	+30
 charts__openxml-sdk_Chart_3D (Column).pptx	ir	828	506	-322
-charts__openxml-sdk_Chart_3D(Column)+Animation (Box In, by element in category).pptx	html	98	60	-38
+charts__openxml-sdk_Chart_3D(Column)+Animation (Box In, by element in category).pptx	html	98	128	+30
 charts__openxml-sdk_Chart_3D(Column)+Animation (Box In, by element in category).pptx	ir	905	574	-331
-charts__openxml-sdk_Chart_3D(Column)+Animation (Box Out, by element in category).pptx	html	100	61	-39
+charts__openxml-sdk_Chart_3D(Column)+Animation (Box Out, by element in category).pptx	html	100	130	+30
 charts__openxml-sdk_Chart_3D(Column)+Animation (Box Out, by element in category).pptx	ir	908	576	-332
-charts__openxml-sdk_Chart_3D(Column)+Animation (Fly In, by element in category).pptx	html	98	60	-38
+charts__openxml-sdk_Chart_3D(Column)+Animation (Fly In, by element in category).pptx	html	98	128	+30
 charts__openxml-sdk_Chart_3D(Column)+Animation (Fly In, by element in category).pptx	ir	905	574	-331
-charts__openxml-sdk_Chart_3D(Column)+Animation (Fly Out, by element in category).pptx	html	100	61	-39
+charts__openxml-sdk_Chart_3D(Column)+Animation (Fly Out, by element in category).pptx	html	100	130	+30
 charts__openxml-sdk_Chart_3D(Column)+Animation (Fly Out, by element in category).pptx	ir	908	576	-332
-charts__openxml-sdk_SmartArt_OrgChart1+Animation (Fly In, as one object).pptx	html	71	42	-29
+charts__openxml-sdk_SmartArt_OrgChart1+Animation (Fly In, as one object).pptx	html	71	101	+30
 charts__openxml-sdk_SmartArt_OrgChart1+Animation (Fly In, as one object).pptx	ir	858	536	-322
-charts__openxml-sdk_SmartArt_OrgChart1+Animation (Fly In, by level one by one).pptx	html	77	48	-29
+charts__openxml-sdk_SmartArt_OrgChart1+Animation (Fly In, by level one by one).pptx	html	77	107	+30
 charts__openxml-sdk_SmartArt_OrgChart1+Animation (Fly In, by level one by one).pptx	ir	870	548	-322
-charts__openxml-sdk_SmartArt_OrgChart1.pptx	html	46	17	-29
+charts__openxml-sdk_SmartArt_OrgChart1.pptx	html	46	76	+30
 charts__openxml-sdk_SmartArt_OrgChart1.pptx	ir	808	486	-322
-charts__openxml-sdk_SmartArt_OrgChart1_3D+Animation (Fly In, as one object).pptx	html	91	62	-29
+charts__openxml-sdk_SmartArt_OrgChart1_3D+Animation (Fly In, as one object).pptx	html	91	121	+30
 charts__openxml-sdk_SmartArt_OrgChart1_3D+Animation (Fly In, as one object).pptx	ir	898	576	-322
-charts__openxml-sdk_SmartArt_OrgChart1_3D+Animation (Fly In, by level one by one).pptx	html	97	68	-29
+charts__openxml-sdk_SmartArt_OrgChart1_3D+Animation (Fly In, by level one by one).pptx	html	97	127	+30
 charts__openxml-sdk_SmartArt_OrgChart1_3D+Animation (Fly In, by level one by one).pptx	ir	910	588	-322
-charts__openxml-sdk_SmartArt_OrgChart1_3D.pptx	html	67	39	-28
+charts__openxml-sdk_SmartArt_OrgChart1_3D.pptx	html	67	97	+30
 charts__openxml-sdk_SmartArt_OrgChart1_3D.pptx	ir	852	530	-322
-edge_cases__openxml-sdk_AutoShapes_2D_Soft Edges (5 Point).pptx	html	111	82	-29
+edge_cases__openxml-sdk_AutoShapes_2D_Soft Edges (5 Point).pptx	html	111	141	+30
 edge_cases__openxml-sdk_AutoShapes_2D_Soft Edges (5 Point).pptx	ir	1779	1457	-322
-edge_cases__openxml-sdk_AutoShapes_3D_Bevel (Circle)+Soft Edges (5 Point).pptx	html	130	100	-30
+edge_cases__openxml-sdk_AutoShapes_3D_Bevel (Circle)+Soft Edges (5 Point).pptx	html	130	160	+30
 edge_cases__openxml-sdk_AutoShapes_3D_Bevel (Circle)+Soft Edges (5 Point).pptx	ir	1817	1493	-324
-formatting__closedxml_CellsWithTimeSpanDataTypeOrFormatting.xlsx	html	1291	1281	-10
-formatting__closedxml_CellsWithTimeSpanDataTypeOrFormatting.xlsx	ir	23936	23926	-10
-formatting__closedxml_CellsWithTimeSpanDataTypeOrFormatting.xlsx	markdown	674	664	-10
-formatting__closedxml_CellsWithTimeSpanDataTypeOrFormatting.xlsx	text	547	537	-10
-images__openxml-sdk_Image_AnimatedGIF.pptx	html	50	21	-29
+images__openxml-sdk_Image_AnimatedGIF.pptx	html	50	80	+30
 images__openxml-sdk_Image_AnimatedGIF.pptx	ir	997	675	-322
-images__openxml-sdk_Image_Small+3D Rotation+Animatioin (Fly In).pptx	html	101	72	-29
+images__openxml-sdk_Image_Small+3D Rotation+Animatioin (Fly In).pptx	html	101	131	+30
 images__openxml-sdk_Image_Small+3D Rotation+Animatioin (Fly In).pptx	ir	1103	781	-322
-images__openxml-sdk_Image_Small+3D Rotation.pptx	html	92	63	-29
+images__openxml-sdk_Image_Small+3D Rotation.pptx	html	92	122	+30
 images__openxml-sdk_Image_Small+3D Rotation.pptx	ir	1085	763	-322
-images__openxml-sdk_Image_Small.pptx	html	51	22	-29
+images__openxml-sdk_Image_Small.pptx	html	51	81	+30
 images__openxml-sdk_Image_Small.pptx	ir	1003	681	-322
-images__openxml-sdk_o09_Performance_typical.pptx	html	6087	5468	-619
+images__openxml-sdk_o09_Performance_typical.pptx	html	6087	6207	+120
 images__openxml-sdk_o09_Performance_typical.pptx	ir	65439	63623	-1816
-images__openxml-sdk_typical.pptx	html	11907	9192	-2715
+images__openxml-sdk_typical.pptx	html	11907	12027	+120
 images__openxml-sdk_typical.pptx	ir	114178	110271	-3907
-large__poi_2411-Performance_Up.pptx	html	13128	11710	-1418
+large__poi_2411-Performance_Up.pptx	html	13128	13368	+240
 large__poi_2411-Performance_Up.pptx	ir	150428	146637	-3791
-styles__openxml-sdk_AutoShapes_2D (Default Styles).pptx	html	99	70	-29
+styles__openxml-sdk_AutoShapes_2D (Default Styles).pptx	html	99	129	+30
 styles__openxml-sdk_AutoShapes_2D (Default Styles).pptx	ir	1755	1433	-322
-tables__openxml-sdk_Table_Large.pptx	html	1790	1760	-30
+tables__openxml-sdk_Table_Large.pptx	html	1790	1820	+30
 tables__openxml-sdk_Table_Large.pptx	ir	46843	46519	-324
-tables__openxml-sdk_Table_Small+Animation (Fly In).pptx	html	537	508	-29
+tables__openxml-sdk_Table_Small+Animation (Fly In).pptx	html	537	567	+30
 tables__openxml-sdk_Table_Small+Animation (Fly In).pptx	ir	13695	13373	-322
-tables__openxml-sdk_Table_Small.pptx	html	529	499	-30
+tables__openxml-sdk_Table_Small.pptx	html	529	559	+30
 tables__openxml-sdk_Table_Small.pptx	ir	13679	13355	-324
