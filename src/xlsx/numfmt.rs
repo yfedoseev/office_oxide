@@ -92,7 +92,10 @@ pub fn apply_format(n: f64, fmt_id: u32, fmt_str: Option<&str>) -> String {
         _ => {},
     }
 
-    // Custom format string (IDs 164+).
+    // Custom format string (IDs 164+), or a workbook's explicit override of a
+    // built-in id. Callers must pass the *declared* code here, never one
+    // resolved from the built-in table: apply_custom is not a general format
+    // engine and garbles codes the match above already declined to handle.
     if let Some(fmt) = fmt_str {
         let fmt = fmt.trim();
         // The General/text sentinels are matched case-insensitively, and
@@ -859,5 +862,28 @@ mod tests {
     fn format_percent_zero_decimals() {
         // 50% with 0 decimals.
         assert_eq!(format_percent(0.5, 0), "50%");
+    }
+}
+
+#[cfg(test)]
+mod builtin_code_tests {
+    use super::*;
+
+    /// `apply_format`'s `fmt_str` branch is for codes a workbook *declares*.
+    /// Feeding it a code resolved from the built-in table sends it to
+    /// `apply_custom`, which is not a general format engine: id 47's
+    /// `mm:ss.0` came out as the literal `mm:ss0.6`.
+    #[test]
+    fn a_builtin_code_is_not_fed_back_in_as_a_custom_format() {
+        let v = 0.563_138_888_888_888_9;
+        // No declared override: the built-in table decides, and id 47 is not
+        // one apply_format renders, so the raw value must survive.
+        let out = apply_format(v, 47, None);
+        assert!(!out.contains("mm:ss"), "format code leaked into the value: {out}");
+        assert!(out.starts_with("0.56"), "value lost: {out}");
+
+        // A genuine declared override is still honoured.
+        let out = apply_format(0.5, 164, Some("0.00\" kg\""));
+        assert!(out.contains("kg"), "declared custom format ignored: {out}");
     }
 }

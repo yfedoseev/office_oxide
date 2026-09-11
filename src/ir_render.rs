@@ -800,6 +800,13 @@ fn render_section_html(section: &Section) -> String {
             parts.push(html);
         }
     }
+    // Speaker notes are not slide-surface content, but dropping them from
+    // HTML loses text the plain and markdown renderers both keep.
+    if let Some(ref notes) = section.speaker_notes {
+        if !notes.is_empty() {
+            parts.push(format!("<aside class=\"speaker-notes\">{}</aside>", escape_html(notes)));
+        }
+    }
     for hf in section_footers(section) {
         for elem in &hf.content {
             let html = render_element_html(elem);
@@ -1200,5 +1207,39 @@ mod tests {
         let ir = simple_ir(vec![Element::ThematicBreak]);
         let html = ir.to_html();
         assert!(html.contains("<hr"), "html: {html}");
+    }
+}
+
+#[cfg(test)]
+mod speaker_notes_render_tests {
+    use super::*;
+
+    /// All three renderers must surface speaker notes. Moving notes out of
+    /// `elements` fixed the leak on the write side but dropped them from
+    /// HTML, which a corpus sweep against v0.1.10 caught.
+    #[test]
+    fn every_renderer_surfaces_speaker_notes() {
+        let ir = DocumentIR {
+            sections: vec![Section {
+                elements: vec![Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan {
+                        text: "VisibleBody".into(),
+                        ..Default::default()
+                    })],
+                    ..Default::default()
+                })],
+                speaker_notes: Some("NoteText".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for (name, out) in [
+            ("plain", ir.plain_text()),
+            ("markdown", ir.to_markdown()),
+            ("html", ir.to_html()),
+        ] {
+            assert!(out.contains("VisibleBody"), "{name}: body text lost");
+            assert!(out.contains("NoteText"), "{name}: speaker notes lost:\n{out}");
+        }
     }
 }
