@@ -367,8 +367,14 @@ impl SheetDataInner {
     }
 
     pub fn add_row(&mut self, cells: Vec<CellData>) -> &mut Self {
+        // set_cell gates on the grid; add_row must too, or a long row emits
+        // cells past column XFD, which do not exist and make Excel repair.
+        if !in_grid(self.rows.len(), 0) {
+            return self;
+        }
         let stored: Vec<Option<StoredCellInner>> = cells
             .into_iter()
+            .take(MAX_COLS)
             .map(|v| Some(StoredCellInner { value: v }))
             .collect();
         self.rows.push(stored);
@@ -401,6 +407,12 @@ impl SheetDataInner {
     }
 
     pub fn set_column_width(&mut self, col: usize, width: f64) -> &mut Self {
+        // `inf` is not a valid xsd:double lexical form and Excel caps width
+        // at 255; a non-finite or out-of-range value is dropped rather than
+        // written through.
+        if !in_grid(0, col) || !width.is_finite() || !(0.0..=MAX_COL_WIDTH).contains(&width) {
+            return self;
+        }
         self.col_widths.insert(col, width);
         self
     }
@@ -412,9 +424,14 @@ impl SheetDataInner {
         row_span: usize,
         col_span: usize,
     ) -> &mut Self {
-        if row_span == 0 || col_span == 0 {
+        if row_span == 0 || col_span == 0 || !in_grid(row, col) {
             return self;
         }
+        // Saturate against the grid rather than adding: `col + col_span` with
+        // a caller-supplied usize overflows, which panicked in debug and wrote
+        // a garbage reference in release.
+        let row_span = row_span.min(MAX_ROWS - row);
+        let col_span = col_span.min(MAX_COLS - col);
         if row_span > 1 || col_span > 1 {
             self.merge_regions.push((row, col, row_span, col_span));
         }
@@ -430,6 +447,26 @@ struct StoredCellInner {
 /// cell is `XFD1048576`.
 const MAX_ROWS: usize = 1_048_576;
 const MAX_COLS: usize = 16_384;
+/// Excel's maximum column width, in characters.
+const MAX_COL_WIDTH: f64 = 255.0;
+/// Excel's maximum characters in a single cell.
+const MAX_CELL_CHARS: usize = 32_767;
+
+/// `ST_UnsignedIntHex` is exactly four bytes of hex — `AARRGGBB`. The public
+/// API documents a six-character RGB string but enforced nothing, so `#FF0000`
+/// (the CSS form), a three-digit shorthand, or an already-ARGB eight-character
+/// value all produced an invalid `styles.xml`.
+fn argb_from_rgb(hex: &str) -> Option<String> {
+    let t = hex.strip_prefix('#').unwrap_or(hex);
+    if !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    match t.len() {
+        6 => Some(format!("FF{}", t.to_ascii_uppercase())),
+        8 => Some(t.to_ascii_uppercase()),
+        _ => None,
+    }
+}
 
 /// Whether a 0-based (row, col) is addressable in Excel. Writing outside it
 /// emitted references like `XFE1048577` that name a cell which does not
@@ -462,10 +499,14 @@ fn sanitize_sheet_name(name: &str, existing: &[String]) -> String {
             }
         })
         .collect();
-    // Excel also rejects a leading or trailing apostrophe.
+    // Excel also rejects a leading or trailing apostrophe. Trim AFTER
+    // truncating as well: cutting a 40-character name at 31 can put an
+    // apostrophe back on the end.
     let cleaned = cleaned.trim_matches('\'').to_string();
     let mut base: String = cleaned.chars().take(31).collect();
-    if base.trim().is_empty() {
+    base = base.trim_matches('\'').to_string();
+    if base.trim().is_empty() || base.eq_ignore_ascii_case("History") {
+        // "History" is reserved by Excel outright.
         base = format!("Sheet{}", existing.len() + 1);
     }
     if !existing.iter().any(|e| e.eq_ignore_ascii_case(&base)) {
@@ -780,6 +821,17 @@ impl XlsxWriter {
     // -----------------------------------------------------------------------
 
     fn write_parts<W: Write + Seek>(&self, opc: &mut OpcWriter<W>) -> Result<()> {
+        // CT_Sheets requires at least one sheet. Writing <sheets/> produced a
+        // workbook no reader accepts, and save() still returned Ok, so add a
+        // blank sheet rather than emitting an invalid file.
+        let default_sheet;
+        let sheets: &[SheetDataInner] = if self.sheets.is_empty() {
+            default_sheet = [SheetDataInner::new("Sheet1")];
+            &default_sheet
+        } else {
+            &self.sheets
+        };
+
         let wb_part = PartName::new("/xl/workbook.xml")?;
 
         opc.add_package_rel(rel_types::OFFICE_DOCUMENT, "xl/workbook.xml");
@@ -795,21 +847,21 @@ impl XlsxWriter {
             opc.add_part(&core_part, crate::core::core_properties::CONTENT_TYPE, &core_xml)?;
         }
 
-        let mut sheet_rids = Vec::with_capacity(self.sheets.len());
-        for (i, _) in self.sheets.iter().enumerate() {
+        let mut sheet_rids = Vec::with_capacity(sheets.len());
+        for (i, _) in sheets.iter().enumerate() {
             let target = format!("worksheets/sheet{}.xml", i + 1);
             let rid = opc.add_part_rel(&wb_part, rel_types::WORKSHEET, &target);
             sheet_rids.push(rid);
         }
         opc.add_part_rel(&wb_part, rel_types::STYLES, "styles.xml");
 
-        let wb_xml = self.build_workbook_xml(&sheet_rids)?;
+        let wb_xml = Self::build_workbook_xml(sheets, &sheet_rids)?;
         opc.add_part(&wb_part, CT_WORKBOOK, &wb_xml)?;
 
         // Collect all unique styles across all sheets, assign indices.
-        let style_table = StyleTable::build(&self.sheets);
+        let style_table = StyleTable::build(sheets);
 
-        for (i, sheet) in self.sheets.iter().enumerate() {
+        for (i, sheet) in sheets.iter().enumerate() {
             let part_name_str = format!("/xl/worksheets/sheet{}.xml", i + 1);
             let part_name = PartName::new(&part_name_str)?;
 
@@ -847,7 +899,10 @@ impl XlsxWriter {
         Ok(())
     }
 
-    fn build_workbook_xml(&self, sheet_rids: &[String]) -> crate::core::Result<Vec<u8>> {
+    fn build_workbook_xml(
+        sheets: &[SheetDataInner],
+        sheet_rids: &[String],
+    ) -> crate::core::Result<Vec<u8>> {
         let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
 
         w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))?;
@@ -857,11 +912,17 @@ impl XlsxWriter {
         root.push_attribute(("xmlns:r", NS_REL));
         w.write_event(Event::Start(root))?;
 
+        // CT_Sheets requires at least one sheet; an empty <sheets/> is invalid
+        // and Excel will not open the workbook.
         w.write_event(Event::Start(BytesStart::new("sheets")))?;
 
-        for (i, sheet) in self.sheets.iter().enumerate() {
+        for (i, sheet) in sheets.iter().enumerate() {
             let mut elem = BytesStart::new("sheet");
-            elem.push_attribute(("name", sheet.name.as_str()));
+            // sanitize_xml_text is applied to element text everywhere but was
+            // never applied to an attribute: a control character in a sheet
+            // name made workbook.xml unparseable.
+            let safe_name = crate::core::xml::sanitize_xml_text(&sheet.name);
+            elem.push_attribute(("name", safe_name.as_ref()));
             let sheet_id = (i + 1).to_string();
             elem.push_attribute(("sheetId", sheet_id.as_str()));
             elem.push_attribute(("r:id", sheet_rids[i].as_str()));
@@ -1093,8 +1154,30 @@ impl XlsxWriter {
         let s_attr = style_idx.map(|i| i.to_string());
 
         match cell {
-            CellData::Empty => {},
+            // An empty cell with a style must still be written, or formatting
+            // a blank cell silently does nothing.
+            CellData::Empty => {
+                if let Some(ref s_val) = s_attr {
+                    let mut c = BytesStart::new("c");
+                    c.push_attribute(("r", cell_ref.as_str()));
+                    c.push_attribute(("s", s_val.as_str()));
+                    w.write_event(Event::Empty(c))?;
+                }
+            },
             CellData::String(s) => {
+                let s: &str = if s.chars().count() > MAX_CELL_CHARS {
+                    let end = s
+                        .char_indices()
+                        .nth(MAX_CELL_CHARS)
+                        .map_or(s.len(), |(i, _)| i);
+                    log::warn!(
+                        "xlsx: cell text exceeds Excel's {MAX_CELL_CHARS}-character limit; \
+                         truncated"
+                    );
+                    &s[..end]
+                } else {
+                    s
+                };
                 let mut c = BytesStart::new("c");
                 c.push_attribute(("r", cell_ref.as_str()));
                 c.push_attribute(("t", "inlineStr"));
@@ -1165,8 +1248,11 @@ impl XlsxWriter {
                 }
                 w.write_event(Event::Start(c))?;
                 w.write_event(Event::Start(BytesStart::new("f")))?;
+                // [ECMA-376] §18.3.1.40: <f> content excludes the leading '='.
+                // The variant is named Formula, so callers type it by habit.
+                let body = f.strip_prefix('=').unwrap_or(f);
                 w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(
-                    f,
+                    body,
                 ))))?;
                 w.write_event(Event::End(BytesEnd::new("f")))?;
                 w.write_event(Event::End(BytesEnd::new("c")))?;
@@ -1497,7 +1583,13 @@ impl StyleTable {
 
         for sheet in sheets {
             let sheet_ptr = sheet as *const SheetDataInner;
-            for ((row, col), style) in &sheet.cell_styles {
+            // cell_styles is a HashMap, so iterating it directly assigns
+            // font/fill/xf indices in a random order and styles.xml differs
+            // byte-for-byte between runs of the same input. Sort first so the
+            // output is reproducible.
+            let mut styled: Vec<_> = sheet.cell_styles.iter().collect();
+            styled.sort_by_key(|((row, col), _)| (*row, *col));
+            for ((row, col), style) in styled {
                 // Resolve font index — O(1) via HashMap.
                 let font_key = FontKey {
                     bold: style.bold,
@@ -1622,14 +1714,19 @@ impl StyleTable {
                 u.push_attribute(("val", "single"));
                 w.write_event(Event::Empty(u))?;
             }
-            if let Some(ref color) = font.color {
+            if let Some(argb) = font.color.as_deref().and_then(argb_from_rgb) {
                 let mut c = BytesStart::new("color");
-                c.push_attribute(("rgb", format!("FF{color}").as_str()));
+                c.push_attribute(("rgb", argb.as_str()));
                 w.write_event(Event::Empty(c))?;
             }
-            // size: default 11pt if not specified
-            let size_half = font.size_half_pt.unwrap_or(22);
-            let size_val = format!("{}", size_half / 2);
+            // size: default 11pt if not specified. Half-points must survive
+            // (10.5pt is a real size), and Excel accepts 1..=409.
+            let size_half = font.size_half_pt.unwrap_or(22).clamp(2, 818);
+            let size_val = if size_half % 2 == 0 {
+                format!("{}", size_half / 2)
+            } else {
+                format!("{}.5", size_half / 2)
+            };
             let mut sz = BytesStart::new("sz");
             sz.push_attribute(("val", size_val.as_str()));
             w.write_event(Event::Empty(sz))?;
@@ -1659,10 +1756,10 @@ impl StyleTable {
             };
             let mut pf = BytesStart::new("patternFill");
             pf.push_attribute(("patternType", pattern_type));
-            if let Some(ref color) = fill.0 {
+            if let Some(argb) = fill.0.as_deref().and_then(argb_from_rgb) {
                 w.write_event(Event::Start(pf))?;
                 let mut fg = BytesStart::new("fgColor");
-                fg.push_attribute(("rgb", format!("FF{color}").as_str()));
+                fg.push_attribute(("rgb", argb.as_str()));
                 w.write_event(Event::Empty(fg))?;
                 w.write_event(Event::End(BytesEnd::new("patternFill")))?;
             } else {
@@ -1916,5 +2013,199 @@ mod tests {
         }
         assert!(sheet_xml.contains("<mergeCells"), "missing mergeCells");
         assert!(sheet_xml.contains(r#"ref="A1:B1""#), "wrong ref");
+    }
+}
+
+#[cfg(test)]
+mod validity_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn part(wb: &XlsxWriter, name: &str) -> String {
+        let mut buf = Cursor::new(Vec::new());
+        wb.write_to(&mut buf).unwrap();
+        buf.set_position(0);
+        let mut zip = zip::ZipArchive::new(buf).unwrap();
+        let mut e = zip.by_name(name).unwrap();
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut e, &mut xml).unwrap();
+        xml
+    }
+
+    /// `sanitize_xml_text` guarded element text but never an attribute, so a
+    /// control character in a sheet name made `workbook.xml` unparseable.
+    #[test]
+    fn control_characters_in_a_sheet_name_do_not_break_the_workbook_part() {
+        let mut wb = XlsxWriter::new();
+        wb.add_sheet("ctl\u{1}chr")
+            .add_row(vec![CellData::Number(1.0)]);
+        let xml = part(&wb, "xl/workbook.xml");
+        assert!(!xml.contains('\u{1}'), "control char reached workbook.xml");
+        assert!(xml.contains("ctlchr"), "the rest of the name must survive: {xml}");
+    }
+
+    /// `ST_UnsignedIntHex` is exactly four hex bytes.
+    #[test]
+    fn colours_that_are_not_six_hex_digits_are_not_written() {
+        let mut wb = XlsxWriter::new();
+        {
+            let mut s = wb.add_sheet("S");
+            s.set_cell_styled(0, 0, CellData::Number(1.0), CellStyle::new().font_color("#FF0000"));
+            s.set_cell_styled(1, 0, CellData::Number(2.0), CellStyle::new().font_color("red"));
+            s.set_cell_styled(2, 0, CellData::Number(3.0), CellStyle::new().background("F00"));
+        }
+        let xml = part(&wb, "xl/styles.xml");
+        assert!(xml.contains(r#"rgb="FFFF0000""#), "a leading # must be accepted: {xml}");
+        assert!(!xml.contains("FFred"), "non-hex colour written: {xml}");
+        assert!(!xml.contains("FFF00\""), "odd-length hex written: {xml}");
+    }
+
+    /// `CT_Col/@width` is an `xsd:double`; `inf` has no lexical form there,
+    /// and Excel caps width at 255.
+    #[test]
+    fn non_finite_or_out_of_range_column_widths_are_dropped() {
+        let mut wb = XlsxWriter::new();
+        {
+            let mut s = wb.add_sheet("S");
+            s.add_row(vec![CellData::Number(1.0)]);
+            s.set_column_width(0, f64::INFINITY);
+            s.set_column_width(1, f64::NAN);
+            s.set_column_width(2, -5.0);
+            s.set_column_width(3, 1e30);
+            s.set_column_width(4, 20.0);
+        }
+        let xml = part(&wb, "xl/worksheets/sheet1.xml");
+        for bad in ["inf", "NaN", "-5.00", "e30"] {
+            assert!(!xml.contains(bad), "wrote {bad} as a column width: {xml}");
+        }
+        assert!(xml.contains("20.00"), "a valid width must survive: {xml}");
+    }
+
+    /// `CT_Sheets` requires at least one `sheet`.
+    #[test]
+    fn a_workbook_with_no_sheets_still_writes_one() {
+        let wb = XlsxWriter::new();
+        let xml = part(&wb, "xl/workbook.xml");
+        assert!(xml.contains("<sheet "), "workbook must carry a sheet: {xml}");
+        assert!(!xml.contains("<sheets></sheets>"), "empty <sheets> is invalid");
+    }
+
+    /// `col + col_span` with a caller-supplied `usize` overflowed.
+    #[test]
+    fn merge_spans_are_clamped_to_the_grid_and_never_overflow() {
+        let mut wb = XlsxWriter::new();
+        {
+            let mut s = wb.add_sheet("S");
+            s.add_row(vec![CellData::Number(1.0)]);
+            s.merge_cells(1, 0, usize::MAX, 2);
+            s.merge_cells(0, 0, 1, usize::MAX);
+            s.merge_cells(0, 20_000, 2, 2);
+        }
+        // Writing must not panic, and no reference may exceed the grid.
+        let xml = part(&wb, "xl/worksheets/sheet1.xml");
+        assert!(!xml.contains("ACOG"), "merge outside the grid written: {xml}");
+    }
+
+    /// `add_row` must gate on the grid the way `set_cell` does.
+    #[test]
+    fn add_row_does_not_write_cells_past_the_last_column() {
+        let mut wb = XlsxWriter::new();
+        {
+            let mut s = wb.add_sheet("S");
+            s.add_row(
+                (0..(MAX_COLS + 2))
+                    .map(|i| CellData::Number(i as f64))
+                    .collect(),
+            );
+        }
+        let xml = part(&wb, "xl/worksheets/sheet1.xml");
+        assert!(xml.contains(r#"r="XFD1""#), "the last real column must be written");
+        assert!(!xml.contains(r#"r="XFE1""#), "column past XFD written: {xml}");
+    }
+
+    /// [ECMA-376] §18.3.1.40: `<f>` content excludes the leading `=`.
+    #[test]
+    fn a_formula_keeps_no_leading_equals_sign() {
+        let mut wb = XlsxWriter::new();
+        wb.add_sheet("S")
+            .add_row(vec![CellData::Formula("=SUM(A1:A2)".into())]);
+        let xml = part(&wb, "xl/worksheets/sheet1.xml");
+        assert!(xml.contains("<f>SUM(A1:A2)</f>"), "leading = not stripped: {xml}");
+    }
+
+    /// Formatting a blank cell must actually write the style.
+    #[test]
+    fn a_styled_empty_cell_is_written_with_its_style() {
+        let mut wb = XlsxWriter::new();
+        {
+            let mut s = wb.add_sheet("S");
+            s.add_row(vec![CellData::Number(1.0)]);
+            s.set_cell_styled(1, 0, CellData::Empty, CellStyle::new().bold());
+        }
+        let xml = part(&wb, "xl/worksheets/sheet1.xml");
+        assert!(xml.contains(r#"<c r="A2" s="#), "styled empty cell dropped: {xml}");
+    }
+
+    /// Half-point sizes are real; integer division threw them away.
+    #[test]
+    fn half_point_font_sizes_survive_and_out_of_range_ones_clamp() {
+        let mut wb = XlsxWriter::new();
+        {
+            let mut s = wb.add_sheet("S");
+            s.set_cell_styled(0, 0, CellData::Number(1.0), CellStyle::new().font_size(10.5));
+            s.set_cell_styled(1, 0, CellData::Number(2.0), CellStyle::new().font_size(-12.0));
+            s.set_cell_styled(2, 0, CellData::Number(3.0), CellStyle::new().font_size(1e9));
+        }
+        let xml = part(&wb, "xl/styles.xml");
+        assert!(xml.contains(r#"val="10.5""#), "half-point size truncated: {xml}");
+        assert!(!xml.contains(r#"val="0""#), "font size 0 is below Excel's minimum: {xml}");
+        assert!(!xml.contains("1000000000"), "font size not clamped: {xml}");
+    }
+
+    /// The same input must produce the same bytes.
+    #[test]
+    fn styles_are_written_deterministically() {
+        let build = || {
+            let mut wb = XlsxWriter::new();
+            {
+                let mut s = wb.add_sheet("S");
+                for i in 0..8 {
+                    s.set_cell_styled(
+                        i,
+                        0,
+                        CellData::Number(i as f64),
+                        CellStyle::new()
+                            .bold()
+                            .background("FFFF00")
+                            .font_size(9.0 + i as f32),
+                    );
+                }
+            }
+            let mut buf = Cursor::new(Vec::new());
+            wb.write_to(&mut buf).unwrap();
+            buf.set_position(0);
+            let mut zip = zip::ZipArchive::new(buf).unwrap();
+            let mut e = zip.by_name("xl/styles.xml").unwrap();
+            let mut xml = String::new();
+            std::io::Read::read_to_string(&mut e, &mut xml).unwrap();
+            xml
+        };
+        let first = build();
+        for _ in 0..25 {
+            assert_eq!(first, build(), "styles.xml is not deterministic");
+        }
+    }
+
+    /// Truncating a name at 31 characters can put an apostrophe back on the end.
+    #[test]
+    fn sheet_name_truncation_does_not_reintroduce_a_trailing_apostrophe() {
+        let name = format!("{}'{}", "a".repeat(30), "z".repeat(9));
+        let cleaned = sanitize_sheet_name(&name, &[]);
+        assert!(!cleaned.ends_with('\''), "trailing apostrophe survived: {cleaned}");
+        assert!(cleaned.chars().count() <= 31);
+
+        // "History" is reserved by Excel.
+        let cleaned = sanitize_sheet_name("History", &[]);
+        assert_ne!(cleaned, "History", "Excel reserves this name");
     }
 }
