@@ -88,9 +88,22 @@ pub struct Run {
     pub font_size_pt: Option<f64>,
     /// Font name, e.g. `"Calibri"`.
     pub font_name: Option<String>,
+    /// When set, this run is a hard line break (`<a:br/>`) rather than text.
+    pub line_break: bool,
 }
 
 impl Run {
+    /// Create a hard line break. DrawingML has no in-text newline, so a
+    /// break must be its own `<a:br/>` element; dropping it joins the
+    /// surrounding words together.
+    #[must_use]
+    pub fn line_break() -> Self {
+        Self {
+            line_break: true,
+            ..Self::new("")
+        }
+    }
+
     /// Create a plain text run.
     pub fn new(text: impl Into<String>) -> Self {
         Self {
@@ -186,7 +199,7 @@ enum BodyItem {
     /// Free-floating text box: (runs, x_emu, y_emu, cx_emu, cy_emu)
     TextBox(Vec<Run>, i64, i64, i64, i64),
     /// Embedded image: (data, format, x_emu, y_emu, cx_emu, cy_emu)
-    Image(Vec<u8>, crate::ir::ImageFormat, i64, i64, u64, u64),
+    Image(Vec<u8>, crate::ir::ImageFormat, i64, i64, u64, u64, Option<String>),
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +327,25 @@ impl SlideData {
     /// Embed an image at an absolute position on the slide.
     ///
     /// All coordinates are in EMU (English Metric Units; 914 400 EMU = 1 inch).
+    /// Attach an image with alt text. Alt text is what a screen reader
+    /// announces; without it the picture is invisible to assistive tech.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_image_with_alt(
+        &mut self,
+        data: Vec<u8>,
+        format: crate::ir::ImageFormat,
+        x: i64,
+        y: i64,
+        cx: u64,
+        cy: u64,
+        alt: Option<String>,
+    ) -> &mut Self {
+        self.body_items
+            .push(BodyItem::Image(data, format, x, y, cx, cy, alt));
+        self
+    }
+
+    /// Attach an image to this slide at an absolute position, in EMU.
     pub fn add_image(
         &mut self,
         data: Vec<u8>,
@@ -324,7 +356,7 @@ impl SlideData {
         cy: u64,
     ) -> &mut Self {
         self.body_items
-            .push(BodyItem::Image(data, format, x, y, cx, cy));
+            .push(BodyItem::Image(data, format, x, y, cx, cy, None));
         self
     }
 
@@ -555,9 +587,9 @@ impl PptxWriter {
             );
 
             // rId2+ = one per embedded image
-            let mut img_rids: Vec<(String, i64, i64, u64, u64)> = Vec::new();
+            let mut img_rids: Vec<(String, i64, i64, u64, u64, Option<String>)> = Vec::new();
             for item in &slide.body_items {
-                if let BodyItem::Image(data, fmt, x, y, cx, cy) = item {
+                if let BodyItem::Image(data, fmt, x, y, cx, cy, alt) = item {
                     let rid = format!("rId{}", img_rids.len() + 2);
                     let ext = fmt.extension();
                     opc.add_part_rel(
@@ -568,7 +600,7 @@ impl PptxWriter {
                     let media_part =
                         PartName::new(&format!("/ppt/media/image{global_img_idx}.{ext}"))?;
                     opc.add_part(&media_part, fmt.content_type(), data)?;
-                    img_rids.push((rid, *x, *y, *cx, *cy));
+                    img_rids.push((rid, *x, *y, *cx, *cy, alt.clone()));
                     global_img_idx += 1;
                 }
             }
@@ -630,8 +662,13 @@ fn write_decl(w: &mut Writer<Vec<u8>>) {
 }
 
 fn write_text_element(w: &mut Writer<Vec<u8>>, tag: &str, text: &str) {
-    w.write_event(Event::Start(BytesStart::new(tag)))
-        .expect("write start");
+    let mut start = BytesStart::new(tag);
+    // Without xml:space="preserve" a conformant consumer strips leading and
+    // trailing whitespace from the run.
+    if text.starts_with(char::is_whitespace) || text.ends_with(char::is_whitespace) {
+        start.push_attribute(("xml:space", "preserve"));
+    }
+    w.write_event(Event::Start(start)).expect("write start");
     w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(text))))
         .expect("write text");
     w.write_event(Event::End(BytesEnd::new(tag)))
@@ -666,6 +703,11 @@ fn write_nv_grp_sp_pr(w: &mut Writer<Vec<u8>>) {
 
 // Write a DrawingML run (<a:r>) with optional rPr.
 fn write_dml_run(w: &mut Writer<Vec<u8>>, run: &Run) {
+    if run.line_break {
+        w.write_event(Event::Empty(BytesStart::new("a:br")))
+            .expect("write br");
+        return;
+    }
     w.write_event(Event::Start(BytesStart::new("a:r")))
         .expect("write");
 
@@ -1230,7 +1272,7 @@ fn write_layout_placeholder(
 
 fn generate_slide_xml(
     slide: &SlideData,
-    img_rids: &[(String, i64, i64, u64, u64)],
+    img_rids: &[(String, i64, i64, u64, u64, Option<String>)],
     pres_cx: u64,
     pres_cy: u64,
 ) -> Vec<u8> {
@@ -1273,8 +1315,8 @@ fn generate_slide_xml(
     }
 
     // Embedded images
-    for (rid, x, y, cx, cy) in img_rids {
-        write_pic_shape(&mut w, next_id, rid, *x, *y, *cx, *cy);
+    for (rid, x, y, cx, cy, alt) in img_rids {
+        write_pic_shape(&mut w, next_id, rid, *x, *y, *cx, *cy, alt.as_deref());
         next_id += 1;
     }
 
@@ -1541,7 +1583,16 @@ fn write_text_box_shape(
         .expect("write");
 }
 
-fn write_pic_shape(w: &mut Writer<Vec<u8>>, id: u32, rid: &str, x: i64, y: i64, cx: u64, cy: u64) {
+fn write_pic_shape(
+    w: &mut Writer<Vec<u8>>,
+    id: u32,
+    rid: &str,
+    x: i64,
+    y: i64,
+    cx: u64,
+    cy: u64,
+    alt: Option<&str>,
+) {
     let id_str = id.to_string();
     let name = format!("Image {id}");
 
@@ -1553,6 +1604,11 @@ fn write_pic_shape(w: &mut Writer<Vec<u8>>, id: u32, rid: &str, x: i64, y: i64, 
     let mut cnv_pr = BytesStart::new("p:cNvPr");
     cnv_pr.push_attribute(("id", id_str.as_str()));
     cnv_pr.push_attribute(("name", name.as_str()));
+    // descr is the alt text a screen reader announces; without it the
+    // picture is invisible to assistive technology.
+    if let Some(text) = alt.filter(|t| !t.is_empty()) {
+        cnv_pr.push_attribute(("descr", text));
+    }
     w.write_event(Event::Empty(cnv_pr)).expect("write");
     write_empty(w, "p:cNvPicPr");
     write_empty(w, "p:nvPr");

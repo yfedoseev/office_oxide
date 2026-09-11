@@ -1866,3 +1866,118 @@ fn xlsx_conversion_keeps_list_and_text_box_content() {
         assert!(sheet.contains(word), "{word} was dropped: {sheet}");
     }
 }
+
+/// `TextSpan::hyperlink` was read and explicitly discarded, so the URL was not
+/// recoverable from the output at all.
+#[test]
+fn hyperlinks_survive_the_write_path() {
+    use office_oxide::format::DocumentFormat;
+
+    let md = "See [the docs](https://example.com/a?b=1&c=2) for details.\n";
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_markdown_to_writer(md, DocumentFormat::Docx, &mut buf)
+        .unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+
+    let mut body = String::new();
+    {
+        let mut e = zip.by_name("word/document.xml").unwrap();
+        std::io::Read::read_to_string(&mut e, &mut body).unwrap();
+    }
+    assert!(body.contains("<w:hyperlink"), "no w:hyperlink emitted: {body}");
+
+    let mut rels = String::new();
+    {
+        let mut e = zip.by_name("word/_rels/document.xml.rels").unwrap();
+        std::io::Read::read_to_string(&mut e, &mut rels).unwrap();
+    }
+    assert!(
+        rels.contains("https://example.com/a?b=1&amp;c=2"),
+        "the URL never reached a relationship: {rels}"
+    );
+    assert!(
+        rels.contains(r#"TargetMode="External""#),
+        "a hyperlink relationship must be external: {rels}"
+    );
+}
+
+/// DrawingML has no in-text newline: a dropped break joins the words on
+/// either side of it.
+#[test]
+fn pptx_line_breaks_are_emitted_as_br_elements() {
+    use office_oxide::format::DocumentFormat;
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        sections: vec![Section {
+            elements: vec![Element::Paragraph(Paragraph {
+                content: vec![
+                    InlineContent::Text(TextSpan {
+                        text: "LINEA".into(),
+                        ..Default::default()
+                    }),
+                    InlineContent::LineBreak,
+                    InlineContent::Text(TextSpan {
+                        text: "LINEB".into(),
+                        underline: Some(UnderlineStyle::Single),
+                        ..Default::default()
+                    }),
+                ],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(&ir, DocumentFormat::Pptx, &mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut slide = String::new();
+    let mut e = zip.by_name("ppt/slides/slide1.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut slide).unwrap();
+
+    assert!(slide.contains("<a:br/>"), "no <a:br/> emitted: {slide}");
+    assert!(slide.contains(r#"u="sng""#), "underline was dropped: {slide}");
+}
+
+/// Tab stops were accepted by the API and emitted nowhere, so a dot-leader
+/// table of contents lost both its leaders and its alignment.
+#[test]
+fn paragraph_tab_stops_are_emitted() {
+    use office_oxide::format::DocumentFormat;
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        sections: vec![Section {
+            elements: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    text: "Chapter 1".into(),
+                    ..Default::default()
+                })],
+                tabs: vec![TabStop {
+                    position_twips: 8640,
+                    alignment: TabAlignment::Right,
+                    leader: TabLeader::Dot,
+                }],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(&ir, DocumentFormat::Docx, &mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut body = String::new();
+    let mut e = zip.by_name("word/document.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut body).unwrap();
+
+    assert!(body.contains("<w:tabs>"), "no w:tabs emitted: {body}");
+    assert!(body.contains(r#"w:pos="8640""#), "tab position lost: {body}");
+    assert!(body.contains(r#"w:leader="dot""#), "dot leader lost: {body}");
+}

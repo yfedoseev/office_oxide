@@ -1198,7 +1198,11 @@ impl XlsxWriter {
                 }
                 w.write_event(Event::Start(c))?;
                 w.write_event(Event::Start(BytesStart::new("is")))?;
-                w.write_event(Event::Start(BytesStart::new("t")))?;
+                let mut t_start = BytesStart::new("t");
+                if s.starts_with(char::is_whitespace) || s.ends_with(char::is_whitespace) {
+                    t_start.push_attribute(("xml:space", "preserve"));
+                }
+                w.write_event(Event::Start(t_start))?;
                 w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(
                     s,
                 ))))?;

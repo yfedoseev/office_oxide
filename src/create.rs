@@ -211,6 +211,7 @@ fn add_element_to_docx(writer: &mut crate::docx::write::DocxWriter, elem: &Eleme
                     space_before_twips: p.space_before_twips,
                     space_after_twips: p.space_after_twips,
                     line_spacing: p.line_spacing.clone(),
+                    tabs: p.tabs.clone(),
                     keep_with_next: p.keep_with_next,
                     keep_together: p.keep_together,
                     page_break_before: p.page_break_before,
@@ -293,6 +294,7 @@ fn ir_inline_to_runs(content: &[InlineContent]) -> Vec<crate::docx::write::Run> 
                 run.italic = span.italic;
                 run.strikethrough = span.strikethrough;
                 run.font_name = span.font_name.clone();
+                run.hyperlink = span.hyperlink.clone();
                 run.font_size_half_pt = span.font_size_half_pt;
                 run.color_rgb = span.color;
                 run.underline_style = span.underline.clone();
@@ -361,7 +363,10 @@ fn coalesce_runs(runs: Vec<crate::docx::write::Run>) -> Vec<crate::docx::write::
 /// Compare two runs' style properties (everything except `text`,
 /// `footnote_ref`, `endnote_ref`) for byte-equality.
 fn run_props_equal(a: &crate::docx::write::Run, b: &crate::docx::write::Run) -> bool {
-    a.bold == b.bold
+    // hyperlink is part of a run's identity: merging a linked run with an
+    // unlinked one silently swallows the link.
+    a.hyperlink == b.hyperlink
+        && a.bold == b.bold
         && a.italic == b.italic
         && a.underline == b.underline
         && a.underline_style == b.underline_style
@@ -920,7 +925,15 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
             if let (Some(data), Some(fmt)) = (&img.data, &img.format) {
                 let cx = img.display_width_emu.unwrap_or(3_000_000);
                 let cy = img.display_height_emu.unwrap_or(2_000_000);
-                slide.add_image(data.clone(), fmt.clone(), 0, 0, cx, cy);
+                slide.add_image_with_alt(
+                    data.clone(),
+                    fmt.clone(),
+                    0,
+                    0,
+                    cx,
+                    cy,
+                    img.alt_text.clone(),
+                );
             }
         },
         Element::CodeBlock(cb) => {
@@ -1339,6 +1352,13 @@ fn inline_to_pptx_runs(content: &[InlineContent]) -> Vec<crate::pptx::write::Run
     content
         .iter()
         .filter_map(|item| {
+            match item {
+                // A dropped line break silently joins the words on either
+                // side of it ("LINEA" + "LINEB" renders as "LINEALINEB").
+                InlineContent::LineBreak => return Some(Run::line_break()),
+                InlineContent::Text(_) => {},
+                _ => return None,
+            }
             if let InlineContent::Text(span) = item {
                 if span.text.is_empty() {
                     return None;
@@ -1349,6 +1369,12 @@ fn inline_to_pptx_runs(content: &[InlineContent]) -> Vec<crate::pptx::write::Run
                 }
                 if span.italic {
                     run = run.italic();
+                }
+                if span.underline.is_some() {
+                    run = run.underline();
+                }
+                if span.strikethrough {
+                    run = run.strikethrough();
                 }
                 if let Some(half_pt) = span.font_size_half_pt {
                     run = run.font_size(half_pt as f64 / 2.0);

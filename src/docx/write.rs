@@ -139,6 +139,9 @@ pub struct Run {
     pub vertical_align: Option<VerticalAlign>,
     /// All-caps text transform.
     pub all_caps: bool,
+    /// Hyperlink target URL. Emitted as a `w:hyperlink` wrapper with an
+    /// external relationship; previously read and thrown away.
+    pub hyperlink: Option<String>,
     /// Small-caps text transform.
     pub small_caps: bool,
     /// Character spacing in half-points (positive = expand, negative = condense).
@@ -266,6 +269,9 @@ pub struct IrParaProps {
     /// Outline level in ECMA-376 §17.3.1.20's value space: `0` = Heading 1,
     /// … `9` = no outline level (body text).
     pub outline_level: Option<u8>,
+    /// Tab stops for this paragraph. Dot-leader tables of contents lose both
+    /// their leaders and their alignment when these are dropped.
+    pub tabs: Vec<crate::ir::TabStop>,
     /// Paragraph border definition.
     pub border: Option<crate::ir::ParagraphBorder>,
 }
@@ -423,6 +429,41 @@ struct CoreProps {
     description: Option<String>,
     created: Option<String>,
     modified: Option<String>,
+}
+
+/// Resolved `r:id` for each hyperlink URL used anywhere in the package.
+type HyperlinkRids = std::collections::HashMap<String, String>;
+
+/// Every distinct hyperlink URL reachable from `elements`, in first-seen order.
+fn collect_hyperlinks(elements: &[DocxElement], out: &mut Vec<String>) {
+    fn push_runs(runs: &[Run], out: &mut Vec<String>) {
+        for r in runs {
+            if let Some(ref url) = r.hyperlink {
+                if !url.is_empty() && !out.contains(url) {
+                    out.push(url.clone());
+                }
+            }
+        }
+    }
+    for e in elements {
+        match e {
+            DocxElement::RichParagraph(p) => push_runs(&p.runs, out),
+            DocxElement::RichList(l) => {
+                for item in &l.items {
+                    collect_hyperlinks(item, out);
+                }
+            },
+            DocxElement::RichTable(t) => {
+                for row in &t.rows {
+                    for c in &row.cells {
+                        collect_hyperlinks(&c.content, out);
+                    }
+                }
+            },
+            DocxElement::TextBox(tb) => collect_hyperlinks(&tb.content, out),
+            _ => {},
+        }
+    }
 }
 
 struct ImageInfo {
@@ -867,6 +908,33 @@ impl DocxWriter {
         }
 
         // --- Register headers/footers ---
+        // Hyperlinks need one external relationship each, shared by every run
+        // that points at the same URL. Collected before any part is written
+        // because headers, footers and notes can carry links too.
+        let mut hyperlink_rids: HyperlinkRids = HyperlinkRids::new();
+        {
+            let mut urls: Vec<String> = Vec::new();
+            collect_hyperlinks(&self.elements, &mut urls);
+            for hf in &self.headers_footers {
+                collect_hyperlinks(&hf.elements, &mut urls);
+            }
+            for n in self.footnotes.iter().chain(self.endnotes.iter()) {
+                collect_hyperlinks(&n.elements, &mut urls);
+            }
+            for url in urls {
+                if hyperlink_rids.contains_key(&url) {
+                    continue;
+                }
+                let rid = opc.add_part_rel_with_mode(
+                    &doc_part,
+                    rel_types::HYPERLINK,
+                    &url,
+                    crate::core::relationships::TargetMode::External,
+                );
+                hyperlink_rids.insert(url, rid);
+            }
+        }
+
         let mut hf_rids: Vec<(HfType, String)> = Vec::new();
         for (i, hf) in self.headers_footers.iter().enumerate() {
             let n = i + 1;
@@ -889,6 +957,7 @@ impl DocxWriter {
                     hf.hf_type,
                     HfType::DefaultHeader | HfType::FirstPageHeader | HfType::EvenPageHeader
                 ),
+                &hyperlink_rids,
             );
             opc.add_part(&hf_part, ct, &hf_xml)?;
             hf_rids.push((hf.hf_type, rid));
@@ -898,7 +967,7 @@ impl DocxWriter {
         let footnote_rid = if !self.footnotes.is_empty() {
             let notes_part = PartName::new("/word/footnotes.xml")?;
             let rid = opc.add_part_rel(&doc_part, rel_types::FOOTNOTES, "footnotes.xml");
-            let xml = generate_footnotes_xml(&self.footnotes, &image_rids);
+            let xml = generate_footnotes_xml(&self.footnotes, &image_rids, &hyperlink_rids);
             opc.add_part(&notes_part, CT_FOOTNOTES, &xml)?;
             Some(rid)
         } else {
@@ -908,7 +977,7 @@ impl DocxWriter {
         let endnote_rid = if !self.endnotes.is_empty() {
             let notes_part = PartName::new("/word/endnotes.xml")?;
             let rid = opc.add_part_rel(&doc_part, rel_types::ENDNOTES, "endnotes.xml");
-            let xml = generate_endnotes_xml(&self.endnotes, &image_rids);
+            let xml = generate_endnotes_xml(&self.endnotes, &image_rids, &hyperlink_rids);
             opc.add_part(&notes_part, CT_ENDNOTES, &xml)?;
             Some(rid)
         } else {
@@ -960,6 +1029,7 @@ impl DocxWriter {
             sectpr_info.as_ref(),
             !self.images.is_empty(),
             self.has_text_boxes(),
+            &hyperlink_rids,
         );
         opc.add_part(&doc_part, CT_DOCUMENT, &document_xml)?;
 
@@ -1042,6 +1112,7 @@ impl DocxWriter {
         sect_pr: Option<&SectPrInfo>,
         has_images: bool,
         has_text_boxes: bool,
+        links: &HyperlinkRids,
     ) -> Vec<u8> {
         let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
 
@@ -1094,7 +1165,7 @@ impl DocxWriter {
                 write_inline_section_break_paragraph(&mut w, sp);
                 continue;
             }
-            write_docx_element(&mut w, element, image_rids, &mut image_counter);
+            write_docx_element(&mut w, element, image_rids, &mut image_counter, links);
         }
 
         if let Some(sp) = sect_pr {
@@ -1397,10 +1468,7 @@ fn ir_inline_to_runs(content: &[crate::ir::InlineContent]) -> Vec<Run> {
                 run.all_caps = span.all_caps;
                 run.small_caps = span.small_caps;
                 run.char_spacing_half_pt = span.char_spacing_half_pt;
-                if let Some(ref url) = span.hyperlink {
-                    // Emit text with hyperlink as plain text (hyperlink embedding requires rel)
-                    let _ = url;
-                }
+                run.hyperlink = span.hyperlink.clone();
                 runs.push(run);
             },
             InlineContent::LineBreak => {
@@ -1445,6 +1513,7 @@ fn ir_paragraph_to_props(p: &crate::ir::Paragraph) -> IrParaProps {
         background_color: p.background_color,
         outline_level: p.outline_level,
         border: p.border.clone(),
+        tabs: p.tabs.clone(),
     }
 }
 
@@ -1471,12 +1540,13 @@ fn write_docx_element(
     elem: &DocxElement,
     image_rids: &[ImageInfo],
     image_counter: &mut u32,
+    links: &HyperlinkRids,
 ) {
     match elem {
         DocxElement::Paragraph(p) => write_paragraph(w, p),
-        DocxElement::RichParagraph(p) => write_rich_paragraph(w, p),
+        DocxElement::RichParagraph(p) => write_rich_paragraph(w, p, links),
         DocxElement::Table(t) => write_table(w, t),
-        DocxElement::RichTable(t) => write_rich_table(w, t, image_rids, image_counter),
+        DocxElement::RichTable(t) => write_rich_table(w, t, image_rids, image_counter, links),
         DocxElement::Image(idx) => {
             *image_counter += 1;
             if let Some(info) = image_rids.iter().find(|i| i.idx == *idx) {
@@ -1508,9 +1578,9 @@ fn write_docx_element(
         DocxElement::SectPr(_) => {},
         DocxElement::PageBreak => write_page_break(w),
         DocxElement::ColumnBreak => write_column_break(w),
-        DocxElement::RichList(rl) => write_rich_list(w, rl, image_rids, image_counter),
+        DocxElement::RichList(rl) => write_rich_list(w, rl, image_rids, image_counter, links),
         DocxElement::CodeBlock(content) => write_code_block(w, content),
-        DocxElement::TextBox(tb) => write_text_box(w, tb, image_rids, image_counter),
+        DocxElement::TextBox(tb) => write_text_box(w, tb, image_rids, image_counter, links),
     }
 }
 
@@ -1551,7 +1621,32 @@ fn write_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxParagraph) {
         .expect("write p end");
 }
 
-fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph) {
+/// `w:val` for a tab stop's alignment.
+fn tab_align_val(a: &crate::ir::TabAlignment) -> &'static str {
+    use crate::ir::TabAlignment;
+    match a {
+        TabAlignment::Left => "left",
+        TabAlignment::Center => "center",
+        TabAlignment::Right => "right",
+        TabAlignment::Decimal => "decimal",
+        TabAlignment::Bar => "bar",
+    }
+}
+
+/// `w:leader`, or `None` when the stop has no leader (the default).
+fn tab_leader_val(l: &crate::ir::TabLeader) -> Option<&'static str> {
+    use crate::ir::TabLeader;
+    match l {
+        TabLeader::None => None,
+        TabLeader::Dot => Some("dot"),
+        TabLeader::Hyphen => Some("hyphen"),
+        TabLeader::Underscore => Some("underscore"),
+        TabLeader::Heavy => Some("heavy"),
+        TabLeader::MiddleDot => Some("middleDot"),
+    }
+}
+
+fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph, links: &HyperlinkRids) {
     w.write_event(Event::Start(BytesStart::new("w:p")))
         .expect("write p start");
 
@@ -1570,7 +1665,8 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph) {
         || props.page_break_before
         || props.background_color.is_some()
         || props.outline_level.is_some()
-        || props.border.is_some();
+        || props.border.is_some()
+        || !props.tabs.is_empty();
 
     if has_ppr {
         w.write_event(Event::Start(BytesStart::new("w:pPr")))
@@ -1596,8 +1692,8 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph) {
         }
 
         // CT_PPrBase is a strict sequence. The order below follows it:
-        // numPr, pBdr, shd, spacing, ind, jc, outlineLvl. Emitting these
-        // in a different order produces a schema-invalid document.
+        // numPr, pBdr, shd, tabs, spacing, ind, jc, outlineLvl. Emitting
+        // these in a different order produces a schema-invalid document.
         if let Some((num_id, ilvl)) = props.numbering {
             write_num_pr(w, num_id, ilvl);
         }
@@ -1612,6 +1708,22 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph) {
             shd.push_attribute(("w:fill", rgb_to_hex(*color).as_str()));
             shd.push_attribute(("w:color", "auto"));
             w.write_event(Event::Empty(shd)).expect("write pShd");
+        }
+
+        if !props.tabs.is_empty() {
+            w.write_event(Event::Start(BytesStart::new("w:tabs")))
+                .expect("write tabs start");
+            for stop in &props.tabs {
+                let mut t = BytesStart::new("w:tab");
+                t.push_attribute(("w:val", tab_align_val(&stop.alignment)));
+                t.push_attribute(("w:pos", stop.position_twips.to_string().as_str()));
+                if let Some(leader) = tab_leader_val(&stop.leader) {
+                    t.push_attribute(("w:leader", leader));
+                }
+                w.write_event(Event::Empty(t)).expect("write tab");
+            }
+            w.write_event(Event::End(BytesEnd::new("w:tabs")))
+                .expect("write tabs end");
         }
 
         // Spacing
@@ -1681,8 +1793,31 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph) {
             .expect("write pPr end");
     }
 
-    for run in &p.runs {
-        write_run(w, run);
+    // A run carrying a URL is wrapped in w:hyperlink pointing at the external
+    // relationship collected for it. Adjacent runs sharing a URL share one
+    // wrapper, so a styled link stays a single link.
+    let mut i = 0usize;
+    while i < p.runs.len() {
+        let url = p.runs[i].hyperlink.as_deref().filter(|u| !u.is_empty());
+        match url.and_then(|u| links.get(u)) {
+            Some(rid) => {
+                let mut link = BytesStart::new("w:hyperlink");
+                link.push_attribute(("r:id", rid.as_str()));
+                w.write_event(Event::Start(link)).expect("write hyperlink");
+                while i < p.runs.len()
+                    && p.runs[i].hyperlink.as_deref().filter(|u| !u.is_empty()) == url
+                {
+                    write_run(w, &p.runs[i]);
+                    i += 1;
+                }
+                w.write_event(Event::End(BytesEnd::new("w:hyperlink")))
+                    .expect("write hyperlink end");
+            },
+            None => {
+                write_run(w, &p.runs[i]);
+                i += 1;
+            },
+        }
     }
 
     w.write_event(Event::End(BytesEnd::new("w:p")))
@@ -2007,6 +2142,7 @@ fn write_rich_table(
     table: &DocxRichTable,
     image_rids: &[ImageInfo],
     image_counter: &mut u32,
+    links: &HyperlinkRids,
 ) {
     if let Some(ref caption) = table.caption {
         let p = DocxParagraph::plain(caption, Some("Caption".to_string()), None);
@@ -2206,7 +2342,7 @@ fn write_rich_table(
             }
 
             for elem in &cell.content {
-                write_docx_element(w, elem, image_rids, image_counter);
+                write_docx_element(w, elem, image_rids, image_counter, links);
             }
 
             w.write_event(Event::End(BytesEnd::new("w:tc")))
@@ -2286,6 +2422,7 @@ fn write_rich_list(
     rl: &DocxRichList,
     image_rids: &[ImageInfo],
     image_counter: &mut u32,
+    links: &HyperlinkRids,
 ) {
     for item_elems in &rl.items {
         // Wrap item elements in a ListParagraph with numbering
@@ -2301,9 +2438,9 @@ fn write_rich_list(
                         runs: rp.runs.clone(),
                         props: new_props,
                     };
-                    write_rich_paragraph(w, &new_p);
+                    write_rich_paragraph(w, &new_p, links);
                 },
-                other => write_docx_element(w, other, image_rids, image_counter),
+                other => write_docx_element(w, other, image_rids, image_counter, links),
             }
         }
     }
@@ -2344,6 +2481,7 @@ fn write_text_box(
     tb: &DocxTextBox,
     image_rids: &[ImageInfo],
     image_counter: &mut u32,
+    links: &HyperlinkRids,
 ) {
     let float_anchor_val = |a: &crate::ir::FloatAnchor| match a {
         crate::ir::FloatAnchor::Page => "page",
@@ -2490,7 +2628,7 @@ fn write_text_box(
         .expect("write txbxContent start");
     let mut txb_ic = 0u32;
     for elem in &tb.content {
-        write_docx_element(w, elem, image_rids, &mut txb_ic);
+        write_docx_element(w, elem, image_rids, &mut txb_ic, links);
     }
     w.write_event(Event::End(BytesEnd::new("w:txbxContent")))
         .expect("write txbxContent end");
@@ -3049,7 +3187,12 @@ fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
 // Header/footer XML generation
 // ---------------------------------------------------------------------------
 
-fn generate_hf_xml(elements: &[DocxElement], image_rids: &[ImageInfo], is_header: bool) -> Vec<u8> {
+fn generate_hf_xml(
+    elements: &[DocxElement],
+    image_rids: &[ImageInfo],
+    is_header: bool,
+    links: &HyperlinkRids,
+) -> Vec<u8> {
     let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
     w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
         .expect("write decl");
@@ -3062,7 +3205,7 @@ fn generate_hf_xml(elements: &[DocxElement], image_rids: &[ImageInfo], is_header
 
     let mut ic = 0u32;
     for elem in elements {
-        write_docx_element(&mut w, elem, image_rids, &mut ic);
+        write_docx_element(&mut w, elem, image_rids, &mut ic, links);
     }
     if elements.is_empty() {
         w.write_event(Event::Start(BytesStart::new("w:p")))
@@ -3080,12 +3223,20 @@ fn generate_hf_xml(elements: &[DocxElement], image_rids: &[ImageInfo], is_header
 // Footnotes/endnotes XML generation
 // ---------------------------------------------------------------------------
 
-fn generate_footnotes_xml(notes: &[DocxNote], image_rids: &[ImageInfo]) -> Vec<u8> {
-    generate_notes_xml(notes, image_rids, false)
+fn generate_footnotes_xml(
+    notes: &[DocxNote],
+    image_rids: &[ImageInfo],
+    links: &HyperlinkRids,
+) -> Vec<u8> {
+    generate_notes_xml(notes, image_rids, false, links)
 }
 
-fn generate_endnotes_xml(notes: &[DocxNote], image_rids: &[ImageInfo]) -> Vec<u8> {
-    generate_notes_xml(notes, image_rids, true)
+fn generate_endnotes_xml(
+    notes: &[DocxNote],
+    image_rids: &[ImageInfo],
+    links: &HyperlinkRids,
+) -> Vec<u8> {
+    generate_notes_xml(notes, image_rids, true, links)
 }
 
 /// `word/settings.xml`, written only when a part depends on it.
@@ -3110,7 +3261,12 @@ fn generate_settings_xml(even_and_odd_headers: bool, embed_fonts: bool) -> Vec<u
     w.into_inner()
 }
 
-fn generate_notes_xml(notes: &[DocxNote], image_rids: &[ImageInfo], is_endnote: bool) -> Vec<u8> {
+fn generate_notes_xml(
+    notes: &[DocxNote],
+    image_rids: &[ImageInfo],
+    is_endnote: bool,
+    links: &HyperlinkRids,
+) -> Vec<u8> {
     let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
     w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
         .expect("write decl");
@@ -3171,7 +3327,7 @@ fn generate_notes_xml(notes: &[DocxNote], image_rids: &[ImageInfo], is_endnote: 
 
         let mut ic = 0u32;
         for elem in &note.elements {
-            write_docx_element(&mut w, elem, image_rids, &mut ic);
+            write_docx_element(&mut w, elem, image_rids, &mut ic, links);
         }
         if note.elements.is_empty() {
             w.write_event(Event::Start(BytesStart::new("w:p")))
