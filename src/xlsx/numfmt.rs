@@ -5,6 +5,15 @@
 //! integers, fixed decimals, thousands separators, percentages, currency,
 //! and scientific notation. Complex conditions/colors are stripped gracefully.
 
+/// The built-in id whose format code is exactly `code`, if any.
+///
+/// Writing an explicit `<numFmt>` for a code that is already built in gives
+/// the cell a custom id (164+) for no reason, which shows up as an IR
+/// difference on the second write→parse cycle.
+pub fn builtin_id_for_code(code: &str) -> Option<u32> {
+    (0..=49).find(|&id| builtin_format_code(id) == Some(code))
+}
+
 /// Return the canonical format code for a built-in number-format ID
 /// (OOXML §18.8.30 reserved IDs 0–49). Custom formats (ID ≥ 164) are not
 /// built-in and are looked up from the workbook's `<numFmts>` table instead,

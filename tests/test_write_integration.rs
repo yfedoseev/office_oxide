@@ -1733,3 +1733,136 @@ fn nested_list_items_reach_every_format() {
         }
     }
 }
+
+/// The XLSX bridge re-parsed the *rendered* cell string instead of using the
+/// type the reader recorded, so "007" became 7, a currency cell became text,
+/// and a cell reading "inf" became an Excel error cell.
+#[test]
+fn xlsx_cells_keep_the_type_and_format_the_reader_recorded() {
+    use office_oxide::format::DocumentFormat;
+    use office_oxide::ir::*;
+
+    fn cell(
+        text: &str,
+        dt: Option<CellDataType>,
+        raw: Option<f64>,
+        fmt: Option<&str>,
+    ) -> TableCell {
+        TableCell {
+            content: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    text: text.into(),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            })],
+            data_type: dt,
+            raw_number: raw,
+            number_format: fmt.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    let ir = DocumentIR {
+        sections: vec![Section {
+            elements: vec![Element::Table(Table {
+                rows: vec![TableRow {
+                    cells: vec![
+                        cell("007", Some(CellDataType::Text), None, None),
+                        cell("inf", Some(CellDataType::Text), None, None),
+                        cell(
+                            "$1,234.50",
+                            Some(CellDataType::Number),
+                            Some(1234.5),
+                            Some("$#,##0.00"),
+                        ),
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(&ir, DocumentFormat::Xlsx, &mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+
+    let mut sheet = String::new();
+    {
+        let mut e = zip.by_name("xl/worksheets/sheet1.xml").unwrap();
+        std::io::Read::read_to_string(&mut e, &mut sheet).unwrap();
+    }
+    assert!(sheet.contains("007"), "leading zeros destroyed: {sheet}");
+    assert!(!sheet.contains("#NUM!"), "a text cell became an error cell: {sheet}");
+    assert!(sheet.contains("1234.5"), "the number must be written as a number: {sheet}");
+
+    let mut styles = String::new();
+    {
+        let mut e = zip.by_name("xl/styles.xml").unwrap();
+        std::io::Read::read_to_string(&mut e, &mut styles).unwrap();
+    }
+    // "$#,##0.00" is built-in id 7, so it is referenced rather than redeclared.
+    // What matters is that the cell resolves to that format, not to General.
+    assert!(
+        styles.contains(r#"numFmtId="7""#),
+        "the cell's number format was dropped: {styles}"
+    );
+}
+
+/// `ir_to_xlsx` ended in `_ => {}`, so lists, code blocks, notes and the
+/// contents of a text box were discarded. PPTX wraps slide bodies in a text
+/// box, which made PPTX → XLSX near-total text loss.
+#[test]
+fn xlsx_conversion_keeps_list_and_text_box_content() {
+    use office_oxide::format::DocumentFormat;
+    use office_oxide::ir::*;
+
+    let para = |t: &str| {
+        Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan {
+                text: t.into(),
+                ..Default::default()
+            })],
+            ..Default::default()
+        })
+    };
+    let ir = DocumentIR {
+        sections: vec![Section {
+            elements: vec![
+                Element::List(List {
+                    items: vec![ListItem {
+                        content: vec![para("ListWord")],
+                        nested: None,
+                    }],
+                    ..Default::default()
+                }),
+                Element::CodeBlock(CodeBlock {
+                    content: "CodeWord".into(),
+                    ..Default::default()
+                }),
+                Element::TextBox(TextBox {
+                    content: vec![para("BoxedWord")],
+                    ..Default::default()
+                }),
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(&ir, DocumentFormat::Xlsx, &mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut sheet = String::new();
+    let mut e = zip.by_name("xl/worksheets/sheet1.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut sheet).unwrap();
+
+    for word in ["ListWord", "CodeWord", "BoxedWord"] {
+        assert!(sheet.contains(word), "{word} was dropped: {sheet}");
+    }
+}

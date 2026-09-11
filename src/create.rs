@@ -491,10 +491,12 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                         let mut col = 0usize;
                         for cell in &row.cells {
                             let text = cell_text(cell);
-                            let data = text_to_cell_data(&text);
-                            if let Some(style) =
-                                xlsx_cell_style(row.is_header, cell.background_color)
-                            {
+                            let data = ir_cell_to_cell_data(cell, &text);
+                            if let Some(style) = xlsx_cell_style(
+                                row.is_header,
+                                cell.background_color,
+                                cell.number_format.as_deref(),
+                            ) {
                                 sheet.set_cell_styled(row_cursor, col, data, style);
                             } else {
                                 sheet.set_cell(row_cursor, col, data);
@@ -576,6 +578,19 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                             }
                         }
                     }
+                    // Everything in the box that is not an image still has
+                    // text; the arm used to look for images and nothing else.
+                    let mut rows = Vec::new();
+                    for inner in &tb.content {
+                        if !matches!(inner, Element::Image(_)) {
+                            xlsx_text_rows(inner, &mut rows);
+                        }
+                    }
+                    for line in rows {
+                        body_paragraphs_seen = true;
+                        sheet.set_cell(row_cursor, 0, CellData::String(line));
+                        row_cursor += 1;
+                    }
                 },
                 Element::Heading(h) => {
                     let text = inline_to_text(&h.content);
@@ -592,7 +607,22 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                         row_cursor += 1;
                     }
                 },
-                _ => {},
+                Element::ThematicBreak
+                | Element::PageBreak
+                | Element::ColumnBreak
+                | Element::Shape(_) => {},
+                // Everything else has no native spreadsheet shape but does
+                // have text, and dropping it silently is how a PPTX → XLSX
+                // conversion lost 96% of its words.
+                other => {
+                    let mut rows = Vec::new();
+                    xlsx_text_rows(other, &mut rows);
+                    for line in rows {
+                        body_paragraphs_seen = true;
+                        sheet.set_cell(row_cursor, 0, CellData::String(line));
+                        row_cursor += 1;
+                    }
+                },
             }
         }
 
@@ -1124,6 +1154,46 @@ fn cell_text(cell: &TableCell) -> String {
         .join(" ")
 }
 
+/// Convert an IR cell to writer data, honouring the type the parser recorded.
+///
+/// Re-parsing the *rendered* string threw away `data_type`, `raw_number` and
+/// `number_format`: "007" became the number 7, a currency cell became text,
+/// and a cell whose text happens to read "inf" or "NaN" became an Excel error
+/// cell. The typed fields are only populated by the XLSX reader; prose formats
+/// leave them `None` and still fall back to sniffing the text.
+fn ir_cell_to_cell_data(cell: &TableCell, text: &str) -> crate::xlsx::write::CellData {
+    use crate::ir::CellDataType;
+    use crate::xlsx::write::CellData;
+
+    match cell.data_type {
+        Some(CellDataType::Number) | Some(CellDataType::Date) => {
+            if let Some(n) = cell.raw_number {
+                return CellData::Number(n);
+            }
+        },
+        Some(CellDataType::Boolean) => {
+            let t = text.trim();
+            if t.eq_ignore_ascii_case("true") || t == "1" {
+                return CellData::Boolean(true);
+            }
+            if t.eq_ignore_ascii_case("false") || t == "0" {
+                return CellData::Boolean(false);
+            }
+        },
+        // Text and Error cells keep their rendered form verbatim; sniffing
+        // would re-introduce the "007" and "inf" corruption.
+        Some(CellDataType::Text) | Some(CellDataType::Error) => {
+            return if text.is_empty() {
+                CellData::Empty
+            } else {
+                CellData::String(text.to_string())
+            };
+        },
+        None => {},
+    }
+    text_to_cell_data(text)
+}
+
 fn text_to_cell_data(text: &str) -> crate::xlsx::write::CellData {
     use crate::xlsx::write::CellData;
     if text.is_empty() {
@@ -1170,13 +1240,97 @@ fn first_inline_font_name(content: &[InlineContent]) -> Option<String> {
     None
 }
 
-fn xlsx_cell_style(is_header: bool, bg: Option<[u8; 3]>) -> Option<crate::xlsx::write::CellStyle> {
+/// Flatten an element the XLSX writer has no native shape for into one text
+/// row per logical line.
+///
+/// `ir_to_xlsx` used to end in `_ => {}`, silently swallowing `List`,
+/// `CodeBlock`, `Footnote`, `Endnote` and everything inside a `TextBox` that
+/// was not an image. Converting a presentation to a spreadsheet lost almost
+/// all of its text that way.
+fn xlsx_text_rows(elem: &Element, out: &mut Vec<String>) {
+    match elem {
+        Element::Paragraph(p) => {
+            let t = inline_to_text(&p.content);
+            if !t.is_empty() {
+                out.push(t);
+            }
+        },
+        Element::Heading(h) => {
+            let t = inline_to_text(&h.content);
+            if !t.is_empty() {
+                out.push(t);
+            }
+        },
+        Element::List(l) => {
+            fn walk(list: &crate::ir::List, out: &mut Vec<String>) {
+                for item in &list.items {
+                    for e in &item.content {
+                        xlsx_text_rows(e, out);
+                    }
+                    if let Some(ref nested) = item.nested {
+                        walk(nested, out);
+                    }
+                }
+            }
+            walk(l, out);
+        },
+        Element::CodeBlock(cb) => {
+            for line in cb.content.lines() {
+                out.push(line.to_string());
+            }
+        },
+        Element::Footnote(n) | Element::Endnote(n) => {
+            for e in &n.content {
+                xlsx_text_rows(e, out);
+            }
+        },
+        Element::Table(t) => {
+            for row in &t.rows {
+                let line = row
+                    .cells
+                    .iter()
+                    .map(cell_text)
+                    .collect::<Vec<_>>()
+                    .join("\t");
+                if !line.trim().is_empty() {
+                    out.push(line);
+                }
+            }
+        },
+        Element::TextBox(tb) => {
+            for e in &tb.content {
+                xlsx_text_rows(e, out);
+            }
+        },
+        Element::Image(_)
+        | Element::ThematicBreak
+        | Element::PageBreak
+        | Element::ColumnBreak
+        | Element::Shape(_) => {},
+    }
+}
+
+fn xlsx_cell_style(
+    is_header: bool,
+    bg: Option<[u8; 3]>,
+    number_format: Option<&str>,
+) -> Option<crate::xlsx::write::CellStyle> {
     use crate::xlsx::write::CellStyle;
+    // A cell's number format is what makes a currency or date cell render as
+    // one; dropping it turned every formatted number into a bare value.
+    let with_fmt = |style: CellStyle| match number_format {
+        Some(code) if !code.is_empty() => style.number_format_code(code),
+        _ => style,
+    };
     if is_header {
         let bg_hex = bg.map(rgb_to_hex).unwrap_or_else(|| "D3D3D3".to_string());
-        Some(CellStyle::new().bold().background(bg_hex))
+        Some(with_fmt(CellStyle::new().bold().background(bg_hex)))
+    } else if let Some(c) = bg {
+        Some(with_fmt(CellStyle::new().background(rgb_to_hex(c))))
+    } else if number_format.is_some_and(|c| !c.is_empty()) {
+        Some(with_fmt(CellStyle::new()))
     } else {
-        bg.map(|c| CellStyle::new().background(rgb_to_hex(c)))
+        None
     }
 }
 

@@ -133,6 +133,10 @@ pub struct CellStyle {
     pub background_color: Option<String>,
     /// Number format to apply to the cell value.
     pub number_format: NumberFormat,
+    /// An explicit format code, e.g. `"$#,##0.00"`. Takes precedence over
+    /// `number_format`, and is how a format read from a source document is
+    /// carried through instead of being flattened to `General`.
+    pub number_format_code: Option<String>,
     /// Horizontal alignment override.
     pub h_align: Option<HAlign>,
     /// Wrap text within the cell.
@@ -188,6 +192,14 @@ impl CellStyle {
     }
 
     /// Set a number format.
+    /// Apply an explicit number format code (e.g. `"$#,##0.00"`).
+    #[must_use]
+    pub fn number_format_code(mut self, code: impl Into<String>) -> Self {
+        self.number_format_code = Some(code.into());
+        self
+    }
+
+    /// Set the number format applied to the cell value.
     pub fn number_format(mut self, fmt: NumberFormat) -> Self {
         self.number_format = fmt;
         self
@@ -1621,15 +1633,30 @@ impl StyleTable {
                     idx
                 };
 
-                // Resolve number format id.
-                let num_fmt_id = match style.number_format.builtin_id() {
-                    Some(id) => id,
-                    None => {
+                // Resolve number format id. An explicit code wins, and codes
+                // are deduplicated so N cells sharing one format get one id.
+                let num_fmt_id = if let Some(ref code) = style.number_format_code {
+                    if let Some(id) = crate::xlsx::numfmt::builtin_id_for_code(code) {
+                        // Already a built-in; a custom id would be noise.
+                        id
+                    } else if let Some((id, _)) = table.num_fmts.iter().find(|(_, c)| c == code) {
+                        *id
+                    } else {
                         let id = next_custom_fmt_id;
                         next_custom_fmt_id += 1;
-                        table.num_fmts.push((id, "General".to_string()));
+                        table.num_fmts.push((id, code.clone()));
                         id
-                    },
+                    }
+                } else {
+                    match style.number_format.builtin_id() {
+                        Some(id) => id,
+                        None => {
+                            let id = next_custom_fmt_id;
+                            next_custom_fmt_id += 1;
+                            table.num_fmts.push((id, "General".to_string()));
+                            id
+                        },
+                    }
                 };
 
                 let h_align_str = style.h_align.as_ref().map(|a| {
