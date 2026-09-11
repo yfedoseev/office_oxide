@@ -2048,3 +2048,57 @@ fn pptx_writes_real_tables_and_nested_bullets() {
     assert!(slide.contains(r#"lvl="2""#), "third-level bullet lost: {slide}");
     assert!(slide.contains("marL="), "bullets need a hanging indent: {slide}");
 }
+
+/// Frame position, page background and the table caption were all IR fields
+/// with no writer behind them.
+#[test]
+fn frame_position_background_and_table_caption_are_emitted() {
+    use office_oxide::format::DocumentFormat;
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        sections: vec![Section {
+            background_rgb: Some([0x11, 0x22, 0x33]),
+            elements: vec![
+                Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan {
+                        text: "framed".into(),
+                        ..Default::default()
+                    })],
+                    frame_position: Some(FramePosition {
+                        x_twips: 100,
+                        y_twips: 200,
+                        width_twips: 3000,
+                        height_twips: 400,
+                    }),
+                    ..Default::default()
+                }),
+                Element::Table(Table {
+                    caption: Some("TableCaptionText".into()),
+                    rows: vec![TableRow {
+                        cells: vec![TableCell::default()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(&ir, DocumentFormat::Docx, &mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut body = String::new();
+    let mut e = zip.by_name("word/document.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut body).unwrap();
+
+    assert!(body.contains("<w:framePr"), "frame position lost: {body}");
+    assert!(body.contains(r#"w:color="112233""#), "page background lost: {body}");
+    assert!(
+        body.contains(r#"<w:tblCaption w:val="TableCaptionText"/>"#),
+        "table caption not written as w:tblCaption: {body}"
+    );
+}

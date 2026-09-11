@@ -272,6 +272,9 @@ pub struct IrParaProps {
     /// Tab stops for this paragraph. Dot-leader tables of contents lose both
     /// their leaders and their alignment when these are dropped.
     pub tabs: Vec<crate::ir::TabStop>,
+    /// Absolute frame position (`w:framePr`). Used by the layout-preserving
+    /// path; the field existed in the IR and reached no writer.
+    pub frame_position: Option<crate::ir::FramePosition>,
     /// Paragraph border definition.
     pub border: Option<crate::ir::ParagraphBorder>,
 }
@@ -484,6 +487,8 @@ struct ImageInfo {
 pub struct DocxWriter {
     elements: Vec<DocxElement>,
     images: Vec<DocxImage>,
+    /// Page background colour, written as `w:background`.
+    background_rgb: Option<[u8; 3]>,
     headers_footers: Vec<DocxHf>,
     footnotes: Vec<DocxNote>,
     endnotes: Vec<DocxNote>,
@@ -502,6 +507,7 @@ impl DocxWriter {
         Self {
             elements: Vec::new(),
             images: Vec::new(),
+            background_rgb: None,
             headers_footers: Vec::new(),
             footnotes: Vec::new(),
             endnotes: Vec::new(),
@@ -666,6 +672,13 @@ impl DocxWriter {
     }
 
     /// Set section page setup and column layout (appended as `<w:sectPr>` at end of body).
+    /// Set the page background colour, written as `w:background`.
+    pub fn set_background_rgb(&mut self, rgb: [u8; 3]) -> &mut Self {
+        self.background_rgb = Some(rgb);
+        self
+    }
+
+    /// Set section properties: page geometry, column layout and break type.
     pub fn set_section_props(
         &mut self,
         page_setup: Option<PageSetup>,
@@ -1132,6 +1145,16 @@ impl DocxWriter {
         }
         w.write_event(Event::Start(root))
             .expect("write document start");
+
+        // w:background must be the first child of w:document. The IR carried
+        // a section background colour that reached no writer, so page colour
+        // was silently lost.
+        if let Some(rgb) = self.background_rgb {
+            let mut bg = BytesStart::new("w:background");
+            bg.push_attribute(("w:color", rgb_to_hex(rgb).as_str()));
+            w.write_event(Event::Empty(bg)).expect("write background");
+        }
+
         w.write_event(Event::Start(BytesStart::new("w:body")))
             .expect("write body start");
 
@@ -1514,6 +1537,7 @@ fn ir_paragraph_to_props(p: &crate::ir::Paragraph) -> IrParaProps {
         outline_level: p.outline_level,
         border: p.border.clone(),
         tabs: p.tabs.clone(),
+        frame_position: p.frame_position.clone(),
     }
 }
 
@@ -1666,7 +1690,8 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph, links: &
         || props.background_color.is_some()
         || props.outline_level.is_some()
         || props.border.is_some()
-        || !props.tabs.is_empty();
+        || !props.tabs.is_empty()
+        || props.frame_position.is_some();
 
     if has_ppr {
         w.write_event(Event::Start(BytesStart::new("w:pPr")))
@@ -1689,6 +1714,17 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph, links: &
         if props.page_break_before {
             w.write_event(Event::Empty(BytesStart::new("w:pageBreakBefore")))
                 .expect("write pageBreakBefore");
+        }
+        // CT_PPrBase puts framePr straight after pageBreakBefore.
+        if let Some(ref fp) = props.frame_position {
+            let mut frame = BytesStart::new("w:framePr");
+            frame.push_attribute(("w:w", fp.width_twips.to_string().as_str()));
+            frame.push_attribute(("w:h", fp.height_twips.to_string().as_str()));
+            frame.push_attribute(("w:hAnchor", "page"));
+            frame.push_attribute(("w:vAnchor", "page"));
+            frame.push_attribute(("w:x", fp.x_twips.to_string().as_str()));
+            frame.push_attribute(("w:y", fp.y_twips.to_string().as_str()));
+            w.write_event(Event::Empty(frame)).expect("write framePr");
         }
 
         // CT_PPrBase is a strict sequence. The order below follows it:
@@ -2155,6 +2191,15 @@ fn write_rich_table(
     // tblPr
     w.write_event(Event::Start(BytesStart::new("w:tblPr")))
         .expect("write tblPr start");
+
+    // w:tblCaption is what the reader looks for. Emitting the caption only as
+    // a Caption-styled paragraph lost it on round-trip and accumulated a
+    // phantom body paragraph on every cycle.
+    if let Some(ref caption) = table.caption {
+        let mut cap = BytesStart::new("w:tblCaption");
+        cap.push_attribute(("w:val", caption.as_str()));
+        w.write_event(Event::Empty(cap)).expect("write tblCaption");
+    }
 
     let mut tbl_w = BytesStart::new("w:tblW");
     if let Some(w_twips) = table.width_twips {

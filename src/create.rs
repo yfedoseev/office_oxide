@@ -101,6 +101,10 @@ pub fn ir_to_docx(ir: &DocumentIR) -> crate::docx::write::DocxWriter {
     // Write metadata
     writer.set_metadata(&ir.metadata);
 
+    if let Some(rgb) = ir.sections.first().and_then(|s| s.background_rgb) {
+        writer.set_background_rgb(rgb);
+    }
+
     for section in &ir.sections {
         // Section title becomes H1 — but skip it when the title is already
         // carried by the section's leading heading element. The DOCX parser
@@ -212,6 +216,7 @@ fn add_element_to_docx(writer: &mut crate::docx::write::DocxWriter, elem: &Eleme
                     space_after_twips: p.space_after_twips,
                     line_spacing: p.line_spacing.clone(),
                     tabs: p.tabs.clone(),
+                    frame_position: p.frame_position.clone(),
                     keep_with_next: p.keep_with_next,
                     keep_together: p.keep_together,
                     page_break_before: p.page_break_before,
