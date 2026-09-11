@@ -90,6 +90,7 @@ pub fn row_grpprl(centers: &[i16], rgfs: &[u16]) -> Vec<u8> {
 }
 
 /// Build a complete synthetic `.doc` from the given paragraphs.
+#[allow(dead_code)]
 pub fn build_doc(paras: &[Para]) -> Vec<u8> {
     build_doc_full(paras, &Subdocs::default(), FibTweaks::default())
 }
@@ -127,6 +128,28 @@ pub struct FibTweaks {
 /// Build a synthetic `.doc`, optionally with subdocuments and FIB tweaks.
 #[allow(dead_code)]
 pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> Vec<u8> {
+    build_inner(paras, subdocs, tweaks, &[], &[])
+}
+
+/// Build a synthetic `.doc` whose paragraphs carry the given PAPX `istd` values
+/// and whose Table stream ends with `stsh` (an STSH style sheet).
+///
+/// Separate from [`build_doc_full`] so the existing tests keep building
+/// style-free documents, and so an integration test can exercise the
+/// style-sheet path through the public API alone — which is what the
+/// revert-check gate needs, since it reverts everything under `src/`.
+#[allow(dead_code)]
+pub fn build_doc_with_styles(paras: &[Para], istds: &[u16], stsh: &[u8]) -> Vec<u8> {
+    build_inner(paras, &Subdocs::default(), FibTweaks::default(), istds, stsh)
+}
+
+fn build_inner(
+    paras: &[Para],
+    subdocs: &Subdocs,
+    tweaks: FibTweaks,
+    istds: &[u16],
+    stsh: &[u8],
+) -> Vec<u8> {
     let n = paras.len();
 
     // Build the main text (UTF-16LE) and the CP range of each paragraph.
@@ -173,11 +196,17 @@ pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> V
     table.extend_from_slice(&build_plcf_bte_papx(n, &cp_starts, text_len));
     let lcb_plcf = (table.len() as u32) - fc_plcf;
 
+    // An optional style sheet appended after the PAPX index; `fcStshf` is an
+    // offset into the Table stream, and 0 is only "absent" when `lcbStshf` is.
+    let fc_stshf = table.len() as u32;
+    let lcb_stshf = stsh.len() as u32;
+    table.extend_from_slice(stsh);
+
     // ── WordDocument stream: FIB + N FKP pages + text. ──
     let wd_len = text_offset as usize + text_bytes.len();
     let wd_sectors = wd_len.div_ceil(512);
     let mut word_doc = vec![0u8; wd_sectors * 512];
-    write_fib(&mut word_doc, text_len, fc_plcf, lcb_plcf);
+    write_fib(&mut word_doc, text_len, fc_plcf, lcb_plcf, fc_stshf, lcb_stshf);
     for (i, &ccp) in ccps.iter().enumerate() {
         let off = 0x50 + i * 4;
         word_doc[off..off + 4].copy_from_slice(&ccp.to_le_bytes());
@@ -200,7 +229,8 @@ pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> V
         };
         let fc0 = text_offset + cp0 * 2;
         let fc1 = text_offset + cp1 * 2;
-        let page = build_fkp_page(fc0, fc1, &p.grpprl);
+        let istd = istds.get(i).copied().unwrap_or(0);
+        let page = build_fkp_page(fc0, fc1, &p.grpprl, istd);
         let off = (i + 1) * 512;
         word_doc[off..off + 512].copy_from_slice(&page);
     }
@@ -208,6 +238,43 @@ pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> V
         .copy_from_slice(&text_bytes);
 
     build_cfb(&word_doc, &table)
+}
+
+/// One `LPStd` for a style sheet: `cbStd(u16)` + `STD`.
+///
+/// `STD` = `stdf` (10 bytes of `StdfBase`, whose low 12 bits are `sti`) plus
+/// `xstzName` (`cch(u16)` + `cch` UTF-16 code units + a 2-byte terminator).
+fn lpstd(sti: u16, name: &str) -> Vec<u8> {
+    let mut std = vec![0u8; 10];
+    std[0..2].copy_from_slice(&sti.to_le_bytes());
+    let units: Vec<u16> = name.encode_utf16().collect();
+    std.extend_from_slice(&(units.len() as u16).to_le_bytes());
+    for u in &units {
+        std.extend_from_slice(&u.to_le_bytes());
+    }
+    std.extend_from_slice(&0u16.to_le_bytes());
+    let mut out = (std.len() as u16).to_le_bytes().to_vec();
+    out.extend_from_slice(&std);
+    out
+}
+
+/// A spec-conformant STSH ([MS-DOC] §2.7.1 / §2.9.274) whose `istd` 1-9 are the
+/// built-in `Heading 1`-`Heading 9` styles and `istd` 0 is `Normal`, so a
+/// paragraph whose PAPX `istd` is 3 resolves to Heading 3.
+#[allow(dead_code)]
+pub fn heading_style_sheet() -> Vec<u8> {
+    let mut d = 18u16.to_le_bytes().to_vec(); // cbStshi
+    d.extend_from_slice(&15u16.to_le_bytes()); // cstd
+    d.extend_from_slice(&0x000Au16.to_le_bytes()); // cbSTDBaseInFile
+    d.extend_from_slice(&[0u8; 14]); // rest of the 18-byte Stshif
+    d.extend_from_slice(&lpstd(0, "Normal"));
+    for lvl in 1..=9u16 {
+        d.extend_from_slice(&lpstd(lvl, &format!("Heading {lvl}")));
+    }
+    for _ in 0..5 {
+        d.extend_from_slice(&[0u8; 2]); // empty LPStd (cbStd = 0)
+    }
+    d
 }
 
 /// Open a synthetic `.doc` byte buffer through the public API.
@@ -220,12 +287,21 @@ pub fn open_doc(bytes: &[u8]) -> Document {
 // ── CFB / DOC byte construction ──
 
 /// Write the FIB into the first 512 bytes of `word_doc`.
-fn write_fib(word_doc: &mut [u8], text_len: u32, fc_plcf: u32, lcb_plcf: u32) {
+fn write_fib(
+    word_doc: &mut [u8],
+    text_len: u32,
+    fc_plcf: u32,
+    lcb_plcf: u32,
+    fc_stshf: u32,
+    lcb_stshf: u32,
+) {
     word_doc[0..2].copy_from_slice(&0xA5ECu16.to_le_bytes()); // wIdent = Word 97+
     word_doc[2..4].copy_from_slice(&0x00C1u16.to_le_bytes()); // nFib
     // flags at 0x0A: bit 9 (fWhichTblStm) clear → use 0Table.
     word_doc[0x0A..0x0C].copy_from_slice(&0u16.to_le_bytes());
     word_doc[0x4C..0x50].copy_from_slice(&text_len.to_le_bytes()); // ccpText
+    word_doc[0x00A2..0x00A6].copy_from_slice(&fc_stshf.to_le_bytes()); // fcStshf
+    word_doc[0x00A6..0x00AA].copy_from_slice(&lcb_stshf.to_le_bytes()); // lcbStshf
     word_doc[0x01A2..0x01A6].copy_from_slice(&0u32.to_le_bytes()); // fcClx = 0
     word_doc[0x01A6..0x01AA].copy_from_slice(&21u32.to_le_bytes()); // lcbClx = CLX size
     word_doc[0x0102..0x0106].copy_from_slice(&fc_plcf.to_le_bytes());
@@ -261,7 +337,7 @@ fn build_plcf_bte_papx(n: usize, cp_starts: &[u32], text_len: u32) -> Vec<u8> {
 }
 
 /// Build one 512-byte PAPX FKP page holding a single paragraph.
-fn build_fkp_page(fc0: u32, fc1: u32, grpprl: &[u8]) -> [u8; 512] {
+fn build_fkp_page(fc0: u32, fc1: u32, grpprl: &[u8], istd: u16) -> [u8; 512] {
     let mut page = [0u8; 512];
     page[0..4].copy_from_slice(&fc0.to_le_bytes());
     page[4..8].copy_from_slice(&fc1.to_le_bytes());
@@ -274,6 +350,7 @@ fn build_fkp_page(fc0: u32, fc1: u32, grpprl: &[u8]) -> [u8; 512] {
     }
     let cw = ((3 + g.len()) / 2) as u8;
     let mut papx = vec![cw, 0, 0];
+    papx[1..3].copy_from_slice(&istd.to_le_bytes());
     papx.extend_from_slice(&g);
 
     // PAPX stored at word offset 11 (byte 22); BX byte 0 carries the word off.

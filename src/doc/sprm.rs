@@ -27,6 +27,11 @@
 
 use crate::ir::{TabAlignment, TabLeader, TabStop};
 
+/// The `sprmPOutLvl` (0x2640) operand value meaning "this paragraph is body
+/// text". The SPRM encodes the level zero-based, so 0x00–0x08 are Heading 1–9
+/// and this value — not 0 — is the body-text marker ([MS-DOC] §2.6.2).
+const OUTLVL_BODY_TEXT: u8 = 9;
+
 /// A single decoded SPRM: opcode plus its operand bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sprm {
@@ -215,13 +220,38 @@ pub struct PapProps {
     /// list/tab-stop PR; in the tables-only PR this field is always empty, but
     /// it is cloned through the IR so the `Paragraph.tabs` shape stays uniform.
     pub tabs: Vec<TabStop>,
-    /// Outline level from `sprmPOutLvl` (0x2640), in [MS-DOC]'s value space:
-    /// `0` = Heading 1 … `8` = Heading 9, and `9` = body text. Stored only
-    /// for real heading levels (0–8); `9` and absent both leave this `None`.
+    /// Outline level, in [MS-DOC]'s value space: `0` = Heading 1 … `8` =
+    /// Heading 9, and `9` = body text. Stored only for real heading levels
+    /// (0–8); `9` and "nothing resolved" both leave this `None`.
     ///
     /// This is the evidence that a document has *real* heading structure,
     /// which is what gates the line-shape heading guess in `convert_doc`.
+    ///
+    /// It comes from either source, and is filled in two stages:
+    /// `extract_pap_props` sets it from `sprmPOutLvl` (0x2640) when that SPRM
+    /// is present; otherwise it stays `None` until `build_paragraphs` resolves
+    /// the paragraph's style (`istd`) into a level. So the value returned by
+    /// `extract_pap_props` alone is *not* necessarily final.
+    ///
+    /// Keeping one field rather than a parallel 1-based one is deliberate: two
+    /// fields encoding the same level at different offsets have to be kept in
+    /// step by hand, and a caller that sets only one of them silently loses the
+    /// level.
     pub outline_level: Option<u8>,
+    /// The style index this paragraph is restyled to by a direct `sprmPIstd`
+    /// (0x4600) in the grpprl, if any. It overrides the PAPX header's own
+    /// `istd` when resolving the style (see `crate::doc::styles`); `None` means
+    /// the PAPX header `istd` applies unchanged.
+    pub style_istd: Option<u16>,
+    /// True when the grpprl carries a `sprmPOutLvl` (0x2640) whose operand is a
+    /// valid outline level (0x00–0x09).
+    ///
+    /// This distinguishes "the SPRM is absent" from "the SPRM is present and
+    /// says body text" (operand 0x09): in both cases `outline_level` is `None`,
+    /// but only the latter settles the question — when this flag is set the
+    /// paragraph's style must not be consulted. An operand above 0x09 is not an
+    /// outline level at all, leaves this flag false, and is ignored.
+    pub outline_lvl_explicit: bool,
 }
 
 /// One table cell descriptor (TKBKTAP, 20 bytes) distilled from a row's
@@ -429,11 +459,32 @@ pap_sprm_dispatch! {
     /// 1-byte operand: 0..=8 are Heading 1..9 and 9 is body text.
     /// The opcode is 0x2640 — *not* the 0x6412 a byte-swapped reading
     /// suggests, which is `sprmPDyaLine`.
+    ///
+    /// `outline_lvl_explicit` records that the SPRM is present with a valid
+    /// operand, so "absent" and "present but body text" stay distinguishable:
+    /// only the latter suppresses a heading the paragraph's style would
+    /// otherwise give it. An operand above 9 is not an outline level at all,
+    /// leaves the flag false, and is ignored.
     "sprmPOutLvl" @ "2.6.2" => [0x2640] (props, operand) {
         if let Some(&lvl) = operand.first() {
-            if lvl <= 8 {
+            if lvl < OUTLVL_BODY_TEXT {
+                props.outline_lvl_explicit = true;
                 props.outline_level = Some(lvl);
+            } else if lvl == OUTLVL_BODY_TEXT {
+                // Explicitly body text: settle it, and never consult the style.
+                props.outline_lvl_explicit = true;
             }
+        }
+    }
+
+    /// 2-byte operand: the style index (`istd`) this paragraph is restyled to.
+    /// It overrides the PAPX header `istd` when the style is resolved.
+    ///
+    /// Not 0x640A: `ispmd` 0x0A is `sprmPIlvl` (0x260A), and 0x640A is not a
+    /// paragraph SPRM at all.
+    "sprmPIstd" @ "2.6.2" => [0x4600] (props, operand) {
+        if operand.len() >= 2 {
+            props.style_istd = Some(u16::from_le_bytes([operand[0], operand[1]]));
         }
     }
 
@@ -533,6 +584,7 @@ mod tests {
         (0x2417, "sprmPFTtp"),
         (0x260A, "sprmPIlvl"),
         (0x2640, "sprmPOutLvl"),
+        (0x4600, "sprmPIstd"),
         (0x460B, "sprmPIlfo"),
         (0x6412, "sprmPDyaLine"),
         (0x6649, "sprmPItap"),
@@ -638,6 +690,74 @@ mod tests {
         assert_eq!(sprms[0].operand, vec![0x01]);
         assert_eq!(sprms[1].opcode, 0x6649);
         assert_eq!(sprms[1].operand, vec![0x01, 0x00, 0x00, 0x00]);
+    }
+
+    /// Regression: 0x6412 is **sprmPDyaLine** (line spacing), not an outline
+    /// level. An earlier revision read its low byte as one, so ordinary line
+    /// spacing turned body paragraphs into headings. 0x6412 occurs 758 times in
+    /// the POI corpus, all of it line spacing, so this must stay inert.
+    #[test]
+    fn sprm_p_dya_line_is_not_read_as_an_outline_level() {
+        // LSPD: dyaLine = 0x0005, fMultLinespace = 0x0000.
+        let props = extract_pap_props(&[0x12, 0x64, 0x05, 0x00, 0x00, 0x00]);
+        assert_eq!(props.outline_level, None, "line spacing must never become an outline level");
+        assert!(
+            !props.outline_lvl_explicit,
+            "line spacing must not settle the outline level either"
+        );
+    }
+
+    /// The `sprmPOutLvl` operand is **zero-based**: `0x00`–`0x08` are Heading
+    /// 1–9 and `0x09` is body text. Each edge is pinned separately, because an
+    /// off-by-one here is invisible in aggregate counts — it silently re-labels
+    /// every heading in every document by one level.
+    #[test]
+    fn sprm_p_out_lvl_zero_is_heading_one() {
+        let props = extract_pap_props(&[0x40, 0x26, 0x00]);
+        assert_eq!(props.outline_level, Some(0), "0x00 is Heading 1, not body text");
+        assert!(props.outline_lvl_explicit);
+    }
+
+    #[test]
+    fn sprm_p_out_lvl_eight_is_heading_nine() {
+        let props = extract_pap_props(&[0x40, 0x26, 0x08]);
+        assert_eq!(props.outline_level, Some(8), "0x08 is Heading 9");
+        assert!(props.outline_lvl_explicit);
+    }
+
+    #[test]
+    fn sprm_p_out_lvl_nine_is_body_text() {
+        let props = extract_pap_props(&[0x40, 0x26, 0x09]);
+        assert_eq!(props.outline_level, None, "0x09 means body text, not Heading 9");
+        assert!(
+            props.outline_lvl_explicit,
+            "body text must still settle the question, so the style is never consulted"
+        );
+    }
+
+    #[test]
+    fn sprm_p_out_lvl_above_nine_is_not_an_outline_level() {
+        let props = extract_pap_props(&[0x40, 0x26, 0x0A]);
+        assert_eq!(props.outline_level, None);
+        assert!(
+            !props.outline_lvl_explicit,
+            "an operand above 0x09 is not an outline level and must not settle anything"
+        );
+    }
+
+    /// `sprmPIstd` (0x4600) overrides the PAPX `istd`; its operand is the 2-byte
+    /// istd. It surfaces on `PapProps.style_istd` from the same grpprl walk that
+    /// decodes the other paragraph properties.
+    #[test]
+    fn pap_props_read_sprm_p_istd_override() {
+        // opcode 0x4600 (LE) + 2-byte operand = istd 5.
+        let grpprl = vec![0x00, 0x46, 0x05, 0x00];
+        assert_eq!(extract_pap_props(&grpprl).style_istd, Some(5));
+    }
+
+    #[test]
+    fn pap_props_style_istd_absent_when_no_sprm() {
+        assert_eq!(extract_pap_props(&[0x16, 0x24, 0x01]).style_istd, None);
     }
 
     #[test]

@@ -22,7 +22,19 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // styles would silently lose their headings, and with them
     // `metadata.title` and `Section.title`, both of which are derived from
     // the first `Element::Heading` below.
-    let has_structured_headings = paragraphs.iter().any(|p| p.props.outline_level.is_some());
+    //
+    // Gated on a level the document states *explicitly* (`sprmPOutLvl`), not
+    // merely one we resolved from a style. A couple of styled paragraphs are
+    // not evidence that the document's headings are structured: real
+    // documents style a few headings and leave the rest as plain ALL-CAPS
+    // lines, and gating on those collapsed `parentinvguid.doc` from 35
+    // headings to 2 — the 33 unstyled section headings stopped being
+    // recognised altogether. Style-derived levels still give the paragraphs
+    // that carry them their real level; they just do not switch the guess off
+    // for their neighbours.
+    let has_structured_headings = paragraphs
+        .iter()
+        .any(|p| p.props.outline_lvl_explicit && p.props.outline_level.is_some());
     if !paragraphs.is_empty() {
         walk_paragraphs(paragraphs, has_structured_headings, &mut elements);
     } else {
@@ -526,7 +538,7 @@ fn emit_heading(text: &str, level: u8, elements: &mut Vec<Element>) {
         }
     }
     elements.push(Element::Heading(Heading {
-        level: level.clamp(1, 6),
+        level: level.clamp(1, MAX_HEADING_DEPTH),
         content,
         ..Default::default()
     }));
@@ -825,6 +837,142 @@ mod tests {
         assert!(
             els.iter().any(|e| matches!(e, Element::Table(_))),
             "f_in_table cell paragraph must be emitted inside a table"
+        );
+    }
+
+    /// A paragraph inside a table whose style resolves to a heading must stay a
+    /// table cell. `walk_paragraphs` routes table paragraphs before `emit_prose`,
+    /// so a styled heading can neither leak into the table structure nor escape
+    /// it as a top-level `Heading`.
+    ///
+    /// Note this guards the *routing* (pre-existing) as well as the styled
+    /// heading branch: without the final contrast below it would pass even with
+    /// the branch deleted, which is how it was first (wrongly) revert-checked.
+    #[test]
+    fn styled_heading_inside_table_stays_a_cell() {
+        let mark = DocParagraph {
+            text: String::new(),
+            terminator: '\r',
+            props: PapProps {
+                is_table_trailing_mark: true,
+                itap: 1,
+                outline_level: Some(2),
+                ..PapProps::default()
+            },
+        };
+        let cell = DocParagraph {
+            text: "cell text".into(),
+            terminator: '\u{7}', // closes the cell
+            props: PapProps {
+                f_in_table: true,
+                outline_level: Some(2),
+                ..PapProps::default()
+            },
+        };
+        let paragraphs = [mark.clone(), cell.clone(), mark];
+        let mut els = Vec::new();
+        walk_paragraphs(&paragraphs, true, &mut els);
+        assert!(
+            els.iter().any(|e| matches!(e, Element::Table(_))),
+            "the cell must still be emitted inside a table"
+        );
+        assert!(
+            !els.iter().any(|e| matches!(e, Element::Heading(_))),
+            "a styled heading inside a table must not become a Heading"
+        );
+
+        // Contrast, so the assertions above cannot pass merely because the
+        // level is ignored: the same paragraph outside a table must produce a
+        // Heading. It carries `outline_level`, so `emit_heading` handles it
+        // whatever the text looks like — what the contrast pins is the table
+        // routing above, not the line-shape guess.
+        let mut prose = cell;
+        prose.props.f_in_table = false;
+        prose.terminator = '\r';
+        prose.text = "cell text.".into();
+        let mut els = Vec::new();
+        walk_paragraphs(&[prose], true, &mut els);
+        assert!(
+            els.iter().any(|e| matches!(e, Element::Heading(_))),
+            "outside a table the same styled paragraph must emit a Heading"
+        );
+    }
+
+    /// A row-terminator paragraph that also carries a heading style must end the
+    /// row, not emit a `Heading` into the element stream.
+    #[test]
+    fn styled_heading_on_row_terminator_is_not_a_heading() {
+        let row = DocParagraph {
+            // A row terminator can carry the trailing cell's text; keeping it
+            // non-empty is what makes this test meaningful — an empty text
+            // would be dropped by `emit_prose` whether or not the routing is
+            // correct, so the test could not tell the two apart.
+            text: "row text.".into(),
+            terminator: '\r',
+            props: PapProps {
+                is_table_trailing_mark: true,
+                itap: 1,
+                outline_level: Some(1),
+                ..PapProps::default()
+            },
+        };
+        let mut els = Vec::new();
+        walk_paragraphs(std::slice::from_ref(&row), true, &mut els);
+        assert!(
+            !els.iter().any(|e| matches!(e, Element::Heading(_))),
+            "a row-terminator paragraph must end a row, not emit a Heading"
+        );
+        // Contrast: the same paragraph as ordinary prose must emit a Heading.
+        // It carries `outline_level`, so this pins that being a row terminator
+        // — not the text shape — is what suppressed the heading above.
+        let mut prose = row;
+        prose.props.is_table_trailing_mark = false;
+        let mut els = Vec::new();
+        walk_paragraphs(&[prose], true, &mut els);
+        assert!(
+            els.iter().any(|e| matches!(e, Element::Heading(_))),
+            "as ordinary prose the same paragraph must emit a Heading"
+        );
+    }
+
+    /// A paragraph that is a list member and whose style resolves to a heading
+    /// stays a list item: `walk_paragraphs` routes list membership (keyed on
+    /// `ilfo`) before `emit_prose`. Like the table case this pins the routing;
+    /// the positive coverage for the styled-heading branch itself lives in
+    /// `doc::document` (`synthetic_doc_styled_heading_uses_style_sheet_level`).
+    #[test]
+    fn styled_heading_list_item_stays_a_list_item() {
+        let item = DocParagraph {
+            text: "item".into(),
+            terminator: '\r',
+            props: PapProps {
+                ilfo: Some(1),
+                ilvl: Some(0),
+                outline_level: Some(3),
+                ..PapProps::default()
+            },
+        };
+        let mut els = Vec::new();
+        walk_paragraphs(std::slice::from_ref(&item), true, &mut els);
+        assert!(
+            els.iter().any(|e| matches!(e, Element::List(_))),
+            "a list member must be emitted as a List"
+        );
+        assert!(
+            !els.iter().any(|e| matches!(e, Element::Heading(_))),
+            "a styled heading that is a list item must not become a Heading"
+        );
+        // Contrast: outside a list the same paragraph must emit a Heading. It
+        // carries `outline_level`, so this pins that list membership — not the
+        // text shape — is what suppressed the heading above.
+        let mut prose = item;
+        prose.props.ilfo = None;
+        prose.text = "item.".into();
+        let mut els = Vec::new();
+        walk_paragraphs(&[prose], true, &mut els);
+        assert!(
+            els.iter().any(|e| matches!(e, Element::Heading(_))),
+            "outside a list the same styled paragraph must emit a Heading"
         );
     }
 
