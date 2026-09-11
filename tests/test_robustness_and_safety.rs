@@ -338,7 +338,9 @@ fn replace_text_matches_and_writes_escaped_characters_correctly() {
     let bytes = docx_with(r#"<w:p><w:r><w:t>AT&amp;T is here</w:t></w:r></w:p>"#);
     let mut doc = EditableDocument::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
         .expect("open for editing");
-    let n = doc.replace_text("AT&T", "M & S <Ltd>");
+    let n = doc
+        .replace_text("AT&T", "M & S <Ltd>")
+        .expect("docx supports replace");
     assert_eq!(n, 1, "the decoded text must match");
 
     let mut out = Cursor::new(Vec::new());
@@ -359,7 +361,11 @@ fn replace_text_does_not_rewrite_table_elements() {
     );
     let mut doc = EditableDocument::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
         .expect("open for editing");
-    assert_eq!(doc.replace_text("cell", "CELL"), 1);
+    assert_eq!(
+        doc.replace_text("cell", "CELL")
+            .expect("docx supports replace"),
+        1
+    );
 
     let mut out = Cursor::new(Vec::new());
     doc.write_to(&mut out).expect("save");

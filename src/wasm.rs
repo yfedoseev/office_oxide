@@ -98,8 +98,10 @@ impl WasmEditableDocument {
     /// Replace every occurrence of `find` with `replace` in the document's
     /// text, returning how many replacements were made.
     #[wasm_bindgen(js_name = replaceText)]
-    pub fn replace_text(&mut self, find: &str, replace: &str) -> usize {
-        self.inner.replace_text(find, replace)
+    pub fn replace_text(&mut self, find: &str, replace: &str) -> Result<usize, JsValue> {
+        self.inner
+            .replace_text(find, replace)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Serialise the edited document back to bytes.

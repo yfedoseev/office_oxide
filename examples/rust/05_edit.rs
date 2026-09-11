@@ -23,8 +23,12 @@ fn main() {
 
     // ── Edit ────────────────────────────────────────────────────────────────
     let mut ed = EditableDocument::open(&template_path).expect("open editable");
-    let n1 = ed.replace_text("{{NAME}}", "World");
-    let n2 = ed.replace_text("{{SENDER}}", "The Office Oxide Team");
+    let n1 = ed
+        .replace_text("{{NAME}}", "World")
+        .expect("docx supports replace");
+    let n2 = ed
+        .replace_text("{{SENDER}}", "The Office Oxide Team")
+        .expect("docx supports replace");
     ed.save(&output_path).expect("save edited document");
 
     println!("Replacements: {{NAME}} x{n1}, {{SENDER}} x{n2}");

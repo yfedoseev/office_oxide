@@ -212,7 +212,9 @@ impl PyEditable {
     /// Returns the number of replacements.
     #[pyo3(signature = (find, replace, /))]
     fn replace_text(&mut self, find: &str, replace: &str) -> PyResult<usize> {
-        Ok(self.get_mut()?.replace_text(find, replace))
+        self.get_mut()?
+            .replace_text(find, replace)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     /// Set a cell value in an XLSX document.

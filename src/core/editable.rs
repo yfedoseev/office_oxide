@@ -102,15 +102,22 @@ impl EditablePackage {
         let mut zip = ZipWriter::new(writer);
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
-        // Write all parts
-        for (name, data) in &self.parts {
+        // Sorted: parts and part_rels are HashMaps, so iterating them directly
+        // produced a different ZIP entry order on every save. Saving an
+        // unchanged document then produced a different byte stream each time,
+        // defeating content-hash caching and churning any VCS around the CLI.
+        let mut parts: Vec<_> = self.parts.iter().collect();
+        parts.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        for (name, data) in parts {
             let zip_path = &name.as_str()[1..]; // strip leading /
             zip.start_file(zip_path, options)?;
             zip.write_all(data)?;
         }
 
         // Write part-level .rels files
-        for (source, rels) in &self.part_rels {
+        let mut part_rels: Vec<_> = self.part_rels.iter().collect();
+        part_rels.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        for (source, rels) in part_rels {
             if rels.all().is_empty() {
                 continue;
             }
@@ -142,7 +149,11 @@ impl EditablePackage {
             for (ext, ct) in self.content_types.defaults() {
                 ct_builder.add_default(ext, ct);
             }
-            for (pn, ct) in self.content_types.overrides() {
+            // Sorted for the same reason as the parts above: a HashMap made
+            // [Content_Types].xml differ byte-for-byte between saves.
+            let mut overrides: Vec<_> = self.content_types.overrides().iter().collect();
+            overrides.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+            for (pn, ct) in overrides {
                 ct_builder.add_override(pn.clone(), ct);
             }
             let data = ct_builder.serialize();
@@ -242,4 +253,37 @@ fn find_open_tag(xml: &str, from: usize, prefix: &str) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod determinism_tests {
+    use super::*;
+
+    /// Saving an unchanged package produced a different byte stream every
+    /// time, because parts, part rels and content-type overrides were all
+    /// iterated out of `HashMap`s.
+    #[test]
+    fn saving_the_same_package_twice_produces_the_same_bytes() {
+        let mut wb = crate::xlsx::write::XlsxWriter::new();
+        for n in ["Alpha", "Beta", "Gamma", "Delta"] {
+            wb.add_sheet(n)
+                .add_row(vec![crate::xlsx::write::CellData::String(n.into())]);
+        }
+        let mut src = std::io::Cursor::new(Vec::new());
+        wb.write_to(&mut src).unwrap();
+
+        let save = || {
+            let mut r = src.clone();
+            r.set_position(0);
+            let pkg = EditablePackage::from_reader(r).expect("open");
+            let mut out = std::io::Cursor::new(Vec::new());
+            pkg.write_to(&mut out).unwrap();
+            out.into_inner()
+        };
+
+        let first = save();
+        for _ in 0..15 {
+            assert_eq!(first, save(), "the edit path is not byte-deterministic");
+        }
+    }
 }

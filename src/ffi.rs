@@ -430,9 +430,18 @@ pub extern "C" fn office_editable_replace_text(
         return -1;
     };
     let h = unsafe { &mut *handle };
-    let n = h.doc.replace_text(find_s, replace_s);
-    set_err(error_code, OFFICE_OK);
-    n as i64
+    match h.doc.replace_text(find_s, replace_s) {
+        Ok(n) => {
+            set_err(error_code, OFFICE_OK);
+            n as i64
+        },
+        Err(_) => {
+            // XLSX has no text replacement; reporting 0 told the caller the
+            // edit had simply matched nothing.
+            set_err(error_code, OFFICE_ERR_UNSUPPORTED);
+            -1
+        },
+    }
 }
 
 /// Set a cell value in an XLSX document.
