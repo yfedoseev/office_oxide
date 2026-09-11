@@ -1981,3 +1981,44 @@ fn paragraph_tab_stops_are_emitted() {
     assert!(body.contains(r#"w:pos="8640""#), "tab position lost: {body}");
     assert!(body.contains(r#"w:leader="dot""#), "dot leader lost: {body}");
 }
+
+/// The markdown front end produced neither `Element::CodeBlock` nor nested
+/// lists, so the fence language leaked into the text and every bullet
+/// flattened to level 0.
+#[test]
+fn markdown_produces_code_blocks_and_nested_lists() {
+    use office_oxide::{DocumentIR, format::DocumentFormat, ir::Element};
+
+    let md = "```rust\nlet x = 1;\n```\n\n- one\n  - one-a\n    - one-a-i\n- two\n";
+    let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
+    let elements = &ir.sections[0].elements;
+
+    let code = elements
+        .iter()
+        .find_map(|e| match e {
+            Element::CodeBlock(c) => Some(c),
+            _ => None,
+        })
+        .expect("a fenced block must become Element::CodeBlock");
+    assert_eq!(code.language.as_deref(), Some("rust"), "fence language lost");
+    assert_eq!(code.content, "let x = 1;", "fence body wrong: {:?}", code.content);
+
+    let list = elements
+        .iter()
+        .find_map(|e| match e {
+            Element::List(l) => Some(l),
+            _ => None,
+        })
+        .expect("a list");
+    assert_eq!(list.items.len(), 2, "top level should hold two items");
+    let level1 = list.items[0]
+        .nested
+        .as_ref()
+        .expect("one-a must nest under one");
+    assert_eq!(level1.items.len(), 1);
+    let level2 = level1.items[0]
+        .nested
+        .as_ref()
+        .expect("one-a-i must nest under one-a");
+    assert_eq!(level2.items.len(), 1);
+}
