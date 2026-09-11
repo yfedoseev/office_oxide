@@ -2022,3 +2022,29 @@ fn markdown_produces_code_blocks_and_nested_lists() {
         .expect("one-a-i must nest under one-a");
     assert_eq!(level2.items.len(), 1);
 }
+
+/// A table flattened into tab-joined text loses the grid entirely, and every
+/// bullet emitted at level 0 loses the nesting the IR carries.
+#[test]
+fn pptx_writes_real_tables_and_nested_bullets() {
+    use office_oxide::format::DocumentFormat;
+
+    let md = "# Deck\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n- one\n  - one-a\n    - one-a-i\n";
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_markdown_to_writer(md, DocumentFormat::Pptx, &mut buf)
+        .unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut slide = String::new();
+    let mut e = zip.by_name("ppt/slides/slide1.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut slide).unwrap();
+
+    assert!(slide.contains("<a:tbl>"), "no real table emitted: {slide}");
+    assert!(slide.contains("<a:gridCol"), "table has no grid: {slide}");
+    assert_eq!(slide.matches("<a:tr ").count(), 2, "expected two table rows");
+    assert!(!slide.contains('\t'), "a raw tab means the table was flattened");
+
+    assert!(slide.contains(r#"lvl="1""#), "second-level bullet lost: {slide}");
+    assert!(slide.contains(r#"lvl="2""#), "third-level bullet lost: {slide}");
+    assert!(slide.contains("marL="), "bullets need a hanging indent: {slide}");
+}

@@ -195,7 +195,11 @@ pub struct ParaProps {
 enum BodyItem {
     Text(String),
     RichText(Vec<Run>, ParaProps),
-    BulletList(Vec<String>),
+    /// Bullet list items paired with their nesting level (0 = top level).
+    BulletList(Vec<(u8, String)>),
+    /// A real table: rows of cell text. Flattening a table into tab-joined
+    /// text lost the grid entirely.
+    Table(Vec<Vec<String>>),
     /// Free-floating text box: (runs, x_emu, y_emu, cx_emu, cy_emu)
     TextBox(Vec<Run>, i64, i64, i64, i64),
     /// Embedded image: (data, format, x_emu, y_emu, cx_emu, cy_emu)
@@ -295,8 +299,25 @@ impl SlideData {
 
     /// Add a bullet list to the body area.
     pub fn add_bullet_list(&mut self, items: &[&str]) -> &mut Self {
-        let owned: Vec<String> = items.iter().map(|s| s.to_string()).collect();
+        let owned: Vec<(u8, String)> = items.iter().map(|s| (0, (*s).to_string())).collect();
         self.body_items.push(BodyItem::BulletList(owned));
+        self
+    }
+
+    /// Add a bullet list whose items carry an explicit nesting level.
+    ///
+    /// Every item used to be emitted at level 0 with no `marL`/`indent`, so
+    /// nesting was lost and the bullet glyph sat at the same x as its text.
+    pub fn add_nested_bullet_list(&mut self, items: &[(u8, String)]) -> &mut Self {
+        self.body_items.push(BodyItem::BulletList(items.to_vec()));
+        self
+    }
+
+    /// Add a table as a real `a:tbl`, not tab-joined text.
+    pub fn add_table(&mut self, rows: Vec<Vec<String>>) -> &mut Self {
+        if !rows.is_empty() {
+            self.body_items.push(BodyItem::Table(rows));
+        }
         self
     }
 
@@ -662,13 +683,10 @@ fn write_decl(w: &mut Writer<Vec<u8>>) {
 }
 
 fn write_text_element(w: &mut Writer<Vec<u8>>, tag: &str, text: &str) {
-    let mut start = BytesStart::new(tag);
-    // Without xml:space="preserve" a conformant consumer strips leading and
-    // trailing whitespace from the run.
-    if text.starts_with(char::is_whitespace) || text.ends_with(char::is_whitespace) {
-        start.push_attribute(("xml:space", "preserve"));
-    }
-    w.write_event(Event::Start(start)).expect("write start");
+    // No xml:space here: DrawingML's a:t is an xsd:string that preserves
+    // whitespace already, and the attribute is not permitted on it.
+    w.write_event(Event::Start(BytesStart::new(tag)))
+        .expect("write start");
     w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(text))))
         .expect("write text");
     w.write_event(Event::End(BytesEnd::new(tag)))
@@ -1300,10 +1318,24 @@ fn generate_slide_xml(
         let placeholder_items: Vec<&BodyItem> = slide
             .body_items
             .iter()
-            .filter(|i| !matches!(i, BodyItem::TextBox(..) | BodyItem::Image(..)))
+            .filter(|i| {
+                !matches!(i, BodyItem::TextBox(..) | BodyItem::Image(..) | BodyItem::Table(..))
+            })
             .collect();
         write_body_shape(&mut w, next_id, &placeholder_items, pres_cx, pres_cy);
         next_id += 1;
+    }
+
+    // Tables, as real graphic frames rather than tab-joined text.
+    for item in &slide.body_items {
+        if let BodyItem::Table(rows) = item {
+            let margin = (pres_cx as f64 * BODY_X_FRAC) as u64;
+            let cx = pres_cx.saturating_sub(2 * margin).max(914_400);
+            let cy = (rows.len() as u64 * 457_200).min(pres_cy / 2).max(457_200);
+            let y = (pres_cy as f64 * BODY_Y_FRAC) as i64;
+            write_table_frame(&mut w, next_id, rows, margin as i64, y, cx, cy);
+            next_id += 1;
+        }
     }
 
     // Free-floating text boxes
@@ -1492,16 +1524,128 @@ fn write_body_shape(
             BodyItem::RichText(runs, props) => write_rich_paragraph(w, runs, props),
             BodyItem::BulletList(bullets) => {
                 for bullet in bullets {
-                    write_bullet_paragraph(w, bullet);
+                    write_bullet_paragraph(w, bullet.0, &bullet.1);
                 }
             },
-            BodyItem::TextBox(..) | BodyItem::Image(..) => {}, // handled separately
+            // Tables, text boxes and images are separate shapes, not body text.
+            BodyItem::Table(..) | BodyItem::TextBox(..) | BodyItem::Image(..) => {},
         }
     }
 
     w.write_event(Event::End(BytesEnd::new("p:txBody")))
         .expect("write");
     w.write_event(Event::End(BytesEnd::new("p:sp")))
+        .expect("write");
+}
+
+/// A real `a:tbl` inside a `p:graphicFrame`.
+///
+/// The bridge used to join cells with tabs and rows with newlines into a
+/// single text run, which loses the grid, every cell boundary and any hope of
+/// a renderer laying it out as a table.
+fn write_table_frame(
+    w: &mut Writer<Vec<u8>>,
+    id: u32,
+    rows: &[Vec<String>],
+    x: i64,
+    y: i64,
+    cx: u64,
+    cy: u64,
+) {
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if cols == 0 {
+        return;
+    }
+    let col_w = (cx / cols as u64).max(1);
+    let row_h = (cy / rows.len() as u64).max(1);
+
+    w.write_event(Event::Start(BytesStart::new("p:graphicFrame")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:nvGraphicFramePr")))
+        .expect("write");
+    let mut c_nv_pr = BytesStart::new("p:cNvPr");
+    let id_str = id.to_string();
+    let name = format!("Table {id}");
+    c_nv_pr.push_attribute(("id", id_str.as_str()));
+    c_nv_pr.push_attribute(("name", name.as_str()));
+    w.write_event(Event::Empty(c_nv_pr)).expect("write");
+    write_empty(w, "p:cNvGraphicFramePr");
+    write_empty(w, "p:nvPr");
+    w.write_event(Event::End(BytesEnd::new("p:nvGraphicFramePr")))
+        .expect("write");
+
+    w.write_event(Event::Start(BytesStart::new("p:xfrm")))
+        .expect("write");
+    let mut off = BytesStart::new("a:off");
+    off.push_attribute(("x", x.to_string().as_str()));
+    off.push_attribute(("y", y.to_string().as_str()));
+    w.write_event(Event::Empty(off)).expect("write");
+    let mut ext = BytesStart::new("a:ext");
+    ext.push_attribute(("cx", cx.to_string().as_str()));
+    ext.push_attribute(("cy", cy.to_string().as_str()));
+    w.write_event(Event::Empty(ext)).expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:xfrm")))
+        .expect("write");
+
+    w.write_event(Event::Start(BytesStart::new("a:graphic")))
+        .expect("write");
+    let mut gd = BytesStart::new("a:graphicData");
+    gd.push_attribute(("uri", "http://schemas.openxmlformats.org/drawingml/2006/table"));
+    w.write_event(Event::Start(gd)).expect("write");
+
+    w.write_event(Event::Start(BytesStart::new("a:tbl")))
+        .expect("write");
+    let mut tbl_pr = BytesStart::new("a:tblPr");
+    tbl_pr.push_attribute(("firstRow", "1"));
+    tbl_pr.push_attribute(("bandRow", "1"));
+    w.write_event(Event::Empty(tbl_pr)).expect("write");
+
+    w.write_event(Event::Start(BytesStart::new("a:tblGrid")))
+        .expect("write");
+    for _ in 0..cols {
+        let mut gc = BytesStart::new("a:gridCol");
+        gc.push_attribute(("w", col_w.to_string().as_str()));
+        w.write_event(Event::Empty(gc)).expect("write");
+    }
+    w.write_event(Event::End(BytesEnd::new("a:tblGrid")))
+        .expect("write");
+
+    for row in rows {
+        let mut tr = BytesStart::new("a:tr");
+        tr.push_attribute(("h", row_h.to_string().as_str()));
+        w.write_event(Event::Start(tr)).expect("write");
+        for c in 0..cols {
+            w.write_event(Event::Start(BytesStart::new("a:tc")))
+                .expect("write");
+            w.write_event(Event::Start(BytesStart::new("a:txBody")))
+                .expect("write");
+            write_empty(w, "a:bodyPr");
+            w.write_event(Event::Start(BytesStart::new("a:p")))
+                .expect("write");
+            w.write_event(Event::Start(BytesStart::new("a:r")))
+                .expect("write");
+            write_text_element(w, "a:t", row.get(c).map_or("", String::as_str));
+            w.write_event(Event::End(BytesEnd::new("a:r")))
+                .expect("write");
+            w.write_event(Event::End(BytesEnd::new("a:p")))
+                .expect("write");
+            w.write_event(Event::End(BytesEnd::new("a:txBody")))
+                .expect("write");
+            write_empty(w, "a:tcPr");
+            w.write_event(Event::End(BytesEnd::new("a:tc")))
+                .expect("write");
+        }
+        w.write_event(Event::End(BytesEnd::new("a:tr")))
+            .expect("write");
+    }
+
+    w.write_event(Event::End(BytesEnd::new("a:tbl")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("a:graphicData")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("a:graphic")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:graphicFrame")))
         .expect("write");
 }
 
@@ -1707,11 +1851,23 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, runs: &[Run], props: &ParaProps
         .expect("write");
 }
 
-fn write_bullet_paragraph(w: &mut Writer<Vec<u8>>, text: &str) {
+/// One level of hanging indent, in EMU — the value PowerPoint uses.
+const BULLET_INDENT_EMU: u32 = 342_900;
+
+fn write_bullet_paragraph(w: &mut Writer<Vec<u8>>, level: u8, text: &str) {
     w.write_event(Event::Start(BytesStart::new("a:p")))
         .expect("write");
-    w.write_event(Event::Start(BytesStart::new("a:pPr")))
-        .expect("write");
+    let level = level.min(8);
+    let mut p_pr = BytesStart::new("a:pPr");
+    if level > 0 {
+        p_pr.push_attribute(("lvl", level.to_string().as_str()));
+    }
+    // A hanging indent per level: without marL/indent the bullet glyph and
+    // its text start at the same x, so nesting is invisible.
+    let mar_l = BULLET_INDENT_EMU * (u32::from(level) + 1);
+    p_pr.push_attribute(("marL", mar_l.to_string().as_str()));
+    p_pr.push_attribute(("indent", format!("-{BULLET_INDENT_EMU}").as_str()));
+    w.write_event(Event::Start(p_pr)).expect("write");
     let mut bu = BytesStart::new("a:buChar");
     bu.push_attribute(("char", "\u{2022}"));
     w.write_event(Event::Empty(bu)).expect("write");

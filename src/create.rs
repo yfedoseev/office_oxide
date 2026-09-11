@@ -880,7 +880,7 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
         Element::List(l) => {
             // Flatten the whole tree: `ListItem::nested` was read by no
             // writer, so every item below level 0 was silently dropped.
-            fn flatten(list: &crate::ir::List, out: &mut Vec<String>) {
+            fn flatten(list: &crate::ir::List, level: u8, out: &mut Vec<(u8, String)>) {
                 for item in &list.items {
                     let text = item
                         .content
@@ -892,34 +892,26 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
                         .collect::<Vec<_>>()
                         .join(" ");
                     if !text.is_empty() {
-                        out.push(text);
+                        out.push((level, text));
                     }
                     if let Some(ref nested) = item.nested {
-                        flatten(nested, out);
+                        flatten(nested, level.saturating_add(1), out);
                     }
                 }
             }
-            let mut items: Vec<String> = Vec::new();
-            flatten(l, &mut items);
-            let item_refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
-            slide.add_bullet_list(&item_refs);
+            let mut items: Vec<(u8, String)> = Vec::new();
+            flatten(l, l.level, &mut items);
+            slide.add_nested_bullet_list(&items);
         },
         Element::Table(t) => {
-            let text = t
+            // A real a:tbl, not tab-joined text: the previous form lost the
+            // grid, every cell boundary and all per-cell formatting.
+            let rows: Vec<Vec<String>> = t
                 .rows
                 .iter()
-                .map(|row| {
-                    row.cells
-                        .iter()
-                        .map(cell_text)
-                        .collect::<Vec<_>>()
-                        .join("\t")
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !text.is_empty() {
-                slide.add_text(&text);
-            }
+                .map(|row| row.cells.iter().map(cell_text).collect())
+                .collect();
+            slide.add_table(rows);
         },
         Element::Image(img) => {
             if let (Some(data), Some(fmt)) = (&img.data, &img.format) {
@@ -949,7 +941,14 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
                 emit_pptx_element(slide, inner);
             }
         },
-        _ => {},
+        // Footnote and endnote bodies have no slide equivalent, but their
+        // text is unambiguous content — the catch-all used to drop it.
+        Element::Footnote(n) | Element::Endnote(n) => {
+            for inner in &n.content {
+                emit_pptx_element(slide, inner);
+            }
+        },
+        Element::PageBreak | Element::ColumnBreak | Element::Shape(_) => {},
     }
 }
 
