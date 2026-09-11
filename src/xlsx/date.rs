@@ -57,7 +57,14 @@ impl DateTimeValue {
 
         // Split into integer days and fractional time
         let day_serial = serial.trunc() as i64;
-        let time_frac = serial - serial.trunc();
+        let mut time_frac = serial - serial.trunc();
+        let mut day_serial = day_serial;
+        // Rounding to the nearest second can reach a full day. Carry it into
+        // the date rather than emitting hour 24, which no date library accepts.
+        if (time_frac * 86400.0).round() as u64 >= 86_400 {
+            time_frac = 0.0;
+            day_serial += 1;
+        }
 
         let (year, month, day) = if date1904 {
             // 1904 system: day 0 = Jan 1, 1904
@@ -244,17 +251,15 @@ pub fn is_date_cell(style_index: Option<u32>, styles: Option<&StyleSheet>) -> bo
         return false;
     };
 
-    // Check built-in date format IDs first
-    if is_date_format_id(fmt_id) {
-        return true;
-    }
-
-    // Check custom format string
-    if let Some(fmt_str) = styles.number_format_for(idx) {
+    // A workbook may redefine a built-in id — [ECMA-376] §18.8.30 permits
+    // ids 0-163 to be overridden — so an explicit <numFmt> wins over the
+    // built-in meaning of its id. Testing the id first made a cell formatted
+    // `0.00" kg"` under id 14 render as a 1900 date.
+    if let Some(fmt_str) = styles.number_format_override_for(idx) {
         return is_date_format_string(fmt_str);
     }
 
-    false
+    is_date_format_id(fmt_id)
 }
 
 #[cfg(test)]
@@ -387,5 +392,26 @@ mod tests {
     #[test]
     fn negative_serial_returns_none() {
         assert!(DateTimeValue::from_serial(-1.0, false).is_none());
+    }
+}
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+
+    /// Rounding the time fraction to the nearest second can reach a whole
+    /// day. The day was never carried, so the value came out as hour 24 —
+    /// which `chrono` and Python's `datetime` both reject.
+    #[test]
+    fn a_time_that_rounds_up_to_a_full_day_carries_into_the_date() {
+        let v = DateTimeValue::from_serial(45000.9999999, false).expect("valid serial");
+        assert!(v.hour < 24, "hour must stay in 0..=23, got {}", v.hour);
+        assert_eq!((v.hour, v.minute, v.second), (0, 0, 0));
+
+        let prev = DateTimeValue::from_serial(45000.0, false).unwrap();
+        assert!(
+            (v.year, v.month, v.day) > (prev.year, prev.month, prev.day),
+            "the rounded-up day must advance the date"
+        );
     }
 }

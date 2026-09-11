@@ -145,9 +145,28 @@ impl StyleSheet {
 
     /// Get the number format string for a cell format index.
     pub fn number_format_for(&self, style_index: u32) -> Option<&str> {
+        if let Some(explicit) = self.number_format_override_for(style_index) {
+            return Some(explicit);
+        }
+        // Fall back to the built-in table. Returning `None` for every built-in
+        // id meant a caller asking about a Currency, Percent or Date cell —
+        // most real formatted cells — learned nothing.
         let xf = self.cell_formats.get(style_index as usize)?;
-        let fmt_id = xf.number_format_id;
-        self.number_formats.get(&fmt_id).map(|s| s.as_str())
+        crate::xlsx::numfmt::builtin_format_code(xf.number_format_id)
+    }
+
+    /// The format code a `<numFmt>` in *this workbook* declares for a cell
+    /// format index, ignoring the built-in table.
+    ///
+    /// [ECMA-376] §18.8.30 lets a workbook redefine built-in ids 0-163, so an
+    /// explicit declaration has to win over the built-in meaning of its id.
+    /// Date detection uses this rather than `number_format_for`, which would
+    /// otherwise report the built-in code it just overrode.
+    pub fn number_format_override_for(&self, style_index: u32) -> Option<&str> {
+        let xf = self.cell_formats.get(style_index as usize)?;
+        self.number_formats
+            .get(&xf.number_format_id)
+            .map(|s| s.as_str())
     }
 
     /// Get the font for a cell format index.
@@ -595,8 +614,12 @@ mod tests {
             cell_style_formats: vec![],
         };
 
-        assert_eq!(ss.number_format_for(0), None); // Built-in format 0 not in custom list
+        // A built-in id resolves through the built-in table; only an explicit
+        // <numFmt> shows up as an override.
+        assert_eq!(ss.number_format_for(0), Some("General"));
+        assert_eq!(ss.number_format_override_for(0), None);
         assert_eq!(ss.number_format_for(1), Some("yyyy-mm-dd"));
+        assert_eq!(ss.number_format_override_for(1), Some("yyyy-mm-dd"));
         assert_eq!(ss.number_format_id_for(0), Some(0));
         assert_eq!(ss.number_format_id_for(1), Some(164));
     }
