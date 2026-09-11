@@ -2361,3 +2361,73 @@ fn a_floating_image_anchor_has_no_duplicate_attributes() {
         b.clear();
     }
 }
+
+/// `CT_TcPrBase` sequence: tcW, gridSpan, vMerge, tcBorders, shd, tcMar,
+/// textDirection, vAlign. A cell carrying borders plus shading plus padding
+/// was invalid; 53 corpus conversions failed on this alone.
+#[test]
+fn table_cell_properties_follow_the_schema_sequence() {
+    use office_oxide::format::DocumentFormat;
+    use office_oxide::ir::*;
+
+    let ir = DocumentIR {
+        sections: vec![Section {
+            elements: vec![Element::Table(Table {
+                rows: vec![TableRow {
+                    cells: vec![TableCell {
+                        width_twips: Some(1000),
+                        background_color: Some([1, 2, 3]),
+                        border: Some(TableBorder {
+                            top: Some(BorderLine {
+                                style: BorderStyle::Single,
+                                color: Some([0, 0, 0]),
+                                size: Some(4),
+                                space: Some(0),
+                            }),
+                            bottom: None,
+                            left: None,
+                            right: None,
+                            inside_h: None,
+                            inside_v: None,
+                        }),
+                        padding: Some(CellPadding {
+                            top_twips: Some(10),
+                            left_twips: Some(10),
+                            bottom_twips: Some(10),
+                            right_twips: Some(10),
+                        }),
+                        vertical_align: Some(CellVerticalAlign::Center),
+                        text_direction: Some(TextDirection::TbRl),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut buf = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(&ir, DocumentFormat::Docx, &mut buf).unwrap();
+    buf.set_position(0);
+    let mut zip = zip::ZipArchive::new(buf).unwrap();
+    let mut xml = String::new();
+    let mut e = zip.by_name("word/document.xml").unwrap();
+    std::io::Read::read_to_string(&mut e, &mut xml).unwrap();
+
+    let pos = |n: &str| xml.find(n).unwrap_or_else(|| panic!("missing {n}:\n{xml}"));
+    let (w, bdr, shd, mar, td, va) = (
+        pos("<w:tcW"),
+        pos("<w:tcBorders"),
+        pos("<w:shd"),
+        pos("<w:tcMar"),
+        pos("<w:textDirection"),
+        pos("<w:vAlign"),
+    );
+    assert!(w < bdr, "tcW must precede tcBorders");
+    assert!(bdr < shd, "tcBorders must precede shd");
+    assert!(shd < mar, "shd must precede tcMar");
+    assert!(mar < td, "tcMar must precede textDirection");
+    assert!(td < va, "textDirection must precede vAlign");
+}

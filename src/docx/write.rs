@@ -2307,6 +2307,10 @@ fn write_rich_table(
                 w.write_event(Event::Start(BytesStart::new("w:tcPr")))
                     .expect("write tcPr start");
 
+                // CT_TcPrBase is a strict sequence: tcW, gridSpan, vMerge,
+                // tcBorders, shd, tcMar, textDirection, vAlign. This is the
+                // third element-ordering defect of the same shape in this
+                // release (w:pPr and w:tblPr were the others).
                 if let Some(width) = cell.width_twips {
                     let mut tcw = BytesStart::new("w:tcW");
                     tcw.push_attribute(("w:w", width.to_string().as_str()));
@@ -2330,6 +2334,11 @@ fn write_rich_table(
                         .expect("write vMerge restart");
                 }
 
+                if let Some(ref border) = cell.border {
+                    write_table_borders(w, border, "w:tcBorders");
+                }
+
+                // CT_TcPrBase orders tcMar before textDirection and vAlign.
                 if let Some(ref bg) = cell.background_color {
                     let mut shd = BytesStart::new("w:shd");
                     shd.push_attribute(("w:val", "clear"));
@@ -2338,11 +2347,6 @@ fn write_rich_table(
                     w.write_event(Event::Empty(shd)).expect("write cell shd");
                 }
 
-                if let Some(ref border) = cell.border {
-                    write_table_borders(w, border, "w:tcBorders");
-                }
-
-                // CT_TcPrBase orders tcMar before textDirection and vAlign.
                 if let Some(ref pad) = cell.padding {
                     w.write_event(Event::Start(BytesStart::new("w:tcMar")))
                         .expect("write tcMar start");
@@ -2363,17 +2367,6 @@ fn write_rich_table(
                         .expect("write tcMar end");
                 }
 
-                if let Some(ref va) = cell.vertical_align {
-                    let val = match va {
-                        CellVerticalAlign::Top => "top",
-                        CellVerticalAlign::Center => "center",
-                        CellVerticalAlign::Bottom => "bottom",
-                    };
-                    let mut v_align = BytesStart::new("w:vAlign");
-                    v_align.push_attribute(("w:val", val));
-                    w.write_event(Event::Empty(v_align)).expect("write vAlign");
-                }
-
                 if let Some(ref td) = cell.text_direction {
                     let val = match td {
                         crate::ir::TextDirection::LrTb => "lrTb",
@@ -2385,7 +2378,16 @@ fn write_rich_table(
                     w.write_event(Event::Empty(td_elem))
                         .expect("write textDirection");
                 }
-
+                if let Some(ref va) = cell.vertical_align {
+                    let val = match va {
+                        CellVerticalAlign::Top => "top",
+                        CellVerticalAlign::Center => "center",
+                        CellVerticalAlign::Bottom => "bottom",
+                    };
+                    let mut v_align = BytesStart::new("w:vAlign");
+                    v_align.push_attribute(("w:val", val));
+                    w.write_event(Event::Empty(v_align)).expect("write vAlign");
+                }
                 w.write_event(Event::End(BytesEnd::new("w:tcPr")))
                     .expect("write tcPr end");
             }
