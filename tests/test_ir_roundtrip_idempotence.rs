@@ -69,3 +69,85 @@ fn pptx_roundtrip_preserves_slide_body() {
         assert!(text.contains(needle), "PPTX round-trip dropped body text {needle:?}: {text:?}");
     }
 }
+
+/// issue #259 — `section.title` must not be re-emitted as a duplicate
+/// heading when the heading it came from isn't the section's literal
+/// first element (e.g. a byline or date line ahead of it). The old
+/// check only looked at `section.elements.first()`.
+#[test]
+fn docx_heading_not_first_element_does_not_duplicate_on_roundtrip() {
+    use office_oxide::ir::{Element, Heading, InlineContent, Metadata, Paragraph, Section, TextSpan};
+
+    let ir = DocumentIR {
+        metadata: Metadata { format: DocumentFormat::Docx, ..Default::default() },
+        sections: vec![Section {
+            title: Some("My Heading".to_string()),
+            elements: vec![
+                Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(
+                        "A byline before the heading",
+                    ))],
+                    ..Default::default()
+                }),
+                Element::Heading(Heading {
+                    level: 1,
+                    content: vec![InlineContent::Text(TextSpan::plain("My Heading"))],
+                    ..Default::default()
+                }),
+            ],
+            ..Default::default()
+        }],
+        defined_names: Vec::new(),
+    };
+
+    let mut buf = Cursor::new(Vec::new());
+    create::create_from_ir_to_writer(&ir, DocumentFormat::Docx, &mut buf).unwrap();
+    buf.set_position(0);
+    let text = Document::from_reader(buf, DocumentFormat::Docx).unwrap().plain_text();
+
+    let occurrences = text.matches("My Heading").count();
+    assert_eq!(
+        occurrences, 1,
+        "heading duplicated on write, expected exactly one occurrence: {text:?}"
+    );
+}
+
+/// issue #259's PPTX analogue — the title heading duplicating into the
+/// slide body when it isn't the section's first element.
+#[test]
+fn pptx_title_heading_not_first_element_does_not_duplicate_on_roundtrip() {
+    use office_oxide::ir::{Element, Heading, InlineContent, Metadata, Paragraph, Section, TextSpan};
+
+    let ir = DocumentIR {
+        metadata: Metadata { format: DocumentFormat::Pptx, ..Default::default() },
+        sections: vec![Section {
+            title: Some("Slide Title".to_string()),
+            elements: vec![
+                Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(
+                        "A decorative shape before the title",
+                    ))],
+                    ..Default::default()
+                }),
+                Element::Heading(Heading {
+                    level: 1,
+                    content: vec![InlineContent::Text(TextSpan::plain("Slide Title"))],
+                    ..Default::default()
+                }),
+            ],
+            ..Default::default()
+        }],
+        defined_names: Vec::new(),
+    };
+
+    let mut buf = Cursor::new(Vec::new());
+    create::create_from_ir_to_writer(&ir, DocumentFormat::Pptx, &mut buf).unwrap();
+    buf.set_position(0);
+    let text = Document::from_reader(buf, DocumentFormat::Pptx).unwrap().plain_text();
+
+    let occurrences = text.matches("Slide Title").count();
+    assert_eq!(
+        occurrences, 1,
+        "title duplicated into body on write, expected exactly one occurrence: {text:?}"
+    );
+}

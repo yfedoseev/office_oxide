@@ -123,19 +123,23 @@ pub fn ir_to_docx(ir: &DocumentIR) -> crate::docx::write::DocxWriter {
 
     for section in &ir.sections {
         // Section title becomes H1 — but skip it when the title is already
-        // carried by the section's leading heading element. The DOCX parser
-        // derives `section.title` FROM the first heading (which it also keeps
-        // in `elements`), so re-emitting the title here would materialise a
-        // duplicate H1 on every write→parse cycle, breaking round-trip
-        // idempotence. Only emit a standalone title-H1 for a title that is
-        // NOT already represented as the leading heading.
-        let title_is_leading_heading = matches!(
-            section.elements.first(),
-            Some(Element::Heading(h))
-                if section.title.as_deref().is_some_and(|t| inline_to_text(&h.content) == t)
-        );
+        // carried by one of the section's own heading elements. The DOCX
+        // parser derives `section.title` FROM a heading (which it also
+        // keeps in `elements`), so re-emitting the title here would
+        // materialise a duplicate H1 on every write→parse cycle, breaking
+        // round-trip idempotence. This used to check only
+        // `section.elements.first()`, so a section whose heading wasn't
+        // its literal first element (e.g. a byline or date line before
+        // it) got the heading duplicated on every round trip (issue
+        // #259) — checking the whole element list instead of just the
+        // first entry fixes it without changing behavior for the common
+        // leading-heading case.
+        let title_already_present = section.elements.iter().any(|e| {
+            matches!(e, Element::Heading(h)
+                if section.title.as_deref().is_some_and(|t| inline_to_text(&h.content) == t))
+        });
         if let Some(ref title) = section.title {
-            if !title.is_empty() && !title_is_leading_heading {
+            if !title.is_empty() && !title_already_present {
                 let runs = [Run::new(title)];
                 let props = IrParaProps {
                     style: Some("Heading1".to_string()),
@@ -844,19 +848,25 @@ fn emit_pptx_slide_from_section(writer: &mut crate::pptx::write::PptxWriter, sec
     }
 
     // The PPTX parser surfaces the slide-title placeholder as BOTH
-    // `section.title` and a leading Heading element. The title placeholder is
-    // already set above, so re-emitting that heading as body text would both
-    // pollute the body and cause the real body content to be dropped on a
-    // write→parse cycle (breaking round-trip idempotence). Skip the leading
-    // heading when it merely duplicates the section title.
-    let skip_leading_title_heading = matches!(
-        section.elements.first(),
-        Some(Element::Heading(h))
-            if section.title.as_deref().is_some_and(|t| inline_to_text(&h.content) == t)
-    );
+    // `section.title` and a Heading element somewhere in `elements`. The
+    // title placeholder is already set above, so re-emitting that
+    // heading as body text would both pollute the body and duplicate it
+    // on a write→parse cycle (breaking round-trip idempotence). This
+    // used to only check `section.elements.first()` — the same bug
+    // shape as #259 on the DOCX side — so a slide whose title heading
+    // wasn't its literal first shape (a decorative or subtitle shape
+    // ahead of it in z-order) got the title duplicated into the body on
+    // every round trip. Find the matching heading wherever it is and
+    // skip only that one occurrence, not every element after it.
+    let title_heading_idx = section.title.as_deref().and_then(|t| {
+        section
+            .elements
+            .iter()
+            .position(|e| matches!(e, Element::Heading(h) if inline_to_text(&h.content) == t))
+    });
 
     for (i, elem) in section.elements.iter().enumerate() {
-        if i == 0 && skip_leading_title_heading {
+        if Some(i) == title_heading_idx {
             continue;
         }
         emit_pptx_element(slide, elem);
