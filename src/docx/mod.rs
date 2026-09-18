@@ -128,6 +128,10 @@ pub struct DocxDocument {
     /// carries no extended-properties part. The parser already existed;
     /// nothing on the read side called it until now (issue #245).
     pub app_properties: Option<crate::core::properties::AppProperties>,
+    /// `true` when the document part's own relationships include a
+    /// `vbaProject` entry — a cheap macro-presence signal, no VBA
+    /// interpretation (issue #283).
+    pub has_macros: bool,
     /// Footnote bodies from `word/footnotes.xml`, in document order.
     /// Separator/continuation pseudo-notes are filtered out.
     pub footnotes: Vec<NoteBody>,
@@ -199,6 +203,7 @@ impl DocxDocument {
         let app_properties = crate::core::properties::read_app_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let doc_rels = opc.read_rels_for(&main_part)?;
+        let has_macros = doc_rels.first_by_type(rel_types::VBA_PROJECT).is_some();
 
         // Parse theme
         // A theme is decoration: it supplies colour-scheme lookups and
@@ -484,6 +489,7 @@ impl DocxDocument {
             images,
             core_properties,
             app_properties,
+            has_macros,
             footnotes,
             endnotes,
             comments,
@@ -4343,6 +4349,41 @@ mod tests {
             msg.contains("password-protected"),
             "expected a friendly password-protected message, got: {msg}"
         );
+    }
+
+    #[test]
+    fn test_vba_project_relationship_sets_metadata_has_macros() {
+        // issue #283 — no API surface reported whether a document
+        // contains macros. A vbaProject relationship on the document
+        // part must set Metadata::has_macros.
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>hello</w:t></w:r></w:p></w:body>
+</w:document>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.ms-word.document.macroEnabled.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let vba_part = PartName::new("/word/vbaProject.bin").unwrap();
+        writer
+            .add_part(&vba_part, "application/vnd.ms-office.vbaProject", b"fake vba bytes")
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::VBA_PROJECT, "vbaProject.bin");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        assert!(doc.has_macros, "DocxDocument::has_macros must be true");
+        let ir = crate::convert_docx::docx_to_ir(&doc);
+        assert!(ir.metadata.has_macros, "Metadata::has_macros must be true");
     }
 
     #[test]

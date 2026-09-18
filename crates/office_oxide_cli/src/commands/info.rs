@@ -8,6 +8,9 @@ pub fn run(file: &str) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref title) = ir.metadata.title {
         println!("Title: {title}");
     }
+    if ir.metadata.has_macros {
+        println!("Macros: yes");
+    }
     println!("Sections: {}", ir.sections.len());
 
     for (i, section) in ir.sections.iter().enumerate() {

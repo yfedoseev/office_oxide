@@ -80,6 +80,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Ppt,
             title,
+            has_macros: doc.has_macros(),
             ..Default::default()
         },
         sections,

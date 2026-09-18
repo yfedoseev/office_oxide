@@ -28,6 +28,10 @@ pub struct DocDocument {
     /// were parsed and then never used, so none of this reached any
     /// consumer.
     subdocuments: Vec<SubDocument>,
+    /// `true` when the CFB container has a top-level `_VBA_PROJECT`
+    /// storage — a cheap macro-presence signal, no VBA interpretation
+    /// (issue #283).
+    has_macros: bool,
 }
 
 /// One of the subdocuments stored after the main text in a `.doc`.
@@ -151,12 +155,14 @@ impl DocDocument {
             Ok(data_stream) => extract_images(&data_stream),
             Err(_) => Vec::new(),
         };
+        let has_macros = cfb.has_root_entry("_VBA_PROJECT");
 
         Ok(Self {
             text,
             images,
             paragraphs,
             subdocuments,
+            has_macros,
         })
     }
 
@@ -175,6 +181,12 @@ impl DocDocument {
     /// the file stores them.
     pub fn subdocuments(&self) -> &[SubDocument] {
         &self.subdocuments
+    }
+
+    /// `true` when the file carries a `_VBA_PROJECT` storage — a cheap
+    /// macro-presence signal, no VBA interpretation (issue #283).
+    pub fn has_macros(&self) -> bool {
+        self.has_macros
     }
 
     /// Get the extracted plain text.
@@ -240,6 +252,7 @@ mod tests {
     fn markdown_double_spacing() {
         let doc = DocDocument {
             subdocuments: Vec::new(),
+            has_macros: false,
             images: Vec::new(),
             text: "First paragraph\nSecond paragraph\n\nAfter gap".into(),
             paragraphs: Vec::new(),
@@ -254,6 +267,7 @@ mod tests {
     fn plain_text_access() {
         let doc = DocDocument {
             subdocuments: Vec::new(),
+            has_macros: false,
             images: Vec::new(),
             text: "Hello World".into(),
             paragraphs: Vec::new(),
@@ -264,6 +278,7 @@ mod tests {
     fn make_doc(text: &str) -> DocDocument {
         DocDocument {
             subdocuments: Vec::new(),
+            has_macros: false,
             images: Vec::new(),
             text: text.to_string(),
             paragraphs: Vec::new(),
@@ -276,6 +291,7 @@ mod tests {
     fn make_doc_with_paragraphs(paras: Vec<DocParagraph>) -> DocDocument {
         DocDocument {
             subdocuments: Vec::new(),
+            has_macros: false,
             images: Vec::new(),
             text: String::new(),
             paragraphs: paras,

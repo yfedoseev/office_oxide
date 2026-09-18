@@ -399,6 +399,7 @@ mod tests {
             embedded_fonts: Vec::new(),
             core_properties: None,
             app_properties: None,
+            has_macros: false,
             styles_data: None,
             theme_data: None,
         };

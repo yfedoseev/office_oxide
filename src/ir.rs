@@ -531,6 +531,13 @@ pub struct Metadata {
     pub modified: Option<String>,
     /// Document description / comments.
     pub description: Option<String>,
+    /// `true` when the source document carries a macro/VBA project — an
+    /// OOXML part reached via a `vbaProject` relationship, or a legacy
+    /// CFB file's top-level `_VBA_PROJECT` storage. A cheap presence-only
+    /// signal for content-safety use cases; office_oxide never
+    /// interprets or executes the macro content itself (issue #283).
+    #[serde(default)]
+    pub has_macros: bool,
 }
 
 /// A logical section (DOCX: section break, XLSX: worksheet, PPTX: slide).

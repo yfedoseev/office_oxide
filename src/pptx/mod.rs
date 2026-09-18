@@ -67,6 +67,10 @@ pub struct PptxDocument {
     /// slide/notes/hidden-slide counts). `None` when the package carries no
     /// extended-properties part (issue #245).
     pub app_properties: Option<crate::core::properties::AppProperties>,
+    /// `true` when the presentation part's own relationships include a
+    /// `vbaProject` entry — a cheap macro-presence signal, no VBA
+    /// interpretation (issue #283).
+    pub has_macros: bool,
 }
 
 impl PptxDocument {
@@ -119,6 +123,7 @@ impl PptxDocument {
         let app_properties = crate::core::properties::read_app_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let pres_rels = opc.read_rels_for(&main_part)?;
+        let has_macros = pres_rels.first_by_type(rel_types::VBA_PROJECT).is_some();
 
         // Parse theme
         // See the DOCX reader: a malformed theme is not a reason to refuse
@@ -290,6 +295,7 @@ impl PptxDocument {
             embedded_fonts,
             core_properties,
             app_properties,
+            has_macros,
         })
     }
 }

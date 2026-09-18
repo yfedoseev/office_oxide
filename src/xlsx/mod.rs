@@ -93,6 +93,10 @@ pub struct XlsxDocument {
     /// page/word/character/paragraph counts). `None` when the package
     /// carries no extended-properties part (issue #245).
     pub app_properties: Option<crate::core::properties::AppProperties>,
+    /// `true` when the workbook part's own relationships include a
+    /// `vbaProject` entry — a cheap macro-presence signal, no VBA
+    /// interpretation (issue #283).
+    pub has_macros: bool,
     // Raw bytes for lazy parsing (None after parsing or if not present)
     styles_data: Option<Vec<u8>>,
     theme_data: Option<Vec<u8>>,
@@ -190,6 +194,7 @@ impl XlsxDocument {
             Ok(data) => Relationships::parse(&data)?,
             Err(_) => Relationships::empty(),
         };
+        let has_macros = wb_rels.first_by_type(rel_types::VBA_PROJECT).is_some();
 
         // Parse shared strings (must be first — cells reference by index)
         let shared_strings = match Self::read_xml_entry(&mut archive, "xl/sharedStrings.xml") {
@@ -355,6 +360,7 @@ impl XlsxDocument {
             embedded_fonts,
             core_properties,
             app_properties,
+            has_macros,
             styles_data: None,
             theme_data,
         })
@@ -380,6 +386,7 @@ impl XlsxDocument {
         let app_properties = crate::core::properties::read_app_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let wb_rels = opc.read_rels_for(&main_part)?;
+        let has_macros = wb_rels.first_by_type(rel_types::VBA_PROJECT).is_some();
 
         let shared_strings = if let Some(rel) = wb_rels.first_by_type(rel_types::SHARED_STRINGS) {
             let part_name = main_part.resolve_relative(&rel.target)?;
@@ -528,6 +535,7 @@ impl XlsxDocument {
             embedded_fonts,
             core_properties,
             app_properties,
+            has_macros,
             styles_data: None,
             theme_data,
         })

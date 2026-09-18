@@ -16,6 +16,7 @@ pub struct XlsDocument {
     /// Worksheets in workbook order.
     pub sheets: Vec<Sheet>,
     images: Vec<XlsImage>,
+    has_macros: bool,
 }
 
 #[cfg(test)]
@@ -26,6 +27,7 @@ impl XlsDocument {
         Self {
             sheets,
             images: Vec::new(),
+            has_macros: false,
         }
     }
 }
@@ -90,11 +92,13 @@ impl XlsDocument {
         } else {
             return Err(XlsError::MissingStream("neither Workbook nor Book stream found".into()));
         };
+        let has_macros = cfb.has_root_entry("_VBA_PROJECT");
         // Drop CFB early to free file handle and memory.
         drop(cfb);
 
         let mut doc = Self::parse_workbook_stream(&stream_data)?;
         doc.images = extract_images(&stream_data);
+        doc.has_macros = has_macros;
         Ok(doc)
     }
 
@@ -267,12 +271,21 @@ impl XlsDocument {
         Ok(Self {
             sheets,
             images: Vec::new(),
+            // Set by the caller (from_reader), which has the CfbReader
+            // this function doesn't.
+            has_macros: false,
         })
     }
 
     /// Get all extracted images.
     pub fn images(&self) -> &[XlsImage] {
         &self.images
+    }
+
+    /// `true` when the file carries a `_VBA_PROJECT` storage — a cheap
+    /// macro-presence signal, no VBA interpretation (issue #283).
+    pub fn has_macros(&self) -> bool {
+        self.has_macros
     }
 
     /// Extract plain text from the document.
@@ -769,6 +782,7 @@ mod tests {
     fn plain_text_output() {
         let doc = XlsDocument {
             images: Vec::new(),
+            has_macros: false,
             sheets: vec![Sheet {
                 display: Vec::new(),
                 name: "Sheet1".into(),
@@ -792,6 +806,7 @@ mod tests {
     fn markdown_output() {
         let doc = XlsDocument {
             images: Vec::new(),
+            has_macros: false,
             sheets: vec![Sheet {
                 display: Vec::new(),
                 name: "Data".into(),
@@ -812,6 +827,7 @@ mod tests {
     fn make_doc(sheets: Vec<Sheet>) -> XlsDocument {
         XlsDocument {
             images: Vec::new(),
+            has_macros: false,
             sheets,
         }
     }

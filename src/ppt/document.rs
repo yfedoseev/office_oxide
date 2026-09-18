@@ -14,12 +14,14 @@ pub struct PptDocument {
     /// Text content extracted from each slide.
     pub slides: Vec<SlideText>,
     images: Vec<PptImage>,
+    has_macros: bool,
 }
 
 impl PptDocument {
     /// Open a PPT file from a reader.
     pub fn from_reader<R: Read + Seek>(reader: R) -> Result<Self> {
         let mut cfb = CfbReader::new(reader)?;
+        let has_macros = cfb.has_root_entry("_VBA_PROJECT");
 
         let stream = match cfb
             .open_stream("PowerPoint Document")
@@ -30,6 +32,7 @@ impl PptDocument {
                 return Ok(Self {
                     slides: Vec::new(),
                     images: Vec::new(),
+                    has_macros,
                 });
             },
         };
@@ -43,7 +46,13 @@ impl PptDocument {
             Err(_) => Vec::new(),
         };
 
-        Ok(Self { slides, images })
+        Ok(Self { slides, images, has_macros })
+    }
+
+    /// `true` when the file carries a `_VBA_PROJECT` storage — a cheap
+    /// macro-presence signal, no VBA interpretation (issue #283).
+    pub fn has_macros(&self) -> bool {
+        self.has_macros
     }
 
     /// Open a PPT file from a path.
@@ -123,6 +132,7 @@ mod tests {
     fn plain_text_basic() {
         let doc = PptDocument {
             images: Vec::new(),
+            has_macros: false,
             slides: vec![
                 SlideText {
                     text_runs: vec![
@@ -154,6 +164,7 @@ mod tests {
     fn markdown_basic() {
         let doc = PptDocument {
             images: Vec::new(),
+            has_macros: false,
             slides: vec![SlideText {
                 text_runs: vec![
                     TextRun {
@@ -177,6 +188,7 @@ mod tests {
     fn notes_excluded_from_plain_text() {
         let doc = PptDocument {
             images: Vec::new(),
+            has_macros: false,
             slides: vec![SlideText {
                 text_runs: vec![
                     TextRun {
@@ -212,6 +224,7 @@ mod tests {
         let doc = PptDocument {
             images: Vec::new(),
             slides: Vec::new(),
+            has_macros: false,
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
         assert!(ir.sections.is_empty());
@@ -223,6 +236,7 @@ mod tests {
         use crate::ir::Element;
         let doc = PptDocument {
             images: Vec::new(),
+            has_macros: false,
             slides: vec![make_slide(vec![(TextType::Title, "My Slide")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -234,6 +248,7 @@ mod tests {
     fn ir_center_title_treated_like_title() {
         let doc = PptDocument {
             images: Vec::new(),
+            has_macros: false,
             slides: vec![make_slide(vec![(TextType::CenterTitle, "Centered")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -245,6 +260,7 @@ mod tests {
         use crate::ir::Element;
         let doc = PptDocument {
             images: Vec::new(),
+            has_macros: false,
             slides: vec![make_slide(vec![
                 (TextType::Body, "Body text"),
                 (TextType::HalfBody, "Half body"),
@@ -261,6 +277,7 @@ mod tests {
         use crate::ir::{Element, InlineContent};
         let doc = PptDocument {
             images: Vec::new(),
+            has_macros: false,
             slides: vec![make_slide(vec![(TextType::Notes, "Speaker note")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -280,6 +297,7 @@ mod tests {
         use crate::ir::Element;
         let doc = PptDocument {
             images: Vec::new(),
+            has_macros: false,
             slides: vec![make_slide(vec![(TextType::Other, "misc text")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -290,6 +308,7 @@ mod tests {
     fn ir_slide_without_title_gets_fallback_name() {
         let doc = PptDocument {
             images: Vec::new(),
+            has_macros: false,
             slides: vec![make_slide(vec![(TextType::Body, "content")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -301,6 +320,7 @@ mod tests {
         let doc = PptDocument {
             images: Vec::new(),
             slides: Vec::new(),
+            has_macros: false,
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
         assert_eq!(ir.metadata.format, crate::format::DocumentFormat::Ppt);

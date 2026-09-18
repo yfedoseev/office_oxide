@@ -18,6 +18,12 @@ pub mod rel_types {
     /// Relationship type for extended (application) properties.
     pub const EXTENDED_PROPERTIES: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties";
+    /// Relationship type for an embedded VBA project (`vbaProject.bin`),
+    /// referenced from the main document part's own `.rels` — presence
+    /// alone is a cheap macro-content signal, no VBA interpretation
+    /// required (issue #283).
+    pub const VBA_PROJECT: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vbaProject";
     /// Relationship type for the package thumbnail.
     pub const THUMBNAIL: &str =
         "http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail";

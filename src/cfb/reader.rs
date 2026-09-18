@@ -98,6 +98,18 @@ impl<R: Read + Seek> CfbReader<R> {
         (self.entries[idx].entry_type == EntryType::Stream).then_some(idx)
     }
 
+    /// `true` when the root storage has a direct child (stream *or*
+    /// storage) with this name — e.g. a `_VBA_PROJECT` storage, which
+    /// [`find_entry`](Self::find_entry) alone can never see, since it
+    /// only matches streams. Same root-scoped tree walk as `find_entry`,
+    /// without the type filter.
+    pub fn has_root_entry(&self, name: &str) -> bool {
+        if self.entries.is_empty() || self.entries[0].entry_type != EntryType::RootStorage {
+            return false;
+        }
+        self.find_in_tree(self.entries[0].child, name).is_some()
+    }
+
     /// Find an entry by path (e.g., "Storage1/StreamName"), case-insensitive.
     pub fn find_entry_by_path(&self, path: &str) -> Option<usize> {
         let parts: Vec<&str> = path.split('/').collect();
@@ -588,6 +600,19 @@ mod tests {
             &stream, b"Hello, CFB!",
             "must return the root-level stream, not the embedded object's"
         );
+    }
+
+    /// issue #283 — a `_VBA_PROJECT` (or here, "ObjectPool") root-level
+    /// entry is a STORAGE, not a stream; `find_entry`/`has_stream` alone
+    /// can never see it, since they only match streams. `has_root_entry`
+    /// must find it regardless of type, and must not match a nested
+    /// entry (the embedded "TestStream" one level down).
+    #[test]
+    fn test_has_root_entry_finds_a_storage_not_just_streams() {
+        let data = build_cfb_with_embedded_same_name_stream();
+        let reader = CfbReader::new(Cursor::new(data)).unwrap();
+        assert!(reader.has_root_entry("ObjectPool"), "must find the root-level storage");
+        assert!(!reader.has_root_entry("NoSuchEntry"));
     }
 
     #[test]

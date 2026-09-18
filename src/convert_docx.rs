@@ -211,6 +211,7 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             created: cp.and_then(|c| c.created.clone()),
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
+            has_macros: doc.has_macros,
         },
         sections: ir_sections,
     }

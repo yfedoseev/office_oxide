@@ -88,6 +88,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Doc,
             title,
+            has_macros: doc.has_macros(),
             ..Default::default()
         },
         sections,

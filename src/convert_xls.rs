@@ -152,6 +152,7 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Xls,
             title,
+            has_macros: doc.has_macros(),
             ..Default::default()
         },
         sections,
