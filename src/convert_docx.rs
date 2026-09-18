@@ -535,14 +535,25 @@ fn convert_block_elements(
                 let eff = effective_paragraph_props(p, doc);
                 let eff_ref = eff.as_ref();
 
+                // Heading level wins over list membership. Word's own
+                // multilevel-list "Heading" gallery attaches numPr/ilfo to
+                // the heading styles themselves, so a numbered heading
+                // ("1. Introduction", "2.3 Scope") is the normal shape of
+                // headings in real documents — checking list membership
+                // first turned every one of them into a ListItem, leaving
+                // the IR with no Headings, no Section.title, no guessed
+                // metadata.title (issue #223).
+                let heading_level = resolve_heading_level(p, doc);
+
                 // Check if this is a list item — group consecutive list
                 // paragraphs. `<w:numId w:val="0"/>` is the ECMA-376 way of
                 // saying "this paragraph has no numbering" — usually a
                 // style-level list switched off for one paragraph. Treating
                 // it as a list turned an ordinary paragraph into a bullet.
-                if let Some(nr) = eff_ref
-                    .and_then(|pp| pp.numbering_ref.as_ref())
-                    .filter(|nr| nr.num_id != 0)
+                if heading_level.is_none()
+                    && let Some(nr) = eff_ref
+                        .and_then(|pp| pp.numbering_ref.as_ref())
+                        .filter(|nr| nr.num_id != 0)
                 {
                     let list_element =
                         convert_list_group(blocks, &mut i, nr.num_id, doc, &mut numbering_counts);
@@ -550,8 +561,6 @@ fn convert_block_elements(
                     continue;
                 }
 
-                // Check for heading
-                let heading_level = resolve_heading_level(p, doc);
                 let alignment = eff_ref.and_then(paragraph_alignment);
 
                 // Detect "horizontal rule" encoding: empty paragraph

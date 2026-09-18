@@ -439,6 +439,17 @@ fn walk_paragraphs(
         } else if p.props.f_in_table {
             flush_list(&mut list_items, elements);
             table.add_cell_paragraph(p);
+        } else if let Some(lvl) = p.props.outline_level {
+            // Outline level wins over list membership, exactly like the
+            // DOCX converter: Word's multilevel-list "Heading" gallery
+            // attaches an ilfo to the heading styles themselves, so a
+            // numbered heading ("1. Introduction") is the normal shape of
+            // a heading in real documents. Checking ilfo first turned
+            // every one of them into a list item and left no Headings in
+            // the IR at all (issue #223).
+            table.flush(elements);
+            flush_list(&mut list_items, elements);
+            emit_heading(&p.text, lvl + 1, elements);
         } else if is_doc_list_item(p.props.ilfo) {
             // List membership is keyed on `ilfo` (sprmPIlfo, `0x460B`), not on
             // `ilvl`: per [MS-DOC] §2.4.6.3 a paragraph is a list item only when
@@ -449,17 +460,14 @@ fn walk_paragraphs(
         } else {
             table.flush(elements);
             flush_list(&mut list_items, elements);
-            match p.props.outline_level {
-                // A real outline level: use it, and never guess alongside it.
-                Some(lvl) => emit_heading(&p.text, lvl + 1, elements),
-                None if has_structured_headings => {
-                    elements.push(Element::Paragraph(Paragraph {
-                        content: inline_content_for(&p.text),
-                        tabs: p.props.tabs.clone(),
-                        ..Default::default()
-                    }));
-                },
-                None => emit_prose(&p.text, &p.props.tabs, elements),
+            if has_structured_headings {
+                elements.push(Element::Paragraph(Paragraph {
+                    content: inline_content_for(&p.text),
+                    tabs: p.props.tabs.clone(),
+                    ..Default::default()
+                }));
+            } else {
+                emit_prose(&p.text, &p.props.tabs, elements);
             }
         }
     }
@@ -752,6 +760,33 @@ mod tests {
                 "ilfo {ilfo:#06x} must be emitted as ordinary prose"
             );
         }
+    }
+
+    /// issue #223 — a paragraph with a real outline level (heading) that
+    /// *also* carries a valid `ilfo` (Word's multilevel-list "Heading"
+    /// gallery attaches numPr/ilfo to the heading styles themselves) must
+    /// come out as a Heading, not a ListItem — this is the normal shape
+    /// of a numbered heading ("1. Introduction") in real documents.
+    #[test]
+    fn test_numbered_heading_wins_over_list_membership() {
+        let props = PapProps {
+            ilvl: Some(0),
+            ilfo: Some(1), // valid 1-based list index
+            outline_level: Some(0), // Heading 1
+            ..PapProps::default()
+        };
+        let p = para("1. Introduction", props);
+        let mut els = Vec::new();
+        walk_paragraphs(&[p], false, &mut els);
+
+        assert!(
+            els.iter().any(|e| matches!(e, Element::Heading(h) if h.level == 1)),
+            "a numbered Heading 1 must be emitted as a Heading, got {els:#?}"
+        );
+        assert!(
+            !els.iter().any(|e| matches!(e, Element::List(_))),
+            "list membership must be dropped once the paragraph is a heading, got {els:#?}"
+        );
     }
 
     /// `0xF802`–`0xFFFF` is the negation of a 1-based index and is still a list

@@ -4122,6 +4122,82 @@ mod tests {
     }
 
     #[test]
+    fn test_numbered_heading_wins_over_list_membership() {
+        // issue #223 — Word's multilevel-list "Heading" gallery attaches
+        // numPr to the heading styles themselves, so a numbered heading
+        // ("1. Introduction") is the normal shape of a heading in real
+        // documents. Checking list membership before outlineLvl turned
+        // every one of them into a ListItem, leaving no Headings at all.
+        let numbering_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="0">
+    <w:lvl w:ilvl="0">
+      <w:start w:val="1"/>
+      <w:numFmt w:val="decimal"/>
+      <w:lvlText w:val="%1."/>
+    </w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="1">
+    <w:abstractNumId w:val="0"/>
+  </w:num>
+</w:numbering>"#;
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:pPr>
+        <w:outlineLvl w:val="0"/>
+        <w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>
+      </w:pPr>
+      <w:r><w:t>Introduction</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let numbering_part = PartName::new("/word/numbering.xml").unwrap();
+        writer
+            .add_part(
+                &numbering_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml",
+                numbering_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::NUMBERING, "numbering.xml");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let ir = crate::convert_docx::docx_to_ir(&doc);
+        assert!(
+            ir.sections[0]
+                .elements
+                .iter()
+                .any(|e| matches!(e, crate::ir::Element::Heading(h) if h.level == 1)),
+            "expected a Heading 1, got {:#?}",
+            ir.sections[0].elements
+        );
+        assert!(
+            !ir.sections[0]
+                .elements
+                .iter()
+                .any(|e| matches!(e, crate::ir::Element::List(_))),
+            "list membership must be dropped once the paragraph is a heading, got {:#?}",
+            ir.sections[0].elements
+        );
+    }
+
+    #[test]
     fn test_num_start_override_is_read_back() {
         // issue #260 — the writer emits <w:num><w:lvlOverride><w:startOverride>
         // (confirmed present in real numbering.xml output) but nothing read
