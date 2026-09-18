@@ -222,8 +222,25 @@ impl DocDocument {
     }
 
     /// Get the extracted plain text.
+    ///
+    /// Includes footnote/endnote/comment/textbox bodies — `to_ir()` (via
+    /// `doc_to_ir`) already carries this content as its own elements, and
+    /// leaving it out here made this renderer disagree with that one, the
+    /// same gap already fixed for DOCX in #240 (issue #248).
     pub fn plain_text(&self) -> String {
-        self.text.clone()
+        let mut out = self.text.clone();
+        for sub in &self.subdocuments {
+            let text = sub.text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(text);
+            out.push('\n');
+        }
+        out
     }
 
     /// Get a reference to the extracted plain text.
@@ -240,26 +257,49 @@ impl DocDocument {
     }
 
     /// Convert to markdown (basic: paragraphs separated by blank lines).
+    ///
+    /// Includes footnote/endnote/comment/textbox bodies — see the
+    /// identical note on `plain_text()` (issue #248).
     pub fn to_markdown(&self) -> String {
-        let mut result = String::new();
-        let mut prev_empty = false;
-
-        for line in self.text.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                if !prev_empty {
-                    result.push('\n');
-                }
-                prev_empty = true;
-            } else {
-                result.push_str(trimmed);
-                result.push_str("\n\n");
-                prev_empty = false;
+        let mut result = text_to_markdown_blocks(&self.text);
+        for sub in &self.subdocuments {
+            let block = text_to_markdown_blocks(&sub.text);
+            let block = block.trim();
+            if block.is_empty() {
+                continue;
             }
+            if !result.ends_with("\n\n") && !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(block);
+            result.push_str("\n\n");
         }
-
         result
     }
+}
+
+/// Split `text` into markdown paragraphs, each separated by a blank line —
+/// the shared rendering shape `to_markdown()` uses for both the main text
+/// and every subdocument body.
+fn text_to_markdown_blocks(text: &str) -> String {
+    let mut result = String::new();
+    let mut prev_empty = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !prev_empty {
+                result.push('\n');
+            }
+            prev_empty = true;
+        } else {
+            result.push_str(trimmed);
+            result.push_str("\n\n");
+            prev_empty = false;
+        }
+    }
+
+    result
 }
 
 fn clx_size_zero_or_oob(clx_size: u32, clx_start: usize, stream_len: usize) -> bool {
@@ -309,6 +349,53 @@ mod tests {
             paragraphs: Vec::new(),
         };
         assert_eq!(doc.plain_text(), "Hello World");
+    }
+
+    /// issue #248 — `plain_text()`/`to_markdown()` only ever walked
+    /// `self.text` (the main body), never `self.subdocuments`, so a
+    /// footnote/endnote/comment/textbox-only document silently vanished
+    /// from both renderers even though `to_ir()` (via `doc_to_ir`) already
+    /// carried the content correctly.
+    #[test]
+    fn plain_text_and_markdown_include_subdocument_bodies() {
+        let doc = DocDocument {
+            subdocuments: vec![
+                SubDocument { kind: SubDocumentKind::Footnotes, text: "FOOTNOTE ONE".into() },
+                SubDocument { kind: SubDocumentKind::Comments, text: "REVIEW NOTE".into() },
+                SubDocument { kind: SubDocumentKind::HeaderTextBoxes, text: "SIDEBAR".into() },
+            ],
+            has_macros: false,
+            text_complete: true,
+            summary_properties: None,
+            images: Vec::new(),
+            text: "Main body text".into(),
+            paragraphs: Vec::new(),
+        };
+        let text = doc.plain_text();
+        for token in ["Main body text", "FOOTNOTE ONE", "REVIEW NOTE", "SIDEBAR"] {
+            assert!(text.contains(token), "{token} missing from plain_text(): {text:?}");
+        }
+        let md = doc.to_markdown();
+        for token in ["Main body text", "FOOTNOTE ONE", "REVIEW NOTE", "SIDEBAR"] {
+            assert!(md.contains(token), "{token} missing from to_markdown(): {md:?}");
+        }
+    }
+
+    /// An empty subdocument body must contribute nothing — no stray blank
+    /// paragraphs or extra separators.
+    #[test]
+    fn empty_subdocuments_are_skipped_in_both_renderers() {
+        let doc = DocDocument {
+            subdocuments: vec![SubDocument { kind: SubDocumentKind::Comments, text: "  \n ".into() }],
+            has_macros: false,
+            text_complete: true,
+            summary_properties: None,
+            images: Vec::new(),
+            text: "Body".into(),
+            paragraphs: Vec::new(),
+        };
+        assert_eq!(doc.plain_text(), "Body");
+        assert_eq!(doc.to_markdown(), "Body\n\n");
     }
 
     /// `text_complete()` reaches `to_ir()`'s `Metadata::text_truncated` so
