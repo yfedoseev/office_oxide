@@ -21,6 +21,27 @@
 //!   `office_oxide_free_bytes(ptr, len)`.
 //! - Opaque handles (`*mut OfficeDocumentHandle`, `*mut OfficeEditableHandle`)
 //!   must be freed with their corresponding `*_free` function.
+//!
+//! # Thread-safety Convention
+//! **A handle must not be used from more than one thread at a time.** The
+//! contract is the same as `sqlite3*` in serialized-off mode or `FILE*`:
+//!
+//! - Each handle is owned by the caller and carries no internal lock. These
+//!   functions reconstruct `&`/`&mut` references to the handle's contents
+//!   across the FFI boundary, so two concurrent calls that touch the same
+//!   handle — e.g. two threads calling
+//!   `office_oxide_editable_replace_text` on one `*mut OfficeEditableHandle`,
+//!   or one thread calling a `*_free` while another still uses the handle —
+//!   are a data race and undefined behaviour. Rust cannot detect or prevent
+//!   this across the boundary; it is the caller's responsibility.
+//! - Callers that share a handle between threads (Go goroutines on different
+//!   OS threads, .NET thread-pool work items, raw pthreads) must serialize
+//!   every call on that handle with their own mutex. Python's GIL happens to
+//!   provide that serialization for the Python binding; no other binding gets
+//!   it for free.
+//! - *Distinct* handles are independent: different threads may each use their
+//!   own handle concurrently without synchronization, and the library's own
+//!   Rust-side state is otherwise thread-safe.
 #![allow(missing_docs)]
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -155,6 +176,10 @@ fn parse_format(s: &str) -> Option<DocumentFormat> {
 // ─── Document (read-only) ───────────────────────────────────────────────────
 
 /// Opaque handle for a read-only Document.
+///
+/// Not safe to share across threads without external synchronization: see
+/// the module-level "Thread-safety Convention". Concurrent calls on the
+/// *same* handle are undefined behaviour; distinct handles are independent.
 pub struct OfficeDocumentHandle {
     _doc: Document,
 }
@@ -340,6 +365,11 @@ pub extern "C" fn office_document_save_as(
 // ─── EditableDocument ──────────────────────────────────────────────────────
 
 /// Opaque handle for an editable document.
+///
+/// Not safe to share across threads without external synchronization: see
+/// the module-level "Thread-safety Convention". Every mutating call takes
+/// `&mut` to the handle's contents, so two concurrent calls on the same
+/// handle are a data race the caller must prevent with its own mutex.
 pub struct OfficeEditableHandle {
     doc: EditableDocument,
 }

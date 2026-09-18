@@ -353,14 +353,17 @@ cargo install office_oxide_mcp
 `office-oxide` provides fast Office document processing from your terminal:
 
 ```bash
-office-oxide text report.docx         # Extract plain text
-office-oxide markdown data.xlsx       # Convert to Markdown
-office-oxide html slides.pptx         # Convert to HTML
-office-oxide ir document.docx         # Dump IR as JSON
-office-oxide info report.docx         # Show format and metadata
+office-oxide text report.docx                    # Extract plain text
+office-oxide markdown data.xlsx                  # Convert to Markdown
+office-oxide markdown report.docx --embed-images  # Markdown with inline base64 images
+office-oxide html slides.pptx                    # Convert to HTML
+office-oxide ir document.docx                    # Dump IR as JSON
+office-oxide info report.docx                    # Show format and metadata
+office-oxide replace report.docx OLD NEW         # Find/replace text (DOCX/PPTX)
 ```
 
-All six formats supported (docx, xlsx, pptx, doc, xls, ppt). Use `--help` for all options.
+All six formats are supported for reading (docx, xlsx, pptx, doc, xls, ppt); `replace` writes
+DOCX and PPTX. Use `--help` for all options.
 
 ## MCP Server
 
@@ -376,7 +379,7 @@ Add to your MCP client configuration:
 }
 ```
 
-The server exposes `extract` and `info` tools. All processing runs locally — no files leave your machine.
+The server exposes `extract`, `replace_text`, and `info` tools. All processing runs locally — no files leave your machine.
 
 ## Building from Source
 

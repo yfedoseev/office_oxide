@@ -1,6 +1,6 @@
 # office-oxide for Node.js — The Fastest Office Document Library for JavaScript & TypeScript
 
-Native Node.js bindings for [office_oxide](https://github.com/yfedoseev/office_oxide) — a fast Rust library for parsing, converting, and editing Office documents (DOCX, XLSX, PPTX, DOC, XLS, PPT).
+Native Node.js bindings for [office_oxide](https://github.com/yfedoseev/office_oxide) — a fast Rust library for parsing and converting Office documents (DOCX, XLSX, PPTX, DOC, XLS, PPT), and for writing and editing DOCX, XLSX, and PPTX (the legacy binary formats are read-only, and convertible to OOXML via `saveAs`).
 
 Links directly against the Rust C FFI via [koffi](https://koffi.dev). No `node-gyp` build step. Pre-built native libraries are shipped for Linux, macOS, and Windows (x64 + arm64).
 
@@ -82,6 +82,8 @@ The native shared library is resolved (in order):
 Requires Node.js 18 or newer. TypeScript definitions ship in the package.
 
 ## Editing
+
+Only DOCX, XLSX, and PPTX are editable; DOC, XLS, and PPT are read-only.
 
 ```js
 import { EditableDocument } from 'office-oxide';

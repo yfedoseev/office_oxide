@@ -1,6 +1,6 @@
 # OfficeOxide for .NET — The Fastest Office Document Library for C#
 
-Idiomatic C# bindings for [office_oxide](https://github.com/yfedoseev/office_oxide) — a fast Rust library for parsing, converting, and editing Microsoft Office documents (DOCX, XLSX, PPTX, DOC, XLS, PPT).
+Idiomatic C# bindings for [office_oxide](https://github.com/yfedoseev/office_oxide) — a fast Rust library for parsing and converting Microsoft Office documents (DOCX, XLSX, PPTX, DOC, XLS, PPT), and for writing and editing DOCX, XLSX, and PPTX (the legacy binary formats are read-only, and convertible to OOXML via `SaveAs`).
 
 - `IDisposable` / `using` pattern for native handles.
 - `LibraryImport` source generator — NativeAOT-compatible, trim-safe.
@@ -66,6 +66,8 @@ The NuGet package bundles pre-built native libraries for:
 | Windows | Yes | Yes |
 
 ## Editing
+
+Only DOCX, XLSX, and PPTX are editable; DOC, XLS, and PPT are read-only.
 
 ```csharp
 using var ed = EditableDocument.Open("template.docx");

@@ -21,6 +21,15 @@
  *   - Opaque handles must be freed with their corresponding *_free() function.
  *   - Static C strings returned as `const char*` (e.g., version, format names)
  *     are NOT to be freed.
+ *
+ * Thread-safety Convention:
+ *   - A handle must NOT be used from more than one thread at a time. Handles
+ *     carry no internal lock (same contract as sqlite3* or FILE*): two
+ *     concurrent calls on the same handle, or a *_free() racing any other call
+ *     on that handle, are undefined behaviour.
+ *   - Callers sharing a handle across threads must serialize every call on it
+ *     with their own mutex.
+ *   - Distinct handles are independent and may be used concurrently.
  */
 
 #ifndef OFFICE_OXIDE_H

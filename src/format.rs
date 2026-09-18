@@ -53,12 +53,24 @@ impl DocumentFormat {
 
 impl DocumentFormat {
     /// Detect format from a file extension string (case-insensitive, without dot).
+    ///
+    /// Macro-enabled and template extensions map to their base OOXML
+    /// format: they are the same package layout with a different content
+    /// type, which the readers already accept. Rejecting them here made
+    /// `Document::open("report.docm")` fail with `UnsupportedFormat`
+    /// before any reader ran.
     #[must_use]
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_ascii_lowercase().as_str() {
-            "docx" => Some(Self::Docx),
-            "xlsx" => Some(Self::Xlsx),
-            "pptx" => Some(Self::Pptx),
+            // WordprocessingML: document, macro-enabled document,
+            // template, macro-enabled template.
+            "docx" | "docm" | "dotx" | "dotm" => Some(Self::Docx),
+            // SpreadsheetML: workbook, macro-enabled workbook, templates,
+            // macro-enabled add-in.
+            "xlsx" | "xlsm" | "xltx" | "xltm" | "xlam" => Some(Self::Xlsx),
+            // PresentationML: presentation, macro-enabled presentation,
+            // templates, slideshows.
+            "pptx" | "pptm" | "potx" | "potm" | "ppsx" | "ppsm" => Some(Self::Pptx),
             "doc" => Some(Self::Doc),
             "xls" => Some(Self::Xls),
             "ppt" => Some(Self::Ppt),
@@ -106,6 +118,40 @@ mod tests {
         assert_eq!(DocumentFormat::from_extension("ppt"), Some(DocumentFormat::Ppt));
         assert_eq!(DocumentFormat::from_extension("txt"), None);
         assert_eq!(DocumentFormat::from_extension("pdf"), None);
+    }
+
+    /// Macro-enabled and template extensions used to return `None`, so
+    /// `Document::open("file.docm")` failed with `UnsupportedFormat`
+    /// before any reader saw the bytes.
+    #[test]
+    fn test_from_extension_macro_enabled_and_templates() {
+        for ext in ["docm", "dotx", "dotm", "DOCM"] {
+            assert_eq!(
+                DocumentFormat::from_extension(ext),
+                Some(DocumentFormat::Docx),
+                "{ext} should map to Docx"
+            );
+        }
+        for ext in ["xlsm", "xltx", "xltm", "xlam", "XLSM"] {
+            assert_eq!(
+                DocumentFormat::from_extension(ext),
+                Some(DocumentFormat::Xlsx),
+                "{ext} should map to Xlsx"
+            );
+        }
+        for ext in ["pptm", "potx", "potm", "ppsx", "ppsm", "PPTM"] {
+            assert_eq!(
+                DocumentFormat::from_extension(ext),
+                Some(DocumentFormat::Pptx),
+                "{ext} should map to Pptx"
+            );
+        }
+        // Still not a document format.
+        assert_eq!(DocumentFormat::from_extension("docz"), None);
+        assert_eq!(
+            DocumentFormat::from_path(Path::new("macros/book.xlsm")),
+            Some(DocumentFormat::Xlsx)
+        );
     }
 
     #[test]

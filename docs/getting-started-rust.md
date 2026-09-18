@@ -15,7 +15,8 @@ office_oxide = "0.1.11"
 
 ```toml
 [dependencies]
-# Default build — full read/write/edit support for all six formats.
+# Default build — read support for all six formats; write/edit support
+# for DOCX, XLSX, PPTX.
 office_oxide = "0.1.11"
 
 # Memory-mapped opens for large OOXML files.
