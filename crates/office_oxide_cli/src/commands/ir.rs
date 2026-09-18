@@ -30,6 +30,7 @@ fn ir_to_json(ir: &office_oxide::DocumentIR) -> serde_json::Value {
             // surface entirely once they stopped being a paragraph.
             json!({
                 "title": s.title,
+                "hidden": s.hidden,
                 "speaker_notes": s.speaker_notes,
                 "elements": s.elements.iter().map(element_to_json).collect::<Vec<_>>(),
             })

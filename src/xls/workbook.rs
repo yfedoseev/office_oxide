@@ -181,6 +181,14 @@ impl XlsDocument {
         let mut externsheet: Vec<(u16, i16, i16)> = Vec::new();
         let mut sheet_idx = 0usize;
         let mut pending_formula_string: Option<(u16, u16)> = None;
+        // An embedded chart (or other embedded object) is its own nested
+        // BOF..EOF substream *inside* the parent worksheet's own substream
+        // ([MS-XLS] §2.1.7.20.1, dt=0x0020 for a chart sheet). Without
+        // tracking nesting depth, the chart's own closing EOF was mistaken
+        // for the worksheet's, truncating the sheet's data and permanently
+        // desyncing `sheet_idx` from `sheet_infos` for every sheet after it
+        // (issue #237).
+        let mut nested_bof_depth = 0u32;
         // Safety cap against a pathologically record-dense file (millions of
         // minimal, near-empty records), not against ordinary large ones.
         // 500,000 was low enough to hit on real, legitimate workbooks —
@@ -292,9 +300,19 @@ impl XlsDocument {
                         cells.clear();
                         merged_cells.clear();
                         pending_formula_string = None;
+                        nested_bof_depth = 0;
                     }
                 },
                 Phase::InSheet => match rec.record_type {
+                    RT_BOF => {
+                        // An embedded chart (or other object) nested inside
+                        // this worksheet's own substream — its EOF must not
+                        // be mistaken for the worksheet's own.
+                        nested_bof_depth += 1;
+                    },
+                    RT_EOF if nested_bof_depth > 0 => {
+                        nested_bof_depth -= 1;
+                    },
                     RT_EOF => {
                         let (name, hidden) = match sheet_infos.get(sheet_idx) {
                             Some(info) => (info.name.clone(), info.hidden),
@@ -1100,6 +1118,45 @@ mod tests {
             ir.sections.iter().map(|s| s.hidden).collect::<Vec<_>>(),
             [true, false, true]
         );
+    }
+
+    /// An embedded chart is its own nested `BOF..EOF` substream inside the
+    /// parent worksheet's substream. Before #237, its `EOF` was mistaken
+    /// for the worksheet's own: the sheet's remaining cells were dropped,
+    /// `sheet_idx` desynced from `sheet_infos`, and every sheet after it
+    /// got the wrong name/visibility.
+    #[test]
+    fn test_embedded_chart_eof_does_not_close_the_parent_sheet() {
+        let mut sheet1_body = label(0, 0, "before_chart");
+        sheet1_body.extend(bof(0x0020)); // chart substream, nested inside Sheet1
+        sheet1_body.extend(label(0, 1, "inside_chart"));
+        sheet1_body.extend(eof()); // chart's own EOF — must not close Sheet1
+        sheet1_body.extend(label(1, 0, "after_chart"));
+
+        let stream = workbook_stream(&[
+            ("Sheet1", 0, sheet1_body),
+            ("Sheet2", 1, label(0, 0, "Sheet2A1")), // hidden
+        ]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+
+        assert_eq!(
+            doc.sheets.len(),
+            2,
+            "the chart's nested EOF must not fabricate an extra sheet, got {:?}",
+            doc.sheets.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert_eq!(doc.sheets[0].name, "Sheet1");
+        assert!(!doc.sheets[0].hidden);
+        assert_eq!(doc.sheets[1].name, "Sheet2");
+        assert!(doc.sheets[1].hidden, "Sheet2's real hidden flag must survive, not desync to false");
+
+        let text = doc.plain_text();
+        assert!(text.contains("before_chart"), "text: {text}");
+        assert!(
+            text.contains("after_chart"),
+            "cells after the embedded chart must not be dropped, text: {text}"
+        );
+        assert!(text.contains("Sheet2A1"), "text: {text}");
     }
 
     // ── Record-parsing safety cap (issue #236) ──────────────────────────────
