@@ -2138,7 +2138,17 @@ fn write_run(w: &mut Writer<Vec<u8>>, run: &Run) {
     } else {
         let text = &run.text;
         let mut t_elem = BytesStart::new("w:t");
-        if text.starts_with(' ') || text.ends_with(' ') || text.contains("  ") {
+        // A tab/CR/LF-only (or -containing) run used to be written with
+        // no xml:space="preserve" at all — a whitespace-only text node
+        // without it may be normalized/collapsed by a consuming
+        // processor per XML 1.0 §2.10. The space-only check below never
+        // caught it, since it only looked for ' ', not '\t'/'\r'/'\n'
+        // (issue #294).
+        if text.starts_with(' ')
+            || text.ends_with(' ')
+            || text.contains("  ")
+            || text.contains(['\t', '\r', '\n'])
+        {
             t_elem.push_attribute(("xml:space", "preserve"));
         }
         w.write_event(Event::Start(t_elem)).expect("write t start");
@@ -4294,6 +4304,27 @@ mod tests {
         let mut buf = Cursor::new(Vec::new());
         writer.write_to(&mut buf).unwrap();
         assert_eq!(writer.truncated_subtrees(), 0);
+    }
+
+    #[test]
+    fn test_tab_only_run_gets_xml_space_preserve() {
+        // issue #294 — a run whose text is a tab character was written
+        // as <w:t>\t</w:t> with no xml:space="preserve"; a whitespace-only
+        // text node without it may be collapsed by a consuming processor.
+        let mut doc = DocxWriter::new();
+        doc.add_ir_paragraph(
+            &[Run {
+                text: "\t".to_string(),
+                ..Default::default()
+            }],
+            None,
+        );
+        let parts = all_parts(doc);
+        let document_xml = &parts["word/document.xml"];
+        assert!(
+            document_xml.contains(r#"xml:space="preserve""#),
+            "a tab-only run must carry xml:space=\"preserve\": {document_xml}"
+        );
     }
 
     #[test]
