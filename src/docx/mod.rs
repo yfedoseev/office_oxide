@@ -2259,6 +2259,13 @@ fn parse_wsp(
     let mut stroke_rgb: Option<(u8, u8, u8)> = None;
     let mut fill_rgb: Option<(u8, u8, u8)> = None;
     let mut stroke_w_emu: Option<i64> = None;
+    // A `<wps:wsp>` with both `<a:prstGeom>` (shape geometry, schema-
+    // required) AND `<wps:txbx><w:txbxContent>` (real text) is the
+    // standard way Word encodes a text box — not a shape that happens to
+    // also carry a text box. Emitting both `Element::Shape` and
+    // `Element::TextBox` for the one drawing doubled it into a
+    // content-free phantom shape plus the real text box (issue #263).
+    let mut has_text_box = false;
 
     loop {
         match reader.read_event()? {
@@ -2277,6 +2284,7 @@ fn parse_wsp(
                 b"txbx" => continue,
                 b"txbxContent" => {
                     text_boxes.push(parse_block_elements_until(reader, b"txbxContent")?);
+                    has_text_box = true;
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
@@ -2286,6 +2294,10 @@ fn parse_wsp(
             Event::Eof => break,
             _ => {},
         }
+    }
+
+    if has_text_box {
+        return Ok(None);
     }
 
     Ok(kind.map(|k| ShapeInfo {
@@ -3990,6 +4002,46 @@ mod tests {
             text.contains("Kept Cell"),
             "the surviving cell must still be present: {text:?}"
         );
+    }
+
+    #[test]
+    fn test_text_box_with_prstgeom_is_not_double_extracted_as_a_phantom_shape() {
+        // issue #263 — a <wps:wsp> carrying both <a:prstGeom> (required by
+        // schema) and real <wps:txbx> text content produced a content-free
+        // phantom Shape(Rect) in addition to the real TextBox.
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+             xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+             xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+             xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+<w:r><w:drawing><wp:inline><a:graphic><a:graphicData>
+  <wps:wsp>
+    <wps:spPr><a:prstGeom prst="rect"/></wps:spPr>
+    <wps:txbx><w:txbxContent><w:p><w:r><w:t>7</w:t></w:r></w:p></w:txbxContent></wps:txbx>
+  </wps:wsp>
+</a:graphicData></a:graphic></wp:inline></w:drawing></w:r>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let shape_count = p
+            .content
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    ParagraphContent::Run(r)
+                        if r.content.iter().any(|rc| matches!(rc, RunContent::Drawing(d) if d.shape.is_some()))
+                )
+            })
+            .count();
+        assert_eq!(shape_count, 0, "no phantom Shape should be produced");
+        let texts = run_texts(&p);
+        let text_box_found = p.content.iter().any(|c| match c {
+            ParagraphContent::Run(r) => r
+                .content
+                .iter()
+                .any(|rc| matches!(rc, RunContent::TextBox(_))),
+            _ => false,
+        });
+        assert!(text_box_found, "the real text box must still be present: {texts:?}");
     }
 
     #[test]
