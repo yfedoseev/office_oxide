@@ -3313,4 +3313,217 @@ mod tests {
         // Caller of this helper falls back to the full basename.
         assert_eq!(strip_embedded_font_filename("font_5_.ttf"), "");
     }
+
+    /// Parse a `<w:p>…</w:p>` fragment directly through `parse_paragraph`,
+    /// the way the body-element dispatcher does: consume the `<w:p>` start
+    /// event first, then hand the reader (now positioned just inside) to
+    /// the function under test.
+    fn parse_paragraph_fragment(xml: &[u8]) -> Paragraph {
+        let mut reader = quick_xml::Reader::from_reader(xml);
+        reader.config_mut().trim_text(false);
+        match reader.read_event().unwrap() {
+            Event::Start(_) => {},
+            other => panic!("expected <w:p> start, got {other:?}"),
+        }
+        parse_paragraph(&mut reader).unwrap()
+    }
+
+    fn run_texts(p: &Paragraph) -> Vec<String> {
+        p.content
+            .iter()
+            .filter_map(|c| match c {
+                ParagraphContent::Run(r) => Some(
+                    r.content
+                        .iter()
+                        .filter_map(|rc| match rc {
+                            RunContent::Text(t) => Some(t.clone()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_ffdata_checkbox_state_is_captured() {
+        // issue #276 — a FORMCHECKBOX's checked state exists nowhere else
+        // in the document; skipping w:ffData lost it unrecoverably.
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:r><w:fldChar w:fldCharType="begin"><w:ffData>
+  <w:name w:val="Check1"/>
+  <w:checkBox><w:default w:val="0"/><w:checked w:val="1"/></w:checkBox>
+</w:ffData></w:fldChar></w:r>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let ff = p.content.iter().find_map(|c| match c {
+            ParagraphContent::Run(r) => r.content.iter().find_map(|rc| match rc {
+                RunContent::FormField(ff) => Some(ff.clone()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        let ff = ff.expect("FormField was not captured");
+        assert_eq!(ff.name.as_deref(), Some("Check1"));
+        assert_eq!(ff.kind, FormFieldKind::CheckBox { checked: true });
+        assert_eq!(ff.value_text().as_deref(), Some("\u{2612}"));
+    }
+
+    #[test]
+    fn test_ffdata_dropdown_full_option_list_is_captured() {
+        // issue #276 — the full option list, not just the selected value,
+        // must survive even when the field also has a cached display run.
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:r><w:fldChar w:fldCharType="begin"><w:ffData>
+  <w:ddList>
+    <w:listEntry w:val="Red"/>
+    <w:listEntry w:val="Green"/>
+    <w:listEntry w:val="Blue"/>
+    <w:result w:val="1"/>
+  </w:ddList>
+</w:ffData></w:fldChar></w:r>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let ff = p.content.iter().find_map(|c| match c {
+            ParagraphContent::Run(r) => r.content.iter().find_map(|rc| match rc {
+                RunContent::FormField(ff) => Some(ff.clone()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        let ff = ff.expect("FormField was not captured");
+        assert_eq!(ff.value_text().as_deref(), Some("Green"));
+        match ff.kind {
+            FormFieldKind::DropDown { entries, selected } => {
+                assert_eq!(entries, vec!["Red", "Green", "Blue"]);
+                assert_eq!(selected, 1);
+            },
+            other => panic!("expected DropDown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_omml_math_text_is_not_dropped() {
+        // issue #270 — every <m:t> inside an m:oMath is real, visible text.
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+  <m:d><m:e><m:r><m:t>x</m:t></m:r></m:e><m:e><m:r><m:t>y</m:t></m:r></m:e></m:d>
+</m:oMath>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let texts = run_texts(&p).join("");
+        assert!(texts.contains('x'), "expected 'x' in {texts:?}");
+        assert!(texts.contains('y'), "expected 'y' in {texts:?}");
+    }
+
+    #[test]
+    fn test_vml_imagedata_is_extracted_as_an_image() {
+        // issue #268 — v:imagedata's r:id was only ever read for text
+        // boxes; a v:shape wrapping an image, not a text box, vanished.
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:r><w:pict xmlns:v="urn:schemas-microsoft-com:vml" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <v:shape style="width:100pt;height:50pt">
+    <v:imagedata r:id="rId9"/>
+  </v:shape>
+</w:pict></w:r>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let rid = p.content.iter().find_map(|c| match c {
+            ParagraphContent::Run(r) => r.content.iter().find_map(|rc| match rc {
+                RunContent::Drawing(d) => Some(d.relationship_id.clone()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        assert_eq!(rid.as_deref(), Some("rId9"));
+    }
+
+    #[test]
+    fn test_wordart_textpath_string_is_extracted_as_text() {
+        // issue #274 — WordArt's visible text lives in an XML attribute,
+        // not element content, so it was never read at all.
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:r><w:pict xmlns:v="urn:schemas-microsoft-com:vml">
+  <v:shape><v:textpath string="WORD-ART"/></v:shape>
+</w:pict></w:r>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let texts = run_texts(&p).join("");
+        assert!(texts.contains("WORD-ART"), "expected WordArt text in {texts:?}");
+    }
+
+    #[test]
+    fn test_hyperlink_with_both_rid_and_anchor_keeps_the_external_target() {
+        // issues #242, #292 — the anchor branch was checked first and
+        // unconditionally taken, discarding a real external r:id whenever
+        // a w:anchor fragment was also present.
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<w:hyperlink r:id="rId7" w:anchor="section1"><w:r><w:t>link</w:t></w:r></w:hyperlink>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let hl = p.content.iter().find_map(|c| match c {
+            ParagraphContent::Hyperlink(h) => Some(h.clone()),
+            _ => None,
+        });
+        let hl = hl.expect("hyperlink was not captured");
+        match &hl.target {
+            HyperlinkTarget::External(rid) => assert_eq!(rid, "rId7"),
+            other => panic!("expected an External target carrying r:id, got {other:?}"),
+        }
+        assert_eq!(hl.fragment.as_deref(), Some("section1"));
+    }
+
+    #[test]
+    fn test_hyperlink_field_code_instrtext_url_is_captured() {
+        // issue #267 — a HYPERLINK expressed via fldChar/instrText (common
+        // pandoc/older-tool output) had its URL completely unreachable.
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:r><w:fldChar w:fldCharType="begin"/></w:r>
+<w:r><w:instrText xml:space="preserve"> HYPERLINK "https://example.com/page" </w:instrText></w:r>
+<w:r><w:fldChar w:fldCharType="separate"/></w:r>
+<w:r><w:t>Click here</w:t></w:r>
+<w:r><w:fldChar w:fldCharType="end"/></w:r>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let hl = p.content.iter().find_map(|c| match c {
+            ParagraphContent::Hyperlink(h) => Some(h.clone()),
+            _ => None,
+        });
+        let hl = hl.expect("field-code hyperlink was not resolved");
+        match &hl.target {
+            HyperlinkTarget::External(url) => assert_eq!(url, "https://example.com/page"),
+            other => panic!("expected an External URL target, got {other:?}"),
+        }
+        let text: String = hl
+            .runs
+            .iter()
+            .flat_map(|r| &r.content)
+            .filter_map(|rc| match rc {
+                RunContent::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Click here");
+    }
+
+    #[test]
+    fn test_footnote_reference_mark_reaches_run_content() {
+        // issue #241 — to_ir() carried the note body but lost where in
+        // the text it was actually cited.
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:r><w:t>see</w:t></w:r>
+<w:r><w:footnoteReference w:id="3"/></w:r>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let found = p.content.iter().any(|c| match c {
+            ParagraphContent::Run(r) => r
+                .content
+                .iter()
+                .any(|rc| matches!(rc, RunContent::FootnoteRef(3))),
+            _ => false,
+        });
+        assert!(found, "expected a FootnoteRef(3) in the paragraph content");
+    }
 }
