@@ -860,6 +860,79 @@ fn render_element_html(element: &Element) -> String {
     }
 }
 
+/// A CSS colour literal for an IR RGB triple.
+fn css_rgb(rgb: [u8; 3]) -> String {
+    format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
+}
+
+/// A font family name reduced to what is safe inside a quoted CSS value.
+///
+/// A font name comes from an untrusted document, so anything that could
+/// terminate the quoted value or the declaration — quotes, `;`, `(`, `)` —
+/// is dropped rather than escaped. Letters (including non-ASCII, for CJK
+/// family names), digits, spaces and the few punctuation marks real font
+/// names use survive.
+fn css_font_family(name: &str) -> Option<String> {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.'))
+        .collect();
+    let cleaned = cleaned.trim();
+    (!cleaned.is_empty()).then(|| format!("font-family:'{cleaned}'"))
+}
+
+/// `text-decoration-style` for the underline variants a plain `<u>` cannot
+/// distinguish. `<u>` already supplies `text-decoration-line: underline`.
+fn underline_decoration_style(style: &UnderlineStyle) -> Option<&'static str> {
+    match style {
+        UnderlineStyle::Double => Some("double"),
+        UnderlineStyle::Dotted => Some("dotted"),
+        UnderlineStyle::Dash | UnderlineStyle::DotDash | UnderlineStyle::DotDotDash => {
+            Some("dashed")
+        },
+        UnderlineStyle::Wave => Some("wavy"),
+        UnderlineStyle::Single
+        | UnderlineStyle::Thick
+        | UnderlineStyle::Words
+        | UnderlineStyle::None => None,
+    }
+}
+
+/// The CSS declarations for the span formatting that has no dedicated HTML
+/// element: colour, highlight, font and the caps variants.
+///
+/// Returns `None` when the span carries none of them, so an unformatted
+/// span still renders as bare text with no wrapper.
+fn span_style_css(span: &TextSpan) -> Option<String> {
+    let mut decls: Vec<String> = Vec::new();
+    if let Some(rgb) = span.color {
+        decls.push(format!("color:{}", css_rgb(rgb)));
+    }
+    if let Some(rgb) = span.highlight {
+        decls.push(format!("background-color:{}", css_rgb(rgb)));
+    }
+    if let Some(ref name) = span.font_name {
+        if let Some(decl) = css_font_family(name) {
+            decls.push(decl);
+        }
+    }
+    if let Some(half_pt) = span.font_size_half_pt {
+        if half_pt % 2 == 0 {
+            decls.push(format!("font-size:{}pt", half_pt / 2));
+        } else {
+            decls.push(format!("font-size:{}.5pt", half_pt / 2));
+        }
+    }
+    // `all_caps` wins over `small_caps` when a document sets both, which is
+    // what Word renders.
+    if span.all_caps {
+        decls.push("text-transform:uppercase".to_string());
+    } else if span.small_caps {
+        decls.push("font-variant:small-caps".to_string());
+    }
+    (!decls.is_empty()).then(|| decls.join(";"))
+}
+
 fn render_inline_html(content: &[InlineContent]) -> String {
     let mut out = String::new();
     for item in content {
@@ -867,6 +940,13 @@ fn render_inline_html(content: &[InlineContent]) -> String {
             InlineContent::Text(span) => {
                 let mut text = escape_html(&span.text);
 
+                // Super/subscript sit innermost so the raised text still
+                // picks up the emphasis and colour wrapped around it.
+                match span.vertical_align {
+                    Some(VerticalAlign::Superscript) => text = format!("<sup>{text}</sup>"),
+                    Some(VerticalAlign::Subscript) => text = format!("<sub>{text}</sub>"),
+                    Some(VerticalAlign::Baseline) | None => {},
+                }
                 if span.bold {
                     text = format!("<strong>{text}</strong>");
                 }
@@ -875,6 +955,21 @@ fn render_inline_html(content: &[InlineContent]) -> String {
                 }
                 if span.strikethrough {
                     text = format!("<del>{text}</del>");
+                }
+                // `UnderlineStyle::None` is an explicit "not underlined" in
+                // the source, so it must not produce a `<u>`.
+                if let Some(ref u) = span.underline {
+                    if *u != UnderlineStyle::None {
+                        text = match underline_decoration_style(u) {
+                            Some(kind) => {
+                                format!("<u style=\"text-decoration-style:{kind}\">{text}</u>")
+                            },
+                            None => format!("<u>{text}</u>"),
+                        };
+                    }
+                }
+                if let Some(css) = span_style_css(span) {
+                    text = format!("<span style=\"{}\">{text}</span>", escape_html(&css));
                 }
                 if let Some(url) = span.hyperlink.as_deref().and_then(safe_url) {
                     text = format!("<a href=\"{}\">{text}</a>", escape_html(&url));
@@ -1179,6 +1274,83 @@ mod tests {
         assert!(html.contains("<ol>"));
         assert!(html.contains("<li><p>First</p></li>"));
         assert!(html.contains("<li><p>Second</p></li>"));
+    }
+
+    /// #314: `render_inline_html` read only bold/italic/strikethrough/
+    /// hyperlink, so underline, super/subscript, highlight, colour, font and
+    /// the caps variants vanished from `to_html()` while the IR carried them.
+    #[test]
+    fn test_html_span_formatting_is_not_dropped() {
+        let styled = |f: fn(&mut TextSpan)| {
+            let mut s = TextSpan::plain("X");
+            f(&mut s);
+            simple_ir(vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(s)],
+                ..Default::default()
+            })])
+            .to_html()
+        };
+
+        // Underline: `<u>`, and a distinguishable style for the variants a
+        // bare `<u>` cannot express.
+        let html = styled(|s| s.underline = Some(UnderlineStyle::Single));
+        assert_eq!(html, "<p><u>X</u></p>");
+        let html = styled(|s| s.underline = Some(UnderlineStyle::Double));
+        assert!(html.contains("text-decoration-style:double"), "{html}");
+        // An explicit "no underline" must not produce one.
+        let html = styled(|s| s.underline = Some(UnderlineStyle::None));
+        assert_eq!(html, "<p>X</p>");
+
+        // Super/subscript, mirroring what the markdown renderer already did.
+        let html = styled(|s| s.vertical_align = Some(VerticalAlign::Superscript));
+        assert_eq!(html, "<p><sup>X</sup></p>");
+        let html = styled(|s| s.vertical_align = Some(VerticalAlign::Subscript));
+        assert_eq!(html, "<p><sub>X</sub></p>");
+        let html = styled(|s| s.vertical_align = Some(VerticalAlign::Baseline));
+        assert_eq!(html, "<p>X</p>");
+
+        // Highlight, colour, font and caps all land in one style span.
+        let html = styled(|s| s.highlight = Some([255, 255, 0]));
+        assert!(html.contains("background-color:#FFFF00"), "{html}");
+        let html = styled(|s| s.color = Some([17, 34, 51]));
+        assert!(html.contains("color:#112233"), "{html}");
+        let html = styled(|s| s.font_name = Some("Times New Roman".into()));
+        assert!(html.contains("font-family:'Times New Roman'"), "{html}");
+        let html = styled(|s| s.font_size_half_pt = Some(24));
+        assert!(html.contains("font-size:12pt"), "{html}");
+        let html = styled(|s| s.font_size_half_pt = Some(25));
+        assert!(html.contains("font-size:12.5pt"), "{html}");
+        let html = styled(|s| s.all_caps = true);
+        assert!(html.contains("text-transform:uppercase"), "{html}");
+        let html = styled(|s| s.small_caps = true);
+        assert!(html.contains("font-variant:small-caps"), "{html}");
+
+        // A plain span still renders bare — no empty wrapper.
+        assert_eq!(styled(|_| {}), "<p>X</p>");
+    }
+
+    /// #314: the new attribute values must not be able to break out of the
+    /// `style="…"` they sit in, and text content stays escaped.
+    #[test]
+    fn test_html_span_style_values_are_escaped() {
+        let ir = simple_ir(vec![Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan {
+                text: "<b>&hi</b>".into(),
+                font_name: Some("Evil'; color:red; x:'".into()),
+                underline: Some(UnderlineStyle::Single),
+                ..Default::default()
+            })],
+            ..Default::default()
+        })]);
+        let html = ir.to_html();
+        // Text content is still escaped.
+        assert!(html.contains("&lt;b&gt;&amp;hi&lt;/b&gt;"), "{html}");
+        assert!(!html.contains("<b>"), "{html}");
+        // Nothing that could close the quoted value or start another
+        // declaration survives into the attribute.
+        let open = html.find("style=\"").expect("a style attribute") + "style=\"".len();
+        let close = open + html[open..].find('"').expect("a closing quote");
+        assert_eq!(&html[open..close], "font-family:'Evil colorred x'");
     }
 
     /// #315: `List.start_number` was parsed and then ignored by both
