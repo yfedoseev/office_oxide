@@ -218,13 +218,38 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
                 return;
             }
 
+            let mut has_text_content = false;
             if let Some(ref tb) = auto.text_body {
                 let mut inner = Vec::new();
                 convert_text_body(tb, &mut inner);
-                if inner.is_empty() {
-                    return;
+                if !inner.is_empty() {
+                    has_text_content = true;
+                    push_positional_textbox(elements, inner, auto.position.as_ref());
                 }
-                push_positional_textbox(elements, inner, auto.position.as_ref());
+            }
+            // A non-text AutoShape (decorative icon, action button, …)
+            // whose only content is its accessibility description used
+            // to produce zero IR output at all — not even a placeholder
+            // carrying the alt text, unlike Picture shapes, where alt
+            // text already survives. Emit the same kind of data-less
+            // Image placeholder Picture already falls back to when its
+            // own relationship can't be resolved, so the description and
+            // position survive (issue #300).
+            if !has_text_content
+                && let Some(alt) = auto.alt_text.clone()
+            {
+                let (display_w, display_h) = auto
+                    .position
+                    .as_ref()
+                    .map(|p| (Some(p.cx.max(0) as u64), Some(p.cy.max(0) as u64)))
+                    .unwrap_or((None, None));
+                elements.push(Element::Image(Image {
+                    alt_text: Some(alt),
+                    data: None,
+                    display_width_emu: display_w,
+                    display_height_emu: display_h,
+                    ..Default::default()
+                }));
             }
         },
         crate::pptx::Shape::Picture(pic) => {
@@ -578,6 +603,32 @@ mod tests {
                 out
             })
             .collect()
+    }
+
+    /// issue #300 — a non-text AutoShape (decorative icon, action
+    /// button, …) whose only content is its accessibility description
+    /// used to produce zero IR output at all, unlike Picture shapes,
+    /// where alt text already survives.
+    #[test]
+    fn test_non_text_autoshape_alt_text_reaches_the_ir() {
+        let shape = crate::pptx::Shape::AutoShape(crate::pptx::shape::AutoShape {
+            id: 1,
+            name: "Icon 1".to_string(),
+            alt_text: Some("SRS_Globe_lr2".to_string()),
+            position: None,
+            text_body: None,
+            placeholder: None,
+        });
+        let mut elements = Vec::new();
+        convert_shape(&shape, &mut elements);
+        assert_eq!(elements.len(), 1, "expected one placeholder element, got {elements:?}");
+        match &elements[0] {
+            Element::Image(img) => {
+                assert_eq!(img.alt_text.as_deref(), Some("SRS_Globe_lr2"));
+                assert!(img.data.is_none(), "a non-text AutoShape has no image bytes");
+            },
+            other => panic!("expected Element::Image, got {other:?}"),
+        }
     }
 
     /// A placeholder whose bullets all sit at outline level 1 — ordinary
