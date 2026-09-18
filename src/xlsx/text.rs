@@ -171,7 +171,16 @@ impl XlsxDocument {
     /// Write a cell value directly to a buffer (avoids allocation for shared strings).
     pub fn write_cell_value(&self, cell: &Cell, buf: &mut String) {
         match &cell.value {
-            CellValue::Empty => {},
+            // A formula cell with no cached `<v>` (the default output shape
+            // of closedxml and similar writers) rendered as a blank cell
+            // indistinguishable from a genuinely empty one, and the formula
+            // text never reached any consumer at all (issue #279).
+            CellValue::Empty => {
+                if let Some(f) = &cell.formula {
+                    buf.push('=');
+                    buf.push_str(f);
+                }
+            },
             CellValue::Number(n) => {
                 if date::is_date_cell(cell.style_index, self.styles.as_ref()) {
                     if let Some(dt) = date::DateTimeValue::from_serial(*n, self.workbook.date1904) {
@@ -250,7 +259,13 @@ impl XlsxDocument {
         date_indices: &std::collections::HashSet<u32>,
     ) {
         match &cell.value {
-            CellValue::Empty => {},
+            // See `write_cell_value`'s identical arm (issue #279).
+            CellValue::Empty => {
+                if let Some(f) = &cell.formula {
+                    buf.push('=');
+                    buf.push_str(f);
+                }
+            },
             CellValue::Number(n) => {
                 let is_date = cell.style_index.is_some_and(|i| date_indices.contains(&i));
                 if is_date {

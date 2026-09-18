@@ -1290,6 +1290,104 @@ mod tests {
         assert_eq!(data_row.cells.len(), 3, "an unmerged row must keep all 3 cells");
     }
 
+    /// issue #279 — a formula cell with no cached `<v>` (the default output
+    /// shape of closedxml and similar writers) rendered as a blank cell
+    /// indistinguishable from a genuinely empty one, and the formula text
+    /// never reached any consumer at all.
+    #[test]
+    fn test_uncached_formula_cell_shows_formula_text_and_reaches_the_ir() {
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1"><f t="array" ref="A1:B2">1+2</f></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        let doc = open_bytes(single_sheet_xlsx(sheet_xml, &[]));
+        let ir = crate::convert_xlsx::xlsx_to_ir(&doc);
+        let table = ir.sections[0]
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                crate::ir::Element::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("expected a table element");
+        let cell = &table.rows[0].cells[0];
+        assert_eq!(cell.formula.as_deref(), Some("1+2"), "formula text must reach the IR");
+        assert!(
+            !cell.content.is_empty(),
+            "a formula cell with no cached value must not render as a blank cell"
+        );
+        let text = ir.plain_text();
+        assert!(
+            text.contains("=1+2"),
+            "plain_text() must show the formula as a fallback when there's no cached value, got: {text:?}"
+        );
+    }
+
+    /// `Document::plain_text()`/`to_markdown()` dispatch to `XlsxDocument`'s
+    /// own renderer (`xlsx/text.rs`), a separate path from `to_ir()` —
+    /// fixing only the IR side left the CLI's default `text`/`markdown`
+    /// output still blank for an uncached formula cell. Both paths must
+    /// show the fallback (issue #279).
+    #[test]
+    fn test_uncached_formula_cell_shows_formula_text_via_the_low_level_xlsx_renderer() {
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1"><f t="array" ref="A1:B2">1+2</f></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        let doc = open_bytes(single_sheet_xlsx(sheet_xml, &[]));
+        assert_eq!(
+            doc.plain_text().trim(),
+            "=1+2",
+            "XlsxDocument::plain_text() must fall back to the formula, not blank"
+        );
+        assert!(
+            doc.to_markdown().contains("=1+2"),
+            "XlsxDocument::to_markdown() must fall back to the formula, got: {:?}",
+            doc.to_markdown()
+        );
+    }
+
+    /// A formula cell that *does* have a cached value keeps showing that
+    /// value (unaffected default behaviour) while also exposing the
+    /// formula text on `TableCell::formula` (issue #279).
+    #[test]
+    fn test_cached_formula_cell_keeps_its_value_and_also_exposes_the_formula() {
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1"><f>1+2</f><v>3</v></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        let doc = open_bytes(single_sheet_xlsx(sheet_xml, &[]));
+        let ir = crate::convert_xlsx::xlsx_to_ir(&doc);
+        let table = ir.sections[0]
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                crate::ir::Element::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("expected a table element");
+        let cell = &table.rows[0].cells[0];
+        assert_eq!(cell.formula.as_deref(), Some("1+2"));
+        let text = ir.plain_text();
+        assert!(text.contains('3'), "cached value must still be shown, got: {text:?}");
+        assert!(
+            !text.contains("=1+2"),
+            "the formula fallback text must not override a real cached value, got: {text:?}"
+        );
+    }
+
     /// issue #232 — same gap as DOCX, confirmed independently for XLSX.
     #[test]
     fn test_encrypted_xlsx_gives_a_friendly_error_via_the_format_specific_reader() {

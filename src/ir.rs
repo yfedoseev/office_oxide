@@ -1153,6 +1153,13 @@ pub struct TableCell {
     /// `numFmtId`). `None` when the cell carries no style.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub number_format_id: Option<u32>,
+    /// Formula text (XLSX only, without the leading `=`), when the cell
+    /// carries a formula — present alongside `content` even when a cached
+    /// value made `content` non-empty, so a consumer isn't forced to
+    /// choose between seeing the computed value and knowing a formula
+    /// produced it (issue #279).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formula: Option<String>,
 }
 
 /// An ordered or unordered list.

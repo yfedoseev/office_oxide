@@ -134,10 +134,11 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                     raw_number,
                     number_format,
                     number_format_id,
+                    formula: cell.formula.clone(),
                 });
             }
             // Drop trailing empty cells.
-            while cells.last().is_some_and(|cd| cd.text.is_empty()) {
+            while cells.last().is_some_and(|cd| cd.text.is_empty() && cd.formula.is_none()) {
                 cells.pop();
             }
             parsed_rows.push(cells);
@@ -167,7 +168,8 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         let mut prose_score = 0usize;
         let mut nonempty_rows = 0usize;
         for cells in &parsed_rows {
-            let nc = cells.iter().filter(|cd| !cd.text.is_empty()).count();
+            let nc =
+                cells.iter().filter(|cd| !cd.text.is_empty() || cd.formula.is_some()).count();
             if nc == 0 {
                 continue;
             }
@@ -255,8 +257,12 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             // (they were just visual separators).
             let mut out: Vec<Element> = Vec::new();
             for cells in &parsed_rows {
-                // Find the first non-empty cell.
-                let Some(cd) = cells.iter().find(|cd| !cd.text.is_empty()) else {
+                // Find the first non-empty cell (a formula with no cached
+                // value counts too — it has real content, just no cached
+                // display text).
+                let Some(cd) =
+                    cells.iter().find(|cd| !cd.text.is_empty() || cd.formula.is_some())
+                else {
                     continue;
                 };
                 out.push(Element::Paragraph(Paragraph {
@@ -274,7 +280,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 // stays under the `B` header even when `A2` is absent.
                 let mut tcells: Vec<TableCell> = Vec::with_capacity(grid_width);
                 for cd in cells {
-                    let content = if cd.text.is_empty() {
+                    let content = if cd.text.is_empty() && cd.formula.is_none() {
                         Vec::new()
                     } else {
                         // Cell font formatting reached the IR in prose mode
@@ -293,6 +299,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                         raw_number: cd.raw_number,
                         number_format: cd.number_format.clone(),
                         number_format_id: cd.number_format_id,
+                        formula: cd.formula.clone(),
                         ..Default::default()
                     };
                     while tcells.len() < cd.col as usize {
@@ -540,7 +547,7 @@ fn empty_cell() -> TableCell {
 /// weight from the workbook stylesheet, and the sheet's hyperlink target if
 /// the cell has one.
 fn cell_span(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> TextSpan {
-    let mut span = TextSpan::plain(cd.text.clone());
+    let mut span = TextSpan::plain(display_text(cd).into_owned());
     span.hyperlink = cd.hyperlink.clone();
     let Some(font) = cd.style_index.and_then(|idx| font_for(doc, idx)) else {
         return span;
@@ -579,6 +586,24 @@ struct CellData {
     number_format: Option<String>,
     /// Number-format ID, when the cell has a non-General format.
     number_format_id: Option<u32>,
+    /// Formula text (`<f>` content, shared-formula followers already
+    /// reconstructed by `xlsx::shared_formula`), when present.
+    formula: Option<String>,
+}
+
+/// The text a cell should show when it has no cached value: `=formula`
+/// when one exists, otherwise empty. A formula cell with no `<v>` (common
+/// output shape from closedxml and similar writers that never cache
+/// values) used to render as a blank cell indistinguishable from a
+/// genuinely empty one (issue #279).
+fn display_text(cd: &CellData) -> std::borrow::Cow<'_, str> {
+    if !cd.text.is_empty() {
+        std::borrow::Cow::Borrowed(&cd.text)
+    } else if let Some(f) = &cd.formula {
+        std::borrow::Cow::Owned(format!("={f}"))
+    } else {
+        std::borrow::Cow::Borrowed("")
+    }
 }
 
 /// Derive a cell's semantic type, raw numeric value, and number-format
