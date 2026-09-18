@@ -42,9 +42,18 @@ pub const RT_CSTRING: u16 = 0x0FBA;
 /// or `LocationAtom` (other `RT_CSTRING` children at different instances).
 pub const CSTRING_INSTANCE_TARGET: u16 = 0x001;
 
-/// [MS-ODRAW] §2.2.14 `OfficeArtSpContainer` — a single shape (its
+/// [MS-ODRAW] §2.2.16 `OfficeArtSpgrContainer` — a group of shapes. Its
+/// first child `RT_SHAPE` is the group's own placeholder shape (no
+/// `RT_CHILD_ANCHOR`); every subsequent `RT_SHAPE` child is a real member
+/// of the group, positioned via `RT_CHILD_ANCHOR` (issue #255).
+pub const RT_SPGR_CONTAINER: u16 = 0xF003;
+/// [MS-ODRAW] §2.2.16 `OfficeArtSpContainer` — a single shape (its
 /// properties, anchor, client data, and text box, as children).
 pub const RT_SHAPE: u16 = 0xF004;
+/// [MS-ODRAW] §2.2.16 `OfficeArtChildAnchor` — a group member shape's
+/// position in its group's local coordinate space: `xLeft`/`yTop`/
+/// `xRight`/`yBottom`, each a signed 32-bit integer (issue #255).
+pub const RT_CHILD_ANCHOR: u16 = 0xF00F;
 /// [MS-PPT] 2.7.3 `OfficeArtClientData` — a shape's PPT-specific data
 /// (placeholder role, animation, interactive info), a child of `RT_SHAPE`.
 pub const RT_CLIENT_DATA: u16 = 0xF011;

@@ -1,6 +1,6 @@
 use crate::format::DocumentFormat;
 use crate::ir::*;
-use crate::ppt::{CharFormatSpan, ParaFormatSpan, TextType};
+use crate::ppt::{CharFormatSpan, ParaFormatSpan, TextRun, TextType};
 
 /// Split `text` into paragraphs at bare `\r` / `\n` delimiters.
 ///
@@ -143,6 +143,58 @@ fn alignment_at(para_formats: &[ParaFormatSpan], at: usize) -> Option<ParagraphA
         .and_then(map_alignment)
 }
 
+/// Build a table cell's block content from its shape's own text runs,
+/// reusing the same paragraph/formatting-span logic as ordinary body text
+/// (issue #255).
+fn table_cell_content(runs: &[TextRun]) -> Vec<Element> {
+    let mut elements = Vec::new();
+    for run in runs {
+        if run.text.trim().is_empty() {
+            continue;
+        }
+        let text_chars: Vec<char> = run.text.chars().collect();
+        for &(start, end) in &split_paragraphs(&run.text) {
+            let content = spans_for_range(
+                &text_chars,
+                start,
+                end,
+                &run.char_formats,
+                run.hyperlink.as_deref(),
+            );
+            if !content.is_empty() {
+                elements.push(Element::Paragraph(Paragraph {
+                    content,
+                    alignment: alignment_at(&run.para_formats, start),
+                    ..Default::default()
+                }));
+            }
+        }
+    }
+    elements
+}
+
+/// Convert a reconstructed grid-of-shapes table (issue #255) into
+/// `Element::Table`.
+fn table_block_to_element(table: &crate::ppt::TableBlock) -> Element {
+    let rows = table
+        .rows
+        .iter()
+        .map(|row| TableRow {
+            cells: row
+                .iter()
+                .map(|cell_runs| TableCell {
+                    content: table_cell_content(cell_runs),
+                    col_span: 1,
+                    row_span: 1,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+        .collect();
+    Element::Table(Table { rows, ..Default::default() })
+}
+
 pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
     let mut sections = Vec::new();
 
@@ -246,6 +298,14 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                     }
                 },
             }
+        }
+
+        // Reconstructed grid-of-shapes tables (issue #255) always land
+        // after the slide's ordinary text — the binary format has no
+        // single reading-order concept spanning both, so this is a
+        // deliberate simplification rather than a claim of true order.
+        for table in &slide.tables {
+            elements.push(table_block_to_element(table));
         }
 
         let title = slide_title.unwrap_or_else(|| format!("Slide {}", slide_idx + 1));

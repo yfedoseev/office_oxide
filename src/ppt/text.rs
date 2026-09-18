@@ -133,12 +133,13 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
     // Last resort: no resolvable structure at all — dump whatever text atoms
     // exist anywhere in the stream, minus the master boilerplate.
     let mut runs = Vec::new();
-    extract_shape_text(stream, 0, &[], &stream_wide_hyperlinks, None, &mut runs);
+    let mut tables = Vec::new();
+    extract_shape_text(stream, 0, &[], &stream_wide_hyperlinks, None, &mut runs, &mut tables);
     runs.retain(|r| !is_master_placeholder_prompt(&r.text));
-    if runs.is_empty() {
+    if runs.is_empty() && tables.is_empty() {
         Vec::new()
     } else {
-        vec![SlideText { text_runs: runs }]
+        vec![SlideText { text_runs: runs, tables }]
     }
 }
 
@@ -156,9 +157,10 @@ fn collect_slide_containers(
         let Ok(rec) = rec else { break };
         if rec.header.rec_type == RT_SLIDE {
             let mut runs = Vec::new();
-            extract_shape_text(&rec.data, 0, &[], hyperlinks, None, &mut runs);
+            let mut tables = Vec::new();
+            extract_shape_text(&rec.data, 0, &[], hyperlinks, None, &mut runs, &mut tables);
             runs.retain(|r| !is_master_placeholder_prompt(&r.text));
-            out.push(SlideText { text_runs: runs });
+            out.push(SlideText { text_runs: runs, tables });
             continue;
         }
         if rec.header.is_container() {
@@ -288,12 +290,21 @@ fn resolve_slide(
     hyperlinks: &HashMap<u32, String>,
 ) -> SlideText {
     let mut text_runs = Vec::new();
+    let mut tables = Vec::new();
     if let Some(offset) = dir.resolve(persist_id_ref) {
         if let Some(children) = bounded_container_children(stream, offset, RT_SLIDE) {
-            extract_shape_text(&children, 0, outline_texts, hyperlinks, None, &mut text_runs);
+            extract_shape_text(
+                &children,
+                0,
+                outline_texts,
+                hyperlinks,
+                None,
+                &mut text_runs,
+                &mut tables,
+            );
         }
     }
-    SlideText { text_runs }
+    SlideText { text_runs, tables }
 }
 
 /// Recursively collect a shape tree's text, in document order, from a bounded
@@ -318,6 +329,7 @@ fn extract_shape_text(
     hyperlinks: &HashMap<u32, String>,
     current_hyperlink: Option<&str>,
     out: &mut Vec<TextRun>,
+    tables: &mut Vec<super::table::TableBlock>,
 ) {
     if depth > MAX_SHAPE_DEPTH {
         return;
@@ -435,14 +447,113 @@ fn extract_shape_text(
                 // of THIS shape's own text — carries it (issue #257).
                 let shape_hyperlink = resolve_shape_hyperlink(&rec.data, hyperlinks);
                 let hyperlink_ref = shape_hyperlink.as_deref().or(current_hyperlink);
-                extract_shape_text(&rec.data, depth + 1, outline_texts, hyperlinks, hyperlink_ref, out);
+                extract_shape_text(
+                    &rec.data,
+                    depth + 1,
+                    outline_texts,
+                    hyperlinks,
+                    hyperlink_ref,
+                    out,
+                    tables,
+                );
+            },
+            RT_SPGR_CONTAINER => {
+                // A group whose members form a clean rectangular grid is
+                // a reconstructed table (issue #255); anything less
+                // certain falls through to the ordinary flat-paragraph
+                // group walk below, unchanged from before this existed.
+                if let Some(table) = try_extract_table_from_spgr(
+                    &rec.data,
+                    depth + 1,
+                    outline_texts,
+                    hyperlinks,
+                    current_hyperlink,
+                ) {
+                    tables.push(table);
+                } else {
+                    extract_shape_text(
+                        &rec.data,
+                        depth + 1,
+                        outline_texts,
+                        hyperlinks,
+                        current_hyperlink,
+                        out,
+                        tables,
+                    );
+                }
             },
             _ if rec.header.is_container() => {
-                extract_shape_text(&rec.data, depth + 1, outline_texts, hyperlinks, current_hyperlink, out);
+                extract_shape_text(
+                    &rec.data,
+                    depth + 1,
+                    outline_texts,
+                    hyperlinks,
+                    current_hyperlink,
+                    out,
+                    tables,
+                );
             },
             _ => {},
         }
     }
+}
+
+/// Try to recognize `spgr_data` (an `OfficeArtSpgrContainer`'s own
+/// children) as a table: every `RT_SHAPE` after the group's own leading
+/// placeholder shape must carry an `RT_CHILD_ANCHOR`, and the resulting
+/// positions must form a clean rectangular grid (issue #255). Returns
+/// `None` on the first sign this isn't a simple table (a member with no
+/// anchor, or a grid [`table::build_table`] can't make sense of) — the
+/// caller falls back to the ordinary flat-paragraph group walk.
+fn try_extract_table_from_spgr(
+    spgr_data: &[u8],
+    depth: usize,
+    outline_texts: &[TextRun],
+    hyperlinks: &HashMap<u32, String>,
+    current_hyperlink: Option<&str>,
+) -> Option<super::table::TableBlock> {
+    if depth > MAX_SHAPE_DEPTH {
+        return None;
+    }
+    let mut cells = Vec::new();
+    let mut seen_group_placeholder = false;
+    for rec in RecordIter::new(spgr_data) {
+        let Ok(rec) = rec else { break };
+        if rec.header.rec_type != RT_SHAPE {
+            continue;
+        }
+        if !seen_group_placeholder {
+            // The group's own placeholder shape — its bounding box, not
+            // a cell. It has no `RT_CHILD_ANCHOR` of its own.
+            seen_group_placeholder = true;
+            continue;
+        }
+        let anchor = RecordIter::new(&rec.data)
+            .filter_map(Result::ok)
+            .find(|c| c.header.rec_type == RT_CHILD_ANCHOR)?;
+        if anchor.data.len() < 16 {
+            return None;
+        }
+        let left =
+            i32::from_le_bytes([anchor.data[0], anchor.data[1], anchor.data[2], anchor.data[3]]);
+        let top =
+            i32::from_le_bytes([anchor.data[4], anchor.data[5], anchor.data[6], anchor.data[7]]);
+
+        let shape_hyperlink = resolve_shape_hyperlink(&rec.data, hyperlinks);
+        let hyperlink_ref = shape_hyperlink.as_deref().or(current_hyperlink);
+        let mut runs = Vec::new();
+        extract_shape_text(
+            &rec.data,
+            depth + 1,
+            outline_texts,
+            hyperlinks,
+            hyperlink_ref,
+            &mut runs,
+            &mut Vec::new(),
+        );
+        cells.push(super::table::TableCellData { left, top, runs });
+    }
+    super::table::build_table(&cells)
 }
 
 /// Fallback used only when the persist directory can't be resolved at all:
@@ -466,9 +577,7 @@ fn extract_slides_from_slide_list_cache(slide_list: &[u8]) -> Vec<SlideText> {
                         slides.push(slide);
                     }
                 }
-                current = Some(SlideText {
-                    text_runs: Vec::new(),
-                });
+                current = Some(SlideText { text_runs: Vec::new(), ..Default::default() });
                 current_type = TextType::Other;
             },
             RT_TEXT_HEADER if rec.data.len() >= 4 => {
@@ -765,10 +874,15 @@ fn apply_style_text_prop(run: &mut TextRun, data: &[u8]) {
 }
 
 /// Text content of a single slide.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SlideText {
     /// All text runs belonging to this slide.
     pub text_runs: Vec<TextRun>,
+    /// Shape groups recognized as tables (issue #255). Rendered after
+    /// `text_runs` in the IR — the binary format has no single unified
+    /// reading-order concept to interleave them with, so this is a
+    /// deliberate simplification, not a claim of true document order.
+    pub tables: Vec<super::table::TableBlock>,
 }
 
 fn decode_utf16le(data: &[u8]) -> String {
@@ -808,7 +922,7 @@ mod tests {
         // "Hi" in UTF-16LE
         stream.extend(make_atom(RT_TEXT_CHARS, 0, &[0x48, 0x00, 0x69, 0x00]));
         let mut runs = Vec::new();
-        extract_shape_text(&stream, 0, &[], &HashMap::new(), None, &mut runs);
+        extract_shape_text(&stream, 0, &[], &HashMap::new(), None, &mut runs, &mut Vec::new());
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "Hi");
         assert_eq!(runs[0].text_type, TextType::Title);
@@ -819,7 +933,7 @@ mod tests {
         let mut stream = make_atom(RT_TEXT_HEADER, 0, &1u32.to_le_bytes()); // Body
         stream.extend(make_atom(RT_TEXT_BYTES, 0, b"Hello World"));
         let mut runs = Vec::new();
-        extract_shape_text(&stream, 0, &[], &HashMap::new(), None, &mut runs);
+        extract_shape_text(&stream, 0, &[], &HashMap::new(), None, &mut runs, &mut Vec::new());
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "Hello World");
         assert_eq!(runs[0].text_type, TextType::Body);
@@ -832,7 +946,7 @@ mod tests {
         stream.extend(make_atom(RT_TEXT_HEADER, 0, &1u32.to_le_bytes()));
         stream.extend(make_atom(RT_TEXT_BYTES, 0, b"Body text"));
         let mut runs = Vec::new();
-        extract_shape_text(&stream, 0, &[], &HashMap::new(), None, &mut runs);
+        extract_shape_text(&stream, 0, &[], &HashMap::new(), None, &mut runs, &mut Vec::new());
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].text, "Title");
         assert_eq!(runs[1].text, "Body text");
@@ -911,7 +1025,7 @@ mod tests {
 
         let shape = make_hyperlinked_shape(1, b"Click here", 1); // Body, exHyperlinkIdRef=1
         let mut runs = Vec::new();
-        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs);
+        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs, &mut Vec::new());
 
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "Click here");
@@ -946,7 +1060,7 @@ mod tests {
         let shape = make_container(RT_SHAPE, 0, &textbox);
 
         let mut runs = Vec::new();
-        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs);
+        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs, &mut Vec::new());
 
         assert_eq!(runs.len(), 3, "must split into prefix/linked/suffix: {runs:?}");
         assert_eq!(runs[0].text, "See ");
@@ -980,11 +1094,102 @@ mod tests {
         let shape = make_container(RT_SHAPE, 0, &textbox);
 
         let mut runs = Vec::new();
-        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs);
+        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs, &mut Vec::new());
 
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "clickme");
         assert_eq!(runs[0].hyperlink.as_deref(), Some("http://example.com/"));
+    }
+
+    // ── #255: grid-of-shapes table reconstruction ──
+
+    fn make_child_anchor(left: i32, top: i32, right: i32, bottom: i32) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&left.to_le_bytes());
+        body.extend_from_slice(&top.to_le_bytes());
+        body.extend_from_slice(&right.to_le_bytes());
+        body.extend_from_slice(&bottom.to_le_bytes());
+        make_atom(RT_CHILD_ANCHOR, 0, &body)
+    }
+
+    fn make_table_cell_shape(left: i32, top: i32, text: &[u8]) -> Vec<u8> {
+        let mut children = make_child_anchor(left, top, left + 100, top + 50);
+        // Tx_TYPE_OTHER
+        let mut textbox_children = make_atom(RT_TEXT_HEADER, 0, &4u32.to_le_bytes());
+        textbox_children.extend(make_atom(RT_TEXT_BYTES, 0, text));
+        children.extend(make_container(0xF00D, 0, &textbox_children));
+        make_container(RT_SHAPE, 0, &children)
+    }
+
+    /// issue #255 — a group whose members form a clean 2x2 grid must
+    /// become one `TableBlock`, and the cell text must NOT also appear as
+    /// flat paragraphs (that would duplicate it in the IR).
+    #[test]
+    fn spgr_container_with_clean_grid_becomes_a_table() {
+        let mut spgr_children = make_container(RT_SHAPE, 0, &[]); // group's own placeholder shape
+        spgr_children.extend(make_table_cell_shape(0, 0, b"A1"));
+        spgr_children.extend(make_table_cell_shape(100, 0, b"B1"));
+        spgr_children.extend(make_table_cell_shape(0, 50, b"A2"));
+        spgr_children.extend(make_table_cell_shape(100, 50, b"B2"));
+        let spgr = make_container(RT_SPGR_CONTAINER, 0, &spgr_children);
+
+        let mut runs = Vec::new();
+        let mut tables = Vec::new();
+        extract_shape_text(&spgr, 0, &[], &HashMap::new(), None, &mut runs, &mut tables);
+
+        assert!(runs.is_empty(), "cell text must not also appear as flat paragraphs: {runs:?}");
+        assert_eq!(tables.len(), 1);
+        let t = &tables[0];
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[0].len(), 2);
+        assert_eq!(t.rows[0][0][0].text, "A1");
+        assert_eq!(t.rows[0][1][0].text, "B1");
+        assert_eq!(t.rows[1][0][0].text, "A2");
+        assert_eq!(t.rows[1][1][0].text, "B2");
+    }
+
+    /// issue #255 — a group that ISN'T a clean grid (here: only 3
+    /// members, one short of a 2x2) must fall back to the ordinary
+    /// flat-paragraph group walk, unchanged from before this feature
+    /// existed — no text lost, just no table structure.
+    #[test]
+    fn spgr_container_that_is_not_a_grid_falls_back_to_flat_paragraphs() {
+        let mut spgr_children = make_container(RT_SHAPE, 0, &[]);
+        spgr_children.extend(make_table_cell_shape(0, 0, b"One"));
+        spgr_children.extend(make_table_cell_shape(100, 0, b"Two"));
+        spgr_children.extend(make_table_cell_shape(0, 50, b"Three"));
+        let spgr = make_container(RT_SPGR_CONTAINER, 0, &spgr_children);
+
+        let mut runs = Vec::new();
+        let mut tables = Vec::new();
+        extract_shape_text(&spgr, 0, &[], &HashMap::new(), None, &mut runs, &mut tables);
+
+        assert!(tables.is_empty());
+        assert_eq!(runs.len(), 3);
+    }
+
+    /// issue #255 — a group member with no `RT_CHILD_ANCHOR` at all (an
+    /// odd/unexpected shape) must also bail to the flat-paragraph
+    /// fallback rather than guessing a position for it.
+    #[test]
+    fn spgr_container_member_without_child_anchor_falls_back() {
+        let mut spgr_children = make_container(RT_SHAPE, 0, &[]);
+        spgr_children.extend(make_table_cell_shape(0, 0, b"A1"));
+        spgr_children.extend(make_table_cell_shape(100, 0, b"B1"));
+        spgr_children.extend(make_table_cell_shape(0, 50, b"A2"));
+        // Fourth shape has text but no ChildAnchor at all.
+        let mut textbox_children = make_atom(RT_TEXT_HEADER, 0, &4u32.to_le_bytes());
+        textbox_children.extend(make_atom(RT_TEXT_BYTES, 0, b"NoAnchor"));
+        let textbox = make_container(0xF00D, 0, &textbox_children);
+        spgr_children.extend(make_container(RT_SHAPE, 0, &textbox));
+        let spgr = make_container(RT_SPGR_CONTAINER, 0, &spgr_children);
+
+        let mut runs = Vec::new();
+        let mut tables = Vec::new();
+        extract_shape_text(&spgr, 0, &[], &HashMap::new(), None, &mut runs, &mut tables);
+
+        assert!(tables.is_empty());
+        assert_eq!(runs.len(), 4);
     }
 
     /// A shape with no `InteractiveInfo` at all must never get a
@@ -1001,7 +1206,7 @@ mod tests {
         let shape = make_container(RT_SHAPE, 0, &textbox);
 
         let mut runs = Vec::new();
-        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs);
+        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs, &mut Vec::new());
         assert_eq!(runs[0].hyperlink, None);
     }
 
@@ -1028,7 +1233,7 @@ mod tests {
         let shape = make_container(RT_SHAPE, 0, &shape_children);
 
         let mut runs = Vec::new();
-        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs);
+        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs, &mut Vec::new());
         assert_eq!(runs[0].hyperlink, None);
     }
 
@@ -1065,7 +1270,7 @@ mod tests {
         let shape = make_container(0xF004, 0, &textbox); // shape container
 
         let mut runs = Vec::new();
-        extract_shape_text(&shape, 0, &[], &HashMap::new(), None, &mut runs);
+        extract_shape_text(&shape, 0, &[], &HashMap::new(), None, &mut runs, &mut Vec::new());
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "Nested");
     }
@@ -1383,7 +1588,15 @@ mod tests {
         let shape = make_container(0xF004, 0, &textbox);
 
         let mut runs = Vec::new();
-        extract_shape_text(&shape, 0, &outline_texts, &HashMap::new(), None, &mut runs);
+        extract_shape_text(
+            &shape,
+            0,
+            &outline_texts,
+            &HashMap::new(),
+            None,
+            &mut runs,
+            &mut Vec::new(),
+        );
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "second");
         assert_eq!(runs[0].text_type, TextType::Body);

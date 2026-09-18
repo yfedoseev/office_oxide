@@ -167,6 +167,7 @@ mod tests {
                             ..Default::default()
                         },
                     ],
+                    ..Default::default()
                 },
                 SlideText {
                     text_runs: vec![TextRun {
@@ -175,6 +176,7 @@ mod tests {
                         hyperlink: None,
                         ..Default::default()
                     }],
+                    ..Default::default()
                 },
             ],
         };
@@ -205,6 +207,7 @@ mod tests {
                         ..Default::default()
                     },
                 ],
+                ..Default::default()
             }],
         };
         let md = doc.to_markdown();
@@ -234,6 +237,7 @@ mod tests {
                         ..Default::default()
                     },
                 ],
+                ..Default::default()
             }],
         };
         let text = doc.plain_text();
@@ -252,6 +256,7 @@ mod tests {
                     ..Default::default()
                 })
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -342,6 +347,7 @@ mod tests {
                     hyperlink: Some("http://testuri.org/".to_string()),
                     ..Default::default()
                 }],
+                ..Default::default()
             }],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -580,6 +586,7 @@ mod tests {
                     }],
                     para_formats: Vec::new(),
                 }],
+                ..Default::default()
             }],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -616,6 +623,7 @@ mod tests {
                     ],
                     para_formats: Vec::new(),
                 }],
+                ..Default::default()
             }],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -655,6 +663,7 @@ mod tests {
                         format: ParaFormat { alignment: Some(1) }, // Tx_ALIGNCenter
                     }],
                 }],
+                ..Default::default()
             }],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -684,6 +693,7 @@ mod tests {
                     hyperlink: None,
                     ..Default::default()
                 }],
+                ..Default::default()
             }],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -699,5 +709,52 @@ mod tests {
             .collect();
         assert_eq!(texts, ["a sunny day", "the blue sky", "some green grass"]);
         assert!(!texts.iter().any(|t| t.contains('\r')), "no leftover literal \\r: {texts:?}");
+    }
+
+    /// issue #255 — a reconstructed grid-of-shapes table must reach the
+    /// IR as `Element::Table`, with each cell's text in the right slot.
+    #[test]
+    fn ir_reconstructed_table_becomes_element_table() {
+        use crate::ir::Element;
+        use crate::ppt::TableBlock;
+
+        fn cell_run(text: &str) -> Vec<TextRun> {
+            vec![TextRun {
+                text_type: TextType::Other,
+                text: text.to_string(),
+                ..Default::default()
+            }]
+        }
+
+        let doc = PptDocument {
+            images: Vec::new(),
+            has_macros: false,
+            summary_properties: None,
+            slides: vec![SlideText {
+                tables: vec![TableBlock {
+                    rows: vec![
+                        vec![cell_run("A1"), cell_run("B1")],
+                        vec![cell_run("A2"), cell_run("B2")],
+                    ],
+                }],
+                ..Default::default()
+            }],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        let Element::Table(t) = &ir.sections[0].elements[0] else {
+            panic!("expected a table, got {:?}", ir.sections[0].elements[0]);
+        };
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[0].cells.len(), 2);
+
+        let cell_text = |r: usize, c: usize| {
+            let crate::ir::Element::Paragraph(p) = &t.rows[r].cells[c].content[0] else { panic!() };
+            let crate::ir::InlineContent::Text(span) = &p.content[0] else { panic!() };
+            span.text.clone()
+        };
+        assert_eq!(cell_text(0, 0), "A1");
+        assert_eq!(cell_text(0, 1), "B1");
+        assert_eq!(cell_text(1, 0), "A2");
+        assert_eq!(cell_text(1, 1), "B2");
     }
 }

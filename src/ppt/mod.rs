@@ -15,6 +15,7 @@ pub mod images;
 mod persist;
 mod records;
 mod style;
+mod table;
 mod text;
 
 pub use crate::core::OfficeDocument;
@@ -22,4 +23,5 @@ pub use document::PptDocument;
 pub use error::{PptError, Result};
 pub use images::{ImageFormat, PptImage};
 pub use style::{CharFormat, CharFormatSpan, ParaFormat, ParaFormatSpan};
+pub use table::TableBlock;
 pub use text::{SlideText, TextRun, TextType};
