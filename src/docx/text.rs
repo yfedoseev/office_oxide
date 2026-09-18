@@ -157,6 +157,19 @@ fn plain_text_run(run: &Run, out: &mut String) {
                     out.push('\n');
                 }
             },
+            // The reference mark itself carries no text of its own — the
+            // note *body* is walked separately (issue #240); this is only
+            // the citation point (issue #241), nothing to render here.
+            RunContent::FootnoteRef(_) | RunContent::EndnoteRef(_) | RunContent::CommentRef(_) => {},
+            RunContent::FormField(ff) => {
+                if let Some(text) = &ff.display_text {
+                    out.push_str(text);
+                }
+            },
+            // Resolved into a TextBox during from_opc when the reference
+            // could be followed; an unresolvable one is dropped (matches
+            // the type's own documented intent).
+            RunContent::DeferredPart(_) => {},
         }
     }
 }
@@ -393,6 +406,13 @@ fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, text: &mut String) {
                     text.push('\n');
                 }
             },
+            RunContent::FootnoteRef(_) | RunContent::EndnoteRef(_) | RunContent::CommentRef(_) => {},
+            RunContent::FormField(ff) => {
+                if let Some(t) = &ff.display_text {
+                    text.push_str(t);
+                }
+            },
+            RunContent::DeferredPart(_) => {},
         }
     }
 }

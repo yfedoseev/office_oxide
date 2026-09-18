@@ -666,6 +666,8 @@ impl VmlContent {
                 inline: true,
                 anchor_position: None,
                 shape: None,
+                chart_rel_id: None,
+                chart_text: Vec::new(),
             }));
         }
         for b in self.boxes {
@@ -1173,6 +1175,117 @@ enum FieldPart {
     Instr(String),
 }
 
+/// An in-progress complex field, tracked across the several runs that make
+/// up `begin … instrText … separate … <display runs> … end`.
+struct OpenField {
+    /// Accumulated `<w:instrText>` content across every run seen so far.
+    instr: String,
+    /// Index into the paragraph's `content` vec where the field's display
+    /// runs start — set when `separate` is seen, since everything from
+    /// that point until `end` is the field's rendered result.
+    content_start: usize,
+    /// Whether `separate` has been seen yet. A field with no `separate`
+    /// (some writers omit it, e.g. a display-only field) has no distinct
+    /// result span to splice out.
+    separated: bool,
+}
+
+/// Fold one run's field-code events into the paragraph's open-field stack,
+/// resolving a completed field into a `ParagraphContent::Hyperlink` when it
+/// turns out to be a `HYPERLINK` field (issue #267).
+///
+/// Fields nest in principle (a field's instruction can itself contain
+/// another field), so `fields` is a stack — but only the outermost
+/// completed `HYPERLINK` field is ever turned into a hyperlink; an inner
+/// field's own `instr`/`content_start` are simply discarded when it ends,
+/// since nested field results already sit in `content` as ordinary runs.
+fn apply_field_parts(
+    parts: &[FieldPart],
+    content: &mut Vec<ParagraphContent>,
+    fields: &mut Vec<OpenField>,
+) {
+    for part in parts {
+        match part {
+            FieldPart::Begin => {
+                fields.push(OpenField {
+                    instr: String::new(),
+                    content_start: content.len(),
+                    separated: false,
+                });
+            },
+            FieldPart::Instr(s) => {
+                if let Some(f) = fields.last_mut() {
+                    f.instr.push_str(s);
+                }
+            },
+            FieldPart::Separate => {
+                if let Some(f) = fields.last_mut() {
+                    f.separated = true;
+                    f.content_start = content.len();
+                }
+            },
+            FieldPart::End => {
+                let Some(f) = fields.pop() else { continue };
+                if !f.separated {
+                    continue;
+                }
+                let Some(target) = hyperlink_target_from_instr(&f.instr) else {
+                    continue;
+                };
+                let start = f.content_start.min(content.len());
+                let runs: Vec<Run> = content
+                    .drain(start..)
+                    .filter_map(|c| match c {
+                        ParagraphContent::Run(r) => Some(r),
+                        ParagraphContent::Hyperlink(h) => Some(Run {
+                            properties: None,
+                            content: h.runs.into_iter().flat_map(|r| r.content).collect(),
+                        }),
+                    })
+                    .collect();
+                content.push(ParagraphContent::Hyperlink(Hyperlink {
+                    target,
+                    fragment: None,
+                    tooltip: None,
+                    runs,
+                }));
+            },
+        }
+    }
+}
+
+/// Collect every `<m:t>` text run inside an OMML equation (`<m:oMath>` or
+/// `<m:oMathPara>`), concatenated with no separators. This is not a
+/// structural math model — just enough to stop 100% content loss on a
+/// document whose only content is a formula (issue #270).
+fn collect_omml_text(reader: &mut quick_xml::Reader<&[u8]>, end_local: &[u8]) -> CoreResult<String> {
+    let mut text = String::new();
+    let mut depth = 1i32;
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => {
+                if e.local_name().as_ref() == b"t" {
+                    text.push_str(&xml::read_text_content_fast(reader)?);
+                } else {
+                    depth += 1;
+                }
+            },
+            Event::End(ref e) => {
+                if e.local_name().as_ref() == end_local && depth <= 1 {
+                    break;
+                }
+                depth -= 1;
+                if depth <= 0 {
+                    break;
+                }
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(text)
+}
+
 fn parse_run(
     reader: &mut quick_xml::Reader<&[u8]>,
     fields: &mut Vec<FieldPart>,
@@ -1585,7 +1698,10 @@ fn collect_runs_until(
         match reader.read_event()? {
             Event::Start(ref e) => {
                 if e.local_name().as_ref() == b"r" {
-                    runs.push(parse_run(reader)?);
+                    // A field cannot legally nest inside w:fldSimple's own
+                    // display runs, so field-part tracking is a fresh,
+                    // throwaway vec here.
+                    runs.push(parse_run(reader, &mut Vec::new())?);
                 } else {
                     xml::skip_element_fast(reader)?;
                 }

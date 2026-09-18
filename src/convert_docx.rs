@@ -1018,6 +1018,52 @@ fn convert_run(
                 // run *and* re-attached it to the image, so the document
                 // grew every time it was read and written back.
             },
+            // The citation point in body text — the note *body* is
+            // converted separately into `Element::Footnote`/`Endnote`.
+            // Carrying the reference mark here is what #241 was about:
+            // before this, to_ir() had the note body but no record of
+            // where it was cited.
+            crate::docx::RunContent::FootnoteRef(id) => {
+                content.push(InlineContent::FootnoteRef(FootnoteRef {
+                    note_id: *id,
+                    marker: None,
+                }));
+            },
+            crate::docx::RunContent::EndnoteRef(id) => {
+                content.push(InlineContent::EndnoteRef(FootnoteRef {
+                    note_id: *id,
+                    marker: None,
+                }));
+            },
+            // No IR-level representation for a comment's citation point
+            // today (only the comment body reaches the IR, via the
+            // existing Element::Endnote aliasing) — nothing to add here.
+            crate::docx::RunContent::CommentRef(_) => {},
+            crate::docx::RunContent::FormField(ff) => {
+                if let Some(text) = &ff.display_text {
+                    content.push(InlineContent::Text(TextSpan {
+                        text: text.clone(),
+                        bold,
+                        italic,
+                        strikethrough: strike,
+                        hyperlink: hyperlink_url.map(|s| s.to_string()),
+                        font_size_half_pt,
+                        font_name: font_name.clone(),
+                        color: text_color,
+                        underline: underline.clone(),
+                        highlight,
+                        vertical_align: vertical_align.clone(),
+                        all_caps,
+                        small_caps,
+                        char_spacing_half_pt,
+                    }));
+                }
+            },
+            // Resolved into a TextBox sibling during from_opc when the
+            // reference could be followed (SmartArt #271, embedded
+            // package #304); an unresolvable one is dropped, matching the
+            // type's documented intent.
+            crate::docx::RunContent::DeferredPart(_) => {},
         }
     }
 }

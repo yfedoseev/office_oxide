@@ -124,14 +124,6 @@ const DAYS_IN_MONTH: [[u32; 12]; 2] = [
     [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31], // leap
 ];
 
-/// Largest serial `from_serial` will convert.
-///
-/// Excel's own maximum is 2_958_465 (9999-12-31); this leaves generous
-/// headroom while keeping the year-by-year scan below bounded to a few
-/// thousand iterations. Anything larger is not a real date, and callers
-/// fall back to rendering the raw number.
-pub const MAX_DATE_SERIAL: f64 = 5_000_000.0;
-
 fn is_leap_year(y: i32) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
