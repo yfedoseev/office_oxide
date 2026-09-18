@@ -213,6 +213,7 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
             format: DocumentFormat::Xls,
             title,
             has_macros: doc.has_macros(),
+            text_truncated: doc.truncated(),
             ..Default::default()
         },
         sections,

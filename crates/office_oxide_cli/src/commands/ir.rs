@@ -15,6 +15,14 @@ fn ir_to_json(ir: &office_oxide::DocumentIR) -> serde_json::Value {
         "metadata": {
             "format": format!("{:?}", ir.metadata.format),
             "title": ir.metadata.title,
+            "author": ir.metadata.author,
+            "subject": ir.metadata.subject,
+            "keywords": ir.metadata.keywords,
+            "created": ir.metadata.created,
+            "modified": ir.metadata.modified,
+            "description": ir.metadata.description,
+            "has_macros": ir.metadata.has_macros,
+            "text_truncated": ir.metadata.text_truncated,
         },
         "sections": ir.sections.iter().map(|s| {
             // speaker_notes is a sibling of `elements`, not one of them.
@@ -188,6 +196,7 @@ mod tests {
                 speaker_notes: Some("SPEAKER_NOTES_MARKER".to_string()),
                 ..Default::default()
             }],
+            defined_names: Vec::new(),
         };
         let json = ir_to_json(&ir);
         let rendered = serde_json::to_string(&json).unwrap();
@@ -215,6 +224,7 @@ mod tests {
                 })],
                 ..Default::default()
             }],
+            defined_names: Vec::new(),
         };
         let json = ir_to_json(&ir);
         let rendered = serde_json::to_string(&json).unwrap();
@@ -244,6 +254,7 @@ mod tests {
                 })],
                 ..Default::default()
             }],
+            defined_names: Vec::new(),
         };
         let json = ir_to_json(&ir);
         let rendered = serde_json::to_string(&json).unwrap();

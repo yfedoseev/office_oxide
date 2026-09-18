@@ -22,6 +22,12 @@ pub struct XlsDocument {
     pub defined_names: Vec<DefinedName>,
     images: Vec<XlsImage>,
     has_macros: bool,
+    /// `true` when the record-parsing safety cap ran out before the
+    /// Workbook stream did — trailing sheets, or the whole workbook, are
+    /// missing from `sheets` with no other signal a caller could use to
+    /// tell that apart from a file that genuinely ended there (issue
+    /// #236).
+    truncated: bool,
 }
 
 /// A named range recovered from a `NAME` record.
@@ -46,6 +52,7 @@ impl XlsDocument {
             defined_names: Vec::new(),
             images: Vec::new(),
             has_macros: false,
+            truncated: false,
         }
     }
 }
@@ -133,6 +140,13 @@ impl XlsDocument {
     }
 
     fn parse_workbook_stream(data: &[u8]) -> Result<Self> {
+        Self::parse_workbook_stream_with_budget(data, 20_000_000)
+    }
+
+    /// As `parse_workbook_stream`, with the record-parsing safety cap
+    /// (issue #236) as an explicit parameter so tests can exercise the
+    /// exhausted-budget path without a multi-million-record fixture.
+    fn parse_workbook_stream_with_budget(data: &[u8], record_budget: u32) -> Result<Self> {
         let mut sheet_infos: Vec<SheetInfo> = Vec::new();
         let mut sst: Vec<String> = Vec::new();
         let mut sheets = Vec::new();
@@ -167,10 +181,26 @@ impl XlsDocument {
         let mut externsheet: Vec<(u16, i16, i16)> = Vec::new();
         let mut sheet_idx = 0usize;
         let mut pending_formula_string: Option<(u16, u16)> = None;
-        let mut record_budget = 500_000u32; // Safety cap to prevent pathological files
+        // Safety cap against a pathologically record-dense file (millions of
+        // minimal, near-empty records), not against ordinary large ones.
+        // 500,000 was low enough to hit on real, legitimate workbooks —
+        // aspose-cells_Sample.xls's 101 sheets truncated to 69 mid-parse
+        // with no signal at all, and 3 govdocs1 corpus files (7-29 MB) lost
+        // their *entire* content this way (issue #236). The default caller
+        // (`parse_workbook_stream`) passes 20,000,000, which still bounds a
+        // crafted file's worst-case work (tens of millions of cheap
+        // record-type dispatches is well under a second), while
+        // comfortably clearing every real file measured so far.
+        let mut record_budget = record_budget;
+        // Whether the budget ran out before the record stream did — the
+        // rest of the workbook (trailing sheets, or all of it) is missing,
+        // with no other signal a caller could use to tell that apart from
+        // a file that genuinely ended there.
+        let mut record_budget_exhausted = false;
 
         for rec in RecordIter::new(data) {
             if record_budget == 0 {
+                record_budget_exhausted = true;
                 break;
             }
             record_budget -= 1;
@@ -382,6 +412,7 @@ impl XlsDocument {
             // Set by the caller (from_reader), which has the CfbReader
             // this function doesn't.
             has_macros: false,
+            truncated: record_budget_exhausted,
         })
     }
 
@@ -394,6 +425,13 @@ impl XlsDocument {
     /// macro-presence signal, no VBA interpretation (issue #283).
     pub fn has_macros(&self) -> bool {
         self.has_macros
+    }
+
+    /// `true` when the record-parsing safety cap cut the Workbook stream
+    /// short — trailing sheets, or the whole workbook, are missing from
+    /// `sheets` (issue #236).
+    pub fn truncated(&self) -> bool {
+        self.truncated
     }
 
     /// Extract plain text from the document.
@@ -1064,6 +1102,58 @@ mod tests {
         );
     }
 
+    // ── Record-parsing safety cap (issue #236) ──────────────────────────────
+
+    /// A budget of 0 must not panic or hang — just truncate before any
+    /// record is processed at all.
+    #[test]
+    fn test_zero_budget_truncates_before_any_record_and_is_flagged() {
+        let stream = workbook_stream(&[("Sheet1", 0, label(0, 0, "x"))]);
+        let doc = XlsDocument::parse_workbook_stream_with_budget(&stream, 0)
+            .expect("a zero budget must not error, just truncate");
+        assert!(doc.sheets.is_empty());
+        assert!(doc.truncated(), "a zero budget must be flagged as truncated");
+    }
+
+    /// A budget that runs out exactly between two sheets (globals: BOF +
+    /// 2×BOUNDSHEET + EOF = 4 records, then each sheet: BOF + LABEL + EOF =
+    /// 3 records) must keep the first sheet intact, drop the second
+    /// entirely, and flag the workbook as truncated — mirroring the real
+    /// corpus files the issue cites (aspose-cells_Sample.xls: 101 sheets
+    /// truncated to 69; several govdocs1 files: entire workbook lost).
+    #[test]
+    fn test_budget_exhausted_between_sheets_keeps_earlier_sheets_and_flags_truncation() {
+        let stream = workbook_stream(&[
+            ("Sheet1", 0, label(0, 0, "Sheet1A1")),
+            ("Sheet2", 0, label(0, 0, "Sheet2A1")),
+        ]);
+        let doc = XlsDocument::parse_workbook_stream_with_budget(&stream, 7)
+            .expect("parses up to the cap");
+        assert_eq!(doc.sheets.len(), 1, "Sheet1 must survive, Sheet2 must be dropped entirely");
+        assert_eq!(doc.sheets[0].name, "Sheet1");
+        assert!(doc.truncated(), "a mid-workbook cutoff must be flagged as truncated");
+
+        // A budget generous enough to cover both sheets must not flag
+        // truncation at all.
+        let doc_full =
+            XlsDocument::parse_workbook_stream_with_budget(&stream, 20_000_000).expect("parses");
+        assert_eq!(doc_full.sheets.len(), 2);
+        assert!(!doc_full.truncated());
+    }
+
+    /// The truncation flag reaches `to_ir()`'s `Metadata::text_truncated`,
+    /// the same signal DOC's piece-table gap (#230) already surfaces.
+    #[test]
+    fn test_truncation_reaches_metadata() {
+        let stream = workbook_stream(&[
+            ("Sheet1", 0, label(0, 0, "Sheet1A1")),
+            ("Sheet2", 0, label(0, 0, "Sheet2A1")),
+        ]);
+        let doc = XlsDocument::parse_workbook_stream_with_budget(&stream, 7).expect("parses");
+        let ir = crate::convert_xls::xls_to_ir(&doc);
+        assert!(ir.metadata.text_truncated);
+    }
+
     #[test]
     fn build_grid_from_cells() {
         let mut cells = vec![
@@ -1123,6 +1213,7 @@ mod tests {
             images: Vec::new(),
             has_macros: false,
             defined_names: Vec::new(),
+            truncated: false,
             sheets: vec![Sheet {
                 display: Vec::new(),
                 name: "Sheet1".into(),
@@ -1148,6 +1239,7 @@ mod tests {
             images: Vec::new(),
             has_macros: false,
             defined_names: Vec::new(),
+            truncated: false,
             sheets: vec![Sheet {
                 display: Vec::new(),
                 name: "Data".into(),
@@ -1202,6 +1294,7 @@ mod tests {
             images: Vec::new(),
             has_macros: false,
             defined_names: Vec::new(),
+            truncated: false,
             sheets,
         }
     }
