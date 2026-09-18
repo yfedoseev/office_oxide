@@ -381,8 +381,19 @@ fn build_display(
         let text = match &cell.value {
             CellValue::Number(n) => match format_for(cell.xf_index) {
                 Some((fmt_id, code)) => {
-                    let is_date = date::is_date_format_id(fmt_id as u32)
-                        || code.is_some_and(date::is_date_format_string);
+                    // A workbook may redefine a built-in id — [ECMA-376]
+                    // §18.8.30 permits ids 0-163 to be overridden — so an
+                    // explicit `FORMAT` code wins over the built-in meaning
+                    // of its id. Testing the id first classified a
+                    // scientific-notation cell whose id-50 format the file
+                    // overrode to `0.00000E+0` as a date, and the date
+                    // conversion then ran for minutes on its magnitude.
+                    // Mirrors `date::is_date_cell`, fixed the same way in
+                    // #207.
+                    let is_date = match code {
+                        Some(c) => date::is_date_format_string(c),
+                        None => date::is_date_format_id(fmt_id as u32),
+                    };
                     if is_date {
                         // XLS predates the 1904 option being common; the
                         // date-system flag lives in `DATEMODE`, which the
@@ -727,6 +738,50 @@ mod tests {
         let ir = crate::convert_xls::xls_to_ir(&doc);
         assert_eq!(ir.sections.len(), 2);
         assert_eq!(ir.sections[1].title.as_deref(), Some("B"));
+    }
+
+    /// A workbook may override a built-in `numFmtId`; ECMA-376 §18.8.30
+    /// permits it for ids 0-163, and a real Gnumeric file redefines id 50
+    /// (nominally a locale date) as `0.00000E+0`. Testing the id before the
+    /// declared code classified such a cell as a date and handed its
+    /// magnitude to the calendar walk, which ran for minutes (#225).
+    #[test]
+    fn test_xls_overridden_builtin_date_id_is_not_treated_as_a_date() {
+        let mut formats = std::collections::HashMap::new();
+        formats.insert(50u16, "0.00000E+0".to_string());
+        // xf 0 -> fmt id 50.
+        let xf_numfmt = vec![50u16];
+
+        let cells = vec![Cell {
+            xf_index: 0,
+            row: 0,
+            col: 0,
+            value: CellValue::Number(4.052_85e199),
+        }];
+
+        let started = std::time::Instant::now();
+        let display = build_display(&cells, &formats, &xf_numfmt);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "build_display took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !display[0][0].starts_with("1900-") && !display[0][0].starts_with("9999-"),
+            "the overridden format is not a date: {}",
+            display[0][0]
+        );
+        assert!(display[0][0].contains('E'), "expected scientific notation, got {}", display[0][0]);
+
+        // A built-in date id with *no* declared override is still a date.
+        let cells = vec![Cell {
+            xf_index: 0,
+            row: 0,
+            col: 0,
+            value: CellValue::Number(38971.0),
+        }];
+        let display = build_display(&cells, &std::collections::HashMap::new(), &[14u16]);
+        assert_eq!(display[0][0], "2006-09-11");
     }
 
     #[test]

@@ -35,6 +35,13 @@ impl fmt::Display for DateTimeValue {
     }
 }
 
+/// Largest serial day count `DateTimeValue::from_serial` will convert.
+///
+/// Excel's own last representable date, 9999-12-31, is serial 2,958,465;
+/// this sits well past it while keeping the calendar walk in
+/// `serial_to_date_1900`/`_1904` bounded to a few thousand iterations.
+pub const MAX_DATE_SERIAL: f64 = 5_000_000.0;
+
 impl DateTimeValue {
     /// Format as ISO 8601 string.
     pub fn to_iso_string(&self) -> String {
@@ -52,6 +59,18 @@ impl DateTimeValue {
     /// Serials >= 61 are off by one day compared to reality.
     pub fn from_serial(serial: f64, date1904: bool) -> Option<Self> {
         if serial < 0.0 {
+            return None;
+        }
+        // `serial_to_date_*` walk the calendar a year at a time, so the work
+        // they do is proportional to the input. `serial.trunc() as i64`
+        // saturates rather than erroring for out-of-range floats, so a cell
+        // holding 1e300 asked for ~2.5e16 iterations — a hang, not a slow
+        // answer, on ordinary (non-adversarial) scientific-notation values
+        // that a misclassifying caller routed here. Bound the input itself
+        // so no caller, present or future, can reach that loop with a value
+        // outside any real calendar date (MAX_DATE_SERIAL is comfortably
+        // past 9999-12-31, which Excel itself caps at serial 2,958,465).
+        if !serial.is_finite() || serial > MAX_DATE_SERIAL {
             return None;
         }
 
@@ -413,5 +432,33 @@ mod override_tests {
             (v.year, v.month, v.day) > (prev.year, prev.month, prev.day),
             "the rounded-up day must advance the date"
         );
+    }
+
+    /// The calendar walk costs one iteration per year, and `as i64`
+    /// saturates rather than erroring, so a cell holding 1e300 asked for
+    /// ~2.5e16 iterations and never returned. Out-of-calendar serials are
+    /// refused up front; callers then render the raw value (#225).
+    #[test]
+    fn test_out_of_calendar_serials_are_refused_instead_of_hanging() {
+        for serial in [1e300, 1e12, 1e10, f64::MAX, MAX_DATE_SERIAL + 1.0] {
+            let started = std::time::Instant::now();
+            assert!(
+                DateTimeValue::from_serial(serial, false).is_none(),
+                "{serial} is not a calendar date"
+            );
+            assert!(DateTimeValue::from_serial(serial, true).is_none());
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "{serial} took {:?}",
+                started.elapsed()
+            );
+        }
+        assert!(DateTimeValue::from_serial(f64::NAN, false).is_none());
+        assert!(DateTimeValue::from_serial(f64::INFINITY, false).is_none());
+
+        // Every date Excel itself can hold still converts: 9999-12-31 is
+        // serial 2,958,465, comfortably inside the bound.
+        let last = DateTimeValue::from_serial(2_958_465.0, false).expect("9999-12-31");
+        assert_eq!((last.year, last.month, last.day), (9999, 12, 31));
     }
 }
