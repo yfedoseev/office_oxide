@@ -278,8 +278,8 @@ fn docx_builder_corpus(out: &str) {
         ..Default::default()
     });
     w.add_text_box(&TextBox::default());
-    w.add_footnote(1, &[Element::Paragraph(Default::default())]);
-    w.add_endnote(1, &[Element::Paragraph(Default::default())]);
+    w.add_footnote(1, &[Element::Paragraph(Default::default())], None);
+    w.add_endnote(1, &[Element::Paragraph(Default::default())], None);
     for t in [
         HfType::DefaultHeader,
         HfType::DefaultFooter,

@@ -30,6 +30,7 @@ fn ir_with(elements: Vec<Element>) -> DocumentIR {
             elements,
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     }
 }
 
@@ -135,6 +136,7 @@ fn all_three_renderers_include_headers_and_footers() {
             footer: Some(hf("FOOTER_TEXT")),
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
     for (name, out) in [
         ("plain", ir.plain_text()),
@@ -163,6 +165,7 @@ fn plain_text_does_not_emit_markdown_syntax_as_a_separator() {
                 ..Default::default()
             })
             .collect(),
+    defined_names: Vec::new(),
     };
     let plain = ir.plain_text();
     assert!(plain.contains("SLIDE1") && plain.contains("SLIDE2"));

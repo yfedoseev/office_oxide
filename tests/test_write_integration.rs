@@ -297,6 +297,7 @@ fn sample_ir(format: office_oxide::DocumentFormat) -> office_oxide::DocumentIR {
             ],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     }
 }
 
@@ -604,6 +605,7 @@ fn ir_paragraph_alignment_round_trip() {
             ],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -640,6 +642,7 @@ fn ir_paragraph_indentation_round_trip() {
             })],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -672,6 +675,7 @@ fn ir_paragraph_line_spacing_round_trip() {
             })],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -769,6 +773,7 @@ fn ir_table_with_borders_round_trip() {
             })],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -828,6 +833,7 @@ fn ir_table_with_cell_shading_round_trip() {
             })],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -888,6 +894,7 @@ fn ir_inline_image_round_trip() {
             ],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -942,6 +949,7 @@ fn ir_section_page_setup_round_trip() {
             break_type: SectionBreakType::NextPage,
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -979,6 +987,7 @@ fn ir_two_column_section_round_trip() {
             }),
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1024,6 +1033,7 @@ fn ir_run_typography_round_trip() {
             })],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1057,6 +1067,7 @@ fn ir_code_block_round_trip() {
             })],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1119,6 +1130,7 @@ fn ir_table_cell_padding_round_trip() {
             })],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1195,6 +1207,7 @@ fn ir_table_cell_text_align_round_trip() {
             })],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1263,6 +1276,7 @@ fn ir_table_caption_round_trip() {
             })],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1329,6 +1343,7 @@ fn ir_thematic_break_emits_bordered_paragraph() {
             ],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1388,6 +1403,7 @@ fn ir_page_and_column_breaks_round_trip() {
             ],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1461,6 +1477,7 @@ fn ir_footnote_endnote_round_trip() {
             ],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1505,6 +1522,7 @@ fn ir_text_box_round_trip() {
             })],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1561,6 +1579,7 @@ fn ir_numbered_list_round_trip() {
             })],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1600,6 +1619,7 @@ fn ir_multi_section_round_trip() {
             make_section("Section B", SectionBreakType::NextPage),
             make_section("Section C", SectionBreakType::OddPage),
         ],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1642,6 +1662,7 @@ fn convenience_functions_round_trip() {
             ],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -2123,6 +2144,7 @@ fn a_hyperlink_in_a_footnote_keeps_the_part_well_formed() {
             })],
             ..Default::default()
         })],
+        None,
     );
     let _ = Run::new("");
 

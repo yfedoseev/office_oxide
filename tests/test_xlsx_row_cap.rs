@@ -42,6 +42,7 @@ fn roundtrip_sheet(n: usize) -> DocumentIR {
             })],
             ..Default::default()
         }],
+    defined_names: Vec::new(),
     };
     let mut buf = Cursor::new(Vec::new());
     create::create_from_ir_to_writer(&ir, DocumentFormat::Xlsx, &mut buf).unwrap();
