@@ -28,6 +28,10 @@ pub struct AutoShape {
     pub text_body: Option<TextBody>,
     /// Placeholder role, if this shape is a slide placeholder.
     pub placeholder: Option<PlaceholderInfo>,
+    /// Click-action hyperlink from `p:cNvPr > a:hlinkClick` — the
+    /// shape's own navigation target, separate from any hyperlink on
+    /// text inside it (issue #299).
+    pub hyperlink: Option<HyperlinkInfo>,
 }
 
 /// An image or picture shape (`<p:pic>`).
@@ -49,6 +53,8 @@ pub struct PictureShape {
     /// Image format inferred from the relationship target extension or
     /// byte signature (e.g. `"png"`, `"jpeg"`, `"gif"`, `"emf"`).
     pub format: Option<String>,
+    /// Click-action hyperlink from `p:cNvPr > a:hlinkClick` (issue #299).
+    pub hyperlink: Option<HyperlinkInfo>,
 }
 
 /// A group of child shapes (`<p:grpSp>`).

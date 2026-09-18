@@ -228,26 +228,29 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
                 }
             }
             // A non-text AutoShape (decorative icon, action button, …)
-            // whose only content is its accessibility description used
-            // to produce zero IR output at all — not even a placeholder
-            // carrying the alt text, unlike Picture shapes, where alt
-            // text already survives. Emit the same kind of data-less
-            // Image placeholder Picture already falls back to when its
-            // own relationship can't be resolved, so the description and
-            // position survive (issue #300).
-            if !has_text_content
-                && let Some(alt) = auto.alt_text.clone()
-            {
+            // whose only content is its accessibility description and/or
+            // its own click action used to produce zero IR output at
+            // all — not even a placeholder, unlike Picture shapes,
+            // where alt text already survives. Action Buttons are drawn
+            // as icons with no text by convention, so for those the
+            // click target *is* the shape's entire purpose (issue #299,
+            // #300). Emit the same kind of data-less Image placeholder
+            // Picture already falls back to when its own relationship
+            // can't be resolved, so the description, click action and
+            // position all survive.
+            let shape_hyperlink = auto.hyperlink.as_ref().and_then(hyperlink_info_url);
+            if !has_text_content && (auto.alt_text.is_some() || shape_hyperlink.is_some()) {
                 let (display_w, display_h) = auto
                     .position
                     .as_ref()
                     .map(|p| (Some(p.cx.max(0) as u64), Some(p.cy.max(0) as u64)))
                     .unwrap_or((None, None));
                 elements.push(Element::Image(Image {
-                    alt_text: Some(alt),
+                    alt_text: auto.alt_text.clone(),
                     data: None,
                     display_width_emu: display_w,
                     display_height_emu: display_h,
+                    hyperlink: shape_hyperlink,
                     ..Default::default()
                 }));
             }
@@ -271,6 +274,7 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
                 format,
                 display_width_emu: display_w,
                 display_height_emu: display_h,
+                hyperlink: pic.hyperlink.as_ref().and_then(hyperlink_info_url),
                 ..Default::default()
             });
             push_positional_textbox(elements, vec![img_el], pic.position.as_ref());
@@ -414,19 +418,25 @@ fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) 
     }
 }
 
+/// Resolve a parsed `HyperlinkInfo` (run-level `a:rPr/a:hlinkClick` or
+/// shape-level `p:cNvPr/a:hlinkClick`) into the IR's flat URL string.
+/// Internal targets become `#fragment` references, matching how DOCX's
+/// own `hyperlink_url` treats `w:anchor`.
+fn hyperlink_info_url(info: &crate::pptx::HyperlinkInfo) -> Option<String> {
+    match &info.target {
+        crate::pptx::HyperlinkTarget::External(url) => Some(url.clone()),
+        crate::pptx::HyperlinkTarget::Internal(loc) if !loc.is_empty() => Some(format!("#{loc}")),
+        crate::pptx::HyperlinkTarget::Internal(_) => None,
+    }
+}
+
 fn convert_text_paragraph_inline(para: &crate::pptx::TextParagraph) -> Vec<InlineContent> {
     let mut content = Vec::new();
     for tc in &para.content {
         match tc {
             crate::pptx::TextContent::Run(run) => {
                 if !run.text.is_empty() {
-                    let hyperlink = run.hyperlink.as_ref().and_then(|h| match &h.target {
-                        crate::pptx::HyperlinkTarget::External(url) => Some(url.clone()),
-                        crate::pptx::HyperlinkTarget::Internal(loc) if !loc.is_empty() => {
-                            Some(format!("#{loc}"))
-                        },
-                        crate::pptx::HyperlinkTarget::Internal(_) => None,
-                    });
+                    let hyperlink = run.hyperlink.as_ref().and_then(hyperlink_info_url);
                     let font_size_half_pt = run.font_size_hundredths_pt.map(|hp| {
                         crate::core::units::HalfPoint::from_drawingml_sz(hp)
                             .0
@@ -618,6 +628,7 @@ mod tests {
             position: None,
             text_body: None,
             placeholder: None,
+            hyperlink: None,
         });
         let mut elements = Vec::new();
         convert_shape(&shape, &mut elements);

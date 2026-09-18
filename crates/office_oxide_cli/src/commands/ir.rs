@@ -62,6 +62,7 @@ fn element_to_json(elem: &office_oxide::ir::Element) -> serde_json::Value {
         Element::Image(img) => json!({
             "type": "image",
             "alt_text": img.alt_text,
+            "hyperlink": img.hyperlink,
         }),
         Element::ThematicBreak => json!({ "type": "thematic_break" }),
         Element::TextBox(tb) => json!({
@@ -217,5 +218,33 @@ mod tests {
             "a Shape element must render as its own type, not unknown: {rendered}"
         );
         assert!(!rendered.contains("unknown"), "no element should render as unknown: {rendered}");
+    }
+
+    /// issue #299 — `Image::hyperlink` (a shape's own click action) was
+    /// added to the IR but the CLI's JSON projection only ever surfaced
+    /// `alt_text`, the same "field added, one consumer missed" shape
+    /// #221 already found once for `speaker_notes`.
+    #[test]
+    fn test_image_hyperlink_reaches_the_json_projection() {
+        let ir = DocumentIR {
+            metadata: Metadata {
+                format: DocumentFormat::Pptx,
+                title: None,
+                ..Default::default()
+            },
+            sections: vec![Section {
+                elements: vec![Element::Image(office_oxide::ir::Image {
+                    hyperlink: Some("#slide2.xml".to_string()),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            }],
+        };
+        let json = ir_to_json(&ir);
+        let rendered = serde_json::to_string(&json).unwrap();
+        assert!(
+            rendered.contains("#slide2.xml"),
+            "the ir command's JSON projection must include Image::hyperlink: {rendered}"
+        );
     }
 }

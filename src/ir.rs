@@ -1274,6 +1274,12 @@ pub struct Image {
     /// Inline vs. floating positioning.
     #[serde(default)]
     pub positioning: ImagePositioning,
+    /// Click-action target (PPTX `p:cNvPr > a:hlinkClick`) — the shape's
+    /// own navigation/URL target, distinct from any hyperlink on text
+    /// inside the shape. Action Buttons and "click this icon to
+    /// navigate" shapes carry their entire purpose here (issue #299).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperlink: Option<String>,
 }
 
 #[cfg(test)]

@@ -213,7 +213,7 @@ fn parse_shape_tree(
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
                 b"sp" => shapes.push(parse_auto_shape(reader, rels)?),
-                b"pic" => shapes.push(parse_picture(reader, media)?),
+                b"pic" => shapes.push(parse_picture(reader, rels, media)?),
                 b"grpSp" => shapes.push(parse_group_shape(reader, rels, media)?),
                 b"graphicFrame" => shapes.push(parse_graphic_frame(reader, rels)?),
                 b"cxnSp" => shapes.push(parse_connector(reader)?),
@@ -246,16 +246,18 @@ fn parse_auto_shape(
     let mut position = None;
     let mut text_body = None;
     let mut placeholder = None;
+    let mut hyperlink = None;
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
                 b"nvSpPr" => {
-                    let props = parse_nv_common_props(reader)?;
+                    let props = parse_nv_common_props(reader, rels)?;
                     id = props.0;
                     name = props.1;
                     alt_text = props.2;
                     placeholder = props.3;
+                    hyperlink = props.4;
                 },
                 b"spPr" => {
                     position = parse_shape_properties(reader)?;
@@ -280,6 +282,7 @@ fn parse_auto_shape(
         name,
         alt_text,
         position,
+        hyperlink,
         text_body,
         placeholder,
     }))
@@ -291,6 +294,7 @@ fn parse_auto_shape(
 
 fn parse_picture(
     reader: &mut quick_xml::Reader<&[u8]>,
+    rels: &Relationships,
     media: &std::collections::HashMap<String, (Vec<u8>, String)>,
 ) -> CoreResult<Shape> {
     let mut id = 0u32;
@@ -298,15 +302,17 @@ fn parse_picture(
     let mut alt_text = None;
     let mut position = None;
     let mut embed_rid: Option<String> = None;
+    let mut hyperlink = None;
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
                 b"nvPicPr" => {
-                    let props = parse_nv_pic_props(reader)?;
+                    let props = parse_nv_pic_props(reader, rels)?;
                     id = props.0;
                     name = props.1;
                     alt_text = props.2;
+                    hyperlink = props.3;
                 },
                 b"blipFill" => {
                     embed_rid = parse_blip_fill_embed(reader)?;
@@ -339,6 +345,7 @@ fn parse_picture(
         embed_rid,
         data,
         format,
+        hyperlink,
     }))
 }
 
@@ -428,7 +435,7 @@ fn parse_group_shape(
                     position = parse_grp_shape_properties(reader)?;
                 },
                 b"sp" => children.push(parse_auto_shape(reader, rels)?),
-                b"pic" => children.push(parse_picture(reader, media)?),
+                b"pic" => children.push(parse_picture(reader, rels, media)?),
                 b"grpSp" => children.push(parse_group_shape(reader, rels, media)?),
                 b"graphicFrame" => children.push(parse_graphic_frame(reader, rels)?),
                 b"cxnSp" => children.push(parse_connector(reader)?),
@@ -649,11 +656,13 @@ fn parse_connector(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Shape> {
 /// ```
 fn parse_nv_common_props(
     reader: &mut quick_xml::Reader<&[u8]>,
-) -> CoreResult<(u32, String, Option<String>, Option<PlaceholderInfo>)> {
+    rels: &Relationships,
+) -> CoreResult<(u32, String, Option<String>, Option<PlaceholderInfo>, Option<HyperlinkInfo>)> {
     let mut id = 0u32;
     let mut name = String::new();
     let mut alt_text = None;
     let mut placeholder = None;
+    let mut hyperlink = None;
 
     loop {
         match reader.read_event()? {
@@ -668,7 +677,7 @@ fn parse_nv_common_props(
                                 .map(|v| v.into_owned())
                                 .unwrap_or_default();
                             alt_text = xml::optional_attr_str(e, b"descr")?.map(|v| v.into_owned());
-                            xml::skip_element_fast(reader)?;
+                            hyperlink = parse_cnvpr_hyperlink(reader, rels)?;
                         },
                         // p:nvPr contains p:ph — don't skip, keep parsing
                         b"nvPr" => {},
@@ -704,20 +713,78 @@ fn parse_nv_common_props(
         }
     }
 
-    Ok((id, name, alt_text, placeholder))
+    Ok((id, name, alt_text, placeholder, hyperlink))
+}
+
+/// Parse `p:cNvPr`'s children (`a:hlinkClick`/`a:hlinkHover`) after the
+/// caller already consumed the `cNvPr` Start event and read its own
+/// attributes. Reads through the matching `</p:cNvPr>`. `a:hlinkClick`
+/// wins when both are present — a hover-only action with no click
+/// target is unusual and click is the primary action.
+///
+/// This is the shape's own click action (Action Buttons, "jump to
+/// slide" navigation icons) — a separate mechanism from the run-level
+/// `a:rPr/a:hlinkClick` hyperlink `parse_run_properties` already
+/// handles. Both `p:nvSpPr` (AutoShape) and `p:nvPicPr` (PictureShape)
+/// used to skip this subtree entirely, so a shape whose only purpose
+/// was its click action (typical for Action Buttons, which are drawn
+/// as icons with no text) vanished from the IR completely (issue #299).
+fn parse_cnvpr_hyperlink(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    rels: &Relationships,
+) -> CoreResult<Option<HyperlinkInfo>> {
+    let mut hover: Option<HyperlinkInfo> = None;
+    let mut click: Option<HyperlinkInfo> = None;
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) if e.local_name().as_ref() == b"hlinkClick" => {
+                click = parse_hlink_click(e, rels)?;
+                // A non-empty `<a:hlinkClick>...</a:hlinkClick>` can carry
+                // an `<a:snd>` child (Action Button sound); its content
+                // has no IR representation, so skip it.
+                xml::skip_element_fast(reader)?;
+            },
+            Event::Empty(ref e) if e.local_name().as_ref() == b"hlinkClick" => {
+                click = parse_hlink_click(e, rels)?;
+            },
+            Event::Start(ref e) if e.local_name().as_ref() == b"hlinkHover" => {
+                hover = parse_hlink_click(e, rels)?;
+                xml::skip_element_fast(reader)?;
+            },
+            Event::Empty(ref e) if e.local_name().as_ref() == b"hlinkHover" => {
+                hover = parse_hlink_click(e, rels)?;
+            },
+            Event::End(ref e) if e.local_name().as_ref() == b"cNvPr" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(click.or(hover))
 }
 
 /// Parse `p:nvPicPr` → (id, name, alt_text)
 fn parse_nv_pic_props(
     reader: &mut quick_xml::Reader<&[u8]>,
-) -> CoreResult<(u32, String, Option<String>)> {
+    rels: &Relationships,
+) -> CoreResult<(u32, String, Option<String>, Option<HyperlinkInfo>)> {
     let mut id = 0u32;
     let mut name = String::new();
     let mut alt_text = None;
+    let mut hyperlink = None;
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"cNvPr" => {
+            Event::Start(ref e) if e.local_name().as_ref() == b"cNvPr" => {
+                id = xml::optional_attr_str(e, b"id")?
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                name = xml::optional_attr_str(e, b"name")?
+                    .map(|v| v.into_owned())
+                    .unwrap_or_default();
+                alt_text = xml::optional_attr_str(e, b"descr")?.map(|v| v.into_owned());
+                hyperlink = parse_cnvpr_hyperlink(reader, rels)?;
+            },
+            Event::Empty(ref e) if e.local_name().as_ref() == b"cNvPr" => {
                 id = xml::optional_attr_str(e, b"id")?
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
@@ -734,7 +801,7 @@ fn parse_nv_pic_props(
         }
     }
 
-    Ok((id, name, alt_text))
+    Ok((id, name, alt_text, hyperlink))
 }
 
 /// Parse `p:nvGrpSpPr` → (id, name)
@@ -1193,7 +1260,13 @@ fn parse_hlink_click(
     e: &quick_xml::events::BytesStart,
     rels: &Relationships,
 ) -> CoreResult<Option<HyperlinkInfo>> {
-    let r_id = xml::optional_attr_str(e, b"r:id")?;
+    // A *present but empty* `r:id=""` is real, valid PowerPoint output —
+    // an Action Button whose only "target" is its own action attribute
+    // (e.g. `action="ppaction://noaction"` on a sound-effect button)
+    // still writes an empty r:id. Treating it the same as a real,
+    // unresolvable id used to give up entirely instead of falling
+    // through to `action`, losing the shape completely (issue #299).
+    let r_id = xml::optional_attr_str(e, b"r:id")?.filter(|v| !v.is_empty());
     let tooltip = xml::optional_attr_str(e, b"tooltip")?.map(|v| v.into_owned());
     let action = xml::optional_attr_str(e, b"action")?;
 
@@ -1568,6 +1641,134 @@ mod tests {
             }
         } else {
             panic!("expected auto shape");
+        }
+    }
+
+    /// issue #299 — a shape's own click action (`p:cNvPr > a:hlinkClick`)
+    /// used to be discarded entirely (the cNvPr Start branch called
+    /// `skip_element_fast`); an Action Button (drawn as an icon with no
+    /// text, whose entire purpose is the click target) vanished from the
+    /// IR completely. Mirrors the real corpus shape poi_51187.pptx: no
+    /// text, an `action="ppaction://hlinksldjump"` jump resolved via
+    /// `r:id`.
+    #[test]
+    fn parse_auto_shape_shape_level_hyperlink() {
+        let xml = make_slide_xml(
+            r#"<p:sp>
+  <p:nvSpPr>
+    <p:cNvPr id="5" name="Icon 1" descr="SRS_Globe_lr2">
+      <a:hlinkClick r:id="rId3" action="ppaction://hlinksldjump"/>
+    </p:cNvPr>
+    <p:cNvSpPr/>
+    <p:nvPr/>
+  </p:nvSpPr>
+  <p:spPr/>
+</p:sp>"#,
+        );
+        let rels_xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId3"
+    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide"
+    Target="slide2.xml"/>
+</Relationships>"#;
+        let rels = Relationships::parse(rels_xml).unwrap();
+        let slide =
+            Slide::parse(&xml, "Slide1".to_string(), &rels, &std::collections::HashMap::new())
+                .unwrap();
+
+        assert_eq!(slide.shapes.len(), 1);
+        let Shape::AutoShape(ref auto) = slide.shapes[0] else {
+            panic!("expected auto shape");
+        };
+        assert_eq!(auto.alt_text.as_deref(), Some("SRS_Globe_lr2"));
+        let hl = auto.hyperlink.as_ref().expect("hyperlink must be captured");
+        match &hl.target {
+            HyperlinkTarget::Internal(target) => assert_eq!(target, "slide2.xml"),
+            other => panic!("expected an Internal target, got {other:?}"),
+        }
+    }
+
+    /// A `<a:hlinkClick>` with a non-empty body (e.g. an `<a:snd>` child
+    /// for an Action Button's click sound, as in
+    /// aspose-slides_HyperlinkSound.pptx) must still be captured and must
+    /// not desync the reader — the child content itself has no IR
+    /// representation and is simply skipped.
+    #[test]
+    fn parse_auto_shape_hlink_click_with_child_element() {
+        let xml = make_slide_xml(
+            r#"<p:sp>
+  <p:nvSpPr>
+    <p:cNvPr id="6" name="Action Button">
+      <a:hlinkClick r:id="rId4" action="ppaction://noaction">
+        <a:snd r:embed="rId5" name="push.wav"/>
+      </a:hlinkClick>
+    </p:cNvPr>
+    <p:cNvSpPr/>
+    <p:nvPr/>
+  </p:nvSpPr>
+  <p:spPr/>
+</p:sp>"#,
+        );
+        let rels_xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId4"
+    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide"
+    Target="slide3.xml"/>
+</Relationships>"#;
+        let rels = Relationships::parse(rels_xml).unwrap();
+        let slide =
+            Slide::parse(&xml, "Slide1".to_string(), &rels, &std::collections::HashMap::new())
+                .unwrap();
+
+        assert_eq!(slide.shapes.len(), 1);
+        let Shape::AutoShape(ref auto) = slide.shapes[0] else {
+            panic!("expected auto shape");
+        };
+        assert!(
+            auto.hyperlink.is_some(),
+            "hlinkClick with a child element must still be captured"
+        );
+    }
+
+    /// issue #299 — a *present but empty* `r:id=""` (real PowerPoint
+    /// output for an Action Button whose only target is its own
+    /// `action` attribute, e.g. `action="ppaction://noaction"`) used to
+    /// be treated the same as a genuinely unresolvable id and give up
+    /// entirely instead of falling through to `action`, losing the
+    /// shape completely. Mirrors the real corpus file
+    /// aspose-slides_HyperlinkSound.pptx exactly.
+    #[test]
+    fn parse_hlink_click_empty_r_id_falls_back_to_action() {
+        let xml = make_slide_xml(
+            r#"<p:sp>
+  <p:nvSpPr>
+    <p:cNvPr id="7" name="Action Button: Sound">
+      <a:hlinkClick r:id="" action="ppaction://noaction">
+        <a:snd r:embed="rId2" name="push.wav"/>
+      </a:hlinkClick>
+    </p:cNvPr>
+    <p:cNvSpPr/>
+    <p:nvPr/>
+  </p:nvSpPr>
+  <p:spPr/>
+</p:sp>"#,
+        );
+        let rels = Relationships::empty();
+        let slide =
+            Slide::parse(&xml, "Slide1".to_string(), &rels, &std::collections::HashMap::new())
+                .unwrap();
+
+        assert_eq!(slide.shapes.len(), 1);
+        let Shape::AutoShape(ref auto) = slide.shapes[0] else {
+            panic!("expected auto shape");
+        };
+        let hl = auto
+            .hyperlink
+            .as_ref()
+            .expect("an empty r:id must fall back to the action attribute");
+        match &hl.target {
+            HyperlinkTarget::Internal(action) => assert_eq!(action, "ppaction://noaction"),
+            other => panic!("expected an Internal action target, got {other:?}"),
         }
     }
 
