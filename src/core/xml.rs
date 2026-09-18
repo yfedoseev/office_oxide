@@ -618,6 +618,15 @@ pub fn skip_element_fast(reader: &mut quick_xml::Reader<&[u8]>) -> Result<()> {
 /// Returns `None` if the data is already UTF-8 (the common case), or `Some(transcoded)`
 /// if transcoding was needed. Callers should use the returned buffer for parsing.
 pub fn ensure_utf8(data: &[u8]) -> Option<Vec<u8>> {
+    // UTF-16 must be settled before the valid-UTF-8 check below. A UTF-16
+    // part whose characters are all ASCII is a run of NUL-interleaved bytes,
+    // and NUL is itself valid UTF-8 — so `from_utf8` accepts it, the real
+    // encoding is never noticed, and every tag name arrives split by nulls.
+    // That silently emptied a UTF-16BE `xl/workbook.xml` (#229).
+    if let Some(decoded) = decode_utf16_xml(data) {
+        return Some(decoded);
+    }
+
     // Quick check: if it's valid UTF-8 already, skip everything
     if std::str::from_utf8(data).is_ok() {
         return None;
@@ -652,7 +661,15 @@ pub fn ensure_utf8(data: &[u8]) -> Option<Vec<u8>> {
     }
 
     // Replace the encoding declaration with utf-8 so the XML parser doesn't complain
-    let mut utf8 = result.into_owned().into_bytes();
+    Some(rewrite_encoding_decl(result.into_owned().into_bytes()))
+}
+
+/// Rewrite an XML declaration's `encoding="..."` value to `utf-8`.
+///
+/// Called after transcoding: leaving the original label in place makes the
+/// bytes self-contradictory, and a strict downstream processor would reject
+/// them.
+fn rewrite_encoding_decl(mut utf8: Vec<u8>) -> Vec<u8> {
     if let Some(pos) = utf8
         .windows(9)
         .position(|w| w.eq_ignore_ascii_case(b"encoding="))
@@ -668,8 +685,37 @@ pub fn ensure_utf8(data: &[u8]) -> Option<Vec<u8>> {
             }
         }
     }
+    utf8
+}
 
-    Some(utf8)
+/// Decode a UTF-16 XML part to UTF-8, or `None` if `data` isn't UTF-16.
+///
+/// Endianness comes from a byte-order mark when one is present. Without a
+/// BOM, XML 1.0 §4.3.3 requires a UTF-16 document to begin with the text
+/// declaration, so the NUL-interleaved `<?` prolog identifies it
+/// unambiguously.
+fn decode_utf16_xml(data: &[u8]) -> Option<Vec<u8>> {
+    let big_endian = match data {
+        [0xFE, 0xFF, ..] => true,
+        [0xFF, 0xFE, ..] => false,
+        // BOM-less: `<?` as UTF-16BE / UTF-16LE code units.
+        [0x00, 0x3C, 0x00, 0x3F, ..] => true,
+        [0x3C, 0x00, 0x3F, 0x00, ..] => false,
+        _ => return None,
+    };
+
+    let encoding = if big_endian {
+        encoding_rs::UTF_16BE
+    } else {
+        encoding_rs::UTF_16LE
+    };
+    // `decode` strips a leading BOM itself, so the result never carries one.
+    let (result, _, had_errors) = encoding.decode(data);
+    if had_errors {
+        return None;
+    }
+
+    Some(rewrite_encoding_decl(result.into_owned().into_bytes()))
 }
 
 #[cfg(test)]

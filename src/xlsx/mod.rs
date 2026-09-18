@@ -1135,9 +1135,130 @@ fn guess_image_format_from_bytes(bytes: &[u8]) -> &'static str {
     }
 }
 
+/// Hand-built XLSX packages for in-crate regression tests.
+///
+/// Several bugs only show up end-to-end (the part is parsed correctly and
+/// dropped later, or the package-level encoding is what's wrong), so the
+/// tests need a real zip rather than a bare XML buffer — but not a corpus
+/// file.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::io::{Cursor, Write};
+
+    /// Build a zip from `(entry_name, bytes)` pairs, in order.
+    pub(crate) fn zip_parts(parts: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        for (name, data) in parts {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(data).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// Wrap one worksheet (and optional extra parts) into a single-sheet
+    /// XLSX package. `sheet_xml` is the full `xl/worksheets/sheet1.xml` body.
+    pub(crate) fn single_sheet_xlsx(sheet_xml: &str, extra: &[(&str, &[u8])]) -> Vec<u8> {
+        let rels = br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1"
+    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+    Target="worksheets/sheet1.xml"/>
+</Relationships>"#;
+        let workbook = br#"<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#;
+        let mut parts: Vec<(&str, &[u8])> = vec![
+            ("xl/_rels/workbook.xml.rels", rels),
+            ("xl/workbook.xml", workbook),
+            ("xl/worksheets/sheet1.xml", sheet_xml.as_bytes()),
+        ];
+        parts.extend_from_slice(extra);
+        zip_parts(&parts)
+    }
+
+    /// Open a hand-built package through the normal XLSX reader.
+    pub(crate) fn open_bytes(bytes: Vec<u8>) -> super::XlsxDocument {
+        super::XlsxDocument::from_reader(Cursor::new(bytes)).expect("package opens")
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::*;
     use super::*;
+
+    /// #229 — a UTF-16BE `xl/workbook.xml` used to parse as a stream of
+    /// unrecognised tags and yield zero sheets, silently, with `Ok`.
+    #[test]
+    fn test_utf16be_workbook_xml_decodes_instead_of_yielding_zero_sheets() {
+        let workbook = r#"<?xml version="1.0" encoding="UTF-16BE"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Utf16" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#;
+        // UTF-16BE, no BOM — spec-legal per XML 1.0 §4.3.3 when the text
+        // declaration names the encoding.
+        let utf16: Vec<u8> = workbook
+            .encode_utf16()
+            .flat_map(|u| u.to_be_bytes())
+            .collect();
+
+        let rels = br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1"
+    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+    Target="worksheets/sheet1.xml"/>
+</Relationships>"#;
+        let sheet = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+</worksheet>"#;
+
+        let doc = open_bytes(zip_parts(&[
+            ("xl/_rels/workbook.xml.rels", rels),
+            ("xl/workbook.xml", &utf16),
+            ("xl/worksheets/sheet1.xml", sheet),
+        ]));
+
+        assert_eq!(doc.workbook.sheets.len(), 1, "the one declared sheet must survive");
+        assert_eq!(doc.workbook.sheets[0].name, "Utf16");
+        assert_eq!(doc.worksheets.len(), 1);
+        assert_eq!(doc.plain_text(), "1");
+    }
+
+    /// #225 (XLSX half) — a huge number under a style whose `<numFmt>`
+    /// override makes a built-in *date* id (50) mean something else must
+    /// render as a number, promptly. Before the fix the cell was classified
+    /// as a date and `from_serial` spun for ~2.5e16 iterations.
+    #[test]
+    fn test_huge_number_under_overridden_date_format_id_does_not_hang() {
+        let styles = br#"<?xml version="1.0" encoding="UTF-8"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <numFmts count="1"><numFmt numFmtId="50" formatCode="0.00000E+0"/></numFmts>
+  <cellXfs count="1"><xf numFmtId="50" applyNumberFormat="1"/></cellXfs>
+</styleSheet>"#;
+        let sheet = r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1" s="0"><v>1e300</v></c></row></sheetData>
+</worksheet>"#;
+
+        let doc = open_bytes(single_sheet_xlsx(sheet, &[("xl/styles.xml", styles)]));
+
+        let started = std::time::Instant::now();
+        let text = doc.plain_text();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "rendering one cell took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !text.starts_with("19") && !text.starts_with("20"),
+            "1e300 must not render as a calendar date, got {text:?}"
+        );
+    }
 
     #[test]
     fn sheet_rels_path_top_level() {

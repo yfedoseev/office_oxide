@@ -51,7 +51,13 @@ impl DateTimeValue {
     /// Serials 1-59 correspond to Jan 1 – Feb 28, 1900.
     /// Serials >= 61 are off by one day compared to reality.
     pub fn from_serial(serial: f64, date1904: bool) -> Option<Self> {
-        if serial < 0.0 {
+        if !(0.0..=MAX_DATE_SERIAL).contains(&serial) {
+            // NaN, negative, and out-of-calendar-range magnitudes all land
+            // here. The upper bound matters for more than tidiness: the
+            // year-by-year loops below are linear in the serial, and an `as
+            // i64` cast saturates rather than erroring, so a cell holding
+            // 1e300 under a date-classified style used to spin for
+            // ~2.5e16 iterations (see #225).
             return None;
         }
 
@@ -99,13 +105,21 @@ const DAYS_IN_MONTH: [[u32; 12]; 2] = [
     [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31], // leap
 ];
 
+/// Largest serial `from_serial` will convert.
+///
+/// Excel's own maximum is 2_958_465 (9999-12-31); this leaves generous
+/// headroom while keeping the year-by-year scan below bounded to a few
+/// thousand iterations. Anything larger is not a real date, and callers
+/// fall back to rendering the raw number.
+pub const MAX_DATE_SERIAL: f64 = 5_000_000.0;
+
 fn is_leap_year(y: i32) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
 /// Convert 1900-system serial to (year, month, day).
 fn serial_to_date_1900(serial: i64) -> Option<(i32, u32, u32)> {
-    if serial < 1 {
+    if serial < 1 || serial > MAX_DATE_SERIAL as i64 {
         return None;
     }
     // Serial 60 is Excel's phantom "29 February 1900", kept for Lotus 1-2-3
@@ -150,7 +164,7 @@ fn serial_to_date_1900(serial: i64) -> Option<(i32, u32, u32)> {
 
 /// Convert 1904-system serial to (year, month, day).
 fn serial_to_date_1904(serial: i64) -> Option<(i32, u32, u32)> {
-    if serial < 0 {
+    if serial < 0 || serial > MAX_DATE_SERIAL as i64 {
         return None;
     }
     // Day 0 = Jan 1, 1904
@@ -392,6 +406,36 @@ mod tests {
     #[test]
     fn negative_serial_returns_none() {
         assert!(DateTimeValue::from_serial(-1.0, false).is_none());
+    }
+
+    /// #225 — the year-by-year scan is linear in the serial and `as i64`
+    /// saturates rather than erroring, so an unbounded input meant an
+    /// effectively infinite loop. The bound lives in the converter itself,
+    /// so a future caller that misclassifies a cell as a date can't
+    /// reintroduce the hang.
+    #[test]
+    fn test_out_of_range_serial_is_rejected_promptly() {
+        let started = std::time::Instant::now();
+        for serial in [MAX_DATE_SERIAL + 1.0, 1e12, 1e300, f64::MAX, f64::INFINITY, f64::NAN] {
+            assert!(
+                DateTimeValue::from_serial(serial, false).is_none(),
+                "{serial} is not a calendar date"
+            );
+            assert!(
+                DateTimeValue::from_serial(serial, true).is_none(),
+                "{serial} is not a calendar date (1904)"
+            );
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "rejection must not loop: took {:?}",
+            started.elapsed()
+        );
+
+        // Every real Excel date still converts — the cap sits well above
+        // Excel's own maximum of 2_958_465 (9999-12-31).
+        let last = DateTimeValue::from_serial(2_958_465.0, false).expect("9999-12-31 converts");
+        assert_eq!((last.year, last.month, last.day), (9999, 12, 31));
     }
 }
 
