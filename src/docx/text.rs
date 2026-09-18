@@ -239,6 +239,26 @@ struct MarkdownCtx<'a> {
 }
 
 fn markdown_blocks(elements: &[BlockElement], ctx: &MarkdownCtx, out: &mut String, _depth: usize) {
+    // Keyed by (num_id, ilvl): the next number to print for that level.
+    // This renderer processes one paragraph at a time with no notion of
+    // "list group" the way convert_docx.rs's IR path has, so each level's
+    // count is simply "one more than last time this exact level was
+    // seen" — matching #243's own per-numId continuation semantics.
+    // Without this every item printed the abstract level's bare
+    // `<w:start>` value forever (issue #316, the 4th instance of this
+    // crate's "two renderers disagree" flaw).
+    let mut numbering_counts: std::collections::HashMap<(u32, u8), u32> =
+        std::collections::HashMap::new();
+    markdown_blocks_inner(elements, ctx, out, _depth, &mut numbering_counts);
+}
+
+fn markdown_blocks_inner(
+    elements: &[BlockElement],
+    ctx: &MarkdownCtx,
+    out: &mut String,
+    _depth: usize,
+    numbering_counts: &mut std::collections::HashMap<(u32, u8), u32>,
+) {
     for elem in elements {
         match elem {
             BlockElement::Paragraph(p) => {
@@ -262,13 +282,29 @@ fn markdown_blocks(elements: &[BlockElement], ctx: &MarkdownCtx, out: &mut Strin
                     let level = numbering.resolve_level(nr.num_id, nr.ilvl)?;
                     let indent = "  ".repeat(nr.ilvl as usize);
                     use super::numbering::NumberFormat;
+                    // The printed number for an ordered format: one more
+                    // than the last time this exact (num_id, ilvl) was
+                    // seen, or the effective start (honoring
+                    // startOverride) on first encounter — not the bare
+                    // abstract-level start reprinted forever (issue #316).
+                    let mut next_ordinal = || {
+                        let key = (nr.num_id, nr.ilvl);
+                        let next = match numbering_counts.get(&key) {
+                            Some(&prev) => prev + 1,
+                            None => numbering
+                                .resolve_start(nr.num_id, nr.ilvl)
+                                .unwrap_or(level.start),
+                        };
+                        numbering_counts.insert(key, next);
+                        next
+                    };
                     let marker = match &level.format {
                         NumberFormat::Bullet => "- ".to_string(),
-                        NumberFormat::Decimal => format!("{}. ", level.start),
-                        NumberFormat::LowerLetter => format!("{}. ", level.start),
-                        NumberFormat::UpperLetter => format!("{}. ", level.start),
-                        NumberFormat::LowerRoman => format!("{}. ", level.start),
-                        NumberFormat::UpperRoman => format!("{}. ", level.start),
+                        NumberFormat::Decimal => format!("{}. ", next_ordinal()),
+                        NumberFormat::LowerLetter => format!("{}. ", next_ordinal()),
+                        NumberFormat::UpperLetter => format!("{}. ", next_ordinal()),
+                        NumberFormat::LowerRoman => format!("{}. ", next_ordinal()),
+                        NumberFormat::UpperRoman => format!("{}. ", next_ordinal()),
                         NumberFormat::None => String::new(),
                         NumberFormat::Other(_) => "- ".to_string(),
                     };

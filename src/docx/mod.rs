@@ -4303,6 +4303,64 @@ mod tests {
     }
 
     #[test]
+    fn test_markdown_ordered_list_increments_instead_of_repeating_the_start_value() {
+        // issue #316 — docx/text.rs's markdown_blocks printed the same
+        // literal <w:start> value for every item in an ordered list,
+        // instead of incrementing. 4th instance of the "two renderers
+        // disagree" flaw (ir_render.rs already increments correctly).
+        let numbering_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="0">
+    <w:lvl w:ilvl="0">
+      <w:start w:val="3"/>
+      <w:numFmt w:val="decimal"/>
+      <w:lvlText w:val="%1."/>
+    </w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="1">
+    <w:abstractNumId w:val="0"/>
+  </w:num>
+</w:numbering>"#;
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>first</w:t></w:r></w:p>
+    <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>second</w:t></w:r></w:p>
+    <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>third</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let numbering_part = PartName::new("/word/numbering.xml").unwrap();
+        writer
+            .add_part(
+                &numbering_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml",
+                numbering_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::NUMBERING, "numbering.xml");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let md = doc.to_markdown();
+        assert!(md.contains("3. first"), "expected '3. first', got: {md:?}");
+        assert!(md.contains("4. second"), "expected '4. second', got: {md:?}");
+        assert!(md.contains("5. third"), "expected '5. third', got: {md:?}");
+    }
+
+    #[test]
     fn test_app_properties_are_read_on_open() {
         // issue #245 — AppProperties::parse existed, fully tested, but
         // nothing on the read side ever called it; company name and every
