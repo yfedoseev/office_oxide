@@ -4663,6 +4663,73 @@ mod tests {
         );
     }
 
+    /// A hyperlink's `r:id` inside a footnote is scoped to
+    /// `word/_rels/footnotes.xml.rels`, not `word/_rels/document.xml.rels` —
+    /// resolving it against the document's own relationships left the raw
+    /// `rIdN` string as the "URL" for every note hyperlink (issue #293).
+    #[test]
+    fn test_footnote_hyperlink_resolves_against_the_footnotes_parts_own_rels() {
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>See</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let footnotes_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:footnote w:id="1"><w:p><w:hyperlink r:id="rId1"><w:r><w:t>source</w:t></w:r></w:hyperlink></w:p></w:footnote>
+</w:footnotes>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let footnotes_part = PartName::new("/word/footnotes.xml").unwrap();
+        writer
+            .add_part(
+                &footnotes_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml",
+                footnotes_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::FOOTNOTES, "footnotes.xml");
+        // The hyperlink's rId is only ever declared in the footnotes
+        // part's own rels, not the document's — this is the crux of #293.
+        writer.add_part_rel_with_mode(
+            &footnotes_part,
+            rel_types::HYPERLINK,
+            "https://example.com/source",
+            TargetMode::External,
+        );
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let hl = doc.footnotes[0].content.iter().find_map(|b| match b {
+            BlockElement::Paragraph(p) => p.content.iter().find_map(|c| match c {
+                ParagraphContent::Hyperlink(h) => Some(h.clone()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        let hl = hl.expect("hyperlink was not captured in the footnote body");
+        assert_eq!(
+            hl.target,
+            HyperlinkTarget::External("https://example.com/source".to_string()),
+            "the footnote hyperlink must resolve against footnotes.xml's own rels, not the \
+             document's — got {:?}",
+            hl.target
+        );
+    }
+
     #[test]
     fn test_footnote_custom_mark_round_trips() {
         // issue #219 item 1 — a custom mark ("*") became an auto-number on

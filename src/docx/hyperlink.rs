@@ -18,7 +18,7 @@ pub struct Hyperlink {
 }
 
 /// The destination of a hyperlink.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum HyperlinkTarget {
     /// External URL, resolved from relationship with TargetMode=External.
     External(String),
