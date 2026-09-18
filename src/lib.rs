@@ -688,6 +688,10 @@ mod tests {
         write_dir_entry(&mut file[dir_offset..dir_offset + 128], "Root Entry", 5, 1, END_OF_CHAIN, 0);
         write_dir_entry(&mut file[dir_offset + 128..dir_offset + 256], name1, 2, NO_ENTRY, 2, 4);
         write_dir_entry(&mut file[dir_offset + 256..dir_offset + 384], name2, 2, NO_ENTRY, 3, 4);
+        // Sibling-link entry 1 ("name1") to entry 2 ("name2") so both are
+        // reachable from Root's tree — find_entry (#226) walks the tree
+        // via child/sibling pointers, not a flat directory-array scan.
+        file[dir_offset + 128 + 0x48..dir_offset + 128 + 0x4C].copy_from_slice(&2u32.to_le_bytes());
         file[dir_offset + 384 + 0x42] = 0; // empty 4th entry
 
         let fat_offset = 512 + sector_size;
