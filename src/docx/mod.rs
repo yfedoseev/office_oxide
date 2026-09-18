@@ -314,6 +314,11 @@ impl DocxDocument {
             attach_chart_text(&mut body.elements, &chart_text_by_rid, &dgm_text_by_rid);
         }
 
+        // Resolve every embedded native OOXML package object
+        // (`<o:OLEObject Type="Embed">`, issue #304) by opening its bytes
+        // with the appropriate format reader and folding in its text.
+        resolve_deferred_parts(&mut body.elements, &mut opc, &main_part, &doc_rels);
+
         // Parse headers and footers. Walk header refs and footer refs
         // separately so each parsed `HeaderFooter` can record its own
         // role; without that distinction, downstream consumers had to
@@ -1798,6 +1803,98 @@ fn attach_chart_text(
     }
 }
 
+/// Replace every `RunContent::DeferredPart(rid)` in the tree with the
+/// extracted plain text of the OOXML package it refers to
+/// (`<o:OLEObject Type="Embed">`, issue #304), wrapped as a `TextBox` so
+/// it flows as ordinary block content. A reference that can't be resolved
+/// (unknown relationship, unreadable part, unrecognised extension, or the
+/// nested document fails to open) is left as `DeferredPart` and every
+/// renderer's catch-all already drops those silently — matching the
+/// pre-existing "unresolvable is dropped" behaviour.
+fn resolve_deferred_parts<R: Read + Seek>(
+    elements: &mut [BlockElement],
+    opc: &mut OpcReader<R>,
+    main_part: &crate::core::opc::PartName,
+    doc_rels: &crate::core::relationships::Relationships,
+) {
+    for elem in elements {
+        match elem {
+            BlockElement::Paragraph(p) => {
+                for pc in &mut p.content {
+                    let runs: &mut [Run] = match pc {
+                        ParagraphContent::Run(r) => std::slice::from_mut(r),
+                        ParagraphContent::Hyperlink(hl) => &mut hl.runs,
+                    };
+                    for run in runs {
+                        for rc in &mut run.content {
+                            match rc {
+                                RunContent::TextBox(blocks) => {
+                                    resolve_deferred_parts(blocks, opc, main_part, doc_rels);
+                                },
+                                RunContent::DeferredPart(rid) => {
+                                    if let Some(blocks) =
+                                        resolve_one_deferred_part(rid, opc, main_part, doc_rels)
+                                    {
+                                        *rc = RunContent::TextBox(blocks);
+                                    }
+                                },
+                                _ => {},
+                            }
+                        }
+                    }
+                }
+            },
+            BlockElement::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        resolve_deferred_parts(&mut cell.content, opc, main_part, doc_rels);
+                    }
+                }
+            },
+        }
+    }
+}
+
+fn resolve_one_deferred_part<R: Read + Seek>(
+    rid: &str,
+    opc: &mut OpcReader<R>,
+    main_part: &crate::core::opc::PartName,
+    doc_rels: &crate::core::relationships::Relationships,
+) -> Option<Vec<BlockElement>> {
+    let rel = doc_rels.get_by_id(rid)?;
+    if rel.target_mode != TargetMode::Internal {
+        return None;
+    }
+    let part = main_part.resolve_relative(&rel.target).ok()?;
+    if !opc.has_part(&part) {
+        return None;
+    }
+    let ext = part.as_str().rsplit('.').next()?;
+    let format = crate::format::DocumentFormat::from_extension(ext)?;
+    let data = opc.read_part(&part).ok()?;
+    let text = crate::Document::from_reader(std::io::Cursor::new(data), format)
+        .ok()?
+        .plain_text();
+    let paragraphs: Vec<BlockElement> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            BlockElement::Paragraph(Paragraph {
+                properties: None,
+                content: vec![ParagraphContent::Run(Run {
+                    properties: None,
+                    content: vec![RunContent::Text(line.to_string())],
+                })],
+            })
+        })
+        .collect();
+    if paragraphs.is_empty() {
+        None
+    } else {
+        Some(paragraphs)
+    }
+}
+
 /// Collect every `<a:t>` text node inside a SmartArt data part
 /// (`word/diagrams/dataN.xml`), in document order, one per line
 /// (issue #271).
@@ -3060,6 +3157,67 @@ mod tests {
 
         let result = writer.finish().unwrap();
         result.into_inner()
+    }
+
+    #[test]
+    fn test_embedded_package_object_text_is_extracted() {
+        // issue #304 — an embedded native OOXML package
+        // (<o:OLEObject Type="Embed">) was never opened at all.
+        let mut xlsx_writer = crate::xlsx::write::XlsxWriter::new();
+        {
+            let mut sheet = xlsx_writer.add_sheet("Sheet1");
+            sheet.set_cell(0, 0, crate::xlsx::write::CellData::String("EmbeddedCellText".to_string()));
+        }
+        let mut embedded_xlsx = Vec::new();
+        xlsx_writer
+            .write_to(Cursor::new(&mut embedded_xlsx))
+            .unwrap();
+
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+             xmlns:o="urn:schemas-microsoft-com:office:office"
+             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>
+    <w:p><w:r><w:pict>
+      <o:OLEObject Type="Embed" ProgID="Excel.Sheet.12" r:id="rId1"/>
+    </w:pict></w:r></w:p>
+  </w:body>
+</w:document>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let embed_part = PartName::new("/word/embeddings/Microsoft_Excel_Worksheet1.xlsx").unwrap();
+        writer
+            .add_part(
+                &embed_part,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                &embedded_xlsx,
+            )
+            .unwrap();
+        let rid = writer.add_part_rel(
+            &doc_part,
+            rel_types::PACKAGE,
+            "embeddings/Microsoft_Excel_Worksheet1.xlsx",
+        );
+        assert_eq!(rid, "rId1", "test fixture assumes the first relationship id");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let text = doc.plain_text();
+        assert!(
+            text.contains("EmbeddedCellText"),
+            "expected embedded workbook text in {text:?}"
+        );
     }
 
     #[test]
