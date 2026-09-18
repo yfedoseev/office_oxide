@@ -427,6 +427,12 @@ fn convert_block_elements(
     doc: &crate::docx::DocxDocument,
 ) {
     let mut i = 0;
+    // A numId resumed later in the same block sequence (after a non-list
+    // paragraph interrupts it) with no explicit override continues
+    // counting from where it left off, per OOXML/Word semantics — not a
+    // fresh 1. Tracks the next start number per numId across the several
+    // `convert_list_group` calls this loop makes (issue #243).
+    let mut numbering_counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     while i < blocks.len() {
         match &blocks[i] {
             crate::docx::BlockElement::Paragraph(p) => {
@@ -446,7 +452,8 @@ fn convert_block_elements(
                     .and_then(|pp| pp.numbering_ref.as_ref())
                     .filter(|nr| nr.num_id != 0)
                 {
-                    let list_element = convert_list_group(blocks, &mut i, nr.num_id, doc);
+                    let list_element =
+                        convert_list_group(blocks, &mut i, nr.num_id, doc, &mut numbering_counts);
                     elements.push(list_element);
                     continue;
                 }
@@ -1123,9 +1130,13 @@ fn convert_list_group(
     i: &mut usize,
     num_id: u32,
     doc: &crate::docx::DocxDocument,
+    numbering_counts: &mut std::collections::HashMap<u32, u32>,
 ) -> Element {
     let mut items = Vec::new();
     let mut is_ordered = false;
+    // How many items at the group's own (shallowest) level this group
+    // contributes — used to advance `numbering_counts` for issue #243.
+    let mut top_level_item_count: u32 = 0;
     // The marker style and start value of the *shallowest* level in the
     // group describe the list the IR is about to build. Both used to be
     // resolved and then thrown away, so a list starting at 5 rendered as
@@ -1169,6 +1180,9 @@ fn convert_list_group(
                     }
                 }
 
+                if top_ilvl == Some(nr.ilvl) {
+                    top_level_item_count += 1;
+                }
                 items.push((nr.ilvl, convert_paragraph_inline(p, doc)));
                 *i += 1;
                 continue;
@@ -1184,6 +1198,20 @@ fn convert_list_group(
     if *i == start_index {
         *i += 1;
     }
+
+    // A numId seen earlier in this same block sequence, with no explicit
+    // `w:start`/`w:startOverride` this time, continues counting from where
+    // the previous group left off rather than restarting at 1 (issue #243).
+    if start_number.is_none() {
+        if let Some(&prev_count) = numbering_counts.get(&num_id) {
+            start_number = Some(prev_count + 1);
+        }
+    }
+    let resumed_from = start_number.unwrap_or(1);
+    numbering_counts.insert(
+        num_id,
+        resumed_from + top_level_item_count.saturating_sub(1),
+    );
 
     // Build nested list structure from flat (ilvl, content) pairs
     let mut list = crate::ir::build_nested_list(is_ordered, &items, 0);
