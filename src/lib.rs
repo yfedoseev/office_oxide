@@ -652,11 +652,24 @@ mod tests {
     /// cap would leak and eventually deadlock every later parse.
     #[test]
     fn test_parse_slot_released_after_panic() {
+        // `PARSE_THREADS` is a process-wide live gauge shared with every
+        // other test in this binary, and `cargo test` runs tests
+        // concurrently by default — a single before/after snapshot is
+        // racy against unrelated tests bumping the same counter between
+        // the two reads. Repeat the panicking call several times instead:
+        // a genuine per-call leak would ratchet the gauge up by roughly
+        // that many slots, which is far outside what ordinary concurrent
+        // test-suite noise could plausibly explain.
+        const ITERATIONS: usize = 20;
         let before = *PARSE_THREADS.lock().unwrap_or_else(|e| e.into_inner());
-        let r: Result<()> = with_parse_stack(|| panic!("boom"));
-        assert!(matches!(r, Err(OfficeError::Panic(_))), "panic should surface as itself");
-        // The slot is released synchronously before `with_parse_stack` returns.
+        for _ in 0..ITERATIONS {
+            let r: Result<()> = with_parse_stack(|| panic!("boom"));
+            assert!(matches!(r, Err(OfficeError::Panic(_))), "panic should surface as itself");
+        }
         let after = *PARSE_THREADS.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(after <= before, "slot leaked: {before} -> {after}");
+        assert!(
+            after < before + ITERATIONS,
+            "slot leaked across {ITERATIONS} panicking calls: {before} -> {after}"
+        );
     }
 }

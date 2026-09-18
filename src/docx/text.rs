@@ -128,15 +128,21 @@ fn plain_text_run(run: &Run, out: &mut String) {
             RunContent::Break(BreakType::Line) => out.push('\n'),
             RunContent::Break(BreakType::Page | BreakType::Column) => out.push('\n'),
             RunContent::Tab => out.push('\t'),
-            // A drawing has no text of its own — except a native chart,
-            // whose title / categories / series were resolved from the
-            // chart part at open time (issue #273).
+            // A drawing has no text of its own — except a native chart or
+            // SmartArt diagram, whose text was resolved from the separate
+            // referenced part at open time (issues #273, #271).
             RunContent::Drawing(d) => {
-                if !d.chart_text.is_empty() {
+                let lines: Vec<&str> = d
+                    .chart_text
+                    .iter()
+                    .chain(d.dgm_text.iter())
+                    .map(String::as_str)
+                    .collect();
+                if !lines.is_empty() {
                     if !out.is_empty() && !out.ends_with(['\n', ' ', '\t']) {
                         out.push('\n');
                     }
-                    out.push_str(&d.chart_text.join("\n"));
+                    out.push_str(&lines.join("\n"));
                     out.push('\n');
                 }
             },
@@ -418,13 +424,20 @@ fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, text: &mut String) {
 }
 
 fn markdown_drawing(drawing: &DrawingInfo, out: &mut String) {
-    // A chart is not an image: render the text we recovered from the chart
-    // part instead of an empty image link with no target.
-    if !drawing.chart_text.is_empty() {
+    // A chart or diagram is not an image: render the text we recovered
+    // from the referenced part instead of an empty image link with no
+    // target.
+    let lines: Vec<&str> = drawing
+        .chart_text
+        .iter()
+        .chain(drawing.dgm_text.iter())
+        .map(String::as_str)
+        .collect();
+    if !lines.is_empty() {
         if !out.is_empty() && !out.ends_with(['\n', ' ', '\t']) {
             out.push('\n');
         }
-        out.push_str(&drawing.chart_text.join("  \n"));
+        out.push_str(&lines.join("  \n"));
         out.push('\n');
         return;
     }

@@ -288,8 +288,30 @@ impl DocxDocument {
                 chart_text_by_rid.insert(rel.id.clone(), lines);
             }
         }
-        if !chart_text_by_rid.is_empty() {
-            attach_chart_text(&mut body.elements, &chart_text_by_rid);
+        // Resolve every SmartArt diagram the body references, the same
+        // way charts are resolved just above (issue #271).
+        let mut dgm_text_by_rid: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for rel in doc_rels.all() {
+            if rel.rel_type != rel_types::DIAGRAM_DATA || rel.target_mode != TargetMode::Internal {
+                continue;
+            }
+            let Ok(part) = main_part.resolve_relative(&rel.target) else {
+                continue;
+            };
+            if !opc.has_part(&part) {
+                continue;
+            }
+            let Ok(data) = opc.read_part(&part) else {
+                continue;
+            };
+            let lines = diagram_text_lines(&data);
+            if !lines.is_empty() {
+                dgm_text_by_rid.insert(rel.id.clone(), lines);
+            }
+        }
+        if !chart_text_by_rid.is_empty() || !dgm_text_by_rid.is_empty() {
+            attach_chart_text(&mut body.elements, &chart_text_by_rid, &dgm_text_by_rid);
         }
 
         // Parse headers and footers. Walk header refs and footer refs
@@ -668,6 +690,8 @@ impl VmlContent {
                 shape: None,
                 chart_rel_id: None,
                 chart_text: Vec::new(),
+                dgm_data_rel_id: None,
+                dgm_text: Vec::new(),
             }));
         }
         for b in self.boxes {
@@ -1729,6 +1753,7 @@ fn collect_runs_until(
 fn attach_chart_text(
     elements: &mut [BlockElement],
     chart_text_by_rid: &std::collections::HashMap<String, Vec<String>>,
+    dgm_text_by_rid: &std::collections::HashMap<String, Vec<String>>,
 ) {
     for elem in elements {
         match elem {
@@ -1747,9 +1772,14 @@ fn attach_chart_text(
                                             d.chart_text = lines.clone();
                                         }
                                     }
+                                    if let Some(rid) = d.dgm_data_rel_id.as_deref() {
+                                        if let Some(lines) = dgm_text_by_rid.get(rid) {
+                                            d.dgm_text = lines.clone();
+                                        }
+                                    }
                                 },
                                 RunContent::TextBox(blocks) => {
-                                    attach_chart_text(blocks, chart_text_by_rid);
+                                    attach_chart_text(blocks, chart_text_by_rid, dgm_text_by_rid);
                                 },
                                 _ => {},
                             }
@@ -1760,12 +1790,35 @@ fn attach_chart_text(
             BlockElement::Table(t) => {
                 for row in &mut t.rows {
                     for cell in &mut row.cells {
-                        attach_chart_text(&mut cell.content, chart_text_by_rid);
+                        attach_chart_text(&mut cell.content, chart_text_by_rid, dgm_text_by_rid);
                     }
                 }
             },
         }
     }
+}
+
+/// Collect every `<a:t>` text node inside a SmartArt data part
+/// (`word/diagrams/dataN.xml`), in document order, one per line
+/// (issue #271).
+fn diagram_text_lines(xml: &[u8]) -> Vec<String> {
+    let mut reader = xml::make_fast_reader(xml);
+    let mut lines = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"t" => {
+                if let Ok(text) = xml::read_text_content_fast(&mut reader) {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        lines.push(text.to_string());
+                    }
+                }
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {},
+        }
+    }
+    lines
 }
 
 // ---------------------------------------------------------------------------
@@ -1833,6 +1886,7 @@ fn parse_inline_or_anchor_body(
     let mut relationship_id: Option<String> = None;
     let mut shape: Option<crate::docx::image::ShapeInfo> = None;
     let mut chart_rel_id: Option<String> = None;
+    let mut dgm_data_rel_id: Option<String> = None;
 
     let mut anchor_x: Option<i64> = None;
     let mut anchor_y: Option<i64> = None;
@@ -1875,6 +1929,9 @@ fn parse_inline_or_anchor_body(
                     if let Some(rid) = g.chart_rel_id {
                         chart_rel_id = Some(rid);
                     }
+                    if let Some(rid) = g.dgm_data_rel_id {
+                        dgm_data_rel_id = Some(rid);
+                    }
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
@@ -1906,10 +1963,14 @@ fn parse_inline_or_anchor_body(
         None
     };
 
-    // A chart-only graphic has neither a blip nor a `prstGeom`, so without
-    // `chart_rel_id` in this condition the whole drawing was discarded and
-    // the chart part was never reachable (issue #273).
-    if relationship_id.is_some() || shape.is_some() || chart_rel_id.is_some() {
+    // A chart-only or diagram-only graphic has neither a blip nor a
+    // `prstGeom`, so without these two conditions the whole drawing was
+    // discarded and the chart/diagram part was never reachable (#273, #271).
+    if relationship_id.is_some()
+        || shape.is_some()
+        || chart_rel_id.is_some()
+        || dgm_data_rel_id.is_some()
+    {
         Ok(Some(DrawingInfo {
             relationship_id: relationship_id.unwrap_or_default(),
             description,
@@ -1920,6 +1981,8 @@ fn parse_inline_or_anchor_body(
             shape,
             chart_rel_id,
             chart_text: Vec::new(),
+            dgm_data_rel_id,
+            dgm_text: Vec::new(),
         }))
     } else {
         Ok(None)
@@ -1962,6 +2025,9 @@ struct GraphicPayload {
     shape: Option<crate::docx::image::ShapeInfo>,
     /// `r:id` of a `<c:chart>` reference, when the graphic is a chart.
     chart_rel_id: Option<String>,
+    /// `r:dm` of a `<dgm:relIds>` reference, when the graphic is a
+    /// SmartArt diagram (issue #271).
+    dgm_data_rel_id: Option<String>,
 }
 
 /// Parse `<a:graphic>` and any contained `<pic:pic>` (image) or
@@ -1973,6 +2039,7 @@ fn parse_graphic(
     let mut relationship_id: Option<String> = None;
     let mut shape: Option<crate::docx::image::ShapeInfo> = None;
     let mut chart_rel_id: Option<String> = None;
+    let mut dgm_data_rel_id: Option<String> = None;
 
     loop {
         match reader.read_event()? {
@@ -1997,6 +2064,15 @@ fn parse_graphic(
                     }
                     xml::skip_element_fast(reader)?;
                 },
+                // A SmartArt diagram: `<dgm:relIds r:dm="…" r:lo="…" .../>`
+                // — `r:dm` points at the data part (`word/diagrams/dataN.xml`)
+                // where the diagram's actual text lives (issue #271).
+                b"relIds" => {
+                    if let Some(rid) = xml::optional_prefixed_attr_str(e, b"dm")? {
+                        dgm_data_rel_id = Some(rid.into_owned());
+                    }
+                    xml::skip_element_fast(reader)?;
+                },
                 // A group shape nests further `<wps:wsp>` children; descend
                 // so text boxes inside groups are not lost.
                 b"grpSp" | b"wgp" => continue,
@@ -2011,6 +2087,11 @@ fn parse_graphic(
                     chart_rel_id = Some(rid.into_owned());
                 }
             },
+            Event::Empty(ref e) if e.local_name().as_ref() == b"relIds" => {
+                if let Some(rid) = xml::optional_prefixed_attr_str(e, b"dm")? {
+                    dgm_data_rel_id = Some(rid.into_owned());
+                }
+            },
             Event::End(ref e) if e.local_name().as_ref() == b"graphic" => break,
             Event::Eof => break,
             _ => {},
@@ -2021,6 +2102,7 @@ fn parse_graphic(
         relationship_id,
         shape,
         chart_rel_id,
+        dgm_data_rel_id,
     })
 }
 
@@ -2944,6 +3026,73 @@ mod tests {
 
         let result = writer.finish().unwrap();
         result.into_inner()
+    }
+
+    /// Like `make_minimal_docx`, but also writes a SmartArt diagram data
+    /// part and the `document.xml -> diagrams/data1.xml` relationship
+    /// (`rId7`, matching what real Word/pandoc output uses) so a
+    /// `<dgm:relIds r:dm="rId7">` reference in `document_xml` resolves.
+    fn make_docx_with_diagram(document_xml: &[u8], diagram_data_xml: &[u8]) -> Vec<u8> {
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+
+        let dgm_part = PartName::new("/word/diagrams/data1.xml").unwrap();
+        writer
+            .add_part(
+                &dgm_part,
+                "application/vnd.openxmlformats-officedocument.drawingml.diagramData+xml",
+                diagram_data_xml,
+            )
+            .unwrap();
+        let rid = writer.add_part_rel(&doc_part, rel_types::DIAGRAM_DATA, "diagrams/data1.xml");
+        assert_eq!(rid, "rId1", "test fixture assumes the first relationship id");
+
+        let result = writer.finish().unwrap();
+        result.into_inner()
+    }
+
+    #[test]
+    fn test_smartart_diagram_text_is_extracted() {
+        // issue #271 — word/diagrams/dataN.xml was never opened, so
+        // SmartArt text was completely invisible.
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+             xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+             xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+             xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram"
+             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>
+    <w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram">
+      <dgm:relIds r:dm="rId1" r:lo="rId1" r:qs="rId1" r:cs="rId1"/>
+    </a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let diagram_data_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram"
+               xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <dgm:ptLst>
+    <dgm:pt><dgm:t><a:p><a:r><a:t>top</a:t></a:r></a:p></dgm:t></dgm:pt>
+    <dgm:pt><dgm:t><a:p><a:r><a:t>middle</a:t></a:r></a:p></dgm:t></dgm:pt>
+    <dgm:pt><dgm:t><a:p><a:r><a:t>bottom</a:t></a:r></a:p></dgm:t></dgm:pt>
+  </dgm:ptLst>
+</dgm:dataModel>"#;
+        let data = make_docx_with_diagram(document_xml, diagram_data_xml);
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let text = doc.plain_text();
+        assert!(text.contains("top"), "expected 'top' in {text:?}");
+        assert!(text.contains("middle"), "expected 'middle' in {text:?}");
+        assert!(text.contains("bottom"), "expected 'bottom' in {text:?}");
     }
 
     #[test]

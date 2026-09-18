@@ -604,8 +604,8 @@ fn collect_paragraph_inline_images(
     }
 }
 
-/// Emit one IR paragraph per line of text recovered from a chart part
-/// referenced by a drawing in this paragraph.
+/// Emit one IR paragraph per line of text recovered from a chart or
+/// SmartArt diagram part referenced by a drawing in this paragraph.
 fn collect_paragraph_chart_text(p: &crate::docx::Paragraph, out: &mut Vec<Element>) {
     for pc in &p.content {
         let runs: &[crate::docx::Run] = match pc {
@@ -617,7 +617,7 @@ fn collect_paragraph_chart_text(p: &crate::docx::Paragraph, out: &mut Vec<Elemen
                 let crate::docx::RunContent::Drawing(d) = rc else {
                     continue;
                 };
-                for line in &d.chart_text {
+                for line in d.chart_text.iter().chain(d.dgm_text.iter()) {
                     out.push(Element::Paragraph(Paragraph {
                         content: vec![InlineContent::Text(TextSpan::plain(line.clone()))],
                         ..Default::default()

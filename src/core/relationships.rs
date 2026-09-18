@@ -89,6 +89,14 @@ pub mod rel_types {
     /// Relationship type for chart parts.
     pub const CHART: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart";
+    /// Relationship type for a SmartArt diagram's data part
+    /// (`word/diagrams/dataN.xml`).
+    pub const DIAGRAM_DATA: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData";
+    /// Relationship type for an embedded native OOXML package object
+    /// (`<o:OLEObject Type="Embed">` → `word/embeddings/*.xlsx`/`.docx`/`.pptx`).
+    pub const PACKAGE: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/package";
     /// Relationship type for the footnotes part.
     pub const FOOTNOTES: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes";
