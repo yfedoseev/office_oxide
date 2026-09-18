@@ -197,6 +197,7 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
             // A hidden sheet is kept and flagged, not dropped — the same
             // contract `convert_xlsx` already honours.
             hidden: sheet.hidden,
+            conditional_formats: sheet.conditional_formats.clone(),
             ..Default::default()
         });
     }

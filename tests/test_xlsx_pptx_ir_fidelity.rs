@@ -442,6 +442,41 @@ fn cell_comments_reach_the_ir() {
 }
 
 // ---------------------------------------------------------------------------
+// #252 — conditional formatting
+// ---------------------------------------------------------------------------
+
+#[test]
+fn conditional_formatting_reaches_the_ir() {
+    let ir = Xlsx::new(vec![Sheet {
+        name: "S",
+        state: None,
+        body: r#"<row r="1"><c r="A1"><v>1</v></c></row>"#,
+        extra: r#"<conditionalFormatting sqref="A1:A10">
+                    <cfRule type="cellIs" operator="greaterThan" priority="1">
+                      <formula>100</formula>
+                    </cfRule>
+                  </conditionalFormatting>"#,
+    }])
+    .ir();
+    let cf = &ir.sections[0].conditional_formats;
+    assert_eq!(cf.len(), 1, "the rule must reach Section::conditional_formats");
+    assert_eq!(cf[0].range, "A1:A10");
+    assert_eq!(cf[0].rule_type, "cellIs");
+    assert_eq!(cf[0].operator.as_deref(), Some("greaterThan"));
+    assert_eq!(cf[0].formulas, vec!["100".to_string()]);
+}
+
+#[test]
+fn a_sheet_with_no_conditional_formatting_has_an_empty_list() {
+    let ir = Xlsx::new(vec![Sheet::new(
+        "S",
+        r#"<row r="1"><c r="A1"><v>1</v></c></row>"#,
+    )])
+    .ir();
+    assert!(ir.sections[0].conditional_formats.is_empty());
+}
+
+// ---------------------------------------------------------------------------
 // #160 / #173 — writer validation
 // ---------------------------------------------------------------------------
 

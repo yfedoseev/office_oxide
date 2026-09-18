@@ -34,6 +34,9 @@ pub struct Worksheet {
     /// `to_xlsx_bytes_layout`. Empty when the worksheet has no
     /// `<xdr:sp>` shapes (the common XLSX case).
     pub text_shapes: Vec<WorksheetTextShape>,
+    /// Conditional formatting rules from `<conditionalFormatting>`/
+    /// `<cfRule>`. Empty when the worksheet defines none (issue #252).
+    pub conditional_formats: Vec<crate::ir::ConditionalFormat>,
 }
 
 /// One cell comment from `xl/comments*.xml`.
@@ -222,6 +225,7 @@ impl Worksheet {
         let mut margins_in: Option<PageMarginsIn> = None;
         let mut page_setup_raw: Option<PageSetupRaw> = None;
         let mut shared = SharedFormulas::default();
+        let mut conditional_formats = Vec::new();
 
         loop {
             match reader.read_event()? {
@@ -256,6 +260,9 @@ impl Worksheet {
                     b"pageSetup" => {
                         page_setup_raw = parse_page_setup_attrs(e)?;
                         reader.read_to_end(e.to_end().name())?;
+                    },
+                    b"conditionalFormatting" => {
+                        conditional_formats.extend(parse_conditional_formatting(&mut reader, e)?);
                     },
                     _ => {},
                 },
@@ -313,8 +320,92 @@ impl Worksheet {
             page_setup,
             images: Vec::new(),
             text_shapes: Vec::new(),
+            conditional_formats,
         })
     }
+}
+
+/// Parse one `<conditionalFormatting sqref="...">` block: its `sqref`
+/// (which range(s) it applies to) and each `<cfRule>` child inside it.
+///
+/// `<cfRule type="cellIs" operator="greaterThan"><formula>100</formula></cfRule>`
+/// is the common shape; colour-scale/data-bar/icon-set rules instead carry
+/// a `<colorScale>`/`<dataBar>`/`<iconSet>` child with no `<formula>` at
+/// all, which is fine — `formulas` is just empty for those (issue #252).
+fn parse_conditional_formatting(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    start: &quick_xml::events::BytesStart,
+) -> crate::core::Result<Vec<crate::ir::ConditionalFormat>> {
+    use quick_xml::events::Event;
+
+    let sqref = xml::optional_attr_str(start, b"sqref")?.map(|v| v.into_owned()).unwrap_or_default();
+    let mut out = Vec::new();
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) if e.local_name().as_ref() == b"cfRule" => {
+                let rule_type =
+                    xml::optional_attr_str(e, b"type")?.map(|v| v.into_owned()).unwrap_or_default();
+                let operator = xml::optional_attr_str(e, b"operator")?.map(|v| v.into_owned());
+                let formulas = read_cf_rule_formulas(reader)?;
+                out.push(crate::ir::ConditionalFormat {
+                    range: sqref.clone(),
+                    rule_type,
+                    operator,
+                    formulas,
+                });
+            },
+            Event::Empty(ref e) if e.local_name().as_ref() == b"cfRule" => {
+                // A rule with no children at all (no formula, no colour
+                // scale/data bar/icon set) — rare, but structurally valid.
+                let rule_type =
+                    xml::optional_attr_str(e, b"type")?.map(|v| v.into_owned()).unwrap_or_default();
+                let operator = xml::optional_attr_str(e, b"operator")?.map(|v| v.into_owned());
+                out.push(crate::ir::ConditionalFormat {
+                    range: sqref.clone(),
+                    rule_type,
+                    operator,
+                    formulas: Vec::new(),
+                });
+            },
+            Event::End(ref e) if e.local_name().as_ref() == b"conditionalFormatting" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(out)
+}
+
+/// Read every `<formula>...</formula>` child of the `<cfRule>` whose Start
+/// event was just consumed, up through its matching `</cfRule>`. A
+/// `between`/`notBetween` operator carries two `<formula>` children (the
+/// low and high bounds); most others carry one; colour-scale/data-bar/
+/// icon-set rules carry none.
+fn read_cf_rule_formulas(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Vec<String>> {
+    use quick_xml::events::Event;
+    let mut formulas = Vec::new();
+    let mut depth = 1u32;
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => {
+                depth += 1;
+                if e.local_name().as_ref() == b"formula" {
+                    formulas.push(xml::read_text_content_fast(reader)?);
+                    depth -= 1; // read_text_content_fast already consumed </formula>
+                }
+            },
+            Event::Empty(_) => {},
+            Event::End(_) => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(formulas)
 }
 
 /// Raw `<pageMargins>` values in inches (per ECMA-376 §18.3.1.62).
@@ -886,6 +977,103 @@ mod tests {
             "got {:?}",
             ws.rows[0].cells[0].value
         );
+    }
+
+    /// issue #252 — a `cellIs`/`greaterThan` rule's sqref, type, operator,
+    /// and single comparison formula must all reach the IR.
+    #[test]
+    fn test_conditional_formatting_cell_is_rule_reaches_the_ir() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+  <conditionalFormatting sqref="A1:A10">
+    <cfRule type="cellIs" dxfId="0" priority="1" operator="greaterThan">
+      <formula>100</formula>
+    </cfRule>
+  </conditionalFormatting>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.conditional_formats.len(), 1);
+        let cf = &ws.conditional_formats[0];
+        assert_eq!(cf.range, "A1:A10");
+        assert_eq!(cf.rule_type, "cellIs");
+        assert_eq!(cf.operator.as_deref(), Some("greaterThan"));
+        assert_eq!(cf.formulas, vec!["100".to_string()]);
+    }
+
+    /// A `between` rule carries two `<formula>` children — both must be
+    /// captured as separate entries, not concatenated together.
+    #[test]
+    fn test_conditional_formatting_between_rule_keeps_both_formulas_separate() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+  <conditionalFormatting sqref="B1:B5">
+    <cfRule type="cellIs" operator="between" priority="1">
+      <formula>10</formula>
+      <formula>20</formula>
+    </cfRule>
+  </conditionalFormatting>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.conditional_formats[0].formulas, vec!["10".to_string(), "20".to_string()]);
+    }
+
+    /// A colour-scale rule has no `<formula>` children at all — must not
+    /// error or swallow the sheet, and correctly reports an empty
+    /// `formulas` list while still recording the rule's type and range.
+    #[test]
+    fn test_conditional_formatting_color_scale_has_no_formulas() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+  <conditionalFormatting sqref="C1:C20">
+    <cfRule type="colorScale" priority="1">
+      <colorScale>
+        <cfvo type="min"/>
+        <cfvo type="max"/>
+        <color rgb="FFFF0000"/>
+        <color rgb="FF00FF00"/>
+      </colorScale>
+    </cfRule>
+  </conditionalFormatting>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.conditional_formats.len(), 1);
+        assert_eq!(ws.conditional_formats[0].rule_type, "colorScale");
+        assert!(ws.conditional_formats[0].formulas.is_empty());
+        assert!(ws.conditional_formats[0].operator.is_none());
+    }
+
+    /// Multiple `<cfRule>`s under the same `<conditionalFormatting>` share
+    /// its `sqref` — each must still produce its own IR entry.
+    #[test]
+    fn test_conditional_formatting_multiple_rules_share_the_same_range() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+  <conditionalFormatting sqref="D1:D10">
+    <cfRule type="cellIs" operator="lessThan" priority="1"><formula>0</formula></cfRule>
+    <cfRule type="cellIs" operator="greaterThan" priority="2"><formula>100</formula></cfRule>
+  </conditionalFormatting>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.conditional_formats.len(), 2);
+        assert!(ws.conditional_formats.iter().all(|cf| cf.range == "D1:D10"));
+        assert_eq!(ws.conditional_formats[0].operator.as_deref(), Some("lessThan"));
+        assert_eq!(ws.conditional_formats[1].operator.as_deref(), Some("greaterThan"));
+    }
+
+    /// A sheet with no `<conditionalFormatting>` at all must produce an
+    /// empty list, not an error.
+    #[test]
+    fn test_no_conditional_formatting_is_an_empty_list() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert!(ws.conditional_formats.is_empty());
     }
 
     /// Turning trimming off for the inline-string body must not leak into

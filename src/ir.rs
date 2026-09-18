@@ -574,6 +574,39 @@ pub struct Metadata {
     pub text_truncated: bool,
 }
 
+/// A conditional formatting rule from a worksheet (XLSX `<cfRule>` inside
+/// `<conditionalFormatting sqref="...">`, XLS `CF`/`CF12` records).
+///
+/// This is a scope/awareness gap fix, not a value-correctness one — no
+/// cell's own value is affected by conditional formatting being invisible,
+/// only the fact that the workbook has this metadata at all. Colour
+/// scales, data bars and icon sets are captured by `rule_type` alone
+/// (their own gradient/icon-set stops are not parsed); cell-value and
+/// formula rules additionally carry their comparison `formulas` (issue
+/// #252).
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct ConditionalFormat {
+    /// The cell range(s) this rule applies to, e.g. `"A1:B10"` or a
+    /// space-separated multi-range sqref like `"A1:A5 C1:C5"`.
+    pub range: String,
+    /// Rule type, e.g. `"cellIs"`, `"expression"`, `"colorScale"`,
+    /// `"dataBar"`, `"iconSet"`, `"top10"`, `"containsText"`,
+    /// `"duplicateValues"`. XLSX's own `type` attribute vocabulary is used
+    /// as-is; XLS rules are mapped onto the closest XLSX equivalent.
+    pub rule_type: String,
+    /// The comparison operator, when the rule type uses one (e.g.
+    /// `"greaterThan"`, `"between"`). `None` for rule types with no
+    /// operator (colour scales, data bars, icon sets, most `top10`/text
+    /// rules).
+    pub operator: Option<String>,
+    /// Formula(s) driving the rule: the comparison value(s) for a
+    /// `cellIs` rule, or the boolean expression for an `expression` rule.
+    /// Empty for rule types that carry no formula (colour scales, data
+    /// bars, icon sets).
+    #[serde(default)]
+    pub formulas: Vec<String>,
+}
+
 /// A logical section (DOCX: section break, XLSX: worksheet, PPTX: slide).
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Section {
@@ -622,6 +655,11 @@ pub struct Section {
     /// made impossible.
     #[serde(default)]
     pub hidden: bool,
+    /// Conditional formatting rules defined on this worksheet (XLSX/XLS
+    /// only). Empty for every other format, and for a worksheet that
+    /// defines none (issue #252).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditional_formats: Vec<ConditionalFormat>,
 }
 
 /// A block-level content element.

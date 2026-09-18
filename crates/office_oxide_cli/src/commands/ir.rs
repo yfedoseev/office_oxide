@@ -32,6 +32,12 @@ fn ir_to_json(ir: &office_oxide::DocumentIR) -> serde_json::Value {
                 "title": s.title,
                 "hidden": s.hidden,
                 "speaker_notes": s.speaker_notes,
+                "conditional_formats": s.conditional_formats.iter().map(|cf| json!({
+                    "range": cf.range,
+                    "rule_type": cf.rule_type,
+                    "operator": cf.operator,
+                    "formulas": cf.formulas,
+                })).collect::<Vec<_>>(),
                 "elements": s.elements.iter().map(element_to_json).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>(),
@@ -306,6 +312,35 @@ mod tests {
         assert!(
             rendered.contains(r#""marker":"footnote""#),
             "a footnote's marker must also reach the projection: {rendered}"
+        );
+    }
+
+    /// issue #252 — a worksheet's conditional formatting rules must reach
+    /// the `ir` command's JSON output.
+    #[test]
+    fn test_conditional_formats_reach_the_json_projection() {
+        let ir = DocumentIR {
+            metadata: Metadata {
+                format: DocumentFormat::Xlsx,
+                title: None,
+                ..Default::default()
+            },
+            sections: vec![Section {
+                conditional_formats: vec![office_oxide::ir::ConditionalFormat {
+                    range: "A1:A10".to_string(),
+                    rule_type: "cellIs".to_string(),
+                    operator: Some("greaterThan".to_string()),
+                    formulas: vec!["100".to_string()],
+                }],
+                ..Default::default()
+            }],
+            defined_names: Vec::new(),
+        };
+        let json = ir_to_json(&ir);
+        let rendered = serde_json::to_string(&json).unwrap();
+        assert!(
+            rendered.contains(r#""range":"A1:A10""#) && rendered.contains(r#""rule_type":"cellIs""#),
+            "the ir command's JSON projection must include Section::conditional_formats: {rendered}"
         );
     }
 }

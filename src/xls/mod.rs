@@ -10,6 +10,7 @@
 //! ```
 
 mod cell;
+mod condfmt;
 mod error;
 pub mod images;
 mod records;

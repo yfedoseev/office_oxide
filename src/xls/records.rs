@@ -34,6 +34,13 @@ pub const RT_SUPBOOK: u16 = 0x01AE;
 /// Chart series/trendline/axis/chart title text ([MS-XLS] §2.4.254), found
 /// inside a chart's nested `BOF..EOF` substream (issue #246).
 pub const RT_SERIESTEXT: u16 = 0x100D;
+/// Begins a conditional-formatting rule group: the cell range(s) it
+/// applies to, plus how many `CF` records follow ([MS-XLS] §2.4.56,
+/// record type 432 = 0x1B0). Issue #252.
+pub const RT_CONDFMT: u16 = 0x01B0;
+/// One conditional-formatting rule within the group opened by the
+/// preceding `CONDFMT` ([MS-XLS] §2.4.42, record type 433 = 0x1B1).
+pub const RT_CF: u16 = 0x01B1;
 
 /// A raw BIFF record: type + data (may span CONTINUE records).
 #[derive(Debug, Clone)]

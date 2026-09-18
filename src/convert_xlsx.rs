@@ -454,6 +454,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 .sheets
                 .get(ws_idx)
                 .is_some_and(|s| s.state != crate::xlsx::SheetState::Visible),
+            conditional_formats: ws.conditional_formats.clone(),
             ..Default::default()
         });
     }

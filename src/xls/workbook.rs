@@ -5,6 +5,7 @@ use std::io::{Read, Seek};
 use crate::cfb::CfbReader;
 
 use super::cell::{Cell, CellValue, parse_cell_record};
+use super::condfmt::{parse_cf, parse_condfmt};
 use super::error::{Result, XlsError};
 use super::images::{XlsImage, extract_images};
 use super::records::*;
@@ -97,6 +98,9 @@ pub struct Sheet {
     /// `.xls` was discarded before it was even in memory, not just
     /// dropped at IR conversion (issue #235, XLS half).
     pub merged_cells: Vec<(u16, u16, u16, u16)>,
+    /// Conditional formatting rules from `CONDFMT`/`CF` records. No
+    /// record handling for either existed at all before (issue #252).
+    pub conditional_formats: Vec<crate::ir::ConditionalFormat>,
 }
 
 /// Sheet metadata from BOUNDSHEET records.
@@ -196,6 +200,12 @@ impl XlsDocument {
         let mut phase = Phase::Globals;
         let mut cells: Vec<Cell> = Vec::new();
         let mut merged_cells: Vec<(u16, u16, u16, u16)> = Vec::new();
+        let mut conditional_formats: Vec<crate::ir::ConditionalFormat> = Vec::new();
+        // The active CONDFMT group: its resolved sqref, and how many CF
+        // records are still expected to follow it (issue #252). A CF
+        // record outside any open CONDFMT group (`None`/exhausted) is
+        // ignored rather than misattributed to the wrong range.
+        let mut pending_cf: Option<(String, u16)> = None;
         let mut raw_names: Vec<RawName> = Vec::new();
         let mut supbook_internal: Vec<bool> = Vec::new();
         let mut externsheet: Vec<(u16, i16, i16)> = Vec::new();
@@ -322,6 +332,8 @@ impl XlsDocument {
                         phase = Phase::InSheet;
                         cells.clear();
                         merged_cells.clear();
+                        conditional_formats.clear();
+                        pending_cf = None;
                         pending_formula_string = None;
                         nested_bof_depth = 0;
                     }
@@ -368,6 +380,7 @@ impl XlsDocument {
                             rows,
                             hidden,
                             merged_cells: std::mem::take(&mut merged_cells),
+                            conditional_formats: std::mem::take(&mut conditional_formats),
                             ..Default::default()
                         });
                         sheet_idx += 1;
@@ -409,6 +422,19 @@ impl XlsDocument {
                                     u16::from_le_bytes([rec.data[off + 6], rec.data[off + 7]]);
                                 merged_cells.push((row_first, row_last, col_first, col_last));
                                 off += 8;
+                            }
+                        }
+                    },
+                    RT_CONDFMT => {
+                        pending_cf = parse_condfmt(&rec.data);
+                    },
+                    RT_CF => {
+                        if let Some((range, remaining)) = pending_cf.take() {
+                            if let Some(cf) = parse_cf(&range, &rec.data) {
+                                conditional_formats.push(cf);
+                            }
+                            if remaining > 1 {
+                                pending_cf = Some((range, remaining - 1));
                             }
                         }
                     },
@@ -1304,6 +1330,86 @@ mod tests {
         let stream = workbook_stream(&[("Sheet1", 0, sheet1_body)]);
         let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
         assert!(doc.chart_text().is_empty());
+    }
+
+    // ── Conditional formatting (issue #252) ─────────────────────────────────
+
+    /// A `CONDFMT`/`CF` record pair, exactly [MS-XLS]'s own worked example
+    /// shape: one range, one `cellIs`/`between` rule.
+    fn condfmt_rec(ranges: &[(u16, u16, u16, u16)]) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&1u16.to_le_bytes()); // ccf
+        d.extend_from_slice(&0u16.to_le_bytes()); // flags
+        d.extend_from_slice(&[0u8; 8]); // refBound
+        d.extend_from_slice(&(ranges.len() as u16).to_le_bytes()); // cref
+        for &(rf, rl, cf, cl) in ranges {
+            d.extend_from_slice(&rf.to_le_bytes());
+            d.extend_from_slice(&rl.to_le_bytes());
+            d.extend_from_slice(&cf.to_le_bytes());
+            d.extend_from_slice(&cl.to_le_bytes());
+        }
+        biff_rec(RT_CONDFMT, &d)
+    }
+
+    fn cf_rec(ct: u8, cp: u8) -> Vec<u8> {
+        biff_rec(RT_CF, &[ct, cp])
+    }
+
+    /// Confirms real end-to-end wiring: a `CONDFMT`/`CF` pair inside a
+    /// sheet's own record stream reaches `Sheet::conditional_formats` and,
+    /// through `convert_xls::xls_to_ir`, `Section::conditional_formats`.
+    #[test]
+    fn test_conditional_formatting_reaches_the_sheet_and_the_ir() {
+        let mut sheet1_body = label(0, 0, "x");
+        sheet1_body.extend(condfmt_rec(&[(0, 9, 0, 0)])); // A1:A10
+        sheet1_body.extend(cf_rec(0x01, 0x05)); // cellIs / greaterThan
+
+        let stream = workbook_stream(&[("Sheet1", 0, sheet1_body)]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+
+        assert_eq!(doc.sheets[0].conditional_formats.len(), 1);
+        let cf = &doc.sheets[0].conditional_formats[0];
+        assert_eq!(cf.range, "A1:A10");
+        assert_eq!(cf.rule_type, "cellIs");
+        assert_eq!(cf.operator.as_deref(), Some("greaterThan"));
+
+        let ir = crate::convert_xls::xls_to_ir(&doc);
+        assert_eq!(ir.sections[0].conditional_formats, doc.sheets[0].conditional_formats);
+    }
+
+    /// Multiple `CF` records under one `CONDFMT` (`ccf > 1`) must all be
+    /// captured, each sharing the group's range.
+    #[test]
+    fn test_multiple_cf_records_under_one_condfmt_are_all_captured() {
+        let mut sheet1_body = label(0, 0, "x");
+        let mut group = Vec::new();
+        group.extend_from_slice(&2u16.to_le_bytes()); // ccf = 2
+        group.extend_from_slice(&0u16.to_le_bytes());
+        group.extend_from_slice(&[0u8; 8]);
+        group.extend_from_slice(&1u16.to_le_bytes()); // cref = 1
+        group.extend_from_slice(&0u16.to_le_bytes()); // rwFirst
+        group.extend_from_slice(&4u16.to_le_bytes()); // rwLast
+        group.extend_from_slice(&1u16.to_le_bytes()); // colFirst
+        group.extend_from_slice(&1u16.to_le_bytes()); // colLast
+        sheet1_body.extend(biff_rec(RT_CONDFMT, &group));
+        sheet1_body.extend(cf_rec(0x01, 0x06)); // lessThan
+        sheet1_body.extend(cf_rec(0x01, 0x05)); // greaterThan
+
+        let stream = workbook_stream(&[("Sheet1", 0, sheet1_body)]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+
+        assert_eq!(doc.sheets[0].conditional_formats.len(), 2);
+        assert!(doc.sheets[0].conditional_formats.iter().all(|cf| cf.range == "B1:B5"));
+        assert_eq!(doc.sheets[0].conditional_formats[0].operator.as_deref(), Some("lessThan"));
+        assert_eq!(doc.sheets[0].conditional_formats[1].operator.as_deref(), Some("greaterThan"));
+    }
+
+    /// A sheet with no `CONDFMT` at all must produce an empty list.
+    #[test]
+    fn test_no_condfmt_is_an_empty_list() {
+        let stream = workbook_stream(&[("Sheet1", 0, label(0, 0, "x"))]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+        assert!(doc.sheets[0].conditional_formats.is_empty());
     }
 
     // ── Record-parsing safety cap (issue #236) ──────────────────────────────
