@@ -36,13 +36,34 @@ impl PresentationInfo {
         let mut reader = xml::make_fast_reader(xml_data);
         let mut slides = Vec::new();
         let mut slide_size = None;
+        // PowerPoint's Sections feature stores its own `p14:sldIdLst` (per-
+        // section slide membership, a different element with different
+        // semantics) nested inside `p:extLst/p:ext/p14:sectionLst`.
+        // Matching `sldIdLst` by local name alone (unavoidable without full
+        // namespace-aware parsing) let it match that element too, and since
+        // `p:extLst` comes after the real `p:sldIdLst` in document order,
+        // each `p14:sldIdLst` overwrote the correct slide list in turn,
+        // leaving only the last section's slides (issue #228). `p:sldSz`
+        // has no `extLst` analogue to collide with, but is guarded the same
+        // way for consistency and against a future extension reusing it.
+        let mut ext_lst_depth: u32 = 0;
 
         loop {
             match reader.read_event()? {
-                Event::Start(ref e) if e.local_name().as_ref() == b"sldIdLst" => {
+                Event::Start(ref e) if e.local_name().as_ref() == b"extLst" => {
+                    ext_lst_depth += 1;
+                },
+                Event::End(ref e) if e.local_name().as_ref() == b"extLst" => {
+                    ext_lst_depth = ext_lst_depth.saturating_sub(1);
+                },
+                Event::Start(ref e)
+                    if ext_lst_depth == 0 && e.local_name().as_ref() == b"sldIdLst" =>
+                {
                     slides = parse_slide_id_list(&mut reader)?;
                 },
-                Event::Empty(ref e) if e.local_name().as_ref() == b"sldSz" => {
+                Event::Empty(ref e)
+                    if ext_lst_depth == 0 && e.local_name().as_ref() == b"sldSz" =>
+                {
                     slide_size = Some(parse_slide_size(e)?);
                 },
                 Event::Eof => break,
@@ -142,5 +163,43 @@ mod tests {
         let size = info.slide_size.unwrap();
         assert_eq!(size.cx, 12192000);
         assert_eq!(size.cy, 6858000);
+    }
+
+    /// PowerPoint Sections store per-section slide membership as
+    /// `p14:sldIdLst` inside `p:extLst/p:ext/p14:sectionLst` — a different
+    /// element that merely shares a local name with the real `p:sldIdLst`.
+    /// Matching by local name alone let each section's list overwrite the
+    /// real one in turn, so a presentation with N sections lost everything
+    /// but the last section's slides (issue #228). This is the issue's own
+    /// minimal reproducer XML shape.
+    #[test]
+    fn sections_extension_does_not_overwrite_the_real_slide_list() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+                xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:sldIdLst>
+    <p:sldId id="1" r:id="rId2"/>
+    <p:sldId id="2" r:id="rId3"/>
+  </p:sldIdLst>
+  <p:extLst>
+    <p:ext uri="{521415D9-36F7-43E2-AB2F-B90AF26B5E84}">
+      <p14:sectionLst xmlns:p14="http://schemas.microsoft.com/office/powerpoint/2010/main">
+        <p14:section name="A"><p14:sldIdLst><p14:sldId id="1"/></p14:sldIdLst></p14:section>
+        <p14:section name="B"><p14:sldIdLst><p14:sldId id="2"/></p14:sldIdLst></p14:section>
+      </p14:sectionLst>
+    </p:ext>
+  </p:extLst>
+</p:presentation>"#;
+        let info = PresentationInfo::parse(xml).unwrap();
+        assert_eq!(
+            info.slides.len(),
+            2,
+            "the real 2-slide p:sldIdLst must survive the extLst Sections block, got {:?}",
+            info.slides
+        );
+        assert_eq!(info.slides[0].id, 1);
+        assert_eq!(info.slides[0].rel_id, "rId2");
+        assert_eq!(info.slides[1].id, 2);
+        assert_eq!(info.slides[1].rel_id, "rId3");
     }
 }
