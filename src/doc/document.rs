@@ -392,13 +392,16 @@ mod tests {
         // 2 (the `elements.is_empty() ? 1 : 2` rule in `emit_prose`). This is
         // the regression test for deriving heading levels from paragraph style
         // rather than the line heuristic.
-        use crate::doc::OutlineLevel;
+        use crate::doc::{LevelSource, OutlineLevel};
         let doc = make_doc_with_paragraphs(vec![
             pap("Intro paragraph.", Default::default()),
             pap(
                 "Subsection",
                 crate::doc::sprm::PapProps {
-                    outline_level: Some(OutlineLevel::Heading(2)),
+                    outline_level: Some(OutlineLevel::Heading {
+                        level: 2,
+                        source: LevelSource::Sprm,
+                    }),
                     ..Default::default()
                 },
             ),
@@ -421,13 +424,16 @@ mod tests {
     #[test]
     fn ir_deep_outline_level_clamps_to_ir_max_depth() {
         use crate::doc::MAX_OUTLINE_LEVEL;
-        use crate::doc::OutlineLevel;
+        use crate::doc::{LevelSource, OutlineLevel};
         use crate::ir::Element;
         use crate::ir::MAX_HEADING_DEPTH;
         let doc = make_doc_with_paragraphs(vec![pap(
             "Deep section",
             crate::doc::sprm::PapProps {
-                outline_level: Some(OutlineLevel::Heading(MAX_OUTLINE_LEVEL - 1)),
+                outline_level: Some(OutlineLevel::Heading {
+                    level: MAX_OUTLINE_LEVEL - 1,
+                    source: LevelSource::Sprm,
+                }),
                 ..Default::default()
             },
         )]);
@@ -889,16 +895,14 @@ mod tests {
         );
     }
 
-    /// A level resolved from the *style sheet* switches the line-shape guess
-    /// off for the whole document, exactly as one resolved from `sprmPOutLvl`
-    /// does: `has_structured_headings` means "resolved a level from either
-    /// source".
+    /// A level resolved from a *style* does **not** switch the line-shape guess
+    /// off: `has_structured_headings` is keyed on `sprmPOutLvl` only.
     ///
     /// The body line here is short and ALL-CAPS with no trailing '.', i.e.
-    /// exactly the shape the guess turns into a heading on its own — so its
-    /// coming out as prose is evidence about the gate, not about the line shape.
+    /// exactly the shape the guess turns into a heading — so it still being
+    /// recognised is what shows the gate did not fire for its neighbour.
     #[test]
-    fn style_derived_heading_switches_off_the_line_shape_guess() {
+    fn style_derived_heading_does_not_switch_off_the_line_shape_guess() {
         use crate::ir::Element;
 
         let doc_bytes = build_synthetic_styled_doc("SHORT ALL CAPS BODY LINE");
@@ -916,11 +920,55 @@ mod tests {
             .collect();
         assert_eq!(
             headings.len(),
-            1,
-            "the ALL-CAPS line must not be guessed once the document has a real \
-             (style-derived) heading; got {elements:?}"
+            2,
+            "the styled paragraph gets its real level and the ALL-CAPS line is \
+             still guessed; got {elements:?}"
         );
-        assert_eq!(headings[0].level, 3, "the one heading is the styled one, at its real level");
+        assert!(
+            headings.iter().any(|h| h.level == 3),
+            "the style-derived level must still be used"
+        );
+    }
+
+    /// The other half of that distinction: a level the paragraph states itself
+    /// (`sprmPOutLvl`, `.source == Sprm`) **does** switch the line-shape guess
+    /// off. Without this the `LevelSource` field would be untested payload —
+    /// nothing would fail if both variants behaved the same.
+    #[test]
+    fn sprm_derived_heading_switches_off_the_line_shape_guess() {
+        use crate::doc::{LevelSource, OutlineLevel};
+        use crate::ir::Element;
+
+        let doc = make_doc_with_paragraphs(vec![
+            pap("ALL CAPS PROSE", Default::default()),
+            pap(
+                "Real Heading",
+                crate::doc::sprm::PapProps {
+                    outline_level: Some(OutlineLevel::Heading {
+                        level: 1,
+                        source: LevelSource::Sprm,
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+
+        let headings: Vec<_> = ir.sections[0]
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                Element::Heading(h) => Some(h),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            headings.len(),
+            1,
+            "the ALL-CAPS line must not be guessed once a paragraph states its own \
+             level"
+        );
+        assert_eq!(headings[0].level, 2);
     }
 
     #[test]

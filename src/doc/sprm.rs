@@ -258,9 +258,28 @@ pub struct PapProps {
 pub enum OutlineLevel {
     /// A real heading level, in [MS-DOC]'s zero-based space: `0` = Heading 1
     /// … `8` = Heading 9.
-    Heading(u8),
+    ///
+    /// `source` is carried in the value rather than in a parallel bool: whether
+    /// the level came from direct formatting or was resolved from a style
+    /// changes what the document-level gate may conclude, and a second field
+    /// that has to agree with the first is a state someone will set halfway.
+    Heading {
+        /// The zero-based outline level.
+        level: u8,
+        /// Where the level came from.
+        source: LevelSource,
+    },
     /// `sprmPOutLvl` operand `0x09`: explicitly *not* a heading.
     BodyText,
+}
+
+/// Where a paragraph's outline level came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LevelSource {
+    /// Stated by the paragraph itself, via `sprmPOutLvl` (0x2640).
+    Sprm,
+    /// Resolved from the paragraph's style (`istd` → `sti` / `Heading N`).
+    Style,
 }
 
 /// One table cell descriptor (TKBKTAP, 20 bytes) distilled from a row's
@@ -477,7 +496,10 @@ pap_sprm_dispatch! {
     "sprmPOutLvl" @ "2.6.2" => [0x2640] (props, operand) {
         if let Some(&lvl) = operand.first() {
             if lvl < OUTLVL_BODY_TEXT {
-                props.outline_level = Some(OutlineLevel::Heading(lvl));
+                props.outline_level = Some(OutlineLevel::Heading {
+                    level: lvl,
+                    source: LevelSource::Sprm,
+                });
             } else if lvl == OUTLVL_BODY_TEXT {
                 // Explicitly body text: settle it, and never consult the style.
                 props.outline_level = Some(OutlineLevel::BodyText);
@@ -720,7 +742,10 @@ mod tests {
         let props = extract_pap_props(&[0x40, 0x26, 0x00]);
         assert_eq!(
             props.outline_level,
-            Some(OutlineLevel::Heading(0)),
+            Some(OutlineLevel::Heading {
+                level: 0,
+                source: LevelSource::Sprm
+            }),
             "0x00 is Heading 1, not body text"
         );
     }
@@ -728,7 +753,14 @@ mod tests {
     #[test]
     fn sprm_p_out_lvl_eight_is_heading_nine() {
         let props = extract_pap_props(&[0x40, 0x26, 0x08]);
-        assert_eq!(props.outline_level, Some(OutlineLevel::Heading(8)), "0x08 is Heading 9");
+        assert_eq!(
+            props.outline_level,
+            Some(OutlineLevel::Heading {
+                level: 8,
+                source: LevelSource::Sprm
+            }),
+            "0x08 is Heading 9"
+        );
     }
 
     #[test]

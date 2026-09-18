@@ -1,4 +1,4 @@
-use crate::doc::{DocDocument, DocParagraph, OutlineLevel, TapCellInfo, TapInfo};
+use crate::doc::{DocDocument, DocParagraph, LevelSource, OutlineLevel, TapCellInfo, TapInfo};
 use crate::format::DocumentFormat;
 use crate::ir::*;
 
@@ -23,18 +23,36 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // `metadata.title` and `Section.title`, both of which are derived from
     // the first `Element::Heading` below.
     //
-    // Gated on a level the document states *explicitly* (`sprmPOutLvl`), not
-    // merely one we resolved from a style. A couple of styled paragraphs are
-    // not evidence that the document's headings are structured: real
-    // documents style a few headings and leave the rest as plain ALL-CAPS
-    // lines, and gating on those collapsed `parentinvguid.doc` from 35
-    // headings to 2 — the 33 unstyled section headings stopped being
-    // recognised altogether. Style-derived levels still give the paragraphs
-    // that carry them their real level; they just do not switch the guess off
-    // for their neighbours.
-    let has_structured_headings = paragraphs
-        .iter()
-        .any(|p| matches!(p.props.outline_level, Some(OutlineLevel::Heading(_))));
+    // Keyed on a level the paragraph states itself (`sprmPOutLvl`), not on one
+    // we resolved from its style — and not, more generally, on "some paragraph
+    // resolved a level" at all.
+    //
+    // The reason is the walk below, not the aggregate: `walk_paragraphs` routes
+    // list members (`ilfo`), table cells, row marks and empty paragraphs
+    // *before* `emit_heading`. A paragraph that resolves a level but is routed
+    // away still trips an outcome-based gate, emits nothing itself, and turns
+    // the guess off for every other paragraph — so the document ends with no
+    // headings at all, and no `metadata.title`, which is derived from the
+    // first one. Measured on 201 open `.doc`: keying the gate on either source
+    // loses headings in 13 files, 9 of which drop to zero (`Bug44431.doc` has a
+    // single `Heading 1`-styled *numbered* paragraph; `AIOOB-Tap.doc` a styled
+    // table cell; `52420.doc` an empty styled paragraph). Numbered headings are
+    // the normal shape in real Word documents, so style-resolved levels make
+    // this common in a way the SPRM path never did.
+    //
+    // Keyed on `sprmPOutLvl` the change is strictly additive. Retiring the
+    // guess entirely is a separate, data-driven piece of work: the guesses are
+    // genuinely mixed ("INTRODUCTION" alongside "SW8 5NQ"), and tying the new
+    // style-sheet path to that decision would be a side effect, not a choice.
+    let has_structured_headings = paragraphs.iter().any(|p| {
+        matches!(
+            p.props.outline_level,
+            Some(OutlineLevel::Heading {
+                source: LevelSource::Sprm,
+                ..
+            })
+        )
+    });
     if !paragraphs.is_empty() {
         walk_paragraphs(paragraphs, has_structured_headings, &mut elements);
     } else {
@@ -463,7 +481,9 @@ fn walk_paragraphs(
             flush_list(&mut list_items, elements);
             match p.props.outline_level {
                 // A real outline level: use it, and never guess alongside it.
-                Some(OutlineLevel::Heading(lvl)) => emit_heading(&p.text, lvl + 1, elements),
+                Some(OutlineLevel::Heading { level, .. }) => {
+                    emit_heading(&p.text, level + 1, elements)
+                },
                 // Explicitly marked body text: never a heading, even when the
                 // paragraph's style is a heading style.
                 Some(OutlineLevel::BodyText) => elements.push(Element::Paragraph(Paragraph {
@@ -863,7 +883,10 @@ mod tests {
             props: PapProps {
                 is_table_trailing_mark: true,
                 itap: 1,
-                outline_level: Some(OutlineLevel::Heading(2)),
+                outline_level: Some(OutlineLevel::Heading {
+                    level: 2,
+                    source: LevelSource::Sprm,
+                }),
                 ..PapProps::default()
             },
         };
@@ -872,7 +895,10 @@ mod tests {
             terminator: '\u{7}', // closes the cell
             props: PapProps {
                 f_in_table: true,
-                outline_level: Some(OutlineLevel::Heading(2)),
+                outline_level: Some(OutlineLevel::Heading {
+                    level: 2,
+                    source: LevelSource::Sprm,
+                }),
                 ..PapProps::default()
             },
         };
@@ -919,7 +945,10 @@ mod tests {
             props: PapProps {
                 is_table_trailing_mark: true,
                 itap: 1,
-                outline_level: Some(OutlineLevel::Heading(1)),
+                outline_level: Some(OutlineLevel::Heading {
+                    level: 1,
+                    source: LevelSource::Sprm,
+                }),
                 ..PapProps::default()
             },
         };
@@ -955,7 +984,10 @@ mod tests {
             props: PapProps {
                 ilfo: Some(1),
                 ilvl: Some(0),
-                outline_level: Some(OutlineLevel::Heading(3)),
+                outline_level: Some(OutlineLevel::Heading {
+                    level: 3,
+                    source: LevelSource::Sprm,
+                }),
                 ..PapProps::default()
             },
         };

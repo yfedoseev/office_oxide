@@ -17,8 +17,8 @@
 //! The `grpprl` is decoded by [`super::sprm::extract_pap_props`].
 
 use super::piece_table::{Piece, decode_cp_range, sanitize_text};
-use super::sprm::OutlineLevel;
 use super::sprm::PapProps;
+use super::sprm::{LevelSource, OutlineLevel};
 use super::styles::{StyleDef, heading_level_for_istd};
 
 /// A paragraph descriptor recovered from a PAPX FKP page.
@@ -324,7 +324,10 @@ fn resolve_outline_level(props: &PapProps, istd: u16, styles: &[StyleDef]) -> Op
         // No direct formatting, so ask the style. `heading_level_for_istd` is
         // 1-based (Heading 1–9) and `OutlineLevel::Heading` is zero-based; the
         // level is at least 1 whenever it is `Some`, so this cannot underflow.
-        None => heading_level_for_istd(styles, istd).map(|level| OutlineLevel::Heading(level - 1)),
+        None => heading_level_for_istd(styles, istd).map(|level| OutlineLevel::Heading {
+            level: level - 1,
+            source: LevelSource::Style,
+        }),
     }
 }
 
@@ -613,7 +616,10 @@ mod tests {
         assert_eq!(paras.len(), 1);
         assert_eq!(
             paras[0].props.outline_level,
-            Some(OutlineLevel::Heading(2)),
+            Some(OutlineLevel::Heading {
+                level: 2,
+                source: LevelSource::Style
+            }),
             "built-in Heading style must resolve to its level"
         );
     }
@@ -653,7 +659,10 @@ mod tests {
         assert_eq!(paras.len(), 1);
         assert_eq!(
             paras[0].props.outline_level,
-            Some(OutlineLevel::Heading(2)),
+            Some(OutlineLevel::Heading {
+                level: 2,
+                source: LevelSource::Style
+            }),
             "`sprmPIstd` override must win over the PAPX `istd`"
         );
     }
@@ -687,7 +696,10 @@ mod tests {
         assert_eq!(paras.len(), 1);
         assert_eq!(
             paras[0].props.outline_level,
-            Some(OutlineLevel::Heading(2)),
+            Some(OutlineLevel::Heading {
+                level: 2,
+                source: LevelSource::Style
+            }),
             "user-defined `heading N` name must resolve to its level"
         );
     }
@@ -718,7 +730,10 @@ mod tests {
         assert_eq!(paras.len(), 1);
         assert_eq!(
             paras[0].props.outline_level,
-            Some(OutlineLevel::Heading(4)),
+            Some(OutlineLevel::Heading {
+                level: 4,
+                source: LevelSource::Sprm
+            }),
             "`sprmPOutLvl` must set the heading level directly"
         );
     }
@@ -756,7 +771,10 @@ mod tests {
         assert_eq!(paras.len(), 1);
         assert_eq!(
             paras[0].props.outline_level,
-            Some(OutlineLevel::Heading(4)),
+            Some(OutlineLevel::Heading {
+                level: 4,
+                source: LevelSource::Sprm
+            }),
             "`sprmPOutLvl` must override the style-derived level"
         );
     }
@@ -902,7 +920,10 @@ mod tests {
         assert_eq!(paras.len(), 1);
         assert_eq!(
             paras[0].props.outline_level,
-            Some(OutlineLevel::Heading(MAX_OUTLINE_LEVEL - 1)),
+            Some(OutlineLevel::Heading {
+                level: MAX_OUTLINE_LEVEL - 1,
+                source: LevelSource::Sprm
+            }),
             "the outline SPRM accepts the full 1..=MAX_OUTLINE_LEVEL range; clamping to \
              the IR depth is the IR boundary's job, not this one"
         );
@@ -998,7 +1019,10 @@ mod tests {
         assert_eq!(paras.len(), 1);
         assert_eq!(
             paras[0].props.outline_level,
-            Some(OutlineLevel::Heading(2)),
+            Some(OutlineLevel::Heading {
+                level: 2,
+                source: LevelSource::Style
+            }),
             "heading must resolve from a style sheet obtained via parse_style_sheet"
         );
     }

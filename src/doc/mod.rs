@@ -16,7 +16,7 @@ pub mod images;
 mod papx;
 mod piece_table;
 mod sprm;
-pub mod styles;
+pub(crate) mod styles;
 
 /// The deepest outline level MS-DOC stores: `Heading 1`–`Heading 9`. The
 /// `StdfBase.sti` and a user-defined `Heading N` style name use this range,
@@ -32,7 +32,7 @@ pub use document::{DocDocument, SubDocument, SubDocumentKind};
 pub use error::{DocError, Result};
 pub use images::{DocImage, ImageFormat};
 pub(crate) use papx::DocParagraph;
-pub(crate) use sprm::OutlineLevel;
+pub(crate) use sprm::{LevelSource, OutlineLevel};
 pub(crate) use sprm::{TapCellInfo, TapInfo};
 // `PapProps` is only needed by unit tests inside this crate, so the re-export
 // is test-gated to avoid an unused-import warning in non-test builds.
