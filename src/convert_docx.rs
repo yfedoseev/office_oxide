@@ -214,6 +214,7 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             has_macros: doc.has_macros,
         },
         sections: ir_sections,
+        defined_names: Vec::new(),
     }
 }
 

@@ -117,6 +117,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             has_macros: doc.has_macros,
         },
         sections,
+        defined_names: Vec::new(),
     }
 }
 

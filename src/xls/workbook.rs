@@ -15,8 +15,25 @@ use super::sst::{parse_sst, read_short_unicode_string, read_unicode_string};
 pub struct XlsDocument {
     /// Worksheets in workbook order.
     pub sheets: Vec<Sheet>,
+    /// Named ranges from `NAME` (`0x0018`) records ([MS-XLS] §2.4.174),
+    /// resolved via `EXTERNSHEET`/`SUPBOOK`. A name whose formula isn't a
+    /// single (possibly 3-D) cell or area reference resolves with an empty
+    /// `value` rather than a guessed one (issue #251, XLS half).
+    pub defined_names: Vec<DefinedName>,
     images: Vec<XlsImage>,
     has_macros: bool,
+}
+
+/// A named range recovered from a `NAME` record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DefinedName {
+    pub name: String,
+    /// The referenced range as `Sheet1!$A$1:$B$10`, or empty when the
+    /// formula wasn't a plain cell/area reference this parser resolves.
+    pub value: String,
+    /// 0-based sheet index when the name is local to one sheet.
+    pub local_sheet_id: Option<u32>,
+    pub hidden: bool,
 }
 
 #[cfg(test)]
@@ -26,6 +43,7 @@ impl XlsDocument {
     pub(crate) fn from_sheets(sheets: Vec<Sheet>) -> Self {
         Self {
             sheets,
+            defined_names: Vec::new(),
             images: Vec::new(),
             has_macros: false,
         }
@@ -137,6 +155,9 @@ impl XlsDocument {
         let mut phase = Phase::Globals;
         let mut cells: Vec<Cell> = Vec::new();
         let mut merged_cells: Vec<(u16, u16, u16, u16)> = Vec::new();
+        let mut raw_names: Vec<RawName> = Vec::new();
+        let mut supbook_internal: Vec<bool> = Vec::new();
+        let mut externsheet: Vec<(u16, i16, i16)> = Vec::new();
         let mut sheet_idx = 0usize;
         let mut pending_formula_string: Option<(u16, u16)> = None;
         let mut record_budget = 500_000u32; // Safety cap to prevent pathological files
@@ -180,6 +201,42 @@ impl XlsDocument {
                         } else {
                             0
                         });
+                    },
+                    RT_NAME => {
+                        if let Some(rn) = parse_name_record(&rec.data) {
+                            raw_names.push(rn);
+                        }
+                    },
+                    RT_SUPBOOK => {
+                        // [MS-XLS] §2.4.271: `cch` at offset 2 (u16) is
+                        // 0x0401 exactly for the "self-referencing" SupBook
+                        // that names this same workbook, vs. an external
+                        // file/DDE/add-in link.
+                        supbook_internal.push(
+                            rec.data.len() >= 4
+                                && u16::from_le_bytes([rec.data[2], rec.data[3]]) == 0x0401,
+                        );
+                    },
+                    RT_EXTERNSHEET => {
+                        // [MS-XLS] §2.4.316: cXTI (u16) then cXTI 6-byte XTI
+                        // structures (iSupBook u16, itabFirst i16, itabLast
+                        // i16).
+                        if rec.data.len() >= 2 {
+                            let count = u16::from_le_bytes([rec.data[0], rec.data[1]]) as usize;
+                            let mut off = 2usize;
+                            for _ in 0..count {
+                                if off + 6 > rec.data.len() {
+                                    break;
+                                }
+                                let i_sup_book = u16::from_le_bytes([rec.data[off], rec.data[off + 1]]);
+                                let itab_first =
+                                    i16::from_le_bytes([rec.data[off + 2], rec.data[off + 3]]);
+                                let itab_last =
+                                    i16::from_le_bytes([rec.data[off + 4], rec.data[off + 5]]);
+                                externsheet.push((i_sup_book, itab_first, itab_last));
+                                off += 6;
+                            }
+                        }
                     },
                     RT_EOF => {
                         phase = Phase::BetweenSheets;
@@ -302,8 +359,12 @@ impl XlsDocument {
             }
         }
 
+        let defined_names =
+            resolve_defined_names(&raw_names, &externsheet, &supbook_internal, &sheet_infos);
+
         Ok(Self {
             sheets,
+            defined_names,
             images: Vec::new(),
             // Set by the caller (from_reader), which has the CfbReader
             // this function doesn't.
@@ -459,6 +520,219 @@ fn parse_boundsheet(data: &[u8]) -> Result<SheetInfo> {
         offset,
         hidden: visibility != 0,
     })
+}
+
+/// A `NAME` record ([MS-XLS] §2.4.174) before its `rgce` formula has been
+/// resolved against `EXTERNSHEET`/`SUPBOOK` (those records can appear
+/// before or after `NAME` in the Globals substream, so resolution happens
+/// once the whole substream has been read).
+struct RawName {
+    name: String,
+    /// 0 = workbook-global; otherwise a 1-based index into `sheet_infos`.
+    itab: u16,
+    hidden: bool,
+    rgce: Vec<u8>,
+}
+
+/// Parse a `NAME` record (`0x0018`).
+///
+/// Layout: grbit(2) chKey(1) cch(1) cce(2) reserved(2) itab(2) reserved(4)
+/// then Name as `XLUnicodeStringNoCch` (1 flag byte + `cch` chars, 1 or 2
+/// bytes each), then `rgce` (`cce` bytes) — confirmed against the worked
+/// example in [MS-XLS] §2.5.155.
+fn parse_name_record(data: &[u8]) -> Option<RawName> {
+    if data.len() < 14 {
+        return None;
+    }
+    let grbit = u16::from_le_bytes([data[0], data[1]]);
+    let is_builtin = (grbit & 0x0020) != 0; // fBuiltin, [MS-XLS] §2.5.155
+    let cch = data[3] as usize;
+    let cce = u16::from_le_bytes([data[4], data[5]]) as usize;
+    let itab = u16::from_le_bytes([data[8], data[9]]);
+
+    let mut pos = 14usize;
+    if pos >= data.len() {
+        return None;
+    }
+    let is_wide = (data[pos] & 0x01) != 0;
+    let first_content_byte = data.get(pos + 1).copied();
+    pos += 1;
+    let name_bytes = if is_wide { cch * 2 } else { cch };
+    if pos + name_bytes > data.len() {
+        return None;
+    }
+    // A built-in name (Print_Area, _FilterDatabase, ...) stores its `Name`
+    // field as a single raw byte ID, not text — decoded as a character it
+    // came out as an unreadable control code (`Print_Area` -> U+0006).
+    // XLSX's reader already surfaces these with their OOXML
+    // `_xlnm.`-prefixed reserved names, so map the ID the same way rather
+    // than leaving the two formats' output inconsistent.
+    let name = if is_builtin && cch == 1 {
+        first_content_byte.and_then(builtin_name).unwrap_or_default().to_string()
+    } else if is_wide {
+        let chars: Vec<u16> = data[pos..pos + name_bytes]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&chars)
+    } else {
+        data[pos..pos + name_bytes].iter().map(|&b| b as char).collect()
+    };
+    pos += name_bytes;
+
+    if pos + cce > data.len() {
+        return None;
+    }
+    let rgce = data[pos..pos + cce].to_vec();
+
+    Some(RawName {
+        name,
+        itab,
+        hidden: (grbit & 0x0001) != 0,
+        rgce,
+    })
+}
+
+/// Map a `NAME` record's built-in ID byte ([MS-XLS] §2.5.28 `BuiltInName`)
+/// to the same `_xlnm.`-prefixed reserved name OOXML/XLSX uses, so a
+/// defined name means the same thing regardless of which format it came
+/// from.
+fn builtin_name(id: u8) -> Option<&'static str> {
+    Some(match id {
+        0x00 => "_xlnm.Consolidate_Area",
+        0x01 => "_xlnm.Auto_Open",
+        0x02 => "_xlnm.Auto_Close",
+        0x03 => "_xlnm.Extract",
+        0x04 => "_xlnm.Database",
+        0x05 => "_xlnm.Criteria",
+        0x06 => "_xlnm.Print_Area",
+        0x07 => "_xlnm.Print_Titles",
+        0x08 => "_xlnm.Recorder",
+        0x09 => "_xlnm.Data_Form",
+        0x0A => "_xlnm.Auto_Activate",
+        0x0B => "_xlnm.Auto_Deactivate",
+        0x0C => "_xlnm.Sheet_Title",
+        0x0D => "_xlnm._FilterDatabase",
+        _ => return None,
+    })
+}
+
+/// Render a 0-based column index as spreadsheet letters (0 -> "A", 25 ->
+/// "Z", 26 -> "AA").
+fn col_letters(mut col: u32) -> String {
+    let mut s = Vec::new();
+    loop {
+        let rem = (col % 26) as u8;
+        s.push(b'A' + rem);
+        if col < 26 {
+            break;
+        }
+        col = col / 26 - 1;
+    }
+    s.reverse();
+    String::from_utf8(s).unwrap()
+}
+
+/// Resolve `NAME` records' `rgce` formulas into `Sheet!$A$1:$B$10`-style
+/// text.
+///
+/// Only a formula that is a single `PtgRef3d` (`0x1A`) or `PtgArea3d`
+/// (`0x1B`) token — the shape every plain named range compiles to — is
+/// decompiled; anything else (unions, functions, multi-token formulas)
+/// resolves with an empty `value` rather than a guessed, possibly wrong,
+/// one. Both token kinds carry an `ixti` that indexes `externsheet`, whose
+/// `(supbook_idx, first_sheet, last_sheet)` resolves to a sheet name only
+/// when `supbook_idx` names *this* workbook (`supbook_internal`) — an
+/// external-workbook reference is left unresolved rather than misreported
+/// as local.
+fn resolve_defined_names(
+    raw_names: &[RawName],
+    externsheet: &[(u16, i16, i16)],
+    supbook_internal: &[bool],
+    sheet_infos: &[SheetInfo],
+) -> Vec<DefinedName> {
+    let sheet_name_for = |itab_first: i16, itab_last: i16, sup: u16| -> Option<String> {
+        if !*supbook_internal.get(sup as usize)? {
+            return None;
+        }
+        if itab_first < 0 || itab_last < 0 {
+            return None;
+        }
+        let first = sheet_infos.get(itab_first as usize)?;
+        if itab_first == itab_last {
+            Some(first.name.clone())
+        } else {
+            let last = sheet_infos.get(itab_last as usize)?;
+            Some(format!("{}:{}", first.name, last.name))
+        }
+    };
+
+    let cell_ref = |row: u16, col_raw: u16| -> String {
+        format!("${}${}", col_letters((col_raw & 0x3FFF) as u32), row + 1)
+    };
+
+    raw_names
+        .iter()
+        .map(|rn| {
+            let value = decompile_single_ref(&rn.rgce, externsheet, &sheet_name_for, &cell_ref)
+                .unwrap_or_default();
+            DefinedName {
+                name: rn.name.clone(),
+                value,
+                local_sheet_id: if rn.itab == 0 {
+                    None
+                } else {
+                    Some((rn.itab - 1) as u32)
+                },
+                hidden: rn.hidden,
+            }
+        })
+        .collect()
+}
+
+/// Decompile `rgce` when it is exactly one `PtgRef3d`/`PtgArea3d` token.
+fn decompile_single_ref(
+    rgce: &[u8],
+    externsheet: &[(u16, i16, i16)],
+    sheet_name_for: &dyn Fn(i16, i16, u16) -> Option<String>,
+    cell_ref: &dyn Fn(u16, u16) -> String,
+) -> Option<String> {
+    if rgce.is_empty() {
+        return None;
+    }
+    let base_ptg = rgce[0] & 0x1F;
+    let ixti_and = |off: usize| -> Option<u16> {
+        rgce.get(off).zip(rgce.get(off + 1)).map(|(a, b)| u16::from_le_bytes([*a, *b]))
+    };
+
+    match base_ptg {
+        // PtgRef3d: ptg(1) ixti(2) row(2) col(2) = 7 bytes total.
+        0x1A if rgce.len() == 7 => {
+            let ixti = ixti_and(1)?;
+            let (sup, first, last) = *externsheet.get(ixti as usize)?;
+            let sheet = sheet_name_for(first, last, sup)?;
+            let row = u16::from_le_bytes([rgce[3], rgce[4]]);
+            let col = u16::from_le_bytes([rgce[5], rgce[6]]);
+            Some(format!("{sheet}!{}", cell_ref(row, col)))
+        },
+        // PtgArea3d: ptg(1) ixti(2) rwFirst(2) rwLast(2) colFirst(2)
+        // colLast(2) = 11 bytes total.
+        0x1B if rgce.len() == 11 => {
+            let ixti = ixti_and(1)?;
+            let (sup, first, last) = *externsheet.get(ixti as usize)?;
+            let sheet = sheet_name_for(first, last, sup)?;
+            let rw_first = u16::from_le_bytes([rgce[3], rgce[4]]);
+            let rw_last = u16::from_le_bytes([rgce[5], rgce[6]]);
+            let col_first = u16::from_le_bytes([rgce[7], rgce[8]]);
+            let col_last = u16::from_le_bytes([rgce[9], rgce[10]]);
+            Some(format!(
+                "{sheet}!{}:{}",
+                cell_ref(rw_first, col_first),
+                cell_ref(rw_last, col_last)
+            ))
+        },
+        _ => None,
+    }
 }
 
 /// Build a 2D grid from sparse cells.
@@ -817,6 +1091,7 @@ mod tests {
         let doc = XlsDocument {
             images: Vec::new(),
             has_macros: false,
+            defined_names: Vec::new(),
             sheets: vec![Sheet {
                 display: Vec::new(),
                 name: "Sheet1".into(),
@@ -841,6 +1116,7 @@ mod tests {
         let doc = XlsDocument {
             images: Vec::new(),
             has_macros: false,
+            defined_names: Vec::new(),
             sheets: vec![Sheet {
                 display: Vec::new(),
                 name: "Data".into(),
@@ -862,6 +1138,7 @@ mod tests {
         XlsDocument {
             images: Vec::new(),
             has_macros: false,
+            defined_names: Vec::new(),
             sheets,
         }
     }
@@ -1083,5 +1360,189 @@ mod tests {
     fn ir_format_is_xls() {
         let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![]));
         assert_eq!(ir.metadata.format, crate::format::DocumentFormat::Xls);
+    }
+
+    // ── NAME record (defined names, #251 XLS half) ─────────────────────────
+
+    fn supbook_internal_record(ctab: u16) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&ctab.to_le_bytes());
+        d.extend_from_slice(&0x0401u16.to_le_bytes()); // self-referencing marker
+        biff_rec(RT_SUPBOOK, &d)
+    }
+
+    fn supbook_external_record() -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&0u16.to_le_bytes()); // ctab
+        d.extend_from_slice(&1u16.to_le_bytes()); // cch = 1 -> virtPath follows
+        d.push(0); // 8-bit chars
+        d.push(b' '); // single-char virtPath (irrelevant to internal detection)
+        biff_rec(RT_SUPBOOK, &d)
+    }
+
+    fn externsheet_record(entries: &[(u16, i16, i16)]) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (sup, first, last) in entries {
+            d.extend_from_slice(&sup.to_le_bytes());
+            d.extend_from_slice(&first.to_le_bytes());
+            d.extend_from_slice(&last.to_le_bytes());
+        }
+        biff_rec(RT_EXTERNSHEET, &d)
+    }
+
+    fn name_record(name: &str, itab: u16, hidden: bool, rgce: &[u8]) -> Vec<u8> {
+        let mut d = Vec::new();
+        let grbit: u16 = if hidden { 0x0001 } else { 0x0000 };
+        d.extend_from_slice(&grbit.to_le_bytes());
+        d.push(0); // chKey
+        d.push(name.len() as u8); // cch
+        d.extend_from_slice(&(rgce.len() as u16).to_le_bytes()); // cce
+        d.extend_from_slice(&0u16.to_le_bytes()); // reserved3
+        d.extend_from_slice(&itab.to_le_bytes()); // itab
+        d.extend_from_slice(&[0u8; 4]); // reserved4..7
+        d.push(0); // fHighByte = 0 (compressed 8-bit chars)
+        d.extend_from_slice(name.as_bytes());
+        d.extend_from_slice(rgce);
+        biff_rec(RT_NAME, &d)
+    }
+
+    /// A built-in `NAME` record: `Name` is a 1-byte `BuiltInName` ID, not
+    /// text.
+    fn builtin_name_record(id: u8, itab: u16, rgce: &[u8]) -> Vec<u8> {
+        let mut d = Vec::new();
+        let grbit: u16 = 0x0020; // fBuiltin
+        d.extend_from_slice(&grbit.to_le_bytes());
+        d.push(0); // chKey
+        d.push(1); // cch
+        d.extend_from_slice(&(rgce.len() as u16).to_le_bytes()); // cce
+        d.extend_from_slice(&0u16.to_le_bytes()); // reserved3
+        d.extend_from_slice(&itab.to_le_bytes()); // itab
+        d.extend_from_slice(&[0u8; 4]); // reserved4..7
+        d.push(0); // fHighByte = 0
+        d.push(id);
+        d.extend_from_slice(rgce);
+        biff_rec(RT_NAME, &d)
+    }
+
+    fn ptg_area3d(ixti: u16, rw_first: u16, rw_last: u16, col_first: u16, col_last: u16) -> Vec<u8> {
+        let mut d = vec![0x1Bu8];
+        d.extend_from_slice(&ixti.to_le_bytes());
+        d.extend_from_slice(&rw_first.to_le_bytes());
+        d.extend_from_slice(&rw_last.to_le_bytes());
+        d.extend_from_slice(&col_first.to_le_bytes());
+        d.extend_from_slice(&col_last.to_le_bytes());
+        d
+    }
+
+    fn ptg_ref3d(ixti: u16, row: u16, col: u16) -> Vec<u8> {
+        let mut d = vec![0x1Au8];
+        d.extend_from_slice(&ixti.to_le_bytes());
+        d.extend_from_slice(&row.to_le_bytes());
+        d.extend_from_slice(&col.to_le_bytes());
+        d
+    }
+
+    /// A global name over an area, and a sheet-local name over a single
+    /// cell, both resolve through `SUPBOOK`/`EXTERNSHEET` to real
+    /// `Sheet!$A$1`-style text and the right `local_sheet_id` (#251).
+    #[test]
+    fn test_name_records_resolve_area_and_cell_refs_via_externsheet() {
+        let globals = vec![
+            supbook_internal_record(2),
+            externsheet_record(&[(0, 0, 0)]),
+            name_record("MyRange", 0, false, &ptg_area3d(0, 0, 9, 0, 1)),
+            name_record("MyCell", 1, true, &ptg_ref3d(0, 3, 4)),
+        ];
+        let stream = workbook_stream_with_globals(
+            &globals,
+            &[("Data", 0, label(0, 0, "x")), ("Summary", 0, label(0, 0, "y"))],
+        );
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+
+        assert_eq!(doc.defined_names.len(), 2);
+
+        let my_range = &doc.defined_names[0];
+        assert_eq!(my_range.name, "MyRange");
+        assert_eq!(my_range.value, "Data!$A$1:$B$10");
+        assert_eq!(my_range.local_sheet_id, None, "itab 0 is workbook-global");
+        assert!(!my_range.hidden);
+
+        let my_cell = &doc.defined_names[1];
+        assert_eq!(my_cell.name, "MyCell");
+        assert_eq!(my_cell.value, "Data!$E$4");
+        assert_eq!(my_cell.local_sheet_id, Some(0), "itab 1 -> sheet_infos[0]");
+        assert!(my_cell.hidden);
+    }
+
+    /// A name pointing through an external-workbook `SUPBOOK` (not the
+    /// self-referencing one) must not be misreported as pointing at a local
+    /// sheet — better an empty `value` than a wrong one.
+    #[test]
+    fn test_name_record_via_external_supbook_leaves_value_unresolved() {
+        let globals = vec![
+            supbook_external_record(),
+            externsheet_record(&[(0, 0, 0)]),
+            name_record("External", 0, false, &ptg_ref3d(0, 0, 0)),
+        ];
+        let stream = workbook_stream_with_globals(&globals, &[("Sheet1", 0, label(0, 0, "x"))]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+
+        assert_eq!(doc.defined_names.len(), 1);
+        assert_eq!(doc.defined_names[0].name, "External");
+        assert_eq!(doc.defined_names[0].value, "");
+    }
+
+    /// A formula more complex than a single cell/area reference (here: no
+    /// tokens at all) must not be guessed at.
+    #[test]
+    fn test_name_record_with_unsupported_formula_shape_leaves_value_empty() {
+        let globals = vec![
+            supbook_internal_record(1),
+            externsheet_record(&[(0, 0, 0)]),
+            name_record("Weird", 0, false, &[]),
+        ];
+        let stream = workbook_stream_with_globals(&globals, &[("Sheet1", 0, label(0, 0, "x"))]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+
+        assert_eq!(doc.defined_names.len(), 1);
+        assert_eq!(doc.defined_names[0].value, "");
+    }
+
+    /// The resolved names reach `to_ir()` as `DocumentIR::defined_names`.
+    #[test]
+    fn test_defined_names_reach_the_ir() {
+        let globals = vec![
+            supbook_internal_record(1),
+            externsheet_record(&[(0, 0, 0)]),
+            name_record("MyRange", 0, false, &ptg_area3d(0, 0, 0, 0, 0)),
+        ];
+        let stream = workbook_stream_with_globals(&globals, &[("Sheet1", 0, label(0, 0, "x"))]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+
+        let ir = crate::convert_xls::xls_to_ir(&doc);
+        assert_eq!(ir.defined_names.len(), 1);
+        assert_eq!(ir.defined_names[0].name, "MyRange");
+        assert_eq!(ir.defined_names[0].value, "Sheet1!$A$1:$A$1");
+    }
+
+    /// A built-in name's `Name` field is a `BuiltInName` ID byte, not text
+    /// (real `.xls` corpus files decoded it as raw control characters like
+    /// U+0006 before this): it now maps to the same `_xlnm.`-prefixed
+    /// reserved name XLSX already surfaces for `<definedName
+    /// name="_xlnm.Print_Area">`.
+    #[test]
+    fn test_builtin_name_decodes_to_the_xlnm_reserved_name() {
+        let globals = vec![
+            supbook_internal_record(1),
+            externsheet_record(&[(0, 0, 0)]),
+            builtin_name_record(0x06, 0, &ptg_area3d(0, 0, 9, 0, 4)), // Print_Area
+        ];
+        let stream = workbook_stream_with_globals(&globals, &[("Sheet1", 0, label(0, 0, "x"))]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+
+        assert_eq!(doc.defined_names.len(), 1);
+        assert_eq!(doc.defined_names[0].name, "_xlnm.Print_Area");
+        assert_eq!(doc.defined_names[0].value, "Sheet1!$A$1:$E$10");
     }
 }

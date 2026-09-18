@@ -39,6 +39,7 @@ impl DocumentIR {
                 ..Default::default()
             },
             sections,
+            defined_names: Vec::new(),
         }
     }
 }

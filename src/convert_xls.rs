@@ -216,6 +216,16 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
             ..Default::default()
         },
         sections,
+        defined_names: doc
+            .defined_names
+            .iter()
+            .map(|dn| DefinedName {
+                name: dn.name.clone(),
+                value: dn.value.clone(),
+                local_sheet_id: dn.local_sheet_id,
+                hidden: dn.hidden,
+            })
+            .collect(),
     }
 }
 

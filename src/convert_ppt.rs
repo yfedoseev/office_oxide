@@ -84,5 +84,6 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
             ..Default::default()
         },
         sections,
+        defined_names: Vec::new(),
     }
 }

@@ -92,6 +92,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             ..Default::default()
         },
         sections,
+        defined_names: Vec::new(),
     }
 }
 

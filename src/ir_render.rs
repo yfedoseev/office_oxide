@@ -1187,6 +1187,7 @@ mod tests {
                 elements,
                 ..Default::default()
             }],
+            defined_names: Vec::new(),
         }
     }
 
@@ -1237,6 +1238,7 @@ mod tests {
                 ..Default::default()
             },
             sections: vec![section],
+            defined_names: Vec::new(),
         };
 
         let markers = [
@@ -1383,6 +1385,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            defined_names: Vec::new(),
         };
         let plain = ir.plain_text();
         assert!(plain.contains("Sheet1"));

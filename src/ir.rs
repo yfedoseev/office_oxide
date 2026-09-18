@@ -509,6 +509,30 @@ pub struct DocumentIR {
     pub metadata: Metadata,
     /// Ordered list of sections (pages, worksheets, slides, etc.).
     pub sections: Vec<Section>,
+    /// Defined names (named ranges, print areas) — currently populated
+    /// for XLSX/XLS only. Parsed correctly by both format readers but
+    /// unreachable through any documented API before this: XLSX's own
+    /// parser output was discarded before reaching the IR, and XLS had
+    /// no NAME-record parser at all (issue #251).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub defined_names: Vec<DefinedName>,
+}
+
+/// A defined name (named range, print area, …) from a spreadsheet
+/// workbook's Name Manager.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct DefinedName {
+    /// Name string.
+    pub name: String,
+    /// Formula or reference value (e.g. `Sheet1!$A$1:$B$10`).
+    pub value: String,
+    /// If set, this name is scoped to a specific sheet (0-based index)
+    /// rather than the whole workbook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_sheet_id: Option<u32>,
+    /// Whether this name is hidden in the Name Manager UI.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 /// Document-level metadata extracted from the source file.

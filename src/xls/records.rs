@@ -28,6 +28,9 @@ pub const RT_FILEPASS: u16 = 0x002F;
 pub const RT_STRING: u16 = 0x0207;
 /// Merged cell ranges for the current worksheet ([MS-XLS] §2.4.180).
 pub const RT_MERGEDCELLS: u16 = 0x00E5;
+pub const RT_NAME: u16 = 0x0018;
+pub const RT_EXTERNSHEET: u16 = 0x0017;
+pub const RT_SUPBOOK: u16 = 0x01AE;
 
 /// A raw BIFF record: type + data (may span CONTINUE records).
 #[derive(Debug, Clone)]

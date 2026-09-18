@@ -503,6 +503,17 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             has_macros: doc.has_macros,
         },
         sections,
+        defined_names: doc
+            .workbook
+            .defined_names
+            .iter()
+            .map(|dn| DefinedName {
+                name: dn.name.clone(),
+                value: dn.value.clone(),
+                local_sheet_id: dn.local_sheet_id,
+                hidden: dn.hidden,
+            })
+            .collect(),
     }
 }
 
