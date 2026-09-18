@@ -266,6 +266,49 @@ mod tests {
         assert!(matches!(ir.sections[0].elements[0], Element::Heading(_)));
     }
 
+    /// issue #253 — a title-slide layout's real title (`textType=6`) and
+    /// subtitle (`textType=5`) must not be swapped: the document title
+    /// must come from the real title text, and the subtitle must not
+    /// become a bold `Heading`.
+    #[test]
+    fn ir_title_slide_title_and_subtitle_are_not_swapped() {
+        use crate::ir::Element;
+        let doc = PptDocument {
+            images: Vec::new(),
+            has_macros: false,
+            summary_properties: None,
+            slides: vec![make_slide(vec![
+                (TextType::from_u32(6), "BSE in the US"), // real title
+                (TextType::from_u32(5), "Lisa A. Ferguson, DVM"), // real subtitle
+            ])],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        assert_eq!(
+            ir.metadata.title.as_deref(),
+            Some("BSE in the US"),
+            "the document title must come from the real title (textType=6), not the subtitle"
+        );
+        assert_eq!(ir.sections[0].title.as_deref(), Some("BSE in the US"));
+        // The subtitle (CenterBody) must land as an ordinary Paragraph via
+        // convert_ppt.rs's catch-all arm, never as a bold Heading.
+        assert!(
+            ir.sections[0]
+                .elements
+                .iter()
+                .any(|e| matches!(e, Element::Paragraph(p)
+                    if p.content.iter().any(|c| matches!(c, crate::ir::InlineContent::Text(t) if t.text == "Lisa A. Ferguson, DVM")))),
+            "the subtitle must reach the IR as an ordinary paragraph"
+        );
+        assert!(
+            !ir.sections[0]
+                .elements
+                .iter()
+                .any(|e| matches!(e, Element::Heading(h)
+                    if h.content.iter().any(|c| matches!(c, crate::ir::InlineContent::Text(t) if t.text == "Lisa A. Ferguson, DVM")))),
+            "the subtitle must never become the document heading"
+        );
+    }
+
     #[test]
     fn ir_center_title_treated_like_title() {
         let doc = PptDocument {

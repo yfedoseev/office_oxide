@@ -29,17 +29,26 @@ pub enum TextType {
 
 impl TextType {
     /// Convert a `TextHeaderAtom` type integer to a `TextType`.
+    ///
+    /// [MS-PPT] `TextTypeEnum`: `Tx_TYPE_TITLE`=0, `_BODY`=1, `_NOTES`=2 (3
+    /// is undefined — the spec's enumeration jumps straight from 2 to 4),
+    /// `_OTHER`=4, `_CENTERBODY`=5, `_CENTERTITLE`=6, `_HALFBODY`=7,
+    /// `_QUARTERBODY`=8. Every value from 3 upward used to be shifted one
+    /// slot low (5 read as CenterTitle, 6 as HalfBody, …), which swapped a
+    /// title-slide layout's real title (6, CenterTitle) and subtitle (5,
+    /// CenterBody) — the single most common slide layout in real
+    /// presentations (issue #253). Verified against the published
+    /// [MS-PPT] TextTypeEnum spec page and its own worked byte example.
     pub fn from_u32(val: u32) -> Self {
         match val {
             0 => Self::Title,
             1 => Self::Body,
             2 => Self::Notes,
-            3 => Self::Other,
-            4 => Self::CenterBody,
-            5 => Self::CenterTitle,
-            6 => Self::HalfBody,
-            7 => Self::QuarterBody,
-            _ => Self::Other,
+            5 => Self::CenterBody,
+            6 => Self::CenterTitle,
+            7 => Self::HalfBody,
+            8 => Self::QuarterBody,
+            _ => Self::Other, // 3 (undefined), 4 (Tx_TYPE_OTHER), and anything else
         }
     }
 }
@@ -541,6 +550,21 @@ mod tests {
         assert_eq!(TextType::from_u32(1), TextType::Body);
         assert_eq!(TextType::from_u32(2), TextType::Notes);
         assert_eq!(TextType::from_u32(99), TextType::Other);
+    }
+
+    /// issue #253 — every `TextTypeEnum` value from 3 upward was shifted
+    /// one slot low (5 misread as `CenterTitle`, 6 as `HalfBody`, …),
+    /// swapping a title slide's real title and subtitle. Values verified
+    /// against the published [MS-PPT] `TextTypeEnum` spec page directly:
+    /// 3 is genuinely undefined (the enum jumps from 2 to 4).
+    #[test]
+    fn text_type_values_3_and_up_match_the_spec_not_the_old_shifted_mapping() {
+        assert_eq!(TextType::from_u32(3), TextType::Other, "3 is undefined in the spec");
+        assert_eq!(TextType::from_u32(4), TextType::Other, "4 = Tx_TYPE_OTHER");
+        assert_eq!(TextType::from_u32(5), TextType::CenterBody, "5 = Tx_TYPE_CENTERBODY");
+        assert_eq!(TextType::from_u32(6), TextType::CenterTitle, "6 = Tx_TYPE_CENTERTITLE");
+        assert_eq!(TextType::from_u32(7), TextType::HalfBody, "7 = Tx_TYPE_HALFBODY");
+        assert_eq!(TextType::from_u32(8), TextType::QuarterBody, "8 = Tx_TYPE_QUARTERBODY");
     }
 
     #[test]
