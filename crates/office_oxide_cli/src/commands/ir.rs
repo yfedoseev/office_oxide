@@ -85,7 +85,24 @@ fn element_to_json(elem: &office_oxide::ir::Element) -> serde_json::Value {
             "language": cb.language,
             "content": cb.content,
         }),
-        _ => json!({ "type": "unknown" }),
+        Element::Shape(s) => json!({
+            "type": "shape",
+            "kind": format!("{:?}", s.kind),
+            "x_emu": s.x_emu,
+            "y_emu": s.y_emu,
+            "width_emu": s.width_emu,
+            "height_emu": s.height_emu,
+        }),
+        // `Element` is `#[non_exhaustive]`, so rustc requires a wildcard
+        // arm here regardless — a genuinely new variant can't be turned
+        // into a compile error from outside the defining crate. This is
+        // the fallback of last resort: it at least carries the Debug
+        // dump, so a new variant is *visibly incomplete* on this surface
+        // rather than indistinguishable from a variant that was properly
+        // handled (issue #221; #221's own maximal-Section round-trip
+        // test, and this crate's Shape-specific test, are what actually
+        // catch a future miss like this one).
+        other => json!({ "type": "unimplemented", "debug": format!("{other:?}") }),
     }
 }
 
@@ -113,7 +130,9 @@ fn inline_to_json(content: &[office_oxide::ir::InlineContent]) -> Vec<serde_json
                 "type": "endnote_ref",
                 "id": r.note_id,
             }),
-            _ => json!({ "type": "unknown" }),
+            // `InlineContent` is also `#[non_exhaustive]`; same reasoning
+            // as element_to_json above (issue #221).
+            other => json!({ "type": "unimplemented", "debug": format!("{other:?}") }),
         })
         .collect()
 }
@@ -136,4 +155,67 @@ fn list_items_to_json(items: &[office_oxide::ir::ListItem]) -> Vec<serde_json::V
             obj
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use office_oxide::DocumentIR;
+    use office_oxide::format::DocumentFormat;
+    use office_oxide::ir::*;
+
+    use super::ir_to_json;
+
+    /// issue #221 — speaker_notes is a sibling of `Section::elements`, not
+    /// one of its items; the CLI's JSON projection missed it once already
+    /// (only caught by a multi-thousand-file corpus sweep). Locked in here
+    /// as a fast unit test.
+    #[test]
+    fn test_speaker_notes_reach_the_json_projection() {
+        let ir = DocumentIR {
+            metadata: Metadata {
+                format: DocumentFormat::Pptx,
+                title: None,
+                ..Default::default()
+            },
+            sections: vec![Section {
+                elements: vec![],
+                speaker_notes: Some("SPEAKER_NOTES_MARKER".to_string()),
+                ..Default::default()
+            }],
+        };
+        let json = ir_to_json(&ir);
+        let rendered = serde_json::to_string(&json).unwrap();
+        assert!(
+            rendered.contains("SPEAKER_NOTES_MARKER"),
+            "the ir command's JSON projection must include speaker_notes: {rendered}"
+        );
+    }
+
+    /// A `Shape` element (the one variant the exhaustive match in
+    /// `element_to_json` was missing) must render as its own type, not
+    /// silently fall through to a generic "unknown".
+    #[test]
+    fn test_shape_element_does_not_render_as_unknown() {
+        let ir = DocumentIR {
+            metadata: Metadata {
+                format: DocumentFormat::Docx,
+                title: None,
+                ..Default::default()
+            },
+            sections: vec![Section {
+                elements: vec![Element::Shape(Shape {
+                    kind: ShapeGeom::Rect,
+                    ..Default::default()
+                })],
+                ..Default::default()
+            }],
+        };
+        let json = ir_to_json(&ir);
+        let rendered = serde_json::to_string(&json).unwrap();
+        assert!(
+            rendered.contains(r#""type":"shape""#),
+            "a Shape element must render as its own type, not unknown: {rendered}"
+        );
+        assert!(!rendered.contains("unknown"), "no element should render as unknown: {rendered}");
+    }
 }

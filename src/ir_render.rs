@@ -1201,6 +1201,64 @@ mod tests {
         InlineContent::Text(TextSpan::plain(text))
     }
 
+    /// issue #221 — a field added as a sibling of `Section::elements`
+    /// (not inside it, like `speaker_notes`) is invisible to any renderer
+    /// that was never explicitly taught about it, and nothing enforces
+    /// that every renderer was. #203 added `speaker_notes` and broke two
+    /// of four consumers (render_section_html and the CLI's `ir` JSON
+    /// projection) silently — a corpus sweep found them, not the unit
+    /// suite. This test populates every text-bearing sibling field at
+    /// once and asserts each one reaches all three IR-level rendering
+    /// surfaces, so a future field with the same shape fails a fast unit
+    /// test instead of needing a multi-thousand-file corpus diff.
+    #[test]
+    fn test_maximal_section_reaches_every_rendering_surface() {
+        let hf = |marker: &str| {
+            Some(HeaderFooter {
+                content: vec![para(marker)],
+            })
+        };
+        let section = Section {
+            title: Some("SECTION_TITLE_MARKER".to_string()),
+            elements: vec![para("BODY_MARKER")],
+            header: hf("HEADER_MARKER"),
+            footer: hf("FOOTER_MARKER"),
+            first_page_header: hf("FIRST_HEADER_MARKER"),
+            first_page_footer: hf("FIRST_FOOTER_MARKER"),
+            even_page_header: hf("EVEN_HEADER_MARKER"),
+            even_page_footer: hf("EVEN_FOOTER_MARKER"),
+            speaker_notes: Some("SPEAKER_NOTES_MARKER".to_string()),
+            ..Default::default()
+        };
+        let ir = DocumentIR {
+            metadata: Metadata {
+                format: DocumentFormat::Pptx,
+                title: None,
+                ..Default::default()
+            },
+            sections: vec![section],
+        };
+
+        let markers = [
+            "BODY_MARKER",
+            "HEADER_MARKER",
+            "FOOTER_MARKER",
+            "FIRST_HEADER_MARKER",
+            "FIRST_FOOTER_MARKER",
+            "EVEN_HEADER_MARKER",
+            "EVEN_FOOTER_MARKER",
+            "SPEAKER_NOTES_MARKER",
+        ];
+        let plain = ir.plain_text();
+        let markdown = ir.to_markdown();
+        let html = ir.to_html();
+        for marker in markers {
+            assert!(plain.contains(marker), "plain_text() is missing {marker}: {plain:?}");
+            assert!(markdown.contains(marker), "to_markdown() is missing {marker}: {markdown:?}");
+            assert!(html.contains(marker), "to_html() is missing {marker}: {html:?}");
+        }
+    }
+
     #[test]
     fn plain_text_paragraph() {
         let ir = simple_ir(vec![para("Hello world")]);
