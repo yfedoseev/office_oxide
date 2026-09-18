@@ -93,8 +93,24 @@ pub fn create_from_ir_to_writer<W: Write + Seek>(
 
 /// Build a `DocxWriter` from `DocumentIR`, exposed so callers can embed
 /// extra parts (fonts, custom metadata) before serialization.
+///
+/// Content past `MAX_NESTING_DEPTH` is dropped rather than overflowing
+/// the writer's stack (`DocumentIR` is `Deserialize`, so it can arrive
+/// from anywhere, including untrusted input). Call
+/// [`crate::docx::write::DocxWriter::truncated_subtrees`] on the
+/// returned writer, after `write_to`/`save`, to learn whether that
+/// happened — it used to be a silent `Ok` with only a `log::warn!`
+/// (issue #218).
 pub fn ir_to_docx(ir: &DocumentIR) -> crate::docx::write::DocxWriter {
     use crate::docx::write::{DocxWriter, IrParaProps, Run};
+
+    // The counter is thread-local (see core::xml::DepthGuard) and shared
+    // across every DocxWriter built on this thread; reset it here so a
+    // fresh ir_to_docx call's count doesn't inherit a previous one's.
+    // Building two DocxWriters concurrently, interleaved, on the same
+    // thread would confuse the two counts — not a pattern this crate (or
+    // realistically any caller) uses.
+    crate::core::xml::reset_truncated_subtrees();
 
     let mut writer = DocxWriter::new();
 

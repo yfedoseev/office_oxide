@@ -496,6 +496,7 @@ pub const MAX_NESTING_DEPTH: usize = 256;
 
 thread_local! {
     static NESTING_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TRUNCATED_SUBTREES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// RAII guard tracking recursion depth in the parsers.
@@ -508,10 +509,17 @@ pub struct DepthGuard(());
 
 impl DepthGuard {
     /// Enter one level of nesting, or return `None` when the limit is hit.
+    ///
+    /// Every `None` also increments the thread-local truncated-subtree
+    /// counter (see [`truncated_subtrees`]) — content past the bound used
+    /// to be dropped with only a `log::warn!`, leaving a caller with no
+    /// way to learn that the document they just wrote or read is missing
+    /// content (issue #218).
     pub fn enter() -> Option<Self> {
         NESTING_DEPTH.with(|d| {
             let cur = d.get();
             if cur >= MAX_NESTING_DEPTH {
+                TRUNCATED_SUBTREES.with(|t| t.set(t.get() + 1));
                 None
             } else {
                 d.set(cur + 1);
@@ -519,6 +527,19 @@ impl DepthGuard {
             }
         })
     }
+}
+
+/// Number of subtrees truncated by [`DepthGuard::enter`] returning `None`
+/// on this thread since the last [`reset_truncated_subtrees`] call.
+pub fn truncated_subtrees() -> usize {
+    TRUNCATED_SUBTREES.with(std::cell::Cell::get)
+}
+
+/// Reset the truncation counter. Called at the start of a top-level
+/// write/parse so its count reflects only that call, not a previous one
+/// on the same thread.
+pub fn reset_truncated_subtrees() {
+    TRUNCATED_SUBTREES.with(|t| t.set(0));
 }
 
 impl Drop for DepthGuard {

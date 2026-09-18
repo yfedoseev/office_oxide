@@ -871,6 +871,16 @@ impl DocxWriter {
         self
     }
 
+    /// Number of subtrees dropped for exceeding the nesting-depth bound
+    /// during either construction (`add_footnote`/`add_endnote`/
+    /// `add_header_footer`, or `create::ir_to_docx`, which resets the
+    /// count at its start) or the `write_to`/`save` call itself. `0`
+    /// means nothing was truncated. Call this *after* `write_to`/`save`
+    /// to see both phases' total (issue #218).
+    pub fn truncated_subtrees(&self) -> usize {
+        crate::core::xml::truncated_subtrees()
+    }
+
     /// Save the document to a file at `path`.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let opc = OpcWriter::create(path)?;
@@ -4182,6 +4192,57 @@ mod tests {
     /// pointing at the literal string `"#anchor"`, which is not a URL.
     /// It must instead be `<w:hyperlink w:anchor="…">` with no
     /// relationship at all.
+    /// issue #218 — content past MAX_NESTING_DEPTH was dropped with only
+    /// a log::warn!; a caller had no way to learn the document they just
+    /// wrote was missing content. truncated_subtrees() must report it.
+    #[test]
+    fn test_truncated_subtrees_reports_depth_bound_hits() {
+        let mut inner = crate::ir::Element::Paragraph(crate::ir::Paragraph::default());
+        for _ in 0..1000 {
+            inner = crate::ir::Element::TextBox(crate::ir::TextBox {
+                content: vec![inner],
+                ..Default::default()
+            });
+        }
+        let ir = crate::ir::DocumentIR {
+            sections: vec![crate::ir::Section {
+                elements: vec![inner],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let writer = crate::create::ir_to_docx(&ir);
+        let mut buf = Cursor::new(Vec::new());
+        writer.write_to(&mut buf).unwrap();
+        assert!(
+            writer.truncated_subtrees() > 0,
+            "1000 levels of nesting must exceed the 256-level bound and be reported"
+        );
+    }
+
+    /// A document well within the depth bound must report zero
+    /// truncation — the counter must not be stuck showing a previous
+    /// call's count.
+    #[test]
+    fn test_truncated_subtrees_is_zero_for_shallow_documents() {
+        let ir = crate::ir::DocumentIR {
+            sections: vec![crate::ir::Section {
+                elements: vec![crate::ir::Element::Paragraph(crate::ir::Paragraph {
+                    content: vec![crate::ir::InlineContent::Text(crate::ir::TextSpan::plain(
+                        "hello",
+                    ))],
+                    ..Default::default()
+                })],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let writer = crate::create::ir_to_docx(&ir);
+        let mut buf = Cursor::new(Vec::new());
+        writer.write_to(&mut buf).unwrap();
+        assert_eq!(writer.truncated_subtrees(), 0);
+    }
+
     #[test]
     fn test_pure_anchor_hyperlink_gets_no_relationship() {
         let mut doc = DocxWriter::new();
