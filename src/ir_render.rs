@@ -701,6 +701,14 @@ fn render_cell_markdown(cell: &TableCell) -> String {
 
 fn render_list_markdown(list: &List, indent: usize) -> String {
     let prefix_str = "  ".repeat(indent);
+    // A numbered list that starts at 3 in the source must start at 3 here:
+    // `start_number` was parsed and then ignored, so every ordered list
+    // rendered as 1, 2, 3 regardless of what the document said.
+    let start = if list.ordered {
+        list.start_number.unwrap_or(1)
+    } else {
+        1
+    };
     let mut lines = Vec::new();
     for (i, item) in list.items.iter().enumerate() {
         let text = item
@@ -710,7 +718,7 @@ fn render_list_markdown(list: &List, indent: usize) -> String {
             .collect::<Vec<_>>()
             .join(" ");
         let marker = if list.ordered {
-            format!("{}. ", i + 1)
+            format!("{}. ", start.saturating_add(u32::try_from(i).unwrap_or(u32::MAX)))
         } else {
             "- ".to_string()
         };
@@ -907,7 +915,14 @@ fn render_table_html(table: &Table) -> String {
 
 fn render_list_html(list: &List) -> String {
     let tag = if list.ordered { "ol" } else { "ul" };
-    let mut html = format!("<{tag}>\n");
+    // `start` only exists on `<ol>`; a browser ignores it on `<ul>`. Omitted
+    // for 1, which is the attribute's own default, so ordinary lists keep a
+    // bare `<ol>`.
+    let start_attr = match list.start_number {
+        Some(n) if list.ordered && n != 1 => format!(" start=\"{n}\""),
+        _ => String::new(),
+    };
+    let mut html = format!("<{tag}{start_attr}>\n");
     for item in &list.items {
         let content = item
             .content
@@ -1164,6 +1179,66 @@ mod tests {
         assert!(html.contains("<ol>"));
         assert!(html.contains("<li><p>First</p></li>"));
         assert!(html.contains("<li><p>Second</p></li>"));
+    }
+
+    /// #315: `List.start_number` was parsed and then ignored by both
+    /// renderers, so a list the document starts at 3 rendered as 1, 2, 3.
+    #[test]
+    fn test_list_start_number_is_honoured() {
+        let list = List {
+            ordered: true,
+            start_number: Some(3),
+            items: vec![
+                ListItem {
+                    content: vec![para("A")],
+                    nested: None,
+                },
+                ListItem {
+                    content: vec![para("B")],
+                    nested: None,
+                },
+                ListItem {
+                    content: vec![para("C")],
+                    nested: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let ir = simple_ir(vec![Element::List(list)]);
+
+        let html = ir.to_html();
+        assert!(html.contains("<ol start=\"3\">"), "html: {html}");
+
+        let md = ir.to_markdown();
+        assert!(md.contains("3. A"), "md: {md}");
+        assert!(md.contains("4. B"), "md: {md}");
+        assert!(md.contains("5. C"), "md: {md}");
+        assert!(!md.contains("1. A"), "md still starts at 1: {md}");
+
+        // An unordered list never gets a `start`, and a list starting at the
+        // attribute's own default keeps a bare `<ol>`.
+        let plain_ol = simple_ir(vec![Element::List(List {
+            ordered: true,
+            start_number: Some(1),
+            items: vec![ListItem {
+                content: vec![para("A")],
+                nested: None,
+            }],
+            ..Default::default()
+        })]);
+        assert!(plain_ol.to_html().contains("<ol>"), "{}", plain_ol.to_html());
+
+        let bullets = simple_ir(vec![Element::List(List {
+            ordered: false,
+            start_number: Some(7),
+            items: vec![ListItem {
+                content: vec![para("A")],
+                nested: None,
+            }],
+            ..Default::default()
+        })]);
+        assert!(!bullets.to_html().contains("start="), "{}", bullets.to_html());
+        assert!(bullets.to_markdown().contains("- A"), "{}", bullets.to_markdown());
     }
 
     // ── Defaults centralized in `block_default` ──────────────────────
