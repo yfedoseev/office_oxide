@@ -2,7 +2,7 @@
 
 use std::io::{Read, Seek};
 
-use crate::cfb::CfbReader;
+use crate::cfb::{CfbReader, SummaryProperties, parse_summary_information};
 
 use super::error::{DocError, Result};
 use super::fib::Fib;
@@ -38,6 +38,11 @@ pub struct DocDocument {
     /// least tell "genuinely short document" apart from "84% missing"
     /// (issue #230).
     text_complete: bool,
+    /// Title/author/subject/keywords/comments/dates from the
+    /// `\x05SummaryInformation` OLE property-set stream every real
+    /// `.doc` carries by default — parsed and then never read anywhere
+    /// in the crate before (issue #244).
+    summary_properties: Option<SummaryProperties>,
 }
 
 /// One of the subdocuments stored after the main text in a `.doc`.
@@ -163,6 +168,10 @@ impl DocDocument {
             Err(_) => Vec::new(),
         };
         let has_macros = cfb.has_root_entry("_VBA_PROJECT");
+        let summary_properties = cfb
+            .open_stream("\u{5}SummaryInformation")
+            .ok()
+            .and_then(|data| parse_summary_information(&data));
 
         Ok(Self {
             text,
@@ -171,6 +180,7 @@ impl DocDocument {
             subdocuments,
             has_macros,
             text_complete,
+            summary_properties,
         })
     }
 
@@ -202,6 +212,13 @@ impl DocDocument {
     /// content that could not be safely recovered (issue #230).
     pub fn text_complete(&self) -> bool {
         self.text_complete
+    }
+
+    /// Title/author/subject/keywords/comments/dates from the file's
+    /// `\x05SummaryInformation` OLE property set, when present and
+    /// well-formed (issue #244).
+    pub fn summary_properties(&self) -> Option<&crate::cfb::SummaryProperties> {
+        self.summary_properties.as_ref()
     }
 
     /// Get the extracted plain text.
@@ -269,6 +286,7 @@ mod tests {
             subdocuments: Vec::new(),
             has_macros: false,
             text_complete: true,
+            summary_properties: None,
             images: Vec::new(),
             text: "First paragraph\nSecond paragraph\n\nAfter gap".into(),
             paragraphs: Vec::new(),
@@ -285,6 +303,7 @@ mod tests {
             subdocuments: Vec::new(),
             has_macros: false,
             text_complete: true,
+            summary_properties: None,
             images: Vec::new(),
             text: "Hello World".into(),
             paragraphs: Vec::new(),
@@ -301,6 +320,7 @@ mod tests {
             subdocuments: Vec::new(),
             has_macros: false,
             text_complete: false,
+            summary_properties: None,
             images: Vec::new(),
             text: "only the recovered fragment".into(),
             paragraphs: Vec::new(),
@@ -327,6 +347,7 @@ mod tests {
             subdocuments: Vec::new(),
             has_macros: false,
             text_complete: true,
+            summary_properties: None,
             images: Vec::new(),
             text: text.to_string(),
             paragraphs: Vec::new(),
@@ -341,6 +362,7 @@ mod tests {
             subdocuments: Vec::new(),
             has_macros: false,
             text_complete: true,
+            summary_properties: None,
             images: Vec::new(),
             text: String::new(),
             paragraphs: paras,
@@ -482,5 +504,42 @@ mod tests {
     fn ir_format_is_doc() {
         let ir = crate::convert_doc::doc_to_ir(&make_doc("content"));
         assert_eq!(ir.metadata.format, crate::format::DocumentFormat::Doc);
+    }
+
+    /// issue #244 — `SummaryInformation` fields must reach `Metadata`, and
+    /// the declared title must beat the heading-guess title.
+    #[test]
+    fn ir_summary_properties_reach_metadata() {
+        let mut doc = make_doc("SOME ALL-CAPS HEADING\nBody text follows.");
+        doc.summary_properties = Some(SummaryProperties {
+            title: Some("Declared Title".to_string()),
+            subject: Some("Declared Subject".to_string()),
+            author: Some("Declared Author".to_string()),
+            keywords: Some("alpha, beta".to_string()),
+            comments: Some("Declared Comment".to_string()),
+            created: Some("2020-01-02T03:04:05Z".to_string()),
+            modified: Some("2021-06-07T08:09:10Z".to_string()),
+        });
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        assert_eq!(ir.metadata.title.as_deref(), Some("Declared Title"));
+        assert_eq!(ir.metadata.author.as_deref(), Some("Declared Author"));
+        assert_eq!(ir.metadata.subject.as_deref(), Some("Declared Subject"));
+        assert_eq!(ir.metadata.keywords, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(ir.metadata.description.as_deref(), Some("Declared Comment"));
+        assert_eq!(ir.metadata.created.as_deref(), Some("2020-01-02T03:04:05Z"));
+        assert_eq!(ir.metadata.modified.as_deref(), Some("2021-06-07T08:09:10Z"));
+    }
+
+    /// A missing/empty title in `SummaryInformation` must not shadow the
+    /// heading-guess fallback (issue #244 must not regress issue #224).
+    #[test]
+    fn ir_empty_summary_title_falls_back_to_heading_guess() {
+        let mut doc = make_doc("A HEADING LINE\nBody text follows.");
+        doc.summary_properties = Some(SummaryProperties {
+            title: Some(String::new()),
+            ..Default::default()
+        });
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        assert_eq!(ir.metadata.title.as_deref(), Some("A HEADING LINE"));
     }
 }

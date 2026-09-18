@@ -28,6 +28,11 @@ pub struct XlsDocument {
     /// tell that apart from a file that genuinely ended there (issue
     /// #236).
     truncated: bool,
+    /// Title/author/subject/keywords/comments/dates from the
+    /// `\x05SummaryInformation` OLE property-set stream every real `.xls`
+    /// carries by default — parsed and then never read anywhere in the
+    /// crate before (issue #244).
+    summary_properties: Option<crate::cfb::SummaryProperties>,
 }
 
 /// A named range recovered from a `NAME` record.
@@ -53,6 +58,7 @@ impl XlsDocument {
             images: Vec::new(),
             has_macros: false,
             truncated: false,
+            summary_properties: None,
         }
     }
 }
@@ -124,12 +130,17 @@ impl XlsDocument {
             return Err(XlsError::MissingStream("neither Workbook nor Book stream found".into()));
         };
         let has_macros = cfb.has_root_entry("_VBA_PROJECT");
+        let summary_properties = cfb
+            .open_stream("\u{5}SummaryInformation")
+            .ok()
+            .and_then(|data| crate::cfb::parse_summary_information(&data));
         // Drop CFB early to free file handle and memory.
         drop(cfb);
 
         let mut doc = Self::parse_workbook_stream(&stream_data)?;
         doc.images = extract_images(&stream_data);
         doc.has_macros = has_macros;
+        doc.summary_properties = summary_properties;
         Ok(doc)
     }
 
@@ -431,6 +442,7 @@ impl XlsDocument {
             // this function doesn't.
             has_macros: false,
             truncated: record_budget_exhausted,
+            summary_properties: None,
         })
     }
 
@@ -450,6 +462,13 @@ impl XlsDocument {
     /// `sheets` (issue #236).
     pub fn truncated(&self) -> bool {
         self.truncated
+    }
+
+    /// Title/author/subject/keywords/comments/dates from the file's
+    /// `\x05SummaryInformation` OLE property set, when present and
+    /// well-formed (issue #244).
+    pub fn summary_properties(&self) -> Option<&crate::cfb::SummaryProperties> {
+        self.summary_properties.as_ref()
     }
 
     /// Extract plain text from the document.
@@ -1271,6 +1290,7 @@ mod tests {
             has_macros: false,
             defined_names: Vec::new(),
             truncated: false,
+            summary_properties: None,
             sheets: vec![Sheet {
                 display: Vec::new(),
                 name: "Sheet1".into(),
@@ -1297,6 +1317,7 @@ mod tests {
             has_macros: false,
             defined_names: Vec::new(),
             truncated: false,
+            summary_properties: None,
             sheets: vec![Sheet {
                 display: Vec::new(),
                 name: "Data".into(),
@@ -1352,6 +1373,7 @@ mod tests {
             has_macros: false,
             defined_names: Vec::new(),
             truncated: false,
+            summary_properties: None,
             sheets,
         }
     }
@@ -1622,6 +1644,43 @@ mod tests {
     fn ir_format_is_xls() {
         let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![]));
         assert_eq!(ir.metadata.format, crate::format::DocumentFormat::Xls);
+    }
+
+    /// issue #244 — `SummaryInformation` fields must reach `Metadata`, and
+    /// the declared title must beat the first-sheet-name fallback.
+    #[test]
+    fn ir_summary_properties_reach_metadata() {
+        let mut doc = make_doc(vec![Sheet { name: "Sheet1".to_string(), ..Default::default() }]);
+        doc.summary_properties = Some(crate::cfb::SummaryProperties {
+            title: Some("Declared Title".to_string()),
+            subject: Some("Declared Subject".to_string()),
+            author: Some("Declared Author".to_string()),
+            keywords: Some("alpha, beta".to_string()),
+            comments: Some("Declared Comment".to_string()),
+            created: Some("2020-01-02T03:04:05Z".to_string()),
+            modified: Some("2021-06-07T08:09:10Z".to_string()),
+        });
+        let ir = crate::convert_xls::xls_to_ir(&doc);
+        assert_eq!(ir.metadata.title.as_deref(), Some("Declared Title"));
+        assert_eq!(ir.metadata.author.as_deref(), Some("Declared Author"));
+        assert_eq!(ir.metadata.subject.as_deref(), Some("Declared Subject"));
+        assert_eq!(ir.metadata.keywords, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(ir.metadata.description.as_deref(), Some("Declared Comment"));
+        assert_eq!(ir.metadata.created.as_deref(), Some("2020-01-02T03:04:05Z"));
+        assert_eq!(ir.metadata.modified.as_deref(), Some("2021-06-07T08:09:10Z"));
+    }
+
+    /// A missing/empty title in `SummaryInformation` must not shadow the
+    /// first-sheet-name fallback.
+    #[test]
+    fn ir_empty_summary_title_falls_back_to_sheet_name() {
+        let mut doc = make_doc(vec![Sheet { name: "Sheet1".to_string(), ..Default::default() }]);
+        doc.summary_properties = Some(crate::cfb::SummaryProperties {
+            title: Some(String::new()),
+            ..Default::default()
+        });
+        let ir = crate::convert_xls::xls_to_ir(&doc);
+        assert_eq!(ir.metadata.title.as_deref(), Some("Sheet1"));
     }
 
     // ── NAME record (defined names, #251 XLS half) ─────────────────────────

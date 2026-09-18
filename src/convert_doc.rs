@@ -29,13 +29,22 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
         line_heuristic(doc.plain_text_ref(), &mut elements);
     }
 
-    let title = elements.iter().find_map(|e| match e {
+    let heading_title = elements.iter().find_map(|e| match e {
         Element::Heading(h) => h.content.first().and_then(|c| match c {
             InlineContent::Text(t) => Some(t.text.clone()),
             _ => None,
         }),
         _ => None,
     });
+    // The file's own declared title (from `\x05SummaryInformation`) beats
+    // a line-shape guess whenever both exist — a document can style
+    // *some* headings and still use plain ALL-CAPS lines for others
+    // (#224), but the declared title is never a guess (issue #244).
+    let summary = doc.summary_properties();
+    let title = summary
+        .and_then(|s| s.title.clone())
+        .filter(|t| !t.is_empty())
+        .or(heading_title);
 
     let mut sections = vec![Section {
         title: title.clone(),
@@ -88,6 +97,15 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Doc,
             title,
+            author: summary.and_then(|s| s.author.clone()).filter(|s| !s.is_empty()),
+            subject: summary.and_then(|s| s.subject.clone()).filter(|s| !s.is_empty()),
+            keywords: summary
+                .and_then(|s| s.keywords.as_deref())
+                .map(crate::convert_docx::split_keywords)
+                .unwrap_or_default(),
+            description: summary.and_then(|s| s.comments.clone()).filter(|s| !s.is_empty()),
+            created: summary.and_then(|s| s.created.clone()),
+            modified: summary.and_then(|s| s.modified.clone()),
             has_macros: doc.has_macros(),
             text_truncated: !doc.text_complete(),
             ..Default::default()

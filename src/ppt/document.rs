@@ -2,7 +2,7 @@
 
 use std::io::{Read, Seek};
 
-use crate::cfb::CfbReader;
+use crate::cfb::{CfbReader, SummaryProperties, parse_summary_information};
 
 use super::error::Result;
 use super::images::{PptImage, extract_images};
@@ -15,6 +15,11 @@ pub struct PptDocument {
     pub slides: Vec<SlideText>,
     images: Vec<PptImage>,
     has_macros: bool,
+    /// Title/author/subject/keywords/comments/dates from the
+    /// `\x05SummaryInformation` OLE property-set stream every real `.ppt`
+    /// carries by default — parsed and then never read anywhere in the
+    /// crate before (issue #244).
+    summary_properties: Option<SummaryProperties>,
 }
 
 impl PptDocument {
@@ -22,6 +27,10 @@ impl PptDocument {
     pub fn from_reader<R: Read + Seek>(reader: R) -> Result<Self> {
         let mut cfb = CfbReader::new(reader)?;
         let has_macros = cfb.has_root_entry("_VBA_PROJECT");
+        let summary_properties = cfb
+            .open_stream("\u{5}SummaryInformation")
+            .ok()
+            .and_then(|data| parse_summary_information(&data));
 
         let stream = match cfb
             .open_stream("PowerPoint Document")
@@ -33,6 +42,7 @@ impl PptDocument {
                     slides: Vec::new(),
                     images: Vec::new(),
                     has_macros,
+                    summary_properties,
                 });
             },
         };
@@ -46,13 +56,20 @@ impl PptDocument {
             Err(_) => Vec::new(),
         };
 
-        Ok(Self { slides, images, has_macros })
+        Ok(Self { slides, images, has_macros, summary_properties })
     }
 
     /// `true` when the file carries a `_VBA_PROJECT` storage — a cheap
     /// macro-presence signal, no VBA interpretation (issue #283).
     pub fn has_macros(&self) -> bool {
         self.has_macros
+    }
+
+    /// Title/author/subject/keywords/comments/dates from the file's
+    /// `\x05SummaryInformation` OLE property set, when present and
+    /// well-formed (issue #244).
+    pub fn summary_properties(&self) -> Option<&SummaryProperties> {
+        self.summary_properties.as_ref()
     }
 
     /// Open a PPT file from a path.
@@ -133,6 +150,7 @@ mod tests {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
+            summary_properties: None,
             slides: vec![
                 SlideText {
                     text_runs: vec![
@@ -165,6 +183,7 @@ mod tests {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
+            summary_properties: None,
             slides: vec![SlideText {
                 text_runs: vec![
                     TextRun {
@@ -189,6 +208,7 @@ mod tests {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
+            summary_properties: None,
             slides: vec![SlideText {
                 text_runs: vec![
                     TextRun {
@@ -225,6 +245,7 @@ mod tests {
             images: Vec::new(),
             slides: Vec::new(),
             has_macros: false,
+            summary_properties: None,
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
         assert!(ir.sections.is_empty());
@@ -237,6 +258,7 @@ mod tests {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
+            summary_properties: None,
             slides: vec![make_slide(vec![(TextType::Title, "My Slide")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -249,6 +271,7 @@ mod tests {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
+            summary_properties: None,
             slides: vec![make_slide(vec![(TextType::CenterTitle, "Centered")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -266,6 +289,7 @@ mod tests {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
+            summary_properties: None,
             slides: vec![make_slide(vec![
                 (TextType::Title, "Title"),
                 (TextType::Body, "Visible body text"),
@@ -299,6 +323,7 @@ mod tests {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
+            summary_properties: None,
             slides: vec![make_slide(vec![(TextType::Body, "Just body text")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -312,6 +337,7 @@ mod tests {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
+            summary_properties: None,
             slides: vec![make_slide(vec![
                 (TextType::Notes, "First note"),
                 (TextType::Notes, "Second note"),
@@ -329,6 +355,7 @@ mod tests {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
+            summary_properties: None,
             slides: vec![make_slide(vec![
                 (TextType::Body, "Body text"),
                 (TextType::HalfBody, "Half body"),
@@ -349,6 +376,7 @@ mod tests {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
+            summary_properties: None,
             slides: vec![make_slide(vec![(TextType::Notes, "Speaker note")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -362,6 +390,7 @@ mod tests {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
+            summary_properties: None,
             slides: vec![make_slide(vec![(TextType::Other, "misc text")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -373,6 +402,7 @@ mod tests {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
+            summary_properties: None,
             slides: vec![make_slide(vec![(TextType::Body, "content")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -385,8 +415,54 @@ mod tests {
             images: Vec::new(),
             slides: Vec::new(),
             has_macros: false,
+            summary_properties: None,
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
         assert_eq!(ir.metadata.format, crate::format::DocumentFormat::Ppt);
+    }
+
+    /// issue #244 — `SummaryInformation` fields must reach `Metadata`, and
+    /// the declared title must beat the first-slide-title fallback.
+    #[test]
+    fn ir_summary_properties_reach_metadata() {
+        let doc = PptDocument {
+            images: Vec::new(),
+            has_macros: false,
+            summary_properties: Some(crate::cfb::SummaryProperties {
+                title: Some("Declared Title".to_string()),
+                subject: Some("Declared Subject".to_string()),
+                author: Some("Declared Author".to_string()),
+                keywords: Some("alpha, beta".to_string()),
+                comments: Some("Declared Comment".to_string()),
+                created: Some("2020-01-02T03:04:05Z".to_string()),
+                modified: Some("2021-06-07T08:09:10Z".to_string()),
+            }),
+            slides: vec![make_slide(vec![(TextType::Title, "Slide Title")])],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        assert_eq!(ir.metadata.title.as_deref(), Some("Declared Title"));
+        assert_eq!(ir.metadata.author.as_deref(), Some("Declared Author"));
+        assert_eq!(ir.metadata.subject.as_deref(), Some("Declared Subject"));
+        assert_eq!(ir.metadata.keywords, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(ir.metadata.description.as_deref(), Some("Declared Comment"));
+        assert_eq!(ir.metadata.created.as_deref(), Some("2020-01-02T03:04:05Z"));
+        assert_eq!(ir.metadata.modified.as_deref(), Some("2021-06-07T08:09:10Z"));
+    }
+
+    /// A missing/empty title in `SummaryInformation` must not shadow the
+    /// first-slide-title fallback.
+    #[test]
+    fn ir_empty_summary_title_falls_back_to_slide_title() {
+        let doc = PptDocument {
+            images: Vec::new(),
+            has_macros: false,
+            summary_properties: Some(crate::cfb::SummaryProperties {
+                title: Some(String::new()),
+                ..Default::default()
+            }),
+            slides: vec![make_slide(vec![(TextType::Title, "Slide Title")])],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        assert_eq!(ir.metadata.title.as_deref(), Some("Slide Title"));
     }
 }

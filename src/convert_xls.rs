@@ -206,12 +206,29 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
     // section; BIFF drawings carry no reliable per-sheet anchor here.
     append_legacy_images(&mut sections, doc.images());
 
-    let title = sections.first().and_then(|s| s.title.clone());
+    // The workbook's own declared title (from `\x05SummaryInformation`)
+    // beats the first sheet's name — a sheet name is not a document
+    // title, it's just the only thing that was ever there to fall back
+    // to (issue #244).
+    let summary = doc.summary_properties();
+    let title = summary
+        .and_then(|s| s.title.clone())
+        .filter(|t| !t.is_empty())
+        .or_else(|| sections.first().and_then(|s| s.title.clone()));
 
     DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Xls,
             title,
+            author: summary.and_then(|s| s.author.clone()).filter(|s| !s.is_empty()),
+            subject: summary.and_then(|s| s.subject.clone()).filter(|s| !s.is_empty()),
+            keywords: summary
+                .and_then(|s| s.keywords.as_deref())
+                .map(crate::convert_docx::split_keywords)
+                .unwrap_or_default(),
+            description: summary.and_then(|s| s.comments.clone()).filter(|s| !s.is_empty()),
+            created: summary.and_then(|s| s.created.clone()),
+            modified: summary.and_then(|s| s.modified.clone()),
             has_macros: doc.has_macros(),
             text_truncated: doc.truncated(),
             ..Default::default()

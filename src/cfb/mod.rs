@@ -18,6 +18,7 @@ pub mod blip;
 mod directory;
 mod error;
 mod header;
+pub mod oleps;
 mod reader;
 
 pub use blip::{BlipFormat, BlipImage, extract_blip_images};
@@ -26,6 +27,7 @@ pub use error::{CfbError, Result};
 pub use header::{
     CFB_SIGNATURE, CfbHeader, DIFAT_SECT, END_OF_CHAIN, FAT_SECT, FREE_SECT, MAX_REG_SECT,
 };
+pub use oleps::{SummaryProperties, parse_summary_information};
 pub use reader::CfbReader;
 
 /// `true` when `reader` begins with the CFB/OLE2 magic signature — the
