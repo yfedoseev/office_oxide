@@ -557,6 +557,7 @@ fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>) {
     let is_heading = trimmed.len() < 100
         && !trimmed.ends_with('.')
         && !trimmed.ends_with(',')
+        && !is_heading_guess_junk(trimmed)
         && (trimmed
             .chars()
             .filter(|c| c.is_alphabetic())
@@ -584,6 +585,68 @@ fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>) {
             ..Default::default()
         }));
     }
+}
+
+/// Reject line shapes the ALL-CAPS / short-opening-line heading guess in
+/// `emit_prose` otherwise misclassifies as headings: pure separator lines,
+/// bare dates, UK postcodes, and "CCY - symbol" currency labels — all
+/// confirmed junk from the 246-file `.doc` corpus sweep behind issue #224
+/// (`______________________________________________`, `11/16/2016`,
+/// `SW8 5NQ`, `GBP - £`). The guess otherwise stays as-is — no reference
+/// implementation does line-shape heading detection at all, so this only
+/// narrows an already-approximate fallback rather than trying to perfect
+/// it (`DRAFT`, a single common ALL-CAPS word, is left uncaught).
+fn is_heading_guess_junk(line: &str) -> bool {
+    (!line.chars().any(|c| c.is_alphanumeric()))
+        || is_bare_date(line)
+        || is_uk_postcode(line)
+        || is_currency_label(line)
+}
+
+/// A line that is *only* `D[D]/-M[M]/-Y[YYY]`-shaped — a whole date with no
+/// other text around it. Deliberately narrow: real headings almost never
+/// consist of exactly three all-digit, slash/dash-separated groups.
+fn is_bare_date(line: &str) -> bool {
+    let parts: Vec<&str> = line.split(['/', '-']).collect();
+    parts.len() == 3
+        && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        && parts[0].len() <= 2
+        && parts[1].len() <= 2
+        && matches!(parts[2].len(), 2 | 4)
+}
+
+/// A UK postcode shape: `<1-2 letters><digit>[letter/digit] <digit><2
+/// letters>` (e.g. `SW8 5NQ`). Not a full validator, just narrow enough
+/// that a genuine heading is unlikely to match it by accident.
+fn is_uk_postcode(line: &str) -> bool {
+    let Some((outward, inward)) = line.rsplit_once(' ') else {
+        return false;
+    };
+    let mut inward_chars = inward.chars();
+    let inward_ok = inward.chars().count() == 3
+        && inward_chars.next().is_some_and(|c| c.is_ascii_digit())
+        && inward_chars.all(|c| c.is_ascii_uppercase());
+    if !inward_ok {
+        return false;
+    }
+    let outward: Vec<char> = outward.chars().collect();
+    (2..=4).contains(&outward.len())
+        && outward[0].is_ascii_uppercase()
+        && outward.iter().any(|c| c.is_ascii_digit())
+        && outward.iter().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// A `"CCY - symbol"`-shaped currency label (`GBP - £`, `EUR - €`): a
+/// 3-letter uppercase code followed by nothing but a currency symbol.
+fn is_currency_label(line: &str) -> bool {
+    let Some((code, rest)) = line.split_once(' ') else {
+        return false;
+    };
+    if code.len() != 3 || !code.chars().all(|c| c.is_ascii_uppercase()) {
+        return false;
+    }
+    let rest = rest.trim().strip_prefix('-').unwrap_or(rest).trim();
+    !rest.is_empty() && !rest.chars().any(|c| c.is_alphanumeric())
 }
 
 // ---------------------------------------------------------------------------
@@ -947,5 +1010,60 @@ mod tests {
         assert_eq!(out[0].cells[0].row_span, 3, "one continuous 3-row merge");
         assert!(out[1].cells.is_empty());
         assert!(out[2].cells.is_empty());
+    }
+
+    // ── Line-shape heading guess tightening (issue #224) ────────────────────
+
+    fn is_heading_guess(text: &str) -> bool {
+        let mut els = Vec::new();
+        emit_prose(text, &[], &mut els);
+        matches!(els.as_slice(), [Element::Heading(_)])
+    }
+
+    /// A pure separator/underscore line must never become a heading —
+    /// found ×4 in a real corpus file (`ob_is.doc`) behind #224.
+    #[test]
+    fn underscore_separator_line_is_not_a_heading() {
+        assert!(!is_heading_guess("______________________________________________"));
+    }
+
+    /// A bare `MM/DD/YYYY` date, found as a false-positive heading in a
+    /// real corpus file behind #224, must not be promoted.
+    #[test]
+    fn bare_date_is_not_a_heading() {
+        assert!(!is_heading_guess("11/16/2016"));
+    }
+
+    /// A UK postcode shape (`SW8 5NQ`), found as a false-positive heading
+    /// in a real corpus file behind #224, must not be promoted.
+    #[test]
+    fn uk_postcode_is_not_a_heading() {
+        assert!(!is_heading_guess("SW8 5NQ"));
+    }
+
+    /// `"CCY - symbol"` currency labels (`GBP - £`, `EUR - €`), found as
+    /// false-positive headings behind #224, must not be promoted.
+    #[test]
+    fn currency_label_is_not_a_heading() {
+        assert!(!is_heading_guess("GBP - £"));
+        assert!(!is_heading_guess("EUR - €"));
+    }
+
+    /// The tightening must not touch real ALL-CAPS section headers the
+    /// guess correctly caught before #224 (e.g. `parentinvguid.doc`'s
+    /// un-styled section headings).
+    #[test]
+    fn genuine_all_caps_headings_still_promoted() {
+        for heading in ["INTRODUCTION", "TABLE OF CONTENTS", "A. GENERAL INFORMATION"] {
+            assert!(is_heading_guess(heading), "{heading:?} must still be promoted");
+        }
+    }
+
+    /// The bare-date rule only rejects a line that is *entirely* a date —
+    /// a date-shaped substring inside otherwise heading-shaped text must
+    /// still be promoted.
+    #[test]
+    fn date_substring_inside_otherwise_heading_shaped_text_is_unaffected() {
+        assert!(is_heading_guess("Report 11/16/2016 Summary"));
     }
 }
