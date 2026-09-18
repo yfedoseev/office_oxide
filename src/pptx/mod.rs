@@ -155,6 +155,14 @@ impl PptxDocument {
             /// Pre-resolved here in Phase 1 so the parallel slide parser
             /// (Phase 2) doesn't need access to the OPC reader.
             media: std::collections::HashMap<String, (Vec<u8>, String)>,
+            /// rId → extracted chart text lines. A `<c:chart r:id="…"/>`
+            /// in the slide XML holds no text of its own — the title,
+            /// axis labels, category names and cached data values live in
+            /// the separate part that id resolves to
+            /// (`ppt/charts/chartN.xml`), which nothing opened at all
+            /// before (issue #239). Pre-resolved here for the same reason
+            /// `media` is.
+            charts: std::collections::HashMap<String, Vec<String>>,
         }
         let mut bundles = Vec::with_capacity(presentation.slides.len());
         for (slide_idx, slide_id) in presentation.slides.iter().enumerate() {
@@ -219,6 +227,29 @@ impl PptxDocument {
                 media.insert(rel.id.clone(), (bytes, ext));
             }
 
+            // Pre-load and extract every embedded chart part the slide
+            // references (issue #239).
+            let mut charts = std::collections::HashMap::new();
+            for rel in slide_rels.all() {
+                if rel.rel_type != rel_types::CHART {
+                    continue;
+                }
+                let target = match part_name.resolve_relative(&rel.target) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if !opc.has_part(&target) {
+                    continue;
+                }
+                let Ok(data) = opc.read_part(&target) else {
+                    continue;
+                };
+                let lines = crate::core::chart::chart_text_lines(&data);
+                if !lines.is_empty() {
+                    charts.insert(rel.id.clone(), lines);
+                }
+            }
+
             // Comments hang off the slide's own relationships, both in the
             // legacy `comments` form and the newer `authors`+`modernComment`
             // pair. Neither part was ever read, so review notes on a deck
@@ -243,13 +274,15 @@ impl PptxDocument {
                 notes_data,
                 comments_data,
                 media,
+                charts,
             });
         }
 
         // Phase 2: parse slides (parallel when feature enabled)
         let slides = crate::core::parallel::map_collect(bundles, |b| -> Result<Slide> {
             let name = xml_csl_name(&b.slide_data);
-            let mut parsed = Slide::parse(&b.slide_data, name, &b.slide_rels, &b.media)?;
+            let mut parsed =
+                Slide::parse(&b.slide_data, name, &b.slide_rels, &b.media, &b.charts)?;
             if let Some(notes_data) = &b.notes_data {
                 parsed.notes = extract_notes_text(notes_data);
             }

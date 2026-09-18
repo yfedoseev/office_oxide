@@ -138,13 +138,25 @@ fn collect_text_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePositio
             Shape::Group(grp) => {
                 collect_text_entries(&grp.children, entries);
             },
-            Shape::GraphicFrame(gf) => {
-                if let GraphicContent::Table(ref tbl) = gf.content {
+            Shape::GraphicFrame(gf) => match &gf.content {
+                GraphicContent::Table(tbl) => {
                     let text = plain_text_from_table(tbl);
                     if !text.is_empty() {
                         entries.push((gf.position.clone(), text));
                     }
-                }
+                },
+                // SmartArt and embedded-chart text: `Document::plain_text()`
+                // dispatches here, a separate path from `to_ir()` (which
+                // already reads `GraphicContent::Text` correctly) — the
+                // same dual-renderer gap already hit for XLS dates (#233)
+                // and XLSX formulas (#279), this time for #239's own fix.
+                GraphicContent::Text(lines) => {
+                    let text = lines.join("\n");
+                    if !text.is_empty() {
+                        entries.push((gf.position.clone(), text));
+                    }
+                },
+                GraphicContent::Unknown => {},
             },
             Shape::Connector(_) => {},
         }
@@ -274,13 +286,20 @@ fn collect_markdown_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePos
             Shape::Group(grp) => {
                 collect_markdown_entries(&grp.children, entries);
             },
-            Shape::GraphicFrame(gf) => {
-                if let GraphicContent::Table(ref tbl) = gf.content {
+            Shape::GraphicFrame(gf) => match &gf.content {
+                GraphicContent::Table(tbl) => {
                     let md = markdown_table(tbl);
                     if !md.is_empty() {
                         entries.push((gf.position.clone(), md));
                     }
-                }
+                },
+                GraphicContent::Text(lines) => {
+                    let md = lines.join("\n");
+                    if !md.is_empty() {
+                        entries.push((gf.position.clone(), md));
+                    }
+                },
+                GraphicContent::Unknown => {},
             },
             Shape::Connector(_) => {},
         }
@@ -927,6 +946,37 @@ mod tests {
         let md = doc.slide_to_markdown(0).unwrap();
         assert!(md.contains("| Merged |  |"), "row 0 must show 2 columns: {md:?}");
         assert!(md.contains("| A | B |"), "row 1 must not shift left: {md:?}");
+    }
+
+    /// `Document::plain_text()`/`to_markdown()` dispatch to this module, a
+    /// separate path from `to_ir()` (which already read
+    /// `GraphicContent::Text` correctly). `GraphicContent::Text` covers
+    /// both SmartArt and embedded-chart text (#239) — neither reached
+    /// plain_text/markdown before this fix.
+    #[test]
+    fn graphic_content_text_reaches_plain_text_and_markdown() {
+        let doc = make_doc(vec![Slide {
+            name: String::new(),
+            shapes: vec![Shape::GraphicFrame(super::super::shape::GraphicFrame {
+                id: 1,
+                name: "Chart".to_string(),
+                position: Some(ShapePosition { x: 0, y: 0, cx: 9000, cy: 3000 }),
+                content: GraphicContent::Text(vec![
+                    "Title: Dollars per Group".to_string(),
+                    "Categories: Group 1, Group 2".to_string(),
+                ]),
+            })],
+            notes: None,
+            background_rgb: None,
+            ..Default::default()
+        }]);
+
+        let plain = doc.slide_plain_text(0).unwrap();
+        assert!(plain.contains("Dollars per Group"), "plain: {plain:?}");
+        assert!(plain.contains("Group 1, Group 2"), "plain: {plain:?}");
+
+        let md = doc.slide_to_markdown(0).unwrap();
+        assert!(md.contains("Dollars per Group"), "markdown: {md:?}");
     }
 
     #[test]

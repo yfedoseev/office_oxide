@@ -100,6 +100,7 @@ impl Slide {
         name: String,
         rels: &Relationships,
         media: &std::collections::HashMap<String, (Vec<u8>, String)>,
+        charts: &std::collections::HashMap<String, Vec<String>>,
     ) -> CoreResult<Self> {
         let mut reader = make_content_reader(xml_data);
         let mut shapes = Vec::new();
@@ -116,7 +117,7 @@ impl Slide {
                     background_rgb = parse_slide_bg(&mut reader)?;
                 },
                 Event::Start(ref e) if e.local_name().as_ref() == b"spTree" => {
-                    shapes = parse_shape_tree(&mut reader, rels, media)?;
+                    shapes = parse_shape_tree(&mut reader, rels, media, charts)?;
                 },
                 Event::Eof => break,
                 _ => {},
@@ -206,6 +207,7 @@ fn parse_shape_tree(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
     media: &std::collections::HashMap<String, (Vec<u8>, String)>,
+    charts: &std::collections::HashMap<String, Vec<String>>,
 ) -> CoreResult<Vec<Shape>> {
     let mut shapes = Vec::new();
 
@@ -214,8 +216,8 @@ fn parse_shape_tree(
             Event::Start(ref e) => match e.local_name().as_ref() {
                 b"sp" => shapes.push(parse_auto_shape(reader, rels)?),
                 b"pic" => shapes.push(parse_picture(reader, rels, media)?),
-                b"grpSp" => shapes.push(parse_group_shape(reader, rels, media)?),
-                b"graphicFrame" => shapes.push(parse_graphic_frame(reader, rels)?),
+                b"grpSp" => shapes.push(parse_group_shape(reader, rels, media, charts)?),
+                b"graphicFrame" => shapes.push(parse_graphic_frame(reader, rels, charts)?),
                 b"cxnSp" => shapes.push(parse_connector(reader)?),
                 _ => {
                     xml::skip_element_fast(reader)?;
@@ -405,6 +407,7 @@ fn parse_group_shape(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
     media: &std::collections::HashMap<String, (Vec<u8>, String)>,
+    charts: &std::collections::HashMap<String, Vec<String>>,
 ) -> CoreResult<Shape> {
     // Groups nest, so this is the recursion an adversarial deck drives.
     // Past the limit the subtree is skipped: a stack overflow aborts the
@@ -436,8 +439,8 @@ fn parse_group_shape(
                 },
                 b"sp" => children.push(parse_auto_shape(reader, rels)?),
                 b"pic" => children.push(parse_picture(reader, rels, media)?),
-                b"grpSp" => children.push(parse_group_shape(reader, rels, media)?),
-                b"graphicFrame" => children.push(parse_graphic_frame(reader, rels)?),
+                b"grpSp" => children.push(parse_group_shape(reader, rels, media, charts)?),
+                b"graphicFrame" => children.push(parse_graphic_frame(reader, rels, charts)?),
                 b"cxnSp" => children.push(parse_connector(reader)?),
                 _ => {
                     xml::skip_element_fast(reader)?;
@@ -501,9 +504,53 @@ fn collect_a_t_text(
     Ok(out)
 }
 
+/// Find `<c:chart r:id="…"/>`'s relationship id inside a `<a:graphicData>`
+/// subtree, reading through the matching `</end_local>` regardless of
+/// whether a chart reference was found (so the reader position stays
+/// correct either way).
+fn find_chart_rid(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    end_local: &[u8],
+) -> CoreResult<Option<String>> {
+    let mut rid = None;
+    let mut depth = 1i32;
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => {
+                if rid.is_none() && e.local_name().as_ref() == b"chart" {
+                    rid = xml::optional_attr_str(e, b"r:id")?
+                        .filter(|v| !v.is_empty())
+                        .map(|v| v.into_owned());
+                }
+                depth += 1;
+            },
+            Event::Empty(ref e) => {
+                if rid.is_none() && e.local_name().as_ref() == b"chart" {
+                    rid = xml::optional_attr_str(e, b"r:id")?
+                        .filter(|v| !v.is_empty())
+                        .map(|v| v.into_owned());
+                }
+            },
+            Event::End(ref e) => {
+                if e.local_name().as_ref() == end_local && depth <= 1 {
+                    break;
+                }
+                depth -= 1;
+                if depth <= 0 {
+                    break;
+                }
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(rid)
+}
+
 fn parse_graphic_frame(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
+    charts: &std::collections::HashMap<String, Vec<String>>,
 ) -> CoreResult<Shape> {
     let mut id = 0u32;
     let mut name = String::new();
@@ -530,11 +577,27 @@ fn parse_graphic_frame(
                             == Some("http://schemas.openxmlformats.org/drawingml/2006/table")
                         {
                             content = parse_graphic_data_table(reader, rels)?;
+                        } else if uri.as_deref()
+                            == Some("http://schemas.openxmlformats.org/drawingml/2006/chart")
+                        {
+                            // The slide XML holds only a reference —
+                            // <c:chart r:id="rIdN"/> — with no text of its
+                            // own; the title, axis labels, category names
+                            // and cached data values all live in the
+                            // separate part that id resolves to
+                            // (ppt/charts/chartN.xml), pre-read into
+                            // `charts` (issue #239).
+                            let rid = find_chart_rid(reader, b"graphicData")?;
+                            let texts = rid.and_then(|r| charts.get(&r)).cloned();
+                            content = match texts {
+                                Some(t) if !t.is_empty() => GraphicContent::Text(t),
+                                _ => GraphicContent::Unknown,
+                            };
                         } else {
-                            // Everything that is not a table — SmartArt
-                            // diagrams, charts, embedded objects — used to be
-                            // skipped wholesale. We can't render them, but
-                            // their `<a:t>` runs are document text.
+                            // Everything else — SmartArt diagrams, embedded
+                            // objects — used to be skipped wholesale along
+                            // with charts. We can't render them, but their
+                            // `<a:t>` runs are document text.
                             let texts = collect_a_t_text(reader, b"graphicData")?;
                             content = if texts.is_empty() {
                                 GraphicContent::Unknown
@@ -1515,8 +1578,13 @@ pub(crate) fn extract_notes_text(xml_data: &[u8]) -> Option<String> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"spTree" => {
-                shapes =
-                    parse_shape_tree(&mut reader, &rels, &std::collections::HashMap::new()).ok()?;
+                shapes = parse_shape_tree(
+                    &mut reader,
+                    &rels,
+                    &std::collections::HashMap::new(),
+                    &std::collections::HashMap::new(),
+                )
+                .ok()?;
             },
             Ok(Event::Eof) => break,
             Err(_) => break,
@@ -1616,7 +1684,7 @@ mod tests {
 
         let rels = Relationships::empty();
         let slide =
-            Slide::parse(&xml, "Slide1".to_string(), &rels, &std::collections::HashMap::new())
+            Slide::parse(&xml, "Slide1".to_string(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new())
                 .unwrap();
 
         assert_eq!(slide.shapes.len(), 1);
@@ -1673,7 +1741,7 @@ mod tests {
 </Relationships>"#;
         let rels = Relationships::parse(rels_xml).unwrap();
         let slide =
-            Slide::parse(&xml, "Slide1".to_string(), &rels, &std::collections::HashMap::new())
+            Slide::parse(&xml, "Slide1".to_string(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new())
                 .unwrap();
 
         assert_eq!(slide.shapes.len(), 1);
@@ -1717,7 +1785,7 @@ mod tests {
 </Relationships>"#;
         let rels = Relationships::parse(rels_xml).unwrap();
         let slide =
-            Slide::parse(&xml, "Slide1".to_string(), &rels, &std::collections::HashMap::new())
+            Slide::parse(&xml, "Slide1".to_string(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new())
                 .unwrap();
 
         assert_eq!(slide.shapes.len(), 1);
@@ -1755,7 +1823,7 @@ mod tests {
         );
         let rels = Relationships::empty();
         let slide =
-            Slide::parse(&xml, "Slide1".to_string(), &rels, &std::collections::HashMap::new())
+            Slide::parse(&xml, "Slide1".to_string(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new())
                 .unwrap();
 
         assert_eq!(slide.shapes.len(), 1);
@@ -1769,6 +1837,100 @@ mod tests {
         match &hl.target {
             HyperlinkTarget::Internal(action) => assert_eq!(action, "ppaction://noaction"),
             other => panic!("expected an Internal action target, got {other:?}"),
+        }
+    }
+
+    /// The slide XML only ever holds `<c:chart r:id="…"/>` — a reference,
+    /// no text — so `parse_graphic_frame` must resolve it against the
+    /// pre-extracted `charts` map (keyed by that same rId) rather than
+    /// finding nothing via the generic `<a:t>` scan every other
+    /// non-table graphic falls back to (issue #239). XML shape matches
+    /// a real corpus file (docx4j_pptx-chart.pptx) byte-for-byte on the
+    /// graphicData/c:chart structure.
+    #[test]
+    fn parse_graphic_frame_resolves_chart_text_from_the_charts_map() {
+        let xml = make_slide_xml(
+            r#"<p:graphicFrame>
+  <p:nvGraphicFramePr>
+    <p:cNvPr id="5" name="Test Chart"/>
+    <p:cNvGraphicFramePr/>
+    <p:nvPr/>
+  </p:nvGraphicFramePr>
+  <p:xfrm><a:off x="0" y="0"/><a:ext cx="100" cy="100"/></p:xfrm>
+  <a:graphic>
+    <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">
+      <c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+               xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+               r:id="rId2"/>
+    </a:graphicData>
+  </a:graphic>
+</p:graphicFrame>"#,
+        );
+        let mut charts = std::collections::HashMap::new();
+        charts.insert(
+            "rId2".to_string(),
+            vec!["Title: Dollars per Group".to_string(), "Categories: Group 1, Group 2".to_string()],
+        );
+
+        let slide = Slide::parse(
+            &xml,
+            String::new(),
+            &Relationships::empty(),
+            &std::collections::HashMap::new(),
+            &charts,
+        )
+        .unwrap();
+
+        match &slide.shapes[0] {
+            Shape::GraphicFrame(gf) => match &gf.content {
+                GraphicContent::Text(lines) => {
+                    assert!(lines.contains(&"Title: Dollars per Group".to_string()), "{lines:?}");
+                    assert!(
+                        lines.contains(&"Categories: Group 1, Group 2".to_string()),
+                        "{lines:?}"
+                    );
+                },
+                other => panic!("expected GraphicContent::Text, got {other:?}"),
+            },
+            other => panic!("expected a GraphicFrame shape, got {other:?}"),
+        }
+    }
+
+    /// No relationship in `charts` for the rId (e.g. the chart part failed
+    /// to open) must not panic — just fall through to Unknown, same as any
+    /// other unresolvable graphic.
+    #[test]
+    fn parse_graphic_frame_chart_with_no_matching_charts_entry_is_unknown() {
+        let xml = make_slide_xml(
+            r#"<p:graphicFrame>
+  <p:nvGraphicFramePr>
+    <p:cNvPr id="5" name="Test Chart"/>
+    <p:cNvGraphicFramePr/>
+    <p:nvPr/>
+  </p:nvGraphicFramePr>
+  <p:xfrm><a:off x="0" y="0"/><a:ext cx="100" cy="100"/></p:xfrm>
+  <a:graphic>
+    <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">
+      <c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+               xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+               r:id="rId2"/>
+    </a:graphicData>
+  </a:graphic>
+</p:graphicFrame>"#,
+        );
+        let slide = Slide::parse(
+            &xml,
+            String::new(),
+            &Relationships::empty(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+        match &slide.shapes[0] {
+            Shape::GraphicFrame(gf) => {
+                assert!(matches!(gf.content, GraphicContent::Unknown));
+            },
+            other => panic!("expected a GraphicFrame shape, got {other:?}"),
         }
     }
 
@@ -1804,7 +1966,7 @@ mod tests {
 
         let rels = Relationships::empty();
         let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new()).unwrap();
+            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
 
         assert_eq!(slide.shapes.len(), 1);
         if let Shape::Group(ref grp) = slide.shapes[0] {
@@ -1879,7 +2041,7 @@ mod tests {
 
         let rels = Relationships::empty();
         let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new()).unwrap();
+            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
 
         assert_eq!(slide.shapes.len(), 1);
         if let Shape::GraphicFrame(ref gf) = slide.shapes[0] {
@@ -1921,7 +2083,7 @@ mod tests {
 
         let rels = Relationships::empty();
         let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new()).unwrap();
+            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
 
         assert_eq!(slide.shapes.len(), 1);
         if let Shape::Picture(ref pic) = slide.shapes[0] {
@@ -1956,7 +2118,7 @@ mod tests {
 
         let rels = Relationships::empty();
         let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new()).unwrap();
+            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
 
         assert_eq!(slide.shapes.len(), 1);
         if let Shape::Connector(ref cxn) = slide.shapes[0] {
@@ -1993,7 +2155,7 @@ mod tests {
 
         let rels = Relationships::empty();
         let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new()).unwrap();
+            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
 
         if let Shape::AutoShape(ref auto) = slide.shapes[0] {
             let tb = auto.text_body.as_ref().unwrap();
@@ -2030,7 +2192,7 @@ mod tests {
 
         let rels = Relationships::empty();
         let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new()).unwrap();
+            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
 
         if let Shape::AutoShape(ref auto) = slide.shapes[0] {
             let tb = auto.text_body.as_ref().unwrap();
@@ -2110,7 +2272,7 @@ mod tests {
 
         let rels = Relationships::empty();
         let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new()).unwrap();
+            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
         if let Shape::AutoShape(ref a) = slide.shapes[0] {
             let tb = a.text_body.as_ref().unwrap();
             if let TextContent::Run(ref r) = tb.paragraphs[0].content[0] {
@@ -2138,7 +2300,7 @@ mod tests {
 
         let rels = Relationships::empty();
         let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new()).unwrap();
+            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
         if let Shape::AutoShape(ref a) = slide.shapes[0] {
             let tb = a.text_body.as_ref().unwrap();
             if let TextContent::Run(ref r) = tb.paragraphs[0].content[0] {
@@ -2166,7 +2328,7 @@ mod tests {
 
         let rels = Relationships::empty();
         let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new()).unwrap();
+            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
         if let Shape::AutoShape(ref a) = slide.shapes[0] {
             let para = &a.text_body.as_ref().unwrap().paragraphs[0];
             assert_eq!(para.alignment, Some(ParagraphAlignment::Center));
@@ -2202,6 +2364,7 @@ mod tests {
                 String::new(),
                 &Relationships::empty(),
                 &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
             )
             .unwrap();
             if let Shape::AutoShape(ref a) = slide.shapes[0] {
@@ -2231,7 +2394,7 @@ mod tests {
 
         let rels = Relationships::empty();
         let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new()).unwrap();
+            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
         if let Shape::AutoShape(ref a) = slide.shapes[0] {
             let para = &a.text_body.as_ref().unwrap().paragraphs[0];
             assert_eq!(para.space_before_hundredths_pt, Some(1200));
@@ -2261,7 +2424,14 @@ mod tests {
         let mut media = std::collections::HashMap::new();
         media.insert("rId7".to_string(), (vec![0xDEu8, 0xADu8, 0xBEu8, 0xEFu8], "png".to_string()));
 
-        let slide = Slide::parse(&xml, String::new(), &Relationships::empty(), &media).unwrap();
+        let slide = Slide::parse(
+            &xml,
+            String::new(),
+            &Relationships::empty(),
+            &media,
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         if let Shape::Picture(ref pic) = slide.shapes[0] {
             assert_eq!(pic.embed_rid.as_deref(), Some("rId7"));
             assert_eq!(pic.data.as_deref(), Some(&[0xDEu8, 0xADu8, 0xBEu8, 0xEFu8][..]));
@@ -2292,6 +2462,7 @@ mod tests {
             &xml,
             String::new(),
             &Relationships::empty(),
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         )
         .unwrap();
@@ -2326,6 +2497,7 @@ mod tests {
             String::new(),
             &Relationships::empty(),
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         )
         .unwrap();
         assert_eq!(slide.background_rgb, Some([0xFF, 0x88, 0x00]));
@@ -2338,6 +2510,7 @@ mod tests {
             &xml,
             String::new(),
             &Relationships::empty(),
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
         )
         .unwrap();
