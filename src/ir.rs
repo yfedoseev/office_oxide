@@ -617,6 +617,82 @@ pub enum Element {
     Shape(Shape),
 }
 
+/// Work item for `Element`'s iterative `Drop`: either a child `Element`
+/// still holding its own subtree, or a batch of `ListItem`s (which recurse
+/// through `List` rather than `Element`, so they need their own case).
+enum DropWork {
+    Elem(Element),
+    Items(Vec<ListItem>),
+}
+
+/// Move every `Element` (and `ListItem`) directly reachable from `elem`
+/// onto `stack`, leaving `elem`'s own recursive fields empty. Used by both
+/// `Drop for Element` and the `List` arm below — see that impl for why
+/// this can't just be normal field access.
+fn drain_element_children(elem: &mut Element, stack: &mut Vec<DropWork>) {
+    match elem {
+        Element::TextBox(tb) => stack.extend(std::mem::take(&mut tb.content).into_iter().map(DropWork::Elem)),
+        Element::Footnote(n) | Element::Endnote(n) => {
+            stack.extend(std::mem::take(&mut n.content).into_iter().map(DropWork::Elem));
+        },
+        Element::Table(t) => {
+            for row in &mut t.rows {
+                for cell in &mut row.cells {
+                    stack.extend(std::mem::take(&mut cell.content).into_iter().map(DropWork::Elem));
+                }
+            }
+        },
+        Element::List(l) => stack.push(DropWork::Items(std::mem::take(&mut l.items))),
+        // No Vec<Element> (or List) field to drain: Heading/Paragraph hold
+        // only InlineContent, and Image/ThematicBreak/PageBreak/
+        // ColumnBreak/CodeBlock/Shape hold none. A future non_exhaustive
+        // variant that adds one just doesn't get the iterative treatment
+        // (falls back to the compiler's normal recursive drop for that
+        // one field) — safe, not a soundness regression, only a missed
+        // optimization for that specific new shape.
+        _ => {},
+    }
+}
+
+impl Drop for Element {
+    /// `DocumentIR` is `Deserialize`, so an `Element` tree can arrive from
+    /// anywhere, including untrusted input, at depths well past what the
+    /// bounded readers/writers ever produce themselves. The default
+    /// compiler-generated drop glue recurses through every nested
+    /// `Vec<Element>` (`TextBox`/`Footnote`/`Endnote`/`Table` cells/`List`
+    /// items, and `List` nests further through `ListItem::nested`), so a
+    /// sufficiently deep value overflowed the stack on drop independent of
+    /// any writer's own depth guard — an abort, not a catchable error
+    /// (issue #218's "Additional context"). This walks the tree with an
+    /// explicit heap-allocated stack instead of the call stack: every
+    /// popped node's own children are drained into the stack *before* it
+    /// is allowed to actually drop, so that drop is O(1) rather than
+    /// recursive.
+    fn drop(&mut self) {
+        let mut stack = Vec::new();
+        drain_element_children(self, &mut stack);
+        while let Some(work) = stack.pop() {
+            match work {
+                DropWork::Elem(mut e) => {
+                    drain_element_children(&mut e, &mut stack);
+                    // `e` drops here: its own Vec<Element>/List fields are
+                    // now empty, so this is shallow, not recursive.
+                },
+                DropWork::Items(items) => {
+                    for mut item in items {
+                        stack.extend(std::mem::take(&mut item.content).into_iter().map(DropWork::Elem));
+                        if let Some(nested) = item.nested.take() {
+                            stack.push(DropWork::Items(nested.items));
+                        }
+                        // `item` drops here: content is empty and nested
+                        // is None, so this is shallow too.
+                    }
+                },
+            }
+        }
+    }
+}
+
 /// A vector shape anchored at absolute page coordinates.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1196,6 +1272,45 @@ pub struct Image {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// issue #218 ("Additional context") — the compiler-generated drop
+    /// glue recurses through every nested Vec<Element>, so a sufficiently
+    /// deep value overflowed the stack on drop alone, independent of any
+    /// writer's own depth guard (DocumentIR is Deserialize, so this can
+    /// arrive from untrusted input). 100,000 levels of TextBox nesting
+    /// would abort a normal thread's stack under the old recursive drop
+    /// (256 levels was already enough to abort a 2 MiB thread per the
+    /// DepthGuard doc comment) and must complete instantly under the new
+    /// iterative one.
+    #[test]
+    fn test_deeply_nested_element_drops_without_stack_overflow() {
+        let mut inner = Element::Paragraph(Paragraph::default());
+        for _ in 0..100_000 {
+            inner = Element::TextBox(TextBox {
+                content: vec![inner],
+                ..Default::default()
+            });
+        }
+        drop(inner); // must not abort the process
+    }
+
+    /// Same shape, but recursing through `List`/`ListItem::nested`
+    /// instead of `TextBox` — the second recursive path `Drop for
+    /// Element` has to flatten.
+    #[test]
+    fn test_deeply_nested_list_drops_without_stack_overflow() {
+        let mut list = List::default();
+        for _ in 0..100_000 {
+            list = List {
+                items: vec![ListItem {
+                    content: vec![],
+                    nested: Some(list),
+                }],
+                ..Default::default()
+            };
+        }
+        drop(Element::List(list)); // must not abort the process
+    }
 
     // ── first_inline_font_size_pt ────────────────────────────────────
 
