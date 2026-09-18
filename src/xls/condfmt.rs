@@ -20,7 +20,7 @@
 use crate::ir::ConditionalFormat;
 
 /// Convert a 0-based column index to a letter string: 0 -> "A", 25 -> "Z".
-fn col_name(col: u16) -> String {
+pub(crate) fn col_name(col: u16) -> String {
     let mut result = Vec::new();
     let mut n = col as u32 + 1;
     while n > 0 {
@@ -34,7 +34,7 @@ fn col_name(col: u16) -> String {
 
 /// Format a 0-based `(row, col)` pair as `"A1"`-style, and a range as
 /// `"A1:B2"` (or just `"A1"` when the range is a single cell).
-fn range_ref(row_first: u16, row_last: u16, col_first: u16, col_last: u16) -> String {
+pub(crate) fn range_ref(row_first: u16, row_last: u16, col_first: u16, col_last: u16) -> String {
     let first = format!("{}{}", col_name(col_first), row_first + 1);
     if row_first == row_last && col_first == col_last {
         first

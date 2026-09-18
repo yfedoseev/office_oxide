@@ -38,6 +38,14 @@ fn ir_to_json(ir: &office_oxide::DocumentIR) -> serde_json::Value {
                     "operator": cf.operator,
                     "formulas": cf.formulas,
                 })).collect::<Vec<_>>(),
+                "data_validations": s.data_validations.iter().map(|dv| json!({
+                    "range": dv.range,
+                    "validation_type": dv.validation_type,
+                    "operator": dv.operator,
+                    "formula1": dv.formula1,
+                    "formula2": dv.formula2,
+                    "allow_blank": dv.allow_blank,
+                })).collect::<Vec<_>>(),
                 "elements": s.elements.iter().map(element_to_json).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>(),
@@ -394,6 +402,39 @@ mod tests {
         assert!(
             rendered.contains(r#""range":"A1:A10""#) && rendered.contains(r#""rule_type":"cellIs""#),
             "the ir command's JSON projection must include Section::conditional_formats: {rendered}"
+        );
+    }
+
+    /// issue #275 — a worksheet's data validation rules must reach the
+    /// `ir` command's JSON output.
+    #[test]
+    fn test_data_validations_reach_the_json_projection() {
+        let ir = DocumentIR {
+            metadata: Metadata {
+                format: DocumentFormat::Xlsx,
+                title: None,
+                ..Default::default()
+            },
+            sections: vec![Section {
+                data_validations: vec![office_oxide::ir::DataValidation {
+                    range: "A1:A10".to_string(),
+                    validation_type: "whole".to_string(),
+                    operator: Some("between".to_string()),
+                    formula1: Some("1".to_string()),
+                    formula2: Some("10".to_string()),
+                    allow_blank: true,
+                }],
+                ..Default::default()
+            }],
+            defined_names: Vec::new(),
+        };
+        let json = ir_to_json(&ir);
+        let rendered = serde_json::to_string(&json).unwrap();
+        assert!(
+            rendered.contains(r#""range":"A1:A10""#)
+                && rendered.contains(r#""validation_type":"whole""#)
+                && rendered.contains(r#""allow_blank":true"#),
+            "the ir command's JSON projection must include Section::data_validations: {rendered}"
         );
     }
 }

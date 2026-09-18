@@ -11,6 +11,7 @@
 
 mod cell;
 mod condfmt;
+mod data_validation;
 mod error;
 pub mod images;
 mod records;

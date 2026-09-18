@@ -42,6 +42,10 @@ pub const RT_CONDFMT: u16 = 0x01B0;
 /// preceding `CONDFMT` ([MS-XLS] §2.4.42, record type 433 = 0x1B1).
 pub const RT_CF: u16 = 0x01B1;
 
+/// One data validation rule ([MS-XLS] §2.4.44, record type 446 = 0x1BE).
+/// Issue #275.
+pub const RT_DV: u16 = 0x01BE;
+
 /// A raw BIFF record: type + data (may span CONTINUE records).
 #[derive(Debug, Clone)]
 pub struct BiffRecord {

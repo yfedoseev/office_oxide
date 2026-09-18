@@ -198,6 +198,7 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
             // contract `convert_xlsx` already honours.
             hidden: sheet.hidden,
             conditional_formats: sheet.conditional_formats.clone(),
+            data_validations: sheet.data_validations.clone(),
             ..Default::default()
         });
     }

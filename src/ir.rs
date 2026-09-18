@@ -607,6 +607,45 @@ pub struct ConditionalFormat {
     pub formulas: Vec<String>,
 }
 
+/// A data validation rule from a worksheet (XLSX `<dataValidation>`, XLS
+/// `DV` records grouped under a `DVAL`).
+///
+/// Same scope tier as [`ConditionalFormat`] (issue #252): an
+/// awareness/scope gap, not a value-correctness one — no cell's own value
+/// is affected by a validation rule being invisible, only the fact the
+/// workbook defines the constraint at all. XLS's `formula1`/`formula2` are
+/// RPN byte-code token arrays, not text, and this crate has no general
+/// formula disassembler anywhere (same limitation already documented on
+/// `ConditionalFormat` for XLS's `CF` records); the type/operator/range/
+/// allow-blank metadata is still extracted, but XLS's `formula1`/
+/// `formula2` are always `None`. XLSX's `<formula1>`/`<formula2>` are
+/// already plain text in the XML and are populated directly (issue #275).
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct DataValidation {
+    /// The cell range(s) this rule applies to, e.g. `"A1:B10"` or a
+    /// space-separated multi-range sqref like `"A1:A5 C1:C5"`.
+    pub range: String,
+    /// Validation type, using XLSX's own `type` attribute vocabulary:
+    /// `"whole"`, `"decimal"`, `"list"`, `"date"`, `"time"`,
+    /// `"textLength"`, `"custom"`, or `"none"` (no restriction, just a
+    /// prompt/error message). XLS's numeric type code is mapped onto it.
+    pub validation_type: String,
+    /// The comparison operator, when the type uses one (e.g.
+    /// `"between"`, `"greaterThan"`). `None` for types with no operator
+    /// (`"list"`, `"custom"`, `"none"`).
+    pub operator: Option<String>,
+    /// The first comparison value / formula / explicit list source (e.g.
+    /// `"Yes,No,Maybe"` for an inline list, or a cell reference/formula).
+    /// `None` for XLS (see the type's own doc); populated for XLSX.
+    pub formula1: Option<String>,
+    /// The second comparison value, used only by the `"between"`/
+    /// `"notBetween"` operators. `None` otherwise, and always `None` for
+    /// XLS.
+    pub formula2: Option<String>,
+    /// Whether an empty cell is considered valid (`allowBlank`).
+    pub allow_blank: bool,
+}
+
 /// A logical section (DOCX: section break, XLSX: worksheet, PPTX: slide).
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Section {
@@ -660,6 +699,11 @@ pub struct Section {
     /// defines none (issue #252).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditional_formats: Vec<ConditionalFormat>,
+    /// Data validation rules defined on this worksheet (XLSX/XLS only).
+    /// Empty for every other format, and for a worksheet that defines
+    /// none (issue #275).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_validations: Vec<DataValidation>,
 }
 
 /// A block-level content element.

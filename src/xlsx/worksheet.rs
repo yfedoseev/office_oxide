@@ -37,6 +37,9 @@ pub struct Worksheet {
     /// Conditional formatting rules from `<conditionalFormatting>`/
     /// `<cfRule>`. Empty when the worksheet defines none (issue #252).
     pub conditional_formats: Vec<crate::ir::ConditionalFormat>,
+    /// Data validation rules from `<dataValidations>`/`<dataValidation>`.
+    /// Empty when the worksheet defines none (issue #275).
+    pub data_validations: Vec<crate::ir::DataValidation>,
 }
 
 /// One cell comment from `xl/comments*.xml`.
@@ -226,6 +229,7 @@ impl Worksheet {
         let mut page_setup_raw: Option<PageSetupRaw> = None;
         let mut shared = SharedFormulas::default();
         let mut conditional_formats = Vec::new();
+        let mut data_validations = Vec::new();
 
         loop {
             match reader.read_event()? {
@@ -263,6 +267,9 @@ impl Worksheet {
                     },
                     b"conditionalFormatting" => {
                         conditional_formats.extend(parse_conditional_formatting(&mut reader, e)?);
+                    },
+                    b"dataValidations" => {
+                        data_validations.extend(parse_data_validations(&mut reader)?);
                     },
                     _ => {},
                 },
@@ -321,6 +328,7 @@ impl Worksheet {
             images: Vec::new(),
             text_shapes: Vec::new(),
             conditional_formats,
+            data_validations,
         })
     }
 }
@@ -406,6 +414,80 @@ fn read_cf_rule_formulas(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::
         }
     }
     Ok(formulas)
+}
+
+/// Read the contents of `<dataValidations>` (already positioned just past
+/// its Start event): every `<dataValidation sqref="..." type="..."
+/// operator="...">` child, up through the matching `</dataValidations>`.
+fn parse_data_validations(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> crate::core::Result<Vec<crate::ir::DataValidation>> {
+    use quick_xml::events::Event;
+    let mut out = Vec::new();
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) if e.local_name().as_ref() == b"dataValidation" => {
+                out.push(parse_data_validation_with_body(reader, e)?);
+            },
+            Event::Empty(ref e) if e.local_name().as_ref() == b"dataValidation" => {
+                out.push(data_validation_from_attrs(e)?);
+            },
+            Event::End(ref e) if e.local_name().as_ref() == b"dataValidations" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(out)
+}
+
+/// The attributes shared by both the Start and Empty forms of
+/// `<dataValidation>`: `sqref`, `type` (default `"none"`), `operator`
+/// (default `"between"`, only meaningful for types that use one — same
+/// `None`-for-list/custom/none convention as the XLS reader), and
+/// `allowBlank`.
+fn data_validation_from_attrs(
+    e: &quick_xml::events::BytesStart,
+) -> crate::core::Result<crate::ir::DataValidation> {
+    let range = xml::optional_attr_str(e, b"sqref")?.map(|v| v.into_owned()).unwrap_or_default();
+    let validation_type =
+        xml::optional_attr_str(e, b"type")?.map(|v| v.into_owned()).unwrap_or_else(|| "none".to_string());
+    let operator = if matches!(validation_type.as_str(), "list" | "custom" | "none") {
+        None
+    } else {
+        Some(
+            xml::optional_attr_str(e, b"operator")?
+                .map(|v| v.into_owned())
+                .unwrap_or_else(|| "between".to_string()),
+        )
+    };
+    let allow_blank = xml::optional_attr_str(e, b"allowBlank")?.as_deref() == Some("1");
+    Ok(crate::ir::DataValidation { range, validation_type, operator, formula1: None, formula2: None, allow_blank })
+}
+
+/// The Start form of `<dataValidation>` additionally carries `<formula1>`/
+/// `<formula2>` children (a comparison value, an explicit list source
+/// like `"Yes,No,Maybe"`, or a cell-range/formula reference) up through
+/// the matching `</dataValidation>`.
+fn parse_data_validation_with_body(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    start: &quick_xml::events::BytesStart,
+) -> crate::core::Result<crate::ir::DataValidation> {
+    use quick_xml::events::Event;
+    let mut dv = data_validation_from_attrs(start)?;
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) if e.local_name().as_ref() == b"formula1" => {
+                dv.formula1 = Some(xml::read_text_content_fast(reader)?);
+            },
+            Event::Start(ref e) if e.local_name().as_ref() == b"formula2" => {
+                dv.formula2 = Some(xml::read_text_content_fast(reader)?);
+            },
+            Event::End(ref e) if e.local_name().as_ref() == b"dataValidation" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(dv)
 }
 
 /// Raw `<pageMargins>` values in inches (per ECMA-376 §18.3.1.62).
@@ -1074,6 +1156,84 @@ mod tests {
 </worksheet>"#;
         let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
         assert!(ws.conditional_formats.is_empty());
+    }
+
+    /// issue #275 — a `whole`/`between` rule's sqref, type, operator, both
+    /// comparison formulas, and `allowBlank` must all reach the IR.
+    #[test]
+    fn test_data_validation_whole_between_rule_reaches_the_ir() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+  <dataValidations count="1">
+    <dataValidation type="whole" operator="between" allowBlank="1" sqref="A1:A10">
+      <formula1>1</formula1>
+      <formula2>10</formula2>
+    </dataValidation>
+  </dataValidations>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.data_validations.len(), 1);
+        let dv = &ws.data_validations[0];
+        assert_eq!(dv.range, "A1:A10");
+        assert_eq!(dv.validation_type, "whole");
+        assert_eq!(dv.operator.as_deref(), Some("between"));
+        assert_eq!(dv.formula1.as_deref(), Some("1"));
+        assert_eq!(dv.formula2.as_deref(), Some("10"));
+        assert!(dv.allow_blank);
+    }
+
+    /// A `list` rule's explicit inline source (`"Yes,No,Maybe"`) must
+    /// reach `formula1` verbatim, and `list` carries no operator.
+    #[test]
+    fn test_data_validation_list_rule_has_no_operator() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="B1"><v>1</v></c></row></sheetData>
+  <dataValidations count="1">
+    <dataValidation type="list" allowBlank="0" sqref="B1:B5">
+      <formula1>"Yes,No,Maybe"</formula1>
+    </dataValidation>
+  </dataValidations>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.data_validations.len(), 1);
+        let dv = &ws.data_validations[0];
+        assert_eq!(dv.validation_type, "list");
+        assert!(dv.operator.is_none());
+        assert_eq!(dv.formula1.as_deref(), Some("\"Yes,No,Maybe\""));
+        assert!(!dv.allow_blank);
+    }
+
+    /// The childless Empty-tag form (`<dataValidation .../>`, no
+    /// `<formula1>`) must still parse its attributes correctly.
+    #[test]
+    fn test_data_validation_empty_tag_form_still_parses_attrs() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="C1"><v>1</v></c></row></sheetData>
+  <dataValidations count="1">
+    <dataValidation type="textLength" operator="lessThanOrEqual" sqref="C1:C5"/>
+  </dataValidations>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.data_validations.len(), 1);
+        let dv = &ws.data_validations[0];
+        assert_eq!(dv.validation_type, "textLength");
+        assert_eq!(dv.operator.as_deref(), Some("lessThanOrEqual"));
+        assert!(dv.formula1.is_none());
+    }
+
+    /// A sheet with no `<dataValidations>` at all must produce an empty
+    /// list, not an error.
+    #[test]
+    fn test_no_data_validations_is_an_empty_list() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert!(ws.data_validations.is_empty());
     }
 
     /// Turning trimming off for the inline-string body must not leak into
