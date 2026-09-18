@@ -112,6 +112,74 @@ fn docx_heading_not_first_element_does_not_duplicate_on_roundtrip() {
     );
 }
 
+/// issue #264 — independent text boxes on one slide must not merge into
+/// one (or spawn a spurious empty one) on a write→reread round trip;
+/// each keeps its own position.
+#[test]
+fn pptx_independent_text_boxes_stay_independent_on_roundtrip() {
+    use office_oxide::ir::{Element, InlineContent, Metadata, Paragraph, Section, TextBox, TextSpan};
+
+    fn textbox(text: &str, x: i64) -> Element {
+        Element::TextBox(TextBox {
+            content: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(text))],
+                ..Default::default()
+            })],
+            x_emu: Some(x),
+            y_emu: Some(500_000),
+            width_emu: Some(2_000_000),
+            height_emu: Some(500_000),
+            ..Default::default()
+        })
+    }
+
+    let ir = DocumentIR {
+        metadata: Metadata { format: DocumentFormat::Pptx, ..Default::default() },
+        sections: vec![Section {
+            elements: vec![
+                textbox("Text Box", 0),
+                textbox("Aspose.Slides for .NET", 2_500_000),
+                textbox("Welcome", 5_000_000),
+            ],
+            ..Default::default()
+        }],
+        defined_names: Vec::new(),
+    };
+
+    let (ir1, _) = write_parse(&ir, DocumentFormat::Pptx);
+    let box_count =
+        ir1.sections[0].elements.iter().filter(|e| matches!(e, Element::TextBox(_))).count();
+    assert_eq!(
+        box_count, 3,
+        "expected 3 independent text boxes, got {box_count}: {:?}",
+        ir1.sections[0]
+    );
+
+    let texts: Vec<String> = ir1
+        .sections[0]
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            Element::TextBox(tb) => tb.content.iter().find_map(|inner| match inner {
+                Element::Paragraph(p) => Some(
+                    p.content
+                        .iter()
+                        .filter_map(|c| match c {
+                            InlineContent::Text(t) => Some(t.text.clone()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .collect();
+    assert!(texts.contains(&"Text Box".to_string()), "{texts:?}");
+    assert!(texts.contains(&"Aspose.Slides for .NET".to_string()), "{texts:?}");
+    assert!(texts.contains(&"Welcome".to_string()), "{texts:?}");
+}
+
 /// issue #259's PPTX analogue — the title heading duplicating into the
 /// slide body when it isn't the section's first element.
 #[test]

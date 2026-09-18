@@ -998,12 +998,71 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
             slide.add_rich_text(&[run]);
         },
         Element::TextBox(tb) => {
-            // The PPTX parser wraps a slide's body placeholder content in a
-            // TextBox. Emit its inner block content back into the slide body;
-            // without this arm the body (bullets, paragraphs) was silently
-            // dropped on a write→parse cycle.
+            // A `TextBox` in the IR only ever exists because the reader
+            // saw a real `<a:xfrm>` on the source shape (see
+            // `push_positional_textbox` in convert_pptx.rs — content
+            // without one flows as plain elements and is never wrapped
+            // at all). This includes a body PLACEHOLDER that happens to
+            // inherit a real position, which is why a `List`/`Table` can
+            // show up as a TextBox's content too, not just a genuine
+            // free-floating text box.
+            //
+            // Flattening everything into the generic slide-body stream
+            // (the old behavior) threw the box's own position away and
+            // merged multiple independent text boxes' content into one
+            // undifferentiated stream — or conjured a spurious empty box
+            // out of unrelated body content once that flattening was
+            // "fixed" to stop dropping text (issue #264). Paragraph/
+            // Heading content — the common "this really is just a text
+            // box" case — is now emitted as its own positioned shape,
+            // the same way `Element::Image` already does. A nested
+            // `List`/`Table`/`TextBox` — which has no positioned
+            // representation of its own here — still flattens into the
+            // body stream as before, preserving its own structure rather
+            // than losing it to plain text (and keeping write→parse
+            // idempotent: a body placeholder wrapping a bulleted list
+            // reads back into the same TextBox{List} shape either way).
+            let mut paragraphs = Vec::new();
             for inner in &tb.content {
-                emit_pptx_element(slide, inner);
+                match inner {
+                    Element::Paragraph(_) | Element::Heading(_) => {
+                        let single = std::slice::from_ref(inner);
+                        paragraphs.extend(textbox_content_to_pptx_paragraphs(single));
+                    },
+                    // `Element::Image`'s own arm always anchors at (0, 0)
+                    // — routing it through `emit_pptx_element` like the
+                    // other fallback cases would silently move it there,
+                    // discarding the *wrapping* text box's real position
+                    // (issue #264 — confirmed on real corpus files: a
+                    // positioned image inside a TextBox lost its position
+                    // and stopped counting as a positioned shape at all).
+                    Element::Image(img) => {
+                        if let (Some(data), Some(fmt)) = (&img.data, &img.format) {
+                            let cx =
+                                img.display_width_emu.unwrap_or(tb.width_emu.unwrap_or(3_000_000));
+                            let cy = img
+                                .display_height_emu
+                                .unwrap_or(tb.height_emu.unwrap_or(2_000_000));
+                            slide.add_image_with_alt(
+                                data.clone(),
+                                fmt.clone(),
+                                tb.x_emu.unwrap_or(0),
+                                tb.y_emu.unwrap_or(0),
+                                cx,
+                                cy,
+                                img.alt_text.clone(),
+                            );
+                        }
+                    },
+                    _ => emit_pptx_element(slide, inner),
+                }
+            }
+            if !paragraphs.is_empty() {
+                let x = tb.x_emu.unwrap_or(0);
+                let y = tb.y_emu.unwrap_or(0);
+                let cx = tb.width_emu.map(|w| w as i64).unwrap_or(3_000_000);
+                let cy = tb.height_emu.map(|h| h as i64).unwrap_or(500_000);
+                slide.add_multi_paragraph_text_box(paragraphs, x, y, cx, cy);
             }
         },
         // Footnote and endnote bodies have no slide equivalent, but their
@@ -1423,6 +1482,57 @@ fn xlsx_cell_style(
     } else {
         None
     }
+}
+
+/// Convert a `TextBox`'s block content into the `(runs, ParaProps)`
+/// pairs `SlideData::add_multi_paragraph_text_box` needs (issue #264).
+///
+/// Handles `Paragraph`/`Heading` (the common case — a real text box's
+/// content is ordinary flowed paragraphs) as real paragraphs, each with
+/// its own alignment/spacing carried through the same way
+/// `emit_pptx_element`'s own `Element::Paragraph` arm does. Anything
+/// else (a table, list, or nested text box inside a text box — rare)
+/// falls back to one plain-text paragraph via `inline_to_text`-style
+/// flattening, so it isn't silently dropped, at the cost of its own
+/// rich formatting.
+/// Convert `Paragraph`/`Heading` elements into the `(runs, ParaProps)`
+/// pairs `SlideData::add_multi_paragraph_text_box` needs (issue #264).
+/// Callers only pass paragraph-like content here — a nested `List`/
+/// `Table`/`TextBox` inside a `TextBox` is emitted separately (see
+/// `emit_pptx_element`'s own `Element::TextBox` arm), since it has no
+/// positioned representation of its own and collapsing it to plain text
+/// would both lose its structure and break write→parse idempotence for
+/// the common "body placeholder wrapped in a TextBox" case.
+fn textbox_content_to_pptx_paragraphs(
+    content: &[Element],
+) -> Vec<(Vec<crate::pptx::write::Run>, crate::pptx::write::ParaProps)> {
+    let mut out = Vec::new();
+    for elem in content {
+        match elem {
+            Element::Paragraph(p) => {
+                let runs = inline_to_pptx_runs(&p.content);
+                if !runs.is_empty() {
+                    let props = crate::pptx::write::ParaProps {
+                        alignment: p.alignment.clone(),
+                        space_before_hundredths_pt: p.space_before_twips.map(|t| t * 5),
+                    };
+                    out.push((runs, props));
+                }
+            },
+            Element::Heading(h) => {
+                let runs = inline_to_pptx_runs(&h.content);
+                if !runs.is_empty() {
+                    let props = crate::pptx::write::ParaProps {
+                        alignment: h.alignment.clone(),
+                        ..Default::default()
+                    };
+                    out.push((runs, props));
+                }
+            },
+            _ => {},
+        }
+    }
+    out
 }
 
 fn inline_to_pptx_runs(content: &[InlineContent]) -> Vec<crate::pptx::write::Run> {

@@ -212,8 +212,13 @@ enum BodyItem {
     /// A real table: rows of cell text. Flattening a table into tab-joined
     /// text lost the grid entirely.
     Table(Vec<Vec<String>>),
-    /// Free-floating text box: (runs, x_emu, y_emu, cx_emu, cy_emu)
-    TextBox(Vec<Run>, i64, i64, i64, i64),
+    /// Free-floating text box: (paragraphs, x_emu, y_emu, cx_emu, cy_emu).
+    /// Each paragraph is its own `(runs, props)` pair — a text box can
+    /// hold more than one paragraph (issue #264: the writer used to
+    /// support only a single flat run list here, which is why the fix
+    /// for that issue converts a source `TextBox`'s multiple block
+    /// elements into multiple paragraphs rather than losing all but one).
+    TextBox(Vec<(Vec<Run>, ParaProps)>, i64, i64, i64, i64),
     /// Embedded image: (data, format, x_emu, y_emu, cx_emu, cy_emu)
     Image(Vec<u8>, crate::ir::ImageFormat, i64, i64, u64, u64, Option<String>),
 }
@@ -338,8 +343,13 @@ impl SlideData {
     /// All dimensions are in EMU (English Metric Units).
     /// 1 inch = 914 400 EMU; 1 cm ≈ 360 000 EMU.
     pub fn add_text_box(&mut self, text: &str, x: i64, y: i64, cx: i64, cy: i64) -> &mut Self {
-        self.body_items
-            .push(BodyItem::TextBox(vec![Run::new(text)], x, y, cx, cy));
+        self.body_items.push(BodyItem::TextBox(
+            vec![(vec![Run::new(text)], ParaProps::default())],
+            x,
+            y,
+            cx,
+            cy,
+        ));
         self
     }
 
@@ -352,8 +362,29 @@ impl SlideData {
         cx: i64,
         cy: i64,
     ) -> &mut Self {
-        self.body_items
-            .push(BodyItem::TextBox(runs.to_vec(), x, y, cx, cy));
+        self.body_items.push(BodyItem::TextBox(
+            vec![(runs.to_vec(), ParaProps::default())],
+            x,
+            y,
+            cx,
+            cy,
+        ));
+        self
+    }
+
+    /// Add a free-floating text box with multiple paragraphs, each with
+    /// its own runs and paragraph properties (issue #264 — a `TextBox`
+    /// read from a real PPTX can hold more than one block of text, e.g.
+    /// a heading paragraph followed by body paragraphs).
+    pub(crate) fn add_multi_paragraph_text_box(
+        &mut self,
+        paragraphs: Vec<(Vec<Run>, ParaProps)>,
+        x: i64,
+        y: i64,
+        cx: i64,
+        cy: i64,
+    ) -> &mut Self {
+        self.body_items.push(BodyItem::TextBox(paragraphs, x, y, cx, cy));
         self
     }
 
@@ -1335,12 +1366,14 @@ fn write_layout_placeholder(
 fn collect_slide_hyperlinks(items: &[BodyItem]) -> Vec<String> {
     let mut urls = Vec::new();
     for item in items {
-        let runs = match item {
-            BodyItem::RichText(runs, _) => runs.as_slice(),
-            BodyItem::TextBox(runs, ..) => runs.as_slice(),
+        let all_runs: Vec<&Run> = match item {
+            BodyItem::RichText(runs, _) => runs.iter().collect(),
+            BodyItem::TextBox(paragraphs, ..) => {
+                paragraphs.iter().flat_map(|(runs, _)| runs.iter()).collect()
+            },
             _ => continue,
         };
-        for run in runs {
+        for run in all_runs {
             if let Some(ref url) = run.hyperlink {
                 if !urls.contains(url) {
                     urls.push(url.clone());
@@ -1404,8 +1437,8 @@ fn generate_slide_xml(
 
     // Free-floating text boxes
     for item in &slide.body_items {
-        if let BodyItem::TextBox(runs, x, y, cx, cy) = item {
-            write_text_box_shape(&mut w, next_id, runs, *x, *y, *cx, *cy, hyperlink_rids);
+        if let BodyItem::TextBox(paragraphs, x, y, cx, cy) = item {
+            write_text_box_shape(&mut w, next_id, paragraphs, *x, *y, *cx, *cy, hyperlink_rids);
             next_id += 1;
         }
     }
@@ -1730,7 +1763,7 @@ fn write_table_frame(
 fn write_text_box_shape(
     w: &mut Writer<Vec<u8>>,
     id: u32,
-    runs: &[Run],
+    paragraphs: &[(Vec<Run>, ParaProps)],
     x: i64,
     y: i64,
     cx: i64,
@@ -1798,7 +1831,9 @@ fn write_text_box_shape(
     body_pr.push_attribute(("rIns", "0"));
     body_pr.push_attribute(("bIns", "0"));
     w.write_event(Event::Empty(body_pr)).expect("write");
-    write_rich_paragraph(w, runs, &ParaProps::default(), hyperlink_rids);
+    for (runs, props) in paragraphs {
+        write_rich_paragraph(w, runs, props, hyperlink_rids);
+    }
     w.write_event(Event::End(BytesEnd::new("p:txBody")))
         .expect("write");
 
