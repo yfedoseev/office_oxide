@@ -86,9 +86,13 @@ pub fn apply_format(n: f64, fmt_id: u32, fmt_str: Option<&str>) -> String {
         11 => return format_scientific(n),          // 0.00E+00
         12 => return format_general(n),             // # ?/? (fractions — approx)
         13 => return format_general(n),             // # ??/??
-        37 | 38 => return format_commas(n, 0),      // #,##0 accounting variants
-        39 | 40 => return format_commas(n, 2),      // #,##0.00 accounting variants
-        41..=44 => return format_commas(n, 2),      // _(* ...) accounting
+        // Accounting/comma built-ins wrap negatives in parentheses rather
+        // than using a leading minus — the codes this file's own
+        // `builtin_format_code` declares for them (`#,##0 ;(#,##0)`) say so,
+        // per ECMA-376 §18.8.30.
+        37 | 38 => return format_accounting(n, 0), // #,##0 accounting variants
+        39 | 40 => return format_accounting(n, 2), // #,##0.00 accounting variants
+        41..=44 => return format_accounting(n, 2), // _(* ...) accounting
         _ => {},
     }
 
@@ -167,6 +171,16 @@ pub fn format_commas(n: f64, decimals: u8) -> String {
     }
 }
 
+/// Format a number the way Excel's accounting/comma built-ins (ids 37-44)
+/// do: negatives are parenthesised rather than signed with a leading minus.
+pub fn format_accounting(n: f64, decimals: u8) -> String {
+    if n < 0.0 {
+        format!("({})", format_commas(n.abs(), decimals))
+    } else {
+        format_commas(n, decimals)
+    }
+}
+
 fn format_currency(n: f64, symbol: &str, decimals: u8) -> String {
     // Put any minus sign before the currency symbol so callers see
     // "-$99.50" rather than "$-99.50".
@@ -188,9 +202,18 @@ pub fn format_percent(n: f64, decimals: u8) -> String {
 }
 
 fn format_scientific(n: f64) -> String {
-    // Excel uses E+XX notation (no leading zero in exponent on some locales, but
-    // two-digit exponent is safest for matching).
-    format!("{:.2E}", n)
+    // Excel's `0.00E+00` always signs the exponent and pads it to two
+    // digits. Rust's `{:E}` does neither (`1.23E4`, `1.23E-3`), so the
+    // exponent is reassembled by hand.
+    let s = format!("{:.2E}", n);
+    let Some((mantissa, exp)) = s.split_once('E') else {
+        return s;
+    };
+    let (sign, digits) = match exp.strip_prefix('-') {
+        Some(d) => ('-', d),
+        None => ('+', exp.strip_prefix('+').unwrap_or(exp)),
+    };
+    format!("{mantissa}E{sign}{digits:0>2}")
 }
 
 fn insert_commas(n: u64) -> String {
@@ -401,7 +424,14 @@ fn apply_custom(n: f64, fmt: &str) -> String {
             c if !in_num_part && !c.is_ascii_whitespace() => {
                 currency_prefix.push(c);
             },
-            _ => {},
+            // ...and after it, a suffix. Dropping these lost the closing
+            // paren of a custom `#,##0;(#,##0)` and any bare trailing
+            // literal, so the rendered string didn't match the format.
+            c => {
+                if in_num_part {
+                    suffix.push(c);
+                }
+            },
         }
     }
 
@@ -862,6 +892,43 @@ mod tests {
     fn format_percent_zero_decimals() {
         // 50% with 0 decimals.
         assert_eq!(format_percent(0.5, 0), "50%");
+    }
+
+    /// Built-in accounting/comma ids 37-44 parenthesise negatives, as the
+    /// format codes this file's own `builtin_format_code` declares for them
+    /// specify (`#,##0 ;(#,##0)`). The fast path emitted a leading minus
+    /// instead (#234).
+    #[test]
+    fn test_accounting_builtins_parenthesize_negatives() {
+        assert_eq!(apply_format(-1234.0, 37, None), "(1,234)");
+        assert_eq!(apply_format(-1234.0, 38, None), "(1,234)");
+        assert_eq!(apply_format(-1234.5, 39, None), "(1,234.50)");
+        assert_eq!(apply_format(-1234.5, 40, None), "(1,234.50)");
+        assert_eq!(apply_format(-1234.5, 41, None), "(1,234.50)");
+        assert_eq!(apply_format(-1234.5, 44, None), "(1,234.50)");
+        // Positives and zero are untouched.
+        assert_eq!(apply_format(1234.0, 37, None), "1,234");
+        assert_eq!(apply_format(0.0, 37, None), "0");
+    }
+
+    /// A literal character after the digit placeholders is part of the
+    /// output. The interpreter dropped everything past the number part it
+    /// did not recognise as a format token, losing the closing paren of an
+    /// explicitly-declared `#,##0;(#,##0)` (#234).
+    #[test]
+    fn test_custom_format_keeps_trailing_literal_characters() {
+        assert_eq!(apply_format(-1234.0, 164, Some("#,##0;(#,##0)")), "(1,234)");
+        assert_eq!(apply_format(42.0, 164, Some(r#"0"x")"#)), "42x)");
+    }
+
+    /// Excel's `0.00E+00` always signs the exponent and pads it to two
+    /// digits; Rust's `{:E}` does neither (#234).
+    #[test]
+    fn test_scientific_exponent_is_signed_and_padded() {
+        assert_eq!(apply_format(12345.6789, 11, None), "1.23E+04");
+        assert_eq!(apply_format(0.0012345, 11, None), "1.23E-03");
+        assert_eq!(apply_format(1.5, 11, None), "1.50E+00");
+        assert_eq!(apply_format(1.23e120, 11, None), "1.23E+120");
     }
 }
 
