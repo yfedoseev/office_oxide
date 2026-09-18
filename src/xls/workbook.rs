@@ -56,7 +56,24 @@ struct SheetInfo {
 
 impl XlsDocument {
     /// Open an XLS file from a reader (any `Read + Seek`).
-    pub fn from_reader<R: Read + Seek>(reader: R) -> Result<Self> {
+    pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
+        // A pre-OLE2 Excel file (BIFF2/3/4 — Excel 2.x through 4.x) has no
+        // compound-file container at all: it is a raw record stream that
+        // starts with its own `BOF`. `CfbReader` rejects it with "bad magic
+        // signature", which is indistinguishable from a corrupt or
+        // unrelated file. Name the format instead, mirroring the Word
+        // 6.0/95 case in `doc::fib`.
+        if let Some(biff) = detect_raw_biff(&mut reader)? {
+            return Err(XlsError::UnsupportedVersion(format!(
+                "BIFF{biff} (pre-OLE2 Excel {}); only BIFF8 (Excel 97 and later) is supported",
+                match biff {
+                    2 => "2.x",
+                    3 => "3.0",
+                    _ => "4.0",
+                }
+            )));
+        }
+
         let mut cfb = CfbReader::new(reader)?;
 
         // Try "Workbook" (BIFF8) first, then "Book" (BIFF5).
@@ -327,6 +344,48 @@ enum Phase {
     Globals,
     BetweenSheets,
     InSheet,
+}
+
+/// Detect a raw (non-CFB) BIFF2/3/4 stream, returning the BIFF generation.
+///
+/// The reader is left at the position it was handed over at, so a negative
+/// result costs the caller nothing. A BIFF2-4 file opens with a `BOF` whose
+/// `SID` names the generation — `0x0009` (BIFF2), `0x0209` (BIFF3),
+/// `0x0409` (BIFF4) — followed by that record's own small length, which is
+/// what distinguishes it from arbitrary bytes that happen to collide.
+fn detect_raw_biff<R: Read + Seek>(reader: &mut R) -> Result<Option<u8>> {
+    let start = reader.stream_position()?;
+    let mut head = [0u8; 4];
+    let read = fill(reader, &mut head)?;
+    reader.seek(std::io::SeekFrom::Start(start))?;
+    if read < 4 {
+        return Ok(None);
+    }
+    let sid = u16::from_le_bytes([head[0], head[1]]);
+    let len = u16::from_le_bytes([head[2], head[3]]);
+    // A BIFF2-4 BOF body is 4-8 bytes (version + stream type, plus build
+    // fields from BIFF4); anything longer is not one.
+    if len > 16 {
+        return Ok(None);
+    }
+    Ok(match sid {
+        0x0009 => Some(2),
+        0x0209 => Some(3),
+        0x0409 => Some(4),
+        _ => None,
+    })
+}
+
+/// Read as much of `buf` as the reader has, returning how many bytes landed.
+fn fill<R: Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
 }
 
 fn parse_boundsheet(data: &[u8]) -> Result<SheetInfo> {
@@ -738,6 +797,46 @@ mod tests {
         let ir = crate::convert_xls::xls_to_ir(&doc);
         assert_eq!(ir.sections.len(), 2);
         assert_eq!(ir.sections[1].title.as_deref(), Some("B"));
+    }
+
+    /// A raw BIFF2/3/4 stream has no CFB container, so the CFB layer used
+    /// to reject it with "bad magic signature" — indistinguishable from a
+    /// corrupt or unrelated file. Name the format instead (#227).
+    #[test]
+    fn test_raw_biff2_4_reports_the_unsupported_legacy_format() {
+        for (sid, label) in [(0x0009u16, "BIFF2"), (0x0209, "BIFF3"), (0x0409, "BIFF4")] {
+            let mut stream = Vec::new();
+            stream.extend_from_slice(&sid.to_le_bytes());
+            stream.extend_from_slice(&6u16.to_le_bytes()); // BOF body length
+            stream.extend_from_slice(&[0x00, 0x04, 0x10, 0x00, 0x00, 0x00]);
+            stream.extend_from_slice(&RT_EOF.to_le_bytes());
+            stream.extend_from_slice(&0u16.to_le_bytes());
+
+            let err = XlsDocument::from_reader(std::io::Cursor::new(stream))
+                .expect_err("a pre-OLE2 file cannot be read");
+            let msg = err.to_string();
+            assert!(
+                matches!(err, XlsError::UnsupportedVersion(_)),
+                "expected UnsupportedVersion for {label}, got: {msg}"
+            );
+            assert!(msg.contains(label), "error must name {label}: {msg}");
+            assert!(
+                !msg.contains("magic"),
+                "the CFB-layer message must not leak: {msg}"
+            );
+        }
+    }
+
+    /// The BIFF2-4 sniff must not claim an ordinary BIFF8 `.xls`, whose
+    /// container starts with the CFB signature.
+    #[test]
+    fn test_biff2_4_detection_ignores_a_cfb_container() {
+        let mut stream = crate::cfb::CFB_SIGNATURE.to_vec();
+        stream.resize(512, 0);
+        let mut cursor = std::io::Cursor::new(stream);
+        assert_eq!(detect_raw_biff(&mut cursor).unwrap(), None);
+        // ...and the reader is left where it was handed over.
+        assert_eq!(cursor.position(), 0);
     }
 
     /// A workbook may override a built-in `numFmtId`; ECMA-376 §18.8.30
