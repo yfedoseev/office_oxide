@@ -1172,10 +1172,16 @@ fn convert_list_group(
                         if top_ilvl.is_none_or(|t| nr.ilvl < t) {
                             top_ilvl = Some(nr.ilvl);
                             style = number_format_to_list_style(&level.format);
-                            // `w:start` defaults to 1; only report an
-                            // explicit non-default so renderers that ignore
-                            // the field are not silently contradicted.
-                            start_number = (level.start != 1).then_some(level.start);
+                            // Honour this instance's own `<w:startOverride>`
+                            // when present (issue #260), falling back to the
+                            // abstract level's own `<w:start>`. `w:start`
+                            // defaults to 1; only report an explicit
+                            // non-default so renderers that ignore the
+                            // field are not silently contradicted.
+                            let effective_start = numbering
+                                .resolve_start(nr.num_id, nr.ilvl)
+                                .unwrap_or(level.start);
+                            start_number = (effective_start != 1).then_some(effective_start);
                         }
                     }
                 }

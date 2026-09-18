@@ -4045,6 +4045,74 @@ mod tests {
     }
 
     #[test]
+    fn test_num_start_override_is_read_back() {
+        // issue #260 — the writer emits <w:num><w:lvlOverride><w:startOverride>
+        // (confirmed present in real numbering.xml output) but nothing read
+        // it back; List.start_number always came back None.
+        let numbering_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="0">
+    <w:lvl w:ilvl="0">
+      <w:start w:val="1"/>
+      <w:numFmt w:val="decimal"/>
+      <w:lvlText w:val="%1."/>
+    </w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="1">
+    <w:abstractNumId w:val="0"/>
+    <w:lvlOverride w:ilvl="0">
+      <w:startOverride w:val="7"/>
+    </w:lvlOverride>
+  </w:num>
+</w:numbering>"#;
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>seven</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let numbering_part = PartName::new("/word/numbering.xml").unwrap();
+        writer
+            .add_part(
+                &numbering_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml",
+                numbering_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::NUMBERING, "numbering.xml");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let ir = crate::convert_docx::docx_to_ir(&doc);
+        let list = ir.sections[0]
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                crate::ir::Element::List(l) => Some(l),
+                _ => None,
+            })
+            .expect("expected a list element");
+        assert_eq!(
+            list.start_number,
+            Some(7),
+            "startOverride=7 must be read back, not None"
+        );
+    }
+
+    #[test]
     fn test_footnote_reference_mark_reaches_run_content() {
         // issue #241 — to_ir() carried the note body but lost where in
         // the text it was actually cited.
