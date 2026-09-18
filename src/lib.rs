@@ -731,6 +731,29 @@ mod tests {
         );
     }
 
+    /// issue #296 — an encrypted .pptx used to succeed with Ok and a
+    /// silently EMPTY (zero-slide) presentation rather than erroring,
+    /// because sniff_format remapped it to the legacy PPT parser, which
+    /// (unlike the DOC/XLS legacy readers) doesn't detect encryption
+    /// itself and just parsed whatever little structure it could find.
+    /// The #320 fix runs before any legacy-parser dispatch at all, so
+    /// this is the same code path with a .pptx extension.
+    #[test]
+    fn test_open_encrypted_pptx_gives_a_friendly_error_not_an_empty_presentation() {
+        let data = build_two_stream_cfb("EncryptionInfo", "EncryptedPackage");
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("office_oxide_test_encrypted_{}.pptx", std::process::id()));
+        std::fs::write(&path, &data).unwrap();
+        let result = Document::open(&path);
+        std::fs::remove_file(&path).ok();
+        let err = result.err().expect("expected an Err, not a silently empty presentation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("password-protected"),
+            "expected a friendly password-protected message, got: {msg}"
+        );
+    }
+
     /// The same CFB-magic-on-a-.docx-path shape, but WITHOUT the
     /// MS-OFFCRYPTO streams, must still fall through to the legacy
     /// parser (a genuinely misnamed legacy file) — the new check must
