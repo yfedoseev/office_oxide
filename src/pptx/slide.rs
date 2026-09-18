@@ -209,6 +209,19 @@ fn parse_shape_tree(
     media: &std::collections::HashMap<String, (Vec<u8>, String)>,
     charts: &std::collections::HashMap<String, Vec<String>>,
 ) -> CoreResult<Vec<Shape>> {
+    parse_shape_tree_until(reader, rels, media, charts, b"spTree")
+}
+
+/// Shared shape-tree loop, parameterized on the closing tag so it can also
+/// read the contents of an `<mc:Choice>`/`<mc:Fallback>` branch (see
+/// [`parse_alternate_content`]).
+fn parse_shape_tree_until(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    rels: &Relationships,
+    media: &std::collections::HashMap<String, (Vec<u8>, String)>,
+    charts: &std::collections::HashMap<String, Vec<String>>,
+    end_local: &[u8],
+) -> CoreResult<Vec<Shape>> {
     let mut shapes = Vec::new();
 
     loop {
@@ -219,11 +232,62 @@ fn parse_shape_tree(
                 b"grpSp" => shapes.push(parse_group_shape(reader, rels, media, charts)?),
                 b"graphicFrame" => shapes.push(parse_graphic_frame(reader, rels, charts)?),
                 b"cxnSp" => shapes.push(parse_connector(reader)?),
+                b"AlternateContent" => {
+                    shapes.extend(parse_alternate_content(reader, rels, media, charts)?);
+                },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"spTree" => {
+            Event::End(ref e) if e.local_name().as_ref() == end_local => {
+                break;
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+
+    Ok(shapes)
+}
+
+/// `<mc:AlternateContent>` wraps two or more renderings of the same shape
+/// behind a markup-compatibility switch — typically a modern extension
+/// (`<mc:Choice Requires="…">`, e.g. an OMML equation) and a plain
+/// `<mc:Fallback>` for older readers. There's no namespace-support
+/// negotiation here: this takes the first `Choice` branch that actually
+/// yields a recognized shape, and falls back to `Fallback` otherwise —
+/// strictly better than the old behavior of skipping the whole block,
+/// which silently dropped shapes like equation text boxes (issue #272).
+fn parse_alternate_content(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    rels: &Relationships,
+    media: &std::collections::HashMap<String, (Vec<u8>, String)>,
+    charts: &std::collections::HashMap<String, Vec<String>>,
+) -> CoreResult<Vec<Shape>> {
+    let mut shapes: Vec<Shape> = Vec::new();
+    let mut have_choice = false;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"Choice" => {
+                    let s = parse_shape_tree_until(reader, rels, media, charts, b"Choice")?;
+                    if !s.is_empty() {
+                        shapes = s;
+                        have_choice = true;
+                    }
+                },
+                b"Fallback" => {
+                    let s = parse_shape_tree_until(reader, rels, media, charts, b"Fallback")?;
+                    if !have_choice && shapes.is_empty() {
+                        shapes = s;
+                    }
+                },
+                _ => {
+                    xml::skip_element_fast(reader)?;
+                },
+            },
+            Event::End(ref e) if e.local_name().as_ref() == b"AlternateContent" => {
                 break;
             },
             Event::Eof => break,
@@ -442,6 +506,9 @@ fn parse_group_shape(
                 b"grpSp" => children.push(parse_group_shape(reader, rels, media, charts)?),
                 b"graphicFrame" => children.push(parse_graphic_frame(reader, rels, charts)?),
                 b"cxnSp" => children.push(parse_connector(reader)?),
+                b"AlternateContent" => {
+                    children.extend(parse_alternate_content(reader, rels, media, charts)?);
+                },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
@@ -1155,6 +1222,17 @@ fn parse_text_paragraph(
                 },
                 b"fld" => {
                     content.push(TextContent::Field(parse_text_field(reader, e)?));
+                },
+                // `<a14:m>` wraps an OMML equation (`<m:oMath>`/`<m:oMathPara>`)
+                // as a markup-compatibility extension; there's no structural
+                // math model, so pull out every `<m:t>` run so the equation's
+                // text isn't silently dropped (issue #272, PPTX analogue of
+                // the DOCX OMML fix, #270).
+                b"m" => {
+                    let text = collect_a_t_text(reader, b"m")?.concat();
+                    if !text.is_empty() {
+                        content.push(TextContent::Run(TextRun { text, ..Default::default() }));
+                    }
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
@@ -1983,6 +2061,107 @@ mod tests {
         } else {
             panic!("expected group shape");
         }
+    }
+
+    /// issue #272 — an `<m:oMath>` equation reaches the slide text via the
+    /// `<mc:AlternateContent><mc:Choice Requires="a14"><p:sp>...<a14:m>`
+    /// wrapper real PowerPoint output uses (poi-legacy_stress013.pptx,
+    /// slides 5/9/10), mirroring the real file's structure exactly.
+    #[test]
+    fn omml_equation_inside_alternate_content_is_not_dropped() {
+        let xml = make_slide_xml(
+            r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main">
+  <mc:Choice Requires="a14">
+    <p:sp>
+      <p:nvSpPr>
+        <p:cNvPr id="34" name="TextBox 33"/>
+        <p:cNvSpPr txBox="1"/>
+        <p:nvPr/>
+      </p:nvSpPr>
+      <p:spPr/>
+      <p:txBody>
+        <a:bodyPr/>
+        <a:p><a:pPr/><a14:m><m:oMathPara xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"><m:oMath><m:r><m:t>𝑥</m:t></m:r><m:r><m:t>+1</m:t></m:r></m:oMath></m:oMathPara></a14:m></a:p>
+      </p:txBody>
+    </p:sp>
+  </mc:Choice>
+  <mc:Fallback>
+    <p:pic>
+      <p:nvPicPr>
+        <p:cNvPr id="34" name="fallback pic"/>
+        <p:cNvPicPr/>
+        <p:nvPr/>
+      </p:nvPicPr>
+      <p:blipFill><a:blip r:embed="rId99"/></p:blipFill>
+      <p:spPr/>
+    </p:pic>
+  </mc:Fallback>
+</mc:AlternateContent>"#,
+        );
+
+        let rels = Relationships::empty();
+        let slide = Slide::parse(
+            &xml,
+            String::new(),
+            &rels,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(slide.shapes.len(), 1, "expected the Choice branch's shape, got {:?}", slide.shapes);
+        let Shape::AutoShape(ref shape) = slide.shapes[0] else {
+            panic!("expected an AutoShape from mc:Choice, got {:?}", slide.shapes[0]);
+        };
+        let tb = shape.text_body.as_ref().expect("equation text box has a body");
+        let TextContent::Run(ref run) = tb.paragraphs[0].content[0] else {
+            panic!("expected a run carrying the equation text");
+        };
+        assert_eq!(run.text, "𝑥+1");
+    }
+
+    /// When `mc:Choice`'s content is entirely made of elements this crate
+    /// doesn't recognize (yielding zero shapes), the `mc:Fallback` branch
+    /// must still be used instead of losing the shape altogether.
+    #[test]
+    fn alternate_content_falls_back_to_fallback_branch_when_choice_yields_nothing() {
+        let xml = make_slide_xml(
+            r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">
+  <mc:Choice Requires="somethingUnknown">
+    <unknownVendor:thing xmlns:unknownVendor="urn:example:unknown"/>
+  </mc:Choice>
+  <mc:Fallback>
+    <p:sp>
+      <p:nvSpPr>
+        <p:cNvPr id="7" name="Fallback Shape"/>
+        <p:cNvSpPr/>
+        <p:nvPr/>
+      </p:nvSpPr>
+      <p:spPr/>
+      <p:txBody>
+        <a:bodyPr/>
+        <a:p><a:r><a:t>Fallback text</a:t></a:r></a:p>
+      </p:txBody>
+    </p:sp>
+  </mc:Fallback>
+</mc:AlternateContent>"#,
+        );
+
+        let rels = Relationships::empty();
+        let slide = Slide::parse(
+            &xml,
+            String::new(),
+            &rels,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(slide.shapes.len(), 1);
+        let Shape::AutoShape(ref shape) = slide.shapes[0] else {
+            panic!("expected the fallback AutoShape, got {:?}", slide.shapes[0]);
+        };
+        assert_eq!(shape.name, "Fallback Shape");
     }
 
     #[test]
