@@ -260,6 +260,36 @@ impl DocxDocument {
             }
         }
 
+        // Resolve every native DrawingML chart the body references. A
+        // `<w:drawing>` holding a chart carries only `<c:chart r:id="…"/>`;
+        // the chart's title, axis titles, category labels, series names and
+        // cached data values all live in the separate part that id resolves
+        // to (`word/charts/chartN.xml`), which was never opened, so none of
+        // that text reached any consumer (issue #273).
+        let mut chart_text_by_rid: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for rel in doc_rels.all() {
+            if rel.rel_type != rel_types::CHART || rel.target_mode != TargetMode::Internal {
+                continue;
+            }
+            let Ok(part) = main_part.resolve_relative(&rel.target) else {
+                continue;
+            };
+            if !opc.has_part(&part) {
+                continue;
+            }
+            let Ok(data) = opc.read_part(&part) else {
+                continue;
+            };
+            let lines = crate::core::chart::chart_text_lines(&data);
+            if !lines.is_empty() {
+                chart_text_by_rid.insert(rel.id.clone(), lines);
+            }
+        }
+        if !chart_text_by_rid.is_empty() {
+            attach_chart_text(&mut body.elements, &chart_text_by_rid);
+        }
+
         // Parse headers and footers. Walk header refs and footer refs
         // separately so each parsed `HeaderFooter` can record its own
         // role; without that distinction, downstream consumers had to
@@ -1060,6 +1090,58 @@ fn parse_hyperlink(
 }
 
 // ---------------------------------------------------------------------------
+// Embedded chart text
+// ---------------------------------------------------------------------------
+
+/// Walk a parsed body and copy each chart part's extracted text onto the
+/// drawing that references it, keyed by relationship id.
+///
+/// Charts nest wherever drawings do — inside table cells and inside text
+/// boxes — so the walk recurses through both rather than only scanning
+/// top-level paragraphs.
+fn attach_chart_text(
+    elements: &mut [BlockElement],
+    chart_text_by_rid: &std::collections::HashMap<String, Vec<String>>,
+) {
+    for elem in elements {
+        match elem {
+            BlockElement::Paragraph(p) => {
+                for pc in &mut p.content {
+                    let runs: &mut [Run] = match pc {
+                        ParagraphContent::Run(r) => std::slice::from_mut(r),
+                        ParagraphContent::Hyperlink(hl) => &mut hl.runs,
+                    };
+                    for run in runs {
+                        for rc in &mut run.content {
+                            match rc {
+                                RunContent::Drawing(d) => {
+                                    if let Some(rid) = d.chart_rel_id.as_deref() {
+                                        if let Some(lines) = chart_text_by_rid.get(rid) {
+                                            d.chart_text = lines.clone();
+                                        }
+                                    }
+                                },
+                                RunContent::TextBox(blocks) => {
+                                    attach_chart_text(blocks, chart_text_by_rid);
+                                },
+                                _ => {},
+                            }
+                        }
+                    }
+                }
+            },
+            BlockElement::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        attach_chart_text(&mut cell.content, chart_text_by_rid);
+                    }
+                }
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Drawing / image parsing
 // ---------------------------------------------------------------------------
 
@@ -1123,6 +1205,7 @@ fn parse_inline_or_anchor_body(
     let mut description: Option<String> = None;
     let mut relationship_id: Option<String> = None;
     let mut shape: Option<crate::docx::image::ShapeInfo> = None;
+    let mut chart_rel_id: Option<String> = None;
 
     let mut anchor_x: Option<i64> = None;
     let mut anchor_y: Option<i64> = None;
@@ -1162,6 +1245,9 @@ fn parse_inline_or_anchor_body(
                     if let Some(s) = g.shape {
                         shape = Some(s);
                     }
+                    if let Some(rid) = g.chart_rel_id {
+                        chart_rel_id = Some(rid);
+                    }
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
@@ -1193,7 +1279,10 @@ fn parse_inline_or_anchor_body(
         None
     };
 
-    if relationship_id.is_some() || shape.is_some() {
+    // A chart-only graphic has neither a blip nor a `prstGeom`, so without
+    // `chart_rel_id` in this condition the whole drawing was discarded and
+    // the chart part was never reachable (issue #273).
+    if relationship_id.is_some() || shape.is_some() || chart_rel_id.is_some() {
         Ok(Some(DrawingInfo {
             relationship_id: relationship_id.unwrap_or_default(),
             description,
@@ -1202,6 +1291,8 @@ fn parse_inline_or_anchor_body(
             inline,
             anchor_position,
             shape,
+            chart_rel_id,
+            chart_text: Vec::new(),
         }))
     } else {
         Ok(None)
@@ -1242,6 +1333,8 @@ fn parse_position_offset(
 struct GraphicPayload {
     relationship_id: Option<String>,
     shape: Option<crate::docx::image::ShapeInfo>,
+    /// `r:id` of a `<c:chart>` reference, when the graphic is a chart.
+    chart_rel_id: Option<String>,
 }
 
 /// Parse `<a:graphic>` and any contained `<pic:pic>` (image) or
@@ -1252,6 +1345,7 @@ fn parse_graphic(
 ) -> CoreResult<GraphicPayload> {
     let mut relationship_id: Option<String> = None;
     let mut shape: Option<crate::docx::image::ShapeInfo> = None;
+    let mut chart_rel_id: Option<String> = None;
 
     loop {
         match reader.read_event()? {
@@ -1266,6 +1360,16 @@ fn parse_graphic(
                         shape = Some(s);
                     }
                 },
+                // A native chart: the graphic carries only a relationship
+                // pointing at `word/charts/chartN.xml`, where all of its
+                // text actually lives. Usually the empty form, but the
+                // element is allowed children (`<c:extLst>`).
+                b"chart" => {
+                    if let Some(rid) = xml::optional_prefixed_attr_str(e, b"id")? {
+                        chart_rel_id = Some(rid.into_owned());
+                    }
+                    xml::skip_element_fast(reader)?;
+                },
                 // A group shape nests further `<wps:wsp>` children; descend
                 // so text boxes inside groups are not lost.
                 b"grpSp" | b"wgp" => continue,
@@ -1274,6 +1378,11 @@ fn parse_graphic(
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
+            },
+            Event::Empty(ref e) if e.local_name().as_ref() == b"chart" => {
+                if let Some(rid) = xml::optional_prefixed_attr_str(e, b"id")? {
+                    chart_rel_id = Some(rid.into_owned());
+                }
             },
             Event::End(ref e) if e.local_name().as_ref() == b"graphic" => break,
             Event::Eof => break,
@@ -1284,6 +1393,7 @@ fn parse_graphic(
     Ok(GraphicPayload {
         relationship_id,
         shape,
+        chart_rel_id,
     })
 }
 

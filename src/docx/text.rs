@@ -128,7 +128,18 @@ fn plain_text_run(run: &Run, out: &mut String) {
             RunContent::Break(BreakType::Line) => out.push('\n'),
             RunContent::Break(BreakType::Page | BreakType::Column) => out.push('\n'),
             RunContent::Tab => out.push('\t'),
-            RunContent::Drawing(_) => {},
+            // A drawing has no text of its own — except a native chart,
+            // whose title / categories / series were resolved from the
+            // chart part at open time (issue #273).
+            RunContent::Drawing(d) => {
+                if !d.chart_text.is_empty() {
+                    if !out.is_empty() && !out.ends_with(['\n', ' ', '\t']) {
+                        out.push('\n');
+                    }
+                    out.push_str(&d.chart_text.join("\n"));
+                    out.push('\n');
+                }
+            },
             // Text-box prose is document content — in some real files it is
             // most of the document (issue #102). It is *block* content, so
             // it must be separated from the surrounding run: pasting it in
@@ -387,6 +398,16 @@ fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, text: &mut String) {
 }
 
 fn markdown_drawing(drawing: &DrawingInfo, out: &mut String) {
+    // A chart is not an image: render the text we recovered from the chart
+    // part instead of an empty image link with no target.
+    if !drawing.chart_text.is_empty() {
+        if !out.is_empty() && !out.ends_with(['\n', ' ', '\t']) {
+            out.push('\n');
+        }
+        out.push_str(&drawing.chart_text.join("  \n"));
+        out.push('\n');
+        return;
+    }
     out.push_str("![");
     if let Some(ref desc) = drawing.description {
         out.push_str(desc);
