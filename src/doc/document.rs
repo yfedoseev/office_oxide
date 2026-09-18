@@ -7,6 +7,7 @@ use crate::cfb::{CfbReader, SummaryProperties, parse_summary_information};
 use super::error::{DocError, Result};
 use super::fib::Fib;
 use super::images::{DocImage, extract_images};
+use super::list_format::ListFormatting;
 use super::papx::{DocParagraph, build_paragraphs, parse_papx_paragraphs};
 use super::piece_table::{covers_declared_length, extract_text, parse_clx, sanitize_text};
 
@@ -43,6 +44,11 @@ pub struct DocDocument {
     /// `.doc` carries by default — parsed and then never read anywhere
     /// in the crate before (issue #244).
     summary_properties: Option<SummaryProperties>,
+    /// `PlfLst`/`PlfLfo` list definitions, resolving a paragraph's
+    /// `(ilfo, ilvl)` to its declared start-at value and number format —
+    /// parsed from a FIB pointer that was previously read and then never
+    /// used anywhere in the crate (issue #250).
+    list_formatting: ListFormatting,
 }
 
 /// One of the subdocuments stored after the main text in a `.doc`.
@@ -162,6 +168,14 @@ impl DocDocument {
             Vec::new()
         };
 
+        let list_formatting = ListFormatting::parse(
+            &table_stream,
+            fib.fc_plcf_lst,
+            fib.lcb_plcf_lst,
+            fib.fc_plf_lfo,
+            fib.lcb_plf_lfo,
+        );
+
         // Extract images from the Data stream (if present).
         let images = match cfb.open_stream("Data") {
             Ok(data_stream) => extract_images(&data_stream),
@@ -181,6 +195,7 @@ impl DocDocument {
             has_macros,
             text_complete,
             summary_properties,
+            list_formatting,
         })
     }
 
@@ -219,6 +234,13 @@ impl DocDocument {
     /// well-formed (issue #244).
     pub fn summary_properties(&self) -> Option<&crate::cfb::SummaryProperties> {
         self.summary_properties.as_ref()
+    }
+
+    /// `PlfLst`/`PlfLfo` list definitions, resolving a paragraph's
+    /// `(ilfo, ilvl)` to its declared start-at value and number format
+    /// (issue #250).
+    pub(crate) fn list_formatting(&self) -> &ListFormatting {
+        &self.list_formatting
     }
 
     /// Get the extracted plain text.
@@ -327,6 +349,7 @@ mod tests {
             has_macros: false,
             text_complete: true,
             summary_properties: None,
+            list_formatting: crate::doc::list_format::ListFormatting::default(),
             images: Vec::new(),
             text: "First paragraph\nSecond paragraph\n\nAfter gap".into(),
             paragraphs: Vec::new(),
@@ -344,6 +367,7 @@ mod tests {
             has_macros: false,
             text_complete: true,
             summary_properties: None,
+            list_formatting: crate::doc::list_format::ListFormatting::default(),
             images: Vec::new(),
             text: "Hello World".into(),
             paragraphs: Vec::new(),
@@ -367,6 +391,7 @@ mod tests {
             has_macros: false,
             text_complete: true,
             summary_properties: None,
+            list_formatting: crate::doc::list_format::ListFormatting::default(),
             images: Vec::new(),
             text: "Main body text".into(),
             paragraphs: Vec::new(),
@@ -390,6 +415,7 @@ mod tests {
             has_macros: false,
             text_complete: true,
             summary_properties: None,
+            list_formatting: crate::doc::list_format::ListFormatting::default(),
             images: Vec::new(),
             text: "Body".into(),
             paragraphs: Vec::new(),
@@ -408,6 +434,7 @@ mod tests {
             has_macros: false,
             text_complete: false,
             summary_properties: None,
+            list_formatting: crate::doc::list_format::ListFormatting::default(),
             images: Vec::new(),
             text: "only the recovered fragment".into(),
             paragraphs: Vec::new(),
@@ -435,6 +462,7 @@ mod tests {
             has_macros: false,
             text_complete: true,
             summary_properties: None,
+            list_formatting: crate::doc::list_format::ListFormatting::default(),
             images: Vec::new(),
             text: text.to_string(),
             paragraphs: Vec::new(),
@@ -450,6 +478,7 @@ mod tests {
             has_macros: false,
             text_complete: true,
             summary_properties: None,
+            list_formatting: crate::doc::list_format::ListFormatting::default(),
             images: Vec::new(),
             text: String::new(),
             paragraphs: paras,

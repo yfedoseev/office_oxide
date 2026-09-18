@@ -1,4 +1,4 @@
-use crate::doc::{DocDocument, DocParagraph, HyperlinkSpan, TapCellInfo, TapInfo};
+use crate::doc::{DocDocument, DocParagraph, HyperlinkSpan, ListFormatting, TapCellInfo, TapInfo};
 use crate::format::DocumentFormat;
 use crate::ir::*;
 
@@ -24,7 +24,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // the first `Element::Heading` below.
     let has_structured_headings = paragraphs.iter().any(|p| p.props.outline_level.is_some());
     if !paragraphs.is_empty() {
-        walk_paragraphs(paragraphs, has_structured_headings, &mut elements);
+        walk_paragraphs(paragraphs, has_structured_headings, &mut elements, doc.list_formatting());
     } else {
         line_heuristic(doc.plain_text_ref(), &mut elements);
     }
@@ -449,16 +449,23 @@ fn walk_paragraphs(
     paragraphs: &[DocParagraph],
     has_structured_headings: bool,
     elements: &mut Vec<Element>,
+    list_formatting: &ListFormatting,
 ) {
     let mut table = TableBuilder::new();
     let mut list_items: Vec<(u8, Vec<InlineContent>)> = Vec::new();
+    // The run's own `ilfo` (issue #250) — every item in one contiguous list
+    // run shares the same `ilfo`/`ilvl`-derived list identity in practice
+    // (a change of `ilfo` mid-run would itself interrupt list-item
+    // membership via `is_doc_list_item`), so the first item's value is
+    // enough to resolve `start_number`/`ordered` for the whole run.
+    let mut list_ilfo: Option<i16> = None;
 
     for p in paragraphs {
         if p.props.is_table_trailing_mark {
-            flush_list(&mut list_items, elements);
+            flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
             table.end_row(p.props.tap.clone(), p.props.itap);
         } else if p.props.f_in_table {
-            flush_list(&mut list_items, elements);
+            flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
             table.add_cell_paragraph(p);
         } else if let Some(lvl) = p.props.outline_level {
             // Outline level wins over list membership, exactly like the
@@ -469,7 +476,7 @@ fn walk_paragraphs(
             // every one of them into a list item and left no Headings in
             // the IR at all (issue #223).
             table.flush(elements);
-            flush_list(&mut list_items, elements);
+            flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
             emit_heading(&p.text, lvl + 1, elements, &p.hyperlinks);
         } else if is_doc_list_item(p.props.ilfo) {
             // List membership is keyed on `ilfo` (sprmPIlfo, `0x460B`), not on
@@ -477,10 +484,13 @@ fn walk_paragraphs(
             // its `ilfo` is a valid list index. `ilvl` still drives nesting.
             table.flush(elements);
             let ilvl = p.props.ilvl.unwrap_or(0);
+            if list_ilfo.is_none() {
+                list_ilfo = p.props.ilfo;
+            }
             list_items.push((ilvl, inline_content_for(&p.text, &p.hyperlinks)));
         } else {
             table.flush(elements);
-            flush_list(&mut list_items, elements);
+            flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
             if has_structured_headings {
                 elements.push(Element::Paragraph(Paragraph {
                     content: inline_content_for(&p.text, &p.hyperlinks),
@@ -493,11 +503,22 @@ fn walk_paragraphs(
         }
     }
     table.flush(elements);
-    flush_list(&mut list_items, elements);
+    flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
 }
 
 /// Emit the accumulated list run as an `Element::List` and clear it.
-fn flush_list(items: &mut Vec<(u8, Vec<InlineContent>)>, elements: &mut Vec<Element>) {
+///
+/// `ilfo` is the run's own list identity (issue #250): resolved through
+/// `list_formatting` to the declared start-at value and number format for
+/// the run's base level. `None` (no `PlfLst`/`PlfLfo` data, or an `ilfo`
+/// that doesn't resolve) degrades to the pre-#250 contract — bullet,
+/// `start_number: None` — rather than erroring.
+fn flush_list(
+    items: &mut Vec<(u8, Vec<InlineContent>)>,
+    ilfo: Option<i16>,
+    list_formatting: &ListFormatting,
+    elements: &mut Vec<Element>,
+) {
     if items.is_empty() {
         return;
     }
@@ -506,8 +527,13 @@ fn flush_list(items: &mut Vec<(u8, Vec<InlineContent>)>, elements: &mut Vec<Elem
     // collapsed by `build_nested_list` (which would otherwise treat every
     // item as a child of the first and drop the rest when base_level is 0).
     let base_level = items.iter().map(|(lvl, _)| *lvl).min().unwrap_or(0);
-    // `ordered = false` (bullet) — see `walk_paragraphs` for the limitation.
-    let list = build_nested_list(false, items, base_level);
+    let level = ilfo.and_then(|ilfo| list_formatting.level_for(ilfo, base_level));
+    let ordered = level.is_some_and(|l| l.is_numbered());
+    let start_number =
+        level.filter(|l| l.is_numbered() && l.start_at != 1).map(|l| l.start_at as u32);
+
+    let mut list = build_nested_list(ordered, items, base_level);
+    list.start_number = start_number;
     elements.push(Element::List(list));
     items.clear();
 }
@@ -840,7 +866,7 @@ mod tests {
             }],
         };
         let mut els = Vec::new();
-        walk_paragraphs(&[p], false, &mut els);
+        walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
         let Element::Paragraph(par) = &els[0] else {
             panic!("expected a paragraph, got {:?}", els[0]);
         };
@@ -880,7 +906,7 @@ mod tests {
             PapProps::default(),
         );
         let mut els = Vec::new();
-        walk_paragraphs(&[p], false, &mut els);
+        walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
         let Element::Paragraph(par) = &els[0] else {
             panic!("expected a paragraph, got {:?}", els[0]);
         };
@@ -920,7 +946,7 @@ mod tests {
         let row = para("", props);
 
         let mut els = Vec::new();
-        walk_paragraphs(&[row], false, &mut els);
+        walk_paragraphs(&[row], false, &mut els, &ListFormatting::default());
 
         assert!(
             els.iter().any(|e| matches!(e, Element::Table(_))),
@@ -955,7 +981,7 @@ mod tests {
             };
             let p = para("Not a list item.", props);
             let mut els = Vec::new();
-            walk_paragraphs(&[p], false, &mut els);
+            walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
             assert!(
                 !els.iter().any(|e| matches!(e, Element::List(_))),
                 "ilfo {ilfo:#06x} must not build a list"
@@ -982,7 +1008,7 @@ mod tests {
         };
         let p = para("1. Introduction", props);
         let mut els = Vec::new();
-        walk_paragraphs(&[p], false, &mut els);
+        walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
 
         assert!(
             els.iter().any(|e| matches!(e, Element::Heading(h) if h.level == 1)),
@@ -1005,11 +1031,113 @@ mod tests {
         };
         let p = para("A list item via the negated band.", props);
         let mut els = Vec::new();
-        walk_paragraphs(&[p], false, &mut els);
+        walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
         assert!(
             els.iter().any(|e| matches!(e, Element::List(_))),
             "0xF802 (negated index) must still be a list item"
         );
+    }
+
+    /// issue #250 — a list run's `ilfo` must resolve through `PlfLfo`'s
+    /// `lsid` to the matching `PlfLst` entry's `LVL`, surfacing a real
+    /// `start_number` and `ordered = true` instead of always `None`/bullet.
+    #[test]
+    fn list_start_number_and_ordered_resolve_from_list_formatting() {
+        let list_formatting = crate::doc::ListFormatting::from_parts(
+            vec![(
+                0x44F53D09, // lsid
+                vec![
+                    crate::doc::ListLevel { start_at: 5, nfc: 0x00 }, // level 0: numbered, starts at 5
+                    crate::doc::ListLevel { start_at: 1, nfc: 0xFF }, // level 1: bullet
+                ],
+            )],
+            vec![0x44F53D09], // lfo_lsids[0] == lsid above, so ilfo=1 resolves to it
+        );
+        let props = PapProps {
+            ilvl: Some(0),
+            ilfo: Some(1),
+            ..PapProps::default()
+        };
+        let p = para("First", props);
+        let mut els = Vec::new();
+        walk_paragraphs(&[p], false, &mut els, &list_formatting);
+
+        let Element::List(list) = &els[0] else {
+            panic!("expected a List element, got {els:#?}");
+        };
+        assert!(list.ordered, "nfc != 0xFF must render as an ordered list");
+        assert_eq!(list.start_number, Some(5), "iStartAt = 5 must reach List::start_number");
+    }
+
+    /// A level whose `nfc == 0xFF` (a bullet level) must never report
+    /// `start_number`, even when its `iStartAt` happens to be non-1.
+    #[test]
+    fn bullet_level_never_gets_a_start_number() {
+        let list_formatting = crate::doc::ListFormatting::from_parts(
+            vec![(1, vec![crate::doc::ListLevel { start_at: 7, nfc: 0xFF }])],
+            vec![1],
+        );
+        let props = PapProps {
+            ilvl: Some(0),
+            ilfo: Some(1),
+            ..PapProps::default()
+        };
+        let p = para("Bulleted", props);
+        let mut els = Vec::new();
+        walk_paragraphs(&[p], false, &mut els, &list_formatting);
+
+        let Element::List(list) = &els[0] else {
+            panic!("expected a List element, got {els:#?}");
+        };
+        assert!(!list.ordered);
+        assert_eq!(list.start_number, None);
+    }
+
+    /// A declared `iStartAt == 1` (the default) must not set
+    /// `start_number` — only an explicit override is worth surfacing,
+    /// mirroring DOCX's identical contract.
+    #[test]
+    fn start_at_one_is_not_surfaced_as_an_override() {
+        let list_formatting = crate::doc::ListFormatting::from_parts(
+            vec![(1, vec![crate::doc::ListLevel { start_at: 1, nfc: 0x00 }])],
+            vec![1],
+        );
+        let props = PapProps {
+            ilvl: Some(0),
+            ilfo: Some(1),
+            ..PapProps::default()
+        };
+        let p = para("Numbered from 1", props);
+        let mut els = Vec::new();
+        walk_paragraphs(&[p], false, &mut els, &list_formatting);
+
+        let Element::List(list) = &els[0] else {
+            panic!("expected a List element, got {els:#?}");
+        };
+        assert!(list.ordered);
+        assert_eq!(list.start_number, None, "start_at == 1 is the default, not an override");
+    }
+
+    /// An `ilfo` with no matching `PlfLfo`/`PlfLst` data (the common case
+    /// for most existing tests, and for a real file with no `PlfLst` at
+    /// all) must degrade to the pre-#250 contract — bullet, no
+    /// start_number — not panic or produce a wrong-but-confident answer.
+    #[test]
+    fn missing_list_formatting_degrades_to_the_old_contract() {
+        let props = PapProps {
+            ilvl: Some(0),
+            ilfo: Some(1),
+            ..PapProps::default()
+        };
+        let p = para("Item", props);
+        let mut els = Vec::new();
+        walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
+
+        let Element::List(list) = &els[0] else {
+            panic!("expected a List element, got {els:#?}");
+        };
+        assert!(!list.ordered);
+        assert_eq!(list.start_number, None);
     }
 
     /// `sprmPChgTabs` tab stops decoded onto `PapProps` must surface on the
@@ -1027,7 +1155,7 @@ mod tests {
         let p = para("Indented text carrying tab stops.", props);
 
         let mut els = Vec::new();
-        walk_paragraphs(&[p], false, &mut els);
+        walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
         let Element::Paragraph(par) = &els[0] else {
             panic!("expected a paragraph, got {:?}", els[0]);
         };
@@ -1063,7 +1191,7 @@ mod tests {
         };
         let paragraphs = [mark(1), cell, mark(1)];
         let mut els = Vec::new();
-        walk_paragraphs(&paragraphs, false, &mut els);
+        walk_paragraphs(&paragraphs, false, &mut els, &ListFormatting::default());
         assert!(
             els.iter().any(|e| matches!(e, Element::Table(_))),
             "f_in_table cell paragraph must be emitted inside a table"

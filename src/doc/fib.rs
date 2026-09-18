@@ -36,11 +36,22 @@ pub struct Fib {
     pub fc_plcf_bte_papx: u32,
     /// Byte length of the PlcfBtePapx in the Table stream (0x0106).
     pub lcb_plcf_bte_papx: u32,
-    /// Offset of the PlcfLst (list definitions) in the Table stream (0x02E2).
-    /// Zero when the file defines no lists.
+    /// Offset of the PlfLst (list definitions: LSTF + LVL arrays) in the
+    /// Table stream (0x02E2). Zero when the file defines no lists. Named
+    /// `fc_plcf_lst` here (not `fc_plf_lst`) for historical reasons — the
+    /// struct/field spelling predates issue #250, which is the first
+    /// consumer of the pointer it holds.
     pub fc_plcf_lst: u32,
-    /// Byte length of the PlcfLst in the Table stream (0x02E6).
+    /// Byte length of the PlfLst in the Table stream (0x02E6).
     pub lcb_plcf_lst: u32,
+    /// Offset of the PlfLfo (list format overrides: LFO array, one per
+    /// `ilfo`) in the Table stream (0x02EA). `sprmPIlfo`'s value is a
+    /// 1-based index into this array, not into `PlfLst` directly — an
+    /// `LFO.lsid` is what actually selects the matching `LSTF` (issue
+    /// #250). Zero when the file uses no lists.
+    pub fc_plf_lfo: u32,
+    /// Byte length of the PlfLfo in the Table stream (0x02EE).
+    pub lcb_plf_lfo: u32,
 }
 
 impl Fib {
@@ -122,10 +133,20 @@ impl Fib {
             (0, 0)
         };
 
-        // fcPlcfLst / lcbPlcfLst — list definitions (0x02E2 / 0x02E6).
+        // fcPlfLst / lcbPlfLst — list definitions (0x02E2 / 0x02E6).
         // Zero when the document defines no lists.
         let (fc_plcf_lst, lcb_plcf_lst) = if data.len() > 0x02EA {
             (read_u32(data, 0x02E2), read_u32(data, 0x02E6))
+        } else {
+            (0, 0)
+        };
+
+        // fcPlfLfo / lcbPlfLfo — list format overrides (0x02EA / 0x02EE),
+        // immediately following the fcPlfLst/lcbPlfLst pair above. Verified
+        // against the published [MS-DOC] worked example ("Example of a
+        // List"), which shows both pairs at these exact offsets.
+        let (fc_plf_lfo, lcb_plf_lfo) = if data.len() > 0x02F2 {
+            (read_u32(data, 0x02EA), read_u32(data, 0x02EE))
         } else {
             (0, 0)
         };
@@ -146,6 +167,8 @@ impl Fib {
             lcb_plcf_bte_papx,
             fc_plcf_lst,
             lcb_plcf_lst,
+            fc_plf_lfo,
+            lcb_plf_lfo,
         })
     }
 }
@@ -184,9 +207,13 @@ mod tests {
         // fcPlcfBtePapx = 300, lcbPlcfBtePapx = 28
         data[0x0102..0x0106].copy_from_slice(&300u32.to_le_bytes());
         data[0x0106..0x010A].copy_from_slice(&28u32.to_le_bytes());
-        // fcPlcfLst = 400, lcbPlcfLst = 12
+        // fcPlfLst = 400, lcbPlfLst = 12
         data[0x02E2..0x02E6].copy_from_slice(&400u32.to_le_bytes());
         data[0x02E6..0x02EA].copy_from_slice(&12u32.to_le_bytes());
+        // fcPlfLfo / lcbPlfLfo — the exact values from [MS-DOC]'s own
+        // "Example of a List" worked example (issue #250).
+        data[0x02EA..0x02EE].copy_from_slice(&0x000007E1u32.to_le_bytes());
+        data[0x02EE..0x02F2].copy_from_slice(&0x00000018u32.to_le_bytes());
         data
     }
 
@@ -203,6 +230,8 @@ mod tests {
         assert_eq!(fib.lcb_plcf_bte_papx, 28);
         assert_eq!(fib.fc_plcf_lst, 400);
         assert_eq!(fib.lcb_plcf_lst, 12);
+        assert_eq!(fib.fc_plf_lfo, 0x000007E1);
+        assert_eq!(fib.lcb_plf_lfo, 0x00000018);
     }
 
     #[test]
