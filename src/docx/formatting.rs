@@ -38,6 +38,12 @@ pub struct RunProperties {
     /// `TextSpan::highlight`, so reading it back is what closes the
     /// write→read loop for highlighted text.
     pub shading_fill: Option<String>,
+    /// `<w:vanish/>` — Word never renders this run at all (draft notes,
+    /// comment-reference glyph scaffolding, TOC/index field-code
+    /// internals). Converters use this to exclude the run from every
+    /// extraction surface, the same way a run-level `w:del` already is
+    /// (issue #305).
+    pub hidden: Option<bool>,
 }
 
 /// Paragraph-level formatting properties (`w:pPr`).
@@ -197,6 +203,7 @@ impl RunProperties {
             small_caps,
             char_spacing,
             shading_fill,
+            hidden,
         );
     }
 }
@@ -454,6 +461,10 @@ pub(crate) fn parse_run_properties(
                             }
                             xml::skip_element(reader)?;
                         },
+                        b"vanish" => {
+                            props.hidden = Some(parse_toggle(e));
+                            xml::skip_element(reader)?;
+                        },
                         _ => {
                             xml::skip_element(reader)?;
                         },
@@ -501,6 +512,9 @@ pub(crate) fn parse_run_properties(
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             props.style_id = Some(val.into_owned());
                         }
+                    },
+                    b"vanish" => {
+                        props.hidden = Some(parse_toggle(e));
                     },
                     _ => {},
                 }
@@ -703,6 +717,10 @@ pub(crate) fn parse_run_properties_fast(
                             .map(|v| v.into_owned());
                         xml::skip_element_fast(reader)?;
                     },
+                    b"vanish" => {
+                        props.hidden = Some(parse_toggle(e));
+                        xml::skip_element_fast(reader)?;
+                    },
                     _ => {
                         xml::skip_element_fast(reader)?;
                     },
@@ -714,6 +732,7 @@ pub(crate) fn parse_run_properties_fast(
                     b"caps" => props.caps = Some(parse_toggle(e)),
                     b"smallCaps" => props.small_caps = Some(parse_toggle(e)),
                     b"spacing" => props.char_spacing = parse_signed_val(e),
+                    b"vanish" => props.hidden = Some(parse_toggle(e)),
                     b"shd" => {
                         props.shading_fill = xml::optional_attr_str(e, b"w:fill")
                             .ok()

@@ -148,6 +148,10 @@ fn plain_text_blocks(elements: &[BlockElement], out: &mut String) {
 }
 
 fn plain_text_run(run: &Run, out: &mut String) {
+    // `<w:vanish/>` — Word never renders this run at all (issue #305).
+    if run.properties.as_ref().and_then(|rp| rp.hidden).unwrap_or(false) {
+        return;
+    }
     for content in &run.content {
         match content {
             RunContent::Text(text) => out.push_str(text),
@@ -457,6 +461,10 @@ fn flush_run(pending: &mut Option<(RunStyle, String)>, out: &mut String) {
 
 /// Collect a run's text content (no emphasis delimiters).
 fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, text: &mut String) {
+    // `<w:vanish/>` — Word never renders this run at all (issue #305).
+    if run.properties.as_ref().and_then(|rp| rp.hidden).unwrap_or(false) {
+        return;
+    }
     for content in &run.content {
         match content {
             RunContent::Text(t) => text.push_str(t),

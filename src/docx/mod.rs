@@ -4346,6 +4346,40 @@ mod tests {
     }
 
     #[test]
+    fn test_vanish_run_is_excluded_from_extraction() {
+        // issue #305 — <w:vanish/> (Word never renders this run at all)
+        // was never read anywhere; hidden text leaked into every
+        // extraction surface as if it were ordinary visible content.
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:r><w:t xml:space="preserve">Visible before. </w:t></w:r>
+      <w:r><w:rPr><w:vanish/></w:rPr><w:t xml:space="preserve">Hidden </w:t></w:r>
+      <w:r><w:t xml:space="preserve">Visible after.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let data = make_minimal_docx(document_xml);
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+
+        let plain = doc.plain_text();
+        assert!(!plain.contains("Hidden"), "plain_text() must exclude vanish text: {plain:?}");
+        assert!(plain.contains("Visible before."));
+        assert!(plain.contains("Visible after."));
+
+        let md = doc.to_markdown();
+        assert!(!md.contains("Hidden"), "to_markdown() must exclude vanish text: {md:?}");
+
+        let ir = crate::convert_docx::docx_to_ir(&doc);
+        let text_in_ir: String = ir.plain_text();
+        assert!(
+            !text_in_ir.contains("Hidden"),
+            "the IR itself must not carry vanish text: {text_in_ir:?}"
+        );
+    }
+
+    #[test]
     fn test_markdown_ordered_list_increments_instead_of_repeating_the_start_value() {
         // issue #316 — docx/text.rs's markdown_blocks printed the same
         // literal <w:start> value for every item in an ordered list,

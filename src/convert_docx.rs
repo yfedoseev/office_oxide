@@ -1050,6 +1050,15 @@ fn convert_run(
         },
         None => run.properties.as_ref(),
     };
+    // `<w:vanish/>` — Word never renders this run at all. Excluding it
+    // here (rather than carrying a `hidden` flag into the IR for every
+    // renderer to filter separately) keeps plain_text/to_markdown/to_html
+    // and the CLI's JSON projection automatically in agreement, instead
+    // of risking a 5th instance of this crate's "two renderers disagree"
+    // flaw (issue #305).
+    if effective.and_then(|rp| rp.hidden).unwrap_or(false) {
+        return;
+    }
     let bold = effective.and_then(|rp| rp.bold).unwrap_or(false);
     let italic = effective.and_then(|rp| rp.italic).unwrap_or(false);
     let strike = effective
