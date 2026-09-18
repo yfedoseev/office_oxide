@@ -8,6 +8,12 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
     for (slide_idx, slide) in doc.slides.iter().enumerate() {
         let mut elements = Vec::new();
         let mut slide_title: Option<String> = None;
+        // Presenter-only text, kept out of `elements` (which is "what the
+        // audience sees") and routed to the dedicated field instead — the
+        // PPTX side of this was already fixed in #203; #238 is the same
+        // defect on the legacy binary .ppt path, which had never been
+        // ported to route TextType::Notes there at all.
+        let mut notes_lines: Vec<&str> = Vec::new();
 
         for run in &slide.text_runs {
             let text = run.text.trim();
@@ -40,17 +46,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                     }
                 },
                 TextType::Notes => {
-                    for line in text.lines() {
-                        if !line.trim().is_empty() {
-                            elements.push(Element::Paragraph(Paragraph {
-                                content: vec![InlineContent::Text(TextSpan {
-                                    italic: true,
-                                    ..TextSpan::plain(line)
-                                })],
-                                ..Default::default()
-                            }));
-                        }
-                    }
+                    notes_lines.push(text);
                 },
                 _ => {
                     elements.push(Element::Paragraph(Paragraph {
@@ -62,10 +58,16 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
         }
 
         let title = slide_title.unwrap_or_else(|| format!("Slide {}", slide_idx + 1));
+        let speaker_notes = if notes_lines.is_empty() {
+            None
+        } else {
+            Some(notes_lines.join("\n").trim().to_string()).filter(|s| !s.is_empty())
+        };
 
         sections.push(Section {
             title: Some(title),
             elements,
+            speaker_notes,
             ..Default::default()
         });
     }

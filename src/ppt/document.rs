@@ -255,6 +255,74 @@ mod tests {
         assert_eq!(ir.sections[0].title.as_deref(), Some("Centered"));
     }
 
+    /// The PPTX side of this was already fixed in #203; #238 is the same
+    /// defect on the legacy binary .ppt path — `TextType::Notes` runs must
+    /// land on `Section.speaker_notes`, not leak into `elements` as
+    /// ordinary (if italicized) paragraphs indistinguishable from body
+    /// text to most IR consumers.
+    #[test]
+    fn ir_notes_go_to_speaker_notes_not_elements() {
+        use crate::ir::{Element, InlineContent};
+        let doc = PptDocument {
+            images: Vec::new(),
+            has_macros: false,
+            slides: vec![make_slide(vec![
+                (TextType::Title, "Title"),
+                (TextType::Body, "Visible body text"),
+                (TextType::Notes, "Presenter-only notes"),
+            ])],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        assert_eq!(
+            ir.sections[0].speaker_notes.as_deref(),
+            Some("Presenter-only notes"),
+            "notes text must reach Section::speaker_notes"
+        );
+        let elements_text = format!("{:?}", ir.sections[0].elements);
+        assert!(
+            !elements_text.contains("Presenter-only notes"),
+            "notes text must not also leak into elements: {elements_text}"
+        );
+        // Visible content is unaffected.
+        assert!(
+            ir.sections[0]
+                .elements
+                .iter()
+                .any(|e| matches!(e, Element::Paragraph(p) if matches!(&p.content[0], InlineContent::Text(t) if t.text == "Visible body text"))),
+            "body text must still reach elements"
+        );
+    }
+
+    /// A slide with no notes at all gets `None`, not an empty string.
+    #[test]
+    fn ir_no_notes_is_none_not_empty_string() {
+        let doc = PptDocument {
+            images: Vec::new(),
+            has_macros: false,
+            slides: vec![make_slide(vec![(TextType::Body, "Just body text")])],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        assert!(ir.sections[0].speaker_notes.is_none());
+    }
+
+    /// Multiple `TextType::Notes` runs on one slide are joined, not just
+    /// the last one kept.
+    #[test]
+    fn ir_multiple_notes_runs_are_joined() {
+        let doc = PptDocument {
+            images: Vec::new(),
+            has_macros: false,
+            slides: vec![make_slide(vec![
+                (TextType::Notes, "First note"),
+                (TextType::Notes, "Second note"),
+            ])],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        let notes = ir.sections[0].speaker_notes.as_deref().unwrap_or_default();
+        assert!(notes.contains("First note"), "notes: {notes:?}");
+        assert!(notes.contains("Second note"), "notes: {notes:?}");
+    }
+
     #[test]
     fn ir_body_half_quarter_produce_paragraphs() {
         use crate::ir::Element;
@@ -273,23 +341,19 @@ mod tests {
     }
 
     #[test]
-    fn ir_notes_produce_italic_paragraphs() {
-        use crate::ir::{Element, InlineContent};
+    fn ir_notes_produce_no_visible_elements() {
+        // Superseded by #238: notes used to become an italic Element::
+        // Paragraph in `elements`; they now route to Section::speaker_notes
+        // instead (see ir_notes_go_to_speaker_notes_not_elements above) and
+        // a notes-only slide has no visible elements at all.
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
             slides: vec![make_slide(vec![(TextType::Notes, "Speaker note")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
-        if let Element::Paragraph(ref p) = ir.sections[0].elements[0] {
-            if let InlineContent::Text(ref span) = p.content[0] {
-                assert!(span.italic);
-            } else {
-                panic!("expected text span");
-            }
-        } else {
-            panic!("expected paragraph");
-        }
+        assert!(ir.sections[0].elements.is_empty());
+        assert_eq!(ir.sections[0].speaker_notes.as_deref(), Some("Speaker note"));
     }
 
     #[test]
