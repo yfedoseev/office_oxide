@@ -494,6 +494,26 @@ fn in_grid(row: usize, col: usize) -> bool {
     false
 }
 
+/// Restrict an image extension to `[A-Za-z0-9]{1,10}` before it reaches a
+/// ZIP entry name, a relationship target, or a `<Default Extension="..">`.
+///
+/// `add_image`'s `format` was spliced in verbatim: `"a/b/c"` produced a
+/// bogus-but-contained part name, and control characters — a raw NUL in
+/// particular — reached the ZIP filename (a path-truncation vector for
+/// any C-based extractor) plus `[Content_Types].xml` and the drawing's
+/// `.rels` unescapably, making both non-well-formed XML while `save()`
+/// still returned `Ok(())`. Falls back to `"bin"` when nothing in the
+/// input survives filtering (issue #220).
+fn sanitize_image_extension(format: &str) -> String {
+    let cleaned: String =
+        format.chars().filter(|c| c.is_ascii_alphanumeric()).take(10).collect();
+    if cleaned.is_empty() {
+        "bin".to_string()
+    } else {
+        cleaned
+    }
+}
+
 /// Make a worksheet name Excel will accept: 1-31 characters, none of
 /// `[ ] : * ? / \`, and unique within the workbook.
 ///
@@ -660,7 +680,7 @@ impl<'a> SheetData<'a> {
     ) -> &mut Self {
         self.0.images.push(SheetImage {
             data,
-            format: format.into(),
+            format: sanitize_image_extension(&format.into()),
             x_emu,
             y_emu,
             cx_emu,
@@ -915,7 +935,7 @@ impl XlsxWriter {
         sheets: &[SheetDataInner],
         sheet_rids: &[String],
     ) -> crate::core::Result<Vec<u8>> {
-        let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+        let mut w = Writer::new(Vec::new());
 
         w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))?;
 
@@ -952,7 +972,7 @@ impl XlsxWriter {
         style_table: &StyleTable,
         drawing_rid: Option<&str>,
     ) -> crate::core::Result<Vec<u8>> {
-        let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+        let mut w = Writer::new(Vec::new());
 
         w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))?;
 
@@ -1291,7 +1311,7 @@ fn build_drawing_xml(
     const NS_XDR: &str = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing";
     const NS_A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
 
-    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+    let mut w = Writer::new(Vec::new());
     w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))?;
 
     let mut root = BytesStart::new("xdr:wsDr");
@@ -1699,7 +1719,7 @@ impl StyleTable {
     }
 
     fn build_styles_xml(&self) -> crate::core::Result<Vec<u8>> {
-        let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+        let mut w = Writer::new(Vec::new());
 
         w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))?;
 
@@ -1903,6 +1923,50 @@ fn format_number(n: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// issue #220 — a control character (a raw NUL in particular) in the
+    /// image extension reached the ZIP entry name, the relationship
+    /// target and [Content_Types].xml unescapably, producing a
+    /// non-well-formed package while save() still returned Ok(()).
+    #[test]
+    fn test_add_image_sanitizes_a_hostile_extension() {
+        let mut wb = XlsxWriter::new();
+        wb.add_sheet("S")
+            .add_image(vec![0x89, 0x50], "p\0n\u{1}g", 0, 0, 500_000, 500_000);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        wb.write_to(&mut buf).expect("write xlsx");
+        let bytes = buf.into_inner();
+
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut media_names = Vec::new();
+        for i in 0..zip.len() {
+            let name = zip.by_index(i).unwrap().name().to_string();
+            assert!(
+                !name.bytes().any(|b| b.is_ascii_control()),
+                "ZIP entry name must not carry a raw control character from the \
+                 caller's extension: {name:?}"
+            );
+            if name.starts_with("xl/media/") {
+                media_names.push(name);
+            }
+        }
+        assert_eq!(media_names.len(), 1, "expected exactly one media entry: {media_names:?}");
+        assert!(
+            media_names[0].ends_with(".png"),
+            "the alphanumeric characters of the hostile extension must survive: {}",
+            media_names[0]
+        );
+    }
+
+    /// A caller-supplied extension that's entirely non-alphanumeric must
+    /// still produce a usable file, not an empty/invalid one.
+    #[test]
+    fn test_add_image_falls_back_to_bin_for_an_entirely_invalid_extension() {
+        assert_eq!(sanitize_image_extension("/../../"), "bin");
+        assert_eq!(sanitize_image_extension(""), "bin");
+        assert_eq!(sanitize_image_extension("png"), "png");
+        assert_eq!(sanitize_image_extension("a/b/c"), "abc");
+    }
 
     #[test]
     fn col_name_basic() {

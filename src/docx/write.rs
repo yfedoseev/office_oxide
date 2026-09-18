@@ -1173,7 +1173,15 @@ impl DocxWriter {
         has_text_boxes: bool,
         links: &HyperlinkRids,
     ) -> Vec<u8> {
-        let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+        // Not `Writer::new_with_indent`: pretty-printing adds
+        // 2 x nesting_level spaces per line, and a text-box-in-text-box
+        // tree adds ~9 XML levels per Element level, making output
+        // Θ(depth²) — measured at 352 MB for a 1,000-deep IR that's only
+        // 146 KB as JSON, 99.75% of it whitespace. Word doesn't care
+        // about XML formatting; this writer's own reader doesn't either.
+        // Removing indentation removes the amplification entirely rather
+        // than merely capping it (issue #220).
+        let mut w = Writer::new(Vec::new());
 
         w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
             .expect("write decl");
@@ -1252,7 +1260,7 @@ impl DocxWriter {
     }
 
     fn generate_numbering_xml(&self) -> Vec<u8> {
-        let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+        let mut w = Writer::new(Vec::new());
 
         w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
             .expect("write decl");
@@ -3354,7 +3362,7 @@ fn generate_hf_xml(
     is_header: bool,
     links: &HyperlinkRids,
 ) -> Vec<u8> {
-    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+    let mut w = Writer::new(Vec::new());
     w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
         .expect("write decl");
 
@@ -3411,7 +3419,7 @@ fn generate_endnotes_xml(
 
 /// `word/settings.xml`, written only when a part depends on it.
 fn generate_settings_xml(even_and_odd_headers: bool, embed_fonts: bool) -> Vec<u8> {
-    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+    let mut w = Writer::new(Vec::new());
     w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
         .expect("write decl");
     let mut root = BytesStart::new("w:settings");
@@ -3437,7 +3445,7 @@ fn generate_notes_xml(
     is_endnote: bool,
     links: &HyperlinkRids,
 ) -> Vec<u8> {
-    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+    let mut w = Writer::new(Vec::new());
     w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
         .expect("write decl");
 
@@ -3561,7 +3569,7 @@ fn generate_notes_xml(
 // ---------------------------------------------------------------------------
 
 fn generate_core_props_xml(props: &CoreProps) -> Vec<u8> {
-    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+    let mut w = Writer::new(Vec::new());
     w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
         .expect("write decl");
 
@@ -3659,7 +3667,7 @@ fn generate_core_props_xml(props: &CoreProps) -> Vec<u8> {
 /// face, they should embed it under a distinct family name (e.g.
 /// `Calibri-Bold`) and reference that name from runs explicitly.
 fn generate_font_table_xml(entries: &[(String, String)]) -> Vec<u8> {
-    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+    let mut w = Writer::new(Vec::new());
     w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
         .expect("decl");
 
@@ -3693,7 +3701,7 @@ fn generate_font_table_xml(entries: &[(String, String)]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 fn generate_styles_xml(has_numbering: bool, has_notes: bool) -> Vec<u8> {
-    let mut w = Writer::new_with_indent(Vec::new(), b' ', 2);
+    let mut w = Writer::new(Vec::new());
 
     w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
         .expect("write decl");
@@ -4195,6 +4203,51 @@ mod tests {
     /// issue #218 — content past MAX_NESTING_DEPTH was dropped with only
     /// a log::warn!; a caller had no way to learn the document they just
     /// wrote was missing content. truncated_subtrees() must report it.
+    /// issue #220 — pretty-printed indentation made document.xml grow
+    /// Θ(depth²): 2 x nesting_level spaces per line, ~9 XML levels per
+    /// text-box level. Compares output size at two nesting depths; a
+    /// roughly-doubled depth must not roughly-quadruple the output.
+    #[test]
+    fn test_document_xml_size_does_not_grow_quadratically_with_nesting_depth() {
+        fn nested_ir(depth: usize) -> crate::ir::DocumentIR {
+            let mut inner = crate::ir::Element::Paragraph(crate::ir::Paragraph {
+                content: vec![crate::ir::InlineContent::Text(crate::ir::TextSpan::plain("x"))],
+                ..Default::default()
+            });
+            for _ in 0..depth {
+                inner = crate::ir::Element::TextBox(crate::ir::TextBox {
+                    content: vec![inner],
+                    ..Default::default()
+                });
+            }
+            crate::ir::DocumentIR {
+                sections: vec![crate::ir::Section {
+                    elements: vec![inner],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        }
+        fn document_xml_len(depth: usize) -> usize {
+            let writer = crate::create::ir_to_docx(&nested_ir(depth));
+            let mut buf = Cursor::new(Vec::new());
+            writer.write_to(&mut buf).unwrap();
+            buf.into_inner().len()
+        }
+
+        let small = document_xml_len(20) as f64;
+        let doubled = document_xml_len(40) as f64;
+        // Linear growth roughly doubles; quadratic roughly quadruples.
+        // Allow generous headroom (6x) — this only needs to catch the
+        // amplification returning, not pin an exact constant.
+        assert!(
+            doubled < small * 6.0,
+            "document.xml grew {}x when depth doubled (small={small}, doubled={doubled}) — \
+             looks quadratic again",
+            doubled / small
+        );
+    }
+
     #[test]
     fn test_truncated_subtrees_reports_depth_bound_hits() {
         let mut inner = crate::ir::Element::Paragraph(crate::ir::Paragraph::default());
