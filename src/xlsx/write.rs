@@ -353,6 +353,10 @@ struct SheetDataInner {
     /// Text shapes anchored on this sheet via a DrawingML drawing part.
     /// Used by the layout-preserving PDF→XLSX path.
     pub text_shapes: Vec<SheetTextShape>,
+    /// Per-cell external hyperlink targets (issue #262 — this writer had
+    /// no hyperlink concept at all, so a cell's URL was silently dropped
+    /// on every write, unconditionally).
+    pub hyperlinks: HashMap<(usize, usize), String>,
 }
 
 impl SheetDataInner {
@@ -366,6 +370,7 @@ impl SheetDataInner {
             page_setup: None,
             images: Vec::new(),
             text_shapes: Vec::new(),
+            hyperlinks: HashMap::new(),
         }
     }
 
@@ -415,6 +420,22 @@ impl SheetDataInner {
         self.ensure_cell(row, col);
         self.rows[row][col] = Some(StoredCellInner { value });
         self.cell_styles.insert((row, col), style);
+        self
+    }
+
+    /// Set (or overwrite) the external hyperlink target for a cell
+    /// (issue #262). Silently ignored outside the sheet grid, matching
+    /// `set_cell`/`set_cell_styled`.
+    pub fn set_cell_hyperlink(
+        &mut self,
+        row: usize,
+        col: usize,
+        url: impl Into<String>,
+    ) -> &mut Self {
+        if !in_grid(row, col) {
+            return self;
+        }
+        self.hyperlinks.insert((row, col), url.into());
         self
     }
 
@@ -598,6 +619,18 @@ impl<'a> SheetData<'a> {
         style: CellStyle,
     ) -> &mut Self {
         self.0.set_cell_styled(row, col, value, style);
+        self
+    }
+
+    /// Set (or overwrite) the external hyperlink target for a cell
+    /// (issue #262).
+    pub fn set_cell_hyperlink(
+        &mut self,
+        row: usize,
+        col: usize,
+        url: impl Into<String>,
+    ) -> &mut Self {
+        self.0.set_cell_hyperlink(row, col, url);
         self
     }
 
@@ -913,7 +946,28 @@ impl XlsxWriter {
                 None
             };
 
-            let ws_xml = Self::build_worksheet_xml(sheet, &style_table, drawing_rid.as_deref())?;
+            // One external relationship per cell hyperlink, scoped to
+            // this sheet's own `_rels` file (each worksheet part has
+            // its own relationships part; an r:id registered against
+            // one sheet doesn't resolve inside another's XML) (issue
+            // #262).
+            let mut hyperlink_rids: HashMap<(usize, usize), String> = HashMap::new();
+            for (&(row, col), url) in &sheet.hyperlinks {
+                let rid = opc.add_part_rel_with_mode(
+                    &part_name,
+                    rel_types::HYPERLINK,
+                    url,
+                    crate::core::relationships::TargetMode::External,
+                );
+                hyperlink_rids.insert((row, col), rid);
+            }
+
+            let ws_xml = Self::build_worksheet_xml(
+                sheet,
+                &style_table,
+                drawing_rid.as_deref(),
+                &hyperlink_rids,
+            )?;
             opc.add_part(&part_name, CT_WORKSHEET, &ws_xml)?;
         }
 
@@ -971,6 +1025,7 @@ impl XlsxWriter {
         sheet: &SheetDataInner,
         style_table: &StyleTable,
         drawing_rid: Option<&str>,
+        hyperlink_rids: &HashMap<(usize, usize), String>,
     ) -> crate::core::Result<Vec<u8>> {
         let mut w = Writer::new(Vec::new());
 
@@ -1044,6 +1099,26 @@ impl XlsxWriter {
                 w.write_event(Event::Empty(mc))?;
             }
             w.write_event(Event::End(BytesEnd::new("mergeCells")))?;
+        }
+
+        // `<hyperlinks>` (CT_Worksheet, ECMA-376 §18.3.1.48) MUST appear
+        // after `mergeCells` and before `pageMargins`/`pageSetup`/
+        // `printOptions` per the worksheet child-order schema — same
+        // constraint as `<drawing>` below (issue #262).
+        if !sheet.hyperlinks.is_empty() {
+            let mut sorted: Vec<(&(usize, usize), &String)> = hyperlink_rids.iter().collect();
+            sorted.sort_unstable_by_key(|&(&(r, c), _)| (r, c));
+            if !sorted.is_empty() {
+                w.write_event(Event::Start(BytesStart::new("hyperlinks")))?;
+                for (&(row, col), rid) in sorted {
+                    let cell_ref = format!("{}{}", col_name(col as u32), row + 1);
+                    let mut hl = BytesStart::new("hyperlink");
+                    hl.push_attribute(("ref", cell_ref.as_str()));
+                    hl.push_attribute(("r:id", rid.as_str()));
+                    w.write_event(Event::Empty(hl))?;
+                }
+                w.write_event(Event::End(BytesEnd::new("hyperlinks")))?;
+            }
         }
 
         // <pageMargins> + <pageSetup>. ECMA-376 §18.3.1.62 / §18.3.1.63 —
@@ -2104,6 +2179,70 @@ mod tests {
         }
         assert!(sheet_xml.contains("<mergeCells"), "missing mergeCells");
         assert!(sheet_xml.contains(r#"ref="A1:B1""#), "wrong ref");
+    }
+
+    /// issue #262 — xlsx::write had no hyperlink concept at all; a cell's
+    /// URL was silently dropped, unconditionally, on every write. Checks
+    /// both the raw XML shape (worksheet `<hyperlinks>` + its own
+    /// `_rels` external relationship) and that the crate's own reader
+    /// resolves it back to a URL.
+    #[test]
+    fn cell_hyperlink_round_trips() {
+        let mut wb = XlsxWriter::new();
+        let mut sheet = wb.add_sheet("Links");
+        sheet.set_cell(0, 0, CellData::String("Contact".into()));
+        sheet.set_cell_hyperlink(0, 0, "mailto:someone@example.com");
+
+        let mut buf = std::io::Cursor::new(Vec::new());
+        wb.write_to(&mut buf).expect("write xlsx");
+
+        buf.set_position(0);
+        let mut zip = zip::ZipArchive::new(buf.clone()).expect("open zip");
+        let mut sheet_xml = String::new();
+        {
+            let mut entry = zip.by_name("xl/worksheets/sheet1.xml").expect("find sheet");
+            std::io::Read::read_to_string(&mut entry, &mut sheet_xml).expect("read");
+        }
+        assert!(sheet_xml.contains("<hyperlinks>"), "missing hyperlinks element: {sheet_xml}");
+        assert!(sheet_xml.contains(r#"ref="A1""#), "wrong cell ref: {sheet_xml}");
+
+        let mut rels_xml = String::new();
+        {
+            let mut entry = zip
+                .by_name("xl/worksheets/_rels/sheet1.xml.rels")
+                .expect("find sheet rels");
+            std::io::Read::read_to_string(&mut entry, &mut rels_xml).expect("read");
+        }
+        assert!(
+            rels_xml.contains("mailto:someone@example.com"),
+            "missing hyperlink target in rels: {rels_xml}"
+        );
+        assert!(
+            rels_xml.contains(r#"TargetMode="External""#),
+            "hyperlink relationship must be External: {rels_xml}"
+        );
+
+        buf.set_position(0);
+        let doc = crate::Document::from_reader(buf, crate::DocumentFormat::Xlsx).expect("reparse");
+        let ir = doc.to_ir();
+        let mut found = false;
+        for e in &ir.sections[0].elements {
+            let crate::ir::Element::Table(t) = e else { continue };
+            for row in &t.rows {
+                for cell in &row.cells {
+                    for ce in &cell.content {
+                        let crate::ir::Element::Paragraph(p) = ce else { continue };
+                        for ic in &p.content {
+                            let crate::ir::InlineContent::Text(ts) = ic else { continue };
+                            if ts.hyperlink.as_deref() == Some("mailto:someone@example.com") {
+                                found = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found, "hyperlink did not round-trip through the reader: {:?}", ir.sections[0]);
     }
 }
 

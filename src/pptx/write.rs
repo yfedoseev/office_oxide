@@ -21,6 +21,7 @@
 //! writer.save("output.pptx").unwrap();
 //! ```
 
+use std::collections::HashMap;
 use std::io::{Seek, Write};
 use std::path::Path;
 
@@ -90,6 +91,10 @@ pub struct Run {
     pub font_name: Option<String>,
     /// When set, this run is a hard line break (`<a:br/>`) rather than text.
     pub line_break: bool,
+    /// External hyperlink target URL, if any (issue #262 — this writer
+    /// had no hyperlink concept at all, so a run's URL was silently
+    /// dropped, unconditionally, on every write).
+    pub hyperlink: Option<String>,
 }
 
 impl Run {
@@ -151,6 +156,12 @@ impl Run {
         self
     }
 
+    /// External hyperlink target URL.
+    pub fn hyperlink(mut self, url: impl Into<String>) -> Self {
+        self.hyperlink = Some(url.into());
+        self
+    }
+
     fn has_rpr(&self) -> bool {
         self.bold
             || self.italic
@@ -159,6 +170,7 @@ impl Run {
             || self.color.is_some()
             || self.font_size_pt.is_some()
             || self.font_name.is_some()
+            || self.hyperlink.is_some()
     }
 }
 
@@ -631,6 +643,21 @@ impl PptxWriter {
                 }
             }
 
+            // One external relationship per distinct hyperlink URL used
+            // on this slide, scoped to this slide's own `_rels` file —
+            // an r:id registered against one slide part doesn't resolve
+            // inside another slide's XML (issue #262).
+            let mut hyperlink_rids: HashMap<String, String> = HashMap::new();
+            for url in collect_slide_hyperlinks(&slide.body_items) {
+                let rid = opc.add_part_rel_with_mode(
+                    slide_part,
+                    rel_types::HYPERLINK,
+                    &url,
+                    crate::core::relationships::TargetMode::External,
+                );
+                hyperlink_rids.insert(url, rid);
+            }
+
             if let Some(notes) = slide.notes.as_ref().filter(|n| !n.is_empty()) {
                 let idx = i + 1;
                 let notes_part = PartName::new(&format!("/ppt/notesSlides/notesSlide{idx}.xml"))?;
@@ -652,7 +679,7 @@ impl PptxWriter {
                 opc.add_part(&notes_part, CT_NOTES_SLIDE, &generate_notes_slide_xml(notes))?;
             }
 
-            let slide_xml = generate_slide_xml(slide, &img_rids, self.cx, self.cy);
+            let slide_xml = generate_slide_xml(slide, &img_rids, self.cx, self.cy, &hyperlink_rids);
             opc.add_part(slide_part, CT_SLIDE, &slide_xml)?;
         }
 
@@ -725,7 +752,7 @@ fn write_nv_grp_sp_pr(w: &mut Writer<Vec<u8>>) {
 }
 
 // Write a DrawingML run (<a:r>) with optional rPr.
-fn write_dml_run(w: &mut Writer<Vec<u8>>, run: &Run) {
+fn write_dml_run(w: &mut Writer<Vec<u8>>, run: &Run, hyperlink_rids: &HashMap<String, String>) {
     if run.line_break {
         w.write_event(Event::Empty(BytesStart::new("a:br")))
             .expect("write br");
@@ -755,7 +782,9 @@ fn write_dml_run(w: &mut Writer<Vec<u8>>, run: &Run) {
             rpr.push_attribute(("sz", hundredths.to_string().as_str()));
         }
 
-        if run.color.is_some() || run.font_name.is_some() {
+        let rid = run.hyperlink.as_deref().and_then(|u| hyperlink_rids.get(u));
+
+        if run.color.is_some() || run.font_name.is_some() || rid.is_some() {
             w.write_event(Event::Start(rpr)).expect("write rPr start");
 
             if let Some(hex) = run.color.as_deref().and_then(normalize_hex_rgb) {
@@ -772,6 +801,12 @@ fn write_dml_run(w: &mut Writer<Vec<u8>>, run: &Run) {
                 let mut latin = BytesStart::new("a:latin");
                 latin.push_attribute(("typeface", name.as_str()));
                 w.write_event(Event::Empty(latin)).expect("write");
+            }
+
+            if let Some(rid) = rid {
+                let mut hlink = BytesStart::new("a:hlinkClick");
+                hlink.push_attribute(("r:id", rid.as_str()));
+                w.write_event(Event::Empty(hlink)).expect("write hlinkClick");
             }
 
             w.write_event(Event::End(BytesEnd::new("a:rPr")))
@@ -1293,11 +1328,35 @@ fn write_layout_placeholder(
 // slides/slideN.xml
 // ---------------------------------------------------------------------------
 
+/// Every distinct hyperlink URL reachable from `items`' runs, in
+/// first-seen order (issue #262). Only `RichText`/`TextBox` carry
+/// `Run`s today — `BulletList`/`Table` are plain strings with no
+/// hyperlink concept in the writer at all.
+fn collect_slide_hyperlinks(items: &[BodyItem]) -> Vec<String> {
+    let mut urls = Vec::new();
+    for item in items {
+        let runs = match item {
+            BodyItem::RichText(runs, _) => runs.as_slice(),
+            BodyItem::TextBox(runs, ..) => runs.as_slice(),
+            _ => continue,
+        };
+        for run in runs {
+            if let Some(ref url) = run.hyperlink {
+                if !urls.contains(url) {
+                    urls.push(url.clone());
+                }
+            }
+        }
+    }
+    urls
+}
+
 fn generate_slide_xml(
     slide: &SlideData,
     img_rids: &[(String, i64, i64, u64, u64, Option<String>)],
     pres_cx: u64,
     pres_cy: u64,
+    hyperlink_rids: &HashMap<String, String>,
 ) -> Vec<u8> {
     let mut w = Writer::new(Vec::new());
     write_decl(&mut w);
@@ -1327,7 +1386,7 @@ fn generate_slide_xml(
                 !matches!(i, BodyItem::TextBox(..) | BodyItem::Image(..) | BodyItem::Table(..))
             })
             .collect();
-        write_body_shape(&mut w, next_id, &placeholder_items, pres_cx, pres_cy);
+        write_body_shape(&mut w, next_id, &placeholder_items, pres_cx, pres_cy, hyperlink_rids);
         next_id += 1;
     }
 
@@ -1346,7 +1405,7 @@ fn generate_slide_xml(
     // Free-floating text boxes
     for item in &slide.body_items {
         if let BodyItem::TextBox(runs, x, y, cx, cy) = item {
-            write_text_box_shape(&mut w, next_id, runs, *x, *y, *cx, *cy);
+            write_text_box_shape(&mut w, next_id, runs, *x, *y, *cx, *cy, hyperlink_rids);
             next_id += 1;
         }
     }
@@ -1457,7 +1516,7 @@ fn write_title_shape(
             alignment: Some(a.clone()),
             ..Default::default()
         };
-        write_rich_paragraph(w, &runs, &props);
+        write_rich_paragraph(w, &runs, &props, &HashMap::new());
     } else {
         write_plain_paragraph(w, title);
     }
@@ -1474,6 +1533,7 @@ fn write_body_shape(
     items: &[&BodyItem],
     pres_cx: u64,
     pres_cy: u64,
+    hyperlink_rids: &HashMap<String, String>,
 ) {
     let id_str = id.to_string();
     w.write_event(Event::Start(BytesStart::new("p:sp")))
@@ -1531,7 +1591,7 @@ fn write_body_shape(
                 wrote_paragraph = true;
             },
             BodyItem::RichText(runs, props) => {
-                write_rich_paragraph(w, runs, props);
+                write_rich_paragraph(w, runs, props, hyperlink_rids);
                 wrote_paragraph = true;
             },
             BodyItem::BulletList(bullets) => {
@@ -1675,6 +1735,7 @@ fn write_text_box_shape(
     y: i64,
     cx: i64,
     cy: i64,
+    hyperlink_rids: &HashMap<String, String>,
 ) {
     let id_str = id.to_string();
     let name = format!("TextBox {id}");
@@ -1737,7 +1798,7 @@ fn write_text_box_shape(
     body_pr.push_attribute(("rIns", "0"));
     body_pr.push_attribute(("bIns", "0"));
     w.write_event(Event::Empty(body_pr)).expect("write");
-    write_rich_paragraph(w, runs, &ParaProps::default());
+    write_rich_paragraph(w, runs, &ParaProps::default(), hyperlink_rids);
     w.write_event(Event::End(BytesEnd::new("p:txBody")))
         .expect("write");
 
@@ -1829,7 +1890,12 @@ fn write_plain_paragraph(w: &mut Writer<Vec<u8>>, text: &str) {
         .expect("write");
 }
 
-fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, runs: &[Run], props: &ParaProps) {
+fn write_rich_paragraph(
+    w: &mut Writer<Vec<u8>>,
+    runs: &[Run],
+    props: &ParaProps,
+    hyperlink_rids: &HashMap<String, String>,
+) {
     use crate::ir::ParagraphAlignment;
     w.write_event(Event::Start(BytesStart::new("a:p")))
         .expect("write");
@@ -1863,7 +1929,7 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, runs: &[Run], props: &ParaProps
         }
     }
     for run in runs {
-        write_dml_run(w, run);
+        write_dml_run(w, run, hyperlink_rids);
     }
     w.write_event(Event::End(BytesEnd::new("a:p")))
         .expect("write");
@@ -1967,6 +2033,68 @@ mod tests {
         let mut xml = String::new();
         std::io::Read::read_to_string(&mut entry, &mut xml).unwrap();
         xml
+    }
+
+    /// issue #262 — pptx::write had no hyperlink concept at all; a run's
+    /// URL was silently dropped, unconditionally, on every write. Checks
+    /// both the raw XML shape (`<a:hlinkClick r:id="...">` + the slide's
+    /// own `_rels` external relationship) and that the crate's own
+    /// reader resolves it back to a URL.
+    #[test]
+    fn run_hyperlink_round_trips() {
+        let mut writer = PptxWriter::new();
+        writer
+            .add_slide()
+            .add_rich_text(&[Run::new("Click here").hyperlink("https://example.com/")]);
+
+        let mut buf = Cursor::new(Vec::new());
+        writer.write_to(&mut buf).unwrap();
+
+        buf.set_position(0);
+        let mut zip = zip::ZipArchive::new(buf.clone()).unwrap();
+        let mut slide_xml = String::new();
+        {
+            let mut entry = zip.by_name("ppt/slides/slide1.xml").unwrap();
+            std::io::Read::read_to_string(&mut entry, &mut slide_xml).unwrap();
+        }
+        assert!(slide_xml.contains("<a:hlinkClick"), "missing hlinkClick: {slide_xml}");
+
+        let mut rels_xml = String::new();
+        {
+            let mut entry = zip.by_name("ppt/slides/_rels/slide1.xml.rels").unwrap();
+            std::io::Read::read_to_string(&mut entry, &mut rels_xml).unwrap();
+        }
+        assert!(
+            rels_xml.contains("https://example.com/"),
+            "missing hyperlink target in rels: {rels_xml}"
+        );
+        assert!(
+            rels_xml.contains(r#"TargetMode="External""#),
+            "hyperlink relationship must be External: {rels_xml}"
+        );
+
+        buf.set_position(0);
+        let doc = crate::Document::from_reader(buf, crate::DocumentFormat::Pptx).expect("reparse");
+        let ir = doc.to_ir();
+        let text = doc.plain_text();
+        assert!(text.contains("Click here"), "run text lost on round trip: {text:?}");
+        // Body content reads back wrapped in a TextBox (the PPTX reader's
+        // own placeholder-wrapping convention), so search recursively.
+        fn has_the_hyperlink(elements: &[crate::ir::Element]) -> bool {
+            elements.iter().any(|e| match e {
+                crate::ir::Element::Paragraph(p) => p.content.iter().any(|c| {
+                    matches!(c, crate::ir::InlineContent::Text(t)
+                        if t.hyperlink.as_deref() == Some("https://example.com/"))
+                }),
+                crate::ir::Element::TextBox(tb) => has_the_hyperlink(&tb.content),
+                _ => false,
+            })
+        }
+        assert!(
+            has_the_hyperlink(&ir.sections[0].elements),
+            "hyperlink did not round-trip through the reader: {:?}",
+            ir.sections[0]
+        );
     }
 
     /// `CT_SlideMaster` is a strict sequence: `cSld`, then the **required**

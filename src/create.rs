@@ -546,6 +546,9 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                             } else {
                                 sheet.set_cell(row_cursor, col, data);
                             }
+                            if let Some(url) = cell_hyperlink(cell) {
+                                sheet.set_cell_hyperlink(row_cursor, col, url);
+                            }
                             let cs = cell.col_span.max(1) as usize;
                             let rs = cell.row_span.max(1) as usize;
                             if cs > 1 || rs > 1 {
@@ -572,13 +575,29 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                         if let Some(name) = first_inline_font_name(&p.content) {
                             style = style.font_name(name);
                         }
-                        for line in split_paragraph_for_xlsx(&text) {
+                        // The first hyperlink anywhere in the paragraph,
+                        // attached to the first resulting row — this
+                        // fallback (non-tabular content split across
+                        // cells) doesn't track which specific sub-line a
+                        // hyperlink's own span covers, matching the
+                        // simplification `cell_hyperlink` already makes
+                        // for a real table cell's content (issue #262).
+                        let hyperlink = p.content.iter().find_map(|c| match c {
+                            InlineContent::Text(t) => t.hyperlink.clone(),
+                            _ => None,
+                        });
+                        for (i, line) in split_paragraph_for_xlsx(&text).into_iter().enumerate() {
                             sheet.set_cell_styled(
                                 row_cursor,
                                 0,
                                 CellData::String(line),
                                 style.clone(),
                             );
+                            if i == 0 {
+                                if let Some(ref url) = hyperlink {
+                                    sheet.set_cell_hyperlink(row_cursor, 0, url.clone());
+                                }
+                            }
                             row_cursor += 1;
                         }
                     }
@@ -1212,6 +1231,20 @@ fn cell_text(cell: &TableCell) -> String {
         .join(" ")
 }
 
+/// The first hyperlink URL found anywhere in a cell's content, if any
+/// (issue #262 — xlsx::write had no hyperlink concept at all, so a
+/// cell's `TextSpan.hyperlink` — the same field DOCX/PPTX runs already
+/// use — was silently dropped on every write).
+fn cell_hyperlink(cell: &TableCell) -> Option<String> {
+    cell.content.iter().find_map(|e| match e {
+        Element::Paragraph(p) => p.content.iter().find_map(|c| match c {
+            InlineContent::Text(t) => t.hyperlink.clone(),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
 /// Convert an IR cell to writer data, honouring the type the parser recorded.
 ///
 /// Re-parsing the *rendered* string threw away `data_type`, `raw_number` and
@@ -1429,6 +1462,9 @@ fn inline_to_pptx_runs(content: &[InlineContent]) -> Vec<crate::pptx::write::Run
                 }
                 if let Some(ref name) = span.font_name {
                     run = run.font(name.clone());
+                }
+                if let Some(ref url) = span.hyperlink {
+                    run = run.hyperlink(url.clone());
                 }
                 Some(run)
             } else {
