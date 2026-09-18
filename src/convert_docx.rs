@@ -212,6 +212,7 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
+            text_truncated: false,
         },
         sections: ir_sections,
         defined_names: Vec::new(),

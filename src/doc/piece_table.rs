@@ -136,6 +136,36 @@ pub fn extract_text(word_doc: &[u8], pieces: &[Piece], max_chars: u32) -> String
     extract_text_range(word_doc, pieces, 0, max_chars)
 }
 
+/// Whether `pieces` fully covers `[0, text_len)` with no gaps.
+///
+/// A well-formed piece table starts at CP 0 and each piece picks up exactly
+/// where the previous one ended, all the way to (at least) `text_len`. When
+/// that doesn't hold — the first piece starts past 0, a gap sits between
+/// two pieces, or the pieces stop short of `text_len` — every CP the gap
+/// covers is silently absent from `extract_text`'s output with no error:
+/// a `.doc` can end up 84% shorter than its own FIB says it is, and look
+/// identical to a document that genuinely has that little text (issue
+/// #230). This doesn't attempt to recover the missing text (a fallback
+/// byte-range read risks producing *wrong*, garbled text for other files,
+/// which is worse than an accurate partial extraction) — it only gives a
+/// caller a way to tell the two cases apart.
+pub fn covers_declared_length(pieces: &[Piece], text_len: u32) -> bool {
+    if text_len == 0 {
+        return true;
+    }
+    let mut expected_start = 0u32;
+    for piece in pieces {
+        if piece.cp_start != expected_start {
+            return false;
+        }
+        expected_start = piece.cp_end;
+        if expected_start >= text_len {
+            return true;
+        }
+    }
+    false
+}
+
 /// Extract the text for a character-position range `[cp_start, cp_end)`.
 ///
 /// The piece table addresses one contiguous character space that holds the
@@ -767,5 +797,62 @@ mod multi_piece_tests {
         let c = clx(&[(0, 6, 512)]);
         let pieces = parse_clx(&c).expect("parse");
         assert_eq!(extract_text_range(&word_doc, &pieces, 2, 5), "CDE");
+    }
+
+    // ── Piece table coverage vs the FIB's declared text length (#230) ──────
+
+    fn piece(cp_start: u32, cp_end: u32) -> Piece {
+        Piece { cp_start, cp_end, fc: 0, is_compressed: true }
+    }
+
+    /// A single piece that covers the whole declared range.
+    #[test]
+    fn covers_declared_length_true_for_a_full_single_piece() {
+        assert!(covers_declared_length(&[piece(0, 100)], 100));
+        // Covering more than declared is fine too.
+        assert!(covers_declared_length(&[piece(0, 200)], 100));
+    }
+
+    /// Several contiguous pieces that together reach the declared length.
+    #[test]
+    fn covers_declared_length_true_for_contiguous_pieces() {
+        assert!(covers_declared_length(&[piece(0, 40), piece(40, 70), piece(70, 100)], 100));
+    }
+
+    /// The exact real-world shape from the issue: a single piece that
+    /// starts well past CP 0 and doesn't reach `text_len` — the piece
+    /// table itself is internally consistent (one valid piece), but it
+    /// leaves the first 2816 of 3390 declared characters completely
+    /// unmapped.
+    #[test]
+    fn covers_declared_length_false_when_the_only_piece_starts_past_zero() {
+        assert!(!covers_declared_length(&[piece(2816, 3390)], 3368));
+    }
+
+    /// A gap between two otherwise-valid pieces.
+    #[test]
+    fn covers_declared_length_false_for_a_gap_between_pieces() {
+        assert!(!covers_declared_length(&[piece(0, 40), piece(50, 100)], 100));
+    }
+
+    /// Pieces that stop short of the declared length with no gap before
+    /// that point.
+    #[test]
+    fn covers_declared_length_false_when_pieces_stop_short() {
+        assert!(!covers_declared_length(&[piece(0, 40)], 100));
+    }
+
+    /// No pieces at all, but the FIB declares text — an empty piece table
+    /// with a nonzero `ccpText` is definitionally a gap, not "no text".
+    #[test]
+    fn covers_declared_length_false_for_no_pieces_with_nonzero_text_len() {
+        assert!(!covers_declared_length(&[], 100));
+    }
+
+    /// `text_len == 0` trivially has nothing to cover.
+    #[test]
+    fn covers_declared_length_true_when_text_len_is_zero() {
+        assert!(covers_declared_length(&[], 0));
+        assert!(covers_declared_length(&[piece(0, 10)], 0));
     }
 }

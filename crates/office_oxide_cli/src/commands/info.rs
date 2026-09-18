@@ -11,6 +11,12 @@ pub fn run(file: &str) -> Result<(), Box<dyn std::error::Error>> {
     if ir.metadata.has_macros {
         println!("Macros: yes");
     }
+    if ir.metadata.text_truncated {
+        println!(
+            "Warning: text extraction is incomplete — the source file's own structure disagrees \
+             with itself about how much text there is, and the gap could not be safely recovered"
+        );
+    }
     println!("Sections: {}", ir.sections.len());
 
     for (i, section) in ir.sections.iter().enumerate() {

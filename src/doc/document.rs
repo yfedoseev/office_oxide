@@ -8,7 +8,7 @@ use super::error::{DocError, Result};
 use super::fib::Fib;
 use super::images::{DocImage, extract_images};
 use super::papx::{DocParagraph, build_paragraphs, parse_papx_paragraphs};
-use super::piece_table::{extract_text, parse_clx, sanitize_text};
+use super::piece_table::{covers_declared_length, extract_text, parse_clx, sanitize_text};
 
 /// A parsed legacy Word document.
 #[derive(Debug)]
@@ -32,6 +32,12 @@ pub struct DocDocument {
     /// storage — a cheap macro-presence signal, no VBA interpretation
     /// (issue #283).
     has_macros: bool,
+    /// `false` when the piece table has a gap before the FIB's declared
+    /// `ccpText` — text in that gap is silently absent from `plain_text()`/
+    /// `paragraphs()` with no other signal, so a caller who cares can at
+    /// least tell "genuinely short document" apart from "84% missing"
+    /// (issue #230).
+    text_complete: bool,
 }
 
 /// One of the subdocuments stored after the main text in a `.doc`.
@@ -107,6 +113,7 @@ impl DocDocument {
         let clx_end = clx_end.min(table_stream.len());
         let clx_data = &table_stream[clx_start..clx_end];
         let pieces = parse_clx(clx_data)?;
+        let text_complete = covers_declared_length(&pieces, fib.text_len);
 
         let raw_text = extract_text(&word_doc, &pieces, fib.text_len);
         let text = sanitize_text(&raw_text);
@@ -163,6 +170,7 @@ impl DocDocument {
             paragraphs,
             subdocuments,
             has_macros,
+            text_complete,
         })
     }
 
@@ -187,6 +195,13 @@ impl DocDocument {
     /// macro-presence signal, no VBA interpretation (issue #283).
     pub fn has_macros(&self) -> bool {
         self.has_macros
+    }
+
+    /// `false` when the piece table has a gap before the FIB's declared
+    /// text length, meaning `plain_text()`/`paragraphs()` are missing real
+    /// content that could not be safely recovered (issue #230).
+    pub fn text_complete(&self) -> bool {
+        self.text_complete
     }
 
     /// Get the extracted plain text.
@@ -253,6 +268,7 @@ mod tests {
         let doc = DocDocument {
             subdocuments: Vec::new(),
             has_macros: false,
+            text_complete: true,
             images: Vec::new(),
             text: "First paragraph\nSecond paragraph\n\nAfter gap".into(),
             paragraphs: Vec::new(),
@@ -268,6 +284,7 @@ mod tests {
         let doc = DocDocument {
             subdocuments: Vec::new(),
             has_macros: false,
+            text_complete: true,
             images: Vec::new(),
             text: "Hello World".into(),
             paragraphs: Vec::new(),
@@ -275,10 +292,41 @@ mod tests {
         assert_eq!(doc.plain_text(), "Hello World");
     }
 
+    /// `text_complete()` reaches `to_ir()`'s `Metadata::text_truncated` so
+    /// a caller who never inspects `DocDocument` directly can still tell a
+    /// piece-table gap apart from a genuinely short document (issue #230).
+    #[test]
+    fn incomplete_text_reaches_metadata_as_truncated() {
+        let doc = DocDocument {
+            subdocuments: Vec::new(),
+            has_macros: false,
+            text_complete: false,
+            images: Vec::new(),
+            text: "only the recovered fragment".into(),
+            paragraphs: Vec::new(),
+        };
+        assert!(!doc.text_complete());
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        assert!(
+            ir.metadata.text_truncated,
+            "a piece-table gap must be visible on Metadata::text_truncated"
+        );
+    }
+
+    /// The common case: a complete piece table must not be flagged.
+    #[test]
+    fn complete_text_is_not_flagged_truncated() {
+        let doc = make_doc("Hello World");
+        assert!(doc.text_complete());
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        assert!(!ir.metadata.text_truncated);
+    }
+
     fn make_doc(text: &str) -> DocDocument {
         DocDocument {
             subdocuments: Vec::new(),
             has_macros: false,
+            text_complete: true,
             images: Vec::new(),
             text: text.to_string(),
             paragraphs: Vec::new(),
@@ -292,6 +340,7 @@ mod tests {
         DocDocument {
             subdocuments: Vec::new(),
             has_macros: false,
+            text_complete: true,
             images: Vec::new(),
             text: String::new(),
             paragraphs: paras,

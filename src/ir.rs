@@ -562,6 +562,15 @@ pub struct Metadata {
     /// interprets or executes the macro content itself (issue #283).
     #[serde(default)]
     pub has_macros: bool,
+    /// `true` when the source's own structure disagrees with itself about
+    /// how much text there is, and this crate could not safely recover the
+    /// difference — currently DOC only: the piece table has a gap before
+    /// the FIB's declared text length, so `plain_text()`/`to_ir()` are
+    /// missing real content with no other signal that anything is wrong
+    /// (issue #230). `false` (the default) means either the format has no
+    /// such self-check, or the check passed.
+    #[serde(default)]
+    pub text_truncated: bool,
 }
 
 /// A logical section (DOCX: section break, XLSX: worksheet, PPTX: slide).

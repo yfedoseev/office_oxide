@@ -89,6 +89,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             format: DocumentFormat::Doc,
             title,
             has_macros: doc.has_macros(),
+            text_truncated: !doc.text_complete(),
             ..Default::default()
         },
         sections,
