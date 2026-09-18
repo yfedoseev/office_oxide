@@ -4142,6 +4142,49 @@ mod tests {
     }
 
     #[test]
+    fn test_table_caption_does_not_duplicate_across_round_trips() {
+        // issue #311 — a table's caption is written both as w:tblCaption
+        // (accessibility metadata) and as a visible "Caption"-styled
+        // paragraph immediately before <w:tbl>. Reading it back turned
+        // that paragraph into an ordinary sibling, so the next write
+        // emitted BOTH — growing by one duplicate paragraph per round
+        // trip with no convergence. 4 consecutive round trips must not
+        // grow the element count past the first stable read.
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:pStyle w:val="Caption"/></w:pPr><w:r><w:t>Table 1: Results</w:t></w:r></w:p>
+    <w:tbl>
+      <w:tblPr><w:tblCaption w:val="Table 1: Results"/></w:tblPr>
+      <w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let data = make_minimal_docx(document_xml);
+        let mut ir = DocxDocument::from_reader(Cursor::new(data))
+            .map(|doc| crate::convert_docx::docx_to_ir(&doc))
+            .unwrap();
+
+        let element_count = |ir: &crate::ir::DocumentIR| -> usize {
+            ir.sections.iter().map(|s| s.elements.len()).sum()
+        };
+        let first_count = element_count(&ir);
+
+        for round in 0..4 {
+            let writer = crate::create::ir_to_docx(&ir);
+            let mut buf = Cursor::new(Vec::new());
+            writer.write_to(&mut buf).unwrap();
+            let doc = DocxDocument::from_reader(Cursor::new(buf.into_inner())).unwrap();
+            ir = crate::convert_docx::docx_to_ir(&doc);
+            assert_eq!(
+                element_count(&ir),
+                first_count,
+                "round {round}: element count grew from {first_count} — caption is duplicating"
+            );
+        }
+    }
+
+    #[test]
     fn test_numbered_heading_wins_over_list_membership() {
         // issue #223 — Word's multilevel-list "Heading" gallery attaches
         // numPr to the heading styles themselves, so a numbered heading

@@ -648,11 +648,45 @@ fn convert_block_elements(
                 i += 1;
             },
             crate::docx::BlockElement::Table(t) => {
-                elements.push(convert_table(t, doc));
+                let table_elem = convert_table(t, doc);
+                // A table's accessibility caption (`w:tblCaption`) sits
+                // in `Table.caption`, but the writer also emits it as a
+                // visible "Caption"-styled paragraph immediately before
+                // `<w:tbl>` (nothing else ever renders `Table.caption`
+                // as visible text). Reading it back turned that
+                // paragraph into an ordinary sibling `Element::Paragraph`
+                // alongside the table's own `caption` field — the same
+                // text represented twice — and the next write emitted
+                // BOTH, growing by one duplicate paragraph every
+                // round trip. Absorbing the immediately-preceding
+                // matching paragraph here instead keeps the caption
+                // represented exactly once (issue #311).
+                if let Element::Table(Table { caption: Some(cap), .. }) = &table_elem {
+                    let cap = cap.trim();
+                    let last_matches = matches!(
+                        elements.last(),
+                        Some(Element::Paragraph(p)) if paragraph_plain_text(p).trim() == cap
+                    );
+                    if last_matches {
+                        elements.pop();
+                    }
+                }
+                elements.push(table_elem);
                 i += 1;
             },
         }
     }
+}
+
+/// Plain-text content of a paragraph's inline runs, no formatting.
+fn paragraph_plain_text(p: &Paragraph) -> String {
+    let mut out = String::new();
+    for content in &p.content {
+        if let InlineContent::Text(span) = content {
+            out.push_str(&span.text);
+        }
+    }
+    out
 }
 
 /// Pull `<w:framePr>` data out of a paragraph's properties into the IR
