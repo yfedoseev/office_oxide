@@ -172,18 +172,10 @@ mod block_default {
     pub fn default_html(element: &Element) -> String {
         match element {
             Element::ThematicBreak => "<hr />".to_string(),
-            Element::TextBox(tb) => tb
-                .content
-                .iter()
-                .map(super::render_element_html)
-                .collect::<Vec<_>>()
-                .join("\n"),
-            Element::Footnote(n) | Element::Endnote(n) => n
-                .content
-                .iter()
-                .map(super::render_element_html)
-                .collect::<Vec<_>>()
-                .join("\n"),
+            Element::TextBox(tb) => super::render_elements_html(&tb.content).join("\n"),
+            Element::Footnote(n) | Element::Endnote(n) => {
+                super::render_elements_html(&n.content).join("\n")
+            },
             Element::PageBreak | Element::ColumnBreak | Element::Shape(_) => String::new(),
             // `src` is required on `<img>`; an element without one is
             // invalid HTML. With no addressable source in the IR, describe
@@ -813,8 +805,7 @@ fn render_section_html(section: &Section) -> String {
             parts.push(format!("<h2>{}</h2>", escape_html(title)));
         }
     }
-    for elem in &section.elements {
-        let html = render_element_html(elem);
+    for html in render_elements_html(&section.elements) {
         if !html.is_empty() {
             parts.push(html);
         }
@@ -998,8 +989,8 @@ fn render_table_html(table: &Table) -> String {
             if cell.row_span > 1 {
                 attrs.push_str(&format!(" rowspan=\"{}\"", cell.row_span));
             }
-            let content: Vec<String> = cell.content.iter().map(render_element_html).collect();
-            html.push_str(&format!("<{tag}{attrs}>{}</{tag}>", content.join("")));
+            let content = render_elements_html(&cell.content).join("");
+            html.push_str(&format!("<{tag}{attrs}>{content}</{tag}>"));
         }
         html.push_str("</tr>\n");
     }
@@ -1009,31 +1000,106 @@ fn render_table_html(table: &Table) -> String {
 }
 
 fn render_list_html(list: &List) -> String {
-    let tag = if list.ordered { "ol" } else { "ul" };
+    render_list_group_html(&[list])
+}
+
+/// Render one or more `List`s as a single `<ul>`/`<ol>` block.
+///
+/// Real DOCX generators hand visually-continuous bullets a fresh `w:numId`
+/// per paragraph, which the converter faithfully turns into one
+/// `Element::List` per fragment. Emitting a separate list block for each
+/// produced a run of one-item `<ul>`s — extra margins in a browser and
+/// "list, 1 item" announced repeatedly by a screen reader — where markdown's
+/// line-based output incidentally showed one continuous list. Adjacent
+/// fragments that agree on shape are re-joined here; see
+/// [`merge_adjacent_lists`] for what counts as adjacent.
+fn render_list_group_html(lists: &[&List]) -> String {
+    let Some(first) = lists.first() else {
+        return String::new();
+    };
+    let tag = if first.ordered { "ol" } else { "ul" };
     // `start` only exists on `<ol>`; a browser ignores it on `<ul>`. Omitted
     // for 1, which is the attribute's own default, so ordinary lists keep a
     // bare `<ol>`.
-    let start_attr = match list.start_number {
-        Some(n) if list.ordered && n != 1 => format!(" start=\"{n}\""),
+    let start_attr = match first.start_number {
+        Some(n) if first.ordered && n != 1 => format!(" start=\"{n}\""),
         _ => String::new(),
     };
     let mut html = format!("<{tag}{start_attr}>\n");
-    for item in &list.items {
-        let content = item
-            .content
-            .iter()
-            .map(render_element_html)
-            .collect::<Vec<_>>()
-            .join("");
-        html.push_str(&format!("<li>{content}"));
-        if let Some(ref nested) = item.nested {
-            html.push('\n');
-            html.push_str(&render_list_html(nested));
+    for list in lists {
+        for item in &list.items {
+            let content = render_elements_html(&item.content).join("");
+            html.push_str(&format!("<li>{content}"));
+            if let Some(ref nested) = item.nested {
+                html.push('\n');
+                html.push_str(&render_list_html(nested));
+            }
+            html.push_str("</li>\n");
         }
-        html.push_str("</li>\n");
     }
     html.push_str(&format!("</{tag}>"));
     html
+}
+
+/// Whether `next` is a continuation of `prev` rather than a new list.
+///
+/// Conservative on purpose: the two must agree on ordered-ness, marker
+/// style and nesting level, and an ordered list that carries its own
+/// explicit `start_number` is a deliberate restart and stays separate.
+fn lists_are_continuous(prev: &List, next: &List) -> bool {
+    prev.ordered == next.ordered
+        && prev.style == next.style
+        && prev.level == next.level
+        && !(next.ordered && next.start_number.is_some())
+}
+
+/// Group a block-element slice into runs, coalescing adjacent continuous
+/// `Element::List` siblings so each run renders as one list block.
+///
+/// Borrows throughout — nothing is cloned, so this costs nothing on the
+/// large documents where element counts matter.
+fn merge_adjacent_lists(elements: &[Element]) -> Vec<Vec<&Element>> {
+    let mut groups: Vec<Vec<&Element>> = Vec::with_capacity(elements.len());
+    for element in elements {
+        let continues = match (element, groups.last().and_then(|g| g.last())) {
+            (Element::List(next), Some(Element::List(prev))) => lists_are_continuous(prev, next),
+            _ => false,
+        };
+        if continues {
+            // `continues` is only true when a last group exists.
+            if let Some(group) = groups.last_mut() {
+                group.push(element);
+            }
+        } else {
+            groups.push(vec![element]);
+        }
+    }
+    groups
+}
+
+/// Render a block-element slice to one HTML string per emitted block,
+/// with adjacent continuous lists merged into single list blocks.
+///
+/// Every place that walks a `Vec<Element>` for HTML goes through this so
+/// the merge applies uniformly — section bodies, table cells, text boxes
+/// and note bodies alike.
+fn render_elements_html(elements: &[Element]) -> Vec<String> {
+    merge_adjacent_lists(elements)
+        .into_iter()
+        .map(|group| match group.as_slice() {
+            [single] => render_element_html(single),
+            many => {
+                let lists: Vec<&List> = many
+                    .iter()
+                    .filter_map(|e| match e {
+                        Element::List(l) => Some(l),
+                        _ => None,
+                    })
+                    .collect();
+                render_list_group_html(&lists)
+            },
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1274,6 +1340,82 @@ mod tests {
         assert!(html.contains("<ol>"));
         assert!(html.contains("<li><p>First</p></li>"));
         assert!(html.contains("<li><p>Second</p></li>"));
+    }
+
+    /// #317: numId fragmentation splits visually-continuous bullets into one
+    /// `Element::List` each; HTML emitted a separate one-item `<ul>` per
+    /// fragment where markdown showed one continuous list.
+    #[test]
+    fn test_adjacent_same_style_lists_merge_in_html() {
+        let bullet = |text: &str| {
+            Element::List(List {
+                ordered: false,
+                style: Some(ListStyle::Bullet),
+                items: vec![ListItem {
+                    content: vec![para(text)],
+                    nested: None,
+                }],
+                ..Default::default()
+            })
+        };
+
+        let ir = simple_ir(vec![bullet("one"), bullet("two"), bullet("three")]);
+        let html = ir.to_html();
+        assert_eq!(html.matches("<ul>").count(), 1, "html: {html}");
+        assert_eq!(html.matches("</ul>").count(), 1, "html: {html}");
+        assert_eq!(html.matches("<li>").count(), 3, "html: {html}");
+        // Order is preserved.
+        let pos = |needle: &str| html.find(needle).expect(needle);
+        assert!(pos("one") < pos("two") && pos("two") < pos("three"), "html: {html}");
+
+        // Intervening non-list content keeps the lists apart.
+        let split = simple_ir(vec![bullet("one"), para("interruption"), bullet("two")]);
+        assert_eq!(split.to_html().matches("<ul>").count(), 2, "{}", split.to_html());
+
+        // A different marker style is a different list.
+        let other_style = Element::List(List {
+            ordered: false,
+            style: Some(ListStyle::Square),
+            items: vec![ListItem {
+                content: vec![para("sq")],
+                nested: None,
+            }],
+            ..Default::default()
+        });
+        let mixed = simple_ir(vec![bullet("one"), other_style]);
+        assert_eq!(mixed.to_html().matches("<ul>").count(), 2, "{}", mixed.to_html());
+
+        // Ordered vs unordered never merge.
+        let numbered = Element::List(List {
+            ordered: true,
+            items: vec![ListItem {
+                content: vec![para("n")],
+                nested: None,
+            }],
+            ..Default::default()
+        });
+        let mixed = simple_ir(vec![bullet("one"), numbered]);
+        let html = mixed.to_html();
+        assert_eq!(html.matches("<ul>").count(), 1, "{html}");
+        assert_eq!(html.matches("<ol>").count(), 1, "{html}");
+
+        // An ordered list with its own explicit start is a deliberate
+        // restart and keeps its own block (and its `start` attribute).
+        let restart = |n: u32| {
+            Element::List(List {
+                ordered: true,
+                start_number: Some(n),
+                items: vec![ListItem {
+                    content: vec![para("i")],
+                    nested: None,
+                }],
+                ..Default::default()
+            })
+        };
+        let restarted = simple_ir(vec![restart(1), restart(5)]);
+        let html = restarted.to_html();
+        assert_eq!(html.matches("<ol").count(), 2, "{html}");
+        assert!(html.contains("<ol start=\"5\">"), "{html}");
     }
 
     /// #314: `render_inline_html` read only bold/italic/strikethrough/
