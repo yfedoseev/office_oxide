@@ -399,6 +399,15 @@ impl Document {
         self.to_ir().to_html()
     }
 
+    /// Convert to an HTML fragment with explicit rendering options.
+    ///
+    /// With [`ir_render::ImageEmbed::Base64`] the fragment carries its
+    /// images inline as `data:` URIs, so it renders standalone — the
+    /// counterpart of [`Self::to_markdown_with`].
+    pub fn to_html_with(&self, options: ir_render::HtmlOptions) -> String {
+        self.to_ir().to_html_with(options)
+    }
+
     /// Convert to the format-agnostic Document IR.
     pub fn to_ir(&self) -> DocumentIR {
         match &self.inner {
