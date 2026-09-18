@@ -211,6 +211,22 @@ fn plain_text_run(run: &Run, out: &mut String) {
 }
 
 fn plain_text_table(table: &Table, out: &mut String) {
+    // A table cell can hold another table, so this recurses (via
+    // `plain_text_blocks` -> `plain_text_table` -> `plain_text_blocks` ...)
+    // on whatever it's given — including a tree the XML parser already
+    // bounded to `MAX_NESTING_DEPTH`, which on the small default thread
+    // stack `plain_text()`/`to_markdown()` run on (unlike parsing itself,
+    // which gets its own larger stack) is still deep enough to overflow.
+    // Past the cap, stop descending rather than crash the whole process —
+    // the same defect class as an unguarded XML parse, just one layer
+    // downstream of it (issue #329).
+    let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+        out.push_str(&format!(
+            "[nested table deeper than {} levels not shown — document truncated]\n",
+            crate::core::xml::MAX_NESTING_DEPTH
+        ));
+        return;
+    };
     for row in &table.rows {
         // A cell deleted via tracked changes is excluded from the
         // accepted view, same policy already applied to run-level

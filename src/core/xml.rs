@@ -471,28 +471,45 @@ pub fn sanitize_xml_text(s: &str) -> std::borrow::Cow<'_, str> {
 /// stack a caller might have, not the best. Nested-table documents built at
 /// increasing depths overflow at:
 ///
-/// | build | stack | cliff |
-/// |---|---|---|
-/// | release | 16 MB parse stack | 3,000-4,000 |
-/// | debug | default 2 MiB thread | 512-1,024 |
+/// | build | stack | layer | cliff |
+/// |---|---|---|---|
+/// | release | 16 MB parse stack | XML parse (`parse_table`) | 3,000-4,000 |
+/// | debug | default 2 MiB thread | XML parse (`parse_table`) | 512-1,024 |
+/// | debug | default 2 MiB thread | `to_ir()` (`convert_table`) | 150-200 |
 ///
-/// 256 is chosen against the 2 MiB figure with a 2x margin — still ~50x
-/// deeper than any document a human authoring tool produces, and now with the
-/// 16 MB parse stack beneath it rather than whatever the caller happened to
-/// have.
+/// `DepthGuard` bounds the XML-parse recursion, which now runs on its own
+/// `PARSE_STACK_SIZE` thread rather than whatever the caller happened to
+/// have (see below) — but the *result* is then walked again by `to_ir()`/
+/// `plain_text()`/`to_markdown()`, on whatever stack the caller gave *them*,
+/// which this crate does not control and is not necessarily large. Those
+/// walkers hit their own stack limit well before the XML-parse cliff, since
+/// `convert_table`/`plain_text_table` recurse with a much larger frame
+/// (multiple local `Vec`s and struct literals per level) than the XML
+/// event-loop's `parse_table` does — so they carry their own `DepthGuard`
+/// too (issue #329), and it's the tighter of the two cliffs, not the
+/// parse-stack one, that this constant must stay under.
 ///
-/// That 2x margin only ever held where the parse actually got the stack it was
-/// measured against, and it often did not: `needs_stack_thread` inferred the
-/// answer from `RLIMIT_STACK`, which describes the main thread rather than the
-/// running one, so an unlimited limit ran the parse inline on an ordinary
-/// 2 MiB thread and 256 levels aborted the process. Every threaded platform
-/// now parses on a `PARSE_STACK_SIZE` stack, so this constant is calibrated
-/// against a stack the library owns.
+/// 100 is chosen with real margin under the 150-200 debug/2 MiB `to_ir()`
+/// cliff — still ~20x deeper than any document a human authoring tool
+/// produces.
 ///
-/// Re-measure if the parser structs grow: the release cliff was
-/// 5,000-10,000 before this release's fields were added, so it moves with
-/// the frame size.
-pub const MAX_NESTING_DEPTH: usize = 256;
+/// That the XML-parse cliff has its own large margin only ever held where
+/// the parse actually got the stack it was measured against, and it often
+/// did not: `needs_stack_thread` inferred the answer from `RLIMIT_STACK`,
+/// which describes the main thread rather than the running one, so an
+/// unlimited limit ran the parse inline on an ordinary 2 MiB thread. Every
+/// threaded platform now parses on a `PARSE_STACK_SIZE` stack, so *that*
+/// part of this constant is calibrated against a stack the library owns —
+/// the `to_ir()`/`plain_text()` cliff is not, and never can be, since it
+/// runs on the caller's own stack.
+///
+/// Re-measure if the parser or IR-conversion structs grow — this moves with
+/// the frame size, and it moved once already: earlier releases' cliffs were
+/// measured only against the XML-parse layer and were 5,000-10,000 (release)
+/// / 512-1,024 (debug) before this release's added fields (and before the
+/// conversion-layer `DepthGuard`s existed at all) pulled the real, tighter
+/// limit down to what's measured above.
+pub const MAX_NESTING_DEPTH: usize = 100;
 
 thread_local! {
     static NESTING_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

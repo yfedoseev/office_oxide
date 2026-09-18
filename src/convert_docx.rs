@@ -1404,6 +1404,34 @@ const MAX_GRID_SPAN: u32 = 1_000;
 const MAX_TABLE_COLS: usize = 10_000;
 
 fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) -> Element {
+    // A table cell can hold another table (`convert_block_elements` ->
+    // `convert_table` -> `convert_block_elements` -> ...), so this
+    // recurses on whatever it's given — including a tree the XML parser
+    // already bounded to `MAX_NESTING_DEPTH`. That bound protects parsing
+    // (which runs on its own larger stack), but to_ir() runs on whatever
+    // stack the caller has, and re-walking a tree that deep overflowed it
+    // (issue #329, the same defect class as an unguarded XML parse, one
+    // layer downstream of it).
+    let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+        return Element::Table(Table {
+            rows: vec![TableRow {
+                cells: vec![TableCell {
+                    content: vec![Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan::plain(format!(
+                            "[nested table deeper than {} levels not shown — \
+                             document truncated]",
+                            crate::core::xml::MAX_NESTING_DEPTH
+                        )))],
+                        ..Default::default()
+                    })],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+    };
+
     // First pass: compute row_span from vMerge patterns
     let num_rows = table.rows.len();
     // `w:gridSpan` is attacker-controlled and parsed as an unbounded u32.
