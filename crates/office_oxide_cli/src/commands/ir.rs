@@ -88,11 +88,13 @@ fn element_to_json(elem: &office_oxide::ir::Element) -> serde_json::Value {
         Element::Footnote(n) => json!({
             "type": "footnote",
             "id": n.id,
+            "marker": n.marker,
             "elements": n.content.iter().map(element_to_json).collect::<Vec<_>>(),
         }),
         Element::Endnote(n) => json!({
             "type": "endnote",
             "id": n.id,
+            "marker": n.marker,
             "elements": n.content.iter().map(element_to_json).collect::<Vec<_>>(),
         }),
         Element::CodeBlock(cb) => json!({
@@ -262,6 +264,48 @@ mod tests {
         assert!(
             rendered.contains("#slide2.xml"),
             "the ir command's JSON projection must include Image::hyperlink: {rendered}"
+        );
+    }
+
+    /// issue #332 — `.doc` comments and real endnotes both reach the IR as
+    /// `Element::Endnote` (there's no dedicated `Element::Comment`), and
+    /// `Note::marker` ("comment" vs "endnote") is the only thing that tells
+    /// them apart. The JSON projection dropped it, making the two
+    /// indistinguishable in `ir` output.
+    #[test]
+    fn test_note_marker_reaches_the_json_projection() {
+        let ir = DocumentIR {
+            metadata: Metadata {
+                format: DocumentFormat::Doc,
+                title: None,
+                ..Default::default()
+            },
+            sections: vec![Section {
+                elements: vec![
+                    Element::Endnote(Note {
+                        id: 0,
+                        marker: Some("comment".to_string()),
+                        content: vec![],
+                    }),
+                    Element::Footnote(Note {
+                        id: 1,
+                        marker: Some("footnote".to_string()),
+                        content: vec![],
+                    }),
+                ],
+                ..Default::default()
+            }],
+            defined_names: Vec::new(),
+        };
+        let json = ir_to_json(&ir);
+        let rendered = serde_json::to_string(&json).unwrap();
+        assert!(
+            rendered.contains(r#""marker":"comment""#),
+            "a comment's marker must distinguish it from a real endnote: {rendered}"
+        );
+        assert!(
+            rendered.contains(r#""marker":"footnote""#),
+            "a footnote's marker must also reach the projection: {rendered}"
         );
     }
 }

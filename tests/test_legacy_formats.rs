@@ -129,6 +129,48 @@ fn footnotes_headers_comments_and_text_boxes_reach_the_ir() {
     assert!(kinds.contains(&"footnote"), "no footnote element: {kinds:?}");
     assert!(kinds.contains(&"endnote"), "no endnote element: {kinds:?}");
     assert!(kinds.contains(&"textbox"), "no textbox element: {kinds:?}");
+
+    // issue #247 — a comment and a real endnote both land as
+    // `Element::Endnote` (there is no dedicated comment variant), but their
+    // `marker` must distinguish them: the comment's text ("REVIEW NOTE")
+    // must carry marker "comment", and the real endnote's text ("ENDNOTE
+    // ONE") must carry marker "endnote" — not the other way around, which
+    // is what the pre-#247 FIB offset bug produced (comments always read
+    // zero-length, and a real endnote's content surfaced under the
+    // textbox slot instead).
+    let note_markers: Vec<(Option<&str>, String)> = ir.sections[0]
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            Element::Endnote(n) => {
+                let text: String = n
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        Element::Paragraph(p) => p.content.iter().find_map(|ic| match ic {
+                            office_oxide::ir::InlineContent::Text(t) => Some(t.text.clone()),
+                            _ => None,
+                        }),
+                        _ => None,
+                    })
+                    .collect();
+                Some((n.marker.as_deref(), text))
+            },
+            _ => None,
+        })
+        .collect();
+    assert!(
+        note_markers
+            .iter()
+            .any(|(marker, text)| *marker == Some("comment") && text.contains("REVIEW NOTE")),
+        "the comment must carry marker \"comment\", got {note_markers:?}"
+    );
+    assert!(
+        note_markers
+            .iter()
+            .any(|(marker, text)| *marker == Some("endnote") && text.contains("ENDNOTE ONE")),
+        "the real endnote must carry marker \"endnote\", got {note_markers:?}"
+    );
 }
 
 #[test]

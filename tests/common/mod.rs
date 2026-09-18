@@ -178,8 +178,19 @@ pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> V
     let wd_sectors = wd_len.div_ceil(512);
     let mut word_doc = vec![0u8; wd_sectors * 512];
     write_fib(&mut word_doc, text_len, fc_plcf, lcb_plcf);
+    // [MS-DOC] FibRgLw97 real offsets for these fields (issue #247): 0x58
+    // is `reserved3`, MUST be zero/ignored, and sits between ccpHdd and
+    // ccpAtn — not a slot in this array, so the mapping isn't a flat
+    // `0x50 + i*4` stride.
+    const CCP_OFFSETS: [usize; 5] = [
+        0x50, // ccpFtn (footnotes)
+        0x54, // ccpHdd (headers)
+        0x5C, // ccpAtn (comments) — NOT 0x58, which is reserved3
+        0x60, // ccpEdn (endnotes)
+        0x64, // ccpTxbx (textboxes)
+    ];
     for (i, &ccp) in ccps.iter().enumerate() {
-        let off = 0x50 + i * 4;
+        let off = CCP_OFFSETS[i];
         word_doc[off..off + 4].copy_from_slice(&ccp.to_le_bytes());
     }
     if let Some(w) = tweaks.wident {

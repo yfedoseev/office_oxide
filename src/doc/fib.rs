@@ -83,15 +83,23 @@ impl Fib {
         let use_table1 = (flags & (1 << 9)) != 0;
 
         // FibRgLw97 starts at offset 0x22, its size field at 0x22 (u16, should be 0x16).
-        // Text lengths in FibRgLw97:
-        // ccpText at 0x4C (offset from FIB start)
+        // Text lengths in FibRgLw97 ([MS-DOC] FibRgLw97): cbMac, reserved1,
+        // reserved2, ccpText, ccpFtn, ccpHdd, reserved3 (MUST be zero, MUST
+        // be ignored — NOT ccpAtn), ccpAtn, ccpEdn, ccpTxbx, ccpHdrTxbx.
+        // Issue #247: every field from `comment_len` on used to be read one
+        // slot early (`comment_len` landed on the always-zero `reserved3`,
+        // so it silently read as 0 for every `.doc` ever opened; comments
+        // ended up mislabeled as endnotes, endnotes as textboxes, and the
+        // real `ccpHdrTxbx` — header-anchored textbox text — was never read
+        // at all).
         let text_len = read_u32(data, 0x4C);
         let footnote_len = read_u32(data, 0x50);
         let header_len = read_u32(data, 0x54);
-        let comment_len = read_u32(data, 0x58);
-        let endnote_len = read_u32(data, 0x5C);
-        let textbox_len = read_u32(data, 0x60);
-        let header_textbox_len = read_u32(data, 0x64);
+        // 0x58 = reserved3, MUST be zero, MUST be ignored — deliberately unread.
+        let comment_len = read_u32(data, 0x5C);
+        let endnote_len = read_u32(data, 0x60);
+        let textbox_len = read_u32(data, 0x64);
+        let header_textbox_len = read_u32(data, 0x68);
 
         // FibRgFcLcb97 is laid out at a fixed set of absolute offsets within
         // the WordDocument stream for Word 97+ (nFib = 0x00C1). The offsets
@@ -216,5 +224,36 @@ mod tests {
         data[0x0A..0x0C].copy_from_slice(&0u16.to_le_bytes()); // clear bit 9
         let fib = Fib::parse(&data).unwrap();
         assert!(!fib.use_table1);
+    }
+
+    /// issue #247 — every `FibRgLw97` field from `comment_len` on used to be
+    /// read one slot early (landing on `reserved3`, spec-mandated always
+    /// zero, at 0x58) instead of its real offset. Each field below gets a
+    /// distinct value so a shift in either direction is caught, and
+    /// `reserved3` itself is set to a nonzero value to prove it's never
+    /// read at all.
+    #[test]
+    fn fibrglw97_fields_read_from_their_real_spec_offsets() {
+        let mut data = build_minimal_fib();
+        data[0x4C..0x50].copy_from_slice(&100u32.to_le_bytes()); // ccpText
+        data[0x50..0x54].copy_from_slice(&11u32.to_le_bytes()); // ccpFtn
+        data[0x54..0x58].copy_from_slice(&22u32.to_le_bytes()); // ccpHdd
+        data[0x58..0x5C].copy_from_slice(&0xDEADBEEFu32.to_le_bytes()); // reserved3 — MUST be ignored
+        data[0x5C..0x60].copy_from_slice(&33u32.to_le_bytes()); // ccpAtn (comments)
+        data[0x60..0x64].copy_from_slice(&44u32.to_le_bytes()); // ccpEdn (endnotes)
+        data[0x64..0x68].copy_from_slice(&55u32.to_le_bytes()); // ccpTxbx (textboxes)
+        data[0x68..0x6C].copy_from_slice(&66u32.to_le_bytes()); // ccpHdrTxbx (header textboxes)
+
+        let fib = Fib::parse(&data).unwrap();
+        assert_eq!(fib.text_len, 100);
+        assert_eq!(fib.footnote_len, 11);
+        assert_eq!(fib.header_len, 22);
+        assert_eq!(fib.comment_len, 33, "must read ccpAtn at 0x5C, not reserved3 at 0x58");
+        assert_eq!(fib.endnote_len, 44, "must read ccpEdn at 0x60");
+        assert_eq!(fib.textbox_len, 55, "must read ccpTxbx at 0x64");
+        assert_eq!(
+            fib.header_textbox_len, 66,
+            "must read the real ccpHdrTxbx at 0x68, previously never read at all"
+        );
     }
 }
