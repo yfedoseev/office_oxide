@@ -1426,9 +1426,37 @@ impl HfType {
 // Convert IR Table → DocxRichTable with vMerge expansion
 // ---------------------------------------------------------------------------
 
+/// No real Word table has anywhere near this many columns; this only
+/// exists to cap `convert_ir_table`'s grid-width computation against a
+/// malicious/corrupt `col_span` (e.g. `u32::MAX` on one cell), which
+/// would otherwise blow up the `Vec<Vec<bool>>` grid allocation before
+/// the (already-clamped) per-cell span loop below ever runs.
+const MAX_TABLE_COLS: usize = 4096;
+
 fn convert_ir_table(table: &crate::ir::Table) -> DocxRichTable {
     let num_rows = table.rows.len();
-    let num_cols = table.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0);
+    // The real grid width is the sum of each row's col_spans, not its
+    // literal TableCell *count* — a row with a horizontally-merged cell
+    // has more grid columns than cell entries, so a plain `cells.len()`
+    // undercounts it whenever another row happens to have more
+    // (unmerged) entries but a smaller total span. That undercount
+    // starved the grid-fill loop below of columns, silently dropping a
+    // real cell with content from every row past the miscomputed width
+    // (issue #265). Each cell's own contribution to the sum is clamped
+    // first, not just the final max, so a single huge col_span can't
+    // overflow or dominate the sum before the clamp ever applies.
+    let num_cols = table
+        .rows
+        .iter()
+        .map(|r| {
+            r.cells
+                .iter()
+                .map(|c| (c.col_span.max(1) as usize).min(MAX_TABLE_COLS))
+                .sum::<usize>()
+                .min(MAX_TABLE_COLS)
+        })
+        .max()
+        .unwrap_or(0);
 
     // Grid to track occupied cells (for vMerge continuation)
     let mut grid: Vec<Vec<bool>> = vec![vec![false; num_cols]; num_rows];
@@ -4200,6 +4228,49 @@ mod tests {
         let tr = xml.find("<w:tr").expect("table must have a row");
         assert!(pr < grid && grid < tr, "order must be tblPr, tblGrid, rows");
         assert_eq!(xml.matches("<w:gridCol").count(), 2);
+    }
+
+    /// issue #265 — `num_cols` used to come from the max literal
+    /// `TableCell` *count* per row, not the max col_span-summed grid
+    /// width. A single row with a merged cell (spans 1, 2, 1 = grid
+    /// width 4, but only 3 `TableCell` entries) computed `num_cols = 3`,
+    /// so the grid-fill loop's cursor ran out of budget before reaching
+    /// the row's last cell and silently dropped it — even though no
+    /// OTHER row had more literal cells either.
+    #[test]
+    fn a_row_with_a_merged_cell_does_not_lose_its_last_real_cell() {
+        use crate::ir::{Element, InlineContent, Paragraph, Table, TableCell, TableRow, TextSpan};
+
+        fn cell(text: &str, col_span: u32) -> TableCell {
+            TableCell {
+                content: vec![Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(text))],
+                    ..Default::default()
+                })],
+                col_span,
+                row_span: 1,
+                ..Default::default()
+            }
+        }
+
+        let table = Table {
+            rows: vec![TableRow {
+                cells: vec![cell("FIRST", 1), cell("MERGED", 2), cell("THIRD", 1)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut doc = DocxWriter::new();
+        doc.add_ir_table(&table);
+        let xml = part_xml(doc, "word/document.xml");
+
+        assert!(xml.contains("FIRST"), "{xml}");
+        assert!(xml.contains("MERGED"), "{xml}");
+        assert!(
+            xml.contains("THIRD"),
+            "the last real cell after a merge must not be dropped: {xml}"
+        );
     }
 
     /// `CT_Numbering` is `numPicBullet*, abstractNum*, num*` — every
