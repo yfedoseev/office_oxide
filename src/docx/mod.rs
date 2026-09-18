@@ -4045,6 +4045,76 @@ mod tests {
     }
 
     #[test]
+    fn test_table_cell_jc_is_mapped_back_to_text_align() {
+        // issue #215 gap: the writer emits <w:jc> inside a cell's paragraph
+        // from TableCell::text_align, but nothing read it back on open.
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tr>
+        <w:tc>
+          <w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>centered</w:t></w:r></w:p>
+        </w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let data = make_minimal_docx(document_xml);
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let ir = crate::convert_docx::docx_to_ir(&doc);
+        let table = ir.sections[0]
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                crate::ir::Element::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("expected a table element");
+        assert_eq!(
+            table.rows[0].cells[0].text_align,
+            Some(crate::ir::ParagraphAlignment::Center)
+        );
+    }
+
+    #[test]
+    fn test_outline_level_promotion_keeps_the_rest_of_the_paragraph_properties() {
+        // issue #215 gap: promoting a paragraph to a Heading via
+        // <w:outlineLvl> used to keep only level/content/frame_position/
+        // alignment, discarding indent, spacing, keep-with-next and every
+        // other property in the same step.
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:pPr>
+        <w:outlineLvl w:val="0"/>
+        <w:ind w:left="720"/>
+        <w:spacing w:before="240" w:after="120"/>
+        <w:keepNext/>
+      </w:pPr>
+      <w:r><w:t>Rich Heading</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let data = make_minimal_docx(document_xml);
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let ir = crate::convert_docx::docx_to_ir(&doc);
+        let heading = ir.sections[0]
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                crate::ir::Element::Heading(h) => Some(h),
+                _ => None,
+            })
+            .expect("expected a heading element");
+        assert_eq!(heading.indent_left_twips, Some(720));
+        assert_eq!(heading.space_before_twips, Some(240));
+        assert_eq!(heading.space_after_twips, Some(120));
+        assert!(heading.keep_with_next);
+    }
+
+    #[test]
     fn test_num_start_override_is_read_back() {
         // issue #260 — the writer emits <w:num><w:lvlOverride><w:startOverride>
         // (confirmed present in real numbering.xml output) but nothing read

@@ -676,6 +676,48 @@ pub struct Heading {
     /// round-trip flattens them to left-aligned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alignment: Option<ParagraphAlignment>,
+    /// Left indent in twips (mirrors `Paragraph::indent_left_twips`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indent_left_twips: Option<i32>,
+    /// Right indent in twips (mirrors `Paragraph::indent_right_twips`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indent_right_twips: Option<i32>,
+    /// First-line indent in twips, negative = hanging (mirrors
+    /// `Paragraph::first_line_indent_twips`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_line_indent_twips: Option<i32>,
+    /// Space before the heading in twips (mirrors
+    /// `Paragraph::space_before_twips`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_before_twips: Option<u32>,
+    /// Space after the heading in twips (mirrors
+    /// `Paragraph::space_after_twips`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_after_twips: Option<u32>,
+    /// Line spacing rule (mirrors `Paragraph::line_spacing`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_spacing: Option<LineSpacing>,
+    /// Background / shading colour (mirrors `Paragraph::background_color`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_color: Option<[u8; 3]>,
+    /// Borders (mirrors `Paragraph::border`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border: Option<ParagraphBorder>,
+    /// Tab stops (mirrors `Paragraph::tabs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tabs: Vec<TabStop>,
+    /// Keep this heading on the same page as the next paragraph (mirrors
+    /// `Paragraph::keep_with_next`).
+    #[serde(default)]
+    pub keep_with_next: bool,
+    /// Prevent a page break within this heading (mirrors
+    /// `Paragraph::keep_together`).
+    #[serde(default)]
+    pub keep_together: bool,
+    /// Force a page break before this heading (mirrors
+    /// `Paragraph::page_break_before`).
+    #[serde(default)]
+    pub page_break_before: bool,
 }
 
 impl Heading {

@@ -389,6 +389,66 @@ fn apply_paragraph_properties(pp: &crate::docx::ParagraphProperties, out: &mut P
         .collect();
 }
 
+/// Same property set as [`apply_paragraph_properties`], but for a promoted
+/// `Heading`. Outline-level promotion used to keep only the heading's level,
+/// content, frame position and alignment — indent, spacing, line spacing,
+/// keep-with-next/together, shading, borders and tabs all vanished in the
+/// same step, since `Heading` had no fields to receive them (issue #215).
+fn apply_paragraph_properties_to_heading(pp: &crate::docx::ParagraphProperties, out: &mut Heading) {
+    if let Some(ind) = pp.indent.as_ref() {
+        out.indent_left_twips = ind.left.map(|t| t.0);
+        out.indent_right_twips = ind.right.map(|t| t.0);
+        out.first_line_indent_twips = match (ind.first_line, ind.hanging) {
+            (_, Some(h)) if h.0 != 0 => Some(h.0.saturating_neg()),
+            (Some(f), _) => Some(f.0),
+            _ => None,
+        };
+    }
+    if let Some(sp) = pp.spacing.as_ref() {
+        out.space_before_twips = sp.before.map(|t| t.0.max(0) as u32);
+        out.space_after_twips = sp.after.map(|t| t.0.max(0) as u32);
+        out.line_spacing = sp.line.as_ref().map(|l| {
+            let v = l.value.max(0) as u32;
+            match l.rule {
+                Some(crate::docx::LineSpacingRule::Exact) => LineSpacing::Exact(v),
+                Some(crate::docx::LineSpacingRule::AtLeast) => LineSpacing::AtLeast(v),
+                _ => LineSpacing::Auto(v),
+            }
+        });
+    }
+    out.keep_with_next = pp.keep_next.unwrap_or(false);
+    out.keep_together = pp.keep_lines.unwrap_or(false);
+    out.page_break_before = pp.page_break_before.unwrap_or(false);
+    out.border = pp.borders.as_ref().map(para_borders_to_ir);
+    out.background_color = pp
+        .shading
+        .as_ref()
+        .and_then(|sh| sh.fill.as_deref())
+        .and_then(hex_to_rgb);
+    out.tabs = pp
+        .tabs
+        .iter()
+        .map(|t| TabStop {
+            position_twips: t.position_twips,
+            alignment: match t.alignment.as_str() {
+                "center" => TabAlignment::Center,
+                "right" | "end" => TabAlignment::Right,
+                "decimal" => TabAlignment::Decimal,
+                "bar" => TabAlignment::Bar,
+                _ => TabAlignment::Left,
+            },
+            leader: match t.leader.as_deref() {
+                Some("dot") => TabLeader::Dot,
+                Some("hyphen") => TabLeader::Hyphen,
+                Some("underscore") => TabLeader::Underscore,
+                Some("heavy") => TabLeader::Heavy,
+                Some("middleDot") => TabLeader::MiddleDot,
+                _ => TabLeader::None,
+            },
+        })
+        .collect();
+}
+
 /// Build an IR `PageSetup` from a section's properties, or `None` when the
 /// section states neither a page size nor margins. A `<w:sectPr>` that only
 /// carries a break type or header references says nothing about the page,
@@ -480,12 +540,17 @@ fn convert_block_elements(
                 }
 
                 if let Some(level) = heading_level {
-                    elements.push(Element::Heading(Heading {
+                    let mut heading = Heading {
                         level: (level + 1).min(6),
                         content: convert_paragraph_inline(p, doc),
                         frame_position: paragraph_frame_position(p),
                         alignment,
-                    }));
+                        ..Default::default()
+                    };
+                    if let Some(pp) = eff_ref {
+                        apply_paragraph_properties_to_heading(pp, &mut heading);
+                    }
+                    elements.push(Element::Heading(heading));
                 } else {
                     // Check for page break in runs
                     let (before_break, hard_break) = split_at_page_break(p, doc);
@@ -1372,11 +1437,23 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
             let mut cell_elements = Vec::new();
             convert_block_elements(&cell.content, &mut cell_elements, doc);
 
+            // The writer already emits `<w:jc>` inside a cell's paragraph
+            // from `TableCell::text_align` (`docx/write.rs`), but nothing
+            // read it back — take the first paragraph's alignment as the
+            // cell's own, the same convention the writer uses when it
+            // stamps every paragraph in the cell with this one value
+            // (issue #215).
+            let text_align = cell_elements.iter().find_map(|e| match e {
+                Element::Paragraph(p) => p.alignment.clone(),
+                _ => None,
+            });
+
             let cp = cell.properties.as_ref();
             ir_cells.push(TableCell {
                 content: cell_elements,
                 col_span,
                 row_span,
+                text_align,
                 background_color: cp
                     .and_then(|p| p.shading.as_ref())
                     .and_then(|sh| sh.fill.as_deref())

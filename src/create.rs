@@ -197,6 +197,19 @@ fn add_element_to_docx(writer: &mut crate::docx::write::DocxWriter, elem: &Eleme
             let props = IrParaProps {
                 style: Some(format!("Heading{level}")),
                 alignment: h.alignment.clone(),
+                indent_left_twips: h.indent_left_twips,
+                indent_right_twips: h.indent_right_twips,
+                first_line_indent_twips: h.first_line_indent_twips,
+                space_before_twips: h.space_before_twips,
+                space_after_twips: h.space_after_twips,
+                line_spacing: h.line_spacing.clone(),
+                tabs: h.tabs.clone(),
+                frame_position: h.frame_position.clone(),
+                keep_with_next: h.keep_with_next,
+                keep_together: h.keep_together,
+                page_break_before: h.page_break_before,
+                background_color: h.background_color,
+                border: h.border.clone(),
                 ..Default::default()
             };
             writer.add_ir_paragraph(&runs, Some(props));
