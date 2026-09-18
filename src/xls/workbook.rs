@@ -139,6 +139,13 @@ impl XlsDocument {
         // Number-format tables from the globals substream.
         let mut formats: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
         let mut xf_numfmt: Vec<u16> = Vec::new();
+        // [MS-XLS] §2.4.77 DATEMODE: a nonzero `f1904DateSystem` means the
+        // workbook's date serials are 1904-based, not 1900-based — a 1462-
+        // day (Excel epoch delta) offset if unaccounted for. Defaults to
+        // false (1900 system) when absent, matching Excel's own default
+        // and every date-serial-carrying record parsed before DATEMODE
+        // appears (issue #233).
+        let mut date1904 = false;
 
         // Quick check: if the first BOF indicates BIFF5 or earlier, limit processing.
         let biff8 = data.len() >= 6 && {
@@ -202,6 +209,12 @@ impl XlsDocument {
                             0
                         });
                     },
+                    RT_DATEMODE => {
+                        // [MS-XLS] §2.4.77: a single BOOLEAN (u16 LE) at
+                        // offset 0, nonzero means the 1904 date system.
+                        date1904 = rec.data.len() >= 2
+                            && u16::from_le_bytes([rec.data[0], rec.data[1]]) != 0;
+                    },
                     RT_NAME => {
                         if let Some(rn) = parse_name_record(&rec.data) {
                             raw_names.push(rn);
@@ -263,7 +276,7 @@ impl XlsDocument {
                         // no error and no notice. Excel round-trips such a
                         // sheet perfectly; keep it and flag it, the way the
                         // XLSX reader already does.
-                        let display = build_display(&cells, &formats, &xf_numfmt);
+                        let display = build_display(&cells, &formats, &xf_numfmt, date1904);
                         let rows = build_grid(&mut cells);
                         sheets.push(Sheet {
                             name,
@@ -392,8 +405,9 @@ impl XlsDocument {
             }
             out.push_str(&sheet.name);
             out.push('\n');
-            for row in &sheet.rows {
-                let line: Vec<String> = row.iter().map(|c| c.as_text()).collect();
+            for (r, row) in sheet.rows.iter().enumerate() {
+                let line: Vec<String> =
+                    (0..row.len()).map(|c| cell_display_text(sheet, r, c)).collect();
                 let trimmed = line.join("\t").trim_end().to_string();
                 out.push_str(&trimmed);
                 out.push('\n');
@@ -425,9 +439,9 @@ impl XlsDocument {
 
             // First row as header.
             out.push('|');
-            if let Some(first_row) = sheet.rows.first() {
+            if !sheet.rows.is_empty() {
                 for c in 0..col_count {
-                    let text = first_row.get(c).map(|v| v.as_text()).unwrap_or_default();
+                    let text = cell_display_text(sheet, 0, c);
                     out.push(' ');
                     out.push_str(&text);
                     out.push_str(" |");
@@ -443,10 +457,10 @@ impl XlsDocument {
             out.push('\n');
 
             // Data rows.
-            for row in sheet.rows.iter().skip(1) {
+            for (r, _) in sheet.rows.iter().enumerate().skip(1) {
                 out.push('|');
                 for c in 0..col_count {
-                    let text = row.get(c).map(|v| v.as_text()).unwrap_or_default();
+                    let text = cell_display_text(sheet, r, c);
                     out.push(' ');
                     out.push_str(&text);
                     out.push_str(" |");
@@ -749,6 +763,25 @@ fn parse_format_record(data: &[u8]) -> Option<(u16, String)> {
     Some((id, code))
 }
 
+/// The format-aware text for `sheet.rows[r][c]`: `sheet.display[r][c]` when
+/// present, falling back to the cell's raw `CellValue::as_text()`.
+///
+/// `Document::plain_text()`/`to_markdown()` dispatch to `XlsDocument`'s own
+/// `plain_text()`/`to_markdown()` below, a separate path from `to_ir()`
+/// (`convert_xls.rs`, which already read `sheet.display` correctly). Those
+/// two methods read `sheet.rows` directly via `CellValue::as_text()`,
+/// bypassing `build_display`'s number-format/date rendering entirely — a
+/// date cell came out as a raw serial (`38971`) from the CLI's default
+/// `text`/`markdown` output even though `to_ir()` got it right, the same
+/// dual-renderer gap fixed for XLSX formula text in #279. The fallback to
+/// raw text covers the (normally unreachable) case where `display` and
+/// `rows` disagree in shape.
+fn cell_display_text(sheet: &Sheet, r: usize, c: usize) -> String {
+    sheet.display.get(r).and_then(|row| row.get(c)).cloned().unwrap_or_else(|| {
+        sheet.rows.get(r).and_then(|row| row.get(c)).map(CellValue::as_text).unwrap_or_default()
+    })
+}
+
 /// Render each cell's display text, applying the workbook's number formats.
 ///
 /// Mirrors the XLSX side: a number whose format is a date format renders as
@@ -758,6 +791,7 @@ fn build_display(
     cells: &[Cell],
     formats: &std::collections::HashMap<u16, String>,
     xf_numfmt: &[u16],
+    date1904: bool,
 ) -> Vec<Vec<String>> {
     use crate::xlsx::{date, numfmt};
 
@@ -785,10 +819,7 @@ fn build_display(
                         None => date::is_date_format_id(fmt_id as u32),
                     };
                     if is_date {
-                        // XLS predates the 1904 option being common; the
-                        // date-system flag lives in `DATEMODE`, which the
-                        // reader does not track, so assume the 1900 system.
-                        match date::DateTimeValue::from_serial(*n, false) {
+                        match date::DateTimeValue::from_serial(*n, date1904) {
                             Some(dt) => dt.to_iso_string(),
                             None => cell.value.as_text(),
                         }
@@ -1134,6 +1165,38 @@ mod tests {
         assert!(md.contains("| 1 | 2 |"));
     }
 
+    /// `Document::plain_text()`/`to_markdown()` dispatch to these two
+    /// methods, a separate path from `to_ir()` — which already read
+    /// `sheet.display` correctly. Before this fix these methods read
+    /// `sheet.rows` directly (raw `CellValue::as_text()`), so a date cell
+    /// showed its raw serial (`38971`) here even when `to_ir()`/`markdown`
+    /// via the shared IR renderer got it right — the same dual-renderer
+    /// gap already hit for XLSX formula text (#279).
+    #[test]
+    fn plain_text_and_markdown_prefer_the_format_aware_display_text() {
+        let sheet = Sheet {
+            name: "Sheet1".into(),
+            rows: vec![vec![CellValue::Number(38971.0)]],
+            display: vec![vec!["2006-09-11".to_string()]],
+            ..Default::default()
+        };
+        let doc = make_doc(vec![sheet]);
+        assert!(
+            doc.plain_text().contains("2006-09-11"),
+            "plain_text() must use the formatted date, got: {:?}",
+            doc.plain_text()
+        );
+        assert!(
+            !doc.plain_text().contains("38971"),
+            "plain_text() must not fall back to the raw serial when display is populated"
+        );
+        assert!(
+            doc.to_markdown().contains("2006-09-11"),
+            "to_markdown() must use the formatted date, got: {:?}",
+            doc.to_markdown()
+        );
+    }
+
     fn make_doc(sheets: Vec<Sheet>) -> XlsDocument {
         XlsDocument {
             images: Vec::new(),
@@ -1328,7 +1391,7 @@ mod tests {
         }];
 
         let started = std::time::Instant::now();
-        let display = build_display(&cells, &formats, &xf_numfmt);
+        let display = build_display(&cells, &formats, &xf_numfmt, false);
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "build_display took {:?}",
@@ -1352,8 +1415,57 @@ mod tests {
             col: 0,
             value: CellValue::Number(38971.0),
         }];
-        let display = build_display(&cells, &std::collections::HashMap::new(), &[14u16]);
+        let display = build_display(&cells, &std::collections::HashMap::new(), &[14u16], false);
         assert_eq!(display[0][0], "2006-09-11");
+    }
+
+    /// The same date serial renders a different calendar date depending on
+    /// `date1904` — the 1900/1904 epoch delta is exactly 1462 days. Before
+    /// #233, `build_display` had no `date1904` parameter at all and always
+    /// rendered as if the workbook were 1900-mode.
+    #[test]
+    fn test_build_display_honours_the_date1904_flag() {
+        let cells = vec![Cell {
+            xf_index: 0,
+            row: 0,
+            col: 0,
+            value: CellValue::Number(38971.0),
+        }];
+        let display_1900 =
+            build_display(&cells, &std::collections::HashMap::new(), &[14u16], false);
+        let display_1904 =
+            build_display(&cells, &std::collections::HashMap::new(), &[14u16], true);
+        assert_eq!(display_1900[0][0], "2006-09-11");
+        assert_ne!(
+            display_1900[0][0], display_1904[0][0],
+            "the same serial must render differently under the 1904 date system"
+        );
+    }
+
+    /// End-to-end: a real `DATEMODE` record (`0x0022`) in the globals
+    /// substream must reach the cell that renders the date, via the full
+    /// `parse_workbook_stream` record walk — not just `build_display`
+    /// called directly (issue #233).
+    #[test]
+    fn test_datemode_record_reaches_the_rendered_cell() {
+        // ifmt=14 (built-in "m/d/yyyy") at offset 2 of a minimal XF record.
+        let xf_date = biff_rec(RT_XF, &[0, 0, 14, 0]);
+        let cell = number(0, 0, 0, 38971.0);
+
+        let globals_1900 = vec![xf_date.clone()];
+        let stream_1900 =
+            workbook_stream_with_globals(&globals_1900, &[("Sheet1", 0, cell.clone())]);
+        let doc_1900 = XlsDocument::parse_workbook_stream(&stream_1900).expect("parses");
+
+        let globals_1904 = vec![xf_date, biff_rec(RT_DATEMODE, &1u16.to_le_bytes())];
+        let stream_1904 = workbook_stream_with_globals(&globals_1904, &[("Sheet1", 0, cell)]);
+        let doc_1904 = XlsDocument::parse_workbook_stream(&stream_1904).expect("parses");
+
+        assert_eq!(doc_1900.sheets[0].display[0][0], "2006-09-11");
+        assert_ne!(
+            doc_1900.sheets[0].display[0][0], doc_1904.sheets[0].display[0][0],
+            "a DATEMODE=1904 record must change the rendered date"
+        );
     }
 
     #[test]
