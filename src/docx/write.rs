@@ -444,13 +444,30 @@ struct CoreProps {
 /// Resolved `r:id` for each hyperlink URL used anywhere in the package.
 type HyperlinkRids = std::collections::HashMap<String, String>;
 
-/// Every distinct hyperlink URL reachable from `elements`, in first-seen order.
+/// Split a hyperlink target into its relationship-worthy base and an
+/// optional fragment, matching how the reader put them back together
+/// (`resolve_hyperlinks` in `docx/mod.rs`: `externalURL#fragment` or a
+/// bare `#fragment` for a same-document anchor with no relationship at
+/// all). A pure `#fragment` URL has an empty base.
+fn split_hyperlink_fragment(url: &str) -> (&str, Option<&str>) {
+    match url.split_once('#') {
+        Some((base, frag)) if !frag.is_empty() => (base, Some(frag)),
+        _ => (url, None),
+    }
+}
+
+/// Every distinct hyperlink base URL reachable from `elements`, in
+/// first-seen order. A same-document-only link (`#anchor`, empty base)
+/// needs no relationship at all — registering one fabricated a bogus
+/// `TargetMode="External"` entry pointing at `"#anchor"` for every such
+/// link, which is not a URL (issue #292).
 fn collect_hyperlinks(elements: &[DocxElement], out: &mut Vec<String>) {
     fn push_runs(runs: &[Run], out: &mut Vec<String>) {
         for r in runs {
             if let Some(ref url) = r.hyperlink {
-                if !url.is_empty() && !out.contains(url) {
-                    out.push(url.clone());
+                let (base, _frag) = split_hyperlink_fragment(url);
+                if !base.is_empty() && !out.iter().any(|u| u == base) {
+                    out.push(base.to_string());
                 }
             }
         }
@@ -1874,10 +1891,28 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph, links: &
     let mut i = 0usize;
     while i < p.runs.len() {
         let url = p.runs[i].hyperlink.as_deref().filter(|u| !u.is_empty());
-        match url.and_then(|u| links.get(u)) {
-            Some(rid) => {
+        // A pure `#anchor` URL (empty base) is a same-document link with
+        // no relationship at all — `w:anchor` alone. Anything else with a
+        // fragment (`https://…#section`) keeps the relationship on the
+        // fragment-free base and carries the fragment as `w:anchor`
+        // alongside `r:id`, matching how real Word documents (and this
+        // reader, since #242/#292) encode "external page, jump to
+        // bookmark within it" instead of losing the relationship.
+        let split = url.map(split_hyperlink_fragment);
+        let wrap = match split {
+            Some((base, frag)) if base.is_empty() => Some((None, frag)),
+            Some((base, frag)) => links.get(base).map(|rid| (Some(rid.as_str()), frag)),
+            None => None,
+        };
+        match wrap {
+            Some((rid, frag)) => {
                 let mut link = BytesStart::new("w:hyperlink");
-                link.push_attribute(("r:id", rid.as_str()));
+                if let Some(rid) = rid {
+                    link.push_attribute(("r:id", rid));
+                }
+                if let Some(frag) = frag {
+                    link.push_attribute(("w:anchor", frag));
+                }
                 w.write_event(Event::Start(link)).expect("write hyperlink");
                 while i < p.runs.len()
                     && p.runs[i].hyperlink.as_deref().filter(|u| !u.is_empty()) == url
@@ -4140,6 +4175,74 @@ mod tests {
             }],
             ..Default::default()
         })
+    }
+
+    /// issue #292 — a pure same-document anchor (`#anchor`, no external
+    /// URL) used to get a fabricated `TargetMode="External"` relationship
+    /// pointing at the literal string `"#anchor"`, which is not a URL.
+    /// It must instead be `<w:hyperlink w:anchor="…">` with no
+    /// relationship at all.
+    #[test]
+    fn test_pure_anchor_hyperlink_gets_no_relationship() {
+        let mut doc = DocxWriter::new();
+        doc.add_ir_paragraph(
+            &[Run {
+                text: "jump".to_string(),
+                hyperlink: Some("#_top".to_string()),
+                ..Default::default()
+            }],
+            None,
+        );
+        let parts = all_parts(doc);
+        let document_xml = &parts["word/document.xml"];
+        assert!(
+            document_xml.contains(r#"w:anchor="_top""#),
+            "missing w:anchor: {document_xml}"
+        );
+        assert!(
+            !document_xml.contains("r:id"),
+            "a pure anchor must not carry r:id: {document_xml}"
+        );
+        let rels = parts.get("word/_rels/document.xml.rels").cloned().unwrap_or_default();
+        assert!(
+            !rels.contains("_top"),
+            "a pure anchor must not fabricate a relationship: {rels}"
+        );
+    }
+
+    /// issue #292 — an external URL with a fragment (`https://…#section`,
+    /// the standard "external doc, jump to bookmark" shape, and how real
+    /// Word TOC/cross-reference entries always look) must keep BOTH the
+    /// relationship (on the fragment-free base) and the fragment itself,
+    /// as a separate `w:anchor`, rather than folding the fragment into
+    /// the relationship Target or losing it.
+    #[test]
+    fn test_external_hyperlink_with_fragment_keeps_both_rid_and_anchor() {
+        let mut doc = DocxWriter::new();
+        doc.add_ir_paragraph(
+            &[Run {
+                text: "link".to_string(),
+                hyperlink: Some("https://example.com/page#section1".to_string()),
+                ..Default::default()
+            }],
+            None,
+        );
+        let parts = all_parts(doc);
+        let document_xml = &parts["word/document.xml"];
+        assert!(
+            document_xml.contains(r#"w:anchor="section1""#),
+            "missing w:anchor: {document_xml}"
+        );
+        assert!(document_xml.contains("r:id"), "missing r:id: {document_xml}");
+        let rels = &parts["word/_rels/document.xml.rels"];
+        assert!(
+            rels.contains(r#"Target="https://example.com/page""#),
+            "relationship target must be the fragment-free base URL: {rels}"
+        );
+        assert!(
+            !rels.contains("#section1"),
+            "the fragment must not leak into the relationship Target: {rels}"
+        );
     }
 
     fn all_parts(doc: DocxWriter) -> std::collections::HashMap<String, String> {

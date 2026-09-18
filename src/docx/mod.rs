@@ -4266,6 +4266,89 @@ mod tests {
     }
 
     #[test]
+    fn test_docx_chart_text_is_extracted() {
+        // issue #273 — a native DrawingML chart embedded in a DOCX had its
+        // title/category/series text never extracted at all: the chart
+        // part (word/charts/chartN.xml) was never opened. The extraction
+        // engine itself (core::chart::chart_text_lines) was already
+        // tested; this is the missing end-to-end DOCX wiring test.
+        let chart_xml = br#"<?xml version="1.0"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:chart>
+    <c:title><c:tx><c:rich><a:p><a:r><a:t>Dollars per Group</a:t></a:r></a:p></c:rich></c:tx></c:title>
+    <c:plotArea>
+      <c:barChart>
+        <c:ser>
+          <c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>Revenue</c:v></c:pt></c:strCache></c:strRef></c:tx>
+          <c:cat><c:strRef><c:strCache>
+            <c:pt idx="0"><c:v>Group 1</c:v></c:pt>
+            <c:pt idx="1"><c:v>Group 2</c:v></c:pt>
+          </c:strCache></c:strRef></c:cat>
+          <c:val><c:numRef><c:numCache>
+            <c:pt idx="0"><c:v>15.53</c:v></c:pt>
+            <c:pt idx="1"><c:v>27.32</c:v></c:pt>
+          </c:numCache></c:numRef></c:val>
+        </c:ser>
+      </c:barChart>
+    </c:plotArea>
+  </c:chart>
+</c:chartSpace>"#;
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+            xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>
+    <w:p><w:r><w:t>Pie:</w:t></w:r></w:p>
+    <w:p><w:r><w:drawing>
+      <wp:inline>
+        <wp:extent cx="2000000" cy="1500000"/>
+        <wp:docPr id="1" name="Chart 1"/>
+        <a:graphic><a:graphicData uri="">
+          <c:chart r:id="rId1"/>
+        </a:graphicData></a:graphic>
+      </wp:inline>
+    </w:drawing></w:r></w:p>
+  </w:body>
+</w:document>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let chart_part = PartName::new("/word/charts/chart1.xml").unwrap();
+        writer
+            .add_part(
+                &chart_part,
+                "application/vnd.openxmlformats-officedocument.drawingml.chart+xml",
+                chart_xml,
+            )
+            .unwrap();
+        let rid = writer.add_part_rel(&doc_part, rel_types::CHART, "charts/chart1.xml");
+        assert_eq!(rid, "rId1", "test fixture assumes the first relationship id");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let text = doc.plain_text();
+        for expected in ["Dollars per Group", "Revenue", "Group 1", "Group 2", "15.53", "27.32"] {
+            assert!(
+                text.contains(expected),
+                "chart text {expected:?} missing from plain_text(): {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_plain_text_and_markdown_include_footnote_body_content() {
         // issue #240 — plain_text()/to_markdown() only walked body.elements
         // and headers/footers, never self.footnotes/endnotes/comments. A
