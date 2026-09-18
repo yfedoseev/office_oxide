@@ -94,6 +94,9 @@ impl PptxDocument {
                 "application/vnd.openxmlformats-officedocument.presentationml.template.main+xml",
                 "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml",
                 "application/vnd.ms-powerpoint.slideshow.macroEnabled.main+xml",
+                // `.potm` (macro-enabled template) was missing, so every
+                // real .potm failed with FormatMismatch.
+                "application/vnd.ms-powerpoint.template.macroEnabled.main+xml",
             ],
             "a PresentationML presentation",
         )?;
@@ -337,5 +340,74 @@ impl crate::core::OfficeDocument for PptxDocument {
 
     fn to_markdown(&self) -> String {
         self.to_markdown()
+    }
+}
+
+#[cfg(test)]
+mod content_type_tests {
+    use std::io::{Cursor, Write};
+
+    use crate::core::relationships::rel_types;
+
+    /// Build a minimal PresentationML package whose main part carries
+    /// `content_type`.
+    fn minimal_package(content_type: &str) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+
+        zip.start_file("[Content_Types].xml", opts).unwrap();
+        zip.write_all(
+            format!(
+                r#"<?xml version="1.0"?><Types
+                     xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+                   <Override PartName="/ppt/presentation.xml" ContentType="{content_type}"/>
+                 </Types>"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+        zip.start_file("_rels/.rels", opts).unwrap();
+        zip.write_all(
+            format!(
+                r#"<?xml version="1.0"?><Relationships
+                     xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                   <Relationship Id="rId1" Type="{}" Target="ppt/presentation.xml"/>
+                 </Relationships>"#,
+                rel_types::OFFICE_DOCUMENT
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+        zip.start_file("ppt/presentation.xml", opts).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?><p:presentation
+                  xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+                <p:sldIdLst/></p:presentation>"#,
+        )
+        .unwrap();
+
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// `.potm`'s real content type was missing from the whitelist, so every
+    /// macro-enabled PowerPoint template failed with a format mismatch.
+    #[test]
+    fn test_potm_content_type_accepted() {
+        for ct in [
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
+            "application/vnd.ms-powerpoint.template.macroEnabled.main+xml",
+            "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml",
+        ] {
+            let bytes = minimal_package(ct);
+            super::PptxDocument::from_reader(Cursor::new(bytes))
+                .unwrap_or_else(|e| panic!("content type {ct} should be accepted, got {e}"));
+        }
+        // A non-PresentationML main part is still refused.
+        let bytes = minimal_package(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+        );
+        assert!(super::PptxDocument::from_reader(Cursor::new(bytes)).is_err());
     }
 }

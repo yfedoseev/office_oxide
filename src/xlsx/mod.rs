@@ -349,6 +349,9 @@ impl XlsxDocument {
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
                 "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
                 "application/vnd.ms-excel.template.macroEnabled.main+xml",
+                // `.xlam` (macro-enabled add-in) was missing from the
+                // whitelist.
+                "application/vnd.ms-excel.addin.macroEnabled.main+xml",
             ],
             "a SpreadsheetML workbook",
         )?;
@@ -1293,5 +1296,69 @@ mod tests {
         let parsed = parse_drawing_anchors(xml).expect("parse ok");
         assert!(parsed.pictures.is_empty());
         assert!(parsed.text_shapes.is_empty());
+    }
+
+    /// Build a minimal SpreadsheetML package whose main part carries
+    /// `content_type`.
+    fn minimal_package(content_type: &str) -> Vec<u8> {
+        use std::io::Write;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+
+        zip.start_file("[Content_Types].xml", opts).unwrap();
+        zip.write_all(
+            format!(
+                r#"<?xml version="1.0"?><Types
+                     xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+                   <Override PartName="/xl/workbook.xml" ContentType="{content_type}"/>
+                 </Types>"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+        zip.start_file("_rels/.rels", opts).unwrap();
+        zip.write_all(
+            format!(
+                r#"<?xml version="1.0"?><Relationships
+                     xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                   <Relationship Id="rId1" Type="{}" Target="xl/workbook.xml"/>
+                 </Relationships>"#,
+                rel_types::OFFICE_DOCUMENT
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+        zip.start_file("xl/workbook.xml", opts).unwrap();
+        zip.write_all(
+            br#"<?xml version="1.0"?><workbook
+                  xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+                <sheets/></workbook>"#,
+        )
+        .unwrap();
+
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// `.xlam`'s real content type was missing from the OPC whitelist.
+    #[test]
+    fn test_xlam_content_type_accepted() {
+        for ct in [
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+            "application/vnd.ms-excel.addin.macroEnabled.main+xml",
+            "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+        ] {
+            let bytes = minimal_package(ct);
+            let opc = crate::core::opc::OpcReader::new(std::io::Cursor::new(bytes)).unwrap();
+            XlsxDocument::from_opc(opc)
+                .unwrap_or_else(|e| panic!("content type {ct} should be accepted, got {e}"));
+        }
+        // A non-SpreadsheetML main part is still refused.
+        let bytes = minimal_package(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+        );
+        let opc = crate::core::opc::OpcReader::new(std::io::Cursor::new(bytes)).unwrap();
+        assert!(XlsxDocument::from_opc(opc).is_err());
     }
 }
