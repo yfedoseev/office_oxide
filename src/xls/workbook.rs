@@ -33,6 +33,14 @@ pub struct XlsDocument {
     /// carries by default — parsed and then never read anywhere in the
     /// crate before (issue #244).
     summary_properties: Option<crate::cfb::SummaryProperties>,
+    /// Text (series names, trendline names/labels, axis titles, chart
+    /// titles) recovered from `SeriesText` records (`0x100D`, [MS-XLS]
+    /// §2.4.254) inside every embedded chart's nested `BOF..EOF`
+    /// substream. No BIFF chart-record handling existed at all before
+    /// this — a chart's own text never reached `to_ir()`/`plain_text()`
+    /// in any form, unlike the crate's working XLSX equivalent (issue
+    /// #246).
+    chart_text: Vec<String>,
 }
 
 /// A named range recovered from a `NAME` record.
@@ -59,6 +67,7 @@ impl XlsDocument {
             has_macros: false,
             truncated: false,
             summary_properties: None,
+            chart_text: Vec::new(),
         }
     }
 }
@@ -200,6 +209,9 @@ impl XlsDocument {
         // desyncing `sheet_idx` from `sheet_infos` for every sheet after it
         // (issue #237).
         let mut nested_bof_depth = 0u32;
+        // Text recovered from `SeriesText` records inside chart substreams
+        // (issue #246) — collected across every sheet's embedded charts.
+        let mut chart_text: Vec<String> = Vec::new();
         // Safety cap against a pathologically record-dense file (millions of
         // minimal, near-empty records), not against ordinary large ones.
         // 500,000 was low enough to hit on real, legitimate workbooks —
@@ -324,6 +336,19 @@ impl XlsDocument {
                     RT_EOF if nested_bof_depth > 0 => {
                         nested_bof_depth -= 1;
                     },
+                    RT_SERIESTEXT if nested_bof_depth > 0 => {
+                        // [MS-XLS] §2.4.254: 2 bytes reserved, then a
+                        // ShortXLUnicodeString covering series names,
+                        // trendline names/labels, axis titles, and chart
+                        // titles alike — no need to track which is which
+                        // to surface the human-meaningful words (#246).
+                        if let Ok((s, _)) = read_short_unicode_string(&rec.data, 2) {
+                            let s = s.trim();
+                            if !s.is_empty() {
+                                chart_text.push(s.to_string());
+                            }
+                        }
+                    },
                     RT_EOF => {
                         let (name, hidden) = match sheet_infos.get(sheet_idx) {
                             Some(info) => (info.name.clone(), info.hidden),
@@ -443,6 +468,7 @@ impl XlsDocument {
             has_macros: false,
             truncated: record_budget_exhausted,
             summary_properties: None,
+            chart_text,
         })
     }
 
@@ -471,6 +497,12 @@ impl XlsDocument {
         self.summary_properties.as_ref()
     }
 
+    /// Text recovered from every embedded chart's `SeriesText` records —
+    /// series/trendline names, axis titles, chart titles (issue #246).
+    pub fn chart_text(&self) -> &[String] {
+        &self.chart_text
+    }
+
     /// Extract plain text from the document.
     pub fn plain_text(&self) -> String {
         let mut out = String::new();
@@ -485,6 +517,19 @@ impl XlsDocument {
                     (0..row.len()).map(|c| cell_display_text(sheet, r, c)).collect();
                 let trimmed = line.join("\t").trim_end().to_string();
                 out.push_str(&trimmed);
+                out.push('\n');
+            }
+        }
+        // Chart text (series names, axis/chart titles) recovered from
+        // embedded charts (issue #246) — keep it out of both renderers,
+        // not just one (see #331 for the XLSX-side version of this gap).
+        for text in &self.chart_text {
+            let text = text.trim();
+            if !text.is_empty() {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(text);
                 out.push('\n');
             }
         }
@@ -541,6 +586,12 @@ impl XlsDocument {
                     out.push_str(" |");
                 }
                 out.push('\n');
+            }
+        }
+        for (i, text) in self.chart_text.iter().enumerate() {
+            let text = text.trim();
+            if !text.is_empty() {
+                out.push_str(&format!("## Chart {}\n\n{}\n\n", i + 1, text));
             }
         }
         out
@@ -1178,6 +1229,83 @@ mod tests {
         assert!(text.contains("Sheet2A1"), "text: {text}");
     }
 
+    /// [MS-XLS] §2.4.254: `SeriesText` = 2 bytes reserved + a
+    /// `ShortXLUnicodeString` (1-byte `cch`, 1-byte flags with bit 0 =
+    /// `fHighByte`, then `cch` (or `cch*2` if wide) bytes of characters).
+    fn series_text(text: &str) -> Vec<u8> {
+        let mut d = vec![0u8, 0u8]; // reserved
+        d.push(text.chars().count() as u8); // cch
+        d.push(0); // flags: compressed (8-bit) characters
+        d.extend_from_slice(text.as_bytes());
+        biff_rec(RT_SERIESTEXT, &d)
+    }
+
+    /// issue #246 — a chart's own `SeriesText` records (series names, axis/
+    /// chart titles) must reach `chart_text()`, `plain_text()`,
+    /// `to_markdown()`, and the IR, not just be silently skipped along with
+    /// the rest of the chart substream.
+    #[test]
+    fn test_chart_seriestext_reaches_chart_text_and_both_renderers() {
+        let mut sheet1_body = label(0, 0, "before_chart");
+        sheet1_body.extend(bof(0x0020)); // chart substream, nested inside Sheet1
+        sheet1_body.extend(series_text("Revenue Trend"));
+        sheet1_body.extend(series_text("Q1 Sales"));
+        sheet1_body.extend(eof());
+        sheet1_body.extend(label(1, 0, "after_chart"));
+
+        let stream = workbook_stream(&[("Sheet1", 0, sheet1_body)]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+
+        assert_eq!(
+            doc.chart_text(),
+            &["Revenue Trend".to_string(), "Q1 Sales".to_string()],
+            "both SeriesText records must be recovered in order"
+        );
+
+        let text = doc.plain_text();
+        assert!(text.contains("Revenue Trend"), "plain_text: {text}");
+        assert!(text.contains("Q1 Sales"), "plain_text: {text}");
+        assert!(text.contains("before_chart"), "plain_text: {text}");
+        assert!(text.contains("after_chart"), "plain_text: {text}");
+
+        let md = doc.to_markdown();
+        assert!(md.contains("Revenue Trend"), "to_markdown: {md}");
+        assert!(md.contains("Q1 Sales"), "to_markdown: {md}");
+
+        let ir = crate::convert_xls::xls_to_ir(&doc);
+        let charts_section = ir
+            .sections
+            .iter()
+            .find(|s| s.title.as_deref() == Some("Charts"))
+            .expect("a Charts section must be synthesized");
+        let charts_text: String = charts_section
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                crate::ir::Element::Paragraph(p) => p.content.iter().find_map(|c| match c {
+                    crate::ir::InlineContent::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(charts_text.contains("Revenue Trend"), "IR Charts section: {charts_text}");
+        assert!(charts_text.contains("Q1 Sales"), "IR Charts section: {charts_text}");
+    }
+
+    /// A `SeriesText`-shaped record type value seen *outside* any chart
+    /// substream (`nested_bof_depth == 0`) must not be captured — the
+    /// nesting guard is load-bearing, not decorative.
+    #[test]
+    fn test_seriestext_outside_chart_substream_is_ignored() {
+        let mut sheet1_body = label(0, 0, "plain_cell");
+        sheet1_body.extend(series_text("stray"));
+        let stream = workbook_stream(&[("Sheet1", 0, sheet1_body)]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+        assert!(doc.chart_text().is_empty());
+    }
+
     // ── Record-parsing safety cap (issue #236) ──────────────────────────────
 
     /// A budget of 0 must not panic or hang — just truncate before any
@@ -1291,6 +1419,7 @@ mod tests {
             defined_names: Vec::new(),
             truncated: false,
             summary_properties: None,
+            chart_text: Vec::new(),
             sheets: vec![Sheet {
                 display: Vec::new(),
                 name: "Sheet1".into(),
@@ -1318,6 +1447,7 @@ mod tests {
             defined_names: Vec::new(),
             truncated: false,
             summary_properties: None,
+            chart_text: Vec::new(),
             sheets: vec![Sheet {
                 display: Vec::new(),
                 name: "Data".into(),
@@ -1374,6 +1504,7 @@ mod tests {
             defined_names: Vec::new(),
             truncated: false,
             summary_properties: None,
+            chart_text: Vec::new(),
             sheets,
         }
     }

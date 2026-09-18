@@ -206,6 +206,32 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
     // section; BIFF drawings carry no reliable per-sheet anchor here.
     append_legacy_images(&mut sections, doc.images());
 
+    // Charts weren't rendered at all, only their own text (series names,
+    // trendline names/labels, axis/chart titles) was recovered from
+    // `SeriesText` records — surfacing it as a dedicated section keeps
+    // every human-meaningful word in the workbook reachable, the same
+    // contract `convert_xlsx` already honours for its own charts
+    // (issue #246).
+    if !doc.chart_text().is_empty() {
+        let mut chart_elements: Vec<Element> = Vec::new();
+        for (i, text) in doc.chart_text().iter().enumerate() {
+            chart_elements.push(Element::Heading(Heading {
+                level: 3,
+                content: vec![InlineContent::Text(TextSpan::plain(format!("Chart {}", i + 1)))],
+                ..Default::default()
+            }));
+            chart_elements.push(Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(text.clone()))],
+                ..Default::default()
+            }));
+        }
+        sections.push(Section {
+            title: Some("Charts".to_string()),
+            elements: chart_elements,
+            ..Default::default()
+        });
+    }
+
     // The workbook's own declared title (from `\x05SummaryInformation`)
     // beats the first sheet's name — a sheet name is not a document
     // title, it's just the only thing that was ever there to fall back

@@ -31,6 +31,9 @@ pub const RT_MERGEDCELLS: u16 = 0x00E5;
 pub const RT_NAME: u16 = 0x0018;
 pub const RT_EXTERNSHEET: u16 = 0x0017;
 pub const RT_SUPBOOK: u16 = 0x01AE;
+/// Chart series/trendline/axis/chart title text ([MS-XLS] §2.4.254), found
+/// inside a chart's nested `BOF..EOF` substream (issue #246).
+pub const RT_SERIESTEXT: u16 = 0x100D;
 
 /// A raw BIFF record: type + data (may span CONTINUE records).
 #[derive(Debug, Clone)]

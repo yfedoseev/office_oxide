@@ -15,6 +15,13 @@ impl XlsxDocument {
                 }
             }
         }
+        // `to_markdown()` already surfaces chart text (axis titles, series
+        // names); `plain_text()` silently dropped it entirely (issue #331).
+        for text in &self.chart_text {
+            if !text.trim().is_empty() {
+                parts.push(text.trim().to_string());
+            }
+        }
         parts.join("\n\n")
     }
 
@@ -422,5 +429,35 @@ mod tests {
         assert!(!idx.contains(&0), "id 50 overridden to a numeric code is not a date");
         assert!(idx.contains(&1), "a custom yyyy-mm-dd code is a date");
         assert!(idx.contains(&2), "an un-overridden built-in date id is a date");
+    }
+
+    /// issue #331 — `to_markdown()` already surfaced chart text; `plain_text()`
+    /// silently dropped it, so the CLI's default `text` output (and anything
+    /// built on `plain_text()`, like PDF export) lost every chart's words.
+    #[test]
+    fn test_plain_text_includes_chart_text() {
+        let doc = XlsxDocument {
+            workbook: super::super::WorkbookInfo {
+                sheets: Vec::new(),
+                defined_names: Vec::new(),
+                date1904: false,
+            },
+            worksheets: Vec::new(),
+            shared_strings: super::super::SharedStringTable::empty(),
+            styles: None,
+            theme: None,
+            chart_text: vec!["Title: Rotated Title".to_string()],
+            embedded_fonts: Vec::new(),
+            core_properties: None,
+            app_properties: None,
+            has_macros: false,
+            styles_data: None,
+            theme_data: None,
+        };
+        assert!(
+            doc.plain_text().contains("Rotated Title"),
+            "plain_text() must include chart text, same as to_markdown(): {:?}",
+            doc.plain_text()
+        );
     }
 }
