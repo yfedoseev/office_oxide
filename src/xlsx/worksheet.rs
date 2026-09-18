@@ -655,17 +655,41 @@ fn read_text_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<
 }
 
 /// Fast inline string parser: `<is><t>text</t></is>` or `<is><r>...<t>text</t>...</r></is>`.
+///
+/// Runs with the sheet reader's text trimming turned off. The sheet reader
+/// trims — right for `<v>`, wrong here: quick-xml reports every entity
+/// reference as its own event, splitting the literal text around it into
+/// separate `Event::Text` fragments, and trimming each fragment
+/// independently eats the space that sat at the entity boundary, so
+/// `AT&amp;T &lt;tag&gt;` read back as `AT&T<tag>` (#269). This matches the
+/// non-trimming reader `shared_strings.rs` already uses for the same
+/// content model.
 fn parse_inline_string_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<String> {
+    let trim_start = reader.config().trim_text_start;
+    let trim_end = reader.config().trim_text_end;
+    reader.config_mut().trim_text(false);
+
+    let result = read_inline_string_body(reader);
+
+    reader.config_mut().trim_text_start = trim_start;
+    reader.config_mut().trim_text_end = trim_end;
+    result
+}
+
+fn read_inline_string_body(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<String> {
     let mut text = String::new();
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"t" {
-                    text.push_str(&read_text_fast(reader)?);
-                } else {
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"t" => text.push_str(&read_text_fast(reader)?),
+                // A rich inline string wraps each run in `<r>`. Descend
+                // into it — skipping the element wholesale discarded the
+                // `<t>` inside and with it the cell's entire text.
+                b"r" => {},
+                _ => {
                     reader.read_to_end(e.to_end().name())?;
-                }
+                },
             },
             Event::End(ref e) if e.local_name().as_ref() == b"is" => {
                 break;
@@ -716,6 +740,84 @@ mod tests {
         // Row 2
         assert!(matches!(ws.rows[1].cells[0].value, CellValue::Boolean(true)));
         assert!(matches!(&ws.rows[1].cells[1].value, CellValue::Error(e) if e == "#DIV/0!"));
+    }
+
+    /// #269 — the sheet reader trims text, and quick-xml emits every entity
+    /// reference as its own event, so the literal text around `&amp;`/`&lt;`
+    /// arrived as separate fragments that were each trimmed independently.
+    /// Every space touching an escaped character was deleted.
+    #[test]
+    fn test_inline_string_keeps_whitespace_around_escaped_characters() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is><t>AT&amp;T &lt;tag&gt; &quot;quoted&quot; &apos;apostrophe&apos; 5 &lt; 10 and 10 &gt; 5</t></is></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert!(
+            matches!(
+                &ws.rows[0].cells[0].value,
+                CellValue::String(s)
+                    if s == "AT&T <tag> \"quoted\" 'apostrophe' 5 < 10 and 10 > 5"
+            ),
+            "got {:?}",
+            ws.rows[0].cells[0].value
+        );
+    }
+
+    /// The same function skipped `<r>` wholesale, so a *rich* inline string
+    /// lost its text entirely rather than just its spacing.
+    #[test]
+    fn test_rich_inline_string_runs_are_not_skipped() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is>
+        <r><rPr><b/></rPr><t>Hello </t></r>
+        <r><t>world</t></r>
+      </is></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert!(
+            matches!(&ws.rows[0].cells[0].value, CellValue::String(s) if s == "Hello world"),
+            "got {:?}",
+            ws.rows[0].cells[0].value
+        );
+    }
+
+    /// Turning trimming off for the inline-string body must not leak into
+    /// the rest of the sheet: `<v>` is still parsed with surrounding
+    /// whitespace ignored.
+    #[test]
+    fn test_inline_string_does_not_leave_the_sheet_reader_untrimmed() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is><t> padded </t></is></c>
+      <c r="B1"><v>
+        42
+      </v></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert!(
+            matches!(&ws.rows[0].cells[0].value, CellValue::String(s) if s == " padded "),
+            "got {:?}",
+            ws.rows[0].cells[0].value
+        );
+        assert!(
+            matches!(ws.rows[0].cells[1].value, CellValue::Number(n) if n == 42.0),
+            "got {:?}",
+            ws.rows[0].cells[1].value
+        );
     }
 
     #[test]
