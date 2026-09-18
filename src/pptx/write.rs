@@ -620,6 +620,11 @@ impl PptxWriter {
                     );
                     let media_part =
                         PartName::new(&format!("/ppt/media/image{global_img_idx}.{ext}"))?;
+                    // A per-part Override alone is spec-legal, but real
+                    // SDK validators flag a package with many overrides
+                    // and no matching Default — XLSX's own image-writing
+                    // path already registers one; PPTX's didn't (issue #295).
+                    opc.register_default_content_type(ext, fmt.content_type());
                     opc.add_part(&media_part, fmt.content_type(), data)?;
                     img_rids.push((rid, *x, *y, *cx, *cy, alt.clone()));
                     global_img_idx += 1;
@@ -2250,6 +2255,40 @@ mod tests {
         let cursor = Cursor::new(bytes);
         let mut zip = zip::ZipArchive::new(cursor).unwrap();
         assert!(zip.by_name("ppt/media/image1.png").is_ok(), "media part missing");
+    }
+
+    /// issue #295 — an image part got only a per-part Override
+    /// content-type declaration, no matching Default (an inconsistency
+    /// with XLSX's own image-writing path, which already registers
+    /// one). Spec-legal on its own, but real SDK validators flag a
+    /// package with many overrides and no matching default.
+    #[test]
+    fn test_image_part_gets_a_matching_default_content_type() {
+        use crate::ir::ImageFormat;
+        let png_bytes: Vec<u8> = vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xe2, 0x21, 0xbc,
+            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let mut writer = PptxWriter::new();
+        writer
+            .add_slide()
+            .add_image(png_bytes, ImageFormat::Png, 0, 0, 3_000_000, 2_000_000);
+        let mut buf = Cursor::new(Vec::new());
+        writer.write_to(&mut buf).unwrap();
+        let mut zip = zip::ZipArchive::new(Cursor::new(buf.into_inner())).unwrap();
+        let mut content_types = String::new();
+        std::io::Read::read_to_string(
+            &mut zip.by_name("[Content_Types].xml").unwrap(),
+            &mut content_types,
+        )
+        .unwrap();
+        assert!(
+            content_types.contains(r#"Default Extension="png""#),
+            "missing a Default for the png extension: {content_types}"
+        );
     }
 
     #[test]

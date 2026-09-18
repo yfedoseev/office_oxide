@@ -917,6 +917,11 @@ impl DocxWriter {
             let ct = img.format.content_type();
             let part_name = format!("/word/media/image{n}.{ext}");
             let img_part = PartName::new(&part_name)?;
+            // A per-part Override alone is spec-legal, but real SDK
+            // validators flag a package with many overrides and no
+            // matching Default — XLSX's own image-writing path already
+            // registers one; DOCX's didn't (issue #295).
+            opc.register_default_content_type(ext, ct);
             opc.add_part(&img_part, ct, &img.data)?;
 
             image_rids.push(ImageInfo {
@@ -957,6 +962,10 @@ impl DocxWriter {
                 let target_rel = format!("fonts/font_{n}_{safe}.ttf");
                 let target_abs = format!("/word/fonts/font_{n}_{safe}.ttf");
                 let part = PartName::new(&target_abs)?;
+                // Matches core::embedded_fonts's own Default-registration
+                // convention, which this hand-rolled path had missed
+                // (issue #295).
+                opc.register_default_content_type("ttf", "application/x-font-ttf");
                 opc.add_part(&part, "application/x-font-ttf", data)?;
                 let rid = opc.add_part_rel(&font_table_part, rel_types::FONT, &target_rel);
                 font_entries.push((name.clone(), rid));
@@ -4213,6 +4222,47 @@ mod tests {
     /// issue #218 — content past MAX_NESTING_DEPTH was dropped with only
     /// a log::warn!; a caller had no way to learn the document they just
     /// wrote was missing content. truncated_subtrees() must report it.
+    /// issue #295 — a DOCX image part got only a per-part Override
+    /// content-type declaration, no matching Default (an inconsistency
+    /// with XLSX's own image-writing path).
+    #[test]
+    fn test_docx_image_part_gets_a_matching_default_content_type() {
+        let png_bytes: Vec<u8> = vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xe2, 0x21, 0xbc,
+            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let mut doc = DocxWriter::new();
+        doc.add_ir_image(&crate::ir::Image {
+            data: Some(png_bytes),
+            format: Some(crate::ir::ImageFormat::Png),
+            ..Default::default()
+        });
+        let parts = all_parts(doc);
+        let content_types = &parts["[Content_Types].xml"];
+        assert!(
+            content_types.contains(r#"Default Extension="png""#),
+            "missing a Default for the png extension: {content_types}"
+        );
+    }
+
+    /// issue #295 — DOCX's hand-rolled font-embedding path (which
+    /// duplicates the shared core::embedded_fonts logic) omitted the
+    /// matching Default-registration call too.
+    #[test]
+    fn test_docx_embedded_font_gets_a_matching_default_content_type() {
+        let mut doc = DocxWriter::new();
+        doc.embed_font("Test Font", vec![0u8; 16]);
+        let parts = all_parts(doc);
+        let content_types = &parts["[Content_Types].xml"];
+        assert!(
+            content_types.contains(r#"Default Extension="ttf""#),
+            "missing a Default for the ttf extension: {content_types}"
+        );
+    }
+
     /// issue #220 — pretty-printed indentation made document.xml grow
     /// Θ(depth²): 2 x nesting_level spaces per line, ~9 XML levels per
     /// text-box level. Compares output size at two nesting depths; a
