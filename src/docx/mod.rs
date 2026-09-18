@@ -163,7 +163,20 @@ impl DocxDocument {
     }
 
     /// Open a DOCX document from any `Read + Seek` source.
-    pub fn from_reader<R: Read + Seek>(reader: R) -> Result<Self> {
+    pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
+        // A password-protected DOCX is a CFB container, not a zip at all.
+        // Without this check, opening one here (rather than through the
+        // unified `Document::from_reader`, which already has it) failed
+        // with a confusing low-level "Could not find EOCD" zip error
+        // instead of naming the real cause (issue #232).
+        if crate::cfb::is_cfb_container(&mut reader).map_err(crate::core::Error::from)? {
+            return Err(crate::core::Error::Unsupported(
+                "the file is a password-protected (encrypted) OOXML package; \
+                 decryption is not supported"
+                    .into(),
+            )
+            .into());
+        }
         let opc = OpcReader::new(reader)?;
         Self::from_opc(opc)
     }
@@ -4269,6 +4282,23 @@ mod tests {
             list.start_number,
             Some(7),
             "startOverride=7 must be read back, not None"
+        );
+    }
+
+    #[test]
+    fn test_encrypted_docx_gives_a_friendly_error_via_the_format_specific_reader() {
+        // issue #232 — opening an encrypted OOXML file directly through
+        // DocxDocument::from_reader (bypassing the unified Document
+        // entry point, which already had this check) gave a confusing
+        // "Could not find EOCD" zip error instead of naming the real
+        // cause.
+        let mut cfb = vec![0u8; 512];
+        cfb[0..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        let err = DocxDocument::from_reader(Cursor::new(cfb)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("password-protected"),
+            "expected a friendly password-protected message, got: {msg}"
         );
     }
 

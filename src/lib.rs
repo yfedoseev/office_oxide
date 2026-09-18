@@ -214,28 +214,12 @@ where
 
 /// Whether a reader's first bytes are the CFB (compound file) signature.
 ///
-/// Leaves the reader rewound to the start.
+/// Leaves the reader rewound to the start. Thin wrapper around
+/// `cfb::is_cfb_container`, which is also called directly by each OOXML
+/// format's own `from_reader` (issue #232) — kept here too so this
+/// module's existing `Result` (`OfficeError`) call sites don't change.
 fn is_cfb_container<R: Read + Seek>(reader: &mut R) -> Result<bool> {
-    use std::io::SeekFrom;
-    let mut magic = [0u8; 8];
-    reader.seek(SeekFrom::Start(0)).map_err(core::Error::from)?;
-    let n = read_up_to(reader, &mut magic)?;
-    reader.seek(SeekFrom::Start(0)).map_err(core::Error::from)?;
-    Ok(n == 8 && magic == crate::cfb::CFB_SIGNATURE)
-}
-
-/// Read up to `buf.len()` bytes, tolerating short reads.
-fn read_up_to<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        match reader.read(&mut buf[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {},
-            Err(e) => return Err(core::Error::from(e).into()),
-        }
-    }
-    Ok(filled)
+    Ok(crate::cfb::is_cfb_container(reader).map_err(core::Error::from)?)
 }
 
 /// Dispatch a method call to the inner document type across all variants.

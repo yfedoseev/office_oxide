@@ -140,7 +140,18 @@ impl XlsxDocument {
     }
 
     /// Open an XLSX document from any `Read + Seek` source.
-    pub fn from_reader<R: Read + Seek>(reader: R) -> Result<Self> {
+    pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
+        // A password-protected XLSX is a CFB container, not a zip at all.
+        // See the identical check in docx::DocxDocument::from_reader
+        // (issue #232).
+        if crate::cfb::is_cfb_container(&mut reader).map_err(crate::core::Error::from)? {
+            return Err(crate::core::Error::Unsupported(
+                "the file is a password-protected (encrypted) OOXML package; \
+                 decryption is not supported"
+                    .into(),
+            )
+            .into());
+        }
         let archive = ZipArchive::new(reader).map_err(crate::core::Error::from)?;
         Self::from_zip(archive)
     }
@@ -1218,6 +1229,19 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    /// issue #232 — same gap as DOCX, confirmed independently for XLSX.
+    #[test]
+    fn test_encrypted_xlsx_gives_a_friendly_error_via_the_format_specific_reader() {
+        let mut cfb = vec![0u8; 512];
+        cfb[0..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        let err = XlsxDocument::from_reader(std::io::Cursor::new(cfb)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("password-protected"),
+            "expected a friendly password-protected message, got: {msg}"
+        );
+    }
 
     /// issue #245 — AppProperties::parse existed, fully tested, but
     /// nothing on the read side ever called it (fast zip path).

@@ -84,7 +84,18 @@ impl PptxDocument {
     }
 
     /// Open a PPTX document from any `Read + Seek` source.
-    pub fn from_reader<R: Read + Seek>(reader: R) -> Result<Self> {
+    pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
+        // A password-protected PPTX is a CFB container, not a zip at all.
+        // See the identical check in docx::DocxDocument::from_reader
+        // (issue #232).
+        if crate::cfb::is_cfb_container(&mut reader).map_err(crate::core::Error::from)? {
+            return Err(crate::core::Error::Unsupported(
+                "the file is a password-protected (encrypted) OOXML package; \
+                 decryption is not supported"
+                    .into(),
+            )
+            .into());
+        }
         let opc = OpcReader::new(reader)?;
         Self::from_opc(opc)
     }
@@ -415,5 +426,18 @@ mod content_type_tests {
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
         );
         assert!(super::PptxDocument::from_reader(Cursor::new(bytes)).is_err());
+    }
+
+    /// issue #232 — same gap as DOCX/XLSX, confirmed independently for PPTX.
+    #[test]
+    fn test_encrypted_pptx_gives_a_friendly_error_via_the_format_specific_reader() {
+        let mut cfb = vec![0u8; 512];
+        cfb[0..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        let err = super::PptxDocument::from_reader(Cursor::new(cfb)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("password-protected"),
+            "expected a friendly password-protected message, got: {msg}"
+        );
     }
 }
