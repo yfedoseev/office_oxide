@@ -1317,6 +1317,18 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
                 continue;
             }
 
+            // A cell deleted via tracked changes (`w:cellDel`) is excluded
+            // from the accepted view — same policy already applied to
+            // run-level `w:del` — but its grid position still needs to be
+            // accounted for, exactly like a vMerge-continue cell, so later
+            // real cells in the row don't shift into the wrong column
+            // (issue #266).
+            let is_deleted = cell.properties.as_ref().is_some_and(|p| p.deleted);
+            if is_deleted {
+                grid_col += col_span as usize;
+                continue;
+            }
+
             let row_span = if grid_col < num_cols {
                 row_spans[row_idx][grid_col]
             } else {

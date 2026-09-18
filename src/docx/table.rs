@@ -107,6 +107,10 @@ pub struct TableCellProperties {
     pub text_direction: Option<String>,
     /// Per-cell margin overrides (`w:tcMar`), in twips.
     pub margins: Option<CellMargins>,
+    /// `true` when the cell carries `<w:cellDel>` — deleted via tracked
+    /// changes, pending acceptance. Mirrors the policy already applied to
+    /// run-level `w:del`: excluded from the accepted view (issue #266).
+    pub deleted: bool,
 }
 
 /// Vertical alignment of a cell's content (`w:vAlign`).

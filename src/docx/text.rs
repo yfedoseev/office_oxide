@@ -182,7 +182,15 @@ fn plain_text_run(run: &Run, out: &mut String) {
 
 fn plain_text_table(table: &Table, out: &mut String) {
     for row in &table.rows {
-        for (i, cell) in row.cells.iter().enumerate() {
+        // A cell deleted via tracked changes is excluded from the
+        // accepted view, same policy already applied to run-level
+        // `w:del` (issue #266).
+        let cells: Vec<_> = row
+            .cells
+            .iter()
+            .filter(|c| !c.properties.as_ref().is_some_and(|p| p.deleted))
+            .collect();
+        for (i, cell) in cells.iter().enumerate() {
             if i > 0 {
                 out.push('\t');
             }
@@ -461,7 +469,12 @@ fn markdown_table(table: &Table, _ctx: &MarkdownCtx, out: &mut String) {
 
     for row in &table.rows {
         let mut cells: Vec<String> = Vec::new();
-        for cell in &row.cells {
+        // Same tracked-changes policy as plain_text_table (issue #266).
+        for cell in row
+            .cells
+            .iter()
+            .filter(|c| !c.properties.as_ref().is_some_and(|p| p.deleted))
+        {
             let mut cell_text = String::new();
             plain_text_blocks(&cell.content, &mut cell_text);
             let cell_text = cell_text.trim().replace('\n', " ");

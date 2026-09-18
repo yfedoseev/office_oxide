@@ -2505,6 +2505,10 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Table> {
     let mut properties = None;
     let mut grid = Vec::new();
     let mut rows = Vec::new();
+    // A whole row can be wrapped the same way a cell can
+    // (`<w:tbl><w:sdt><w:sdtContent><w:tr>`) — same transparent-wrapper
+    // treatment as `parse_table_row` gives `<w:tc>` (issue #277).
+    let mut wrapper_depth = 0usize;
 
     loop {
         match reader.read_event()? {
@@ -2518,12 +2522,23 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Table> {
                 b"tr" => {
                     rows.push(parse_table_row(reader)?);
                 },
+                b"sdt" | b"sdtContent" => {
+                    wrapper_depth += 1;
+                },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"tbl" => {
-                break;
+            Event::End(ref e) => {
+                let local = e.local_name();
+                if local.as_ref() == b"tbl" && wrapper_depth == 0 {
+                    break;
+                }
+                if matches!(local.as_ref(), b"sdt" | b"sdtContent") {
+                    wrapper_depth = wrapper_depth.saturating_sub(1);
+                } else if local.as_ref() == b"tbl" {
+                    break;
+                }
             },
             Event::Eof => break,
             _ => {},
@@ -2642,6 +2657,12 @@ fn parse_table_grid(
 fn parse_table_row(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableRow> {
     let mut properties = None;
     let mut cells = Vec::new();
+    // A cell can be wrapped in a content control (`<w:tr><w:sdt><w:sdtContent>
+    // <w:tc>`). Treating `sdt`/`sdtContent` as opaque dropped the whole cell,
+    // shifting every subsequent cell in the row into the wrong column
+    // (issue #277) — descend into them instead, matching how
+    // `parse_paragraph` already treats them as transparent wrappers.
+    let mut wrapper_depth = 0usize;
 
     loop {
         match reader.read_event()? {
@@ -2652,12 +2673,23 @@ fn parse_table_row(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableRow
                 b"tc" => {
                     cells.push(parse_table_cell(reader)?);
                 },
+                b"sdt" | b"sdtContent" => {
+                    wrapper_depth += 1;
+                },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"tr" => {
-                break;
+            Event::End(ref e) => {
+                let local = e.local_name();
+                if local.as_ref() == b"tr" && wrapper_depth == 0 {
+                    break;
+                }
+                if matches!(local.as_ref(), b"sdt" | b"sdtContent") {
+                    wrapper_depth = wrapper_depth.saturating_sub(1);
+                } else if local.as_ref() == b"tr" {
+                    break;
+                }
             },
             Event::Eof => break,
             _ => {},
@@ -2793,6 +2825,12 @@ fn parse_table_cell_properties(
                     }
                     xml::skip_element_fast(reader)?;
                 },
+                // `<w:cellDel>` marks the whole cell deleted via tracked
+                // changes, pending acceptance (issue #266).
+                b"cellDel" => {
+                    props.deleted = true;
+                    xml::skip_element_fast(reader)?;
+                },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
@@ -2800,6 +2838,9 @@ fn parse_table_cell_properties(
             Event::Empty(ref e) => match e.local_name().as_ref() {
                 b"tcW" => {
                     props.width = parse_table_width(e)?;
+                },
+                b"cellDel" => {
+                    props.deleted = true;
                 },
                 b"vMerge" => {
                     let val = xml::optional_attr_str(e, b"w:val")?;
@@ -3813,6 +3854,69 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "Click here");
+    }
+
+    #[test]
+    fn test_sdt_wrapped_table_cell_is_not_dropped() {
+        // issue #277 — a cell wrapped in a content control
+        // (<w:tr><w:sdt><w:sdtContent><w:tc>) was entirely dropped by the
+        // catch-all, shifting every subsequent cell in the row into the
+        // wrong column.
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tr>
+        <w:sdt><w:sdtContent><w:tc><w:p><w:r><w:t>SdtCell</w:t></w:r></w:p></w:tc></w:sdtContent></w:sdt>
+        <w:tc><w:p><w:r><w:t>SecondCell</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let data = make_minimal_docx(xml);
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let md = doc.to_markdown();
+        assert!(
+            md.contains("SdtCell") && md.contains("SecondCell"),
+            "both cells must survive: {md:?}"
+        );
+        // Not just present anywhere — in the right columns, not merged/shifted.
+        assert!(
+            md.contains("| SdtCell | SecondCell |"),
+            "cells must stay in their original columns: {md:?}"
+        );
+    }
+
+    #[test]
+    fn test_tracked_change_deleted_cell_is_excluded_from_accepted_view() {
+        // issue #266 — a cell marked <w:cellDel> (deleted via tracked
+        // changes, pending acceptance) still appeared in the accepted
+        // output, same bug w:del was already fixed for at the run level.
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tr>
+        <w:tc>
+          <w:tcPr><w:cellDel w:id="1" w:author="A" w:date="2020-01-01T00:00:00Z"/></w:tcPr>
+          <w:p><w:r><w:t>REMOVED CELL</w:t></w:r></w:p>
+        </w:tc>
+        <w:tc><w:p><w:r><w:t>Kept Cell</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let data = make_minimal_docx(xml);
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let text = doc.plain_text();
+        assert!(
+            !text.contains("REMOVED CELL"),
+            "deleted cell content must not appear in the accepted view: {text:?}"
+        );
+        assert!(
+            text.contains("Kept Cell"),
+            "the surviving cell must still be present: {text:?}"
+        );
     }
 
     #[test]
