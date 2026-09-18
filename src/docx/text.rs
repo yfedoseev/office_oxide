@@ -26,6 +26,15 @@ impl DocxDocument {
         for hf in self.headers_footers.iter().filter(|h| !h.is_header) {
             plain_text_blocks(&hf.content, &mut out);
         }
+        // Footnote/endnote/comment bodies are real document content that
+        // to_ir() already carries (as Element::Footnote/Endnote) — without
+        // walking them here too, a footnote-only document returned "" even
+        // though it visibly has text, and a document's word count changed
+        // depending on which of plain_text()/to_markdown()/to_ir() a caller
+        // used (issue #240).
+        for n in self.footnotes.iter().chain(self.endnotes.iter()).chain(self.comments.iter()) {
+            plain_text_blocks(&n.content, &mut out);
+        }
         // Trim trailing newlines
         while out.ends_with('\n') {
             out.pop();
@@ -53,6 +62,23 @@ impl DocxDocument {
         }
 
         markdown_blocks(&self.body.elements, &ctx, &mut out, 0);
+
+        // See the identical note on plain_text() (issue #240): footnote,
+        // endnote and comment bodies are real content that to_ir() already
+        // carries, and dropping them here made this renderer disagree with
+        // that one.
+        for n in self.footnotes.iter().chain(self.endnotes.iter()).chain(self.comments.iter()) {
+            let mut note_buf = String::new();
+            markdown_blocks(&n.content, &ctx, &mut note_buf, 0);
+            let note_text = note_buf.trim();
+            if !note_text.is_empty() {
+                if !out.ends_with("\n\n") && !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(note_text);
+                out.push('\n');
+            }
+        }
 
         for f in &footer_texts {
             if !out.ends_with("\n\n") {

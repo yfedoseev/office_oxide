@@ -4266,6 +4266,61 @@ mod tests {
     }
 
     #[test]
+    fn test_plain_text_and_markdown_include_footnote_body_content() {
+        // issue #240 — plain_text()/to_markdown() only walked body.elements
+        // and headers/footers, never self.footnotes/endnotes/comments. A
+        // footnote-only document returned "" from both even though to_ir()
+        // (via docx_to_ir) already carried the note body correctly.
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>Ouch</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r><w:r><w:t>.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let footnotes_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote>
+  <w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>
+  <w:footnote w:id="1"><w:p><w:r><w:t>A tachyon walks into a bar.</w:t></w:r></w:p></w:footnote>
+</w:footnotes>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let footnotes_part = PartName::new("/word/footnotes.xml").unwrap();
+        writer
+            .add_part(
+                &footnotes_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml",
+                footnotes_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::FOOTNOTES, "footnotes.xml");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        assert!(
+            doc.plain_text().contains("A tachyon walks into a bar."),
+            "plain_text() must include the footnote body, got: {:?}",
+            doc.plain_text()
+        );
+        assert!(
+            doc.to_markdown().contains("A tachyon walks into a bar."),
+            "to_markdown() must include the footnote body, got: {:?}",
+            doc.to_markdown()
+        );
+    }
+
+    #[test]
     fn test_footnote_custom_mark_round_trips() {
         // issue #219 item 1 — a custom mark ("*") became an auto-number on
         // write (nothing carried it into word/footnotes.xml), and nothing
