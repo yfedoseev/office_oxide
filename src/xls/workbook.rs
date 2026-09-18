@@ -51,6 +51,12 @@ pub struct Sheet {
     /// sheet is kept and flagged rather than dropped, matching XLSX's
     /// `Section::hidden`.
     pub hidden: bool,
+    /// Merged cell ranges from `MERGEDCELLS` (`0x00E5`), as 0-based
+    /// `(row_first, row_last, col_first, col_last)` tuples. The record
+    /// wasn't parsed at all before — merge information for a legacy
+    /// `.xls` was discarded before it was even in memory, not just
+    /// dropped at IR conversion (issue #235, XLS half).
+    pub merged_cells: Vec<(u16, u16, u16, u16)>,
 }
 
 /// Sheet metadata from BOUNDSHEET records.
@@ -130,6 +136,7 @@ impl XlsDocument {
         // Single-pass parsing: globals then sheets sequentially.
         let mut phase = Phase::Globals;
         let mut cells: Vec<Cell> = Vec::new();
+        let mut merged_cells: Vec<(u16, u16, u16, u16)> = Vec::new();
         let mut sheet_idx = 0usize;
         let mut pending_formula_string: Option<(u16, u16)> = None;
         let mut record_budget = 500_000u32; // Safety cap to prevent pathological files
@@ -183,6 +190,7 @@ impl XlsDocument {
                     if rec.record_type == RT_BOF {
                         phase = Phase::InSheet;
                         cells.clear();
+                        merged_cells.clear();
                         pending_formula_string = None;
                     }
                 },
@@ -205,6 +213,7 @@ impl XlsDocument {
                             display,
                             rows,
                             hidden,
+                            merged_cells: std::mem::take(&mut merged_cells),
                             ..Default::default()
                         });
                         sheet_idx += 1;
@@ -221,6 +230,31 @@ impl XlsDocument {
                                         value: CellValue::String(s),
                                     });
                                 }
+                            }
+                        }
+                    },
+                    RT_MERGEDCELLS => {
+                        // [MS-XLS] §2.4.180: cmcs (u16 count), then cmcs
+                        // Ref8 structures (rwFirst, rwLast, colFirst,
+                        // colLast — all 0-based u16 LE). A large file can
+                        // split this across multiple MERGEDCELLS records;
+                        // extending rather than overwriting handles that.
+                        if rec.data.len() >= 2 {
+                            let count = u16::from_le_bytes([rec.data[0], rec.data[1]]) as usize;
+                            let mut off = 2usize;
+                            for _ in 0..count {
+                                if off + 8 > rec.data.len() {
+                                    break;
+                                }
+                                let row_first = u16::from_le_bytes([rec.data[off], rec.data[off + 1]]);
+                                let row_last =
+                                    u16::from_le_bytes([rec.data[off + 2], rec.data[off + 3]]);
+                                let col_first =
+                                    u16::from_le_bytes([rec.data[off + 4], rec.data[off + 5]]);
+                                let col_last =
+                                    u16::from_le_bytes([rec.data[off + 6], rec.data[off + 7]]);
+                                merged_cells.push((row_first, row_last, col_first, col_last));
+                                off += 8;
                             }
                         }
                     },

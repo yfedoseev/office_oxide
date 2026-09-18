@@ -24,10 +24,45 @@ const MAX_CELLS_PER_SHEET: usize = 1_000_000;
 #[cfg(test)]
 const MAX_CELLS_PER_SHEET: usize = 5_000;
 
+/// Reduce `Sheet::merged_cells` ((row_first, row_last, col_first,
+/// col_last) tuples from the MERGEDCELLS record) to an anchor
+/// (row, col) -> (row_span, col_span) map plus the set of positions
+/// each range covers — the same split `convert_xlsx.rs` uses, so both
+/// formats feed the sparse, span-driven TableRow model
+/// ir_render.rs's table_grid expects (issue #235, XLS half).
+fn merge_lookup(
+    merged_cells: &[(u16, u16, u16, u16)],
+) -> (
+    std::collections::HashMap<(u16, u16), (u16, u16)>,
+    std::collections::HashSet<(u16, u16)>,
+) {
+    let mut span = std::collections::HashMap::new();
+    let mut covered = std::collections::HashSet::new();
+    for &(row_first, row_last, col_first, col_last) in merged_cells {
+        let (row_lo, row_hi) = (row_first.min(row_last), row_first.max(row_last));
+        let (col_lo, col_hi) = (col_first.min(col_last), col_first.max(col_last));
+        let row_span = row_hi - row_lo + 1;
+        let col_span = col_hi - col_lo + 1;
+        if row_span <= 1 && col_span <= 1 {
+            continue;
+        }
+        span.insert((row_lo, col_lo), (row_span, col_span));
+        for r in row_lo..=row_hi {
+            for c in col_lo..=col_hi {
+                if (r, c) != (row_lo, col_lo) {
+                    covered.insert((r, c));
+                }
+            }
+        }
+    }
+    (span, covered)
+}
+
 pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
     let mut sections = Vec::new();
 
     for sheet in &doc.sheets {
+        let (merge_span, merge_covered) = merge_lookup(&sheet.merged_cells);
         let mut rows = Vec::new();
         // Rows past the last one carrying data are padding; measuring the
         // sheet against them would report a truncation that dropped nothing.
@@ -84,6 +119,31 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
                     col_span: 1,
                     row_span: 1,
                     ..Default::default()
+                });
+            }
+
+            // Apply merges: the anchor gets its real span, and every
+            // position it covers is dropped from the row entirely —
+            // `sheet.rows[row_idx]` is already a dense, fully-padded
+            // grid (`row.iter().enumerate()` gives every column 0..N),
+            // so `row_idx`/`col_idx` are already the true absolute
+            // positions `merged_cells` uses, no gap-adjustment needed.
+            if !merge_span.is_empty() {
+                for (col_idx, cell) in cells.iter_mut().enumerate() {
+                    if let Some(&(row_span, col_span)) =
+                        merge_span.get(&(row_idx as u16, col_idx as u16))
+                    {
+                        cell.row_span = row_span as u32;
+                        cell.col_span = col_span as u32;
+                    }
+                }
+            }
+            if !merge_covered.is_empty() {
+                let mut col_idx = 0u16;
+                cells.retain(|_| {
+                    let keep = !merge_covered.contains(&(row_idx as u16, col_idx));
+                    col_idx += 1;
+                    keep
                 });
             }
 
@@ -240,6 +300,54 @@ mod tests {
                 _ => Vec::new(),
             })
             .collect()
+    }
+
+    /// issue #235 (XLS half) — TableCell::col_span/row_span were
+    /// hardcoded to 1 on every cell; the MERGEDCELLS record wasn't even
+    /// parsed, so merge information was discarded before it was in
+    /// memory, not just dropped at IR conversion.
+    #[test]
+    fn merged_cells_set_col_span_on_the_anchor_and_exclude_covered_cells() {
+        let sheet = Sheet {
+            name: "S".into(),
+            display: Vec::new(),
+            rows: vec![
+                vec![
+                    CellValue::String("Header".to_string()),
+                    CellValue::Empty,
+                    CellValue::Empty,
+                ],
+                vec![
+                    CellValue::String("a".to_string()),
+                    CellValue::String("b".to_string()),
+                    CellValue::String("c".to_string()),
+                ],
+            ],
+            merged_cells: vec![(0, 0, 0, 2)], // row 0, cols 0..=2
+            ..Default::default()
+        };
+        let ir = xls_to_ir(&XlsDocument::from_sheets(vec![sheet]));
+        let table = ir.sections[0]
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                Element::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("expected a table element");
+
+        let header_row = &table.rows[0];
+        assert_eq!(
+            header_row.cells.len(),
+            1,
+            "the 2 covered cells must be excluded, leaving only the anchor: {:?}",
+            header_row.cells
+        );
+        assert_eq!(header_row.cells[0].col_span, 3);
+        assert_eq!(header_row.cells[0].row_span, 1);
+
+        let data_row = &table.rows[1];
+        assert_eq!(data_row.cells.len(), 3, "an unmerged row must keep all 3 cells");
     }
 
     #[test]
