@@ -3,6 +3,7 @@ use quick_xml::events::Event;
 use crate::core::xml;
 
 use super::cell::{Cell, CellRef, CellValue};
+use super::shared_formula::SharedFormulas;
 
 /// A parsed worksheet from `xl/worksheets/sheetN.xml`.
 #[derive(Debug, Clone)]
@@ -220,6 +221,7 @@ impl Worksheet {
         // end iff at least one was seen.
         let mut margins_in: Option<PageMarginsIn> = None;
         let mut page_setup_raw: Option<PageSetupRaw> = None;
+        let mut shared = SharedFormulas::default();
 
         loop {
             match reader.read_event()? {
@@ -233,7 +235,7 @@ impl Worksheet {
                         // previous row (ECMA-376 18.3.1.73); some writers omit
                         // it throughout the sheet.
                         let implied = rows.last().map_or(1, |r: &Row| r.index + 1);
-                        rows.push(parse_row_fast(&mut reader, e, implied)?);
+                        rows.push(parse_row_fast(&mut reader, e, implied, &mut shared)?);
                     },
                     b"mergeCell" => {
                         if let Some(range) = xml::optional_attr_str(e, b"ref")? {
@@ -285,6 +287,21 @@ impl Worksheet {
         }
 
         let page_setup = build_page_setup(margins_in, page_setup_raw);
+
+        // A shared group's master usually precedes its followers, but not
+        // always — calamine ships a fixture with the records reversed — so
+        // followers that arrived first are filled in now.
+        if shared.has_pending() {
+            for (at, formula) in shared.resolve_pending() {
+                if let Some(cell) = rows
+                    .iter_mut()
+                    .find(|r| r.index == at.row + 1)
+                    .and_then(|r| r.cells.iter_mut().find(|c| c.reference == at))
+                {
+                    cell.formula = Some(formula);
+                }
+            }
+        }
 
         Ok(Worksheet {
             comments: Vec::new(),
@@ -501,6 +518,7 @@ fn parse_row_fast(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
     implied_index: u32,
+    shared: &mut SharedFormulas,
 ) -> crate::core::Result<Row> {
     let index: u32 = xml::optional_attr_str(start, b"r")?
         .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok())
@@ -514,7 +532,7 @@ fn parse_row_fast(
         match reader.read_event()? {
             Event::Start(ref e) => {
                 if e.local_name().as_ref() == b"c" {
-                    let cell = parse_cell_fast(reader, e, index, next_col)?;
+                    let cell = parse_cell_fast(reader, e, index, next_col, shared)?;
                     next_col = cell.reference.col.saturating_add(1);
                     cells.push(cell);
                 } else {
@@ -560,12 +578,24 @@ fn parse_empty_cell(
     })
 }
 
+/// Read the `si` group index of an `<f>` element, but only when it really
+/// is a shared formula (`t="shared"`). Array and dataTable formulas also
+/// carry a `ref`, and a plain formula carries neither.
+fn shared_si(e: &quick_xml::events::BytesStart) -> crate::core::Result<Option<u32>> {
+    if xml::optional_attr_str(e, b"t")?.as_deref() != Some("shared") {
+        return Ok(None);
+    }
+    Ok(xml::optional_attr_str(e, b"si")?
+        .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok()))
+}
+
 /// Fast cell parser using plain Reader (no namespace resolution).
 fn parse_cell_fast(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
     row: u32,
     implied_col: u32,
+    shared: &mut SharedFormulas,
 ) -> crate::core::Result<Cell> {
     let ref_str = xml::optional_attr_str(start, b"r")?
         .map(|v| v.into_owned())
@@ -589,7 +619,13 @@ fn parse_cell_fast(
                     raw_value = Some(read_text_fast(reader)?);
                 },
                 b"f" => {
-                    formula = Some(read_text_fast(reader)?);
+                    let si = shared_si(e)?;
+                    let text = read_text_fast(reader)?;
+                    // A shared group's master carries the text once, here.
+                    if let Some(si) = si {
+                        shared.add_master(si, reference.clone(), text.clone());
+                    }
+                    formula = Some(text);
                 },
                 b"is" => {
                     raw_value = Some(parse_inline_string_fast(reader)?);
@@ -599,7 +635,14 @@ fn parse_cell_fast(
                 },
             },
             Event::Empty(ref e) if e.local_name().as_ref() == b"f" => {
-                formula = None;
+                // A bare `<f t="shared" si="N"/>` is a follower: no text of
+                // its own, but its formula is the group master's translated
+                // by the row/column offset. Discarding it made a formula
+                // cell indistinguishable from one with no formula (#278).
+                formula = match shared_si(e)? {
+                    Some(si) => shared.follower(si, &reference),
+                    None => None,
+                };
             },
             Event::End(ref e) if e.local_name().as_ref() == b"c" => {
                 break;
@@ -655,17 +698,41 @@ fn read_text_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<
 }
 
 /// Fast inline string parser: `<is><t>text</t></is>` or `<is><r>...<t>text</t>...</r></is>`.
+///
+/// Runs with the sheet reader's text trimming turned off. The sheet reader
+/// trims — right for `<v>`, wrong here: quick-xml reports every entity
+/// reference as its own event, splitting the literal text around it into
+/// separate `Event::Text` fragments, and trimming each fragment
+/// independently eats the space that sat at the entity boundary, so
+/// `AT&amp;T &lt;tag&gt;` read back as `AT&T<tag>` (#269). This matches the
+/// non-trimming reader `shared_strings.rs` already uses for the same
+/// content model.
 fn parse_inline_string_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<String> {
+    let trim_start = reader.config().trim_text_start;
+    let trim_end = reader.config().trim_text_end;
+    reader.config_mut().trim_text(false);
+
+    let result = read_inline_string_body(reader);
+
+    reader.config_mut().trim_text_start = trim_start;
+    reader.config_mut().trim_text_end = trim_end;
+    result
+}
+
+fn read_inline_string_body(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<String> {
     let mut text = String::new();
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"t" {
-                    text.push_str(&read_text_fast(reader)?);
-                } else {
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                b"t" => text.push_str(&read_text_fast(reader)?),
+                // A rich inline string wraps each run in `<r>`. Descend
+                // into it — skipping the element wholesale discarded the
+                // `<t>` inside and with it the cell's entire text.
+                b"r" => {},
+                _ => {
                     reader.read_to_end(e.to_end().name())?;
-                }
+                },
             },
             Event::End(ref e) if e.local_name().as_ref() == b"is" => {
                 break;
@@ -716,6 +783,138 @@ mod tests {
         // Row 2
         assert!(matches!(ws.rows[1].cells[0].value, CellValue::Boolean(true)));
         assert!(matches!(&ws.rows[1].cells[1].value, CellValue::Error(e) if e == "#DIV/0!"));
+    }
+
+    /// #278 — a shared-formula group carries its text once, on the master;
+    /// every follower is a bare `<f t="shared" si="N"/>` that used to set
+    /// `formula = None`, indistinguishable from a cell with no formula.
+    #[test]
+    fn test_shared_formula_followers_reconstruct_their_formula() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="2"><c r="B2"><f t="shared" ref="B2:B4" si="0">A2</f><v>1</v></c></row>
+    <row r="3"><c r="B3"><f t="shared" si="0"/><v>2</v></c></row>
+    <row r="4"><c r="B4"><f t="shared" si="0"/><v>3</v></c></row>
+  </sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.rows[0].cells[0].formula.as_deref(), Some("A2"));
+        assert_eq!(ws.rows[1].cells[0].formula.as_deref(), Some("A3"));
+        assert_eq!(ws.rows[2].cells[0].formula.as_deref(), Some("A4"));
+    }
+
+    /// Same, with the master written after its followers — the record order
+    /// calamine's `..._reversed.xlsx` fixture uses.
+    #[test]
+    fn test_shared_formula_master_after_followers_still_resolves() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="3"><c r="B3"><f t="shared" si="0"/><v>2</v></c></row>
+    <row r="2"><c r="B2"><f t="shared" ref="B2:B3" si="0">A2*2</f><v>1</v></c></row>
+  </sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.rows[1].cells[0].formula.as_deref(), Some("A2*2"));
+        assert_eq!(ws.rows[0].cells[0].formula.as_deref(), Some("A3*2"));
+    }
+
+    /// A plain `<f/>` with no `t="shared"` still means "no formula text",
+    /// and a follower whose group never had a master stays `None` rather
+    /// than inventing one.
+    #[test]
+    fn test_bare_formula_element_without_shared_group_stays_none() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1"><f/><v>1</v></c>
+      <c r="B1"><f t="shared" si="9"/><v>2</v></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.rows[0].cells[0].formula, None);
+        assert_eq!(ws.rows[0].cells[1].formula, None);
+    }
+
+    /// #269 — the sheet reader trims text, and quick-xml emits every entity
+    /// reference as its own event, so the literal text around `&amp;`/`&lt;`
+    /// arrived as separate fragments that were each trimmed independently.
+    /// Every space touching an escaped character was deleted.
+    #[test]
+    fn test_inline_string_keeps_whitespace_around_escaped_characters() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is><t>AT&amp;T &lt;tag&gt; &quot;quoted&quot; &apos;apostrophe&apos; 5 &lt; 10 and 10 &gt; 5</t></is></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert!(
+            matches!(
+                &ws.rows[0].cells[0].value,
+                CellValue::String(s)
+                    if s == "AT&T <tag> \"quoted\" 'apostrophe' 5 < 10 and 10 > 5"
+            ),
+            "got {:?}",
+            ws.rows[0].cells[0].value
+        );
+    }
+
+    /// The same function skipped `<r>` wholesale, so a *rich* inline string
+    /// lost its text entirely rather than just its spacing.
+    #[test]
+    fn test_rich_inline_string_runs_are_not_skipped() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is>
+        <r><rPr><b/></rPr><t>Hello </t></r>
+        <r><t>world</t></r>
+      </is></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert!(
+            matches!(&ws.rows[0].cells[0].value, CellValue::String(s) if s == "Hello world"),
+            "got {:?}",
+            ws.rows[0].cells[0].value
+        );
+    }
+
+    /// Turning trimming off for the inline-string body must not leak into
+    /// the rest of the sheet: `<v>` is still parsed with surrounding
+    /// whitespace ignored.
+    #[test]
+    fn test_inline_string_does_not_leave_the_sheet_reader_untrimmed() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is><t> padded </t></is></c>
+      <c r="B1"><v>
+        42
+      </v></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert!(
+            matches!(&ws.rows[0].cells[0].value, CellValue::String(s) if s == " padded "),
+            "got {:?}",
+            ws.rows[0].cells[0].value
+        );
+        assert!(
+            matches!(ws.rows[0].cells[1].value, CellValue::Number(n) if n == 42.0),
+            "got {:?}",
+            ws.rows[0].cells[1].value
+        );
     }
 
     #[test]
