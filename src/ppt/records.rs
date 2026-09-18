@@ -54,6 +54,11 @@ pub const RT_SHAPE: u16 = 0xF004;
 /// position in its group's local coordinate space: `xLeft`/`yTop`/
 /// `xRight`/`yBottom`, each a signed 32-bit integer (issue #255).
 pub const RT_CHILD_ANCHOR: u16 = 0xF00F;
+/// [MS-ODRAW] §2.2.9 `OfficeArtFOPT` — a shape's property table
+/// (`rh.recInstance` = property count), including `pib` ("Blip to
+/// display"), which resolves a picture shape to its actual image
+/// (issue #256).
+pub const RT_FOPT: u16 = 0xF00B;
 /// [MS-PPT] 2.7.3 `OfficeArtClientData` — a shape's PPT-specific data
 /// (placeholder role, animation, interactive info), a child of `RT_SHAPE`.
 pub const RT_CLIENT_DATA: u16 = 0xF011;

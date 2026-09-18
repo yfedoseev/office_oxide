@@ -197,6 +197,10 @@ fn table_block_to_element(table: &crate::ppt::TableBlock) -> Element {
 
 pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
     let mut sections = Vec::new();
+    // Every picture shape successfully resolved to a specific image
+    // (issue #256) — excluded from the old whole-file dump-onto-last-
+    // slide fallback below, so an image isn't attached twice.
+    let mut resolved_image_indices = std::collections::HashSet::new();
 
     for (slide_idx, slide) in doc.slides.iter().enumerate() {
         let mut elements = Vec::new();
@@ -308,6 +312,21 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
             elements.push(table_block_to_element(table));
         }
 
+        // Picture shapes resolved to a specific image via their own
+        // `pib` property (issue #256) — attached to the slide that
+        // actually contains the shape, instead of every image in the
+        // whole file landing on whichever slide happened to be last.
+        for &idx in &slide.image_refs {
+            if let Some(img) = doc.images().get(idx) {
+                resolved_image_indices.insert(idx);
+                elements.push(Element::Image(Image {
+                    data: Some(img.data.clone()),
+                    format: ImageFormat::from_blip(&img.format),
+                    ..Default::default()
+                }));
+            }
+        }
+
         let title = slide_title.unwrap_or_else(|| format!("Slide {}", slide_idx + 1));
         let speaker_notes = if notes_lines.is_empty() {
             None
@@ -323,9 +342,17 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
         });
     }
 
-    // Extracted pictures never reached the IR, so every image in a legacy
-    // deck was silently dropped on conversion.
-    crate::convert_xls::append_legacy_images(&mut sections, doc.images());
+    // Any image no shape's `pib` property resolved to (issue #256's
+    // still-imperfect leftover case: masters, unresolved/complex
+    // references, etc.) still reaches the IR rather than vanishing —
+    // just without a specific slide to attribute it to.
+    let leftover_images: Vec<crate::cfb::blip::BlipImage> = doc
+        .images()
+        .iter()
+        .filter(|img| !resolved_image_indices.contains(&img.index))
+        .cloned()
+        .collect();
+    crate::convert_xls::append_legacy_images(&mut sections, &leftover_images);
 
     // The deck's own declared title (from `\x05SummaryInformation`) beats
     // the first slide's own title — a slide title is not a document

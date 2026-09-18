@@ -81,7 +81,15 @@ pub struct BlipImage {
     pub format: BlipFormat,
     /// Raw image data.
     pub data: Vec<u8>,
-    /// Index of this image in the stream (0-based).
+    /// This image's 0-based position in the stream's own top-level
+    /// array of `OfficeArtBStoreContainerFileBlock` entries — i.e. the
+    /// same array position an `OfficeArtFOPT` shape's `pib` ("Blip to
+    /// display") property references, per [MS-ODRAW]. Every top-level
+    /// entry counts toward this position, including an `OfficeArtFBSE`
+    /// wrapper entry that didn't yield an image (issue #336) — the
+    /// index is *not* simply "how many images have been extracted so
+    /// far", since that would drift out of alignment with `pib` as soon
+    /// as any entry is skipped.
     pub index: usize,
 }
 
@@ -103,12 +111,52 @@ fn metafile_header_size(rec_type: u16) -> usize {
     }
 }
 
+/// `OfficeArtFBSE` ("File BLIP Store Entry", [MS-ODRAW] §2.2.32):
+/// `btWin32`(1) + `btMacOS`(1) + `rgbUid`(16) + `tag`(2) + `size`(4) +
+/// `cRef`(4) + `foDelay`(4) + `unused1`(1) + `cbName`(1) + `unused2`(1) +
+/// `unused3`(1) = 36 fixed bytes, then `nameData` (`cbName` bytes), then
+/// an optional embedded `OfficeArtBlip`.
+const FBSE_FIXED_SIZE: usize = 36;
+/// Offset of `cbName` within an FBSE record's body (right after `rh`).
+const FBSE_CBNAME_OFFSET: usize = 33;
+
+/// Extract a single `OfficeArtBlip` record's image bytes, given its own
+/// record header fields already decoded.
+fn extract_one_blip(
+    data: &[u8],
+    rec_type: u16,
+    inst: u16,
+    data_start: usize,
+    data_end: usize,
+) -> Option<BlipImage> {
+    let format = BlipFormat::from_record_type(rec_type);
+    if !format.is_image() {
+        return None;
+    }
+    let skip = uid_size(rec_type, inst) + metafile_header_size(rec_type);
+    let img_start = data_start + skip;
+    if img_start >= data_end {
+        return None;
+    }
+    let img_data = &data[img_start..data_end];
+    if img_data.is_empty() {
+        return None;
+    }
+    Some(BlipImage { format, data: img_data.to_vec(), index: 0 })
+}
+
 /// Extract all BLIP images from an OfficeArt data stream.
 ///
-/// Works for both PPT Pictures streams and DOC Data streams.
+/// Works for both PPT Pictures streams and DOC Data streams. Each
+/// top-level entry — a raw `OfficeArtBlip`, an `OfficeArtFBSE` wrapper
+/// (issue #336), or anything unrecognized — counts as one array slot
+/// toward [`BlipImage::index`], whether or not it actually yielded an
+/// image; only "descend into a container" steps into the array rather
+/// than past a sibling of it, so those don't count.
 pub fn extract_blip_images(data: &[u8]) -> Vec<BlipImage> {
     let mut images = Vec::new();
     let mut pos = 0;
+    let mut slot_index = 0usize;
 
     while pos + 8 <= data.len() {
         let ver_inst = u16::from_le_bytes([data[pos], data[pos + 1]]);
@@ -122,27 +170,52 @@ pub fn extract_blip_images(data: &[u8]) -> Vec<BlipImage> {
         let data_start = pos + 8;
         let data_end = (data_start + rec_len).min(data.len());
 
-        let format = BlipFormat::from_record_type(rec_type);
-
-        if format.is_image() {
-            let skip = uid_size(rec_type, inst) + metafile_header_size(rec_type);
-            let img_start = data_start + skip;
-            if img_start < data_end {
-                let img_data = &data[img_start..data_end];
-                if !img_data.is_empty() {
-                    images.push(BlipImage {
-                        format,
-                        data: img_data.to_vec(),
-                        index: images.len(),
-                    });
+        if rec_type == 0xF007 {
+            // OfficeArtFBSE: the actual pixel data (if present at all,
+            // rather than referencing PowerPoint's separate delay
+            // stream) is an OfficeArtBlip nested past the fixed header
+            // and name field.
+            if data_start + FBSE_FIXED_SIZE <= data_end {
+                let cb_name = data[data_start + FBSE_CBNAME_OFFSET] as usize;
+                let embedded_start = data_start + FBSE_FIXED_SIZE + cb_name;
+                if embedded_start + 8 <= data_end {
+                    let e_ver_inst =
+                        u16::from_le_bytes([data[embedded_start], data[embedded_start + 1]]);
+                    let e_rec_type = u16::from_le_bytes([
+                        data[embedded_start + 2],
+                        data[embedded_start + 3],
+                    ]);
+                    let e_rec_len = u32::from_le_bytes([
+                        data[embedded_start + 4],
+                        data[embedded_start + 5],
+                        data[embedded_start + 6],
+                        data[embedded_start + 7],
+                    ]) as usize;
+                    let e_inst = e_ver_inst >> 4;
+                    let e_data_start = embedded_start + 8;
+                    let e_data_end = (e_data_start + e_rec_len).min(data_end);
+                    if let Some(mut img) =
+                        extract_one_blip(data, e_rec_type, e_inst, e_data_start, e_data_end)
+                    {
+                        img.index = slot_index;
+                        images.push(img);
+                    }
                 }
             }
+            slot_index += 1;
+            pos = data_end;
+        } else if let Some(mut img) = extract_one_blip(data, rec_type, inst, data_start, data_end) {
+            img.index = slot_index;
+            images.push(img);
+            slot_index += 1;
             pos = data_end;
         } else if ver == 0x0F {
-            // Container record — descend into children.
+            // Container record — descend into children, not a sibling
+            // array entry, so no slot is consumed here.
             pos = data_start;
         } else {
-            // Non-BLIP atom — skip over it.
+            // Non-BLIP atom — skip over it, but it still occupies a slot.
+            slot_index += 1;
             pos = data_end;
         }
     }
@@ -168,6 +241,93 @@ mod tests {
         buf.extend(vec![0u8; mf_sz]);
         buf.extend_from_slice(image_data);
         buf
+    }
+
+    /// Build an `OfficeArtFBSE` record (issue #336) wrapping the given
+    /// embedded `OfficeArtBlip` bytes (from [`make_blip`]).
+    fn make_fbse(name: &str, embedded_blip: &[u8]) -> Vec<u8> {
+        let name_utf16: Vec<u8> =
+            name.encode_utf16().chain(std::iter::once(0u16)).flat_map(u16::to_le_bytes).collect();
+        let mut body = Vec::new();
+        body.push(0); // btWin32
+        body.push(0); // btMacOS
+        body.extend(vec![0u8; 16]); // rgbUid
+        body.extend_from_slice(&0xFFu16.to_le_bytes()); // tag
+        body.extend_from_slice(&(embedded_blip.len() as u32).to_le_bytes()); // size
+        body.extend_from_slice(&1u32.to_le_bytes()); // cRef
+        body.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // foDelay
+        body.push(0); // unused1
+        body.push(name_utf16.len() as u8); // cbName
+        body.push(0); // unused2
+        body.push(0); // unused3
+        body.extend_from_slice(&name_utf16);
+        body.extend_from_slice(embedded_blip);
+
+        let ver_inst: u16 = 0x2; // rh.recVer MUST be 0x2 for FBSE
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&ver_inst.to_le_bytes());
+        buf.extend_from_slice(&0xF007u16.to_le_bytes());
+        buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        buf.extend(body);
+        buf
+    }
+
+    #[test]
+    fn fbse_wrapped_blip_is_extracted() {
+        let jpeg = make_blip(0xF01D, 0x46A, b"\xff\xd8\xff\xe0FBSE_JPEG");
+        let stream = make_fbse("pic.jpg", &jpeg);
+        let images = extract_blip_images(&stream);
+        assert_eq!(images.len(), 1, "the embedded blip inside an FBSE wrapper must be extracted");
+        assert_eq!(images[0].format, BlipFormat::Jpeg);
+        assert_eq!(images[0].data, b"\xff\xd8\xff\xe0FBSE_JPEG");
+    }
+
+    #[test]
+    fn fbse_entry_before_a_raw_blip_does_not_shift_its_index() {
+        // FBSE entry (slot 0) + a raw blip (slot 1) — the raw blip's
+        // index must be 1, matching its real array position, not 0
+        // (which is what "count of successfully extracted images so
+        // far" would have produced before this was fixed).
+        let jpeg = make_blip(0xF01D, 0x46A, b"\xff\xd8\xff\xe0FBSE_JPEG");
+        let mut stream = make_fbse("pic.jpg", &jpeg);
+        stream.extend(make_blip(0xF01E, 0x6E0, b"\x89PNGPNG_RAW"));
+
+        let images = extract_blip_images(&stream);
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].index, 0);
+        assert_eq!(images[1].index, 1);
+        assert_eq!(images[1].format, BlipFormat::Png);
+    }
+
+    #[test]
+    fn empty_fbse_slot_still_advances_the_index() {
+        // cRef=0 (an "empty slot" per spec) with no embedded blip at
+        // all — it must still consume slot 0 so the following real
+        // image correctly reports index 1.
+        let mut body = Vec::new();
+        body.push(0);
+        body.push(0);
+        body.extend(vec![0u8; 16]);
+        body.extend_from_slice(&0xFFu16.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // size
+        body.extend_from_slice(&0u32.to_le_bytes()); // cRef = 0 (empty slot)
+        body.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        body.push(0);
+        body.push(0); // cbName = 0, no name
+        body.push(0);
+        body.push(0);
+        let mut empty_fbse = Vec::new();
+        empty_fbse.extend_from_slice(&0x2u16.to_le_bytes());
+        empty_fbse.extend_from_slice(&0xF007u16.to_le_bytes());
+        empty_fbse.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        empty_fbse.extend(body);
+
+        let mut stream = empty_fbse;
+        stream.extend(make_blip(0xF01D, 0x46A, b"\xff\xd8\xff\xe0AFTER_EMPTY"));
+
+        let images = extract_blip_images(&stream);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].index, 1);
     }
 
     #[test]

@@ -757,4 +757,63 @@ mod tests {
         assert_eq!(cell_text(1, 0), "A2");
         assert_eq!(cell_text(1, 1), "B2");
     }
+
+    /// issue #256 — a picture shape's own `pib`-resolved image must
+    /// attach to the slide that actually contains it, not every slide's
+    /// images landing on whichever slide happens to be last.
+    #[test]
+    fn ir_image_attaches_to_its_own_slide_not_the_last_one() {
+        use crate::cfb::blip::{BlipFormat, BlipImage};
+        use crate::ir::Element;
+
+        let doc = PptDocument {
+            images: vec![
+                BlipImage { format: BlipFormat::Png, data: b"PNG0".to_vec(), index: 0 },
+                BlipImage { format: BlipFormat::Jpeg, data: b"JPEG1".to_vec(), index: 1 },
+            ],
+            has_macros: false,
+            summary_properties: None,
+            slides: vec![
+                SlideText { image_refs: vec![0], ..Default::default() }, // slide 1: image 0
+                SlideText { ..Default::default() },                     // slide 2: no images
+                SlideText { image_refs: vec![1], ..Default::default() }, // slide 3: image 1
+            ],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        assert_eq!(ir.sections.len(), 3);
+
+        let image_data = |section: &crate::ir::Section| -> Vec<Vec<u8>> {
+            section
+                .elements
+                .iter()
+                .filter_map(|e| match e {
+                    Element::Image(img) => img.data.clone(),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(image_data(&ir.sections[0]), vec![b"PNG0".to_vec()]);
+        assert!(image_data(&ir.sections[1]).is_empty(), "slide 2 has no images of its own");
+        assert_eq!(image_data(&ir.sections[2]), vec![b"JPEG1".to_vec()]);
+    }
+
+    /// issue #256 — an image no shape resolved via `pib` must still
+    /// reach the IR (the old fallback behavior), not vanish entirely.
+    #[test]
+    fn ir_unresolved_image_still_reaches_the_ir_as_a_leftover() {
+        use crate::cfb::blip::{BlipFormat, BlipImage};
+        use crate::ir::Element;
+
+        let doc = PptDocument {
+            images: vec![BlipImage { format: BlipFormat::Png, data: b"ORPHAN".to_vec(), index: 0 }],
+            has_macros: false,
+            summary_properties: None,
+            slides: vec![SlideText { ..Default::default() }],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        let found = ir.sections[0].elements.iter().any(|e| {
+            matches!(e, Element::Image(img) if img.data.as_deref() == Some(b"ORPHAN".as_slice()))
+        });
+        assert!(found, "an unresolved image must not be silently dropped");
+    }
 }

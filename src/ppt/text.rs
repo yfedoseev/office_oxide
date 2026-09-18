@@ -134,12 +134,22 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
     // exist anywhere in the stream, minus the master boilerplate.
     let mut runs = Vec::new();
     let mut tables = Vec::new();
-    extract_shape_text(stream, 0, &[], &stream_wide_hyperlinks, None, &mut runs, &mut tables);
+    let mut image_refs = Vec::new();
+    extract_shape_text(
+        stream,
+        0,
+        &[],
+        &stream_wide_hyperlinks,
+        None,
+        &mut runs,
+        &mut tables,
+        &mut image_refs,
+    );
     runs.retain(|r| !is_master_placeholder_prompt(&r.text));
-    if runs.is_empty() && tables.is_empty() {
+    if runs.is_empty() && tables.is_empty() && image_refs.is_empty() {
         Vec::new()
     } else {
-        vec![SlideText { text_runs: runs, tables }]
+        vec![SlideText { text_runs: runs, tables, image_refs }]
     }
 }
 
@@ -158,9 +168,19 @@ fn collect_slide_containers(
         if rec.header.rec_type == RT_SLIDE {
             let mut runs = Vec::new();
             let mut tables = Vec::new();
-            extract_shape_text(&rec.data, 0, &[], hyperlinks, None, &mut runs, &mut tables);
+            let mut image_refs = Vec::new();
+            extract_shape_text(
+                &rec.data,
+                0,
+                &[],
+                hyperlinks,
+                None,
+                &mut runs,
+                &mut tables,
+                &mut image_refs,
+            );
             runs.retain(|r| !is_master_placeholder_prompt(&r.text));
-            out.push(SlideText { text_runs: runs, tables });
+            out.push(SlideText { text_runs: runs, tables, image_refs });
             continue;
         }
         if rec.header.is_container() {
@@ -291,6 +311,7 @@ fn resolve_slide(
 ) -> SlideText {
     let mut text_runs = Vec::new();
     let mut tables = Vec::new();
+    let mut image_refs = Vec::new();
     if let Some(offset) = dir.resolve(persist_id_ref) {
         if let Some(children) = bounded_container_children(stream, offset, RT_SLIDE) {
             extract_shape_text(
@@ -301,10 +322,11 @@ fn resolve_slide(
                 None,
                 &mut text_runs,
                 &mut tables,
+                &mut image_refs,
             );
         }
     }
-    SlideText { text_runs, tables }
+    SlideText { text_runs, tables, image_refs }
 }
 
 /// Recursively collect a shape tree's text, in document order, from a bounded
@@ -330,6 +352,7 @@ fn extract_shape_text(
     current_hyperlink: Option<&str>,
     out: &mut Vec<TextRun>,
     tables: &mut Vec<super::table::TableBlock>,
+    image_refs: &mut Vec<usize>,
 ) {
     if depth > MAX_SHAPE_DEPTH {
         return;
@@ -447,6 +470,13 @@ fn extract_shape_text(
                 // of THIS shape's own text — carries it (issue #257).
                 let shape_hyperlink = resolve_shape_hyperlink(&rec.data, hyperlinks);
                 let hyperlink_ref = shape_hyperlink.as_deref().or(current_hyperlink);
+                // This shape's own picture reference, if it has one
+                // (issue #256) — resolved here, at the shape actually
+                // carrying it, not inferred from whichever slide
+                // happens to be processed last.
+                if let Some(idx) = resolve_shape_pib(&rec.data) {
+                    image_refs.push(idx);
+                }
                 extract_shape_text(
                     &rec.data,
                     depth + 1,
@@ -455,6 +485,7 @@ fn extract_shape_text(
                     hyperlink_ref,
                     out,
                     tables,
+                    image_refs,
                 );
             },
             RT_SPGR_CONTAINER => {
@@ -479,6 +510,7 @@ fn extract_shape_text(
                         current_hyperlink,
                         out,
                         tables,
+                        image_refs,
                     );
                 }
             },
@@ -491,6 +523,7 @@ fn extract_shape_text(
                     current_hyperlink,
                     out,
                     tables,
+                    image_refs,
                 );
             },
             _ => {},
@@ -549,6 +582,7 @@ fn try_extract_table_from_spgr(
             hyperlinks,
             hyperlink_ref,
             &mut runs,
+            &mut Vec::new(),
             &mut Vec::new(),
         );
         cells.push(super::table::TableCellData { left, top, runs });
@@ -763,6 +797,45 @@ fn resolve_shape_hyperlink(shape_data: &[u8], hyperlinks: &HashMap<u32, String>)
     hyperlinks.get(&ex_hyperlink_id_ref).cloned()
 }
 
+/// Resolve a shape's `pib` ("Blip to display") property from its
+/// `OfficeArtFOPT` property table (a direct child of the shape, not
+/// nested inside `RT_CLIENT_DATA`), if it has one.
+///
+/// Returns the *0-based* image index (into the document's own
+/// `Pictures`-stream-derived image list, [`BlipImage::index`]) — `pib`
+/// itself is a documented ONE-based index into that same array, and
+/// `0x00000000` means "no picture" per [MS-ODRAW] (issue #256).
+fn resolve_shape_pib(shape_data: &[u8]) -> Option<usize> {
+    let fopt = RecordIter::new(shape_data)
+        .filter_map(Result::ok)
+        .find(|c| c.header.rec_type == RT_FOPT)?;
+    let count = fopt.header.rec_instance as usize;
+    for i in 0..count {
+        let pos = i * 6;
+        if pos + 6 > fopt.data.len() {
+            break;
+        }
+        let opid = u16::from_le_bytes([fopt.data[pos], fopt.data[pos + 1]]);
+        let pid = opid & 0x3FFF;
+        let f_complex = (opid >> 15) & 1;
+        // Blip:pib, [MS-ODRAW] property ID 0x0104 — only meaningful (a
+        // plain 4-byte index, not a length) when fComplex is unset.
+        if pid == 0x0104 && f_complex == 0 {
+            let op = u32::from_le_bytes([
+                fopt.data[pos + 2],
+                fopt.data[pos + 3],
+                fopt.data[pos + 4],
+                fopt.data[pos + 5],
+            ]);
+            if op == 0 {
+                return None; // explicitly "no picture"
+            }
+            return Some((op - 1) as usize);
+        }
+    }
+    None
+}
+
 /// Split `out[idx]` into up to 3 runs at the character offsets `begin..end`
 /// (`TextRange`, [MS-PPT] 2.6.12): the unlinked prefix (if any), the
 /// hyperlinked `[begin, end)` slice, and the unlinked suffix (if any) — the
@@ -883,6 +956,13 @@ pub struct SlideText {
     /// reading-order concept to interleave them with, so this is a
     /// deliberate simplification, not a claim of true document order.
     pub tables: Vec<super::table::TableBlock>,
+    /// 0-based indices into the document's `Pictures`-stream-derived
+    /// image list ([`super::images::PptImage::index`]) for every
+    /// picture shape resolved on this slide, in shape-tree encounter
+    /// order (issue #256 — these used to be silently dumped onto
+    /// whichever slide happened to be last, regardless of which slide
+    /// actually contains the shape referencing them).
+    pub image_refs: Vec<usize>,
 }
 
 fn decode_utf16le(data: &[u8]) -> String {
@@ -922,7 +1002,16 @@ mod tests {
         // "Hi" in UTF-16LE
         stream.extend(make_atom(RT_TEXT_CHARS, 0, &[0x48, 0x00, 0x69, 0x00]));
         let mut runs = Vec::new();
-        extract_shape_text(&stream, 0, &[], &HashMap::new(), None, &mut runs, &mut Vec::new());
+        extract_shape_text(
+            &stream,
+            0,
+            &[],
+            &HashMap::new(),
+            None,
+            &mut runs,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "Hi");
         assert_eq!(runs[0].text_type, TextType::Title);
@@ -933,7 +1022,16 @@ mod tests {
         let mut stream = make_atom(RT_TEXT_HEADER, 0, &1u32.to_le_bytes()); // Body
         stream.extend(make_atom(RT_TEXT_BYTES, 0, b"Hello World"));
         let mut runs = Vec::new();
-        extract_shape_text(&stream, 0, &[], &HashMap::new(), None, &mut runs, &mut Vec::new());
+        extract_shape_text(
+            &stream,
+            0,
+            &[],
+            &HashMap::new(),
+            None,
+            &mut runs,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "Hello World");
         assert_eq!(runs[0].text_type, TextType::Body);
@@ -946,7 +1044,16 @@ mod tests {
         stream.extend(make_atom(RT_TEXT_HEADER, 0, &1u32.to_le_bytes()));
         stream.extend(make_atom(RT_TEXT_BYTES, 0, b"Body text"));
         let mut runs = Vec::new();
-        extract_shape_text(&stream, 0, &[], &HashMap::new(), None, &mut runs, &mut Vec::new());
+        extract_shape_text(
+            &stream,
+            0,
+            &[],
+            &HashMap::new(),
+            None,
+            &mut runs,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].text, "Title");
         assert_eq!(runs[1].text, "Body text");
@@ -990,6 +1097,94 @@ mod tests {
         make_container(RT_SHAPE, 0, &shape_children)
     }
 
+    // ── #256: picture-shape `pib` resolution ──
+
+    /// Build an `OfficeArtFOPT` record (issue #256) with a single
+    /// `Blip:pib` property entry (`opid.opid = 0x0104`, `fBid = 1`,
+    /// `fComplex = 0`), `op = pib_value` (the documented ONE-based
+    /// index).
+    fn make_fopt_with_pib(pib_value: u32) -> Vec<u8> {
+        let opid: u16 = 0x0104 | (1 << 14); // pid=0x0104, fBid=1, fComplex=0
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&opid.to_le_bytes());
+        entry.extend_from_slice(&pib_value.to_le_bytes());
+
+        // rh.recVer=0x3, rh.recInstance=1 (one property), rh.recType=0xF00B.
+        let ver_inst: u16 = 0x3 | (1 << 4);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&ver_inst.to_le_bytes());
+        buf.extend_from_slice(&RT_FOPT.to_le_bytes());
+        buf.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+        buf.extend(entry);
+        buf
+    }
+
+    #[test]
+    fn resolve_shape_pib_finds_the_pib_property() {
+        let shape_data = make_fopt_with_pib(3); // one-based
+        assert_eq!(resolve_shape_pib(&shape_data), Some(2)); // zero-based
+    }
+
+    #[test]
+    fn resolve_shape_pib_zero_means_no_picture() {
+        let shape_data = make_fopt_with_pib(0);
+        assert_eq!(resolve_shape_pib(&shape_data), None);
+    }
+
+    #[test]
+    fn resolve_shape_pib_none_without_fopt() {
+        assert_eq!(resolve_shape_pib(&[]), None);
+    }
+
+    #[test]
+    fn resolve_shape_pib_skips_unrelated_properties() {
+        // Two properties: an unrelated one (pid=0x0080, some Shape
+        // Boolean property) first, then pib — the scan must not stop at
+        // the first entry.
+        let unrelated_opid: u16 = 0x0080;
+        let mut entries = Vec::new();
+        entries.extend_from_slice(&unrelated_opid.to_le_bytes());
+        entries.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        let pib_opid: u16 = 0x0104 | (1 << 14);
+        entries.extend_from_slice(&pib_opid.to_le_bytes());
+        entries.extend_from_slice(&5u32.to_le_bytes());
+
+        let ver_inst: u16 = 0x3 | (2 << 4); // 2 properties
+        let mut shape_data = Vec::new();
+        shape_data.extend_from_slice(&ver_inst.to_le_bytes());
+        shape_data.extend_from_slice(&RT_FOPT.to_le_bytes());
+        shape_data.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        shape_data.extend(entries);
+
+        assert_eq!(resolve_shape_pib(&shape_data), Some(4));
+    }
+
+    #[test]
+    fn shape_with_pib_reaches_image_refs_end_to_end() {
+        let mut shape_children = make_fopt_with_pib(1); // zero-based index 0
+        let mut textbox_children = make_atom(RT_TEXT_HEADER, 0, &4u32.to_le_bytes());
+        textbox_children.extend(make_atom(RT_TEXT_BYTES, 0, b"caption"));
+        shape_children.extend(make_container(0xF00D, 0, &textbox_children));
+        let shape = make_container(RT_SHAPE, 0, &shape_children);
+
+        let mut runs = Vec::new();
+        let mut tables = Vec::new();
+        let mut image_refs = Vec::new();
+        extract_shape_text(
+            &shape,
+            0,
+            &[],
+            &HashMap::new(),
+            None,
+            &mut runs,
+            &mut tables,
+            &mut image_refs,
+        );
+
+        assert_eq!(image_refs, vec![0]);
+        assert_eq!(runs.len(), 1, "the shape's own text must still be extracted alongside its pib");
+    }
+
     #[test]
     fn parse_ex_hyperlinks_resolves_id_to_target_url() {
         let ex_obj_list =
@@ -1025,7 +1220,16 @@ mod tests {
 
         let shape = make_hyperlinked_shape(1, b"Click here", 1); // Body, exHyperlinkIdRef=1
         let mut runs = Vec::new();
-        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs, &mut Vec::new());
+        extract_shape_text(
+            &shape,
+            0,
+            &[],
+            &hyperlinks,
+            None,
+            &mut runs,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
 
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "Click here");
@@ -1060,7 +1264,16 @@ mod tests {
         let shape = make_container(RT_SHAPE, 0, &textbox);
 
         let mut runs = Vec::new();
-        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs, &mut Vec::new());
+        extract_shape_text(
+            &shape,
+            0,
+            &[],
+            &hyperlinks,
+            None,
+            &mut runs,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
 
         assert_eq!(runs.len(), 3, "must split into prefix/linked/suffix: {runs:?}");
         assert_eq!(runs[0].text, "See ");
@@ -1094,7 +1307,16 @@ mod tests {
         let shape = make_container(RT_SHAPE, 0, &textbox);
 
         let mut runs = Vec::new();
-        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs, &mut Vec::new());
+        extract_shape_text(
+            &shape,
+            0,
+            &[],
+            &hyperlinks,
+            None,
+            &mut runs,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
 
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "clickme");
@@ -1135,7 +1357,16 @@ mod tests {
 
         let mut runs = Vec::new();
         let mut tables = Vec::new();
-        extract_shape_text(&spgr, 0, &[], &HashMap::new(), None, &mut runs, &mut tables);
+        extract_shape_text(
+            &spgr,
+            0,
+            &[],
+            &HashMap::new(),
+            None,
+            &mut runs,
+            &mut tables,
+            &mut Vec::new(),
+        );
 
         assert!(runs.is_empty(), "cell text must not also appear as flat paragraphs: {runs:?}");
         assert_eq!(tables.len(), 1);
@@ -1162,7 +1393,16 @@ mod tests {
 
         let mut runs = Vec::new();
         let mut tables = Vec::new();
-        extract_shape_text(&spgr, 0, &[], &HashMap::new(), None, &mut runs, &mut tables);
+        extract_shape_text(
+            &spgr,
+            0,
+            &[],
+            &HashMap::new(),
+            None,
+            &mut runs,
+            &mut tables,
+            &mut Vec::new(),
+        );
 
         assert!(tables.is_empty());
         assert_eq!(runs.len(), 3);
@@ -1186,7 +1426,16 @@ mod tests {
 
         let mut runs = Vec::new();
         let mut tables = Vec::new();
-        extract_shape_text(&spgr, 0, &[], &HashMap::new(), None, &mut runs, &mut tables);
+        extract_shape_text(
+            &spgr,
+            0,
+            &[],
+            &HashMap::new(),
+            None,
+            &mut runs,
+            &mut tables,
+            &mut Vec::new(),
+        );
 
         assert!(tables.is_empty());
         assert_eq!(runs.len(), 4);
@@ -1206,7 +1455,16 @@ mod tests {
         let shape = make_container(RT_SHAPE, 0, &textbox);
 
         let mut runs = Vec::new();
-        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs, &mut Vec::new());
+        extract_shape_text(
+            &shape,
+            0,
+            &[],
+            &hyperlinks,
+            None,
+            &mut runs,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
         assert_eq!(runs[0].hyperlink, None);
     }
 
@@ -1233,7 +1491,16 @@ mod tests {
         let shape = make_container(RT_SHAPE, 0, &shape_children);
 
         let mut runs = Vec::new();
-        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs, &mut Vec::new());
+        extract_shape_text(
+            &shape,
+            0,
+            &[],
+            &hyperlinks,
+            None,
+            &mut runs,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
         assert_eq!(runs[0].hyperlink, None);
     }
 
@@ -1270,7 +1537,16 @@ mod tests {
         let shape = make_container(0xF004, 0, &textbox); // shape container
 
         let mut runs = Vec::new();
-        extract_shape_text(&shape, 0, &[], &HashMap::new(), None, &mut runs, &mut Vec::new());
+        extract_shape_text(
+            &shape,
+            0,
+            &[],
+            &HashMap::new(),
+            None,
+            &mut runs,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "Nested");
     }
@@ -1595,6 +1871,7 @@ mod tests {
             &HashMap::new(),
             None,
             &mut runs,
+            &mut Vec::new(),
             &mut Vec::new(),
         );
         assert_eq!(runs.len(), 1);
