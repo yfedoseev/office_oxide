@@ -26,6 +26,8 @@ pub mod edit;
 pub mod error;
 /// Number format rendering: apply Excel format strings to numeric values.
 pub mod numfmt;
+/// Shared-formula (`<f t="shared">`) group expansion.
+pub mod shared_formula;
 /// Shared string table (SST) parsing and lookup.
 pub mod shared_strings;
 /// Spreadsheet styles: number formats, fonts, fills, borders, cell formats.
