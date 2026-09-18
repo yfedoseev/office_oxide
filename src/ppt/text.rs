@@ -1,5 +1,7 @@
 //! Text extraction from PPT binary records.
 
+use std::collections::HashMap;
+
 use super::persist::{self, PersistDirectory};
 use super::records::*;
 
@@ -60,6 +62,12 @@ pub struct TextRun {
     pub text_type: TextType,
     /// The decoded text content.
     pub text: String,
+    /// The URL target of the shape's own `InteractiveInfo` click action
+    /// (`II_HyperlinkAction`/`II_JumpAction`/`II_CustomShowAction`),
+    /// resolved through the document's `ExObjList`. `None` when the shape
+    /// has no interactive info, or its action has no hyperlink to resolve
+    /// (issue #257).
+    pub hyperlink: Option<String>,
 }
 
 /// Extract per-slide text from a "PowerPoint Document" stream.
@@ -75,6 +83,9 @@ pub struct TextRun {
 /// heuristics only when a usable directory can't be built at all (e.g. a
 /// minimal hand-built stream that never went through a real save cycle).
 pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<SlideText> {
+    // A best-effort fallback scope for the weaker paths below, which have
+    // no persist-resolved DocumentContainer to search within at all.
+    let stream_wide_hyperlinks = parse_ex_hyperlinks(stream);
     if let Some(dir) = persist::build(stream, current_user) {
         if let Some(slides) = extract_slides_via_persist(stream, &dir) {
             // A resolved-but-entirely-textless result is ambiguous: it's the
@@ -103,7 +114,7 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
     // render on a slide — in two POI corpus files they were 116 of the 137
     // and 121 extracted characters respectively.
     let mut slides = Vec::new();
-    collect_slide_containers(stream, 0, &mut slides);
+    collect_slide_containers(stream, 0, &stream_wide_hyperlinks, &mut slides);
     if slides.iter().any(|s| !s.text_runs.is_empty()) {
         return slides;
     }
@@ -111,7 +122,7 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
     // Last resort: no resolvable structure at all — dump whatever text atoms
     // exist anywhere in the stream, minus the master boilerplate.
     let mut runs = Vec::new();
-    extract_shape_text(stream, 0, &[], &mut runs);
+    extract_shape_text(stream, 0, &[], &stream_wide_hyperlinks, None, &mut runs);
     runs.retain(|r| !is_master_placeholder_prompt(&r.text));
     if runs.is_empty() {
         Vec::new()
@@ -121,7 +132,12 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
 }
 
 /// Walk the record tree collecting one `SlideText` per `Slide` container.
-fn collect_slide_containers(data: &[u8], depth: usize, out: &mut Vec<SlideText>) {
+fn collect_slide_containers(
+    data: &[u8],
+    depth: usize,
+    hyperlinks: &HashMap<u32, String>,
+    out: &mut Vec<SlideText>,
+) {
     if depth > MAX_SHAPE_DEPTH {
         return;
     }
@@ -129,13 +145,13 @@ fn collect_slide_containers(data: &[u8], depth: usize, out: &mut Vec<SlideText>)
         let Ok(rec) = rec else { break };
         if rec.header.rec_type == RT_SLIDE {
             let mut runs = Vec::new();
-            extract_shape_text(&rec.data, 0, &[], &mut runs);
+            extract_shape_text(&rec.data, 0, &[], hyperlinks, None, &mut runs);
             runs.retain(|r| !is_master_placeholder_prompt(&r.text));
             out.push(SlideText { text_runs: runs });
             continue;
         }
         if rec.header.is_container() {
-            collect_slide_containers(&rec.data, depth + 1, out);
+            collect_slide_containers(&rec.data, depth + 1, hyperlinks, out);
         }
     }
 }
@@ -180,6 +196,11 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
     let doc_offset = dir.resolve(dir.doc_persist_id)?;
     let doc_children = bounded_container_children(stream, doc_offset, RT_DOCUMENT)?;
     let slide_list = find_child(&doc_children, RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES)?;
+    // The current DocumentContainer's own ExObjListContainer — not a raw
+    // whole-stream scan, which could resolve a stale, superseded copy left
+    // behind by an earlier incremental save (the same hazard the persist
+    // directory itself exists to route around for slides) (issue #257).
+    let hyperlinks = parse_ex_hyperlinks(&doc_children);
 
     let mut slides = Vec::new();
     let mut current_persist_id: Option<u32> = None;
@@ -191,7 +212,7 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
         match rec.header.rec_type {
             RT_SLIDE_PERSIST_ATOM if rec.data.len() >= 4 => {
                 if let Some(persist_id_ref) = current_persist_id.take() {
-                    slides.push(resolve_slide(stream, dir, persist_id_ref, &outline_texts));
+                    slides.push(resolve_slide(stream, dir, persist_id_ref, &outline_texts, &hyperlinks));
                 }
                 current_persist_id =
                     Some(u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]));
@@ -209,19 +230,21 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
                 outline_texts.push(TextRun {
                     text_type: current_type,
                     text: decode_utf16le(&rec.data),
+                    hyperlink: None,
                 });
             },
             RT_TEXT_BYTES => {
                 outline_texts.push(TextRun {
                     text_type: current_type,
                     text: rec.data.iter().map(|&b| b as char).collect(),
+                    hyperlink: None,
                 });
             },
             _ => {},
         }
     }
     if let Some(persist_id_ref) = current_persist_id.take() {
-        slides.push(resolve_slide(stream, dir, persist_id_ref, &outline_texts));
+        slides.push(resolve_slide(stream, dir, persist_id_ref, &outline_texts, &hyperlinks));
     }
 
     Some(slides)
@@ -239,11 +262,12 @@ fn resolve_slide(
     dir: &PersistDirectory,
     persist_id_ref: u32,
     outline_texts: &[TextRun],
+    hyperlinks: &HashMap<u32, String>,
 ) -> SlideText {
     let mut text_runs = Vec::new();
     if let Some(offset) = dir.resolve(persist_id_ref) {
         if let Some(children) = bounded_container_children(stream, offset, RT_SLIDE) {
-            extract_shape_text(&children, 0, outline_texts, &mut text_runs);
+            extract_shape_text(&children, 0, outline_texts, hyperlinks, None, &mut text_runs);
         }
     }
     SlideText { text_runs }
@@ -268,12 +292,23 @@ fn extract_shape_text(
     data: &[u8],
     depth: usize,
     outline_texts: &[TextRun],
+    hyperlinks: &HashMap<u32, String>,
+    current_hyperlink: Option<&str>,
     out: &mut Vec<TextRun>,
 ) {
     if depth > MAX_SHAPE_DEPTH {
         return;
     }
     let mut current_type = TextType::Other;
+    // Text-run-level hyperlink state (issue #257): a `MouseClick/
+    // MouseOverInteractiveInfoContainer` appearing directly as a *sibling*
+    // of the text atoms (not nested in `RT_CLIENT_DATA`, which is the
+    // separate whole-shape mechanism `RT_SHAPE` below already handles) is
+    // immediately followed by a `MouseClick/MouseOverTextInteractiveInfoAtom`
+    // giving the character range, within the *most recently pushed* text
+    // run, that the hyperlink actually covers.
+    let mut last_text_run_idx: Option<usize> = None;
+    let mut pending_interactive: Option<(u32, u8)> = None;
 
     for rec in RecordIter::new(data) {
         let Ok(rec) = rec else { break };
@@ -281,6 +316,8 @@ fn extract_shape_text(
             RT_TEXT_HEADER if rec.data.len() >= 4 => {
                 let t = u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]);
                 current_type = TextType::from_u32(t);
+                last_text_run_idx = None;
+                pending_interactive = None;
             },
             RT_TEXT_CHARS => {
                 let text = decode_utf16le(&rec.data);
@@ -288,7 +325,9 @@ fn extract_shape_text(
                     out.push(TextRun {
                         text_type: current_type,
                         text,
+                        hyperlink: current_hyperlink.map(str::to_string),
                     });
+                    last_text_run_idx = Some(out.len() - 1);
                 }
             },
             RT_TEXT_BYTES => {
@@ -297,7 +336,9 @@ fn extract_shape_text(
                     out.push(TextRun {
                         text_type: current_type,
                         text,
+                        hyperlink: current_hyperlink.map(str::to_string),
                     });
+                    last_text_run_idx = Some(out.len() - 1);
                 }
             },
             RT_OUTLINE_TEXT_REF_ATOM if rec.data.len() >= 4 => {
@@ -306,13 +347,68 @@ fn extract_shape_text(
                 if index >= 0 {
                     if let Some(run) = outline_texts.get(index as usize) {
                         if !run.text.is_empty() {
-                            out.push(run.clone());
+                            let mut run = run.clone();
+                            run.hyperlink = current_hyperlink.map(str::to_string);
+                            out.push(run);
+                            last_text_run_idx = Some(out.len() - 1);
                         }
                     }
                 }
             },
+            RT_INTERACTIVE_INFO => {
+                // A sibling-level InteractiveInfo (text-run hyperlink);
+                // when this same container instead sits inside
+                // `RT_CLIENT_DATA` (the whole-shape case), it's reached and
+                // handled separately by `resolve_shape_hyperlink` below —
+                // capturing it here too is harmless since no
+                // `RT_TEXT_INTERACTIVE_INFO_ATOM` ever immediately follows
+                // it in that context, so `pending_interactive` just gets
+                // reset at the next `RT_TEXT_HEADER` unused.
+                if let Some(atom) = find_descendant(&rec.data, RT_INTERACTIVE_INFO_ATOM, 0, 0) {
+                    if atom.len() >= 9 {
+                        let ex_hyperlink_id_ref =
+                            u32::from_le_bytes([atom[4], atom[5], atom[6], atom[7]]);
+                        pending_interactive = Some((ex_hyperlink_id_ref, atom[8]));
+                    }
+                }
+            },
+            RT_TEXT_INTERACTIVE_INFO_ATOM if rec.data.len() >= 8 => {
+                if let (Some(idx), Some((ex_hyperlink_id_ref, action))) =
+                    (last_text_run_idx, pending_interactive.take())
+                {
+                    if matches!(action, 0x03 | 0x04 | 0x07) {
+                        if let Some(url) = hyperlinks.get(&ex_hyperlink_id_ref) {
+                            let begin = i32::from_le_bytes([
+                                rec.data[0],
+                                rec.data[1],
+                                rec.data[2],
+                                rec.data[3],
+                            ])
+                            .max(0) as usize;
+                            let end = i32::from_le_bytes([
+                                rec.data[4],
+                                rec.data[5],
+                                rec.data[6],
+                                rec.data[7],
+                            ])
+                            .max(0) as usize;
+                            split_run_with_hyperlink(out, idx, begin, end, url);
+                        }
+                    }
+                }
+            },
+            RT_SHAPE => {
+                // Resolve this shape's own hyperlink (if any) before
+                // walking its subtree, so every TextRun produced from it
+                // — including nested containers like a group's own child
+                // shapes, which are siblings under a group, not children
+                // of THIS shape's own text — carries it (issue #257).
+                let shape_hyperlink = resolve_shape_hyperlink(&rec.data, hyperlinks);
+                let hyperlink_ref = shape_hyperlink.as_deref().or(current_hyperlink);
+                extract_shape_text(&rec.data, depth + 1, outline_texts, hyperlinks, hyperlink_ref, out);
+            },
             _ if rec.header.is_container() => {
-                extract_shape_text(&rec.data, depth + 1, outline_texts, out);
+                extract_shape_text(&rec.data, depth + 1, outline_texts, hyperlinks, current_hyperlink, out);
             },
             _ => {},
         }
@@ -356,6 +452,11 @@ fn extract_slides_from_slide_list_cache(slide_list: &[u8]) -> Vec<SlideText> {
                         slide.text_runs.push(TextRun {
                             text_type: current_type,
                             text,
+                            // This inline-cache walk has no shape tree to
+                            // resolve a hyperlink from — it's a weaker
+                            // fallback than the persist-directory path,
+                            // only reached when that path isn't available.
+                            hyperlink: None,
                         });
                     }
                 }
@@ -367,6 +468,7 @@ fn extract_slides_from_slide_list_cache(slide_list: &[u8]) -> Vec<SlideText> {
                         slide.text_runs.push(TextRun {
                             text_type: current_type,
                             text,
+                            hyperlink: None,
                         });
                     }
                 }
@@ -431,6 +533,134 @@ fn find_descendant(data: &[u8], rec_type: u16, instance: u16, depth: usize) -> O
     None
 }
 
+/// Build the document-wide `exHyperlinkId -> target URL` table from the
+/// `ExObjListContainer` ([MS-PPT] 2.10.1), a direct child of the top-level
+/// `DocumentContainer` — i.e. of `stream` itself, the same "PowerPoint
+/// Document" stream passed to [`extract_slides_text`]. Each entry comes
+/// from one `ExHyperlinkContainer`'s `ExHyperlinkAtom.exHyperlinkId` and
+/// its sibling `TargetAtom` (a `RT_CSTRING` at
+/// [`CSTRING_INSTANCE_TARGET`]) (issue #257).
+fn parse_ex_hyperlinks(stream: &[u8]) -> HashMap<u32, String> {
+    let mut out = HashMap::new();
+    let Some(ex_obj_list) = find_descendant(stream, RT_EXTERNAL_OBJECT_LIST, 0, 0) else {
+        return out;
+    };
+    collect_ex_hyperlinks(&ex_obj_list, 0, &mut out);
+    out
+}
+
+fn collect_ex_hyperlinks(data: &[u8], depth: usize, out: &mut HashMap<u32, String>) {
+    if depth > MAX_SHAPE_DEPTH {
+        return;
+    }
+    for rec in RecordIter::new(data) {
+        let Ok(rec) = rec else { break };
+        if rec.header.rec_type == RT_EXTERNAL_HYPERLINK {
+            if let Some((id, url)) = parse_one_ex_hyperlink(&rec.data) {
+                out.insert(id, url);
+            }
+            continue; // ExHyperlinkContainer's own children are never other ExHyperlinks
+        }
+        if rec.header.is_container() {
+            collect_ex_hyperlinks(&rec.data, depth + 1, out);
+        }
+    }
+}
+
+/// Parse one `ExHyperlinkContainer`'s own children: its `ExHyperlinkAtom`
+/// (`exHyperlinkId`) and its `TargetAtom` (the URL/path).
+fn parse_one_ex_hyperlink(data: &[u8]) -> Option<(u32, String)> {
+    let mut id = None;
+    let mut target = None;
+    for rec in RecordIter::new(data) {
+        let Ok(rec) = rec else { break };
+        match rec.header.rec_type {
+            RT_EXTERNAL_HYPERLINK_ATOM if rec.data.len() >= 4 => {
+                id = Some(u32::from_le_bytes([
+                    rec.data[0],
+                    rec.data[1],
+                    rec.data[2],
+                    rec.data[3],
+                ]));
+            },
+            RT_CSTRING if rec.header.rec_instance == CSTRING_INSTANCE_TARGET => {
+                let s = decode_utf16le(&rec.data);
+                if !s.is_empty() {
+                    target = Some(s);
+                }
+            },
+            _ => {},
+        }
+    }
+    Some((id?, target?))
+}
+
+/// Resolve a shape's own hyperlink target (if any), by scanning its direct
+/// children for `OfficeArtClientData` (`RT_CLIENT_DATA`), then its
+/// `InteractiveInfo` child, then that record's own `InteractiveInfoAtom`.
+///
+/// Only `II_JumpAction` (0x03), `II_HyperlinkAction` (0x04), and
+/// `II_CustomShowAction` (0x07) carry a meaningful `exHyperlinkIdRef` per
+/// [MS-PPT] 2.6.10; any other action (or one whose id doesn't resolve in
+/// `hyperlinks`) yields `None` rather than a wrong-but-confident guess.
+fn resolve_shape_hyperlink(shape_data: &[u8], hyperlinks: &HashMap<u32, String>) -> Option<String> {
+    let client_data = find_descendant(shape_data, RT_CLIENT_DATA, 0, 0)?;
+    // `rh.recInstance` distinguishes MouseClickInteractiveInfoContainer (0)
+    // from MouseOverInteractiveInfoContainer (1); prefer the click action
+    // (the real, navigable hyperlink) when a shape happens to have both.
+    let interactive_info = find_descendant(&client_data, RT_INTERACTIVE_INFO, 0, 0)
+        .or_else(|| find_descendant(&client_data, RT_INTERACTIVE_INFO, 1, 0))?;
+    let atom = find_descendant(&interactive_info, RT_INTERACTIVE_INFO_ATOM, 0, 0)?;
+    if atom.len() < 9 {
+        return None;
+    }
+    let ex_hyperlink_id_ref = u32::from_le_bytes([atom[4], atom[5], atom[6], atom[7]]);
+    let action = atom[8];
+    if !matches!(action, 0x03 | 0x04 | 0x07) {
+        return None;
+    }
+    hyperlinks.get(&ex_hyperlink_id_ref).cloned()
+}
+
+/// Split `out[idx]` into up to 3 runs at the character offsets `begin..end`
+/// (`TextRange`, [MS-PPT] 2.6.12): the unlinked prefix (if any), the
+/// hyperlinked `[begin, end)` slice, and the unlinked suffix (if any) — the
+/// text-run-level hyperlink mechanism, where a hyperlink covers only part
+/// of a run's text (e.g. a URL appearing mid-sentence) rather than the
+/// whole shape (issue #257).
+///
+/// `begin`/`end` are [MS-PPT]'s `TextPosition` character offsets, which
+/// this slices via `char` count rather than UTF-16 code units — an exact
+/// match for the common case, off by one per astral-plane character
+/// (surrogate pair) in the rare case one appears before the hyperlinked
+/// range, which is judged not worth the extra bookkeeping here.
+fn split_run_with_hyperlink(out: &mut Vec<TextRun>, idx: usize, begin: usize, end: usize, url: &str) {
+    let Some(run) = out.get(idx) else { return };
+    let chars: Vec<char> = run.text.chars().collect();
+    let begin = begin.min(chars.len());
+    let end = end.clamp(begin, chars.len());
+    if begin >= end {
+        return; // empty or invalid range — leave the run untouched
+    }
+
+    let text_type = run.text_type;
+    let surrounding_hyperlink = run.hyperlink.clone();
+    let prefix: String = chars[..begin].iter().collect();
+    let linked: String = chars[begin..end].iter().collect();
+    let suffix: String = chars[end..].iter().collect();
+
+    let mut replacement = Vec::with_capacity(3);
+    if !prefix.is_empty() {
+        replacement.push(TextRun { text_type, text: prefix, hyperlink: surrounding_hyperlink.clone() });
+    }
+    replacement.push(TextRun { text_type, text: linked, hyperlink: Some(url.to_string()) });
+    if !suffix.is_empty() {
+        replacement.push(TextRun { text_type, text: suffix, hyperlink: surrounding_hyperlink });
+    }
+
+    out.splice(idx..=idx, replacement);
+}
+
 /// Text content of a single slide.
 #[derive(Debug, Clone)]
 pub struct SlideText {
@@ -475,7 +705,7 @@ mod tests {
         // "Hi" in UTF-16LE
         stream.extend(make_atom(RT_TEXT_CHARS, 0, &[0x48, 0x00, 0x69, 0x00]));
         let mut runs = Vec::new();
-        extract_shape_text(&stream, 0, &[], &mut runs);
+        extract_shape_text(&stream, 0, &[], &HashMap::new(), None, &mut runs);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "Hi");
         assert_eq!(runs[0].text_type, TextType::Title);
@@ -486,7 +716,7 @@ mod tests {
         let mut stream = make_atom(RT_TEXT_HEADER, 0, &1u32.to_le_bytes()); // Body
         stream.extend(make_atom(RT_TEXT_BYTES, 0, b"Hello World"));
         let mut runs = Vec::new();
-        extract_shape_text(&stream, 0, &[], &mut runs);
+        extract_shape_text(&stream, 0, &[], &HashMap::new(), None, &mut runs);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "Hello World");
         assert_eq!(runs[0].text_type, TextType::Body);
@@ -499,10 +729,226 @@ mod tests {
         stream.extend(make_atom(RT_TEXT_HEADER, 0, &1u32.to_le_bytes()));
         stream.extend(make_atom(RT_TEXT_BYTES, 0, b"Body text"));
         let mut runs = Vec::new();
-        extract_shape_text(&stream, 0, &[], &mut runs);
+        extract_shape_text(&stream, 0, &[], &HashMap::new(), None, &mut runs);
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].text, "Title");
         assert_eq!(runs[1].text, "Body text");
+    }
+
+    /// Build one `ExHyperlinkContainer`: `ExHyperlinkAtom` (id) +
+    /// `TargetAtom` (a `RT_CSTRING` at `CSTRING_INSTANCE_TARGET`, UTF-16LE).
+    fn make_ex_hyperlink(id: u32, url: &str) -> Vec<u8> {
+        let mut children = make_atom(RT_EXTERNAL_HYPERLINK_ATOM, 0, &id.to_le_bytes());
+        let utf16: Vec<u8> = url.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        children.extend(make_atom(RT_CSTRING, CSTRING_INSTANCE_TARGET, &utf16));
+        make_container(RT_EXTERNAL_HYPERLINK, 0, &children)
+    }
+
+    /// Build one shape's `InteractiveInfoAtom` body: `soundIdRef`(4)=0,
+    /// `exHyperlinkIdRef`(4), `action`(1), `oleVerb`(1)=0, `jump`(1)=0,
+    /// `flags`(1)=0, `hyperlinkType`(1)=0, `unused`(3)=0 — 16 bytes total
+    /// ([MS-PPT] 2.6.10, `rh.recLen` MUST be 0x10).
+    fn interactive_info_atom_body(ex_hyperlink_id_ref: u32, action: u8) -> Vec<u8> {
+        let mut d = vec![0u8; 16];
+        d[4..8].copy_from_slice(&ex_hyperlink_id_ref.to_le_bytes());
+        d[8] = action;
+        d
+    }
+
+    /// Build a shape (`RT_SHAPE`) with a `ClientTextbox` carrying the given
+    /// text and a `ClientData`/`InteractiveInfo` referencing
+    /// `ex_hyperlink_id_ref` via a click action (`II_HyperlinkAction`).
+    fn make_hyperlinked_shape(text_type: u32, text: &[u8], ex_hyperlink_id_ref: u32) -> Vec<u8> {
+        let mut textbox_children = make_atom(RT_TEXT_HEADER, 0, &text_type.to_le_bytes());
+        textbox_children.extend(make_atom(RT_TEXT_BYTES, 0, text));
+        let textbox = make_container(0xF00D, 0, &textbox_children);
+
+        let atom = interactive_info_atom_body(ex_hyperlink_id_ref, 0x04); // II_HyperlinkAction
+        let interactive_info =
+            make_container(RT_INTERACTIVE_INFO, 0, &make_atom(RT_INTERACTIVE_INFO_ATOM, 0, &atom));
+        let client_data = make_container(RT_CLIENT_DATA, 0, &interactive_info);
+
+        let mut shape_children = client_data;
+        shape_children.extend(&textbox);
+        make_container(RT_SHAPE, 0, &shape_children)
+    }
+
+    #[test]
+    fn parse_ex_hyperlinks_resolves_id_to_target_url() {
+        let ex_obj_list =
+            make_container(RT_EXTERNAL_OBJECT_LIST, 0, &make_ex_hyperlink(1, "http://example.com"));
+        let map = parse_ex_hyperlinks(&ex_obj_list);
+        assert_eq!(map.get(&1).map(String::as_str), Some("http://example.com"));
+    }
+
+    #[test]
+    fn parse_ex_hyperlinks_multiple_entries() {
+        let mut ex_obj_list_children = make_ex_hyperlink(1, "http://a.example/");
+        ex_obj_list_children.extend(make_ex_hyperlink(2, "http://b.example/"));
+        let ex_obj_list = make_container(RT_EXTERNAL_OBJECT_LIST, 0, &ex_obj_list_children);
+        let map = parse_ex_hyperlinks(&ex_obj_list);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&1).map(String::as_str), Some("http://a.example/"));
+        assert_eq!(map.get(&2).map(String::as_str), Some("http://b.example/"));
+    }
+
+    #[test]
+    fn empty_stream_yields_no_hyperlinks() {
+        assert!(parse_ex_hyperlinks(&[]).is_empty());
+    }
+
+    /// issue #257 — the real end-to-end chain: a shape's own
+    /// `InteractiveInfoAtom` (`exHyperlinkIdRef` + `II_HyperlinkAction`)
+    /// resolves through the document's `ExObjList` to a real URL, which
+    /// ends up on the shape's own `TextRun::hyperlink`.
+    #[test]
+    fn shape_with_interactive_info_resolves_its_hyperlink() {
+        let mut hyperlinks = HashMap::new();
+        hyperlinks.insert(1u32, "http://testuri.org/".to_string());
+
+        let shape = make_hyperlinked_shape(1, b"Click here", 1); // Body, exHyperlinkIdRef=1
+        let mut runs = Vec::new();
+        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "Click here");
+        assert_eq!(runs[0].hyperlink.as_deref(), Some("http://testuri.org/"));
+    }
+
+    /// issue #257 — the far more common, real-world shape: a hyperlink
+    /// covering only PART of a text run's characters, via a sibling
+    /// `MouseClickInteractiveInfoContainer` + `MouseClickTextInteractiveInfoAtom`
+    /// pair in the `ClientTextbox` (not nested in `RT_CLIENT_DATA` at all —
+    /// confirmed against real corpus bytes, not just the spec). The run
+    /// must split into unlinked-prefix / linked / unlinked-suffix pieces.
+    #[test]
+    fn text_range_hyperlink_splits_the_run() {
+        let mut hyperlinks = HashMap::new();
+        hyperlinks.insert(7u32, "http://example.com/".to_string());
+
+        let mut textbox_children = make_atom(RT_TEXT_HEADER, 0, &1u32.to_le_bytes()); // Body
+        textbox_children.extend(make_atom(RT_TEXT_BYTES, 0, b"See http://example.com/ here"));
+        let atom = interactive_info_atom_body(7, 0x04); // II_HyperlinkAction
+        textbox_children.extend(make_container(
+            RT_INTERACTIVE_INFO,
+            0,
+            &make_atom(RT_INTERACTIVE_INFO_ATOM, 0, &atom),
+        ));
+        // TextRange: begin=4, end=23 -> "http://example.com/" (chars 4..23).
+        let mut range = Vec::new();
+        range.extend_from_slice(&4i32.to_le_bytes());
+        range.extend_from_slice(&23i32.to_le_bytes());
+        textbox_children.extend(make_atom(RT_TEXT_INTERACTIVE_INFO_ATOM, 0, &range));
+        let textbox = make_container(0xF00D, 0, &textbox_children);
+        let shape = make_container(RT_SHAPE, 0, &textbox);
+
+        let mut runs = Vec::new();
+        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs);
+
+        assert_eq!(runs.len(), 3, "must split into prefix/linked/suffix: {runs:?}");
+        assert_eq!(runs[0].text, "See ");
+        assert_eq!(runs[0].hyperlink, None);
+        assert_eq!(runs[1].text, "http://example.com/");
+        assert_eq!(runs[1].hyperlink.as_deref(), Some("http://example.com/"));
+        assert_eq!(runs[2].text, " here");
+        assert_eq!(runs[2].hyperlink, None);
+    }
+
+    /// The hyperlinked range can cover the WHOLE run (no unlinked prefix
+    /// or suffix) — must produce exactly one run, not empty placeholders.
+    #[test]
+    fn text_range_hyperlink_covering_the_whole_run_produces_one_run() {
+        let mut hyperlinks = HashMap::new();
+        hyperlinks.insert(1u32, "http://example.com/".to_string());
+
+        let mut textbox_children = make_atom(RT_TEXT_HEADER, 0, &1u32.to_le_bytes());
+        textbox_children.extend(make_atom(RT_TEXT_BYTES, 0, b"clickme"));
+        let atom = interactive_info_atom_body(1, 0x04);
+        textbox_children.extend(make_container(
+            RT_INTERACTIVE_INFO,
+            0,
+            &make_atom(RT_INTERACTIVE_INFO_ATOM, 0, &atom),
+        ));
+        let mut range = Vec::new();
+        range.extend_from_slice(&0i32.to_le_bytes());
+        range.extend_from_slice(&7i32.to_le_bytes());
+        textbox_children.extend(make_atom(RT_TEXT_INTERACTIVE_INFO_ATOM, 0, &range));
+        let textbox = make_container(0xF00D, 0, &textbox_children);
+        let shape = make_container(RT_SHAPE, 0, &textbox);
+
+        let mut runs = Vec::new();
+        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "clickme");
+        assert_eq!(runs[0].hyperlink.as_deref(), Some("http://example.com/"));
+    }
+
+    /// A shape with no `InteractiveInfo` at all must never get a
+    /// hyperlink, even when the document has some hyperlinks elsewhere.
+    #[test]
+    fn shape_without_interactive_info_has_no_hyperlink() {
+        let mut hyperlinks = HashMap::new();
+        hyperlinks.insert(1u32, "http://testuri.org/".to_string());
+
+        let header = make_atom(RT_TEXT_HEADER, 0, &1u32.to_le_bytes());
+        let mut textbox_children = header;
+        textbox_children.extend(make_atom(RT_TEXT_BYTES, 0, b"Plain text"));
+        let textbox = make_container(0xF00D, 0, &textbox_children);
+        let shape = make_container(RT_SHAPE, 0, &textbox);
+
+        let mut runs = Vec::new();
+        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs);
+        assert_eq!(runs[0].hyperlink, None);
+    }
+
+    /// `II_NoAction` (0x00) must never resolve a hyperlink, even when
+    /// `exHyperlinkIdRef` happens to name a real entry — the action type
+    /// gates whether the id is meaningful at all ([MS-PPT] 2.6.10).
+    #[test]
+    fn non_hyperlink_action_does_not_resolve_a_hyperlink() {
+        let mut hyperlinks = HashMap::new();
+        hyperlinks.insert(1u32, "http://testuri.org/".to_string());
+
+        let textbox_children = {
+            let mut c = make_atom(RT_TEXT_HEADER, 0, &1u32.to_le_bytes());
+            c.extend(make_atom(RT_TEXT_BYTES, 0, b"Not a link"));
+            c
+        };
+        let textbox = make_container(0xF00D, 0, &textbox_children);
+        let atom = interactive_info_atom_body(1, 0x00); // II_NoAction
+        let interactive_info =
+            make_container(RT_INTERACTIVE_INFO, 0, &make_atom(RT_INTERACTIVE_INFO_ATOM, 0, &atom));
+        let client_data = make_container(RT_CLIENT_DATA, 0, &interactive_info);
+        let mut shape_children = client_data;
+        shape_children.extend(&textbox);
+        let shape = make_container(RT_SHAPE, 0, &shape_children);
+
+        let mut runs = Vec::new();
+        extract_shape_text(&shape, 0, &[], &hyperlinks, None, &mut runs);
+        assert_eq!(runs[0].hyperlink, None);
+    }
+
+    /// issue #257 — full public pipeline: `extract_slides_text` on a
+    /// synthetic "PowerPoint Document" stream carrying both an
+    /// `ExObjListContainer` and a hyperlinked shape (with no persist
+    /// directory or `SlideListWithText` — the "last resort" fallback,
+    /// which still builds `hyperlinks` from the *whole* stream first)
+    /// resolves the shape's `TextRun::hyperlink` end to end.
+    #[test]
+    fn extract_slides_text_resolves_hyperlinks_end_to_end() {
+        let shape = make_hyperlinked_shape(1, b"Hyperlink text", 1);
+        let mut stream = make_container(
+            RT_EXTERNAL_OBJECT_LIST,
+            0,
+            &make_ex_hyperlink(1, "http://testuri.org/"),
+        );
+        stream.extend(&shape);
+
+        let slides = extract_slides_text(&stream, None);
+        assert_eq!(slides.len(), 1);
+        assert_eq!(slides[0].text_runs[0].text, "Hyperlink text");
+        assert_eq!(slides[0].text_runs[0].hyperlink.as_deref(), Some("http://testuri.org/"));
     }
 
     #[test]
@@ -516,7 +962,7 @@ mod tests {
         let shape = make_container(0xF004, 0, &textbox); // shape container
 
         let mut runs = Vec::new();
-        extract_shape_text(&shape, 0, &[], &mut runs);
+        extract_shape_text(&shape, 0, &[], &HashMap::new(), None, &mut runs);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "Nested");
     }
@@ -700,6 +1146,62 @@ mod tests {
         );
     }
 
+    /// issue #257 — `ExObjListContainer` resolution must go through the
+    /// same persist-directory mechanism slides do, not a raw whole-stream
+    /// scan: a stale/orphaned `ExObjListContainer` left behind by an
+    /// earlier incremental save (mapping the same `exHyperlinkId` to a
+    /// *different*, superseded URL) must never win over the current,
+    /// persist-resolved one.
+    #[test]
+    fn persist_resolution_uses_the_current_exobjlist_not_a_stale_one() {
+        let mut stream = Vec::new();
+
+        // Stale, orphaned ExObjListContainer — not reachable from the
+        // current, persist-resolved DocumentContainer.
+        let stale_ex_obj_list = make_container(
+            RT_EXTERNAL_OBJECT_LIST,
+            0,
+            &make_ex_hyperlink(1, "http://stale.example/"),
+        );
+        stream.extend(&stale_ex_obj_list);
+
+        // The real slide: a hyperlinked shape referencing exHyperlinkId=1.
+        let shape = make_hyperlinked_shape(1, b"REAL SLIDE TEXT", 1);
+        let real_slide = make_container(RT_SLIDE, 0, &shape);
+
+        // The real, current DocumentContainer: SlideListWithText +
+        // its own ExObjListContainer (same id, real URL).
+        let doc_offset = stream.len() as u32;
+        let slide_persist = slide_persist_atom_bytes(2, 256);
+        let slide_list = make_container(RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES, &slide_persist);
+        let real_ex_obj_list = make_container(
+            RT_EXTERNAL_OBJECT_LIST,
+            0,
+            &make_ex_hyperlink(1, "http://real.example/"),
+        );
+        let mut doc_children = slide_list;
+        doc_children.extend(&real_ex_obj_list);
+        stream.extend(make_container(RT_DOCUMENT, 0, &doc_children));
+
+        let real_slide_offset = stream.len() as u32;
+        stream.extend(&real_slide);
+
+        let pd_offset = stream.len() as u32;
+        stream.extend(persist_directory_bytes(&[(1, doc_offset), (2, real_slide_offset)]));
+        let edit_offset = stream.len() as u32;
+        stream.extend(user_edit_atom_bytes(0, pd_offset, 1));
+        let current_user = current_user_bytes(edit_offset);
+
+        let slides = extract_slides_text(&stream, Some(&current_user));
+        assert_eq!(slides.len(), 1);
+        assert_eq!(slides[0].text_runs[0].text, "REAL SLIDE TEXT");
+        assert_eq!(
+            slides[0].text_runs[0].hyperlink.as_deref(),
+            Some("http://real.example/"),
+            "the current ExObjList's URL must win over the stale one"
+        );
+    }
+
     #[test]
     fn persist_resolution_works_without_current_user_stream() {
         let (stream, _current_user) = build_persist_regression_fixture();
@@ -760,10 +1262,12 @@ mod tests {
             TextRun {
                 text_type: TextType::Title,
                 text: "first".into(),
+                hyperlink: None,
             },
             TextRun {
                 text_type: TextType::Body,
                 text: "second".into(),
+                hyperlink: None,
             },
         ];
 
@@ -774,7 +1278,7 @@ mod tests {
         let shape = make_container(0xF004, 0, &textbox);
 
         let mut runs = Vec::new();
-        extract_shape_text(&shape, 0, &outline_texts, &mut runs);
+        extract_shape_text(&shape, 0, &outline_texts, &HashMap::new(), None, &mut runs);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "second");
         assert_eq!(runs[0].text_type, TextType::Body);

@@ -30,6 +30,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                         level: 1,
                         content: vec![InlineContent::Text(TextSpan {
                             bold: true,
+                            hyperlink: run.hyperlink.clone(),
                             ..TextSpan::plain(text)
                         })],
                         ..Default::default()
@@ -39,7 +40,10 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                     for line in text.lines() {
                         if !line.trim().is_empty() {
                             elements.push(Element::Paragraph(Paragraph {
-                                content: vec![InlineContent::Text(TextSpan::plain(line))],
+                                content: vec![InlineContent::Text(TextSpan {
+                                    hyperlink: run.hyperlink.clone(),
+                                    ..TextSpan::plain(line)
+                                })],
                                 ..Default::default()
                             }));
                         }
@@ -50,7 +54,10 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                 },
                 _ => {
                     elements.push(Element::Paragraph(Paragraph {
-                        content: vec![InlineContent::Text(TextSpan::plain(text))],
+                        content: vec![InlineContent::Text(TextSpan {
+                            hyperlink: run.hyperlink.clone(),
+                            ..TextSpan::plain(text)
+                        })],
                         ..Default::default()
                     }));
                 },

@@ -36,6 +36,43 @@ pub const RT_TEXT_SPECIAL_INFO: u16 = 0x0FAA;
 pub const RT_TEXT_RULER: u16 = 0x0FA2;
 pub const RT_STYLE_TEXT_PROP: u16 = 0x0FA1;
 pub const RT_CSTRING: u16 = 0x0FBA;
+/// `TargetAtom`'s own `rh.recInstance` value ([MS-PPT] 2.10.19) — the
+/// `RT_CSTRING` sibling within an `ExHyperlinkContainer` that carries the
+/// hyperlink's actual target URL/path, as opposed to `FriendlyNameAtom`
+/// or `LocationAtom` (other `RT_CSTRING` children at different instances).
+pub const CSTRING_INSTANCE_TARGET: u16 = 0x001;
+
+/// [MS-ODRAW] §2.2.14 `OfficeArtSpContainer` — a single shape (its
+/// properties, anchor, client data, and text box, as children).
+pub const RT_SHAPE: u16 = 0xF004;
+/// [MS-PPT] 2.7.3 `OfficeArtClientData` — a shape's PPT-specific data
+/// (placeholder role, animation, interactive info), a child of `RT_SHAPE`.
+pub const RT_CLIENT_DATA: u16 = 0xF011;
+/// [MS-PPT] 2.10.1 `ExObjListContainer` — the document-wide table of
+/// external objects (hyperlinks, embedded media), a child of the top-level
+/// `DocumentContainer`.
+pub const RT_EXTERNAL_OBJECT_LIST: u16 = 0x0409;
+/// [MS-PPT] 2.10.16 `ExHyperlinkContainer` — one hyperlink's own id +
+/// target, found inside `RT_EXTERNAL_OBJECT_LIST`.
+pub const RT_EXTERNAL_HYPERLINK: u16 = 0x0FD7;
+/// [MS-PPT] 2.10.17 `ExHyperlinkAtom` — the numeric id (`exHyperlinkId`)
+/// that `InteractiveInfoAtom.exHyperlinkIdRef` refers back to.
+pub const RT_EXTERNAL_HYPERLINK_ATOM: u16 = 0x0FD3;
+/// [MS-PPT] 2.6.9 `MouseClickInteractiveInfoContainer` /
+/// `MouseOverInteractiveInfoContainer` — a shape's click/hover action,
+/// found inside its `RT_CLIENT_DATA`.
+pub const RT_INTERACTIVE_INFO: u16 = 0x0FF2;
+/// [MS-PPT] 2.6.10 `InteractiveInfoAtom` — the action type + hyperlink id
+/// reference, inside `RT_INTERACTIVE_INFO`.
+pub const RT_INTERACTIVE_INFO_ATOM: u16 = 0x0FF3;
+/// [MS-PPT] 2.6.11 `MouseClickTextInteractiveInfoAtom` /
+/// `MouseOverTextInteractiveInfoAtom` — the character range (within the
+/// text of the nearest preceding `TextHeaderAtom`) that a *sibling*
+/// `RT_INTERACTIVE_INFO` (appearing directly in a `ClientTextbox`, not
+/// nested in `RT_CLIENT_DATA`) anchors its hyperlink to. This is the
+/// text-run-level hyperlink mechanism — distinct from, and far more
+/// common than, the whole-shape one via `RT_CLIENT_DATA` (issue #257).
+pub const RT_TEXT_INTERACTIVE_INFO_ATOM: u16 = 0x0FDF;
 
 // ── SlideListWithText `rh.recInstance` discriminants ([MS-PPT] 2.4.14) ──
 /// `rh.recInstance` value identifying a `SlideListWithTextContainer` (real slides).

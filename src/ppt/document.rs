@@ -157,10 +157,12 @@ mod tests {
                         TextRun {
                             text_type: TextType::Title,
                             text: "Welcome".into(),
+                            hyperlink: None,
                         },
                         TextRun {
                             text_type: TextType::Body,
                             text: "Hello world".into(),
+                            hyperlink: None,
                         },
                     ],
                 },
@@ -168,6 +170,7 @@ mod tests {
                     text_runs: vec![TextRun {
                         text_type: TextType::Title,
                         text: "Slide 2".into(),
+                        hyperlink: None,
                     }],
                 },
             ],
@@ -189,10 +192,12 @@ mod tests {
                     TextRun {
                         text_type: TextType::Title,
                         text: "My Title".into(),
+                        hyperlink: None,
                     },
                     TextRun {
                         text_type: TextType::Body,
                         text: "Content here".into(),
+                        hyperlink: None,
                     },
                 ],
             }],
@@ -214,10 +219,12 @@ mod tests {
                     TextRun {
                         text_type: TextType::Title,
                         text: "Title".into(),
+                        hyperlink: None,
                     },
                     TextRun {
                         text_type: TextType::Notes,
                         text: "Speaker notes".into(),
+                        hyperlink: None,
                     },
                 ],
             }],
@@ -234,6 +241,7 @@ mod tests {
                 .map(|(t, s)| TextRun {
                     text_type: t,
                     text: s.to_string(),
+                    hyperlink: None,
                 })
                 .collect(),
         }
@@ -307,6 +315,34 @@ mod tests {
                     if h.content.iter().any(|c| matches!(c, crate::ir::InlineContent::Text(t) if t.text == "Lisa A. Ferguson, DVM")))),
             "the subtitle must never become the document heading"
         );
+    }
+
+    /// issue #257 — a `TextRun::hyperlink` resolved from `InteractiveInfo`
+    /// must reach `TextSpan::hyperlink` in the IR, for every text type
+    /// that hyperlink can attach to (not just plain body paragraphs).
+    #[test]
+    fn ir_hyperlink_reaches_textspan_hyperlink() {
+        use crate::ir::{Element, InlineContent};
+        let doc = PptDocument {
+            images: Vec::new(),
+            has_macros: false,
+            summary_properties: None,
+            slides: vec![SlideText {
+                text_runs: vec![TextRun {
+                    text_type: TextType::Body,
+                    text: "Click here".to_string(),
+                    hyperlink: Some("http://testuri.org/".to_string()),
+                }],
+            }],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        let Element::Paragraph(p) = &ir.sections[0].elements[0] else {
+            panic!("expected a paragraph, got {:?}", ir.sections[0].elements[0]);
+        };
+        let InlineContent::Text(span) = &p.content[0] else {
+            panic!("expected text content");
+        };
+        assert_eq!(span.hyperlink.as_deref(), Some("http://testuri.org/"));
     }
 
     #[test]
