@@ -526,6 +526,12 @@ fn convert_block_elements(
                 // frame. Leaving them unread silently dropped most of the
                 // prose in documents that lay text out with shapes.
                 collect_paragraph_text_boxes(p, doc, elements);
+                // Native charts keep every word they display in a separate
+                // part (`word/charts/chartN.xml`). The reader resolves it
+                // at open time; hoist the recovered lines to paragraph
+                // siblings so the chart's title, categories, series names
+                // and data values reach the IR (issue #273).
+                collect_paragraph_chart_text(p, elements);
                 i += 1;
             },
             crate::docx::BlockElement::Table(t) => {
@@ -590,6 +596,30 @@ fn collect_paragraph_inline_images(
                         display_width_emu: Some(d.width.0.max(0) as u64),
                         display_height_emu: Some(d.height.0.max(0) as u64),
                         positioning: ImagePositioning::Inline,
+                        ..Default::default()
+                    }));
+                }
+            }
+        }
+    }
+}
+
+/// Emit one IR paragraph per line of text recovered from a chart part
+/// referenced by a drawing in this paragraph.
+fn collect_paragraph_chart_text(p: &crate::docx::Paragraph, out: &mut Vec<Element>) {
+    for pc in &p.content {
+        let runs: &[crate::docx::Run] = match pc {
+            crate::docx::ParagraphContent::Run(r) => std::slice::from_ref(r),
+            crate::docx::ParagraphContent::Hyperlink(hl) => &hl.runs,
+        };
+        for run in runs {
+            for rc in &run.content {
+                let crate::docx::RunContent::Drawing(d) = rc else {
+                    continue;
+                };
+                for line in &d.chart_text {
+                    out.push(Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan::plain(line.clone()))],
                         ..Default::default()
                     }));
                 }
