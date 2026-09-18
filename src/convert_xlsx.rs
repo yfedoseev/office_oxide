@@ -59,10 +59,59 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             })
             .collect();
 
+        // `merged_cells` ("A1:C1") was parsed and then never read on this
+        // path: every TableCell got col_span/row_span hardcoded to 1, so
+        // a merged header or label flattened to an ordinary unspanned
+        // grid (issue #235). Reduce each range to the anchor's span plus
+        // the set of positions it covers, so the anchor carries the real
+        // span and covered positions are excluded from the row entirely
+        // — the same sparse, span-driven model every other format's
+        // TableRow already uses (matches ir_render.rs's table_grid,
+        // which resolves col_span/row_span by walking row.cells and
+        // skipping ahead over covered columns).
+        let mut merge_span: std::collections::HashMap<(u32, u32), (u32, u32)> =
+            std::collections::HashMap::new();
+        let mut merge_covered: std::collections::HashSet<(u32, u32)> =
+            std::collections::HashSet::new();
+        for range in &ws.merged_cells {
+            let Some((start, end)) = range.split_once(':') else {
+                continue;
+            };
+            let (Some(s), Some(e)) =
+                (crate::xlsx::CellRef::parse(start), crate::xlsx::CellRef::parse(end))
+            else {
+                continue;
+            };
+            let (row_lo, row_hi) = (s.row.min(e.row), s.row.max(e.row));
+            let (col_lo, col_hi) = (s.col.min(e.col), s.col.max(e.col));
+            let row_span = row_hi - row_lo + 1;
+            let col_span = col_hi - col_lo + 1;
+            if row_span <= 1 && col_span <= 1 {
+                continue;
+            }
+            merge_span.insert((row_lo, col_lo), (row_span, col_span));
+            for r in row_lo..=row_hi {
+                for c in col_lo..=col_hi {
+                    if (r, c) != (row_lo, col_lo) {
+                        merge_covered.insert((r, c));
+                    }
+                }
+            }
+        }
+
         let total_rows = ws.rows.len();
         let mut parsed_rows: Vec<Vec<CellData>> =
             Vec::with_capacity(total_rows.min(MAX_ROWS_PER_SHEET));
+        // Absolute 0-based sheet row number per `parsed_rows` entry, kept
+        // alongside rather than folded into `CellData` (only the merge
+        // lookup below needs it). `merged_cells` ranges like "A5:C5" are
+        // sheet-absolute, and `parsed_rows`'s own index is only sheet-row-
+        // aligned when there's no gap of fully-empty rows — the same
+        // assumption `grid_width`/`is_header` already make elsewhere in
+        // this function, not a new limitation introduced here.
+        let mut row_numbers: Vec<u32> = Vec::with_capacity(total_rows.min(MAX_ROWS_PER_SHEET));
         for row in ws.rows.iter().take(MAX_ROWS_PER_SHEET) {
+            row_numbers.push(row.index.saturating_sub(1));
             let mut cells: Vec<CellData> = Vec::with_capacity(row.cells.len());
             for cell in &row.cells {
                 buf.clear();
@@ -265,6 +314,31 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 while tcells.len() < grid_width {
                     tcells.push(empty_cell());
                 }
+                // Apply merges: set the anchor's real span, then drop
+                // every position the merge covers from the row entirely
+                // (dense-grid -> sparse, span-driven row) rather than
+                // rebuilding the placement loop above around them.
+                let true_row = row_numbers.get(row_idx).copied().unwrap_or(row_idx as u32);
+                if !merge_span.is_empty() {
+                    for (col, cell) in tcells.iter_mut().enumerate() {
+                        if let Some(&(row_span, col_span)) =
+                            merge_span.get(&(true_row, col as u32))
+                        {
+                            cell.row_span = row_span;
+                            cell.col_span = col_span;
+                        }
+                    }
+                }
+                let tcells: Vec<TableCell> = if merge_covered.is_empty() {
+                    tcells
+                } else {
+                    tcells
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(col, _)| !merge_covered.contains(&(true_row, *col as u32)))
+                        .map(|(_, cell)| cell)
+                        .collect()
+                };
                 rows.push(TableRow {
                     cells: tcells,
                     is_header: row_idx == 0,

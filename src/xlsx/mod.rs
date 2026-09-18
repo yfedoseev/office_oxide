@@ -1238,6 +1238,58 @@ mod tests {
     use super::test_support::*;
     use super::*;
 
+    /// issue #235 — TableCell::col_span/row_span were hardcoded to 1
+    /// on every spreadsheet cell; merged_cells was parsed and then
+    /// never read on the to_ir() path.
+    #[test]
+    fn test_merged_cell_range_sets_col_span_on_the_anchor_and_excludes_covered_cells() {
+        // issue #235 — TableCell::col_span/row_span were hardcoded to 1
+        // on every spreadsheet cell; merged_cells was parsed and then
+        // never read on the to_ir() path, so a merged header/label
+        // flattened to an ordinary unspanned grid.
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is><t>Header</t></is></c>
+      <c r="B1" t="inlineStr"><is><t></t></is></c>
+      <c r="C1" t="inlineStr"><is><t></t></is></c>
+    </row>
+    <row r="2">
+      <c r="A2" t="inlineStr"><is><t>a</t></is></c>
+      <c r="B2" t="inlineStr"><is><t>b</t></is></c>
+      <c r="C2" t="inlineStr"><is><t>c</t></is></c>
+    </row>
+  </sheetData>
+  <mergeCells count="1">
+    <mergeCell ref="A1:C1"/>
+  </mergeCells>
+</worksheet>"#;
+        let doc = open_bytes(single_sheet_xlsx(sheet_xml, &[]));
+        let ir = crate::convert_xlsx::xlsx_to_ir(&doc);
+        let table = ir.sections[0]
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                crate::ir::Element::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("expected a table element");
+
+        let header_row = &table.rows[0];
+        assert_eq!(
+            header_row.cells.len(),
+            1,
+            "the 2 covered cells must be excluded, leaving only the anchor: {:?}",
+            header_row.cells
+        );
+        assert_eq!(header_row.cells[0].col_span, 3, "anchor must carry the real span");
+        assert_eq!(header_row.cells[0].row_span, 1);
+
+        let data_row = &table.rows[1];
+        assert_eq!(data_row.cells.len(), 3, "an unmerged row must keep all 3 cells");
+    }
+
     /// issue #232 — same gap as DOCX, confirmed independently for XLSX.
     #[test]
     fn test_encrypted_xlsx_gives_a_friendly_error_via_the_format_specific_reader() {
