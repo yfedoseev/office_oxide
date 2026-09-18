@@ -31,7 +31,7 @@ impl XlsDocument {
 }
 
 /// A worksheet from an XLS workbook.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Sheet {
     /// Sheet display name.
     pub name: String,
@@ -43,6 +43,12 @@ pub struct Sheet {
     pub display: Vec<Vec<String>>,
     /// Cell values, indexed as `rows[row][col]`.
     pub rows: Vec<Vec<CellValue>>,
+    /// Whether `BOUNDSHEET` marked this sheet hidden or very hidden.
+    ///
+    /// "Hidden" means "not shown in the UI by default", not "deleted": the
+    /// sheet is kept and flagged rather than dropped, matching XLSX's
+    /// `Section::hidden`.
+    pub hidden: bool,
 }
 
 /// Sheet metadata from BOUNDSHEET records.
@@ -178,21 +184,25 @@ impl XlsDocument {
                 },
                 Phase::InSheet => match rec.record_type {
                     RT_EOF => {
-                        let name = if sheet_idx < sheet_infos.len() {
-                            sheet_infos[sheet_idx].name.clone()
-                        } else {
-                            format!("Sheet{}", sheet_idx + 1)
+                        let (name, hidden) = match sheet_infos.get(sheet_idx) {
+                            Some(info) => (info.name.clone(), info.hidden),
+                            None => (format!("Sheet{}", sheet_idx + 1), false),
                         };
-                        let hidden = sheet_idx < sheet_infos.len() && sheet_infos[sheet_idx].hidden;
-                        if !hidden {
-                            let display = build_display(&cells, &formats, &xf_numfmt);
-                            let rows = build_grid(&mut cells);
-                            sheets.push(Sheet {
-                                name,
-                                display,
-                                rows,
-                            });
-                        }
+                        // A hidden sheet's records were parsed and then
+                        // thrown away, so a workbook whose data sat on a
+                        // sheet its author merely *hid* came back short with
+                        // no error and no notice. Excel round-trips such a
+                        // sheet perfectly; keep it and flag it, the way the
+                        // XLSX reader already does.
+                        let display = build_display(&cells, &formats, &xf_numfmt);
+                        let rows = build_grid(&mut cells);
+                        sheets.push(Sheet {
+                            name,
+                            display,
+                            rows,
+                            hidden,
+                            ..Default::default()
+                        });
                         sheet_idx += 1;
                         phase = Phase::BetweenSheets;
                     },
@@ -576,6 +586,132 @@ impl crate::core::OfficeDocument for XlsDocument {
 mod tests {
     use super::*;
 
+    // ── Hand-built BIFF8 fixtures ─────────────────────────────────────────
+    //
+    // The record-walking state machine is the part several of these tests
+    // exercise, and a minimal stream built here is far easier to reason
+    // about (and to keep in the repo) than a real workbook.
+
+    /// Wrap `data` in a BIFF record header.
+    pub(super) fn biff_rec(rt: u16, data: &[u8]) -> Vec<u8> {
+        let mut v = rt.to_le_bytes().to_vec();
+        v.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        v.extend_from_slice(data);
+        v
+    }
+
+    /// A BIFF8 `BOF` opening a substream of the given doctype.
+    pub(super) fn bof(dt: u16) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&0x0600u16.to_le_bytes()); // BIFF8
+        d.extend_from_slice(&dt.to_le_bytes());
+        d.extend_from_slice(&[0u8; 12]);
+        biff_rec(RT_BOF, &d)
+    }
+
+    pub(super) fn eof() -> Vec<u8> {
+        biff_rec(RT_EOF, &[])
+    }
+
+    /// `BOUNDSHEET`: 0 = visible, 1 = hidden, 2 = very hidden.
+    pub(super) fn boundsheet(name: &str, visibility: u8) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&0u32.to_le_bytes()); // stream offset, unused here
+        d.push(visibility);
+        d.push(0); // worksheet
+        d.push(name.len() as u8);
+        d.push(0); // 8-bit (compressed) characters
+        d.extend_from_slice(name.as_bytes());
+        biff_rec(RT_BOUNDSHEET, &d)
+    }
+
+    pub(super) fn number(row: u16, col: u16, xf: u16, value: f64) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&row.to_le_bytes());
+        d.extend_from_slice(&col.to_le_bytes());
+        d.extend_from_slice(&xf.to_le_bytes());
+        d.extend_from_slice(&value.to_le_bytes());
+        biff_rec(RT_NUMBER, &d)
+    }
+
+    /// A BIFF8 `LABEL` (inline 8-bit string) cell.
+    pub(super) fn label(row: u16, col: u16, text: &str) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&row.to_le_bytes());
+        d.extend_from_slice(&col.to_le_bytes());
+        d.extend_from_slice(&0u16.to_le_bytes()); // xf
+        d.extend_from_slice(&(text.chars().count() as u16).to_le_bytes());
+        d.push(0); // 8-bit characters
+        d.extend_from_slice(text.as_bytes());
+        biff_rec(RT_LABEL, &d)
+    }
+
+    /// Assemble a workbook stream: a globals substream carrying one
+    /// `BOUNDSHEET` per sheet, then each sheet's own `BOF..EOF` substream.
+    pub(super) fn workbook_stream(sheets: &[(&str, u8, Vec<u8>)]) -> Vec<u8> {
+        workbook_stream_with_globals(&[], sheets)
+    }
+
+    /// As `workbook_stream`, with extra records appended to the globals
+    /// substream (`DATEMODE`, `CODEPAGE`, `NAME`, ...).
+    pub(super) fn workbook_stream_with_globals(
+        globals: &[Vec<u8>],
+        sheets: &[(&str, u8, Vec<u8>)],
+    ) -> Vec<u8> {
+        let mut s = bof(0x0005);
+        for (name, visibility, _) in sheets {
+            s.extend(boundsheet(name, *visibility));
+        }
+        for g in globals {
+            s.extend_from_slice(g);
+        }
+        s.extend(eof());
+        for (_, _, body) in sheets {
+            s.extend(bof(0x0010));
+            s.extend_from_slice(body);
+            s.extend(eof());
+        }
+        s
+    }
+
+    /// A hidden sheet's records were parsed and then discarded, so the
+    /// sheet vanished from `to_ir()` entirely — silent deletion of data its
+    /// author only hid. XLSX keeps and flags such a sheet; XLS now does
+    /// too (#231).
+    #[test]
+    fn test_xls_hidden_sheets_kept_and_flagged() {
+        let stream = workbook_stream(&[
+            ("Sheet1", 1, label(0, 0, "Sheet1A1")),   // hidden
+            ("Sheet2", 0, label(0, 0, "Sheet2A1")),   // visible
+            ("Sheet3", 2, label(0, 0, "Sheet3A1")),   // very hidden
+        ]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+
+        assert_eq!(doc.sheets.len(), 3, "no sheet may be dropped for being hidden");
+        assert_eq!(
+            doc.sheets.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["Sheet1", "Sheet2", "Sheet3"]
+        );
+        assert_eq!(
+            doc.sheets.iter().map(|s| s.hidden).collect::<Vec<_>>(),
+            [true, false, true],
+            "visibility is reported, not acted on"
+        );
+        // The hidden sheets' data survives.
+        let text = doc.plain_text();
+        for expected in ["Sheet1A1", "Sheet2A1", "Sheet3A1"] {
+            assert!(text.contains(expected), "lost {expected} from: {text}");
+        }
+
+        // ...and the flag reaches the IR.
+        let ir = crate::convert_xls::xls_to_ir(&doc);
+        assert_eq!(ir.sections.len(), 3);
+        assert_eq!(
+            ir.sections.iter().map(|s| s.hidden).collect::<Vec<_>>(),
+            [true, false, true]
+        );
+    }
+
     #[test]
     fn build_grid_from_cells() {
         let mut cells = vec![
@@ -643,6 +779,7 @@ mod tests {
                     ],
                     vec![CellValue::String("Alice".into()), CellValue::Number(30.0)],
                 ],
+                ..Default::default()
             }],
         };
         let text = doc.plain_text();
@@ -662,6 +799,7 @@ mod tests {
                     vec![CellValue::String("X".into()), CellValue::String("Y".into())],
                     vec![CellValue::Number(1.0), CellValue::Number(2.0)],
                 ],
+                ..Default::default()
             }],
         };
         let md = doc.to_markdown();
@@ -691,6 +829,7 @@ mod tests {
             display: Vec::new(),
             name: "Empty".into(),
             rows: vec![],
+            ..Default::default()
         }]));
         assert_eq!(ir.sections[0].title.as_deref(), Some("Empty"));
         assert!(ir.sections[0].elements.is_empty());
@@ -710,6 +849,7 @@ mod tests {
             display: Vec::new(),
             name: "Results".into(),
             rows,
+            ..Default::default()
         }]));
         assert_eq!(ir.metadata.title.as_deref(), Some("Results"));
         assert!(matches!(ir.sections[0].elements[0], Element::Table(_)));
@@ -732,6 +872,7 @@ mod tests {
                 CellValue::Empty,
                 CellValue::String("b".into()),
             ]],
+            ..Default::default()
         }]));
         let Element::Table(ref t) = ir.sections[0].elements[0] else {
             panic!("expected a table");
@@ -762,6 +903,7 @@ mod tests {
                 ],
                 vec![CellValue::Empty, CellValue::Empty],
             ],
+            ..Default::default()
         }]));
         let Element::Table(ref t) = ir.sections[0].elements[0] else {
             panic!("expected a table");
@@ -776,6 +918,7 @@ mod tests {
             display: Vec::new(),
             name: "S".into(),
             rows: vec![vec![CellValue::Empty; 8]; 4],
+            ..Default::default()
         }]));
         assert!(ir.sections[0].elements.is_empty(), "an empty grid must not materialise a table");
     }
@@ -787,11 +930,13 @@ mod tests {
                 display: Vec::new(),
                 name: "A".into(),
                 rows: vec![vec![CellValue::Number(1.0)]],
+                ..Default::default()
             },
             Sheet {
                 display: Vec::new(),
                 name: "B".into(),
                 rows: vec![vec![CellValue::String("x".into())]],
+                ..Default::default()
             },
         ]);
         let ir = crate::convert_xls::xls_to_ir(&doc);
@@ -820,10 +965,7 @@ mod tests {
                 "expected UnsupportedVersion for {label}, got: {msg}"
             );
             assert!(msg.contains(label), "error must name {label}: {msg}");
-            assert!(
-                !msg.contains("magic"),
-                "the CFB-layer message must not leak: {msg}"
-            );
+            assert!(!msg.contains("magic"), "the CFB-layer message must not leak: {msg}");
         }
     }
 
@@ -870,7 +1012,11 @@ mod tests {
             "the overridden format is not a date: {}",
             display[0][0]
         );
-        assert!(display[0][0].contains('E'), "expected scientific notation, got {}", display[0][0]);
+        assert!(
+            display[0][0].contains('E'),
+            "expected scientific notation, got {}",
+            display[0][0]
+        );
 
         // A built-in date id with *no* declared override is still a date.
         let cells = vec![Cell {

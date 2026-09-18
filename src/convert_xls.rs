@@ -134,6 +134,9 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
         sections.push(Section {
             title: Some(sheet.name.clone()),
             elements,
+            // A hidden sheet is kept and flagged, not dropped — the same
+            // contract `convert_xlsx` already honours.
+            hidden: sheet.hidden,
             ..Default::default()
         });
     }
@@ -201,6 +204,7 @@ mod tests {
             name: "S".into(),
             display: Vec::new(),
             rows: grid,
+            ..Default::default()
         }
     }
 
@@ -260,6 +264,7 @@ mod tests {
             name: "S".into(),
             display: Vec::new(),
             rows: vec![vec![CellValue::Empty; 64]; 2_000],
+            ..Default::default()
         }]));
         assert!(ir.sections[0].elements.is_empty());
     }
@@ -274,6 +279,7 @@ mod tests {
             name: "S".into(),
             display: Vec::new(),
             rows: grid,
+            ..Default::default()
         }]));
         let notice = cell_texts(&ir)
             .into_iter()
