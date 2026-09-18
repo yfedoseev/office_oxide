@@ -154,24 +154,26 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
     // before this.
     if let Some(last) = ir_sections.last_mut() {
         for n in &doc.footnotes {
+            let (marker, rest) = extract_note_marker(&n.content, "FootnoteReference");
             let mut content = Vec::new();
-            convert_block_elements(&n.content, &mut content, doc);
+            convert_block_elements(rest, &mut content, doc);
             if !content.is_empty() {
                 last.elements.push(Element::Footnote(Note {
                     id: n.id,
                     content,
-                    marker: None,
+                    marker,
                 }));
             }
         }
         for n in &doc.endnotes {
+            let (marker, rest) = extract_note_marker(&n.content, "EndnoteReference");
             let mut content = Vec::new();
-            convert_block_elements(&n.content, &mut content, doc);
+            convert_block_elements(rest, &mut content, doc);
             if !content.is_empty() {
                 last.elements.push(Element::Endnote(Note {
                     id: n.id,
                     content,
-                    marker: None,
+                    marker,
                 }));
             }
         }
@@ -387,6 +389,36 @@ fn apply_paragraph_properties(pp: &crate::docx::ParagraphProperties, out: &mut P
             },
         })
         .collect();
+}
+
+/// Split a custom footnote/endnote mark off the front of a note body, if
+/// present. The writer (`docx/write.rs::generate_notes_xml`) puts the mark
+/// in its own leading paragraph — a single run styled `style_name`
+/// ("FootnoteReference"/"EndnoteReference") with the literal glyph as its
+/// only content — so a real Word auto-number run (which carries the same
+/// style but no `w:t`, just an empty `<w:footnoteRef/>`) is never mistaken
+/// for a custom mark: `content` there stays empty, `Text` never appears
+/// (issue #219).
+fn extract_note_marker<'a>(
+    content: &'a [crate::docx::BlockElement],
+    style_name: &str,
+) -> (Option<String>, &'a [crate::docx::BlockElement]) {
+    let Some(crate::docx::BlockElement::Paragraph(p)) = content.first() else {
+        return (None, content);
+    };
+    let [crate::docx::ParagraphContent::Run(run)] = p.content.as_slice() else {
+        return (None, content);
+    };
+    if run.properties.as_ref().and_then(|rp| rp.style_id.as_deref()) != Some(style_name) {
+        return (None, content);
+    }
+    let [crate::docx::RunContent::Text(text)] = run.content.as_slice() else {
+        return (None, content);
+    };
+    if text.is_empty() {
+        return (None, content);
+    }
+    (Some(text.clone()), &content[1..])
 }
 
 /// Same property set as [`apply_paragraph_properties`], but for a promoted
@@ -1095,13 +1127,13 @@ fn convert_run(
             // Carrying the reference mark here is what #241 was about:
             // before this, to_ir() had the note body but no record of
             // where it was cited.
-            crate::docx::RunContent::FootnoteRef(id) => {
+            crate::docx::RunContent::FootnoteRef(id, _) => {
                 content.push(InlineContent::FootnoteRef(FootnoteRef {
                     note_id: *id,
                     marker: None,
                 }));
             },
-            crate::docx::RunContent::EndnoteRef(id) => {
+            crate::docx::RunContent::EndnoteRef(id, _) => {
                 content.push(InlineContent::EndnoteRef(FootnoteRef {
                     note_id: *id,
                     marker: None,

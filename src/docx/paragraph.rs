@@ -49,10 +49,13 @@ pub enum RunContent {
     /// A `w:footnoteReference` mark: the citation point in the body text.
     /// Carries the referenced note's `w:id`. The note *body* was already
     /// read from `footnotes.xml`; without this the IR could not say where
-    /// it was cited (issue #241).
-    FootnoteRef(u32),
+    /// it was cited (issue #241). The second field mirrors
+    /// `w:customMarkFollows`: `true` means the note body supplies its own
+    /// mark glyph as a leading run instead of Word's auto-number
+    /// (issue #219).
+    FootnoteRef(u32, bool),
     /// A `w:endnoteReference` mark. See [`RunContent::FootnoteRef`].
-    EndnoteRef(u32),
+    EndnoteRef(u32, bool),
     /// A `w:commentReference` mark. See [`RunContent::FootnoteRef`].
     CommentRef(u32),
     /// Legacy form-field state parsed out of `<w:fldChar><w:ffData>`.

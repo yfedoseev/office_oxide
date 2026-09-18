@@ -285,10 +285,10 @@ fn add_element_to_docx(writer: &mut crate::docx::write::DocxWriter, elem: &Eleme
             writer.add_text_box(tb);
         },
         Element::Footnote(n) => {
-            writer.add_footnote(n.id, &n.content);
+            writer.add_footnote(n.id, &n.content, n.marker.clone());
         },
         Element::Endnote(n) => {
-            writer.add_endnote(n.id, &n.content);
+            writer.add_endnote(n.id, &n.content, n.marker.clone());
         },
         Element::CodeBlock(cb) => {
             writer.add_code_block(&cb.content);
@@ -332,12 +332,14 @@ fn ir_inline_to_runs(content: &[InlineContent]) -> Vec<crate::docx::write::Run> 
             InlineContent::FootnoteRef(r) => {
                 runs.push(Run {
                     footnote_ref: Some(r.note_id),
+                    note_ref_marker: r.marker.clone(),
                     ..Default::default()
                 });
             },
             InlineContent::EndnoteRef(r) => {
                 runs.push(Run {
                     endnote_ref: Some(r.note_id),
+                    note_ref_marker: r.marker.clone(),
                     ..Default::default()
                 });
             },

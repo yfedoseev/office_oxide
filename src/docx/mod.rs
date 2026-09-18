@@ -1489,9 +1489,16 @@ fn push_note_reference(
         .and_then(|v| v.trim().parse::<i64>().ok())
         .map(|v| v.max(0) as u32)
         .unwrap_or(0);
+    // `w:customMarkFollows="1"` tells Word the note body supplies its own
+    // mark glyph instead of the auto-number; without threading this back,
+    // a custom footnote mark ("*", "†") has nowhere in the IR to land, and
+    // downstream conversion has no way to distinguish it from an ordinary
+    // leading run of note-body text (issue #219).
+    let custom_mark = xml::optional_attr_str(e, b"w:customMarkFollows")?
+        .is_some_and(|v| matches!(v.as_ref(), "1" | "true" | "on"));
     out.push(match e.local_name().as_ref() {
-        b"footnoteReference" => RunContent::FootnoteRef(id),
-        b"endnoteReference" => RunContent::EndnoteRef(id),
+        b"footnoteReference" => RunContent::FootnoteRef(id, custom_mark),
+        b"endnoteReference" => RunContent::EndnoteRef(id, custom_mark),
         _ => RunContent::CommentRef(id),
     });
     Ok(())
@@ -4183,6 +4190,89 @@ mod tests {
     }
 
     #[test]
+    fn test_footnote_custom_mark_round_trips() {
+        // issue #219 item 1 — a custom mark ("*") became an auto-number on
+        // write (nothing carried it into word/footnotes.xml), and nothing
+        // read it back even where it was written correctly by other tools.
+        let ir = crate::ir::DocumentIR {
+            sections: vec![crate::ir::Section {
+                elements: vec![
+                    crate::ir::Element::Paragraph(crate::ir::Paragraph {
+                        content: vec![
+                            crate::ir::InlineContent::Text(crate::ir::TextSpan::plain("see")),
+                            crate::ir::InlineContent::FootnoteRef(crate::ir::FootnoteRef {
+                                note_id: 1,
+                                marker: Some("*".to_string()),
+                            }),
+                        ],
+                        ..Default::default()
+                    }),
+                    crate::ir::Element::Footnote(crate::ir::Note {
+                        id: 1,
+                        marker: Some("*".to_string()),
+                        content: vec![crate::ir::Element::Paragraph(crate::ir::Paragraph {
+                            content: vec![crate::ir::InlineContent::Text(
+                                crate::ir::TextSpan::plain("custom marked note"),
+                            )],
+                            ..Default::default()
+                        })],
+                    }),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let writer = crate::create::ir_to_docx(&ir);
+        let mut buf = Cursor::new(Vec::new());
+        writer.write_to(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+
+        // The reference itself must carry customMarkFollows so Word shows
+        // "*" instead of an auto-number in the body citation.
+        let doc_xml = {
+            let mut reader =
+                OpcReader::new(Cursor::new(bytes.clone())).expect("valid opc package");
+            let part = PartName::new("/word/document.xml").unwrap();
+            String::from_utf8(reader.read_part(&part).unwrap()).unwrap()
+        };
+        assert!(
+            doc_xml.contains("customMarkFollows"),
+            "reference run must carry customMarkFollows: {doc_xml}"
+        );
+
+        let doc = DocxDocument::from_reader(Cursor::new(bytes)).unwrap();
+        let out_ir = crate::convert_docx::docx_to_ir(&doc);
+        let note = out_ir.sections[0]
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                crate::ir::Element::Footnote(n) => Some(n),
+                _ => None,
+            })
+            .expect("expected a footnote element");
+        assert_eq!(note.marker.as_deref(), Some("*"));
+        // The custom mark must not leak into the note's actual text.
+        let note_text = note
+            .content
+            .iter()
+            .find_map(|e| match e {
+                crate::ir::Element::Paragraph(p) => Some(
+                    p.content
+                        .iter()
+                        .filter_map(|c| match c {
+                            crate::ir::InlineContent::Text(s) => Some(s.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(note_text, "custom marked note");
+    }
+
+    #[test]
     fn test_footnote_reference_mark_reaches_run_content() {
         // issue #241 — to_ir() carried the note body but lost where in
         // the text it was actually cited.
@@ -4195,7 +4285,7 @@ mod tests {
             ParagraphContent::Run(r) => r
                 .content
                 .iter()
-                .any(|rc| matches!(rc, RunContent::FootnoteRef(3))),
+                .any(|rc| matches!(rc, RunContent::FootnoteRef(3, _))),
             _ => false,
         });
         assert!(found, "expected a FootnoteRef(3) in the paragraph content");

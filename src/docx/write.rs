@@ -150,6 +150,11 @@ pub struct Run {
     pub footnote_ref: Option<u32>,
     /// Endnote reference (special run that emits a `<w:endnoteReference>`).
     pub endnote_ref: Option<u32>,
+    /// Custom footnote/endnote mark (e.g. `*`, `†`) for whichever of
+    /// `footnote_ref`/`endnote_ref` is set. When present, the reference
+    /// carries `w:customMarkFollows="1"` and the note body gets the glyph
+    /// as its own leading run instead of an auto-number (issue #219).
+    pub note_ref_marker: Option<String>,
 }
 
 impl Run {
@@ -388,6 +393,8 @@ struct DocxHf {
 struct DocxNote {
     id: u32,
     elements: Vec<DocxElement>,
+    /// Custom mark glyph (e.g. `*`); `None` means Word's own auto-number.
+    marker: Option<String>,
 }
 
 struct DocxRichList {
@@ -774,7 +781,12 @@ impl DocxWriter {
     }
 
     /// Add a footnote with the given ID and IR content.
-    pub fn add_footnote(&mut self, id: u32, content: &[crate::ir::Element]) -> &mut Self {
+    pub fn add_footnote(
+        &mut self,
+        id: u32,
+        content: &[crate::ir::Element],
+        marker: Option<String>,
+    ) -> &mut Self {
         let mut elems: Vec<DocxElement> = Vec::new();
         for elem in content {
             convert_ir_element_to_docx_elements(elem, &mut elems);
@@ -782,12 +794,18 @@ impl DocxWriter {
         self.footnotes.push(DocxNote {
             id,
             elements: elems,
+            marker,
         });
         self
     }
 
     /// Add an endnote with the given ID and IR content.
-    pub fn add_endnote(&mut self, id: u32, content: &[crate::ir::Element]) -> &mut Self {
+    pub fn add_endnote(
+        &mut self,
+        id: u32,
+        content: &[crate::ir::Element],
+        marker: Option<String>,
+    ) -> &mut Self {
         let mut elems: Vec<DocxElement> = Vec::new();
         for elem in content {
             convert_ir_element_to_docx_elements(elem, &mut elems);
@@ -795,6 +813,7 @@ impl DocxWriter {
         self.endnotes.push(DocxNote {
             id,
             elements: elems,
+            marker,
         });
         self
     }
@@ -1514,6 +1533,7 @@ fn ir_inline_to_runs(content: &[crate::ir::InlineContent]) -> Vec<Run> {
             InlineContent::FootnoteRef(r) => {
                 let run = Run {
                     footnote_ref: Some(r.note_id),
+                    note_ref_marker: r.marker.clone(),
                     ..Default::default()
                 };
                 runs.push(run);
@@ -1521,6 +1541,7 @@ fn ir_inline_to_runs(content: &[crate::ir::InlineContent]) -> Vec<Run> {
             InlineContent::EndnoteRef(r) => {
                 let run = Run {
                     endnote_ref: Some(r.note_id),
+                    note_ref_marker: r.marker.clone(),
                     ..Default::default()
                 };
                 runs.push(run);
@@ -2035,11 +2056,11 @@ fn write_field_run(w: &mut Writer<Vec<u8>>, run: &Run, instr: &str) {
 
 fn write_run(w: &mut Writer<Vec<u8>>, run: &Run) {
     if let Some(note_id) = run.footnote_ref {
-        write_footnote_ref_run(w, note_id, false);
+        write_footnote_ref_run(w, note_id, false, run.note_ref_marker.as_deref());
         return;
     }
     if let Some(note_id) = run.endnote_ref {
-        write_footnote_ref_run(w, note_id, true);
+        write_footnote_ref_run(w, note_id, true, run.note_ref_marker.as_deref());
         return;
     }
 
@@ -2077,7 +2098,12 @@ fn write_run(w: &mut Writer<Vec<u8>>, run: &Run) {
         .expect("write r end");
 }
 
-fn write_footnote_ref_run(w: &mut Writer<Vec<u8>>, note_id: u32, is_endnote: bool) {
+fn write_footnote_ref_run(
+    w: &mut Writer<Vec<u8>>,
+    note_id: u32,
+    is_endnote: bool,
+    marker: Option<&str>,
+) {
     w.write_event(Event::Start(BytesStart::new("w:r")))
         .expect("write r start");
     w.write_event(Event::Start(BytesStart::new("w:rPr")))
@@ -2098,6 +2124,12 @@ fn write_footnote_ref_run(w: &mut Writer<Vec<u8>>, note_id: u32, is_endnote: boo
         "w:footnoteReference"
     };
     let mut ref_elem = BytesStart::new(tag);
+    // A custom mark (e.g. "*") replaces Word's own auto-number only when
+    // this flag says so; without it Word renders the sequential number
+    // regardless of what the note body itself contains (issue #219).
+    if marker.is_some() {
+        ref_elem.push_attribute(("w:customMarkFollows", "1"));
+    }
     ref_elem.push_attribute(("w:id", note_id.to_string().as_str()));
     w.write_event(Event::Empty(ref_elem))
         .expect("write note ref");
@@ -3421,6 +3453,44 @@ fn generate_notes_xml(
         w.write_event(Event::Start(note_elem))
             .expect("write note start");
 
+        // A custom mark (issue #219) gets its own leading paragraph rather
+        // than being spliced into the first content paragraph's runs — a
+        // cosmetic simplification (Word shows it on its own line instead
+        // of inline before the note text), not a content-loss one. The
+        // "FootnoteReference"/"EndnoteReference" character style is what
+        // marks this run, on read, as the mark rather than ordinary body
+        // text — the same style Word's own auto-number run carries.
+        if let Some(marker) = note.marker.as_deref() {
+            let style_name = if is_endnote {
+                "EndnoteReference"
+            } else {
+                "FootnoteReference"
+            };
+            w.write_event(Event::Start(BytesStart::new("w:p")))
+                .expect("write marker p start");
+            w.write_event(Event::Start(BytesStart::new("w:r")))
+                .expect("write marker r start");
+            w.write_event(Event::Start(BytesStart::new("w:rPr")))
+                .expect("write marker rPr start");
+            let mut r_style = BytesStart::new("w:rStyle");
+            r_style.push_attribute(("w:val", style_name));
+            w.write_event(Event::Empty(r_style)).expect("write marker rStyle");
+            w.write_event(Event::End(BytesEnd::new("w:rPr")))
+                .expect("write marker rPr end");
+            w.write_event(Event::Start(BytesStart::new("w:t")))
+                .expect("write marker t start");
+            w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(
+                marker,
+            ))))
+            .expect("write marker text");
+            w.write_event(Event::End(BytesEnd::new("w:t")))
+                .expect("write marker t end");
+            w.write_event(Event::End(BytesEnd::new("w:r")))
+                .expect("write marker r end");
+            w.write_event(Event::End(BytesEnd::new("w:p")))
+                .expect("write marker p end");
+        }
+
         let mut ic = 0u32;
         for elem in &note.elements {
             write_docx_element(&mut w, elem, image_rids, &mut ic, links);
@@ -4148,7 +4218,7 @@ mod tests {
     #[test]
     fn notes_part_carries_the_separator_notes() {
         let mut doc = DocxWriter::new();
-        doc.add_footnote(1, &[crate::ir::Element::Paragraph(Default::default())]);
+        doc.add_footnote(1, &[crate::ir::Element::Paragraph(Default::default())], None);
         let parts = all_parts(doc);
         let notes = &parts["word/footnotes.xml"];
         assert!(notes.contains(r#"w:type="separator""#), "missing separator note: {notes}");

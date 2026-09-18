@@ -486,6 +486,15 @@ pub struct FootnoteRef {
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct CodeBlock {
     /// Optional language identifier for syntax highlighting.
+    ///
+    /// **Not preserved through DOCX.** WordprocessingML has no native slot
+    /// for a code block's language — only the `Code` paragraph style
+    /// survives a round trip. Carrying it would mean inventing a
+    /// non-standard convention (custom XML wrapper, style-name suffix,
+    /// `w:tag`), which was judged not worth the compatibility risk for a
+    /// syntax-highlighting hint. HTML and Markdown *do* preserve it (via
+    /// `<pre><code class="language-…">` and the fence's language token,
+    /// respectively) — this limitation is DOCX-specific (issue #219).
     pub language: Option<String>,
     /// The preformatted code text.
     pub content: String,

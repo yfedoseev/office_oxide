@@ -166,7 +166,7 @@ fn plain_text_run(run: &Run, out: &mut String) {
             // The reference mark itself carries no text of its own — the
             // note *body* is walked separately (issue #240); this is only
             // the citation point (issue #241), nothing to render here.
-            RunContent::FootnoteRef(_) | RunContent::EndnoteRef(_) | RunContent::CommentRef(_) => {},
+            RunContent::FootnoteRef(..) | RunContent::EndnoteRef(..) | RunContent::CommentRef(_) => {},
             RunContent::FormField(ff) => {
                 if let Some(text) = &ff.display_text {
                     out.push_str(text);
@@ -420,7 +420,7 @@ fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, text: &mut String) {
                     text.push('\n');
                 }
             },
-            RunContent::FootnoteRef(_) | RunContent::EndnoteRef(_) | RunContent::CommentRef(_) => {},
+            RunContent::FootnoteRef(..) | RunContent::EndnoteRef(..) | RunContent::CommentRef(_) => {},
             RunContent::FormField(ff) => {
                 if let Some(t) = &ff.display_text {
                     text.push_str(t);
