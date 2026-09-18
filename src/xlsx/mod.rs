@@ -587,8 +587,18 @@ fn extract_chart_text(xml: &[u8]) -> String {
                             // Decide whether this <c:v> is series-name, category,
                             // or value based on the enclosing scope.
                             let in_tx = stack.iter().any(|t| t.as_slice() == b"tx");
-                            let in_cat = stack.iter().any(|t| t.as_slice() == b"cat");
-                            let in_val = stack.iter().any(|t| t.as_slice() == b"val");
+                            // Scatter charts carry their points in
+                            // `<c:xVal>`/`<c:yVal>` and bubble charts add
+                            // `<c:bubbleSize>` rather than the
+                            // `<c:cat>`/`<c:val>` bar/line/pie/area charts
+                            // use. Checking only the latter dropped every
+                            // scatter/bubble data point (#281).
+                            let in_cat = stack
+                                .iter()
+                                .any(|t| matches!(t.as_slice(), b"cat" | b"xVal"));
+                            let in_val = stack
+                                .iter()
+                                .any(|t| matches!(t.as_slice(), b"val" | b"yVal" | b"bubbleSize"));
                             if in_tx && s.name.is_empty() {
                                 s.name = val;
                             } else if in_cat {
@@ -630,17 +640,21 @@ fn extract_chart_text(xml: &[u8]) -> String {
             },
             Ok(quick_xml::events::Event::Text(t)) => {
                 if let Ok(s) = crate::core::xml::unescape_text(&t) {
-                    let trimmed = s.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
                     let top = stack.last().map(|v| v.as_slice());
+                    // Appended verbatim. A title Excel split across runs
+                    // carries the space *between* two runs as leading or
+                    // trailing whitespace on one of them, so trimming each
+                    // run before concatenating ran the words together —
+                    // "Chart Title - with additional formatting" came back
+                    // as "ChartTitle-withadditionalformatting" (#280).
+                    // The assembled string is trimmed once, where it is
+                    // flushed at `</c:title>` / `</c:v>`.
                     match top {
                         Some(b"t") => {
-                            current_title.push_str(trimmed);
+                            current_title.push_str(&s);
                         },
                         Some(b"v") => {
-                            cur_v.push_str(trimmed);
+                            cur_v.push_str(&s);
                         },
                         _ => {},
                     }
@@ -1356,6 +1370,76 @@ mod tests {
         let out = extract_chart_text(xml);
         assert!(out.contains("Categories: Q1, Q2"), "got: {out}");
         assert!(out.contains("Budget: 1000, 2000"), "got: {out}");
+    }
+
+    /// #280 — Excel splits a formatted title across runs, sometimes
+    /// mid-word; the inter-run space rides on one run's edge, so trimming
+    /// each run before concatenating deleted it.
+    #[test]
+    fn test_chart_title_keeps_spaces_between_runs() {
+        let xml = br#"<?xml version="1.0"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:chart>
+    <c:title><c:tx><c:rich><a:p>
+      <a:r><a:t>Chart </a:t></a:r>
+      <a:r><a:t>Title</a:t></a:r>
+      <a:r><a:t> - </a:t></a:r>
+      <a:r><a:t>with </a:t></a:r>
+      <a:r><a:t>a</a:t></a:r>
+      <a:r><a:t>dd</a:t></a:r>
+      <a:r><a:t>iti</a:t></a:r>
+      <a:r><a:t>o</a:t></a:r>
+      <a:r><a:t>nal </a:t></a:r>
+      <a:r><a:t>format</a:t></a:r>
+      <a:r><a:t>ting</a:t></a:r>
+    </a:p></c:rich></c:tx></c:title>
+  </c:chart>
+</c:chartSpace>"#;
+        let out = extract_chart_text(xml);
+        assert_eq!(out, "Title: Chart Title - with additional formatting", "got: {out}");
+    }
+
+    /// #281 — scatter/bubble series hold their points in
+    /// `<c:xVal>`/`<c:yVal>`/`<c:bubbleSize>`, not `<c:cat>`/`<c:val>`.
+    #[test]
+    fn test_scatter_and_bubble_series_data_points_are_captured() {
+        let xml = br#"<?xml version="1.0"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+  <c:chart><c:plotArea>
+    <c:scatterChart>
+      <c:ser>
+        <c:tx><c:strRef><c:strCache><c:pt><c:v>Y</c:v></c:pt></c:strCache></c:strRef></c:tx>
+        <c:xVal><c:numRef><c:numCache>
+          <c:pt><c:v>0</c:v></c:pt><c:pt><c:v>1</c:v></c:pt>
+        </c:numCache></c:numRef></c:xVal>
+        <c:yVal><c:numRef><c:numCache>
+          <c:pt><c:v>0.5</c:v></c:pt><c:pt><c:v>1.5</c:v></c:pt>
+        </c:numCache></c:numRef></c:yVal>
+      </c:ser>
+    </c:scatterChart>
+  </c:plotArea></c:chart>
+</c:chartSpace>"#;
+        let out = extract_chart_text(xml);
+        assert!(out.contains("Categories: 0, 1"), "x-values missing: {out}");
+        assert!(out.contains("Y: 0.5, 1.5"), "y-values missing: {out}");
+
+        let bubble = br#"<?xml version="1.0"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+  <c:chart><c:plotArea>
+    <c:bubbleChart>
+      <c:ser>
+        <c:yVal><c:numRef><c:numCache><c:pt><c:v>7</c:v></c:pt></c:numCache></c:numRef></c:yVal>
+        <c:bubbleSize><c:numRef><c:numCache>
+          <c:pt><c:v>3</c:v></c:pt>
+        </c:numCache></c:numRef></c:bubbleSize>
+      </c:ser>
+    </c:bubbleChart>
+  </c:plotArea></c:chart>
+</c:chartSpace>"#;
+        let out = extract_chart_text(bubble);
+        assert!(out.contains("7"), "bubble y-value missing: {out}");
+        assert!(out.contains("3"), "bubble size missing: {out}");
     }
 
     #[test]
