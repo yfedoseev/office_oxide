@@ -774,7 +774,9 @@ impl DocxWriter {
 
     /// Add an IR list with rich style information.
     pub fn add_ir_list(&mut self, list: &crate::ir::List) -> &mut Self {
-        self.add_ir_list_at(list, list.level);
+        let num_id = self.next_num_id;
+        self.next_num_id += 1;
+        self.add_ir_list_at(list, list.level, num_id);
         self
     }
 
@@ -782,9 +784,15 @@ impl DocxWriter {
     ///
     /// `ListItem::nested` was read by no writer at all, so everything below
     /// level 0 vanished from the output while the API reported success.
-    fn add_ir_list_at(&mut self, list: &crate::ir::List, level: u8) {
-        let num_id = self.next_num_id;
-        self.next_num_id += 1;
+    ///
+    /// `num_id` is shared across every recursive call for one logical list
+    /// (only `add_ir_list` mints a fresh one) — a nested sub-list used to
+    /// get its own brand-new `numId` per level, which the reader (correctly,
+    /// per spec: one logical list keeps one `numId` across all its levels)
+    /// re-parsed as an unrelated *sibling* top-level list instead of a
+    /// child of the parent item, losing the parent/child relationship (and
+    /// sometimes the `ordered` flag) on every round trip (issue #261).
+    fn add_ir_list_at(&mut self, list: &crate::ir::List, level: u8, num_id: u32) {
         let start_number = list.start_number.unwrap_or(1);
         let style = list.style.clone();
 
@@ -815,7 +823,7 @@ impl DocxWriter {
 
         for item in &list.items {
             if let Some(ref nested) = item.nested {
-                self.add_ir_list_at(nested, level.saturating_add(1).min(8));
+                self.add_ir_list_at(nested, level.saturating_add(1).min(8), num_id);
             }
         }
     }
@@ -1321,23 +1329,53 @@ impl DocxWriter {
         // CT_Numbering is `numPicBullet*, abstractNum*, num*`: every abstract
         // definition must precede every instance, so these run as two passes
         // rather than one pair per list.
-        write_abstract_num(&mut w, 0, "bullet", "\u{2022}");
-        write_abstract_num(&mut w, 1, "decimal", "%1.");
+        write_abstract_num(&mut w, 0, &[(0, "bullet", "\u{2022}".to_string())]);
+        write_abstract_num(&mut w, 1, &[(0, "decimal", "%1.".to_string())]);
+
+        // One logical list's recursive nesting levels now share a single
+        // `numId` (issue #261), so group by `num_id` here rather than
+        // emitting one abstractNum/num pair per `RichList` entry — that
+        // would redefine the same numId's abstractNumId repeatedly and,
+        // worse, only ever define level 0.
+        let mut num_ids: Vec<u32> = Vec::new();
         for elem in &self.elements {
             if let DocxElement::RichList(rl) = elem {
-                let abstract_id = rl.num_id - 3 + 2;
-                let (fmt, lvl_text) = list_style_to_fmt(rl.style.as_ref(), rl.ordered);
-                write_abstract_num(&mut w, abstract_id, fmt, lvl_text);
+                if !num_ids.contains(&rl.num_id) {
+                    num_ids.push(rl.num_id);
+                }
             }
         }
 
-        write_num(&mut w, 1, 0, None);
-        write_num(&mut w, 2, 1, None);
-        for elem in &self.elements {
-            if let DocxElement::RichList(rl) = elem {
-                let abstract_id = rl.num_id - 3 + 2;
-                write_num(&mut w, rl.num_id, abstract_id, rl.start_number);
+        for &num_id in &num_ids {
+            let abstract_id = num_id - 3 + 2;
+            let mut levels: Vec<(u8, &str, String)> = Vec::new();
+            for elem in &self.elements {
+                if let DocxElement::RichList(rl) = elem {
+                    if rl.num_id == num_id && !levels.iter().any(|(l, ..)| *l == rl.level) {
+                        let (fmt, lvl_text) =
+                            list_style_to_fmt(rl.style.as_ref(), rl.ordered, rl.level);
+                        levels.push((rl.level, fmt, lvl_text));
+                    }
+                }
             }
+            write_abstract_num(&mut w, abstract_id, &levels);
+        }
+
+        write_num(&mut w, 1, 0, &[]);
+        write_num(&mut w, 2, 1, &[]);
+        for &num_id in &num_ids {
+            let abstract_id = num_id - 3 + 2;
+            let mut overrides: Vec<(u8, u32)> = Vec::new();
+            for elem in &self.elements {
+                if let DocxElement::RichList(rl) = elem {
+                    if rl.num_id == num_id {
+                        if let Some(start) = rl.start_number {
+                            overrides.push((rl.level, start));
+                        }
+                    }
+                }
+            }
+            write_num(&mut w, num_id, abstract_id, &overrides);
         }
 
         w.write_event(Event::End(BytesEnd::new("w:numbering")))
@@ -3927,41 +3965,47 @@ fn write_character_style(w: &mut Writer<Vec<u8>>, style_id: &str, name: &str) {
         .expect("write char style end");
 }
 
+/// Write one `abstractNum` with one `w:lvl` per entry in `levels`
+/// (`(ilvl, numFmt, lvlText)`). A logical list now keeps a single
+/// `numId`/`abstractNum` across every nesting level (issue #261), so
+/// this must define every level actually used, not just level 0 — a
+/// paragraph referencing an `ilvl` this abstractNum never defines falls
+/// back to Word's own default numbering behavior instead of the level's
+/// real ordered/bullet style.
 fn write_abstract_num(
     w: &mut Writer<Vec<u8>>,
     abstract_num_id: u32,
-    num_fmt: &str,
-    lvl_text: &str,
+    levels: &[(u8, &str, String)],
 ) {
     let mut elem = BytesStart::new("w:abstractNum");
     elem.push_attribute(("w:abstractNumId", abstract_num_id.to_string().as_str()));
     w.write_event(Event::Start(elem))
         .expect("write abstractNum start");
 
-    let mut lvl = BytesStart::new("w:lvl");
-    lvl.push_attribute(("w:ilvl", "0"));
-    w.write_event(Event::Start(lvl)).expect("write lvl start");
+    for (ilvl, num_fmt, lvl_text) in levels {
+        let mut lvl = BytesStart::new("w:lvl");
+        lvl.push_attribute(("w:ilvl", ilvl.to_string().as_str()));
+        w.write_event(Event::Start(lvl)).expect("write lvl start");
 
-    let mut fmt = BytesStart::new("w:numFmt");
-    fmt.push_attribute(("w:val", num_fmt));
-    w.write_event(Event::Empty(fmt)).expect("write numFmt");
+        let mut fmt = BytesStart::new("w:numFmt");
+        fmt.push_attribute(("w:val", *num_fmt));
+        w.write_event(Event::Empty(fmt)).expect("write numFmt");
 
-    let mut text = BytesStart::new("w:lvlText");
-    text.push_attribute(("w:val", lvl_text));
-    w.write_event(Event::Empty(text)).expect("write lvlText");
+        let mut text = BytesStart::new("w:lvlText");
+        text.push_attribute(("w:val", lvl_text.as_str()));
+        w.write_event(Event::Empty(text)).expect("write lvlText");
 
-    w.write_event(Event::End(BytesEnd::new("w:lvl")))
-        .expect("write lvl end");
+        w.write_event(Event::End(BytesEnd::new("w:lvl")))
+            .expect("write lvl end");
+    }
     w.write_event(Event::End(BytesEnd::new("w:abstractNum")))
         .expect("write abstractNum end");
 }
 
-fn write_num(
-    w: &mut Writer<Vec<u8>>,
-    num_id: u32,
-    abstract_num_id: u32,
-    start_override: Option<u32>,
-) {
+/// Write one `w:num` with one `w:lvlOverride`/`w:startOverride` per entry
+/// in `overrides` (`(ilvl, start)`) — a nested list can set its own
+/// `start_number` independently of its parent's.
+fn write_num(w: &mut Writer<Vec<u8>>, num_id: u32, abstract_num_id: u32, overrides: &[(u8, u32)]) {
     let mut elem = BytesStart::new("w:num");
     elem.push_attribute(("w:numId", num_id.to_string().as_str()));
     w.write_event(Event::Start(elem)).expect("write num start");
@@ -3971,9 +4015,9 @@ fn write_num(
     w.write_event(Event::Empty(abs))
         .expect("write abstractNumId");
 
-    if let Some(start) = start_override {
+    for (ilvl, start) in overrides {
         let mut lvl_override = BytesStart::new("w:lvlOverride");
-        lvl_override.push_attribute(("w:ilvl", "0"));
+        lvl_override.push_attribute(("w:ilvl", ilvl.to_string().as_str()));
         w.write_event(Event::Start(lvl_override))
             .expect("write lvlOverride start");
         let mut so = BytesStart::new("w:startOverride");
@@ -4040,22 +4084,30 @@ fn border_style_val(style: &BorderStyle) -> &'static str {
     }
 }
 
-fn list_style_to_fmt(style: Option<&ListStyle>, ordered: bool) -> (&'static str, &'static str) {
+/// `ilvl` (0-based) selects which level's own counter the `%N.` numFmt
+/// placeholder in `lvlText` refers to — each nesting level counts
+/// independently (`%1.` at level 0, `%2.` at level 1, …), matching how a
+/// nested list restarts its own numbering rather than continuing the
+/// parent's (issue #261 — every level used to render the same `%1.`
+/// regardless of depth, which only happened to look right because each
+/// level got its own, disconnected `numId` before this fix).
+fn list_style_to_fmt(style: Option<&ListStyle>, ordered: bool, ilvl: u8) -> (&'static str, String) {
+    let n = ilvl as u32 + 1;
     match style {
-        Some(ListStyle::Bullet) => ("bullet", "\u{2022}"),
-        Some(ListStyle::Decimal) => ("decimal", "%1."),
-        Some(ListStyle::LowerRoman) => ("lowerRoman", "%1."),
-        Some(ListStyle::UpperRoman) => ("upperRoman", "%1."),
-        Some(ListStyle::LowerAlpha) => ("lowerLetter", "%1."),
-        Some(ListStyle::UpperAlpha) => ("upperLetter", "%1."),
-        Some(ListStyle::Dash) => ("bullet", "\u{2013}"),
-        Some(ListStyle::Square) => ("bullet", "\u{25AA}"),
-        Some(ListStyle::Circle) => ("bullet", "\u{25CB}"),
+        Some(ListStyle::Bullet) => ("bullet", "\u{2022}".to_string()),
+        Some(ListStyle::Decimal) => ("decimal", format!("%{n}.")),
+        Some(ListStyle::LowerRoman) => ("lowerRoman", format!("%{n}.")),
+        Some(ListStyle::UpperRoman) => ("upperRoman", format!("%{n}.")),
+        Some(ListStyle::LowerAlpha) => ("lowerLetter", format!("%{n}.")),
+        Some(ListStyle::UpperAlpha) => ("upperLetter", format!("%{n}.")),
+        Some(ListStyle::Dash) => ("bullet", "\u{2013}".to_string()),
+        Some(ListStyle::Square) => ("bullet", "\u{25AA}".to_string()),
+        Some(ListStyle::Circle) => ("bullet", "\u{25CB}".to_string()),
         None => {
             if ordered {
-                ("decimal", "%1.")
+                ("decimal", format!("%{n}."))
             } else {
-                ("bullet", "\u{2022}")
+                ("bullet", "\u{2022}".to_string())
             }
         },
     }
@@ -4235,6 +4287,102 @@ mod tests {
         let spacing = xml.find("<w:spacing").expect("w:spacing");
         let ind = xml.find("<w:ind").expect("w:ind");
         assert!(spacing < ind, "CT_PPrBase requires spacing before ind");
+    }
+
+    /// issue #261 — a nested list's items used to get a brand-new,
+    /// unrelated `numId` per level, so the reader (which groups
+    /// consecutive paragraphs by matching `numId`, per spec) re-parsed
+    /// the nested sub-list as an unrelated sibling top-level list rather
+    /// than a child of the parent item. All levels of one logical list
+    /// must share a single `numId`, varying only `w:ilvl`.
+    #[test]
+    fn nested_list_items_share_one_num_id_across_levels() {
+        let mut doc = DocxWriter::new();
+        let nested = crate::ir::List {
+            ordered: false,
+            items: vec![crate::ir::ListItem {
+                content: crate::ir::inline_to_element_block(vec![crate::ir::InlineContent::Text(
+                    crate::ir::TextSpan { text: "child".into(), ..Default::default() },
+                )]),
+                nested: None,
+            }],
+            level: 1,
+            ..Default::default()
+        };
+        let list = crate::ir::List {
+            ordered: true,
+            items: vec![crate::ir::ListItem {
+                content: crate::ir::inline_to_element_block(vec![crate::ir::InlineContent::Text(
+                    crate::ir::TextSpan { text: "parent".into(), ..Default::default() },
+                )]),
+                nested: Some(nested),
+            }],
+            level: 0,
+            ..Default::default()
+        };
+        doc.add_ir_list(&list);
+        let xml = part_xml(doc, "word/document.xml");
+
+        // Collect every numId referenced in the document body.
+        let num_ids: std::collections::HashSet<&str> = xml
+            .split("w:numId w:val=\"")
+            .skip(1)
+            .filter_map(|s| s.split('"').next())
+            .collect();
+        assert_eq!(
+            num_ids.len(),
+            1,
+            "parent and nested list items must share one numId, got {num_ids:?} in {xml}"
+        );
+        assert!(xml.contains(r#"w:ilvl w:val="0""#), "parent item must be at ilvl 0: {xml}");
+        assert!(xml.contains(r#"w:ilvl w:val="1""#), "nested item must be at ilvl 1: {xml}");
+    }
+
+    /// issue #261 — the shared numId's abstractNum must define BOTH
+    /// levels actually used (not just ilvl 0), so a nested level's real
+    /// ordered/bullet style is honored instead of falling back to
+    /// whatever Word does with an undefined level.
+    #[test]
+    fn nested_list_abstract_num_defines_both_levels() {
+        let mut doc = DocxWriter::new();
+        let nested = crate::ir::List {
+            ordered: false,
+            items: vec![crate::ir::ListItem {
+                content: crate::ir::inline_to_element_block(vec![crate::ir::InlineContent::Text(
+                    crate::ir::TextSpan { text: "child".into(), ..Default::default() },
+                )]),
+                nested: None,
+            }],
+            level: 1,
+            ..Default::default()
+        };
+        let list = crate::ir::List {
+            ordered: true,
+            items: vec![crate::ir::ListItem {
+                content: crate::ir::inline_to_element_block(vec![crate::ir::InlineContent::Text(
+                    crate::ir::TextSpan { text: "parent".into(), ..Default::default() },
+                )]),
+                nested: Some(nested),
+            }],
+            level: 0,
+            ..Default::default()
+        };
+        doc.add_ir_list(&list);
+        let numbering = part_xml(doc, "word/numbering.xml");
+
+        let abstract_num =
+            &numbering[numbering.find("<w:abstractNum w:abstractNumId=\"2\"").unwrap()..];
+        let abstract_num = &abstract_num[..abstract_num.find("</w:abstractNum>").unwrap()];
+        assert!(abstract_num.contains(r#"w:ilvl="0""#), "missing level 0: {abstract_num}");
+        assert!(abstract_num.contains(r#"w:ilvl="1""#), "missing level 1: {abstract_num}");
+        assert!(
+            abstract_num.contains(r#"w:val="decimal""#),
+            "level 0 (ordered) must be decimal: {abstract_num}"
+        );
+        assert!(
+            abstract_num.contains(r#"w:val="bullet""#),
+            "level 1 (unordered) must be bullet: {abstract_num}"
+        );
     }
 
     fn ir_list(ordered: bool, text: &str) -> crate::ir::Element {
