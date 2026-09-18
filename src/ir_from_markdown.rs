@@ -115,9 +115,13 @@ impl<'a> MarkdownParser<'a> {
                 continue;
             }
 
-            // Thematic break `---` / `***` / `___` starts a new section
+            // Thematic break `---` / `***` / `___`. It both records itself as
+            // an `Element::ThematicBreak` (so it round-trips instead of being
+            // silently swallowed) and, matching this parser's existing page-
+            // boundary convention, starts a new section.
             if is_thematic_break(line) {
                 self.advance();
+                current.elements.push(Element::ThematicBreak);
                 if !current.elements.is_empty() || current.title.is_some() {
                     sections.push(current);
                     current = Section {
@@ -628,6 +632,56 @@ mod tests {
             .collect();
         assert!(spans.iter().any(|s| s.bold && s.text == "world"));
         assert!(spans.iter().any(|s| s.italic && s.text == "rust"));
+    }
+
+    #[test]
+    fn test_fenced_code_block_becomes_code_block_element() {
+        // issue #215 gap 1: the fence language used to leak into the text
+        // as a plain paragraph ("rust let x = 1;") with no CodeBlock at all.
+        let md = "```rust\nlet x = 1;\n```\n";
+        let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
+        let block = match &ir.sections[0].elements[0] {
+            Element::CodeBlock(c) => c,
+            other => panic!("expected CodeBlock, got {other:?}"),
+        };
+        assert_eq!(block.language.as_deref(), Some("rust"));
+        assert_eq!(block.content, "let x = 1;");
+    }
+
+    #[test]
+    fn test_thematic_break_becomes_thematic_break_element() {
+        // issue #215 gap 2: `---` only ever split sections; no
+        // Element::ThematicBreak was ever produced, so the mark itself
+        // was silently dropped from the round trip.
+        let md = "```rust\nlet x = 1;\n```\n\n---\n";
+        let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
+        assert!(
+            ir.sections[0]
+                .elements
+                .iter()
+                .any(|e| matches!(e, Element::ThematicBreak)),
+            "expected an Element::ThematicBreak, got {:#?}",
+            ir.sections[0].elements
+        );
+    }
+
+    #[test]
+    fn test_nested_bullet_list_preserves_nesting_depth() {
+        // issue #215 gap 3: src/ir_from_markdown.rs:281 used to hardcode
+        // `nested: None`, flattening every item to ilvl=0.
+        let md = "- item1\n  - sub1\n  - sub2\n- item2\n";
+        let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
+        let list = match &ir.sections[0].elements[0] {
+            Element::List(l) => l,
+            other => panic!("expected List, got {other:?}"),
+        };
+        assert_eq!(list.items.len(), 2);
+        let nested = list.items[0]
+            .nested
+            .as_ref()
+            .expect("first item should have a nested sub-list");
+        assert_eq!(nested.items.len(), 2);
+        assert!(list.items[1].nested.is_none());
     }
 
     #[test]
