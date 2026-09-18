@@ -461,6 +461,57 @@ fn split_hyperlink_fragment(url: &str) -> (&str, Option<&str>) {
 /// needs no relationship at all — registering one fabricated a bogus
 /// `TargetMode="External"` entry pointing at `"#anchor"` for every such
 /// link, which is not a URL (issue #292).
+/// Register one external relationship per distinct hyperlink URL in
+/// `elements`, scoped to `part`'s own rels file. Each OPC part (the main
+/// document, a header/footer, footnotes.xml, endnotes.xml) has its own
+/// `_rels/<part>.xml.rels`; an r:id registered against one part does not
+/// resolve inside another's XML, so this must be called once per part
+/// rather than reusing a single package-wide map (issue #293).
+fn register_hyperlink_rids<W: Write + Seek>(
+    opc: &mut OpcWriter<W>,
+    part: &PartName,
+    elements: &[DocxElement],
+) -> HyperlinkRids {
+    let mut urls = Vec::new();
+    collect_hyperlinks(elements, &mut urls);
+    let mut rids = HyperlinkRids::new();
+    for url in urls {
+        let rid = opc.add_part_rel_with_mode(
+            part,
+            rel_types::HYPERLINK,
+            &url,
+            crate::core::relationships::TargetMode::External,
+        );
+        rids.insert(url, rid);
+    }
+    rids
+}
+
+/// As `register_hyperlink_rids`, but collects across every note's elements
+/// first — footnotes.xml/endnotes.xml holds many `<w:footnote>`/
+/// `<w:endnote>` bodies in one part, so they share one `_rels` file.
+fn register_note_hyperlink_rids<W: Write + Seek>(
+    opc: &mut OpcWriter<W>,
+    part: &PartName,
+    notes: &[DocxNote],
+) -> HyperlinkRids {
+    let mut urls = Vec::new();
+    for n in notes {
+        collect_hyperlinks(&n.elements, &mut urls);
+    }
+    let mut rids = HyperlinkRids::new();
+    for url in urls {
+        let rid = opc.add_part_rel_with_mode(
+            part,
+            rel_types::HYPERLINK,
+            &url,
+            crate::core::relationships::TargetMode::External,
+        );
+        rids.insert(url, rid);
+    }
+    rids
+}
+
 fn collect_hyperlinks(elements: &[DocxElement], out: &mut Vec<String>) {
     fn push_runs(runs: &[Run], out: &mut Vec<String>) {
         for r in runs {
@@ -975,33 +1026,16 @@ impl DocxWriter {
             opc.add_part(&font_table_part, CT_FONT_TABLE, &xml)?;
         }
 
-        // --- Register headers/footers ---
-        // Hyperlinks need one external relationship each, shared by every run
-        // that points at the same URL. Collected before any part is written
-        // because headers, footers and notes can carry links too.
-        let mut hyperlink_rids: HyperlinkRids = HyperlinkRids::new();
-        {
-            let mut urls: Vec<String> = Vec::new();
-            collect_hyperlinks(&self.elements, &mut urls);
-            for hf in &self.headers_footers {
-                collect_hyperlinks(&hf.elements, &mut urls);
-            }
-            for n in self.footnotes.iter().chain(self.endnotes.iter()) {
-                collect_hyperlinks(&n.elements, &mut urls);
-            }
-            for url in urls {
-                if hyperlink_rids.contains_key(&url) {
-                    continue;
-                }
-                let rid = opc.add_part_rel_with_mode(
-                    &doc_part,
-                    rel_types::HYPERLINK,
-                    &url,
-                    crate::core::relationships::TargetMode::External,
-                );
-                hyperlink_rids.insert(url, rid);
-            }
-        }
+        // --- Register the body's own hyperlinks ---
+        // A relationship id is scoped to the part that declares it
+        // (word/_rels/<part>.xml.rels), not the package as a whole. A
+        // single map registered only against document.xml and then reused
+        // for header/footer/footnote/endnote parts emitted an r:id that
+        // does not exist in *those* parts' own rels files — a dangling
+        // relationship in every header, footer, footnote and endnote
+        // hyperlink (issue #293). Each part below gets its own map,
+        // registered against that part.
+        let hyperlink_rids: HyperlinkRids = register_hyperlink_rids(&mut opc, &doc_part, &self.elements);
 
         let mut hf_rids: Vec<(HfType, String)> = Vec::new();
         for (i, hf) in self.headers_footers.iter().enumerate() {
@@ -1018,6 +1052,7 @@ impl DocxWriter {
             let rid = opc.add_part_rel(&doc_part, rel_type, &target);
             let part_name = format!("/word/{target}");
             let hf_part = PartName::new(&part_name)?;
+            let hf_hyperlink_rids = register_hyperlink_rids(&mut opc, &hf_part, &hf.elements);
             let hf_xml = generate_hf_xml(
                 &hf.elements,
                 &image_rids,
@@ -1025,7 +1060,7 @@ impl DocxWriter {
                     hf.hf_type,
                     HfType::DefaultHeader | HfType::FirstPageHeader | HfType::EvenPageHeader
                 ),
-                &hyperlink_rids,
+                &hf_hyperlink_rids,
             );
             opc.add_part(&hf_part, ct, &hf_xml)?;
             hf_rids.push((hf.hf_type, rid));
@@ -1035,7 +1070,9 @@ impl DocxWriter {
         let footnote_rid = if !self.footnotes.is_empty() {
             let notes_part = PartName::new("/word/footnotes.xml")?;
             let rid = opc.add_part_rel(&doc_part, rel_types::FOOTNOTES, "footnotes.xml");
-            let xml = generate_footnotes_xml(&self.footnotes, &image_rids, &hyperlink_rids);
+            let note_hyperlink_rids =
+                register_note_hyperlink_rids(&mut opc, &notes_part, &self.footnotes);
+            let xml = generate_footnotes_xml(&self.footnotes, &image_rids, &note_hyperlink_rids);
             opc.add_part(&notes_part, CT_FOOTNOTES, &xml)?;
             Some(rid)
         } else {
@@ -1045,7 +1082,9 @@ impl DocxWriter {
         let endnote_rid = if !self.endnotes.is_empty() {
             let notes_part = PartName::new("/word/endnotes.xml")?;
             let rid = opc.add_part_rel(&doc_part, rel_types::ENDNOTES, "endnotes.xml");
-            let xml = generate_endnotes_xml(&self.endnotes, &image_rids, &hyperlink_rids);
+            let note_hyperlink_rids =
+                register_note_hyperlink_rids(&mut opc, &notes_part, &self.endnotes);
+            let xml = generate_endnotes_xml(&self.endnotes, &image_rids, &note_hyperlink_rids);
             opc.add_part(&notes_part, CT_ENDNOTES, &xml)?;
             Some(rid)
         } else {
@@ -4437,6 +4476,131 @@ mod tests {
         assert!(
             !rels.contains("#section1"),
             "the fragment must not leak into the relationship Target: {rels}"
+        );
+    }
+
+    /// A footnote hyperlink's `r:id` must resolve within footnotes.xml's
+    /// own rels, not document.xml's — reusing one package-wide map
+    /// registered against document.xml left a dangling relationship in
+    /// every footnote/endnote/header/footer hyperlink on write (#293).
+    #[test]
+    fn test_footnote_hyperlink_gets_a_relationship_in_its_own_rels_part() {
+        use crate::ir::{Element, InlineContent, Paragraph, TextSpan};
+
+        let mut doc = DocxWriter::new();
+        doc.add_ir_paragraph(&[Run { text: "see note".to_string(), ..Default::default() }], None);
+        doc.add_footnote(
+            1,
+            &[Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    hyperlink: Some("https://example.com/footnote-source".to_string()),
+                    ..TextSpan::plain("source")
+                })],
+                ..Default::default()
+            })],
+            None,
+        );
+        let parts = all_parts(doc);
+
+        let footnotes_xml = &parts["word/footnotes.xml"];
+        assert!(footnotes_xml.contains("r:id"), "footnote must carry a hyperlink r:id: {footnotes_xml}");
+
+        let footnotes_rels = parts
+            .get("word/_rels/footnotes.xml.rels")
+            .expect("footnotes.xml must have its own _rels part, not rely on document.xml's");
+        assert!(
+            footnotes_rels.contains("https://example.com/footnote-source"),
+            "the URL must be registered in footnotes.xml's own rels: {footnotes_rels}"
+        );
+
+        // The r:id used inside footnotes.xml must actually be one of the
+        // ids footnotes.xml.rels declares (not merely present in
+        // document.xml.rels, which resolves in the wrong scope).
+        let rid = footnotes_xml
+            .split("r:id=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("r:id attribute value");
+        assert!(
+            footnotes_rels.contains(&format!("Id=\"{rid}\"")),
+            "footnotes.xml uses r:id={rid:?}, which must be declared in its own rels: {footnotes_rels}"
+        );
+    }
+
+    /// Same bug, header side: a header hyperlink's r:id must resolve
+    /// within header1.xml's own rels, not document.xml's (#293's write-
+    /// side bug class, same fix applied to headers/footers too).
+    #[test]
+    fn test_header_hyperlink_gets_a_relationship_in_its_own_rels_part() {
+        use crate::ir::{Element, InlineContent, Paragraph, TextSpan};
+
+        let mut doc = DocxWriter::new();
+        doc.add_ir_paragraph(&[Run { text: "body".to_string(), ..Default::default() }], None);
+        doc.add_section_header(
+            HfType::DefaultHeader,
+            vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    hyperlink: Some("https://example.com/header-link".to_string()),
+                    ..TextSpan::plain("link")
+                })],
+                ..Default::default()
+            })],
+        );
+        let parts = all_parts(doc);
+
+        let header_xml = &parts["word/header1.xml"];
+        let header_rels = parts
+            .get("word/_rels/header1.xml.rels")
+            .expect("header1.xml must have its own _rels part");
+        let rid = header_xml
+            .split("r:id=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("r:id attribute value");
+        assert!(
+            header_rels.contains(&format!("Id=\"{rid}\"")),
+            "header1.xml uses r:id={rid:?}, which must be declared in its own rels: {header_rels}"
+        );
+    }
+
+    /// End-to-end: a footnote hyperlink written out and read back resolves
+    /// to its real URL, not a dangling relationship id (#293, write side).
+    #[test]
+    fn test_footnote_hyperlink_round_trips_to_the_real_url() {
+        use crate::ir::{Element, InlineContent, Paragraph, TextSpan};
+
+        let mut doc = DocxWriter::new();
+        doc.add_ir_paragraph(&[Run { text: "see note".to_string(), ..Default::default() }], None);
+        doc.add_footnote(
+            1,
+            &[Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    hyperlink: Some("https://example.com/footnote-source".to_string()),
+                    ..TextSpan::plain("source")
+                })],
+                ..Default::default()
+            })],
+            None,
+        );
+        let mut buf = Cursor::new(Vec::new());
+        doc.write_to(&mut buf).unwrap();
+        buf.set_position(0);
+
+        let reopened = crate::docx::DocxDocument::from_reader(buf).unwrap();
+        let hl = reopened.footnotes[0].content.iter().find_map(|b| match b {
+            crate::docx::BlockElement::Paragraph(p) => p.content.iter().find_map(|c| match c {
+                crate::docx::ParagraphContent::Hyperlink(h) => match &h.target {
+                    crate::docx::HyperlinkTarget::External(url) => Some(url.clone()),
+                    crate::docx::HyperlinkTarget::Internal(_) => None,
+                },
+                _ => None,
+            }),
+            _ => None,
+        });
+        assert_eq!(
+            hl.as_deref(),
+            Some("https://example.com/footnote-source"),
+            "footnote hyperlink must round-trip to the real URL, not a dangling r:id, got {hl:?}"
         );
     }
 
