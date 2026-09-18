@@ -56,7 +56,9 @@ pub use headers::{
 pub use hyperlink::{Hyperlink, HyperlinkTarget};
 pub use image::{AnchorFrame, AnchorPosition, DrawingInfo, ShapeInfo, ShapeKind};
 pub use numbering::{NumberFormat, NumberingDefinitions};
-pub use paragraph::{BreakType, Paragraph, ParagraphContent, Run, RunContent};
+pub use paragraph::{
+    BreakType, FormField, FormFieldKind, Paragraph, ParagraphContent, Run, RunContent,
+};
 pub use styles::{Style, StyleSheet, StyleType};
 pub use table::{
     CellMargins, CellVAlign, RowHeightRule, Table, TableCell, TableProperties, TableRow,
@@ -335,10 +337,21 @@ impl DocxDocument {
             if !opc.has_part(&part) {
                 return Vec::new();
             }
-            match opc.read_part(&part) {
-                Ok(data) => parse_notes_part(&data, end).unwrap_or_default(),
-                Err(_) => Vec::new(),
+            let Ok(data) = opc.read_part(&part) else {
+                return Vec::new();
+            };
+            let mut notes = parse_notes_part(&data, end).unwrap_or_default();
+            // `r:id` is scoped per OPC part: a hyperlink inside a
+            // footnote/endnote/comment resolves against *that* part's
+            // `_rels`, not `document.xml.rels`. Resolving against the
+            // document's relationships left the raw `rIdN` string as the
+            // "URL" for every note hyperlink (issue #293).
+            if let Ok(note_rels) = opc.read_rels_for(&part) {
+                for n in &mut notes {
+                    resolve_hyperlinks(&mut n.content, &note_rels);
+                }
             }
+            notes
         };
         let footnotes = read_notes(rel_types::FOOTNOTES, b"footnote");
         let endnotes = read_notes(rel_types::ENDNOTES, b"endnote");
@@ -606,23 +619,125 @@ fn parse_block_elements_until(
     Ok(elements)
 }
 
-/// Collect every `<w:txbxContent>` body inside a VML `<w:pict>` / `<w:object>`
-/// subtree, reading through the matching closing tag.
-fn parse_text_boxes_in(
+/// Everything a legacy VML `<w:pict>` / `<w:object>` subtree can carry.
+///
+/// Only `<w:txbxContent>` used to be read, so a `w:pict` wrapping an
+/// image (#268), WordArt (#274) or an embedded package (#304) contributed
+/// nothing at all to the document.
+#[derive(Default)]
+struct VmlContent {
+    /// `<w:txbxContent>` bodies (text boxes).
+    boxes: Vec<Vec<BlockElement>>,
+    /// `<v:imagedata>` relationship ids with the enclosing shape's size.
+    images: Vec<(String, Emu, Emu)>,
+    /// `<v:textpath string="…">` values (WordArt).
+    wordart: Vec<String>,
+    /// `<o:OLEObject Type="Embed">` relationship ids.
+    ole_rids: Vec<String>,
+}
+
+impl VmlContent {
+    fn is_empty(&self) -> bool {
+        self.boxes.is_empty()
+            && self.images.is_empty()
+            && self.wordart.is_empty()
+            && self.ole_rids.is_empty()
+    }
+
+    fn merge(&mut self, other: VmlContent) {
+        self.boxes.extend(other.boxes);
+        self.images.extend(other.images);
+        self.wordart.extend(other.wordart);
+        self.ole_rids.extend(other.ole_rids);
+    }
+
+    /// Append this payload to a run's content in a stable order: WordArt
+    /// text, then images, then text boxes, then deferred packages.
+    fn push_into(self, out: &mut Vec<RunContent>) {
+        for s in self.wordart {
+            out.push(RunContent::Text(s));
+        }
+        for (rid, w, h) in self.images {
+            out.push(RunContent::Drawing(DrawingInfo {
+                relationship_id: rid,
+                description: None,
+                width: w,
+                height: h,
+                inline: true,
+                anchor_position: None,
+                shape: None,
+            }));
+        }
+        for b in self.boxes {
+            out.push(RunContent::TextBox(b));
+        }
+        for rid in self.ole_rids {
+            out.push(RunContent::DeferredPart(rid));
+        }
+    }
+}
+
+/// Read a VML `<v:shape style="width:191pt;height:88pt">` size. VML uses
+/// CSS-ish lengths, so the unit has to be honoured.
+fn vml_style_size(e: &quick_xml::events::BytesStart) -> Option<(Emu, Emu)> {
+    let style = xml::optional_attr_str(e, b"style").ok()??;
+    fn dim(style: &str, key: &str) -> Option<i64> {
+        // Match `width:` but not `mso-wrap-width:`; a leading `;` or the
+        // string start must precede it.
+        let mut rest = style;
+        loop {
+            let at = rest.find(key)?;
+            let ok = at == 0
+                || rest[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c == ';' || c.is_whitespace());
+            if ok {
+                let v = rest[at + key.len()..].trim();
+                let end = v
+                    .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+                    .unwrap_or(v.len());
+                let num: f64 = v[..end].parse().ok()?;
+                let unit = v[end..].trim();
+                // 1 pt = 12700 EMU; the rest convert through points.
+                let emu_per = match unit.trim_end_matches(|c: char| c == ';' || c.is_whitespace()) {
+                    "in" => 914_400.0,
+                    "cm" => 360_000.0,
+                    "mm" => 36_000.0,
+                    "px" => 9525.0,
+                    "pc" => 152_400.0,
+                    _ => 12_700.0,
+                };
+                return Some((num * emu_per) as i64);
+            }
+            rest = &rest[at + key.len()..];
+        }
+    }
+    let w = dim(&style, "width:").unwrap_or(0);
+    let h = dim(&style, "height:").unwrap_or(0);
+    if w == 0 && h == 0 {
+        None
+    } else {
+        Some((Emu(w), Emu(h)))
+    }
+}
+
+/// Collect the contents of a VML `<w:pict>` / `<w:object>` subtree,
+/// reading through the matching closing tag.
+fn parse_vml_content_in(
     reader: &mut quick_xml::Reader<&[u8]>,
     end_local: &[u8],
-) -> CoreResult<Vec<Vec<BlockElement>>> {
-    let mut boxes = Vec::new();
+) -> CoreResult<VmlContent> {
+    let mut out = VmlContent::default();
     let mut depth = 1i32;
+    // `<v:imagedata>` is a child of `<v:shape>`, which is where the
+    // display size lives.
+    let mut shape_size = (Emu(0), Emu(0));
+
     loop {
-        match reader.read_event()? {
-            Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"txbxContent" {
-                    boxes.push(parse_block_elements_until(reader, b"txbxContent")?);
-                } else {
-                    depth += 1;
-                }
-            },
+        let (e, is_start) = match reader.read_event()? {
+            Event::Start(e) => (e, true),
+            Event::Empty(e) => (e, false),
             Event::End(ref e) => {
                 if e.local_name().as_ref() == end_local && depth <= 1 {
                     break;
@@ -631,12 +746,56 @@ fn parse_text_boxes_in(
                 if depth <= 0 {
                     break;
                 }
+                continue;
             },
             Event::Eof => break,
+            _ => continue,
+        };
+        match e.local_name().as_ref() {
+            b"txbxContent" if is_start => {
+                out.boxes.push(parse_block_elements_until(reader, b"txbxContent")?);
+                // The subtree is fully consumed, so depth is unchanged.
+                continue;
+            },
+            b"shape" | b"rect" | b"roundrect" | b"oval" | b"line" | b"polyline" => {
+                if let Some(sz) = vml_style_size(&e) {
+                    shape_size = sz;
+                }
+            },
+            b"imagedata" => {
+                // Word writes `r:id`; some producers write `o:relid`.
+                let rid = xml::optional_attr_str(&e, b"r:id")?
+                    .or(xml::optional_attr_str(&e, b"o:relid")?)
+                    .map(|v| v.into_owned());
+                if let Some(rid) = rid.filter(|r| !r.is_empty()) {
+                    out.images.push((rid, shape_size.0, shape_size.1));
+                }
+            },
+            // WordArt keeps its text in an *attribute*, so neither the
+            // text-box nor the run path ever reached it.
+            b"textpath" => {
+                if let Some(s) = xml::optional_attr_str(&e, b"string")? {
+                    let s = s.into_owned();
+                    if !s.trim().is_empty() {
+                        out.wordart.push(s);
+                    }
+                }
+            },
+            b"OLEObject" => {
+                let embedded = xml::optional_attr_str(&e, b"Type")?
+                    .is_none_or(|t| t.eq_ignore_ascii_case("Embed"));
+                let rid = xml::optional_attr_str(&e, b"r:id")?.map(|v| v.into_owned());
+                if let Some(rid) = rid.filter(|_| embedded) {
+                    out.ole_rids.push(rid);
+                }
+            },
             _ => {},
         }
+        if is_start {
+            depth += 1;
+        }
     }
-    Ok(boxes)
+    Ok(out)
 }
 
 /// Parse `<mc:AlternateContent>`, taking the `<mc:Choice>` branch and
@@ -646,16 +805,14 @@ fn parse_text_boxes_in(
 /// Extracting both duplicated every text box's contents; extracting
 /// neither dropped them. `<mc:Fallback>` is used only when no `<mc:Choice>`
 /// yielded content.
-fn parse_alternate_content(
-    reader: &mut quick_xml::Reader<&[u8]>,
-) -> CoreResult<Vec<Vec<BlockElement>>> {
-    let mut chosen: Vec<Vec<BlockElement>> = Vec::new();
-    let mut fallback: Vec<Vec<BlockElement>> = Vec::new();
+fn parse_alternate_content(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<VmlContent> {
+    let mut chosen = VmlContent::default();
+    let mut fallback = VmlContent::default();
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"Choice" => chosen.extend(parse_text_boxes_in(reader, b"Choice")?),
-                b"Fallback" => fallback.extend(parse_text_boxes_in(reader, b"Fallback")?),
+                b"Choice" => chosen.merge(parse_vml_content_in(reader, b"Choice")?),
+                b"Fallback" => fallback.merge(parse_vml_content_in(reader, b"Fallback")?),
                 _ => xml::skip_element_fast(reader)?,
             },
             Event::End(ref e) if e.local_name().as_ref() == b"AlternateContent" => break,
@@ -806,16 +963,47 @@ fn resolve_hyperlinks(
         match elem {
             BlockElement::Paragraph(p) => {
                 for content in &mut p.content {
-                    if let ParagraphContent::Hyperlink(hl) = content {
-                        if let HyperlinkTarget::External(ref r_id) = hl.target {
-                            if let Some(rel) = rels.get_by_id(r_id) {
-                                if rel.target_mode == TargetMode::External {
-                                    hl.target = HyperlinkTarget::External(rel.target.clone());
-                                } else {
-                                    hl.target = HyperlinkTarget::Internal(rel.target.clone());
+                    match content {
+                        ParagraphContent::Hyperlink(hl) => {
+                            if let HyperlinkTarget::External(ref r_id) = hl.target {
+                                match rels.get_by_id(r_id) {
+                                    Some(rel) => {
+                                        // A `w:anchor` alongside `r:id` is a URI
+                                        // fragment of the resolved target.
+                                        let mut t = rel.target.clone();
+                                        if let Some(frag) =
+                                            hl.fragment.as_deref().filter(|f| !f.is_empty())
+                                        {
+                                            t.push('#');
+                                            t.push_str(frag);
+                                        }
+                                        hl.target = if rel.target_mode == TargetMode::External {
+                                            HyperlinkTarget::External(t)
+                                        } else {
+                                            HyperlinkTarget::Internal(t)
+                                        };
+                                    },
+                                    // Unresolvable relationship: a bare
+                                    // relationship id is not a URL. Fall back
+                                    // to the anchor when the element carried
+                                    // one rather than reporting `rIdN`.
+                                    None => {
+                                        if let Some(frag) =
+                                            hl.fragment.as_deref().filter(|f| !f.is_empty())
+                                        {
+                                            hl.target =
+                                                HyperlinkTarget::Internal(frag.to_string());
+                                        }
+                                    },
                                 }
                             }
-                        }
+                            for run in &mut hl.runs {
+                                resolve_hyperlinks_in_run(run, rels);
+                            }
+                        },
+                        ParagraphContent::Run(run) => {
+                            resolve_hyperlinks_in_run(run, rels);
+                        },
                     }
                 }
             },
@@ -826,6 +1014,16 @@ fn resolve_hyperlinks(
                     }
                 }
             },
+        }
+    }
+}
+
+/// Resolve hyperlinks nested inside a run's text-box bodies. Text-box
+/// prose is ordinary content and carries ordinary links.
+fn resolve_hyperlinks_in_run(run: &mut Run, rels: &crate::core::relationships::Relationships) {
+    for rc in &mut run.content {
+        if let RunContent::TextBox(blocks) = rc {
+            resolve_hyperlinks(blocks, rels);
         }
     }
 }
@@ -867,6 +1065,9 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
     // Depth of transparent wrappers we have descended into, so their
     // closing tags are consumed without ending the paragraph.
     let mut wrapper_depth = 0usize;
+    // Open complex fields (`{ HYPERLINK … }`). A field spans several runs,
+    // so it is stitched together here rather than inside `parse_run`.
+    let mut fields: Vec<OpenField> = Vec::new();
 
     loop {
         match reader.read_event()? {
@@ -875,14 +1076,54 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
                     paragraph.properties = Some(parse_paragraph_properties_fast(reader)?);
                 },
                 b"r" => {
-                    paragraph
-                        .content
-                        .push(ParagraphContent::Run(parse_run(reader)?));
+                    let mut parts = Vec::new();
+                    let run = parse_run(reader, &mut parts)?;
+                    apply_field_parts(&parts, &mut paragraph.content, &mut fields);
+                    if !run.content.is_empty() || run.properties.is_some() {
+                        paragraph.content.push(ParagraphContent::Run(run));
+                    }
                 },
                 b"hyperlink" => {
                     paragraph
                         .content
                         .push(ParagraphContent::Hyperlink(parse_hyperlink(reader, e)?));
+                },
+                // `w:fldSimple` is the one-element form of the same field
+                // mechanism; its `w:instr` attribute holds the URL of a
+                // HYPERLINK field (issue #267). Other field types keep the
+                // existing transparent-wrapper behaviour.
+                b"fldSimple" => {
+                    let target = xml::optional_attr_str(e, b"w:instr")?
+                        .as_deref()
+                        .and_then(hyperlink_target_from_instr);
+                    match target {
+                        Some(target) => {
+                            let runs = collect_runs_until(reader, b"fldSimple")?;
+                            paragraph.content.push(ParagraphContent::Hyperlink(Hyperlink {
+                                target,
+                                fragment: None,
+                                tooltip: None,
+                                runs,
+                            }));
+                        },
+                        None => wrapper_depth += 1,
+                    }
+                },
+                // OMML equations: no structural model, but every `<m:t>`
+                // inside one is real, visible text (issue #270).
+                b"oMath" | b"oMathPara" => {
+                    let end: &[u8] = if e.local_name().as_ref() == b"oMathPara" {
+                        b"oMathPara"
+                    } else {
+                        b"oMath"
+                    };
+                    let text = collect_omml_text(reader, end)?;
+                    if !text.is_empty() {
+                        paragraph.content.push(ParagraphContent::Run(Run {
+                            properties: None,
+                            content: vec![RunContent::Text(text)],
+                        }));
+                    }
                 },
                 b"del" | b"moveFrom" => {
                     // Tracked deletions are not document content.
@@ -915,7 +1156,27 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
     Ok(paragraph)
 }
 
-fn parse_run(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Run> {
+/// One part of a complex field (`{ HYPERLINK "…" }`), reported out of
+/// `parse_run` so the enclosing paragraph can stitch the sequence back
+/// together: the instruction and the display runs live in *different*
+/// runs, so neither alone can resolve the field.
+#[derive(Debug, Clone)]
+enum FieldPart {
+    /// `<w:fldChar w:fldCharType="begin"/>`.
+    Begin,
+    /// `<w:fldChar w:fldCharType="separate"/>` — the field result starts.
+    Separate,
+    /// `<w:fldChar w:fldCharType="end"/>`.
+    End,
+    /// `<w:instrText>` content (a field's instruction is often split
+    /// across several runs, so these accumulate).
+    Instr(String),
+}
+
+fn parse_run(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    fields: &mut Vec<FieldPart>,
+) -> CoreResult<Run> {
     let mut run = Run::default();
 
     loop {
@@ -955,18 +1216,42 @@ fn parse_run(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Run> {
                 },
                 // VML shapes (`<w:pict>`) and the compatibility wrapper
                 // (`<mc:AlternateContent>`) are the other two places a text
-                // box hides. `parse_text_boxes_in` also resolves
+                // box hides. `parse_vml_content_in` also resolves
                 // AlternateContent to its `<mc:Choice>` branch so shape text
-                // is not extracted twice (once per branch).
+                // is not extracted twice (once per branch), and picks up the
+                // *other* payloads a VML shape can carry: legacy images
+                // (issue #268), WordArt (#274) and embedded packages (#304).
                 b"pict" | b"object" => {
-                    for b in parse_text_boxes_in(reader, b"pict")? {
-                        run.content.push(RunContent::TextBox(b));
-                    }
+                    let end: &[u8] = if e.local_name().as_ref() == b"object" {
+                        b"object"
+                    } else {
+                        b"pict"
+                    };
+                    parse_vml_content_in(reader, end)?.push_into(&mut run.content);
                 },
                 b"AlternateContent" => {
-                    for b in parse_alternate_content(reader)? {
-                        run.content.push(RunContent::TextBox(b));
+                    parse_alternate_content(reader)?.push_into(&mut run.content);
+                },
+                // A note's reference mark. The mark *is* content: it is
+                // where the note is cited (issue #241).
+                b"footnoteReference" | b"endnoteReference" | b"commentReference" => {
+                    push_note_reference(e, &mut run.content)?;
+                    xml::skip_element_fast(reader)?;
+                },
+                // Complex field codes. The `begin` char also carries
+                // `<w:ffData>` for legacy form fields, whose state exists
+                // nowhere else in the document (issue #276).
+                b"fldChar" => {
+                    fields.push(fld_char_part(e)?);
+                    if let Some(mut ff) = parse_fld_char_body(reader)? {
+                        ff.display_text = ff.value_text();
+                        run.content.push(RunContent::FormField(ff));
                     }
+                },
+                // The field instruction — for a HYPERLINK field this holds
+                // the URL, which was previously unreachable (issue #267).
+                b"instrText" => {
+                    fields.push(FieldPart::Instr(xml::read_text_content_fast(reader)?));
                 },
                 // `<w:sym>` carries its character in the `w:char` attribute
                 // as a hex code point, usually in the Wingdings private-use
@@ -1034,6 +1319,12 @@ fn parse_run(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Run> {
                         run.content.push(RunContent::Text(c.to_string()));
                     }
                 },
+                b"footnoteReference" | b"endnoteReference" | b"commentReference" => {
+                    push_note_reference(e, &mut run.content)?;
+                },
+                b"fldChar" => {
+                    fields.push(fld_char_part(e)?);
+                },
                 _ => {},
             },
             Event::End(ref e) if e.local_name().as_ref() == b"r" => {
@@ -1046,6 +1337,208 @@ fn parse_run(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Run> {
     Ok(run)
 }
 
+/// Push the `RunContent` for a `w:footnoteReference` /
+/// `w:endnoteReference` / `w:commentReference` mark.
+fn push_note_reference(
+    e: &quick_xml::events::BytesStart,
+    out: &mut Vec<RunContent>,
+) -> CoreResult<()> {
+    let id: u32 = xml::optional_attr_str(e, b"w:id")?
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .map(|v| v.max(0) as u32)
+        .unwrap_or(0);
+    out.push(match e.local_name().as_ref() {
+        b"footnoteReference" => RunContent::FootnoteRef(id),
+        b"endnoteReference" => RunContent::EndnoteRef(id),
+        _ => RunContent::CommentRef(id),
+    });
+    Ok(())
+}
+
+/// Map a `<w:fldChar w:fldCharType="…">` onto its field part. An absent or
+/// unrecognised type is treated as `begin`, which is what Word writes when
+/// the attribute is omitted.
+fn fld_char_part(e: &quick_xml::events::BytesStart) -> CoreResult<FieldPart> {
+    Ok(match xml::optional_attr_str(e, b"w:fldCharType")?.as_deref() {
+        Some("separate") => FieldPart::Separate,
+        Some("end") => FieldPart::End,
+        _ => FieldPart::Begin,
+    })
+}
+
+/// Read the children of a non-empty `<w:fldChar>`, returning the
+/// `<w:ffData>` form-field state when it carries one.
+fn parse_fld_char_body(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<FormField>> {
+    let mut form = None;
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => {
+                if e.local_name().as_ref() == b"ffData" {
+                    form = Some(parse_ff_data(reader)?);
+                } else {
+                    xml::skip_element_fast(reader)?;
+                }
+            },
+            Event::End(ref e) if e.local_name().as_ref() == b"fldChar" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(form)
+}
+
+/// Parse `<w:ffData>`: the checkbox state, the dropdown option list and
+/// selection, or the text field's default value. Reads through
+/// `</w:ffData>`.
+fn parse_ff_data(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<FormField> {
+    // Which `w:ffData` child we are inside: `w:default` means a different
+    // thing in each (a checkbox's initial state, a dropdown's index, a text
+    // field's value).
+    #[derive(PartialEq)]
+    enum Kind {
+        None,
+        CheckBox,
+        DdList,
+        TextInput,
+    }
+
+    let mut name = None;
+    let mut kind = Kind::None;
+    let mut checked: Option<bool> = None;
+    let mut cb_default = false;
+    let mut entries: Vec<String> = Vec::new();
+    let mut selected = 0usize;
+    let mut text_default: Option<String> = None;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) | Event::Empty(ref e) => {
+                let val = xml::optional_attr_str(e, b"w:val")?.map(|v| v.into_owned());
+                match e.local_name().as_ref() {
+                    b"name" => name = val,
+                    b"checkBox" => kind = Kind::CheckBox,
+                    b"ddList" => kind = Kind::DdList,
+                    b"textInput" => kind = Kind::TextInput,
+                    b"checked" => checked = Some(xml::parse_toggle(e, b"w:val")),
+                    b"listEntry" => entries.push(val.unwrap_or_default()),
+                    b"result" => {
+                        if let Some(v) = val.as_deref().and_then(|v| v.trim().parse::<usize>().ok())
+                        {
+                            selected = v;
+                        }
+                    },
+                    b"default" => match kind {
+                        Kind::CheckBox => cb_default = xml::parse_toggle(e, b"w:val"),
+                        Kind::DdList => {
+                            if let Some(v) =
+                                val.as_deref().and_then(|v| v.trim().parse::<usize>().ok())
+                            {
+                                selected = v;
+                            }
+                        },
+                        Kind::TextInput => text_default = val,
+                        Kind::None => {},
+                    },
+                    _ => {},
+                }
+            },
+            Event::End(ref e) if e.local_name().as_ref() == b"ffData" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+
+    Ok(FormField {
+        name,
+        kind: match kind {
+            Kind::CheckBox => FormFieldKind::CheckBox {
+                checked: checked.unwrap_or(cb_default),
+            },
+            Kind::DdList => FormFieldKind::DropDown { entries, selected },
+            Kind::TextInput => FormFieldKind::TextInput {
+                default: text_default,
+            },
+            Kind::None => FormFieldKind::Unknown,
+        },
+        display_text: None,
+    })
+}
+
+/// Split a field instruction into quote-aware tokens:
+/// `HYPERLINK "http://x" \l "frag"` → `[HYPERLINK, http://x, \l, frag]`.
+fn field_instr_tokens(instr: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    for c in instr.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                if !quoted {
+                    out.push(std::mem::take(&mut cur));
+                }
+            },
+            c if c.is_whitespace() && !quoted => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            },
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Resolve a `HYPERLINK` field instruction into a hyperlink target.
+///
+/// `HYPERLINK "https://x" \l "frag"` → external `https://x#frag`;
+/// `HYPERLINK \l "bookmark"` → internal `bookmark`. Returns `None` for
+/// every other field type (PAGE, TOC, REF, …), whose display text already
+/// survives as an ordinary run.
+fn hyperlink_target_from_instr(instr: &str) -> Option<HyperlinkTarget> {
+    let tokens = field_instr_tokens(instr);
+    let (first, rest) = tokens.split_first()?;
+    if !first.eq_ignore_ascii_case("HYPERLINK") {
+        return None;
+    }
+    let mut url: Option<String> = None;
+    let mut anchor: Option<String> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        let tok = &rest[i];
+        if let Some(switch) = tok.strip_prefix('\\') {
+            // `\l` takes the sub-address; `\o`/`\t` take an argument we
+            // do not model; `\n`/`\h`/`\m` take none.
+            let takes_arg = matches!(switch, "l" | "o" | "t" | "L" | "O" | "T");
+            if takes_arg {
+                if let Some(arg) = rest.get(i + 1) {
+                    if switch.eq_ignore_ascii_case("l") {
+                        anchor = Some(arg.clone());
+                    }
+                    i += 1;
+                }
+            }
+        } else if url.is_none() {
+            url = Some(tok.clone());
+        }
+        i += 1;
+    }
+    match (url, anchor) {
+        (Some(mut u), anchor) => {
+            if let Some(a) = anchor.filter(|a| !a.is_empty()) {
+                u.push('#');
+                u.push_str(&a);
+            }
+            Some(HyperlinkTarget::External(u))
+        },
+        (None, Some(a)) => Some(HyperlinkTarget::Internal(a)),
+        (None, None) => None,
+    }
+}
+
 fn parse_hyperlink(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
@@ -1055,15 +1548,38 @@ fn parse_hyperlink(
     let anchor = xml::optional_attr_str(start, b"w:anchor")?.map(|v| v.into_owned());
     let tooltip = xml::optional_attr_str(start, b"w:tooltip")?.map(|v| v.into_owned());
 
-    let target = if let Some(anchor) = anchor {
-        HyperlinkTarget::Internal(anchor)
-    } else if let Some(r_id) = r_id {
-        // Will be resolved to actual URL after parsing via resolve_hyperlinks()
-        HyperlinkTarget::External(r_id)
-    } else {
-        HyperlinkTarget::Internal(String::new())
+    // `r:id` wins when both attributes are present: ECMA-376 makes
+    // `w:anchor` a *fragment* of the relationship's target in that case
+    // (`externalURL#fragment`). Taking the anchor branch unconditionally
+    // discarded the real URL and left a dead same-document reference
+    // behind — the single most prevalent hyperlink defect in the corpus
+    // (issues #242, #292). The anchor is kept in `fragment` and appended
+    // by `resolve_hyperlinks` once the relationship is known.
+    let (target, fragment) = match (r_id, anchor) {
+        // Will be resolved to the actual URL after parsing via
+        // `resolve_hyperlinks()`.
+        (Some(r_id), anchor) => (HyperlinkTarget::External(r_id), anchor),
+        (None, Some(anchor)) => (HyperlinkTarget::Internal(anchor), None),
+        (None, None) => (HyperlinkTarget::Internal(String::new()), None),
     };
 
+    let runs = collect_runs_until(reader, b"hyperlink")?;
+
+    Ok(Hyperlink {
+        target,
+        fragment,
+        tooltip,
+        runs,
+    })
+}
+
+/// Collect the `<w:r>` children of an inline container, reading through
+/// the matching `</end_local>`. Shared by `w:hyperlink` and the
+/// `w:fldSimple` HYPERLINK path.
+fn collect_runs_until(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    end_local: &[u8],
+) -> CoreResult<Vec<Run>> {
     let mut runs = Vec::new();
     loop {
         match reader.read_event()? {
@@ -1074,19 +1590,14 @@ fn parse_hyperlink(
                     xml::skip_element_fast(reader)?;
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"hyperlink" => {
+            Event::End(ref e) if e.local_name().as_ref() == end_local => {
                 break;
             },
             Event::Eof => break,
             _ => {},
         }
     }
-
-    Ok(Hyperlink {
-        target,
-        tooltip,
-        runs,
-    })
+    Ok(runs)
 }
 
 // ---------------------------------------------------------------------------
