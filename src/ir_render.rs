@@ -1,23 +1,33 @@
 use crate::ir::*;
 
-/// How `to_markdown_with` should represent embedded images.
+/// How `to_markdown_with` / `to_html_with` should represent embedded images.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ImageEmbed {
     /// Render the image's description, or nothing when it has none.
-    /// This is what plain `to_markdown` does.
+    /// This is what plain `to_markdown` and `to_html` do.
     #[default]
     None,
-    /// Emit `[image-base64:<data>]` at the image's position in the flow.
+    /// Emit the image bytes inline at the image's position in the flow:
+    /// `[image-base64:<data>]` in markdown, `<img src="data:…;base64,…">`
+    /// in HTML.
     ///
     /// Keeps both the position and the content in one self-contained
     /// string, which is what a vision-capable model consuming the markdown
-    /// needs — images were otherwise dropped entirely.
+    /// — or a browser opening the HTML with no sidecar files — needs;
+    /// images were otherwise dropped entirely.
     Base64,
 }
 
 /// Options for [`DocumentIR::to_markdown_with`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MarkdownOptions {
+    /// How to represent embedded images.
+    pub image_embed: ImageEmbed,
+}
+
+/// Options for [`DocumentIR::to_html_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HtmlOptions {
     /// How to represent embedded images.
     pub image_embed: ImageEmbed,
 }
@@ -30,6 +40,13 @@ thread_local! {
     /// of them purely to reach the single `Element::Image` arm.
     static MARKDOWN_OPTIONS: std::cell::Cell<MarkdownOptions> =
         const { std::cell::Cell::new(MarkdownOptions {
+            image_embed: ImageEmbed::None,
+        }) };
+
+    /// Rendering options for the current `to_html_with` call; same
+    /// reasoning as `MARKDOWN_OPTIONS`.
+    static HTML_OPTIONS: std::cell::Cell<HtmlOptions> =
+        const { std::cell::Cell::new(HtmlOptions {
             image_embed: ImageEmbed::None,
         }) };
 }
@@ -59,6 +76,27 @@ fn base64_encode(data: &[u8]) -> String {
         });
     }
     out
+}
+
+/// The media type to put in an image's `data:` URI.
+///
+/// `Image::format` is authoritative when the converter set it; otherwise the
+/// bytes are sniffed, because a data URI with the wrong (or a generic) type
+/// does not render. `None` means "do not emit a data URI for this image" —
+/// the caller falls back to describing it.
+fn image_mime(img: &Image) -> Option<&'static str> {
+    if let Some(ref fmt) = img.format {
+        return Some(fmt.content_type());
+    }
+    let data = img.data.as_deref()?;
+    Some(match data {
+        [0x89, b'P', b'N', b'G', ..] => "image/png",
+        [0xFF, 0xD8, 0xFF, ..] => "image/jpeg",
+        [b'G', b'I', b'F', b'8', ..] => "image/gif",
+        [b'B', b'M', ..] => "image/bmp",
+        [0x49, 0x49, 0x2A, 0x00, ..] | [0x4D, 0x4D, 0x00, 0x2A, ..] => "image/tiff",
+        _ => return None,
+    })
 }
 
 /// Plain-text marker for a page, slide or thematic boundary.
@@ -177,20 +215,38 @@ mod block_default {
                 super::render_elements_html(&n.content).join("\n")
             },
             Element::PageBreak | Element::ColumnBreak | Element::Shape(_) => String::new(),
-            // `src` is required on `<img>`; an element without one is
-            // invalid HTML. With no addressable source in the IR, describe
-            // the image with its alt text instead.
-            Element::Image(img) => match img.alt_text.as_deref() {
-                Some(alt) if !alt.is_empty() => {
-                    let mut out = String::new();
-                    let _ = write!(
-                        out,
-                        "<figure><figcaption>{}</figcaption></figure>",
-                        super::escape_html(alt)
-                    );
-                    out
-                },
-                _ => String::new(),
+            Element::Image(img) => {
+                // With `ImageEmbed::Base64` the bytes go inline as a data
+                // URI, so the HTML is self-contained — `to_html` otherwise
+                // has no way at all to show an image.
+                if super::HTML_OPTIONS.with(|o| o.get().image_embed) == ImageEmbed::Base64 {
+                    if let (Some(data), Some(mime)) = (img.data.as_ref(), super::image_mime(img)) {
+                        let alt = img.alt_text.as_deref().unwrap_or("");
+                        let mut out = String::new();
+                        let _ = write!(
+                            out,
+                            "<img src=\"data:{mime};base64,{}\" alt=\"{}\" />",
+                            super::base64_encode(data),
+                            super::escape_html(alt)
+                        );
+                        return out;
+                    }
+                }
+                // `src` is required on `<img>`; an element without one is
+                // invalid HTML. With no addressable source in the IR,
+                // describe the image with its alt text instead.
+                match img.alt_text.as_deref() {
+                    Some(alt) if !alt.is_empty() => {
+                        let mut out = String::new();
+                        let _ = write!(
+                            out,
+                            "<figure><figcaption>{}</figcaption></figure>",
+                            super::escape_html(alt)
+                        );
+                        out
+                    },
+                    _ => String::new(),
+                }
             },
             Element::Heading(_)
             | Element::Paragraph(_)
@@ -219,12 +275,24 @@ impl DocumentIR {
 
     /// Render the IR as an HTML fragment (no `<html>`/`<body>` wrapper).
     pub fn to_html(&self) -> String {
+        self.to_html_with(HtmlOptions::default())
+    }
+
+    /// Render the IR as an HTML fragment with explicit options.
+    ///
+    /// With [`ImageEmbed::Base64`] each image whose bytes the IR carries is
+    /// emitted as an `<img src="data:…;base64,…">`, giving a genuinely
+    /// self-contained preview — the mirror of `to_markdown_with`'s existing
+    /// image-embedding option.
+    pub fn to_html_with(&self, options: HtmlOptions) -> String {
+        HTML_OPTIONS.with(|o| o.set(options));
         let section_texts: Vec<String> = self
             .sections
             .iter()
             .map(render_section_html)
             .filter(|s| !s.is_empty())
             .collect();
+        HTML_OPTIONS.with(|o| o.set(HtmlOptions::default()));
         section_texts.join("\n<hr />\n")
     }
 
@@ -1340,6 +1408,63 @@ mod tests {
         assert!(html.contains("<ol>"));
         assert!(html.contains("<li><p>First</p></li>"));
         assert!(html.contains("<li><p>Second</p></li>"));
+    }
+
+    /// #318: `to_html()` had no image-embedding option at all, so an image
+    /// never reached the HTML surface — only a `<figcaption>` when it
+    /// happened to carry alt text.
+    #[test]
+    fn test_html_image_base64_embedding() {
+        // A one-pixel PNG's magic bytes are enough: the renderer only needs
+        // a media type and the bytes.
+        let png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x01, 0x02];
+        let ir = simple_ir(vec![Element::Image(Image {
+            alt_text: Some("A <chart>".into()),
+            data: Some(png.clone()),
+            ..Default::default()
+        })]);
+
+        // Default behaviour is unchanged: a caption, no image data.
+        let plain = ir.to_html();
+        assert!(plain.contains("<figcaption>"), "{plain}");
+        assert!(!plain.contains("<img"), "{plain}");
+
+        let embedded = ir.to_html_with(HtmlOptions {
+            image_embed: ImageEmbed::Base64,
+        });
+        assert!(embedded.contains("<img src=\"data:image/png;base64,"), "{embedded}");
+        assert!(embedded.contains(&base64_encode(&png)), "{embedded}");
+        // Alt text is escaped, not injected.
+        assert!(embedded.contains("alt=\"A &lt;chart&gt;\""), "{embedded}");
+
+        // `format` is authoritative when the converter set it.
+        let jpeg = simple_ir(vec![Element::Image(Image {
+            data: Some(vec![0x00, 0x01, 0x02]),
+            format: Some(ImageFormat::Jpeg),
+            ..Default::default()
+        })]);
+        assert!(
+            jpeg.to_html_with(HtmlOptions {
+                image_embed: ImageEmbed::Base64,
+            })
+            .contains("data:image/jpeg;base64,"),
+        );
+
+        // Unknown bytes with no declared format fall back rather than
+        // emitting a data URI a browser cannot render.
+        let unknown = simple_ir(vec![Element::Image(Image {
+            alt_text: Some("mystery".into()),
+            data: Some(vec![0x00, 0x01, 0x02, 0x03]),
+            ..Default::default()
+        })]);
+        let html = unknown.to_html_with(HtmlOptions {
+            image_embed: ImageEmbed::Base64,
+        });
+        assert!(!html.contains("<img"), "{html}");
+        assert!(html.contains("mystery"), "{html}");
+
+        // The option does not leak into a later default render.
+        assert!(!ir.to_html().contains("<img"));
     }
 
     /// #317: numId fragmentation splits visually-continuous bullets into one
