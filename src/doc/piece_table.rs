@@ -352,20 +352,141 @@ fn cp1252_to_char(b: u8) -> char {
     }
 }
 
+/// A `HYPERLINK` field's display-text span, as a byte range into the string
+/// [`sanitize_text_with_hyperlinks`] returned it alongside, paired with the
+/// URL parsed from the field's own instruction text (issue #249).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HyperlinkSpan {
+    pub range: std::ops::Range<usize>,
+    pub url: String,
+}
+
 /// Convert special Word characters to readable text.
+///
+/// A `.doc` field ([MS-DOC] §2.8.24 — `0x13` begin, `0x14` separator,
+/// `0x15` end) has BOTH its instruction text (`HYPERLINK "url" \o "tip"`,
+/// `DATE \@ "..."`, …) and its cached result between the boundary markers.
+/// Only the cached result — the part between `0x14` and `0x15` — is what
+/// Word itself displays; the instruction text must be dropped entirely,
+/// not just the three boundary characters around it (issue #249).
 pub fn sanitize_text(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
+    strip_fields(text).0
+}
+
+/// As [`sanitize_text`], but also returns each `HYPERLINK` field's display
+/// text as a [`HyperlinkSpan`] (byte range in the *returned* string) paired
+/// with its target URL, so a caller building structured inline content can
+/// attach `TextSpan::hyperlink` to exactly that span (issue #249).
+pub fn sanitize_text_with_hyperlinks(text: &str) -> (String, Vec<HyperlinkSpan>) {
+    strip_fields(text)
+}
+
+/// Shared implementation for [`sanitize_text`] / [`sanitize_text_with_hyperlinks`].
+///
+/// A `depth` counter tracks field nesting (a field's instruction can itself
+/// contain another field, e.g. `{ IF {PAGE} > 1 "yes" "no" }`) so an inner
+/// field's own `0x14`/`0x15` never gets mistaken for the outer field's.
+/// Only the OUTERMOST field's own separator/end are meaningful here: its
+/// instruction text (which may itself contain nested fields) is dropped in
+/// full, and its cached result becomes visible text.
+fn strip_fields(text: &str) -> (String, Vec<HyperlinkSpan>) {
+    let mut out = String::with_capacity(text.len());
+    let mut hyperlinks = Vec::new();
+
+    let mut depth: u32 = 0;
+    let mut in_result = false; // past the outermost field's own 0x14
+    let mut instruction = String::new(); // outermost field's instruction text
+    let mut result_start: usize = 0; // byte offset in `out` where the result began
+
     for ch in text.chars() {
         match ch {
-            '\r' => result.push('\n'),                        // Paragraph mark
-            '\x07' => result.push('\t'),                      // Cell/row mark → tab
-            '\x0C' => result.push('\n'),                      // Page break / section break
-            '\x0B' => result.push('\n'),                      // Vertical tab → newline
-            '\x01' | '\x08' | '\x13' | '\x14' | '\x15' => {}, // Field codes, picture, etc. — skip
-            _ => result.push(ch),
+            '\x13' => {
+                depth += 1;
+                if depth == 1 {
+                    instruction.clear();
+                }
+            },
+            // A stray separator (depth == 0) or a nested field's own
+            // separator (depth > 1) is never a boundary that matters here
+            // — dropped either way, same as every other field control char.
+            '\x14' => {
+                if depth == 1 {
+                    in_result = true;
+                    result_start = out.len();
+                }
+            },
+            '\x15' => {
+                if depth >= 1 {
+                    if depth == 1 {
+                        if in_result {
+                            if let Some(url) = parse_hyperlink_url(&instruction) {
+                                hyperlinks.push(HyperlinkSpan {
+                                    range: result_start..out.len(),
+                                    url,
+                                });
+                            }
+                        }
+                        in_result = false;
+                    }
+                    depth -= 1;
+                }
+            },
+            '\x01' | '\x08' => {}, // Picture placeholder, historic field-mark — always skip
+            _ => {
+                if depth == 0 {
+                    push_mapped(ch, &mut out);
+                } else if depth == 1 && !in_result {
+                    instruction.push(ch); // outermost instruction text
+                } else if depth == 1 && in_result {
+                    push_mapped(ch, &mut out); // outermost cached result
+                }
+                // depth > 1: nested field's own instruction/result — never visible.
+            },
         }
     }
-    result
+
+    (out, hyperlinks)
+}
+
+/// Apply `sanitize_text`'s non-field control-character mappings to a single
+/// character and push the result onto `out`.
+fn push_mapped(ch: char, out: &mut String) {
+    match ch {
+        '\r' => out.push('\n'),   // Paragraph mark
+        '\x07' => out.push('\t'), // Cell/row mark → tab
+        '\x0C' => out.push('\n'), // Page break / section break
+        '\x0B' => out.push('\n'), // Vertical tab → newline
+        _ => out.push(ch),
+    }
+}
+
+/// Parse a `HYPERLINK` field's instruction text for its target URL.
+///
+/// Handles the common external-URL shape (`HYPERLINK "http://..."`) and the
+/// internal-bookmark shape (`HYPERLINK \l "bookmark"`, surfaced as
+/// `#bookmark`). Returns `None` for any other field type or a `HYPERLINK`
+/// field whose instruction has no quoted argument at all.
+fn parse_hyperlink_url(instruction: &str) -> Option<String> {
+    let trimmed = instruction.trim_start();
+    let after_kw = trimmed.strip_prefix("HYPERLINK").or_else(|| {
+        // Word's own writer always uppercases the keyword, but tolerate a
+        // lowercase one rather than silently missing a real hyperlink.
+        let first_word_len = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+        let (first, rest) = trimmed.split_at(first_word_len);
+        first.eq_ignore_ascii_case("HYPERLINK").then_some(rest)
+    })?;
+
+    let quote_start = after_kw.find('"')?;
+    let after_quote = &after_kw[quote_start + 1..];
+    let quote_end = after_quote.find('"')?;
+    let target = &after_quote[..quote_end];
+
+    let before_quote = after_kw[..quote_start].trim_end();
+    if before_quote.ends_with("\\l") {
+        Some(format!("#{target}"))
+    } else {
+        Some(target.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -491,9 +612,59 @@ mod tests {
         assert_eq!(sanitize_text("A\x07B"), "A\tB");
     }
 
+    /// issue #249 — the instruction text between `0x13` and `0x14` is
+    /// never visible in Word; only the cached result (between `0x14` and
+    /// `0x15`) is. The old behaviour kept both, mashed together.
     #[test]
     fn sanitize_field_codes_stripped() {
-        assert_eq!(sanitize_text("before\x13FIELD\x14result\x15after"), "beforeFIELDresultafter");
+        assert_eq!(sanitize_text("before\x13FIELD\x14result\x15after"), "beforeresultafter");
+    }
+
+    /// The real corpus shape from `hyperlink.doc` (issue #249): a
+    /// `HYPERLINK` field's instruction and quoted URL must vanish from
+    /// visible text, its cached display text must survive, and the URL
+    /// must be recovered as a `HyperlinkSpan` over exactly that text.
+    #[test]
+    fn hyperlink_field_strips_instruction_and_yields_url_span() {
+        let raw = "Before text; \x13 HYPERLINK \"http://testuri.org/\" \x14Hyperlink text\x15; after text";
+        let (text, links) = sanitize_text_with_hyperlinks(raw);
+        assert_eq!(text, "Before text; Hyperlink text; after text");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url, "http://testuri.org/");
+        assert_eq!(&text[links[0].range.clone()], "Hyperlink text");
+    }
+
+    /// A `\l` switch targets an internal bookmark, not an external URL —
+    /// surfaced as a `#bookmark`-shaped target the way a browser-style
+    /// consumer would expect.
+    #[test]
+    fn hyperlink_field_with_bookmark_switch_gets_hash_prefix() {
+        let raw = "\x13 HYPERLINK \\l \"SectionTwo\" \x14Jump to Section Two\x15";
+        let (text, links) = sanitize_text_with_hyperlinks(raw);
+        assert_eq!(text, "Jump to Section Two");
+        assert_eq!(links[0].url, "#SectionTwo");
+    }
+
+    /// A non-`HYPERLINK` field (e.g. `CREATEDATE`) must still have its
+    /// instruction text stripped, but must never produce a hyperlink span.
+    #[test]
+    fn non_hyperlink_field_produces_no_hyperlink_span() {
+        let raw = "\x13 CREATEDATE   \\* MERGEFORMAT \x1419/11/2010 14:49:00\x15";
+        let (text, links) = sanitize_text_with_hyperlinks(raw);
+        assert_eq!(text, "19/11/2010 14:49:00");
+        assert!(links.is_empty(), "a CREATEDATE field must never yield a hyperlink span");
+    }
+
+    /// A field nested inside another field's instruction (e.g. `{ IF
+    /// {PAGE} > 1 "yes" "no" }`) must not have its own `0x14`/`0x15`
+    /// mistaken for the outer field's boundary — the whole nested field is
+    /// swallowed as part of the outer instruction, and only the outer
+    /// field's own cached result becomes visible.
+    #[test]
+    fn nested_field_does_not_confuse_the_outer_fields_boundary() {
+        let raw = "\x13 IF \x13 PAGE \x141\x15 > 1 \"yes\" \"no\" \x14no\x15";
+        let text = sanitize_text(raw);
+        assert_eq!(text, "no");
     }
 
     #[test]
@@ -733,11 +904,13 @@ mod tests {
     /// documented replacement, including the field-code markers it strips.
     #[test]
     fn sanitize_all_control_marks() {
-        assert_eq!(sanitize_text("A\x01B"), "AB"); // field begin stripped
-        assert_eq!(sanitize_text("A\x08B"), "AB"); // field separator stripped
-        assert_eq!(sanitize_text("A\x13B"), "AB"); // field begin
-        assert_eq!(sanitize_text("A\x14B"), "AB"); // field separator
-        assert_eq!(sanitize_text("A\x15B"), "AB"); // field end
+        assert_eq!(sanitize_text("A\x01B"), "AB"); // picture placeholder stripped
+        assert_eq!(sanitize_text("A\x08B"), "AB"); // historic field-mark stripped
+        // An unclosed field (issue #249): "B" is instruction text with no
+        // matching separator/end, so it's never promoted to visible output.
+        assert_eq!(sanitize_text("A\x13B"), "A");
+        assert_eq!(sanitize_text("A\x14B"), "AB"); // stray separator (no open field): dropped, "B" is plain text
+        assert_eq!(sanitize_text("A\x15B"), "AB"); // stray end (no open field): dropped, "B" is plain text
         assert_eq!(sanitize_text("A\x0BB"), "A\nB"); // vertical tab -> newline
     }
 }

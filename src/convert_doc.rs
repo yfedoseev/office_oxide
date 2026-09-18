@@ -1,4 +1,4 @@
-use crate::doc::{DocDocument, DocParagraph, TapCellInfo, TapInfo};
+use crate::doc::{DocDocument, DocParagraph, HyperlinkSpan, TapCellInfo, TapInfo};
 use crate::format::DocumentFormat;
 use crate::ir::*;
 
@@ -181,7 +181,7 @@ impl TableBuilder {
         self.ensure_open();
         if !p.text.is_empty() {
             self.cell.push(Element::Paragraph(Paragraph {
-                content: inline_content_for(&p.text),
+                content: inline_content_for(&p.text, &p.hyperlinks),
                 // `tabs` is always empty in the tables-only build (it is
                 // populated by the list/tab-stop PR); cloning keeps the IR
                 // shape uniform with the list path.
@@ -470,25 +470,25 @@ fn walk_paragraphs(
             // the IR at all (issue #223).
             table.flush(elements);
             flush_list(&mut list_items, elements);
-            emit_heading(&p.text, lvl + 1, elements);
+            emit_heading(&p.text, lvl + 1, elements, &p.hyperlinks);
         } else if is_doc_list_item(p.props.ilfo) {
             // List membership is keyed on `ilfo` (sprmPIlfo, `0x460B`), not on
             // `ilvl`: per [MS-DOC] §2.4.6.3 a paragraph is a list item only when
             // its `ilfo` is a valid list index. `ilvl` still drives nesting.
             table.flush(elements);
             let ilvl = p.props.ilvl.unwrap_or(0);
-            list_items.push((ilvl, inline_content_for(&p.text)));
+            list_items.push((ilvl, inline_content_for(&p.text, &p.hyperlinks)));
         } else {
             table.flush(elements);
             flush_list(&mut list_items, elements);
             if has_structured_headings {
                 elements.push(Element::Paragraph(Paragraph {
-                    content: inline_content_for(&p.text),
+                    content: inline_content_for(&p.text, &p.hyperlinks),
                     tabs: p.props.tabs.clone(),
                     ..Default::default()
                 }));
             } else {
-                emit_prose(&p.text, &p.props.tabs, elements);
+                emit_prose(&p.text, &p.props.tabs, elements, &p.hyperlinks);
             }
         }
     }
@@ -518,12 +518,17 @@ fn flush_list(items: &mut Vec<(u8, Vec<InlineContent>)>, elements: &mut Vec<Elem
 /// within a single structured paragraph's inner text that is the only source
 /// of `'\n'`, so each `'\n'` becomes an `InlineContent::LineBreak` instead of
 /// being flattened into one run.
-fn inline_content_for(text: &str) -> Vec<InlineContent> {
+///
+/// `hyperlinks` are `HYPERLINK` field display-text spans as byte ranges into
+/// `text` (issue #249) — empty for callers with no per-paragraph hyperlink
+/// data (e.g. the line-shape heading heuristic, which works over the flat,
+/// already-sanitized document text rather than a single `DocParagraph`).
+fn inline_content_for(text: &str, hyperlinks: &[HyperlinkSpan]) -> Vec<InlineContent> {
     let mut out = Vec::new();
+    let mut base = 0usize;
     for seg in text.split('\n') {
-        if !seg.is_empty() {
-            out.push(InlineContent::Text(TextSpan::plain(seg)));
-        }
+        push_segment(seg, base, hyperlinks, &mut out);
+        base += seg.len() + 1; // +1 for the '\n' the split consumed
         out.push(InlineContent::LineBreak);
     }
     // Drop the trailing `LineBreak` appended after the final segment.
@@ -538,17 +543,84 @@ fn inline_content_for(text: &str) -> Vec<InlineContent> {
     out
 }
 
+/// Push one line-break-free segment of text as one or more `TextSpan`s,
+/// splitting out any hyperlink span that overlaps it. `base` is `seg`'s own
+/// byte offset within the original (pre-split) text, so `hyperlinks`'
+/// ranges (computed against that same original text) line up correctly.
+fn push_segment(seg: &str, base: usize, hyperlinks: &[HyperlinkSpan], out: &mut Vec<InlineContent>) {
+    if seg.is_empty() {
+        return;
+    }
+    let seg_start = base;
+    let seg_end = base + seg.len();
+
+    let mut relevant: Vec<(usize, usize, &str)> = hyperlinks
+        .iter()
+        .filter_map(|h| {
+            let s = h.range.start.max(seg_start);
+            let e = h.range.end.min(seg_end);
+            (s < e).then_some((s, e, h.url.as_str()))
+        })
+        .collect();
+    relevant.sort_by_key(|(s, _, _)| *s);
+
+    let mut cursor = seg_start;
+    for (s, e, url) in relevant {
+        if s > cursor {
+            let plain = &seg[cursor - seg_start..s - seg_start];
+            if !plain.is_empty() {
+                out.push(InlineContent::Text(TextSpan::plain(plain)));
+            }
+        }
+        let link_text = &seg[s - seg_start..e - seg_start];
+        out.push(InlineContent::Text(TextSpan {
+            hyperlink: Some(url.to_string()),
+            ..TextSpan::plain(link_text)
+        }));
+        cursor = e.max(cursor);
+    }
+    if cursor < seg_end {
+        let plain = &seg[cursor - seg_start..];
+        if !plain.is_empty() {
+            out.push(InlineContent::Text(TextSpan::plain(plain)));
+        }
+    }
+}
+
+/// Shift `hyperlinks`' byte ranges by `-trim_start` (the number of bytes
+/// `text.trim()` removed from the front) and clip them to
+/// `[0, trimmed_len]`, dropping any span that trimming removed entirely.
+/// Needed because `emit_heading`/`emit_prose` call `inline_content_for` on
+/// `text.trim()`, not `text` itself, so the spans (computed against the
+/// untrimmed paragraph text) would otherwise point at the wrong bytes.
+fn shift_hyperlinks_for_trim(
+    hyperlinks: &[HyperlinkSpan],
+    trim_start: usize,
+    trimmed_len: usize,
+) -> Vec<HyperlinkSpan> {
+    hyperlinks
+        .iter()
+        .filter_map(|h| {
+            let start = h.range.start.saturating_sub(trim_start).min(trimmed_len);
+            let end = h.range.end.saturating_sub(trim_start).min(trimmed_len);
+            (start < end).then(|| HyperlinkSpan { range: start..end, url: h.url.clone() })
+        })
+        .collect()
+}
+
 /// Classify a prose paragraph as a heading or paragraph and push it.
 ///
 /// Mirrors the line-based heuristic so a PAPX-bearing document keeps the same
 /// heading/title detection as the fallback path.
 /// Emit a heading at an explicit level, honouring soft line breaks.
-fn emit_heading(text: &str, level: u8, elements: &mut Vec<Element>) {
+fn emit_heading(text: &str, level: u8, elements: &mut Vec<Element>, hyperlinks: &[HyperlinkSpan]) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return;
     }
-    let mut content = inline_content_for(trimmed);
+    let trim_start = text.len() - text.trim_start().len();
+    let hyperlinks = shift_hyperlinks_for_trim(hyperlinks, trim_start, trimmed.len());
+    let mut content = inline_content_for(trimmed, &hyperlinks);
     for ic in &mut content {
         if let InlineContent::Text(t) = ic {
             t.bold = true;
@@ -567,7 +639,7 @@ fn emit_heading(text: &str, level: u8, elements: &mut Vec<Element>) {
 /// This is a guess and is only reached for documents that carry no
 /// `sprmPOutLvl` at all. Running it alongside real outline levels produced
 /// two disagreeing answers for the same paragraphs in one document.
-fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>) {
+fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>, hyperlinks: &[HyperlinkSpan]) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return;
@@ -586,7 +658,9 @@ fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>) {
     if is_heading {
         // Honour soft line breaks inside headings too: split on `'\n'` (the
         // sanitised form of `0x0B`) and keep each segment bold.
-        let mut content = inline_content_for(trimmed);
+        let trim_start = text.len() - text.trim_start().len();
+        let shifted = shift_hyperlinks_for_trim(hyperlinks, trim_start, trimmed.len());
+        let mut content = inline_content_for(trimmed, &shifted);
         for ic in &mut content {
             if let InlineContent::Text(t) = ic {
                 t.bold = true;
@@ -599,7 +673,7 @@ fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>) {
         }));
     } else {
         elements.push(Element::Paragraph(Paragraph {
-            content: inline_content_for(text),
+            content: inline_content_for(text, hyperlinks),
             tabs: tabs.to_vec(),
             ..Default::default()
         }));
@@ -674,7 +748,7 @@ fn is_currency_label(line: &str) -> bool {
 
 fn line_heuristic(text: &str, elements: &mut Vec<Element>) {
     for line in text.lines() {
-        emit_prose(line, &[], elements);
+        emit_prose(line, &[], elements, &[]);
     }
 }
 
@@ -744,7 +818,54 @@ mod tests {
             text: text.to_string(),
             terminator: '\r',
             props,
+            hyperlinks: Vec::new(),
         }
+    }
+
+    /// issue #249 — a `HYPERLINK` field's display text must reach
+    /// `TextSpan::hyperlink` in the IR, with the surrounding plain text on
+    /// either side kept as ordinary, unlinked runs.
+    #[test]
+    fn hyperlink_span_reaches_textspan_hyperlink_in_the_ir() {
+        let text = "Before text; Hyperlink text; after text.".to_string();
+        let link_start = text.find("Hyperlink text").unwrap();
+        let link_end = link_start + "Hyperlink text".len();
+        let p = DocParagraph {
+            text,
+            terminator: '\r',
+            props: PapProps::default(),
+            hyperlinks: vec![crate::doc::HyperlinkSpan {
+                range: link_start..link_end,
+                url: "http://testuri.org/".to_string(),
+            }],
+        };
+        let mut els = Vec::new();
+        walk_paragraphs(&[p], false, &mut els);
+        let Element::Paragraph(par) = &els[0] else {
+            panic!("expected a paragraph, got {:?}", els[0]);
+        };
+        let spans: Vec<&TextSpan> = par
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                InlineContent::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        let linked = spans
+            .iter()
+            .find(|s| s.hyperlink.is_some())
+            .expect("a hyperlinked span must be present");
+        assert_eq!(linked.text, "Hyperlink text");
+        assert_eq!(linked.hyperlink.as_deref(), Some("http://testuri.org/"));
+        assert!(
+            spans.iter().any(|s| s.hyperlink.is_none() && s.text.contains("Before text")),
+            "surrounding plain text must stay unlinked: {spans:?}"
+        );
+        assert!(
+            spans.iter().any(|s| s.hyperlink.is_none() && s.text.contains("after text")),
+            "surrounding plain text must stay unlinked: {spans:?}"
+        );
     }
 
     /// Medium #4: a soft line break (`0x0B`, which `sanitize_text` maps to
@@ -929,6 +1050,7 @@ mod tests {
                 itap,
                 ..PapProps::default()
             },
+            hyperlinks: Vec::new(),
         };
         let cell = DocParagraph {
             text: "cell text".into(),
@@ -937,6 +1059,7 @@ mod tests {
                 f_in_table: true,
                 ..PapProps::default()
             },
+            hyperlinks: Vec::new(),
         };
         let paragraphs = [mark(1), cell, mark(1)];
         let mut els = Vec::new();
@@ -1035,7 +1158,7 @@ mod tests {
 
     fn is_heading_guess(text: &str) -> bool {
         let mut els = Vec::new();
-        emit_prose(text, &[], &mut els);
+        emit_prose(text, &[], &mut els, &[]);
         matches!(els.as_slice(), [Element::Heading(_)])
     }
 

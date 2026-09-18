@@ -462,6 +462,7 @@ mod tests {
             text: text.to_string(),
             terminator: '\r',
             props,
+            hyperlinks: Vec::new(),
         }
     }
 

@@ -16,7 +16,7 @@
 //!
 //! The `grpprl` is decoded by [`super::sprm::extract_pap_props`].
 
-use super::piece_table::{Piece, decode_cp_range, sanitize_text};
+use super::piece_table::{HyperlinkSpan, Piece, decode_cp_range, sanitize_text_with_hyperlinks};
 use super::sprm::PapProps;
 
 /// A paragraph descriptor recovered from a PAPX FKP page.
@@ -41,6 +41,9 @@ pub struct DocParagraph {
     pub terminator: char,
     /// Distilled PAP flags (`fInTable`, row-mark, list, …).
     pub props: PapProps,
+    /// `HYPERLINK` field display-text spans (byte ranges into `text`)
+    /// paired with their target URLs (issue #249).
+    pub hyperlinks: Vec<HyperlinkSpan>,
 }
 
 /// Parse every PAPX FKP page referenced by the PlcfBtePapx.
@@ -303,12 +306,14 @@ pub fn build_paragraphs(
             continue;
         }
         let terminator = chars[chars.len() - 1];
-        let content: String = sanitize_text(&chars[..chars.len() - 1].iter().collect::<String>());
+        let (content, hyperlinks) =
+            sanitize_text_with_hyperlinks(&chars[..chars.len() - 1].iter().collect::<String>());
         let props = super::sprm::extract_pap_props(&fp.grpprl);
         out.push(DocParagraph {
             text: content,
             terminator,
             props,
+            hyperlinks,
         });
     }
     out
@@ -473,6 +478,13 @@ mod tests {
 
     /// Regression: field codes (0x13/0x14/0x15) in a paragraph must be
     /// stripped from the IR text, matching the sanitised plain-text path.
+    ///
+    /// issue #249 — the instruction text between `0x13` and `0x14`
+    /// ("HYPERLINK ...", the field's own code, never shown by Word) must
+    /// be dropped entirely, not just its boundary markers; only the cached
+    /// result (between `0x14` and `0x15`) is visible text. This test used
+    /// to assert the opposite (`"SeeHYPERLINKresulthere"`, keeping both
+    /// halves) — that was the bug, not the contract.
     #[test]
     fn build_paragraphs_strips_field_codes() {
         // A HYPERLINK field run inside one paragraph, terminated by '\r'.
@@ -495,8 +507,8 @@ mod tests {
         assert!(!t.contains('\u{13}'), "field begin must be stripped");
         assert!(!t.contains('\u{14}'), "field separator must be stripped");
         assert!(!t.contains('\u{15}'), "field end must be stripped");
-        assert!(t.contains("HYPERLINK"), "field result text survives");
-        assert_eq!(t, "SeeHYPERLINKresulthere");
+        assert!(!t.contains("HYPERLINK"), "field instruction text must not leak into visible text");
+        assert_eq!(t, "Seeresulthere");
     }
 
     /// Regression: the `cw == 0` Word8 re-read branch must not drop the trailing
