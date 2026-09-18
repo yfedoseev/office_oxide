@@ -114,17 +114,81 @@ fn needs_stack_thread() -> bool {
     !cfg!(target_arch = "wasm32")
 }
 
+/// Number of parse threads that may be in flight at once.
+///
+/// Each parse thread reserves `PARSE_STACK_SIZE` (16 MB) of address space, so
+/// an unbounded fan-out of simultaneous parses could exhaust the process's
+/// thread or address-space limits. Scale with the machine but stay inside a
+/// fixed ceiling, because the point is to have *some* bound.
+fn max_parse_threads() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map_or(16, |n| n.get().saturating_mul(4))
+            .clamp(8, 64)
+    })
+}
+
+/// Parse threads currently in flight, and the signal that one has finished.
+static PARSE_THREADS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static PARSE_SLOT_FREED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// RAII reservation for one in-flight parse thread.
+struct ParseSlot;
+
+impl ParseSlot {
+    /// Reserve a slot, waiting for one to free up when the cap is reached.
+    ///
+    /// Waiting (rather than failing) is deliberate: a parse is short-lived and
+    /// always releases its slot, so a host that fans out many simultaneous
+    /// parses is throttled to the cap instead of being handed a spurious
+    /// "too many concurrent parses" error it cannot act on. Callers already
+    /// block for the duration of their own parse, so the only visible effect
+    /// is that the (cap + 1)-th concurrent parse starts slightly later.
+    fn acquire() -> Self {
+        let cap = max_parse_threads();
+        let mut in_flight = PARSE_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        while *in_flight >= cap {
+            // A timeout keeps a lost notification from parking a caller
+            // forever; the predicate is rechecked on every wake.
+            let (guard, _) = PARSE_SLOT_FREED
+                .wait_timeout(in_flight, std::time::Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner());
+            in_flight = guard;
+        }
+        *in_flight += 1;
+        Self
+    }
+}
+
+impl Drop for ParseSlot {
+    fn drop(&mut self) {
+        let mut in_flight = PARSE_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        *in_flight = in_flight.saturating_sub(1);
+        drop(in_flight);
+        PARSE_SLOT_FREED.notify_one();
+    }
+}
+
 /// Run a parsing closure on a stack whose size we control.
 ///
 /// Every caller gets `PARSE_STACK_SIZE`, so a deeply nested document meets the
 /// same headroom whether it arrives from a Rust binary, a Python binding or a
 /// test harness. Only wasm32, which has no threads, runs inline.
+///
+/// At most [`max_parse_threads`] parses are in flight at once; further callers
+/// wait for a slot rather than spawning an unbounded number of 16 MB-stack
+/// threads. The reservation is released when this function returns, whether
+/// the parse succeeded, failed or panicked.
 fn with_parse_stack<F, T>(f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
     if needs_stack_thread() {
+        // Held until the join below completes, so the count tracks threads
+        // that actually exist.
+        let _slot = ParseSlot::acquire();
         std::thread::Builder::new()
             .stack_size(PARSE_STACK_SIZE)
             .spawn(f)
@@ -528,4 +592,62 @@ pub fn to_markdown(path: impl AsRef<Path>) -> Result<String> {
 /// Convert any supported document file to an HTML fragment.
 pub fn to_html(path: impl AsRef<Path>) -> Result<String> {
     Ok(Document::open(path)?.to_html())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `with_parse_stack` used to spawn one 16 MB-stack thread per parse with
+    /// no bound at all, so a host that fanned out many simultaneous parses
+    /// could drive the process into its thread-creation limit. More callers
+    /// than the cap must still all complete, and never more than the cap may
+    /// be in flight at once.
+    #[test]
+    fn test_with_parse_stack_bounds_concurrent_parses() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cap = max_parse_threads();
+        assert!((8..=64).contains(&cap), "cap should be sane, got {cap}");
+
+        let peak = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+        let callers: Vec<_> = (0..cap + 16)
+            .map(|_| {
+                let peak = Arc::clone(&peak);
+                let done = Arc::clone(&done);
+                std::thread::spawn(move || {
+                    let r: Result<()> = with_parse_stack(move || {
+                        let live = *PARSE_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+                        peak.fetch_max(live, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        Ok(())
+                    });
+                    r.expect("parse closure should succeed");
+                    done.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        for c in callers {
+            c.join().expect("caller thread should not panic");
+        }
+
+        assert_eq!(done.load(Ordering::SeqCst), cap + 16, "every parse must complete");
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak >= 1, "the in-flight counter should have been observed");
+        assert!(peak <= cap, "in-flight parses {peak} exceeded the cap {cap}");
+    }
+
+    /// A panic inside the parse closure must still release its slot, or the
+    /// cap would leak and eventually deadlock every later parse.
+    #[test]
+    fn test_parse_slot_released_after_panic() {
+        let before = *PARSE_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        let r: Result<()> = with_parse_stack(|| panic!("boom"));
+        assert!(matches!(r, Err(OfficeError::Panic(_))), "panic should surface as itself");
+        // The slot is released synchronously before `with_parse_stack` returns.
+        let after = *PARSE_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(after <= before, "slot leaked: {before} -> {after}");
+    }
 }
