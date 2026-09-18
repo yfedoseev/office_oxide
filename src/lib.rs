@@ -264,7 +264,7 @@ impl Document {
         // username and a document name, and this runs at info level on every
         // open. The caller already knows which path it passed.
         info!("Document::open: {format:?} format");
-        let format = format.ok_or_else(|| {
+        let ext_format = format.ok_or_else(|| {
             OfficeError::UnsupportedFormat(
                 path.extension()
                     .and_then(|e| e.to_str())
@@ -272,7 +272,28 @@ impl Document {
                     .to_string(),
             )
         })?;
-        let format = sniff_format(path, format);
+        let format = sniff_format(path, ext_format);
+        // sniff_format's CFB branch exists so a legacy .doc/.xls/.ppt file
+        // saved with the wrong extension still opens — but an encrypted
+        // OOXML package is ALSO a CFB container, so the same branch was
+        // silently misrouting it to the legacy parser too, which then
+        // failed looking for a stream that was never there ("missing
+        // stream: WordDocument stream not found") instead of surfacing
+        // the real cause. Distinguish the two by the MS-OFFCRYPTO streams
+        // an encrypted package actually carries (issue #320).
+        if matches!(format, DocumentFormat::Doc | DocumentFormat::Xls | DocumentFormat::Ppt)
+            && matches!(
+                ext_format,
+                DocumentFormat::Docx | DocumentFormat::Xlsx | DocumentFormat::Pptx
+            )
+            && is_encrypted_ooxml_cfb(path)
+        {
+            return Err(OfficeError::UnsupportedFormat(
+                "the file is a password-protected (encrypted) OOXML package; \
+                 decryption is not supported"
+                    .into(),
+            ));
+        }
 
         match format {
             DocumentFormat::Docx => {
@@ -549,6 +570,20 @@ impl OfficeDocument for Document {
 }
 
 /// Sniff magic bytes to detect format mismatches.
+/// `true` when the CFB container at `path` carries the MS-OFFCRYPTO
+/// encryption streams (`EncryptionInfo` + `EncryptedPackage`) that mark it
+/// as a password-protected OOXML package, rather than a genuine legacy
+/// binary document that happens to reuse the same container format.
+fn is_encrypted_ooxml_cfb(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(reader) = crate::cfb::CfbReader::new(file) else {
+        return false;
+    };
+    reader.has_stream("EncryptionInfo") && reader.has_stream("EncryptedPackage")
+}
+
 fn sniff_format(path: &Path, ext_format: DocumentFormat) -> DocumentFormat {
     let Ok(mut file) = std::fs::File::open(path) else {
         return ext_format;
@@ -590,6 +625,133 @@ pub fn to_html(path: impl AsRef<Path>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a minimal CFB container with two named, empty-ish streams at
+    /// the root — enough for `has_stream` (a flat scan over directory
+    /// entries; sibling-tree links don't matter for it) without needing a
+    /// full CFB writer. Mirrors `cfb::reader::tests::build_minimal_cfb`,
+    /// extended to two streams instead of one.
+    fn build_two_stream_cfb(name1: &str, name2: &str) -> Vec<u8> {
+        const NO_ENTRY: u32 = 0xFFFF_FFFF;
+        const END_OF_CHAIN: u32 = 0xFFFF_FFFE;
+        const FAT_SECT: u32 = 0xFFFF_FFFD;
+        const FREE_SECT: u32 = 0xFFFF_FFFF;
+        let sector_size = 512usize;
+        let mut file = vec![0u8; 512 + 4 * sector_size];
+
+        file[0..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        file[0x18..0x1A].copy_from_slice(&0x003Eu16.to_le_bytes());
+        file[0x1A..0x1C].copy_from_slice(&3u16.to_le_bytes());
+        file[0x1C..0x1E].copy_from_slice(&0xFFFEu16.to_le_bytes());
+        file[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
+        file[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
+        file[0x2C..0x30].copy_from_slice(&1u32.to_le_bytes());
+        file[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());
+        file[0x38..0x3C].copy_from_slice(&4096u32.to_le_bytes());
+        file[0x3C..0x40].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+        file[0x40..0x44].copy_from_slice(&0u32.to_le_bytes());
+        file[0x44..0x48].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+        file[0x48..0x4C].copy_from_slice(&0u32.to_le_bytes());
+        file[0x4C..0x50].copy_from_slice(&1u32.to_le_bytes());
+        for i in 1..109 {
+            let off = 0x4C + i * 4;
+            file[off..off + 4].copy_from_slice(&FREE_SECT.to_le_bytes());
+        }
+
+        fn write_dir_entry(
+            buf: &mut [u8],
+            name: &str,
+            entry_type: u8,
+            child: u32,
+            start_sector: u32,
+            stream_size: u32,
+        ) {
+            const NO_ENTRY: u32 = 0xFFFF_FFFF;
+            let utf16: Vec<u16> = name.encode_utf16().collect();
+            for (i, &ch) in utf16.iter().enumerate() {
+                let bytes = ch.to_le_bytes();
+                buf[i * 2] = bytes[0];
+                buf[i * 2 + 1] = bytes[1];
+            }
+            let name_size = ((utf16.len() + 1) * 2) as u16;
+            buf[0x40..0x42].copy_from_slice(&name_size.to_le_bytes());
+            buf[0x42] = entry_type;
+            buf[0x43] = 1;
+            buf[0x44..0x48].copy_from_slice(&NO_ENTRY.to_le_bytes());
+            buf[0x48..0x4C].copy_from_slice(&NO_ENTRY.to_le_bytes());
+            buf[0x4C..0x50].copy_from_slice(&child.to_le_bytes());
+            buf[0x74..0x78].copy_from_slice(&start_sector.to_le_bytes());
+            buf[0x78..0x7C].copy_from_slice(&stream_size.to_le_bytes());
+        }
+
+        let dir_offset = 512;
+        write_dir_entry(&mut file[dir_offset..dir_offset + 128], "Root Entry", 5, 1, END_OF_CHAIN, 0);
+        write_dir_entry(&mut file[dir_offset + 128..dir_offset + 256], name1, 2, NO_ENTRY, 2, 4);
+        write_dir_entry(&mut file[dir_offset + 256..dir_offset + 384], name2, 2, NO_ENTRY, 3, 4);
+        file[dir_offset + 384 + 0x42] = 0; // empty 4th entry
+
+        let fat_offset = 512 + sector_size;
+        let write_fat = |file: &mut [u8], index: usize, value: u32| {
+            let off = fat_offset + index * 4;
+            file[off..off + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        write_fat(&mut file, 0, END_OF_CHAIN); // dir
+        write_fat(&mut file, 1, FAT_SECT); // FAT
+        write_fat(&mut file, 2, END_OF_CHAIN); // stream1
+        write_fat(&mut file, 3, END_OF_CHAIN); // stream2
+        for i in 4..128 {
+            write_fat(&mut file, i, FREE_SECT);
+        }
+
+        file[512 + 2 * sector_size..512 + 2 * sector_size + 4].copy_from_slice(b"data");
+        file[512 + 3 * sector_size..512 + 3 * sector_size + 4].copy_from_slice(b"data");
+
+        file
+    }
+
+    /// issue #320 — an encrypted OOXML file has the same CFB magic bytes
+    /// as a genuine legacy .doc/.xls/.ppt, so `sniff_format`'s
+    /// "wrong-extension" branch silently remapped it to the legacy
+    /// parser, which then failed looking for a stream that was never
+    /// there ("missing stream: WordDocument stream not found") instead
+    /// of naming the real cause.
+    #[test]
+    fn test_open_encrypted_ooxml_gives_a_friendly_error_not_a_legacy_parser_failure() {
+        let data = build_two_stream_cfb("EncryptionInfo", "EncryptedPackage");
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("office_oxide_test_encrypted_{}.docx", std::process::id()));
+        std::fs::write(&path, &data).unwrap();
+        let result = Document::open(&path);
+        std::fs::remove_file(&path).ok();
+        let err = result.err().expect("expected an Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("password-protected"),
+            "expected a friendly password-protected message, got: {msg}"
+        );
+    }
+
+    /// The same CFB-magic-on-a-.docx-path shape, but WITHOUT the
+    /// MS-OFFCRYPTO streams, must still fall through to the legacy
+    /// parser (a genuinely misnamed legacy file) — the new check must
+    /// not misfire on the case #232/sniff_format already handled
+    /// correctly.
+    #[test]
+    fn test_open_cfb_without_offcrypto_streams_still_falls_through_to_legacy_parser() {
+        let data = build_two_stream_cfb("SomeStream", "OtherStream");
+        let dir = std::env::temp_dir();
+        let path =
+            dir.join(format!("office_oxide_test_not_encrypted_{}.docx", std::process::id()));
+        std::fs::write(&path, &data).unwrap();
+        let result = Document::open(&path);
+        std::fs::remove_file(&path).ok();
+        let err = result.err().expect("expected an Err");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("password-protected"),
+            "a non-OFFCRYPTO CFB must not be misreported as encrypted: {msg}"
+        );
+    }
 
     /// `with_parse_stack` used to spawn one 16 MB-stack thread per parse with
     /// no bound at all, so a host that fanned out many simultaneous parses
