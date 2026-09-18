@@ -1,6 +1,7 @@
 use super::PptxDocument;
 use super::shape::{
-    GraphicContent, HyperlinkTarget, Shape, ShapePosition, Table, TextBody, TextContent,
+    GraphicContent, HyperlinkTarget, Shape, ShapePosition, Table, TableCell, TableRow, TextBody,
+    TextContent,
 };
 
 impl PptxDocument {
@@ -166,23 +167,77 @@ fn plain_text_from_body(body: &TextBody) -> String {
     parts.join("\n")
 }
 
-fn plain_text_from_table(table: &Table) -> String {
-    let mut rows = Vec::new();
-    for row in &table.rows {
-        let mut cells = Vec::new();
+/// Resolve `grid_span`/`row_span` into a proper 2-D grid, so a merged
+/// cell's neighbours land at their true column position instead of
+/// shifting left to fill the gap. Mirrors `ir_render.rs::table_grid`
+/// exactly — this crate hit the identical "flat cell list, not a grid"
+/// bug shape a third time here, on PPTX's own default text/markdown
+/// renderers, after DOCX's read side (#137, closed) and the write path
+/// (#265) (issue #289).
+fn pptx_table_grid(table: &Table) -> Vec<Vec<Option<&TableCell>>> {
+    // A raw PPTX row's `cells` includes h_merge/v_merge *continuation*
+    // placeholders alongside the real, span-owning cell — unlike the IR's
+    // `Table`, which never carries them at all (convert_pptx_table drops
+    // them before building `TableRow`). Summing every cell's grid_span,
+    // continuation placeholders included, double-counted the columns a
+    // merge already covers.
+    fn real_cells(r: &TableRow) -> impl Iterator<Item = &TableCell> {
+        r.cells.iter().filter(|c| !c.h_merge && !c.v_merge)
+    }
+    let cell_total: usize = table.rows.iter().map(|r| real_cells(r).count()).sum();
+    let width = table
+        .rows
+        .iter()
+        .map(|r| real_cells(r).map(|c| c.grid_span.max(1) as usize).sum::<usize>())
+        .max()
+        .unwrap_or(0)
+        .min(cell_total.saturating_mul(1_000).max(1));
+    let mut grid: Vec<Vec<Option<&TableCell>>> = vec![vec![None; width]; table.rows.len()];
+    let mut covered: Vec<Vec<bool>> = vec![vec![false; width]; table.rows.len()];
+
+    for (r, row) in table.rows.iter().enumerate() {
+        let mut c = 0usize;
         for cell in &row.cells {
             if cell.h_merge || cell.v_merge {
                 continue;
             }
-            let text = cell
-                .text_body
-                .as_ref()
-                .map(plain_text_from_body)
-                .unwrap_or_default();
-            cells.push(text);
+            while c < width && covered[r][c] {
+                c += 1;
+            }
+            if c >= width {
+                break;
+            }
+            grid[r][c] = Some(cell);
+            let cs = cell.grid_span.max(1) as usize;
+            let rs = cell.row_span.max(1) as usize;
+            for dr in 0..rs {
+                for dc in 0..cs {
+                    if r + dr < covered.len() && c + dc < width {
+                        covered[r + dr][c + dc] = true;
+                    }
+                }
+            }
+            c += cs;
         }
-        rows.push(cells.join("\t"));
     }
+    grid
+}
+
+fn cell_plain_text(cell: &TableCell) -> String {
+    cell.text_body.as_ref().map(plain_text_from_body).unwrap_or_default()
+}
+
+fn plain_text_from_table(table: &Table) -> String {
+    let grid = pptx_table_grid(table);
+    let rows: Vec<String> = grid
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|slot| slot.map(cell_plain_text).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\t")
+        })
+        .collect();
     rows.join("\n")
 }
 
@@ -304,49 +359,38 @@ fn markdown_table(table: &Table) -> String {
         return String::new();
     }
 
-    let mut col_count = 0;
-    let mut md_rows: Vec<Vec<String>> = Vec::new();
-
-    for row in &table.rows {
-        let mut cells = Vec::new();
-        for cell in &row.cells {
-            if cell.h_merge || cell.v_merge {
-                continue;
-            }
-            let text = cell
-                .text_body
-                .as_ref()
-                .map(|tb| {
-                    // Flatten paragraphs for table cells — replace newlines with spaces
-                    plain_text_from_body(tb).replace('\n', " ")
-                })
-                .unwrap_or_default();
-            cells.push(text);
-        }
-        if cells.len() > col_count {
-            col_count = cells.len();
-        }
-        md_rows.push(cells);
-    }
-
+    let grid = pptx_table_grid(table);
+    let col_count = grid.first().map(Vec::len).unwrap_or(0);
     if col_count == 0 {
         return String::new();
     }
+    let md_rows: Vec<Vec<String>> = grid
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|slot| {
+                    slot.map(|cell| {
+                        cell.text_body
+                            .as_ref()
+                            .map(|tb| {
+                                // Flatten paragraphs for table cells — replace newlines with spaces
+                                plain_text_from_body(tb).replace('\n', " ")
+                            })
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default()
+                })
+                .collect()
+        })
+        .collect();
 
     let mut result = String::new();
 
     // Header row
     if let Some(header) = md_rows.first() {
         result.push('|');
-        for (i, cell) in header.iter().enumerate() {
+        for cell in header {
             result.push_str(&format!(" {cell} |"));
-            if i >= col_count - 1 {
-                break;
-            }
-        }
-        // Pad if fewer cells than col_count
-        for _ in header.len()..col_count {
-            result.push_str("  |");
         }
         result.push('\n');
 
@@ -361,14 +405,8 @@ fn markdown_table(table: &Table) -> String {
     // Data rows
     for row in md_rows.iter().skip(1) {
         result.push('|');
-        for (i, cell) in row.iter().enumerate() {
+        for cell in row {
             result.push_str(&format!(" {cell} |"));
-            if i >= col_count - 1 {
-                break;
-            }
-        }
-        for _ in row.len()..col_count {
-            result.push_str("  |");
         }
         result.push('\n');
     }
@@ -797,6 +835,98 @@ mod tests {
         assert!(md.contains("| H1 | H2 |"));
         assert!(md.contains("| --- | --- |"));
         assert!(md.contains("| A | B |"));
+    }
+
+    fn text_cell(text: &str, grid_span: u32, row_span: u32, h_merge: bool, v_merge: bool) -> TableCell {
+        let text_body = if h_merge || v_merge {
+            None
+        } else {
+            Some(TextBody {
+                paragraphs: vec![TextParagraph {
+                    level: 0,
+                    alignment: None,
+                    space_before_hundredths_pt: None,
+                    content: vec![TextContent::Run(TextRun {
+                        text: text.to_string(),
+                        bold: None,
+                        italic: None,
+                        strikethrough: false,
+                        hyperlink: None,
+                        font_size_hundredths_pt: None,
+                        color_rgb: None,
+                        ..Default::default()
+                    })],
+                    ..Default::default()
+                }],
+            })
+        };
+        TableCell {
+            text_body,
+            grid_span,
+            row_span,
+            h_merge,
+            v_merge,
+        }
+    }
+
+    /// issue #289 — merged-cell tables rendered with the wrong column
+    /// count and shifted/misaligned content: both plain_text_from_table
+    /// and markdown_table filtered out h_merge/v_merge continuation
+    /// cells and then just pushed the *remaining* cells into a flat
+    /// list (`col_count = cells.len()`), with no grid/covered-position
+    /// tracking — the same "flat cell list, not a grid" bug shape
+    /// already found and fixed for DOCX's read side (#137) and write
+    /// path (#265). A 2x2 grid where row 0's first cell spans both
+    /// columns must still show row 1's two cells at their true
+    /// positions, with row 0's merged cell's content followed by one
+    /// blank slot, not shifted left.
+    #[test]
+    fn markdown_and_plain_text_tables_handle_merged_cells() {
+        let table = Table {
+            first_row_header: false,
+            last_row_header: false,
+            rows: vec![
+                TableRow {
+                    cells: vec![
+                        text_cell("Merged", 2, 1, false, false),
+                        text_cell("", 1, 1, true, false),
+                    ],
+                },
+                TableRow {
+                    cells: vec![
+                        text_cell("A", 1, 1, false, false),
+                        text_cell("B", 1, 1, false, false),
+                    ],
+                },
+            ],
+        };
+        let doc = make_doc(vec![Slide {
+            name: String::new(),
+            shapes: vec![Shape::GraphicFrame(super::super::shape::GraphicFrame {
+                id: 1,
+                name: "Table".to_string(),
+                position: Some(ShapePosition {
+                    x: 0,
+                    y: 0,
+                    cx: 9000,
+                    cy: 3000,
+                }),
+                content: GraphicContent::Table(table),
+            })],
+            notes: None,
+            background_rgb: None,
+            ..Default::default()
+        }]);
+
+        let plain = doc.slide_plain_text(0).unwrap();
+        assert!(
+            plain.contains("A\tB"),
+            "row 1's cells must stay at their true columns: {plain:?}"
+        );
+
+        let md = doc.slide_to_markdown(0).unwrap();
+        assert!(md.contains("| Merged |  |"), "row 0 must show 2 columns: {md:?}");
+        assert!(md.contains("| A | B |"), "row 1 must not shift left: {md:?}");
     }
 
     #[test]
