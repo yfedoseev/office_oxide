@@ -4,9 +4,11 @@
 //!
 //! The fastest Office document processing library for Rust.
 //!
-//! Reads, writes, and edits **DOCX, XLSX, PPTX, DOC, XLS, PPT** — all six
-//! Microsoft Office formats — with a single unified API and zero C/C++
-//! dependencies.
+//! Reads all six Microsoft Office formats — **DOCX, XLSX, PPTX, DOC, XLS,
+//! PPT** — through a single unified API, with zero C/C++ dependencies.
+//! Writing and editing cover **DOCX, XLSX and PPTX**; the legacy binary
+//! formats (DOC, XLS, PPT) are read-only, and convertible to OOXML via
+//! [`Document::save_as`].
 //!
 //! ## Quick start
 //!
