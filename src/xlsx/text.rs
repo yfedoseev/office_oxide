@@ -398,6 +398,7 @@ mod tests {
             chart_text: Vec::new(),
             embedded_fonts: Vec::new(),
             core_properties: None,
+            app_properties: None,
             styles_data: None,
             theme_data: None,
         };

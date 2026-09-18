@@ -63,6 +63,10 @@ pub struct PptxDocument {
     /// Parsed `docProps/core.xml`. `None` when the package carries no
     /// core-properties part.
     pub core_properties: Option<crate::core::properties::CoreProperties>,
+    /// Parsed `docProps/app.xml` (company, producing application, template,
+    /// slide/notes/hidden-slide counts). `None` when the package carries no
+    /// extended-properties part (issue #245).
+    pub app_properties: Option<crate::core::properties::AppProperties>,
 }
 
 impl PptxDocument {
@@ -101,6 +105,7 @@ impl PptxDocument {
             "a PresentationML presentation",
         )?;
         let core_properties = crate::core::properties::read_core_properties(&mut opc);
+        let app_properties = crate::core::properties::read_app_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let pres_rels = opc.read_rels_for(&main_part)?;
 
@@ -273,6 +278,7 @@ impl PptxDocument {
             theme,
             embedded_fonts,
             core_properties,
+            app_properties,
         })
     }
 }

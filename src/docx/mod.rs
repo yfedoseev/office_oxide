@@ -123,6 +123,11 @@ pub struct DocxDocument {
     /// Parsed `docProps/core.xml`. `None` when the package carries no
     /// core-properties part.
     pub core_properties: Option<crate::core::properties::CoreProperties>,
+    /// Parsed `docProps/app.xml` (company, producing application, template,
+    /// page/word/character/paragraph counts). `None` when the package
+    /// carries no extended-properties part. The parser already existed;
+    /// nothing on the read side called it until now (issue #245).
+    pub app_properties: Option<crate::core::properties::AppProperties>,
     /// Footnote bodies from `word/footnotes.xml`, in document order.
     /// Separator/continuation pseudo-notes are filtered out.
     pub footnotes: Vec<NoteBody>,
@@ -178,6 +183,7 @@ impl DocxDocument {
             "a WordprocessingML document",
         )?;
         let core_properties = crate::core::properties::read_core_properties(&mut opc);
+        let app_properties = crate::core::properties::read_app_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let doc_rels = opc.read_rels_for(&main_part)?;
 
@@ -464,6 +470,7 @@ impl DocxDocument {
             embedded_fonts,
             images,
             core_properties,
+            app_properties,
             footnotes,
             endnotes,
             comments,
@@ -4263,6 +4270,53 @@ mod tests {
             Some(7),
             "startOverride=7 must be read back, not None"
         );
+    }
+
+    #[test]
+    fn test_app_properties_are_read_on_open() {
+        // issue #245 — AppProperties::parse existed, fully tested, but
+        // nothing on the read side ever called it; company name and every
+        // word/page/paragraph count were unreachable through any public
+        // API.
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>hello</w:t></w:r></w:p></w:body>
+</w:document>"#;
+        let app_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">
+  <Company>Acme Corp</Company>
+  <Words>1250</Words>
+  <Pages>3</Pages>
+</Properties>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let app_part = PartName::new("/docProps/app.xml").unwrap();
+        writer
+            .add_part(
+                &app_part,
+                "application/vnd.openxmlformats-officedocument.extended-properties+xml",
+                app_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::EXTENDED_PROPERTIES, "docProps/app.xml");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let app = doc.app_properties.expect("app_properties must be populated");
+        assert_eq!(app.company.as_deref(), Some("Acme Corp"));
+        assert_eq!(app.words, Some(1250));
+        assert_eq!(app.pages, Some(3));
     }
 
     #[test]

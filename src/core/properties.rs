@@ -227,6 +227,33 @@ pub fn read_core_properties<R: std::io::Read + std::io::Seek>(
     CoreProperties::parse(&data).ok()
 }
 
+/// Read and parse `docProps/app.xml` (extended/application properties —
+/// company, producing application, template, editing time, and page/word/
+/// character/line/paragraph/slide/notes/hidden-slide counts) from an open
+/// package, the same way [`read_core_properties`] reads `docProps/core.xml`.
+///
+/// `AppProperties::parse` already existed, fully tested, but nothing on
+/// the read side ever called it — company name and every count field were
+/// unreachable through any public API (issue #245).
+pub fn read_app_properties<R: std::io::Read + std::io::Seek>(
+    opc: &mut super::opc::OpcReader<R>,
+) -> Option<AppProperties> {
+    let part = opc
+        .package_rels()
+        .first_by_type(super::relationships::rel_types::EXTENDED_PROPERTIES)
+        .and_then(|rel| {
+            super::opc::PartName::new(&format!("/{}", rel.target.trim_start_matches('/'))).ok()
+        })
+        .filter(|p| opc.has_part(p))
+        .or_else(|| {
+            super::opc::PartName::new("/docProps/app.xml")
+                .ok()
+                .filter(|p| opc.has_part(p))
+        })?;
+    let data = opc.read_part(&part).ok()?;
+    AppProperties::parse(&data).ok()
+}
+
 // ---------------------------------------------------------------------------
 // App (Extended) Properties — docProps/app.xml
 // ---------------------------------------------------------------------------

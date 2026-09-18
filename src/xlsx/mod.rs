@@ -89,6 +89,10 @@ pub struct XlsxDocument {
     /// Parsed `docProps/core.xml`. `None` when the package carries no
     /// core-properties part.
     pub core_properties: Option<crate::core::properties::CoreProperties>,
+    /// Parsed `docProps/app.xml` (company, producing application, template,
+    /// page/word/character/paragraph counts). `None` when the package
+    /// carries no extended-properties part (issue #245).
+    pub app_properties: Option<crate::core::properties::AppProperties>,
     // Raw bytes for lazy parsing (None after parsing or if not present)
     styles_data: Option<Vec<u8>>,
     theme_data: Option<Vec<u8>>,
@@ -166,6 +170,9 @@ impl XlsxDocument {
         let core_properties = Self::read_xml_entry(&mut archive, "docProps/core.xml")
             .ok()
             .and_then(|d| crate::core::properties::CoreProperties::parse(&d).ok());
+        let app_properties = Self::read_xml_entry(&mut archive, "docProps/app.xml")
+            .ok()
+            .and_then(|d| crate::core::properties::AppProperties::parse(&d).ok());
 
         // Read workbook relationships to resolve sheet targets
         let wb_rels = match Self::read_xml_entry(&mut archive, "xl/_rels/workbook.xml.rels") {
@@ -336,6 +343,7 @@ impl XlsxDocument {
             chart_text,
             embedded_fonts,
             core_properties,
+            app_properties,
             styles_data: None,
             theme_data,
         })
@@ -358,6 +366,7 @@ impl XlsxDocument {
             "a SpreadsheetML workbook",
         )?;
         let core_properties = crate::core::properties::read_core_properties(&mut opc);
+        let app_properties = crate::core::properties::read_app_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let wb_rels = opc.read_rels_for(&main_part)?;
 
@@ -507,6 +516,7 @@ impl XlsxDocument {
             chart_text: Vec::new(),
             embedded_fonts,
             core_properties,
+            app_properties,
             styles_data: None,
             theme_data,
         })
@@ -1208,6 +1218,25 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    /// issue #245 — AppProperties::parse existed, fully tested, but
+    /// nothing on the read side ever called it (fast zip path).
+    #[test]
+    fn test_app_properties_are_read_on_open() {
+        let app_xml: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">
+  <Company>Acme Corp</Company>
+  <Words>1250</Words>
+</Properties>"#;
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+</worksheet>"#;
+        let doc = open_bytes(single_sheet_xlsx(sheet_xml, &[("docProps/app.xml", app_xml)]));
+        let app = doc.app_properties.expect("app_properties must be populated");
+        assert_eq!(app.company.as_deref(), Some("Acme Corp"));
+        assert_eq!(app.words, Some(1250));
+    }
 
     /// #229 — a UTF-16BE `xl/workbook.xml` used to parse as a stream of
     /// unrecognised tags and yield zero sheets, silently, with `Ok`.
