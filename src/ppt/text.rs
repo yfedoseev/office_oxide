@@ -4,12 +4,13 @@ use std::collections::HashMap;
 
 use super::persist::{self, PersistDirectory};
 use super::records::*;
+use super::style::{self, CharFormatSpan, ParaFormatSpan};
 
 /// Guards against pathologically deep (or maliciously crafted) shape nesting.
 const MAX_SHAPE_DEPTH: usize = 64;
 
 /// Text type from TextHeaderAtom.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TextType {
     /// Title placeholder text.
     Title,
@@ -18,6 +19,7 @@ pub enum TextType {
     /// Speaker notes text.
     Notes,
     /// Other or unclassified text.
+    #[default]
     Other,
     /// Centered body placeholder.
     CenterBody,
@@ -56,7 +58,7 @@ impl TextType {
 }
 
 /// A text run extracted from a slide.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TextRun {
     /// The role of this text within its slide.
     pub text_type: TextType,
@@ -68,6 +70,15 @@ pub struct TextRun {
     /// has no interactive info, or its action has no hyperlink to resolve
     /// (issue #257).
     pub hyperlink: Option<String>,
+    /// Direct character-level formatting (bold/italic/underline/size/
+    /// color/position), resolved from this run's `StyleTextPropAtom` if
+    /// one was present. Empty when no such atom was found — callers must
+    /// treat that as "no formatting info", not "definitely unformatted"
+    /// (issue #254).
+    pub char_formats: Vec<CharFormatSpan>,
+    /// Direct paragraph-level formatting (currently: alignment only),
+    /// resolved the same way. Empty when no `StyleTextPropAtom` was found.
+    pub para_formats: Vec<ParaFormatSpan>,
 }
 
 /// Extract per-slide text from a "PowerPoint Document" stream.
@@ -206,6 +217,7 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
     let mut current_persist_id: Option<u32> = None;
     let mut outline_texts: Vec<TextRun> = Vec::new();
     let mut current_type = TextType::Other;
+    let mut last_outline_idx: Option<usize> = None;
 
     for rec in RecordIter::new(&slide_list) {
         let Ok(rec) = rec else { break };
@@ -218,10 +230,12 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
                     Some(u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]));
                 outline_texts.clear();
                 current_type = TextType::Other;
+                last_outline_idx = None;
             },
             RT_TEXT_HEADER if rec.data.len() >= 4 => {
                 let t = u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]);
                 current_type = TextType::from_u32(t);
+                last_outline_idx = None;
             },
             RT_TEXT_CHARS => {
                 // Positional index into this list is meaningful (it's what
@@ -231,14 +245,23 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
                     text_type: current_type,
                     text: decode_utf16le(&rec.data),
                     hyperlink: None,
+                    ..Default::default()
                 });
+                last_outline_idx = Some(outline_texts.len() - 1);
             },
             RT_TEXT_BYTES => {
                 outline_texts.push(TextRun {
                     text_type: current_type,
                     text: rec.data.iter().map(|&b| b as char).collect(),
                     hyperlink: None,
+                    ..Default::default()
                 });
+                last_outline_idx = Some(outline_texts.len() - 1);
+            },
+            RT_STYLE_TEXT_PROP => {
+                if let Some(idx) = last_outline_idx {
+                    apply_style_text_prop(&mut outline_texts[idx], &rec.data);
+                }
             },
             _ => {},
         }
@@ -326,6 +349,7 @@ fn extract_shape_text(
                         text_type: current_type,
                         text,
                         hyperlink: current_hyperlink.map(str::to_string),
+                        ..Default::default()
                     });
                     last_text_run_idx = Some(out.len() - 1);
                 }
@@ -337,8 +361,14 @@ fn extract_shape_text(
                         text_type: current_type,
                         text,
                         hyperlink: current_hyperlink.map(str::to_string),
+                        ..Default::default()
                     });
                     last_text_run_idx = Some(out.len() - 1);
+                }
+            },
+            RT_STYLE_TEXT_PROP => {
+                if let Some(idx) = last_text_run_idx {
+                    apply_style_text_prop(&mut out[idx], &rec.data);
                 }
             },
             RT_OUTLINE_TEXT_REF_ATOM if rec.data.len() >= 4 => {
@@ -457,6 +487,7 @@ fn extract_slides_from_slide_list_cache(slide_list: &[u8]) -> Vec<SlideText> {
                             // fallback than the persist-directory path,
                             // only reached when that path isn't available.
                             hyperlink: None,
+                            ..Default::default()
                         });
                     }
                 }
@@ -469,6 +500,7 @@ fn extract_slides_from_slide_list_cache(slide_list: &[u8]) -> Vec<SlideText> {
                             text_type: current_type,
                             text,
                             hyperlink: None,
+                            ..Default::default()
                         });
                     }
                 }
@@ -648,17 +680,88 @@ fn split_run_with_hyperlink(out: &mut Vec<TextRun>, idx: usize, begin: usize, en
     let prefix: String = chars[..begin].iter().collect();
     let linked: String = chars[begin..end].iter().collect();
     let suffix: String = chars[end..].iter().collect();
+    // Splitting a run must not silently drop its own direct formatting —
+    // slice each formatting span onto whichever piece(s) it overlaps,
+    // re-based to that piece's own character indices.
+    let prefix_char_fmt = slice_char_formats(&run.char_formats, 0..begin);
+    let linked_char_fmt = slice_char_formats(&run.char_formats, begin..end);
+    let suffix_char_fmt = slice_char_formats(&run.char_formats, end..chars.len());
+    let prefix_para_fmt = slice_para_formats(&run.para_formats, 0..begin);
+    let linked_para_fmt = slice_para_formats(&run.para_formats, begin..end);
+    let suffix_para_fmt = slice_para_formats(&run.para_formats, end..chars.len());
 
     let mut replacement = Vec::with_capacity(3);
     if !prefix.is_empty() {
-        replacement.push(TextRun { text_type, text: prefix, hyperlink: surrounding_hyperlink.clone() });
+        replacement.push(TextRun {
+            text_type,
+            text: prefix,
+            hyperlink: surrounding_hyperlink.clone(),
+            char_formats: prefix_char_fmt,
+            para_formats: prefix_para_fmt,
+        });
     }
-    replacement.push(TextRun { text_type, text: linked, hyperlink: Some(url.to_string()) });
+    replacement.push(TextRun {
+        text_type,
+        text: linked,
+        hyperlink: Some(url.to_string()),
+        char_formats: linked_char_fmt,
+        para_formats: linked_para_fmt,
+    });
     if !suffix.is_empty() {
-        replacement.push(TextRun { text_type, text: suffix, hyperlink: surrounding_hyperlink });
+        replacement.push(TextRun {
+            text_type,
+            text: suffix,
+            hyperlink: surrounding_hyperlink,
+            char_formats: suffix_char_fmt,
+            para_formats: suffix_para_fmt,
+        });
     }
 
     out.splice(idx..=idx, replacement);
+}
+
+/// Slice/clip a set of character-formatting spans onto `range`, re-based
+/// so the returned spans are relative to `range.start` (i.e. valid over
+/// the substring `text[range]` on its own).
+fn slice_char_formats(spans: &[CharFormatSpan], range: std::ops::Range<usize>) -> Vec<CharFormatSpan> {
+    spans
+        .iter()
+        .filter_map(|s| {
+            let start = s.start.max(range.start);
+            let end = s.end.min(range.end);
+            (start < end).then(|| CharFormatSpan {
+                start: start - range.start,
+                end: end - range.start,
+                format: s.format.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Same as [`slice_char_formats`] for paragraph-formatting spans.
+fn slice_para_formats(spans: &[ParaFormatSpan], range: std::ops::Range<usize>) -> Vec<ParaFormatSpan> {
+    spans
+        .iter()
+        .filter_map(|s| {
+            let start = s.start.max(range.start);
+            let end = s.end.min(range.end);
+            (start < end).then(|| ParaFormatSpan {
+                start: start - range.start,
+                end: end - range.start,
+                format: s.format.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Parse `data` as a `StyleTextPropAtom` body and attach the resulting
+/// character-/paragraph-formatting spans to `run`, clamped against
+/// `run.text`'s own character count (issue #254).
+fn apply_style_text_prop(run: &mut TextRun, data: &[u8]) {
+    let text_char_len = run.text.chars().count();
+    let (para_spans, char_spans) = style::parse_style_text_prop(data, text_char_len);
+    run.para_formats = para_spans;
+    run.char_formats = char_spans;
 }
 
 /// Text content of a single slide.
@@ -1263,11 +1366,13 @@ mod tests {
                 text_type: TextType::Title,
                 text: "first".into(),
                 hyperlink: None,
+                ..Default::default()
             },
             TextRun {
                 text_type: TextType::Body,
                 text: "second".into(),
                 hyperlink: None,
+                ..Default::default()
             },
         ];
 

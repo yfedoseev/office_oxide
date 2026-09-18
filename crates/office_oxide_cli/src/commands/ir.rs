@@ -52,10 +52,12 @@ fn element_to_json(elem: &office_oxide::ir::Element) -> serde_json::Value {
         Element::Heading(h) => json!({
             "type": "heading",
             "level": h.level,
+            "alignment": h.alignment,
             "content": inline_to_json(&h.content),
         }),
         Element::Paragraph(p) => json!({
             "type": "paragraph",
+            "alignment": p.alignment,
             "content": inline_to_json(&p.content),
         }),
         Element::Table(t) => json!({
@@ -143,6 +145,15 @@ fn inline_to_json(content: &[office_oxide::ir::InlineContent]) -> Vec<serde_json
                 "italic": span.italic,
                 "strikethrough": span.strikethrough,
                 "hyperlink": span.hyperlink,
+                "underline": span.underline,
+                "font_size_half_pt": span.font_size_half_pt,
+                "color": span.color.map(|[r, g, b]| format!("{r:02X}{g:02X}{b:02X}")),
+                "font_name": span.font_name,
+                "highlight": span.highlight.map(|[r, g, b]| format!("{r:02X}{g:02X}{b:02X}")),
+                "vertical_align": span.vertical_align,
+                "all_caps": span.all_caps,
+                "small_caps": span.small_caps,
+                "char_spacing_half_pt": span.char_spacing_half_pt,
             }),
             InlineContent::LineBreak => json!({ "type": "line_break" }),
             InlineContent::FootnoteRef(r) => json!({
@@ -313,6 +324,48 @@ mod tests {
             rendered.contains(r#""marker":"footnote""#),
             "a footnote's marker must also reach the projection: {rendered}"
         );
+    }
+
+    /// issue #333 — `inline_to_json` used to project only `text`/`bold`/
+    /// `italic`/`strikethrough`/`hyperlink` from a `TextSpan`, silently
+    /// dropping every other formatting field the IR actually carries.
+    #[test]
+    fn test_text_span_formatting_fields_reach_the_json_projection() {
+        use office_oxide::ir::{TextSpan, UnderlineStyle, VerticalAlign};
+
+        let ir = DocumentIR {
+            metadata: Metadata {
+                format: DocumentFormat::Ppt,
+                title: None,
+                ..Default::default()
+            },
+            sections: vec![Section {
+                elements: vec![Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan {
+                        underline: Some(UnderlineStyle::Single),
+                        font_size_half_pt: Some(36),
+                        color: Some([0x12, 0x34, 0x56]),
+                        font_name: Some("Calibri".to_string()),
+                        vertical_align: Some(VerticalAlign::Superscript),
+                        all_caps: true,
+                        ..TextSpan::plain("styled")
+                    })],
+                    alignment: Some(ParagraphAlignment::Center),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            }],
+            defined_names: Vec::new(),
+        };
+        let json = ir_to_json(&ir);
+        let rendered = serde_json::to_string(&json).unwrap();
+        assert!(rendered.contains(r#""underline":"single""#), "{rendered}");
+        assert!(rendered.contains(r#""font_size_half_pt":36"#), "{rendered}");
+        assert!(rendered.contains(r#""color":"123456""#), "{rendered}");
+        assert!(rendered.contains(r#""font_name":"Calibri""#), "{rendered}");
+        assert!(rendered.contains(r#""vertical_align":"superscript""#), "{rendered}");
+        assert!(rendered.contains(r#""all_caps":true"#), "{rendered}");
+        assert!(rendered.contains(r#""alignment":"center""#), "{rendered}");
     }
 
     /// issue #252 — a worksheet's conditional formatting rules must reach

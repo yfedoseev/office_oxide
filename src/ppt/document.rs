@@ -158,11 +158,13 @@ mod tests {
                             text_type: TextType::Title,
                             text: "Welcome".into(),
                             hyperlink: None,
+                            ..Default::default()
                         },
                         TextRun {
                             text_type: TextType::Body,
                             text: "Hello world".into(),
                             hyperlink: None,
+                            ..Default::default()
                         },
                     ],
                 },
@@ -171,6 +173,7 @@ mod tests {
                         text_type: TextType::Title,
                         text: "Slide 2".into(),
                         hyperlink: None,
+                        ..Default::default()
                     }],
                 },
             ],
@@ -193,11 +196,13 @@ mod tests {
                         text_type: TextType::Title,
                         text: "My Title".into(),
                         hyperlink: None,
+                        ..Default::default()
                     },
                     TextRun {
                         text_type: TextType::Body,
                         text: "Content here".into(),
                         hyperlink: None,
+                        ..Default::default()
                     },
                 ],
             }],
@@ -220,11 +225,13 @@ mod tests {
                         text_type: TextType::Title,
                         text: "Title".into(),
                         hyperlink: None,
+                        ..Default::default()
                     },
                     TextRun {
                         text_type: TextType::Notes,
                         text: "Speaker notes".into(),
                         hyperlink: None,
+                        ..Default::default()
                     },
                 ],
             }],
@@ -242,6 +249,7 @@ mod tests {
                     text_type: t,
                     text: s.to_string(),
                     hyperlink: None,
+                    ..Default::default()
                 })
                 .collect(),
         }
@@ -332,6 +340,7 @@ mod tests {
                     text_type: TextType::Body,
                     text: "Click here".to_string(),
                     hyperlink: Some("http://testuri.org/".to_string()),
+                    ..Default::default()
                 }],
             }],
         };
@@ -543,5 +552,152 @@ mod tests {
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
         assert_eq!(ir.metadata.title.as_deref(), Some("Slide Title"));
+    }
+
+    // ── #254: direct character/paragraph formatting ──
+
+    /// issue #254 — real `bold: Some(false)` from a `StyleTextPropAtom`
+    /// must override the old synthetic "titles are always bold" default,
+    /// not just be ignored in its favor.
+    #[test]
+    fn ir_real_char_formatting_overrides_synthetic_title_bold() {
+        use crate::ir::{Element, InlineContent};
+        use crate::ppt::{CharFormat, CharFormatSpan};
+
+        let doc = PptDocument {
+            images: Vec::new(),
+            has_macros: false,
+            summary_properties: None,
+            slides: vec![SlideText {
+                text_runs: vec![TextRun {
+                    text_type: TextType::Title,
+                    text: "Not Bold".to_string(),
+                    hyperlink: None,
+                    char_formats: vec![CharFormatSpan {
+                        start: 0,
+                        end: 8,
+                        format: CharFormat { bold: Some(false), ..Default::default() },
+                    }],
+                    para_formats: Vec::new(),
+                }],
+            }],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        let Element::Heading(h) = &ir.sections[0].elements[0] else {
+            panic!("expected a heading, got {:?}", ir.sections[0].elements[0]);
+        };
+        let InlineContent::Text(span) = &h.content[0] else {
+            panic!("expected text content");
+        };
+        assert!(!span.bold, "explicit bold:false from the file must win over the old synthetic default");
+    }
+
+    /// issue #254 — two `TextCFRun`s with different formatting over the
+    /// same run of text must produce two separately-formatted `TextSpan`s,
+    /// not one span with the first (or last) run's formatting applied to
+    /// everything.
+    #[test]
+    fn ir_char_formatting_produces_multiple_spans_within_one_paragraph() {
+        use crate::ir::{Element, InlineContent};
+        use crate::ppt::{CharFormat, CharFormatSpan};
+
+        let doc = PptDocument {
+            images: Vec::new(),
+            has_macros: false,
+            summary_properties: None,
+            slides: vec![SlideText {
+                text_runs: vec![TextRun {
+                    text_type: TextType::Body,
+                    text: "ABCDEF".to_string(),
+                    hyperlink: None,
+                    char_formats: vec![
+                        CharFormatSpan { start: 0, end: 3, format: CharFormat { bold: Some(true), ..Default::default() } },
+                        CharFormatSpan { start: 3, end: 6, format: CharFormat { italic: Some(true), ..Default::default() } },
+                    ],
+                    para_formats: Vec::new(),
+                }],
+            }],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        let Element::Paragraph(p) = &ir.sections[0].elements[0] else {
+            panic!("expected a paragraph, got {:?}", ir.sections[0].elements[0]);
+        };
+        assert_eq!(p.content.len(), 2, "one span per formatting run: {:?}", p.content);
+        let InlineContent::Text(first) = &p.content[0] else { panic!() };
+        let InlineContent::Text(second) = &p.content[1] else { panic!() };
+        assert_eq!(first.text, "ABC");
+        assert!(first.bold);
+        assert!(!first.italic);
+        assert_eq!(second.text, "DEF");
+        assert!(second.italic);
+        assert!(!second.bold);
+    }
+
+    /// issue #254 — a `TextPFRun`'s alignment must reach `Paragraph::alignment`.
+    #[test]
+    fn ir_paragraph_alignment_reaches_ir() {
+        use crate::ir::{Element, ParagraphAlignment};
+        use crate::ppt::{ParaFormat, ParaFormatSpan};
+
+        let doc = PptDocument {
+            images: Vec::new(),
+            has_macros: false,
+            summary_properties: None,
+            slides: vec![SlideText {
+                text_runs: vec![TextRun {
+                    text_type: TextType::Body,
+                    text: "Centered".to_string(),
+                    hyperlink: None,
+                    char_formats: Vec::new(),
+                    para_formats: vec![ParaFormatSpan {
+                        start: 0,
+                        end: 8,
+                        format: ParaFormat { alignment: Some(1) }, // Tx_ALIGNCenter
+                    }],
+                }],
+            }],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        let Element::Paragraph(p) = &ir.sections[0].elements[0] else {
+            panic!("expected a paragraph, got {:?}", ir.sections[0].elements[0]);
+        };
+        assert_eq!(p.alignment, Some(ParagraphAlignment::Center));
+    }
+
+    /// issue #334 — a lone `\r` inside one text atom (the standard PPT97
+    /// multi-bullet layout, per [MS-PPT]'s own worked example) must split
+    /// into separate `Paragraph` elements, not survive as a literal `\r`
+    /// embedded in one giant paragraph (`str::lines()` alone doesn't split
+    /// on a bare `\r`).
+    #[test]
+    fn ir_bare_cr_splits_into_multiple_paragraphs() {
+        use crate::ir::{Element, InlineContent};
+
+        let doc = PptDocument {
+            images: Vec::new(),
+            has_macros: false,
+            summary_properties: None,
+            slides: vec![SlideText {
+                text_runs: vec![TextRun {
+                    text_type: TextType::Body,
+                    text: "a sunny day\rthe blue sky\rsome green grass".to_string(),
+                    hyperlink: None,
+                    ..Default::default()
+                }],
+            }],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        assert_eq!(ir.sections[0].elements.len(), 3, "{:?}", ir.sections[0].elements);
+        let texts: Vec<&str> = ir.sections[0]
+            .elements
+            .iter()
+            .map(|e| {
+                let Element::Paragraph(p) = e else { panic!("expected paragraphs") };
+                let InlineContent::Text(t) = &p.content[0] else { panic!() };
+                t.text.as_str()
+            })
+            .collect();
+        assert_eq!(texts, ["a sunny day", "the blue sky", "some green grass"]);
+        assert!(!texts.iter().any(|t| t.contains('\r')), "no leftover literal \\r: {texts:?}");
     }
 }
