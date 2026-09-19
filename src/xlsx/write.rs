@@ -285,6 +285,22 @@ pub struct PageSetup {
     pub landscape: bool,
 }
 
+/// A cell comment to write back as a real legacy Excel comment
+/// (`xl/comments*.xml` + a companion VML shape), not the plain-text row
+/// dump the writer used to fall back to for `Element::Endnote` content
+/// with nowhere else to go (issue #344).
+#[derive(Debug, Clone)]
+pub struct SheetCommentOut {
+    /// 0-based row.
+    pub row: usize,
+    /// 0-based column.
+    pub col: usize,
+    /// Comment author, when known.
+    pub author: Option<String>,
+    /// Comment body text.
+    pub text: String,
+}
+
 /// A picture anchored on a worksheet via a DrawingML drawing part.
 ///
 /// Anchor coordinates are in EMU and absolute relative to the sheet
@@ -357,6 +373,10 @@ struct SheetDataInner {
     /// no hyperlink concept at all, so a cell's URL was silently dropped
     /// on every write, unconditionally).
     pub hyperlinks: HashMap<(usize, usize), String>,
+    /// Cell comments to write as real `xl/comments*.xml` + VML entries
+    /// (issue #344 — these used to have nowhere to go and fell through
+    /// to being dumped as plain extra rows below the table).
+    pub comments: Vec<SheetCommentOut>,
 }
 
 impl SheetDataInner {
@@ -371,6 +391,7 @@ impl SheetDataInner {
             images: Vec::new(),
             text_shapes: Vec::new(),
             hyperlinks: HashMap::new(),
+            comments: Vec::new(),
         }
     }
 
@@ -436,6 +457,22 @@ impl SheetDataInner {
             return self;
         }
         self.hyperlinks.insert((row, col), url.into());
+        self
+    }
+
+    /// Add a real cell comment (issue #344). Silently ignored outside
+    /// the sheet grid, matching `set_cell`/`set_cell_styled`.
+    pub fn set_cell_comment(
+        &mut self,
+        row: usize,
+        col: usize,
+        author: Option<String>,
+        text: impl Into<String>,
+    ) -> &mut Self {
+        if !in_grid(row, col) {
+            return self;
+        }
+        self.comments.push(SheetCommentOut { row, col, author, text: text.into() });
         self
     }
 
@@ -631,6 +668,18 @@ impl<'a> SheetData<'a> {
         url: impl Into<String>,
     ) -> &mut Self {
         self.0.set_cell_hyperlink(row, col, url);
+        self
+    }
+
+    /// Add a real cell comment (issue #344).
+    pub fn set_cell_comment(
+        &mut self,
+        row: usize,
+        col: usize,
+        author: Option<String>,
+        text: impl Into<String>,
+    ) -> &mut Self {
+        self.0.set_cell_comment(row, col, author, text);
         self
     }
 
@@ -962,11 +1011,22 @@ impl XlsxWriter {
                 hyperlink_rids.insert((row, col), rid);
             }
 
+            // Real legacy Excel comments: xl/comments<n>.xml (the
+            // content) plus xl/drawings/vmlDrawing<n>.vml (the popup
+            // shape Excel needs to render an indicator at all) — sheets
+            // with no comments get neither part (issue #344).
+            let legacy_drawing_rid = if !sheet.comments.is_empty() {
+                Some(Self::write_comments_for_sheet(opc, &part_name, i + 1, &sheet.comments)?)
+            } else {
+                None
+            };
+
             let ws_xml = Self::build_worksheet_xml(
                 sheet,
                 &style_table,
                 drawing_rid.as_deref(),
                 &hyperlink_rids,
+                legacy_drawing_rid.as_deref(),
             )?;
             opc.add_part(&part_name, CT_WORKSHEET, &ws_xml)?;
         }
@@ -1026,6 +1086,7 @@ impl XlsxWriter {
         style_table: &StyleTable,
         drawing_rid: Option<&str>,
         hyperlink_rids: &HashMap<(usize, usize), String>,
+        legacy_drawing_rid: Option<&str>,
     ) -> crate::core::Result<Vec<u8>> {
         let mut w = Writer::new(Vec::new());
 
@@ -1173,9 +1234,53 @@ impl XlsxWriter {
             w.write_event(Event::Empty(d))?;
         }
 
+        // `<legacyDrawing>` (the VML part carrying comment popup shapes)
+        // comes after `<drawing>`, the last child CT_Worksheet allows
+        // before `</worksheet>` for what this writer emits (issue #344).
+        if let Some(rid) = legacy_drawing_rid {
+            let mut ld = BytesStart::new("legacyDrawing");
+            ld.push_attribute(("r:id", rid));
+            w.write_event(Event::Empty(ld))?;
+        }
+
         w.write_event(Event::End(BytesEnd::new("worksheet")))?;
 
         Ok(w.into_inner())
+    }
+
+    /// Write `xl/comments<sheet_n>.xml` (the comment text, per
+    /// [MS-XLS]... no — ECMA-376 §18.7.3 `CT_Comments`) and the
+    /// companion `xl/drawings/vmlDrawing<sheet_n>.vml` (the legacy VML
+    /// popup shape Excel requires to actually display a comment
+    /// indicator on the cell), wiring both relationships off the
+    /// worksheet part.
+    ///
+    /// Returns the relationship ID for `<legacyDrawing r:id="…"/>` —
+    /// note this points at the *VML* part, not the comments part; the
+    /// comments part itself is found purely by relationship type, with
+    /// no reference inside the worksheet body at all.
+    fn write_comments_for_sheet<W: Write + Seek>(
+        opc: &mut OpcWriter<W>,
+        worksheet_part: &PartName,
+        sheet_n: usize,
+        comments: &[SheetCommentOut],
+    ) -> Result<String> {
+        let comments_target = format!("../comments{}.xml", sheet_n);
+        opc.add_part_rel(worksheet_part, rel_types::COMMENTS, &comments_target);
+        let comments_part = PartName::new(&format!("/xl/comments{}.xml", sheet_n))?;
+        const CT_COMMENTS: &str =
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml";
+        let comments_xml = build_comments_xml(comments);
+        opc.add_part(&comments_part, CT_COMMENTS, &comments_xml)?;
+
+        let vml_target = format!("../drawings/vmlDrawing{}.vml", sheet_n);
+        let vml_rid = opc.add_part_rel(worksheet_part, rel_types::VML_DRAWING, &vml_target);
+        let vml_part = PartName::new(&format!("/xl/drawings/vmlDrawing{}.vml", sheet_n))?;
+        const CT_VML: &str = "application/vnd.openxmlformats-officedocument.vmlDrawing";
+        let vml_xml = build_vml_comments_xml(comments);
+        opc.add_part(&vml_part, CT_VML, &vml_xml)?;
+
+        Ok(vml_rid)
     }
 
     /// Materialise `xl/drawings/drawing<sheet_n>.xml`, write each
@@ -1368,6 +1473,89 @@ impl XlsxWriter {
 
         Ok(())
     }
+}
+
+/// Escape the handful of characters that matter inside XML text content
+/// and attribute values (`&`, `<`, `>`) — the writer's own `quick_xml`
+/// `Writer` handles this automatically for `Event::Text`/attribute
+/// values via its own API, but the VML builder below writes some
+/// content as raw string interpolation, so text needs escaping by hand.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Generate `xl/comments<n>.xml` (ECMA-376 §18.7 `CT_Comments`): one
+/// `<author>` per distinct comment author (falling back to an empty
+/// author for comments with none, matching what Excel itself writes),
+/// then one `<comment>` per entry referencing its author by index.
+fn build_comments_xml(comments: &[SheetCommentOut]) -> Vec<u8> {
+    let mut authors: Vec<String> = Vec::new();
+    let mut author_idx: Vec<usize> = Vec::with_capacity(comments.len());
+    for c in comments {
+        let name = c.author.clone().unwrap_or_default();
+        let idx = match authors.iter().position(|a| a == &name) {
+            Some(i) => i,
+            None => {
+                authors.push(name);
+                authors.len() - 1
+            },
+        };
+        author_idx.push(idx);
+    }
+
+    let mut xml = String::new();
+    xml.push_str(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#);
+    xml.push_str(
+        r#"<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">"#,
+    );
+    xml.push_str("<authors>");
+    for a in &authors {
+        xml.push_str(&format!("<author>{}</author>", xml_escape(a)));
+    }
+    xml.push_str("</authors><commentList>");
+    for (i, c) in comments.iter().enumerate() {
+        let ref_ = format!("{}{}", col_name(c.col as u32), c.row + 1);
+        xml.push_str(&format!(
+            r#"<comment ref="{}" authorId="{}"><text><r><t xml:space="preserve">{}</t></r></text></comment>"#,
+            ref_,
+            author_idx[i],
+            xml_escape(&c.text)
+        ));
+    }
+    xml.push_str("</commentList></comments>");
+    xml.into_bytes()
+}
+
+/// Generate `xl/drawings/vmlDrawing<n>.vml`: the legacy comment popup
+/// shapes Excel needs to show a comment indicator at all — a sheet
+/// whose `xl/comments*.xml` exists but has no matching VML shape can
+/// make Excel offer to "repair" the file, or simply not show the
+/// indicator. One `<v:shape>` per comment, referencing the shared
+/// `_x0000_t202` shapetype and anchored to its cell via `<x:Row>`/
+/// `<x:Column>` (0-based) inside `<x:ClientData ObjectType="Note">`.
+/// The exact `style` position is a reasonable default near the cell,
+/// not pixel-perfect — Excel repositions the popup itself based on
+/// `Row`/`Column`, matching the convention other real-world XLSX
+/// writers (PhpSpreadsheet, openpyxl) use for this same template.
+fn build_vml_comments_xml(comments: &[SheetCommentOut]) -> Vec<u8> {
+    let mut xml = String::new();
+    xml.push_str(r#"<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel">"#);
+    xml.push_str(r#"<o:shapelayout v:ext="edit"><o:idmap v:ext="edit" data="1"/></o:shapelayout>"#);
+    xml.push_str(
+        r#"<v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype>"#,
+    );
+    for (i, c) in comments.iter().enumerate() {
+        let id = i + 1;
+        let left_pt = 60.0 + (c.col as f64) * 2.0;
+        let top_pt = 1.5 + (c.row as f64) * 2.0;
+        xml.push_str(&format!(
+            r##"<v:shape id="_x0000_s{id}" type="#_x0000_t202" style="position:absolute;margin-left:{left_pt}pt;margin-top:{top_pt}pt;width:108pt;height:59.25pt;z-index:{id};visibility:hidden" fillcolor="#ffffe1" o:insetmode="auto"><v:fill color2="#ffffe1"/><v:shadow on="t" color="black" obscured="t"/><v:path o:connecttype="none"/><v:textbox style="mso-direction-alt:auto"><div style="text-align:left"/></v:textbox><x:ClientData ObjectType="Note"><x:MoveWithCells/><x:SizeWithCells/><x:AutoFill>False</x:AutoFill><x:Row>{row}</x:Row><x:Column>{col}</x:Column></x:ClientData></v:shape>"##,
+            row = c.row,
+            col = c.col,
+        ));
+    }
+    xml.push_str("</xml>");
+    xml.into_bytes()
 }
 
 /// Generate `xl/drawings/drawing<n>.xml` for a sheet's pictures.

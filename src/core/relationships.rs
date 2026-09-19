@@ -61,6 +61,10 @@ pub mod rel_types {
     /// Relationship type for comments.
     pub const COMMENTS: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
+    /// Relationship type for a legacy VML drawing part (comment popup
+    /// shapes). Issue #344.
+    pub const VML_DRAWING: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing";
     /// Relationship type for a modern (Excel 2016+) threaded-comment part
     /// (`xl/threadedComments/threadedCommentN.xml`), worksheet-to-part.
     /// Issue #301.

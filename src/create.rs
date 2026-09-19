@@ -704,6 +704,46 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                 | Element::PageBreak
                 | Element::ColumnBreak
                 | Element::Shape(_) => {},
+                // An XLSX-sourced cell comment round-trips as
+                // Element::Endnote (convert_xlsx.rs appends one per
+                // comment, marker = "{cell_ref}" or "{cell_ref}
+                // ({author})"). Written back as a real cell comment
+                // instead of falling into the generic wildcard below,
+                // which dumped every comment's text as a spurious extra
+                // row with no cell reference at all (issue #344).
+                Element::Endnote(n) => {
+                    let placed = parse_xlsx_comment_marker(n.marker.as_deref())
+                        .and_then(|(cell_ref, author)| {
+                            crate::xlsx::CellRef::parse(&cell_ref).map(|r| (r, author))
+                        })
+                        .map(|(r, author)| {
+                            let mut rows = Vec::new();
+                            for inner in &n.content {
+                                xlsx_text_rows(inner, &mut rows);
+                            }
+                            let text = rows.join("\n");
+                            if !text.is_empty() {
+                                sheet.set_cell_comment(r.row as usize, r.col as usize, author, text);
+                            }
+                        })
+                        .is_some();
+                    // A marker that doesn't match the XLSX "{cell_ref}
+                    // ({author})" shape (an endnote from a non-XLSX
+                    // source converted to a spreadsheet, say) still has
+                    // real text — fall back to the generic row dump
+                    // rather than silently dropping it.
+                    if !placed {
+                        let mut rows = Vec::new();
+                        for inner in &n.content {
+                            xlsx_text_rows(inner, &mut rows);
+                        }
+                        for line in rows {
+                            body_paragraphs_seen = true;
+                            sheet.set_cell(row_cursor, 0, CellData::String(line));
+                            row_cursor += 1;
+                        }
+                    }
+                },
                 // Everything else has no native spreadsheet shape but does
                 // have text, and dropping it silently is how a PPTX → XLSX
                 // conversion lost 96% of its words.
@@ -1426,6 +1466,24 @@ fn first_inline_font_name(content: &[InlineContent]) -> Option<String> {
 /// `CodeBlock`, `Footnote`, `Endnote` and everything inside a `TextBox` that
 /// was not an image. Converting a presentation to a spreadsheet lost almost
 /// all of its text that way.
+/// Parse an XLSX-sourced comment's `Note::marker` — `"{cell_ref}"` or
+/// `"{cell_ref} ({author})"`, exactly the shape `convert_xlsx.rs`
+/// generates for every `Element::Endnote` it builds from a real cell
+/// comment — back into `(cell_ref, author)`. Returns `None` for any
+/// other shape (no marker, or one that doesn't parse this way), so the
+/// caller can fall back to treating it as ordinary endnote content
+/// (issue #344).
+fn parse_xlsx_comment_marker(marker: Option<&str>) -> Option<(String, Option<String>)> {
+    let marker = marker?;
+    match marker.split_once(" (") {
+        Some((cell_ref, rest)) => {
+            let author = rest.strip_suffix(')')?;
+            Some((cell_ref.to_string(), Some(author.to_string())))
+        },
+        None => Some((marker.to_string(), None)),
+    }
+}
+
 fn xlsx_text_rows(elem: &Element, out: &mut Vec<String>) {
     match elem {
         Element::Paragraph(p) => {
@@ -1705,5 +1763,87 @@ mod xlsx_table_write_tests {
             Some("https://example.com/b2"),
             "B2's hyperlink must survive at its own column, not be lost to a left-shift: {found:?}"
         );
+    }
+
+    /// issue #344 — the XLSX reader turns every real cell comment into an
+    /// `Element::Endnote` whose marker is `"{cell_ref}"` or
+    /// `"{cell_ref} ({author})"` (see `convert_xlsx.rs`). The writer used
+    /// to have nowhere to put endnote content in a spreadsheet and fell
+    /// back to dumping each one's text as a spurious extra row with no
+    /// cell reference at all, silently turning every commented cell into
+    /// bogus sheet data instead of round-tripping the comment. It must
+    /// now write a real `xl/comments*.xml` + `vmlDrawing*.vml` pair and
+    /// leave the sheet's own grid untouched.
+    #[test]
+    fn a_cell_comment_round_trips_as_a_real_comment_not_an_extra_row() {
+        let cell = |text: &str| TableCell {
+            content: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan { text: text.to_string(), ..Default::default() })],
+                ..Default::default()
+            })],
+            col_span: 1,
+            row_span: 1,
+            ..Default::default()
+        };
+
+        let table = Table {
+            rows: vec![TableRow {
+                cells: vec![cell("A1"), cell("B1")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let comment = Element::Endnote(Note {
+            id: 1,
+            marker: Some("B1 (Jane Doe)".to_string()),
+            content: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    text: "This needs review".to_string(),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            })],
+        });
+
+        let ir = DocumentIR {
+            metadata: Metadata { format: DocumentFormat::Xlsx, ..Default::default() },
+            sections: vec![Section {
+                elements: vec![Element::Table(table), comment],
+                ..Default::default()
+            }],
+            defined_names: Vec::new(),
+        };
+
+        let mut buf = Cursor::new(Vec::new());
+        create_from_ir_to_writer(&ir, DocumentFormat::Xlsx, &mut buf).unwrap();
+        buf.set_position(0);
+
+        // The written package must contain a real comments part and its
+        // companion VML drawing, not just plain sheet data.
+        let mut zip = zip::ZipArchive::new(buf.clone()).unwrap();
+        let names: Vec<String> = (0..zip.len()).map(|i| zip.by_index(i).unwrap().name().to_string()).collect();
+        assert!(
+            names.iter().any(|n| n.starts_with("xl/comments") && n.ends_with(".xml")),
+            "expected a comments part, got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("vmlDrawing")),
+            "expected a companion VML drawing part, got: {names:?}"
+        );
+
+        buf.set_position(0);
+        let doc = crate::Document::from_reader(buf, DocumentFormat::Xlsx).unwrap();
+        let ir2 = doc.to_ir();
+
+        let Element::Table(t) = &ir2.sections[0].elements[0] else {
+            panic!("expected a table as the first element");
+        };
+        assert_eq!(t.rows.len(), 1, "the comment must not appear as an extra sheet row");
+
+        let has_comment_endnote = ir2.sections[0].elements.iter().any(|e| {
+            matches!(e, Element::Endnote(n) if n.marker.as_deref() == Some("B1 (Jane Doe)"))
+        });
+        assert!(has_comment_endnote, "the comment must round-trip back onto cell B1: {:?}", ir2.sections[0].elements);
     }
 }
