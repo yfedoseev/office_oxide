@@ -372,9 +372,126 @@ fn resolve_slide(
                 &mut image_refs,
             );
             hidden = slide_is_hidden(&children);
+
+            // Placeholder character/paragraph formatting a direct
+            // StyleTextPropAtom left unset falls back to the slide's
+            // main master (issue #335). Best-effort: any missing piece
+            // of this chain (no SlideAtom, no master, no matching
+            // TxMasterStyleAtom) just leaves direct formatting as-is.
+            if let Some(master_id) = find_master_id(&children) {
+                if let Some(styles) = resolve_master_styles(stream, dir, master_id) {
+                    apply_master_inheritance(&mut text_runs, &styles);
+                }
+            }
         }
     }
     SlideText { text_runs, tables, image_refs, hidden }
+}
+
+/// The level-0 (no indentation) master style for the two placeholder
+/// text types this crate resolves inheritance for — matches the
+/// issue's own "title vs body" scope. Levels 1-4 (nested outline
+/// bullets) are a follow-up, not attempted here.
+#[derive(Debug, Clone, Default)]
+struct MasterStyles {
+    title: Option<(super::style::ParaFormat, super::style::CharFormat)>,
+    body: Option<(super::style::ParaFormat, super::style::CharFormat)>,
+}
+
+/// Find a `Slide` container's own `SlideAtom` and return its
+/// `masterIdRef` — the persist ID of the main master this slide
+/// inherits from. Layout ([MS-PPT] 2.4.2, cross-checked against Apache
+/// POI's `SlideAtom`): after the embedded 12-byte `SSlideLayoutAtom`,
+/// `masterIdRef: i32` immediately follows (body-relative offset 12).
+fn find_master_id(slide_children: &[u8]) -> Option<u32> {
+    // `USES_MASTER_SLIDE_ID` (0x80000000, per Apache POI's `SlideAtom`) is
+    // OR'd into `masterID`'s high bit as a "this references a real master"
+    // flag, not part of the persist ID itself — every real corpus file
+    // sets it, and masking it out is required for `dir.resolve()` to ever
+    // find the master (without this, every lookup silently misses).
+    const USES_MASTER_SLIDE_ID: u32 = 0x8000_0000;
+    for rec in RecordIter::new(slide_children) {
+        let Ok(rec) = rec else { break };
+        if rec.header.rec_type == RT_SLIDE_ATOM {
+            let b = rec.data.get(12..16)?;
+            let master_id = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            return Some(master_id & !USES_MASTER_SLIDE_ID);
+        }
+    }
+    None
+}
+
+/// Resolve `master_id` through the persist directory to its
+/// `MainMaster` container, then parse its `TxMasterStyleAtom` children
+/// for the Title/Body text types' level-0 style (issue #335).
+fn resolve_master_styles(stream: &[u8], dir: &PersistDirectory, master_id: u32) -> Option<MasterStyles> {
+    let offset = dir.resolve(master_id)?;
+    let children = bounded_container_children(stream, offset, RT_MAIN_MASTER)?;
+    let mut styles = MasterStyles::default();
+    for rec in RecordIter::new(&children) {
+        let Ok(rec) = rec else { break };
+        if rec.header.rec_type != RT_TX_MASTER_STYLE_ATOM {
+            continue;
+        }
+        let text_type = TextType::from_u32(rec.header.rec_instance as u32);
+        let target = match text_type {
+            TextType::Title => &mut styles.title,
+            TextType::Body => &mut styles.body,
+            _ => continue,
+        };
+        if target.is_none() {
+            let levels = style::parse_tx_master_style_atom(&rec.data, rec.header.rec_instance);
+            *target = levels.into_iter().next();
+        }
+    }
+    if styles.title.is_none() && styles.body.is_none() {
+        return None;
+    }
+    Some(styles)
+}
+
+/// Fill any unset `CharFormat`/`ParaFormat` field on every Title/Body
+/// `TextRun` from the resolved master style — a run with no direct
+/// formatting spans at all gets one synthetic whole-text span carrying
+/// pure master formatting, matching what PowerPoint itself renders
+/// (issue #335).
+fn apply_master_inheritance(text_runs: &mut [TextRun], styles: &MasterStyles) {
+    for run in text_runs {
+        let Some((master_pf, master_cf)) = (match run.text_type {
+            TextType::Title => styles.title.as_ref(),
+            TextType::Body => styles.body.as_ref(),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let text_char_len = run.text.chars().count();
+        if run.char_formats.is_empty() {
+            if text_char_len > 0 {
+                run.char_formats.push(CharFormatSpan {
+                    start: 0,
+                    end: text_char_len,
+                    format: master_cf.clone(),
+                });
+            }
+        } else {
+            for span in &mut run.char_formats {
+                span.format = span.format.inherit_from(master_cf);
+            }
+        }
+        if run.para_formats.is_empty() {
+            if text_char_len > 0 {
+                run.para_formats.push(ParaFormatSpan {
+                    start: 0,
+                    end: text_char_len,
+                    format: master_pf.clone(),
+                });
+            }
+        } else {
+            for span in &mut run.para_formats {
+                span.format = span.format.inherit_from(master_pf);
+            }
+        }
+    }
 }
 
 /// Recursively collect a shape tree's text, in document order, from a bounded
@@ -2073,6 +2190,89 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "second");
         assert_eq!(runs[0].text_type, TextType::Body);
+    }
+
+    /// A `SlideAtom` body: 12 opaque bytes of embedded `SSlideLayoutAtom`,
+    /// then `masterIdRef: i32`, `notesIdRef: i32`, `flags: u16`.
+    fn slide_atom_bytes(master_id_ref: u32) -> Vec<u8> {
+        let mut body = vec![0u8; 12];
+        body.extend_from_slice(&master_id_ref.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        make_atom(RT_SLIDE_ATOM, 0, &body)
+    }
+
+    /// A `TxMasterStyleAtom` body with exactly one indent level (0),
+    /// setting only `alignment` (`PFMasks` bit 11) and `font_size`
+    /// (`CFMasks` bit 17) — the same two bits `style.rs`'s own
+    /// `parse_pf_body`/`parse_cf_body` decode. `text_type` `0`
+    /// (`Title`)/`1` (`Body`) are both `< 5`, so no per-level
+    /// `indentLevel` field is present (issue #335).
+    fn master_style_bytes(text_type: u16, alignment: u16, font_size: i16) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u16.to_le_bytes()); // levels = 1
+        const PF_ALIGN: u32 = 1 << 11;
+        body.extend_from_slice(&PF_ALIGN.to_le_bytes());
+        body.extend_from_slice(&alignment.to_le_bytes());
+        const CF_SIZE: u32 = 1 << 17;
+        body.extend_from_slice(&CF_SIZE.to_le_bytes());
+        body.extend_from_slice(&font_size.to_le_bytes());
+        make_atom(RT_TX_MASTER_STYLE_ATOM, text_type, &body)
+    }
+
+    #[test]
+    fn placeholder_formatting_inherits_from_master_when_direct_formatting_is_absent() {
+        // A Title placeholder with no StyleTextPropAtom of its own at
+        // all (no direct formatting) whose slide's SlideAtom.masterIdRef
+        // points — with the USES_MASTER_SLIDE_ID flag bit (0x80000000)
+        // set, exactly as every real corpus file does — at a MainMaster
+        // carrying a Title TxMasterStyleAtom. The run must end up with
+        // the master's alignment/font_size (issue #335).
+        let mut stream = Vec::new();
+
+        let doc_offset = stream.len() as u32;
+        let mut slide_list_children = slide_persist_atom_bytes(2, 256);
+        slide_list_children.extend(make_atom(RT_TEXT_HEADER, 0, &0u32.to_le_bytes())); // type=Title
+        slide_list_children.extend(make_atom(RT_TEXT_BYTES, 0, b"Title Text"));
+        let slide_list = make_container(RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES, &slide_list_children);
+        stream.extend(make_container(RT_DOCUMENT, 0, &slide_list));
+
+        let slide_offset = stream.len() as u32;
+        let index_bytes = 0i32.to_le_bytes();
+        let outline_ref = make_atom(RT_OUTLINE_TEXT_REF_ATOM, 0, &index_bytes);
+        let textbox = make_container(0xF00D, 0, &outline_ref);
+        let shape = make_container(0xF004, 0, &textbox);
+        let mut slide_children = slide_atom_bytes(3 | 0x8000_0000);
+        slide_children.extend(shape);
+        stream.extend(make_container(RT_SLIDE, 0, &slide_children));
+
+        let master_offset = stream.len() as u32;
+        let master_children = master_style_bytes(0, 1, 44); // Title, center, 44pt
+        stream.extend(make_container(RT_MAIN_MASTER, 0, &master_children));
+
+        let pd_offset = stream.len() as u32;
+        stream.extend(persist_directory_bytes(&[
+            (1, doc_offset),
+            (2, slide_offset),
+            (3, master_offset),
+        ]));
+        let edit_offset = stream.len() as u32;
+        stream.extend(user_edit_atom_bytes(0, pd_offset, 1));
+        let current_user = current_user_bytes(edit_offset);
+
+        let slides = extract_slides_text(&stream, Some(&current_user));
+        assert_eq!(slides.len(), 1);
+        let run = &slides[0].text_runs[0];
+        assert_eq!(run.text, "Title Text");
+        assert_eq!(
+            run.char_formats.len(),
+            1,
+            "expected one synthetic master-inherited span: {:?}",
+            run.char_formats
+        );
+        assert_eq!(run.char_formats[0].format.font_size, Some(44), "font size must inherit from the master");
+        assert_eq!(run.para_formats.len(), 1);
+        assert_eq!(run.para_formats[0].format.alignment, Some(1), "alignment must inherit from the master");
     }
 
     #[test]

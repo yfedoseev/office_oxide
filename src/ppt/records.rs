@@ -16,6 +16,22 @@ use super::error::{PptError, Result};
 pub const RT_DOCUMENT: u16 = 0x03E8;
 pub const RT_SLIDE: u16 = 0x03EE;
 pub const RT_SLIDE_BASE: u16 = 0x03EC;
+/// SlideAtom ([MS-PPT] 2.4.2, record type 1007) — a `Slide` container's
+/// own atom; carries `masterIdRef`, the persist ID of the main master
+/// this slide inherits formatting from (issue #335).
+pub const RT_SLIDE_ATOM: u16 = 0x03EF;
+/// MainMaster container ([MS-PPT] 2.5.3, record type 1016) — the slide
+/// master; among its children are up to several `TxMasterStyleAtom`s,
+/// one per text type, each holding the level-indexed default
+/// character/paragraph formatting a placeholder shape falls back to for
+/// any property its own direct `StyleTextPropAtom` didn't set (issue
+/// #335).
+pub const RT_MAIN_MASTER: u16 = 0x03F8;
+/// TxMasterStyleAtom ([MS-PPT] 2.9.5, record type 4003). `recInstance`
+/// is itself the `TextTypeEnum` value this atom's styles apply to — "the
+/// atom instance value is the text type", per Apache POI's own doc
+/// comment on the equivalent class (issue #335).
+pub const RT_TX_MASTER_STYLE_ATOM: u16 = 0x0FA3;
 pub const RT_NOTES: u16 = 0x03F0;
 pub const RT_SLIDE_LIST_WITH_TEXT: u16 = 0x0FF0;
 pub const RT_TEXT_HEADER: u16 = 0x0F9F;

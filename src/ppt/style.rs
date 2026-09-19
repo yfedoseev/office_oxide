@@ -176,7 +176,16 @@ fn parse_pf_run(c: &mut Cursor) -> Option<(usize, ParaFormat)> {
     let count = c.u32()? as usize;
     c.skip(2)?; // indentLevel
     let masks = c.u32()?;
+    Some((count, parse_pf_body(c, masks)?))
+}
 
+/// The `TextPFException` body shared by `TextPFRun` (issue #254) and each
+/// level of a `TxMasterStyleAtom` (issue #335) — same `masks: u32` +
+/// mask-selected fields, just with a different prefix before this point
+/// (`count: u32` + `indentLevel: u16` for a run; a conditional 2-byte
+/// `indentLevel` for a master style level, see
+/// [`parse_master_style_level`]).
+fn parse_pf_body(c: &mut Cursor, masks: u32) -> Option<ParaFormat> {
     if masks & (PF_HAS_BULLET | PF_BULLET_HAS_FONT | PF_BULLET_HAS_COLOR | PF_BULLET_HAS_SIZE) != 0 {
         c.skip(2)?; // bulletFlags
     }
@@ -225,7 +234,7 @@ fn parse_pf_run(c: &mut Cursor) -> Option<(usize, ParaFormat)> {
         c.skip(2)?;
     }
 
-    Some((count, ParaFormat { alignment }))
+    Some(ParaFormat { alignment })
 }
 
 // CFMasks bit positions ([MS-PPT] 2.9.13).
@@ -247,6 +256,15 @@ const CF_SYMBOL_TYPEFACE: u32 = 1 << 23;
 fn parse_cf_run(c: &mut Cursor) -> Option<(usize, CharFormat)> {
     let count = c.u32()? as usize;
     let masks = c.u32()?;
+    Some((count, parse_cf_body(c, masks)?))
+}
+
+/// The `TextCFException` body shared by `TextCFRun` (issue #254) and each
+/// level of a `TxMasterStyleAtom` (issue #335) — same `masks: u32` +
+/// mask-selected fields, just with a different prefix (a `count: u32` for
+/// a run; nothing for a master style level, see
+/// [`parse_master_style_level`]).
+fn parse_cf_body(c: &mut Cursor, masks: u32) -> Option<CharFormat> {
     let mut fmt = CharFormat::default();
 
     if masks & CF_FONT_STYLE_ANY != 0 {
@@ -283,7 +301,82 @@ fn parse_cf_run(c: &mut Cursor) -> Option<(usize, CharFormat)> {
         fmt.position = c.i16();
     }
 
-    Some((count, fmt))
+    Some(fmt)
+}
+
+/// Parse one indent level's `(ParaFormat, CharFormat)` pair from a
+/// `TxMasterStyleAtom` body cursor, positioned right after the level
+/// count (or the previous level's character style).
+///
+/// `has_indent_level_field`: per [MS-PPT] and cross-checked against
+/// Apache POI's `TxMasterStyleAtom#init()`, only text types whose
+/// numeric `TextTypeEnum` value is `>= 5` (`CenterBody`/`CenterTitle`/
+/// `HalfBody`/`QuarterBody` — placeholder-layout variants, not the
+/// ordinary `Title`(0)/`Body`(1)/`Notes`(2)/`Other`(4) this crate
+/// resolves master inheritance for) carry an explicit 2-byte
+/// `indentLevel` before each level's paragraph mask; for the rest, a
+/// level's position in the array *is* its indent level, with no
+/// separate field to skip.
+fn parse_master_style_level(c: &mut Cursor, has_indent_level_field: bool) -> Option<(ParaFormat, CharFormat)> {
+    if has_indent_level_field {
+        c.skip(2)?; // indentLevel
+    }
+    let pf_masks = c.u32()?;
+    let pf = parse_pf_body(c, pf_masks)?;
+    let cf_masks = c.u32()?;
+    let cf = parse_cf_body(c, cf_masks)?;
+    Some((pf, cf))
+}
+
+/// Parse a `TxMasterStyleAtom` body (`rec.data`, header already stripped)
+/// into its per-level `(ParaFormat, CharFormat)` pairs, in indent-level
+/// order (index 0 = no indentation). Up to 5 levels per [MS-PPT]/POI's
+/// own `TxMasterStyleAtom.MAX_INDENT`. `text_type_native_id` is the
+/// record's own `recInstance` — "the atom instance value is the text
+/// type" (POI's own doc comment on this record), encoded exactly like
+/// `TextHeaderAtom`'s `txType` (issue #335).
+///
+/// Stops (returning whatever levels parsed cleanly so far) on any
+/// malformed/truncated level rather than propagating an error — master
+/// style inheritance is a best-effort enhancement to direct formatting,
+/// never a hard requirement for reading the rest of the document.
+pub fn parse_tx_master_style_atom(data: &[u8], text_type_native_id: u16) -> Vec<(ParaFormat, CharFormat)> {
+    let mut c = Cursor::new(data);
+    let Some(levels) = c.u16() else { return Vec::new() };
+    let has_indent_level_field = text_type_native_id >= 5;
+    let mut out = Vec::with_capacity((levels as usize).min(5));
+    for _ in 0..levels.min(5) {
+        match parse_master_style_level(&mut c, has_indent_level_field) {
+            Some(pair) => out.push(pair),
+            None => break,
+        }
+    }
+    out
+}
+
+impl CharFormat {
+    /// Fill any field this format left unset (`None`) from `master`,
+    /// keeping every field this format *did* specify untouched — the
+    /// "only fill in what's missing" inheritance [MS-PPT] describes for
+    /// a placeholder shape falling back to its master's
+    /// `TextMasterStyleAtom` (issue #335).
+    pub fn inherit_from(&self, master: &CharFormat) -> CharFormat {
+        CharFormat {
+            bold: self.bold.or(master.bold),
+            italic: self.italic.or(master.italic),
+            underline: self.underline.or(master.underline),
+            font_size: self.font_size.or(master.font_size),
+            color: self.color.or(master.color),
+            position: self.position.or(master.position),
+        }
+    }
+}
+
+impl ParaFormat {
+    /// As [`CharFormat::inherit_from`], for paragraph-level formatting.
+    pub fn inherit_from(&self, master: &ParaFormat) -> ParaFormat {
+        ParaFormat { alignment: self.alignment.or(master.alignment) }
+    }
 }
 
 /// Parse a `StyleTextPropAtom` body (`rec.data`, i.e. with the 8-byte
@@ -495,5 +588,65 @@ mod tests {
         data.extend(le32(0));
         let (para, _) = parse_style_text_prop(&data, 5);
         assert_eq!(para.len(), 0); // zero-length span isn't pushed, but parsing terminates
+    }
+
+    /// issue #335 — a `TxMasterStyleAtom` body with one indent level
+    /// (Title/Body text types carry no per-level `indentLevel` field,
+    /// per Apache POI's own `TxMasterStyleAtom#init()`), setting
+    /// alignment + font size.
+    #[test]
+    fn tx_master_style_atom_single_level_no_indent_field() {
+        let mut data = Vec::new();
+        data.extend(le16(1)); // levels = 1
+        data.extend(le32(PF_ALIGN));
+        data.extend(le16(2)); // alignment = right
+        data.extend(le32(CF_SIZE));
+        data.extend((32i16).to_le_bytes()); // font_size = 32
+
+        let levels = parse_tx_master_style_atom(&data, 0); // Title (native id 0, no indent field)
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].0.alignment, Some(2));
+        assert_eq!(levels[0].1.font_size, Some(32));
+    }
+
+    /// `CenterBody`(5)/`CenterTitle`(6)/`HalfBody`(7)/`QuarterBody`(8) DO
+    /// carry an explicit 2-byte `indentLevel` before each level's
+    /// paragraph mask — getting this wrong would desync every field
+    /// after it.
+    #[test]
+    fn tx_master_style_atom_center_body_has_indent_level_field() {
+        let mut data = Vec::new();
+        data.extend(le16(1)); // levels = 1
+        data.extend(le16(0)); // indentLevel (present for type >= 5)
+        data.extend(le32(PF_ALIGN));
+        data.extend(le16(1)); // alignment = center
+        data.extend(le32(0)); // no CF fields set
+        let levels = parse_tx_master_style_atom(&data, 5); // CenterBody
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].0.alignment, Some(1));
+    }
+
+    #[test]
+    fn tx_master_style_atom_truncated_does_not_panic() {
+        let levels = parse_tx_master_style_atom(&[0x01, 0x00], 0);
+        assert!(levels.is_empty());
+    }
+
+    #[test]
+    fn char_format_inherit_from_fills_only_unset_fields() {
+        let direct = CharFormat { bold: Some(true), ..Default::default() };
+        let master = CharFormat { bold: Some(false), font_size: Some(44), ..Default::default() };
+        let merged = direct.inherit_from(&master);
+        assert_eq!(merged.bold, Some(true), "a direct value must never be overridden by the master");
+        assert_eq!(merged.font_size, Some(44), "an unset field must be filled from the master");
+    }
+
+    #[test]
+    fn para_format_inherit_from_fills_only_unset_fields() {
+        let direct = ParaFormat { alignment: Some(0) };
+        let master = ParaFormat { alignment: Some(2) };
+        assert_eq!(direct.inherit_from(&master).alignment, Some(0));
+        let unset = ParaFormat { alignment: None };
+        assert_eq!(unset.inherit_from(&master).alignment, Some(2));
     }
 }
