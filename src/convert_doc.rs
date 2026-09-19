@@ -186,6 +186,25 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // were already in hand.
     crate::convert_xls::append_legacy_images(&mut sections, doc.images());
 
+    // Embedded OLE objects (issue #284) — at minimum, recognize each
+    // object exists and surface its identity, even without extracting
+    // its native payload. Mirrors #337's identical fix for legacy PPT:
+    // a data-less Element::Image with a descriptive alt_text, the same
+    // precedent #300 established for a data-less AutoShape placeholder.
+    if !doc.ole_objects().is_empty() {
+        if sections.is_empty() {
+            sections.push(Section::default());
+        }
+        let last = sections.last_mut().expect("just ensured non-empty");
+        for obj in doc.ole_objects() {
+            last.elements.push(Element::Image(Image {
+                alt_text: Some(obj.description.clone()),
+                data: None,
+                ..Default::default()
+            }));
+        }
+    }
+
     DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Doc,

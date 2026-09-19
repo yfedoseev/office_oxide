@@ -67,6 +67,12 @@ pub struct DocDocument {
     /// callers fall back to the merged-substory behavior in that case
     /// (issue #345).
     comments: Vec<ParsedComment>,
+    /// Embedded OLE objects (Excel workbooks, Equation Editor/MathType,
+    /// OLE Package, embedded Word/PowerPoint, etc.) found under the
+    /// root's `ObjectPool` storage, identified by presence of a
+    /// well-known stream name. Empty when there's no `ObjectPool` at
+    /// all (issue #284).
+    ole_objects: Vec<super::ole_objects::EmbeddedOleObject>,
 }
 
 /// One of the subdocuments stored after the main text in a `.doc`.
@@ -276,6 +282,11 @@ impl DocDocument {
             Err(_) => Vec::new(),
         };
         let has_macros = cfb.has_root_entry("_VBA_PROJECT");
+        // At minimum, recognize an embedded OLE object exists and
+        // surface its identity — before this, `ObjectPool` was never
+        // traversed at all, so an embedded Excel workbook, Equation
+        // Editor object, etc. left no trace anywhere (issue #284).
+        let ole_objects = super::ole_objects::extract_ole_objects(&cfb);
         let summary_properties = cfb
             .open_stream("\u{5}SummaryInformation")
             .ok()
@@ -293,6 +304,7 @@ impl DocDocument {
             comment_authors,
             header_footer,
             comments,
+            ole_objects,
         })
     }
 
@@ -337,6 +349,13 @@ impl DocDocument {
     /// #345).
     pub(crate) fn comments(&self) -> &[ParsedComment] {
         &self.comments
+    }
+
+    /// Embedded OLE objects found under `ObjectPool`, identified by
+    /// presence of a well-known stream name. Empty when there's no
+    /// `ObjectPool` at all, or it's empty/unrecognizable (issue #284).
+    pub(crate) fn ole_objects(&self) -> &[super::ole_objects::EmbeddedOleObject] {
+        &self.ole_objects
     }
 
     /// `true` when the file carries a `_VBA_PROJECT` storage — a cheap
@@ -710,6 +729,7 @@ mod tests {
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
             comments: Vec::new(),
+            ole_objects: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: "First paragraph\nSecond paragraph\n\nAfter gap".into(),
@@ -731,6 +751,7 @@ mod tests {
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
             comments: Vec::new(),
+            ole_objects: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: "Hello World".into(),
@@ -758,6 +779,7 @@ mod tests {
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
             comments: Vec::new(),
+            ole_objects: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: "Main body text".into(),
@@ -785,6 +807,7 @@ mod tests {
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
             comments: Vec::new(),
+            ole_objects: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: "Body".into(),
@@ -807,6 +830,7 @@ mod tests {
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
             comments: Vec::new(),
+            ole_objects: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: "only the recovered fragment".into(),
@@ -838,6 +862,7 @@ mod tests {
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
             comments: Vec::new(),
+            ole_objects: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: text.to_string(),
@@ -857,6 +882,7 @@ mod tests {
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
             comments: Vec::new(),
+            ole_objects: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: String::new(),
