@@ -710,7 +710,7 @@ impl DocxWriter {
 
     /// Add a full IR table with borders, column widths, and cell styling.
     pub fn add_ir_table(&mut self, table: &crate::ir::Table) -> &mut Self {
-        let rich = convert_ir_table(table);
+        let rich = convert_ir_table(table, &mut self.next_num_id);
         self.elements.push(DocxElement::RichTable(rich));
         self
     }
@@ -802,7 +802,7 @@ impl DocxWriter {
             .map(|item| {
                 let mut elems: Vec<DocxElement> = Vec::new();
                 for content_elem in &item.content {
-                    convert_ir_element_to_docx_elements(content_elem, &mut elems);
+                    convert_ir_element_to_docx_elements(content_elem, &mut elems, &mut self.next_num_id);
                 }
                 elems
             })
@@ -839,7 +839,7 @@ impl DocxWriter {
     pub fn add_text_box(&mut self, tb: &crate::ir::TextBox) -> &mut Self {
         let mut inner: Vec<DocxElement> = Vec::new();
         for elem in &tb.content {
-            convert_ir_element_to_docx_elements(elem, &mut inner);
+            convert_ir_element_to_docx_elements(elem, &mut inner, &mut self.next_num_id);
         }
         let width_emu = tb.width_emu.unwrap_or(914400);
         let height_emu = tb.height_emu.unwrap_or(685800);
@@ -865,7 +865,7 @@ impl DocxWriter {
     ) -> &mut Self {
         let mut elems: Vec<DocxElement> = Vec::new();
         for elem in content {
-            convert_ir_element_to_docx_elements(elem, &mut elems);
+            convert_ir_element_to_docx_elements(elem, &mut elems, &mut self.next_num_id);
         }
         self.footnotes.push(DocxNote {
             id,
@@ -884,7 +884,7 @@ impl DocxWriter {
     ) -> &mut Self {
         let mut elems: Vec<DocxElement> = Vec::new();
         for elem in content {
-            convert_ir_element_to_docx_elements(elem, &mut elems);
+            convert_ir_element_to_docx_elements(elem, &mut elems, &mut self.next_num_id);
         }
         self.endnotes.push(DocxNote {
             id,
@@ -921,7 +921,7 @@ impl DocxWriter {
     ) -> &mut Self {
         let mut docx_elems: Vec<DocxElement> = Vec::new();
         for elem in &elements {
-            convert_ir_element_to_docx_elements(elem, &mut docx_elems);
+            convert_ir_element_to_docx_elements(elem, &mut docx_elems, &mut self.next_num_id);
         }
         self.headers_footers.push(DocxHf {
             hf_type,
@@ -1315,6 +1315,53 @@ impl DocxWriter {
         w.into_inner()
     }
 
+    /// Collect every `RichList` in the document, wherever it sits — not
+    /// just `self.elements`, but recursively inside table cells, text
+    /// boxes, and each header/footer/footnote/endnote's own element tree.
+    /// `generate_numbering_xml` used to scan only the top-level
+    /// `self.elements`, so a list nested in a cell/text box/header never
+    /// got its own `abstractNum`/`num` definitions at all — before #339's
+    /// fix gave such lists their own `RichList` entries in the first
+    /// place, this had no effect (they were flat paragraphs), but without
+    /// this recursive collection that fix would still have produced
+    /// `<w:numId>` references to definitions that don't exist.
+    fn all_rich_lists(&self) -> Vec<&DocxRichList> {
+        fn walk<'a>(elements: &'a [DocxElement], out: &mut Vec<&'a DocxRichList>) {
+            for elem in elements {
+                match elem {
+                    DocxElement::RichList(rl) => {
+                        out.push(rl);
+                        for item in &rl.items {
+                            walk(item, out);
+                        }
+                    },
+                    DocxElement::RichTable(t) => {
+                        for row in &t.rows {
+                            for cell in &row.cells {
+                                walk(&cell.content, out);
+                            }
+                        }
+                    },
+                    DocxElement::TextBox(tb) => walk(&tb.content, out),
+                    _ => {},
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        walk(&self.elements, &mut out);
+        for hf in &self.headers_footers {
+            walk(&hf.elements, &mut out);
+        }
+        for note in &self.footnotes {
+            walk(&note.elements, &mut out);
+        }
+        for note in &self.endnotes {
+            walk(&note.elements, &mut out);
+        }
+        out
+    }
+
     fn generate_numbering_xml(&self) -> Vec<u8> {
         let mut w = Writer::new(Vec::new());
 
@@ -1336,26 +1383,23 @@ impl DocxWriter {
         // `numId` (issue #261), so group by `num_id` here rather than
         // emitting one abstractNum/num pair per `RichList` entry — that
         // would redefine the same numId's abstractNumId repeatedly and,
-        // worse, only ever define level 0.
+        // worse, only ever define level 0. Collected from everywhere a
+        // `RichList` can appear (issue #339), not just top-level elements.
+        let rich_lists = self.all_rich_lists();
         let mut num_ids: Vec<u32> = Vec::new();
-        for elem in &self.elements {
-            if let DocxElement::RichList(rl) = elem {
-                if !num_ids.contains(&rl.num_id) {
-                    num_ids.push(rl.num_id);
-                }
+        for rl in &rich_lists {
+            if !num_ids.contains(&rl.num_id) {
+                num_ids.push(rl.num_id);
             }
         }
 
         for &num_id in &num_ids {
             let abstract_id = num_id - 3 + 2;
             let mut levels: Vec<(u8, &str, String)> = Vec::new();
-            for elem in &self.elements {
-                if let DocxElement::RichList(rl) = elem {
-                    if rl.num_id == num_id && !levels.iter().any(|(l, ..)| *l == rl.level) {
-                        let (fmt, lvl_text) =
-                            list_style_to_fmt(rl.style.as_ref(), rl.ordered, rl.level);
-                        levels.push((rl.level, fmt, lvl_text));
-                    }
+            for rl in &rich_lists {
+                if rl.num_id == num_id && !levels.iter().any(|(l, ..)| *l == rl.level) {
+                    let (fmt, lvl_text) = list_style_to_fmt(rl.style.as_ref(), rl.ordered, rl.level);
+                    levels.push((rl.level, fmt, lvl_text));
                 }
             }
             write_abstract_num(&mut w, abstract_id, &levels);
@@ -1366,12 +1410,10 @@ impl DocxWriter {
         for &num_id in &num_ids {
             let abstract_id = num_id - 3 + 2;
             let mut overrides: Vec<(u8, u32)> = Vec::new();
-            for elem in &self.elements {
-                if let DocxElement::RichList(rl) = elem {
-                    if rl.num_id == num_id {
-                        if let Some(start) = rl.start_number {
-                            overrides.push((rl.level, start));
-                        }
+            for rl in &rich_lists {
+                if rl.num_id == num_id {
+                    if let Some(start) = rl.start_number {
+                        overrides.push((rl.level, start));
                     }
                 }
             }
@@ -1433,7 +1475,7 @@ impl HfType {
 /// the (already-clamped) per-cell span loop below ever runs.
 const MAX_TABLE_COLS: usize = 4096;
 
-fn convert_ir_table(table: &crate::ir::Table) -> DocxRichTable {
+fn convert_ir_table(table: &crate::ir::Table, next_num_id: &mut u32) -> DocxRichTable {
     let num_rows = table.rows.len();
     // The real grid width is the sum of each row's col_spans, not its
     // literal TableCell *count* — a row with a horizontally-merged cell
@@ -1508,7 +1550,7 @@ fn convert_ir_table(table: &crate::ir::Table) -> DocxRichTable {
             // Convert cell content
             let mut content_elems: Vec<DocxElement> = Vec::new();
             for elem in &cell.content {
-                convert_ir_element_to_docx_elements(elem, &mut content_elems);
+                convert_ir_element_to_docx_elements(elem, &mut content_elems, next_num_id);
             }
             if content_elems.is_empty() {
                 content_elems.push(DocxElement::Paragraph(DocxParagraph::plain("", None, None)));
@@ -1561,7 +1603,11 @@ fn convert_ir_table(table: &crate::ir::Table) -> DocxRichTable {
     }
 }
 
-fn convert_ir_element_to_docx_elements(elem: &crate::ir::Element, out: &mut Vec<DocxElement>) {
+fn convert_ir_element_to_docx_elements(
+    elem: &crate::ir::Element,
+    out: &mut Vec<DocxElement>,
+    next_num_id: &mut u32,
+) {
     // The readers bound nesting with DepthGuard (MAX_NESTING_DEPTH); the
     // writers never did, so a deeply nested IR — and DocumentIR is
     // Deserialize, so it can come from anywhere — overflowed the stack and
@@ -1590,29 +1636,18 @@ fn convert_ir_element_to_docx_elements(elem: &crate::ir::Element, out: &mut Vec<
             };
             out.push(DocxElement::RichParagraph(DocxRichParagraph { runs, props }));
         },
-        E::Table(t) => out.push(DocxElement::RichTable(convert_ir_table(t))),
+        E::Table(t) => out.push(DocxElement::RichTable(convert_ir_table(t, next_num_id))),
         E::List(l) => {
-            // numId 1 -> abstract 0 (bullet), numId 2 -> abstract 1 (decimal).
-            // Hardcoding 1 made every ordered list nested in a cell, text box
-            // or header render as bullets, disagreeing with the same list at
-            // top level.
-            let num_id = if l.ordered { 2u32 } else { 1u32 };
-            for item in &l.items {
-                for content_elem in &item.content {
-                    if let E::Paragraph(p) = content_elem {
-                        let runs = ir_paragraph_to_runs(p);
-                        let mut props = ir_paragraph_to_props(p);
-                        props.style = Some("ListParagraph".to_string());
-                        props.numbering = Some((num_id, l.level));
-                        out.push(DocxElement::RichParagraph(DocxRichParagraph { runs, props }));
-                    }
-                }
-                // Sub-lists were dropped entirely: everything below level 0
-                // never reached the file.
-                if let Some(ref nested) = item.nested {
-                    convert_ir_element_to_docx_elements(&E::List(nested.clone()), out);
-                }
-            }
+            // A fresh numId per logical list nested in a cell, text box, or
+            // header/footer/note — hardcoding numId 1/2 (the two reserved
+            // bullet/decimal definitions) made every unrelated ordered list
+            // anywhere in these contexts share one numbering sequence, so
+            // Word continued list B's numbers from wherever list A left off
+            // instead of restarting at 1 (issue #339, split off from #261
+            // which fixed the analogous top-level-list bug).
+            let num_id = *next_num_id;
+            *next_num_id += 1;
+            convert_ir_list_at(l, l.level, num_id, out, next_num_id);
         },
         E::Image(_img) => {
             // Image embedding requires the outer DocxWriter context for index tracking.
@@ -1624,7 +1659,7 @@ fn convert_ir_element_to_docx_elements(elem: &crate::ir::Element, out: &mut Vec<
         E::TextBox(tb) => {
             let mut inner: Vec<DocxElement> = Vec::new();
             for e in &tb.content {
-                convert_ir_element_to_docx_elements(e, &mut inner);
+                convert_ir_element_to_docx_elements(e, &mut inner, next_num_id);
             }
             out.push(DocxElement::TextBox(DocxTextBox {
                 content: inner,
@@ -1644,6 +1679,53 @@ fn convert_ir_element_to_docx_elements(elem: &crate::ir::Element, out: &mut Vec<
             // writer in pdf_oxide directly; the markdown-driven IR
             // writer doesn't have anywhere to put them yet.
         },
+    }
+}
+
+/// Emit `list` and, recursively, every sub-list hanging off its items, into
+/// `out` — the free-function counterpart of `DocxWriter::add_ir_list_at`
+/// for content nested inside a table cell, text box, header/footer, or
+/// footnote/endnote, which has no `self.elements` to push sibling
+/// `RichList` entries into. `num_id` is shared across every recursive call
+/// for one logical list (only the `E::List` match arm that calls this
+/// mints a fresh one), matching `add_ir_list_at`'s contract that one
+/// logical list keeps one `numId` across all its nesting levels (issue
+/// #339).
+fn convert_ir_list_at(
+    list: &crate::ir::List,
+    level: u8,
+    num_id: u32,
+    out: &mut Vec<DocxElement>,
+    next_num_id: &mut u32,
+) {
+    let start_number = list.start_number.unwrap_or(1);
+    let style = list.style.clone();
+
+    let items: Vec<Vec<DocxElement>> = list
+        .items
+        .iter()
+        .map(|item| {
+            let mut elems: Vec<DocxElement> = Vec::new();
+            for content_elem in &item.content {
+                convert_ir_element_to_docx_elements(content_elem, &mut elems, next_num_id);
+            }
+            elems
+        })
+        .collect();
+
+    out.push(DocxElement::RichList(DocxRichList {
+        ordered: list.ordered,
+        items,
+        start_number: if start_number != 1 { Some(start_number) } else { None },
+        style,
+        level,
+        num_id,
+    }));
+
+    for item in &list.items {
+        if let Some(ref nested) = item.nested {
+            convert_ir_list_at(nested, level.saturating_add(1).min(8), num_id, out, next_num_id);
+        }
     }
 }
 
@@ -4924,11 +5006,62 @@ mod tests {
             ..Default::default()
         };
         doc.add_ir_table(&table);
-        let xml = part_xml(doc, "word/document.xml");
+        let parts = all_parts(doc);
+        let xml = &parts["word/document.xml"];
+        // A list nested in a table cell now mints its own numId (>= 3),
+        // not the shared reserved decimal definition (numId 2) — reusing
+        // numId 2 for every such list cross-contaminated numbering between
+        // unrelated lists (issue #339). numId 1 is reserved for bullets,
+        // so this list must not use it either.
         assert!(
-            xml.contains(r#"<w:numId w:val="2"/>"#),
+            xml.contains(r#"<w:numId w:val="3"/>"#),
+            "expected a freshly minted numId (3): {xml}"
+        );
+        assert!(
+            !xml.contains(r#"<w:numId w:val="1"/>"#),
             "an ordered list must not use the bullet definition: {xml}"
         );
+
+        let numbering = &parts["word/numbering.xml"];
+        let abstract_num =
+            &numbering[numbering.find("<w:abstractNum w:abstractNumId=\"2\"").unwrap()..];
+        let abstract_num = &abstract_num[..abstract_num.find("</w:abstractNum>").unwrap()];
+        assert!(
+            abstract_num.contains(r#"w:val="decimal""#),
+            "the minted list's own abstractNum must be decimal-formatted: {abstract_num}"
+        );
+    }
+
+    /// issue #339 — two unrelated ordered lists nested in two different
+    /// table cells must get two different `numId`s, not share the one
+    /// reserved decimal definition (which made Word continue list B's
+    /// numbers from wherever list A left off instead of restarting at 1).
+    #[test]
+    fn two_unrelated_nested_lists_in_different_cells_get_different_num_ids() {
+        let mut doc = DocxWriter::new();
+        let table = crate::ir::Table {
+            rows: vec![crate::ir::TableRow {
+                cells: vec![
+                    crate::ir::TableCell {
+                        content: vec![ir_list(true, "a1")],
+                        ..Default::default()
+                    },
+                    crate::ir::TableCell {
+                        content: vec![ir_list(true, "b1")],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        doc.add_ir_table(&table);
+        let xml = part_xml(doc, "word/document.xml");
+
+        let num_ids: Vec<&str> =
+            xml.split("w:numId w:val=\"").skip(1).filter_map(|s| s.split('"').next()).collect();
+        assert_eq!(num_ids.len(), 2, "{xml:?}");
+        assert_ne!(num_ids[0], num_ids[1], "two unrelated lists must not share a numId: {xml}");
     }
 
     /// `w:type="first"` does nothing without `w:titlePg`; a `w:type="even"`
