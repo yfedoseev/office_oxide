@@ -606,6 +606,7 @@ mod tests {
                         format: CharFormat { bold: Some(false), ..Default::default() },
                     }],
                     para_formats: Vec::new(),
+                    placeholder_role: None,
                 }],
                 ..Default::default()
             }],
@@ -643,6 +644,7 @@ mod tests {
                         CharFormatSpan { start: 3, end: 6, format: CharFormat { italic: Some(true), ..Default::default() } },
                     ],
                     para_formats: Vec::new(),
+                    placeholder_role: None,
                 }],
                 ..Default::default()
             }],
@@ -683,6 +685,7 @@ mod tests {
                         end: 8,
                         format: ParaFormat { alignment: Some(1) }, // Tx_ALIGNCenter
                     }],
+                    placeholder_role: None,
                 }],
                 ..Default::default()
             }],
@@ -692,6 +695,35 @@ mod tests {
             panic!("expected a paragraph, got {:?}", ir.sections[0].elements[0]);
         };
         assert_eq!(p.alignment, Some(ParagraphAlignment::Center));
+    }
+
+    /// issue #258 — a run's resolved placeholder role must reach
+    /// `Paragraph::placeholder_role` in the IR.
+    #[test]
+    fn ir_placeholder_role_reaches_the_paragraph() {
+        use crate::ir::Element;
+
+        let doc = PptDocument {
+            images: Vec::new(),
+            has_macros: false,
+            summary_properties: None,
+            slides: vec![SlideText {
+                text_runs: vec![TextRun {
+                    text_type: TextType::Other,
+                    text: "Footer text".to_string(),
+                    hyperlink: None,
+                    char_formats: Vec::new(),
+                    para_formats: Vec::new(),
+                    placeholder_role: Some("ftr".to_string()),
+                }],
+                ..Default::default()
+            }],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        let Element::Paragraph(p) = &ir.sections[0].elements[0] else {
+            panic!("expected a paragraph, got {:?}", ir.sections[0].elements[0]);
+        };
+        assert_eq!(p.placeholder_role.as_deref(), Some("ftr"));
     }
 
     /// issue #334 — a lone `\r` inside one text atom (the standard PPT97

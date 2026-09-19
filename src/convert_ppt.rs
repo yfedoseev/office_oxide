@@ -165,6 +165,7 @@ fn table_cell_content(runs: &[TextRun]) -> Vec<Element> {
                 elements.push(Element::Paragraph(Paragraph {
                     content,
                     alignment: alignment_at(&run.para_formats, start),
+                    placeholder_role: run.placeholder_role.clone(),
                     ..Default::default()
                 }));
             }
@@ -304,6 +305,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                             elements.push(Element::Paragraph(Paragraph {
                                 content,
                                 alignment: alignment_at(&run.para_formats, start),
+                                placeholder_role: run.placeholder_role.clone(),
                                 ..Default::default()
                             }));
                         }
@@ -327,6 +329,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                         elements.push(Element::Paragraph(Paragraph {
                             content,
                             alignment: alignment_at(&run.para_formats, paragraphs.first().map_or(0, |p| p.0)),
+                            placeholder_role: run.placeholder_role.clone(),
                             ..Default::default()
                         }));
                     }

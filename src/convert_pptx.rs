@@ -260,6 +260,15 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
                 convert_text_body(tb, &mut inner);
                 if !inner.is_empty() {
                     has_text_content = true;
+                    // Surface the placeholder's own role (subtitle, date,
+                    // slide number, footer, object, …) on every paragraph
+                    // built from it — richer than `TextType`'s 8 values
+                    // and, unlike it, not thrown away after the
+                    // title/body classification above is done with it
+                    // (issue #258).
+                    if let Some(ph_type) = auto.placeholder.as_ref().and_then(|ph| ph.ph_type.as_deref()) {
+                        tag_placeholder_role(&mut inner, ph_type);
+                    }
                     if is_body_ph {
                         elements.extend(inner);
                     } else {
@@ -349,6 +358,28 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
             crate::pptx::GraphicContent::Unknown => {},
         },
         crate::pptx::Shape::Connector(_) => {},
+    }
+}
+
+/// Set `placeholder_role` on every `Paragraph` reachable from `elements`
+/// (recursing into `List` items and `TextBox` content, the two other
+/// block containers a placeholder's own text can be wrapped in) — issue
+/// #258. `Heading` is deliberately left untouched: title/centered-title
+/// placeholders already have a reliable, unambiguous signal via
+/// `is_title_placeholder`/`TextType`, so this only adds real information
+/// for the roles that `TextType`'s 8 values can't express.
+fn tag_placeholder_role(elements: &mut [Element], role: &str) {
+    for el in elements {
+        match el {
+            Element::Paragraph(p) => p.placeholder_role = Some(role.to_string()),
+            Element::List(l) => {
+                for item in &mut l.items {
+                    tag_placeholder_role(&mut item.content, role);
+                }
+            },
+            Element::TextBox(tb) => tag_placeholder_role(&mut tb.content, role),
+            _ => {},
+        }
     }
 }
 
@@ -712,6 +743,46 @@ mod tests {
         assert!(
             elements.iter().any(|e| matches!(e, Element::Paragraph(_))),
             "the body placeholder's text must still reach the IR as flowed content: {elements:?}"
+        );
+    }
+
+    /// issue #258 — a placeholder's `ph_type` (subtitle/date/footer/etc.,
+    /// richer than the title/body split `is_title_placeholder`/
+    /// `is_body_placeholder` collapse everything else into) must reach
+    /// `Paragraph::placeholder_role` in the IR, not be discarded after
+    /// the title/body classification above is done with it.
+    #[test]
+    fn placeholder_ph_type_reaches_paragraph_placeholder_role() {
+        use crate::pptx::shape::{AutoShape, PlaceholderInfo, ShapePosition, TextBody};
+        let shape = crate::pptx::Shape::AutoShape(AutoShape {
+            id: 4,
+            name: "Date Placeholder 4".to_string(),
+            alt_text: None,
+            position: Some(ShapePosition { x: 100, y: 200, cx: 300, cy: 400 }),
+            text_body: Some(TextBody { paragraphs: vec![bullet(0, "9/19/2026")] }),
+            placeholder: Some(PlaceholderInfo { ph_type: Some("dt".to_string()), idx: Some(2) }),
+            hyperlink: None,
+        });
+        let mut elements = Vec::new();
+        convert_shape(&shape, &mut elements);
+        // A placeholder with a real (non-zero) position wraps its content
+        // in a positioned `TextBox` (see `push_positional_textbox`), so
+        // the tagged `Paragraph` lives one level down from `elements`.
+        let inner = match elements.as_slice() {
+            [Element::TextBox(tb)] => &tb.content,
+            _ => &elements,
+        };
+        let paragraph_roles: Vec<Option<String>> = inner
+            .iter()
+            .filter_map(|e| match e {
+                Element::Paragraph(p) => Some(p.placeholder_role.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            paragraph_roles,
+            vec![Some("dt".to_string())],
+            "the date placeholder's own paragraph must carry its role: {elements:?}"
         );
     }
 

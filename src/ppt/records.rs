@@ -136,6 +136,13 @@ pub const RT_EXTERNAL_OLE_EMBED: u16 = 0x0FCC;
 /// to an external object (an `ExOleObjAtom` or `ExMediaAtom`), found
 /// directly inside its `RT_CLIENT_DATA` (issue #337).
 pub const RT_EXTERNAL_OBJECT_REF_ATOM: u16 = 0x0BC1;
+/// [MS-PPT] `OEPlaceholderAtom` (record type 3011) — a shape's fine-grained
+/// placeholder role (`placeholderId`), found directly inside its
+/// `RT_CLIENT_DATA`. Body: `placementId` (4 bytes) + `placeholderId`
+/// (1 byte) + `placeholderSize` (1 byte) + `unusedShort` (2 bytes) = 8
+/// bytes, confirmed against Apache POI's `OEPlaceholderAtom.java` (issue
+/// #258).
+pub const RT_OE_PLACEHOLDER_ATOM: u16 = 0x0BC3;
 
 // ── SlideListWithText `rh.recInstance` discriminants ([MS-PPT] 2.4.14) ──
 /// `rh.recInstance` value identifying a `SlideListWithTextContainer` (real slides).

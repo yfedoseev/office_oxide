@@ -1046,6 +1046,15 @@ pub struct Paragraph {
     /// page origin (top-left).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_position: Option<FramePosition>,
+    /// PPTX/PPT placeholder role this paragraph's content came from (e.g.
+    /// `"title"`, `"body"`, `"ctrTitle"`, `"subTitle"`, `"dt"`, `"sldNum"`,
+    /// `"ftr"`, `"hdr"`, `"obj"`, `"chart"`, `"tbl"`, `"clipArt"`, `"dgm"`,
+    /// `"media"`, `"pic"`) — the same `ST_PlaceholderType` vocabulary OOXML
+    /// itself uses for `<p:ph type="...">`, so both formats share one
+    /// string set. `None` when the paragraph is not from a placeholder
+    /// shape, or the source placeholder carries no resolvable role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder_role: Option<String>,
 }
 
 /// Absolute frame position for a paragraph anchored to the page.

@@ -79,6 +79,12 @@ pub struct TextRun {
     /// Direct paragraph-level formatting (currently: alignment only),
     /// resolved the same way. Empty when no `StyleTextPropAtom` was found.
     pub para_formats: Vec<ParaFormatSpan>,
+    /// This run's shape's placeholder role (`OEPlaceholderAtom.placeholderId`,
+    /// mapped to the same `ST_PlaceholderType` string vocabulary PPTX's own
+    /// `<p:ph type="...">` uses), resolved from the shape actually carrying
+    /// it — `None` when the shape has no `OEPlaceholderAtom`, or its
+    /// `placeholderId` has no OOXML-equivalent role (issue #258).
+    pub placeholder_role: Option<String>,
 }
 
 /// Extract per-slide text from a "PowerPoint Document" stream.
@@ -144,6 +150,7 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
         &stream_wide_hyperlinks,
         &stream_wide_ole_objects,
         None,
+        None,
         &mut runs,
         &mut tables,
         &mut image_refs,
@@ -181,6 +188,7 @@ fn collect_slide_containers(
                 &[],
                 hyperlinks,
                 ole_objects,
+                None,
                 None,
                 &mut runs,
                 &mut tables,
@@ -379,6 +387,7 @@ fn resolve_slide(
                 hyperlinks,
                 ole_objects,
                 None,
+                None,
                 &mut text_runs,
                 &mut tables,
                 &mut image_refs,
@@ -529,6 +538,7 @@ fn extract_shape_text(
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
     current_hyperlink: Option<&str>,
+    current_placeholder_role: Option<&str>,
     out: &mut Vec<TextRun>,
     tables: &mut Vec<super::table::TableBlock>,
     image_refs: &mut Vec<usize>,
@@ -564,6 +574,7 @@ fn extract_shape_text(
                         text_type: current_type,
                         text,
                         hyperlink: current_hyperlink.map(str::to_string),
+                        placeholder_role: current_placeholder_role.map(str::to_string),
                         ..Default::default()
                     });
                     last_text_run_idx = Some(out.len() - 1);
@@ -576,6 +587,7 @@ fn extract_shape_text(
                         text_type: current_type,
                         text,
                         hyperlink: current_hyperlink.map(str::to_string),
+                        placeholder_role: current_placeholder_role.map(str::to_string),
                         ..Default::default()
                     });
                     last_text_run_idx = Some(out.len() - 1);
@@ -594,6 +606,7 @@ fn extract_shape_text(
                         if !run.text.is_empty() {
                             let mut run = run.clone();
                             run.hyperlink = current_hyperlink.map(str::to_string);
+                            run.placeholder_role = current_placeholder_role.map(str::to_string);
                             out.push(run);
                             last_text_run_idx = Some(out.len() - 1);
                         }
@@ -650,6 +663,13 @@ fn extract_shape_text(
                 // of THIS shape's own text — carries it (issue #257).
                 let shape_hyperlink = resolve_shape_hyperlink(&rec.data, hyperlinks);
                 let hyperlink_ref = shape_hyperlink.as_deref().or(current_hyperlink);
+                // This shape's own placeholder role, if it has one — same
+                // "resolve at the shape actually carrying it, fall back to
+                // whatever the enclosing group/shape already had" pattern
+                // as the hyperlink just above (issue #258).
+                let shape_placeholder_role = resolve_shape_placeholder_role(&rec.data);
+                let placeholder_role_ref =
+                    shape_placeholder_role.as_deref().or(current_placeholder_role);
                 // This shape's own picture reference, if it has one
                 // (issue #256) — resolved here, at the shape actually
                 // carrying it, not inferred from whichever slide
@@ -671,6 +691,7 @@ fn extract_shape_text(
                     hyperlinks,
                     ole_objects,
                     hyperlink_ref,
+                    placeholder_role_ref,
                     out,
                     tables,
                     image_refs,
@@ -698,6 +719,7 @@ fn extract_shape_text(
                         hyperlinks,
                         ole_objects,
                         current_hyperlink,
+                        current_placeholder_role,
                         out,
                         tables,
                         image_refs,
@@ -713,6 +735,7 @@ fn extract_shape_text(
                     hyperlinks,
                     ole_objects,
                     current_hyperlink,
+                    current_placeholder_role,
                     out,
                     tables,
                     image_refs,
@@ -775,6 +798,7 @@ fn try_extract_table_from_spgr(
             hyperlinks,
             &HashMap::new(),
             hyperlink_ref,
+            None,
             &mut runs,
             &mut Vec::new(),
             &mut Vec::new(),
@@ -1037,6 +1061,61 @@ fn resolve_shape_ole_object(
     ole_objects.get(&obj_id_ref).copied()
 }
 
+/// Resolve a shape's own placeholder role (if any): its `RT_CLIENT_DATA`'s
+/// direct `OEPlaceholderAtom` child's `placeholderId` byte, mapped to the
+/// OOXML `ST_PlaceholderType` string vocabulary (issue #258).
+///
+/// Scoped to the "regular presentation slide" context only, per Apache
+/// POI's `org.apache.poi.sl.usermodel.Placeholder` enum (the authoritative
+/// cross-reference this mapping was verified against): the *same* raw
+/// `placeholderId` byte means a different role depending on whether the
+/// shape lives on a slide, a slide master, a notes slide, or a notes
+/// master (e.g. raw `13` is Title on a slide, but raw `1` is Title on a
+/// slide master). This function's caller (`collect_slide_containers`) only
+/// walks shapes already confirmed to be inside a real `RT_SLIDE`
+/// container, so the slide-context mapping is the correct one there;
+/// applying this same mapping to a master/notes shape would misattribute
+/// its role. Master/notes placeholder roles are not resolved by this
+/// pass — a real but bounded simplification of the full 4-context table,
+/// consistent with this crate's established "at minimum" completeness bar
+/// for this kind of gap.
+fn resolve_shape_placeholder_role(shape_data: &[u8]) -> Option<String> {
+    let client_data = find_descendant(shape_data, RT_CLIENT_DATA, 0, 0)?;
+    let atom = find_descendant(&client_data, RT_OE_PLACEHOLDER_ATOM, 0, 0)?;
+    // placementId(4) + placeholderId(1) + ...
+    let placeholder_id = *atom.get(4)?;
+    placeholder_id_to_ooxml_type(placeholder_id).map(str::to_string)
+}
+
+/// Map a `.ppt` slide-context `OEPlaceholderAtom.placeholderId` byte to the
+/// OOXML `ST_PlaceholderType` string it corresponds to, verified against
+/// Apache POI's `Placeholder` enum's `nativeSlideId`/`ooxmlId` columns.
+/// Three roles (`VERTICAL_OBJECT`/`VERTICAL_TEXT_TITLE`/`VERTICAL_TEXT_BODY`,
+/// raw `17`/`18`/`25`) have no OOXML equivalent at all (POI itself records
+/// their `ooxmlId` as `-2`, "no mapping") and are deliberately left
+/// unmapped here rather than inventing a non-standard string.
+fn placeholder_id_to_ooxml_type(id: u8) -> Option<&'static str> {
+    match id {
+        7 => Some("dt"),       // Date
+        8 => Some("sldNum"),   // Slide number
+        9 => Some("ftr"),      // Footer
+        10 => Some("hdr"),     // Header
+        11 => Some("sldImg"),  // Slide image
+        13 => Some("title"),   // Title
+        14 => Some("body"),    // Body
+        15 => Some("ctrTitle"), // Centered title
+        16 => Some("subTitle"), // Subtitle
+        19 => Some("obj"),     // Object
+        20 => Some("chart"),   // Chart
+        21 => Some("tbl"),     // Table
+        22 => Some("clipArt"), // Clip art
+        23 => Some("dgm"),     // Diagram / org chart
+        24 => Some("media"),   // Media
+        26 => Some("pic"),     // Picture
+        _ => None,
+    }
+}
+
 /// Resolve a shape's own hyperlink target (if any), by scanning its direct
 /// children for `OfficeArtClientData` (`RT_CLIENT_DATA`), then its
 /// `InteractiveInfo` child, then that record's own `InteractiveInfoAtom`.
@@ -1126,6 +1205,7 @@ fn split_run_with_hyperlink(out: &mut Vec<TextRun>, idx: usize, begin: usize, en
 
     let text_type = run.text_type;
     let surrounding_hyperlink = run.hyperlink.clone();
+    let placeholder_role = run.placeholder_role.clone();
     let prefix: String = chars[..begin].iter().collect();
     let linked: String = chars[begin..end].iter().collect();
     let suffix: String = chars[end..].iter().collect();
@@ -1147,6 +1227,7 @@ fn split_run_with_hyperlink(out: &mut Vec<TextRun>, idx: usize, begin: usize, en
             hyperlink: surrounding_hyperlink.clone(),
             char_formats: prefix_char_fmt,
             para_formats: prefix_para_fmt,
+            placeholder_role: placeholder_role.clone(),
         });
     }
     replacement.push(TextRun {
@@ -1155,6 +1236,7 @@ fn split_run_with_hyperlink(out: &mut Vec<TextRun>, idx: usize, begin: usize, en
         hyperlink: Some(url.to_string()),
         char_formats: linked_char_fmt,
         para_formats: linked_para_fmt,
+        placeholder_role: placeholder_role.clone(),
     });
     if !suffix.is_empty() {
         replacement.push(TextRun {
@@ -1163,6 +1245,7 @@ fn split_run_with_hyperlink(out: &mut Vec<TextRun>, idx: usize, begin: usize, en
             hyperlink: surrounding_hyperlink,
             char_formats: suffix_char_fmt,
             para_formats: suffix_para_fmt,
+            placeholder_role,
         });
     }
 
@@ -1311,6 +1394,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
+            None,
             &mut runs,
             &mut Vec::new(),
             &mut Vec::new(),
@@ -1332,6 +1416,7 @@ mod tests {
             &[],
             &HashMap::new(),
             &HashMap::new(),
+            None,
             None,
             &mut runs,
             &mut Vec::new(),
@@ -1356,6 +1441,7 @@ mod tests {
             &[],
             &HashMap::new(),
             &HashMap::new(),
+            None,
             None,
             &mut runs,
             &mut Vec::new(),
@@ -1485,6 +1571,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
+            None,
             &mut runs,
             &mut tables,
             &mut image_refs,
@@ -1551,6 +1638,7 @@ mod tests {
             &HashMap::new(),
             &ole_objects,
             None,
+            None,
             &mut runs,
             &mut Vec::new(),
             &mut Vec::new(),
@@ -1573,6 +1661,84 @@ mod tests {
         let shape_children = client_data;
 
         assert!(resolve_shape_ole_object(&shape_children, &ole_objects).is_none());
+    }
+
+    /// Build an `OEPlaceholderAtom` body: `placementId(4)` +
+    /// `placeholderId(1)` + `placeholderSize(1)` + `unusedShort(2)`.
+    fn make_oe_placeholder_atom_data(placeholder_id: u8) -> Vec<u8> {
+        let mut data = vec![0u8; 8];
+        data[4] = placeholder_id;
+        data
+    }
+
+    #[test]
+    fn test_placeholder_id_to_ooxml_type_maps_known_slide_context_values() {
+        assert_eq!(placeholder_id_to_ooxml_type(13), Some("title"));
+        assert_eq!(placeholder_id_to_ooxml_type(14), Some("body"));
+        assert_eq!(placeholder_id_to_ooxml_type(15), Some("ctrTitle"));
+        assert_eq!(placeholder_id_to_ooxml_type(16), Some("subTitle"));
+        assert_eq!(placeholder_id_to_ooxml_type(7), Some("dt"));
+        assert_eq!(placeholder_id_to_ooxml_type(8), Some("sldNum"));
+        assert_eq!(placeholder_id_to_ooxml_type(9), Some("ftr"));
+        assert_eq!(placeholder_id_to_ooxml_type(10), Some("hdr"));
+        assert_eq!(placeholder_id_to_ooxml_type(22), Some("clipArt"));
+    }
+
+    /// Raw values with no OOXML equivalent (vertical title/body/object —
+    /// POI's own table records their `ooxmlId` as -2) must not be
+    /// invented a non-standard string.
+    #[test]
+    fn test_placeholder_id_to_ooxml_type_leaves_vertical_roles_unmapped() {
+        assert_eq!(placeholder_id_to_ooxml_type(17), None);
+        assert_eq!(placeholder_id_to_ooxml_type(18), None);
+        assert_eq!(placeholder_id_to_ooxml_type(25), None);
+        assert_eq!(placeholder_id_to_ooxml_type(0), None);
+        assert_eq!(placeholder_id_to_ooxml_type(255), None);
+    }
+
+    #[test]
+    fn test_resolve_shape_placeholder_role_reads_the_atom() {
+        let atom = make_atom(RT_OE_PLACEHOLDER_ATOM, 0, &make_oe_placeholder_atom_data(9)); // Footer
+        let client_data = make_container(RT_CLIENT_DATA, 0, &atom);
+        assert_eq!(resolve_shape_placeholder_role(&client_data).as_deref(), Some("ftr"));
+    }
+
+    #[test]
+    fn test_resolve_shape_placeholder_role_none_without_the_atom() {
+        let client_data = make_container(RT_CLIENT_DATA, 0, &[]);
+        assert!(resolve_shape_placeholder_role(&client_data).is_none());
+    }
+
+    /// End-to-end (issue #258): a shape carrying an `OEPlaceholderAtom`
+    /// for "Footer" produces a `TextRun` whose `placeholder_role` is
+    /// `Some("ftr")`.
+    #[test]
+    fn test_shape_with_oe_placeholder_atom_reaches_placeholder_role_end_to_end() {
+        let mut text_header = make_atom(RT_TEXT_HEADER, 0, &4u32.to_le_bytes()); // TextType::Other
+        text_header.extend(make_atom(RT_TEXT_CHARS, 0, &[0x46, 0x00, 0x74, 0x00])); // "Ft" UTF-16LE
+        let placeholder_atom =
+            make_atom(RT_OE_PLACEHOLDER_ATOM, 0, &make_oe_placeholder_atom_data(9)); // Footer
+        let client_data = make_container(RT_CLIENT_DATA, 0, &placeholder_atom);
+        let mut shape_data = text_header;
+        shape_data.extend(client_data);
+        let shape = make_container(RT_SHAPE, 0, &shape_data);
+
+        let mut runs = Vec::new();
+        extract_shape_text(
+            &shape,
+            0,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            None,
+            &mut runs,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].placeholder_role.as_deref(), Some("ftr"));
     }
 
     #[test]
@@ -1616,6 +1782,7 @@ mod tests {
             &[],
             &hyperlinks,
             &HashMap::new(),
+            None,
             None,
             &mut runs,
             &mut Vec::new(),
@@ -1663,6 +1830,7 @@ mod tests {
             &hyperlinks,
             &HashMap::new(),
             None,
+            None,
             &mut runs,
             &mut Vec::new(),
             &mut Vec::new(),
@@ -1707,6 +1875,7 @@ mod tests {
             &[],
             &hyperlinks,
             &HashMap::new(),
+            None,
             None,
             &mut runs,
             &mut Vec::new(),
@@ -1760,6 +1929,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
+            None,
             &mut runs,
             &mut tables,
             &mut Vec::new(),
@@ -1798,6 +1968,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
+            None,
             &mut runs,
             &mut tables,
             &mut Vec::new(),
@@ -1833,6 +2004,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             None,
+            None,
             &mut runs,
             &mut tables,
             &mut Vec::new(),
@@ -1863,6 +2035,7 @@ mod tests {
             &[],
             &hyperlinks,
             &HashMap::new(),
+            None,
             None,
             &mut runs,
             &mut Vec::new(),
@@ -1901,6 +2074,7 @@ mod tests {
             &[],
             &hyperlinks,
             &HashMap::new(),
+            None,
             None,
             &mut runs,
             &mut Vec::new(),
@@ -1949,6 +2123,7 @@ mod tests {
             &[],
             &HashMap::new(),
             &HashMap::new(),
+            None,
             None,
             &mut runs,
             &mut Vec::new(),
@@ -2397,6 +2572,7 @@ mod tests {
             &outline_texts,
             &HashMap::new(),
             &HashMap::new(),
+            None,
             None,
             &mut runs,
             &mut Vec::new(),

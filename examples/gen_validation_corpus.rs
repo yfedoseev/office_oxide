@@ -184,6 +184,9 @@ fn maximal_properties_corpus(out: &str) {
             width_twips: 3000,
             height_twips: 400,
         }),
+        // Not exercised here: no writer currently emits `<p:ph type="...">`
+        // from this field (issue #258 is read-only: PPTX/PPT -> IR).
+        placeholder_role: None,
     };
 
     let ir = DocumentIR {
