@@ -162,6 +162,25 @@ fn is_title_placeholder(ph_type: Option<&str>) -> bool {
     matches!(ph_type, Some("title" | "ctrTitle"))
 }
 
+/// A body/content-style placeholder: `type="body"`/`"subTitle"`, or no
+/// `type` attribute at all (the OOXML default for a text placeholder).
+/// This crate's own PPTX writer always emits an explicit, synthetic
+/// `<a:xfrm>` on these two shape kinds (`write_title_shape`/
+/// `write_body_shape`) for consistent rendering across viewers that
+/// don't resolve slide-layout inheritance — but on the next read, that
+/// self-inflicted explicit position was indistinguishable from a real,
+/// deliberately positioned free-floating text box, so this content got
+/// wrapped in a spurious `Element::TextBox` on every write→reread cycle
+/// (issue #342). `dt`/`ftr`/`sldNum`/`pic`/`chart`/`tbl`/`media`
+/// placeholders are deliberately excluded — this crate's writer never
+/// emits those on a slide (only `write_layout_placeholder`, a separate,
+/// unrelated slide-*layout* writer, uses other `ph_type`s), so an
+/// explicit position on one of those in a real file is far more likely
+/// to be a genuine, meaningful override worth preserving.
+fn is_body_placeholder(ph_type: Option<&str>) -> bool {
+    matches!(ph_type, None | Some("body" | "subTitle"))
+}
+
 /// Locate the title placeholder and return its text together with the
 /// alignment of the first paragraph. Used by `pptx_to_ir` to seed both
 /// `Section.title` and the synthesised level-2 Heading's alignment.
@@ -221,13 +240,22 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
                 return;
             }
 
+            let is_body_ph = auto
+                .placeholder
+                .as_ref()
+                .is_some_and(|ph| is_body_placeholder(ph.ph_type.as_deref()));
+
             let mut has_text_content = false;
             if let Some(ref tb) = auto.text_body {
                 let mut inner = Vec::new();
                 convert_text_body(tb, &mut inner);
                 if !inner.is_empty() {
                     has_text_content = true;
-                    push_positional_textbox(elements, inner, auto.position.as_ref());
+                    if is_body_ph {
+                        elements.extend(inner);
+                    } else {
+                        push_positional_textbox(elements, inner, auto.position.as_ref());
+                    }
                 }
             }
             // A non-text AutoShape (decorative icon, action button, …)
@@ -643,6 +671,62 @@ mod tests {
             },
             other => panic!("expected Element::Image, got {other:?}"),
         }
+    }
+
+    /// issue #342 — this crate's own PPTX writer always gives a body/
+    /// title placeholder shape an explicit `<a:xfrm>` (for consistent
+    /// rendering across viewers that don't resolve slide-layout
+    /// inheritance), which used to be indistinguishable on read from a
+    /// real, deliberately positioned free-floating text box — every
+    /// deck this crate wrote got its body content wrapped in a spurious
+    /// `Element::TextBox` on the very next read. A body placeholder's
+    /// content must flow as ordinary elements even when it carries a
+    /// real (non-zero) position.
+    #[test]
+    fn a_body_placeholder_with_an_explicit_position_still_flows_not_wraps() {
+        use crate::pptx::shape::{AutoShape, PlaceholderInfo, ShapePosition, TextBody};
+        let shape = crate::pptx::Shape::AutoShape(AutoShape {
+            id: 2,
+            name: "Content Placeholder 2".to_string(),
+            alt_text: None,
+            position: Some(ShapePosition { x: 100, y: 200, cx: 300, cy: 400 }),
+            text_body: Some(TextBody { paragraphs: vec![bullet(0, "Body text")] }),
+            placeholder: Some(PlaceholderInfo { ph_type: Some("body".to_string()), idx: Some(1) }),
+            hyperlink: None,
+        });
+        let mut elements = Vec::new();
+        convert_shape(&shape, &mut elements);
+        assert!(
+            !elements.iter().any(|e| matches!(e, Element::TextBox(_))),
+            "a body placeholder's content must not be wrapped in a positioned TextBox: {elements:?}"
+        );
+        assert!(
+            elements.iter().any(|e| matches!(e, Element::Paragraph(_))),
+            "the body placeholder's text must still reach the IR as flowed content: {elements:?}"
+        );
+    }
+
+    /// A genuine free-floating text box (no `<p:ph>` at all) must keep
+    /// its positioned-`TextBox` wrap even though it carries the exact
+    /// same kind of real position a body placeholder now flows past.
+    #[test]
+    fn a_non_placeholder_shape_with_a_position_still_wraps() {
+        use crate::pptx::shape::{AutoShape, ShapePosition, TextBody};
+        let shape = crate::pptx::Shape::AutoShape(AutoShape {
+            id: 3,
+            name: "TextBox 3".to_string(),
+            alt_text: None,
+            position: Some(ShapePosition { x: 100, y: 200, cx: 300, cy: 400 }),
+            text_body: Some(TextBody { paragraphs: vec![bullet(0, "Floating text")] }),
+            placeholder: None,
+            hyperlink: None,
+        });
+        let mut elements = Vec::new();
+        convert_shape(&shape, &mut elements);
+        assert!(
+            elements.iter().any(|e| matches!(e, Element::TextBox(_))),
+            "a real free-floating text box must keep its positioned wrap: {elements:?}"
+        );
     }
 
     /// A placeholder whose bullets all sit at outline level 1 — ordinary
