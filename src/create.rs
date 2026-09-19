@@ -1014,37 +1014,41 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
         Element::List(l) => {
             // Flatten the whole tree: `ListItem::nested` was read by no
             // writer, so every item below level 0 was silently dropped.
-            fn flatten(list: &crate::ir::List, level: u8, out: &mut Vec<(u8, String)>) {
+            // Each item's runs (not just its plain text) now carry
+            // through, so a hyperlink or bold/italic/color on a list
+            // item's text survives the write (issue #341).
+            fn flatten(
+                list: &crate::ir::List,
+                level: u8,
+                out: &mut Vec<(u8, Vec<crate::pptx::write::Run>)>,
+            ) {
                 for item in &list.items {
-                    let text = item
+                    let runs: Vec<crate::pptx::write::Run> = item
                         .content
                         .iter()
-                        .map(|e| match e {
-                            Element::Paragraph(p) => inline_to_text(&p.content),
-                            _ => String::new(),
+                        .flat_map(|e| match e {
+                            Element::Paragraph(p) => inline_to_pptx_runs(&p.content),
+                            _ => Vec::new(),
                         })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if !text.is_empty() {
-                        out.push((level, text));
+                        .collect();
+                    if !runs.is_empty() {
+                        out.push((level, runs));
                     }
                     if let Some(ref nested) = item.nested {
                         flatten(nested, level.saturating_add(1), out);
                     }
                 }
             }
-            let mut items: Vec<(u8, String)> = Vec::new();
+            let mut items: Vec<(u8, Vec<crate::pptx::write::Run>)> = Vec::new();
             flatten(l, l.level, &mut items);
-            slide.add_nested_bullet_list(&items);
+            slide.add_nested_bullet_list(items);
         },
         Element::Table(t) => {
             // A real a:tbl, not tab-joined text: the previous form lost the
-            // grid, every cell boundary and all per-cell formatting.
-            let rows: Vec<Vec<String>> = t
-                .rows
-                .iter()
-                .map(|row| row.cells.iter().map(cell_text).collect())
-                .collect();
+            // grid, every cell boundary, and (until issue #341) all
+            // per-cell run formatting including hyperlinks.
+            let rows: Vec<Vec<Vec<crate::pptx::write::Run>>> =
+                t.rows.iter().map(|row| row.cells.iter().map(cell_runs).collect()).collect();
             slide.add_table(rows);
         },
         Element::Image(img) => {
@@ -1345,6 +1349,19 @@ fn cell_text(cell: &TableCell) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// A PPTX table cell's content as styled `Run`s instead of `cell_text`'s
+/// plain string — needed so a cell's hyperlink/bold/italic/color reaches
+/// the PPTX writer at all (issue #341).
+fn cell_runs(cell: &TableCell) -> Vec<crate::pptx::write::Run> {
+    cell.content
+        .iter()
+        .flat_map(|e| match e {
+            Element::Paragraph(p) => inline_to_pptx_runs(&p.content),
+            _ => Vec::new(),
+        })
+        .collect()
 }
 
 /// The first hyperlink URL found anywhere in a cell's content, if any

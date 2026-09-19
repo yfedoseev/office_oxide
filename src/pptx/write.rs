@@ -208,10 +208,15 @@ enum BodyItem {
     Text(String),
     RichText(Vec<Run>, ParaProps),
     /// Bullet list items paired with their nesting level (0 = top level).
-    BulletList(Vec<(u8, String)>),
-    /// A real table: rows of cell text. Flattening a table into tab-joined
-    /// text lost the grid entirely.
-    Table(Vec<Vec<String>>),
+    /// Each item is a paragraph's worth of styled `Run`s — issue #341:
+    /// this used to be a bare `String`, so a hyperlink or any character
+    /// formatting on a list item's text was silently dropped on write.
+    BulletList(Vec<(u8, Vec<Run>)>),
+    /// A real table: rows of cells, each cell a paragraph's worth of
+    /// styled `Run`s. Flattening a table into tab-joined plain text lost
+    /// the grid entirely; flattening each cell to a bare `String` (issue
+    /// #341) then lost every run's formatting, including hyperlinks.
+    Table(Vec<Vec<Vec<Run>>>),
     /// Free-floating text box: (paragraphs, x_emu, y_emu, cx_emu, cy_emu).
     /// Each paragraph is its own `(runs, props)` pair — a text box can
     /// hold more than one paragraph (issue #264: the writer used to
@@ -316,22 +321,27 @@ impl SlideData {
 
     /// Add a bullet list to the body area.
     pub fn add_bullet_list(&mut self, items: &[&str]) -> &mut Self {
-        let owned: Vec<(u8, String)> = items.iter().map(|s| (0, (*s).to_string())).collect();
+        let owned: Vec<(u8, Vec<Run>)> = items.iter().map(|s| (0, vec![Run::new(*s)])).collect();
         self.body_items.push(BodyItem::BulletList(owned));
         self
     }
 
-    /// Add a bullet list whose items carry an explicit nesting level.
+    /// Add a bullet list whose items carry an explicit nesting level and
+    /// full run-level formatting (bold, italic, color, hyperlink, ...).
     ///
     /// Every item used to be emitted at level 0 with no `marL`/`indent`, so
-    /// nesting was lost and the bullet glyph sat at the same x as its text.
-    pub fn add_nested_bullet_list(&mut self, items: &[(u8, String)]) -> &mut Self {
-        self.body_items.push(BodyItem::BulletList(items.to_vec()));
+    /// nesting was lost and the bullet glyph sat at the same x as its text
+    /// — and every item used to be a bare `String`, so run formatting was
+    /// lost too (issue #341).
+    pub fn add_nested_bullet_list(&mut self, items: Vec<(u8, Vec<Run>)>) -> &mut Self {
+        self.body_items.push(BodyItem::BulletList(items));
         self
     }
 
-    /// Add a table as a real `a:tbl`, not tab-joined text.
-    pub fn add_table(&mut self, rows: Vec<Vec<String>>) -> &mut Self {
+    /// Add a table as a real `a:tbl`, not tab-joined text. Each cell is a
+    /// paragraph's worth of styled `Run`s, so hyperlinks and character
+    /// formatting survive (issue #341).
+    pub fn add_table(&mut self, rows: Vec<Vec<Vec<Run>>>) -> &mut Self {
         if !rows.is_empty() {
             self.body_items.push(BodyItem::Table(rows));
         }
@@ -1360,9 +1370,11 @@ fn write_layout_placeholder(
 // ---------------------------------------------------------------------------
 
 /// Every distinct hyperlink URL reachable from `items`' runs, in
-/// first-seen order (issue #262). Only `RichText`/`TextBox` carry
-/// `Run`s today — `BulletList`/`Table` are plain strings with no
-/// hyperlink concept in the writer at all.
+/// first-seen order (issue #262, extended by #341 to also look inside
+/// `BulletList`/`Table` cells — both now carry real `Run`s too, and a
+/// run whose hyperlink URL was never registered here has no relationship
+/// id for `write_dml_run` to find, so its `<a:hlinkClick>` would
+/// silently never get written even though the run itself is present).
 fn collect_slide_hyperlinks(items: &[BodyItem]) -> Vec<String> {
     let mut urls = Vec::new();
     for item in items {
@@ -1371,6 +1383,8 @@ fn collect_slide_hyperlinks(items: &[BodyItem]) -> Vec<String> {
             BodyItem::TextBox(paragraphs, ..) => {
                 paragraphs.iter().flat_map(|(runs, _)| runs.iter()).collect()
             },
+            BodyItem::BulletList(items) => items.iter().flat_map(|(_, runs)| runs.iter()).collect(),
+            BodyItem::Table(rows) => rows.iter().flatten().flatten().collect(),
             _ => continue,
         };
         for run in all_runs {
@@ -1430,7 +1444,7 @@ fn generate_slide_xml(
             let cx = pres_cx.saturating_sub(2 * margin).max(914_400);
             let cy = (rows.len() as u64 * 457_200).min(pres_cy / 2).max(457_200);
             let y = (pres_cy as f64 * BODY_Y_FRAC) as i64;
-            write_table_frame(&mut w, next_id, rows, margin as i64, y, cx, cy);
+            write_table_frame(&mut w, next_id, rows, margin as i64, y, cx, cy, hyperlink_rids);
             next_id += 1;
         }
     }
@@ -1629,7 +1643,7 @@ fn write_body_shape(
             },
             BodyItem::BulletList(bullets) => {
                 for bullet in bullets {
-                    write_bullet_paragraph(w, bullet.0, &bullet.1);
+                    write_bullet_paragraph(w, bullet.0, &bullet.1, hyperlink_rids);
                     wrote_paragraph = true;
                 }
             },
@@ -1657,11 +1671,12 @@ fn write_body_shape(
 fn write_table_frame(
     w: &mut Writer<Vec<u8>>,
     id: u32,
-    rows: &[Vec<String>],
+    rows: &[Vec<Vec<Run>>],
     x: i64,
     y: i64,
     cx: u64,
     cy: u64,
+    hyperlink_rids: &HashMap<String, String>,
 ) {
     let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
     if cols == 0 {
@@ -1733,11 +1748,11 @@ fn write_table_frame(
             write_empty(w, "a:bodyPr");
             w.write_event(Event::Start(BytesStart::new("a:p")))
                 .expect("write");
-            w.write_event(Event::Start(BytesStart::new("a:r")))
-                .expect("write");
-            write_text_element(w, "a:t", row.get(c).map_or("", String::as_str));
-            w.write_event(Event::End(BytesEnd::new("a:r")))
-                .expect("write");
+            if let Some(cell_runs) = row.get(c) {
+                for run in cell_runs {
+                    write_dml_run(w, run, hyperlink_rids);
+                }
+            }
             w.write_event(Event::End(BytesEnd::new("a:p")))
                 .expect("write");
             w.write_event(Event::End(BytesEnd::new("a:txBody")))
@@ -1973,7 +1988,12 @@ fn write_rich_paragraph(
 /// One level of hanging indent, in EMU — the value PowerPoint uses.
 const BULLET_INDENT_EMU: u32 = 342_900;
 
-fn write_bullet_paragraph(w: &mut Writer<Vec<u8>>, level: u8, text: &str) {
+fn write_bullet_paragraph(
+    w: &mut Writer<Vec<u8>>,
+    level: u8,
+    runs: &[Run],
+    hyperlink_rids: &HashMap<String, String>,
+) {
     w.write_event(Event::Start(BytesStart::new("a:p")))
         .expect("write");
     let level = level.min(8);
@@ -1992,11 +2012,9 @@ fn write_bullet_paragraph(w: &mut Writer<Vec<u8>>, level: u8, text: &str) {
     w.write_event(Event::Empty(bu)).expect("write");
     w.write_event(Event::End(BytesEnd::new("a:pPr")))
         .expect("write");
-    w.write_event(Event::Start(BytesStart::new("a:r")))
-        .expect("write");
-    write_text_element(w, "a:t", text);
-    w.write_event(Event::End(BytesEnd::new("a:r")))
-        .expect("write");
+    for run in runs {
+        write_dml_run(w, run, hyperlink_rids);
+    }
     w.write_event(Event::End(BytesEnd::new("a:p")))
         .expect("write");
 }
@@ -2129,6 +2147,74 @@ mod tests {
             has_the_hyperlink(&ir.sections[0].elements),
             "hyperlink did not round-trip through the reader: {:?}",
             ir.sections[0]
+        );
+    }
+
+    /// issue #341 — `BodyItem::Table`/`BulletList` used to flatten every
+    /// cell/item to a bare `String`, so a hyperlink (or any other run
+    /// formatting) inside a table cell or bullet-list item was silently
+    /// dropped on write. Both now carry real `Run`s, and
+    /// `collect_slide_hyperlinks` must find URLs inside them too, or the
+    /// relationship id `write_dml_run` looks up would never exist.
+    #[test]
+    fn table_and_bullet_list_hyperlinks_round_trip() {
+        let mut writer = PptxWriter::new();
+        {
+            let slide = writer.add_slide();
+            slide.add_table(vec![vec![
+                vec![Run::new("Web Page").hyperlink("https://example.com/table")],
+            ]]);
+            slide.add_nested_bullet_list(vec![(
+                0,
+                vec![Run::new("Bulleted link").hyperlink("https://example.com/bullet")],
+            )]);
+        }
+
+        let mut buf = Cursor::new(Vec::new());
+        writer.write_to(&mut buf).unwrap();
+        buf.set_position(0);
+
+        let doc = crate::Document::from_reader(buf, crate::DocumentFormat::Pptx).expect("reparse");
+        let ir = doc.to_ir();
+
+        fn hyperlinks(elements: &[crate::ir::Element], out: &mut Vec<String>) {
+            for e in elements {
+                match e {
+                    crate::ir::Element::Paragraph(p) => {
+                        for c in &p.content {
+                            if let crate::ir::InlineContent::Text(t) = c {
+                                if let Some(u) = &t.hyperlink {
+                                    out.push(u.clone());
+                                }
+                            }
+                        }
+                    },
+                    crate::ir::Element::Table(t) => {
+                        for row in &t.rows {
+                            for cell in &row.cells {
+                                hyperlinks(&cell.content, out);
+                            }
+                        }
+                    },
+                    crate::ir::Element::List(l) => {
+                        for item in &l.items {
+                            hyperlinks(&item.content, out);
+                        }
+                    },
+                    crate::ir::Element::TextBox(tb) => hyperlinks(&tb.content, out),
+                    _ => {},
+                }
+            }
+        }
+        let mut found = Vec::new();
+        hyperlinks(&ir.sections[0].elements, &mut found);
+        assert!(
+            found.contains(&"https://example.com/table".to_string()),
+            "table cell hyperlink lost: {found:?}"
+        );
+        assert!(
+            found.contains(&"https://example.com/bullet".to_string()),
+            "bullet list hyperlink lost: {found:?}"
         );
     }
 

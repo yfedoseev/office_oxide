@@ -11,7 +11,7 @@ use office_oxide::create::{create_from_ir, create_from_markdown};
 use office_oxide::docx::write::{DocxWriter, HfType, Run as DRun};
 use office_oxide::format::DocumentFormat;
 use office_oxide::ir::*;
-use office_oxide::pptx::write::PptxWriter;
+use office_oxide::pptx::write::{PptxWriter, Run as PRun};
 use office_oxide::xlsx::write::{CellData, CellStyle, XlsxWriter};
 
 const PNG: &[u8] = &[
@@ -303,7 +303,10 @@ fn pptx_builder_corpus(out: &str) {
         s.add_text_box("boxed", 100_000, 100_000, 2_000_000, 500_000);
         s.add_image(PNG.to_vec(), ImageFormat::Png, 0, 900_000, 500_000, 500_000);
         s.set_notes("presenter only");
-        s.add_table(vec![vec!["A".into(), "B".into()], vec!["1".into(), "2".into()]]);
+        s.add_table(vec![
+            vec![vec![PRun::new("A")], vec![PRun::new("B")]],
+            vec![vec![PRun::new("1")], vec![PRun::new("2")]],
+        ]);
     }
     p.add_slide();
     p.save(format!("{out}/builder.pptx")).unwrap();
