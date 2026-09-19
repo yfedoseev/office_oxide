@@ -1071,7 +1071,29 @@ pub enum InlineContent {
     EndnoteRef(FootnoteRef),
 }
 
-/// Pick the dominant font size (in points) for a paragraph's worth of
+/// Concatenate a heading/paragraph's inline content into plain text —
+/// `Text` spans verbatim, `LineBreak` as `\n`, note references dropped.
+/// The one canonical extraction every writer's "does this heading match
+/// title text T" check must use; a second, narrower reimplementation in
+/// `convert_docx.rs`'s own title-derivation (which silently dropped
+/// `LineBreak` instead of emitting `\n`) made `section.title` disagree
+/// with this function on any heading containing a line break, so the
+/// write-side "is the title already present in the elements" check
+/// always came back `false` for such headings and duplicated them on
+/// every write (issue #338).
+pub fn inline_to_text(content: &[InlineContent]) -> String {
+    let mut out = String::new();
+    for item in content {
+        match item {
+            InlineContent::Text(span) => out.push_str(&span.text),
+            InlineContent::LineBreak => out.push('\n'),
+            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
+        }
+    }
+    out
+}
+
+/// Extract the first `font_size_half_pt` declared on any run in a run of
 /// inline content. Returns the *first* declared `font_size_half_pt`,
 /// converted from half-points to points (e.g. 18 half-pt → 9 pt).
 ///

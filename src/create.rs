@@ -1332,18 +1332,6 @@ fn emit_pptx_slides_compacted(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn inline_to_text(content: &[InlineContent]) -> String {
-    let mut out = String::new();
-    for item in content {
-        match item {
-            InlineContent::Text(span) => out.push_str(&span.text),
-            InlineContent::LineBreak => out.push('\n'),
-            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
-        }
-    }
-    out
-}
-
 fn rgb_to_hex(rgb: [u8; 3]) -> String {
     format!("{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
 }
@@ -1846,5 +1834,63 @@ mod xlsx_table_write_tests {
             matches!(e, Element::Endnote(n) if n.marker.as_deref() == Some("B1 (Jane Doe)"))
         });
         assert!(has_comment_endnote, "the comment must round-trip back onto cell B1: {:?}", ir2.sections[0].elements);
+    }
+}
+
+#[cfg(test)]
+mod docx_section_title_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// issue #338 — `convert_docx.rs` derives `section.title` from a
+    /// heading using a narrower text extraction (only `InlineContent::
+    /// Text`, silently dropping `LineBreak`) than `ir_to_docx`'s "is the
+    /// title already present in the elements" check (`inline_to_text`,
+    /// which turns `LineBreak` into `\n`). A heading containing a line
+    /// break therefore never string-matched its own derived title, so
+    /// the title-suppression check always failed and a second, spurious
+    /// copy of the heading got written on every round trip. Both sides
+    /// must now agree by construction — they share `ir::inline_to_text`.
+    #[test]
+    fn a_heading_with_a_line_break_is_not_duplicated_as_a_second_title() {
+        let heading = Element::Heading(Heading {
+            level: 1,
+            content: vec![InlineContent::LineBreak, InlineContent::Text(TextSpan::plain("Individual Elements"))],
+            ..Default::default()
+        });
+        let body = Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan::plain("Body text."))],
+            ..Default::default()
+        });
+
+        let ir = DocumentIR {
+            metadata: Metadata { format: DocumentFormat::Docx, ..Default::default() },
+            sections: vec![Section {
+                title: Some(inline_to_text(&[
+                    InlineContent::LineBreak,
+                    InlineContent::Text(TextSpan::plain("Individual Elements")),
+                ])),
+                elements: vec![heading, body],
+                ..Default::default()
+            }],
+            defined_names: Vec::new(),
+        };
+
+        let mut buf = Cursor::new(Vec::new());
+        create_from_ir_to_writer(&ir, DocumentFormat::Docx, &mut buf).unwrap();
+        buf.set_position(0);
+        let doc = crate::Document::from_reader(buf, DocumentFormat::Docx).unwrap();
+        let ir2 = doc.to_ir();
+
+        let heading_count = ir2.sections[0]
+            .elements
+            .iter()
+            .filter(|e| matches!(e, Element::Heading(h) if inline_to_text(&h.content).contains("Individual Elements")))
+            .count();
+        assert_eq!(
+            heading_count, 1,
+            "the heading must not be duplicated as a second title on write: {:?}",
+            ir2.sections[0].elements
+        );
     }
 }

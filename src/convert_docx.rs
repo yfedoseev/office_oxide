@@ -71,20 +71,12 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         let mut elements = Vec::new();
         convert_block_elements(&doc.body.elements[start..end], &mut elements, doc);
 
+        // Must use the same extraction the write path's "is the title
+        // already present in the elements" check uses (`inline_to_text`),
+        // or a heading containing a `LineBreak` disagrees between the two
+        // and gets duplicated on every write (issue #338).
         let title = elements.iter().find_map(|e| {
-            if let Element::Heading(h) = e {
-                Some(
-                    h.content
-                        .iter()
-                        .filter_map(|c| match c {
-                            InlineContent::Text(span) => Some(span.text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<String>(),
-                )
-            } else {
-                None
-            }
+            if let Element::Heading(h) = e { Some(inline_to_text(&h.content)) } else { None }
         });
         if doc_title.is_none() {
             doc_title = title.clone();
