@@ -338,6 +338,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
             title: Some(title),
             elements,
             speaker_notes,
+            hidden: slide.hidden,
             ..Default::default()
         });
     }

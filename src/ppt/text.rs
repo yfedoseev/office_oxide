@@ -149,7 +149,7 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
     if runs.is_empty() && tables.is_empty() && image_refs.is_empty() {
         Vec::new()
     } else {
-        vec![SlideText { text_runs: runs, tables, image_refs }]
+        vec![SlideText { text_runs: runs, tables, image_refs, ..Default::default() }]
     }
 }
 
@@ -180,7 +180,8 @@ fn collect_slide_containers(
                 &mut image_refs,
             );
             runs.retain(|r| !is_master_placeholder_prompt(&r.text));
-            out.push(SlideText { text_runs: runs, tables, image_refs });
+            let hidden = slide_is_hidden(&rec.data);
+            out.push(SlideText { text_runs: runs, tables, image_refs, hidden });
             continue;
         }
         if rec.header.is_container() {
@@ -312,6 +313,7 @@ fn resolve_slide(
     let mut text_runs = Vec::new();
     let mut tables = Vec::new();
     let mut image_refs = Vec::new();
+    let mut hidden = false;
     if let Some(offset) = dir.resolve(persist_id_ref) {
         if let Some(children) = bounded_container_children(stream, offset, RT_SLIDE) {
             extract_shape_text(
@@ -324,9 +326,10 @@ fn resolve_slide(
                 &mut tables,
                 &mut image_refs,
             );
+            hidden = slide_is_hidden(&children);
         }
     }
-    SlideText { text_runs, tables, image_refs }
+    SlideText { text_runs, tables, image_refs, hidden }
 }
 
 /// Recursively collect a shape tree's text, in document order, from a bounded
@@ -963,6 +966,35 @@ pub struct SlideText {
     /// whichever slide happened to be last, regardless of which slide
     /// actually contains the shape referencing them).
     pub image_refs: Vec<usize>,
+    /// Whether the slide is marked hidden (not shown during a slide
+    /// show) via a `SlideShowSlideInfoAtom` HIDDEN_BIT sibling of the
+    /// `Slide` container. The content is still extracted — a consumer
+    /// indexing a deck usually wants it — but a caller can now tell the
+    /// author didn't intend it to be seen (issue #297, the `.ppt`
+    /// analogue of the already-fixed XLSX/PPTX #193).
+    pub hidden: bool,
+}
+
+/// Look for a `SlideShowSlideInfoAtom` among a `Slide` container's direct
+/// children and read its `HIDDEN_BIT` (`0x0004`) out of the
+/// `effectTransitionFlags` field.
+///
+/// Layout ([MS-PPT] 2.13.24): after the 8-byte record header, `slideTime:
+/// i32`, `soundIdRef: i32`, `effectDirection: u8`, `effectType: u8`,
+/// `effectTransitionFlags: u16` (offset 10 within the atom body), `speed:
+/// u8`, 3 unused bytes — 16 bytes total, 24 with the header. Verified
+/// against Apache POI's `SSSlideInfoAtom`.
+fn slide_is_hidden(children: &[u8]) -> bool {
+    for rec in RecordIter::new(children) {
+        let Ok(rec) = rec else { break };
+        if rec.header.rec_type == RT_SLIDE_SHOW_SLIDE_INFO_ATOM {
+            if let Some(flags_bytes) = rec.data.get(10..12) {
+                let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
+                return flags & 0x0004 != 0;
+            }
+        }
+    }
+    false
 }
 
 fn decode_utf16le(data: &[u8]) -> String {
@@ -1574,6 +1606,55 @@ mod tests {
         assert_eq!(slides[1].text_runs[0].text, "Slide 2 Title");
     }
 
+    /// issue #297 — a `SlideShowSlideInfoAtom` HIDDEN_BIT sibling of the
+    /// `Slide` container's real content must reach `SlideText::hidden`.
+    #[test]
+    fn hidden_slide_is_flagged() {
+        let stream = hidden_slide_container_bytes("Hidden Slide");
+        let slides = extract_slides_text(&stream, None);
+        assert_eq!(slides.len(), 1);
+        assert_eq!(slides[0].text_runs[0].text, "Hidden Slide");
+        assert!(slides[0].hidden, "slide must be flagged hidden");
+    }
+
+    /// A slide with no `SlideShowSlideInfoAtom` at all — the overwhelming
+    /// majority of real slides — must not be flagged hidden.
+    #[test]
+    fn ordinary_slide_is_not_hidden() {
+        let stream = slide_container_bytes("Ordinary Slide");
+        let slides = extract_slides_text(&stream, None);
+        assert_eq!(slides.len(), 1);
+        assert!(!slides[0].hidden);
+    }
+
+    /// A `SlideShowSlideInfoAtom` present but with HIDDEN_BIT clear (a
+    /// slide that merely has a custom transition) must not be flagged
+    /// hidden either.
+    #[test]
+    fn slide_info_atom_without_hidden_bit_is_not_hidden() {
+        let header = make_atom(RT_TEXT_HEADER, 0, &0u32.to_le_bytes());
+        let mut textbox_children = header;
+        textbox_children.extend(make_atom(RT_TEXT_BYTES, 0, b"Visible Slide"));
+        let textbox = make_container(0xF00D, 0, &textbox_children);
+
+        let mut info_body = 0i32.to_le_bytes().to_vec();
+        info_body.extend_from_slice(&0i32.to_le_bytes());
+        info_body.push(0);
+        info_body.push(5); // effectType = fade, unrelated to hidden
+        info_body.extend_from_slice(&0x0001u16.to_le_bytes()); // MANUAL_ADVANCE_BIT only
+        info_body.push(0);
+        info_body.extend_from_slice(&[0, 0, 0]);
+        let info_atom = make_atom(RT_SLIDE_SHOW_SLIDE_INFO_ATOM, 0, &info_body);
+
+        let mut children = textbox;
+        children.extend(info_atom);
+        let stream = make_container(RT_SLIDE, 0, &children);
+
+        let slides = extract_slides_text(&stream, None);
+        assert_eq!(slides.len(), 1);
+        assert!(!slides[0].hidden);
+    }
+
     #[test]
     fn text_type_variants() {
         assert_eq!(TextType::from_u32(0), TextType::Title);
@@ -1679,6 +1760,30 @@ mod tests {
         textbox_children.extend(make_atom(RT_TEXT_BYTES, 0, title.as_bytes()));
         let textbox = make_container(0xF00D, 0, &textbox_children); // ClientTextbox
         make_container(RT_SLIDE, 0, &textbox)
+    }
+
+    /// Same shape as `slide_container_bytes`, plus a
+    /// `SlideShowSlideInfoAtom` sibling of the `ClientTextbox` with
+    /// `HIDDEN_BIT` (0x0004) set — the real byte shape [MS-PPT] 2.13.24
+    /// describes, cross-checked against Apache POI's `SSSlideInfoAtom`.
+    fn hidden_slide_container_bytes(title: &str) -> Vec<u8> {
+        let header = make_atom(RT_TEXT_HEADER, 0, &0u32.to_le_bytes());
+        let mut textbox_children = header;
+        textbox_children.extend(make_atom(RT_TEXT_BYTES, 0, title.as_bytes()));
+        let textbox = make_container(0xF00D, 0, &textbox_children); // ClientTextbox
+
+        let mut info_body = 0i32.to_le_bytes().to_vec(); // slideTime
+        info_body.extend_from_slice(&0i32.to_le_bytes()); // soundIdRef
+        info_body.push(0); // effectDirection
+        info_body.push(0); // effectType
+        info_body.extend_from_slice(&0x0004u16.to_le_bytes()); // effectTransitionFlags: HIDDEN_BIT
+        info_body.push(0); // speed
+        info_body.extend_from_slice(&[0, 0, 0]); // unused
+        let info_atom = make_atom(RT_SLIDE_SHOW_SLIDE_INFO_ATOM, 0, &info_body);
+
+        let mut children = textbox;
+        children.extend(info_atom);
+        make_container(RT_SLIDE, 0, &children)
     }
 
     /// Builds a synthetic "PowerPoint Document" stream containing a

@@ -27,6 +27,11 @@ pub const RT_OUTLINE_TEXT_REF_ATOM: u16 = 0x0F9E;
 pub const RT_TEXT_CHARS: u16 = 0x0FA0;
 pub const RT_TEXT_BYTES: u16 = 0x0FA8;
 pub const RT_SLIDE_PERSIST_ATOM: u16 = 0x03F3;
+/// Optional child of a `Slide` container: which slideshow transition to
+/// use, and whether the slide is hidden ([MS-PPT] 2.5.1 `SlideContainer`,
+/// 2.4.15.4/2.13.24 `SlideShowSlideInfoAtom`, record type 1017 = 0x3F9).
+/// Issue #297.
+pub const RT_SLIDE_SHOW_SLIDE_INFO_ATOM: u16 = 0x03F9;
 pub const RT_USER_EDIT_ATOM: u16 = 0x0FF5;
 /// PersistDirectoryAtom ([MS-PPT] 2.3.4).
 pub const RT_PERSIST_DIRECTORY_ATOM: u16 = 0x1772;
