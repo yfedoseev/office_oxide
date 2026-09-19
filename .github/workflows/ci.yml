@@ -93,6 +93,17 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+  # Mechanical house rules from CONTRIBUTING.md: test functions are named
+  # `test_*`, no `allow(dead_code)`, no issue/PR numbers in code or comments.
+  house-rules:
+    name: House Rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check test naming, dead-code suppressions and ticket references
+        run: scripts/house-rules-check.sh
+
   # Linting with Clippy
   clippy:
     name: Clippy
@@ -156,7 +167,7 @@ jobs:
           cargo run --quiet --example gen_validation_corpus -- "${RUNNER_TEMP}/corpus"
 
       # Schema validity: catches missing required elements and wrong element
-      # order, the class behind #199, #200 and #202.
+      # order, the class behind the clrMap defect.
       - name: Validate every part against ISO/IEC 29500-4
         run: python3 scripts/ooxml-validate/validate.py "${RUNNER_TEMP}"/corpus/*
 
