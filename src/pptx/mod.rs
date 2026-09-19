@@ -19,6 +19,10 @@
 pub mod edit;
 /// Error types for PPTX parsing and creation.
 pub mod error;
+/// Slide-master `<p:txStyles>` default formatting — a placeholder's
+/// fallback when its own direct formatting leaves a property unset
+/// (issue #291).
+pub(crate) mod master;
 /// `ppt/presentation.xml` data model.
 pub mod presentation;
 /// Shape data model for PresentationML slides.
@@ -163,7 +167,16 @@ impl PptxDocument {
             /// before (issue #239). Pre-resolved here for the same reason
             /// `media` is.
             charts: std::collections::HashMap<String, Vec<String>>,
+            /// This slide's resolved master title/body level-0 defaults,
+            /// via its layout's own `SLIDE_MASTER` relationship — `None`
+            /// when the layout/master chain can't be resolved at all
+            /// (issue #291).
+            master_styles: Option<master::MasterTextStyles>,
         }
+        // Many slides share one layout/master — resolve and parse each
+        // unique master part at most once (issue #291).
+        let mut master_styles_cache: std::collections::HashMap<String, master::MasterTextStyles> =
+            std::collections::HashMap::new();
         let mut bundles = Vec::with_capacity(presentation.slides.len());
         for (slide_idx, slide_id) in presentation.slides.iter().enumerate() {
             // Try to resolve by rel_id, fall back to positional lookup
@@ -185,6 +198,32 @@ impl PptxDocument {
                 .read_rels_for(&part_name)
                 .unwrap_or_else(|_| Relationships::empty());
             let slide_data = opc.read_part(&part_name)?;
+
+            // Slide -> layout -> master, resolved through their own
+            // relationships exactly like every other part this reader
+            // already follows (images, notes, charts) — never opened at
+            // all before this (issue #291).
+            let master_styles = slide_rels
+                .first_by_type(rel_types::SLIDE_LAYOUT)
+                .and_then(|rel| part_name.resolve_relative(&rel.target).ok())
+                .filter(|pn| opc.has_part(pn))
+                .and_then(|layout_part| {
+                    let layout_rels = opc.read_rels_for(&layout_part).ok()?;
+                    let master_rel = layout_rels.first_by_type(rel_types::SLIDE_MASTER)?;
+                    let master_part = layout_part.resolve_relative(&master_rel.target).ok()?;
+                    if !opc.has_part(&master_part) {
+                        return None;
+                    }
+                    let key = master_part.as_str().to_string();
+                    if let Some(cached) = master_styles_cache.get(&key) {
+                        return Some(cached.clone());
+                    }
+                    let data = opc.read_part(&master_part).ok()?;
+                    let styles = master::parse_master_text_styles(&data);
+                    master_styles_cache.insert(key, styles.clone());
+                    Some(styles)
+                })
+                .filter(|s| !s.is_empty());
 
             let notes_data =
                 if let Some(notes_rel) = slide_rels.first_by_type(rel_types::NOTES_SLIDE) {
@@ -275,6 +314,7 @@ impl PptxDocument {
                 comments_data,
                 media,
                 charts,
+                master_styles,
             });
         }
 
@@ -288,6 +328,9 @@ impl PptxDocument {
             }
             for data in &b.comments_data {
                 parsed.comments.extend(slide::parse_comments(data));
+            }
+            if let Some(ref styles) = b.master_styles {
+                apply_master_inheritance(&mut parsed.shapes, styles);
             }
             Ok(parsed)
         })?;
@@ -361,6 +404,56 @@ fn xml_csl_name(xml_data: &[u8]) -> String {
 /// body placeholder (type="body") and returns its structured `TextBody`.
 fn extract_notes_body(xml_data: &[u8]) -> Option<TextBody> {
     slide::extract_notes_body(xml_data)
+}
+
+/// Fill any unset (`None`) character/paragraph-formatting field on
+/// every Title/Body placeholder shape's runs from the resolved slide
+/// master's level-0 defaults — never overriding a field the run/
+/// paragraph already specified directly (issue #291, the PPTX analogue
+/// of the legacy `.ppt` fix in issue #335).
+fn apply_master_inheritance(shapes: &mut [Shape], styles: &master::MasterTextStyles) {
+    for shape in shapes {
+        match shape {
+            Shape::Group(grp) => apply_master_inheritance(&mut grp.children, styles),
+            Shape::AutoShape(auto) => {
+                let ph_type = auto.placeholder.as_ref().and_then(|p| p.ph_type.as_deref());
+                let defaults = match ph_type {
+                    Some("title" | "ctrTitle") => styles.title.as_ref(),
+                    Some("body" | "subTitle") | None if auto.placeholder.is_some() => {
+                        styles.body.as_ref()
+                    },
+                    _ => None,
+                };
+                let Some(defaults) = defaults else { continue };
+                let Some(ref mut tb) = auto.text_body else { continue };
+                for para in &mut tb.paragraphs {
+                    if para.alignment.is_none() {
+                        para.alignment = defaults.alignment.clone();
+                    }
+                    for content in &mut para.content {
+                        if let shape::TextContent::Run(run) = content {
+                            if run.bold.is_none() {
+                                run.bold = defaults.bold;
+                            }
+                            if run.italic.is_none() {
+                                run.italic = defaults.italic;
+                            }
+                            if run.underline.is_none() {
+                                run.underline = defaults.underline.clone();
+                            }
+                            if run.font_size_hundredths_pt.is_none() {
+                                run.font_size_hundredths_pt = defaults.font_size_hundredths_pt;
+                            }
+                            if run.color_rgb.is_none() {
+                                run.color_rgb = defaults.color_rgb;
+                            }
+                        }
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
 }
 
 /// Best-effort image-format detection from the raw bytes.
