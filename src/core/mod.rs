@@ -9,6 +9,7 @@
 /// Text extraction from DrawingML chart parts (`c:chartSpace`), shared by
 /// the DOCX and PPTX readers for charts embedded via a drawing relationship.
 pub mod chart;
+pub(crate) mod codepage;
 /// `[Content_Types].xml` parsing and writing.
 pub mod content_types;
 /// Shared `docProps/core.xml` generator used by DOCX, PPTX, XLSX writers.

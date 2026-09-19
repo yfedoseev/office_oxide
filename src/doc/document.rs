@@ -126,7 +126,7 @@ impl DocDocument {
         let pieces = parse_clx(clx_data)?;
         let text_complete = covers_declared_length(&pieces, fib.text_len);
 
-        let raw_text = extract_text(&word_doc, &pieces, fib.text_len);
+        let raw_text = extract_text(&word_doc, &pieces, fib.text_len, fib.lid);
         let text = sanitize_text(&raw_text);
 
         // The subdocuments follow the main text contiguously in the piece
@@ -145,7 +145,8 @@ impl DocDocument {
                 continue;
             }
             let end = cp.saturating_add(len);
-            let raw = super::piece_table::extract_text_range(&word_doc, &pieces, cp, end);
+            let raw =
+                super::piece_table::extract_text_range(&word_doc, &pieces, cp, end, fib.lid);
             let sub = sanitize_text(&raw);
             if !sub.trim().is_empty() {
                 subdocuments.push(SubDocument { kind, text: sub });
@@ -163,7 +164,7 @@ impl DocDocument {
                 fib.fc_plcf_bte_papx,
                 fib.lcb_plcf_bte_papx,
             );
-            build_paragraphs(&word_doc, &pieces, &fkp, fib.text_len)
+            build_paragraphs(&word_doc, &pieces, &fkp, fib.text_len, fib.lid)
         } else {
             Vec::new()
         };

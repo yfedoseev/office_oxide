@@ -132,8 +132,10 @@ fn parse_plc_pcd(data: &[u8]) -> Result<Vec<Piece>> {
 }
 
 /// Extract text from the WordDocument stream using the piece table.
-pub fn extract_text(word_doc: &[u8], pieces: &[Piece], max_chars: u32) -> String {
-    extract_text_range(word_doc, pieces, 0, max_chars)
+/// `lid` is the FIB's language id (`Fib::lid`), which selects the
+/// codepage compressed (8-bit) runs decode with (issue #310).
+pub fn extract_text(word_doc: &[u8], pieces: &[Piece], max_chars: u32, lid: u16) -> String {
+    extract_text_range(word_doc, pieces, 0, max_chars, lid)
 }
 
 /// Whether `pieces` fully covers `[0, text_len)` with no gaps.
@@ -180,6 +182,7 @@ pub fn extract_text_range(
     pieces: &[Piece],
     range_start: u32,
     range_end: u32,
+    lid: u16,
 ) -> String {
     let mut text = String::new();
     if range_end <= range_start {
@@ -206,7 +209,7 @@ pub fn extract_text_range(
 
             if byte_offset + byte_count <= word_doc.len() {
                 for &b in &word_doc[byte_offset..byte_offset + byte_count] {
-                    text.push(cp1252_to_char(b));
+                    text.push(super::codepage::decode_byte(b, lid));
                 }
             }
         } else {
@@ -272,6 +275,7 @@ pub(crate) fn decode_cp_range(
     pieces: &[Piece],
     cp_start: u32,
     cp_end: u32,
+    lid: u16,
 ) -> String {
     let mut out = String::new();
     if cp_end <= cp_start {
@@ -299,7 +303,7 @@ pub(crate) fn decode_cp_range(
             for cp in seg_start..seg_end {
                 let off = base + (cp - piece.cp_start) as usize;
                 if off < word_doc.len() {
-                    out.push(cp1252_to_char(word_doc[off]));
+                    out.push(super::codepage::decode_byte(word_doc[off], lid));
                 }
             }
         } else {
@@ -318,7 +322,7 @@ pub(crate) fn decode_cp_range(
 }
 
 /// Convert a CP1252 byte to a Unicode char.
-fn cp1252_to_char(b: u8) -> char {
+pub(crate) fn cp1252_to_char(b: u8) -> char {
     // CP1252 is identical to Latin-1 except for bytes 0x80-0x9F.
     match b {
         0x80 => '\u{20AC}', // €
@@ -551,7 +555,7 @@ mod tests {
             is_compressed: true,
         }];
 
-        let text = extract_text(&word_doc, &pieces, 5);
+        let text = extract_text(&word_doc, &pieces, 5, 0);
         assert_eq!(text, "Hello");
     }
 
@@ -572,7 +576,7 @@ mod tests {
             is_compressed: false,
         }];
 
-        let text = extract_text(&word_doc, &pieces, 2);
+        let text = extract_text(&word_doc, &pieces, 2, 0);
         assert_eq!(text, "Hi");
     }
 
@@ -601,7 +605,7 @@ mod tests {
             },
         ];
 
-        let text = extract_text(&word_doc, &pieces, 4);
+        let text = extract_text(&word_doc, &pieces, 4, 0);
         assert_eq!(text, "ABCD");
     }
 
@@ -687,7 +691,7 @@ mod tests {
             is_compressed: true,
         }];
 
-        let text = extract_text(&word_doc, &pieces, 3);
+        let text = extract_text(&word_doc, &pieces, 3, 0);
         assert_eq!(text, "Hel");
     }
 
@@ -744,7 +748,7 @@ mod tests {
             "fully unbacked piece must clamp to cp_start (no iteration)"
         );
         assert_eq!(
-            decode_cp_range(&word_doc, &[unbacked], 0, 20_000_000),
+            decode_cp_range(&word_doc, &[unbacked], 0, 20_000_000, 0),
             "",
             "CP range with no backing bytes yields empty text"
         );
@@ -763,7 +767,7 @@ mod tests {
             "partially backed Unicode piece must clamp to 32, not 20M"
         );
         assert_eq!(
-            decode_cp_range(&word_doc, &[backed], 0, 20_000_000)
+            decode_cp_range(&word_doc, &[backed], 0, 20_000_000, 0)
                 .chars()
                 .count(),
             32,
@@ -857,7 +861,7 @@ mod tests {
             is_compressed: false,
         };
         // Request only CP 4..7 -> "oWo".
-        let out = decode_cp_range(&word_doc, &[piece], 4, 7);
+        let out = decode_cp_range(&word_doc, &[piece], 4, 7, 0);
         assert_eq!(out, "oWo", "mid-range decode must use cp - cp_start offset");
     }
 
@@ -954,7 +958,7 @@ mod multi_piece_tests {
 
         let pieces = parse_clx(&c).expect("parse");
         assert_eq!(pieces.len(), 3);
-        assert_eq!(extract_text(&word_doc, &pieces, 6), "ABCDEF");
+        assert_eq!(extract_text(&word_doc, &pieces, 6, 0), "ABCDEF");
     }
 
     /// Ranges must be clipped at both ends, which is what lets the
@@ -969,7 +973,7 @@ mod multi_piece_tests {
         word_doc.extend_from_slice(&text);
         let c = clx(&[(0, 6, 512)]);
         let pieces = parse_clx(&c).expect("parse");
-        assert_eq!(extract_text_range(&word_doc, &pieces, 2, 5), "CDE");
+        assert_eq!(extract_text_range(&word_doc, &pieces, 2, 5, 0), "CDE");
     }
 
     // ── Piece table coverage vs the FIB's declared text length (#230) ──────

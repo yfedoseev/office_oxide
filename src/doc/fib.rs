@@ -11,6 +11,12 @@ use super::error::{DocError, Result};
 pub struct Fib {
     /// Word version identifier.
     pub version: u16,
+    /// FibBase `lid`: the document's default language ID (Windows LCID),
+    /// e.g. `0x0419` = Russian. Determines which codepage compressed
+    /// (8-bit) text runs are stored in — before this field existed,
+    /// every compressed run was decoded as CP1252 regardless of the
+    /// document's actual authoring locale (issue #310).
+    pub lid: u16,
     /// Which table stream to use: true = "1Table", false = "0Table".
     pub use_table1: bool,
     /// Offset of the CLX (piece table) in the Table stream.
@@ -80,6 +86,9 @@ impl Fib {
         }
 
         let version = u16::from_le_bytes([data[2], data[3]]);
+        // FibBase.lid, absolute offset 0x06 (u16 LE) — verified against
+        // FibBase's field layout (wIdent, nFib, unused, lid, ...).
+        let lid = u16::from_le_bytes([data[0x06], data[0x07]]);
 
         // Flags at offset 0x0A (u16): [MS-DOC] §2.5.1 FibBase.
         //   bit 8  = fEncrypted
@@ -153,6 +162,7 @@ impl Fib {
 
         Ok(Self {
             version,
+            lid,
             use_table1,
             clx_offset,
             clx_size,

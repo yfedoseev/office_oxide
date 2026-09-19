@@ -36,35 +36,7 @@ pub fn decode_biff5_text(bytes: &[u8], codepage: Option<u16>) -> String {
     if cp == MAC_CENTRAL_EUROPE {
         return bytes.iter().map(|&b| mac_central_europe_char(b)).collect();
     }
-    if let Some(encoding) = encoding_for_codepage(cp) {
-        let (decoded, _, _) = encoding.decode(bytes);
-        return decoded.into_owned();
-    }
-    bytes.iter().map(|&b| b as char).collect()
-}
-
-/// Map a Windows/Macintosh codepage identifier to the `encoding_rs`
-/// encoding that decodes it. Only single-byte legacy codepages this
-/// crate has verified against a real corpus file are included; anything
-/// else falls back to the raw byte-as-code-point behavior in
-/// [`decode_biff5_text`].
-fn encoding_for_codepage(cp: u16) -> Option<&'static encoding_rs::Encoding> {
-    use encoding_rs::*;
-    Some(match cp {
-        1250 => WINDOWS_1250,
-        1251 => WINDOWS_1251,
-        1252 => WINDOWS_1252,
-        1253 => WINDOWS_1253,
-        1254 => WINDOWS_1254,
-        1255 => WINDOWS_1255,
-        1256 => WINDOWS_1256,
-        1257 => WINDOWS_1257,
-        1258 => WINDOWS_1258,
-        874 => WINDOWS_874,
-        866 => IBM866,
-        10000 => MACINTOSH,
-        _ => return None,
-    })
+    crate::core::codepage::decode_windows_codepage(bytes, cp)
 }
 
 const MAC_CENTRAL_EUROPE: u16 = 10029;

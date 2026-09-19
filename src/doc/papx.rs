@@ -283,6 +283,7 @@ pub fn build_paragraphs(
     pieces: &[Piece],
     fkp: &[FkpParagraph],
     text_len: u32,
+    lid: u16,
 ) -> Vec<DocParagraph> {
     let mut keyed: Vec<(u32, &FkpParagraph)> = fkp
         .iter()
@@ -300,7 +301,7 @@ pub fn build_paragraphs(
         }
         // Decode this paragraph's CP range directly; sanitise the inner text
         // but keep the trailing terminator raw (it drives table grouping).
-        let decoded = decode_cp_range(word_doc, pieces, cp_start, cp_end);
+        let decoded = decode_cp_range(word_doc, pieces, cp_start, cp_end, lid);
         let chars: Vec<char> = decoded.chars().collect();
         if chars.is_empty() {
             continue;
@@ -428,7 +429,7 @@ mod tests {
             mk(5, 6, &rowmark), // "\u{7}" row mark
         ];
 
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 6);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 6, 0);
         assert_eq!(paras.len(), 4);
         // leading mark
         assert_eq!(paras[0].text, "");
@@ -468,7 +469,7 @@ mod tests {
         };
         let fkp = vec![mk(0, 6), mk(6, 12)];
 
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 12);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 12, 0);
         assert_eq!(paras.len(), 2);
         assert_eq!(paras[0].text, "Hi 😀", "emoji must not desync the range");
         assert_eq!(paras[0].terminator, '\r');
@@ -500,7 +501,7 @@ mod tests {
             grpprl: Vec::new(),
         };
         let fkp = vec![mk(0, raw.chars().count() as u32)];
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, 0);
         assert_eq!(paras.len(), 1);
         assert_eq!(paras[0].terminator, '\r');
         let t = &paras[0].text;

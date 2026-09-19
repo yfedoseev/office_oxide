@@ -9,6 +9,7 @@
 //! println!("{}", doc.plain_text());
 //! ```
 
+mod codepage;
 mod document;
 mod error;
 mod fib;
