@@ -120,6 +120,22 @@ pub const RT_INTERACTIVE_INFO_ATOM: u16 = 0x0FF3;
 /// text-run-level hyperlink mechanism — distinct from, and far more
 /// common than, the whole-shape one via `RT_CLIENT_DATA` (issue #257).
 pub const RT_TEXT_INTERACTIVE_INFO_ATOM: u16 = 0x0FDF;
+/// [MS-PPT] 2.10.20 `ExOleObjAtom` — one embedded/linked/ActiveX OLE
+/// object's identity: `objID` (joins back to a shape's `ExObjRefAtom`),
+/// `subType` (Excel/Word/Equation Editor/etc.), and `type` (embedded=0,
+/// linked=1, control=2). Found inside an `ExEmbed` container
+/// (`RT_EXTERNAL_OLE_EMBED`), itself inside `RT_EXTERNAL_OBJECT_LIST`
+/// (issue #337).
+pub const RT_EXTERNAL_OLE_OBJECT_ATOM: u16 = 0x0FC3;
+/// [MS-PPT] 2.10.19 `ExEmbed` — the container wrapping one
+/// `ExOleObjAtom` (plus `CString` menu/progId/clipboard-format names
+/// this crate doesn't need for identity purposes), a child of
+/// `RT_EXTERNAL_OBJECT_LIST` (issue #337).
+pub const RT_EXTERNAL_OLE_EMBED: u16 = 0x0FCC;
+/// [MS-PPT] 2.4.9.2 `ExObjRefAtom` — a shape's own reference (`exObjIdRef`)
+/// to an external object (an `ExOleObjAtom` or `ExMediaAtom`), found
+/// directly inside its `RT_CLIENT_DATA` (issue #337).
+pub const RT_EXTERNAL_OBJECT_REF_ATOM: u16 = 0x0BC1;
 
 // ── SlideListWithText `rh.recInstance` discriminants ([MS-PPT] 2.4.14) ──
 /// `rh.recInstance` value identifying a `SlideListWithTextContainer` (real slides).

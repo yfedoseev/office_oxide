@@ -195,6 +195,36 @@ fn table_block_to_element(table: &crate::ppt::TableBlock) -> Element {
     Element::Table(Table { rows, ..Default::default() })
 }
 
+/// Human-readable identity for an `ExOleObjAtom` (issue #337) — the
+/// `subType`/`type` values per [MS-PPT] 2.10.20, cross-checked against
+/// Apache POI's `ExOleObjAtom.Subtype`/`OleType` enums.
+fn describe_ole_object(info: &crate::ppt::OleObjectInfo) -> String {
+    let subtype = match info.subtype {
+        0 => "OLE object",
+        1 => "Microsoft Clipart Gallery object",
+        2 => "Microsoft Word table",
+        3 => "Microsoft Excel worksheet",
+        4 => "Microsoft Graph object",
+        5 => "Microsoft Organization Chart",
+        6 => "Microsoft Equation Editor object",
+        7 => "Microsoft WordArt object",
+        8 => "Sound object",
+        9 => "Image object",
+        10 => "Embedded PowerPoint presentation",
+        11 => "Embedded PowerPoint slide",
+        12 => "Microsoft Project object",
+        13 => "Microsoft Note-It object",
+        14 => "Microsoft Excel chart",
+        15 => "Media Player object",
+        _ => "OLE object",
+    };
+    match info.kind {
+        1 => format!("Linked {subtype}"),
+        2 => format!("{subtype} (ActiveX control)"),
+        _ => format!("Embedded {subtype}"),
+    }
+}
+
 pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
     let mut sections = Vec::new();
     // Every picture shape successfully resolved to a specific image
@@ -325,6 +355,22 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                     ..Default::default()
                 }));
             }
+        }
+
+        // Embedded/linked/ActiveX OLE objects (issue #337) — at minimum,
+        // recognize the object exists and surface its identity, even
+        // without extracting the object's own payload (that needs
+        // ObjStgDataRef -> the Ole10Native/native storage, a separate,
+        // larger mechanism). Mirrors #300's precedent for a data-less
+        // AutoShape: an Image placeholder with no bytes but a
+        // descriptive alt_text, so the object's presence and kind still
+        // reach plain-text/markdown/HTML output.
+        for info in &slide.ole_object_refs {
+            elements.push(Element::Image(Image {
+                alt_text: Some(describe_ole_object(info)),
+                data: None,
+                ..Default::default()
+            }));
         }
 
         let title = slide_title.unwrap_or_else(|| format!("Slide {}", slide_idx + 1));

@@ -97,6 +97,7 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
     // A best-effort fallback scope for the weaker paths below, which have
     // no persist-resolved DocumentContainer to search within at all.
     let stream_wide_hyperlinks = parse_ex_hyperlinks(stream);
+    let stream_wide_ole_objects = parse_ex_ole_objects(stream);
     if let Some(dir) = persist::build(stream, current_user) {
         if let Some(slides) = extract_slides_via_persist(stream, &dir) {
             // A resolved-but-entirely-textless result is ambiguous: it's the
@@ -125,7 +126,7 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
     // render on a slide — in two POI corpus files they were 116 of the 137
     // and 121 extracted characters respectively.
     let mut slides = Vec::new();
-    collect_slide_containers(stream, 0, &stream_wide_hyperlinks, &mut slides);
+    collect_slide_containers(stream, 0, &stream_wide_hyperlinks, &stream_wide_ole_objects, &mut slides);
     if slides.iter().any(|s| !s.text_runs.is_empty()) {
         return slides;
     }
@@ -135,21 +136,24 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
     let mut runs = Vec::new();
     let mut tables = Vec::new();
     let mut image_refs = Vec::new();
+    let mut ole_object_refs = Vec::new();
     extract_shape_text(
         stream,
         0,
         &[],
         &stream_wide_hyperlinks,
+        &stream_wide_ole_objects,
         None,
         &mut runs,
         &mut tables,
         &mut image_refs,
+        &mut ole_object_refs,
     );
     runs.retain(|r| !is_master_placeholder_prompt(&r.text));
     if runs.is_empty() && tables.is_empty() && image_refs.is_empty() {
         Vec::new()
     } else {
-        vec![SlideText { text_runs: runs, tables, image_refs, ..Default::default() }]
+        vec![SlideText { text_runs: runs, tables, image_refs, ole_object_refs, ..Default::default() }]
     }
 }
 
@@ -158,6 +162,7 @@ fn collect_slide_containers(
     data: &[u8],
     depth: usize,
     hyperlinks: &HashMap<u32, String>,
+    ole_objects: &HashMap<u32, OleObjectInfo>,
     out: &mut Vec<SlideText>,
 ) {
     if depth > MAX_SHAPE_DEPTH {
@@ -169,23 +174,26 @@ fn collect_slide_containers(
             let mut runs = Vec::new();
             let mut tables = Vec::new();
             let mut image_refs = Vec::new();
+            let mut ole_object_refs = Vec::new();
             extract_shape_text(
                 &rec.data,
                 0,
                 &[],
                 hyperlinks,
+                ole_objects,
                 None,
                 &mut runs,
                 &mut tables,
                 &mut image_refs,
+                &mut ole_object_refs,
             );
             runs.retain(|r| !is_master_placeholder_prompt(&r.text));
             let hidden = slide_is_hidden(&rec.data);
-            out.push(SlideText { text_runs: runs, tables, image_refs, hidden });
+            out.push(SlideText { text_runs: runs, tables, image_refs, ole_object_refs, hidden });
             continue;
         }
         if rec.header.is_container() {
-            collect_slide_containers(&rec.data, depth + 1, hyperlinks, out);
+            collect_slide_containers(&rec.data, depth + 1, hyperlinks, ole_objects, out);
         }
     }
 }
@@ -235,6 +243,7 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
     // behind by an earlier incremental save (the same hazard the persist
     // directory itself exists to route around for slides) (issue #257).
     let hyperlinks = parse_ex_hyperlinks(&doc_children);
+    let ole_objects = parse_ex_ole_objects(&doc_children);
     // The deck's header/footer/user-date text, applied uniformly to every
     // slide ("Apply to All" in PowerPoint's own Header and Footer dialog)
     // rather than stored per-slide — confirmed by direct inspection of a
@@ -252,7 +261,7 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
         match rec.header.rec_type {
             RT_SLIDE_PERSIST_ATOM if rec.data.len() >= 4 => {
                 if let Some(persist_id_ref) = current_persist_id.take() {
-                    slides.push(resolve_slide(stream, dir, persist_id_ref, &outline_texts, &hyperlinks));
+                    slides.push(resolve_slide(stream, dir, persist_id_ref, &outline_texts, &hyperlinks, &ole_objects));
                 }
                 current_persist_id =
                     Some(u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]));
@@ -295,7 +304,7 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
         }
     }
     if let Some(persist_id_ref) = current_persist_id.take() {
-        slides.push(resolve_slide(stream, dir, persist_id_ref, &outline_texts, &hyperlinks));
+        slides.push(resolve_slide(stream, dir, persist_id_ref, &outline_texts, &hyperlinks, &ole_objects));
     }
 
     if !headers_footers.is_empty() {
@@ -354,10 +363,12 @@ fn resolve_slide(
     persist_id_ref: u32,
     outline_texts: &[TextRun],
     hyperlinks: &HashMap<u32, String>,
+    ole_objects: &HashMap<u32, OleObjectInfo>,
 ) -> SlideText {
     let mut text_runs = Vec::new();
     let mut tables = Vec::new();
     let mut image_refs = Vec::new();
+    let mut ole_object_refs = Vec::new();
     let mut hidden = false;
     if let Some(offset) = dir.resolve(persist_id_ref) {
         if let Some(children) = bounded_container_children(stream, offset, RT_SLIDE) {
@@ -366,10 +377,12 @@ fn resolve_slide(
                 0,
                 outline_texts,
                 hyperlinks,
+                ole_objects,
                 None,
                 &mut text_runs,
                 &mut tables,
                 &mut image_refs,
+                &mut ole_object_refs,
             );
             hidden = slide_is_hidden(&children);
 
@@ -385,7 +398,7 @@ fn resolve_slide(
             }
         }
     }
-    SlideText { text_runs, tables, image_refs, hidden }
+    SlideText { text_runs, tables, image_refs, ole_object_refs, hidden }
 }
 
 /// The level-0 (no indentation) master style for the two placeholder
@@ -514,10 +527,12 @@ fn extract_shape_text(
     depth: usize,
     outline_texts: &[TextRun],
     hyperlinks: &HashMap<u32, String>,
+    ole_objects: &HashMap<u32, OleObjectInfo>,
     current_hyperlink: Option<&str>,
     out: &mut Vec<TextRun>,
     tables: &mut Vec<super::table::TableBlock>,
     image_refs: &mut Vec<usize>,
+    ole_object_refs: &mut Vec<OleObjectInfo>,
 ) {
     if depth > MAX_SHAPE_DEPTH {
         return;
@@ -642,15 +657,24 @@ fn extract_shape_text(
                 if let Some(idx) = resolve_shape_pib(&rec.data) {
                     image_refs.push(idx);
                 }
+                // This shape's own embedded/linked/ActiveX OLE object
+                // identity, if it has one — the same "resolve at the
+                // shape actually carrying it" reasoning as the picture
+                // case just above (issue #337).
+                if let Some(info) = resolve_shape_ole_object(&rec.data, ole_objects) {
+                    ole_object_refs.push(info);
+                }
                 extract_shape_text(
                     &rec.data,
                     depth + 1,
                     outline_texts,
                     hyperlinks,
+                    ole_objects,
                     hyperlink_ref,
                     out,
                     tables,
                     image_refs,
+                    ole_object_refs,
                 );
             },
             RT_SPGR_CONTAINER => {
@@ -672,10 +696,12 @@ fn extract_shape_text(
                         depth + 1,
                         outline_texts,
                         hyperlinks,
+                        ole_objects,
                         current_hyperlink,
                         out,
                         tables,
                         image_refs,
+                        ole_object_refs,
                     );
                 }
             },
@@ -685,10 +711,12 @@ fn extract_shape_text(
                     depth + 1,
                     outline_texts,
                     hyperlinks,
+                    ole_objects,
                     current_hyperlink,
                     out,
                     tables,
                     image_refs,
+                    ole_object_refs,
                 );
             },
             _ => {},
@@ -745,8 +773,10 @@ fn try_extract_table_from_spgr(
             depth + 1,
             outline_texts,
             hyperlinks,
+            &HashMap::new(),
             hyperlink_ref,
             &mut runs,
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
         );
@@ -933,6 +963,78 @@ fn parse_one_ex_hyperlink(data: &[u8]) -> Option<(u32, String)> {
         }
     }
     Some((id?, target?))
+}
+
+/// One embedded/linked/ActiveX OLE object's identity, resolved from its
+/// `ExOleObjAtom` (issue #337).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OleObjectInfo {
+    /// `ExOleObjAtom.subType` — 0-15; see `describe_ole_subtype` in
+    /// `convert_ppt.rs` for the enum meaning.
+    pub subtype: u32,
+    /// `ExOleObjAtom.type` — 0 = embedded, 1 = linked, 2 = ActiveX control.
+    pub kind: u32,
+}
+
+/// Build the document-wide `objID -> OleObjectInfo` table from the
+/// `ExObjListContainer`'s `ExOleObjAtom` records (issue #337) — the same
+/// container #257 already partially parses for hyperlinks, walked again
+/// here for its `ExEmbed`/`ExOleObjAtom` children instead.
+fn parse_ex_ole_objects(stream: &[u8]) -> HashMap<u32, OleObjectInfo> {
+    let mut out = HashMap::new();
+    let Some(ex_obj_list) = find_descendant(stream, RT_EXTERNAL_OBJECT_LIST, 0, 0) else {
+        return out;
+    };
+    collect_ex_ole_objects(&ex_obj_list, 0, &mut out);
+    out
+}
+
+fn collect_ex_ole_objects(data: &[u8], depth: usize, out: &mut HashMap<u32, OleObjectInfo>) {
+    if depth > MAX_SHAPE_DEPTH {
+        return;
+    }
+    for rec in RecordIter::new(data) {
+        let Ok(rec) = rec else { break };
+        if rec.header.rec_type == RT_EXTERNAL_OLE_OBJECT_ATOM {
+            if let Some((id, info)) = parse_one_ex_ole_obj_atom(&rec.data) {
+                out.insert(id, info);
+            }
+            continue; // an ExOleObjAtom's own siblings are never other ExOleObjAtoms
+        }
+        if rec.header.is_container() {
+            collect_ex_ole_objects(&rec.data, depth + 1, out);
+        }
+    }
+}
+
+/// Parse one `ExOleObjAtom`'s fixed body: `drawAspect`(4) + `type`(4) +
+/// `objID`(4) + `subType`(4) + ... (`objStgDataRef`/`options` follow but
+/// aren't needed for identity), per [MS-PPT] 2.10.20 — byte layout
+/// cross-checked against Apache POI's `ExOleObjAtom`.
+fn parse_one_ex_ole_obj_atom(data: &[u8]) -> Option<(u32, OleObjectInfo)> {
+    if data.len() < 16 {
+        return None;
+    }
+    let kind = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    let obj_id = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+    let subtype = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+    Some((obj_id, OleObjectInfo { subtype, kind }))
+}
+
+/// Resolve a shape's own OLE object reference (if any): its
+/// `RT_CLIENT_DATA`'s direct `ExObjRefAtom` child, joined against the
+/// document-wide `ole_objects` table by `objID` (issue #337).
+fn resolve_shape_ole_object(
+    shape_data: &[u8],
+    ole_objects: &HashMap<u32, OleObjectInfo>,
+) -> Option<OleObjectInfo> {
+    let client_data = find_descendant(shape_data, RT_CLIENT_DATA, 0, 0)?;
+    let atom = find_descendant(&client_data, RT_EXTERNAL_OBJECT_REF_ATOM, 0, 0)?;
+    if atom.len() < 4 {
+        return None;
+    }
+    let obj_id_ref = u32::from_le_bytes([atom[0], atom[1], atom[2], atom[3]]);
+    ole_objects.get(&obj_id_ref).copied()
 }
 
 /// Resolve a shape's own hyperlink target (if any), by scanning its direct
@@ -1128,6 +1230,12 @@ pub struct SlideText {
     /// whichever slide happened to be last, regardless of which slide
     /// actually contains the shape referencing them).
     pub image_refs: Vec<usize>,
+    /// Every embedded/linked/ActiveX OLE object resolved on this slide,
+    /// in shape-tree encounter order — a slide with an embedded Excel
+    /// workbook, Word document, Equation Editor object, etc. previously
+    /// surfaced nothing at all indicating the object even existed
+    /// (issue #337).
+    pub ole_object_refs: Vec<OleObjectInfo>,
     /// Whether the slide is marked hidden (not shown during a slide
     /// show) via a `SlideShowSlideInfoAtom` HIDDEN_BIT sibling of the
     /// `Slide` container. The content is still extracted — a consumer
@@ -1201,8 +1309,10 @@ mod tests {
             0,
             &[],
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &mut runs,
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
         );
@@ -1221,8 +1331,10 @@ mod tests {
             0,
             &[],
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &mut runs,
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
         );
@@ -1243,8 +1355,10 @@ mod tests {
             0,
             &[],
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &mut runs,
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
         );
@@ -1369,14 +1483,96 @@ mod tests {
             0,
             &[],
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &mut runs,
             &mut tables,
             &mut image_refs,
+            &mut Vec::new(),
         );
 
         assert_eq!(image_refs, vec![0]);
         assert_eq!(runs.len(), 1, "the shape's own text must still be extracted alongside its pib");
+    }
+
+    /// Build one `ExOleObjAtom`'s 24-byte fixed body per [MS-PPT] 2.10.20:
+    /// `drawAspect`(4) + `type`(4) + `objID`(4) + `subType`(4) +
+    /// `objStgDataRef`(4) + `options`(4).
+    fn make_ex_ole_obj_atom(obj_id: u32, subtype: u32, kind: u32) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes()); // drawAspect = VISIBLE
+        data.extend_from_slice(&kind.to_le_bytes());
+        data.extend_from_slice(&obj_id.to_le_bytes());
+        data.extend_from_slice(&subtype.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes()); // objStgDataRef
+        data.extend_from_slice(&0u32.to_le_bytes()); // options/isBlank
+        make_atom(RT_EXTERNAL_OLE_OBJECT_ATOM, 0, &data)
+    }
+
+    /// issue #337 — a shape whose `RT_CLIENT_DATA` carries an
+    /// `ExObjRefAtom` (`exObjIdRef`), joined against the document's
+    /// `ExObjListContainer` -> `ExEmbed` -> `ExOleObjAtom` chain by
+    /// `objID`.
+    #[test]
+    fn parse_ex_ole_objects_resolves_id_to_subtype_and_kind() {
+        let ole_atom = make_ex_ole_obj_atom(1, 3, 0); // objID=1, Excel, embedded
+        let ex_embed = make_container(RT_EXTERNAL_OLE_EMBED, 0, &ole_atom);
+        let ex_obj_list = make_container(RT_EXTERNAL_OBJECT_LIST, 0, &ex_embed);
+
+        let map = parse_ex_ole_objects(&ex_obj_list);
+        let info = map.get(&1).expect("objID 1 must resolve");
+        assert_eq!(info.subtype, 3, "Excel subtype");
+        assert_eq!(info.kind, 0, "embedded, not linked");
+    }
+
+    /// End-to-end: a shape referencing an OLE object via `ExObjRefAtom`
+    /// inside its `RT_CLIENT_DATA` resolves through to `ole_object_refs`,
+    /// alongside its own ordinary text (issue #337 — mirrors #256's
+    /// `shape_with_pib_reaches_image_refs_end_to_end` for the OLE case).
+    #[test]
+    fn shape_with_ex_obj_ref_reaches_ole_object_refs_end_to_end() {
+        let mut ole_objects = HashMap::new();
+        ole_objects.insert(1u32, super::OleObjectInfo { subtype: 3, kind: 0 });
+
+        let ex_obj_ref_atom = make_atom(RT_EXTERNAL_OBJECT_REF_ATOM, 0, &1u32.to_le_bytes());
+        let client_data = make_container(RT_CLIENT_DATA, 0, &ex_obj_ref_atom);
+        let mut shape_children = client_data;
+        let mut textbox_children = make_atom(RT_TEXT_HEADER, 0, &4u32.to_le_bytes());
+        textbox_children.extend(make_atom(RT_TEXT_BYTES, 0, b"caption"));
+        shape_children.extend(make_container(0xF00D, 0, &textbox_children));
+        let shape = make_container(RT_SHAPE, 0, &shape_children);
+
+        let mut runs = Vec::new();
+        let mut ole_object_refs = Vec::new();
+        extract_shape_text(
+            &shape,
+            0,
+            &[],
+            &HashMap::new(),
+            &ole_objects,
+            None,
+            &mut runs,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut ole_object_refs,
+        );
+
+        assert_eq!(ole_object_refs.len(), 1);
+        assert_eq!(ole_object_refs[0].subtype, 3);
+        assert_eq!(runs.len(), 1, "the shape's own text must still be extracted alongside its OLE ref");
+    }
+
+    /// A shape with no `ExObjRefAtom` at all must not resolve anything,
+    /// even when the document has real OLE objects elsewhere.
+    #[test]
+    fn resolve_shape_ole_object_none_without_ex_obj_ref() {
+        let mut ole_objects = HashMap::new();
+        ole_objects.insert(1u32, super::OleObjectInfo { subtype: 3, kind: 0 });
+
+        let client_data = make_container(RT_CLIENT_DATA, 0, &[]);
+        let shape_children = client_data;
+
+        assert!(resolve_shape_ole_object(&shape_children, &ole_objects).is_none());
     }
 
     #[test]
@@ -1419,8 +1615,10 @@ mod tests {
             0,
             &[],
             &hyperlinks,
+            &HashMap::new(),
             None,
             &mut runs,
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
         );
@@ -1463,8 +1661,10 @@ mod tests {
             0,
             &[],
             &hyperlinks,
+            &HashMap::new(),
             None,
             &mut runs,
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
         );
@@ -1506,8 +1706,10 @@ mod tests {
             0,
             &[],
             &hyperlinks,
+            &HashMap::new(),
             None,
             &mut runs,
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
         );
@@ -1556,9 +1758,11 @@ mod tests {
             0,
             &[],
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &mut runs,
             &mut tables,
+            &mut Vec::new(),
             &mut Vec::new(),
         );
 
@@ -1592,9 +1796,11 @@ mod tests {
             0,
             &[],
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &mut runs,
             &mut tables,
+            &mut Vec::new(),
             &mut Vec::new(),
         );
 
@@ -1625,9 +1831,11 @@ mod tests {
             0,
             &[],
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &mut runs,
             &mut tables,
+            &mut Vec::new(),
             &mut Vec::new(),
         );
 
@@ -1654,8 +1862,10 @@ mod tests {
             0,
             &[],
             &hyperlinks,
+            &HashMap::new(),
             None,
             &mut runs,
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
         );
@@ -1690,8 +1900,10 @@ mod tests {
             0,
             &[],
             &hyperlinks,
+            &HashMap::new(),
             None,
             &mut runs,
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
         );
@@ -1736,8 +1948,10 @@ mod tests {
             0,
             &[],
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &mut runs,
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
         );
@@ -2182,8 +2396,10 @@ mod tests {
             0,
             &outline_texts,
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &mut runs,
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
         );
