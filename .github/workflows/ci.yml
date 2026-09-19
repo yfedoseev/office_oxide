@@ -37,7 +37,9 @@ on:
       - 'scripts/bench.sh'
       - 'scripts/bench-requirements.txt'
   pull_request:
-    branches: [main, develop]
+    # release/** so a PR into a release branch gets the full matrix, not
+    # just the PR-metadata checks.
+    branches: [main, develop, 'release/**']
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
