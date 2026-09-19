@@ -1,4 +1,7 @@
-use crate::doc::{DocDocument, DocParagraph, HyperlinkSpan, ListFormatting, TapCellInfo, TapInfo};
+use crate::doc::{
+    ChpProps, DocDocument, DocParagraph, HyperlinkSpan, ListFormatting, PapProps, TapCellInfo,
+    TapInfo,
+};
 use crate::format::DocumentFormat;
 use crate::ir::*;
 
@@ -293,11 +296,17 @@ impl TableBuilder {
         self.ensure_open();
         if !p.text.is_empty() {
             self.cell.push(Element::Paragraph(Paragraph {
-                content: inline_content_for(&p.text, &p.hyperlinks),
+                content: inline_content_for(&p.text, &p.hyperlinks, &p.chp_runs),
                 // `tabs` is always empty in the tables-only build (it is
                 // populated by the list/tab-stop PR); cloning keeps the IR
                 // shape uniform with the list path.
                 tabs: p.props.tabs.clone(),
+                alignment: p.props.alignment.clone(),
+                indent_left_twips: p.props.indent_left_twips,
+                indent_right_twips: p.props.indent_right_twips,
+                first_line_indent_twips: p.props.first_line_indent_twips,
+                space_before_twips: p.props.space_before_twips,
+                space_after_twips: p.props.space_after_twips,
                 ..Default::default()
             }));
         }
@@ -589,7 +598,7 @@ fn walk_paragraphs(
             // the IR at all (issue #223).
             table.flush(elements);
             flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
-            emit_heading(&p.text, lvl + 1, elements, &p.hyperlinks);
+            emit_heading(&p.text, lvl + 1, elements, &p.hyperlinks, &p.chp_runs);
         } else if is_doc_list_item(p.props.ilfo) {
             // List membership is keyed on `ilfo` (sprmPIlfo, `0x460B`), not on
             // `ilvl`: per [MS-DOC] §2.4.6.3 a paragraph is a list item only when
@@ -599,18 +608,24 @@ fn walk_paragraphs(
             if list_ilfo.is_none() {
                 list_ilfo = p.props.ilfo;
             }
-            list_items.push((ilvl, inline_content_for(&p.text, &p.hyperlinks)));
+            list_items.push((ilvl, inline_content_for(&p.text, &p.hyperlinks, &p.chp_runs)));
         } else {
             table.flush(elements);
             flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
             if has_structured_headings {
                 elements.push(Element::Paragraph(Paragraph {
-                    content: inline_content_for(&p.text, &p.hyperlinks),
+                    content: inline_content_for(&p.text, &p.hyperlinks, &p.chp_runs),
                     tabs: p.props.tabs.clone(),
+                    alignment: p.props.alignment.clone(),
+                    indent_left_twips: p.props.indent_left_twips,
+                    indent_right_twips: p.props.indent_right_twips,
+                    first_line_indent_twips: p.props.first_line_indent_twips,
+                    space_before_twips: p.props.space_before_twips,
+                    space_after_twips: p.props.space_after_twips,
                     ..Default::default()
                 }));
             } else {
-                emit_prose(&p.text, &p.props.tabs, elements, &p.hyperlinks);
+                emit_prose(&p.text, &p.props, elements, &p.hyperlinks, &p.chp_runs);
             }
         }
     }
@@ -658,14 +673,20 @@ fn flush_list(
 /// being flattened into one run.
 ///
 /// `hyperlinks` are `HYPERLINK` field display-text spans as byte ranges into
-/// `text` (issue #249) — empty for callers with no per-paragraph hyperlink
-/// data (e.g. the line-shape heading heuristic, which works over the flat,
-/// already-sanitized document text rather than a single `DocParagraph`).
-fn inline_content_for(text: &str, hyperlinks: &[HyperlinkSpan]) -> Vec<InlineContent> {
+/// `text` (issue #249); `chp_runs` are character-property run boundaries,
+/// also byte ranges into `text` (issue #287) — both empty for callers with
+/// no per-paragraph data (e.g. the line-shape heading heuristic, which
+/// works over the flat, already-sanitized document text rather than a
+/// single `DocParagraph`).
+fn inline_content_for(
+    text: &str,
+    hyperlinks: &[HyperlinkSpan],
+    chp_runs: &[(std::ops::Range<usize>, ChpProps)],
+) -> Vec<InlineContent> {
     let mut out = Vec::new();
     let mut base = 0usize;
     for seg in text.split('\n') {
-        push_segment(seg, base, hyperlinks, &mut out);
+        push_segment(seg, base, hyperlinks, chp_runs, &mut out);
         base += seg.len() + 1; // +1 for the '\n' the split consumed
         out.push(InlineContent::LineBreak);
     }
@@ -681,47 +702,83 @@ fn inline_content_for(text: &str, hyperlinks: &[HyperlinkSpan]) -> Vec<InlineCon
     out
 }
 
+/// Apply one `ChpProps` to a plain `TextSpan` built from `text`.
+fn styled_span(text: &str, props: &ChpProps) -> TextSpan {
+    TextSpan {
+        bold: props.bold,
+        italic: props.italic,
+        underline: props.underline.clone(),
+        color: props.color,
+        font_size_half_pt: props.font_size_half_pt,
+        ..TextSpan::plain(text)
+    }
+}
+
 /// Push one line-break-free segment of text as one or more `TextSpan`s,
-/// splitting out any hyperlink span that overlaps it. `base` is `seg`'s own
-/// byte offset within the original (pre-split) text, so `hyperlinks`'
-/// ranges (computed against that same original text) line up correctly.
-fn push_segment(seg: &str, base: usize, hyperlinks: &[HyperlinkSpan], out: &mut Vec<InlineContent>) {
+/// splitting on every hyperlink and character-property (issue #287) run
+/// boundary that overlaps it. `base` is `seg`'s own byte offset within the
+/// original (pre-split) text, so `hyperlinks`'/`chp_runs`' ranges (computed
+/// against that same original text) line up correctly.
+fn push_segment(
+    seg: &str,
+    base: usize,
+    hyperlinks: &[HyperlinkSpan],
+    chp_runs: &[(std::ops::Range<usize>, ChpProps)],
+    out: &mut Vec<InlineContent>,
+) {
     if seg.is_empty() {
         return;
     }
     let seg_start = base;
     let seg_end = base + seg.len();
 
-    let mut relevant: Vec<(usize, usize, &str)> = hyperlinks
-        .iter()
-        .filter_map(|h| {
-            let s = h.range.start.max(seg_start);
-            let e = h.range.end.min(seg_end);
-            (s < e).then_some((s, e, h.url.as_str()))
-        })
-        .collect();
-    relevant.sort_by_key(|(s, _, _)| *s);
-
-    let mut cursor = seg_start;
-    for (s, e, url) in relevant {
-        if s > cursor {
-            let plain = &seg[cursor - seg_start..s - seg_start];
-            if !plain.is_empty() {
-                out.push(InlineContent::Text(TextSpan::plain(plain)));
-            }
+    // Every point where either a hyperlink or a CHP run starts/ends within
+    // this segment is a potential span boundary; walking the sorted, deduped
+    // union of both (plus the segment's own bounds) guarantees each
+    // resulting sub-slice has one unambiguous hyperlink state and one
+    // unambiguous `ChpProps` — `resolve_chp_segments` already guarantees
+    // `chp_runs` fully and contiguously covers the paragraph, so no
+    // sub-slice here can straddle two different CHP runs.
+    let mut breakpoints: Vec<usize> = vec![seg_start, seg_end];
+    for h in hyperlinks {
+        if h.range.start > seg_start && h.range.start < seg_end {
+            breakpoints.push(h.range.start);
         }
-        let link_text = &seg[s - seg_start..e - seg_start];
-        out.push(InlineContent::Text(TextSpan {
-            hyperlink: Some(url.to_string()),
-            ..TextSpan::plain(link_text)
-        }));
-        cursor = e.max(cursor);
+        if h.range.end > seg_start && h.range.end < seg_end {
+            breakpoints.push(h.range.end);
+        }
     }
-    if cursor < seg_end {
-        let plain = &seg[cursor - seg_start..];
-        if !plain.is_empty() {
-            out.push(InlineContent::Text(TextSpan::plain(plain)));
+    for (r, _) in chp_runs {
+        if r.start > seg_start && r.start < seg_end {
+            breakpoints.push(r.start);
         }
+        if r.end > seg_start && r.end < seg_end {
+            breakpoints.push(r.end);
+        }
+    }
+    breakpoints.sort_unstable();
+    breakpoints.dedup();
+
+    for pair in breakpoints.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if a >= b {
+            continue;
+        }
+        let slice = &seg[a - seg_start..b - seg_start];
+        if slice.is_empty() {
+            continue;
+        }
+        let hyperlink =
+            hyperlinks.iter().find(|h| h.range.start <= a && b <= h.range.end);
+        let props = chp_runs.iter().find(|(r, _)| r.start <= a && b <= r.end).map(|(_, p)| p);
+        let mut span = match props {
+            Some(p) => styled_span(slice, p),
+            None => TextSpan::plain(slice),
+        };
+        if let Some(h) = hyperlink {
+            span.hyperlink = Some(h.url.clone());
+        }
+        out.push(InlineContent::Text(span));
     }
 }
 
@@ -746,19 +803,42 @@ fn shift_hyperlinks_for_trim(
         .collect()
 }
 
+/// As [`shift_hyperlinks_for_trim`], for CHP run boundaries (issue #287).
+fn shift_chp_runs_for_trim(
+    chp_runs: &[(std::ops::Range<usize>, ChpProps)],
+    trim_start: usize,
+    trimmed_len: usize,
+) -> Vec<(std::ops::Range<usize>, ChpProps)> {
+    chp_runs
+        .iter()
+        .filter_map(|(r, props)| {
+            let start = r.start.saturating_sub(trim_start).min(trimmed_len);
+            let end = r.end.saturating_sub(trim_start).min(trimmed_len);
+            (start < end).then(|| (start..end, props.clone()))
+        })
+        .collect()
+}
+
 /// Classify a prose paragraph as a heading or paragraph and push it.
 ///
 /// Mirrors the line-based heuristic so a PAPX-bearing document keeps the same
 /// heading/title detection as the fallback path.
 /// Emit a heading at an explicit level, honouring soft line breaks.
-fn emit_heading(text: &str, level: u8, elements: &mut Vec<Element>, hyperlinks: &[HyperlinkSpan]) {
+fn emit_heading(
+    text: &str,
+    level: u8,
+    elements: &mut Vec<Element>,
+    hyperlinks: &[HyperlinkSpan],
+    chp_runs: &[(std::ops::Range<usize>, ChpProps)],
+) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return;
     }
     let trim_start = text.len() - text.trim_start().len();
     let hyperlinks = shift_hyperlinks_for_trim(hyperlinks, trim_start, trimmed.len());
-    let mut content = inline_content_for(trimmed, &hyperlinks);
+    let chp_runs = shift_chp_runs_for_trim(chp_runs, trim_start, trimmed.len());
+    let mut content = inline_content_for(trimmed, &hyperlinks, &chp_runs);
     for ic in &mut content {
         if let InlineContent::Text(t) = ic {
             t.bold = true;
@@ -777,7 +857,13 @@ fn emit_heading(text: &str, level: u8, elements: &mut Vec<Element>, hyperlinks: 
 /// This is a guess and is only reached for documents that carry no
 /// `sprmPOutLvl` at all. Running it alongside real outline levels produced
 /// two disagreeing answers for the same paragraphs in one document.
-fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>, hyperlinks: &[HyperlinkSpan]) {
+fn emit_prose(
+    text: &str,
+    props: &PapProps,
+    elements: &mut Vec<Element>,
+    hyperlinks: &[HyperlinkSpan],
+    chp_runs: &[(std::ops::Range<usize>, ChpProps)],
+) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return;
@@ -798,7 +884,8 @@ fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>, hyperli
         // sanitised form of `0x0B`) and keep each segment bold.
         let trim_start = text.len() - text.trim_start().len();
         let shifted = shift_hyperlinks_for_trim(hyperlinks, trim_start, trimmed.len());
-        let mut content = inline_content_for(trimmed, &shifted);
+        let shifted_chp = shift_chp_runs_for_trim(chp_runs, trim_start, trimmed.len());
+        let mut content = inline_content_for(trimmed, &shifted, &shifted_chp);
         for ic in &mut content {
             if let InlineContent::Text(t) = ic {
                 t.bold = true;
@@ -811,8 +898,14 @@ fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>, hyperli
         }));
     } else {
         elements.push(Element::Paragraph(Paragraph {
-            content: inline_content_for(text, hyperlinks),
-            tabs: tabs.to_vec(),
+            content: inline_content_for(text, hyperlinks, chp_runs),
+            tabs: props.tabs.clone(),
+            alignment: props.alignment.clone(),
+            indent_left_twips: props.indent_left_twips,
+            indent_right_twips: props.indent_right_twips,
+            first_line_indent_twips: props.first_line_indent_twips,
+            space_before_twips: props.space_before_twips,
+            space_after_twips: props.space_after_twips,
             ..Default::default()
         }));
     }
@@ -886,7 +979,7 @@ fn is_currency_label(line: &str) -> bool {
 
 fn line_heuristic(text: &str, elements: &mut Vec<Element>) {
     for line in text.lines() {
-        emit_prose(line, &[], elements, &[]);
+        emit_prose(line, &PapProps::default(), elements, &[], &[]);
     }
 }
 
@@ -974,6 +1067,7 @@ mod tests {
             terminator: '\r',
             props,
             hyperlinks: Vec::new(),
+            chp_runs: Vec::new(),
         }
     }
 
@@ -993,6 +1087,7 @@ mod tests {
                 range: link_start..link_end,
                 url: "http://testuri.org/".to_string(),
             }],
+            chp_runs: Vec::new(),
         };
         let mut els = Vec::new();
         walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
@@ -1021,6 +1116,100 @@ mod tests {
             spans.iter().any(|s| s.hyperlink.is_none() && s.text.contains("after text")),
             "surrounding plain text must stay unlinked: {spans:?}"
         );
+    }
+
+    /// Regression (issue #287): real per-run character formatting
+    /// (bold/italic/underline/color/font-size) from CHPX reaches the IR's
+    /// `TextSpan`s, split at exactly the right byte boundaries — not the
+    /// always-`false`/`None` defaults from before this fix.
+    #[test]
+    fn test_chp_runs_reach_textspan_formatting_split_at_the_right_boundaries() {
+        let text = "Plain bold italic.".to_string();
+        let bold_start = text.find("bold").unwrap();
+        let bold_end = bold_start + "bold".len();
+        let italic_start = text.find("italic").unwrap();
+        let italic_end = italic_start + "italic".len();
+        let p = DocParagraph {
+            text,
+            terminator: '\r',
+            props: PapProps::default(),
+            hyperlinks: Vec::new(),
+            chp_runs: vec![
+                (
+                    bold_start..bold_end,
+                    ChpProps { bold: true, color: Some([255, 0, 0]), ..Default::default() },
+                ),
+                (
+                    italic_start..italic_end,
+                    ChpProps {
+                        italic: true,
+                        underline: Some(crate::ir::UnderlineStyle::Single),
+                        font_size_half_pt: Some(28),
+                        ..Default::default()
+                    },
+                ),
+            ],
+        };
+        let mut els = Vec::new();
+        walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
+        let Element::Paragraph(par) = &els[0] else {
+            panic!("expected a paragraph, got {:?}", els[0]);
+        };
+        let spans: Vec<&TextSpan> = par
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                InlineContent::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+
+        let plain = spans.iter().find(|s| s.text == "Plain ").expect("leading plain span");
+        assert!(!plain.bold && !plain.italic, "unformatted text must stay unformatted");
+
+        let bold = spans.iter().find(|s| s.text == "bold").expect("bold span");
+        assert!(bold.bold);
+        assert!(!bold.italic);
+        assert_eq!(bold.color, Some([255, 0, 0]));
+
+        let italic = spans.iter().find(|s| s.text == "italic").expect("italic span");
+        assert!(italic.italic);
+        assert!(!italic.bold);
+        assert_eq!(italic.underline, Some(crate::ir::UnderlineStyle::Single));
+        assert_eq!(italic.font_size_half_pt, Some(28));
+
+        assert!(
+            spans.iter().any(|s| s.text == " " && !s.bold && !s.italic),
+            "the gap between the two formatted runs must stay a separate, unformatted span: {spans:?}"
+        );
+    }
+
+    /// Regression (issue #287): paragraph alignment/indentation/spacing
+    /// from PAP SPRMs reach the IR's `Paragraph`, not the always-`None`
+    /// defaults from before this fix.
+    #[test]
+    fn test_pap_alignment_indent_and_spacing_reach_the_ir_paragraph() {
+        let props = PapProps {
+            alignment: Some(crate::ir::ParagraphAlignment::Center),
+            indent_left_twips: Some(720),
+            indent_right_twips: Some(360),
+            first_line_indent_twips: Some(-360),
+            space_before_twips: Some(200),
+            space_after_twips: Some(100),
+            ..Default::default()
+        };
+        let p = para("A centered, indented paragraph.", props);
+        let mut els = Vec::new();
+        walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
+        let Element::Paragraph(par) = &els[0] else {
+            panic!("expected a paragraph, got {:?}", els[0]);
+        };
+        assert_eq!(par.alignment, Some(crate::ir::ParagraphAlignment::Center));
+        assert_eq!(par.indent_left_twips, Some(720));
+        assert_eq!(par.indent_right_twips, Some(360));
+        assert_eq!(par.first_line_indent_twips, Some(-360));
+        assert_eq!(par.space_before_twips, Some(200));
+        assert_eq!(par.space_after_twips, Some(100));
     }
 
     /// Medium #4: a soft line break (`0x0B`, which `sanitize_text` maps to
@@ -1308,6 +1497,7 @@ mod tests {
                 ..PapProps::default()
             },
             hyperlinks: Vec::new(),
+            chp_runs: Vec::new(),
         };
         let cell = DocParagraph {
             text: "cell text".into(),
@@ -1317,6 +1507,7 @@ mod tests {
                 ..PapProps::default()
             },
             hyperlinks: Vec::new(),
+            chp_runs: Vec::new(),
         };
         let paragraphs = [mark(1), cell, mark(1)];
         let mut els = Vec::new();
@@ -1415,7 +1606,7 @@ mod tests {
 
     fn is_heading_guess(text: &str) -> bool {
         let mut els = Vec::new();
-        emit_prose(text, &[], &mut els, &[]);
+        emit_prose(text, &PapProps::default(), &mut els, &[], &[]);
         matches!(els.as_slice(), [Element::Heading(_)])
     }
 

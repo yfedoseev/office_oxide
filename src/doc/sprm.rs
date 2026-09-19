@@ -25,7 +25,7 @@
 //! list/tab-stop PR, not here. The fixtures pass either way only because their
 //! `cb < 256`, so a ≥12-column table is what exposes the difference.
 
-use crate::ir::{TabAlignment, TabLeader, TabStop};
+use crate::ir::{ParagraphAlignment, TabAlignment, TabLeader, TabStop, UnderlineStyle};
 
 /// A single decoded SPRM: opcode plus its operand bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,9 +184,9 @@ pub fn parse_grpprl(grpprl: &[u8]) -> Vec<Sprm> {
 
 /// Paragraph-property flags distilled from a PAP grpprl.
 ///
-/// Only the SPRMs needed for table / list reconstruction are tracked; every
-/// other SPRM is walked over and discarded.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Table/list reconstruction fields plus, since issue #287,
+/// alignment/indentation/spacing.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PapProps {
     /// `sprmPFInTable` (0x2416): this paragraph lives inside a table.
     pub f_in_table: bool,
@@ -222,6 +222,24 @@ pub struct PapProps {
     /// This is the evidence that a document has *real* heading structure,
     /// which is what gates the line-shape heading guess in `convert_doc`.
     pub outline_level: Option<u8>,
+    /// `sprmPJc` (0x2461) / legacy `sprmPJc80` (0x2403): paragraph
+    /// alignment. Values beyond the four/five `ParagraphAlignment`
+    /// variants (Arabic Kashida justification, Thai distribute, …) map to
+    /// the closest fit (`Justify`/`Distribute`) rather than being dropped.
+    pub alignment: Option<ParagraphAlignment>,
+    /// `sprmPDxaLeft` (0x845E) / legacy `sprmPDxaLeft80` (0x840F), in
+    /// twips.
+    pub indent_left_twips: Option<i32>,
+    /// `sprmPDxaRight` (0x845D) / legacy `sprmPDxaRight80` (0x840E), in
+    /// twips.
+    pub indent_right_twips: Option<i32>,
+    /// `sprmPDxaLeft1` (0x8460) / legacy `sprmPDxaLeft180` (0x8411), in
+    /// twips. Negative = hanging indent.
+    pub first_line_indent_twips: Option<i32>,
+    /// `sprmPDyaBefore` (0xA413), in twips.
+    pub space_before_twips: Option<u32>,
+    /// `sprmPDyaAfter` (0xA414), in twips.
+    pub space_after_twips: Option<u32>,
 }
 
 /// One table cell descriptor (TKBKTAP, 20 bytes) distilled from a row's
@@ -489,6 +507,102 @@ pap_sprm_dispatch! {
     "sprmPChgTabsPapx" @ "2.6.2" => [0xC60D] (props, operand) {
         let _ = (props, operand);
     }
+
+    /// Unsigned 8-bit enum (1 byte, spra 0/1): paragraph justification.
+    /// `sprmPJc` (modern, values 0-9) and `sprmPJc80` (legacy, values
+    /// 0-5) share the same 0-3 meanings (left/center/right/justify);
+    /// `sprmPJc`'s extended values beyond 3 are folded into the closest
+    /// fit rather than dropped.
+    "sprmPJc" @ "2.6.2" => [0x2461] (props, operand) {
+        if let Some(&jc) = operand.first() {
+            props.alignment = match jc {
+                0 => Some(ParagraphAlignment::Left),
+                1 => Some(ParagraphAlignment::Center),
+                2 => Some(ParagraphAlignment::Right),
+                4 => Some(ParagraphAlignment::Distribute),
+                _ => Some(ParagraphAlignment::Justify),
+            };
+        }
+    }
+
+    /// See `sprmPJc`.
+    "sprmPJc80" @ "2.6.2" => [0x2403] (props, operand) {
+        if let Some(&jc) = operand.first() {
+            props.alignment = match jc {
+                0 => Some(ParagraphAlignment::Left),
+                1 => Some(ParagraphAlignment::Center),
+                2 => Some(ParagraphAlignment::Right),
+                _ => Some(ParagraphAlignment::Justify),
+            };
+        }
+    }
+
+    /// XAS (signed 16-bit, twips, spra 4): logical left indent.
+    "sprmPDxaLeft" @ "2.6.2" => [0x845E] (props, operand) {
+        if operand.len() >= 2 {
+            props.indent_left_twips = Some(i32::from(i16::from_le_bytes([operand[0], operand[1]])));
+        }
+    }
+
+    /// See `sprmPDxaLeft` (legacy form, same unit and meaning).
+    "sprmPDxaLeft80" @ "2.6.2" => [0x840F] (props, operand) {
+        if operand.len() >= 2 {
+            props.indent_left_twips = Some(i32::from(i16::from_le_bytes([operand[0], operand[1]])));
+        }
+    }
+
+    /// XAS (signed 16-bit, twips, spra 4): logical right indent.
+    "sprmPDxaRight" @ "2.6.2" => [0x845D] (props, operand) {
+        if operand.len() >= 2 {
+            props.indent_right_twips = Some(i32::from(i16::from_le_bytes([operand[0], operand[1]])));
+        }
+    }
+
+    /// See `sprmPDxaRight` (legacy form, same unit and meaning).
+    "sprmPDxaRight80" @ "2.6.2" => [0x840E] (props, operand) {
+        if operand.len() >= 2 {
+            props.indent_right_twips = Some(i32::from(i16::from_le_bytes([operand[0], operand[1]])));
+        }
+    }
+
+    /// XAS (signed 16-bit, twips, spra 4): first-line indent relative to
+    /// the rest of the paragraph. Negative = hanging indent.
+    "sprmPDxaLeft1" @ "2.6.2" => [0x8460] (props, operand) {
+        if operand.len() >= 2 {
+            props.first_line_indent_twips =
+                Some(i32::from(i16::from_le_bytes([operand[0], operand[1]])));
+        }
+    }
+
+    /// See `sprmPDxaLeft1` (legacy form, same unit and meaning).
+    "sprmPDxaLeft180" @ "2.6.2" => [0x8411] (props, operand) {
+        if operand.len() >= 2 {
+            props.first_line_indent_twips =
+                Some(i32::from(i16::from_le_bytes([operand[0], operand[1]])));
+        }
+    }
+
+    /// Unsigned 16-bit integer (spra 5), twips: spacing before the
+    /// paragraph. Per [MS-DOC] the value MUST be 0x0000-0x7BC0; an
+    /// out-of-range operand is ignored.
+    "sprmPDyaBefore" @ "2.6.2" => [0xA413] (props, operand) {
+        if operand.len() >= 2 {
+            let v = u16::from_le_bytes([operand[0], operand[1]]);
+            if v <= 0x7BC0 {
+                props.space_before_twips = Some(u32::from(v));
+            }
+        }
+    }
+
+    /// See `sprmPDyaBefore`.
+    "sprmPDyaAfter" @ "2.6.2" => [0xA414] (props, operand) {
+        if operand.len() >= 2 {
+            let v = u16::from_le_bytes([operand[0], operand[1]]);
+            if v <= 0x7BC0 {
+                props.space_after_twips = Some(u32::from(v));
+            }
+        }
+    }
 }
 
 /// Decode a PAP `grpprl` into the paragraph flags we care about.
@@ -515,10 +629,13 @@ pub fn extract_pap_props(grpprl: &[u8]) -> PapProps {
 
 /// Character-property flags distilled from a CHP grpprl (`sgc` == 2).
 ///
-/// Only the revision-mark SPRMs are tracked (issue #288): a run's other
-/// character formatting (#287, bold/italic/font/color/…) is a larger,
-/// separate scope that this minimal CHPX-walking pass does not attempt.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Issue #288 added the revision-mark flags; issue #287 added
+/// bold/italic/underline/color/font-size. Font *name* (`sprmCRgFtc0` — an
+/// index into the `SttbfFfn` font table) is deliberately not attempted
+/// here: resolving it needs a whole separate STTB+FFN parser that nothing
+/// in `src/doc/` touches yet, unlike font *size* (`sprmCHps`), which is a
+/// self-contained 2-byte operand.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChpProps {
     /// `sprmCFRMarkDel` (0x0800): the run is formatted as deleted
     /// revision-mark text. The "accepted" view (what `plain_text()` and
@@ -531,6 +648,20 @@ pub struct ChpProps {
     /// every CHP opcode this crate recognizes, not just the ones that
     /// currently change extraction behavior.
     pub f_rmark_ins: bool,
+    /// `sprmCFBold` (0x0835).
+    pub bold: bool,
+    /// `sprmCFItalic` (0x0836).
+    pub italic: bool,
+    /// `sprmCKul` (0x2A3E): underline style. `None` (Kul value `0`, no
+    /// underline) is the default, not `Some(UnderlineStyle::None)` —
+    /// there's no source signal that distinguishes "never set" from an
+    /// explicit "turned off", so the simpler of the two is used.
+    pub underline: Option<UnderlineStyle>,
+    /// `sprmCCv` (0x6870): true RGB text color. `None` when the color is
+    /// `cvAuto` (`fAuto` byte set) or the SPRM is absent.
+    pub color: Option<[u8; 3]>,
+    /// `sprmCHps` (0x4A43): font size in half-points.
+    pub font_size_half_pt: Option<u32>,
 }
 
 /// Declare the character SPRM dispatch and its identity registry from one
@@ -582,6 +713,65 @@ chp_sprm_dispatch! {
             props.f_rmark_ins = b != 0;
         }
     }
+
+    /// ToggleOperand (1 byte, spra 0): whether the text is bold.
+    "sprmCFBold" @ "2.6.1" => [0x0835] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.bold = b != 0;
+        }
+    }
+
+    /// ToggleOperand (1 byte, spra 0): whether the text is italicized.
+    "sprmCFItalic" @ "2.6.1" => [0x0836] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.italic = b != 0;
+        }
+    }
+
+    /// Kul value (1 byte, spra 1): underlining style. `0` = none (leaves
+    /// `underline` at its default `None`); other values map to the
+    /// closest `UnderlineStyle` variant, with any value this crate does
+    /// not otherwise recognize (e.g. `Hidden`, or a reserved value)
+    /// falling back to `Single` rather than being silently dropped —
+    /// some underline is a closer approximation of the source than none.
+    "sprmCKul" @ "2.6.1" => [0x2A3E] (props, operand) {
+        if let Some(&kul) = operand.first() {
+            props.underline = match kul {
+                0x00 => None,
+                0x03 => Some(UnderlineStyle::Double),
+                0x04 => Some(UnderlineStyle::Dotted),
+                0x06 => Some(UnderlineStyle::Thick),
+                0x07 => Some(UnderlineStyle::Dash),
+                0x09 => Some(UnderlineStyle::DotDash),
+                0x0A => Some(UnderlineStyle::DotDotDash),
+                0x0B => Some(UnderlineStyle::Wave),
+                0x02 => Some(UnderlineStyle::Words),
+                _ => Some(UnderlineStyle::Single),
+            };
+        }
+    }
+
+    /// COLORREF (4 bytes, spra 3): `[red, green, blue, fAuto]`. `fAuto !=
+    /// 0` means "use the automatic/default color" — treated as "no
+    /// override", not black.
+    "sprmCCv" @ "2.6.1" => [0x6870] (props, operand) {
+        if operand.len() >= 4 {
+            props.color =
+                if operand[3] != 0 { None } else { Some([operand[0], operand[1], operand[2]]) };
+        }
+    }
+
+    /// Unsigned 2-byte integer (spra 2), half-points. Per [MS-DOC], the
+    /// value MUST be between 2 and 3276; an out-of-range operand is
+    /// ignored rather than stored, since it cannot be a real font size.
+    "sprmCHps" @ "2.6.1" => [0x4A43] (props, operand) {
+        if operand.len() >= 2 {
+            let hps = u16::from_le_bytes([operand[0], operand[1]]);
+            if (2..=3276).contains(&hps) {
+                props.font_size_half_pt = Some(u32::from(hps));
+            }
+        }
+    }
 }
 
 /// Decode a CHP `grpprl` into the character flags we care about.
@@ -623,6 +813,16 @@ mod tests {
         (0xC60D, "sprmPChgTabsPapx"),
         (0xC615, "sprmPChgTabs"),
         (0xD608, "sprmTDefTable"),
+        (0x2461, "sprmPJc"),
+        (0x2403, "sprmPJc80"),
+        (0x845E, "sprmPDxaLeft"),
+        (0x840F, "sprmPDxaLeft80"),
+        (0x845D, "sprmPDxaRight"),
+        (0x840E, "sprmPDxaRight80"),
+        (0x8460, "sprmPDxaLeft1"),
+        (0x8411, "sprmPDxaLeft180"),
+        (0xA413, "sprmPDyaBefore"),
+        (0xA414, "sprmPDyaAfter"),
     ];
 
     /// Every opcode the dispatch claims must name the property [MS-DOC]
@@ -809,6 +1009,52 @@ mod tests {
         assert!(props.is_table_trailing_mark);
         assert_eq!(props.itap, 1);
         assert!(props.tap.is_some(), "0xD608 operand must parse into a TapInfo");
+    }
+
+    /// Regression (issue #287): alignment/indentation/spacing SPRMs decode
+    /// to their real values, not the always-`None`/`0` they were before.
+    #[test]
+    fn test_extract_pap_props_alignment_indent_and_spacing() {
+        // sprmPJc(0x2461) = 1 (center)
+        let props = extract_pap_props(&[0x61, 0x24, 0x01]);
+        assert_eq!(props.alignment, Some(ParagraphAlignment::Center));
+
+        // sprmPJc80(0x2403) = 2 (right) — legacy opcode, same meaning.
+        let props = extract_pap_props(&[0x03, 0x24, 0x02]);
+        assert_eq!(props.alignment, Some(ParagraphAlignment::Right));
+
+        // sprmPJc(0x2461) = 3 (both/justify)
+        let props = extract_pap_props(&[0x61, 0x24, 0x03]);
+        assert_eq!(props.alignment, Some(ParagraphAlignment::Justify));
+
+        // sprmPDxaLeft(0x845E) = 720 twips (0.5in), sprmPDxaLeft1(0x8460) =
+        // -360 (hanging indent), sprmPDxaRight(0x845D) = 0.
+        let mut grpprl = Vec::new();
+        grpprl.extend_from_slice(&[0x5E, 0x84]);
+        grpprl.extend_from_slice(&720i16.to_le_bytes());
+        grpprl.extend_from_slice(&[0x60, 0x84]);
+        grpprl.extend_from_slice(&(-360i16).to_le_bytes());
+        grpprl.extend_from_slice(&[0x5D, 0x84]);
+        grpprl.extend_from_slice(&0i16.to_le_bytes());
+        let props = extract_pap_props(&grpprl);
+        assert_eq!(props.indent_left_twips, Some(720));
+        assert_eq!(props.first_line_indent_twips, Some(-360));
+        assert_eq!(props.indent_right_twips, Some(0));
+
+        // sprmPDyaBefore(0xA413) = 200, sprmPDyaAfter(0xA414) = 100 twips.
+        let mut grpprl = Vec::new();
+        grpprl.extend_from_slice(&[0x13, 0xA4]);
+        grpprl.extend_from_slice(&200u16.to_le_bytes());
+        grpprl.extend_from_slice(&[0x14, 0xA4]);
+        grpprl.extend_from_slice(&100u16.to_le_bytes());
+        let props = extract_pap_props(&grpprl);
+        assert_eq!(props.space_before_twips, Some(200));
+        assert_eq!(props.space_after_twips, Some(100));
+
+        // Out-of-range spacing (> 0x7BC0) is ignored, not stored.
+        let mut grpprl = vec![0x13, 0xA4];
+        grpprl.extend_from_slice(&0x7BC1u16.to_le_bytes());
+        assert_eq!(extract_pap_props(&grpprl).space_before_twips, None);
     }
 
     #[test]
@@ -1184,6 +1430,11 @@ mod tests {
     const MS_DOC_CHP_SPRM_TABLE: &[(u16, &str)] = &[
         (0x0800, "sprmCFRMarkDel"),
         (0x0801, "sprmCFRMarkIns"),
+        (0x0835, "sprmCFBold"),
+        (0x0836, "sprmCFItalic"),
+        (0x2A3E, "sprmCKul"),
+        (0x6870, "sprmCCv"),
+        (0x4A43, "sprmCHps"),
     ];
 
     #[test]
@@ -1201,6 +1452,28 @@ mod tests {
             assert!(
                 section.starts_with("2.6"),
                 "0x{opcode:04X} ({name}) must cite its [MS-DOC] §2.6.x section, got {section:?}"
+            );
+        }
+    }
+
+    /// Mirrors `every_registered_opcode_changes_the_decoded_props`, but for
+    /// the CHP registry. `sprmCHps` needs its own payload since a generic
+    /// `[1, 0, 0, 0]` operand (font size `1` half-point) falls outside its
+    /// valid `2..=3276` range and would be silently ignored, not stored.
+    #[test]
+    fn test_every_registered_chp_opcode_changes_the_decoded_props() {
+        for &(opcode, name, _) in CHP_SPRM_REGISTRY {
+            let mut grpprl = opcode.to_le_bytes().to_vec();
+            if opcode == 0x4A43 {
+                grpprl.extend_from_slice(&[48u8, 0]); // 24pt, in range
+            } else {
+                grpprl.extend_from_slice(&[1u8, 0, 0, 0]);
+            }
+            let props = extract_chp_props(&grpprl);
+            assert_ne!(
+                format!("{props:?}"),
+                format!("{:?}", ChpProps::default()),
+                "0x{opcode:04X} ({name}) is registered but decoding it changes nothing"
             );
         }
     }
@@ -1234,6 +1507,59 @@ mod tests {
     #[test]
     fn test_extract_chp_props_empty_grpprl_is_default() {
         assert_eq!(extract_chp_props(&[]), ChpProps::default());
+    }
+
+    #[test]
+    fn test_extract_chp_props_bold_and_italic() {
+        let props = extract_chp_props(&[0x35, 0x08, 0x01, 0x36, 0x08, 0x01]);
+        assert!(props.bold);
+        assert!(props.italic);
+
+        // Zero operand toggles off, not on.
+        let props = extract_chp_props(&[0x35, 0x08, 0x00]);
+        assert!(!props.bold);
+    }
+
+    #[test]
+    fn test_extract_chp_props_underline_maps_kul_values() {
+        assert_eq!(extract_chp_props(&[0x3E, 0x2A, 0x00]).underline, None);
+        assert_eq!(
+            extract_chp_props(&[0x3E, 0x2A, 0x01]).underline,
+            Some(UnderlineStyle::Single)
+        );
+        assert_eq!(
+            extract_chp_props(&[0x3E, 0x2A, 0x03]).underline,
+            Some(UnderlineStyle::Double)
+        );
+        assert_eq!(extract_chp_props(&[0x3E, 0x2A, 0x0B]).underline, Some(UnderlineStyle::Wave));
+        // An unrecognized/reserved value still yields "some underline",
+        // not silence.
+        assert_eq!(
+            extract_chp_props(&[0x3E, 0x2A, 0x63]).underline,
+            Some(UnderlineStyle::Single)
+        );
+    }
+
+    #[test]
+    fn test_extract_chp_props_color_ignores_auto() {
+        // fAuto = 0: real RGB color.
+        let props = extract_chp_props(&[0x70, 0x68, 0xFF, 0x99, 0x00, 0x00]);
+        assert_eq!(props.color, Some([0xFF, 0x99, 0x00]));
+
+        // fAuto = 1: "use the automatic color" — no override.
+        let props = extract_chp_props(&[0x70, 0x68, 0xFF, 0x99, 0x00, 0x01]);
+        assert_eq!(props.color, None);
+    }
+
+    #[test]
+    fn test_extract_chp_props_font_size_rejects_out_of_range() {
+        // 24pt = 48 half-points.
+        let props = extract_chp_props(&[0x43, 0x4A, 48, 0]);
+        assert_eq!(props.font_size_half_pt, Some(48));
+
+        // 0 is below the spec's minimum of 2 — ignored, not stored.
+        let props = extract_chp_props(&[0x43, 0x4A, 0, 0]);
+        assert_eq!(props.font_size_half_pt, None);
     }
 
     #[test]

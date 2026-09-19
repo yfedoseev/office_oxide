@@ -391,8 +391,8 @@ pub(crate) fn cp1252_to_char(b: u8) -> char {
 }
 
 /// A `HYPERLINK` field's display-text span, as a byte range into the string
-/// [`sanitize_text_with_hyperlinks`] returned it alongside, paired with the
-/// URL parsed from the field's own instruction text (issue #249).
+/// [`sanitize_text_with_hyperlinks_and_chp`] returned it alongside, paired
+/// with the URL parsed from the field's own instruction text (issue #249).
 #[derive(Debug, Clone, PartialEq)]
 pub struct HyperlinkSpan {
     pub range: std::ops::Range<usize>,
@@ -408,18 +408,31 @@ pub struct HyperlinkSpan {
 /// Word itself displays; the instruction text must be dropped entirely,
 /// not just the three boundary characters around it (issue #249).
 pub fn sanitize_text(text: &str) -> String {
-    strip_fields(text).0
+    strip_fields(text, None).0
 }
 
-/// As [`sanitize_text`], but also returns each `HYPERLINK` field's display
-/// text as a [`HyperlinkSpan`] (byte range in the *returned* string) paired
+/// As [`sanitize_text`], but also returns character-property run
+/// boundaries (byte ranges in the *returned* string, issue #287) alongside
+/// each `HYPERLINK` field's display text as a [`HyperlinkSpan`] paired
 /// with its target URL, so a caller building structured inline content can
-/// attach `TextSpan::hyperlink` to exactly that span (issue #249).
-pub fn sanitize_text_with_hyperlinks(text: &str) -> (String, Vec<HyperlinkSpan>) {
-    strip_fields(text)
+/// attach both `TextSpan::hyperlink` (issue #249) and the real per-run
+/// formatting to exactly the right spans.
+/// `char_props[i]` is the [`ChpProps`] of `text.chars().nth(i)`; the two
+/// MUST have the same length (every char in `text`, including ones that get
+/// dropped as field markup, needs an entry so the indices line up).
+///
+/// Field markers/instruction text never reach the output, so they never
+/// start or interrupt a run — consecutive *emitted* chars with equal
+/// `ChpProps` merge into one span, exactly mirroring how consecutive
+/// characters with unrelated formatting must not.
+pub(crate) fn sanitize_text_with_hyperlinks_and_chp(
+    text: &str,
+    char_props: &[super::sprm::ChpProps],
+) -> (String, Vec<HyperlinkSpan>, Vec<(std::ops::Range<usize>, super::sprm::ChpProps)>) {
+    strip_fields(text, Some(char_props))
 }
 
-/// Shared implementation for [`sanitize_text`] / [`sanitize_text_with_hyperlinks`].
+/// Shared implementation for `sanitize_text`/`sanitize_text_with_hyperlinks_and_chp`.
 ///
 /// A `depth` counter tracks field nesting (a field's instruction can itself
 /// contain another field, e.g. `{ IF {PAGE} > 1 "yes" "no" }`) so an inner
@@ -427,16 +440,49 @@ pub fn sanitize_text_with_hyperlinks(text: &str) -> (String, Vec<HyperlinkSpan>)
 /// Only the OUTERMOST field's own separator/end are meaningful here: its
 /// instruction text (which may itself contain nested fields) is dropped in
 /// full, and its cached result becomes visible text.
-fn strip_fields(text: &str) -> (String, Vec<HyperlinkSpan>) {
+/// Before pushing the char at `idx` onto `out`, close the currently open
+/// CHP run if its props differ from this char's (or none is open yet) and
+/// open a new one starting at `out.len()` — the same "compare to current,
+/// close and reopen on change" shape `strip_fields` already uses for
+/// `result_start`/hyperlink tracking, generalized to an arbitrary props
+/// type. A no-op when `char_props` is `None` (the `sanitize_text` caller,
+/// which doesn't track CHP runs).
+fn track_chp_run(
+    char_props: Option<&[super::sprm::ChpProps]>,
+    idx: usize,
+    out: &str,
+    chp_spans: &mut Vec<(std::ops::Range<usize>, super::sprm::ChpProps)>,
+    open_run: &mut Option<(usize, super::sprm::ChpProps)>,
+) {
+    let Some(props_arr) = char_props else { return };
+    let props = props_arr.get(idx).cloned().unwrap_or_default();
+    match open_run {
+        Some((_, cur)) if *cur == props => {}, // still open, same props
+        Some((start, cur)) => {
+            chp_spans.push((*start..out.len(), cur.clone()));
+            *open_run = Some((out.len(), props));
+        },
+        None => *open_run = Some((out.len(), props)),
+    }
+}
+
+fn strip_fields(
+    text: &str,
+    char_props: Option<&[super::sprm::ChpProps]>,
+) -> (String, Vec<HyperlinkSpan>, Vec<(std::ops::Range<usize>, super::sprm::ChpProps)>) {
     let mut out = String::with_capacity(text.len());
     let mut hyperlinks = Vec::new();
+    let mut chp_spans: Vec<(std::ops::Range<usize>, super::sprm::ChpProps)> = Vec::new();
+    // The currently-open CHP run: (byte offset in `out` where it started,
+    // its props). Only touched when `char_props` is `Some`.
+    let mut open_run: Option<(usize, super::sprm::ChpProps)> = None;
 
     let mut depth: u32 = 0;
     let mut in_result = false; // past the outermost field's own 0x14
     let mut instruction = String::new(); // outermost field's instruction text
     let mut result_start: usize = 0; // byte offset in `out` where the result began
 
-    for ch in text.chars() {
+    for (idx, ch) in text.chars().enumerate() {
         match ch {
             '\x13' => {
                 depth += 1;
@@ -471,19 +517,21 @@ fn strip_fields(text: &str) -> (String, Vec<HyperlinkSpan>) {
             },
             '\x01' | '\x08' => {}, // Picture placeholder, historic field-mark — always skip
             _ => {
-                if depth == 0 {
-                    push_mapped(ch, &mut out);
+                if depth == 0 || (depth == 1 && in_result) {
+                    track_chp_run(char_props, idx, &out, &mut chp_spans, &mut open_run);
+                    push_mapped(ch, &mut out); // depth == 0: plain text; depth == 1 && in_result: outermost cached result
                 } else if depth == 1 && !in_result {
                     instruction.push(ch); // outermost instruction text
-                } else if depth == 1 && in_result {
-                    push_mapped(ch, &mut out); // outermost cached result
                 }
                 // depth > 1: nested field's own instruction/result — never visible.
             },
         }
     }
+    if let Some((start, props)) = open_run {
+        chp_spans.push((start..out.len(), props));
+    }
 
-    (out, hyperlinks)
+    (out, hyperlinks, chp_spans)
 }
 
 /// Apply `sanitize_text`'s non-field control-character mappings to a single
@@ -713,7 +761,8 @@ mod tests {
     #[test]
     fn hyperlink_field_strips_instruction_and_yields_url_span() {
         let raw = "Before text; \x13 HYPERLINK \"http://testuri.org/\" \x14Hyperlink text\x15; after text";
-        let (text, links) = sanitize_text_with_hyperlinks(raw);
+        let char_props = vec![super::super::sprm::ChpProps::default(); raw.chars().count()];
+        let (text, links, _spans) = sanitize_text_with_hyperlinks_and_chp(raw, &char_props);
         assert_eq!(text, "Before text; Hyperlink text; after text");
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].url, "http://testuri.org/");
@@ -726,9 +775,42 @@ mod tests {
     #[test]
     fn hyperlink_field_with_bookmark_switch_gets_hash_prefix() {
         let raw = "\x13 HYPERLINK \\l \"SectionTwo\" \x14Jump to Section Two\x15";
-        let (text, links) = sanitize_text_with_hyperlinks(raw);
+        let char_props = vec![super::super::sprm::ChpProps::default(); raw.chars().count()];
+        let (text, links, _spans) = sanitize_text_with_hyperlinks_and_chp(raw, &char_props);
         assert_eq!(text, "Jump to Section Two");
         assert_eq!(links[0].url, "#SectionTwo");
+    }
+
+    /// Regression (issue #287): consecutive chars with equal `ChpProps`
+    /// merge into one span; a props change starts a new one, at the right
+    /// byte offset.
+    #[test]
+    fn test_sanitize_text_with_hyperlinks_and_chp_merges_equal_runs_and_splits_on_change() {
+        use super::super::sprm::ChpProps;
+        let bold = ChpProps { bold: true, ..Default::default() };
+        let plain = ChpProps::default();
+        // "AB" bold, "CD" plain.
+        let char_props = vec![bold.clone(), bold.clone(), plain.clone(), plain.clone()];
+        let (text, _links, spans) =
+            sanitize_text_with_hyperlinks_and_chp("ABCD", &char_props);
+        assert_eq!(text, "ABCD");
+        assert_eq!(spans, vec![(0..2, bold), (2..4, plain)]);
+    }
+
+    /// A field's dropped instruction text must not create a spurious CHP
+    /// span or desync the `char_props` index — only chars that actually
+    /// reach `out` (the field's cached result, here) get tracked.
+    #[test]
+    fn test_sanitize_text_with_hyperlinks_and_chp_skips_dropped_field_chars() {
+        use super::super::sprm::ChpProps;
+        let italic = ChpProps { italic: true, ..Default::default() };
+        // "Hi \x13...instruction...\x14Bye\x15" — one span over "Hi Bye".
+        let raw = "Hi \x13HYPERLINK \"x\"\x14Bye\x15";
+        let char_props: Vec<ChpProps> = raw.chars().map(|_| italic.clone()).collect();
+        let (text, _links, spans) =
+            sanitize_text_with_hyperlinks_and_chp(raw, &char_props);
+        assert_eq!(text, "Hi Bye");
+        assert_eq!(spans, vec![(0..text.len(), italic)]);
     }
 
     /// A non-`HYPERLINK` field (e.g. `CREATEDATE`) must still have its
@@ -736,7 +818,8 @@ mod tests {
     #[test]
     fn non_hyperlink_field_produces_no_hyperlink_span() {
         let raw = "\x13 CREATEDATE   \\* MERGEFORMAT \x1419/11/2010 14:49:00\x15";
-        let (text, links) = sanitize_text_with_hyperlinks(raw);
+        let char_props = vec![super::super::sprm::ChpProps::default(); raw.chars().count()];
+        let (text, links, _spans) = sanitize_text_with_hyperlinks_and_chp(raw, &char_props);
         assert_eq!(text, "19/11/2010 14:49:00");
         assert!(links.is_empty(), "a CREATEDATE field must never yield a hyperlink span");
     }

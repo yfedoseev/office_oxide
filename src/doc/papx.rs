@@ -16,8 +16,11 @@
 //!
 //! The `grpprl` is decoded by [`super::sprm::extract_pap_props`].
 
-use super::piece_table::{HyperlinkSpan, Piece, decode_cp_range, sanitize_text_with_hyperlinks};
-use super::sprm::PapProps;
+use super::chpx::{FkpRun, resolve_chp_cp_runs, resolve_chp_segments};
+use super::piece_table::{
+    HyperlinkSpan, Piece, decode_cp_range, sanitize_text_with_hyperlinks_and_chp,
+};
+use super::sprm::{ChpProps, PapProps};
 
 /// A paragraph descriptor recovered from a PAPX FKP page.
 #[derive(Debug, Clone)]
@@ -44,6 +47,13 @@ pub struct DocParagraph {
     /// `HYPERLINK` field display-text spans (byte ranges into `text`)
     /// paired with their target URLs (issue #249).
     pub hyperlinks: Vec<HyperlinkSpan>,
+    /// Character-property run boundaries (byte ranges into `text`) from
+    /// CHPX (issue #287): bold/italic/underline/color/font-size per run.
+    /// Always covers the whole of `text` when `text` is non-empty — a
+    /// document with no CHPX FKP at all naturally collapses to a single
+    /// span with `ChpProps::default()` (see `resolve_chp_segments`), so
+    /// callers never need a separate "no formatting info" case.
+    pub chp_runs: Vec<(std::ops::Range<usize>, ChpProps)>,
 }
 
 /// Parse every PAPX FKP page referenced by the PlcfBtePapx.
@@ -284,6 +294,7 @@ pub fn build_paragraphs(
     fkp: &[FkpParagraph],
     text_len: u32,
     lid: u16,
+    chp_runs: &[FkpRun],
 ) -> Vec<DocParagraph> {
     let mut keyed: Vec<(u32, &FkpParagraph)> = fkp
         .iter()
@@ -292,6 +303,13 @@ pub fn build_paragraphs(
         .collect();
     keyed.sort_by_key(|(cp, _)| *cp);
 
+    // FC→CP-convert and decode every CHPX run exactly once for the whole
+    // document — `resolve_chp_segments` is called once per paragraph below,
+    // and both `fc_to_cp` and `extract_chp_props` are real work; doing
+    // either of them per paragraph instead of once here turned a real
+    // corpus sweep into a multi-minute hang (issue #287 follow-up fix).
+    let sorted_chp_runs = resolve_chp_cp_runs(chp_runs, pieces);
+
     let mut out = Vec::with_capacity(keyed.len());
     for (cp_start, fp) in keyed {
         let cp_end = fc_to_cp(fp.fc_end, pieces).unwrap_or(cp_start + 1);
@@ -299,22 +317,45 @@ pub fn build_paragraphs(
         if cp_end <= cp_start {
             continue;
         }
-        // Decode this paragraph's CP range directly; sanitise the inner text
-        // but keep the trailing terminator raw (it drives table grouping).
-        let decoded = decode_cp_range(word_doc, pieces, cp_start, cp_end, lid);
+        // Decode per CHP-props segment (issue #287), not the whole
+        // paragraph range in one call, so each decoded char can be
+        // attributed to the right `ChpProps`. Concatenating these
+        // sub-range decodes is byte-for-byte identical to one bulk decode
+        // over `[cp_start, cp_end)` — `decode_cp_range` is a pure function
+        // of its own CP range with no cross-call state — so a paragraph
+        // whose CHPX segments collapse to "one segment, all default" (the
+        // common case for a document with no CHPX at all: `resolve_chp_segments`
+        // returns a single default-props segment spanning the whole range
+        // when `chp_runs` is empty) costs nothing extra and produces
+        // exactly the pre-#287 output.
+        let segments = resolve_chp_segments(&sorted_chp_runs, cp_start, cp_end);
+        let mut decoded = String::new();
+        let mut char_props: Vec<ChpProps> = Vec::with_capacity((cp_end - cp_start) as usize);
+        for (seg_start, seg_end, props) in &segments {
+            let chunk = decode_cp_range(word_doc, pieces, *seg_start, *seg_end, lid);
+            let new_len = char_props.len() + chunk.chars().count();
+            char_props.resize(new_len, props.clone());
+            decoded.push_str(&chunk);
+        }
         let chars: Vec<char> = decoded.chars().collect();
         if chars.is_empty() {
             continue;
         }
+        // Drop the trailing terminator from both the text and its parallel
+        // props entry before sanitizing (it's kept raw, below, since it
+        // drives table/row grouping rather than being visible content).
         let terminator = chars[chars.len() - 1];
-        let (content, hyperlinks) =
-            sanitize_text_with_hyperlinks(&chars[..chars.len() - 1].iter().collect::<String>());
+        let content_str: String = chars[..chars.len() - 1].iter().collect();
+        let content_props = &char_props[..char_props.len().saturating_sub(1)];
+        let (content, hyperlinks, chp_spans) =
+            sanitize_text_with_hyperlinks_and_chp(&content_str, content_props);
         let props = super::sprm::extract_pap_props(&fp.grpprl);
         out.push(DocParagraph {
             text: content,
             terminator,
             props,
             hyperlinks,
+            chp_runs: chp_spans,
         });
     }
     out
@@ -429,7 +470,7 @@ mod tests {
             mk(5, 6, &rowmark), // "\u{7}" row mark
         ];
 
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 6, 0);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 6, 0, &[]);
         assert_eq!(paras.len(), 4);
         // leading mark
         assert_eq!(paras[0].text, "");
@@ -469,7 +510,7 @@ mod tests {
         };
         let fkp = vec![mk(0, 6), mk(6, 12)];
 
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 12, 0);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 12, 0, &[]);
         assert_eq!(paras.len(), 2);
         assert_eq!(paras[0].text, "Hi 😀", "emoji must not desync the range");
         assert_eq!(paras[0].terminator, '\r');
@@ -501,7 +542,7 @@ mod tests {
             grpprl: Vec::new(),
         };
         let fkp = vec![mk(0, raw.chars().count() as u32)];
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, 0);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, 0, &[]);
         assert_eq!(paras.len(), 1);
         assert_eq!(paras[0].terminator, '\r');
         let t = &paras[0].text;

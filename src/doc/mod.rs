@@ -29,11 +29,9 @@ pub use ole_objects::EmbeddedOleObject;
 pub(crate) use list_format::ListFormatting;
 pub(crate) use papx::DocParagraph;
 pub(crate) use piece_table::HyperlinkSpan;
-pub(crate) use sprm::{TapCellInfo, TapInfo};
-// `PapProps` and `ListLevel` are only needed by unit tests inside this
-// crate, so their re-exports are test-gated to avoid an unused-import
-// warning in non-test builds.
+pub(crate) use sprm::{ChpProps, PapProps, TapCellInfo, TapInfo};
+// `ListLevel` is only needed by unit tests inside this crate, so its
+// re-export is test-gated to avoid an unused-import warning in non-test
+// builds.
 #[cfg(test)]
 pub(crate) use list_format::ListLevel;
-#[cfg(test)]
-pub(crate) use sprm::PapProps;

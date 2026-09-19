@@ -9,7 +9,7 @@ use super::fib::Fib;
 use super::images::{DocImage, extract_images};
 use super::list_format::ListFormatting;
 use super::papx::{DocParagraph, build_paragraphs, parse_papx_paragraphs};
-use super::chpx::resolve_deleted_cp_ranges;
+use super::chpx::{parse_chpx_runs, resolve_deleted_cp_ranges_from_runs};
 use super::piece_table::{
     covers_declared_length, extract_text_range_excluding, parse_clx, sanitize_text,
 };
@@ -198,26 +198,26 @@ impl DocDocument {
         let pieces = parse_clx(clx_data)?;
         let text_complete = covers_declared_length(&pieces, fib.text_len);
 
-        // Deleted revision-mark text (`sprmCFRMarkDel`) is excluded from the
-        // main text up front, at extraction time — the same "accepted view"
-        // policy already applied to DOCX's `w:del` (issue #288). Structured
-        // paragraph text (`paragraphs()`, used by `doc_to_ir`) is left
-        // unfiltered for now: splicing deletions out of a multi-run
-        // paragraph while preserving field-code (`HYPERLINK`) boundaries is
-        // part of the larger CHP-formatting work tracked by issue #287, not
-        // this minimal fix.
-        let deleted_ranges = if fib.fc_plcf_bte_chpx != 0 && fib.lcb_plcf_bte_chpx != 0 {
-            resolve_deleted_cp_ranges(
-                &word_doc,
-                &table_stream,
-                &pieces,
-                fib.fc_plcf_bte_chpx,
-                fib.lcb_plcf_bte_chpx,
-                fib.text_len,
-            )
+        // The CHPX FKP is parsed once here (rather than separately by each
+        // consumer) since both the deleted-revision-mark filter below and
+        // `build_paragraphs`'s per-run character formatting (issue #287)
+        // need it, and a CHPX FKP walk is not cheap to repeat.
+        let chpx_runs = if fib.fc_plcf_bte_chpx != 0 && fib.lcb_plcf_bte_chpx != 0 {
+            parse_chpx_runs(&word_doc, &table_stream, fib.fc_plcf_bte_chpx, fib.lcb_plcf_bte_chpx)
         } else {
             Vec::new()
         };
+
+        // Deleted revision-mark text (`sprmCFRMarkDel`) is excluded from the
+        // main flat text up front, at extraction time — the same "accepted
+        // view" policy already applied to DOCX's `w:del` (issue #288).
+        // Structured paragraph text (`paragraphs()`, used by `doc_to_ir`) is
+        // left unfiltered: splicing deletions out of a multi-run paragraph
+        // while preserving field-code (`HYPERLINK`) boundaries, on top of
+        // the per-run character formatting `build_paragraphs` now also
+        // carries (issue #287), is more than this fix attempts — it stays a
+        // deliberately separate, still-open piece of #288's own scope.
+        let deleted_ranges = resolve_deleted_cp_ranges_from_runs(&chpx_runs, &pieces, fib.text_len);
         let raw_text = extract_text_range_excluding(
             &word_doc,
             &pieces,
@@ -293,7 +293,7 @@ impl DocDocument {
                 fib.fc_plcf_bte_papx,
                 fib.lcb_plcf_bte_papx,
             );
-            build_paragraphs(&word_doc, &pieces, &fkp, fib.text_len, fib.lid)
+            build_paragraphs(&word_doc, &pieces, &fkp, fib.text_len, fib.lid, &chpx_runs)
         } else {
             Vec::new()
         };
@@ -927,6 +927,7 @@ mod tests {
             terminator: '\r',
             props,
             hyperlinks: Vec::new(),
+            chp_runs: Vec::new(),
         }
     }
 

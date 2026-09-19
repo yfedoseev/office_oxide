@@ -154,15 +154,16 @@ fn extract_chpx_grpprl(page: &[u8], word_off: usize) -> Vec<u8> {
 /// This is the "at minimum" fix for issue #288: the accepted-view policy
 /// already applied to DOCX's `w:del` extended to DOC, without attempting
 /// the larger #287 (full character-formatting fidelity).
-pub fn resolve_deleted_cp_ranges(
-    word_doc: &[u8],
-    table_stream: &[u8],
+///
+/// Takes an already-parsed run list, produced once by [`parse_chpx_runs`]
+/// — the caller (`document.rs`) also needs those same runs for
+/// [`resolve_chp_segments`] (issue #287) and must not re-walk the whole
+/// CHPX FKP once per consumer.
+pub fn resolve_deleted_cp_ranges_from_runs(
+    runs: &[FkpRun],
     pieces: &[Piece],
-    fc_plcf_bte_chpx: u32,
-    lcb_plcf_bte_chpx: u32,
     text_len: u32,
 ) -> Vec<(u32, u32)> {
-    let runs = parse_chpx_runs(word_doc, table_stream, fc_plcf_bte_chpx, lcb_plcf_bte_chpx);
     let mut deleted: Vec<(u32, u32)> = runs
         .iter()
         .filter(|r| {
@@ -180,6 +181,98 @@ pub fn resolve_deleted_cp_ranges(
 
     deleted.sort_unstable_by_key(|&(s, _)| s);
     merge_ranges(deleted)
+}
+
+/// Resolve the character-property segments covering
+/// `[para_cp_start, para_cp_end)` for one paragraph (issue #287).
+///
+/// Fully contiguous and gap-filled: any CP within the paragraph's range
+/// that no CHPX run covers gets `ChpProps::default()`, so callers never
+/// need a separate "no formatting" fallback path, and a document with no
+/// CHPX at all (`sorted_cp_runs` empty) degrades to one all-default
+/// segment spanning the whole paragraph — byte-for-byte what decoding it
+/// in one shot already produced before this function existed.
+///
+/// Bounded and malformed-input-safe: overlapping/out-of-order runs (a
+/// corrupted or adversarial FKP) never produce overlapping output segments
+/// or an unbounded result — each run only ever contributes the portion of
+/// its own range beyond what a lower-sorted run already claimed.
+///
+/// Takes `sorted_cp_runs` — every CHPX run for the *whole document*,
+/// already FC→CP-converted and sorted by `cp_start` via
+/// [`resolve_chp_cp_runs`]. This is deliberate: `build_paragraphs` calls
+/// this once per paragraph, and `fc_to_cp` is itself `O(pieces)`. Doing the
+/// FC→CP conversion (and the `extract_chp_props` decode) per paragraph
+/// instead of once for the whole document turned a real corpus sweep into
+/// an effectively unbounded `O(runs × pieces × paragraphs)` — the exact
+/// shape of hang AGENTS.md rule 6 exists to rule out — so this function
+/// only ever binary-searches into an already-converted, already-sorted
+/// slice, touching each run at most once across the whole document.
+pub fn resolve_chp_segments(
+    sorted_cp_runs: &[(u32, u32, ChpProps)],
+    para_cp_start: u32,
+    para_cp_end: u32,
+) -> Vec<(u32, u32, ChpProps)> {
+    if para_cp_end <= para_cp_start {
+        return Vec::new();
+    }
+    // First run whose `cp_start` is at or past the paragraph's start. Any
+    // run entirely before this index also ends before `para_cp_start`
+    // *unless* it's a run that started earlier but extends into this
+    // paragraph — back up one extra slot to catch that overlap without
+    // having to scan from the very beginning. Backing up exactly one slot
+    // is exact for a well-formed CHPX (its runs
+    // are contiguous and non-overlapping, so at most one earlier run can
+    // straddle into this paragraph). A malformed/adversarial CHPX with
+    // several long overlapping runs could in principle need to back up
+    // further to find every one that reaches into `[para_cp_start,
+    // para_cp_end)`; the cost of missing one there is a mis-attributed
+    // stretch falling back to `ChpProps::default()`, not a panic, a hang,
+    // or duplicated output (the per-run clipping below already guards
+    // against that) — an acceptable degradation for a case a real Word
+    // writer never produces, traded for keeping this a binary search
+    // instead of a bounded backward scan.
+    let start_idx = sorted_cp_runs.partition_point(|&(s, _, _)| s < para_cp_start);
+    let start_idx = start_idx.saturating_sub(1);
+
+    let mut out = Vec::new();
+    let mut cursor = para_cp_start;
+    for &(s, e, ref props) in &sorted_cp_runs[start_idx..] {
+        if s >= para_cp_end {
+            break; // sorted by cp_start: every later run starts even later
+        }
+        let seg_start = s.max(cursor).max(para_cp_start);
+        let seg_end = e.min(para_cp_end);
+        if seg_end <= seg_start {
+            continue; // this run doesn't actually reach the paragraph, or is fully covered already
+        }
+        if seg_start > cursor {
+            out.push((cursor, seg_start, ChpProps::default()));
+        }
+        out.push((seg_start, seg_end, props.clone()));
+        cursor = seg_end;
+    }
+    if cursor < para_cp_end {
+        out.push((cursor, para_cp_end, ChpProps::default()));
+    }
+    out
+}
+
+/// Convert every CHPX run for the whole document from FC to CP once,
+/// decode each one's `ChpProps` once, and sort by `cp_start` — the
+/// document-level precomputation [`resolve_chp_segments`] relies on to stay
+/// linear instead of doing this per paragraph.
+pub fn resolve_chp_cp_runs(runs: &[FkpRun], pieces: &[Piece]) -> Vec<(u32, u32, ChpProps)> {
+    let mut out: Vec<(u32, u32, ChpProps)> = runs
+        .iter()
+        .filter_map(|r| {
+            let cp_start = fc_to_cp(r.fc_start, pieces)?;
+            let cp_end = fc_to_cp(r.fc_end, pieces).unwrap_or(cp_start);
+            (cp_end > cp_start).then(|| (cp_start, cp_end, extract_chp_props(&r.grpprl)))
+        })
+        .collect();
+    out.sort_unstable_by_key(|&(s, _, _)| s);
+    out
 }
 
 /// Merge overlapping/adjacent `(start, end)` ranges (already sorted by
@@ -264,13 +357,15 @@ mod tests {
     #[test]
     fn test_resolve_deleted_cp_ranges_finds_deleted_run() {
         // Two runs: cp[0,3) normal, cp[3,6) deleted (sprmCFRMarkDel = 1).
-        // `resolve_deleted_cp_ranges` only reads the FKP page out of
-        // `word_doc` (via the page number); it never dereferences a
-        // piece's `fc` against `word_doc`, so `word_doc` here IS the FKP
-        // page (page 0) and the piece's `fc = 0x800` is a purely notional
-        // text-storage offset, exactly as in a real file where the FKP
-        // page and the text it describes live in unrelated regions of the
-        // WordDocument stream.
+        // Exercises the same two-step pipeline `document.rs` uses:
+        // `parse_chpx_runs` (byte-level FKP walk) then
+        // `resolve_deleted_cp_ranges_from_runs` (CP-range resolution).
+        // `parse_chpx_runs` only reads the FKP page out of `word_doc` (via
+        // the page number); it never dereferences a piece's `fc` against
+        // `word_doc`, so `word_doc` here IS the FKP page (page 0) and the
+        // piece's `fc = 0x800` is a purely notional text-storage offset,
+        // exactly as in a real file where the FKP page and the text it
+        // describes live in unrelated regions of the WordDocument stream.
         let pieces = [unicode_piece(0x800, 6)];
 
         let mut page = vec![0u8; 512];
@@ -292,8 +387,143 @@ mod tests {
         plc.extend_from_slice(&1024u32.to_le_bytes());
         plc.extend_from_slice(&0u32.to_le_bytes()); // page 0
 
-        let deleted = resolve_deleted_cp_ranges(&page, &plc, &pieces, 0, plc.len() as u32, 6);
+        let runs = parse_chpx_runs(&page, &plc, 0, plc.len() as u32);
+        let deleted = resolve_deleted_cp_ranges_from_runs(&runs, &pieces, 6);
         assert_eq!(deleted, vec![(3, 6)]);
+    }
+
+    /// `resolve_chp_segments` decodes each `FkpRun`'s own `grpprl` via
+    /// `extract_chp_props`, so a props-carrying test run needs a real
+    /// encoded grpprl, not just the struct's `props` field (which doesn't
+    /// exist — `FkpRun` only carries raw bytes). `sprmCFBold(0x0835) = 1`.
+    fn bold_grpprl() -> Vec<u8> {
+        vec![0x35, 0x08, 0x01]
+    }
+
+    #[test]
+    fn test_resolve_chp_segments_empty_runs_yields_one_default_segment() {
+        let segs = resolve_chp_segments(&[], 0, 10);
+        assert_eq!(segs, vec![(0, 10, ChpProps::default())]);
+    }
+
+    #[test]
+    fn test_resolve_chp_segments_out_of_range_is_empty() {
+        assert!(resolve_chp_segments(&[], 10, 10).is_empty());
+        assert!(resolve_chp_segments(&[], 10, 5).is_empty());
+    }
+
+    #[test]
+    fn test_resolve_chp_segments_single_run_covers_whole_paragraph() {
+        let pieces = [unicode_piece(0x800, 10)];
+        let runs =
+            vec![FkpRun { fc_start: 0x800, fc_end: 0x800 + 10 * 2, grpprl: bold_grpprl() }];
+        let segs = resolve_chp_segments(&resolve_chp_cp_runs(&runs, &pieces), 0, 10);
+        assert_eq!(segs, vec![(0, 10, ChpProps { bold: true, ..Default::default() })]);
+    }
+
+    /// A run covering only the middle of the paragraph gap-fills both
+    /// sides with default (unformatted) props.
+    #[test]
+    fn test_resolve_chp_segments_middle_run_gap_fills_both_sides() {
+        let pieces = [unicode_piece(0x800, 10)];
+        let runs = vec![FkpRun {
+            fc_start: 0x800 + 3 * 2,
+            fc_end: 0x800 + 7 * 2,
+            grpprl: bold_grpprl(),
+        }];
+        let segs = resolve_chp_segments(&resolve_chp_cp_runs(&runs, &pieces), 0, 10);
+        assert_eq!(
+            segs,
+            vec![
+                (0, 3, ChpProps::default()),
+                (3, 7, ChpProps { bold: true, ..Default::default() }),
+                (7, 10, ChpProps::default()),
+            ]
+        );
+    }
+
+    /// A run entirely outside `[para_cp_start, para_cp_end)` contributes
+    /// nothing — the whole paragraph gap-fills to default.
+    #[test]
+    fn test_resolve_chp_segments_run_outside_paragraph_is_ignored() {
+        let pieces = [unicode_piece(0x800, 20)];
+        let runs =
+            vec![FkpRun { fc_start: 0x800 + 15 * 2, fc_end: 0x800 + 18 * 2, grpprl: bold_grpprl() }];
+        let segs = resolve_chp_segments(&resolve_chp_cp_runs(&runs, &pieces), 0, 10);
+        assert_eq!(segs, vec![(0, 10, ChpProps::default())]);
+    }
+
+    /// Overlapping/malformed runs must not produce overlapping output
+    /// segments (AGENTS.md rule 6) — a later-sorted run only contributes
+    /// the portion of its range beyond what an earlier one already
+    /// claimed.
+    #[test]
+    fn test_resolve_chp_segments_overlapping_runs_do_not_duplicate_coverage() {
+        let pieces = [unicode_piece(0x800, 10)];
+        let runs = vec![
+            FkpRun { fc_start: 0x800, fc_end: 0x800 + 5 * 2, grpprl: bold_grpprl() },
+            // Overlaps [0,5) by [2,5); only [5,8) is new.
+            FkpRun { fc_start: 0x800 + 2 * 2, fc_end: 0x800 + 8 * 2, grpprl: Vec::new() },
+        ];
+        let segs = resolve_chp_segments(&resolve_chp_cp_runs(&runs, &pieces), 0, 10);
+        // Total coverage must be exactly [0,10) with no gaps or overlaps.
+        let mut cursor = 0u32;
+        for &(s, e, _) in &segs {
+            assert_eq!(s, cursor, "segments must be contiguous, no gap or overlap");
+            assert!(e > s);
+            cursor = e;
+        }
+        assert_eq!(cursor, 10);
+    }
+
+    #[test]
+    fn test_resolve_chp_cp_runs_converts_and_sorts() {
+        let pieces = [unicode_piece(0x800, 10)];
+        // Deliberately out of FC/CP order: the second run's CP range (5..8)
+        // comes before the first's (0..3) in the input slice.
+        let runs = vec![
+            FkpRun { fc_start: 0x800 + 5 * 2, fc_end: 0x800 + 8 * 2, grpprl: Vec::new() },
+            FkpRun { fc_start: 0x800, fc_end: 0x800 + 3 * 2, grpprl: bold_grpprl() },
+        ];
+        let cp_runs = resolve_chp_cp_runs(&runs, &pieces);
+        assert_eq!(cp_runs.len(), 2);
+        assert_eq!((cp_runs[0].0, cp_runs[0].1), (0, 3));
+        assert!(cp_runs[0].2.bold);
+        assert_eq!((cp_runs[1].0, cp_runs[1].1), (5, 8));
+    }
+
+    /// Regression: `resolve_chp_segments` must stay fast (binary search +
+    /// bounded scan) as the document-wide run count grows, not degrade
+    /// into a linear-per-call scan. A real 780-file corpus sweep hung for
+    /// minutes before this fix, because `build_paragraphs` calls this once
+    /// per paragraph and the pre-fix version re-scanned (and FC→CP
+    /// re-converted) every run in the whole document on every call —
+    /// `O(runs × pieces × paragraphs)`. 5,000 runs × 2,000 simulated
+    /// paragraph queries finishing well under a second is a low-flake way
+    /// to catch a regression back to that shape without hard-coding a
+    /// brittle exact time bound.
+    #[test]
+    fn test_resolve_chp_segments_stays_fast_with_many_runs_and_many_queries() {
+        let pieces = [unicode_piece(0, 20_000)];
+        let runs: Vec<FkpRun> = (0..5_000u32)
+            .map(|i| FkpRun {
+                fc_start: i * 4,
+                fc_end: i * 4 + 4,
+                grpprl: if i % 2 == 0 { bold_grpprl() } else { Vec::new() },
+            })
+            .collect();
+        let cp_runs = resolve_chp_cp_runs(&runs, &pieces);
+
+        let start = std::time::Instant::now();
+        for p in 0..2_000u32 {
+            let seg = resolve_chp_segments(&cp_runs, p * 10, p * 10 + 8);
+            assert!(!seg.is_empty());
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs() < 5,
+            "5,000 runs × 2,000 queries took {elapsed:?} — likely back to O(runs) per query"
+        );
     }
 
     #[test]
