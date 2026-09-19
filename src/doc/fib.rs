@@ -70,6 +70,19 @@ pub struct Fib {
     pub fc_plcf_hdd: u32,
     /// Byte length of the PlcfHdd in the Table stream (0x00F6).
     pub lcb_plcf_hdd: u32,
+    /// Offset of the PlcfandRef (comment reference-point PLC, main
+    /// document CPs + `ATRDPre10` author/bookmark data) in the Table
+    /// stream (0x00BA). Zero when the document has no comments. Issue
+    /// #345.
+    pub fc_plcf_and_ref: u32,
+    /// Byte length of the PlcfandRef in the Table stream (0x00BE).
+    pub lcb_plcf_and_ref: u32,
+    /// Offset of the PlcfandTxt (comment-body boundary PLC, CPs within
+    /// the Comments substory's own character space) in the Table stream
+    /// (0x00C2). Zero when the document has no comments. Issue #345.
+    pub fc_plcf_and_txt: u32,
+    /// Byte length of the PlcfandTxt in the Table stream (0x00C6).
+    pub lcb_plcf_and_txt: u32,
 }
 
 impl Fib {
@@ -197,6 +210,26 @@ impl Fib {
             (0, 0)
         };
 
+        // fcPlcfandRef/lcbPlcfandRef (0x00BA/0x00BE) and fcPlcfandTxt/
+        // lcbPlcfandTxt (0x00C2/0x00C6) — fields 4 and 5 (0-based pairs)
+        // in FibRgFcLcb97's fixed order: fcStshfOrig(0), fcStshf(1),
+        // fcPlcffndRef(2), fcPlcffndTxt(3), fcPlcfandRef(4),
+        // fcPlcfandTxt(5) — confirmed against the live spec page listing
+        // that exact sequence. 0x9A + 4*8 = 0xBA, 0x9A + 5*8 = 0xC2,
+        // consistent with the pair-index formula already cross-checked
+        // above for fcPlcfHdd/fcPlcfBtePapx/fcClx/fcGrpXstAtnOwners.
+        // Issue #345.
+        let (fc_plcf_and_ref, lcb_plcf_and_ref) = if data.len() > 0x00C2 {
+            (read_u32(data, 0x00BA), read_u32(data, 0x00BE))
+        } else {
+            (0, 0)
+        };
+        let (fc_plcf_and_txt, lcb_plcf_and_txt) = if data.len() > 0x00CA {
+            (read_u32(data, 0x00C2), read_u32(data, 0x00C6))
+        } else {
+            (0, 0)
+        };
+
         Ok(Self {
             version,
             lid,
@@ -220,6 +253,10 @@ impl Fib {
             lcb_grp_xst_atn_owners,
             fc_plcf_hdd,
             lcb_plcf_hdd,
+            fc_plcf_and_ref,
+            lcb_plcf_and_ref,
+            fc_plcf_and_txt,
+            lcb_plcf_and_txt,
         })
     }
 }
@@ -364,5 +401,22 @@ mod tests {
         let fib = Fib::parse(&data).unwrap();
         assert_eq!(fib.fc_plcf_hdd, 800);
         assert_eq!(fib.lcb_plcf_hdd, 56);
+    }
+
+    /// issue #345 — `fcPlcfandRef`/`lcbPlcfandRef` and `fcPlcfandTxt`/
+    /// `lcbPlcfandTxt` were never parsed at all.
+    #[test]
+    fn plcf_and_ref_and_txt_read_from_their_real_offsets() {
+        let mut data = build_minimal_fib();
+        data[0x00BA..0x00BE].copy_from_slice(&900u32.to_le_bytes());
+        data[0x00BE..0x00C2].copy_from_slice(&64u32.to_le_bytes());
+        data[0x00C2..0x00C6].copy_from_slice(&1000u32.to_le_bytes());
+        data[0x00C6..0x00CA].copy_from_slice(&12u32.to_le_bytes());
+
+        let fib = Fib::parse(&data).unwrap();
+        assert_eq!(fib.fc_plcf_and_ref, 900);
+        assert_eq!(fib.lcb_plcf_and_ref, 64);
+        assert_eq!(fib.fc_plcf_and_txt, 1000);
+        assert_eq!(fib.lcb_plcf_and_txt, 12);
     }
 }

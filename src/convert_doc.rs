@@ -82,15 +82,47 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             {
                 continue;
             }
+            // `PlcfandTxt`/`PlcfandRef` successfully split this document's
+            // Comments substory into individual, correctly-attributed
+            // comments — emit one `Element::Endnote` per comment instead
+            // of falling through to the generic merged-substory path
+            // below (issue #345).
+            if sub.kind == crate::doc::SubDocumentKind::Comments && !doc.comments().is_empty() {
+                for comment in doc.comments() {
+                    let content: Vec<Element> = comment
+                        .text
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .map(|l| {
+                            Element::Paragraph(Paragraph {
+                                content: vec![InlineContent::Text(TextSpan::plain(l))],
+                                ..Default::default()
+                            })
+                        })
+                        .collect();
+                    if content.is_empty() {
+                        continue;
+                    }
+                    section.elements.push(Element::Endnote(Note {
+                        id: next_id,
+                        marker: Some(subdocument_label(sub.kind).to_string()),
+                        content,
+                        author: comment.author.clone(),
+                    }));
+                    next_id += 1;
+                }
+                continue;
+            }
             // Footnote/endnote bodies are self-delimited: each one starts
             // with the literal auto-number reference-mark character
             // (`\u{2}`) in the substory's own text — confirmed on the full
             // local corpus (footnotes 49/51 files, endnotes 5/5 files that
             // had one). Comments carry no such marker in their substory
-            // (0/12 files) — the reference point lives only in the main
-            // text via `PlcfAtn`, not duplicated here — so they stay
-            // merged into one Note per document until that PLC is parsed
-            // (issue #286 tracks that remaining gap).
+            // (0/12 files); they're split above via `PlcfandTxt` instead
+            // when that PLC parses cleanly (issue #345). This is the
+            // fallback path for a Comments substory whose `doc.comments()`
+            // came back empty (PLC absent/malformed/mismatched) — it stays
+            // merged into one Note, same as before #345.
             let splittable = matches!(
                 sub.kind,
                 crate::doc::SubDocumentKind::Footnotes | crate::doc::SubDocumentKind::Endnotes

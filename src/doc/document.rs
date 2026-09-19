@@ -60,6 +60,13 @@ pub struct DocDocument {
     /// footer, first-page from default, or one section from another
     /// (issue #285).
     header_footer: HeaderFooterStories,
+    /// Individual comments, split from the merged Comments substory using
+    /// `PlcfandTxt`'s CP boundaries and attributed via `PlcfandRef`'s
+    /// `ATRDPre10.ibst` index into `comment_authors`. Empty when either
+    /// PLC is absent, malformed, or the two disagree on comment count —
+    /// callers fall back to the merged-substory behavior in that case
+    /// (issue #345).
+    comments: Vec<ParsedComment>,
 }
 
 /// One of the subdocuments stored after the main text in a `.doc`.
@@ -69,6 +76,17 @@ pub struct SubDocument {
     pub kind: SubDocumentKind,
     /// Sanitised text of the subdocument.
     pub text: String,
+}
+
+/// One comment, split out of the merged Comments substory by `PlcfandTxt`
+/// and attributed by the matching `PlcfandRef` entry (issue #345).
+#[derive(Debug, Clone)]
+pub struct ParsedComment {
+    /// Sanitised body text of this one comment.
+    pub text: String,
+    /// The comment's author, resolved from `GrpXstAtnOwners` via the
+    /// matching `ATRDPre10.ibst`. `None` when `ibst` is out of range.
+    pub author: Option<String>,
 }
 
 /// The first document section's header/footer content, split out of the
@@ -174,10 +192,20 @@ impl DocDocument {
         let raw_text = extract_text(&word_doc, &pieces, fib.text_len, fib.lid);
         let text = sanitize_text(&raw_text);
 
+        // Needed inside the loop below to resolve each comment's author by
+        // `ibst` index — parsed here (it only needs `table_stream`/`fib`,
+        // not anything the loop computes) rather than after it. Issue #298.
+        let comment_authors = parse_grp_xst_atn_owners(
+            &table_stream,
+            fib.fc_grp_xst_atn_owners,
+            fib.lcb_grp_xst_atn_owners,
+        );
+
         // The subdocuments follow the main text contiguously in the piece
         // table's character space, each delimited by its own `ccp*` length.
         let mut subdocuments = Vec::new();
         let mut header_footer = HeaderFooterStories::default();
+        let mut comments = Vec::new();
         let mut cp = fib.text_len;
         for (kind, len) in [
             (SubDocumentKind::Footnotes, fib.footnote_len),
@@ -199,6 +227,17 @@ impl DocDocument {
                     &raw,
                     fib.fc_plcf_hdd,
                     fib.lcb_plcf_hdd,
+                );
+            }
+            if kind == SubDocumentKind::Comments {
+                comments = parse_comments(
+                    &table_stream,
+                    &raw,
+                    fib.fc_plcf_and_txt,
+                    fib.lcb_plcf_and_txt,
+                    fib.fc_plcf_and_ref,
+                    fib.lcb_plcf_and_ref,
+                    &comment_authors,
                 );
             }
             let sub = sanitize_text(&raw);
@@ -242,12 +281,6 @@ impl DocDocument {
             .ok()
             .and_then(|data| parse_summary_information(&data));
 
-        let comment_authors = parse_grp_xst_atn_owners(
-            &table_stream,
-            fib.fc_grp_xst_atn_owners,
-            fib.lcb_grp_xst_atn_owners,
-        );
-
         Ok(Self {
             text,
             images,
@@ -259,6 +292,7 @@ impl DocDocument {
             list_formatting,
             comment_authors,
             header_footer,
+            comments,
         })
     }
 
@@ -294,6 +328,15 @@ impl DocDocument {
     /// stories (issue #285).
     pub(crate) fn header_footer(&self) -> &HeaderFooterStories {
         &self.header_footer
+    }
+
+    /// Individual comments split from the merged Comments substory, each
+    /// with its own resolved author. Empty when `PlcfandTxt`/`PlcfandRef`
+    /// couldn't be parsed or disagreed on comment count — callers must
+    /// fall back to the merged-substory behavior in that case (issue
+    /// #345).
+    pub(crate) fn comments(&self) -> &[ParsedComment] {
+        &self.comments
     }
 
     /// `true` when the file carries a `_VBA_PROJECT` storage — a cheap
@@ -517,6 +560,132 @@ fn parse_plcf_hdd_stories(
     result
 }
 
+/// Split the merged Comments substory into individual comments using
+/// `PlcfandTxt`'s CP boundaries, and attribute each to an author using
+/// the matching `PlcfandRef`/`ATRDPre10.ibst` entry. Returns an empty
+/// `Vec` (meaning "fall back to the merged substory") whenever either
+/// PLC is absent/malformed, or the two disagree on comment count — that
+/// mismatch means the file doesn't match the fixed-size assumptions
+/// here closely enough to trust a per-comment split (issue #345).
+fn parse_comments(
+    table_stream: &[u8],
+    raw_comment_text: &str,
+    fc_txt: u32,
+    lcb_txt: u32,
+    fc_ref: u32,
+    lcb_ref: u32,
+    authors: &[String],
+) -> Vec<ParsedComment> {
+    let Some(bodies) = parse_plcf_and_txt_ranges(table_stream, raw_comment_text, fc_txt, lcb_txt)
+    else {
+        return Vec::new();
+    };
+    let ibsts = parse_plcf_and_ref_ibsts(table_stream, fc_ref, lcb_ref);
+    if bodies.len() != ibsts.len() {
+        return Vec::new();
+    }
+    bodies
+        .into_iter()
+        .zip(ibsts)
+        .filter_map(|(text, ibst)| {
+            if text.is_empty() {
+                return None;
+            }
+            Some(ParsedComment { text, author: authors.get(ibst).cloned() })
+        })
+        .collect()
+}
+
+/// `PlcfandTxt` — a PLC of pure CPs (no data elements) whose `aCP` has
+/// `n + 2` entries for `n` comment-text ranges within the Comments
+/// substory's own character space: `aCP[0..=n]` (`n + 1` values) are the
+/// usual PLC boundary CPs, and the final entry is undefined/ignored, per
+/// [MS-DOC] "PlcfandTxt". Each range's leading `0x0005` reference-mark
+/// character is stripped before returning.
+fn parse_plcf_and_txt_ranges(
+    table_stream: &[u8],
+    raw_comment_text: &str,
+    fc: u32,
+    lcb: u32,
+) -> Option<Vec<String>> {
+    if lcb == 0 {
+        return None;
+    }
+    let start = fc as usize;
+    let end = start.saturating_add(lcb as usize).min(table_stream.len());
+    if start >= end || (end - start) % 4 != 0 {
+        return None;
+    }
+    let total_cps = (end - start) / 4;
+    if total_cps < 2 {
+        return None;
+    }
+    let n = total_cps - 2;
+    if n == 0 {
+        return None;
+    }
+
+    let cps: Vec<usize> = (0..=n)
+        .map(|i| {
+            u32::from_le_bytes([
+                table_stream[start + i * 4],
+                table_stream[start + i * 4 + 1],
+                table_stream[start + i * 4 + 2],
+                table_stream[start + i * 4 + 3],
+            ]) as usize
+        })
+        .collect();
+
+    Some(
+        (0..n)
+            .map(|i| {
+                let (lo, hi) = (cps[i], cps[i + 1]);
+                if hi <= lo {
+                    return String::new();
+                }
+                let text: String = raw_comment_text.chars().skip(lo).take(hi - lo).collect();
+                let text = text.strip_prefix('\u{5}').unwrap_or(&text);
+                sanitize_text(text).trim().to_string()
+            })
+            .collect(),
+    )
+}
+
+/// `PlcfandRef`'s data elements are `ATRDPre10` structures (30 bytes
+/// each: a 20-byte `xstUsrInitl`, then a 2-byte `ibst` index into
+/// `GrpXstAtnOwners`, then 8 bytes this crate doesn't need). Returns one
+/// `ibst` per comment, in the same document order as `PlcfandTxt`'s
+/// ranges (both PLCs are populated in comment-creation order, per
+/// [MS-DOC] "PlcfandTxt"'s own cross-reference to "PlcfandRef").
+fn parse_plcf_and_ref_ibsts(table_stream: &[u8], fc: u32, lcb: u32) -> Vec<usize> {
+    const ATRD_PRE10_SIZE: usize = 30;
+    if lcb == 0 {
+        return Vec::new();
+    }
+    let start = fc as usize;
+    let end = start.saturating_add(lcb as usize);
+    if end > table_stream.len() || start >= end {
+        return Vec::new();
+    }
+    let cb = end - start;
+    if cb < 4 {
+        return Vec::new();
+    }
+    // PLC element count: iMac = (cb - 4) / (4 + cbStruct).
+    let n = (cb - 4) / (4 + ATRD_PRE10_SIZE);
+    let data_start = start + 4 * (n + 1);
+    (0..n)
+        .filter_map(|i| {
+            let atrd_start = data_start + i * ATRD_PRE10_SIZE;
+            let ibst_offset = atrd_start + 20;
+            if ibst_offset + 2 > table_stream.len() {
+                return None;
+            }
+            Some(u16::from_le_bytes([table_stream[ibst_offset], table_stream[ibst_offset + 1]]) as usize)
+        })
+        .collect()
+}
+
 impl crate::core::OfficeDocument for DocDocument {
     fn plain_text(&self) -> String {
         self.plain_text()
@@ -540,6 +709,7 @@ mod tests {
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
+            comments: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: "First paragraph\nSecond paragraph\n\nAfter gap".into(),
@@ -560,6 +730,7 @@ mod tests {
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
+            comments: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: "Hello World".into(),
@@ -586,6 +757,7 @@ mod tests {
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
+            comments: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: "Main body text".into(),
@@ -612,6 +784,7 @@ mod tests {
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
+            comments: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: "Body".into(),
@@ -633,6 +806,7 @@ mod tests {
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
+            comments: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: "only the recovered fragment".into(),
@@ -663,6 +837,7 @@ mod tests {
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
+            comments: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: text.to_string(),
@@ -681,6 +856,7 @@ mod tests {
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
+            comments: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: String::new(),
@@ -972,11 +1148,10 @@ mod tests {
     }
 
     /// Comments never carry the `\u{2}` marker in their own substory (see
-    /// above), so they must keep the old merged-into-one-Note behavior —
-    /// splitting on a marker that isn't there would either no-op safely
-    /// or (if some other document ever used `\u{2}` differently inside
-    /// comment text) corrupt real content, so the split path is gated on
-    /// `SubDocumentKind` as well as the marker's presence.
+    /// above) — real per-comment splitting comes from `PlcfandTxt`
+    /// instead (issue #345, tested separately). When that PLC is absent
+    /// (as here, with `doc.comments()` at its default empty `Vec`), the
+    /// old merged-into-one-Note behavior is the only safe fallback.
     #[test]
     fn comments_stay_merged_into_a_single_note() {
         use crate::ir::{Element, Note};
@@ -1085,5 +1260,126 @@ mod tests {
             "must fall back to the old merged TextBox when PlcfHdd yielded nothing: {:?}",
             section.elements
         );
+    }
+
+    /// issue #345 — byte-level `PlcfandTxt`/`PlcfandRef` parsing for a
+    /// 2-comment document. `PlcfandTxt.aCP` has `n + 2 = 4` entries for
+    /// `n = 2` comment ranges within the Comments substory's own
+    /// character space; `PlcfandRef`'s data elements are 30-byte
+    /// `ATRDPre10`s whose `ibst` (offset 20) indexes `comment_authors`.
+    #[test]
+    fn parse_comments_splits_and_attributes_two_comments() {
+        let raw = "\u{5}First comment\r\u{5}Second comment\r";
+        let first_len = "\u{5}First comment\r".chars().count();
+        let total_len = raw.chars().count();
+        assert_eq!(first_len, 15);
+        assert_eq!(total_len, 31);
+
+        // PlcfandTxt: pure-CP PLC, comments-substory-local CPs.
+        let and_txt_cps: [u32; 4] = [0, first_len as u32, total_len as u32, 0];
+        let mut and_txt = Vec::new();
+        for cp in and_txt_cps {
+            and_txt.extend_from_slice(&cp.to_le_bytes());
+        }
+
+        // PlcfandRef: 3 main-doc CPs (n=2 comments) + 2 ATRDPre10s (30
+        // bytes each), ibst at offset 20 within each.
+        let and_ref_cps: [u32; 3] = [0, 1, 2];
+        let mut and_ref = Vec::new();
+        for cp in and_ref_cps {
+            and_ref.extend_from_slice(&cp.to_le_bytes());
+        }
+        let mut atrd0 = vec![0u8; 30];
+        atrd0[20..22].copy_from_slice(&1u16.to_le_bytes()); // ibst=1
+        let mut atrd1 = vec![0u8; 30];
+        atrd1[20..22].copy_from_slice(&0u16.to_le_bytes()); // ibst=0
+        and_ref.extend_from_slice(&atrd0);
+        and_ref.extend_from_slice(&atrd1);
+
+        // Lay both PLCs out in one fake table stream, back to back.
+        let and_txt_fc = 0u32;
+        let and_ref_fc = and_txt.len() as u32;
+        let mut table_stream = and_txt.clone();
+        table_stream.extend_from_slice(&and_ref);
+
+        let authors = vec!["Miklos Vajna".to_string(), "vmiklos".to_string()];
+        let comments = parse_comments(
+            &table_stream,
+            raw,
+            and_txt_fc,
+            and_txt.len() as u32,
+            and_ref_fc,
+            and_ref.len() as u32,
+            &authors,
+        );
+
+        assert_eq!(comments.len(), 2, "expected 2 split comments: {comments:?}");
+        assert_eq!(comments[0].text, "First comment");
+        assert_eq!(comments[0].author.as_deref(), Some("vmiklos"), "ibst=1 -> authors[1]");
+        assert_eq!(comments[1].text, "Second comment");
+        assert_eq!(comments[1].author.as_deref(), Some("Miklos Vajna"), "ibst=0 -> authors[0]");
+    }
+
+    #[test]
+    fn parse_comments_falls_back_to_empty_on_a_count_mismatch() {
+        // A PlcfandTxt describing 2 ranges but a PlcfandRef describing
+        // only 1 ATRDPre10 must not be trusted at all.
+        let and_txt_cps: [u32; 4] = [0, 5, 10, 0];
+        let mut and_txt = Vec::new();
+        for cp in and_txt_cps {
+            and_txt.extend_from_slice(&cp.to_le_bytes());
+        }
+        let and_ref_cps: [u32; 2] = [0, 1];
+        let mut and_ref = Vec::new();
+        for cp in and_ref_cps {
+            and_ref.extend_from_slice(&cp.to_le_bytes());
+        }
+        and_ref.extend_from_slice(&[0u8; 30]);
+
+        let mut table_stream = and_txt.clone();
+        table_stream.extend_from_slice(&and_ref);
+        let comments = parse_comments(
+            &table_stream,
+            "helloworld",
+            0,
+            and_txt.len() as u32,
+            and_txt.len() as u32,
+            and_ref.len() as u32,
+            &[],
+        );
+        assert!(comments.is_empty(), "count mismatch must fall back to empty: {comments:?}");
+    }
+
+    /// issue #345 — `doc_to_ir` must emit one `Element::Endnote` per
+    /// `doc.comments()` entry (each with its own resolved author) instead
+    /// of falling through to the generic merged-substory path, whenever
+    /// `PlcfandTxt`/`PlcfandRef` successfully split the document.
+    #[test]
+    fn split_comments_reach_the_ir_as_separate_notes() {
+        use crate::ir::Element;
+        let mut doc = make_doc("Body text.");
+        doc.subdocuments = vec![SubDocument {
+            kind: SubDocumentKind::Comments,
+            text: "Inner\nOuter\nAs in non-range.".into(),
+        }];
+        doc.comments = vec![
+            ParsedComment { text: "Inner".into(), author: Some("vmiklos".into()) },
+            ParsedComment { text: "Outer".into(), author: Some("vmiklos".into()) },
+            ParsedComment { text: "As in non-range.".into(), author: Some("Miklos Vajna".into()) },
+        ];
+
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        let notes: Vec<&crate::ir::Note> = ir.sections[0]
+            .elements
+            .iter()
+            .filter_map(|e| if let Element::Endnote(n) = e { Some(n) } else { None })
+            .collect();
+        assert_eq!(notes.len(), 3, "expected one Endnote per split comment: {notes:?}");
+        assert_eq!(notes[0].author.as_deref(), Some("vmiklos"));
+        assert_eq!(notes[1].author.as_deref(), Some("vmiklos"));
+        assert_eq!(notes[2].author.as_deref(), Some("Miklos Vajna"));
+        assert_eq!(notes[0].id, 0);
+        assert_eq!(notes[1].id, 1);
+        assert_eq!(notes[2].id, 2);
     }
 }
