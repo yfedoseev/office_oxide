@@ -6,6 +6,7 @@ use crate::cfb::CfbReader;
 
 use super::cell::{Cell, CellValue, parse_cell_record};
 use super::condfmt::{parse_cf, parse_condfmt};
+use super::comment::{XlsComment, obj_id, parse_note, txo_text};
 use super::data_validation::parse_dv;
 use super::hyperlink::parse_hlink;
 use super::error::{Result, XlsError};
@@ -109,6 +110,9 @@ pub struct Sheet {
     /// Cell hyperlinks from `HLINK` records. No record handling existed
     /// at all before (issue #306).
     pub hyperlinks: Vec<super::hyperlink::XlsHyperlink>,
+    /// Cell comments from `NOTE`/`TXO`/`OBJ` records. No record handling
+    /// existed at all before (issue #307).
+    pub comments: Vec<XlsComment>,
 }
 
 /// Sheet metadata from BOUNDSHEET records.
@@ -216,6 +220,15 @@ impl XlsDocument {
         let mut pending_cf: Option<(String, u16)> = None;
         let mut data_validations: Vec<crate::ir::DataValidation> = Vec::new();
         let mut hyperlinks: Vec<super::hyperlink::XlsHyperlink> = Vec::new();
+        // Comments: an OBJ's object id -> its immediately-following TXO's
+        // text, plus the NOTE records naming which (row, col, author)
+        // each id belongs to. Resolved into `comments` at end-of-sheet
+        // rather than as each NOTE is seen, since a sheet's NOTE records
+        // commonly all sit together near the end of its record stream,
+        // after every OBJ/TXO pair (issue #307).
+        let mut last_obj_id: Option<u16> = None;
+        let mut obj_text: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
+        let mut pending_notes: Vec<(u16, u16, u16, Option<String>)> = Vec::new();
         let mut raw_names: Vec<RawName> = Vec::new();
         let mut supbook_internal: Vec<bool> = Vec::new();
         let mut externsheet: Vec<(u16, i16, i16)> = Vec::new();
@@ -346,6 +359,9 @@ impl XlsDocument {
                         pending_cf = None;
                         data_validations.clear();
                         hyperlinks.clear();
+                        last_obj_id = None;
+                        obj_text.clear();
+                        pending_notes.clear();
                         pending_formula_string = None;
                         nested_bof_depth = 0;
                     }
@@ -395,6 +411,18 @@ impl XlsDocument {
                             conditional_formats: std::mem::take(&mut conditional_formats),
                             data_validations: std::mem::take(&mut data_validations),
                             hyperlinks: std::mem::take(&mut hyperlinks),
+                            comments: pending_notes
+                                .drain(..)
+                                .filter_map(|(row, col, shapeid, author)| {
+                                    obj_text.get(&shapeid).map(|text| XlsComment {
+                                        row,
+                                        col,
+                                        author,
+                                        text: text.clone(),
+                                    })
+                                })
+                                .filter(|c| !c.text.is_empty())
+                                .collect(),
                             ..Default::default()
                         });
                         sheet_idx += 1;
@@ -460,6 +488,21 @@ impl XlsDocument {
                     RT_HLINK => {
                         if let Some(hl) = parse_hlink(&rec.data) {
                             hyperlinks.push(hl);
+                        }
+                    },
+                    RT_OBJ => {
+                        last_obj_id = obj_id(&rec.data);
+                    },
+                    RT_TXO => {
+                        if let Some(id) = last_obj_id.take() {
+                            if let Some(text) = txo_text(&rec.data) {
+                                obj_text.insert(id, text);
+                            }
+                        }
+                    },
+                    RT_NOTE => {
+                        if let Some(note) = parse_note(&rec.data) {
+                            pending_notes.push(note);
                         }
                     },
                     RT_FORMULA => {

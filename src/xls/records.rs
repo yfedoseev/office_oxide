@@ -50,6 +50,17 @@ pub const RT_DV: u16 = 0x01BE;
 /// type 440 = 0x1B8). Issue #306.
 pub const RT_HLINK: u16 = 0x01B8;
 
+/// Declares a drawing shape/object and its object id ([MS-XLS] §2.4.181,
+/// record type 93 = 0x5D). Only used here to correlate a `NOTE`'s
+/// `shapeid` to its comment text (issue #307).
+pub const RT_OBJ: u16 = 0x005D;
+/// A cell comment's position and author ([MS-XLS] §2.4.178, record type
+/// 28 = 0x1C). Issue #307.
+pub const RT_NOTE: u16 = 0x001C;
+/// The text of the drawing shape declared by the immediately preceding
+/// `OBJ` record ([MS-XLS] §2.4.326, record type 438 = 0x1B6). Issue #307.
+pub const RT_TXO: u16 = 0x01B6;
+
 /// A raw BIFF record: type + data (may span CONTINUE records).
 #[derive(Debug, Clone)]
 pub struct BiffRecord {

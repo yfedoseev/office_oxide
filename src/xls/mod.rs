@@ -10,7 +10,8 @@
 //! ```
 
 mod cell;
-mod condfmt;
+pub mod comment;
+pub(crate) mod condfmt;
 mod data_validation;
 mod error;
 pub mod hyperlink;
@@ -21,6 +22,7 @@ mod workbook;
 
 pub use crate::core::OfficeDocument;
 pub use cell::{Cell, CellValue};
+pub use comment::XlsComment;
 pub use error::{Result, XlsError};
 pub use hyperlink::XlsHyperlink;
 pub use images::{ImageFormat, XlsImage};

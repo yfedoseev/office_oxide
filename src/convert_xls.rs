@@ -215,6 +215,26 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
             }));
         }
 
+        // Cell comments are document content, and were never surfaced at
+        // all before (issue #307) — appended as endnotes so every
+        // renderer sees them, the same convention convert_xlsx.rs uses
+        // for its own comments.
+        for (i, c) in sheet.comments.iter().enumerate() {
+            let cell_ref = crate::xls::condfmt::col_name(c.col) + &(c.row + 1).to_string();
+            let marker = match c.author.as_deref() {
+                Some(a) => format!("{cell_ref} ({a})"),
+                None => cell_ref,
+            };
+            elements.push(Element::Endnote(Note {
+                id: i as u32,
+                marker: Some(marker),
+                content: vec![Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(c.text.clone()))],
+                    ..Default::default()
+                })],
+            }));
+        }
+
         sections.push(Section {
             title: Some(sheet.name.clone()),
             elements,
@@ -542,5 +562,41 @@ mod tests {
             };
             assert_eq!(span.hyperlink.as_deref(), Some("http://example.com"));
         }
+    }
+
+    /// issue #307 — `Sheet::comments` (resolved from NOTE/TXO/OBJ
+    /// records) must reach the sheet's elements as endnotes, the same
+    /// convention convert_xlsx.rs uses for its own cell comments.
+    #[test]
+    fn comments_reach_the_sheet_as_endnotes() {
+        let sheet = Sheet {
+            name: "S".into(),
+            display: Vec::new(),
+            rows: vec![vec![CellValue::String("data".to_string())]],
+            comments: vec![crate::xls::XlsComment {
+                row: 0,
+                col: 0,
+                author: Some("Gilsinei Hansen".to_string()),
+                text: "a real cell comment".to_string(),
+            }],
+            ..Default::default()
+        };
+        let ir = xls_to_ir(&XlsDocument::from_sheets(vec![sheet]));
+        let note = ir.sections[0]
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                Element::Endnote(n) => Some(n),
+                _ => None,
+            })
+            .expect("a comment endnote");
+        assert_eq!(note.marker.as_deref(), Some("A1 (Gilsinei Hansen)"));
+        let Element::Paragraph(p) = &note.content[0] else {
+            panic!("expected a paragraph");
+        };
+        let InlineContent::Text(span) = &p.content[0] else {
+            panic!("expected a text span");
+        };
+        assert_eq!(span.text, "a real cell comment");
     }
 }
