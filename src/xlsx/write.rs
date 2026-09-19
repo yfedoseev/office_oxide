@@ -229,12 +229,43 @@ pub enum CellData {
     Empty,
     /// A string value (written as an inline string).
     String(String),
+    /// A string made of multiple differently-formatted runs (written as
+    /// an inline rich string, one `<r>` per run) — closes the write
+    /// side of the read-only gap issue #303 left: a cell with several
+    /// runs of distinct bold/italic/color/font formatting used to have
+    /// nowhere to go but a single flattened `CellData::String`, silently
+    /// dropping every run's own formatting (issue #346).
+    RichString(Vec<RichRun>),
     /// A numeric value.
     Number(f64),
     /// A boolean value.
     Boolean(bool),
     /// A formula, e.g. `"SUM(A1:A10)"`. Do not include the leading `=`.
     Formula(String),
+}
+
+/// One run of a multi-run cell's inline rich text (issue #346) — the
+/// write-side mirror of `shared_strings::RichTextRun` (read). Fields
+/// intentionally simpler than the read side's (a plain hex color
+/// string, not a theme-resolving `ColorRef`) since a caller building a
+/// cell to write always already has concrete values, never a theme
+/// index to resolve.
+#[derive(Debug, Clone, Default)]
+pub struct RichRun {
+    /// The run's text.
+    pub text: String,
+    /// Bold toggle.
+    pub bold: bool,
+    /// Italic toggle.
+    pub italic: bool,
+    /// Underline toggle.
+    pub underline: bool,
+    /// Font color (RGB hex without `#`, e.g. `"FF0000"`).
+    pub font_color: Option<String>,
+    /// Font size in points.
+    pub font_size_pt: Option<f32>,
+    /// Font family.
+    pub font_name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1403,6 +1434,66 @@ impl XlsxWriter {
                     s,
                 ))))?;
                 w.write_event(Event::End(BytesEnd::new("t")))?;
+                w.write_event(Event::End(BytesEnd::new("is")))?;
+                w.write_event(Event::End(BytesEnd::new("c")))?;
+            },
+            CellData::RichString(runs) => {
+                let mut c = BytesStart::new("c");
+                c.push_attribute(("r", cell_ref.as_str()));
+                c.push_attribute(("t", "inlineStr"));
+                if let Some(ref s_val) = s_attr {
+                    c.push_attribute(("s", s_val.as_str()));
+                }
+                w.write_event(Event::Start(c))?;
+                w.write_event(Event::Start(BytesStart::new("is")))?;
+                for run in runs {
+                    if run.text.is_empty() {
+                        continue;
+                    }
+                    w.write_event(Event::Start(BytesStart::new("r")))?;
+                    let argb = run.font_color.as_deref().and_then(argb_from_rgb);
+                    let has_rpr = run.bold
+                        || run.italic
+                        || run.underline
+                        || argb.is_some()
+                        || run.font_size_pt.is_some()
+                        || run.font_name.is_some();
+                    if has_rpr {
+                        w.write_event(Event::Start(BytesStart::new("rPr")))?;
+                        if run.bold {
+                            w.write_event(Event::Empty(BytesStart::new("b")))?;
+                        }
+                        if run.italic {
+                            w.write_event(Event::Empty(BytesStart::new("i")))?;
+                        }
+                        if run.underline {
+                            w.write_event(Event::Empty(BytesStart::new("u")))?;
+                        }
+                        if let Some(ref name) = run.font_name {
+                            let mut rfont = BytesStart::new("rFont");
+                            rfont.push_attribute(("val", name.as_str()));
+                            w.write_event(Event::Empty(rfont))?;
+                        }
+                        if let Some(size) = run.font_size_pt {
+                            let mut sz = BytesStart::new("sz");
+                            let size_str = size.to_string();
+                            sz.push_attribute(("val", size_str.as_str()));
+                            w.write_event(Event::Empty(sz))?;
+                        }
+                        if let Some(ref argb) = argb {
+                            let mut clr = BytesStart::new("color");
+                            clr.push_attribute(("rgb", argb.as_str()));
+                            w.write_event(Event::Empty(clr))?;
+                        }
+                        w.write_event(Event::End(BytesEnd::new("rPr")))?;
+                    }
+                    w.write_event(Event::Start(BytesStart::new("t")))?;
+                    w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(
+                        &run.text,
+                    ))))?;
+                    w.write_event(Event::End(BytesEnd::new("t")))?;
+                    w.write_event(Event::End(BytesEnd::new("r")))?;
+                }
                 w.write_event(Event::End(BytesEnd::new("is")))?;
                 w.write_event(Event::End(BytesEnd::new("c")))?;
             },

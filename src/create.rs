@@ -1462,26 +1462,83 @@ fn ir_cell_to_cell_data(cell: &TableCell, text: &str) -> crate::xlsx::write::Cel
         // Text and Error cells keep their rendered form verbatim; sniffing
         // would re-introduce the "007" and "inf" corruption.
         Some(CellDataType::Text) | Some(CellDataType::Error) => {
-            return if text.is_empty() {
-                CellData::Empty
-            } else {
-                CellData::String(text.to_string())
-            };
+            return text_cell_data(cell, text);
         },
         None => {},
     }
-    text_to_cell_data(text)
+    if !text.is_empty() {
+        if let Ok(n) = text.parse::<f64>() {
+            return CellData::Number(n);
+        }
+    }
+    text_cell_data(cell, text)
 }
 
-fn text_to_cell_data(text: &str) -> crate::xlsx::write::CellData {
+/// Build a plain or rich-run `CellData` for text-bearing cell content —
+/// rich only when at least one run carries real character formatting
+/// (bold/italic/underline/color/font), keeping the common (plain) case's
+/// written XML exactly as before. Closes the write side of the
+/// read-only gap issue #303 left on the read path: a cell's own
+/// bold/italic/color/font (single- or multi-run) used to be silently
+/// discarded on write regardless of how it reached the IR (issue #346).
+fn text_cell_data(cell: &TableCell, text: &str) -> crate::xlsx::write::CellData {
     use crate::xlsx::write::CellData;
     if text.is_empty() {
-        CellData::Empty
-    } else if let Ok(n) = text.parse::<f64>() {
-        CellData::Number(n)
+        return CellData::Empty;
+    }
+    let runs = ir_cell_rich_runs(cell);
+    let has_formatting = runs.iter().any(|r| {
+        r.bold
+            || r.italic
+            || r.underline
+            || r.font_color.is_some()
+            || r.font_size_pt.is_some()
+            || r.font_name.is_some()
+    });
+    if has_formatting && !runs.is_empty() {
+        CellData::RichString(runs)
     } else {
         CellData::String(text.to_string())
     }
+}
+
+/// A table cell's paragraphs/spans as `xlsx::write::RichRun`s — the
+/// per-run mirror of `cell_text`'s flattening, with the same
+/// paragraph-join-by-space behavior (issue #346).
+fn ir_cell_rich_runs(cell: &TableCell) -> Vec<crate::xlsx::write::RichRun> {
+    use crate::xlsx::write::RichRun;
+    let mut runs: Vec<RichRun> = Vec::new();
+    let mut first_paragraph = true;
+    for elem in &cell.content {
+        let Element::Paragraph(p) = elem else { continue };
+        if !first_paragraph {
+            runs.push(RichRun { text: " ".to_string(), ..Default::default() });
+        }
+        first_paragraph = false;
+        for inc in &p.content {
+            match inc {
+                InlineContent::Text(span) => {
+                    if span.text.is_empty() {
+                        continue;
+                    }
+                    runs.push(RichRun {
+                        text: span.text.clone(),
+                        bold: span.bold,
+                        italic: span.italic,
+                        underline: span.underline.is_some(),
+                        font_color: span.color.map(rgb_to_hex),
+                        font_size_pt: span.font_size_half_pt.map(|hp| hp as f32 / 2.0),
+                        font_name: span.font_name.clone(),
+                    });
+                },
+                InlineContent::LineBreak => {
+                    runs.push(RichRun { text: "\n".to_string(), ..Default::default() });
+                },
+                _ => {},
+            }
+        }
+    }
+    runs
 }
 
 /// Pluck the first `Element::Heading`'s plain text from a section's
@@ -1906,6 +1963,87 @@ mod xlsx_table_write_tests {
             matches!(e, Element::Endnote(n) if n.marker.as_deref() == Some("B1 (Jane Doe)"))
         });
         assert!(has_comment_endnote, "the comment must round-trip back onto cell B1: {:?}", ir2.sections[0].elements);
+    }
+
+    /// issue #346 — a table cell's own character formatting (bold/
+    /// italic/color) was silently discarded on write no matter how it
+    /// reached the IR: `ir_cell_to_cell_data` built a `CellData` from
+    /// the cell's flattened text and a style derived only from
+    /// `is_header`/`background_color`/`number_format`, never the
+    /// cell's own `TextSpan`s. Both a single formatted run and a
+    /// multi-run cell (the exact shape #303 taught the reader to
+    /// parse, with no write-side counterpart until now) must survive a
+    /// write->reread round trip with per-run fidelity.
+    #[test]
+    fn cell_character_formatting_round_trips_including_multi_run() {
+        let span = |text: &str, bold: bool, color: Option<[u8; 3]>| InlineContent::Text(TextSpan {
+            text: text.to_string(),
+            bold,
+            color,
+            ..Default::default()
+        });
+        let cell = |spans: Vec<InlineContent>| TableCell {
+            content: vec![Element::Paragraph(Paragraph { content: spans, ..Default::default() })],
+            col_span: 1,
+            row_span: 1,
+            ..Default::default()
+        };
+
+        let table = Table {
+            rows: vec![TableRow {
+                cells: vec![
+                    cell(vec![span("Bold Red", true, Some([255, 0, 0]))]),
+                    cell(vec![span("Plain", false, None)]),
+                    cell(vec![span("Bold ", true, None), span("Plain", false, None)]),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let ir = DocumentIR {
+            metadata: Metadata { format: DocumentFormat::Xlsx, ..Default::default() },
+            sections: vec![Section { elements: vec![Element::Table(table)], ..Default::default() }],
+            defined_names: Vec::new(),
+        };
+
+        let mut buf = Cursor::new(Vec::new());
+        create_from_ir_to_writer(&ir, DocumentFormat::Xlsx, &mut buf).unwrap();
+        buf.set_position(0);
+        let doc = crate::Document::from_reader(buf, DocumentFormat::Xlsx).unwrap();
+        let ir2 = doc.to_ir();
+
+        let Element::Table(t) = &ir2.sections[0].elements[0] else {
+            panic!("expected a table as the first element");
+        };
+        fn spans_of(cell: &TableCell) -> Vec<&TextSpan> {
+            cell.content
+                .iter()
+                .flat_map(|e| match e {
+                    Element::Paragraph(p) => p.content.iter().filter_map(|c| {
+                        if let InlineContent::Text(t) = c { Some(t) } else { None }
+                    }).collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                })
+                .collect()
+        }
+
+        let s0 = spans_of(&t.rows[0].cells[0]);
+        assert_eq!(s0.len(), 1);
+        assert_eq!(s0[0].text, "Bold Red");
+        assert!(s0[0].bold, "bold must survive a single-run cell round trip");
+        assert_eq!(s0[0].color, Some([255, 0, 0]), "color must survive a single-run cell round trip");
+
+        let s1 = spans_of(&t.rows[0].cells[1]);
+        assert_eq!(s1.len(), 1);
+        assert!(!s1[0].bold, "a plain cell must not gain formatting");
+
+        let s2 = spans_of(&t.rows[0].cells[2]);
+        assert_eq!(s2.len(), 2, "both runs of a multi-run cell must survive separately: {s2:?}");
+        assert_eq!(s2[0].text, "Bold ");
+        assert!(s2[0].bold, "the first run's bold must survive");
+        assert_eq!(s2[1].text, "Plain");
+        assert!(!s2[1].bold, "the second run must not inherit the first run's bold");
     }
 }
 

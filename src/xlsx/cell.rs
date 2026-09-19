@@ -99,6 +99,14 @@ pub struct Cell {
     pub style_index: Option<u32>,
     /// Formula content from the `<f>` element, if present.
     pub formula: Option<String>,
+    /// Rich-run formatting for an inline (`t="inlineStr"`) string cell —
+    /// the mirror of `SharedString.rich_text` for a cell whose text
+    /// lives directly in the `<c>` element instead of the shared string
+    /// table. `#303` parsed this for shared strings but missed this
+    /// structurally identical path entirely, so an inline rich-text
+    /// cell's bold/italic/color/font was silently discarded (issue
+    /// #346).
+    pub rich_runs: Option<Vec<crate::xlsx::shared_strings::RichTextRun>>,
     /// The cell's `vm` attribute: a 1-based index into the workbook's
     /// `xl/metadata.xml` `<valueMetadata>` array. Excel 365's in-cell
     /// rich-value images (`=IMAGE(...)`/"Place in Cell") are stored as a

@@ -127,7 +127,7 @@ fn parse_si(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Shared
 /// Parse a single `<r>` rich text run element, including its `<rPr>`
 /// formatting (issue #303 — this used to be skipped entirely, discarding
 /// every run's bold/italic/size/font/color/superscript, permanently).
-fn parse_rich_text_run(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<RichTextRun> {
+pub(crate) fn parse_rich_text_run(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<RichTextRun> {
     let mut text = String::new();
     let mut bold = None;
     let mut italic = None;

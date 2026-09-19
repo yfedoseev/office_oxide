@@ -864,6 +864,7 @@ fn parse_empty_cell(
         style_index,
         formula: None,
         vm: None,
+        rich_runs: None,
     })
 }
 
@@ -902,6 +903,7 @@ fn parse_cell_fast(
 
     let mut raw_value: Option<String> = None;
     let mut formula: Option<String> = None;
+    let mut inline_rich_runs: Option<Vec<crate::xlsx::shared_strings::RichTextRun>> = None;
 
     loop {
         match reader.read_event()? {
@@ -919,7 +921,9 @@ fn parse_cell_fast(
                     formula = Some(text);
                 },
                 b"is" => {
-                    raw_value = Some(parse_inline_string_fast(reader)?);
+                    let (text, runs) = parse_inline_string_fast(reader)?;
+                    raw_value = Some(text);
+                    inline_rich_runs = runs;
                 },
                 _ => {
                     reader.read_to_end(e.to_end().name())?;
@@ -981,6 +985,7 @@ fn parse_cell_fast(
         style_index,
         formula,
         vm,
+        rich_runs: inline_rich_runs,
     })
 }
 
@@ -999,7 +1004,9 @@ fn read_text_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<
 /// `AT&amp;T &lt;tag&gt;` read back as `AT&T<tag>` (#269). This matches the
 /// non-trimming reader `shared_strings.rs` already uses for the same
 /// content model.
-fn parse_inline_string_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<String> {
+fn parse_inline_string_fast(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> crate::core::Result<(String, Option<Vec<crate::xlsx::shared_strings::RichTextRun>>)> {
     let trim_start = reader.config().trim_text_start;
     let trim_end = reader.config().trim_text_end;
     reader.config_mut().trim_text(false);
@@ -1011,17 +1018,25 @@ fn parse_inline_string_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::cor
     result
 }
 
-fn read_inline_string_body(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<String> {
-    let mut text = String::new();
+fn read_inline_string_body(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> crate::core::Result<(String, Option<Vec<crate::xlsx::shared_strings::RichTextRun>>)> {
+    let mut plain_text = String::new();
+    let mut runs: Vec<crate::xlsx::shared_strings::RichTextRun> = Vec::new();
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"t" => text.push_str(&read_text_fast(reader)?),
-                // A rich inline string wraps each run in `<r>`. Descend
-                // into it — skipping the element wholesale discarded the
-                // `<t>` inside and with it the cell's entire text.
-                b"r" => {},
+                b"t" => plain_text.push_str(&read_text_fast(reader)?),
+                // A rich inline string wraps each run in `<r>`, exactly
+                // like a shared string's `<si>` — reuse the same parser
+                // so a run's `<rPr>` (bold/italic/size/font/color) isn't
+                // discarded here the way it used to be (issue #346;
+                // #303 fixed this for shared strings but missed this
+                // structurally identical inline-string path entirely).
+                b"r" => {
+                    runs.push(crate::xlsx::shared_strings::parse_rich_text_run(reader)?);
+                },
                 _ => {
                     reader.read_to_end(e.to_end().name())?;
                 },
@@ -1034,7 +1049,12 @@ fn read_inline_string_body(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core
         }
     }
 
-    Ok(text)
+    if !runs.is_empty() {
+        let full_text = runs.iter().map(|r| r.text.as_str()).collect::<String>();
+        Ok((full_text, Some(runs)))
+    } else {
+        Ok((plain_text, None))
+    }
 }
 
 #[cfg(test)]
@@ -1178,6 +1198,39 @@ mod tests {
             "got {:?}",
             ws.rows[0].cells[0].value
         );
+    }
+
+    /// issue #346 — an inline (`t="inlineStr"`) rich-text cell's run
+    /// formatting (bold/italic/color/font) used to be silently
+    /// discarded — the reader concatenated each run's text (see the
+    /// test above) but skipped `<rPr>` wholesale via the generic
+    /// unknown-element fallback. #303 fixed this exact gap for shared
+    /// strings (`sst.xml`) but missed this structurally identical
+    /// inline-string path entirely, since it lives in a completely
+    /// different parser (`parse_cell_fast`/`parse_inline_string_fast`
+    /// here, vs `shared_strings.rs::parse_si`).
+    #[test]
+    fn test_rich_inline_string_run_formatting_reaches_the_cell() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is>
+        <r><rPr><b/><color rgb="FFFF0000"/></rPr><t>Hello </t></r>
+        <r><t>world</t></r>
+      </is></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        let cell = &ws.rows[0].cells[0];
+        let runs = cell.rich_runs.as_ref().expect("expected rich_runs to be populated");
+        assert_eq!(runs.len(), 2, "got {runs:?}");
+        assert_eq!(runs[0].text, "Hello ");
+        assert_eq!(runs[0].bold, Some(true), "bold must reach the run");
+        assert!(runs[0].color.is_some(), "color must reach the run");
+        assert_eq!(runs[1].text, "world");
+        assert!(runs[1].bold.is_none(), "the second run must not inherit the first run's bold");
     }
 
     /// issue #252 — a `cellIs`/`greaterThan` rule's sqref, type, operator,

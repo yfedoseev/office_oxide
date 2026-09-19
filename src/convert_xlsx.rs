@@ -128,6 +128,10 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                         .shared_strings
                         .get_shared(*idx)
                         .and_then(|s| s.rich_text.clone()),
+                    // An inline (`t="inlineStr"`) string cell carries its
+                    // own rich runs directly on the raw `Cell`, not via
+                    // the shared string table (issue #346).
+                    crate::xlsx::cell::CellValue::String(_) => cell.rich_runs.clone(),
                     _ => None,
                 };
                 cells.push(CellData {
