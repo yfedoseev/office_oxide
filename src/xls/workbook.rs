@@ -7,6 +7,7 @@ use crate::cfb::CfbReader;
 use super::cell::{Cell, CellValue, parse_cell_record};
 use super::condfmt::{parse_cf, parse_condfmt};
 use super::data_validation::parse_dv;
+use super::hyperlink::parse_hlink;
 use super::error::{Result, XlsError};
 use super::images::{XlsImage, extract_images};
 use super::records::*;
@@ -105,6 +106,9 @@ pub struct Sheet {
     /// Data validation rules from `DV` records. No record handling
     /// existed at all before (issue #275).
     pub data_validations: Vec<crate::ir::DataValidation>,
+    /// Cell hyperlinks from `HLINK` records. No record handling existed
+    /// at all before (issue #306).
+    pub hyperlinks: Vec<super::hyperlink::XlsHyperlink>,
 }
 
 /// Sheet metadata from BOUNDSHEET records.
@@ -211,6 +215,7 @@ impl XlsDocument {
         // ignored rather than misattributed to the wrong range.
         let mut pending_cf: Option<(String, u16)> = None;
         let mut data_validations: Vec<crate::ir::DataValidation> = Vec::new();
+        let mut hyperlinks: Vec<super::hyperlink::XlsHyperlink> = Vec::new();
         let mut raw_names: Vec<RawName> = Vec::new();
         let mut supbook_internal: Vec<bool> = Vec::new();
         let mut externsheet: Vec<(u16, i16, i16)> = Vec::new();
@@ -340,6 +345,7 @@ impl XlsDocument {
                         conditional_formats.clear();
                         pending_cf = None;
                         data_validations.clear();
+                        hyperlinks.clear();
                         pending_formula_string = None;
                         nested_bof_depth = 0;
                     }
@@ -388,6 +394,7 @@ impl XlsDocument {
                             merged_cells: std::mem::take(&mut merged_cells),
                             conditional_formats: std::mem::take(&mut conditional_formats),
                             data_validations: std::mem::take(&mut data_validations),
+                            hyperlinks: std::mem::take(&mut hyperlinks),
                             ..Default::default()
                         });
                         sheet_idx += 1;
@@ -448,6 +455,11 @@ impl XlsDocument {
                     RT_DV => {
                         if let Some(dv) = parse_dv(&rec.data) {
                             data_validations.push(dv);
+                        }
+                    },
+                    RT_HLINK => {
+                        if let Some(hl) = parse_hlink(&rec.data) {
+                            hyperlinks.push(hl);
                         }
                     },
                     RT_FORMULA => {

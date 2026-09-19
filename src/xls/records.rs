@@ -46,6 +46,10 @@ pub const RT_CF: u16 = 0x01B1;
 /// Issue #275.
 pub const RT_DV: u16 = 0x01BE;
 
+/// A cell (or cell range's) hyperlink target ([MS-XLS] §2.4.130, record
+/// type 440 = 0x1B8). Issue #306.
+pub const RT_HLINK: u16 = 0x01B8;
+
 /// A raw BIFF record: type + data (may span CONTINUE records).
 #[derive(Debug, Clone)]
 pub struct BiffRecord {

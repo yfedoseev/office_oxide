@@ -30,6 +30,26 @@ const MAX_CELLS_PER_SHEET: usize = 5_000;
 /// each range covers — the same split `convert_xlsx.rs` uses, so both
 /// formats feed the sparse, span-driven TableRow model
 /// ir_render.rs's table_grid expects (issue #235, XLS half).
+/// Reduce `Sheet::hyperlinks` (one entry per `HLINK` record, which can
+/// cover a whole range, not just a single cell) to a per-cell lookup —
+/// the same shape `convert_xlsx.rs` already builds from its own
+/// `Worksheet::hyperlinks` (issue #306).
+fn hyperlink_lookup(
+    hyperlinks: &[crate::xls::XlsHyperlink],
+) -> std::collections::HashMap<(u16, u16), String> {
+    let mut map = std::collections::HashMap::new();
+    for hl in hyperlinks {
+        let (row_lo, row_hi) = (hl.row_first.min(hl.row_last), hl.row_first.max(hl.row_last));
+        let (col_lo, col_hi) = (hl.col_first.min(hl.col_last), hl.col_first.max(hl.col_last));
+        for r in row_lo..=row_hi {
+            for c in col_lo..=col_hi {
+                map.insert((r, c), hl.target.clone());
+            }
+        }
+    }
+    map
+}
+
 fn merge_lookup(
     merged_cells: &[(u16, u16, u16, u16)],
 ) -> (
@@ -63,6 +83,7 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
 
     for sheet in &doc.sheets {
         let (merge_span, merge_covered) = merge_lookup(&sheet.merged_cells);
+        let links = hyperlink_lookup(&sheet.hyperlinks);
         let mut rows = Vec::new();
         // Rows past the last one carrying data are padding; measuring the
         // sheet against them would report a truncation that dropped nothing.
@@ -107,12 +128,15 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
                     .filter(|s| !s.is_empty())
                     .cloned()
                     .unwrap_or_else(|| cell_value.as_text());
+                let hyperlink = links.get(&(row_idx as u16, col_idx as u16)).cloned();
                 cells.push(TableCell {
                     content: vec![Element::Paragraph(Paragraph {
                         content: if text.is_empty() {
                             Vec::new()
                         } else {
-                            vec![InlineContent::Text(TextSpan::plain(text))]
+                            let mut span = TextSpan::plain(text);
+                            span.hyperlink = hyperlink;
+                            vec![InlineContent::Text(span)]
                         },
                         ..Default::default()
                     })],
@@ -451,5 +475,72 @@ mod tests {
             .find(|t| t.contains("not shown"))
             .expect("a truncation notice");
         assert!(notice.contains(&rows.to_string()), "notice: {notice}");
+    }
+
+    /// issue #306 — `Sheet::hyperlinks` (from `HLINK` records) must reach
+    /// the cell's own `TextSpan::hyperlink`, the same IR shape
+    /// `convert_xlsx.rs` already uses.
+    #[test]
+    fn hyperlink_reaches_the_cells_text_span() {
+        let sheet = Sheet {
+            name: "S".into(),
+            display: Vec::new(),
+            rows: vec![vec![CellValue::String("Stacie@ABC.com".to_string())]],
+            hyperlinks: vec![crate::xls::XlsHyperlink {
+                row_first: 0,
+                row_last: 0,
+                col_first: 0,
+                col_last: 0,
+                target: "mailto:Stacie@ABC.com".to_string(),
+            }],
+            ..Default::default()
+        };
+        let ir = xls_to_ir(&XlsDocument::from_sheets(vec![sheet]));
+        let Element::Table(t) = &ir.sections[0].elements[0] else {
+            panic!("expected a table");
+        };
+        let Element::Paragraph(p) = &t.rows[0].cells[0].content[0] else {
+            panic!("expected a paragraph");
+        };
+        let InlineContent::Text(span) = &p.content[0] else {
+            panic!("expected a text span");
+        };
+        assert_eq!(span.hyperlink.as_deref(), Some("mailto:Stacie@ABC.com"));
+    }
+
+    /// A hyperlink covering a multi-cell range (rare, but the record
+    /// format allows it) must apply to every cell in that range, not
+    /// just the anchor.
+    #[test]
+    fn hyperlink_range_applies_to_every_covered_cell() {
+        let sheet = Sheet {
+            name: "S".into(),
+            display: Vec::new(),
+            rows: vec![vec![
+                CellValue::String("A".to_string()),
+                CellValue::String("B".to_string()),
+            ]],
+            hyperlinks: vec![crate::xls::XlsHyperlink {
+                row_first: 0,
+                row_last: 0,
+                col_first: 0,
+                col_last: 1,
+                target: "http://example.com".to_string(),
+            }],
+            ..Default::default()
+        };
+        let ir = xls_to_ir(&XlsDocument::from_sheets(vec![sheet]));
+        let Element::Table(t) = &ir.sections[0].elements[0] else {
+            panic!("expected a table");
+        };
+        for cell in &t.rows[0].cells {
+            let Element::Paragraph(p) = &cell.content[0] else {
+                panic!("expected a paragraph");
+            };
+            let InlineContent::Text(span) = &p.content[0] else {
+                panic!("expected a text span");
+            };
+            assert_eq!(span.hyperlink.as_deref(), Some("http://example.com"));
+        }
     }
 }
