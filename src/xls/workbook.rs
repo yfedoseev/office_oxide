@@ -196,6 +196,10 @@ impl XlsDocument {
         // and every date-serial-carrying record parsed before DATEMODE
         // appears (issue #233).
         let mut date1904 = false;
+        // BIFF5 8-bit text's declared codepage ([MS-XLS] §2.4.53).
+        // `None` means "not yet seen" and defers to the BIFF5 default
+        // (Windows-1252) at decode time, not "no codepage" (issue #309).
+        let mut codepage: Option<u16> = None;
 
         // Quick check: if the first BOF indicates BIFF5 or earlier, limit processing.
         let biff8 = data.len() >= 6 && {
@@ -308,6 +312,9 @@ impl XlsDocument {
                         // offset 0, nonzero means the 1904 date system.
                         date1904 = rec.data.len() >= 2
                             && u16::from_le_bytes([rec.data[0], rec.data[1]]) != 0;
+                    },
+                    RT_CODEPAGE => {
+                        codepage = super::codepage::parse_codepage(&rec.data);
                     },
                     RT_NAME => {
                         if let Some(rn) = parse_name_record(&rec.data) {
@@ -516,7 +523,7 @@ impl XlsDocument {
                                 continue;
                             }
                         }
-                        if let Ok(parsed) = parse_cell_record(&rec, &sst) {
+                        if let Ok(parsed) = parse_cell_record(&rec, &sst, codepage) {
                             cells.extend(parsed);
                         }
                     },
@@ -532,8 +539,10 @@ impl XlsDocument {
                                     u16::from_le_bytes([rec.data[6], rec.data[7]]) as usize;
                                 let start = 8;
                                 let end = (start + str_len).min(rec.data.len());
-                                let s: String =
-                                    rec.data[start..end].iter().map(|&b| b as char).collect();
+                                let s = super::codepage::decode_biff5_text(
+                                    &rec.data[start..end],
+                                    codepage,
+                                );
                                 cells.push(Cell {
                                     row,
                                     col,
@@ -541,7 +550,7 @@ impl XlsDocument {
                                     value: CellValue::String(s),
                                 });
                             }
-                        } else if let Ok(parsed) = parse_cell_record(&rec, &sst) {
+                        } else if let Ok(parsed) = parse_cell_record(&rec, &sst, codepage) {
                             cells.extend(parsed);
                         }
                     },

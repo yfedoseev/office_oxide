@@ -67,14 +67,18 @@ pub struct Cell {
 /// Parse cells from a BIFF record.
 ///
 /// Returns a list of cells extracted from a single record.
-pub fn parse_cell_record(record: &BiffRecord, sst: &[String]) -> Result<Vec<Cell>> {
+pub fn parse_cell_record(
+    record: &BiffRecord,
+    sst: &[String],
+    codepage: Option<u16>,
+) -> Result<Vec<Cell>> {
     match record.record_type {
         RT_LABELSST => parse_labelsst(&record.data, sst),
         RT_NUMBER => parse_number(&record.data),
         RT_RK => parse_rk_record(&record.data),
         RT_MULRK => parse_mulrk(&record.data),
         RT_BOOLERR => parse_boolerr(&record.data),
-        RT_LABEL | RT_RSTRING => parse_label(&record.data),
+        RT_LABEL | RT_RSTRING => parse_label(&record.data, codepage),
         RT_BLANK => parse_blank(&record.data),
         RT_MULBLANK => parse_mulblank(&record.data),
         RT_FORMULA => parse_formula(&record.data),
@@ -198,7 +202,7 @@ fn parse_boolerr(data: &[u8]) -> Result<Vec<Cell>> {
     }])
 }
 
-fn parse_label(data: &[u8]) -> Result<Vec<Cell>> {
+fn parse_label(data: &[u8], codepage: Option<u16>) -> Result<Vec<Cell>> {
     if data.len() < 8 {
         return Err(XlsError::InvalidRecord("LABEL too short".into()));
     }
@@ -210,11 +214,12 @@ fn parse_label(data: &[u8]) -> Result<Vec<Cell>> {
     let s = match read_unicode_string(data, 6) {
         Ok((s, end)) if end <= data.len() + 4 => s,
         _ => {
-            // BIFF5 LABEL: [u16 len][raw bytes] at offset 6.
+            // BIFF5 LABEL: [u16 len][raw bytes] at offset 6, decoded
+            // using the workbook's declared codepage (issue #309).
             let str_len = u16::from_le_bytes([data[6], data[7]]) as usize;
             let start = 8;
             let end = (start + str_len).min(data.len());
-            data[start..end].iter().map(|&b| b as char).collect()
+            super::codepage::decode_biff5_text(&data[start..end], codepage)
         },
     };
     Ok(vec![Cell {
@@ -411,7 +416,7 @@ mod tests {
             record_type: RT_LABELSST,
             data,
         };
-        let cells = parse_cell_record(&rec, &sst).unwrap();
+        let cells = parse_cell_record(&rec, &sst, None).unwrap();
         assert_eq!(cells.len(), 1);
         assert_eq!(cells[0].row, 0);
         assert_eq!(cells[0].col, 1);
@@ -429,7 +434,7 @@ mod tests {
             record_type: RT_NUMBER,
             data,
         };
-        let cells = parse_cell_record(&rec, &[]).unwrap();
+        let cells = parse_cell_record(&rec, &[], None).unwrap();
         assert_eq!(cells[0].value, CellValue::Number(42.5));
     }
 
@@ -445,7 +450,7 @@ mod tests {
             record_type: RT_BOOLERR,
             data,
         };
-        let cells = parse_cell_record(&rec, &[]).unwrap();
+        let cells = parse_cell_record(&rec, &[], None).unwrap();
         assert_eq!(cells[0].value, CellValue::Bool(true));
     }
 
@@ -461,7 +466,7 @@ mod tests {
             record_type: RT_BOOLERR,
             data,
         };
-        let cells = parse_cell_record(&rec, &[]).unwrap();
+        let cells = parse_cell_record(&rec, &[], None).unwrap();
         assert_eq!(cells[0].value, CellValue::Error(0x07));
     }
 
@@ -485,7 +490,7 @@ mod tests {
             record_type: RT_MULRK,
             data,
         };
-        let cells = parse_cell_record(&rec, &[]).unwrap();
+        let cells = parse_cell_record(&rec, &[], None).unwrap();
         assert_eq!(cells.len(), 2);
         assert_eq!(cells[0].col, 0);
         assert_eq!(cells[0].value, CellValue::Number(10.0));

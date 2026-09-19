@@ -10,6 +10,7 @@
 //! ```
 
 mod cell;
+mod codepage;
 pub mod comment;
 pub(crate) mod condfmt;
 mod data_validation;
