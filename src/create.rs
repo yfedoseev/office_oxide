@@ -532,9 +532,26 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                             sheet.set_column_width(ci, w.clamp(3.0, 80.0));
                         }
                     }
+                    // Columns currently claimed by a still-open vertical
+                    // merge anchored in an earlier row, mapped to how many
+                    // more rows (including the one about to be processed)
+                    // it still covers. Without this, `col` advanced purely
+                    // by summing `col_span` across each row's own cells —
+                    // but a row-covering merge means the covered rows have
+                    // that column excluded from their own `cells` entirely
+                    // (the sparse, span-driven model every reader already
+                    // uses), so every cell after the gap silently shifted
+                    // left, misplacing content and hyperlinks onto the
+                    // wrong column instead of skipping over the claimed
+                    // one (issue #340).
+                    let mut active_spans: std::collections::BTreeMap<usize, usize> =
+                        std::collections::BTreeMap::new();
                     for row in &t.rows {
                         let mut col = 0usize;
                         for cell in &row.cells {
+                            while active_spans.get(&col).is_some_and(|&remaining| remaining > 0) {
+                                col += 1;
+                            }
                             let text = cell_text(cell);
                             let data = ir_cell_to_cell_data(cell, &text);
                             if let Some(style) = xlsx_cell_style(
@@ -554,8 +571,20 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                             if cs > 1 || rs > 1 {
                                 sheet.merge_cells(row_cursor, col, rs, cs);
                             }
+                            if rs > 1 {
+                                for c in col..col + cs {
+                                    active_spans.insert(c, rs);
+                                }
+                            }
                             col += cs;
                         }
+                        // This row is now consumed: every still-open span
+                        // (including any minted just above) has one fewer
+                        // row left to cover.
+                        for v in active_spans.values_mut() {
+                            *v = v.saturating_sub(1);
+                        }
+                        active_spans.retain(|_, v| *v > 0);
                         row_cursor += 1;
                     }
                 },
@@ -1582,4 +1611,99 @@ fn inline_to_pptx_runs(content: &[InlineContent]) -> Vec<crate::pptx::write::Run
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod xlsx_table_write_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// issue #340 — a row-spanning merge (`row_span > 1`) claims its
+    /// column for every row it covers. The covered rows' own `cells`
+    /// correctly exclude that column (the sparse, span-driven model
+    /// every reader uses), but the writer used to compute each cell's
+    /// output column by summing `col_span` in encounter order within
+    /// that row's own (already-filtered) cell list — with no way to
+    /// know a column was skipped, every cell after the gap silently
+    /// shifted left, misplacing its content and hyperlink onto the
+    /// wrong column instead of the one actually claimed by the merge.
+    #[test]
+    fn a_cell_after_a_row_spanning_merge_keeps_its_own_column_and_hyperlink() {
+        let cell = |text: &str, url: &str, row_span: u32| TableCell {
+            content: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    text: text.to_string(),
+                    hyperlink: Some(url.to_string()),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            })],
+            col_span: 1,
+            row_span,
+            ..Default::default()
+        };
+
+        let table = Table {
+            rows: vec![
+                TableRow {
+                    cells: vec![
+                        cell("Anchor", "https://example.com/anchor", 3),
+                        cell("B0", "https://example.com/b0", 1),
+                    ],
+                    ..Default::default()
+                },
+                // Column 0 is covered by the anchor's row_span=3 merge, so
+                // this row's own `cells` correctly holds only column 1 —
+                // the writer must place it at column 1, not column 0.
+                TableRow { cells: vec![cell("B1", "https://example.com/b1", 1)], ..Default::default() },
+                TableRow { cells: vec![cell("B2", "https://example.com/b2", 1)], ..Default::default() },
+            ],
+            ..Default::default()
+        };
+
+        let ir = DocumentIR {
+            metadata: Metadata { format: DocumentFormat::Xlsx, ..Default::default() },
+            sections: vec![Section { elements: vec![Element::Table(table)], ..Default::default() }],
+            defined_names: Vec::new(),
+        };
+
+        let mut buf = Cursor::new(Vec::new());
+        create_from_ir_to_writer(&ir, DocumentFormat::Xlsx, &mut buf).unwrap();
+        buf.set_position(0);
+        let doc = crate::Document::from_reader(buf, DocumentFormat::Xlsx).unwrap();
+        let ir2 = doc.to_ir();
+
+        let mut found: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let Element::Table(t) = &ir2.sections[0].elements[0] else {
+            panic!("expected a table");
+        };
+        for row in &t.rows {
+            for cell in &row.cells {
+                for c in &cell.content {
+                    if let Element::Paragraph(p) = c {
+                        for inc in &p.content {
+                            if let InlineContent::Text(span) = inc {
+                                if let Some(url) = &span.hyperlink {
+                                    found.insert(span.text.clone(), url.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(found.get("Anchor").map(String::as_str), Some("https://example.com/anchor"));
+        assert_eq!(found.get("B0").map(String::as_str), Some("https://example.com/b0"));
+        assert_eq!(
+            found.get("B1").map(String::as_str),
+            Some("https://example.com/b1"),
+            "B1's hyperlink must survive at its own column, not be lost to a left-shift: {found:?}"
+        );
+        assert_eq!(
+            found.get("B2").map(String::as_str),
+            Some("https://example.com/b2"),
+            "B2's hyperlink must survive at its own column, not be lost to a left-shift: {found:?}"
+        );
+    }
 }
