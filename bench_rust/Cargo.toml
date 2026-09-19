@@ -10,7 +10,7 @@ edition = "2021"
 
 [dependencies]
 office_oxide = { path = "..", default-features = false }
-calamine = "0.26"
+calamine = "0.36"
 dotext = "0.1"
 docx-rs = "0.4"
 libc = "0.2"
