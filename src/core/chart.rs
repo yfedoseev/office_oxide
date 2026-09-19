@@ -279,7 +279,8 @@ mod tests {
 
     #[test]
     fn test_chart_text_scatter_uses_xval_yval() {
-        let xml = br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+        let xml =
+            br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
   <c:chart><c:plotArea><c:scatterChart><c:ser>
     <c:xVal><c:numRef><c:numCache>
       <c:pt idx="0"><c:v>1</c:v></c:pt><c:pt idx="1"><c:v>2</c:v></c:pt>
@@ -297,7 +298,8 @@ mod tests {
     fn test_chart_text_multi_run_title_keeps_spacing() {
         // A title typed as two runs must not fuse into "SalesReport", and
         // two paragraphs must not fuse either.
-        let xml = br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+        let xml =
+            br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
                        xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
   <c:chart><c:title><c:tx><c:rich>
     <a:p><a:r><a:t>Sales </a:t></a:r><a:r><a:t>Report</a:t></a:r></a:p>
@@ -318,7 +320,8 @@ mod tests {
 
     #[test]
     fn test_chart_text_empty_when_no_content() {
-        let xml = br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+        let xml =
+            br#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
   <c:chart><c:plotArea/></c:chart></c:chartSpace>"#;
         assert!(chart_text_lines(xml).is_empty());
         assert!(extract_chart_text(xml).is_empty());

@@ -427,7 +427,14 @@ mod tests {
     #[test]
     fn test_out_of_range_serial_is_rejected_promptly() {
         let started = std::time::Instant::now();
-        for serial in [MAX_DATE_SERIAL + 1.0, 1e12, 1e300, f64::MAX, f64::INFINITY, f64::NAN] {
+        for serial in [
+            MAX_DATE_SERIAL + 1.0,
+            1e12,
+            1e300,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NAN,
+        ] {
             assert!(
                 DateTimeValue::from_serial(serial, false).is_none(),
                 "{serial} is not a calendar date"

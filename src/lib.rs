@@ -685,7 +685,14 @@ mod tests {
         }
 
         let dir_offset = 512;
-        write_dir_entry(&mut file[dir_offset..dir_offset + 128], "Root Entry", 5, 1, END_OF_CHAIN, 0);
+        write_dir_entry(
+            &mut file[dir_offset..dir_offset + 128],
+            "Root Entry",
+            5,
+            1,
+            END_OF_CHAIN,
+            0,
+        );
         write_dir_entry(&mut file[dir_offset + 128..dir_offset + 256], name1, 2, NO_ENTRY, 2, 4);
         write_dir_entry(&mut file[dir_offset + 256..dir_offset + 384], name2, 2, NO_ENTRY, 3, 4);
         // Sibling-link entry 1 ("name1") to entry 2 ("name2") so both are
@@ -750,7 +757,9 @@ mod tests {
         std::fs::write(&path, &data).unwrap();
         let result = Document::open(&path);
         std::fs::remove_file(&path).ok();
-        let err = result.err().expect("expected an Err, not a silently empty presentation");
+        let err = result
+            .err()
+            .expect("expected an Err, not a silently empty presentation");
         let msg = err.to_string();
         assert!(
             msg.contains("password-protected"),
@@ -767,8 +776,7 @@ mod tests {
     fn test_open_cfb_without_offcrypto_streams_still_falls_through_to_legacy_parser() {
         let data = build_two_stream_cfb("SomeStream", "OtherStream");
         let dir = std::env::temp_dir();
-        let path =
-            dir.join(format!("office_oxide_test_not_encrypted_{}.docx", std::process::id()));
+        let path = dir.join(format!("office_oxide_test_not_encrypted_{}.docx", std::process::id()));
         std::fs::write(&path, &data).unwrap();
         let result = Document::open(&path);
         std::fs::remove_file(&path).ok();

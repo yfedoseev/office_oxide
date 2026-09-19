@@ -4,12 +4,12 @@ use std::io::{Read, Seek};
 
 use crate::cfb::{CfbReader, SummaryProperties, parse_summary_information};
 
+use super::chpx::{parse_chpx_runs, resolve_deleted_cp_ranges_from_runs};
 use super::error::{DocError, Result};
 use super::fib::Fib;
 use super::images::{DocImage, extract_images};
 use super::list_format::ListFormatting;
 use super::papx::{DocParagraph, build_paragraphs, parse_papx_paragraphs};
-use super::chpx::{parse_chpx_runs, resolve_deleted_cp_ranges_from_runs};
 use super::piece_table::{
     covers_declared_length, extract_text_range_excluding, parse_clx, sanitize_text,
 };
@@ -250,15 +250,10 @@ impl DocDocument {
                 continue;
             }
             let end = cp.saturating_add(len);
-            let raw =
-                super::piece_table::extract_text_range(&word_doc, &pieces, cp, end, fib.lid);
+            let raw = super::piece_table::extract_text_range(&word_doc, &pieces, cp, end, fib.lid);
             if kind == SubDocumentKind::HeadersFooters {
-                header_footer = parse_plcf_hdd_stories(
-                    &table_stream,
-                    &raw,
-                    fib.fc_plcf_hdd,
-                    fib.lcb_plcf_hdd,
-                );
+                header_footer =
+                    parse_plcf_hdd_stories(&table_stream, &raw, fib.fc_plcf_hdd, fib.lcb_plcf_hdd);
             }
             if kind == SubDocumentKind::Comments {
                 comments = parse_comments(
@@ -517,8 +512,12 @@ fn parse_grp_xst_atn_owners(table_stream: &[u8], fc: u32, lcb: u32) -> Vec<Strin
         if pos + byte_len > end {
             break;
         }
-        let units: Vec<u16> =
-            table_stream[pos..pos + byte_len].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let units: Vec<u16> = table_stream[pos..pos + byte_len]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
         pos += byte_len;
         names.push(String::from_utf16_lossy(&units));
     }
@@ -555,7 +554,7 @@ fn parse_plcf_hdd_stories(
     let start = fc as usize;
     let byte_len = lcb as usize;
     let end = start.saturating_add(byte_len).min(table_stream.len());
-    if start >= end || (end - start) % 4 != 0 {
+    if start >= end || !(end - start).is_multiple_of(4) {
         return result;
     }
     let total_cps = (end - start) / 4;
@@ -587,7 +586,11 @@ fn parse_plcf_hdd_stories(
         let text: String = raw_header_text.chars().skip(lo).take(hi - lo).collect();
         let sanitized = sanitize_text(&text);
         let trimmed = sanitized.trim();
-        if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     };
 
     // First section's group starts right after the 6 fixed separator
@@ -633,7 +636,10 @@ fn parse_comments(
             if text.is_empty() {
                 return None;
             }
-            Some(ParsedComment { text, author: authors.get(ibst).cloned() })
+            Some(ParsedComment {
+                text,
+                author: authors.get(ibst).cloned(),
+            })
         })
         .collect()
 }
@@ -655,7 +661,7 @@ fn parse_plcf_and_txt_ranges(
     }
     let start = fc as usize;
     let end = start.saturating_add(lcb as usize).min(table_stream.len());
-    if start >= end || (end - start) % 4 != 0 {
+    if start >= end || !(end - start).is_multiple_of(4) {
         return None;
     }
     let total_cps = (end - start) / 4;
@@ -723,7 +729,8 @@ fn parse_plcf_and_ref_ibsts(table_stream: &[u8], fc: u32, lcb: u32) -> Vec<usize
             if ibst_offset + 2 > table_stream.len() {
                 return None;
             }
-            Some(u16::from_le_bytes([table_stream[ibst_offset], table_stream[ibst_offset + 1]]) as usize)
+            Some(u16::from_le_bytes([table_stream[ibst_offset], table_stream[ibst_offset + 1]])
+                as usize)
         })
         .collect()
 }
@@ -792,9 +799,18 @@ mod tests {
     fn test_plain_text_and_markdown_include_subdocument_bodies() {
         let doc = DocDocument {
             subdocuments: vec![
-                SubDocument { kind: SubDocumentKind::Footnotes, text: "FOOTNOTE ONE".into() },
-                SubDocument { kind: SubDocumentKind::Comments, text: "REVIEW NOTE".into() },
-                SubDocument { kind: SubDocumentKind::HeaderTextBoxes, text: "SIDEBAR".into() },
+                SubDocument {
+                    kind: SubDocumentKind::Footnotes,
+                    text: "FOOTNOTE ONE".into(),
+                },
+                SubDocument {
+                    kind: SubDocumentKind::Comments,
+                    text: "REVIEW NOTE".into(),
+                },
+                SubDocument {
+                    kind: SubDocumentKind::HeaderTextBoxes,
+                    text: "SIDEBAR".into(),
+                },
             ],
             has_macros: false,
             text_complete: true,
@@ -823,7 +839,10 @@ mod tests {
     #[test]
     fn test_empty_subdocuments_are_skipped_in_both_renderers() {
         let doc = DocDocument {
-            subdocuments: vec![SubDocument { kind: SubDocumentKind::Comments, text: "  \n ".into() }],
+            subdocuments: vec![SubDocument {
+                kind: SubDocumentKind::Comments,
+                text: "  \n ".into(),
+            }],
             has_macros: false,
             text_complete: true,
             summary_properties: None,
@@ -1119,15 +1138,23 @@ mod tests {
     fn test_a_single_comment_author_reaches_the_comments_note() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
-        doc.subdocuments =
-            vec![SubDocument { kind: SubDocumentKind::Comments, text: "Here is a comment".into() }];
+        doc.subdocuments = vec![SubDocument {
+            kind: SubDocumentKind::Comments,
+            text: "Here is a comment".into(),
+        }];
         doc.comment_authors = vec!["Michael McCandless".to_string()];
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
         let note = ir.sections[0]
             .elements
             .iter()
-            .find_map(|e| if let Element::Endnote(n) = e { Some(n) } else { None })
+            .find_map(|e| {
+                if let Element::Endnote(n) = e {
+                    Some(n)
+                } else {
+                    None
+                }
+            })
             .expect("expected a comments Endnote");
         assert_eq!(note.author.as_deref(), Some("Michael McCandless"));
     }
@@ -1139,15 +1166,23 @@ mod tests {
     fn test_multiple_comment_authors_leave_the_note_author_unset() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
-        doc.subdocuments =
-            vec![SubDocument { kind: SubDocumentKind::Comments, text: "Inner\nOuter".into() }];
+        doc.subdocuments = vec![SubDocument {
+            kind: SubDocumentKind::Comments,
+            text: "Inner\nOuter".into(),
+        }];
         doc.comment_authors = vec!["vmiklos".to_string(), "Miklos Vajna".to_string()];
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
         let note = ir.sections[0]
             .elements
             .iter()
-            .find_map(|e| if let Element::Endnote(n) = e { Some(n) } else { None })
+            .find_map(|e| {
+                if let Element::Endnote(n) = e {
+                    Some(n)
+                } else {
+                    None
+                }
+            })
             .expect("expected a comments Endnote");
         assert_eq!(note.author, None);
     }
@@ -1173,7 +1208,13 @@ mod tests {
         let footnotes: Vec<&Note> = ir.sections[0]
             .elements
             .iter()
-            .filter_map(|e| if let Element::Footnote(n) = e { Some(n) } else { None })
+            .filter_map(|e| {
+                if let Element::Footnote(n) = e {
+                    Some(n)
+                } else {
+                    None
+                }
+            })
             .collect();
         assert_eq!(footnotes.len(), 3, "expected one Footnote element per reference mark");
         let text_of = |n: &Note| -> String {
@@ -1215,7 +1256,13 @@ mod tests {
         let comments: Vec<&Note> = ir.sections[0]
             .elements
             .iter()
-            .filter_map(|e| if let Element::Endnote(n) = e { Some(n) } else { None })
+            .filter_map(|e| {
+                if let Element::Endnote(n) = e {
+                    Some(n)
+                } else {
+                    None
+                }
+            })
             .collect();
         assert_eq!(comments.len(), 1, "comments must stay merged until PlcfAtn is parsed");
         assert_eq!(comments[0].content.len(), 2, "both lines must still reach the one Note");
@@ -1283,10 +1330,16 @@ mod tests {
         let ir = crate::convert_doc::doc_to_ir(&doc);
         let section = &ir.sections[0];
         assert!(section.header.is_some(), "odd_header must reach Section.header");
-        assert!(section.first_page_footer.is_some(), "first_footer must reach Section.first_page_footer");
+        assert!(
+            section.first_page_footer.is_some(),
+            "first_footer must reach Section.first_page_footer"
+        );
         assert!(section.footer.is_none());
         assert!(
-            !section.elements.iter().any(|e| matches!(e, Element::TextBox(_))),
+            !section
+                .elements
+                .iter()
+                .any(|e| matches!(e, Element::TextBox(_))),
             "must not also dump the merged blob as a generic TextBox once structured: {:?}",
             section.elements
         );
@@ -1306,7 +1359,10 @@ mod tests {
         let section = &ir.sections[0];
         assert!(section.header.is_none());
         assert!(
-            section.elements.iter().any(|e| matches!(e, Element::TextBox(_))),
+            section
+                .elements
+                .iter()
+                .any(|e| matches!(e, Element::TextBox(_))),
             "must fall back to the old merged TextBox when PlcfHdd yielded nothing: {:?}",
             section.elements
         );
@@ -1413,16 +1469,31 @@ mod tests {
             text: "Inner\nOuter\nAs in non-range.".into(),
         }];
         doc.comments = vec![
-            ParsedComment { text: "Inner".into(), author: Some("vmiklos".into()) },
-            ParsedComment { text: "Outer".into(), author: Some("vmiklos".into()) },
-            ParsedComment { text: "As in non-range.".into(), author: Some("Miklos Vajna".into()) },
+            ParsedComment {
+                text: "Inner".into(),
+                author: Some("vmiklos".into()),
+            },
+            ParsedComment {
+                text: "Outer".into(),
+                author: Some("vmiklos".into()),
+            },
+            ParsedComment {
+                text: "As in non-range.".into(),
+                author: Some("Miklos Vajna".into()),
+            },
         ];
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
         let notes: Vec<&crate::ir::Note> = ir.sections[0]
             .elements
             .iter()
-            .filter_map(|e| if let Element::Endnote(n) = e { Some(n) } else { None })
+            .filter_map(|e| {
+                if let Element::Endnote(n) = e {
+                    Some(n)
+                } else {
+                    None
+                }
+            })
             .collect();
         assert_eq!(notes.len(), 3, "expected one Endnote per split comment: {notes:?}");
         assert_eq!(notes[0].author.as_deref(), Some("vmiklos"));

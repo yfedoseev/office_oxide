@@ -5,11 +5,11 @@ use std::io::{Read, Seek};
 use crate::cfb::CfbReader;
 
 use super::cell::{Cell, CellValue, parse_cell_record};
-use super::condfmt::{parse_cf, parse_condfmt};
 use super::comment::{XlsComment, obj_id, parse_note, txo_text};
+use super::condfmt::{parse_cf, parse_condfmt};
 use super::data_validation::parse_dv;
-use super::hyperlink::parse_hlink;
 use super::error::{Result, XlsError};
+use super::hyperlink::parse_hlink;
 use super::images::{XlsImage, extract_images};
 use super::records::*;
 use super::sst::{parse_sst, read_short_unicode_string, read_unicode_string};
@@ -337,7 +337,8 @@ impl XlsDocument {
                                 if off + 6 > rec.data.len() {
                                     break;
                                 }
-                                let i_sup_book = u16::from_le_bytes([rec.data[off], rec.data[off + 1]]);
+                                let i_sup_book =
+                                    u16::from_le_bytes([rec.data[off], rec.data[off + 1]]);
                                 let itab_first =
                                     i16::from_le_bytes([rec.data[off + 2], rec.data[off + 3]]);
                                 let itab_last =
@@ -425,7 +426,6 @@ impl XlsDocument {
                                 })
                                 .filter(|c| !c.text.is_empty())
                                 .collect(),
-                            ..Default::default()
                         });
                         sheet_idx += 1;
                         phase = Phase::BetweenSheets;
@@ -457,7 +457,8 @@ impl XlsDocument {
                                 if off + 8 > rec.data.len() {
                                     break;
                                 }
-                                let row_first = u16::from_le_bytes([rec.data[off], rec.data[off + 1]]);
+                                let row_first =
+                                    u16::from_le_bytes([rec.data[off], rec.data[off + 1]]);
                                 let row_last =
                                     u16::from_le_bytes([rec.data[off + 2], rec.data[off + 3]]);
                                 let col_first =
@@ -610,8 +611,9 @@ impl XlsDocument {
             out.push_str(&sheet.name);
             out.push('\n');
             for (r, row) in sheet.rows.iter().enumerate() {
-                let line: Vec<String> =
-                    (0..row.len()).map(|c| cell_display_text(sheet, r, c)).collect();
+                let line: Vec<String> = (0..row.len())
+                    .map(|c| cell_display_text(sheet, r, c))
+                    .collect();
                 let trimmed = line.join("\t").trim_end().to_string();
                 out.push_str(&trimmed);
                 out.push('\n');
@@ -805,15 +807,23 @@ fn parse_name_record(data: &[u8]) -> Option<RawName> {
     // `_xlnm.`-prefixed reserved names, so map the ID the same way rather
     // than leaving the two formats' output inconsistent.
     let name = if is_builtin && cch == 1 {
-        first_content_byte.and_then(builtin_name).unwrap_or_default().to_string()
+        first_content_byte
+            .and_then(builtin_name)
+            .unwrap_or_default()
+            .to_string()
     } else if is_wide {
         let chars: Vec<u16> = data[pos..pos + name_bytes]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         String::from_utf16_lossy(&chars)
     } else {
-        data[pos..pos + name_bytes].iter().map(|&b| b as char).collect()
+        data[pos..pos + name_bytes]
+            .iter()
+            .map(|&b| b as char)
+            .collect()
     };
     pos += name_bytes;
 
@@ -939,7 +949,9 @@ fn decompile_single_ref(
     }
     let base_ptg = rgce[0] & 0x1F;
     let ixti_and = |off: usize| -> Option<u16> {
-        rgce.get(off).zip(rgce.get(off + 1)).map(|(a, b)| u16::from_le_bytes([*a, *b]))
+        rgce.get(off)
+            .zip(rgce.get(off + 1))
+            .map(|(a, b)| u16::from_le_bytes([*a, *b]))
     };
 
     match base_ptg {
@@ -1000,9 +1012,19 @@ fn parse_format_record(data: &[u8]) -> Option<(u16, String)> {
 /// raw text covers the (normally unreachable) case where `display` and
 /// `rows` disagree in shape.
 fn cell_display_text(sheet: &Sheet, r: usize, c: usize) -> String {
-    sheet.display.get(r).and_then(|row| row.get(c)).cloned().unwrap_or_else(|| {
-        sheet.rows.get(r).and_then(|row| row.get(c)).map(CellValue::as_text).unwrap_or_default()
-    })
+    sheet
+        .display
+        .get(r)
+        .and_then(|row| row.get(c))
+        .cloned()
+        .unwrap_or_else(|| {
+            sheet
+                .rows
+                .get(r)
+                .and_then(|row| row.get(c))
+                .map(CellValue::as_text)
+                .unwrap_or_default()
+        })
 }
 
 /// Render each cell's display text, applying the workbook's number formats.
@@ -1255,15 +1277,18 @@ mod tests {
     #[test]
     fn test_xls_hidden_sheets_kept_and_flagged() {
         let stream = workbook_stream(&[
-            ("Sheet1", 1, label(0, 0, "Sheet1A1")),   // hidden
-            ("Sheet2", 0, label(0, 0, "Sheet2A1")),   // visible
-            ("Sheet3", 2, label(0, 0, "Sheet3A1")),   // very hidden
+            ("Sheet1", 1, label(0, 0, "Sheet1A1")), // hidden
+            ("Sheet2", 0, label(0, 0, "Sheet2A1")), // visible
+            ("Sheet3", 2, label(0, 0, "Sheet3A1")), // very hidden
         ]);
         let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
 
         assert_eq!(doc.sheets.len(), 3, "no sheet may be dropped for being hidden");
         assert_eq!(
-            doc.sheets.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            doc.sheets
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
             ["Sheet1", "Sheet2", "Sheet3"]
         );
         assert_eq!(
@@ -1280,10 +1305,7 @@ mod tests {
         // ...and the flag reaches the IR.
         let ir = crate::convert_xls::xls_to_ir(&doc);
         assert_eq!(ir.sections.len(), 3);
-        assert_eq!(
-            ir.sections.iter().map(|s| s.hidden).collect::<Vec<_>>(),
-            [true, false, true]
-        );
+        assert_eq!(ir.sections.iter().map(|s| s.hidden).collect::<Vec<_>>(), [true, false, true]);
     }
 
     /// An embedded chart is its own nested `BOF..EOF` substream inside the
@@ -1314,7 +1336,10 @@ mod tests {
         assert_eq!(doc.sheets[0].name, "Sheet1");
         assert!(!doc.sheets[0].hidden);
         assert_eq!(doc.sheets[1].name, "Sheet2");
-        assert!(doc.sheets[1].hidden, "Sheet2's real hidden flag must survive, not desync to false");
+        assert!(
+            doc.sheets[1].hidden,
+            "Sheet2's real hidden flag must survive, not desync to false"
+        );
 
         let text = doc.plain_text();
         assert!(text.contains("before_chart"), "text: {text}");
@@ -1469,7 +1494,12 @@ mod tests {
         let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
 
         assert_eq!(doc.sheets[0].conditional_formats.len(), 2);
-        assert!(doc.sheets[0].conditional_formats.iter().all(|cf| cf.range == "B1:B5"));
+        assert!(
+            doc.sheets[0]
+                .conditional_formats
+                .iter()
+                .all(|cf| cf.range == "B1:B5")
+        );
         assert_eq!(doc.sheets[0].conditional_formats[0].operator.as_deref(), Some("lessThan"));
         assert_eq!(doc.sheets[0].conditional_formats[1].operator.as_deref(), Some("greaterThan"));
     }
@@ -1911,8 +1941,7 @@ mod tests {
         }];
         let display_1900 =
             build_display(&cells, &std::collections::HashMap::new(), &[14u16], false);
-        let display_1904 =
-            build_display(&cells, &std::collections::HashMap::new(), &[14u16], true);
+        let display_1904 = build_display(&cells, &std::collections::HashMap::new(), &[14u16], true);
         assert_eq!(display_1900[0][0], "2006-09-11");
         assert_ne!(
             display_1900[0][0], display_1904[0][0],
@@ -1956,7 +1985,10 @@ mod tests {
     /// the declared title must beat the first-sheet-name fallback.
     #[test]
     fn test_ir_summary_properties_reach_metadata() {
-        let mut doc = make_doc(vec![Sheet { name: "Sheet1".to_string(), ..Default::default() }]);
+        let mut doc = make_doc(vec![Sheet {
+            name: "Sheet1".to_string(),
+            ..Default::default()
+        }]);
         doc.summary_properties = Some(crate::cfb::SummaryProperties {
             title: Some("Declared Title".to_string()),
             subject: Some("Declared Subject".to_string()),
@@ -1980,7 +2012,10 @@ mod tests {
     /// first-sheet-name fallback.
     #[test]
     fn test_ir_empty_summary_title_falls_back_to_sheet_name() {
-        let mut doc = make_doc(vec![Sheet { name: "Sheet1".to_string(), ..Default::default() }]);
+        let mut doc = make_doc(vec![Sheet {
+            name: "Sheet1".to_string(),
+            ..Default::default()
+        }]);
         doc.summary_properties = Some(crate::cfb::SummaryProperties {
             title: Some(String::new()),
             ..Default::default()
@@ -2052,7 +2087,13 @@ mod tests {
         biff_rec(RT_NAME, &d)
     }
 
-    fn ptg_area3d(ixti: u16, rw_first: u16, rw_last: u16, col_first: u16, col_last: u16) -> Vec<u8> {
+    fn ptg_area3d(
+        ixti: u16,
+        rw_first: u16,
+        rw_last: u16,
+        col_first: u16,
+        col_last: u16,
+    ) -> Vec<u8> {
         let mut d = vec![0x1Bu8];
         d.extend_from_slice(&ixti.to_le_bytes());
         d.extend_from_slice(&rw_first.to_le_bytes());
@@ -2083,7 +2124,10 @@ mod tests {
         ];
         let stream = workbook_stream_with_globals(
             &globals,
-            &[("Data", 0, label(0, 0, "x")), ("Summary", 0, label(0, 0, "y"))],
+            &[
+                ("Data", 0, label(0, 0, "x")),
+                ("Summary", 0, label(0, 0, "y")),
+            ],
         );
         let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
 

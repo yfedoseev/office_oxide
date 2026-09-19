@@ -1521,21 +1521,12 @@ mod tests {
     #[test]
     fn test_extract_chp_props_underline_maps_kul_values() {
         assert_eq!(extract_chp_props(&[0x3E, 0x2A, 0x00]).underline, None);
-        assert_eq!(
-            extract_chp_props(&[0x3E, 0x2A, 0x01]).underline,
-            Some(UnderlineStyle::Single)
-        );
-        assert_eq!(
-            extract_chp_props(&[0x3E, 0x2A, 0x03]).underline,
-            Some(UnderlineStyle::Double)
-        );
+        assert_eq!(extract_chp_props(&[0x3E, 0x2A, 0x01]).underline, Some(UnderlineStyle::Single));
+        assert_eq!(extract_chp_props(&[0x3E, 0x2A, 0x03]).underline, Some(UnderlineStyle::Double));
         assert_eq!(extract_chp_props(&[0x3E, 0x2A, 0x0B]).underline, Some(UnderlineStyle::Wave));
         // An unrecognized/reserved value still yields "some underline",
         // not silence.
-        assert_eq!(
-            extract_chp_props(&[0x3E, 0x2A, 0x63]).underline,
-            Some(UnderlineStyle::Single)
-        );
+        assert_eq!(extract_chp_props(&[0x3E, 0x2A, 0x63]).underline, Some(UnderlineStyle::Single));
     }
 
     #[test]

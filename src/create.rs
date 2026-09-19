@@ -548,7 +548,10 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                     for row in &t.rows {
                         let mut col = 0usize;
                         for cell in &row.cells {
-                            while active_spans.get(&col).is_some_and(|&remaining| remaining > 0) {
+                            while active_spans
+                                .get(&col)
+                                .is_some_and(|&remaining| remaining > 0)
+                            {
                                 col += 1;
                             }
                             let text = cell_text(cell);
@@ -722,7 +725,12 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                             }
                             let text = rows.join("\n");
                             if !text.is_empty() {
-                                sheet.set_cell_comment(r.row as usize, r.col as usize, author, text);
+                                sheet.set_cell_comment(
+                                    r.row as usize,
+                                    r.col as usize,
+                                    author,
+                                    text,
+                                );
                             }
                         })
                         .is_some();
@@ -1101,8 +1109,11 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
             // A real a:tbl, not tab-joined text: the previous form lost the
             // grid, every cell boundary, and (until table cells carried runs) all
             // per-cell run formatting including hyperlinks.
-            let rows: Vec<Vec<Vec<crate::pptx::write::Run>>> =
-                t.rows.iter().map(|row| row.cells.iter().map(cell_runs).collect()).collect();
+            let rows: Vec<Vec<Vec<crate::pptx::write::Run>>> = t
+                .rows
+                .iter()
+                .map(|row| row.cells.iter().map(cell_runs).collect())
+                .collect();
             slide.add_table(rows);
         },
         Element::Image(img) => {
@@ -1165,8 +1176,9 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
                     // and stopped counting as a positioned shape at all).
                     Element::Image(img) => {
                         if let (Some(data), Some(fmt)) = (&img.data, &img.format) {
-                            let cx =
-                                img.display_width_emu.unwrap_or(tb.width_emu.unwrap_or(3_000_000));
+                            let cx = img
+                                .display_width_emu
+                                .unwrap_or(tb.width_emu.unwrap_or(3_000_000));
                             let cy = img
                                 .display_height_emu
                                 .unwrap_or(tb.height_emu.unwrap_or(2_000_000));
@@ -1509,9 +1521,14 @@ fn ir_cell_rich_runs(cell: &TableCell) -> Vec<crate::xlsx::write::RichRun> {
     let mut runs: Vec<RichRun> = Vec::new();
     let mut first_paragraph = true;
     for elem in &cell.content {
-        let Element::Paragraph(p) = elem else { continue };
+        let Element::Paragraph(p) = elem else {
+            continue;
+        };
         if !first_paragraph {
-            runs.push(RichRun { text: " ".to_string(), ..Default::default() });
+            runs.push(RichRun {
+                text: " ".to_string(),
+                ..Default::default()
+            });
         }
         first_paragraph = false;
         for inc in &p.content {
@@ -1531,7 +1548,10 @@ fn ir_cell_rich_runs(cell: &TableCell) -> Vec<crate::xlsx::write::RichRun> {
                     });
                 },
                 InlineContent::LineBreak => {
-                    runs.push(RichRun { text: "\n".to_string(), ..Default::default() });
+                    runs.push(RichRun {
+                        text: "\n".to_string(),
+                        ..Default::default()
+                    });
                 },
                 _ => {},
             }
@@ -1828,15 +1848,27 @@ mod xlsx_table_write_tests {
                 // Column 0 is covered by the anchor's row_span=3 merge, so
                 // this row's own `cells` correctly holds only column 1 —
                 // the writer must place it at column 1, not column 0.
-                TableRow { cells: vec![cell("B1", "https://example.com/b1", 1)], ..Default::default() },
-                TableRow { cells: vec![cell("B2", "https://example.com/b2", 1)], ..Default::default() },
+                TableRow {
+                    cells: vec![cell("B1", "https://example.com/b1", 1)],
+                    ..Default::default()
+                },
+                TableRow {
+                    cells: vec![cell("B2", "https://example.com/b2", 1)],
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         };
 
         let ir = DocumentIR {
-            metadata: Metadata { format: DocumentFormat::Xlsx, ..Default::default() },
-            sections: vec![Section { elements: vec![Element::Table(table)], ..Default::default() }],
+            metadata: Metadata {
+                format: DocumentFormat::Xlsx,
+                ..Default::default()
+            },
+            sections: vec![Section {
+                elements: vec![Element::Table(table)],
+                ..Default::default()
+            }],
             defined_names: Vec::new(),
         };
 
@@ -1893,7 +1925,10 @@ mod xlsx_table_write_tests {
     fn test_a_cell_comment_round_trips_as_a_real_comment_not_an_extra_row() {
         let cell = |text: &str| TableCell {
             content: vec![Element::Paragraph(Paragraph {
-                content: vec![InlineContent::Text(TextSpan { text: text.to_string(), ..Default::default() })],
+                content: vec![InlineContent::Text(TextSpan {
+                    text: text.to_string(),
+                    ..Default::default()
+                })],
                 ..Default::default()
             })],
             col_span: 1,
@@ -1923,7 +1958,10 @@ mod xlsx_table_write_tests {
         });
 
         let ir = DocumentIR {
-            metadata: Metadata { format: DocumentFormat::Xlsx, ..Default::default() },
+            metadata: Metadata {
+                format: DocumentFormat::Xlsx,
+                ..Default::default()
+            },
             sections: vec![Section {
                 elements: vec![Element::Table(table), comment],
                 ..Default::default()
@@ -1938,9 +1976,13 @@ mod xlsx_table_write_tests {
         // The written package must contain a real comments part and its
         // companion VML drawing, not just plain sheet data.
         let mut zip = zip::ZipArchive::new(buf.clone()).unwrap();
-        let names: Vec<String> = (0..zip.len()).map(|i| zip.by_index(i).unwrap().name().to_string()).collect();
+        let names: Vec<String> = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect();
         assert!(
-            names.iter().any(|n| n.starts_with("xl/comments") && n.ends_with(".xml")),
+            names
+                .iter()
+                .any(|n| n.starts_with("xl/comments") && n.ends_with(".xml")),
             "expected a comments part, got: {names:?}"
         );
         assert!(
@@ -1957,10 +1999,14 @@ mod xlsx_table_write_tests {
         };
         assert_eq!(t.rows.len(), 1, "the comment must not appear as an extra sheet row");
 
-        let has_comment_endnote = ir2.sections[0].elements.iter().any(|e| {
-            matches!(e, Element::Endnote(n) if n.marker.as_deref() == Some("B1 (Jane Doe)"))
-        });
-        assert!(has_comment_endnote, "the comment must round-trip back onto cell B1: {:?}", ir2.sections[0].elements);
+        let has_comment_endnote = ir2.sections[0].elements.iter().any(
+            |e| matches!(e, Element::Endnote(n) if n.marker.as_deref() == Some("B1 (Jane Doe)")),
+        );
+        assert!(
+            has_comment_endnote,
+            "the comment must round-trip back onto cell B1: {:?}",
+            ir2.sections[0].elements
+        );
     }
 
     /// A table cell's own character formatting (bold/
@@ -1974,14 +2020,19 @@ mod xlsx_table_write_tests {
     /// write->reread round trip with per-run fidelity.
     #[test]
     fn test_cell_character_formatting_round_trips_including_multi_run() {
-        let span = |text: &str, bold: bool, color: Option<[u8; 3]>| InlineContent::Text(TextSpan {
-            text: text.to_string(),
-            bold,
-            color,
-            ..Default::default()
-        });
+        let span = |text: &str, bold: bool, color: Option<[u8; 3]>| {
+            InlineContent::Text(TextSpan {
+                text: text.to_string(),
+                bold,
+                color,
+                ..Default::default()
+            })
+        };
         let cell = |spans: Vec<InlineContent>| TableCell {
-            content: vec![Element::Paragraph(Paragraph { content: spans, ..Default::default() })],
+            content: vec![Element::Paragraph(Paragraph {
+                content: spans,
+                ..Default::default()
+            })],
             col_span: 1,
             row_span: 1,
             ..Default::default()
@@ -2000,8 +2051,14 @@ mod xlsx_table_write_tests {
         };
 
         let ir = DocumentIR {
-            metadata: Metadata { format: DocumentFormat::Xlsx, ..Default::default() },
-            sections: vec![Section { elements: vec![Element::Table(table)], ..Default::default() }],
+            metadata: Metadata {
+                format: DocumentFormat::Xlsx,
+                ..Default::default()
+            },
+            sections: vec![Section {
+                elements: vec![Element::Table(table)],
+                ..Default::default()
+            }],
             defined_names: Vec::new(),
         };
 
@@ -2018,9 +2075,17 @@ mod xlsx_table_write_tests {
             cell.content
                 .iter()
                 .flat_map(|e| match e {
-                    Element::Paragraph(p) => p.content.iter().filter_map(|c| {
-                        if let InlineContent::Text(t) = c { Some(t) } else { None }
-                    }).collect::<Vec<_>>(),
+                    Element::Paragraph(p) => p
+                        .content
+                        .iter()
+                        .filter_map(|c| {
+                            if let InlineContent::Text(t) = c {
+                                Some(t)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>(),
                     _ => Vec::new(),
                 })
                 .collect()
@@ -2030,7 +2095,11 @@ mod xlsx_table_write_tests {
         assert_eq!(s0.len(), 1);
         assert_eq!(s0[0].text, "Bold Red");
         assert!(s0[0].bold, "bold must survive a single-run cell round trip");
-        assert_eq!(s0[0].color, Some([255, 0, 0]), "color must survive a single-run cell round trip");
+        assert_eq!(
+            s0[0].color,
+            Some([255, 0, 0]),
+            "color must survive a single-run cell round trip"
+        );
 
         let s1 = spans_of(&t.rows[0].cells[1]);
         assert_eq!(s1.len(), 1);
@@ -2063,7 +2132,10 @@ mod docx_section_title_tests {
     fn test_a_heading_with_a_line_break_is_not_duplicated_as_a_second_title() {
         let heading = Element::Heading(Heading {
             level: 1,
-            content: vec![InlineContent::LineBreak, InlineContent::Text(TextSpan::plain("Individual Elements"))],
+            content: vec![
+                InlineContent::LineBreak,
+                InlineContent::Text(TextSpan::plain("Individual Elements")),
+            ],
             ..Default::default()
         });
         let body = Element::Paragraph(Paragraph {
@@ -2072,7 +2144,10 @@ mod docx_section_title_tests {
         });
 
         let ir = DocumentIR {
-            metadata: Metadata { format: DocumentFormat::Docx, ..Default::default() },
+            metadata: Metadata {
+                format: DocumentFormat::Docx,
+                ..Default::default()
+            },
             sections: vec![Section {
                 title: Some(inline_to_text(&[
                     InlineContent::LineBreak,
@@ -2123,7 +2198,10 @@ mod pptx_notes_write_tests {
         })];
 
         let ir = DocumentIR {
-            metadata: Metadata { format: DocumentFormat::Pptx, ..Default::default() },
+            metadata: Metadata {
+                format: DocumentFormat::Pptx,
+                ..Default::default()
+            },
             sections: vec![Section {
                 elements: vec![Element::Paragraph(Paragraph {
                     content: vec![InlineContent::Text(TextSpan::plain("Visible body"))],
@@ -2141,12 +2219,18 @@ mod pptx_notes_write_tests {
         let doc = crate::Document::from_reader(buf, DocumentFormat::Pptx).unwrap();
         let ir2 = doc.to_ir();
 
-        let notes2 = ir2.sections[0].speaker_notes.as_ref().expect("notes must survive the round trip");
+        let notes2 = ir2.sections[0]
+            .speaker_notes
+            .as_ref()
+            .expect("notes must survive the round trip");
         let bold_survived = notes2.iter().any(|e| {
             matches!(e, Element::Paragraph(p) if p.content.iter().any(|c| {
                 matches!(c, InlineContent::Text(t) if t.text == "THIS LINE IS BOLD" && t.bold)
             }))
         });
-        assert!(bold_survived, "bold formatting on speaker notes must survive a write->reread round trip: {notes2:?}");
+        assert!(
+            bold_survived,
+            "bold formatting on speaker notes must survive a write->reread round trip: {notes2:?}"
+        );
     }
 }

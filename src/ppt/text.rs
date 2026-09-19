@@ -130,7 +130,13 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
     // render on a slide — in two POI corpus files they were 116 of the 137
     // and 121 extracted characters respectively.
     let mut slides = Vec::new();
-    collect_slide_containers(stream, 0, &stream_wide_hyperlinks, &stream_wide_ole_objects, &mut slides);
+    collect_slide_containers(
+        stream,
+        0,
+        &stream_wide_hyperlinks,
+        &stream_wide_ole_objects,
+        &mut slides,
+    );
     if slides.iter().any(|s| !s.text_runs.is_empty()) {
         return slides;
     }
@@ -158,7 +164,13 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
     if runs.is_empty() && tables.is_empty() && image_refs.is_empty() {
         Vec::new()
     } else {
-        vec![SlideText { text_runs: runs, tables, image_refs, ole_object_refs, ..Default::default() }]
+        vec![SlideText {
+            text_runs: runs,
+            tables,
+            image_refs,
+            ole_object_refs,
+            ..Default::default()
+        }]
     }
 }
 
@@ -195,7 +207,13 @@ fn collect_slide_containers(
             );
             runs.retain(|r| !is_master_placeholder_prompt(&r.text));
             let hidden = slide_is_hidden(&rec.data);
-            out.push(SlideText { text_runs: runs, tables, image_refs, ole_object_refs, hidden });
+            out.push(SlideText {
+                text_runs: runs,
+                tables,
+                image_refs,
+                ole_object_refs,
+                hidden,
+            });
             continue;
         }
         if rec.header.is_container() {
@@ -267,7 +285,14 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
         match rec.header.rec_type {
             RT_SLIDE_PERSIST_ATOM if rec.data.len() >= 4 => {
                 if let Some(persist_id_ref) = current_persist_id.take() {
-                    slides.push(resolve_slide(stream, dir, persist_id_ref, &outline_texts, &hyperlinks, &ole_objects));
+                    slides.push(resolve_slide(
+                        stream,
+                        dir,
+                        persist_id_ref,
+                        &outline_texts,
+                        &hyperlinks,
+                        &ole_objects,
+                    ));
                 }
                 current_persist_id =
                     Some(u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]));
@@ -310,7 +335,14 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
         }
     }
     if let Some(persist_id_ref) = current_persist_id.take() {
-        slides.push(resolve_slide(stream, dir, persist_id_ref, &outline_texts, &hyperlinks, &ole_objects));
+        slides.push(resolve_slide(
+            stream,
+            dir,
+            persist_id_ref,
+            &outline_texts,
+            &hyperlinks,
+            &ole_objects,
+        ));
     }
 
     if !headers_footers.is_empty() {
@@ -405,7 +437,13 @@ fn resolve_slide(
             }
         }
     }
-    SlideText { text_runs, tables, image_refs, ole_object_refs, hidden }
+    SlideText {
+        text_runs,
+        tables,
+        image_refs,
+        ole_object_refs,
+        hidden,
+    }
 }
 
 /// The level-0 (no indentation) master style for the two placeholder
@@ -444,7 +482,11 @@ fn find_master_id(slide_children: &[u8]) -> Option<u32> {
 /// Resolve `master_id` through the persist directory to its
 /// `MainMaster` container, then parse its `TxMasterStyleAtom` children
 /// for the Title/Body text types' level-0 style.
-fn resolve_master_styles(stream: &[u8], dir: &PersistDirectory, master_id: u32) -> Option<MasterStyles> {
+fn resolve_master_styles(
+    stream: &[u8],
+    dir: &PersistDirectory,
+    master_id: u32,
+) -> Option<MasterStyles> {
     let offset = dir.resolve(master_id)?;
     let children = bounded_container_children(stream, offset, RT_MAIN_MASTER)?;
     let mut styles = MasterStyles::default();
@@ -665,8 +707,9 @@ fn extract_shape_text(
                 // whatever the enclosing group/shape already had" pattern
                 // as the hyperlink just above.
                 let shape_placeholder_role = resolve_shape_placeholder_role(&rec.data);
-                let placeholder_role_ref =
-                    shape_placeholder_role.as_deref().or(current_placeholder_role);
+                let placeholder_role_ref = shape_placeholder_role
+                    .as_deref()
+                    .or(current_placeholder_role);
                 // This shape's own picture reference, if it has one
                 // — resolved here, at the shape actually
                 // carrying it, not inferred from whichever slide
@@ -780,10 +823,18 @@ fn try_extract_table_from_spgr(
         if anchor.data.len() < 16 {
             return None;
         }
-        let left =
-            i32::from_le_bytes([anchor.data[0], anchor.data[1], anchor.data[2], anchor.data[3]]);
-        let top =
-            i32::from_le_bytes([anchor.data[4], anchor.data[5], anchor.data[6], anchor.data[7]]);
+        let left = i32::from_le_bytes([
+            anchor.data[0],
+            anchor.data[1],
+            anchor.data[2],
+            anchor.data[3],
+        ]);
+        let top = i32::from_le_bytes([
+            anchor.data[4],
+            anchor.data[5],
+            anchor.data[6],
+            anchor.data[7],
+        ]);
 
         let shape_hyperlink = resolve_shape_hyperlink(&rec.data, hyperlinks);
         let hyperlink_ref = shape_hyperlink.as_deref().or(current_hyperlink);
@@ -827,7 +878,10 @@ fn extract_slides_from_slide_list_cache(slide_list: &[u8]) -> Vec<SlideText> {
                         slides.push(slide);
                     }
                 }
-                current = Some(SlideText { text_runs: Vec::new(), ..Default::default() });
+                current = Some(SlideText {
+                    text_runs: Vec::new(),
+                    ..Default::default()
+                });
                 current_type = TextType::Other;
             },
             RT_TEXT_HEADER if rec.data.len() >= 4 => {
@@ -967,12 +1021,7 @@ fn parse_one_ex_hyperlink(data: &[u8]) -> Option<(u32, String)> {
         let Ok(rec) = rec else { break };
         match rec.header.rec_type {
             RT_EXTERNAL_HYPERLINK_ATOM if rec.data.len() >= 4 => {
-                id = Some(u32::from_le_bytes([
-                    rec.data[0],
-                    rec.data[1],
-                    rec.data[2],
-                    rec.data[3],
-                ]));
+                id = Some(u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]));
             },
             RT_CSTRING if rec.header.rec_instance == CSTRING_INSTANCE_TARGET => {
                 let s = decode_utf16le(&rec.data);
@@ -1093,22 +1142,22 @@ fn resolve_shape_placeholder_role(shape_data: &[u8]) -> Option<String> {
 /// unmapped here rather than inventing a non-standard string.
 fn placeholder_id_to_ooxml_type(id: u8) -> Option<&'static str> {
     match id {
-        7 => Some("dt"),       // Date
-        8 => Some("sldNum"),   // Slide number
-        9 => Some("ftr"),      // Footer
-        10 => Some("hdr"),     // Header
-        11 => Some("sldImg"),  // Slide image
-        13 => Some("title"),   // Title
-        14 => Some("body"),    // Body
+        7 => Some("dt"),        // Date
+        8 => Some("sldNum"),    // Slide number
+        9 => Some("ftr"),       // Footer
+        10 => Some("hdr"),      // Header
+        11 => Some("sldImg"),   // Slide image
+        13 => Some("title"),    // Title
+        14 => Some("body"),     // Body
         15 => Some("ctrTitle"), // Centered title
         16 => Some("subTitle"), // Subtitle
-        19 => Some("obj"),     // Object
-        20 => Some("chart"),   // Chart
-        21 => Some("tbl"),     // Table
-        22 => Some("clipArt"), // Clip art
-        23 => Some("dgm"),     // Diagram / org chart
-        24 => Some("media"),   // Media
-        26 => Some("pic"),     // Picture
+        19 => Some("obj"),      // Object
+        20 => Some("chart"),    // Chart
+        21 => Some("tbl"),      // Table
+        22 => Some("clipArt"),  // Clip art
+        23 => Some("dgm"),      // Diagram / org chart
+        24 => Some("media"),    // Media
+        26 => Some("pic"),      // Picture
         _ => None,
     }
 }
@@ -1191,7 +1240,13 @@ fn resolve_shape_pib(shape_data: &[u8]) -> Option<usize> {
 /// match for the common case, off by one per astral-plane character
 /// (surrogate pair) in the rare case one appears before the hyperlinked
 /// range, which is judged not worth the extra bookkeeping here.
-fn split_run_with_hyperlink(out: &mut Vec<TextRun>, idx: usize, begin: usize, end: usize, url: &str) {
+fn split_run_with_hyperlink(
+    out: &mut Vec<TextRun>,
+    idx: usize,
+    begin: usize,
+    end: usize,
+    url: &str,
+) {
     let Some(run) = out.get(idx) else { return };
     let chars: Vec<char> = run.text.chars().collect();
     let begin = begin.min(chars.len());
@@ -1252,7 +1307,10 @@ fn split_run_with_hyperlink(out: &mut Vec<TextRun>, idx: usize, begin: usize, en
 /// Slice/clip a set of character-formatting spans onto `range`, re-based
 /// so the returned spans are relative to `range.start` (i.e. valid over
 /// the substring `text[range]` on its own).
-fn slice_char_formats(spans: &[CharFormatSpan], range: std::ops::Range<usize>) -> Vec<CharFormatSpan> {
+fn slice_char_formats(
+    spans: &[CharFormatSpan],
+    range: std::ops::Range<usize>,
+) -> Vec<CharFormatSpan> {
     spans
         .iter()
         .filter_map(|s| {
@@ -1268,7 +1326,10 @@ fn slice_char_formats(spans: &[CharFormatSpan], range: std::ops::Range<usize>) -
 }
 
 /// Same as [`slice_char_formats`] for paragraph-formatting spans.
-fn slice_para_formats(spans: &[ParaFormatSpan], range: std::ops::Range<usize>) -> Vec<ParaFormatSpan> {
+fn slice_para_formats(
+    spans: &[ParaFormatSpan],
+    range: std::ops::Range<usize>,
+) -> Vec<ParaFormatSpan> {
     spans
         .iter()
         .filter_map(|s| {
@@ -1615,7 +1676,13 @@ mod tests {
     #[test]
     fn test_shape_with_ex_obj_ref_reaches_ole_object_refs_end_to_end() {
         let mut ole_objects = HashMap::new();
-        ole_objects.insert(1u32, super::OleObjectInfo { subtype: 3, kind: 0 });
+        ole_objects.insert(
+            1u32,
+            super::OleObjectInfo {
+                subtype: 3,
+                kind: 0,
+            },
+        );
 
         let ex_obj_ref_atom = make_atom(RT_EXTERNAL_OBJECT_REF_ATOM, 0, &1u32.to_le_bytes());
         let client_data = make_container(RT_CLIENT_DATA, 0, &ex_obj_ref_atom);
@@ -1643,7 +1710,11 @@ mod tests {
 
         assert_eq!(ole_object_refs.len(), 1);
         assert_eq!(ole_object_refs[0].subtype, 3);
-        assert_eq!(runs.len(), 1, "the shape's own text must still be extracted alongside its OLE ref");
+        assert_eq!(
+            runs.len(),
+            1,
+            "the shape's own text must still be extracted alongside its OLE ref"
+        );
     }
 
     /// A shape with no `ExObjRefAtom` at all must not resolve anything,
@@ -1651,7 +1722,13 @@ mod tests {
     #[test]
     fn test_resolve_shape_ole_object_none_without_ex_obj_ref() {
         let mut ole_objects = HashMap::new();
-        ole_objects.insert(1u32, super::OleObjectInfo { subtype: 3, kind: 0 });
+        ole_objects.insert(
+            1u32,
+            super::OleObjectInfo {
+                subtype: 3,
+                kind: 0,
+            },
+        );
 
         let client_data = make_container(RT_CLIENT_DATA, 0, &[]);
         let shape_children = client_data;
@@ -2455,7 +2532,10 @@ mod tests {
         let mut children = make_atom(RT_HEADER_FOOTER_ATOM, 0, &[0u8; 4]);
         let date_bytes: Vec<u8> = date.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
         children.extend(make_atom(RT_CSTRING, 0, &date_bytes));
-        let footer_bytes: Vec<u8> = footer.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let footer_bytes: Vec<u8> = footer
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
         children.extend(make_atom(RT_CSTRING, 2, &footer_bytes));
         make_container(RT_HEADER_FOOTER, 3, &children)
     }
@@ -2487,7 +2567,11 @@ mod tests {
 
         let slides = extract_slides_text(&stream, Some(&current_user));
         assert_eq!(slides.len(), 1);
-        let texts: Vec<&str> = slides[0].text_runs.iter().map(|r| r.text.as_str()).collect();
+        let texts: Vec<&str> = slides[0]
+            .text_runs
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect();
         assert!(texts.contains(&"Slide Title"), "{texts:?}");
         assert!(texts.contains(&"26 August 2004"), "{texts:?}");
         assert!(texts.contains(&"Transport CDM Workshop"), "{texts:?}");
@@ -2658,9 +2742,17 @@ mod tests {
             "expected one synthetic master-inherited span: {:?}",
             run.char_formats
         );
-        assert_eq!(run.char_formats[0].format.font_size, Some(44), "font size must inherit from the master");
+        assert_eq!(
+            run.char_formats[0].format.font_size,
+            Some(44),
+            "font size must inherit from the master"
+        );
         assert_eq!(run.para_formats.len(), 1);
-        assert_eq!(run.para_formats[0].format.alignment, Some(1), "alignment must inherit from the master");
+        assert_eq!(
+            run.para_formats[0].format.alignment,
+            Some(1),
+            "alignment must inherit from the master"
+        );
     }
 
     #[test]

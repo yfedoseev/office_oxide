@@ -32,7 +32,12 @@ impl DocxDocument {
         // though it visibly has text, and a document's word count changed
         // depending on which of plain_text()/to_markdown()/to_ir() a caller
         // used.
-        for n in self.footnotes.iter().chain(self.endnotes.iter()).chain(self.comments.iter()) {
+        for n in self
+            .footnotes
+            .iter()
+            .chain(self.endnotes.iter())
+            .chain(self.comments.iter())
+        {
             plain_text_blocks(&n.content, &mut out);
         }
         // Trim trailing newlines
@@ -67,7 +72,12 @@ impl DocxDocument {
         // endnote and comment bodies are real content that to_ir() already
         // carries, and dropping them here made this renderer disagree with
         // that one.
-        for n in self.footnotes.iter().chain(self.endnotes.iter()).chain(self.comments.iter()) {
+        for n in self
+            .footnotes
+            .iter()
+            .chain(self.endnotes.iter())
+            .chain(self.comments.iter())
+        {
             let mut note_buf = String::new();
             markdown_blocks(&n.content, &ctx, &mut note_buf, 0);
             let note_text = note_buf.trim();
@@ -149,7 +159,12 @@ fn plain_text_blocks(elements: &[BlockElement], out: &mut String) {
 
 fn plain_text_run(run: &Run, out: &mut String) {
     // `<w:vanish/>` — Word never renders this run at all.
-    if run.properties.as_ref().and_then(|rp| rp.hidden).unwrap_or(false) {
+    if run
+        .properties
+        .as_ref()
+        .and_then(|rp| rp.hidden)
+        .unwrap_or(false)
+    {
         return;
     }
     for content in &run.content {
@@ -196,7 +211,9 @@ fn plain_text_run(run: &Run, out: &mut String) {
             // The reference mark itself carries no text of its own — the
             // note *body* is walked separately; this is only
             // the citation point, nothing to render here.
-            RunContent::FootnoteRef(..) | RunContent::EndnoteRef(..) | RunContent::CommentRef(_) => {},
+            RunContent::FootnoteRef(..)
+            | RunContent::EndnoteRef(..)
+            | RunContent::CommentRef(_) => {},
             RunContent::FormField(ff) => {
                 if let Some(text) = &ff.display_text {
                     out.push_str(text);
@@ -478,7 +495,12 @@ fn flush_run(pending: &mut Option<(RunStyle, String)>, out: &mut String) {
 /// Collect a run's text content (no emphasis delimiters).
 fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, text: &mut String) {
     // `<w:vanish/>` — Word never renders this run at all.
-    if run.properties.as_ref().and_then(|rp| rp.hidden).unwrap_or(false) {
+    if run
+        .properties
+        .as_ref()
+        .and_then(|rp| rp.hidden)
+        .unwrap_or(false)
+    {
         return;
     }
     for content in &run.content {
@@ -506,7 +528,9 @@ fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, text: &mut String) {
                     text.push('\n');
                 }
             },
-            RunContent::FootnoteRef(..) | RunContent::EndnoteRef(..) | RunContent::CommentRef(_) => {},
+            RunContent::FootnoteRef(..)
+            | RunContent::EndnoteRef(..)
+            | RunContent::CommentRef(_) => {},
             RunContent::FormField(ff) => {
                 if let Some(t) = &ff.display_text {
                     text.push_str(t);

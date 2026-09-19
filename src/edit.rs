@@ -288,7 +288,8 @@ mod tests {
         let mut cfb = vec![0u8; 512];
         cfb[0..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("office_oxide_edit_test_encrypted_{}.docx", std::process::id()));
+        let path =
+            dir.join(format!("office_oxide_edit_test_encrypted_{}.docx", std::process::id()));
         std::fs::write(&path, &cfb).unwrap();
         let result = EditableDocument::open(&path);
         std::fs::remove_file(&path).ok();
@@ -305,7 +306,8 @@ mod tests {
     /// directory succeeds on Linux; only a later read() fails).
     #[test]
     fn test_open_directory_gives_a_friendly_error() {
-        let dir = std::env::temp_dir().join(format!("office_oxide_edit_test_dir_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("office_oxide_edit_test_dir_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("looks_like.docx");
         std::fs::create_dir_all(&path).unwrap();
@@ -313,9 +315,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         let err = result.err().expect("expected an Err");
         let msg = err.to_string();
-        assert!(
-            msg.contains("directory"),
-            "expected an error naming the directory, got: {msg}"
-        );
+        assert!(msg.contains("directory"), "expected an error naming the directory, got: {msg}");
     }
 }

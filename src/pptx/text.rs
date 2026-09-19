@@ -204,7 +204,11 @@ fn pptx_table_grid(table: &Table) -> Vec<Vec<Option<&TableCell>>> {
     let width = table
         .rows
         .iter()
-        .map(|r| real_cells(r).map(|c| c.grid_span.max(1) as usize).sum::<usize>())
+        .map(|r| {
+            real_cells(r)
+                .map(|c| c.grid_span.max(1) as usize)
+                .sum::<usize>()
+        })
         .max()
         .unwrap_or(0)
         .min(cell_total.saturating_mul(1_000).max(1));
@@ -240,7 +244,10 @@ fn pptx_table_grid(table: &Table) -> Vec<Vec<Option<&TableCell>>> {
 }
 
 fn cell_plain_text(cell: &TableCell) -> String {
-    cell.text_body.as_ref().map(plain_text_from_body).unwrap_or_default()
+    cell.text_body
+        .as_ref()
+        .map(plain_text_from_body)
+        .unwrap_or_default()
 }
 
 fn plain_text_from_table(table: &Table) -> String {
@@ -926,7 +933,13 @@ mod tests {
         assert!(md.contains("| A | B |"));
     }
 
-    fn text_cell(text: &str, grid_span: u32, row_span: u32, h_merge: bool, v_merge: bool) -> TableCell {
+    fn text_cell(
+        text: &str,
+        grid_span: u32,
+        row_span: u32,
+        h_merge: bool,
+        v_merge: bool,
+    ) -> TableCell {
         let text_body = if h_merge || v_merge {
             None
         } else {
@@ -1030,7 +1043,12 @@ mod tests {
             shapes: vec![Shape::GraphicFrame(super::super::shape::GraphicFrame {
                 id: 1,
                 name: "Chart".to_string(),
-                position: Some(ShapePosition { x: 0, y: 0, cx: 9000, cy: 3000 }),
+                position: Some(ShapePosition {
+                    x: 0,
+                    y: 0,
+                    cx: 9000,
+                    cy: 3000,
+                }),
                 content: GraphicContent::Text(vec![
                     "Title: Dollars per Group".to_string(),
                     "Categories: Group 1, Group 2".to_string(),

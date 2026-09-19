@@ -175,7 +175,11 @@ pub fn resolve_deleted_cp_ranges_from_runs(
             let cp_end = fc_to_cp(r.fc_end, pieces).unwrap_or(cp_start);
             let cp_start = cp_start.min(text_len);
             let cp_end = cp_end.min(text_len);
-            if cp_end > cp_start { Some((cp_start, cp_end)) } else { None }
+            if cp_end > cp_start {
+                Some((cp_start, cp_end))
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -415,10 +419,23 @@ mod tests {
     #[test]
     fn test_resolve_chp_segments_single_run_covers_whole_paragraph() {
         let pieces = [unicode_piece(0x800, 10)];
-        let runs =
-            vec![FkpRun { fc_start: 0x800, fc_end: 0x800 + 10 * 2, grpprl: bold_grpprl() }];
+        let runs = vec![FkpRun {
+            fc_start: 0x800,
+            fc_end: 0x800 + 10 * 2,
+            grpprl: bold_grpprl(),
+        }];
         let segs = resolve_chp_segments(&resolve_chp_cp_runs(&runs, &pieces), 0, 10);
-        assert_eq!(segs, vec![(0, 10, ChpProps { bold: true, ..Default::default() })]);
+        assert_eq!(
+            segs,
+            vec![(
+                0,
+                10,
+                ChpProps {
+                    bold: true,
+                    ..Default::default()
+                }
+            )]
+        );
     }
 
     /// A run covering only the middle of the paragraph gap-fills both
@@ -436,7 +453,14 @@ mod tests {
             segs,
             vec![
                 (0, 3, ChpProps::default()),
-                (3, 7, ChpProps { bold: true, ..Default::default() }),
+                (
+                    3,
+                    7,
+                    ChpProps {
+                        bold: true,
+                        ..Default::default()
+                    }
+                ),
                 (7, 10, ChpProps::default()),
             ]
         );
@@ -447,8 +471,11 @@ mod tests {
     #[test]
     fn test_resolve_chp_segments_run_outside_paragraph_is_ignored() {
         let pieces = [unicode_piece(0x800, 20)];
-        let runs =
-            vec![FkpRun { fc_start: 0x800 + 15 * 2, fc_end: 0x800 + 18 * 2, grpprl: bold_grpprl() }];
+        let runs = vec![FkpRun {
+            fc_start: 0x800 + 15 * 2,
+            fc_end: 0x800 + 18 * 2,
+            grpprl: bold_grpprl(),
+        }];
         let segs = resolve_chp_segments(&resolve_chp_cp_runs(&runs, &pieces), 0, 10);
         assert_eq!(segs, vec![(0, 10, ChpProps::default())]);
     }
@@ -461,9 +488,17 @@ mod tests {
     fn test_resolve_chp_segments_overlapping_runs_do_not_duplicate_coverage() {
         let pieces = [unicode_piece(0x800, 10)];
         let runs = vec![
-            FkpRun { fc_start: 0x800, fc_end: 0x800 + 5 * 2, grpprl: bold_grpprl() },
+            FkpRun {
+                fc_start: 0x800,
+                fc_end: 0x800 + 5 * 2,
+                grpprl: bold_grpprl(),
+            },
             // Overlaps [0,5) by [2,5); only [5,8) is new.
-            FkpRun { fc_start: 0x800 + 2 * 2, fc_end: 0x800 + 8 * 2, grpprl: Vec::new() },
+            FkpRun {
+                fc_start: 0x800 + 2 * 2,
+                fc_end: 0x800 + 8 * 2,
+                grpprl: Vec::new(),
+            },
         ];
         let segs = resolve_chp_segments(&resolve_chp_cp_runs(&runs, &pieces), 0, 10);
         // Total coverage must be exactly [0,10) with no gaps or overlaps.
@@ -482,8 +517,16 @@ mod tests {
         // Deliberately out of FC/CP order: the second run's CP range (5..8)
         // comes before the first's (0..3) in the input slice.
         let runs = vec![
-            FkpRun { fc_start: 0x800 + 5 * 2, fc_end: 0x800 + 8 * 2, grpprl: Vec::new() },
-            FkpRun { fc_start: 0x800, fc_end: 0x800 + 3 * 2, grpprl: bold_grpprl() },
+            FkpRun {
+                fc_start: 0x800 + 5 * 2,
+                fc_end: 0x800 + 8 * 2,
+                grpprl: Vec::new(),
+            },
+            FkpRun {
+                fc_start: 0x800,
+                fc_end: 0x800 + 3 * 2,
+                grpprl: bold_grpprl(),
+            },
         ];
         let cp_runs = resolve_chp_cp_runs(&runs, &pieces);
         assert_eq!(cp_runs.len(), 2);
@@ -509,7 +552,11 @@ mod tests {
             .map(|i| FkpRun {
                 fc_start: i * 4,
                 fc_end: i * 4 + 4,
-                grpprl: if i % 2 == 0 { bold_grpprl() } else { Vec::new() },
+                grpprl: if i % 2 == 0 {
+                    bold_grpprl()
+                } else {
+                    Vec::new()
+                },
             })
             .collect();
         let cp_runs = resolve_chp_cp_runs(&runs, &pieces);

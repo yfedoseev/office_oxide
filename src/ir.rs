@@ -724,11 +724,14 @@ pub enum Element {
     Shape(Shape),
 }
 
-/// Work item for `Element`'s iterative `Drop`: either a child `Element`
-/// still holding its own subtree, or a batch of `ListItem`s (which recurse
-/// through `List` rather than `Element`, so they need their own case).
+/// Work item for `Element`'s iterative `Drop`: a batch of child `Element`s
+/// still holding their own subtrees, or a batch of `ListItem`s (which
+/// recurse through `List` rather than `Element`, so they need their own
+/// case). Both variants are whole `Vec`s, moved as-is from the parent's
+/// field: one push per container rather than one per child, and no
+/// per-element boxing on the drop path.
 enum DropWork {
-    Elem(Element),
+    Elems(Vec<Element>),
     Items(Vec<ListItem>),
 }
 
@@ -738,14 +741,14 @@ enum DropWork {
 /// this can't just be normal field access.
 fn drain_element_children(elem: &mut Element, stack: &mut Vec<DropWork>) {
     match elem {
-        Element::TextBox(tb) => stack.extend(std::mem::take(&mut tb.content).into_iter().map(DropWork::Elem)),
+        Element::TextBox(tb) => stack.push(DropWork::Elems(std::mem::take(&mut tb.content))),
         Element::Footnote(n) | Element::Endnote(n) => {
-            stack.extend(std::mem::take(&mut n.content).into_iter().map(DropWork::Elem));
+            stack.push(DropWork::Elems(std::mem::take(&mut n.content)));
         },
         Element::Table(t) => {
             for row in &mut t.rows {
                 for cell in &mut row.cells {
-                    stack.extend(std::mem::take(&mut cell.content).into_iter().map(DropWork::Elem));
+                    stack.push(DropWork::Elems(std::mem::take(&mut cell.content)));
                 }
             }
         },
@@ -780,14 +783,16 @@ impl Drop for Element {
         drain_element_children(self, &mut stack);
         while let Some(work) = stack.pop() {
             match work {
-                DropWork::Elem(mut e) => {
-                    drain_element_children(&mut e, &mut stack);
-                    // `e` drops here: its own Vec<Element>/List fields are
-                    // now empty, so this is shallow, not recursive.
+                DropWork::Elems(elems) => {
+                    for mut e in elems {
+                        drain_element_children(&mut e, &mut stack);
+                        // `e` drops here: its own Vec<Element>/List fields
+                        // are now empty, so this is shallow, not recursive.
+                    }
                 },
                 DropWork::Items(items) => {
                     for mut item in items {
-                        stack.extend(std::mem::take(&mut item.content).into_iter().map(DropWork::Elem));
+                        stack.push(DropWork::Elems(std::mem::take(&mut item.content)));
                         if let Some(nested) = item.nested.take() {
                             stack.push(DropWork::Items(nested.items));
                         }

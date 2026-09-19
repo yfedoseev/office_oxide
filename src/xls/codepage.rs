@@ -42,7 +42,11 @@ pub fn decode_biff5_text(bytes: &[u8], codepage: Option<u16>) -> String {
 const MAC_CENTRAL_EUROPE: u16 = 10029;
 
 fn mac_central_europe_char(b: u8) -> char {
-    if b < 0x80 { b as char } else { MAC_CENTRAL_EUROPE_TABLE[(b - 0x80) as usize] }
+    if b < 0x80 {
+        b as char
+    } else {
+        MAC_CENTRAL_EUROPE_TABLE[(b - 0x80) as usize]
+    }
 }
 
 /// Mac OS Central European (codepage 10029) high-byte (0x80-0xFF) to

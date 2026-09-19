@@ -621,7 +621,7 @@ fn test_a_row_spanning_cell_leaves_the_covered_position_empty() {
             })],
             ..Default::default()
         }],
-    defined_names: Vec::new(),
+        defined_names: Vec::new(),
     };
     let md = ir.to_markdown();
     let second_row = md.lines().nth(2).expect("a second body row");

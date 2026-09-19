@@ -115,9 +115,12 @@ fn parse_property_set(data: &[u8], base: usize) -> Option<SummaryProperties> {
     if data.len() < header_end {
         return None;
     }
-    let num_properties =
-        u32::from_le_bytes([data[base + 4], data[base + 5], data[base + 6], data[base + 7]])
-            as usize;
+    let num_properties = u32::from_le_bytes([
+        data[base + 4],
+        data[base + 5],
+        data[base + 6],
+        data[base + 7],
+    ]) as usize;
     // A hostile stream can claim billions of properties; bound the work
     // to what a real SummaryInformation set could ever hold.
     let num_properties = num_properties.min(64);
@@ -128,7 +131,12 @@ fn parse_property_set(data: &[u8], base: usize) -> Option<SummaryProperties> {
         if data.len() < entry + 8 {
             break;
         }
-        let id = u32::from_le_bytes([data[entry], data[entry + 1], data[entry + 2], data[entry + 3]]);
+        let id = u32::from_le_bytes([
+            data[entry],
+            data[entry + 1],
+            data[entry + 2],
+            data[entry + 3],
+        ]);
         let rel_offset = u32::from_le_bytes([
             data[entry + 4],
             data[entry + 5],
@@ -219,8 +227,10 @@ fn read_string(data: &[u8], pos: usize) -> Option<String> {
                 return None;
             }
             let units: Vec<u16> = data[start..end]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
                 .collect();
             let s = String::from_utf16_lossy(&units);
             Some(s.trim_end_matches('\0').to_string())
@@ -276,9 +286,7 @@ fn filetime_to_iso8601(ticks: u64) -> Option<String> {
     let secs_of_day = unix_secs % 86_400;
     let (hour, minute, second) = (secs_of_day / 3600, (secs_of_day / 60) % 60, secs_of_day % 60);
     let (year, month, day) = civil_from_days(days as i64);
-    Some(format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
-    ))
+    Some(format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"))
 }
 
 /// Days-since-1970-01-01 to (year, month, day), Howard Hinnant's

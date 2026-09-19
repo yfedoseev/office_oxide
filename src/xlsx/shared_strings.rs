@@ -127,7 +127,9 @@ fn parse_si(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Shared
 /// Parse a single `<r>` rich text run element, including its `<rPr>`
 /// formatting (this used to be skipped entirely, discarding
 /// every run's bold/italic/size/font/color/superscript, permanently).
-pub(crate) fn parse_rich_text_run(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<RichTextRun> {
+pub(crate) fn parse_rich_text_run(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> crate::core::Result<RichTextRun> {
     let mut text = String::new();
     let mut bold = None;
     let mut italic = None;
@@ -147,7 +149,8 @@ pub(crate) fn parse_rich_text_run(reader: &mut quick_xml::Reader<&[u8]>) -> crat
                         b"b" => bold = Some(xml::parse_toggle(p, b"val")),
                         b"i" => italic = Some(xml::parse_toggle(p, b"val")),
                         b"sz" => {
-                            font_size = xml::optional_attr_str(p, b"val")?.and_then(|v| v.parse().ok());
+                            font_size =
+                                xml::optional_attr_str(p, b"val")?.and_then(|v| v.parse().ok());
                         },
                         // Run properties use `<rFont>`, not `<name>` (a
                         // different schema from styles.xml's `<font><name>`).
@@ -184,7 +187,15 @@ pub(crate) fn parse_rich_text_run(reader: &mut quick_xml::Reader<&[u8]>) -> crat
         }
     }
 
-    Ok(RichTextRun { text, bold, italic, font_size, font_name, color, vert_align })
+    Ok(RichTextRun {
+        text,
+        bold,
+        italic,
+        font_size,
+        font_name,
+        color,
+        vert_align,
+    })
 }
 
 /// Parse a color reference from an element's attributes.

@@ -71,7 +71,11 @@ fn handle_line(request: serde_json::Value) -> Option<serde_json::Value> {
                 items.iter().filter_map(handle_request).collect()
             };
 
-            if responses.is_empty() { None } else { Some(serde_json::Value::Array(responses)) }
+            if responses.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Array(responses))
+            }
         },
         other => handle_request(&other),
     }
@@ -167,7 +171,8 @@ mod tests {
 
     #[test]
     fn test_wrong_jsonrpc_version_is_invalid_request() {
-        let out = handle_line(json!({"jsonrpc": "1.0", "id": 400, "method": "tools/list"})).unwrap();
+        let out =
+            handle_line(json!({"jsonrpc": "1.0", "id": 400, "method": "tools/list"})).unwrap();
         assert_eq!(out["error"]["code"], json!(-32600));
         assert_eq!(out["id"], json!(400));
     }
@@ -187,7 +192,9 @@ mod tests {
 
     #[test]
     fn test_lone_notification_produces_no_output() {
-        assert!(handle_line(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());
+        assert!(
+            handle_line(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none()
+        );
     }
 
     #[test]

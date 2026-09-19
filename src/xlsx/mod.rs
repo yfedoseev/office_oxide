@@ -301,7 +301,8 @@ impl XlsxDocument {
                 .and_then(|path| Self::read_xml_entry(&mut archive, &path).ok())
                 .and_then(|data| worksheet::parse_threaded_comments(&data).ok())
                 .unwrap_or_default();
-            let comments = worksheet::merge_threaded_comments(comments, threaded_comments, &persons);
+            let comments =
+                worksheet::merge_threaded_comments(comments, threaded_comments, &persons);
 
             bundles.push(SheetBundle {
                 name: sheet.name.clone(),
@@ -314,13 +315,14 @@ impl XlsxDocument {
         }
 
         // Phase 2: parse worksheets (parallel when feature enabled)
-        let mut worksheets = crate::core::parallel::map_collect(bundles, |b| -> Result<Worksheet> {
-            let mut ws = Worksheet::parse(&b.data, b.name, &b.rels)?;
-            ws.images = b.images;
-            ws.text_shapes = b.text_shapes;
-            ws.comments = b.comments;
-            Ok(ws)
-        })?;
+        let mut worksheets =
+            crate::core::parallel::map_collect(bundles, |b| -> Result<Worksheet> {
+                let mut ws = Worksheet::parse(&b.data, b.name, &b.rels)?;
+                ws.images = b.images;
+                ws.text_shapes = b.text_shapes;
+                ws.comments = b.comments;
+                Ok(ws)
+            })?;
 
         // Resolve any in-cell rich-value images: a `vm`-
         // tagged `t="e"` cell whose `vm` maps through the workbook's
@@ -745,7 +747,8 @@ fn read_rich_value_images<R: Read + Seek>(
     };
     let rv_list = parse_rdrichvalue(&rv_xml);
 
-    let Ok(struct_xml) = XlsxDocument::read_xml_entry(archive, "xl/richData/rdrichvaluestructure.xml")
+    let Ok(struct_xml) =
+        XlsxDocument::read_xml_entry(archive, "xl/richData/rdrichvaluestructure.xml")
     else {
         return out;
     };
@@ -767,19 +770,37 @@ fn read_rich_value_images<R: Read + Seek>(
         // `rc.t` must reference the metadataType we identified as
         // XLRICHVALUE — a `<bk>` referencing a different metadata type
         // (e.g. dynamic-array spill markers) isn't an image at all.
-        let Some((rc_type, v)) = rvb_index else { continue };
+        let Some((rc_type, v)) = rvb_index else {
+            continue;
+        };
         if *rc_type != rich_type_id {
             continue;
         }
-        let Some(Some(rv_index)) = future_rvb.get(*v as usize) else { continue };
-        let Some((struct_idx, values)) = rv_list.get(*rv_index as usize) else { continue };
-        let Some(Some(key_pos)) = image_key_positions.get(*struct_idx as usize) else { continue };
-        let Some(local_id_str) = values.get(*key_pos) else { continue };
-        let Ok(local_id) = local_id_str.parse::<usize>() else { continue };
-        let Some(rid) = rel_rids.get(local_id) else { continue };
-        let Some(rel) = rel_rels.get_by_id(rid) else { continue };
+        let Some(Some(rv_index)) = future_rvb.get(*v as usize) else {
+            continue;
+        };
+        let Some((struct_idx, values)) = rv_list.get(*rv_index as usize) else {
+            continue;
+        };
+        let Some(Some(key_pos)) = image_key_positions.get(*struct_idx as usize) else {
+            continue;
+        };
+        let Some(local_id_str) = values.get(*key_pos) else {
+            continue;
+        };
+        let Ok(local_id) = local_id_str.parse::<usize>() else {
+            continue;
+        };
+        let Some(rid) = rel_rids.get(local_id) else {
+            continue;
+        };
+        let Some(rel) = rel_rels.get_by_id(rid) else {
+            continue;
+        };
         let media_path = resolve_relative_zip_path(rel_path, &rel.target);
-        let Ok(bytes) = opc::read_zip_entry(archive, &media_path) else { continue };
+        let Ok(bytes) = opc::read_zip_entry(archive, &media_path) else {
+            continue;
+        };
         let ext = Path::new(&rel.target)
             .extension()
             .and_then(|s| s.to_str())
@@ -818,7 +839,9 @@ fn read_rich_value_images<R: Read + Seek>(
 /// - `value_metadata[p]`: the `(t, v)` of the first `<rc>` in
 ///   `<valueMetadata>`'s `<bk>` at position `p` (0-based) — `p + 1` is
 ///   the cell's own `vm` value.
-fn parse_rich_value_metadata(xml: &[u8]) -> Option<(u32, Vec<Option<u32>>, Vec<Option<(u32, u32)>>)> {
+fn parse_rich_value_metadata(
+    xml: &[u8],
+) -> Option<(u32, Vec<Option<u32>>, Vec<Option<(u32, u32)>>)> {
     use quick_xml::events::Event;
     let mut reader = quick_xml::Reader::from_reader(xml);
     reader.config_mut().trim_text(true);
@@ -843,14 +866,19 @@ fn parse_rich_value_metadata(xml: &[u8]) -> Option<(u32, Vec<Option<u32>>, Vec<O
                 let name = e.local_name();
                 match name.as_ref() {
                     b"metadataTypes" => section = Section::MetadataTypes,
-                    b"futureMetadata" if xml::optional_attr_str(e, b"name").ok().flatten().as_deref() == Some("XLRICHVALUE") => {
+                    b"futureMetadata"
+                        if xml::optional_attr_str(e, b"name").ok().flatten().as_deref()
+                            == Some("XLRICHVALUE") =>
+                    {
                         section = Section::FutureMetadataRich;
                     },
                     b"futureMetadata" => section = Section::None,
                     b"valueMetadata" => section = Section::ValueMetadata,
                     b"metadataType" if section == Section::MetadataTypes => {
                         metadata_type_count += 1;
-                        if xml::optional_attr_str(e, b"name").ok().flatten().as_deref() == Some("XLRICHVALUE") {
+                        if xml::optional_attr_str(e, b"name").ok().flatten().as_deref()
+                            == Some("XLRICHVALUE")
+                        {
                             rich_type_id = Some(metadata_type_count);
                         }
                     },
@@ -874,8 +902,14 @@ fn parse_rich_value_metadata(xml: &[u8]) -> Option<(u32, Vec<Option<u32>>, Vec<O
                         }
                     },
                     b"rc" if section == Section::ValueMetadata && in_bk => {
-                        let t = xml::optional_attr_str(e, b"t").ok().flatten().and_then(|v| v.parse::<u32>().ok());
-                        let v = xml::optional_attr_str(e, b"v").ok().flatten().and_then(|v| v.parse::<u32>().ok());
+                        let t = xml::optional_attr_str(e, b"t")
+                            .ok()
+                            .flatten()
+                            .and_then(|v| v.parse::<u32>().ok());
+                        let v = xml::optional_attr_str(e, b"v")
+                            .ok()
+                            .flatten()
+                            .and_then(|v| v.parse::<u32>().ok());
                         if let (Some(t), Some(v)) = (t, v) {
                             if let Some(slot @ None) = value_metadata.last_mut() {
                                 *slot = Some((t, v));
@@ -889,7 +923,9 @@ fn parse_rich_value_metadata(xml: &[u8]) -> Option<(u32, Vec<Option<u32>>, Vec<O
                 let name = e.local_name();
                 match name.as_ref() {
                     b"bk" => in_bk = false,
-                    b"metadataTypes" | b"futureMetadata" | b"valueMetadata" => section = Section::None,
+                    b"metadataTypes" | b"futureMetadata" | b"valueMetadata" => {
+                        section = Section::None
+                    },
                     _ => {},
                 }
             },
@@ -914,7 +950,11 @@ fn parse_rdrichvalue(xml: &[u8]) -> Vec<(u32, Vec<String>)> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"rv" => {
-                let s = xml::optional_attr_str(e, b"s").ok().flatten().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+                let s = xml::optional_attr_str(e, b"s")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(0);
                 out.push((s, Vec::new()));
             },
             Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"v" => {
@@ -949,9 +989,13 @@ fn parse_rich_value_structures(xml: &[u8]) -> Vec<Option<usize>> {
             Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"s" => {
                 current = Some((0, None));
             },
-            Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"k" => {
+            Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e))
+                if e.local_name().as_ref() == b"k" =>
+            {
                 if let Some((count, image_pos)) = current.as_mut() {
-                    if xml::optional_attr_str(e, b"n").ok().flatten().as_deref() == Some("_rvRel:LocalImageIdentifier") {
+                    if xml::optional_attr_str(e, b"n").ok().flatten().as_deref()
+                        == Some("_rvRel:LocalImageIdentifier")
+                    {
                         *image_pos = Some(*count);
                     }
                     *count += 1;
@@ -981,7 +1025,9 @@ fn parse_rich_value_rel(xml: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     loop {
         match reader.read_event() {
-            Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"rel" => {
+            Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e))
+                if e.local_name().as_ref() == b"rel" =>
+            {
                 if let Some(rid) = xml::optional_attr_str(e, b"r:id").ok().flatten() {
                     out.push(rid.into_owned());
                 }
@@ -1561,7 +1607,9 @@ mod tests {
   <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
 </worksheet>"#;
         let doc = open_bytes(single_sheet_xlsx(sheet_xml, &[("docProps/app.xml", app_xml)]));
-        let app = doc.app_properties.expect("app_properties must be populated");
+        let app = doc
+            .app_properties
+            .expect("app_properties must be populated");
         assert_eq!(app.company.as_deref(), Some("Acme Corp"));
         assert_eq!(app.words, Some(1250));
     }

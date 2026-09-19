@@ -521,8 +521,11 @@ fn render_section_markdown(section: &Section) -> String {
             // Every line must start with `>` to stay inside the
             // blockquote — a bare newline (e.g. between list items)
             // would otherwise end it partway through the notes.
-            let quoted =
-                body.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n");
+            let quoted = body
+                .lines()
+                .map(|l| format!("> {l}"))
+                .collect::<Vec<_>>()
+                .join("\n");
             parts.push(format!("> **Notes:**\n{quoted}"));
         }
     }
@@ -898,7 +901,11 @@ fn render_section_html(section: &Section) -> String {
     // Speaker notes are not slide-surface content, but dropping them from
     // HTML loses text the plain and markdown renderers both keep.
     if let Some(ref notes) = section.speaker_notes {
-        let body = render_elements_html(notes).into_iter().filter(|h| !h.is_empty()).collect::<Vec<_>>().join("");
+        let body = render_elements_html(notes)
+            .into_iter()
+            .filter(|h| !h.is_empty())
+            .collect::<Vec<_>>()
+            .join("");
         if !body.is_empty() {
             parts.push(format!("<aside class=\"speaker-notes\">{body}</aside>"));
         }

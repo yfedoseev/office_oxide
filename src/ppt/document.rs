@@ -56,7 +56,12 @@ impl PptDocument {
             Err(_) => Vec::new(),
         };
 
-        Ok(Self { slides, images, has_macros, summary_properties })
+        Ok(Self {
+            slides,
+            images,
+            has_macros,
+            summary_properties,
+        })
     }
 
     /// `true` when the file carries a `_VBA_PROJECT` storage — a cheap
@@ -603,7 +608,10 @@ mod tests {
                     char_formats: vec![CharFormatSpan {
                         start: 0,
                         end: 8,
-                        format: CharFormat { bold: Some(false), ..Default::default() },
+                        format: CharFormat {
+                            bold: Some(false),
+                            ..Default::default()
+                        },
                     }],
                     para_formats: Vec::new(),
                     placeholder_role: None,
@@ -618,7 +626,10 @@ mod tests {
         let InlineContent::Text(span) = &h.content[0] else {
             panic!("expected text content");
         };
-        assert!(!span.bold, "explicit bold:false from the file must win over the old synthetic default");
+        assert!(
+            !span.bold,
+            "explicit bold:false from the file must win over the old synthetic default"
+        );
     }
 
     /// Two `TextCFRun`s with different formatting over the
@@ -640,8 +651,22 @@ mod tests {
                     text: "ABCDEF".to_string(),
                     hyperlink: None,
                     char_formats: vec![
-                        CharFormatSpan { start: 0, end: 3, format: CharFormat { bold: Some(true), ..Default::default() } },
-                        CharFormatSpan { start: 3, end: 6, format: CharFormat { italic: Some(true), ..Default::default() } },
+                        CharFormatSpan {
+                            start: 0,
+                            end: 3,
+                            format: CharFormat {
+                                bold: Some(true),
+                                ..Default::default()
+                            },
+                        },
+                        CharFormatSpan {
+                            start: 3,
+                            end: 6,
+                            format: CharFormat {
+                                italic: Some(true),
+                                ..Default::default()
+                            },
+                        },
                     ],
                     para_formats: Vec::new(),
                     placeholder_role: None,
@@ -654,8 +679,12 @@ mod tests {
             panic!("expected a paragraph, got {:?}", ir.sections[0].elements[0]);
         };
         assert_eq!(p.content.len(), 2, "one span per formatting run: {:?}", p.content);
-        let InlineContent::Text(first) = &p.content[0] else { panic!() };
-        let InlineContent::Text(second) = &p.content[1] else { panic!() };
+        let InlineContent::Text(first) = &p.content[0] else {
+            panic!()
+        };
+        let InlineContent::Text(second) = &p.content[1] else {
+            panic!()
+        };
         assert_eq!(first.text, "ABC");
         assert!(first.bold);
         assert!(!first.italic);
@@ -755,8 +784,12 @@ mod tests {
             .elements
             .iter()
             .map(|e| {
-                let Element::Paragraph(p) = e else { panic!("expected paragraphs") };
-                let InlineContent::Text(t) = &p.content[0] else { panic!() };
+                let Element::Paragraph(p) = e else {
+                    panic!("expected paragraphs")
+                };
+                let InlineContent::Text(t) = &p.content[0] else {
+                    panic!()
+                };
                 t.text.as_str()
             })
             .collect();
@@ -801,8 +834,12 @@ mod tests {
         assert_eq!(t.rows[0].cells.len(), 2);
 
         let cell_text = |r: usize, c: usize| {
-            let crate::ir::Element::Paragraph(p) = &t.rows[r].cells[c].content[0] else { panic!() };
-            let crate::ir::InlineContent::Text(span) = &p.content[0] else { panic!() };
+            let crate::ir::Element::Paragraph(p) = &t.rows[r].cells[c].content[0] else {
+                panic!()
+            };
+            let crate::ir::InlineContent::Text(span) = &p.content[0] else {
+                panic!()
+            };
             span.text.clone()
         };
         assert_eq!(cell_text(0, 0), "A1");
@@ -821,15 +858,31 @@ mod tests {
 
         let doc = PptDocument {
             images: vec![
-                BlipImage { format: BlipFormat::Png, data: b"PNG0".to_vec(), index: 0 },
-                BlipImage { format: BlipFormat::Jpeg, data: b"JPEG1".to_vec(), index: 1 },
+                BlipImage {
+                    format: BlipFormat::Png,
+                    data: b"PNG0".to_vec(),
+                    index: 0,
+                },
+                BlipImage {
+                    format: BlipFormat::Jpeg,
+                    data: b"JPEG1".to_vec(),
+                    index: 1,
+                },
             ],
             has_macros: false,
             summary_properties: None,
             slides: vec![
-                SlideText { image_refs: vec![0], ..Default::default() }, // slide 1: image 0
-                SlideText { ..Default::default() },                     // slide 2: no images
-                SlideText { image_refs: vec![1], ..Default::default() }, // slide 3: image 1
+                SlideText {
+                    image_refs: vec![0],
+                    ..Default::default()
+                }, // slide 1: image 0
+                SlideText {
+                    ..Default::default()
+                }, // slide 2: no images
+                SlideText {
+                    image_refs: vec![1],
+                    ..Default::default()
+                }, // slide 3: image 1
             ],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -858,10 +911,16 @@ mod tests {
         use crate::ir::Element;
 
         let doc = PptDocument {
-            images: vec![BlipImage { format: BlipFormat::Png, data: b"ORPHAN".to_vec(), index: 0 }],
+            images: vec![BlipImage {
+                format: BlipFormat::Png,
+                data: b"ORPHAN".to_vec(),
+                index: 0,
+            }],
             has_macros: false,
             summary_properties: None,
-            slides: vec![SlideText { ..Default::default() }],
+            slides: vec![SlideText {
+                ..Default::default()
+            }],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
         let found = ir.sections[0].elements.iter().any(|e| {

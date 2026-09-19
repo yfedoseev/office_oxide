@@ -90,8 +90,12 @@ pub fn txo_text(data: &[u8]) -> Option<String> {
         let byte_len = text_length.checked_mul(2)?;
         let end = char_start.checked_add(byte_len)?;
         let bytes = data.get(char_start..end)?;
-        let units: Vec<u16> =
-            bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
         Some(String::from_utf16_lossy(&units))
     }
 }
@@ -120,8 +124,12 @@ pub fn parse_note(data: &[u8]) -> Option<(u16, u16, u16, Option<String>)> {
         let byte_len = author_len.checked_mul(2)?;
         let end = 11usize.checked_add(byte_len)?;
         let bytes = data.get(11..end)?;
-        let units: Vec<u16> =
-            bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
         Some(String::from_utf16_lossy(&units))
     } else {
         let end = 11usize.checked_add(author_len)?;
@@ -195,7 +203,10 @@ mod tests {
 
     #[test]
     fn test_txo_text_compressed_round_trips() {
-        assert_eq!(txo_text(&txo_record("Schroeder: a. GWA", true)).as_deref(), Some("Schroeder: a. GWA"));
+        assert_eq!(
+            txo_text(&txo_record("Schroeder: a. GWA", true)).as_deref(),
+            Some("Schroeder: a. GWA")
+        );
     }
 
     #[test]
@@ -210,7 +221,8 @@ mod tests {
 
     #[test]
     fn test_parse_note_extracts_row_col_shapeid_and_author() {
-        let (row, col, shapeid, author) = parse_note(&note_record(5, 2, 42, Some("Elemar"))).unwrap();
+        let (row, col, shapeid, author) =
+            parse_note(&note_record(5, 2, 42, Some("Elemar"))).unwrap();
         assert_eq!((row, col, shapeid), (5, 2, 42));
         assert_eq!(author.as_deref(), Some("Elemar"));
     }

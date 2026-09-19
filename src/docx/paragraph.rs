@@ -122,9 +122,7 @@ impl FormField {
                 .or_else(|| entries.first())
                 .filter(|s| !s.is_empty())
                 .cloned(),
-            FormFieldKind::TextInput { default } => {
-                default.clone().filter(|s| !s.is_empty())
-            },
+            FormFieldKind::TextInput { default } => default.clone().filter(|s| !s.is_empty()),
             FormFieldKind::Unknown => None,
         }
     }

@@ -90,8 +90,14 @@ impl ListFormatting {
     ) -> Self {
         let list_defs = if lcb_plf_lst > 0 {
             let start = fc_plf_lst as usize;
-            let end = start.saturating_add(lcb_plf_lst as usize).min(table_stream.len());
-            if start < end { parse_plf_lst(&table_stream[start..]) } else { Vec::new() }
+            let end = start
+                .saturating_add(lcb_plf_lst as usize)
+                .min(table_stream.len());
+            if start < end {
+                parse_plf_lst(&table_stream[start..])
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         };
@@ -104,7 +110,11 @@ impl ListFormatting {
         // the Table stream rather than bounding to `lcb_plf_lfo`.
         let lfos = if lcb_plf_lfo > 0 {
             let start = fc_plf_lfo as usize;
-            if start < table_stream.len() { parse_plf_lfo(&table_stream[start..]) } else { Vec::new() }
+            if start < table_stream.len() {
+                parse_plf_lfo(&table_stream[start..])
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         };
@@ -125,7 +135,11 @@ impl ListFormatting {
         // simple/1-level list referenced at ilvl > 0) falls back to the
         // list's own first (and, for a simple list, only) level rather
         // than returning nothing.
-        let mut level = def.levels.get(ilvl as usize).or_else(|| def.levels.first()).copied()?;
+        let mut level = def
+            .levels
+            .get(ilvl as usize)
+            .or_else(|| def.levels.first())
+            .copied()?;
         if let Some(&(_, start_at)) = lfo.start_overrides.iter().find(|(l, _)| *l == ilvl) {
             level.start_at = start_at;
         }
@@ -161,7 +175,10 @@ fn parse_plf_lst(data: &[u8]) -> Vec<ListDef> {
         // unused1 / fAutoNum / unused2 / fHybrid / reserved1 bitfield byte.
         let flags = data[pos + 24];
         let f_simple_list = (flags & 0x01) != 0;
-        lstfs.push(LstfInfo { lsid, levels_count: if f_simple_list { 1 } else { 9 } });
+        lstfs.push(LstfInfo {
+            lsid,
+            levels_count: if f_simple_list { 1 } else { 9 },
+        });
         pos += 28;
     }
 
@@ -179,7 +196,10 @@ fn parse_plf_lst(data: &[u8]) -> Vec<ListDef> {
                 None => break, // truncated — keep whatever levels parsed so far
             }
         }
-        defs.push(ListDef { lsid: info.lsid, levels });
+        defs.push(ListDef {
+            lsid: info.lsid,
+            levels,
+        });
     }
     defs
 }
@@ -200,7 +220,9 @@ fn parse_one_lvl(data: &[u8], pos: usize) -> Option<(ListLevel, usize)> {
     let cb_grpprl_papx = data[pos + 25] as usize;
 
     let after_lvlf = pos + 28;
-    let after_grpprls = after_lvlf.checked_add(cb_grpprl_papx)?.checked_add(cb_grpprl_chpx)?;
+    let after_grpprls = after_lvlf
+        .checked_add(cb_grpprl_papx)?
+        .checked_add(cb_grpprl_chpx)?;
     if after_grpprls + 2 > data.len() {
         return None;
     }
@@ -256,7 +278,10 @@ fn parse_plf_lfo(data: &[u8]) -> Vec<LfoEntry> {
                 None => break, // truncated — keep whatever overrides parsed so far
             }
         }
-        result.push(LfoEntry { lsid: info.lsid, start_overrides });
+        result.push(LfoEntry {
+            lsid: info.lsid,
+            start_overrides,
+        });
     }
     result
 }
@@ -299,10 +324,16 @@ impl ListFormatting {
     /// this module.
     pub(crate) fn from_parts(defs: Vec<(i32, Vec<ListLevel>)>, lfo_lsids: Vec<i32>) -> Self {
         Self {
-            list_defs: defs.into_iter().map(|(lsid, levels)| ListDef { lsid, levels }).collect(),
+            list_defs: defs
+                .into_iter()
+                .map(|(lsid, levels)| ListDef { lsid, levels })
+                .collect(),
             lfos: lfo_lsids
                 .into_iter()
-                .map(|lsid| LfoEntry { lsid, start_overrides: Vec::new() })
+                .map(|lsid| LfoEntry {
+                    lsid,
+                    start_overrides: Vec::new(),
+                })
                 .collect(),
         }
     }
@@ -412,13 +443,16 @@ mod tests {
         let lfolvl_start = lfo_data_start + 4;
         data[lfolvl_start..lfolvl_start + 4].copy_from_slice(&42i32.to_le_bytes()); // iStartAt
         // flags: iLvl=0 (bits 0-3), fStartAt=1 (bit 4), fFormatting=0 (bit 5).
-        let flags: u32 = 0 | (1 << 4);
+        let flags: u32 = 1 << 4;
         data[lfolvl_start + 4..lfolvl_start + 8].copy_from_slice(&flags.to_le_bytes());
 
         let fmt = ListFormatting::parse(&data, 0x0536, 0x001E, 0x07E1, 0x0018);
 
         let overridden = fmt.level_for(1, 0).expect("ilfo=1, ilvl=0 must resolve");
-        assert_eq!(overridden.start_at, 42, "the LFOLVL override must win over the LSTF's own iStartAt=1");
+        assert_eq!(
+            overridden.start_at, 42,
+            "the LFOLVL override must win over the LSTF's own iStartAt=1"
+        );
         assert!(overridden.is_numbered(), "nfc is unaffected by a start-at-only override");
 
         // Level 1 has no override — must still be the LSTF's own value.
@@ -463,7 +497,9 @@ mod tests {
     fn test_ilvl_past_the_lists_own_depth_falls_back_to_the_first_level() {
         let table = spec_example_table_stream();
         let fmt = ListFormatting::parse(&table, 0x0536, 0x001E, 0x07E1, 0x0018);
-        let deep = fmt.level_for(1, 50).expect("out-of-range ilvl must fall back, not None");
+        let deep = fmt
+            .level_for(1, 50)
+            .expect("out-of-range ilvl must fall back, not None");
         assert_eq!(deep.start_at, 1); // lvl[0]'s value
     }
 }

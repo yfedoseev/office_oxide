@@ -76,10 +76,15 @@ fn test_pptx_roundtrip_preserves_slide_body() {
 /// check only looked at `section.elements.first()`.
 #[test]
 fn test_docx_heading_not_first_element_does_not_duplicate_on_roundtrip() {
-    use office_oxide::ir::{Element, Heading, InlineContent, Metadata, Paragraph, Section, TextSpan};
+    use office_oxide::ir::{
+        Element, Heading, InlineContent, Metadata, Paragraph, Section, TextSpan,
+    };
 
     let ir = DocumentIR {
-        metadata: Metadata { format: DocumentFormat::Docx, ..Default::default() },
+        metadata: Metadata {
+            format: DocumentFormat::Docx,
+            ..Default::default()
+        },
         sections: vec![Section {
             title: Some("My Heading".to_string()),
             elements: vec![
@@ -103,7 +108,9 @@ fn test_docx_heading_not_first_element_does_not_duplicate_on_roundtrip() {
     let mut buf = Cursor::new(Vec::new());
     create::create_from_ir_to_writer(&ir, DocumentFormat::Docx, &mut buf).unwrap();
     buf.set_position(0);
-    let text = Document::from_reader(buf, DocumentFormat::Docx).unwrap().plain_text();
+    let text = Document::from_reader(buf, DocumentFormat::Docx)
+        .unwrap()
+        .plain_text();
 
     let occurrences = text.matches("My Heading").count();
     assert_eq!(
@@ -117,7 +124,9 @@ fn test_docx_heading_not_first_element_does_not_duplicate_on_roundtrip() {
 /// each keeps its own position.
 #[test]
 fn test_pptx_independent_text_boxes_stay_independent_on_roundtrip() {
-    use office_oxide::ir::{Element, InlineContent, Metadata, Paragraph, Section, TextBox, TextSpan};
+    use office_oxide::ir::{
+        Element, InlineContent, Metadata, Paragraph, Section, TextBox, TextSpan,
+    };
 
     fn textbox(text: &str, x: i64) -> Element {
         Element::TextBox(TextBox {
@@ -134,7 +143,10 @@ fn test_pptx_independent_text_boxes_stay_independent_on_roundtrip() {
     }
 
     let ir = DocumentIR {
-        metadata: Metadata { format: DocumentFormat::Pptx, ..Default::default() },
+        metadata: Metadata {
+            format: DocumentFormat::Pptx,
+            ..Default::default()
+        },
         sections: vec![Section {
             elements: vec![
                 textbox("Text Box", 0),
@@ -147,16 +159,18 @@ fn test_pptx_independent_text_boxes_stay_independent_on_roundtrip() {
     };
 
     let (ir1, _) = write_parse(&ir, DocumentFormat::Pptx);
-    let box_count =
-        ir1.sections[0].elements.iter().filter(|e| matches!(e, Element::TextBox(_))).count();
+    let box_count = ir1.sections[0]
+        .elements
+        .iter()
+        .filter(|e| matches!(e, Element::TextBox(_)))
+        .count();
     assert_eq!(
         box_count, 3,
         "expected 3 independent text boxes, got {box_count}: {:?}",
         ir1.sections[0]
     );
 
-    let texts: Vec<String> = ir1
-        .sections[0]
+    let texts: Vec<String> = ir1.sections[0]
         .elements
         .iter()
         .filter_map(|e| match e {
@@ -184,10 +198,15 @@ fn test_pptx_independent_text_boxes_stay_independent_on_roundtrip() {
 /// duplicating into the slide body when it isn't the section's first element.
 #[test]
 fn test_pptx_title_heading_not_first_element_does_not_duplicate_on_roundtrip() {
-    use office_oxide::ir::{Element, Heading, InlineContent, Metadata, Paragraph, Section, TextSpan};
+    use office_oxide::ir::{
+        Element, Heading, InlineContent, Metadata, Paragraph, Section, TextSpan,
+    };
 
     let ir = DocumentIR {
-        metadata: Metadata { format: DocumentFormat::Pptx, ..Default::default() },
+        metadata: Metadata {
+            format: DocumentFormat::Pptx,
+            ..Default::default()
+        },
         sections: vec![Section {
             title: Some("Slide Title".to_string()),
             elements: vec![
@@ -211,7 +230,9 @@ fn test_pptx_title_heading_not_first_element_does_not_duplicate_on_roundtrip() {
     let mut buf = Cursor::new(Vec::new());
     create::create_from_ir_to_writer(&ir, DocumentFormat::Pptx, &mut buf).unwrap();
     buf.set_position(0);
-    let text = Document::from_reader(buf, DocumentFormat::Pptx).unwrap().plain_text();
+    let text = Document::from_reader(buf, DocumentFormat::Pptx)
+        .unwrap()
+        .plain_text();
 
     let occurrences = text.matches("Slide Title").count();
     assert_eq!(

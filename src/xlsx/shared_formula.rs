@@ -202,8 +202,7 @@ fn match_reference(s: &str, at: usize, d_col: i64, d_row: i64) -> Option<(usize,
         return None;
     }
     // `A1x` / `A1_` is part of a longer name, not a reference.
-    if b
-        .get(i)
+    if b.get(i)
         .is_some_and(|&n| n.is_ascii_alphanumeric() || n == b'_')
     {
         return None;
@@ -215,7 +214,11 @@ fn match_reference(s: &str, at: usize, d_col: i64, d_row: i64) -> Option<(usize,
         return None;
     }
 
-    let new_col = if col_abs { col as i64 } else { col as i64 + d_col };
+    let new_col = if col_abs {
+        col as i64
+    } else {
+        col as i64 + d_col
+    };
     // `row` is 1-based here, as written.
     let new_row = if row_abs {
         row as i64
@@ -276,10 +279,7 @@ mod tests {
             translate("CONCAT(\"A1 stays\",A1)", &r("B1"), &r("B2")),
             "CONCAT(\"A1 stays\",A2)"
         );
-        assert_eq!(
-            translate("'Sheet A1'!A1", &r("B1"), &r("B2")),
-            "'Sheet A1'!A2"
-        );
+        assert_eq!(translate("'Sheet A1'!A1", &r("B1"), &r("B2")), "'Sheet A1'!A2");
         assert_eq!(translate("Sheet1!A1", &r("B1"), &r("B2")), "Sheet1!A2");
         // A zero delta is returned untouched.
         assert_eq!(translate("A1", &r("B1"), &r("B1")), "A1");

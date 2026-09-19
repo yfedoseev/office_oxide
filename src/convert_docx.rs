@@ -76,7 +76,11 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         // or a heading containing a `LineBreak` disagrees between the two
         // and gets duplicated on every write.
         let title = elements.iter().find_map(|e| {
-            if let Element::Heading(h) = e { Some(inline_to_text(&h.content)) } else { None }
+            if let Element::Heading(h) = e {
+                Some(inline_to_text(&h.content))
+            } else {
+                None
+            }
         });
         if doc_title.is_none() {
             doc_title = title.clone();
@@ -407,7 +411,12 @@ fn extract_note_marker<'a>(
     let [crate::docx::ParagraphContent::Run(run)] = p.content.as_slice() else {
         return (None, content);
     };
-    if run.properties.as_ref().and_then(|rp| rp.style_id.as_deref()) != Some(style_name) {
+    if run
+        .properties
+        .as_ref()
+        .and_then(|rp| rp.style_id.as_deref())
+        != Some(style_name)
+    {
         return (None, content);
     }
     let [crate::docx::RunContent::Text(text)] = run.content.as_slice() else {
@@ -522,7 +531,8 @@ fn convert_block_elements(
     // counting from where it left off, per OOXML/Word semantics — not a
     // fresh 1. Tracks the next start number per numId across the several
     // `convert_list_group` calls this loop makes.
-    let mut numbering_counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut numbering_counts: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
     while i < blocks.len() {
         match &blocks[i] {
             crate::docx::BlockElement::Paragraph(p) => {
@@ -659,7 +669,10 @@ fn convert_block_elements(
                 // round trip. Absorbing the immediately-preceding
                 // matching paragraph here instead keeps the caption
                 // represented exactly once.
-                if let Element::Table(Table { caption: Some(cap), .. }) = &table_elem {
+                if let Element::Table(Table {
+                    caption: Some(cap), ..
+                }) = &table_elem
+                {
                     let cap = cap.trim();
                     let last_matches = matches!(
                         elements.last(),
@@ -1362,10 +1375,7 @@ fn convert_list_group(
         }
     }
     let resumed_from = start_number.unwrap_or(1);
-    numbering_counts.insert(
-        num_id,
-        resumed_from + top_level_item_count.saturating_sub(1),
-    );
+    numbering_counts.insert(num_id, resumed_from + top_level_item_count.saturating_sub(1));
 
     // Build nested list structure from flat (ilvl, content) pairs
     let mut list = crate::ir::build_nested_list(is_ordered, &items, 0);
@@ -1567,7 +1577,9 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
                     .and_then(|p| p.shading.as_ref())
                     .and_then(|sh| sh.fill.as_deref())
                     .and_then(hex_to_rgb),
-                border: cp.and_then(|p| p.borders.as_deref()).map(table_borders_to_ir),
+                border: cp
+                    .and_then(|p| p.borders.as_deref())
+                    .map(table_borders_to_ir),
                 vertical_align: cp.and_then(|p| p.v_align).map(|va| match va {
                     crate::docx::CellVAlign::Top => CellVerticalAlign::Top,
                     crate::docx::CellVAlign::Center => CellVerticalAlign::Center,

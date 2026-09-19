@@ -142,7 +142,11 @@ fn extract_one_blip(
     if img_data.is_empty() {
         return None;
     }
-    Some(BlipImage { format, data: img_data.to_vec(), index: 0 })
+    Some(BlipImage {
+        format,
+        data: img_data.to_vec(),
+        index: 0,
+    })
 }
 
 /// Extract all BLIP images from an OfficeArt data stream.
@@ -181,10 +185,8 @@ pub fn extract_blip_images(data: &[u8]) -> Vec<BlipImage> {
                 if embedded_start + 8 <= data_end {
                     let e_ver_inst =
                         u16::from_le_bytes([data[embedded_start], data[embedded_start + 1]]);
-                    let e_rec_type = u16::from_le_bytes([
-                        data[embedded_start + 2],
-                        data[embedded_start + 3],
-                    ]);
+                    let e_rec_type =
+                        u16::from_le_bytes([data[embedded_start + 2], data[embedded_start + 3]]);
                     let e_rec_len = u32::from_le_bytes([
                         data[embedded_start + 4],
                         data[embedded_start + 5],
@@ -246,8 +248,11 @@ mod tests {
     /// Build an `OfficeArtFBSE` record wrapping the given
     /// embedded `OfficeArtBlip` bytes (from [`make_blip`]).
     fn make_fbse(name: &str, embedded_blip: &[u8]) -> Vec<u8> {
-        let name_utf16: Vec<u8> =
-            name.encode_utf16().chain(std::iter::once(0u16)).flat_map(u16::to_le_bytes).collect();
+        let name_utf16: Vec<u8> = name
+            .encode_utf16()
+            .chain(std::iter::once(0u16))
+            .flat_map(u16::to_le_bytes)
+            .collect();
         let mut body = Vec::new();
         body.push(0); // btWin32
         body.push(0); // btMacOS

@@ -19,13 +19,13 @@ pub(crate) fn codepage_for_lid(lid: u16) -> u16 {
         0x19 | 0x02 | 0x22 | 0x23 => 1251,
         // Polish, Czech, Slovak, Hungarian, Slovenian, Croatian, Romanian.
         0x15 | 0x05 | 0x1B | 0x0E | 0x24 | 0x1A | 0x18 => 1250,
-        0x08 => 1253, // Greek
-        0x1F => 1254, // Turkish
-        0x0D => 1255, // Hebrew
-        0x01 => 1256, // Arabic
-        0x25 | 0x26 | 0x27 => 1257, // Estonian, Latvian, Lithuanian
-        0x2A => 1258, // Vietnamese
-        0x1E => 874,  // Thai
+        0x08 => 1253,        // Greek
+        0x1F => 1254,        // Turkish
+        0x0D => 1255,        // Hebrew
+        0x01 => 1256,        // Arabic
+        0x25..=0x27 => 1257, // Estonian, Latvian, Lithuanian
+        0x2A => 1258,        // Vietnamese
+        0x1E => 874,         // Thai
         _ => 1252,
     }
 }

@@ -557,18 +557,46 @@ mod tests {
 
         let dir_offset = 512;
         // Entry 0: Root Entry, child = 2 ("ObjectPool")
-        write_dir_entry(&mut file[dir_offset..dir_offset + 128], "Root Entry", 5, 2, END_OF_CHAIN, 0);
+        write_dir_entry(
+            &mut file[dir_offset..dir_offset + 128],
+            "Root Entry",
+            5,
+            2,
+            END_OF_CHAIN,
+            0,
+        );
         // Entry 1: "TestStream" NESTED under ObjectPool — the embedded
         // object's copy, lower array index, wrong content.
-        write_dir_entry(&mut file[dir_offset + 128..dir_offset + 256], "TestStream", 2, NO_ENTRY, 2, 6);
+        write_dir_entry(
+            &mut file[dir_offset + 128..dir_offset + 256],
+            "TestStream",
+            2,
+            NO_ENTRY,
+            2,
+            6,
+        );
         // Entry 2: "ObjectPool" storage — child = 1 (the nested stream),
         // right_sibling = 3 (links to the real root-level stream so both
         // are reachable from Root's tree).
-        write_dir_entry(&mut file[dir_offset + 256..dir_offset + 384], "ObjectPool", 1, 1, END_OF_CHAIN, 0);
+        write_dir_entry(
+            &mut file[dir_offset + 256..dir_offset + 384],
+            "ObjectPool",
+            1,
+            1,
+            END_OF_CHAIN,
+            0,
+        );
         file[dir_offset + 256 + 0x48..dir_offset + 256 + 0x4C].copy_from_slice(&3u32.to_le_bytes());
         // Entry 3: "TestStream" at ROOT level — the real, wanted stream,
         // higher array index than the embedded one.
-        write_dir_entry(&mut file[dir_offset + 384..dir_offset + 512], "TestStream", 2, NO_ENTRY, 3, 11);
+        write_dir_entry(
+            &mut file[dir_offset + 384..dir_offset + 512],
+            "TestStream",
+            2,
+            NO_ENTRY,
+            3,
+            11,
+        );
 
         let fat_offset = 512 + sector_size;
         write_fat_entry(&mut file, fat_offset, 0, END_OF_CHAIN);

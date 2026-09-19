@@ -956,7 +956,11 @@ fn test_speaker_notes_stay_off_the_slide_surface_through_a_round_trip() {
         }
         out
     }
-    let notes_text = section.speaker_notes.as_deref().map(text_of).unwrap_or_default();
+    let notes_text = section
+        .speaker_notes
+        .as_deref()
+        .map(text_of)
+        .unwrap_or_default();
     assert_eq!(notes_text, SECRET, "notes must be carried in Section::speaker_notes");
     let elements_only = office_oxide::ir::DocumentIR {
         sections: vec![office_oxide::ir::Section {

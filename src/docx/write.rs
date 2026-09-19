@@ -793,7 +793,11 @@ impl DocxWriter {
             .map(|item| {
                 let mut elems: Vec<DocxElement> = Vec::new();
                 for content_elem in &item.content {
-                    convert_ir_element_to_docx_elements(content_elem, &mut elems, &mut self.next_num_id);
+                    convert_ir_element_to_docx_elements(
+                        content_elem,
+                        &mut elems,
+                        &mut self.next_num_id,
+                    );
                 }
                 elems
             })
@@ -1033,7 +1037,8 @@ impl DocxWriter {
         // relationship in every header, footer, footnote and endnote
         // hyperlink. Each part below gets its own map,
         // registered against that part.
-        let hyperlink_rids: HyperlinkRids = register_hyperlink_rids(&mut opc, &doc_part, &self.elements);
+        let hyperlink_rids: HyperlinkRids =
+            register_hyperlink_rids(&mut opc, &doc_part, &self.elements);
 
         let mut hf_rids: Vec<(HfType, String)> = Vec::new();
         for (i, hf) in self.headers_footers.iter().enumerate() {
@@ -1386,7 +1391,8 @@ impl DocxWriter {
             let mut levels: Vec<(u8, &str, String)> = Vec::new();
             for rl in &rich_lists {
                 if rl.num_id == num_id && !levels.iter().any(|(l, ..)| *l == rl.level) {
-                    let (fmt, lvl_text) = list_style_to_fmt(rl.style.as_ref(), rl.ordered, rl.level);
+                    let (fmt, lvl_text) =
+                        list_style_to_fmt(rl.style.as_ref(), rl.ordered, rl.level);
                     levels.push((rl.level, fmt, lvl_text));
                 }
             }
@@ -1703,7 +1709,11 @@ fn convert_ir_list_at(
     out.push(DocxElement::RichList(DocxRichList {
         ordered: list.ordered,
         items,
-        start_number: if start_number != 1 { Some(start_number) } else { None },
+        start_number: if start_number != 1 {
+            Some(start_number)
+        } else {
+            None
+        },
         style,
         level,
         num_id,
@@ -2100,7 +2110,7 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph, links: &
         // bookmark within it" instead of losing the relationship.
         let split = url.map(split_hyperlink_fragment);
         let wrap = match split {
-            Some((base, frag)) if base.is_empty() => Some((None, frag)),
+            Some(("", frag)) => Some((None, frag)),
             Some((base, frag)) => links.get(base).map(|rid| (Some(rid.as_str()), frag)),
             None => None,
         };
@@ -3717,7 +3727,8 @@ fn generate_notes_xml(
                 .expect("write marker rPr start");
             let mut r_style = BytesStart::new("w:rStyle");
             r_style.push_attribute(("w:val", style_name));
-            w.write_event(Event::Empty(r_style)).expect("write marker rStyle");
+            w.write_event(Event::Empty(r_style))
+                .expect("write marker rStyle");
             w.write_event(Event::End(BytesEnd::new("w:rPr")))
                 .expect("write marker rPr end");
             w.write_event(Event::Start(BytesStart::new("w:t")))
@@ -4439,7 +4450,10 @@ mod tests {
             ordered: false,
             items: vec![crate::ir::ListItem {
                 content: crate::ir::inline_to_element_block(vec![crate::ir::InlineContent::Text(
-                    crate::ir::TextSpan { text: "child".into(), ..Default::default() },
+                    crate::ir::TextSpan {
+                        text: "child".into(),
+                        ..Default::default()
+                    },
                 )]),
                 nested: None,
             }],
@@ -4450,7 +4464,10 @@ mod tests {
             ordered: true,
             items: vec![crate::ir::ListItem {
                 content: crate::ir::inline_to_element_block(vec![crate::ir::InlineContent::Text(
-                    crate::ir::TextSpan { text: "parent".into(), ..Default::default() },
+                    crate::ir::TextSpan {
+                        text: "parent".into(),
+                        ..Default::default()
+                    },
                 )]),
                 nested: Some(nested),
             }],
@@ -4486,7 +4503,10 @@ mod tests {
             ordered: false,
             items: vec![crate::ir::ListItem {
                 content: crate::ir::inline_to_element_block(vec![crate::ir::InlineContent::Text(
-                    crate::ir::TextSpan { text: "child".into(), ..Default::default() },
+                    crate::ir::TextSpan {
+                        text: "child".into(),
+                        ..Default::default()
+                    },
                 )]),
                 nested: None,
             }],
@@ -4497,7 +4517,10 @@ mod tests {
             ordered: true,
             items: vec![crate::ir::ListItem {
                 content: crate::ir::inline_to_element_block(vec![crate::ir::InlineContent::Text(
-                    crate::ir::TextSpan { text: "parent".into(), ..Default::default() },
+                    crate::ir::TextSpan {
+                        text: "parent".into(),
+                        ..Default::default()
+                    },
                 )]),
                 nested: Some(nested),
             }],
@@ -4507,8 +4530,9 @@ mod tests {
         doc.add_ir_list(&list);
         let numbering = part_xml(doc, "word/numbering.xml");
 
-        let abstract_num =
-            &numbering[numbering.find("<w:abstractNum w:abstractNumId=\"2\"").unwrap()..];
+        let abstract_num = &numbering[numbering
+            .find("<w:abstractNum w:abstractNumId=\"2\"")
+            .unwrap()..];
         let abstract_num = &abstract_num[..abstract_num.find("</w:abstractNum>").unwrap()];
         assert!(abstract_num.contains(r#"w:ilvl="0""#), "missing level 0: {abstract_num}");
         assert!(abstract_num.contains(r#"w:ilvl="1""#), "missing level 1: {abstract_num}");
@@ -4595,7 +4619,9 @@ mod tests {
     fn test_document_xml_size_does_not_grow_quadratically_with_nesting_depth() {
         fn nested_ir(depth: usize) -> crate::ir::DocumentIR {
             let mut inner = crate::ir::Element::Paragraph(crate::ir::Paragraph {
-                content: vec![crate::ir::InlineContent::Text(crate::ir::TextSpan::plain("x"))],
+                content: vec![crate::ir::InlineContent::Text(crate::ir::TextSpan::plain(
+                    "x",
+                ))],
                 ..Default::default()
             });
             for _ in 0..depth {
@@ -4714,15 +4740,15 @@ mod tests {
         );
         let parts = all_parts(doc);
         let document_xml = &parts["word/document.xml"];
-        assert!(
-            document_xml.contains(r#"w:anchor="_top""#),
-            "missing w:anchor: {document_xml}"
-        );
+        assert!(document_xml.contains(r#"w:anchor="_top""#), "missing w:anchor: {document_xml}");
         assert!(
             !document_xml.contains("r:id"),
             "a pure anchor must not carry r:id: {document_xml}"
         );
-        let rels = parts.get("word/_rels/document.xml.rels").cloned().unwrap_or_default();
+        let rels = parts
+            .get("word/_rels/document.xml.rels")
+            .cloned()
+            .unwrap_or_default();
         assert!(
             !rels.contains("_top"),
             "a pure anchor must not fabricate a relationship: {rels}"
@@ -4773,7 +4799,13 @@ mod tests {
         use crate::ir::{Element, InlineContent, Paragraph, TextSpan};
 
         let mut doc = DocxWriter::new();
-        doc.add_ir_paragraph(&[Run { text: "see note".to_string(), ..Default::default() }], None);
+        doc.add_ir_paragraph(
+            &[Run {
+                text: "see note".to_string(),
+                ..Default::default()
+            }],
+            None,
+        );
         doc.add_footnote(
             1,
             &[Element::Paragraph(Paragraph {
@@ -4788,7 +4820,10 @@ mod tests {
         let parts = all_parts(doc);
 
         let footnotes_xml = &parts["word/footnotes.xml"];
-        assert!(footnotes_xml.contains("r:id"), "footnote must carry a hyperlink r:id: {footnotes_xml}");
+        assert!(
+            footnotes_xml.contains("r:id"),
+            "footnote must carry a hyperlink r:id: {footnotes_xml}"
+        );
 
         let footnotes_rels = parts
             .get("word/_rels/footnotes.xml.rels")
@@ -4820,7 +4855,13 @@ mod tests {
         use crate::ir::{Element, InlineContent, Paragraph, TextSpan};
 
         let mut doc = DocxWriter::new();
-        doc.add_ir_paragraph(&[Run { text: "body".to_string(), ..Default::default() }], None);
+        doc.add_ir_paragraph(
+            &[Run {
+                text: "body".to_string(),
+                ..Default::default()
+            }],
+            None,
+        );
         doc.add_section_header(
             HfType::DefaultHeader,
             vec![Element::Paragraph(Paragraph {
@@ -4855,7 +4896,13 @@ mod tests {
         use crate::ir::{Element, InlineContent, Paragraph, TextSpan};
 
         let mut doc = DocxWriter::new();
-        doc.add_ir_paragraph(&[Run { text: "see note".to_string(), ..Default::default() }], None);
+        doc.add_ir_paragraph(
+            &[Run {
+                text: "see note".to_string(),
+                ..Default::default()
+            }],
+            None,
+        );
         doc.add_footnote(
             1,
             &[Element::Paragraph(Paragraph {
@@ -5007,8 +5054,9 @@ mod tests {
         );
 
         let numbering = &parts["word/numbering.xml"];
-        let abstract_num =
-            &numbering[numbering.find("<w:abstractNum w:abstractNumId=\"2\"").unwrap()..];
+        let abstract_num = &numbering[numbering
+            .find("<w:abstractNum w:abstractNumId=\"2\"")
+            .unwrap()..];
         let abstract_num = &abstract_num[..abstract_num.find("</w:abstractNum>").unwrap()];
         assert!(
             abstract_num.contains(r#"w:val="decimal""#),
@@ -5042,8 +5090,11 @@ mod tests {
         doc.add_ir_table(&table);
         let xml = part_xml(doc, "word/document.xml");
 
-        let num_ids: Vec<&str> =
-            xml.split("w:numId w:val=\"").skip(1).filter_map(|s| s.split('"').next()).collect();
+        let num_ids: Vec<&str> = xml
+            .split("w:numId w:val=\"")
+            .skip(1)
+            .filter_map(|s| s.split('"').next())
+            .collect();
         assert_eq!(num_ids.len(), 2, "{xml:?}");
         assert_ne!(num_ids[0], num_ids[1], "two unrelated lists must not share a numId: {xml}");
     }

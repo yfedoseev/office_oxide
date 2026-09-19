@@ -810,7 +810,8 @@ fn parse_vml_content_in(
         };
         match e.local_name().as_ref() {
             b"txbxContent" if is_start => {
-                out.boxes.push(parse_block_elements_until(reader, b"txbxContent")?);
+                out.boxes
+                    .push(parse_block_elements_until(reader, b"txbxContent")?);
                 // The subtree is fully consumed, so depth is unchanged.
                 continue;
             },
@@ -1048,8 +1049,7 @@ fn resolve_hyperlinks(
                                         if let Some(frag) =
                                             hl.fragment.as_deref().filter(|f| !f.is_empty())
                                         {
-                                            hl.target =
-                                                HyperlinkTarget::Internal(frag.to_string());
+                                            hl.target = HyperlinkTarget::Internal(frag.to_string());
                                         }
                                     },
                                 }
@@ -1156,12 +1156,14 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
                     match target {
                         Some(target) => {
                             let runs = collect_runs_until(reader, b"fldSimple")?;
-                            paragraph.content.push(ParagraphContent::Hyperlink(Hyperlink {
-                                target,
-                                fragment: None,
-                                tooltip: None,
-                                runs,
-                            }));
+                            paragraph
+                                .content
+                                .push(ParagraphContent::Hyperlink(Hyperlink {
+                                    target,
+                                    fragment: None,
+                                    tooltip: None,
+                                    runs,
+                                }));
                         },
                         None => wrapper_depth += 1,
                     }
@@ -1290,12 +1292,12 @@ fn apply_field_parts(
                 let start = f.content_start.min(content.len());
                 let runs: Vec<Run> = content
                     .drain(start..)
-                    .filter_map(|c| match c {
-                        ParagraphContent::Run(r) => Some(r),
-                        ParagraphContent::Hyperlink(h) => Some(Run {
+                    .map(|c| match c {
+                        ParagraphContent::Run(r) => r,
+                        ParagraphContent::Hyperlink(h) => Run {
                             properties: None,
                             content: h.runs.into_iter().flat_map(|r| r.content).collect(),
-                        }),
+                        },
                     })
                     .collect();
                 content.push(ParagraphContent::Hyperlink(Hyperlink {
@@ -1313,7 +1315,10 @@ fn apply_field_parts(
 /// `<m:oMathPara>`), concatenated with no separators. This is not a
 /// structural math model — just enough to stop 100% content loss on a
 /// document whose only content is a formula.
-fn collect_omml_text(reader: &mut quick_xml::Reader<&[u8]>, end_local: &[u8]) -> CoreResult<String> {
+fn collect_omml_text(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    end_local: &[u8],
+) -> CoreResult<String> {
     let mut text = String::new();
     let mut depth = 1i32;
     loop {
@@ -2853,8 +2858,10 @@ fn parse_table_cell_properties(
                     xml::skip_element_fast(reader)?;
                 },
                 b"tcBorders" => {
-                    props.borders =
-                        Some(Box::new(self::formatting::parse_table_borders_fast(reader, b"tcBorders")?));
+                    props.borders = Some(Box::new(self::formatting::parse_table_borders_fast(
+                        reader,
+                        b"tcBorders",
+                    )?));
                 },
                 b"tcMar" => {
                     props.margins = Some(parse_cell_margins(reader, b"tcMar")?);
@@ -3251,7 +3258,11 @@ mod tests {
         let mut xlsx_writer = crate::xlsx::write::XlsxWriter::new();
         {
             let mut sheet = xlsx_writer.add_sheet("Sheet1");
-            sheet.set_cell(0, 0, crate::xlsx::write::CellData::String("EmbeddedCellText".to_string()));
+            sheet.set_cell(
+                0,
+                0,
+                crate::xlsx::write::CellData::String("EmbeddedCellText".to_string()),
+            );
         }
         let mut embedded_xlsx = Vec::new();
         xlsx_writer
@@ -3299,10 +3310,7 @@ mod tests {
 
         let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
         let text = doc.plain_text();
-        assert!(
-            text.contains("EmbeddedCellText"),
-            "expected embedded workbook text in {text:?}"
-        );
+        assert!(text.contains("EmbeddedCellText"), "expected embedded workbook text in {text:?}");
     }
 
     #[test]
@@ -3367,10 +3375,7 @@ mod tests {
             })
             .collect();
         assert_eq!(lists.len(), 2, "expected two separate list groups (interrupted once)");
-        assert_eq!(
-            lists[0].start_number, None,
-            "first group: no explicit start, defaults to 1"
-        );
+        assert_eq!(lists[0].start_number, None, "first group: no explicit start, defaults to 1");
         assert_eq!(
             lists[1].start_number,
             Some(3),
@@ -4030,10 +4035,7 @@ mod tests {
             !text.contains("REMOVED CELL"),
             "deleted cell content must not appear in the accepted view: {text:?}"
         );
-        assert!(
-            text.contains("Kept Cell"),
-            "the surviving cell must still be present: {text:?}"
-        );
+        assert!(text.contains("Kept Cell"), "the surviving cell must still be present: {text:?}");
     }
 
     #[test]
@@ -4103,10 +4105,7 @@ mod tests {
                 _ => None,
             })
             .expect("expected a table element");
-        assert_eq!(
-            table.rows[0].cells[0].text_align,
-            Some(crate::ir::ParagraphAlignment::Center)
-        );
+        assert_eq!(table.rows[0].cells[0].text_align, Some(crate::ir::ParagraphAlignment::Center));
     }
 
     #[test]
@@ -4326,11 +4325,7 @@ mod tests {
                 _ => None,
             })
             .expect("expected a list element");
-        assert_eq!(
-            list.start_number,
-            Some(7),
-            "startOverride=7 must be read back, not None"
-        );
+        assert_eq!(list.start_number, Some(7), "startOverride=7 must be read back, not None");
     }
 
     #[test]
@@ -4518,7 +4513,9 @@ mod tests {
         let data = writer.finish().unwrap().into_inner();
 
         let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
-        let app = doc.app_properties.expect("app_properties must be populated");
+        let app = doc
+            .app_properties
+            .expect("app_properties must be populated");
         assert_eq!(app.company.as_deref(), Some("Acme Corp"));
         assert_eq!(app.words, Some(1250));
         assert_eq!(app.pages, Some(3));
@@ -4599,7 +4596,14 @@ mod tests {
 
         let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
         let text = doc.plain_text();
-        for expected in ["Dollars per Group", "Revenue", "Group 1", "Group 2", "15.53", "27.32"] {
+        for expected in [
+            "Dollars per Group",
+            "Revenue",
+            "Group 1",
+            "Group 2",
+            "15.53",
+            "27.32",
+        ] {
             assert!(
                 text.contains(expected),
                 "chart text {expected:?} missing from plain_text(): {text:?}"
@@ -4772,8 +4776,7 @@ mod tests {
         // The reference itself must carry customMarkFollows so Word shows
         // "*" instead of an auto-number in the body citation.
         let doc_xml = {
-            let mut reader =
-                OpcReader::new(Cursor::new(bytes.clone())).expect("valid opc package");
+            let mut reader = OpcReader::new(Cursor::new(bytes.clone())).expect("valid opc package");
             let part = PartName::new("/word/document.xml").unwrap();
             String::from_utf8(reader.read_part(&part).unwrap()).unwrap()
         };

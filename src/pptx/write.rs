@@ -262,10 +262,14 @@ impl SlideData {
     /// Attach plain speaker notes to this slide (one paragraph per line).
     /// They are written to a notes slide part and never appear on the
     /// slide surface. For notes with formatting or list structure, use
-    /// [`SlideData::set_notes_structured`] instead.
+    /// `SlideData::set_notes_structured` instead.
     pub fn set_notes(&mut self, notes: &str) -> &mut Self {
-        self.notes =
-            Some(notes.lines().map(|line| BodyItem::Text(line.to_string())).collect());
+        self.notes = Some(
+            notes
+                .lines()
+                .map(|line| BodyItem::Text(line.to_string()))
+                .collect(),
+        );
         self
     }
 
@@ -407,7 +411,8 @@ impl SlideData {
         cx: i64,
         cy: i64,
     ) -> &mut Self {
-        self.body_items.push(BodyItem::TextBox(paragraphs, x, y, cx, cy));
+        self.body_items
+            .push(BodyItem::TextBox(paragraphs, x, y, cx, cy));
         self
     }
 
@@ -637,7 +642,10 @@ impl PptxWriter {
         opc.add_part_rel(&pres_part, rel_types::PRES_PROPS, "presProps.xml");
 
         // Notes slides. Speaker notes live here, never on the slide surface.
-        let has_notes = self.slides.iter().any(|s| s.notes.as_ref().is_some_and(|n| !n.is_empty()));
+        let has_notes = self
+            .slides
+            .iter()
+            .any(|s| s.notes.as_ref().is_some_and(|n| !n.is_empty()));
         if has_notes {
             let nm_part = PartName::new("/ppt/notesMasters/notesMaster1.xml")?;
             opc.add_part_rel(&pres_part, rel_types::NOTES_MASTER, "notesMasters/notesMaster1.xml");
@@ -727,7 +735,11 @@ impl PptxWriter {
                     rel_types::NOTES_MASTER,
                     "../notesMasters/notesMaster1.xml",
                 );
-                opc.add_part(&notes_part, CT_NOTES_SLIDE, &generate_notes_slide_xml(notes, &hyperlink_rids))?;
+                opc.add_part(
+                    &notes_part,
+                    CT_NOTES_SLIDE,
+                    &generate_notes_slide_xml(notes, &hyperlink_rids),
+                )?;
             }
 
             let slide_xml = generate_slide_xml(slide, &img_rids, self.cx, self.cy, &hyperlink_rids);
@@ -857,7 +869,8 @@ fn write_dml_run(w: &mut Writer<Vec<u8>>, run: &Run, hyperlink_rids: &HashMap<St
             if let Some(rid) = rid {
                 let mut hlink = BytesStart::new("a:hlinkClick");
                 hlink.push_attribute(("r:id", rid.as_str()));
-                w.write_event(Event::Empty(hlink)).expect("write hlinkClick");
+                w.write_event(Event::Empty(hlink))
+                    .expect("write hlinkClick");
             }
 
             w.write_event(Event::End(BytesEnd::new("a:rPr")))
@@ -1062,7 +1075,10 @@ fn generate_theme_xml() -> Vec<u8> {
 /// Renders each `BodyItem` the same way `write_body_shape` does for an
 /// ordinary slide body, so notes get the same bold/italic/bullet/
 /// numbering fidelity.
-fn generate_notes_slide_xml(notes: &[BodyItem], hyperlink_rids: &HashMap<String, String>) -> Vec<u8> {
+fn generate_notes_slide_xml(
+    notes: &[BodyItem],
+    hyperlink_rids: &HashMap<String, String>,
+) -> Vec<u8> {
     let mut w = Writer::new(Vec::new());
     write_decl(&mut w);
     w.write_event(Event::Start(pml_root("p:notes")))
@@ -1401,9 +1417,10 @@ fn collect_slide_hyperlinks(items: &[BodyItem]) -> Vec<String> {
     for item in items {
         let all_runs: Vec<&Run> = match item {
             BodyItem::RichText(runs, _) => runs.iter().collect(),
-            BodyItem::TextBox(paragraphs, ..) => {
-                paragraphs.iter().flat_map(|(runs, _)| runs.iter()).collect()
-            },
+            BodyItem::TextBox(paragraphs, ..) => paragraphs
+                .iter()
+                .flat_map(|(runs, _)| runs.iter())
+                .collect(),
             BodyItem::BulletList(items) => items.iter().flat_map(|(_, runs)| runs.iter()).collect(),
             BodyItem::Table(rows) => rows.iter().flatten().flatten().collect(),
             _ => continue,
@@ -2182,9 +2199,9 @@ mod tests {
         let mut writer = PptxWriter::new();
         {
             let slide = writer.add_slide();
-            slide.add_table(vec![vec![
-                vec![Run::new("Web Page").hyperlink("https://example.com/table")],
-            ]]);
+            slide.add_table(vec![vec![vec![
+                Run::new("Web Page").hyperlink("https://example.com/table"),
+            ]]]);
             slide.add_nested_bullet_list(vec![(
                 0,
                 vec![Run::new("Bulleted link").hyperlink("https://example.com/bullet")],
@@ -2401,18 +2418,21 @@ mod tests {
         {
             let slide = writer.add_slide();
             slide.set_notes_structured(vec![
-                BodyItem::RichText(
-                    vec![Run::new("bold note").bold()],
-                    ParaProps::default(),
-                ),
+                BodyItem::RichText(vec![Run::new("bold note").bold()], ParaProps::default()),
                 BodyItem::BulletList(vec![(0, vec![Run::new("bullet one")])]),
             ]);
         }
         let notes_xml = part_xml(writer, "ppt/notesSlides/notesSlide1.xml");
         assert!(notes_xml.contains("bold note"), "notes text must survive: {notes_xml}");
-        assert!(notes_xml.contains(r#"b="1""#), "bold formatting must reach the notes XML: {notes_xml}");
+        assert!(
+            notes_xml.contains(r#"b="1""#),
+            "bold formatting must reach the notes XML: {notes_xml}"
+        );
         assert!(notes_xml.contains("bullet one"), "bullet text must survive: {notes_xml}");
-        assert!(notes_xml.contains("a:buChar"), "bullet marker must reach the notes XML: {notes_xml}");
+        assert!(
+            notes_xml.contains("a:buChar"),
+            "bullet marker must reach the notes XML: {notes_xml}"
+        );
     }
 
     /// A deck with no notes gains no notes parts.

@@ -12,7 +12,11 @@ use clap::Parser;
 use std::process;
 
 #[derive(Parser)]
-#[command(name = "office-oxide", version, about = "Fast Office document processing")]
+#[command(
+    name = "office-oxide",
+    version,
+    about = "Fast Office document processing"
+)]
 struct Cli {
     #[command(subcommand)]
     command: commands::Command,

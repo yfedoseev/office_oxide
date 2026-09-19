@@ -254,8 +254,8 @@ fn parse_num_instance(
                 }
             },
             Event::Start(ref e) if e.local_name().as_ref() == b"lvlOverride" => {
-                in_lvl_override = xml::optional_attr_str(e, b"w:ilvl")?
-                    .and_then(|v| v.parse::<u8>().ok());
+                in_lvl_override =
+                    xml::optional_attr_str(e, b"w:ilvl")?.and_then(|v| v.parse::<u8>().ok());
             },
             Event::End(ref e) if e.local_name().as_ref() == b"lvlOverride" => {
                 in_lvl_override = None;

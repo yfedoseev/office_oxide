@@ -787,12 +787,14 @@ mod tests {
     #[test]
     fn test_sanitize_text_with_hyperlinks_and_chp_merges_equal_runs_and_splits_on_change() {
         use super::super::sprm::ChpProps;
-        let bold = ChpProps { bold: true, ..Default::default() };
+        let bold = ChpProps {
+            bold: true,
+            ..Default::default()
+        };
         let plain = ChpProps::default();
         // "AB" bold, "CD" plain.
         let char_props = vec![bold.clone(), bold.clone(), plain.clone(), plain.clone()];
-        let (text, _links, spans) =
-            sanitize_text_with_hyperlinks_and_chp("ABCD", &char_props);
+        let (text, _links, spans) = sanitize_text_with_hyperlinks_and_chp("ABCD", &char_props);
         assert_eq!(text, "ABCD");
         assert_eq!(spans, vec![(0..2, bold), (2..4, plain)]);
     }
@@ -803,12 +805,14 @@ mod tests {
     #[test]
     fn test_sanitize_text_with_hyperlinks_and_chp_skips_dropped_field_chars() {
         use super::super::sprm::ChpProps;
-        let italic = ChpProps { italic: true, ..Default::default() };
+        let italic = ChpProps {
+            italic: true,
+            ..Default::default()
+        };
         // "Hi \x13...instruction...\x14Bye\x15" — one span over "Hi Bye".
         let raw = "Hi \x13HYPERLINK \"x\"\x14Bye\x15";
         let char_props: Vec<ChpProps> = raw.chars().map(|_| italic.clone()).collect();
-        let (text, _links, spans) =
-            sanitize_text_with_hyperlinks_and_chp(raw, &char_props);
+        let (text, _links, spans) = sanitize_text_with_hyperlinks_and_chp(raw, &char_props);
         assert_eq!(text, "Hi Bye");
         assert_eq!(spans, vec![(0..text.len(), italic)]);
     }
@@ -1145,7 +1149,12 @@ mod multi_piece_tests {
     // ── Piece table coverage vs the FIB's declared text length ──────
 
     fn piece(cp_start: u32, cp_end: u32) -> Piece {
-        Piece { cp_start, cp_end, fc: 0, is_compressed: true }
+        Piece {
+            cp_start,
+            cp_end,
+            fc: 0,
+            is_compressed: true,
+        }
     }
 
     /// A single piece that covers the whole declared range.

@@ -503,7 +503,12 @@ impl SheetDataInner {
         if !in_grid(row, col) {
             return self;
         }
-        self.comments.push(SheetCommentOut { row, col, author, text: text.into() });
+        self.comments.push(SheetCommentOut {
+            row,
+            col,
+            author,
+            text: text.into(),
+        });
         self
     }
 
@@ -594,8 +599,11 @@ fn in_grid(row: usize, col: usize) -> bool {
 /// still returned `Ok(())`. Falls back to `"bin"` when nothing in the
 /// input survives filtering.
 fn sanitize_image_extension(format: &str) -> String {
-    let cleaned: String =
-        format.chars().filter(|c| c.is_ascii_alphanumeric()).take(10).collect();
+    let cleaned: String = format
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(10)
+        .collect();
     if cleaned.is_empty() {
         "bin".to_string()
     } else {
@@ -1486,9 +1494,9 @@ impl XlsxWriter {
                         w.write_event(Event::End(BytesEnd::new("rPr")))?;
                     }
                     w.write_event(Event::Start(BytesStart::new("t")))?;
-                    w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(
-                        &run.text,
-                    ))))?;
+                    w.write_event(Event::Text(BytesText::new(
+                        &crate::core::xml::sanitize_xml_text(&run.text),
+                    )))?;
                     w.write_event(Event::End(BytesEnd::new("t")))?;
                     w.write_event(Event::End(BytesEnd::new("r")))?;
                 }
@@ -1570,7 +1578,9 @@ impl XlsxWriter {
 /// values via its own API, but the VML builder below writes some
 /// content as raw string interpolation, so text needs escaping by hand.
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Generate `xl/comments<n>.xml` (ECMA-376 §18.7 `CT_Comments`): one
@@ -1594,9 +1604,7 @@ fn build_comments_xml(comments: &[SheetCommentOut]) -> Vec<u8> {
 
     let mut xml = String::new();
     xml.push_str(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#);
-    xml.push_str(
-        r#"<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">"#,
-    );
+    xml.push_str(r#"<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">"#);
     xml.push_str("<authors>");
     for a in &authors {
         xml.push_str(&format!("<author>{}</author>", xml_escape(a)));
@@ -2504,13 +2512,19 @@ mod tests {
         let ir = doc.to_ir();
         let mut found = false;
         for e in &ir.sections[0].elements {
-            let crate::ir::Element::Table(t) = e else { continue };
+            let crate::ir::Element::Table(t) = e else {
+                continue;
+            };
             for row in &t.rows {
                 for cell in &row.cells {
                     for ce in &cell.content {
-                        let crate::ir::Element::Paragraph(p) = ce else { continue };
+                        let crate::ir::Element::Paragraph(p) = ce else {
+                            continue;
+                        };
                         for ic in &p.content {
-                            let crate::ir::InlineContent::Text(ts) = ic else { continue };
+                            let crate::ir::InlineContent::Text(ts) = ic else {
+                                continue;
+                            };
                             if ts.hyperlink.as_deref() == Some("mailto:someone@example.com") {
                                 found = true;
                             }

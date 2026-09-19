@@ -346,7 +346,11 @@ mod tests {
     #[test]
     fn test_note_author_reaches_the_json_projection() {
         let ir = DocumentIR {
-            metadata: Metadata { format: DocumentFormat::Doc, title: None, ..Default::default() },
+            metadata: Metadata {
+                format: DocumentFormat::Doc,
+                title: None,
+                ..Default::default()
+            },
             sections: vec![Section {
                 elements: vec![Element::Endnote(Note {
                     id: 0,
@@ -432,7 +436,8 @@ mod tests {
         let json = ir_to_json(&ir);
         let rendered = serde_json::to_string(&json).unwrap();
         assert!(
-            rendered.contains(r#""range":"A1:A10""#) && rendered.contains(r#""rule_type":"cellIs""#),
+            rendered.contains(r#""range":"A1:A10""#)
+                && rendered.contains(r#""rule_type":"cellIs""#),
             "the ir command's JSON projection must include Section::conditional_formats: {rendered}"
         );
     }

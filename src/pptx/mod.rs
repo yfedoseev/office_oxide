@@ -318,8 +318,7 @@ impl PptxDocument {
         // Phase 2: parse slides (parallel when feature enabled)
         let slides = crate::core::parallel::map_collect(bundles, |b| -> Result<Slide> {
             let name = xml_csl_name(&b.slide_data);
-            let mut parsed =
-                Slide::parse(&b.slide_data, name, &b.slide_rels, &b.media, &b.charts)?;
+            let mut parsed = Slide::parse(&b.slide_data, name, &b.slide_rels, &b.media, &b.charts)?;
             if let Some(notes_data) = &b.notes_data {
                 parsed.notes = extract_notes_body(notes_data);
             }
@@ -422,7 +421,9 @@ fn apply_master_inheritance(shapes: &mut [Shape], styles: &master::MasterTextSty
                     _ => None,
                 };
                 let Some(defaults) = defaults else { continue };
-                let Some(ref mut tb) = auto.text_body else { continue };
+                let Some(ref mut tb) = auto.text_body else {
+                    continue;
+                };
                 for para in &mut tb.paragraphs {
                     if para.alignment.is_none() {
                         para.alignment = defaults.alignment.clone();

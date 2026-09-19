@@ -64,11 +64,13 @@ const STD_MONIKER: [u8; 16] = [
 const TAIL_SIZE: usize = 24;
 
 fn read_u16(data: &[u8], pos: usize) -> Option<u16> {
-    data.get(pos..pos + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+    data.get(pos..pos + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
 }
 
 fn read_u32(data: &[u8], pos: usize) -> Option<u32> {
-    data.get(pos..pos + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    data.get(pos..pos + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 /// Read `n_chars` UTF-16LE code units starting at `pos`.
@@ -76,7 +78,12 @@ fn read_utf16le(data: &[u8], pos: usize, n_chars: usize) -> Option<(String, usiz
     let byte_len = n_chars.checked_mul(2)?;
     let end = pos.checked_add(byte_len)?;
     let bytes = data.get(pos..end)?;
-    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect();
     Some((String::from_utf16_lossy(&units), end))
 }
 
@@ -219,7 +226,13 @@ pub fn parse_hlink(data: &[u8]) -> Option<XlsHyperlink> {
         return None;
     }
 
-    Some(XlsHyperlink { row_first, row_last, col_first, col_last, target })
+    Some(XlsHyperlink {
+        row_first,
+        row_last,
+        col_first,
+        col_last,
+        target,
+    })
 }
 
 #[cfg(test)]

@@ -263,7 +263,10 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
         for (i, text) in doc.chart_text().iter().enumerate() {
             chart_elements.push(Element::Heading(Heading {
                 level: 3,
-                content: vec![InlineContent::Text(TextSpan::plain(format!("Chart {}", i + 1)))],
+                content: vec![InlineContent::Text(TextSpan::plain(format!(
+                    "Chart {}",
+                    i + 1
+                )))],
                 ..Default::default()
             }));
             chart_elements.push(Element::Paragraph(Paragraph {
@@ -292,18 +295,23 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Xls,
             title,
-            author: summary.and_then(|s| s.author.clone()).filter(|s| !s.is_empty()),
-            subject: summary.and_then(|s| s.subject.clone()).filter(|s| !s.is_empty()),
+            author: summary
+                .and_then(|s| s.author.clone())
+                .filter(|s| !s.is_empty()),
+            subject: summary
+                .and_then(|s| s.subject.clone())
+                .filter(|s| !s.is_empty()),
             keywords: summary
                 .and_then(|s| s.keywords.as_deref())
                 .map(crate::convert_docx::split_keywords)
                 .unwrap_or_default(),
-            description: summary.and_then(|s| s.comments.clone()).filter(|s| !s.is_empty()),
+            description: summary
+                .and_then(|s| s.comments.clone())
+                .filter(|s| !s.is_empty()),
             created: summary.and_then(|s| s.created.clone()),
             modified: summary.and_then(|s| s.modified.clone()),
             has_macros: doc.has_macros(),
             text_truncated: doc.truncated(),
-            ..Default::default()
         },
         sections,
         defined_names: doc

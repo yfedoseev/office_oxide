@@ -150,7 +150,10 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 });
             }
             // Drop trailing empty cells.
-            while cells.last().is_some_and(|cd| cd.text.is_empty() && cd.formula.is_none()) {
+            while cells
+                .last()
+                .is_some_and(|cd| cd.text.is_empty() && cd.formula.is_none())
+            {
                 cells.pop();
             }
             parsed_rows.push(cells);
@@ -180,8 +183,10 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         let mut prose_score = 0usize;
         let mut nonempty_rows = 0usize;
         for cells in &parsed_rows {
-            let nc =
-                cells.iter().filter(|cd| !cd.text.is_empty() || cd.formula.is_some()).count();
+            let nc = cells
+                .iter()
+                .filter(|cd| !cd.text.is_empty() || cd.formula.is_some())
+                .count();
             if nc == 0 {
                 continue;
             }
@@ -272,8 +277,9 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 // Find the first non-empty cell (a formula with no cached
                 // value counts too — it has real content, just no cached
                 // display text).
-                let Some(cd) =
-                    cells.iter().find(|cd| !cd.text.is_empty() || cd.formula.is_some())
+                let Some(cd) = cells
+                    .iter()
+                    .find(|cd| !cd.text.is_empty() || cd.formula.is_some())
                 else {
                     continue;
                 };
@@ -340,8 +346,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 let true_row = row_numbers.get(row_idx).copied().unwrap_or(row_idx as u32);
                 if !merge_span.is_empty() {
                     for (col, cell) in tcells.iter_mut().enumerate() {
-                        if let Some(&(row_span, col_span)) =
-                            merge_span.get(&(true_row, col as u32))
+                        if let Some(&(row_span, col_span)) = merge_span.get(&(true_row, col as u32))
                         {
                             cell.row_span = row_span;
                             cell.col_span = col_span;
@@ -601,8 +606,11 @@ fn cell_spans(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> Vec<InlineConte
                     Some(crate::core::units::HalfPoint::from_points_rounded(size_pt).0);
             }
             span.font_name = r.font_name.clone();
-            span.color =
-                r.color.as_ref().and_then(|c| c.resolve_opt(doc.theme.as_ref())).map(|rgb| rgb.0);
+            span.color = r
+                .color
+                .as_ref()
+                .and_then(|c| c.resolve_opt(doc.theme.as_ref()))
+                .map(|rgb| rgb.0);
             span.vertical_align = r.vert_align.clone();
             InlineContent::Text(span)
         })

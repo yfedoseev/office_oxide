@@ -118,16 +118,20 @@ pub(crate) fn parse_threaded_comments(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) if e.local_name().as_ref() == b"threadedComment" => {
-                let cell_ref =
-                    xml::optional_attr_str(e, b"ref")?.map(|v| v.into_owned()).unwrap_or_default();
-                let parent_id =
-                    xml::optional_attr_str(e, b"parentId")?.map(|v| v.into_owned());
-                let person_id =
-                    xml::optional_attr_str(e, b"personId")?.map(|v| v.into_owned());
+                let cell_ref = xml::optional_attr_str(e, b"ref")?
+                    .map(|v| v.into_owned())
+                    .unwrap_or_default();
+                let parent_id = xml::optional_attr_str(e, b"parentId")?.map(|v| v.into_owned());
+                let person_id = xml::optional_attr_str(e, b"personId")?.map(|v| v.into_owned());
                 let text = xml::read_text_content_fast(&mut reader)?;
                 let text = text.trim().to_string();
                 if !text.is_empty() {
-                    out.push(RawThreadedComment { cell_ref, parent_id, person_id, text });
+                    out.push(RawThreadedComment {
+                        cell_ref,
+                        parent_id,
+                        person_id,
+                        text,
+                    });
                 }
             },
             Event::Eof => break,
@@ -188,8 +192,10 @@ pub(crate) fn merge_threaded_comments(
         by_ref.entry(tc.cell_ref.clone()).or_default().push(tc);
     }
 
-    let mut out: Vec<SheetComment> =
-        legacy.into_iter().filter(|c| !by_ref.contains_key(&c.cell_ref)).collect();
+    let mut out: Vec<SheetComment> = legacy
+        .into_iter()
+        .filter(|c| !by_ref.contains_key(&c.cell_ref))
+        .collect();
 
     for (cell_ref, mut msgs) in by_ref {
         // The root message (no parentId) leads; replies follow in their
@@ -208,7 +214,11 @@ pub(crate) fn merge_threaded_comments(
                 None => lines.push(m.text.clone()),
             }
         }
-        out.push(SheetComment { cell_ref, author: thread_author, text: lines.join("\n") });
+        out.push(SheetComment {
+            cell_ref,
+            author: thread_author,
+            text: lines.join("\n"),
+        });
     }
     out
 }
@@ -461,14 +471,17 @@ fn parse_conditional_formatting(
 ) -> crate::core::Result<Vec<crate::ir::ConditionalFormat>> {
     use quick_xml::events::Event;
 
-    let sqref = xml::optional_attr_str(start, b"sqref")?.map(|v| v.into_owned()).unwrap_or_default();
+    let sqref = xml::optional_attr_str(start, b"sqref")?
+        .map(|v| v.into_owned())
+        .unwrap_or_default();
     let mut out = Vec::new();
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) if e.local_name().as_ref() == b"cfRule" => {
-                let rule_type =
-                    xml::optional_attr_str(e, b"type")?.map(|v| v.into_owned()).unwrap_or_default();
+                let rule_type = xml::optional_attr_str(e, b"type")?
+                    .map(|v| v.into_owned())
+                    .unwrap_or_default();
                 let operator = xml::optional_attr_str(e, b"operator")?.map(|v| v.into_owned());
                 let formulas = read_cf_rule_formulas(reader)?;
                 out.push(crate::ir::ConditionalFormat {
@@ -481,8 +494,9 @@ fn parse_conditional_formatting(
             Event::Empty(ref e) if e.local_name().as_ref() == b"cfRule" => {
                 // A rule with no children at all (no formula, no colour
                 // scale/data bar/icon set) — rare, but structurally valid.
-                let rule_type =
-                    xml::optional_attr_str(e, b"type")?.map(|v| v.into_owned()).unwrap_or_default();
+                let rule_type = xml::optional_attr_str(e, b"type")?
+                    .map(|v| v.into_owned())
+                    .unwrap_or_default();
                 let operator = xml::optional_attr_str(e, b"operator")?.map(|v| v.into_owned());
                 out.push(crate::ir::ConditionalFormat {
                     range: sqref.clone(),
@@ -504,7 +518,9 @@ fn parse_conditional_formatting(
 /// `between`/`notBetween` operator carries two `<formula>` children (the
 /// low and high bounds); most others carry one; colour-scale/data-bar/
 /// icon-set rules carry none.
-fn read_cf_rule_formulas(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Vec<String>> {
+fn read_cf_rule_formulas(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> crate::core::Result<Vec<String>> {
     use quick_xml::events::Event;
     let mut formulas = Vec::new();
     let mut depth = 1u32;
@@ -563,9 +579,12 @@ fn parse_data_validations(
 fn data_validation_from_attrs(
     e: &quick_xml::events::BytesStart,
 ) -> crate::core::Result<crate::ir::DataValidation> {
-    let range = xml::optional_attr_str(e, b"sqref")?.map(|v| v.into_owned()).unwrap_or_default();
-    let validation_type =
-        xml::optional_attr_str(e, b"type")?.map(|v| v.into_owned()).unwrap_or_else(|| "none".to_string());
+    let range = xml::optional_attr_str(e, b"sqref")?
+        .map(|v| v.into_owned())
+        .unwrap_or_default();
+    let validation_type = xml::optional_attr_str(e, b"type")?
+        .map(|v| v.into_owned())
+        .unwrap_or_else(|| "none".to_string());
     let operator = if matches!(validation_type.as_str(), "list" | "custom" | "none") {
         None
     } else {
@@ -576,7 +595,14 @@ fn data_validation_from_attrs(
         )
     };
     let allow_blank = xml::optional_attr_str(e, b"allowBlank")?.as_deref() == Some("1");
-    Ok(crate::ir::DataValidation { range, validation_type, operator, formula1: None, formula2: None, allow_blank })
+    Ok(crate::ir::DataValidation {
+        range,
+        validation_type,
+        operator,
+        formula1: None,
+        formula2: None,
+        allow_blank,
+    })
 }
 
 /// The Start form of `<dataValidation>` additionally carries `<formula1>`/
@@ -1224,7 +1250,10 @@ mod tests {
 </worksheet>"#;
         let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
         let cell = &ws.rows[0].cells[0];
-        let runs = cell.rich_runs.as_ref().expect("expected rich_runs to be populated");
+        let runs = cell
+            .rich_runs
+            .as_ref()
+            .expect("expected rich_runs to be populated");
         assert_eq!(runs.len(), 2, "got {runs:?}");
         assert_eq!(runs[0].text, "Hello ");
         assert_eq!(runs[0].bold, Some(true), "bold must reach the run");
@@ -1759,7 +1788,8 @@ mod tests {
                 text: "the root message".to_string(),
             },
         ];
-        let merged = merge_threaded_comments(Vec::new(), threaded, &std::collections::HashMap::new());
+        let merged =
+            merge_threaded_comments(Vec::new(), threaded, &std::collections::HashMap::new());
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "the root message\na reply");
     }
@@ -1771,7 +1801,8 @@ mod tests {
             author: None,
             text: "plain note".to_string(),
         }];
-        let merged = merge_threaded_comments(legacy.clone(), Vec::new(), &std::collections::HashMap::new());
+        let merged =
+            merge_threaded_comments(legacy.clone(), Vec::new(), &std::collections::HashMap::new());
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "plain note");
     }

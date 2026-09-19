@@ -81,8 +81,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             // Already represented structurally on `Section.header`/
             // `.footer`/etc above — don't also dump the merged blob as a
             // generic TextBox.
-            if sub.kind == crate::doc::SubDocumentKind::HeadersFooters && header_footer_structured
-            {
+            if sub.kind == crate::doc::SubDocumentKind::HeadersFooters && header_footer_structured {
                 continue;
             }
             // `PlcfandTxt`/`PlcfandRef` successfully split this document's
@@ -132,7 +131,11 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             ) && sub.text.contains('\u{2}');
 
             let bodies: Vec<&str> = if splittable {
-                sub.text.split('\u{2}').map(str::trim).filter(|s| !s.is_empty()).collect()
+                sub.text
+                    .split('\u{2}')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect()
             } else {
                 vec![sub.text.as_str()]
             };
@@ -211,18 +214,23 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Doc,
             title,
-            author: summary.and_then(|s| s.author.clone()).filter(|s| !s.is_empty()),
-            subject: summary.and_then(|s| s.subject.clone()).filter(|s| !s.is_empty()),
+            author: summary
+                .and_then(|s| s.author.clone())
+                .filter(|s| !s.is_empty()),
+            subject: summary
+                .and_then(|s| s.subject.clone())
+                .filter(|s| !s.is_empty()),
             keywords: summary
                 .and_then(|s| s.keywords.as_deref())
                 .map(crate::convert_docx::split_keywords)
                 .unwrap_or_default(),
-            description: summary.and_then(|s| s.comments.clone()).filter(|s| !s.is_empty()),
+            description: summary
+                .and_then(|s| s.comments.clone())
+                .filter(|s| !s.is_empty()),
             created: summary.and_then(|s| s.created.clone()),
             modified: summary.and_then(|s| s.modified.clone()),
             has_macros: doc.has_macros(),
             text_truncated: !doc.text_complete(),
-            ..Default::default()
         },
         sections,
         defined_names: Vec::new(),
@@ -655,8 +663,9 @@ fn flush_list(
     let base_level = items.iter().map(|(lvl, _)| *lvl).min().unwrap_or(0);
     let level = ilfo.and_then(|ilfo| list_formatting.level_for(ilfo, base_level));
     let ordered = level.is_some_and(|l| l.is_numbered());
-    let start_number =
-        level.filter(|l| l.is_numbered() && l.start_at != 1).map(|l| l.start_at as u32);
+    let start_number = level
+        .filter(|l| l.is_numbered() && l.start_at != 1)
+        .map(|l| l.start_at as u32);
 
     let mut list = build_nested_list(ordered, items, base_level);
     list.start_number = start_number;
@@ -767,9 +776,13 @@ fn push_segment(
         if slice.is_empty() {
             continue;
         }
-        let hyperlink =
-            hyperlinks.iter().find(|h| h.range.start <= a && b <= h.range.end);
-        let props = chp_runs.iter().find(|(r, _)| r.start <= a && b <= r.end).map(|(_, p)| p);
+        let hyperlink = hyperlinks
+            .iter()
+            .find(|h| h.range.start <= a && b <= h.range.end);
+        let props = chp_runs
+            .iter()
+            .find(|(r, _)| r.start <= a && b <= r.end)
+            .map(|(_, p)| p);
         let mut span = match props {
             Some(p) => styled_span(slice, p),
             None => TextSpan::plain(slice),
@@ -797,7 +810,10 @@ fn shift_hyperlinks_for_trim(
         .filter_map(|h| {
             let start = h.range.start.saturating_sub(trim_start).min(trimmed_len);
             let end = h.range.end.saturating_sub(trim_start).min(trimmed_len);
-            (start < end).then(|| HyperlinkSpan { range: start..end, url: h.url.clone() })
+            (start < end).then(|| HyperlinkSpan {
+                range: start..end,
+                url: h.url.clone(),
+            })
         })
         .collect()
 }
@@ -932,7 +948,9 @@ fn is_heading_guess_junk(line: &str) -> bool {
 fn is_bare_date(line: &str) -> bool {
     let parts: Vec<&str> = line.split(['/', '-']).collect();
     parts.len() == 3
-        && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
         && parts[0].len() <= 2
         && parts[1].len() <= 2
         && matches!(parts[2].len(), 2 | 4)
@@ -1108,11 +1126,15 @@ mod tests {
         assert_eq!(linked.text, "Hyperlink text");
         assert_eq!(linked.hyperlink.as_deref(), Some("http://testuri.org/"));
         assert!(
-            spans.iter().any(|s| s.hyperlink.is_none() && s.text.contains("Before text")),
+            spans
+                .iter()
+                .any(|s| s.hyperlink.is_none() && s.text.contains("Before text")),
             "surrounding plain text must stay unlinked: {spans:?}"
         );
         assert!(
-            spans.iter().any(|s| s.hyperlink.is_none() && s.text.contains("after text")),
+            spans
+                .iter()
+                .any(|s| s.hyperlink.is_none() && s.text.contains("after text")),
             "surrounding plain text must stay unlinked: {spans:?}"
         );
     }
@@ -1136,7 +1158,11 @@ mod tests {
             chp_runs: vec![
                 (
                     bold_start..bold_end,
-                    ChpProps { bold: true, color: Some([255, 0, 0]), ..Default::default() },
+                    ChpProps {
+                        bold: true,
+                        color: Some([255, 0, 0]),
+                        ..Default::default()
+                    },
                 ),
                 (
                     italic_start..italic_end,
@@ -1163,7 +1189,10 @@ mod tests {
             })
             .collect();
 
-        let plain = spans.iter().find(|s| s.text == "Plain ").expect("leading plain span");
+        let plain = spans
+            .iter()
+            .find(|s| s.text == "Plain ")
+            .expect("leading plain span");
         assert!(!plain.bold && !plain.italic, "unformatted text must stay unformatted");
 
         let bold = spans.iter().find(|s| s.text == "bold").expect("bold span");
@@ -1171,7 +1200,10 @@ mod tests {
         assert!(!bold.italic);
         assert_eq!(bold.color, Some([255, 0, 0]));
 
-        let italic = spans.iter().find(|s| s.text == "italic").expect("italic span");
+        let italic = spans
+            .iter()
+            .find(|s| s.text == "italic")
+            .expect("italic span");
         assert!(italic.italic);
         assert!(!italic.bold);
         assert_eq!(italic.underline, Some(crate::ir::UnderlineStyle::Single));
@@ -1319,7 +1351,7 @@ mod tests {
     fn test_numbered_heading_wins_over_list_membership() {
         let props = PapProps {
             ilvl: Some(0),
-            ilfo: Some(1), // valid 1-based list index
+            ilfo: Some(1),          // valid 1-based list index
             outline_level: Some(0), // Heading 1
             ..PapProps::default()
         };
@@ -1328,7 +1360,8 @@ mod tests {
         walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
 
         assert!(
-            els.iter().any(|e| matches!(e, Element::Heading(h) if h.level == 1)),
+            els.iter()
+                .any(|e| matches!(e, Element::Heading(h) if h.level == 1)),
             "a numbered Heading 1 must be emitted as a Heading, got {els:#?}"
         );
         assert!(
@@ -1364,8 +1397,14 @@ mod tests {
             vec![(
                 0x44F53D09, // lsid
                 vec![
-                    crate::doc::ListLevel { start_at: 5, nfc: 0x00 }, // level 0: numbered, starts at 5
-                    crate::doc::ListLevel { start_at: 1, nfc: 0xFF }, // level 1: bullet
+                    crate::doc::ListLevel {
+                        start_at: 5,
+                        nfc: 0x00,
+                    }, // level 0: numbered, starts at 5
+                    crate::doc::ListLevel {
+                        start_at: 1,
+                        nfc: 0xFF,
+                    }, // level 1: bullet
                 ],
             )],
             vec![0x44F53D09], // lfo_lsids[0] == lsid above, so ilfo=1 resolves to it
@@ -1391,7 +1430,13 @@ mod tests {
     #[test]
     fn test_bullet_level_never_gets_a_start_number() {
         let list_formatting = crate::doc::ListFormatting::from_parts(
-            vec![(1, vec![crate::doc::ListLevel { start_at: 7, nfc: 0xFF }])],
+            vec![(
+                1,
+                vec![crate::doc::ListLevel {
+                    start_at: 7,
+                    nfc: 0xFF,
+                }],
+            )],
             vec![1],
         );
         let props = PapProps {
@@ -1416,7 +1461,13 @@ mod tests {
     #[test]
     fn test_start_at_one_is_not_surfaced_as_an_override() {
         let list_formatting = crate::doc::ListFormatting::from_parts(
-            vec![(1, vec![crate::doc::ListLevel { start_at: 1, nfc: 0x00 }])],
+            vec![(
+                1,
+                vec![crate::doc::ListLevel {
+                    start_at: 1,
+                    nfc: 0x00,
+                }],
+            )],
             vec![1],
         );
         let props = PapProps {
@@ -1643,7 +1694,11 @@ mod tests {
     /// un-styled section headings).
     #[test]
     fn test_genuine_all_caps_headings_still_promoted() {
-        for heading in ["INTRODUCTION", "TABLE OF CONTENTS", "A. GENERAL INFORMATION"] {
+        for heading in [
+            "INTRODUCTION",
+            "TABLE OF CONTENTS",
+            "A. GENERAL INFORMATION",
+        ] {
             assert!(is_heading_guess(heading), "{heading:?} must still be promoted");
         }
     }

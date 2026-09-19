@@ -41,9 +41,7 @@ pub use reader::CfbReader;
 /// friendly "password-protected" error instead of a confusing low-level
 /// zip error ("Could not find EOCD") that says nothing about the real
 /// cause.
-pub fn is_cfb_container<R: std::io::Read + std::io::Seek>(
-    reader: &mut R,
-) -> std::io::Result<bool> {
+pub fn is_cfb_container<R: std::io::Read + std::io::Seek>(reader: &mut R) -> std::io::Result<bool> {
     use std::io::SeekFrom;
     let mut magic = [0u8; 8];
     reader.seek(SeekFrom::Start(0))?;

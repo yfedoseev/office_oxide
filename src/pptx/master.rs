@@ -126,7 +126,10 @@ fn parse_lvl_pr(
     start: &quick_xml::events::BytesStart,
 ) -> CoreResult<MasterRunDefaults> {
     let alignment = parse_algn(start)?;
-    let mut defaults = MasterRunDefaults { alignment, ..Default::default() };
+    let mut defaults = MasterRunDefaults {
+        alignment,
+        ..Default::default()
+    };
     loop {
         match reader.read_event()? {
             Event::Start(ref e) if e.local_name().as_ref() == b"defRPr" => {
@@ -177,7 +180,10 @@ fn parse_def_rpr(
     Ok(())
 }
 
-fn apply_rpr_attrs(e: &quick_xml::events::BytesStart, defaults: &mut MasterRunDefaults) -> CoreResult<()> {
+fn apply_rpr_attrs(
+    e: &quick_xml::events::BytesStart,
+    defaults: &mut MasterRunDefaults,
+) -> CoreResult<()> {
     if let Some(v) = xml::optional_attr_str(e, b"b")? {
         defaults.bold = Some(v.as_ref() != "0");
     }

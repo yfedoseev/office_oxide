@@ -98,7 +98,11 @@ fn spans_for_range(
                 span.italic = italic;
             }
             if let Some(underline) = f.format.underline {
-                span.underline = if underline { Some(UnderlineStyle::Single) } else { None };
+                span.underline = if underline {
+                    Some(UnderlineStyle::Single)
+                } else {
+                    None
+                };
             }
             if let Some(size) = f.format.font_size {
                 span.font_size_half_pt = Some((size.max(0) as u32) * 2);
@@ -193,7 +197,10 @@ fn table_block_to_element(table: &crate::ppt::TableBlock) -> Element {
             ..Default::default()
         })
         .collect();
-    Element::Table(Table { rows, ..Default::default() })
+    Element::Table(Table {
+        rows,
+        ..Default::default()
+    })
 }
 
 /// Human-readable identity for an `ExOleObjAtom` — the
@@ -293,14 +300,22 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                     elements.push(Element::Heading(Heading {
                         level: 1,
                         content,
-                        alignment: alignment_at(&run.para_formats, paragraphs.first().map_or(0, |p| p.0)),
+                        alignment: alignment_at(
+                            &run.para_formats,
+                            paragraphs.first().map_or(0, |p| p.0),
+                        ),
                         ..Default::default()
                     }));
                 },
                 TextType::Body | TextType::HalfBody | TextType::QuarterBody => {
                     for &(start, end) in &paragraphs {
-                        let content =
-                            spans_for_range(&text_chars, start, end, &run.char_formats, run.hyperlink.as_deref());
+                        let content = spans_for_range(
+                            &text_chars,
+                            start,
+                            end,
+                            &run.char_formats,
+                            run.hyperlink.as_deref(),
+                        );
                         if !content.is_empty() {
                             elements.push(Element::Paragraph(Paragraph {
                                 content,
@@ -328,7 +343,10 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                     if !content.is_empty() {
                         elements.push(Element::Paragraph(Paragraph {
                             content,
-                            alignment: alignment_at(&run.para_formats, paragraphs.first().map_or(0, |p| p.0)),
+                            alignment: alignment_at(
+                                &run.para_formats,
+                                paragraphs.first().map_or(0, |p| p.0),
+                            ),
                             placeholder_role: run.placeholder_role.clone(),
                             ..Default::default()
                         }));
@@ -393,7 +411,11 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                 })
             })
             .collect();
-        let speaker_notes = if speaker_notes.is_empty() { None } else { Some(speaker_notes) };
+        let speaker_notes = if speaker_notes.is_empty() {
+            None
+        } else {
+            Some(speaker_notes)
+        };
 
         sections.push(Section {
             title: Some(title),
@@ -430,13 +452,19 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Ppt,
             title,
-            author: summary.and_then(|s| s.author.clone()).filter(|s| !s.is_empty()),
-            subject: summary.and_then(|s| s.subject.clone()).filter(|s| !s.is_empty()),
+            author: summary
+                .and_then(|s| s.author.clone())
+                .filter(|s| !s.is_empty()),
+            subject: summary
+                .and_then(|s| s.subject.clone())
+                .filter(|s| !s.is_empty()),
             keywords: summary
                 .and_then(|s| s.keywords.as_deref())
                 .map(crate::convert_docx::split_keywords)
                 .unwrap_or_default(),
-            description: summary.and_then(|s| s.comments.clone()).filter(|s| !s.is_empty()),
+            description: summary
+                .and_then(|s| s.comments.clone())
+                .filter(|s| !s.is_empty()),
             created: summary.and_then(|s| s.created.clone()),
             modified: summary.and_then(|s| s.modified.clone()),
             has_macros: doc.has_macros(),

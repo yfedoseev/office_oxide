@@ -187,7 +187,13 @@ mod tests {
 
     #[test]
     fn test_no_object_pool_yields_empty() {
-        let entries = vec![entry("Root Entry", EntryType::RootStorage, NO_ENTRY, NO_ENTRY, NO_ENTRY)];
+        let entries = vec![entry(
+            "Root Entry",
+            EntryType::RootStorage,
+            NO_ENTRY,
+            NO_ENTRY,
+            NO_ENTRY,
+        )];
         assert!(find_direct_child(&entries, entries[0].child, "ObjectPool").is_none());
     }
 
@@ -198,7 +204,10 @@ mod tests {
             classify(&["Equation Native"]).as_deref(),
             Some("Embedded Equation Editor/MathType Object")
         );
-        assert_eq!(classify(&["WordDocument"]).as_deref(), Some("Embedded Microsoft Word Document"));
+        assert_eq!(
+            classify(&["WordDocument"]).as_deref(),
+            Some("Embedded Microsoft Word Document")
+        );
         assert_eq!(
             classify(&["PowerPoint Document"]).as_deref(),
             Some("Embedded Microsoft PowerPoint Presentation")

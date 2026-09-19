@@ -509,7 +509,10 @@ mod tests {
         assert!(!t.contains('\u{13}'), "field begin must be stripped");
         assert!(!t.contains('\u{14}'), "field separator must be stripped");
         assert!(!t.contains('\u{15}'), "field end must be stripped");
-        assert!(!t.contains("HYPERLINK"), "field instruction text must not leak into visible text");
+        assert!(
+            !t.contains("HYPERLINK"),
+            "field instruction text must not leak into visible text"
+        );
         assert_eq!(t, "Seeresulthere");
     }
 

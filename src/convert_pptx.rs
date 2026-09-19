@@ -64,7 +64,11 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         let speaker_notes = slide.notes.as_ref().and_then(|tb| {
             let mut converted = Vec::new();
             convert_text_body(tb, &mut converted);
-            if converted.is_empty() { None } else { Some(converted) }
+            if converted.is_empty() {
+                None
+            } else {
+                Some(converted)
+            }
         });
 
         // Slide comments are review content that reached no consumer at
@@ -264,7 +268,11 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
                     // built from it — richer than `TextType`'s 8 values
                     // and, unlike it, not thrown away after the
                     // title/body classification above is done with it.
-                    if let Some(ph_type) = auto.placeholder.as_ref().and_then(|ph| ph.ph_type.as_deref()) {
+                    if let Some(ph_type) = auto
+                        .placeholder
+                        .as_ref()
+                        .and_then(|ph| ph.ph_type.as_deref())
+                    {
                         tag_placeholder_role(&mut inner, ph_type);
                     }
                     if is_body_ph {
@@ -727,9 +735,19 @@ mod tests {
             id: 2,
             name: "Content Placeholder 2".to_string(),
             alt_text: None,
-            position: Some(ShapePosition { x: 100, y: 200, cx: 300, cy: 400 }),
-            text_body: Some(TextBody { paragraphs: vec![bullet(0, "Body text")] }),
-            placeholder: Some(PlaceholderInfo { ph_type: Some("body".to_string()), idx: Some(1) }),
+            position: Some(ShapePosition {
+                x: 100,
+                y: 200,
+                cx: 300,
+                cy: 400,
+            }),
+            text_body: Some(TextBody {
+                paragraphs: vec![bullet(0, "Body text")],
+            }),
+            placeholder: Some(PlaceholderInfo {
+                ph_type: Some("body".to_string()),
+                idx: Some(1),
+            }),
             hyperlink: None,
         });
         let mut elements = Vec::new();
@@ -756,9 +774,19 @@ mod tests {
             id: 4,
             name: "Date Placeholder 4".to_string(),
             alt_text: None,
-            position: Some(ShapePosition { x: 100, y: 200, cx: 300, cy: 400 }),
-            text_body: Some(TextBody { paragraphs: vec![bullet(0, "9/19/2026")] }),
-            placeholder: Some(PlaceholderInfo { ph_type: Some("dt".to_string()), idx: Some(2) }),
+            position: Some(ShapePosition {
+                x: 100,
+                y: 200,
+                cx: 300,
+                cy: 400,
+            }),
+            text_body: Some(TextBody {
+                paragraphs: vec![bullet(0, "9/19/2026")],
+            }),
+            placeholder: Some(PlaceholderInfo {
+                ph_type: Some("dt".to_string()),
+                idx: Some(2),
+            }),
             hyperlink: None,
         });
         let mut elements = Vec::new();
@@ -794,8 +822,15 @@ mod tests {
             id: 3,
             name: "TextBox 3".to_string(),
             alt_text: None,
-            position: Some(ShapePosition { x: 100, y: 200, cx: 300, cy: 400 }),
-            text_body: Some(TextBody { paragraphs: vec![bullet(0, "Floating text")] }),
+            position: Some(ShapePosition {
+                x: 100,
+                y: 200,
+                cx: 300,
+                cy: 400,
+            }),
+            text_body: Some(TextBody {
+                paragraphs: vec![bullet(0, "Floating text")],
+            }),
             placeholder: None,
             hyperlink: None,
         });

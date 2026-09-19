@@ -1165,7 +1165,10 @@ fn parse_text_paragraph(
                 b"m" => {
                     let text = collect_a_t_text(reader, b"m")?.concat();
                     if !text.is_empty() {
-                        content.push(TextContent::Run(TextRun { text, ..Default::default() }));
+                        content.push(TextContent::Run(TextRun {
+                            text,
+                            ..Default::default()
+                        }));
                     }
                 },
                 _ => {
@@ -1697,9 +1700,14 @@ mod tests {
         );
 
         let rels = Relationships::empty();
-        let slide =
-            Slide::parse(&xml, "Slide1".to_string(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new())
-                .unwrap();
+        let slide = Slide::parse(
+            &xml,
+            "Slide1".to_string(),
+            &rels,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
 
         assert_eq!(slide.shapes.len(), 1);
         if let Shape::AutoShape(ref auto) = slide.shapes[0] {
@@ -1754,9 +1762,14 @@ mod tests {
     Target="slide2.xml"/>
 </Relationships>"#;
         let rels = Relationships::parse(rels_xml).unwrap();
-        let slide =
-            Slide::parse(&xml, "Slide1".to_string(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new())
-                .unwrap();
+        let slide = Slide::parse(
+            &xml,
+            "Slide1".to_string(),
+            &rels,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
 
         assert_eq!(slide.shapes.len(), 1);
         let Shape::AutoShape(ref auto) = slide.shapes[0] else {
@@ -1798,9 +1811,14 @@ mod tests {
     Target="slide3.xml"/>
 </Relationships>"#;
         let rels = Relationships::parse(rels_xml).unwrap();
-        let slide =
-            Slide::parse(&xml, "Slide1".to_string(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new())
-                .unwrap();
+        let slide = Slide::parse(
+            &xml,
+            "Slide1".to_string(),
+            &rels,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
 
         assert_eq!(slide.shapes.len(), 1);
         let Shape::AutoShape(ref auto) = slide.shapes[0] else {
@@ -1836,9 +1854,14 @@ mod tests {
 </p:sp>"#,
         );
         let rels = Relationships::empty();
-        let slide =
-            Slide::parse(&xml, "Slide1".to_string(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new())
-                .unwrap();
+        let slide = Slide::parse(
+            &xml,
+            "Slide1".to_string(),
+            &rels,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
 
         assert_eq!(slide.shapes.len(), 1);
         let Shape::AutoShape(ref auto) = slide.shapes[0] else {
@@ -1883,7 +1906,10 @@ mod tests {
         let mut charts = std::collections::HashMap::new();
         charts.insert(
             "rId2".to_string(),
-            vec!["Title: Dollars per Group".to_string(), "Categories: Group 1, Group 2".to_string()],
+            vec![
+                "Title: Dollars per Group".to_string(),
+                "Categories: Group 1, Group 2".to_string(),
+            ],
         );
 
         let slide = Slide::parse(
@@ -1979,8 +2005,14 @@ mod tests {
         );
 
         let rels = Relationships::empty();
-        let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
+        let slide = Slide::parse(
+            &xml,
+            String::new(),
+            &rels,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
 
         assert_eq!(slide.shapes.len(), 1);
         if let Shape::Group(ref grp) = slide.shapes[0] {
@@ -2045,11 +2077,19 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(slide.shapes.len(), 1, "expected the Choice branch's shape, got {:?}", slide.shapes);
+        assert_eq!(
+            slide.shapes.len(),
+            1,
+            "expected the Choice branch's shape, got {:?}",
+            slide.shapes
+        );
         let Shape::AutoShape(ref shape) = slide.shapes[0] else {
             panic!("expected an AutoShape from mc:Choice, got {:?}", slide.shapes[0]);
         };
-        let tb = shape.text_body.as_ref().expect("equation text box has a body");
+        let tb = shape
+            .text_body
+            .as_ref()
+            .expect("equation text box has a body");
         let TextContent::Run(ref run) = tb.paragraphs[0].content[0] else {
             panic!("expected a run carrying the equation text");
         };
@@ -2155,8 +2195,14 @@ mod tests {
         );
 
         let rels = Relationships::empty();
-        let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
+        let slide = Slide::parse(
+            &xml,
+            String::new(),
+            &rels,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
 
         assert_eq!(slide.shapes.len(), 1);
         if let Shape::GraphicFrame(ref gf) = slide.shapes[0] {
@@ -2197,8 +2243,14 @@ mod tests {
         );
 
         let rels = Relationships::empty();
-        let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
+        let slide = Slide::parse(
+            &xml,
+            String::new(),
+            &rels,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
 
         assert_eq!(slide.shapes.len(), 1);
         if let Shape::Picture(ref pic) = slide.shapes[0] {
@@ -2232,8 +2284,14 @@ mod tests {
         );
 
         let rels = Relationships::empty();
-        let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
+        let slide = Slide::parse(
+            &xml,
+            String::new(),
+            &rels,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
 
         assert_eq!(slide.shapes.len(), 1);
         if let Shape::Connector(ref cxn) = slide.shapes[0] {
@@ -2269,8 +2327,14 @@ mod tests {
         );
 
         let rels = Relationships::empty();
-        let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
+        let slide = Slide::parse(
+            &xml,
+            String::new(),
+            &rels,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
 
         if let Shape::AutoShape(ref auto) = slide.shapes[0] {
             let tb = auto.text_body.as_ref().unwrap();
@@ -2306,8 +2370,14 @@ mod tests {
         );
 
         let rels = Relationships::empty();
-        let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
+        let slide = Slide::parse(
+            &xml,
+            String::new(),
+            &rels,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
 
         if let Shape::AutoShape(ref auto) = slide.shapes[0] {
             let tb = auto.text_body.as_ref().unwrap();
@@ -2386,8 +2456,14 @@ mod tests {
         );
 
         let rels = Relationships::empty();
-        let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
+        let slide = Slide::parse(
+            &xml,
+            String::new(),
+            &rels,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         if let Shape::AutoShape(ref a) = slide.shapes[0] {
             let tb = a.text_body.as_ref().unwrap();
             if let TextContent::Run(ref r) = tb.paragraphs[0].content[0] {
@@ -2414,8 +2490,14 @@ mod tests {
         );
 
         let rels = Relationships::empty();
-        let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
+        let slide = Slide::parse(
+            &xml,
+            String::new(),
+            &rels,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         if let Shape::AutoShape(ref a) = slide.shapes[0] {
             let tb = a.text_body.as_ref().unwrap();
             if let TextContent::Run(ref r) = tb.paragraphs[0].content[0] {
@@ -2442,8 +2524,14 @@ mod tests {
         );
 
         let rels = Relationships::empty();
-        let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
+        let slide = Slide::parse(
+            &xml,
+            String::new(),
+            &rels,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         if let Shape::AutoShape(ref a) = slide.shapes[0] {
             let para = &a.text_body.as_ref().unwrap().paragraphs[0];
             assert_eq!(para.alignment, Some(ParagraphAlignment::Center));
@@ -2508,8 +2596,14 @@ mod tests {
         );
 
         let rels = Relationships::empty();
-        let slide =
-            Slide::parse(&xml, String::new(), &rels, &std::collections::HashMap::new(), &std::collections::HashMap::new()).unwrap();
+        let slide = Slide::parse(
+            &xml,
+            String::new(),
+            &rels,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         if let Shape::AutoShape(ref a) = slide.shapes[0] {
             let para = &a.text_body.as_ref().unwrap().paragraphs[0];
             assert_eq!(para.space_before_hundredths_pt, Some(1200));

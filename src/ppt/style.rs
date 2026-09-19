@@ -186,7 +186,8 @@ fn parse_pf_run(c: &mut Cursor) -> Option<(usize, ParaFormat)> {
 /// `indentLevel` for a master style level, see
 /// [`parse_master_style_level`]).
 fn parse_pf_body(c: &mut Cursor, masks: u32) -> Option<ParaFormat> {
-    if masks & (PF_HAS_BULLET | PF_BULLET_HAS_FONT | PF_BULLET_HAS_COLOR | PF_BULLET_HAS_SIZE) != 0 {
+    if masks & (PF_HAS_BULLET | PF_BULLET_HAS_FONT | PF_BULLET_HAS_COLOR | PF_BULLET_HAS_SIZE) != 0
+    {
         c.skip(2)?; // bulletFlags
     }
     if masks & PF_BULLET_CHAR != 0 {
@@ -317,7 +318,10 @@ fn parse_cf_body(c: &mut Cursor, masks: u32) -> Option<CharFormat> {
 /// `indentLevel` before each level's paragraph mask; for the rest, a
 /// level's position in the array *is* its indent level, with no
 /// separate field to skip.
-fn parse_master_style_level(c: &mut Cursor, has_indent_level_field: bool) -> Option<(ParaFormat, CharFormat)> {
+fn parse_master_style_level(
+    c: &mut Cursor,
+    has_indent_level_field: bool,
+) -> Option<(ParaFormat, CharFormat)> {
     if has_indent_level_field {
         c.skip(2)?; // indentLevel
     }
@@ -340,9 +344,14 @@ fn parse_master_style_level(c: &mut Cursor, has_indent_level_field: bool) -> Opt
 /// malformed/truncated level rather than propagating an error — master
 /// style inheritance is a best-effort enhancement to direct formatting,
 /// never a hard requirement for reading the rest of the document.
-pub fn parse_tx_master_style_atom(data: &[u8], text_type_native_id: u16) -> Vec<(ParaFormat, CharFormat)> {
+pub fn parse_tx_master_style_atom(
+    data: &[u8],
+    text_type_native_id: u16,
+) -> Vec<(ParaFormat, CharFormat)> {
     let mut c = Cursor::new(data);
-    let Some(levels) = c.u16() else { return Vec::new() };
+    let Some(levels) = c.u16() else {
+        return Vec::new();
+    };
     let has_indent_level_field = text_type_native_id >= 5;
     let mut out = Vec::with_capacity((levels as usize).min(5));
     for _ in 0..levels.min(5) {
@@ -375,7 +384,9 @@ impl CharFormat {
 impl ParaFormat {
     /// As [`CharFormat::inherit_from`], for paragraph-level formatting.
     pub fn inherit_from(&self, master: &ParaFormat) -> ParaFormat {
-        ParaFormat { alignment: self.alignment.or(master.alignment) }
+        ParaFormat {
+            alignment: self.alignment.or(master.alignment),
+        }
     }
 }
 
@@ -389,18 +400,27 @@ impl ParaFormat {
 /// `count` would overshoot the real text is clamped to `text_char_len`
 /// rather than dropped, so direct formatting on the last real character of
 /// a run is never lost to the phantom trailing mark.
-pub fn parse_style_text_prop(data: &[u8], text_char_len: usize) -> (Vec<ParaFormatSpan>, Vec<CharFormatSpan>) {
+pub fn parse_style_text_prop(
+    data: &[u8],
+    text_char_len: usize,
+) -> (Vec<ParaFormatSpan>, Vec<CharFormatSpan>) {
     let target = text_char_len + 1;
     let mut c = Cursor::new(data);
 
     let mut para_spans = Vec::new();
     let mut covered = 0usize;
     while covered < target {
-        let Some((count, fmt)) = parse_pf_run(&mut c) else { break };
+        let Some((count, fmt)) = parse_pf_run(&mut c) else {
+            break;
+        };
         let start = covered.min(text_char_len);
         let end = covered.saturating_add(count).min(text_char_len);
         if end > start {
-            para_spans.push(ParaFormatSpan { start, end, format: fmt });
+            para_spans.push(ParaFormatSpan {
+                start,
+                end,
+                format: fmt,
+            });
         }
         covered = covered.saturating_add(count);
         if count == 0 {
@@ -411,11 +431,17 @@ pub fn parse_style_text_prop(data: &[u8], text_char_len: usize) -> (Vec<ParaForm
     let mut char_spans = Vec::new();
     covered = 0;
     while covered < target {
-        let Some((count, fmt)) = parse_cf_run(&mut c) else { break };
+        let Some((count, fmt)) = parse_cf_run(&mut c) else {
+            break;
+        };
         let start = covered.min(text_char_len);
         let end = covered.saturating_add(count).min(text_char_len);
         if end > start {
-            char_spans.push(CharFormatSpan { start, end, format: fmt });
+            char_spans.push(CharFormatSpan {
+                start,
+                end,
+                format: fmt,
+            });
         }
         covered = covered.saturating_add(count);
         if count == 0 {
@@ -634,10 +660,21 @@ mod tests {
 
     #[test]
     fn test_char_format_inherit_from_fills_only_unset_fields() {
-        let direct = CharFormat { bold: Some(true), ..Default::default() };
-        let master = CharFormat { bold: Some(false), font_size: Some(44), ..Default::default() };
+        let direct = CharFormat {
+            bold: Some(true),
+            ..Default::default()
+        };
+        let master = CharFormat {
+            bold: Some(false),
+            font_size: Some(44),
+            ..Default::default()
+        };
         let merged = direct.inherit_from(&master);
-        assert_eq!(merged.bold, Some(true), "a direct value must never be overridden by the master");
+        assert_eq!(
+            merged.bold,
+            Some(true),
+            "a direct value must never be overridden by the master"
+        );
         assert_eq!(merged.font_size, Some(44), "an unset field must be filled from the master");
     }
 
