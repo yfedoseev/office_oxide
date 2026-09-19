@@ -98,6 +98,121 @@ pub fn parse_comments(xml_data: &[u8]) -> crate::core::Result<Vec<SheetComment>>
     Ok(out)
 }
 
+/// One message from a modern (Excel 2016+) threaded comment thread —
+/// `xl/threadedComments/threadedComment*.xml`.
+pub(crate) struct RawThreadedComment {
+    cell_ref: String,
+    parent_id: Option<String>,
+    person_id: Option<String>,
+    text: String,
+}
+
+/// Parse a `xl/threadedComments/threadedComment*.xml` part.
+pub(crate) fn parse_threaded_comments(
+    xml_data: &[u8],
+) -> crate::core::Result<Vec<RawThreadedComment>> {
+    use quick_xml::events::Event;
+    let mut reader = xml::make_fast_reader(xml_data);
+    let mut out = Vec::new();
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) if e.local_name().as_ref() == b"threadedComment" => {
+                let cell_ref =
+                    xml::optional_attr_str(e, b"ref")?.map(|v| v.into_owned()).unwrap_or_default();
+                let parent_id =
+                    xml::optional_attr_str(e, b"parentId")?.map(|v| v.into_owned());
+                let person_id =
+                    xml::optional_attr_str(e, b"personId")?.map(|v| v.into_owned());
+                let text = xml::read_text_content_fast(&mut reader)?;
+                let text = text.trim().to_string();
+                if !text.is_empty() {
+                    out.push(RawThreadedComment { cell_ref, parent_id, person_id, text });
+                }
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(out)
+}
+
+/// Parse a `xl/persons/person.xml` part: `personId -> displayName`.
+pub(crate) fn parse_persons(
+    xml_data: &[u8],
+) -> crate::core::Result<std::collections::HashMap<String, String>> {
+    use quick_xml::events::Event;
+    let mut reader = xml::make_fast_reader(xml_data);
+    let mut out = std::collections::HashMap::new();
+
+    loop {
+        match reader.read_event()? {
+            Event::Empty(ref e) | Event::Start(ref e) if e.local_name().as_ref() == b"person" => {
+                let id = xml::optional_attr_str(e, b"id")?.map(|v| v.into_owned());
+                let name = xml::optional_attr_str(e, b"displayName")?.map(|v| v.into_owned());
+                if let (Some(id), Some(name)) = (id, name) {
+                    out.insert(id, name);
+                }
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(out)
+}
+
+/// Merge legacy `xl/comments*.xml` entries with modern threaded-comment
+/// entries for the same worksheet.
+///
+/// Excel 2016+ writes a real cell comment to BOTH parts: the clean text
+/// lives in `threadedComments`, while `comments.xml` carries only a
+/// fixed ~290-character compatibility disclaimer wrapping the same text
+/// ("[Threaded comment]... Comment:\n    <text>"), for older Excel
+/// versions that don't understand threading. A `ref` with a resolved
+/// thread uses that clean text (every message in the thread, root
+/// first, author-resolved via `persons`) instead of the legacy
+/// boilerplate; a `ref` with no threaded entry (a genuine, non-threaded
+/// legacy "Note") keeps its own legacy text unchanged (issue #301).
+pub(crate) fn merge_threaded_comments(
+    legacy: Vec<SheetComment>,
+    threaded: Vec<RawThreadedComment>,
+    persons: &std::collections::HashMap<String, String>,
+) -> Vec<SheetComment> {
+    if threaded.is_empty() {
+        return legacy;
+    }
+
+    let mut by_ref: std::collections::HashMap<String, Vec<&RawThreadedComment>> =
+        std::collections::HashMap::new();
+    for tc in &threaded {
+        by_ref.entry(tc.cell_ref.clone()).or_default().push(tc);
+    }
+
+    let mut out: Vec<SheetComment> =
+        legacy.into_iter().filter(|c| !by_ref.contains_key(&c.cell_ref)).collect();
+
+    for (cell_ref, mut msgs) in by_ref {
+        // The root message (no parentId) leads; replies follow in their
+        // original file order — a stable sort on "has a parent" keeps
+        // that order within each group.
+        msgs.sort_by_key(|m| m.parent_id.is_some());
+        let mut lines = Vec::with_capacity(msgs.len());
+        let mut thread_author = None;
+        for (i, m) in msgs.iter().enumerate() {
+            let author = m.person_id.as_ref().and_then(|id| persons.get(id).cloned());
+            if i == 0 {
+                thread_author = author.clone();
+            }
+            match author {
+                Some(a) => lines.push(format!("{a}: {}", m.text)),
+                None => lines.push(m.text.clone()),
+            }
+        }
+        out.push(SheetComment { cell_ref, author: thread_author, text: lines.join("\n") });
+    }
+    out
+}
+
 /// A text shape anchored on a worksheet via a DrawingML drawing part.
 /// Mirrors `xlsx::write::SheetTextShape`.
 #[derive(Debug, Clone)]
@@ -1494,5 +1609,113 @@ mod tests {
 </worksheet>"#;
         let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
         assert!(ws.page_setup.is_none());
+    }
+
+    // ── Threaded comments (issue #301) ──
+
+    #[test]
+    fn parse_threaded_comments_reads_ref_person_and_text() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ThreadedComments xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments">
+  <threadedComment ref="C2" personId="{P1}" id="{ID1}">
+    <text xml:space="preserve">testing
+</text>
+  </threadedComment>
+</ThreadedComments>"#;
+        let out = parse_threaded_comments(xml).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].cell_ref, "C2");
+        assert_eq!(out[0].person_id.as_deref(), Some("{P1}"));
+        assert!(out[0].parent_id.is_none());
+        assert_eq!(out[0].text, "testing");
+    }
+
+    #[test]
+    fn parse_persons_maps_id_to_display_name() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<personList xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments">
+  <person displayName="Pankaj Chaudhary" id="{P1}" userId="S::x" providerId="AD"/>
+</personList>"#;
+        let out = parse_persons(xml).unwrap();
+        assert_eq!(out.get("{P1}").map(String::as_str), Some("Pankaj Chaudhary"));
+    }
+
+    /// issue #301 — a `ref` with a resolved threaded-comment thread must
+    /// use the clean thread text (author-resolved) instead of the
+    /// legacy ~290-char compatibility boilerplate for the same cell;
+    /// a `ref` with no threaded entry must keep its own legacy text
+    /// unchanged. Mirrors the real corpus file this was verified
+    /// against (poi_64759.xlsx: C2 threaded, B3 a genuine legacy Note).
+    #[test]
+    fn merge_prefers_threaded_text_and_keeps_untouched_legacy_notes() {
+        let legacy = vec![
+            SheetComment {
+                cell_ref: "C2".to_string(),
+                author: Some("tc={ID1}".to_string()),
+                text: "[Threaded comment]\n\nYour version of Excel allows you to read this \
+                       threaded comment... Comment:\n    testing"
+                    .to_string(),
+            },
+            SheetComment {
+                cell_ref: "B3".to_string(),
+                author: Some("Microsoft Office User".to_string()),
+                text: "Microsoft Office User:\nSample Notes".to_string(),
+            },
+        ];
+        let threaded = vec![RawThreadedComment {
+            cell_ref: "C2".to_string(),
+            parent_id: None,
+            person_id: Some("{P1}".to_string()),
+            text: "testing".to_string(),
+        }];
+        let mut persons = std::collections::HashMap::new();
+        persons.insert("{P1}".to_string(), "Pankaj Chaudhary".to_string());
+
+        let merged = merge_threaded_comments(legacy, threaded, &persons);
+        assert_eq!(merged.len(), 2);
+
+        let c2 = merged.iter().find(|c| c.cell_ref == "C2").unwrap();
+        assert_eq!(c2.author.as_deref(), Some("Pankaj Chaudhary"));
+        assert_eq!(c2.text, "Pankaj Chaudhary: testing");
+        assert!(!c2.text.contains("Threaded comment"), "boilerplate must not survive: {c2:?}");
+
+        let b3 = merged.iter().find(|c| c.cell_ref == "B3").unwrap();
+        assert_eq!(b3.text, "Microsoft Office User:\nSample Notes", "untouched legacy Note");
+    }
+
+    /// A reply chain (root + one reply sharing the same `ref`) must
+    /// produce a root-first, multi-line thread rather than dropping the
+    /// reply — the issue's own secondary, not-corpus-confirmed concern.
+    #[test]
+    fn merge_orders_reply_after_root_in_a_thread() {
+        let threaded = vec![
+            RawThreadedComment {
+                cell_ref: "A1".to_string(),
+                parent_id: Some("{ROOT}".to_string()),
+                person_id: None,
+                text: "a reply".to_string(),
+            },
+            RawThreadedComment {
+                cell_ref: "A1".to_string(),
+                parent_id: None,
+                person_id: None,
+                text: "the root message".to_string(),
+            },
+        ];
+        let merged = merge_threaded_comments(Vec::new(), threaded, &std::collections::HashMap::new());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "the root message\na reply");
+    }
+
+    #[test]
+    fn no_threaded_comments_leaves_legacy_list_unchanged() {
+        let legacy = vec![SheetComment {
+            cell_ref: "A1".to_string(),
+            author: None,
+            text: "plain note".to_string(),
+        }];
+        let merged = merge_threaded_comments(legacy.clone(), Vec::new(), &std::collections::HashMap::new());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "plain note");
     }
 }

@@ -61,6 +61,15 @@ pub mod rel_types {
     /// Relationship type for comments.
     pub const COMMENTS: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
+    /// Relationship type for a modern (Excel 2016+) threaded-comment part
+    /// (`xl/threadedComments/threadedCommentN.xml`), worksheet-to-part.
+    /// Issue #301.
+    pub const THREADED_COMMENTS: &str =
+        "http://schemas.microsoft.com/office/2017/10/relationships/threadedComment";
+    /// Relationship type for the workbook-level person list
+    /// (`xl/persons/person.xml`), which threaded comments' `personId`
+    /// resolves against. Issue #301.
+    pub const PERSONS: &str = "http://schemas.microsoft.com/office/2017/10/relationships/person";
     /// Relationship type for document headers.
     pub const HEADER: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/header";

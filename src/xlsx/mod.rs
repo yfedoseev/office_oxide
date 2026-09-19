@@ -215,6 +215,16 @@ impl XlsxDocument {
         let wb_data = Self::read_xml_entry(&mut archive, "xl/workbook.xml")?;
         let workbook = WorkbookInfo::parse(&wb_data)?;
 
+        // The threaded-comments person list (personId -> display name) is a
+        // workbook-level part, not per-sheet (issue #301).
+        let persons = wb_rels
+            .first_by_type(rel_types::PERSONS)
+            .map(|rel| resolve_relative_zip_path("xl/workbook.xml", &rel.target))
+            .or_else(|| Some("xl/persons/person.xml".to_string()))
+            .and_then(|path| Self::read_xml_entry(&mut archive, &path).ok())
+            .and_then(|data| worksheet::parse_persons(&data).ok())
+            .unwrap_or_default();
+
         // Phase 1: gather raw data sequentially (requires &mut archive)
         struct SheetBundle {
             name: String,
@@ -282,6 +292,16 @@ impl XlsxDocument {
                 .and_then(|path| Self::read_xml_entry(&mut archive, &path).ok())
                 .and_then(|data| worksheet::parse_comments(&data).ok())
                 .unwrap_or_default();
+            // Modern (Excel 2016+) threaded comments, when present,
+            // replace the legacy compatibility-boilerplate text for the
+            // same cell with the real thread text (issue #301).
+            let threaded_comments = ws_rels
+                .first_by_type(rel_types::THREADED_COMMENTS)
+                .map(|rel| resolve_relative_zip_path(&sheet_path, &rel.target))
+                .and_then(|path| Self::read_xml_entry(&mut archive, &path).ok())
+                .and_then(|data| worksheet::parse_threaded_comments(&data).ok())
+                .unwrap_or_default();
+            let comments = worksheet::merge_threaded_comments(comments, threaded_comments, &persons);
 
             bundles.push(SheetBundle {
                 name: sheet.name.clone(),
@@ -414,6 +434,19 @@ impl XlsxDocument {
         let wb_data = opc.read_part(&main_part)?;
         let workbook = WorkbookInfo::parse(&wb_data)?;
 
+        // Workbook-level person list for threaded-comment author
+        // resolution (issue #301).
+        let persons = if let Some(rel) = wb_rels.first_by_type(rel_types::PERSONS) {
+            main_part
+                .resolve_relative(&rel.target)
+                .ok()
+                .and_then(|part_name| opc.read_part(&part_name).ok())
+                .and_then(|data| worksheet::parse_persons(&data).ok())
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
+
         struct SheetBundle {
             name: String,
             data: Vec<u8>,
@@ -460,6 +493,14 @@ impl XlsxDocument {
                 .and_then(|pn| opc.read_part(&pn).ok())
                 .and_then(|data| worksheet::parse_comments(&data).ok())
                 .unwrap_or_default();
+            let threaded_comments = ws_rels
+                .first_by_type(rel_types::THREADED_COMMENTS)
+                .and_then(|rel| part_name.resolve_relative(&rel.target).ok())
+                .filter(|pn| opc.has_part(pn))
+                .and_then(|pn| opc.read_part(&pn).ok())
+                .and_then(|data| worksheet::parse_threaded_comments(&data).ok())
+                .unwrap_or_default();
+            let comments = worksheet::merge_threaded_comments(comments, threaded_comments, &persons);
             bundles.push(SheetBundle {
                 name: sheet.name.clone(),
                 data: ws_data,
