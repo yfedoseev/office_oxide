@@ -38,9 +38,10 @@ impl PptxDocument {
         let mut result = parts.join("\n\n");
 
         if let Some(ref notes) = slide.notes {
-            if !notes.is_empty() {
+            let text = super::slide::extract_plain_text_from_body(notes);
+            if !text.is_empty() {
                 result.push_str("\n\n[Notes]\n");
-                result.push_str(notes);
+                result.push_str(&text);
             }
         }
 
@@ -83,8 +84,12 @@ impl PptxDocument {
         }
 
         if let Some(ref notes) = slide.notes {
-            if !notes.is_empty() {
-                for line in notes.lines() {
+            // Same `markdown_from_body` ordinary slide body text already
+            // uses, so bold/italic/strikethrough/bullets in notes get
+            // rendered too, not flattened to plain lines (issue #290).
+            let md = markdown_from_body(notes);
+            if !md.is_empty() {
+                for line in md.lines() {
                     result.push_str("> ");
                     result.push_str(line);
                     result.push('\n');
@@ -495,6 +500,32 @@ mod tests {
         }
     }
 
+    /// One `TextBody` paragraph per line — mirrors what a real notes
+    /// slide's body placeholder parses into.
+    fn notes_body(lines: &[&str]) -> TextBody {
+        TextBody {
+            paragraphs: lines
+                .iter()
+                .map(|line| TextParagraph {
+                    level: 0,
+                    alignment: None,
+                    space_before_hundredths_pt: None,
+                    content: vec![TextContent::Run(TextRun {
+                        text: line.to_string(),
+                        bold: None,
+                        italic: None,
+                        strikethrough: false,
+                        hyperlink: None,
+                        font_size_hundredths_pt: None,
+                        color_rgb: None,
+                        ..Default::default()
+                    })],
+                    ..Default::default()
+                })
+                .collect(),
+        }
+    }
+
     fn text_shape(name: &str, text: &str, x: i64, y: i64) -> Shape {
         Shape::AutoShape(AutoShape {
             id: 1,
@@ -589,7 +620,7 @@ mod tests {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![text_shape("Text", "Hello", 0, 0)],
-            notes: Some("Speaker notes".to_string()),
+            notes: Some(notes_body(&["Speaker notes"])),
             background_rgb: None,
             ..Default::default()
         }]);
@@ -712,13 +743,53 @@ mod tests {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![text_shape("Text", "Content", 0, 0)],
-            notes: Some("Note line 1\nNote line 2".to_string()),
+            notes: Some(notes_body(&["Note line 1", "Note line 2"])),
             background_rgb: None,
             ..Default::default()
         }]);
 
         let md = doc.slide_to_markdown(0).unwrap();
         assert!(md.contains("> Note line 1\n> Note line 2"));
+    }
+
+    /// issue #290 — speaker notes used to be flattened to plain text
+    /// before ever reaching a renderer, so a bold run in notes rendered
+    /// as plain text even though the identical formatting survives for
+    /// ordinary slide body text via the same `TextRun`/`markdown_run`
+    /// path.
+    #[test]
+    fn markdown_notes_preserve_bold_formatting() {
+        let notes = TextBody {
+            paragraphs: vec![TextParagraph {
+                level: 0,
+                alignment: None,
+                space_before_hundredths_pt: None,
+                content: vec![TextContent::Run(TextRun {
+                    text: "THIS LINE IS BOLD".to_string(),
+                    bold: Some(true),
+                    italic: None,
+                    strikethrough: false,
+                    hyperlink: None,
+                    font_size_hundredths_pt: None,
+                    color_rgb: None,
+                    ..Default::default()
+                })],
+                ..Default::default()
+            }],
+        };
+        let doc = make_doc(vec![Slide {
+            name: String::new(),
+            shapes: vec![text_shape("Text", "Content", 0, 0)],
+            notes: Some(notes),
+            background_rgb: None,
+            ..Default::default()
+        }]);
+
+        let md = doc.slide_to_markdown(0).unwrap();
+        assert!(
+            md.contains("> **THIS LINE IS BOLD**"),
+            "bold formatting must survive in notes markdown: {md:?}"
+        );
     }
 
     #[test]

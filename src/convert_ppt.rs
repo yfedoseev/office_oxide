@@ -328,11 +328,23 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
         }
 
         let title = slide_title.unwrap_or_else(|| format!("Slide {}", slide_idx + 1));
-        let speaker_notes = if notes_lines.is_empty() {
-            None
-        } else {
-            Some(notes_lines.join("\n").trim().to_string()).filter(|s| !s.is_empty())
-        };
+        // Legacy PPT's binary text extraction has no run-level formatting
+        // for notes text (unlike PPTX's XML-based TextBody), so each
+        // line becomes a plain paragraph — matches the old
+        // newline-joined-string behavior content-wise, just typed to
+        // match Section::speaker_notes's structured shape (issue #290).
+        let speaker_notes: Vec<Element> = notes_lines
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|line| {
+                Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(line))],
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let speaker_notes = if speaker_notes.is_empty() { None } else { Some(speaker_notes) };
 
         sections.push(Section {
             title: Some(title),

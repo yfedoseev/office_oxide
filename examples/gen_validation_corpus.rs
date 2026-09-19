@@ -192,7 +192,10 @@ fn maximal_properties_corpus(out: &str) {
             elements: vec![Element::Paragraph(para), Element::Table(table)],
             page_setup: Some(PageSetup::default()),
             background_rgb: Some([0x11, 0x22, 0x33]),
-            speaker_notes: Some("notes".into()),
+            speaker_notes: Some(vec![Element::Paragraph(Paragraph {
+                content: vec![span("notes")],
+                ..Default::default()
+            })]),
             ..Default::default()
         }],
         ..Default::default()

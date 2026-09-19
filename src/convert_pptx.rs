@@ -57,7 +57,16 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         // `elements`. Putting them in the element list made every writer treat
         // them as ordinary body text, so a round trip promoted a presenter's
         // private note onto the visible slide.
-        let speaker_notes = slide.notes.as_ref().filter(|n| !n.is_empty()).cloned();
+        //
+        // Converted through the same `convert_text_body` ordinary slide
+        // body text already uses, so bold/italic/bullets/numbering in
+        // notes survive instead of being flattened to plain lines
+        // (issue #290).
+        let speaker_notes = slide.notes.as_ref().and_then(|tb| {
+            let mut converted = Vec::new();
+            convert_text_body(tb, &mut converted);
+            if converted.is_empty() { None } else { Some(converted) }
+        });
 
         // Slide comments are review content that reached no consumer at
         // all. Carry them as endnotes so every renderer sees them.

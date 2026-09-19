@@ -683,8 +683,15 @@ pub struct Section {
     /// own field rather than in `elements` so that writing a document back
     /// out cannot promote a presenter's private note into audience-visible
     /// body text. Renderers label them explicitly.
+    ///
+    /// Structured `Element`s (`Paragraph`/`List`), not a flat `String` —
+    /// notes carry the exact same bold/italic/bullet/numbering
+    /// formatting slide body text already does, via the same
+    /// `TextBody`/run model, but used to be flattened to plain lines
+    /// before ever reaching the IR, silently losing all of it (issue
+    /// #290).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub speaker_notes: Option<String>,
+    pub speaker_notes: Option<Vec<Element>>,
     /// Solid background colour for this section (RGB).
     /// PPTX: parsed from `<p:cSld><p:bg><p:bgPr><a:solidFill>` on the slide.
     /// Image / gradient backgrounds are intentionally skipped — only the

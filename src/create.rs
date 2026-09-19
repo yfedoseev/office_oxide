@@ -922,10 +922,14 @@ pub fn ir_to_pptx(ir: &DocumentIR) -> crate::pptx::write::PptxWriter {
 fn emit_pptx_slide_from_section(writer: &mut crate::pptx::write::PptxWriter, section: &Section) {
     let slide = writer.add_slide();
 
-    // Speaker notes round-trip into ppt/notesSlides/, never onto the slide.
+    // Speaker notes round-trip into ppt/notesSlides/, never onto the
+    // slide. Structured (bold/italic/bullets/numbering), not flattened
+    // to a plain string — matches the fidelity ordinary slide body text
+    // already gets (issue #290).
     if let Some(ref notes) = section.speaker_notes {
-        if !notes.is_empty() {
-            slide.set_notes(notes);
+        let items = pptx_notes_body_items(notes);
+        if !items.is_empty() {
+            slide.set_notes_structured(items);
         }
     }
 
@@ -973,6 +977,57 @@ fn emit_pptx_slide_from_section(writer: &mut crate::pptx::write::PptxWriter, sec
 /// visible horizontal-rule glyph string and treats it as a
 /// separator.
 pub(crate) const PPTX_THEMATIC_BREAK_MARKER: &str = "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}";
+
+/// Convert `Section::speaker_notes` (`Element::Paragraph`/`List`, the
+/// same shape `convert_text_body` produces for ordinary slide body
+/// text) into `pptx::write::BodyItem`s for `set_notes_structured`, so
+/// bold/italic/bullets/numbering in notes reach the written file
+/// instead of being flattened to plain lines (issue #290).
+fn pptx_notes_body_items(notes: &[Element]) -> Vec<crate::pptx::write::BodyItem> {
+    use crate::pptx::write::BodyItem;
+
+    fn flatten_list(
+        list: &crate::ir::List,
+        level: u8,
+        out: &mut Vec<(u8, Vec<crate::pptx::write::Run>)>,
+    ) {
+        for item in &list.items {
+            let runs: Vec<crate::pptx::write::Run> = item
+                .content
+                .iter()
+                .flat_map(|e| match e {
+                    Element::Paragraph(p) => inline_to_pptx_runs(&p.content),
+                    _ => Vec::new(),
+                })
+                .collect();
+            if !runs.is_empty() {
+                out.push((level, runs));
+            }
+            if let Some(ref nested) = item.nested {
+                flatten_list(nested, level.saturating_add(1), out);
+            }
+        }
+    }
+
+    let mut items = Vec::new();
+    for elem in notes {
+        match elem {
+            Element::Paragraph(p) => {
+                let runs = inline_to_pptx_runs(&p.content);
+                items.push(BodyItem::RichText(runs, crate::pptx::write::ParaProps::default()));
+            },
+            Element::List(l) => {
+                let mut bullets = Vec::new();
+                flatten_list(l, l.level, &mut bullets);
+                if !bullets.is_empty() {
+                    items.push(BodyItem::BulletList(bullets));
+                }
+            },
+            _ => {},
+        }
+    }
+    items
+}
 
 fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) {
     match elem {
@@ -1909,5 +1964,53 @@ mod docx_section_title_tests {
             "the heading must not be duplicated as a second title on write: {:?}",
             ir2.sections[0].elements
         );
+    }
+}
+
+#[cfg(test)]
+mod pptx_notes_write_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// issue #290 — a bold run in `Section::speaker_notes` must survive
+    /// a full write→reread round trip, not just reach the writer's own
+    /// intermediate representation.
+    #[test]
+    fn bold_speaker_notes_round_trip() {
+        let notes = vec![Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan {
+                text: "THIS LINE IS BOLD".to_string(),
+                bold: true,
+                ..Default::default()
+            })],
+            ..Default::default()
+        })];
+
+        let ir = DocumentIR {
+            metadata: Metadata { format: DocumentFormat::Pptx, ..Default::default() },
+            sections: vec![Section {
+                elements: vec![Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain("Visible body"))],
+                    ..Default::default()
+                })],
+                speaker_notes: Some(notes),
+                ..Default::default()
+            }],
+            defined_names: Vec::new(),
+        };
+
+        let mut buf = Cursor::new(Vec::new());
+        create_from_ir_to_writer(&ir, DocumentFormat::Pptx, &mut buf).unwrap();
+        buf.set_position(0);
+        let doc = crate::Document::from_reader(buf, DocumentFormat::Pptx).unwrap();
+        let ir2 = doc.to_ir();
+
+        let notes2 = ir2.sections[0].speaker_notes.as_ref().expect("notes must survive the round trip");
+        let bold_survived = notes2.iter().any(|e| {
+            matches!(e, Element::Paragraph(p) if p.content.iter().any(|c| {
+                matches!(c, InlineContent::Text(t) if t.text == "THIS LINE IS BOLD" && t.bold)
+            }))
+        });
+        assert!(bold_survived, "bold formatting on speaker notes must survive a write->reread round trip: {notes2:?}");
     }
 }

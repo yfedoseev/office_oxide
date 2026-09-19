@@ -284,7 +284,7 @@ impl PptxDocument {
             let mut parsed =
                 Slide::parse(&b.slide_data, name, &b.slide_rels, &b.media, &b.charts)?;
             if let Some(notes_data) = &b.notes_data {
-                parsed.notes = extract_notes_text(notes_data);
+                parsed.notes = extract_notes_body(notes_data);
             }
             for data in &b.comments_data {
                 parsed.comments.extend(slide::parse_comments(data));
@@ -357,10 +357,10 @@ fn xml_csl_name(xml_data: &[u8]) -> String {
     String::new()
 }
 
-/// Extract speaker notes plain text from a notes slide XML.
-/// Finds the body placeholder (type="body") and extracts its text.
-fn extract_notes_text(xml_data: &[u8]) -> Option<String> {
-    slide::extract_notes_text(xml_data)
+/// Extract the speaker notes body from a notes slide XML. Finds the
+/// body placeholder (type="body") and returns its structured `TextBody`.
+fn extract_notes_body(xml_data: &[u8]) -> Option<TextBody> {
+    slide::extract_notes_body(xml_data)
 }
 
 /// Best-effort image-format detection from the raw bytes.

@@ -392,8 +392,14 @@ fn render_section_plain(section: &Section) -> String {
     // Speaker notes are not part of the visible surface; label them so a
     // consumer can tell them apart from slide body text.
     if let Some(ref notes) = section.speaker_notes {
-        if !notes.is_empty() {
-            parts.push(format!("[Notes]\n{notes}"));
+        let text = notes
+            .iter()
+            .map(render_element_plain)
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            parts.push(format!("[Notes]\n{text}"));
         }
     }
     for hf in section_footers(section) {
@@ -505,8 +511,19 @@ fn render_section_markdown(section: &Section) -> String {
         }
     }
     if let Some(ref notes) = section.speaker_notes {
-        if !notes.is_empty() {
-            parts.push(format!("> **Notes:** {notes}"));
+        let body = notes
+            .iter()
+            .map(render_element_markdown)
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if !body.is_empty() {
+            // Every line must start with `>` to stay inside the
+            // blockquote — a bare newline (e.g. between list items)
+            // would otherwise end it partway through the notes.
+            let quoted =
+                body.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n");
+            parts.push(format!("> **Notes:**\n{quoted}"));
         }
     }
     for hf in section_footers(section) {
@@ -881,8 +898,9 @@ fn render_section_html(section: &Section) -> String {
     // Speaker notes are not slide-surface content, but dropping them from
     // HTML loses text the plain and markdown renderers both keep.
     if let Some(ref notes) = section.speaker_notes {
-        if !notes.is_empty() {
-            parts.push(format!("<aside class=\"speaker-notes\">{}</aside>", escape_html(notes)));
+        let body = render_elements_html(notes).into_iter().filter(|h| !h.is_empty()).collect::<Vec<_>>().join("");
+        if !body.is_empty() {
+            parts.push(format!("<aside class=\"speaker-notes\">{body}</aside>"));
         }
     }
     for hf in section_footers(section) {
@@ -1228,7 +1246,7 @@ mod tests {
             first_page_footer: hf("FIRST_FOOTER_MARKER"),
             even_page_header: hf("EVEN_HEADER_MARKER"),
             even_page_footer: hf("EVEN_FOOTER_MARKER"),
-            speaker_notes: Some("SPEAKER_NOTES_MARKER".to_string()),
+            speaker_notes: Some(vec![para("SPEAKER_NOTES_MARKER")]),
             ..Default::default()
         };
         let ir = DocumentIR {
@@ -1814,7 +1832,13 @@ mod speaker_notes_render_tests {
                     })],
                     ..Default::default()
                 })],
-                speaker_notes: Some("NoteText".into()),
+                speaker_notes: Some(vec![Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan {
+                        text: "NoteText".into(),
+                        ..Default::default()
+                    })],
+                    ..Default::default()
+                })]),
                 ..Default::default()
             }],
             ..Default::default()

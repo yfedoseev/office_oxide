@@ -392,8 +392,8 @@ mod tests {
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
         assert_eq!(
-            ir.sections[0].speaker_notes.as_deref(),
-            Some("Presenter-only notes"),
+            notes_text(ir.sections[0].speaker_notes.as_deref().unwrap_or_default()),
+            "Presenter-only notes",
             "notes text must reach Section::speaker_notes"
         );
         let elements_text = format!("{:?}", ir.sections[0].elements);
@@ -438,9 +438,27 @@ mod tests {
             ])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
-        let notes = ir.sections[0].speaker_notes.as_deref().unwrap_or_default();
+        let notes = notes_text(ir.sections[0].speaker_notes.as_deref().unwrap_or_default());
         assert!(notes.contains("First note"), "notes: {notes:?}");
         assert!(notes.contains("Second note"), "notes: {notes:?}");
+    }
+
+    /// Flatten `Section::speaker_notes`' `Element::Paragraph`s into plain
+    /// text for assertions — mirrors how `ir_render.rs` does it for real.
+    fn notes_text(elements: &[crate::ir::Element]) -> String {
+        use crate::ir::{Element, InlineContent};
+        let mut out = String::new();
+        for e in elements {
+            if let Element::Paragraph(p) = e {
+                for c in &p.content {
+                    if let InlineContent::Text(t) = c {
+                        out.push_str(&t.text);
+                    }
+                }
+                out.push('\n');
+            }
+        }
+        out.trim_end().to_string()
     }
 
     #[test]
@@ -475,7 +493,10 @@ mod tests {
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
         assert!(ir.sections[0].elements.is_empty());
-        assert_eq!(ir.sections[0].speaker_notes.as_deref(), Some("Speaker note"));
+        assert_eq!(
+            notes_text(ir.sections[0].speaker_notes.as_deref().unwrap_or_default()),
+            "Speaker note"
+        );
     }
 
     #[test]

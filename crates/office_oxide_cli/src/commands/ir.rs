@@ -223,7 +223,10 @@ mod tests {
             },
             sections: vec![Section {
                 elements: vec![],
-                speaker_notes: Some("SPEAKER_NOTES_MARKER".to_string()),
+                speaker_notes: Some(vec![Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain("SPEAKER_NOTES_MARKER"))],
+                    ..Default::default()
+                })]),
                 ..Default::default()
             }],
             defined_names: Vec::new(),

@@ -60,8 +60,11 @@ pub struct Slide {
     pub name: String,
     /// All top-level shapes on this slide.
     pub shapes: Vec<Shape>,
-    /// Speaker notes text, if a notes slide is present.
-    pub notes: Option<String>,
+    /// Speaker notes body, if a notes slide is present. Kept as the
+    /// structured `TextBody` (same model ordinary slide body text uses)
+    /// rather than flattened text, so bold/italic/bullets/numbering in
+    /// notes survive through to the IR (issue #290).
+    pub notes: Option<TextBody>,
     /// Solid background colour (RGB) extracted from the slide's
     /// `<p:cSld><p:bg><p:bgPr><a:solidFill>` element. Only the solid
     /// case is parsed; gradient / image / theme-reference fills are
@@ -1645,9 +1648,13 @@ pub(crate) fn parse_comments(xml_data: &[u8]) -> Vec<SlideComment> {
     out
 }
 
-/// Extract speaker notes plain text from a notes slide XML.
-/// Finds the body placeholder (type="body") and extracts its text.
-pub(crate) fn extract_notes_text(xml_data: &[u8]) -> Option<String> {
+/// Extract the speaker notes body from a notes slide XML. Finds the
+/// body placeholder (`type="body"`) and returns its structured
+/// `TextBody` — the same model ordinary slide body text uses, so a
+/// caller converting it (see `convert_text_body` in `convert_pptx.rs`)
+/// gets the same bold/italic/bullet/numbering fidelity for free
+/// (issue #290).
+pub(crate) fn extract_notes_body(xml_data: &[u8]) -> Option<TextBody> {
     let rels = Relationships::empty();
     let mut reader = make_content_reader(xml_data);
     let mut shapes = Vec::new();
@@ -1670,15 +1677,14 @@ pub(crate) fn extract_notes_text(xml_data: &[u8]) -> Option<String> {
         }
     }
 
-    // Find the body placeholder and extract text
+    // Find the body placeholder and return its text body.
     for shape in &shapes {
         if let Shape::AutoShape(auto) = shape {
             if let Some(ref ph) = auto.placeholder {
                 if ph.ph_type.as_deref() == Some("body") {
                     if let Some(ref tb) = auto.text_body {
-                        let text = extract_plain_text_from_body(tb);
-                        if !text.is_empty() {
-                            return Some(text);
+                        if !extract_plain_text_from_body(tb).is_empty() {
+                            return Some(tb.clone());
                         }
                     }
                 }
@@ -1690,7 +1696,7 @@ pub(crate) fn extract_notes_text(xml_data: &[u8]) -> Option<String> {
 }
 
 /// Extract plain text from a TextBody.
-fn extract_plain_text_from_body(body: &TextBody) -> String {
+pub(crate) fn extract_plain_text_from_body(body: &TextBody) -> String {
     let mut parts = Vec::new();
     for para in &body.paragraphs {
         let mut para_text = String::new();
@@ -2423,8 +2429,8 @@ mod tests {
   </p:cSld>
 </p:notes>"#;
 
-        let text = extract_notes_text(xml).unwrap();
-        assert_eq!(text, "Speaker notes here\nSecond line");
+        let body = extract_notes_body(xml).unwrap();
+        assert_eq!(extract_plain_text_from_body(&body), "Speaker notes here\nSecond line");
     }
 
     // ── New: blip rId extraction, font size, alignment, space_before, bg ─

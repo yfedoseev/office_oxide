@@ -204,7 +204,7 @@ pub struct ParaProps {
 }
 
 #[derive(Debug, Clone)]
-enum BodyItem {
+pub(crate) enum BodyItem {
     Text(String),
     RichText(Vec<Run>, ParaProps),
     /// Bullet list items paired with their nesting level (0 = top level).
@@ -242,8 +242,10 @@ pub struct SlideData {
     /// centered for title placeholders).
     pub title_alignment: Option<crate::ir::ParagraphAlignment>,
     /// Speaker notes for this slide. Written to `ppt/notesSlides/`, never
-    /// onto the slide surface.
-    pub notes: Option<String>,
+    /// onto the slide surface. Structured `BodyItem`s (not a flat
+    /// `String`) so bold/italic/bullets/numbering in notes get the same
+    /// fidelity ordinary body text already does (issue #290).
+    pub(crate) notes: Option<Vec<BodyItem>>,
     body_items: Vec<BodyItem>,
 }
 
@@ -257,10 +259,21 @@ impl SlideData {
         }
     }
 
-    /// Attach speaker notes to this slide. They are written to a notes slide
-    /// part and never appear on the slide surface.
+    /// Attach plain speaker notes to this slide (one paragraph per line).
+    /// They are written to a notes slide part and never appear on the
+    /// slide surface. For notes with formatting or list structure, use
+    /// [`SlideData::set_notes_structured`] instead.
     pub fn set_notes(&mut self, notes: &str) -> &mut Self {
-        self.notes = Some(notes.to_string());
+        self.notes =
+            Some(notes.lines().map(|line| BodyItem::Text(line.to_string())).collect());
+        self
+    }
+
+    /// Attach speaker notes carrying real paragraph/run structure (bold,
+    /// italic, bullets, numbering) — the same fidelity ordinary slide
+    /// body text already has (issue #290).
+    pub(crate) fn set_notes_structured(&mut self, items: Vec<BodyItem>) -> &mut Self {
+        self.notes = Some(items);
         self
     }
 
@@ -624,10 +637,7 @@ impl PptxWriter {
         opc.add_part_rel(&pres_part, rel_types::PRES_PROPS, "presProps.xml");
 
         // Notes slides. Speaker notes live here, never on the slide surface.
-        let has_notes = self
-            .slides
-            .iter()
-            .any(|s| s.notes.as_ref().map(|n| !n.is_empty()).unwrap_or(false));
+        let has_notes = self.slides.iter().any(|s| s.notes.as_ref().is_some_and(|n| !n.is_empty()));
         if has_notes {
             let nm_part = PartName::new("/ppt/notesMasters/notesMaster1.xml")?;
             opc.add_part_rel(&pres_part, rel_types::NOTES_MASTER, "notesMasters/notesMaster1.xml");
@@ -717,7 +727,7 @@ impl PptxWriter {
                     rel_types::NOTES_MASTER,
                     "../notesMasters/notesMaster1.xml",
                 );
-                opc.add_part(&notes_part, CT_NOTES_SLIDE, &generate_notes_slide_xml(notes))?;
+                opc.add_part(&notes_part, CT_NOTES_SLIDE, &generate_notes_slide_xml(notes, &hyperlink_rids))?;
             }
 
             let slide_xml = generate_slide_xml(slide, &img_rids, self.cx, self.cy, &hyperlink_rids);
@@ -1049,7 +1059,10 @@ fn generate_theme_xml() -> Vec<u8> {
 
 /// A notes slide: the speaker-notes body for one slide. `CT_NotesSlide` is
 /// `cSld, clrMapOvr?, ...`; the body placeholder carries the note text.
-fn generate_notes_slide_xml(notes: &str) -> Vec<u8> {
+/// Renders each `BodyItem` the same way `write_body_shape` does for an
+/// ordinary slide body, so notes get the same bold/italic/bullet/
+/// numbering fidelity (issue #290).
+fn generate_notes_slide_xml(notes: &[BodyItem], hyperlink_rids: &HashMap<String, String>) -> Vec<u8> {
     let mut w = Writer::new(Vec::new());
     write_decl(&mut w);
     w.write_event(Event::Start(pml_root("p:notes")))
@@ -1091,22 +1104,30 @@ fn generate_notes_slide_xml(notes: &str) -> Vec<u8> {
     w.write_event(Event::Start(BytesStart::new("p:txBody")))
         .expect("write");
     write_empty(&mut w, "a:bodyPr");
-    for line in notes.split('\n') {
-        w.write_event(Event::Start(BytesStart::new("a:p")))
-            .expect("write");
-        w.write_event(Event::Start(BytesStart::new("a:r")))
-            .expect("write");
-        write_empty(&mut w, "a:rPr");
-        w.write_event(Event::Start(BytesStart::new("a:t")))
-            .expect("write");
-        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(line))))
-            .expect("write");
-        w.write_event(Event::End(BytesEnd::new("a:t")))
-            .expect("write");
-        w.write_event(Event::End(BytesEnd::new("a:r")))
-            .expect("write");
-        w.write_event(Event::End(BytesEnd::new("a:p")))
-            .expect("write");
+    let mut wrote_paragraph = false;
+    for item in notes {
+        match item {
+            BodyItem::Text(text) => {
+                write_plain_paragraph(&mut w, text);
+                wrote_paragraph = true;
+            },
+            BodyItem::RichText(runs, props) => {
+                write_rich_paragraph(&mut w, runs, props, hyperlink_rids);
+                wrote_paragraph = true;
+            },
+            BodyItem::BulletList(bullets) => {
+                for bullet in bullets {
+                    write_bullet_paragraph(&mut w, bullet.0, &bullet.1, hyperlink_rids);
+                    wrote_paragraph = true;
+                }
+            },
+            // Notes are a single placeholder body — tables/text boxes/
+            // images have nowhere positional to go inside it.
+            BodyItem::Table(..) | BodyItem::TextBox(..) | BodyItem::Image(..) => {},
+        }
+    }
+    if !wrote_paragraph {
+        write_empty(&mut w, "a:p");
     }
     w.write_event(Event::End(BytesEnd::new("p:txBody")))
         .expect("write");
@@ -2369,6 +2390,29 @@ mod tests {
         }
         let notes_xml = part_xml(writer, "ppt/notesSlides/notesSlide1.xml");
         assert!(notes_xml.contains(SECRET), "notes part must carry the text");
+    }
+
+    /// issue #290 — structured speaker notes (bold runs, bullet lists)
+    /// must reach the written notes slide XML with real formatting, not
+    /// as plain unstyled text.
+    #[test]
+    fn structured_speaker_notes_carry_bold_and_bullets_to_the_notes_xml() {
+        let mut writer = PptxWriter::new();
+        {
+            let slide = writer.add_slide();
+            slide.set_notes_structured(vec![
+                BodyItem::RichText(
+                    vec![Run::new("bold note").bold()],
+                    ParaProps::default(),
+                ),
+                BodyItem::BulletList(vec![(0, vec![Run::new("bullet one")])]),
+            ]);
+        }
+        let notes_xml = part_xml(writer, "ppt/notesSlides/notesSlide1.xml");
+        assert!(notes_xml.contains("bold note"), "notes text must survive: {notes_xml}");
+        assert!(notes_xml.contains(r#"b="1""#), "bold formatting must reach the notes XML: {notes_xml}");
+        assert!(notes_xml.contains("bullet one"), "bullet text must survive: {notes_xml}");
+        assert!(notes_xml.contains("a:buChar"), "bullet marker must reach the notes XML: {notes_xml}");
     }
 
     /// A deck with no notes gains no notes parts.
