@@ -64,6 +64,12 @@ pub struct Fib {
     pub fc_grp_xst_atn_owners: u32,
     /// Byte length of the GrpXstAtnOwners in the Table stream (0x01BE).
     pub lcb_grp_xst_atn_owners: u32,
+    /// Offset of the PlcfHdd (header/footer story delimiter PLC) in the
+    /// Table stream (0x00F2). Zero when the document has no header
+    /// document at all. Issue #285.
+    pub fc_plcf_hdd: u32,
+    /// Byte length of the PlcfHdd in the Table stream (0x00F6).
+    pub lcb_plcf_hdd: u32,
 }
 
 impl Fib {
@@ -181,6 +187,16 @@ impl Fib {
             (0, 0)
         };
 
+        // fcPlcfHdd / lcbPlcfHdd — header/footer story delimiter PLC
+        // (0x00F2 / 0x00F6). Derived the same way as fcGrpXstAtnOwners
+        // above: index 22 in FibRgFcLcb97's fixed field order, base 0x9A,
+        // 0x9A + 22*4 = 0xF2. Issue #285.
+        let (fc_plcf_hdd, lcb_plcf_hdd) = if data.len() > 0x00FA {
+            (read_u32(data, 0x00F2), read_u32(data, 0x00F6))
+        } else {
+            (0, 0)
+        };
+
         Ok(Self {
             version,
             lid,
@@ -202,6 +218,8 @@ impl Fib {
             lcb_plf_lfo,
             fc_grp_xst_atn_owners,
             lcb_grp_xst_atn_owners,
+            fc_plcf_hdd,
+            lcb_plcf_hdd,
         })
     }
 }
@@ -333,5 +351,18 @@ mod tests {
         let fib = Fib::parse(&data).unwrap();
         assert_eq!(fib.fc_grp_xst_atn_owners, 700);
         assert_eq!(fib.lcb_grp_xst_atn_owners, 40);
+    }
+
+    /// issue #285 — `fcPlcfHdd`/`lcbPlcfHdd` (header/footer story
+    /// delimiter PLC) were never parsed at all.
+    #[test]
+    fn plcf_hdd_read_from_its_real_offset() {
+        let mut data = build_minimal_fib();
+        data[0x00F2..0x00F6].copy_from_slice(&800u32.to_le_bytes());
+        data[0x00F6..0x00FA].copy_from_slice(&56u32.to_le_bytes());
+
+        let fib = Fib::parse(&data).unwrap();
+        assert_eq!(fib.fc_plcf_hdd, 800);
+        assert_eq!(fib.lcb_plcf_hdd, 56);
     }
 }

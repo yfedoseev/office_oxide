@@ -54,6 +54,12 @@ pub struct DocDocument {
     /// `lcbGrpXstAtnOwners`) were never parsed at all before, so every
     /// `.doc` comment's authorship was unrecoverable (issue #298).
     comment_authors: Vec<String>,
+    /// The first section's header/footer content, parsed from `PlcfHdd`.
+    /// Before this, the entire header document collapsed into one
+    /// unlabeled, duplicated blob with no way to tell header from
+    /// footer, first-page from default, or one section from another
+    /// (issue #285).
+    header_footer: HeaderFooterStories,
 }
 
 /// One of the subdocuments stored after the main text in a `.doc`.
@@ -63,6 +69,40 @@ pub struct SubDocument {
     pub kind: SubDocumentKind,
     /// Sanitised text of the subdocument.
     pub text: String,
+}
+
+/// The first document section's header/footer content, split out of the
+/// merged header-document blob using `PlcfHdd`'s story boundaries. Only
+/// the first section's 6 stories are captured — matches this crate's DOC
+/// model, which builds exactly one `ir::Section` for the whole document
+/// (issue #285).
+#[derive(Debug, Clone, Default)]
+pub struct HeaderFooterStories {
+    /// Even-page header (story 0 of a section's group).
+    pub even_header: Option<String>,
+    /// Odd-page header — used on every page when even/odd headers
+    /// aren't separately enabled (story 1).
+    pub odd_header: Option<String>,
+    /// Even-page footer (story 2).
+    pub even_footer: Option<String>,
+    /// Odd-page footer — used on every page when even/odd footers
+    /// aren't separately enabled (story 3).
+    pub odd_footer: Option<String>,
+    /// First-page header (story 4).
+    pub first_header: Option<String>,
+    /// First-page footer (story 5).
+    pub first_footer: Option<String>,
+}
+
+impl HeaderFooterStories {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.even_header.is_none()
+            && self.odd_header.is_none()
+            && self.even_footer.is_none()
+            && self.odd_footer.is_none()
+            && self.first_header.is_none()
+            && self.first_footer.is_none()
+    }
 }
 
 /// The subdocument kinds `.doc` stores after the main text, in the fixed
@@ -137,6 +177,7 @@ impl DocDocument {
         // The subdocuments follow the main text contiguously in the piece
         // table's character space, each delimited by its own `ccp*` length.
         let mut subdocuments = Vec::new();
+        let mut header_footer = HeaderFooterStories::default();
         let mut cp = fib.text_len;
         for (kind, len) in [
             (SubDocumentKind::Footnotes, fib.footnote_len),
@@ -152,6 +193,14 @@ impl DocDocument {
             let end = cp.saturating_add(len);
             let raw =
                 super::piece_table::extract_text_range(&word_doc, &pieces, cp, end, fib.lid);
+            if kind == SubDocumentKind::HeadersFooters {
+                header_footer = parse_plcf_hdd_stories(
+                    &table_stream,
+                    &raw,
+                    fib.fc_plcf_hdd,
+                    fib.lcb_plcf_hdd,
+                );
+            }
             let sub = sanitize_text(&raw);
             if !sub.trim().is_empty() {
                 subdocuments.push(SubDocument { kind, text: sub });
@@ -209,6 +258,7 @@ impl DocDocument {
             summary_properties,
             list_formatting,
             comment_authors,
+            header_footer,
         })
     }
 
@@ -236,6 +286,14 @@ impl DocDocument {
     /// the document was written by that single author (issue #298).
     pub(crate) fn comment_authors(&self) -> &[String] {
         &self.comment_authors
+    }
+
+    /// The first section's header/footer content, split from `PlcfHdd`.
+    /// All fields are `None` when the document has no header document at
+    /// all, or its `PlcfHdd` doesn't cover a full section's worth of
+    /// stories (issue #285).
+    pub(crate) fn header_footer(&self) -> &HeaderFooterStories {
+        &self.header_footer
     }
 
     /// `true` when the file carries a `_VBA_PROJECT` storage — a cheap
@@ -382,6 +440,83 @@ fn parse_grp_xst_atn_owners(table_stream: &[u8], fc: u32, lcb: u32) -> Vec<Strin
     names
 }
 
+/// Parse `PlcfHdd` (the header/footer story delimiter PLC) and split
+/// `raw_header_text` — the header document's own raw (pre-sanitize) text,
+/// where char index `i` corresponds to CP `i` within the header document
+/// itself — into the first section's 6 stories.
+///
+/// `PlcfHdd` is a PLC with no data elements, just an array of CPs
+/// (`aCP`). If the header document exists, its first 6 stories are fixed
+/// footnote/endnote separators; every subsequent group of 6 stories
+/// belongs to one document section, in order: even header, odd header,
+/// even footer, odd footer, first-page header, first-page footer
+/// ([MS-DOC] "Headers"). `aCP` has `n + 2` entries for `n` stories: the
+/// first `n` mark story starts, entry `n` marks the end of the last
+/// story (`== ccpHdd - 1`), and the final entry is undefined/ignored —
+/// so `aCP[0..=n]` (`n + 1` values) are the usual PLC boundary CPs for
+/// `n` elements, per [MS-DOC] "Plcfhdd". This crate models only one
+/// `ir::Section` for the whole document, so only the first section's
+/// group (stories 6..12) is extracted (issue #285).
+fn parse_plcf_hdd_stories(
+    table_stream: &[u8],
+    raw_header_text: &str,
+    fc: u32,
+    lcb: u32,
+) -> HeaderFooterStories {
+    let mut result = HeaderFooterStories::default();
+    if lcb == 0 {
+        return result;
+    }
+    let start = fc as usize;
+    let byte_len = lcb as usize;
+    let end = start.saturating_add(byte_len).min(table_stream.len());
+    if start >= end || (end - start) % 4 != 0 {
+        return result;
+    }
+    let total_cps = (end - start) / 4;
+    if total_cps < 2 {
+        return result;
+    }
+    let n = total_cps - 2;
+    // Need at least the 6 fixed separator stories plus one full
+    // section's group of 6 header/footer stories.
+    if n < 12 {
+        return result;
+    }
+
+    let cps: Vec<usize> = (0..=n)
+        .map(|i| {
+            u32::from_le_bytes([
+                table_stream[start + i * 4],
+                table_stream[start + i * 4 + 1],
+                table_stream[start + i * 4 + 2],
+                table_stream[start + i * 4 + 3],
+            ]) as usize
+        })
+        .collect();
+
+    let char_range = |lo: usize, hi: usize| -> Option<String> {
+        if hi <= lo {
+            return None;
+        }
+        let text: String = raw_header_text.chars().skip(lo).take(hi - lo).collect();
+        let sanitized = sanitize_text(&text);
+        let trimmed = sanitized.trim();
+        if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+    };
+
+    // First section's group starts right after the 6 fixed separator
+    // stories, at story index 6.
+    let base = 6;
+    result.even_header = char_range(cps[base], cps[base + 1]);
+    result.odd_header = char_range(cps[base + 1], cps[base + 2]);
+    result.even_footer = char_range(cps[base + 2], cps[base + 3]);
+    result.odd_footer = char_range(cps[base + 3], cps[base + 4]);
+    result.first_header = char_range(cps[base + 4], cps[base + 5]);
+    result.first_footer = char_range(cps[base + 5], cps[base + 6]);
+    result
+}
+
 impl crate::core::OfficeDocument for DocDocument {
     fn plain_text(&self) -> String {
         self.plain_text()
@@ -405,6 +540,7 @@ mod tests {
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
+            header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: "First paragraph\nSecond paragraph\n\nAfter gap".into(),
             paragraphs: Vec::new(),
@@ -424,6 +560,7 @@ mod tests {
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
+            header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: "Hello World".into(),
             paragraphs: Vec::new(),
@@ -449,6 +586,7 @@ mod tests {
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
+            header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: "Main body text".into(),
             paragraphs: Vec::new(),
@@ -474,6 +612,7 @@ mod tests {
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
+            header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: "Body".into(),
             paragraphs: Vec::new(),
@@ -494,6 +633,7 @@ mod tests {
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
+            header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: "only the recovered fragment".into(),
             paragraphs: Vec::new(),
@@ -523,6 +663,7 @@ mod tests {
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
+            header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: text.to_string(),
             paragraphs: Vec::new(),
@@ -540,6 +681,7 @@ mod tests {
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
             comment_authors: Vec::new(),
+            header_footer: HeaderFooterStories::default(),
             images: Vec::new(),
             text: String::new(),
             paragraphs: paras,
@@ -852,5 +994,96 @@ mod tests {
             .collect();
         assert_eq!(comments.len(), 1, "comments must stay merged until PlcfAtn is parsed (#286)");
         assert_eq!(comments[0].content.len(), 2, "both lines must still reach the one Note");
+    }
+
+    /// issue #285 — byte-level `PlcfHdd` parsing for a single-section
+    /// document. `aCP` has `n + 2 = 14` entries for `n = 12` stories (the
+    /// 6 fixed separators + this one section's 6 header/footer stories):
+    /// the first 6 (indices 0..6) are all-empty separators, story 6..12
+    /// hold the real content, `aCP[12]` closes the last story, and
+    /// `aCP[13]` is the spec's own "undefined, must be ignored" filler.
+    #[test]
+    fn plcf_hdd_splits_the_first_sections_six_stories() {
+        let raw = "EVEN HEADERODD HEADEREVEN FOOTERODD FOOTERFIRST HEADERFIRST FOOTERX";
+        assert_eq!(raw.chars().count(), 67, "fixture text must match the cps below exactly");
+
+        let cps: [u32; 14] = [0, 0, 0, 0, 0, 0, 0, 11, 21, 32, 42, 54, 66, 67];
+        let mut table_stream = Vec::new();
+        for cp in cps {
+            table_stream.extend_from_slice(&cp.to_le_bytes());
+        }
+
+        let stories = parse_plcf_hdd_stories(&table_stream, raw, 0, table_stream.len() as u32);
+        assert_eq!(stories.even_header.as_deref(), Some("EVEN HEADER"));
+        assert_eq!(stories.odd_header.as_deref(), Some("ODD HEADER"));
+        assert_eq!(stories.even_footer.as_deref(), Some("EVEN FOOTER"));
+        assert_eq!(stories.odd_footer.as_deref(), Some("ODD FOOTER"));
+        assert_eq!(stories.first_header.as_deref(), Some("FIRST HEADER"));
+        assert_eq!(stories.first_footer.as_deref(), Some("FIRST FOOTER"));
+    }
+
+    #[test]
+    fn plcf_hdd_zero_length_yields_no_stories() {
+        let stories = parse_plcf_hdd_stories(&[0u8; 8], "", 0, 0);
+        assert!(stories.is_empty());
+    }
+
+    #[test]
+    fn plcf_hdd_shorter_than_one_section_yields_no_stories() {
+        // Only the 6 fixed separators (n=6, needs n+2=8 CPs) — no
+        // section's worth of header/footer stories at all.
+        let table_stream = vec![0u8; 8 * 4];
+        let stories = parse_plcf_hdd_stories(&table_stream, "", 0, table_stream.len() as u32);
+        assert!(stories.is_empty());
+    }
+
+    /// issue #285 — `doc_to_ir` must attach `PlcfHdd`-derived stories to
+    /// the real `Section.header`/`.footer`/etc fields instead of dumping
+    /// the merged blob as a generic `TextBox`, and must still fall back
+    /// to the old behavior when no structured data is available.
+    #[test]
+    fn header_footer_stories_reach_the_section_fields() {
+        use crate::ir::Element;
+        let mut doc = make_doc("Body text.");
+        doc.subdocuments = vec![SubDocument {
+            kind: SubDocumentKind::HeadersFooters,
+            text: "irrelevant merged blob".into(),
+        }];
+        doc.header_footer = HeaderFooterStories {
+            odd_header: Some("The Odd Header".to_string()),
+            first_footer: Some("The First Footer".to_string()),
+            ..Default::default()
+        };
+
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        let section = &ir.sections[0];
+        assert!(section.header.is_some(), "odd_header must reach Section.header");
+        assert!(section.first_page_footer.is_some(), "first_footer must reach Section.first_page_footer");
+        assert!(section.footer.is_none());
+        assert!(
+            !section.elements.iter().any(|e| matches!(e, Element::TextBox(_))),
+            "must not also dump the merged blob as a generic TextBox once structured: {:?}",
+            section.elements
+        );
+    }
+
+    #[test]
+    fn header_footer_falls_back_to_a_textbox_when_plcf_hdd_is_absent() {
+        use crate::ir::Element;
+        let mut doc = make_doc("Body text.");
+        doc.subdocuments = vec![SubDocument {
+            kind: SubDocumentKind::HeadersFooters,
+            text: "OLD MERGED HEADER BLOB".into(),
+        }];
+        // doc.header_footer left at its default (empty) — no PlcfHdd data.
+
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        let section = &ir.sections[0];
+        assert!(section.header.is_none());
+        assert!(
+            section.elements.iter().any(|e| matches!(e, Element::TextBox(_))),
+            "must fall back to the old merged TextBox when PlcfHdd yielded nothing: {:?}",
+            section.elements
+        );
     }
 }

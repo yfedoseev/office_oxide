@@ -52,12 +52,36 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
         ..Default::default()
     }];
 
+    // The header document's PlcfHdd-delimited stories for the first
+    // section — this crate models only one `ir::Section` per DOC
+    // document, so a document with 2+ sections only surfaces the first
+    // one's headers/footers here (issue #285). When PlcfHdd yielded
+    // nothing (older/malformed files), every field below is `None` and
+    // the generic-TextBox fallback in the loop below still applies.
+    let hf = doc.header_footer();
+    if let Some(section) = sections.last_mut() {
+        section.even_page_header = hf.even_header.as_deref().map(text_to_header_footer);
+        section.header = hf.odd_header.as_deref().map(text_to_header_footer);
+        section.even_page_footer = hf.even_footer.as_deref().map(text_to_header_footer);
+        section.footer = hf.odd_footer.as_deref().map(text_to_header_footer);
+        section.first_page_header = hf.first_header.as_deref().map(text_to_header_footer);
+        section.first_page_footer = hf.first_footer.as_deref().map(text_to_header_footer);
+    }
+    let header_footer_structured = !hf.is_empty();
+
     // Footnotes, headers, comments, endnotes and text boxes live after the
     // main text in the same character space. Their `ccp*` lengths were
     // parsed and never used, so none of this reached a consumer.
     if let Some(section) = sections.last_mut() {
         let mut next_id = 0u32;
         for sub in doc.subdocuments() {
+            // Already represented structurally on `Section.header`/
+            // `.footer`/etc above — don't also dump the merged blob as a
+            // generic TextBox (issue #285).
+            if sub.kind == crate::doc::SubDocumentKind::HeadersFooters && header_footer_structured
+            {
+                continue;
+            }
             // Footnote/endnote bodies are self-delimited: each one starts
             // with the literal auto-number reference-mark character
             // (`\u{2}`) in the substory's own text — confirmed on the full
@@ -812,6 +836,23 @@ fn is_currency_label(line: &str) -> bool {
 fn line_heuristic(text: &str, elements: &mut Vec<Element>) {
     for line in text.lines() {
         emit_prose(line, &[], elements, &[]);
+    }
+}
+
+/// Build a `HeaderFooter` from one `PlcfHdd`-delimited story's already
+/// sanitized text (issue #285).
+fn text_to_header_footer(s: &str) -> HeaderFooter {
+    HeaderFooter {
+        content: s
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(l))],
+                    ..Default::default()
+                })
+            })
+            .collect(),
     }
 }
 
