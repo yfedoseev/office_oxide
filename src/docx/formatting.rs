@@ -61,16 +61,19 @@ pub struct ParagraphProperties {
     pub numbering_ref: Option<NumberingRef>,
     /// Outline level (0 = Heading 1, 1 = Heading 2, …).
     pub outline_level: Option<u8>,
-    /// Paragraph-mark run properties (`w:rPr` inside `w:pPr`).
-    pub run_properties: Option<RunProperties>,
+    /// Paragraph-mark run properties (`w:rPr` inside `w:pPr`). Boxed:
+    /// present on only a small minority of real paragraphs, but
+    /// `Option<T>` reserves `size_of(T)` even when `None` — issue #328.
+    pub run_properties: Option<Box<RunProperties>>,
     /// Frame position from `<w:framePr>`. When present this paragraph is
     /// absolutely positioned on the page (used by layout-preserving
     /// PDF-derived DOCX, e.g. pdf_oxide's `to_docx_bytes_layout`).
     pub frame_position: Option<FrameProps>,
     /// Section properties from `<w:sectPr>` inside this paragraph's `<w:pPr>`.
     /// When present this paragraph terminates a section — the properties
-    /// describe the section that ends here.
-    pub section_properties: Option<super::SectionProperties>,
+    /// describe the section that ends here. Boxed: only the last
+    /// paragraph of each section carries this (issue #328).
+    pub section_properties: Option<Box<super::SectionProperties>>,
     /// True when the paragraph has a `<w:pBdr><w:bottom .../></w:pBdr>`.
     /// Used to recover horizontal rules: pdf_to_ir emits
     /// `Element::ThematicBreak` which round-trips through DOCX as an
@@ -81,8 +84,9 @@ pub struct ParagraphProperties {
     pub has_bottom_border: bool,
     /// Full `<w:pBdr>` edge styling. `has_bottom_border` stays as the
     /// cheap horizontal-rule probe; this carries the actual widths,
-    /// colours and styles so they survive a read.
-    pub borders: Option<ParagraphBorders>,
+    /// colours and styles so they survive a read. Boxed: rare on real
+    /// paragraphs (issue #328).
+    pub borders: Option<Box<ParagraphBorders>>,
     /// `<w:keepNext/>` — keep with the following paragraph. `None` when the
     /// element is absent, so a style-inherited value is distinguishable from
     /// an explicit `w:val="0"` that turns it off.
@@ -91,8 +95,9 @@ pub struct ParagraphProperties {
     pub keep_lines: Option<bool>,
     /// `<w:pageBreakBefore/>` — force a page break before this paragraph.
     pub page_break_before: Option<bool>,
-    /// Paragraph shading (`<w:shd>`) — background fill.
-    pub shading: Option<super::table::Shading>,
+    /// Paragraph shading (`<w:shd>`) — background fill. Boxed: rare on
+    /// real paragraphs (issue #328).
+    pub shading: Option<Box<super::table::Shading>>,
     /// Custom tab stops from `<w:tabs>`.
     pub tabs: Vec<TabStopDef>,
 }
@@ -576,7 +581,7 @@ pub(crate) fn parse_paragraph_properties(
                             xml::skip_element(reader)?;
                         },
                         b"rPr" => {
-                            props.run_properties = Some(parse_run_properties(reader)?);
+                            props.run_properties = Some(Box::new(parse_run_properties(reader)?));
                         },
                         _ => {
                             xml::skip_element(reader)?;
@@ -830,7 +835,7 @@ pub(crate) fn parse_paragraph_properties_fast(
                         xml::skip_element_fast(reader)?;
                     },
                     b"rPr" => {
-                        props.run_properties = Some(parse_run_properties_fast(reader)?);
+                        props.run_properties = Some(Box::new(parse_run_properties_fast(reader)?));
                     },
                     b"framePr" => {
                         props.frame_position = parse_frame_pr(e);
@@ -838,7 +843,7 @@ pub(crate) fn parse_paragraph_properties_fast(
                     },
                     b"sectPr" => {
                         props.section_properties =
-                            Some(super::parse_section_properties(reader, e)?);
+                            Some(Box::new(super::parse_section_properties(reader, e)?));
                     },
                     b"pBdr" => {
                         // Capture every `<w:pBdr>` edge with its full
@@ -849,7 +854,7 @@ pub(crate) fn parse_paragraph_properties_fast(
                         // instead of being narrowed to that one boolean.
                         let borders = parse_paragraph_borders_fast(reader)?;
                         props.has_bottom_border = borders.bottom.is_some();
-                        props.borders = Some(borders);
+                        props.borders = Some(Box::new(borders));
                     },
                     b"keepNext" => {
                         props.keep_next = Some(parse_toggle(e));
@@ -864,7 +869,7 @@ pub(crate) fn parse_paragraph_properties_fast(
                         xml::skip_element_fast(reader)?;
                     },
                     b"shd" => {
-                        props.shading = Some(parse_shading(e));
+                        props.shading = Some(Box::new(parse_shading(e)));
                         xml::skip_element_fast(reader)?;
                     },
                     b"tabs" => {
@@ -881,7 +886,7 @@ pub(crate) fn parse_paragraph_properties_fast(
                     b"keepNext" => props.keep_next = Some(parse_toggle(e)),
                     b"keepLines" => props.keep_lines = Some(parse_toggle(e)),
                     b"pageBreakBefore" => props.page_break_before = Some(parse_toggle(e)),
-                    b"shd" => props.shading = Some(parse_shading(e)),
+                    b"shd" => props.shading = Some(Box::new(parse_shading(e))),
                     b"pStyle" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             props.style_id = Some(val.into_owned());
@@ -1305,6 +1310,31 @@ fn parse_num_pr(reader: &mut quick_xml::NsReader<&[u8]>) -> crate::core::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (issue #328): `ParagraphProperties`'s rarely-populated
+    /// sub-structs must stay boxed, not silently regress back to
+    /// `Option<T>` (which reserves `size_of(T)` even when `None`).
+    /// `Paragraph` (paragraph.rs) was 896 bytes before this fix, dominated
+    /// by an unboxed `ParagraphProperties` at 872 bytes; both are checked
+    /// here with headroom above the measured post-fix sizes (176B /
+    /// 200B) so an unrelated new field doesn't make this test flaky, but
+    /// a *large struct un-boxed back into `Option<T>`* — the actual
+    /// regression this guards against — still trips it.
+    #[test]
+    fn test_paragraph_properties_size_stays_boxed() {
+        assert!(
+            std::mem::size_of::<ParagraphProperties>() <= 250,
+            "ParagraphProperties grew to {} bytes — check borders/run_properties/\
+             section_properties/shading are still Option<Box<T>>, not Option<T>",
+            std::mem::size_of::<ParagraphProperties>()
+        );
+        assert!(
+            std::mem::size_of::<super::super::paragraph::Paragraph>() <= 300,
+            "Paragraph grew to {} bytes — a ParagraphProperties field regression \
+             would show up here too",
+            std::mem::size_of::<super::super::paragraph::Paragraph>()
+        );
+    }
 
     #[test]
     fn parse_toggle_bare() {

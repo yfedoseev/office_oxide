@@ -994,7 +994,7 @@ fn parse_document(
             if let Some(props) = &p.properties {
                 if let Some(sp) = &props.section_properties {
                     section_breaks.push(idx + 1);
-                    break_sections.push(sp.clone());
+                    break_sections.push(sp.as_ref().clone());
                 }
             }
         }
@@ -2846,16 +2846,16 @@ fn parse_table_cell_properties(
                     xml::skip_element_fast(reader)?;
                 },
                 b"shd" => {
-                    props.shading = Some(Shading {
+                    props.shading = Some(Box::new(Shading {
                         fill: xml::optional_attr_str(e, b"w:fill")?.map(|v| v.into_owned()),
                         color: xml::optional_attr_str(e, b"w:color")?.map(|v| v.into_owned()),
                         pattern: xml::optional_attr_str(e, b"w:val")?.map(|v| v.into_owned()),
-                    });
+                    }));
                     xml::skip_element_fast(reader)?;
                 },
                 b"tcBorders" => {
                     props.borders =
-                        Some(self::formatting::parse_table_borders_fast(reader, b"tcBorders")?);
+                        Some(Box::new(self::formatting::parse_table_borders_fast(reader, b"tcBorders")?));
                 },
                 b"tcMar" => {
                     props.margins = Some(parse_cell_margins(reader, b"tcMar")?);
@@ -2900,11 +2900,11 @@ fn parse_table_cell_properties(
                     }
                 },
                 b"shd" => {
-                    props.shading = Some(Shading {
+                    props.shading = Some(Box::new(Shading {
                         fill: xml::optional_attr_str(e, b"w:fill")?.map(|v| v.into_owned()),
                         color: xml::optional_attr_str(e, b"w:color")?.map(|v| v.into_owned()),
                         pattern: xml::optional_attr_str(e, b"w:val")?.map(|v| v.into_owned()),
-                    });
+                    }));
                 },
                 b"vAlign" => {
                     props.v_align = parse_cell_v_align(e);

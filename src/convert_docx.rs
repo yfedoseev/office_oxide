@@ -360,7 +360,7 @@ fn apply_paragraph_properties(pp: &crate::docx::ParagraphProperties, out: &mut P
     out.keep_together = pp.keep_lines.unwrap_or(false);
     out.page_break_before = pp.page_break_before.unwrap_or(false);
     out.outline_level = pp.outline_level;
-    out.border = pp.borders.as_ref().map(para_borders_to_ir);
+    out.border = pp.borders.as_deref().map(para_borders_to_ir);
     out.background_color = pp
         .shading
         .as_ref()
@@ -450,7 +450,7 @@ fn apply_paragraph_properties_to_heading(pp: &crate::docx::ParagraphProperties, 
     out.keep_with_next = pp.keep_next.unwrap_or(false);
     out.keep_together = pp.keep_lines.unwrap_or(false);
     out.page_break_before = pp.page_break_before.unwrap_or(false);
-    out.border = pp.borders.as_ref().map(para_borders_to_ir);
+    out.border = pp.borders.as_deref().map(para_borders_to_ir);
     out.background_color = pp
         .shading
         .as_ref()
@@ -1569,7 +1569,7 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
                     .and_then(|p| p.shading.as_ref())
                     .and_then(|sh| sh.fill.as_deref())
                     .and_then(hex_to_rgb),
-                border: cp.and_then(|p| p.borders.as_ref()).map(table_borders_to_ir),
+                border: cp.and_then(|p| p.borders.as_deref()).map(table_borders_to_ir),
                 vertical_align: cp.and_then(|p| p.v_align).map(|va| match va {
                     crate::docx::CellVAlign::Top => CellVerticalAlign::Top,
                     crate::docx::CellVAlign::Center => CellVerticalAlign::Center,
