@@ -189,18 +189,18 @@ fn table(ir: &DocumentIR) -> &Table {
 }
 
 // ---------------------------------------------------------------------------
-// #182 — run properties beyond bold/italic
+// Run properties beyond bold/italic
 // ---------------------------------------------------------------------------
 
 #[test]
-fn run_underline_reaches_the_ir() {
+fn test_run_underline_reaches_the_ir() {
     let ir =
         Docx::new(r#"<w:p><w:r><w:rPr><w:u w:val="double"/></w:rPr><w:t>x</w:t></w:r></w:p>"#).ir();
     assert_eq!(first_span(para(&ir, 0)).underline, Some(UnderlineStyle::Double));
 }
 
 #[test]
-fn run_caps_smallcaps_and_spacing_reach_the_ir() {
+fn test_run_caps_smallcaps_and_spacing_reach_the_ir() {
     let ir = Docx::new(
         r#"<w:p><w:r><w:rPr><w:caps/><w:smallCaps/><w:spacing w:val="-20"/></w:rPr>
              <w:t>x</w:t></w:r></w:p>"#,
@@ -213,7 +213,7 @@ fn run_caps_smallcaps_and_spacing_reach_the_ir() {
 }
 
 #[test]
-fn run_vert_align_reaches_the_ir() {
+fn test_run_vert_align_reaches_the_ir() {
     let ir = Docx::new(
         r#"<w:p><w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:t>2</w:t></w:r></w:p>"#,
     )
@@ -222,7 +222,7 @@ fn run_vert_align_reaches_the_ir() {
 }
 
 #[test]
-fn run_highlight_reads_both_encodings() {
+fn test_run_highlight_reads_both_encodings() {
     // Word's named palette …
     let ir = Docx::new(
         r#"<w:p><w:r><w:rPr><w:highlight w:val="yellow"/></w:rPr><w:t>x</w:t></w:r></w:p>"#,
@@ -239,11 +239,11 @@ fn run_highlight_reads_both_encodings() {
 }
 
 // ---------------------------------------------------------------------------
-// #175 — theme colours and the `w:val` fallback
+// Theme colours and the `w:val` fallback
 // ---------------------------------------------------------------------------
 
 #[test]
-fn theme_color_falls_back_to_w_val_when_no_theme_part() {
+fn test_theme_color_falls_back_to_w_val_when_no_theme_part() {
     // `w:themeColor` with no theme part in the package: the literal `w:val`
     // is the producer-supplied fallback and must be used, not discarded.
     let ir = Docx::new(
@@ -255,7 +255,7 @@ fn theme_color_falls_back_to_w_val_when_no_theme_part() {
 }
 
 #[test]
-fn plain_rgb_color_still_reaches_the_ir() {
+fn test_plain_rgb_color_still_reaches_the_ir() {
     let ir =
         Docx::new(r#"<w:p><w:r><w:rPr><w:color w:val="FF0000"/></w:rPr><w:t>x</w:t></w:r></w:p>"#)
             .ir();
@@ -263,7 +263,7 @@ fn plain_rgb_color_still_reaches_the_ir() {
 }
 
 #[test]
-fn auto_color_stays_none() {
+fn test_auto_color_stays_none() {
     let ir =
         Docx::new(r#"<w:p><w:r><w:rPr><w:color w:val="auto"/></w:rPr><w:t>x</w:t></w:r></w:p>"#)
             .ir();
@@ -271,11 +271,11 @@ fn auto_color_stays_none() {
 }
 
 // ---------------------------------------------------------------------------
-// #181 — paragraph geometry
+// Paragraph geometry
 // ---------------------------------------------------------------------------
 
 #[test]
-fn paragraph_indent_spacing_and_keep_flags_reach_the_ir() {
+fn test_paragraph_indent_spacing_and_keep_flags_reach_the_ir() {
     let ir = Docx::new(
         r#"<w:p><w:pPr>
              <w:ind w:left="720" w:right="360" w:firstLine="240"/>
@@ -295,7 +295,7 @@ fn paragraph_indent_spacing_and_keep_flags_reach_the_ir() {
 }
 
 #[test]
-fn hanging_indent_is_a_negative_first_line_indent() {
+fn test_hanging_indent_is_a_negative_first_line_indent() {
     let ir = Docx::new(
         r#"<w:p><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>
            <w:r><w:t>x</w:t></w:r></w:p>"#,
@@ -305,7 +305,7 @@ fn hanging_indent_is_a_negative_first_line_indent() {
 }
 
 #[test]
-fn exact_line_spacing_keeps_its_rule() {
+fn test_exact_line_spacing_keeps_its_rule() {
     let ir = Docx::new(
         r#"<w:p><w:pPr><w:spacing w:line="240" w:lineRule="exact"/></w:pPr>
            <w:r><w:t>x</w:t></w:r></w:p>"#,
@@ -315,7 +315,7 @@ fn exact_line_spacing_keeps_its_rule() {
 }
 
 #[test]
-fn paragraph_tabs_and_shading_reach_the_ir() {
+fn test_paragraph_tabs_and_shading_reach_the_ir() {
     let ir = Docx::new(
         r#"<w:p><w:pPr>
              <w:shd w:val="clear" w:fill="EEEEEE"/>
@@ -336,11 +336,11 @@ fn paragraph_tabs_and_shading_reach_the_ir() {
 }
 
 // ---------------------------------------------------------------------------
-// #190 — paragraph borders keep their styling
+// Paragraph borders keep their styling
 // ---------------------------------------------------------------------------
 
 #[test]
-fn paragraph_borders_keep_style_size_and_colour() {
+fn test_paragraph_borders_keep_style_size_and_colour() {
     let ir = Docx::new(
         r#"<w:p><w:pPr><w:pBdr>
              <w:top w:val="double" w:sz="12" w:space="4" w:color="FF0000"/>
@@ -358,7 +358,7 @@ fn paragraph_borders_keep_style_size_and_colour() {
 }
 
 #[test]
-fn empty_paragraph_with_only_a_bottom_border_is_still_a_thematic_break() {
+fn test_empty_paragraph_with_only_a_bottom_border_is_still_a_thematic_break() {
     // The horizontal-rule encoding must keep working now that `w:pBdr` is
     // parsed in full rather than narrowed to a boolean.
     let ir = Docx::new(
@@ -369,11 +369,11 @@ fn empty_paragraph_with_only_a_bottom_border_is_still_a_thematic_break() {
 }
 
 // ---------------------------------------------------------------------------
-// #180 / #190 — table geometry and borders
+// Table geometry and borders
 // ---------------------------------------------------------------------------
 
 #[test]
-fn table_geometry_reaches_the_ir() {
+fn test_table_geometry_reaches_the_ir() {
     let ir = Docx::new(
         r#"<w:tbl>
              <w:tblPr>
@@ -431,7 +431,7 @@ fn table_geometry_reaches_the_ir() {
 }
 
 #[test]
-fn auto_and_percentage_table_widths_report_no_twips() {
+fn test_auto_and_percentage_table_widths_report_no_twips() {
     // `w:type="auto"`/`"pct"` carry no absolute measure; reporting one would
     // be a confidently wrong number.
     let ir = Docx::new(
@@ -443,11 +443,11 @@ fn auto_and_percentage_table_widths_report_no_twips() {
 }
 
 // ---------------------------------------------------------------------------
-// #185 — page and column breaks
+// Page and column breaks
 // ---------------------------------------------------------------------------
 
 #[test]
-fn page_break_is_a_page_break_not_a_thematic_break() {
+fn test_page_break_is_a_page_break_not_a_thematic_break() {
     let ir = Docx::new(
         r#"<w:p><w:r><w:t>before</w:t></w:r></w:p>
            <w:p><w:r><w:br w:type="page"/></w:r></w:p>
@@ -469,7 +469,7 @@ fn page_break_is_a_page_break_not_a_thematic_break() {
 }
 
 #[test]
-fn column_break_reaches_the_ir() {
+fn test_column_break_reaches_the_ir() {
     let ir = Docx::new(r#"<w:p><w:r><w:br w:type="column"/></w:r></w:p>"#).ir();
     assert!(
         ir.sections[0]
@@ -482,11 +482,11 @@ fn column_break_reaches_the_ir() {
 }
 
 // ---------------------------------------------------------------------------
-// #191 / #177 — section break type and column layout
+// Section break type and column layout
 // ---------------------------------------------------------------------------
 
 #[test]
-fn section_break_type_comes_from_w_type_not_the_section_index() {
+fn test_section_break_type_comes_from_w_type_not_the_section_index() {
     let ir = Docx::new(
         r#"<w:p><w:pPr><w:sectPr><w:type w:val="nextPage"/>
                 <w:pgSz w:w="12240" w:h="15840"/></w:sectPr></w:pPr>
@@ -501,7 +501,7 @@ fn section_break_type_comes_from_w_type_not_the_section_index() {
 }
 
 #[test]
-fn column_layout_keeps_space_separator_and_widths() {
+fn test_column_layout_keeps_space_separator_and_widths() {
     let ir = Docx::new(
         r#"<w:p><w:r><w:t>x</w:t></w:r></w:p>
            <w:sectPr>
@@ -519,7 +519,7 @@ fn column_layout_keeps_space_separator_and_widths() {
 }
 
 #[test]
-fn a_sect_pr_with_no_page_size_reports_no_page_setup() {
+fn test_a_sect_pr_with_no_page_size_reports_no_page_setup() {
     // Synthesising a Letter page for a section that states none would hand
     // the consumer a measurement the document never made.
     let ir = Docx::new(
@@ -530,11 +530,11 @@ fn a_sect_pr_with_no_page_size_reports_no_page_setup() {
 }
 
 // ---------------------------------------------------------------------------
-// #178 — header / footer routing
+// Header / footer routing
 // ---------------------------------------------------------------------------
 
 #[test]
-fn first_default_and_even_headers_land_in_distinct_slots() {
+fn test_first_default_and_even_headers_land_in_distinct_slots() {
     let ir = Docx::new(
         r#"<w:p><w:r><w:t>body</w:t></w:r></w:p>
            <w:sectPr>
@@ -578,11 +578,11 @@ fn first_default_and_even_headers_land_in_distinct_slots() {
 }
 
 // ---------------------------------------------------------------------------
-// #174 — document metadata
+// Document metadata
 // ---------------------------------------------------------------------------
 
 #[test]
-fn core_properties_populate_the_ir_metadata() {
+fn test_core_properties_populate_the_ir_metadata() {
     let ir = Docx::new(r#"<w:p><w:r><w:t>body</w:t></w:r></w:p>"#)
         .core_props(
             r#"<dc:title>Quarterly Report</dc:title>
@@ -605,7 +605,7 @@ fn core_properties_populate_the_ir_metadata() {
 }
 
 #[test]
-fn title_falls_back_to_the_first_heading_without_core_properties() {
+fn test_title_falls_back_to_the_first_heading_without_core_properties() {
     let ir = Docx::new(
         r#"<w:p><w:pPr><w:outlineLvl w:val="0"/></w:pPr><w:r><w:t>Fallback</w:t></w:r></w:p>"#,
     )
@@ -614,7 +614,7 @@ fn title_falls_back_to_the_first_heading_without_core_properties() {
 }
 
 // ---------------------------------------------------------------------------
-// #187 / #188 — numbering
+// Numbering
 // ---------------------------------------------------------------------------
 
 const NUMBERING: &str = r#"
@@ -625,7 +625,7 @@ const NUMBERING: &str = r#"
   <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#;
 
 #[test]
-fn list_start_number_and_style_reach_the_ir() {
+fn test_list_start_number_and_style_reach_the_ir() {
     let ir = Docx::new(
         r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr>
              <w:r><w:t>one</w:t></w:r></w:p>
@@ -644,7 +644,7 @@ fn list_start_number_and_style_reach_the_ir() {
 }
 
 #[test]
-fn num_id_zero_is_not_a_list() {
+fn test_num_id_zero_is_not_a_list() {
     // `<w:numId w:val="0"/>` explicitly removes numbering. Treating it as a
     // list put a bullet in front of an ordinary paragraph.
     let ir = Docx::new(
@@ -657,11 +657,11 @@ fn num_id_zero_is_not_a_list() {
 }
 
 // ---------------------------------------------------------------------------
-// #194 — style-based formatting
+// style-based formatting
 // ---------------------------------------------------------------------------
 
 #[test]
-fn style_based_run_formatting_reaches_the_ir() {
+fn test_style_based_run_formatting_reaches_the_ir() {
     let ir = Docx::new(
         r#"<w:p><w:pPr><w:pStyle w:val="Emphatic"/></w:pPr><w:r><w:t>styled</w:t></w:r></w:p>"#,
     )
@@ -679,7 +679,7 @@ fn style_based_run_formatting_reaches_the_ir() {
 }
 
 #[test]
-fn style_inheritance_walks_based_on_and_direct_formatting_wins() {
+fn test_style_inheritance_walks_based_on_and_direct_formatting_wins() {
     let ir = Docx::new(
         r#"<w:p><w:pPr><w:pStyle w:val="Child"/></w:pPr>
              <w:r><w:rPr><w:i w:val="0"/></w:rPr><w:t>x</w:t></w:r></w:p>"#,
@@ -699,7 +699,7 @@ fn style_inheritance_walks_based_on_and_direct_formatting_wins() {
 }
 
 #[test]
-fn document_defaults_apply_when_no_style_is_named() {
+fn test_document_defaults_apply_when_no_style_is_named() {
     let ir = Docx::new(r#"<w:p><w:r><w:t>x</w:t></w:r></w:p>"#)
         .styles(
             r#"<w:docDefaults><w:rPrDefault><w:rPr>
@@ -713,7 +713,7 @@ fn document_defaults_apply_when_no_style_is_named() {
 }
 
 #[test]
-fn character_style_sits_between_paragraph_style_and_direct_formatting() {
+fn test_character_style_sits_between_paragraph_style_and_direct_formatting() {
     let ir = Docx::new(
         r#"<w:p><w:pPr><w:pStyle w:val="Body"/></w:pPr>
              <w:r><w:rPr><w:rStyle w:val="Code"/></w:rPr><w:t>x</w:t></w:r></w:p>"#,
@@ -733,7 +733,7 @@ fn character_style_sits_between_paragraph_style_and_direct_formatting() {
 }
 
 #[test]
-fn style_based_paragraph_geometry_reaches_the_ir() {
+fn test_style_based_paragraph_geometry_reaches_the_ir() {
     let ir =
         Docx::new(r#"<w:p><w:pPr><w:pStyle w:val="Quote"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>"#)
             .styles(
@@ -749,7 +749,7 @@ fn style_based_paragraph_geometry_reaches_the_ir() {
 }
 
 #[test]
-fn a_based_on_cycle_does_not_hang() {
+fn test_a_based_on_cycle_does_not_hang() {
     let ir = Docx::new(r#"<w:p><w:pPr><w:pStyle w:val="A"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>"#)
         .styles(
             r#"<w:style w:type="paragraph" w:styleId="A">
@@ -762,11 +762,11 @@ fn a_based_on_cycle_does_not_hang() {
 }
 
 // ---------------------------------------------------------------------------
-// #154 — heading detection via style id / name
+// Heading detection via style id / name
 // ---------------------------------------------------------------------------
 
 #[test]
-fn heading_style_id_without_outline_level_is_still_a_heading() {
+fn test_heading_style_id_without_outline_level_is_still_a_heading() {
     let ir = Docx::new(
         r#"<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>Sub</w:t></w:r></w:p>"#,
     )
@@ -781,7 +781,7 @@ fn heading_style_id_without_outline_level_is_still_a_heading() {
 }
 
 #[test]
-fn heading_style_name_without_a_conventional_id_is_still_a_heading() {
+fn test_heading_style_name_without_a_conventional_id_is_still_a_heading() {
     let ir = Docx::new(
         r#"<w:p><w:pPr><w:pStyle w:val="berschrift1"/></w:pPr><w:r><w:t>Top</w:t></w:r></w:p>"#,
     )
@@ -796,7 +796,7 @@ fn heading_style_name_without_a_conventional_id_is_still_a_heading() {
 }
 
 #[test]
-fn a_non_heading_style_stays_a_paragraph() {
+fn test_a_non_heading_style_stays_a_paragraph() {
     let ir = Docx::new(
         r#"<w:p><w:pPr><w:pStyle w:val="BodyText"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>"#,
     )
@@ -808,11 +808,11 @@ fn a_non_heading_style_stays_a_paragraph() {
 }
 
 // ---------------------------------------------------------------------------
-// #189 — internal hyperlinks
+// Internal hyperlinks
 // ---------------------------------------------------------------------------
 
 #[test]
-fn internal_anchor_hyperlinks_become_fragment_links() {
+fn test_internal_anchor_hyperlinks_become_fragment_links() {
     let ir = Docx::new(
         r#"<w:p><w:hyperlink w:anchor="section2"><w:r><w:t>Jump</w:t></w:r></w:hyperlink></w:p>"#,
     )
@@ -821,11 +821,11 @@ fn internal_anchor_hyperlinks_become_fragment_links() {
 }
 
 // ---------------------------------------------------------------------------
-// #156 — XML entities and character references
+// XML entities and character references
 // ---------------------------------------------------------------------------
 
 #[test]
-fn entity_and_character_references_survive_extraction() {
+fn test_entity_and_character_references_survive_extraction() {
     // quick-xml reports `&amp;` and `&#8212;` as their own events, so a
     // reader that only handled Event::Text deleted them outright.
     let ir =
@@ -834,14 +834,14 @@ fn entity_and_character_references_survive_extraction() {
 }
 
 #[test]
-fn an_unresolvable_entity_is_preserved_verbatim() {
+fn test_an_unresolvable_entity_is_preserved_verbatim() {
     // A DTD-declared entity we cannot expand must not silently vanish.
     let ir = Docx::new(r#"<w:p><w:r><w:t>a&nbsp;b</w:t></w:r></w:p>"#).ir();
     assert_eq!(first_span(para(&ir, 0)).text, "a&nbsp;b");
 }
 
 // ---------------------------------------------------------------------------
-// #152 — w:cr, w:noBreakHyphen, w:softHyphen, w:sym
+// w:cr, w:noBreakHyphen, w:softHyphen, w:sym
 // ---------------------------------------------------------------------------
 
 /// Concatenate a paragraph's text spans, ignoring breaks.
@@ -856,7 +856,7 @@ fn para_text(p: &Paragraph) -> String {
 }
 
 #[test]
-fn a_soft_hyphen_does_not_split_a_word() {
+fn test_a_soft_hyphen_does_not_split_a_word() {
     // `<w:softHyphen/>` is a discretionary line-break hint. Emitting U+00AD
     // for it splits the word for every word-level consumer — one real corpus
     // file carries 68, turning `Fähigkeit` into `Fähig` + `keit`.
@@ -866,7 +866,7 @@ fn a_soft_hyphen_does_not_split_a_word() {
 }
 
 #[test]
-fn non_breaking_hyphen_is_not_dropped() {
+fn test_non_breaking_hyphen_is_not_dropped() {
     // "e-mail" used to extract as "email".
     let ir =
         Docx::new(r#"<w:p><w:r><w:t>e</w:t><w:noBreakHyphen/><w:t>mail</w:t></w:r></w:p>"#).ir();
@@ -874,7 +874,7 @@ fn non_breaking_hyphen_is_not_dropped() {
 }
 
 #[test]
-fn carriage_return_is_a_line_break() {
+fn test_carriage_return_is_a_line_break() {
     let ir = Docx::new(r#"<w:p><w:r><w:t>a</w:t><w:cr/><w:t>b</w:t></w:r></w:p>"#).ir();
     assert!(
         para(&ir, 0)
@@ -887,7 +887,7 @@ fn carriage_return_is_a_line_break() {
 }
 
 #[test]
-fn symbol_runs_produce_a_character() {
+fn test_symbol_runs_produce_a_character() {
     // The Wingdings bullet lives in the private-use area; map it to U+2022
     // rather than emitting an unrenderable code point.
     let ir = Docx::new(
@@ -898,11 +898,11 @@ fn symbol_runs_produce_a_character() {
 }
 
 // ---------------------------------------------------------------------------
-// #141 — transparent paragraph wrappers
+// Transparent paragraph wrappers
 // ---------------------------------------------------------------------------
 
 #[test]
-fn tracked_insertions_and_field_results_are_extracted() {
+fn test_tracked_insertions_and_field_results_are_extracted() {
     let ir = Docx::new(
         r#"<w:p>
              <w:ins w:id="1" w:author="A"><w:r><w:t>INSERTED </w:t></w:r></w:ins>
@@ -916,7 +916,7 @@ fn tracked_insertions_and_field_results_are_extracted() {
 }
 
 #[test]
-fn tracked_deletions_are_not_document_content() {
+fn test_tracked_deletions_are_not_document_content() {
     let ir = Docx::new(
         r#"<w:p>
              <w:r><w:t>kept</w:t></w:r>
@@ -928,7 +928,7 @@ fn tracked_deletions_are_not_document_content() {
 }
 
 // ---------------------------------------------------------------------------
-// #140 / #163 — text boxes, and AlternateContent taken once
+// Text boxes, and AlternateContent taken once
 // ---------------------------------------------------------------------------
 
 /// A shape carrying a text box, wrapped in the compatibility element Word
@@ -972,7 +972,7 @@ fn text_box_texts(ir: &DocumentIR) -> Vec<String> {
 }
 
 #[test]
-fn vml_text_box_content_is_extracted() {
+fn test_vml_text_box_content_is_extracted() {
     let ir = Docx::new(
         r#"<w:p><w:r><w:pict>
              <v:shape xmlns:v="urn:schemas-microsoft-com:vml"><v:textbox><w:txbxContent>
@@ -985,19 +985,19 @@ fn vml_text_box_content_is_extracted() {
 }
 
 #[test]
-fn drawingml_text_box_content_is_extracted_exactly_once() {
+fn test_drawingml_text_box_content_is_extracted_exactly_once() {
     // Extracting both branches duplicated the text; extracting neither
-    // dropped it. This was 90% of the text in the file behind issue #102.
+    // dropped it. This was 90% of the text in the original reproducer.
     let ir = Docx::new(ALTERNATE_TEXTBOX).ir();
     assert_eq!(text_box_texts(&ir), vec!["BOXED TEXT"]);
 }
 
 // ---------------------------------------------------------------------------
-// #142 — footnotes, endnotes and comments
+// Footnotes, endnotes and comments
 // ---------------------------------------------------------------------------
 
 #[test]
-fn footnote_bodies_reach_the_ir() {
+fn test_footnote_bodies_reach_the_ir() {
     let ir = Docx::new(r#"<w:p><w:r><w:t>body</w:t></w:r></w:p>"#)
         .notes(
             "footnotes.xml",
@@ -1023,7 +1023,7 @@ fn footnote_bodies_reach_the_ir() {
 }
 
 #[test]
-fn comment_bodies_reach_the_ir_with_their_author() {
+fn test_comment_bodies_reach_the_ir_with_their_author() {
     let ir = Docx::new(r#"<w:p><w:r><w:t>body</w:t></w:r></w:p>"#)
         .notes(
             "comments.xml",
@@ -1044,11 +1044,11 @@ fn comment_bodies_reach_the_ir_with_their_author() {
 }
 
 // ---------------------------------------------------------------------------
-// #171 — image alt text must not also become body text
+// Image alt text must not also become body text
 // ---------------------------------------------------------------------------
 
 #[test]
-fn image_alt_text_is_not_duplicated_as_body_text() {
+fn test_image_alt_text_is_not_duplicated_as_body_text() {
     // Emitting the alt text as a run *and* on the Image made the IR
     // round-trip unbounded: the document grew on every read/write cycle.
     let ir = Docx::new(
@@ -1080,11 +1080,11 @@ fn image_alt_text_is_not_duplicated_as_body_text() {
 }
 
 // ---------------------------------------------------------------------------
-// #155 — altChunk embedded content
+// altChunk embedded content
 // ---------------------------------------------------------------------------
 
 #[test]
-fn html_alt_chunk_content_is_extracted_at_its_position() {
+fn test_html_alt_chunk_content_is_extracted_at_its_position() {
     // `altChunk` is how mail merge, report generators and CMS exporters
     // inject content — often the whole body, with document.xml holding only
     // a shell. Such a document extracted as almost nothing.
@@ -1115,7 +1115,7 @@ fn html_alt_chunk_content_is_extracted_at_its_position() {
 }
 
 #[test]
-fn a_plain_text_alt_chunk_is_extracted() {
+fn test_a_plain_text_alt_chunk_is_extracted() {
     let ir = Docx::new(r#"<w:altChunk r:id="RID_A"/>"#)
         .alt_chunk("chunk1.txt", "text/plain", "RID_A", "LINE ONE\nLINE TWO")
         .ir();
@@ -1124,7 +1124,7 @@ fn a_plain_text_alt_chunk_is_extracted() {
 }
 
 #[test]
-fn an_unsupported_alt_chunk_type_inserts_nothing_rather_than_garbage() {
+fn test_an_unsupported_alt_chunk_type_inserts_nothing_rather_than_garbage() {
     // A nested `.docx` chunk is a whole package; reading it is a bigger job
     // and is deliberately not attempted.
     let ir = Docx::new(r#"<w:p><w:r><w:t>ONLY</w:t></w:r></w:p><w:altChunk r:id="RID_A"/>"#)
@@ -1143,7 +1143,7 @@ fn an_unsupported_alt_chunk_type_inserts_nothing_rather_than_garbage() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn numbering_inherited_from_a_style_forms_a_list_and_terminates() {
+fn test_numbering_inherited_from_a_style_forms_a_list_and_terminates() {
     // The caller decides "this is a list" from the *effective* properties,
     // which include a `w:numPr` inherited from the paragraph style. The
     // group loop used to test the *direct* `w:pPr`, so it matched nothing,
@@ -1184,7 +1184,7 @@ fn numbering_inherited_from_a_style_forms_a_list_and_terminates() {
 }
 
 #[test]
-fn a_list_group_that_matches_nothing_still_advances() {
+fn test_a_list_group_that_matches_nothing_still_advances() {
     // Belt-and-braces for the same defect: even if the two membership tests
     // ever disagree again, conversion must terminate. A `w:numPr` with no
     // resolvable numbering definition is the shape that gets closest.
@@ -1210,7 +1210,7 @@ fn a_list_group_that_matches_nothing_still_advances() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn text_box_content_does_not_fuse_with_the_following_run() {
+fn test_text_box_content_does_not_fuse_with_the_following_run() {
     // Text-box prose is *block* content. Pasting it into the inline stream
     // bare glued the last word of the box to the first word after it —
     // `Linz` + `ANTRAG` became `LinzANTRAG` on a real corpus file.

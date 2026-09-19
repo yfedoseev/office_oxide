@@ -75,12 +75,39 @@ impl<R: Read + Seek> CfbReader<R> {
         &self.header
     }
 
-    /// Find a stream entry by name (case-insensitive).
+    /// Find a stream entry by name (case-insensitive), among the **root
+    /// storage's direct children only**.
+    ///
+    /// This used to flat-scan `self.entries` — the directory stream's
+    /// on-disk array order, not the logical storage tree — so a document
+    /// that OLE-embeds another document of the same kind (two directory
+    /// entries both named e.g. `WordDocument`/`1Table`, one at the root
+    /// and one nested under `ObjectPool/_<id>/`) could silently return
+    /// the *embedded* object's stream instead of the top-level document's
+    /// own, whenever the embedded copy happened to sit at a lower array
+    /// index. Confirmed on real, non-fuzzed files: 15 failed with a
+    /// confusing "piece table outside the stream" error (the wrong,
+    /// smaller stream was returned), 2 silently extracted the embedded
+    /// object's content as if it were the document's own, both with
+    /// `Ok`/no signal anything was substituted.
     pub fn find_entry(&self, name: &str) -> Option<usize> {
-        let lower = name.to_ascii_lowercase();
-        self.entries
-            .iter()
-            .position(|e| e.entry_type == EntryType::Stream && e.name.to_ascii_lowercase() == lower)
+        if self.entries.is_empty() || self.entries[0].entry_type != EntryType::RootStorage {
+            return None;
+        }
+        let idx = self.find_in_tree(self.entries[0].child, name)?;
+        (self.entries[idx].entry_type == EntryType::Stream).then_some(idx)
+    }
+
+    /// `true` when the root storage has a direct child (stream *or*
+    /// storage) with this name — e.g. a `_VBA_PROJECT` storage, which
+    /// [`find_entry`](Self::find_entry) alone can never see, since it
+    /// only matches streams. Same root-scoped tree walk as `find_entry`,
+    /// without the type filter.
+    pub fn has_root_entry(&self, name: &str) -> bool {
+        if self.entries.is_empty() || self.entries[0].entry_type != EntryType::RootStorage {
+            return false;
+        }
+        self.find_in_tree(self.entries[0].child, name).is_some()
     }
 
     /// Find an entry by path (e.g., "Storage1/StreamName"), case-insensitive.
@@ -479,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn open_minimal_cfb() {
+    fn test_open_minimal_cfb() {
         let data = build_minimal_cfb();
         let cursor = Cursor::new(data);
         let reader = CfbReader::new(cursor).unwrap();
@@ -490,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn read_stream_by_name() {
+    fn test_read_stream_by_name() {
         let data = build_minimal_cfb();
         let cursor = Cursor::new(data);
         let mut reader = CfbReader::new(cursor).unwrap();
@@ -498,8 +525,126 @@ mod tests {
         assert_eq!(&stream, b"Hello, CFB!");
     }
 
+    /// Build a CFB whose root storage has one direct child, "ObjectPool"
+    /// (a storage), which itself holds a stream named "TestStream" — at a
+    /// *lower* directory-array index than a second, unrelated "TestStream"
+    /// that lives directly under the root. Mirrors the real shape found in
+    /// 53379.doc (Apache POI test-data): an embedded OLE sub-document's
+    /// stream sits earlier in the flat array than the top-level document's
+    /// own same-named stream.
+    fn build_cfb_with_embedded_same_name_stream() -> Vec<u8> {
+        let sector_size = 512usize;
+        let mut file = vec![0u8; 512 + 4 * sector_size];
+
+        file[0..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        file[0x18..0x1A].copy_from_slice(&0x003Eu16.to_le_bytes());
+        file[0x1A..0x1C].copy_from_slice(&3u16.to_le_bytes());
+        file[0x1C..0x1E].copy_from_slice(&0xFFFEu16.to_le_bytes());
+        file[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
+        file[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
+        file[0x2C..0x30].copy_from_slice(&1u32.to_le_bytes());
+        file[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());
+        file[0x38..0x3C].copy_from_slice(&4096u32.to_le_bytes());
+        file[0x3C..0x40].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+        file[0x40..0x44].copy_from_slice(&0u32.to_le_bytes());
+        file[0x44..0x48].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+        file[0x48..0x4C].copy_from_slice(&0u32.to_le_bytes());
+        file[0x4C..0x50].copy_from_slice(&1u32.to_le_bytes());
+        for i in 1..109 {
+            let off = 0x4C + i * 4;
+            file[off..off + 4].copy_from_slice(&FREE_SECT.to_le_bytes());
+        }
+
+        let dir_offset = 512;
+        // Entry 0: Root Entry, child = 2 ("ObjectPool")
+        write_dir_entry(
+            &mut file[dir_offset..dir_offset + 128],
+            "Root Entry",
+            5,
+            2,
+            END_OF_CHAIN,
+            0,
+        );
+        // Entry 1: "TestStream" NESTED under ObjectPool — the embedded
+        // object's copy, lower array index, wrong content.
+        write_dir_entry(
+            &mut file[dir_offset + 128..dir_offset + 256],
+            "TestStream",
+            2,
+            NO_ENTRY,
+            2,
+            6,
+        );
+        // Entry 2: "ObjectPool" storage — child = 1 (the nested stream),
+        // right_sibling = 3 (links to the real root-level stream so both
+        // are reachable from Root's tree).
+        write_dir_entry(
+            &mut file[dir_offset + 256..dir_offset + 384],
+            "ObjectPool",
+            1,
+            1,
+            END_OF_CHAIN,
+            0,
+        );
+        file[dir_offset + 256 + 0x48..dir_offset + 256 + 0x4C].copy_from_slice(&3u32.to_le_bytes());
+        // Entry 3: "TestStream" at ROOT level — the real, wanted stream,
+        // higher array index than the embedded one.
+        write_dir_entry(
+            &mut file[dir_offset + 384..dir_offset + 512],
+            "TestStream",
+            2,
+            NO_ENTRY,
+            3,
+            11,
+        );
+
+        let fat_offset = 512 + sector_size;
+        write_fat_entry(&mut file, fat_offset, 0, END_OF_CHAIN);
+        write_fat_entry(&mut file, fat_offset, 1, FAT_SECT);
+        write_fat_entry(&mut file, fat_offset, 2, END_OF_CHAIN);
+        write_fat_entry(&mut file, fat_offset, 3, END_OF_CHAIN);
+        for i in 4..128 {
+            write_fat_entry(&mut file, fat_offset, i, FREE_SECT);
+        }
+
+        let wrong_offset = 512 + 2 * sector_size;
+        file[wrong_offset..wrong_offset + 6].copy_from_slice(b"Wrong!");
+        let real_offset = 512 + 3 * sector_size;
+        file[real_offset..real_offset + 11].copy_from_slice(b"Hello, CFB!");
+
+        file
+    }
+
+    /// find_entry/open_stream used to flat-scan the
+    /// directory array in on-disk order, so an embedded sub-document's
+    /// same-named stream at a lower array index silently won over the
+    /// top-level document's own stream of the same name.
     #[test]
-    fn read_stream_case_insensitive() {
+    fn test_find_entry_resolves_only_root_level_children_not_embedded_objects() {
+        let data = build_cfb_with_embedded_same_name_stream();
+        let mut reader = CfbReader::new(Cursor::new(data)).unwrap();
+        let stream = reader.open_stream("TestStream").unwrap();
+        assert_eq!(
+            &stream, b"Hello, CFB!",
+            "must return the root-level stream, not the embedded object's"
+        );
+    }
+
+    /// A `_VBA_PROJECT` (or here, "ObjectPool") root-level
+    /// entry is a STORAGE, not a stream; `find_entry`/`has_stream` alone
+    /// can never see it, since they only match streams. `has_root_entry`
+    /// must find it regardless of type, and must not match a nested
+    /// entry (the embedded "TestStream" one level down).
+    #[test]
+    fn test_has_root_entry_finds_a_storage_not_just_streams() {
+        let data = build_cfb_with_embedded_same_name_stream();
+        let reader = CfbReader::new(Cursor::new(data)).unwrap();
+        assert!(reader.has_root_entry("ObjectPool"), "must find the root-level storage");
+        assert!(!reader.has_root_entry("NoSuchEntry"));
+    }
+
+    #[test]
+    fn test_read_stream_case_insensitive() {
         let data = build_minimal_cfb();
         let cursor = Cursor::new(data);
         let mut reader = CfbReader::new(cursor).unwrap();
@@ -508,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_not_found() {
+    fn test_stream_not_found() {
         let data = build_minimal_cfb();
         let cursor = Cursor::new(data);
         let mut reader = CfbReader::new(cursor).unwrap();
@@ -516,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn has_stream() {
+    fn test_has_stream() {
         let data = build_minimal_cfb();
         let cursor = Cursor::new(data);
         let reader = CfbReader::new(cursor).unwrap();
@@ -613,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn read_mini_stream() {
+    fn test_read_mini_stream() {
         let data = build_cfb_with_mini_stream();
         let cursor = Cursor::new(data);
         let mut reader = CfbReader::new(cursor).unwrap();
@@ -622,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn find_entry_by_path_simple() {
+    fn test_find_entry_by_path_simple() {
         let data = build_minimal_cfb();
         let cursor = Cursor::new(data);
         let reader = CfbReader::new(cursor).unwrap();

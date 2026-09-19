@@ -121,11 +121,18 @@ impl CoreProperties {
         write_optional_element(&mut w, "cp:lastModifiedBy", self.last_modified_by.as_deref());
         write_optional_element(&mut w, "cp:revision", self.revision.as_deref());
 
-        if let Some(ref created) = self.created {
-            write_datetime_element(&mut w, "dcterms:created", created);
+        // A malformed source `dcterms:created`/`modified` (e.g. a stray
+        // "aaa" mixed into the year, or a PHP writer's space-padded
+        // single-digit month/day) used to be copied through verbatim,
+        // authoring an invalid docProps/core.xml out of a file someone
+        // else broke. Normalize leniently where the intent is unambiguous,
+        // and drop the element (both are optional) rather than emit
+        // something the W3CDTF restricted union rejects.
+        if let Some(created) = self.created.as_deref().and_then(normalize_w3cdtf) {
+            write_datetime_element(&mut w, "dcterms:created", &created);
         }
-        if let Some(ref modified) = self.modified {
-            write_datetime_element(&mut w, "dcterms:modified", modified);
+        if let Some(modified) = self.modified.as_deref().and_then(normalize_w3cdtf) {
+            write_datetime_element(&mut w, "dcterms:modified", &modified);
         }
 
         w.write_event(Event::End(BytesEnd::new("cp:coreProperties")))
@@ -144,6 +151,98 @@ fn write_optional_element(w: &mut Writer<Vec<u8>>, tag: &str, value: Option<&str
         w.write_event(Event::End(BytesEnd::new(tag)))
             .expect("write end");
     }
+}
+
+/// Leniently parse a `dcterms:W3CDTF` value and re-emit it in canonical
+/// form, or return `None` when it can't be recovered as a valid one.
+///
+/// Handles the two shapes found in a 6,062-file real-world corpus sweep
+///: a stray non-digit character mixed into a numeric
+/// component (`2014aaa-10-28T11:34:00Z` — not recoverable, the intent is
+/// ambiguous) and a single-digit month/day/hour written with a leading
+/// space instead of zero-padding (`2021- 9- 3T20:25:22Z` — a known
+/// PHP-writer quirk, unambiguously `2021-09-03T20:25:22Z`).
+fn normalize_w3cdtf(value: &str) -> Option<String> {
+    let value = value.trim();
+    let (date_part, time_part) = match value.split_once('T') {
+        Some((d, t)) => (d, Some(t)),
+        None => (value, None),
+    };
+
+    let date_fields: Vec<&str> = date_part.split('-').collect();
+    // W3CDTF allows YYYY, YYYY-MM, or YYYY-MM-DD precision.
+    if date_fields.is_empty() || date_fields.len() > 3 {
+        return None;
+    }
+    let year = date_fields[0].trim();
+    if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut normalized = year.to_string();
+    for field in &date_fields[1..] {
+        let f = field.trim();
+        if f.is_empty() || f.len() > 2 || !f.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        normalized.push('-');
+        normalized.push_str(&format!("{f:0>2}"));
+    }
+
+    let Some(time_part) = time_part else {
+        return Some(normalized);
+    };
+
+    let (time_body, tz) = split_w3cdtf_timezone(time_part);
+    let time_fields: Vec<&str> = time_body.split(':').collect();
+    if time_fields.len() < 2 || time_fields.len() > 3 {
+        return None;
+    }
+    normalized.push('T');
+    for (i, field) in time_fields.iter().enumerate() {
+        let f = field.trim();
+        // Seconds may carry a fractional part (SS.sss) — validate the
+        // integer portion strictly and keep the fraction verbatim.
+        let (whole, frac) = match f.split_once('.') {
+            Some((w, fr)) => (w, Some(fr)),
+            None => (f, None),
+        };
+        if whole.is_empty() || whole.len() > 2 || !whole.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if let Some(fr) = frac
+            && (fr.is_empty() || !fr.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return None;
+        }
+        if i > 0 {
+            normalized.push(':');
+        }
+        normalized.push_str(&format!("{whole:0>2}"));
+        if let Some(fr) = frac {
+            normalized.push('.');
+            normalized.push_str(fr);
+        }
+    }
+    normalized.push_str(&tz);
+    Some(normalized)
+}
+
+/// Split a W3CDTF time-of-day into its body and trailing timezone
+/// designator (`Z` or `±HH:MM`), if any.
+fn split_w3cdtf_timezone(time_part: &str) -> (&str, String) {
+    let t = time_part.trim();
+    if let Some(stripped) = t.strip_suffix('Z') {
+        return (stripped.trim_end(), "Z".to_string());
+    }
+    if let Some(pos) = t.rfind(['+', '-'])
+        && pos > 0
+    {
+        let (body, offset) = t.split_at(pos);
+        if offset.len() >= 3 {
+            return (body.trim_end(), offset.to_string());
+        }
+    }
+    (t, String::new())
 }
 
 fn write_datetime_element(w: &mut Writer<Vec<u8>>, tag: &str, value: &str) {
@@ -225,6 +324,33 @@ pub fn read_core_properties<R: std::io::Read + std::io::Seek>(
         })?;
     let data = opc.read_part(&part).ok()?;
     CoreProperties::parse(&data).ok()
+}
+
+/// Read and parse `docProps/app.xml` (extended/application properties —
+/// company, producing application, template, editing time, and page/word/
+/// character/line/paragraph/slide/notes/hidden-slide counts) from an open
+/// package, the same way [`read_core_properties`] reads `docProps/core.xml`.
+///
+/// `AppProperties::parse` already existed, fully tested, but nothing on
+/// the read side ever called it — company name and every count field were
+/// unreachable through any public API.
+pub fn read_app_properties<R: std::io::Read + std::io::Seek>(
+    opc: &mut super::opc::OpcReader<R>,
+) -> Option<AppProperties> {
+    let part = opc
+        .package_rels()
+        .first_by_type(super::relationships::rel_types::EXTENDED_PROPERTIES)
+        .and_then(|rel| {
+            super::opc::PartName::new(&format!("/{}", rel.target.trim_start_matches('/'))).ok()
+        })
+        .filter(|p| opc.has_part(p))
+        .or_else(|| {
+            super::opc::PartName::new("/docProps/app.xml")
+                .ok()
+                .filter(|p| opc.has_part(p))
+        })?;
+    let data = opc.read_part(&part).ok()?;
+    AppProperties::parse(&data).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -389,7 +515,7 @@ mod tests {
 </cp:coreProperties>"#;
 
     #[test]
-    fn parse_core_properties() {
+    fn test_parse_core_properties() {
         let props = CoreProperties::parse(SAMPLE_CORE).unwrap();
         assert_eq!(props.title.as_deref(), Some("Quarterly Report"));
         assert_eq!(props.creator.as_deref(), Some("Jane Smith"));
@@ -400,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn core_properties_round_trip() {
+    fn test_core_properties_round_trip() {
         let original = CoreProperties {
             title: Some("Test Doc".to_string()),
             creator: Some("Test Author".to_string()),
@@ -412,6 +538,44 @@ mod tests {
         assert_eq!(parsed.title, original.title);
         assert_eq!(parsed.creator, original.creator);
         assert_eq!(parsed.created, original.created);
+    }
+
+    #[test]
+    fn test_space_padded_single_digit_date_is_normalized_not_dropped() {
+        // A real-world PHP writer's quirk: single-digit
+        // month/day written with a leading space instead of zero-padding.
+        // The intent is unambiguous, so this must be recovered, not
+        // dropped.
+        let props = CoreProperties {
+            modified: Some("2021- 9- 3T20:25:22Z".to_string()),
+            ..Default::default()
+        };
+        let xml = props.serialize();
+        let xml_str = String::from_utf8(xml.clone()).unwrap();
+        assert!(
+            xml_str.contains("2021-09-03T20:25:22Z"),
+            "expected the normalized value, got: {xml_str}"
+        );
+        let parsed = CoreProperties::parse(&xml).unwrap();
+        assert_eq!(parsed.modified.as_deref(), Some("2021-09-03T20:25:22Z"));
+    }
+
+    #[test]
+    fn test_unrecoverably_malformed_date_is_dropped_not_copied_verbatim() {
+        // Garbage mixed into a numeric component (a
+        // deliberately corrupt OpenXML SDK test fixture) has no
+        // unambiguous recovery; the invalid element must be omitted
+        // entirely rather than authoring an invalid docProps/core.xml.
+        let props = CoreProperties {
+            modified: Some("2015sss-06-20T07:40:00Z".to_string()),
+            ..Default::default()
+        };
+        let xml = props.serialize();
+        let xml_str = String::from_utf8(xml).unwrap();
+        assert!(
+            !xml_str.contains("dcterms:modified"),
+            "an unrecoverable date must be dropped, not written: {xml_str}"
+        );
     }
 
     const SAMPLE_APP: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -430,7 +594,7 @@ mod tests {
 </Properties>"#;
 
     #[test]
-    fn parse_app_properties() {
+    fn test_parse_app_properties() {
         let props = AppProperties::parse(SAMPLE_APP).unwrap();
         assert_eq!(props.application.as_deref(), Some("Microsoft Office Word"));
         assert_eq!(props.app_version.as_deref(), Some("16.0000"));
@@ -441,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn app_properties_round_trip() {
+    fn test_app_properties_round_trip() {
         let original = AppProperties {
             application: Some("office_oxide".to_string()),
             app_version: Some("0.1.0".to_string()),

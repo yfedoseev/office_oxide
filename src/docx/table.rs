@@ -97,16 +97,22 @@ pub struct TableCellProperties {
     pub vertical_merge: Option<MergeType>,
     /// Horizontal grid span (number of columns spanned).
     pub grid_span: Option<u32>,
-    /// Cell shading/background.
-    pub shading: Option<Shading>,
-    /// Cell border edges (`w:tcBorders`).
-    pub borders: Option<TableBorders>,
+    /// Cell shading/background. Boxed: rare on real cells in a large
+    /// table — `Option<T>` reserves `size_of(T)` even when `None`.
+    pub shading: Option<Box<Shading>>,
+    /// Cell border edges (`w:tcBorders`). Boxed: rare on real cells in a
+    /// large table.
+    pub borders: Option<Box<TableBorders>>,
     /// Vertical alignment of cell content (`w:vAlign`).
     pub v_align: Option<CellVAlign>,
     /// Text flow direction (`w:textDirection`).
     pub text_direction: Option<String>,
     /// Per-cell margin overrides (`w:tcMar`), in twips.
     pub margins: Option<CellMargins>,
+    /// `true` when the cell carries `<w:cellDel>` — deleted via tracked
+    /// changes, pending acceptance. Mirrors the policy already applied to
+    /// run-level `w:del`: excluded from the accepted view.
+    pub deleted: bool,
 }
 
 /// Vertical alignment of a cell's content (`w:vAlign`).
@@ -160,4 +166,33 @@ pub struct Shading {
     pub color: Option<String>,
     /// Shading pattern value.
     pub pattern: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `TableCellProperties`'s `shading`/
+    /// `borders` must stay boxed. `TableCellProperties` was 536 bytes
+    /// before this fix (dominated by an unboxed `Shading` + `TableBorders`
+    /// pair), and `TableCell` (which every cell in a large table pays for)
+    /// was 560 bytes. Headroom above the measured post-fix sizes (96B /
+    /// 120B) keeps this from being flaky on an unrelated new field, while
+    /// still catching the actual regression: a large struct un-boxed back
+    /// into `Option<T>`.
+    #[test]
+    fn test_table_cell_properties_size_stays_boxed() {
+        assert!(
+            std::mem::size_of::<TableCellProperties>() <= 200,
+            "TableCellProperties grew to {} bytes — check shading/borders \
+             are still Option<Box<T>>, not Option<T>",
+            std::mem::size_of::<TableCellProperties>()
+        );
+        assert!(
+            std::mem::size_of::<TableCell>() <= 250,
+            "TableCell grew to {} bytes — a TableCellProperties field \
+             regression would show up here too",
+            std::mem::size_of::<TableCell>()
+        );
+    }
 }

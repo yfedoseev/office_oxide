@@ -43,18 +43,18 @@ for name in sorted(changed):
 
     # --- Intended-change filters, applied before anything is called a defect.
     reasons = []
-    # #166: plain-text break marker changed from markdown's `---` to U+000C.
+    # plain-text break marker changed from markdown's `---` to U+000C.
     if "\x0c" in b and "---" in a and "\x0c" not in a:
-        reasons.append("break-marker ---/FF (#166)")
+        reasons.append("break-marker ---/FF")
         lost.pop("", None)
-    # #156: entities resolved, so `ATT` becomes `AT`+`T` under \w tokenising.
+    # Entities resolved, so `ATT` becomes `AT`+`T` under \w tokenising.
     if any(c in b for c in "&<>") and not any(c in a for c in "&<>"):
-        reasons.append("entities resolved (#156)")
-    # #170: PPT master boilerplate removed.
+        reasons.append("entities resolved")
+    # PPT master boilerplate removed.
     if "Click to edit Master" in a and "Click to edit Master" not in b:
-        reasons.append("PPT master boilerplate removed (#170)")
-    # #137: section title no longer duplicated.
-    # #166: headers/footers now included in text.
+        reasons.append("PPT master boilerplate removed")
+    # Section title no longer duplicated.
+    # headers/footers now included in text.
     if not lost and gained:
         reasons.append("content added only")
     if lost and not gained:

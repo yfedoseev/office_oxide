@@ -12,7 +12,11 @@ use clap::Parser;
 use std::process;
 
 #[derive(Parser)]
-#[command(name = "office-oxide", about = "Fast Office document processing")]
+#[command(
+    name = "office-oxide",
+    version,
+    about = "Fast Office document processing"
+)]
 struct Cli {
     #[command(subcommand)]
     command: commands::Command,
@@ -23,5 +27,26 @@ fn main() {
     if let Err(e) = commands::run(cli.command) {
         eprintln!("error: {e}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// `--version` must be wired up: the CLI shipped without it, so
+    /// `office-oxide --version` failed with clap's generic
+    /// "unexpected argument" error.
+    #[test]
+    fn test_cli_has_version_flag() {
+        let cmd = Cli::command();
+        assert_eq!(cmd.get_version(), Some(env!("CARGO_PKG_VERSION")));
+        let err = match Cli::try_parse_from(["office-oxide", "--version"]) {
+            Err(e) => e,
+            Ok(_) => panic!("--version should short-circuit parsing"),
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
     }
 }

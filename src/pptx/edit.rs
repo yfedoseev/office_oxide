@@ -74,7 +74,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn replace_in_at_simple() {
+    fn test_replace_in_at_simple() {
         let xml = r#"<a:p><a:r><a:t>Hello World</a:t></a:r></a:p>"#;
         let (result, count) = replace_in_at_elements(xml, "World", "PPTX");
         assert_eq!(count, 1);
@@ -82,7 +82,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_in_at_multiple_runs() {
+    fn test_replace_in_at_multiple_runs() {
         let xml = r#"<a:r><a:t>foo</a:t></a:r><a:r><a:t>foo</a:t></a:r>"#;
         let (result, count) = replace_in_at_elements(xml, "foo", "bar");
         assert_eq!(count, 2);
@@ -90,7 +90,7 @@ mod tests {
     }
 
     #[test]
-    fn no_match_returns_zero() {
+    fn test_no_match_returns_zero() {
         let xml = r#"<a:r><a:t>Hello</a:t></a:r>"#;
         let (result, count) = replace_in_at_elements(xml, "xyz", "abc");
         assert_eq!(count, 0);

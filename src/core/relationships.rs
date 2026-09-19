@@ -18,6 +18,12 @@ pub mod rel_types {
     /// Relationship type for extended (application) properties.
     pub const EXTENDED_PROPERTIES: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties";
+    /// Relationship type for an embedded VBA project (`vbaProject.bin`),
+    /// referenced from the main document part's own `.rels` — presence
+    /// alone is a cheap macro-content signal, no VBA interpretation
+    /// required.
+    pub const VBA_PROJECT: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vbaProject";
     /// Relationship type for the package thumbnail.
     pub const THUMBNAIL: &str =
         "http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail";
@@ -55,6 +61,18 @@ pub mod rel_types {
     /// Relationship type for comments.
     pub const COMMENTS: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
+    /// Relationship type for a legacy VML drawing part (comment popup
+    /// shapes).
+    pub const VML_DRAWING: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing";
+    /// Relationship type for a modern (Excel 2016+) threaded-comment part
+    /// (`xl/threadedComments/threadedCommentN.xml`), worksheet-to-part.
+    pub const THREADED_COMMENTS: &str =
+        "http://schemas.microsoft.com/office/2017/10/relationships/threadedComment";
+    /// Relationship type for the workbook-level person list
+    /// (`xl/persons/person.xml`), which threaded comments' `personId`
+    /// resolves against.
+    pub const PERSONS: &str = "http://schemas.microsoft.com/office/2017/10/relationships/person";
     /// Relationship type for document headers.
     pub const HEADER: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/header";
@@ -89,6 +107,14 @@ pub mod rel_types {
     /// Relationship type for chart parts.
     pub const CHART: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart";
+    /// Relationship type for a SmartArt diagram's data part
+    /// (`word/diagrams/dataN.xml`).
+    pub const DIAGRAM_DATA: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData";
+    /// Relationship type for an embedded native OOXML package object
+    /// (`<o:OLEObject Type="Embed">` → `word/embeddings/*.xlsx`/`.docx`/`.pptx`).
+    pub const PACKAGE: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/package";
     /// Relationship type for the footnotes part.
     pub const FOOTNOTES: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes";
@@ -381,13 +407,13 @@ mod tests {
 </Relationships>"#;
 
     #[test]
-    fn parse_relationships() {
+    fn test_parse_relationships() {
         let rels = Relationships::parse(SAMPLE_RELS).unwrap();
         assert_eq!(rels.all().len(), 3);
     }
 
     #[test]
-    fn get_by_id() {
+    fn test_get_by_id() {
         let rels = Relationships::parse(SAMPLE_RELS).unwrap();
         let r = rels.get_by_id("rId1").unwrap();
         assert_eq!(r.target, "word/document.xml");
@@ -395,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn get_by_type() {
+    fn test_get_by_type() {
         let rels = Relationships::parse(SAMPLE_RELS).unwrap();
         let docs = rels.get_by_type(rel_types::OFFICE_DOCUMENT);
         assert_eq!(docs.len(), 1);
@@ -403,21 +429,21 @@ mod tests {
     }
 
     #[test]
-    fn first_by_type() {
+    fn test_first_by_type() {
         let rels = Relationships::parse(SAMPLE_RELS).unwrap();
         let r = rels.first_by_type(rel_types::CORE_PROPERTIES).unwrap();
         assert_eq!(r.target, "docProps/core.xml");
     }
 
     #[test]
-    fn resolve_target_from_root() {
+    fn test_resolve_target_from_root() {
         let rels = Relationships::parse(SAMPLE_RELS).unwrap();
         let pn = rels.resolve_target_from_root("rId1").unwrap();
         assert_eq!(pn.as_str(), "/word/document.xml");
     }
 
     #[test]
-    fn builder_round_trip() {
+    fn test_builder_round_trip() {
         let mut builder = RelationshipsBuilder::new();
         let id = builder.add(rel_types::OFFICE_DOCUMENT, "word/document.xml");
         assert_eq!(id, "rId1");

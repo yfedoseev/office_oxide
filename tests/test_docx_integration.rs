@@ -101,7 +101,7 @@ fn parse(data: &[u8]) -> DocxDocument {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn round_trip_simple_paragraphs() {
+fn test_round_trip_simple_paragraphs() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -118,7 +118,7 @@ fn round_trip_simple_paragraphs() {
 }
 
 #[test]
-fn round_trip_with_styles() {
+fn test_round_trip_with_styles() {
     let doc_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -164,7 +164,7 @@ fn round_trip_with_styles() {
 }
 
 #[test]
-fn round_trip_with_numbering() {
+fn test_round_trip_with_numbering() {
     let doc_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -210,7 +210,7 @@ fn round_trip_with_numbering() {
 }
 
 #[test]
-fn round_trip_table_with_merged_cells() {
+fn test_round_trip_table_with_merged_cells() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -276,7 +276,7 @@ fn round_trip_table_with_merged_cells() {
 }
 
 #[test]
-fn round_trip_hyperlink() {
+fn test_round_trip_hyperlink() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -315,7 +315,7 @@ fn round_trip_hyperlink() {
 }
 
 #[test]
-fn round_trip_section_properties() {
+fn test_round_trip_section_properties() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -347,7 +347,7 @@ fn round_trip_section_properties() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn empty_body() {
+fn test_empty_body() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body/>
@@ -360,7 +360,7 @@ fn empty_body() {
 }
 
 #[test]
-fn only_tables() {
+fn test_only_tables() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -380,7 +380,7 @@ fn only_tables() {
 }
 
 #[test]
-fn paragraph_with_page_break() {
+fn test_paragraph_with_page_break() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -410,7 +410,7 @@ fn paragraph_with_page_break() {
 }
 
 #[test]
-fn formatting_bold_italic_strikethrough() {
+fn test_formatting_bold_italic_strikethrough() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -436,7 +436,7 @@ fn formatting_bold_italic_strikethrough() {
 }
 
 #[test]
-fn internal_bookmark_hyperlink() {
+fn test_internal_bookmark_hyperlink() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -465,7 +465,7 @@ fn internal_bookmark_hyperlink() {
 }
 
 #[test]
-fn nested_table_in_cell() {
+fn test_nested_table_in_cell() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -497,7 +497,7 @@ fn nested_table_in_cell() {
 }
 
 #[test]
-fn complex_document_with_everything() {
+fn test_complex_document_with_everything() {
     let doc_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -604,7 +604,7 @@ fn complex_document_with_everything() {
 }
 
 // ---------------------------------------------------------------------------
-// Regression: issue #71 — pBdr horizontal-rule paragraph truncates the body
+// Regression: pBdr horizontal-rule paragraph truncates the body
 // ---------------------------------------------------------------------------
 
 // A paragraph whose <w:pPr> carries a bottom-border-only <w:pBdr> (Word's
@@ -613,7 +613,7 @@ fn complex_document_with_everything() {
 // the pBdr scanner to over-read past </w:pBdr>, desyncing the reader and
 // running it to EOF — silently dropping every subsequent paragraph and table.
 #[test]
-fn pbdr_horizontal_rule_does_not_truncate_body() {
+fn test_pbdr_horizontal_rule_does_not_truncate_body() {
     // Compact XML with no inter-tag whitespace, exactly as Word writes
     // document.xml: <w:bottom/> is immediately followed by </w:pBdr> with
     // no whitespace Text event in between to absorb the stray extra read.
@@ -650,7 +650,7 @@ fn pbdr_horizontal_rule_does_not_truncate_body() {
 // <w:bottom> is NOT the last child must also leave the reader correctly
 // positioned at </w:pBdr>.
 #[test]
-fn pbdr_with_multiple_borders_does_not_truncate() {
+fn test_pbdr_with_multiple_borders_does_not_truncate() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pBdr><w:top w:val="single" w:sz="6" w:space="1" w:color="auto"/><w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/><w:right w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr></w:pPr><w:r><w:t>Bordered paragraph</w:t></w:r></w:p><w:p><w:r><w:t>Trailing paragraph</w:t></w:r></w:p></w:body></w:document>"#;
     let data = DocxBuilder::new().with_document(xml).build();
     let doc = parse(&data);
@@ -664,7 +664,7 @@ fn pbdr_with_multiple_borders_does_not_truncate() {
 // A pBdr with a top edge but NO bottom edge (as last child) must neither
 // truncate nor set the horizontal-rule flag.
 #[test]
-fn pbdr_top_border_only_no_hr_flag() {
+fn test_pbdr_top_border_only_no_hr_flag() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:pBdr><w:top w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr></w:pPr><w:r><w:t>Top bordered</w:t></w:r></w:p><w:p><w:r><w:t>Next paragraph</w:t></w:r></w:p></w:body></w:document>"#;
     let data = DocxBuilder::new().with_document(xml).build();
     let doc = parse(&data);
@@ -684,7 +684,7 @@ fn pbdr_top_border_only_no_hr_flag() {
 // Several consecutive horizontal-rule paragraphs — each pBdr must be
 // consumed cleanly so nothing between or after them is dropped.
 #[test]
-fn pbdr_multiple_consecutive_rules_do_not_truncate() {
+fn test_pbdr_multiple_consecutive_rules_do_not_truncate() {
     let hr = r#"<w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr></w:pPr></w:p>"#;
     let xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Start</w:t></w:r></w:p>{hr}{hr}{hr}<w:p><w:r><w:t>End</w:t></w:r></w:p></w:body></w:document>"#
@@ -702,7 +702,7 @@ fn pbdr_multiple_consecutive_rules_do_not_truncate() {
 // A horizontal-rule paragraph INSIDE a table cell must not desync the cell /
 // row / table parse — content after the table must survive.
 #[test]
-fn pbdr_hr_inside_table_cell_does_not_truncate() {
+fn test_pbdr_hr_inside_table_cell_does_not_truncate() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl><w:tr><w:tc><w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr></w:pPr></w:p><w:p><w:r><w:t>After rule in cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>After table</w:t></w:r></w:p></w:body></w:document>"#;
     let data = DocxBuilder::new().with_document(xml).build();
     let doc = parse(&data);
@@ -719,7 +719,7 @@ fn pbdr_hr_inside_table_cell_does_not_truncate() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn missing_document_part() {
+fn test_missing_document_part() {
     // Create a package without document.xml — should error
     let cursor = Cursor::new(Vec::new());
     let mut writer = OpcWriter::new(cursor).unwrap();

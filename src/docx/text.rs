@@ -26,6 +26,20 @@ impl DocxDocument {
         for hf in self.headers_footers.iter().filter(|h| !h.is_header) {
             plain_text_blocks(&hf.content, &mut out);
         }
+        // Footnote/endnote/comment bodies are real document content that
+        // to_ir() already carries (as Element::Footnote/Endnote) — without
+        // walking them here too, a footnote-only document returned "" even
+        // though it visibly has text, and a document's word count changed
+        // depending on which of plain_text()/to_markdown()/to_ir() a caller
+        // used.
+        for n in self
+            .footnotes
+            .iter()
+            .chain(self.endnotes.iter())
+            .chain(self.comments.iter())
+        {
+            plain_text_blocks(&n.content, &mut out);
+        }
         // Trim trailing newlines
         while out.ends_with('\n') {
             out.pop();
@@ -53,6 +67,28 @@ impl DocxDocument {
         }
 
         markdown_blocks(&self.body.elements, &ctx, &mut out, 0);
+
+        // See the identical note on plain_text(): footnote,
+        // endnote and comment bodies are real content that to_ir() already
+        // carries, and dropping them here made this renderer disagree with
+        // that one.
+        for n in self
+            .footnotes
+            .iter()
+            .chain(self.endnotes.iter())
+            .chain(self.comments.iter())
+        {
+            let mut note_buf = String::new();
+            markdown_blocks(&n.content, &ctx, &mut note_buf, 0);
+            let note_text = note_buf.trim();
+            if !note_text.is_empty() {
+                if !out.ends_with("\n\n") && !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(note_text);
+                out.push('\n');
+            }
+        }
 
         for f in &footer_texts {
             if !out.ends_with("\n\n") {
@@ -122,15 +158,41 @@ fn plain_text_blocks(elements: &[BlockElement], out: &mut String) {
 }
 
 fn plain_text_run(run: &Run, out: &mut String) {
+    // `<w:vanish/>` — Word never renders this run at all.
+    if run
+        .properties
+        .as_ref()
+        .and_then(|rp| rp.hidden)
+        .unwrap_or(false)
+    {
+        return;
+    }
     for content in &run.content {
         match content {
             RunContent::Text(text) => out.push_str(text),
             RunContent::Break(BreakType::Line) => out.push('\n'),
             RunContent::Break(BreakType::Page | BreakType::Column) => out.push('\n'),
             RunContent::Tab => out.push('\t'),
-            RunContent::Drawing(_) => {},
+            // A drawing has no text of its own — except a native chart or
+            // SmartArt diagram, whose text was resolved from the separate
+            // referenced part at open time.
+            RunContent::Drawing(d) => {
+                let lines: Vec<&str> = d
+                    .chart_text
+                    .iter()
+                    .chain(d.dgm_text.iter())
+                    .map(String::as_str)
+                    .collect();
+                if !lines.is_empty() {
+                    if !out.is_empty() && !out.ends_with(['\n', ' ', '\t']) {
+                        out.push('\n');
+                    }
+                    out.push_str(&lines.join("\n"));
+                    out.push('\n');
+                }
+            },
             // Text-box prose is document content — in some real files it is
-            // most of the document (issue #102). It is *block* content, so
+            // most of the document. It is *block* content, so
             // it must be separated from the surrounding run: pasting it in
             // bare fused the last word of a text box to the first word after
             // it (`Linz` + `ANTRAG` -> `LinzANTRAG`).
@@ -146,13 +208,52 @@ fn plain_text_run(run: &Run, out: &mut String) {
                     out.push('\n');
                 }
             },
+            // The reference mark itself carries no text of its own — the
+            // note *body* is walked separately; this is only
+            // the citation point, nothing to render here.
+            RunContent::FootnoteRef(..)
+            | RunContent::EndnoteRef(..)
+            | RunContent::CommentRef(_) => {},
+            RunContent::FormField(ff) => {
+                if let Some(text) = &ff.display_text {
+                    out.push_str(text);
+                }
+            },
+            // Resolved into a TextBox during from_opc when the reference
+            // could be followed; an unresolvable one is dropped (matches
+            // the type's own documented intent).
+            RunContent::DeferredPart(_) => {},
         }
     }
 }
 
 fn plain_text_table(table: &Table, out: &mut String) {
+    // A table cell can hold another table, so this recurses (via
+    // `plain_text_blocks` -> `plain_text_table` -> `plain_text_blocks` ...)
+    // on whatever it's given — including a tree the XML parser already
+    // bounded to `MAX_NESTING_DEPTH`, which on the small default thread
+    // stack `plain_text()`/`to_markdown()` run on (unlike parsing itself,
+    // which gets its own larger stack) is still deep enough to overflow.
+    // Past the cap, stop descending rather than crash the whole process —
+    // the same defect class as an unguarded XML parse, just one layer
+    // downstream of it.
+    let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+        out.push_str(&format!(
+            "[nested table deeper than {} levels not shown — document truncated]\n",
+            crate::core::xml::MAX_NESTING_DEPTH
+        ));
+        return;
+    };
     for row in &table.rows {
-        for (i, cell) in row.cells.iter().enumerate() {
+        // A cell deleted via tracked changes is excluded from the
+        // accepted view, same policy already applied to run-level
+        // `w:del`.
+        let cells: Vec<_> = row
+            .cells
+            .iter()
+            .filter(|c| !c.properties.as_ref().is_some_and(|p| p.deleted))
+            .collect();
+        for (i, cell) in cells.iter().enumerate() {
             if i > 0 {
                 out.push('\t');
             }
@@ -175,6 +276,26 @@ struct MarkdownCtx<'a> {
 }
 
 fn markdown_blocks(elements: &[BlockElement], ctx: &MarkdownCtx, out: &mut String, _depth: usize) {
+    // Keyed by (num_id, ilvl): the next number to print for that level.
+    // This renderer processes one paragraph at a time with no notion of
+    // "list group" the way convert_docx.rs's IR path has, so each level's
+    // count is simply "one more than last time this exact level was
+    // seen" — matching the per-numId continuation semantics of the reader.
+    // Without this every item printed the abstract level's bare
+    // `<w:start>` value forever (the 4th instance of this
+    // crate's "two renderers disagree" flaw).
+    let mut numbering_counts: std::collections::HashMap<(u32, u8), u32> =
+        std::collections::HashMap::new();
+    markdown_blocks_inner(elements, ctx, out, _depth, &mut numbering_counts);
+}
+
+fn markdown_blocks_inner(
+    elements: &[BlockElement],
+    ctx: &MarkdownCtx,
+    out: &mut String,
+    _depth: usize,
+    numbering_counts: &mut std::collections::HashMap<(u32, u8), u32>,
+) {
     for elem in elements {
         match elem {
             BlockElement::Paragraph(p) => {
@@ -198,13 +319,29 @@ fn markdown_blocks(elements: &[BlockElement], ctx: &MarkdownCtx, out: &mut Strin
                     let level = numbering.resolve_level(nr.num_id, nr.ilvl)?;
                     let indent = "  ".repeat(nr.ilvl as usize);
                     use super::numbering::NumberFormat;
+                    // The printed number for an ordered format: one more
+                    // than the last time this exact (num_id, ilvl) was
+                    // seen, or the effective start (honoring
+                    // startOverride) on first encounter — not the bare
+                    // abstract-level start reprinted forever.
+                    let mut next_ordinal = || {
+                        let key = (nr.num_id, nr.ilvl);
+                        let next = match numbering_counts.get(&key) {
+                            Some(&prev) => prev + 1,
+                            None => numbering
+                                .resolve_start(nr.num_id, nr.ilvl)
+                                .unwrap_or(level.start),
+                        };
+                        numbering_counts.insert(key, next);
+                        next
+                    };
                     let marker = match &level.format {
                         NumberFormat::Bullet => "- ".to_string(),
-                        NumberFormat::Decimal => format!("{}. ", level.start),
-                        NumberFormat::LowerLetter => format!("{}. ", level.start),
-                        NumberFormat::UpperLetter => format!("{}. ", level.start),
-                        NumberFormat::LowerRoman => format!("{}. ", level.start),
-                        NumberFormat::UpperRoman => format!("{}. ", level.start),
+                        NumberFormat::Decimal => format!("{}. ", next_ordinal()),
+                        NumberFormat::LowerLetter => format!("{}. ", next_ordinal()),
+                        NumberFormat::UpperLetter => format!("{}. ", next_ordinal()),
+                        NumberFormat::LowerRoman => format!("{}. ", next_ordinal()),
+                        NumberFormat::UpperRoman => format!("{}. ", next_ordinal()),
                         NumberFormat::None => String::new(),
                         NumberFormat::Other(_) => "- ".to_string(),
                     };
@@ -357,6 +494,15 @@ fn flush_run(pending: &mut Option<(RunStyle, String)>, out: &mut String) {
 
 /// Collect a run's text content (no emphasis delimiters).
 fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, text: &mut String) {
+    // `<w:vanish/>` — Word never renders this run at all.
+    if run
+        .properties
+        .as_ref()
+        .and_then(|rp| rp.hidden)
+        .unwrap_or(false)
+    {
+        return;
+    }
     for content in &run.content {
         match content {
             RunContent::Text(t) => text.push_str(t),
@@ -382,11 +528,37 @@ fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, text: &mut String) {
                     text.push('\n');
                 }
             },
+            RunContent::FootnoteRef(..)
+            | RunContent::EndnoteRef(..)
+            | RunContent::CommentRef(_) => {},
+            RunContent::FormField(ff) => {
+                if let Some(t) = &ff.display_text {
+                    text.push_str(t);
+                }
+            },
+            RunContent::DeferredPart(_) => {},
         }
     }
 }
 
 fn markdown_drawing(drawing: &DrawingInfo, out: &mut String) {
+    // A chart or diagram is not an image: render the text we recovered
+    // from the referenced part instead of an empty image link with no
+    // target.
+    let lines: Vec<&str> = drawing
+        .chart_text
+        .iter()
+        .chain(drawing.dgm_text.iter())
+        .map(String::as_str)
+        .collect();
+    if !lines.is_empty() {
+        if !out.is_empty() && !out.ends_with(['\n', ' ', '\t']) {
+            out.push('\n');
+        }
+        out.push_str(&lines.join("  \n"));
+        out.push('\n');
+        return;
+    }
     out.push_str("![");
     if let Some(ref desc) = drawing.description {
         out.push_str(desc);
@@ -407,7 +579,12 @@ fn markdown_table(table: &Table, _ctx: &MarkdownCtx, out: &mut String) {
 
     for row in &table.rows {
         let mut cells: Vec<String> = Vec::new();
-        for cell in &row.cells {
+        // Same tracked-changes policy as plain_text_table.
+        for cell in row
+            .cells
+            .iter()
+            .filter(|c| !c.properties.as_ref().is_some_and(|p| p.deleted))
+        {
             let mut cell_text = String::new();
             plain_text_blocks(&cell.content, &mut cell_text);
             let cell_text = cell_text.trim().replace('\n', " ");

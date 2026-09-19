@@ -178,8 +178,19 @@ pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> V
     let wd_sectors = wd_len.div_ceil(512);
     let mut word_doc = vec![0u8; wd_sectors * 512];
     write_fib(&mut word_doc, text_len, fc_plcf, lcb_plcf);
+    // [MS-DOC] FibRgLw97 real offsets for these fields: 0x58
+    // is `reserved3`, MUST be zero/ignored, and sits between ccpHdd and
+    // ccpAtn — not a slot in this array, so the mapping isn't a flat
+    // `0x50 + i*4` stride.
+    const CCP_OFFSETS: [usize; 5] = [
+        0x50, // ccpFtn (footnotes)
+        0x54, // ccpHdd (headers)
+        0x5C, // ccpAtn (comments) — NOT 0x58, which is reserved3
+        0x60, // ccpEdn (endnotes)
+        0x64, // ccpTxbx (textboxes)
+    ];
     for (i, &ccp) in ccps.iter().enumerate() {
-        let off = 0x50 + i * 4;
+        let off = CCP_OFFSETS[i];
         word_doc[off..off + 4].copy_from_slice(&ccp.to_le_bytes());
     }
     if let Some(w) = tweaks.wident {
@@ -297,14 +308,18 @@ fn build_cfb(word_doc: &[u8], table: &[u8]) -> Vec<u8> {
 
     // Directory (sector 0) at offset 512.
     let dir_off = 512;
-    write_dir_entry(&mut file[dir_off..dir_off + 128], "Root Entry", 5, NO_ENTRY, END_OF_CHAIN, 0);
+    // Root Entry's `child` points to entry 1 (WordDocument), which links
+    // to entry 2 (0Table) as its right sibling — a minimal but real tree,
+    // not just 3 unlinked entries.
+    write_dir_entry(&mut file[dir_off..dir_off + 128], "Root Entry", 5, 1, END_OF_CHAIN, 0);
     let wd_start = 2u32;
     let zt_start = (2 + wd_sectors) as u32;
-    write_dir_entry(
+    write_dir_entry_with_sibling(
         &mut file[dir_off + 128..dir_off + 256],
         "WordDocument",
         2,
         NO_ENTRY,
+        2,
         wd_start,
         word_doc.len() as u32,
     );
@@ -393,6 +408,26 @@ fn write_dir_entry(
     start_sector: u32,
     stream_size: u32,
 ) {
+    write_dir_entry_with_sibling(buf, name, entry_type, child, NO_ENTRY, start_sector, stream_size)
+}
+
+/// As `write_dir_entry`, with an explicit right-sibling link.
+///
+/// `CfbReader::find_entry` walks the directory as a real red-black tree
+/// from the root entry's own `child` pointer, not a flat scan — so a
+/// stream with no sibling link from the root is present in the file but
+/// unreachable, and `open_stream` reports it missing. Every
+/// entry after the first one under a given parent needs a `right` link
+/// to the next, or it simply never gets visited.
+fn write_dir_entry_with_sibling(
+    buf: &mut [u8],
+    name: &str,
+    entry_type: u8,
+    child: u32,
+    right_sibling: u32,
+    start_sector: u32,
+    stream_size: u32,
+) {
     let utf16: Vec<u16> = name.encode_utf16().collect();
     for (i, &ch) in utf16.iter().enumerate() {
         let bytes = ch.to_le_bytes();
@@ -404,7 +439,7 @@ fn write_dir_entry(
     buf[0x42] = entry_type;
     buf[0x43] = 1; // black
     buf[0x44..0x48].copy_from_slice(&NO_ENTRY.to_le_bytes()); // left
-    buf[0x48..0x4C].copy_from_slice(&NO_ENTRY.to_le_bytes()); // right
+    buf[0x48..0x4C].copy_from_slice(&right_sibling.to_le_bytes());
     buf[0x4C..0x50].copy_from_slice(&child.to_le_bytes());
     buf[0x74..0x78].copy_from_slice(&start_sector.to_le_bytes());
     buf[0x78..0x7C].copy_from_slice(&stream_size.to_le_bytes());

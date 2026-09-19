@@ -5,7 +5,7 @@ use std::io::Cursor;
 // ===========================================================================
 
 #[test]
-fn docx_write_paragraph_round_trip() {
+fn test_docx_write_paragraph_round_trip() {
     let mut writer = office_oxide::docx::write::DocxWriter::new();
     writer.add_paragraph("Hello world");
     writer.add_paragraph("Second paragraph");
@@ -21,7 +21,7 @@ fn docx_write_paragraph_round_trip() {
 }
 
 #[test]
-fn docx_write_heading_round_trip() {
+fn test_docx_write_heading_round_trip() {
     let mut writer = office_oxide::docx::write::DocxWriter::new();
     writer.add_heading("Chapter One", 1);
     writer.add_paragraph("Content here");
@@ -37,7 +37,7 @@ fn docx_write_heading_round_trip() {
 }
 
 #[test]
-fn docx_write_table_round_trip() {
+fn test_docx_write_table_round_trip() {
     let mut writer = office_oxide::docx::write::DocxWriter::new();
     writer.add_table(&[vec!["Name", "Age"], vec!["Alice", "30"]]);
 
@@ -53,7 +53,7 @@ fn docx_write_table_round_trip() {
 }
 
 #[test]
-fn docx_write_list_round_trip() {
+fn test_docx_write_list_round_trip() {
     let mut writer = office_oxide::docx::write::DocxWriter::new();
     writer.add_list(&["First", "Second", "Third"], false);
 
@@ -73,7 +73,7 @@ fn docx_write_list_round_trip() {
 // ===========================================================================
 
 #[test]
-fn xlsx_write_cells_round_trip() {
+fn test_xlsx_write_cells_round_trip() {
     let mut writer = office_oxide::xlsx::write::XlsxWriter::new();
     {
         let mut sheet = writer.add_sheet("Data");
@@ -104,7 +104,7 @@ fn xlsx_write_cells_round_trip() {
 }
 
 #[test]
-fn xlsx_write_multiple_sheets_round_trip() {
+fn test_xlsx_write_multiple_sheets_round_trip() {
     let mut writer = office_oxide::xlsx::write::XlsxWriter::new();
     {
         let mut s1 = writer.add_sheet("Sheet1");
@@ -127,7 +127,7 @@ fn xlsx_write_multiple_sheets_round_trip() {
 }
 
 #[test]
-fn xlsx_write_empty_cells_round_trip() {
+fn test_xlsx_write_empty_cells_round_trip() {
     let mut writer = office_oxide::xlsx::write::XlsxWriter::new();
     {
         let mut sheet = writer.add_sheet("Sparse");
@@ -153,7 +153,7 @@ fn xlsx_write_empty_cells_round_trip() {
 // ===========================================================================
 
 #[test]
-fn pptx_write_slide_round_trip() {
+fn test_pptx_write_slide_round_trip() {
     let mut writer = office_oxide::pptx::write::PptxWriter::new();
     {
         let slide = writer.add_slide();
@@ -172,7 +172,7 @@ fn pptx_write_slide_round_trip() {
 }
 
 #[test]
-fn pptx_write_multiple_slides_round_trip() {
+fn test_pptx_write_multiple_slides_round_trip() {
     let mut writer = office_oxide::pptx::write::PptxWriter::new();
     {
         let s1 = writer.add_slide();
@@ -197,7 +197,7 @@ fn pptx_write_multiple_slides_round_trip() {
 }
 
 #[test]
-fn pptx_write_bullet_list_round_trip() {
+fn test_pptx_write_bullet_list_round_trip() {
     let mut writer = office_oxide::pptx::write::PptxWriter::new();
     {
         let slide = writer.add_slide();
@@ -297,11 +297,12 @@ fn sample_ir(format: office_oxide::DocumentFormat) -> office_oxide::DocumentIR {
             ],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     }
 }
 
 #[test]
-fn create_from_ir_docx_round_trip() {
+fn test_create_from_ir_docx_round_trip() {
     let ir = sample_ir(office_oxide::DocumentFormat::Docx);
 
     let mut buf = Cursor::new(Vec::new());
@@ -320,7 +321,7 @@ fn create_from_ir_docx_round_trip() {
 }
 
 #[test]
-fn create_from_ir_xlsx_round_trip() {
+fn test_create_from_ir_xlsx_round_trip() {
     let ir = sample_ir(office_oxide::DocumentFormat::Xlsx);
 
     let mut buf = Cursor::new(Vec::new());
@@ -339,7 +340,7 @@ fn create_from_ir_xlsx_round_trip() {
 }
 
 #[test]
-fn create_from_ir_pptx_round_trip() {
+fn test_create_from_ir_pptx_round_trip() {
     let ir = sample_ir(office_oxide::DocumentFormat::Pptx);
 
     let mut buf = Cursor::new(Vec::new());
@@ -362,7 +363,7 @@ fn create_from_ir_pptx_round_trip() {
 // ===========================================================================
 
 #[test]
-fn docx_edit_replace_text_round_trip() {
+fn test_docx_edit_replace_text_round_trip() {
     // Create a docx, then edit it
     let mut writer = office_oxide::docx::write::DocxWriter::new();
     writer.add_paragraph("Hello PLACEHOLDER world");
@@ -387,7 +388,7 @@ fn docx_edit_replace_text_round_trip() {
 }
 
 #[test]
-fn xlsx_edit_set_cell_round_trip() {
+fn test_xlsx_edit_set_cell_round_trip() {
     let mut writer = office_oxide::xlsx::write::XlsxWriter::new();
     {
         let mut sheet = writer.add_sheet("Sheet1");
@@ -422,7 +423,7 @@ fn xlsx_edit_set_cell_round_trip() {
 /// Reproduce on `main` by dropping the `s="5"` assertion's negation: the written cell
 /// is emitted as `<c r="A1"><v>99</v></c>`.
 #[test]
-fn xlsx_edit_set_cell_preserves_cell_style() {
+fn test_xlsx_edit_set_cell_preserves_cell_style() {
     let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
 <sheetData><row r="1"><c r="A1" s="5" t="n"><v>42</v></c></row></sheetData></worksheet>"#;
@@ -454,7 +455,7 @@ fn xlsx_edit_set_cell_preserves_cell_style() {
 ///
 /// Reproduce on `main`: `B1` is absent from the output.
 #[test]
-fn xlsx_edit_set_self_closing_cell_does_not_delete_the_next_cell() {
+fn test_xlsx_edit_set_self_closing_cell_does_not_delete_the_next_cell() {
     let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
 <sheetData><row r="1"><c r="A1" s="5"/><c r="B1" s="6"><v>7</v></c></row></sheetData></worksheet>"#;
@@ -544,7 +545,7 @@ fn read_sheet_xml(bytes: Vec<u8>) -> String {
 }
 
 #[test]
-fn pptx_edit_replace_text_round_trip() {
+fn test_pptx_edit_replace_text_round_trip() {
     let mut writer = office_oxide::pptx::write::PptxWriter::new();
     {
         let slide = writer.add_slide();
@@ -575,7 +576,7 @@ fn pptx_edit_replace_text_round_trip() {
 // ===========================================================================
 
 #[test]
-fn ir_paragraph_alignment_round_trip() {
+fn test_ir_paragraph_alignment_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
@@ -604,6 +605,7 @@ fn ir_paragraph_alignment_round_trip() {
             ],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -623,7 +625,7 @@ fn ir_paragraph_alignment_round_trip() {
 }
 
 #[test]
-fn ir_paragraph_indentation_round_trip() {
+fn test_ir_paragraph_indentation_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
@@ -640,6 +642,7 @@ fn ir_paragraph_indentation_round_trip() {
             })],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -656,7 +659,7 @@ fn ir_paragraph_indentation_round_trip() {
 }
 
 #[test]
-fn ir_paragraph_line_spacing_round_trip() {
+fn test_ir_paragraph_line_spacing_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
@@ -672,6 +675,7 @@ fn ir_paragraph_line_spacing_round_trip() {
             })],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -688,7 +692,7 @@ fn ir_paragraph_line_spacing_round_trip() {
 }
 
 #[test]
-fn ir_table_with_borders_round_trip() {
+fn test_ir_table_with_borders_round_trip() {
     use office_oxide::ir::*;
 
     let border_line = BorderLine {
@@ -769,6 +773,7 @@ fn ir_table_with_borders_round_trip() {
             })],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -788,7 +793,7 @@ fn ir_table_with_borders_round_trip() {
 }
 
 #[test]
-fn ir_table_with_cell_shading_round_trip() {
+fn test_ir_table_with_cell_shading_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
@@ -828,6 +833,7 @@ fn ir_table_with_cell_shading_round_trip() {
             })],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -846,7 +852,7 @@ fn ir_table_with_cell_shading_round_trip() {
 }
 
 #[test]
-fn ir_inline_image_round_trip() {
+fn test_ir_inline_image_round_trip() {
     use office_oxide::ir::*;
 
     // Minimal 1×1 white PNG (67 bytes)
@@ -888,6 +894,7 @@ fn ir_inline_image_round_trip() {
             ],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -916,7 +923,7 @@ fn ir_inline_image_round_trip() {
 }
 
 #[test]
-fn ir_section_page_setup_round_trip() {
+fn test_ir_section_page_setup_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
@@ -942,6 +949,7 @@ fn ir_section_page_setup_round_trip() {
             break_type: SectionBreakType::NextPage,
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -958,7 +966,7 @@ fn ir_section_page_setup_round_trip() {
 }
 
 #[test]
-fn ir_two_column_section_round_trip() {
+fn test_ir_two_column_section_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
@@ -979,6 +987,7 @@ fn ir_two_column_section_round_trip() {
             }),
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -995,7 +1004,7 @@ fn ir_two_column_section_round_trip() {
 }
 
 #[test]
-fn ir_run_typography_round_trip() {
+fn test_ir_run_typography_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
@@ -1024,6 +1033,7 @@ fn ir_run_typography_round_trip() {
             })],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1042,7 +1052,7 @@ fn ir_run_typography_round_trip() {
 }
 
 #[test]
-fn ir_code_block_round_trip() {
+fn test_ir_code_block_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
@@ -1057,6 +1067,7 @@ fn ir_code_block_round_trip() {
             })],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1075,7 +1086,7 @@ fn ir_code_block_round_trip() {
 }
 
 #[test]
-fn ir_table_cell_padding_round_trip() {
+fn test_ir_table_cell_padding_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
@@ -1119,6 +1130,7 @@ fn ir_table_cell_padding_round_trip() {
             })],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1153,7 +1165,7 @@ fn ir_table_cell_padding_round_trip() {
 }
 
 #[test]
-fn ir_table_cell_text_align_round_trip() {
+fn test_ir_table_cell_text_align_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
@@ -1195,6 +1207,7 @@ fn ir_table_cell_text_align_round_trip() {
             })],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1235,7 +1248,7 @@ fn ir_table_cell_text_align_round_trip() {
 }
 
 #[test]
-fn ir_table_caption_round_trip() {
+fn test_ir_table_caption_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
@@ -1263,6 +1276,7 @@ fn ir_table_caption_round_trip() {
             })],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1307,7 +1321,7 @@ fn ir_table_caption_round_trip() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn ir_thematic_break_emits_bordered_paragraph() {
+fn test_ir_thematic_break_emits_bordered_paragraph() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
@@ -1329,6 +1343,7 @@ fn ir_thematic_break_emits_bordered_paragraph() {
             ],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1361,7 +1376,7 @@ fn ir_thematic_break_emits_bordered_paragraph() {
 }
 
 #[test]
-fn ir_page_and_column_breaks_round_trip() {
+fn test_ir_page_and_column_breaks_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
@@ -1388,6 +1403,7 @@ fn ir_page_and_column_breaks_round_trip() {
             ],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1415,7 +1431,7 @@ fn ir_page_and_column_breaks_round_trip() {
 }
 
 #[test]
-fn ir_footnote_endnote_round_trip() {
+fn test_ir_footnote_endnote_round_trip() {
     use office_oxide::ir::*;
 
     let footnote_content = vec![Element::Paragraph(Paragraph {
@@ -1452,15 +1468,18 @@ fn ir_footnote_endnote_round_trip() {
                     id: 1,
                     content: footnote_content,
                     marker: None,
+                    author: None,
                 }),
                 Element::Endnote(Note {
                     id: 2,
                     content: endnote_content,
                     marker: None,
+                    author: None,
                 }),
             ],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1487,7 +1506,7 @@ fn ir_footnote_endnote_round_trip() {
 }
 
 #[test]
-fn ir_text_box_round_trip() {
+fn test_ir_text_box_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
@@ -1505,6 +1524,7 @@ fn ir_text_box_round_trip() {
             })],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1537,7 +1557,7 @@ fn ir_text_box_round_trip() {
 }
 
 #[test]
-fn ir_numbered_list_round_trip() {
+fn test_ir_numbered_list_round_trip() {
     use office_oxide::ir::*;
 
     let item = |text: &str| ListItem {
@@ -1561,6 +1581,7 @@ fn ir_numbered_list_round_trip() {
             })],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1578,7 +1599,7 @@ fn ir_numbered_list_round_trip() {
 }
 
 #[test]
-fn ir_multi_section_round_trip() {
+fn test_ir_multi_section_round_trip() {
     use office_oxide::ir::*;
 
     let make_section = |label: &str, break_type: SectionBreakType| Section {
@@ -1600,6 +1621,7 @@ fn ir_multi_section_round_trip() {
             make_section("Section B", SectionBreakType::NextPage),
             make_section("Section C", SectionBreakType::OddPage),
         ],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1620,7 +1642,7 @@ fn ir_multi_section_round_trip() {
 }
 
 #[test]
-fn convenience_functions_round_trip() {
+fn test_convenience_functions_round_trip() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
@@ -1642,6 +1664,7 @@ fn convenience_functions_round_trip() {
             ],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -1708,7 +1731,7 @@ fn nested_list_ir() -> office_oxide::ir::DocumentIR {
 /// `ListItem::nested` was consumed by the renderers but by no writer, so every
 /// item below level 0 vanished on write while the API reported success.
 #[test]
-fn nested_list_items_reach_every_format() {
+fn test_nested_list_items_reach_every_format() {
     use office_oxide::format::DocumentFormat;
 
     let ir = nested_list_ir();
@@ -1738,7 +1761,7 @@ fn nested_list_items_reach_every_format() {
 /// type the reader recorded, so "007" became 7, a currency cell became text,
 /// and a cell reading "inf" became an Excel error cell.
 #[test]
-fn xlsx_cells_keep_the_type_and_format_the_reader_recorded() {
+fn test_xlsx_cells_keep_the_type_and_format_the_reader_recorded() {
     use office_oxide::format::DocumentFormat;
     use office_oxide::ir::*;
 
@@ -1817,7 +1840,7 @@ fn xlsx_cells_keep_the_type_and_format_the_reader_recorded() {
 /// contents of a text box were discarded. PPTX wraps slide bodies in a text
 /// box, which made PPTX → XLSX near-total text loss.
 #[test]
-fn xlsx_conversion_keeps_list_and_text_box_content() {
+fn test_xlsx_conversion_keeps_list_and_text_box_content() {
     use office_oxide::format::DocumentFormat;
     use office_oxide::ir::*;
 
@@ -1870,7 +1893,7 @@ fn xlsx_conversion_keeps_list_and_text_box_content() {
 /// `TextSpan::hyperlink` was read and explicitly discarded, so the URL was not
 /// recoverable from the output at all.
 #[test]
-fn hyperlinks_survive_the_write_path() {
+fn test_hyperlinks_survive_the_write_path() {
     use office_oxide::format::DocumentFormat;
 
     let md = "See [the docs](https://example.com/a?b=1&c=2) for details.\n";
@@ -1905,7 +1928,7 @@ fn hyperlinks_survive_the_write_path() {
 /// DrawingML has no in-text newline: a dropped break joins the words on
 /// either side of it.
 #[test]
-fn pptx_line_breaks_are_emitted_as_br_elements() {
+fn test_pptx_line_breaks_are_emitted_as_br_elements() {
     use office_oxide::format::DocumentFormat;
     use office_oxide::ir::*;
 
@@ -1946,7 +1969,7 @@ fn pptx_line_breaks_are_emitted_as_br_elements() {
 /// Tab stops were accepted by the API and emitted nowhere, so a dot-leader
 /// table of contents lost both its leaders and its alignment.
 #[test]
-fn paragraph_tab_stops_are_emitted() {
+fn test_paragraph_tab_stops_are_emitted() {
     use office_oxide::format::DocumentFormat;
     use office_oxide::ir::*;
 
@@ -1986,7 +2009,7 @@ fn paragraph_tab_stops_are_emitted() {
 /// lists, so the fence language leaked into the text and every bullet
 /// flattened to level 0.
 #[test]
-fn markdown_produces_code_blocks_and_nested_lists() {
+fn test_markdown_produces_code_blocks_and_nested_lists() {
     use office_oxide::{DocumentIR, format::DocumentFormat, ir::Element};
 
     let md = "```rust\nlet x = 1;\n```\n\n- one\n  - one-a\n    - one-a-i\n- two\n";
@@ -2026,7 +2049,7 @@ fn markdown_produces_code_blocks_and_nested_lists() {
 /// A table flattened into tab-joined text loses the grid entirely, and every
 /// bullet emitted at level 0 loses the nesting the IR carries.
 #[test]
-fn pptx_writes_real_tables_and_nested_bullets() {
+fn test_pptx_writes_real_tables_and_nested_bullets() {
     use office_oxide::format::DocumentFormat;
 
     let md = "# Deck\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n- one\n  - one-a\n    - one-a-i\n";
@@ -2052,7 +2075,7 @@ fn pptx_writes_real_tables_and_nested_bullets() {
 /// Frame position, page background and the table caption were all IR fields
 /// with no writer behind them.
 #[test]
-fn frame_position_background_and_table_caption_are_emitted() {
+fn test_frame_position_background_and_table_caption_are_emitted() {
     use office_oxide::format::DocumentFormat;
     use office_oxide::ir::*;
 
@@ -2107,7 +2130,7 @@ fn frame_position_background_and_table_caption_are_emitted() {
 /// `xmlns:r` on that part's root it is not well-formed XML at all — found by
 /// converting a real document, not by any unit test.
 #[test]
-fn a_hyperlink_in_a_footnote_keeps_the_part_well_formed() {
+fn test_a_hyperlink_in_a_footnote_keeps_the_part_well_formed() {
     use office_oxide::docx::write::{DocxWriter, Run};
     use office_oxide::ir::*;
 
@@ -2123,6 +2146,7 @@ fn a_hyperlink_in_a_footnote_keeps_the_part_well_formed() {
             })],
             ..Default::default()
         })],
+        None,
     );
     let _ = Run::new("");
 
@@ -2157,7 +2181,7 @@ fn a_hyperlink_in_a_footnote_keeps_the_part_well_formed() {
 /// header root declared only `w:` and `r:`, so the part was not well-formed
 /// XML. Pre-existing in v0.1.10; found by converting real documents.
 #[test]
-fn a_drawing_in_a_header_keeps_the_part_well_formed() {
+fn test_a_drawing_in_a_header_keeps_the_part_well_formed() {
     use office_oxide::docx::write::{DocxWriter, HfType};
     use office_oxide::ir::*;
 
@@ -2208,7 +2232,7 @@ fn a_drawing_in_a_header_keeps_the_part_well_formed() {
 /// tblCellMar, tblCaption. A table carrying an alignment or a caption was
 /// invalid — 183 corpus conversions failed on this alone.
 #[test]
-fn table_properties_follow_the_schema_sequence() {
+fn test_table_properties_follow_the_schema_sequence() {
     use office_oxide::format::DocumentFormat;
     use office_oxide::ir::*;
 
@@ -2258,7 +2282,7 @@ fn table_properties_follow_the_schema_sequence() {
 /// content scan, so gating the drawing namespaces on that scan left
 /// `document.xml` using undeclared prefixes.
 #[test]
-fn a_drawing_nested_in_a_table_keeps_document_xml_well_formed() {
+fn test_a_drawing_nested_in_a_table_keeps_document_xml_well_formed() {
     use office_oxide::docx::write::DocxWriter;
     use office_oxide::ir::*;
 
@@ -2307,7 +2331,7 @@ fn a_drawing_nested_in_a_table_keeps_document_xml_well_formed() {
 /// part not well-formed, which no schema check reaches — the parse fails
 /// first.
 #[test]
-fn a_floating_image_anchor_has_no_duplicate_attributes() {
+fn test_a_floating_image_anchor_has_no_duplicate_attributes() {
     use office_oxide::docx::write::DocxWriter;
     use office_oxide::ir::*;
 
@@ -2366,7 +2390,7 @@ fn a_floating_image_anchor_has_no_duplicate_attributes() {
 /// textDirection, vAlign. A cell carrying borders plus shading plus padding
 /// was invalid; 53 corpus conversions failed on this alone.
 #[test]
-fn table_cell_properties_follow_the_schema_sequence() {
+fn test_table_cell_properties_follow_the_schema_sequence() {
     use office_oxide::format::DocumentFormat;
     use office_oxide::ir::*;
 

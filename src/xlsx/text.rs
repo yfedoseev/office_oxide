@@ -15,6 +15,13 @@ impl XlsxDocument {
                 }
             }
         }
+        // `to_markdown()` already surfaces chart text (axis titles, series
+        // names); `plain_text()` silently dropped it entirely.
+        for text in &self.chart_text {
+            if !text.trim().is_empty() {
+                parts.push(text.trim().to_string());
+            }
+        }
         parts.join("\n\n")
     }
 
@@ -171,7 +178,16 @@ impl XlsxDocument {
     /// Write a cell value directly to a buffer (avoids allocation for shared strings).
     pub fn write_cell_value(&self, cell: &Cell, buf: &mut String) {
         match &cell.value {
-            CellValue::Empty => {},
+            // A formula cell with no cached `<v>` (the default output shape
+            // of closedxml and similar writers) rendered as a blank cell
+            // indistinguishable from a genuinely empty one, and the formula
+            // text never reached any consumer at all.
+            CellValue::Empty => {
+                if let Some(f) = &cell.formula {
+                    buf.push('=');
+                    buf.push_str(f);
+                }
+            },
             CellValue::Number(n) => {
                 if date::is_date_cell(cell.style_index, self.styles.as_ref()) {
                     if let Some(dt) = date::DateTimeValue::from_serial(*n, self.workbook.date1904) {
@@ -228,10 +244,15 @@ impl XlsxDocument {
                 let Some(fmt_id) = styles.number_format_id_for(idx) else {
                     return false;
                 };
+                // An explicit <numFmt> wins over the built-in meaning of its
+                // id — [ECMA-376] §18.8.30 lets a workbook redefine ids
+                // 0-163. Same precedence as `date::is_date_cell`; testing the
+                // id first made `0.00000E+0` declared under id 50 render as a
+                // 1900 date.
+                if let Some(fmt_str) = styles.number_format_override_for(idx) {
+                    return date::is_date_format_string(fmt_str);
+                }
                 date::is_date_format_id(fmt_id)
-                    || styles
-                        .number_format_override_for(idx)
-                        .is_some_and(date::is_date_format_string)
             })
             .collect()
     }
@@ -245,7 +266,13 @@ impl XlsxDocument {
         date_indices: &std::collections::HashSet<u32>,
     ) {
         match &cell.value {
-            CellValue::Empty => {},
+            // See `write_cell_value`'s identical arm.
+            CellValue::Empty => {
+                if let Some(f) = &cell.formula {
+                    buf.push('=');
+                    buf.push_str(f);
+                }
+            },
             CellValue::Number(n) => {
                 let is_date = cell.style_index.is_some_and(|i| date_indices.contains(&i));
                 if is_date {
@@ -323,22 +350,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn csv_escape_plain() {
+    fn test_csv_escape_plain() {
         assert_eq!(csv_escape("hello"), "hello");
     }
 
     #[test]
-    fn csv_escape_with_comma() {
+    fn test_csv_escape_with_comma() {
         assert_eq!(csv_escape("a,b"), "\"a,b\"");
     }
 
     #[test]
-    fn csv_escape_with_quotes() {
+    fn test_csv_escape_with_quotes() {
         assert_eq!(csv_escape("say \"hi\""), "\"say \"\"hi\"\"\"");
     }
 
     #[test]
-    fn csv_escape_with_newline() {
+    fn test_csv_escape_with_newline() {
         assert_eq!(csv_escape("line1\nline2"), "\"line1\nline2\"");
     }
 
@@ -349,15 +376,88 @@ mod tests {
     }
 
     #[test]
-    fn format_number_integer() {
+    fn test_format_number_integer() {
         assert_eq!(fmt_num(42.0), "42");
         assert_eq!(fmt_num(0.0), "0");
         assert_eq!(fmt_num(-10.0), "-10");
     }
 
     #[test]
-    fn format_number_float() {
+    fn test_format_number_float() {
         assert_eq!(fmt_num(3.15), "3.15");
         assert_eq!(fmt_num(0.5), "0.5");
+    }
+
+    /// `date_style_indices` backs `to_ir()`'s cell renderer
+    /// and tested the built-in meaning of a `numFmtId` before the workbook's
+    /// own `<numFmt>` override of that id, so `0.00000E+0` declared under id
+    /// 50 was still treated as a date.
+    #[test]
+    fn test_date_style_indices_honours_numfmt_override_over_builtin_id() {
+        let styles = br#"<?xml version="1.0" encoding="UTF-8"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <numFmts count="2">
+    <numFmt numFmtId="50" formatCode="0.00000E+0"/>
+    <numFmt numFmtId="164" formatCode="yyyy-mm-dd"/>
+  </numFmts>
+  <cellXfs count="3">
+    <xf numFmtId="50" applyNumberFormat="1"/>
+    <xf numFmtId="164" applyNumberFormat="1"/>
+    <xf numFmtId="14" applyNumberFormat="1"/>
+  </cellXfs>
+</styleSheet>"#;
+        let ss = super::super::styles::StyleSheet::parse(styles).expect("styles parse");
+        let doc = XlsxDocument {
+            workbook: super::super::WorkbookInfo {
+                sheets: Vec::new(),
+                defined_names: Vec::new(),
+                date1904: false,
+            },
+            worksheets: Vec::new(),
+            shared_strings: super::super::SharedStringTable::empty(),
+            styles: Some(ss),
+            theme: None,
+            chart_text: Vec::new(),
+            embedded_fonts: Vec::new(),
+            core_properties: None,
+            app_properties: None,
+            has_macros: false,
+            styles_data: None,
+            theme_data: None,
+        };
+        let idx = doc.date_style_indices();
+        assert!(!idx.contains(&0), "id 50 overridden to a numeric code is not a date");
+        assert!(idx.contains(&1), "a custom yyyy-mm-dd code is a date");
+        assert!(idx.contains(&2), "an un-overridden built-in date id is a date");
+    }
+
+    /// `to_markdown()` already surfaced chart text; `plain_text()`
+    /// silently dropped it, so the CLI's default `text` output (and anything
+    /// built on `plain_text()`, like PDF export) lost every chart's words.
+    #[test]
+    fn test_plain_text_includes_chart_text() {
+        let doc = XlsxDocument {
+            workbook: super::super::WorkbookInfo {
+                sheets: Vec::new(),
+                defined_names: Vec::new(),
+                date1904: false,
+            },
+            worksheets: Vec::new(),
+            shared_strings: super::super::SharedStringTable::empty(),
+            styles: None,
+            theme: None,
+            chart_text: vec!["Title: Rotated Title".to_string()],
+            embedded_fonts: Vec::new(),
+            core_properties: None,
+            app_properties: None,
+            has_macros: false,
+            styles_data: None,
+            theme_data: None,
+        };
+        assert!(
+            doc.plain_text().contains("Rotated Title"),
+            "plain_text() must include chart text, same as to_markdown(): {:?}",
+            doc.plain_text()
+        );
     }
 }

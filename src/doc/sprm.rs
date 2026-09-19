@@ -25,7 +25,7 @@
 //! list/tab-stop PR, not here. The fixtures pass either way only because their
 //! `cb < 256`, so a ≥12-column table is what exposes the difference.
 
-use crate::ir::{TabAlignment, TabLeader, TabStop};
+use crate::ir::{ParagraphAlignment, TabAlignment, TabLeader, TabStop, UnderlineStyle};
 
 /// A single decoded SPRM: opcode plus its operand bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,15 +36,14 @@ pub struct Sprm {
     pub operand: Vec<u8>,
 }
 
+#[cfg(test)]
 impl Sprm {
     /// `spra` — operand-size class (bits 15..13 of the opcode).
-    #[allow(dead_code)] // diagnostic helper; used in tests
     pub fn spra(&self) -> u8 {
         ((self.opcode >> 13) & 0x7) as u8
     }
 
     /// `sgc` — property class (bits 12..10): `1` = PAP, `5` = TAP, …
-    #[allow(dead_code)] // diagnostic helper; used in tests
     pub fn sgc(&self) -> u8 {
         ((self.opcode >> 10) & 0x7) as u8
     }
@@ -184,9 +183,9 @@ pub fn parse_grpprl(grpprl: &[u8]) -> Vec<Sprm> {
 
 /// Paragraph-property flags distilled from a PAP grpprl.
 ///
-/// Only the SPRMs needed for table / list reconstruction are tracked; every
-/// other SPRM is walked over and discarded.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Table/list reconstruction fields plus
+/// alignment/indentation/spacing.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PapProps {
     /// `sprmPFInTable` (0x2416): this paragraph lives inside a table.
     pub f_in_table: bool,
@@ -222,6 +221,24 @@ pub struct PapProps {
     /// This is the evidence that a document has *real* heading structure,
     /// which is what gates the line-shape heading guess in `convert_doc`.
     pub outline_level: Option<u8>,
+    /// `sprmPJc` (0x2461) / legacy `sprmPJc80` (0x2403): paragraph
+    /// alignment. Values beyond the four/five `ParagraphAlignment`
+    /// variants (Arabic Kashida justification, Thai distribute, …) map to
+    /// the closest fit (`Justify`/`Distribute`) rather than being dropped.
+    pub alignment: Option<ParagraphAlignment>,
+    /// `sprmPDxaLeft` (0x845E) / legacy `sprmPDxaLeft80` (0x840F), in
+    /// twips.
+    pub indent_left_twips: Option<i32>,
+    /// `sprmPDxaRight` (0x845D) / legacy `sprmPDxaRight80` (0x840E), in
+    /// twips.
+    pub indent_right_twips: Option<i32>,
+    /// `sprmPDxaLeft1` (0x8460) / legacy `sprmPDxaLeft180` (0x8411), in
+    /// twips. Negative = hanging indent.
+    pub first_line_indent_twips: Option<i32>,
+    /// `sprmPDyaBefore` (0xA413), in twips.
+    pub space_before_twips: Option<u32>,
+    /// `sprmPDyaAfter` (0xA414), in twips.
+    pub space_after_twips: Option<u32>,
 }
 
 /// One table cell descriptor (TKBKTAP, 20 bytes) distilled from a row's
@@ -234,7 +251,6 @@ pub struct TapCellInfo {
     pub rgf: u16,
     /// Preferred cell width in twips (0 = derive from `rgdxaCenter`).
     /// Kept for completeness; spans are computed from `rgdxaCenter` alone.
-    #[allow(dead_code)]
     pub w_width: u16,
 }
 
@@ -390,7 +406,7 @@ fn tab_from_tbd(position_twips: i32, tbd: u8) -> TabStop {
 /// Generating both the `match` and [`PAP_SPRM_REGISTRY`] from the same
 /// invocation makes the check fail closed: an arm added without naming the
 /// property and its [MS-DOC] section does not compile, and one that names
-/// the wrong property fails `registry_matches_the_spec_table`.
+/// the wrong property fails `test_registry_matches_the_spec_table`.
 macro_rules! pap_sprm_dispatch {
     (
         $(
@@ -405,7 +421,7 @@ macro_rules! pap_sprm_dispatch {
         ///
         /// Consumed by the identity tests; the value of enumerating it is
         /// that the enumeration cannot drift from the dispatch.
-        #[allow(dead_code)]
+        #[cfg(test)]
         pub const PAP_SPRM_REGISTRY: &[(u16, &str, &str)] = &[
             $($(($opcode, $spec_name, $section),)+)*
         ];
@@ -489,6 +505,102 @@ pap_sprm_dispatch! {
     "sprmPChgTabsPapx" @ "2.6.2" => [0xC60D] (props, operand) {
         let _ = (props, operand);
     }
+
+    /// Unsigned 8-bit enum (1 byte, spra 0/1): paragraph justification.
+    /// `sprmPJc` (modern, values 0-9) and `sprmPJc80` (legacy, values
+    /// 0-5) share the same 0-3 meanings (left/center/right/justify);
+    /// `sprmPJc`'s extended values beyond 3 are folded into the closest
+    /// fit rather than dropped.
+    "sprmPJc" @ "2.6.2" => [0x2461] (props, operand) {
+        if let Some(&jc) = operand.first() {
+            props.alignment = match jc {
+                0 => Some(ParagraphAlignment::Left),
+                1 => Some(ParagraphAlignment::Center),
+                2 => Some(ParagraphAlignment::Right),
+                4 => Some(ParagraphAlignment::Distribute),
+                _ => Some(ParagraphAlignment::Justify),
+            };
+        }
+    }
+
+    /// See `sprmPJc`.
+    "sprmPJc80" @ "2.6.2" => [0x2403] (props, operand) {
+        if let Some(&jc) = operand.first() {
+            props.alignment = match jc {
+                0 => Some(ParagraphAlignment::Left),
+                1 => Some(ParagraphAlignment::Center),
+                2 => Some(ParagraphAlignment::Right),
+                _ => Some(ParagraphAlignment::Justify),
+            };
+        }
+    }
+
+    /// XAS (signed 16-bit, twips, spra 4): logical left indent.
+    "sprmPDxaLeft" @ "2.6.2" => [0x845E] (props, operand) {
+        if operand.len() >= 2 {
+            props.indent_left_twips = Some(i32::from(i16::from_le_bytes([operand[0], operand[1]])));
+        }
+    }
+
+    /// See `sprmPDxaLeft` (legacy form, same unit and meaning).
+    "sprmPDxaLeft80" @ "2.6.2" => [0x840F] (props, operand) {
+        if operand.len() >= 2 {
+            props.indent_left_twips = Some(i32::from(i16::from_le_bytes([operand[0], operand[1]])));
+        }
+    }
+
+    /// XAS (signed 16-bit, twips, spra 4): logical right indent.
+    "sprmPDxaRight" @ "2.6.2" => [0x845D] (props, operand) {
+        if operand.len() >= 2 {
+            props.indent_right_twips = Some(i32::from(i16::from_le_bytes([operand[0], operand[1]])));
+        }
+    }
+
+    /// See `sprmPDxaRight` (legacy form, same unit and meaning).
+    "sprmPDxaRight80" @ "2.6.2" => [0x840E] (props, operand) {
+        if operand.len() >= 2 {
+            props.indent_right_twips = Some(i32::from(i16::from_le_bytes([operand[0], operand[1]])));
+        }
+    }
+
+    /// XAS (signed 16-bit, twips, spra 4): first-line indent relative to
+    /// the rest of the paragraph. Negative = hanging indent.
+    "sprmPDxaLeft1" @ "2.6.2" => [0x8460] (props, operand) {
+        if operand.len() >= 2 {
+            props.first_line_indent_twips =
+                Some(i32::from(i16::from_le_bytes([operand[0], operand[1]])));
+        }
+    }
+
+    /// See `sprmPDxaLeft1` (legacy form, same unit and meaning).
+    "sprmPDxaLeft180" @ "2.6.2" => [0x8411] (props, operand) {
+        if operand.len() >= 2 {
+            props.first_line_indent_twips =
+                Some(i32::from(i16::from_le_bytes([operand[0], operand[1]])));
+        }
+    }
+
+    /// Unsigned 16-bit integer (spra 5), twips: spacing before the
+    /// paragraph. Per [MS-DOC] the value MUST be 0x0000-0x7BC0; an
+    /// out-of-range operand is ignored.
+    "sprmPDyaBefore" @ "2.6.2" => [0xA413] (props, operand) {
+        if operand.len() >= 2 {
+            let v = u16::from_le_bytes([operand[0], operand[1]]);
+            if v <= 0x7BC0 {
+                props.space_before_twips = Some(u32::from(v));
+            }
+        }
+    }
+
+    /// See `sprmPDyaBefore`.
+    "sprmPDyaAfter" @ "2.6.2" => [0xA414] (props, operand) {
+        if operand.len() >= 2 {
+            let v = u16::from_le_bytes([operand[0], operand[1]]);
+            if v <= 0x7BC0 {
+                props.space_after_twips = Some(u32::from(v));
+            }
+        }
+    }
 }
 
 /// Decode a PAP `grpprl` into the paragraph flags we care about.
@@ -510,6 +622,166 @@ pub fn extract_pap_props(grpprl: &[u8]) -> PapProps {
         dispatch_pap_sprm(&mut props, sprm.opcode, &sprm.operand);
     }
 
+    props
+}
+
+/// Character-property flags distilled from a CHP grpprl (`sgc` == 2).
+///
+/// Revision-mark flags and
+/// bold/italic/underline/color/font-size. Font *name* (`sprmCRgFtc0` — an
+/// index into the `SttbfFfn` font table) is deliberately not attempted
+/// here: resolving it needs a whole separate STTB+FFN parser that nothing
+/// in `src/doc/` touches yet, unlike font *size* (`sprmCHps`), which is a
+/// self-contained 2-byte operand.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChpProps {
+    /// `sprmCFRMarkDel` (0x0800): the run is formatted as deleted
+    /// revision-mark text. The "accepted" view (what `plain_text()` and
+    /// the IR both show) excludes it, mirroring the policy already
+    /// applied to DOCX's `w:del`.
+    pub f_rmark_del: bool,
+    /// `sprmCFRMarkIns` (0x0801): the run is formatted as inserted
+    /// revision-mark text. Inserted text is part of the accepted view
+    /// (kept, not filtered); tracked here only so the registry enumerates
+    /// every CHP opcode this crate recognizes, not just the ones that
+    /// currently change extraction behavior.
+    pub f_rmark_ins: bool,
+    /// `sprmCFBold` (0x0835).
+    pub bold: bool,
+    /// `sprmCFItalic` (0x0836).
+    pub italic: bool,
+    /// `sprmCKul` (0x2A3E): underline style. `None` (Kul value `0`, no
+    /// underline) is the default, not `Some(UnderlineStyle::None)` —
+    /// there's no source signal that distinguishes "never set" from an
+    /// explicit "turned off", so the simpler of the two is used.
+    pub underline: Option<UnderlineStyle>,
+    /// `sprmCCv` (0x6870): true RGB text color. `None` when the color is
+    /// `cvAuto` (`fAuto` byte set) or the SPRM is absent.
+    pub color: Option<[u8; 3]>,
+    /// `sprmCHps` (0x4A43): font size in half-points.
+    pub font_size_half_pt: Option<u32>,
+}
+
+/// Declare the character SPRM dispatch and its identity registry from one
+/// source, mirroring [`pap_sprm_dispatch`] for `sgc == 2` (CHP) opcodes.
+macro_rules! chp_sprm_dispatch {
+    (
+        $(
+            $(#[$meta:meta])*
+            $spec_name:literal @ $section:literal => [$($opcode:literal),+ $(,)?]
+                ($props:ident, $operand:ident) $body:block
+        )*
+    ) => {
+        /// Every character SPRM this crate decodes: `(opcode, spec name,
+        /// [MS-DOC] section)`. Derived from the dispatch below, never
+        /// maintained alongside it.
+        #[cfg(test)]
+        pub const CHP_SPRM_REGISTRY: &[(u16, &str, &str)] = &[
+            $($(($opcode, $spec_name, $section),)+)*
+        ];
+
+        fn dispatch_chp_sprm(props: &mut ChpProps, opcode: u16, operand: &[u8]) {
+            match opcode {
+                $(
+                    $($opcode)|+ => {
+                        let $props = props;
+                        let $operand = operand;
+                        $body
+                    },
+                )*
+                _ => {},
+            }
+        }
+    };
+}
+
+chp_sprm_dispatch! {
+    /// ToggleOperand (1 byte, spra 0): non-zero means deleted revision-mark
+    /// text.
+    "sprmCFRMarkDel" @ "2.6.1" => [0x0800] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.f_rmark_del = b != 0;
+        }
+    }
+
+    /// ToggleOperand (1 byte, spra 0): non-zero means inserted
+    /// revision-mark text.
+    "sprmCFRMarkIns" @ "2.6.1" => [0x0801] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.f_rmark_ins = b != 0;
+        }
+    }
+
+    /// ToggleOperand (1 byte, spra 0): whether the text is bold.
+    "sprmCFBold" @ "2.6.1" => [0x0835] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.bold = b != 0;
+        }
+    }
+
+    /// ToggleOperand (1 byte, spra 0): whether the text is italicized.
+    "sprmCFItalic" @ "2.6.1" => [0x0836] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.italic = b != 0;
+        }
+    }
+
+    /// Kul value (1 byte, spra 1): underlining style. `0` = none (leaves
+    /// `underline` at its default `None`); other values map to the
+    /// closest `UnderlineStyle` variant, with any value this crate does
+    /// not otherwise recognize (e.g. `Hidden`, or a reserved value)
+    /// falling back to `Single` rather than being silently dropped —
+    /// some underline is a closer approximation of the source than none.
+    "sprmCKul" @ "2.6.1" => [0x2A3E] (props, operand) {
+        if let Some(&kul) = operand.first() {
+            props.underline = match kul {
+                0x00 => None,
+                0x03 => Some(UnderlineStyle::Double),
+                0x04 => Some(UnderlineStyle::Dotted),
+                0x06 => Some(UnderlineStyle::Thick),
+                0x07 => Some(UnderlineStyle::Dash),
+                0x09 => Some(UnderlineStyle::DotDash),
+                0x0A => Some(UnderlineStyle::DotDotDash),
+                0x0B => Some(UnderlineStyle::Wave),
+                0x02 => Some(UnderlineStyle::Words),
+                _ => Some(UnderlineStyle::Single),
+            };
+        }
+    }
+
+    /// COLORREF (4 bytes, spra 3): `[red, green, blue, fAuto]`. `fAuto !=
+    /// 0` means "use the automatic/default color" — treated as "no
+    /// override", not black.
+    "sprmCCv" @ "2.6.1" => [0x6870] (props, operand) {
+        if operand.len() >= 4 {
+            props.color =
+                if operand[3] != 0 { None } else { Some([operand[0], operand[1], operand[2]]) };
+        }
+    }
+
+    /// Unsigned 2-byte integer (spra 2), half-points. Per [MS-DOC], the
+    /// value MUST be between 2 and 3276; an out-of-range operand is
+    /// ignored rather than stored, since it cannot be a real font size.
+    "sprmCHps" @ "2.6.1" => [0x4A43] (props, operand) {
+        if operand.len() >= 2 {
+            let hps = u16::from_le_bytes([operand[0], operand[1]]);
+            if (2..=3276).contains(&hps) {
+                props.font_size_half_pt = Some(u32::from(hps));
+            }
+        }
+    }
+}
+
+/// Decode a CHP `grpprl` into the character flags we care about.
+///
+/// Unknown SPRMs are ignored. An empty `grpprl` yields the default
+/// (all-false) `ChpProps`, which classifies the run as ordinary,
+/// non-revision-marked text.
+pub fn extract_chp_props(grpprl: &[u8]) -> ChpProps {
+    let mut props = ChpProps::default();
+    for sprm in parse_grpprl(grpprl) {
+        dispatch_chp_sprm(&mut props, sprm.opcode, &sprm.operand);
+    }
     props
 }
 
@@ -539,12 +811,22 @@ mod tests {
         (0xC60D, "sprmPChgTabsPapx"),
         (0xC615, "sprmPChgTabs"),
         (0xD608, "sprmTDefTable"),
+        (0x2461, "sprmPJc"),
+        (0x2403, "sprmPJc80"),
+        (0x845E, "sprmPDxaLeft"),
+        (0x840F, "sprmPDxaLeft80"),
+        (0x845D, "sprmPDxaRight"),
+        (0x840E, "sprmPDxaRight80"),
+        (0x8460, "sprmPDxaLeft1"),
+        (0x8411, "sprmPDxaLeft180"),
+        (0xA413, "sprmPDyaBefore"),
+        (0xA414, "sprmPDyaAfter"),
     ];
 
     /// Every opcode the dispatch claims must name the property [MS-DOC]
     /// gives it, and must cite a section.
     #[test]
-    fn registry_matches_the_spec_table() {
+    fn test_registry_matches_the_spec_table() {
         for &(opcode, name, section) in PAP_SPRM_REGISTRY {
             let expected = MS_DOC_SPRM_TABLE
                 .iter()
@@ -565,7 +847,7 @@ mod tests {
     /// No opcode may be dispatched twice — two arms claiming the same
     /// constant means one of them never runs.
     #[test]
-    fn registry_has_no_duplicate_opcodes() {
+    fn test_registry_has_no_duplicate_opcodes() {
         let mut seen: Vec<u16> = PAP_SPRM_REGISTRY.iter().map(|(o, _, _)| *o).collect();
         seen.sort_unstable();
         let before = seen.len();
@@ -578,7 +860,7 @@ mod tests {
     /// occurs 758 times in a 246-file corpus; reading it as an outline
     /// level marked most of those paragraphs as headings.
     #[test]
-    fn known_confusable_opcodes_are_not_claimed() {
+    fn test_known_confusable_opcodes_are_not_claimed() {
         for confusable in [0x6412u16, 0x640A] {
             assert!(
                 !PAP_SPRM_REGISTRY.iter().any(|(o, _, _)| *o == confusable),
@@ -590,7 +872,7 @@ mod tests {
     /// The registry must actually be reachable from the decoder, so a
     /// registry that drifts away from the dispatch cannot pass silently.
     #[test]
-    fn every_registered_opcode_changes_the_decoded_props() {
+    fn test_every_registered_opcode_changes_the_decoded_props() {
         // A one-byte operand is enough for the flag/level SPRMs; the
         // multi-byte ones get four bytes.
         for &(opcode, name, _) in PAP_SPRM_REGISTRY {
@@ -631,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn walks_fixed_and_variable_sprms() {
+    fn test_walks_fixed_and_variable_sprms() {
         let sprms = parse_grpprl(&cell_grpprl());
         assert_eq!(sprms.len(), 2);
         assert_eq!(sprms[0].opcode, 0x2416);
@@ -641,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn row_mark_walk_consumes_every_byte() {
+    fn test_row_mark_walk_consumes_every_byte() {
         let grpprl = row_mark_grpprl();
         let sprms = parse_grpprl(&grpprl);
         // No byte left behind: re-encoding the walked SPRMs — re-inserting the
@@ -675,7 +957,7 @@ mod tests {
     /// `cb = 4 + 22·itcMac = 268` (>= 256). The walker must read the 2-byte
     /// `cb`, decode the full TAP, and still reach the trailing SPRM.
     #[test]
-    fn d608_two_byte_cb_decodes_wide_tables() {
+    fn test_d608_two_byte_cb_decodes_wide_tables() {
         let itc: usize = 12;
         let mut tap = vec![itc as u8]; // itcMac
         for _ in 0..=itc {
@@ -711,7 +993,7 @@ mod tests {
     }
 
     #[test]
-    fn extracts_cell_props() {
+    fn test_extracts_cell_props() {
         let props = extract_pap_props(&cell_grpprl());
         assert!(props.f_in_table);
         assert!(!props.is_table_trailing_mark);
@@ -719,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn extracts_row_mark_props() {
+    fn test_extracts_row_mark_props() {
         let props = extract_pap_props(&row_mark_grpprl());
         assert!(props.f_in_table);
         assert!(props.is_table_trailing_mark);
@@ -727,8 +1009,54 @@ mod tests {
         assert!(props.tap.is_some(), "0xD608 operand must parse into a TapInfo");
     }
 
+    /// Regression: alignment/indentation/spacing SPRMs decode
+    /// to their real values, not the always-`None`/`0` they were before.
     #[test]
-    fn empty_grpprl_is_ordinary_prose() {
+    fn test_extract_pap_props_alignment_indent_and_spacing() {
+        // sprmPJc(0x2461) = 1 (center)
+        let props = extract_pap_props(&[0x61, 0x24, 0x01]);
+        assert_eq!(props.alignment, Some(ParagraphAlignment::Center));
+
+        // sprmPJc80(0x2403) = 2 (right) — legacy opcode, same meaning.
+        let props = extract_pap_props(&[0x03, 0x24, 0x02]);
+        assert_eq!(props.alignment, Some(ParagraphAlignment::Right));
+
+        // sprmPJc(0x2461) = 3 (both/justify)
+        let props = extract_pap_props(&[0x61, 0x24, 0x03]);
+        assert_eq!(props.alignment, Some(ParagraphAlignment::Justify));
+
+        // sprmPDxaLeft(0x845E) = 720 twips (0.5in), sprmPDxaLeft1(0x8460) =
+        // -360 (hanging indent), sprmPDxaRight(0x845D) = 0.
+        let mut grpprl = Vec::new();
+        grpprl.extend_from_slice(&[0x5E, 0x84]);
+        grpprl.extend_from_slice(&720i16.to_le_bytes());
+        grpprl.extend_from_slice(&[0x60, 0x84]);
+        grpprl.extend_from_slice(&(-360i16).to_le_bytes());
+        grpprl.extend_from_slice(&[0x5D, 0x84]);
+        grpprl.extend_from_slice(&0i16.to_le_bytes());
+        let props = extract_pap_props(&grpprl);
+        assert_eq!(props.indent_left_twips, Some(720));
+        assert_eq!(props.first_line_indent_twips, Some(-360));
+        assert_eq!(props.indent_right_twips, Some(0));
+
+        // sprmPDyaBefore(0xA413) = 200, sprmPDyaAfter(0xA414) = 100 twips.
+        let mut grpprl = Vec::new();
+        grpprl.extend_from_slice(&[0x13, 0xA4]);
+        grpprl.extend_from_slice(&200u16.to_le_bytes());
+        grpprl.extend_from_slice(&[0x14, 0xA4]);
+        grpprl.extend_from_slice(&100u16.to_le_bytes());
+        let props = extract_pap_props(&grpprl);
+        assert_eq!(props.space_before_twips, Some(200));
+        assert_eq!(props.space_after_twips, Some(100));
+
+        // Out-of-range spacing (> 0x7BC0) is ignored, not stored.
+        let mut grpprl = vec![0x13, 0xA4];
+        grpprl.extend_from_slice(&0x7BC1u16.to_le_bytes());
+        assert_eq!(extract_pap_props(&grpprl).space_before_twips, None);
+    }
+
+    #[test]
+    fn test_empty_grpprl_is_ordinary_prose() {
         let props = extract_pap_props(&[]);
         assert!(!props.f_in_table);
         assert!(!props.is_table_trailing_mark);
@@ -739,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_pchg_tabs_new_stops() {
+    fn test_decodes_pchg_tabs_new_stops() {
         // PChgTabsOperand (0xC615): PchgTabsDelClose (cDel=0) then PchgTabsAdd
         // (cAdd=2). Positions are 2-byte XAS (signed twips); each TBD is 1
         // byte with `jc` in bits 0..2. new[0]: jc=2 (Right), pos=2000;
@@ -760,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn pchg_tabs_malformed_operand_is_empty() {
+    fn test_pchg_tabs_malformed_operand_is_empty() {
         // Truncated operand: cDel=2 but no rgdxaDel/rgdxaClose bytes, so the
         // Add list is unreachable — must degrade to empty, not panic.
         assert!(decode_pchg_tabs(0xC615, &[0x02]).is_empty());
@@ -776,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_tdef_table_boundaries() {
+    fn test_parses_tdef_table_boundaries() {
         // 0xD608 operand bytes captured from a real Word document (the source
         // .doc is not distributed in this repo): itcMac=2, boundaries
         // [0, 6872, 9302]. (The 2-byte `cb` prefix is stripped by parse_grpprl,
@@ -793,7 +1121,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_tdef_table_vertical_merge_flags() {
+    fn test_parses_tdef_table_vertical_merge_flags() {
         // 0xD608 operand bytes captured from a real Word document (source .doc
         // not distributed): itcMac=4; the first cell descriptor carries
         // fVertMerge | fVertRestart (0x0060). (cb prefix stripped — operand
@@ -810,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_truncated_tdef_table() {
+    fn test_rejects_truncated_tdef_table() {
         assert!(parse_tdef_table(&[]).is_none());
         // itcMac=4 but only 2 further bytes — needs far more for rgdxaCenter
         // + rgtc, so it must fail.
@@ -826,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    fn spra_and_sgc_fields() {
+    fn test_spra_and_sgc_fields() {
         let cell = Sprm {
             opcode: 0x2416,
             operand: vec![1],
@@ -844,7 +1172,7 @@ mod tests {
 
     // --------------------------------------------------------------------
     // Regression tests for the opcode-identity defects in `extract_pap_props`
-    // (PR #116 blind review). Every fixture uses the opcode *as Word writes it
+    // (from a blind review). Every fixture uses the opcode *as Word writes it
     // per [MS-DOC]*, not the project's own constants, so the tests fail while
     // the decoder mislabels opcodes and turn green once dispatch is corrected.
     // --------------------------------------------------------------------
@@ -852,7 +1180,7 @@ mod tests {
     /// `0x460B` is `sprmPIlfo` (2-byte operand). The decoder must populate
     /// `ilfo`. Today it is dispatched as `sprmPIlvl`, so `ilfo` stays `None`.
     #[test]
-    fn sprm_pilfo_opcode_460b_populates_ilfo() {
+    fn test_sprm_pilfo_opcode_460b_populates_ilfo() {
         // sprmPIlfo (0x460B), operand = 0x0005 (ilfo index 5).
         let grpprl = [0x0B, 0x46, 0x05, 0x00];
         let props = extract_pap_props(&grpprl);
@@ -863,7 +1191,7 @@ mod tests {
     /// `0x260A` is `sprmPIlvl` (1-byte operand). The decoder must populate
     /// `ilvl`. Today it is never read (falls through to `_`).
     #[test]
-    fn sprm_pilvl_opcode_260a_populates_ilvl() {
+    fn test_sprm_pilvl_opcode_260a_populates_ilvl() {
         // sprmPIlvl (0x260A), operand = 0x01 (level 1).
         let grpprl = [0x0A, 0x26, 0x01];
         let props = extract_pap_props(&grpprl);
@@ -872,7 +1200,7 @@ mod tests {
 
     /// `0xC615` is `sprmPChgTabs`. The decoder must populate tab stops from it.
     #[test]
-    fn sprm_pchg_tabs_opcode_c615_populates_tabs() {
+    fn test_sprm_pchg_tabs_opcode_c615_populates_tabs() {
         // Per [MS-DOC] §2.9.182 the operand is a `PChgTabsOperand`:
         // `PchgTabsDelClose` (cDel, then 4 bytes per delete) followed by
         // `PchgTabsAdd` (cAdd, then 2-byte positions + 1-byte TBD per add).
@@ -912,7 +1240,7 @@ mod tests {
     /// "255-byte operand" read would overrun and desync the rest of the grpprl;
     /// the byte-level round trip must reproduce the input exactly.
     #[test]
-    fn sprm_pchg_tabs_c615_cb_255_escape_round_trips() {
+    fn test_sprm_pchg_tabs_c615_cb_255_escape_round_trips() {
         // cDel = 1 (delete block = 1 + 4*1 = 5 bytes), cAdd = 2 (add block =
         // 1 + 2*2 + 2 = 7 bytes). Total body = 12 bytes.
         let body: Vec<u8> = vec![
@@ -951,7 +1279,7 @@ mod tests {
     /// rgdxaDel=[16]}` + `PChgTabsAdd{cTabs=1, pos=2000, TBD jc=2}`, followed by
     /// a `sprmPFInTable` so we can prove the walker does NOT swallow it.
     #[test]
-    fn sprm_pchg_tabs_papx_c60d_populates_tabs() {
+    fn test_sprm_pchg_tabs_papx_c60d_populates_tabs() {
         // PchgTabsDel: cTabs=1, rgdxaDel=[16] (2-byte XAS) -> 3 bytes.
         // PchgTabsAdd: cTabs=1, rgdxaAdd=[2000], rgtbdAdd=[jc=2] -> 4 bytes.
         // Body = 7 bytes, so the 1-byte cb prefix is 7.
@@ -981,7 +1309,7 @@ mod tests {
     /// as tab stops. Today it is dispatched as `sprmPChgTabs`, so `tabs` is
     /// populated — the inverse of the correct behaviour.
     #[test]
-    fn sprm_tcell_padding_opcode_d632_does_not_populate_tabs() {
+    fn test_sprm_tcell_padding_opcode_d632_does_not_populate_tabs() {
         // PChgTabsOperand-style bytes tagged with the TCellPadding opcode
         // (0xD632): 1-byte length prefix = 8, then cDel=0, cAdd=2, two
         // positions, two TBDs.
@@ -999,7 +1327,7 @@ mod tests {
     /// (AGENTS.md rule 6). A grpprl holding only the opcode (no cb byte) and one
     /// holding the cb but no body are both malformed inputs.
     #[test]
-    fn sprm_pchg_tabs_c615_truncated_cb_is_empty() {
+    fn test_sprm_pchg_tabs_c615_truncated_cb_is_empty() {
         // Opcode only, no cb byte: the 1-byte cb read is out of bounds -> stop.
         let sprms = parse_grpprl(&[0x15, 0xC6]);
         assert!(sprms.is_empty(), "truncated 0xC615 (no cb) must yield no SPRM, not panic");
@@ -1018,7 +1346,7 @@ mod tests {
     /// misreading caused: a one-byte shift would desync the rest of the grpprl
     /// and either drop or mis-parse the trailing SPRM.
     #[test]
-    fn sprm_pchg_tabs_c615_255_escape_followed_by_sprm() {
+    fn test_sprm_pchg_tabs_c615_255_escape_followed_by_sprm() {
         // cDel=1, cAdd=2 (12-byte body), then a trailing sprmPFInTable
         // (0x2416, 1-byte operand 0x01).
         let body: Vec<u8> = vec![
@@ -1046,7 +1374,7 @@ mod tests {
     /// `break` for each special variable encoding: 0xD608 (2-byte cb), 0xC615
     /// (1-byte cb), and 0xC60D (1-byte cb).
     #[test]
-    fn parse_grpprl_truncated_variable_sprm_prefixes() {
+    fn test_parse_grpprl_truncated_variable_sprm_prefixes() {
         assert!(
             parse_grpprl(&[0x08, 0xD6]).is_empty(),
             "0xD608 with no 2-byte cb must stop, not panic"
@@ -1064,7 +1392,7 @@ mod tests {
     /// `pchg_tabs_operand_len` must bound itself against a short buffer instead
     /// of indexing out of range (AGENTS.md rule 6).
     #[test]
-    fn pchg_tabs_operand_len_truncated() {
+    fn test_pchg_tabs_operand_len_truncated() {
         // start beyond the buffer -> 0.
         assert_eq!(pchg_tabs_operand_len(&[], 0), 0);
         // cDel present but its rgdxa/rgdxaClose block runs past the end -> the
@@ -1077,7 +1405,7 @@ mod tests {
     /// misroutes `0x460B` (as `ilvl`) and `0xD632` (as tabs) and never reads
     /// `0x260A` / `0xC615`.
     #[test]
-    fn opcode_conformance_gate() {
+    fn test_opcode_conformance_gate() {
         // 0x460B = sprmPIlfo -> ilfo
         assert_eq!(
             extract_pap_props(&[0x0B, 0x46, 0x03, 0x00]).ilfo,
@@ -1093,5 +1421,140 @@ mod tests {
                 .is_empty(),
             "0xD632 = sprmTCellPadding"
         );
+    }
+
+    /// [MS-DOC] transcription for the CHP registry, mirroring
+    /// `MS_DOC_SPRM_TABLE` above.
+    const MS_DOC_CHP_SPRM_TABLE: &[(u16, &str)] = &[
+        (0x0800, "sprmCFRMarkDel"),
+        (0x0801, "sprmCFRMarkIns"),
+        (0x0835, "sprmCFBold"),
+        (0x0836, "sprmCFItalic"),
+        (0x2A3E, "sprmCKul"),
+        (0x6870, "sprmCCv"),
+        (0x4A43, "sprmCHps"),
+    ];
+
+    #[test]
+    fn test_chp_registry_matches_the_spec_table() {
+        for &(opcode, name, section) in CHP_SPRM_REGISTRY {
+            let expected = MS_DOC_CHP_SPRM_TABLE
+                .iter()
+                .find(|(o, _)| *o == opcode)
+                .map(|(_, n)| *n);
+            assert_eq!(
+                expected,
+                Some(name),
+                "opcode 0x{opcode:04X} is decoded as {name}, but [MS-DOC] calls it {expected:?}"
+            );
+            assert!(
+                section.starts_with("2.6"),
+                "0x{opcode:04X} ({name}) must cite its [MS-DOC] §2.6.x section, got {section:?}"
+            );
+        }
+    }
+
+    /// Mirrors `test_every_registered_opcode_changes_the_decoded_props`, but for
+    /// the CHP registry. `sprmCHps` needs its own payload since a generic
+    /// `[1, 0, 0, 0]` operand (font size `1` half-point) falls outside its
+    /// valid `2..=3276` range and would be silently ignored, not stored.
+    #[test]
+    fn test_every_registered_chp_opcode_changes_the_decoded_props() {
+        for &(opcode, name, _) in CHP_SPRM_REGISTRY {
+            let mut grpprl = opcode.to_le_bytes().to_vec();
+            if opcode == 0x4A43 {
+                grpprl.extend_from_slice(&[48u8, 0]); // 24pt, in range
+            } else {
+                grpprl.extend_from_slice(&[1u8, 0, 0, 0]);
+            }
+            let props = extract_chp_props(&grpprl);
+            assert_ne!(
+                format!("{props:?}"),
+                format!("{:?}", ChpProps::default()),
+                "0x{opcode:04X} ({name}) is registered but decoding it changes nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn test_chp_registry_has_no_duplicate_opcodes() {
+        let mut seen: Vec<u16> = CHP_SPRM_REGISTRY.iter().map(|(o, _, _)| *o).collect();
+        seen.sort_unstable();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(before, seen.len(), "duplicate opcode in the CHP dispatch");
+    }
+
+    #[test]
+    fn test_extract_chp_props_marks_deleted_and_inserted_runs() {
+        // sprmCFRMarkDel = 1
+        let props = extract_chp_props(&[0x00, 0x08, 0x01]);
+        assert!(props.f_rmark_del);
+        assert!(!props.f_rmark_ins);
+
+        // sprmCFRMarkIns = 1
+        let props = extract_chp_props(&[0x01, 0x08, 0x01]);
+        assert!(!props.f_rmark_del);
+        assert!(props.f_rmark_ins);
+
+        // A zero operand toggles the flag off, not on.
+        let props = extract_chp_props(&[0x00, 0x08, 0x00]);
+        assert!(!props.f_rmark_del);
+    }
+
+    #[test]
+    fn test_extract_chp_props_empty_grpprl_is_default() {
+        assert_eq!(extract_chp_props(&[]), ChpProps::default());
+    }
+
+    #[test]
+    fn test_extract_chp_props_bold_and_italic() {
+        let props = extract_chp_props(&[0x35, 0x08, 0x01, 0x36, 0x08, 0x01]);
+        assert!(props.bold);
+        assert!(props.italic);
+
+        // Zero operand toggles off, not on.
+        let props = extract_chp_props(&[0x35, 0x08, 0x00]);
+        assert!(!props.bold);
+    }
+
+    #[test]
+    fn test_extract_chp_props_underline_maps_kul_values() {
+        assert_eq!(extract_chp_props(&[0x3E, 0x2A, 0x00]).underline, None);
+        assert_eq!(extract_chp_props(&[0x3E, 0x2A, 0x01]).underline, Some(UnderlineStyle::Single));
+        assert_eq!(extract_chp_props(&[0x3E, 0x2A, 0x03]).underline, Some(UnderlineStyle::Double));
+        assert_eq!(extract_chp_props(&[0x3E, 0x2A, 0x0B]).underline, Some(UnderlineStyle::Wave));
+        // An unrecognized/reserved value still yields "some underline",
+        // not silence.
+        assert_eq!(extract_chp_props(&[0x3E, 0x2A, 0x63]).underline, Some(UnderlineStyle::Single));
+    }
+
+    #[test]
+    fn test_extract_chp_props_color_ignores_auto() {
+        // fAuto = 0: real RGB color.
+        let props = extract_chp_props(&[0x70, 0x68, 0xFF, 0x99, 0x00, 0x00]);
+        assert_eq!(props.color, Some([0xFF, 0x99, 0x00]));
+
+        // fAuto = 1: "use the automatic color" — no override.
+        let props = extract_chp_props(&[0x70, 0x68, 0xFF, 0x99, 0x00, 0x01]);
+        assert_eq!(props.color, None);
+    }
+
+    #[test]
+    fn test_extract_chp_props_font_size_rejects_out_of_range() {
+        // 24pt = 48 half-points.
+        let props = extract_chp_props(&[0x43, 0x4A, 48, 0]);
+        assert_eq!(props.font_size_half_pt, Some(48));
+
+        // 0 is below the spec's minimum of 2 — ignored, not stored.
+        let props = extract_chp_props(&[0x43, 0x4A, 0, 0]);
+        assert_eq!(props.font_size_half_pt, None);
+    }
+
+    #[test]
+    fn test_extract_chp_props_ignores_unknown_opcodes() {
+        // 0x2416 = sprmPFInTable — a PAP opcode, must not affect CHP props.
+        let props = extract_chp_props(&[0x16, 0x24, 0x01]);
+        assert_eq!(props, ChpProps::default());
     }
 }

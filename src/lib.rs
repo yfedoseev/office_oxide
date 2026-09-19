@@ -4,9 +4,11 @@
 //!
 //! The fastest Office document processing library for Rust.
 //!
-//! Reads, writes, and edits **DOCX, XLSX, PPTX, DOC, XLS, PPT** — all six
-//! Microsoft Office formats — with a single unified API and zero C/C++
-//! dependencies.
+//! Reads all six Microsoft Office formats — **DOCX, XLSX, PPTX, DOC, XLS,
+//! PPT** — through a single unified API, with zero C/C++ dependencies.
+//! Writing and editing cover **DOCX, XLSX and PPTX**; the legacy binary
+//! formats (DOC, XLS, PPT) are read-only, and convertible to OOXML via
+//! [`Document::save_as`].
 //!
 //! ## Quick start
 //!
@@ -112,17 +114,81 @@ fn needs_stack_thread() -> bool {
     !cfg!(target_arch = "wasm32")
 }
 
+/// Number of parse threads that may be in flight at once.
+///
+/// Each parse thread reserves `PARSE_STACK_SIZE` (16 MB) of address space, so
+/// an unbounded fan-out of simultaneous parses could exhaust the process's
+/// thread or address-space limits. Scale with the machine but stay inside a
+/// fixed ceiling, because the point is to have *some* bound.
+fn max_parse_threads() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map_or(16, |n| n.get().saturating_mul(4))
+            .clamp(8, 64)
+    })
+}
+
+/// Parse threads currently in flight, and the signal that one has finished.
+static PARSE_THREADS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static PARSE_SLOT_FREED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// RAII reservation for one in-flight parse thread.
+struct ParseSlot;
+
+impl ParseSlot {
+    /// Reserve a slot, waiting for one to free up when the cap is reached.
+    ///
+    /// Waiting (rather than failing) is deliberate: a parse is short-lived and
+    /// always releases its slot, so a host that fans out many simultaneous
+    /// parses is throttled to the cap instead of being handed a spurious
+    /// "too many concurrent parses" error it cannot act on. Callers already
+    /// block for the duration of their own parse, so the only visible effect
+    /// is that the (cap + 1)-th concurrent parse starts slightly later.
+    fn acquire() -> Self {
+        let cap = max_parse_threads();
+        let mut in_flight = PARSE_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        while *in_flight >= cap {
+            // A timeout keeps a lost notification from parking a caller
+            // forever; the predicate is rechecked on every wake.
+            let (guard, _) = PARSE_SLOT_FREED
+                .wait_timeout(in_flight, std::time::Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner());
+            in_flight = guard;
+        }
+        *in_flight += 1;
+        Self
+    }
+}
+
+impl Drop for ParseSlot {
+    fn drop(&mut self) {
+        let mut in_flight = PARSE_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        *in_flight = in_flight.saturating_sub(1);
+        drop(in_flight);
+        PARSE_SLOT_FREED.notify_one();
+    }
+}
+
 /// Run a parsing closure on a stack whose size we control.
 ///
 /// Every caller gets `PARSE_STACK_SIZE`, so a deeply nested document meets the
 /// same headroom whether it arrives from a Rust binary, a Python binding or a
 /// test harness. Only wasm32, which has no threads, runs inline.
+///
+/// At most [`max_parse_threads`] parses are in flight at once; further callers
+/// wait for a slot rather than spawning an unbounded number of 16 MB-stack
+/// threads. The reservation is released when this function returns, whether
+/// the parse succeeded, failed or panicked.
 fn with_parse_stack<F, T>(f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
     if needs_stack_thread() {
+        // Held until the join below completes, so the count tracks threads
+        // that actually exist.
+        let _slot = ParseSlot::acquire();
         std::thread::Builder::new()
             .stack_size(PARSE_STACK_SIZE)
             .spawn(f)
@@ -148,28 +214,12 @@ where
 
 /// Whether a reader's first bytes are the CFB (compound file) signature.
 ///
-/// Leaves the reader rewound to the start.
+/// Leaves the reader rewound to the start. Thin wrapper around
+/// `cfb::is_cfb_container`, which is also called directly by each OOXML
+/// format's own `from_reader` — kept here too so this
+/// module's existing `Result` (`OfficeError`) call sites don't change.
 fn is_cfb_container<R: Read + Seek>(reader: &mut R) -> Result<bool> {
-    use std::io::SeekFrom;
-    let mut magic = [0u8; 8];
-    reader.seek(SeekFrom::Start(0)).map_err(core::Error::from)?;
-    let n = read_up_to(reader, &mut magic)?;
-    reader.seek(SeekFrom::Start(0)).map_err(core::Error::from)?;
-    Ok(n == 8 && magic == crate::cfb::CFB_SIGNATURE)
-}
-
-/// Read up to `buf.len()` bytes, tolerating short reads.
-fn read_up_to<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        match reader.read(&mut buf[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {},
-            Err(e) => return Err(core::Error::from(e).into()),
-        }
-    }
-    Ok(filled)
+    Ok(crate::cfb::is_cfb_container(reader).map_err(core::Error::from)?)
 }
 
 /// Dispatch a method call to the inner document type across all variants.
@@ -214,7 +264,7 @@ impl Document {
         // username and a document name, and this runs at info level on every
         // open. The caller already knows which path it passed.
         info!("Document::open: {format:?} format");
-        let format = format.ok_or_else(|| {
+        let ext_format = format.ok_or_else(|| {
             OfficeError::UnsupportedFormat(
                 path.extension()
                     .and_then(|e| e.to_str())
@@ -222,7 +272,28 @@ impl Document {
                     .to_string(),
             )
         })?;
-        let format = sniff_format(path, format);
+        let format = sniff_format(path, ext_format);
+        // sniff_format's CFB branch exists so a legacy .doc/.xls/.ppt file
+        // saved with the wrong extension still opens — but an encrypted
+        // OOXML package is ALSO a CFB container, so the same branch was
+        // silently misrouting it to the legacy parser too, which then
+        // failed looking for a stream that was never there ("missing
+        // stream: WordDocument stream not found") instead of surfacing
+        // the real cause. Distinguish the two by the MS-OFFCRYPTO streams
+        // an encrypted package actually carries.
+        if matches!(format, DocumentFormat::Doc | DocumentFormat::Xls | DocumentFormat::Ppt)
+            && matches!(
+                ext_format,
+                DocumentFormat::Docx | DocumentFormat::Xlsx | DocumentFormat::Pptx
+            )
+            && is_encrypted_ooxml_cfb(path)
+        {
+            return Err(OfficeError::UnsupportedFormat(
+                "the file is a password-protected (encrypted) OOXML package; \
+                 decryption is not supported"
+                    .into(),
+            ));
+        }
 
         match format {
             DocumentFormat::Docx => {
@@ -399,6 +470,15 @@ impl Document {
         self.to_ir().to_html()
     }
 
+    /// Convert to an HTML fragment with explicit rendering options.
+    ///
+    /// With [`ir_render::ImageEmbed::Base64`] the fragment carries its
+    /// images inline as `data:` URIs, so it renders standalone — the
+    /// counterpart of [`Self::to_markdown_with`].
+    pub fn to_html_with(&self, options: ir_render::HtmlOptions) -> String {
+        self.to_ir().to_html_with(options)
+    }
+
     /// Convert to the format-agnostic Document IR.
     pub fn to_ir(&self) -> DocumentIR {
         match &self.inner {
@@ -490,6 +570,20 @@ impl OfficeDocument for Document {
 }
 
 /// Sniff magic bytes to detect format mismatches.
+/// `true` when the CFB container at `path` carries the MS-OFFCRYPTO
+/// encryption streams (`EncryptionInfo` + `EncryptedPackage`) that mark it
+/// as a password-protected OOXML package, rather than a genuine legacy
+/// binary document that happens to reuse the same container format.
+fn is_encrypted_ooxml_cfb(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(reader) = crate::cfb::CfbReader::new(file) else {
+        return false;
+    };
+    reader.has_stream("EncryptionInfo") && reader.has_stream("EncryptedPackage")
+}
+
 fn sniff_format(path: &Path, ext_format: DocumentFormat) -> DocumentFormat {
     let Ok(mut file) = std::fs::File::open(path) else {
         return ext_format;
@@ -526,4 +620,237 @@ pub fn to_markdown(path: impl AsRef<Path>) -> Result<String> {
 /// Convert any supported document file to an HTML fragment.
 pub fn to_html(path: impl AsRef<Path>) -> Result<String> {
     Ok(Document::open(path)?.to_html())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal CFB container with two named, empty-ish streams at
+    /// the root — enough for `has_stream` (a flat scan over directory
+    /// entries; sibling-tree links don't matter for it) without needing a
+    /// full CFB writer. Mirrors `cfb::reader::tests::build_minimal_cfb`,
+    /// extended to two streams instead of one.
+    fn build_two_stream_cfb(name1: &str, name2: &str) -> Vec<u8> {
+        const NO_ENTRY: u32 = 0xFFFF_FFFF;
+        const END_OF_CHAIN: u32 = 0xFFFF_FFFE;
+        const FAT_SECT: u32 = 0xFFFF_FFFD;
+        const FREE_SECT: u32 = 0xFFFF_FFFF;
+        let sector_size = 512usize;
+        let mut file = vec![0u8; 512 + 4 * sector_size];
+
+        file[0..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        file[0x18..0x1A].copy_from_slice(&0x003Eu16.to_le_bytes());
+        file[0x1A..0x1C].copy_from_slice(&3u16.to_le_bytes());
+        file[0x1C..0x1E].copy_from_slice(&0xFFFEu16.to_le_bytes());
+        file[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
+        file[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
+        file[0x2C..0x30].copy_from_slice(&1u32.to_le_bytes());
+        file[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());
+        file[0x38..0x3C].copy_from_slice(&4096u32.to_le_bytes());
+        file[0x3C..0x40].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+        file[0x40..0x44].copy_from_slice(&0u32.to_le_bytes());
+        file[0x44..0x48].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+        file[0x48..0x4C].copy_from_slice(&0u32.to_le_bytes());
+        file[0x4C..0x50].copy_from_slice(&1u32.to_le_bytes());
+        for i in 1..109 {
+            let off = 0x4C + i * 4;
+            file[off..off + 4].copy_from_slice(&FREE_SECT.to_le_bytes());
+        }
+
+        fn write_dir_entry(
+            buf: &mut [u8],
+            name: &str,
+            entry_type: u8,
+            child: u32,
+            start_sector: u32,
+            stream_size: u32,
+        ) {
+            const NO_ENTRY: u32 = 0xFFFF_FFFF;
+            let utf16: Vec<u16> = name.encode_utf16().collect();
+            for (i, &ch) in utf16.iter().enumerate() {
+                let bytes = ch.to_le_bytes();
+                buf[i * 2] = bytes[0];
+                buf[i * 2 + 1] = bytes[1];
+            }
+            let name_size = ((utf16.len() + 1) * 2) as u16;
+            buf[0x40..0x42].copy_from_slice(&name_size.to_le_bytes());
+            buf[0x42] = entry_type;
+            buf[0x43] = 1;
+            buf[0x44..0x48].copy_from_slice(&NO_ENTRY.to_le_bytes());
+            buf[0x48..0x4C].copy_from_slice(&NO_ENTRY.to_le_bytes());
+            buf[0x4C..0x50].copy_from_slice(&child.to_le_bytes());
+            buf[0x74..0x78].copy_from_slice(&start_sector.to_le_bytes());
+            buf[0x78..0x7C].copy_from_slice(&stream_size.to_le_bytes());
+        }
+
+        let dir_offset = 512;
+        write_dir_entry(
+            &mut file[dir_offset..dir_offset + 128],
+            "Root Entry",
+            5,
+            1,
+            END_OF_CHAIN,
+            0,
+        );
+        write_dir_entry(&mut file[dir_offset + 128..dir_offset + 256], name1, 2, NO_ENTRY, 2, 4);
+        write_dir_entry(&mut file[dir_offset + 256..dir_offset + 384], name2, 2, NO_ENTRY, 3, 4);
+        // Sibling-link entry 1 ("name1") to entry 2 ("name2") so both are
+        // reachable from Root's tree — find_entry walks the tree
+        // via child/sibling pointers, not a flat directory-array scan.
+        file[dir_offset + 128 + 0x48..dir_offset + 128 + 0x4C].copy_from_slice(&2u32.to_le_bytes());
+        file[dir_offset + 384 + 0x42] = 0; // empty 4th entry
+
+        let fat_offset = 512 + sector_size;
+        let write_fat = |file: &mut [u8], index: usize, value: u32| {
+            let off = fat_offset + index * 4;
+            file[off..off + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        write_fat(&mut file, 0, END_OF_CHAIN); // dir
+        write_fat(&mut file, 1, FAT_SECT); // FAT
+        write_fat(&mut file, 2, END_OF_CHAIN); // stream1
+        write_fat(&mut file, 3, END_OF_CHAIN); // stream2
+        for i in 4..128 {
+            write_fat(&mut file, i, FREE_SECT);
+        }
+
+        file[512 + 2 * sector_size..512 + 2 * sector_size + 4].copy_from_slice(b"data");
+        file[512 + 3 * sector_size..512 + 3 * sector_size + 4].copy_from_slice(b"data");
+
+        file
+    }
+
+    /// An encrypted OOXML file has the same CFB magic bytes
+    /// as a genuine legacy .doc/.xls/.ppt, so `sniff_format`'s
+    /// "wrong-extension" branch silently remapped it to the legacy
+    /// parser, which then failed looking for a stream that was never
+    /// there ("missing stream: WordDocument stream not found") instead
+    /// of naming the real cause.
+    #[test]
+    fn test_open_encrypted_ooxml_gives_a_friendly_error_not_a_legacy_parser_failure() {
+        let data = build_two_stream_cfb("EncryptionInfo", "EncryptedPackage");
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("office_oxide_test_encrypted_{}.docx", std::process::id()));
+        std::fs::write(&path, &data).unwrap();
+        let result = Document::open(&path);
+        std::fs::remove_file(&path).ok();
+        let err = result.err().expect("expected an Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("password-protected"),
+            "expected a friendly password-protected message, got: {msg}"
+        );
+    }
+
+    /// An encrypted .pptx used to succeed with Ok and a
+    /// silently EMPTY (zero-slide) presentation rather than erroring,
+    /// because sniff_format remapped it to the legacy PPT parser, which
+    /// (unlike the DOC/XLS legacy readers) doesn't detect encryption
+    /// itself and just parsed whatever little structure it could find.
+    /// The encrypted-OOXML check runs before any legacy-parser dispatch at all, so
+    /// this is the same code path with a .pptx extension.
+    #[test]
+    fn test_open_encrypted_pptx_gives_a_friendly_error_not_an_empty_presentation() {
+        let data = build_two_stream_cfb("EncryptionInfo", "EncryptedPackage");
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("office_oxide_test_encrypted_{}.pptx", std::process::id()));
+        std::fs::write(&path, &data).unwrap();
+        let result = Document::open(&path);
+        std::fs::remove_file(&path).ok();
+        let err = result
+            .err()
+            .expect("expected an Err, not a silently empty presentation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("password-protected"),
+            "expected a friendly password-protected message, got: {msg}"
+        );
+    }
+
+    /// The same CFB-magic-on-a-.docx-path shape, but WITHOUT the
+    /// MS-OFFCRYPTO streams, must still fall through to the legacy
+    /// parser (a genuinely misnamed legacy file) — the new check must
+    /// not misfire on the case `sniff_format` already handled
+    /// correctly.
+    #[test]
+    fn test_open_cfb_without_offcrypto_streams_still_falls_through_to_legacy_parser() {
+        let data = build_two_stream_cfb("SomeStream", "OtherStream");
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("office_oxide_test_not_encrypted_{}.docx", std::process::id()));
+        std::fs::write(&path, &data).unwrap();
+        let result = Document::open(&path);
+        std::fs::remove_file(&path).ok();
+        let err = result.err().expect("expected an Err");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("password-protected"),
+            "a non-OFFCRYPTO CFB must not be misreported as encrypted: {msg}"
+        );
+    }
+
+    /// `with_parse_stack` used to spawn one 16 MB-stack thread per parse with
+    /// no bound at all, so a host that fanned out many simultaneous parses
+    /// could drive the process into its thread-creation limit. More callers
+    /// than the cap must still all complete, and never more than the cap may
+    /// be in flight at once.
+    #[test]
+    fn test_with_parse_stack_bounds_concurrent_parses() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cap = max_parse_threads();
+        assert!((8..=64).contains(&cap), "cap should be sane, got {cap}");
+
+        let peak = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+        let callers: Vec<_> = (0..cap + 16)
+            .map(|_| {
+                let peak = Arc::clone(&peak);
+                let done = Arc::clone(&done);
+                std::thread::spawn(move || {
+                    let r: Result<()> = with_parse_stack(move || {
+                        let live = *PARSE_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+                        peak.fetch_max(live, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        Ok(())
+                    });
+                    r.expect("parse closure should succeed");
+                    done.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        for c in callers {
+            c.join().expect("caller thread should not panic");
+        }
+
+        assert_eq!(done.load(Ordering::SeqCst), cap + 16, "every parse must complete");
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak >= 1, "the in-flight counter should have been observed");
+        assert!(peak <= cap, "in-flight parses {peak} exceeded the cap {cap}");
+    }
+
+    /// A panic inside the parse closure must still release its slot, or the
+    /// cap would leak and eventually deadlock every later parse.
+    #[test]
+    fn test_parse_slot_released_after_panic() {
+        // `PARSE_THREADS` is a process-wide live gauge shared with every
+        // other test in this binary, and `cargo test` runs tests
+        // concurrently by default — a single before/after snapshot is
+        // racy against unrelated tests bumping the same counter between
+        // the two reads. Repeat the panicking call several times instead:
+        // a genuine per-call leak would ratchet the gauge up by roughly
+        // that many slots, which is far outside what ordinary concurrent
+        // test-suite noise could plausibly explain.
+        const ITERATIONS: usize = 20;
+        let before = *PARSE_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..ITERATIONS {
+            let r: Result<()> = with_parse_stack(|| panic!("boom"));
+            assert!(matches!(r, Err(OfficeError::Panic(_))), "panic should surface as itself");
+        }
+        let after = *PARSE_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            after < before + ITERATIONS,
+            "slot leaked across {ITERATIONS} panicking calls: {before} -> {after}"
+        );
+    }
 }

@@ -73,7 +73,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn replace_in_wt_simple() {
+    fn test_replace_in_wt_simple() {
         let xml = r#"<w:p><w:r><w:t>Hello World</w:t></w:r></w:p>"#;
         let (result, count) = replace_in_wt_elements(xml, "World", "Rust");
         assert_eq!(count, 1);
@@ -81,7 +81,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_in_wt_multiple() {
+    fn test_replace_in_wt_multiple() {
         let xml = r#"<w:r><w:t>foo bar foo</w:t></w:r>"#;
         let (result, count) = replace_in_wt_elements(xml, "foo", "baz");
         assert_eq!(count, 2);
@@ -89,7 +89,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_preserves_attributes() {
+    fn test_replace_preserves_attributes() {
         let xml = r#"<w:r><w:t xml:space="preserve"> Hello </w:t></w:r>"#;
         let (result, count) = replace_in_wt_elements(xml, "Hello", "World");
         assert_eq!(count, 1);
@@ -97,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn no_match_returns_zero() {
+    fn test_no_match_returns_zero() {
         let xml = r#"<w:r><w:t>Hello</w:t></w:r>"#;
         let (result, count) = replace_in_wt_elements(xml, "xyz", "abc");
         assert_eq!(count, 0);

@@ -39,6 +39,7 @@ impl DocumentIR {
                 ..Default::default()
             },
             sections,
+            defined_names: Vec::new(),
         }
     }
 }
@@ -115,9 +116,13 @@ impl<'a> MarkdownParser<'a> {
                 continue;
             }
 
-            // Thematic break `---` / `***` / `___` starts a new section
+            // Thematic break `---` / `***` / `___`. It both records itself as
+            // an `Element::ThematicBreak` (so it round-trips instead of being
+            // silently swallowed) and, matching this parser's existing page-
+            // boundary convention, starts a new section.
             if is_thematic_break(line) {
                 self.advance();
+                current.elements.push(Element::ThematicBreak);
                 if !current.elements.is_empty() || current.title.is_some() {
                     sections.push(current);
                     current = Section {
@@ -558,7 +563,7 @@ mod tests {
     use crate::format::DocumentFormat;
 
     #[test]
-    fn parse_heading_paragraph() {
+    fn test_parse_heading_paragraph() {
         let md = "# Hello\n\nSome text here.\n";
         let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
         assert_eq!(ir.sections.len(), 1);
@@ -567,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_page_break_into_sections() {
+    fn test_parse_page_break_into_sections() {
         let md = "# Page 1\n\nText one.\n\n---\n\n# Page 2\n\nText two.\n";
         let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
         assert_eq!(ir.sections.len(), 2);
@@ -576,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_unordered_list() {
+    fn test_parse_unordered_list() {
         let md = "- apple\n- banana\n- cherry\n";
         let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
         let list = match &ir.sections[0].elements[0] {
@@ -588,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_ordered_list() {
+    fn test_parse_ordered_list() {
         let md = "1. first\n2. second\n";
         let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
         let list = match &ir.sections[0].elements[0] {
@@ -599,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_pipe_table() {
+    fn test_parse_pipe_table() {
         let md = "| Name | Age |\n|------|-----|\n| Alice | 30 |\n| Bob | 25 |\n";
         let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
         let table = match &ir.sections[0].elements[0] {
@@ -611,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_bold_italic_inline() {
+    fn test_parse_bold_italic_inline() {
         let md = "Hello **world** and *rust*.\n";
         let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
         let para = match &ir.sections[0].elements[0] {
@@ -631,7 +636,57 @@ mod tests {
     }
 
     #[test]
-    fn parse_empty_markdown() {
+    fn test_fenced_code_block_becomes_code_block_element() {
+        // gap 1: the fence language used to leak into the text
+        // as a plain paragraph ("rust let x = 1;") with no CodeBlock at all.
+        let md = "```rust\nlet x = 1;\n```\n";
+        let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
+        let block = match &ir.sections[0].elements[0] {
+            Element::CodeBlock(c) => c,
+            other => panic!("expected CodeBlock, got {other:?}"),
+        };
+        assert_eq!(block.language.as_deref(), Some("rust"));
+        assert_eq!(block.content, "let x = 1;");
+    }
+
+    #[test]
+    fn test_thematic_break_becomes_thematic_break_element() {
+        // gap 2: `---` only ever split sections; no
+        // Element::ThematicBreak was ever produced, so the mark itself
+        // was silently dropped from the round trip.
+        let md = "```rust\nlet x = 1;\n```\n\n---\n";
+        let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
+        assert!(
+            ir.sections[0]
+                .elements
+                .iter()
+                .any(|e| matches!(e, Element::ThematicBreak)),
+            "expected an Element::ThematicBreak, got {:#?}",
+            ir.sections[0].elements
+        );
+    }
+
+    #[test]
+    fn test_nested_bullet_list_preserves_nesting_depth() {
+        // gap 3: src/ir_from_markdown.rs:281 used to hardcode
+        // `nested: None`, flattening every item to ilvl=0.
+        let md = "- item1\n  - sub1\n  - sub2\n- item2\n";
+        let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
+        let list = match &ir.sections[0].elements[0] {
+            Element::List(l) => l,
+            other => panic!("expected List, got {other:?}"),
+        };
+        assert_eq!(list.items.len(), 2);
+        let nested = list.items[0]
+            .nested
+            .as_ref()
+            .expect("first item should have a nested sub-list");
+        assert_eq!(nested.items.len(), 2);
+        assert!(list.items[1].nested.is_none());
+    }
+
+    #[test]
+    fn test_parse_empty_markdown() {
         let ir = DocumentIR::from_markdown("", DocumentFormat::Docx);
         assert_eq!(ir.sections.len(), 1);
         assert!(ir.sections[0].elements.is_empty());

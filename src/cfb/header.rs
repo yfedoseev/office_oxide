@@ -200,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_valid_v3_header() {
+    fn test_parse_valid_v3_header() {
         let buf = build_v3_header();
         let header = CfbHeader::parse(&buf).unwrap();
         assert_eq!(header.major_version, 3);
@@ -213,28 +213,28 @@ mod tests {
     }
 
     #[test]
-    fn bad_signature_rejected() {
+    fn test_bad_signature_rejected() {
         let mut buf = build_v3_header();
         buf[0] = 0x00;
         assert!(CfbHeader::parse(&buf).is_err());
     }
 
     #[test]
-    fn bad_version_rejected() {
+    fn test_bad_version_rejected() {
         let mut buf = build_v3_header();
         buf[0x1A..0x1C].copy_from_slice(&5u16.to_le_bytes());
         assert!(CfbHeader::parse(&buf).is_err());
     }
 
     #[test]
-    fn bad_byte_order_rejected() {
+    fn test_bad_byte_order_rejected() {
         let mut buf = build_v3_header();
         buf[0x1C..0x1E].copy_from_slice(&0xFFFFu16.to_le_bytes());
         assert!(CfbHeader::parse(&buf).is_err());
     }
 
     #[test]
-    fn sector_offset_v3() {
+    fn test_sector_offset_v3() {
         let buf = build_v3_header();
         let header = CfbHeader::parse(&buf).unwrap();
         // Sector 0 starts at byte 512
@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn too_short_buffer_rejected() {
+    fn test_too_short_buffer_rejected() {
         let buf = vec![0u8; 100];
         assert!(CfbHeader::parse(&buf).is_err());
     }

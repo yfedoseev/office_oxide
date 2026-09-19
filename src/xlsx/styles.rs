@@ -526,7 +526,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_styles_basic() {
+    fn test_parse_styles_basic() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <numFmts count="1">
@@ -587,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn number_format_lookup() {
+    fn test_number_format_lookup() {
         let ss = StyleSheet {
             number_formats: [(164u32, "yyyy-mm-dd".to_string())].into_iter().collect(),
             fonts: vec![],
@@ -625,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn font_lookup() {
+    fn test_font_lookup() {
         let ss = StyleSheet {
             number_formats: std::collections::HashMap::new(),
             fonts: vec![

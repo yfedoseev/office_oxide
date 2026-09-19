@@ -471,31 +471,49 @@ pub fn sanitize_xml_text(s: &str) -> std::borrow::Cow<'_, str> {
 /// stack a caller might have, not the best. Nested-table documents built at
 /// increasing depths overflow at:
 ///
-/// | build | stack | cliff |
-/// |---|---|---|
-/// | release | 16 MB parse stack | 3,000-4,000 |
-/// | debug | default 2 MiB thread | 512-1,024 |
+/// | build | stack | layer | cliff |
+/// |---|---|---|---|
+/// | release | 16 MB parse stack | XML parse (`parse_table`) | 3,000-4,000 |
+/// | debug | default 2 MiB thread | XML parse (`parse_table`) | 512-1,024 |
+/// | debug | default 2 MiB thread | `to_ir()` (`convert_table`) | 150-200 |
 ///
-/// 256 is chosen against the 2 MiB figure with a 2x margin — still ~50x
-/// deeper than any document a human authoring tool produces, and now with the
-/// 16 MB parse stack beneath it rather than whatever the caller happened to
-/// have.
+/// `DepthGuard` bounds the XML-parse recursion, which now runs on its own
+/// `PARSE_STACK_SIZE` thread rather than whatever the caller happened to
+/// have (see below) — but the *result* is then walked again by `to_ir()`/
+/// `plain_text()`/`to_markdown()`, on whatever stack the caller gave *them*,
+/// which this crate does not control and is not necessarily large. Those
+/// walkers hit their own stack limit well before the XML-parse cliff, since
+/// `convert_table`/`plain_text_table` recurse with a much larger frame
+/// (multiple local `Vec`s and struct literals per level) than the XML
+/// event-loop's `parse_table` does — so they carry their own `DepthGuard`
+/// too, and it's the tighter of the two cliffs, not the
+/// parse-stack one, that this constant must stay under.
 ///
-/// That 2x margin only ever held where the parse actually got the stack it was
-/// measured against, and it often did not: `needs_stack_thread` inferred the
-/// answer from `RLIMIT_STACK`, which describes the main thread rather than the
-/// running one, so an unlimited limit ran the parse inline on an ordinary
-/// 2 MiB thread and 256 levels aborted the process. Every threaded platform
-/// now parses on a `PARSE_STACK_SIZE` stack, so this constant is calibrated
-/// against a stack the library owns.
+/// 100 is chosen with real margin under the 150-200 debug/2 MiB `to_ir()`
+/// cliff — still ~20x deeper than any document a human authoring tool
+/// produces.
 ///
-/// Re-measure if the parser structs grow: the release cliff was
-/// 5,000-10,000 before this release's fields were added, so it moves with
-/// the frame size.
-pub const MAX_NESTING_DEPTH: usize = 256;
+/// That the XML-parse cliff has its own large margin only ever held where
+/// the parse actually got the stack it was measured against, and it often
+/// did not: `needs_stack_thread` inferred the answer from `RLIMIT_STACK`,
+/// which describes the main thread rather than the running one, so an
+/// unlimited limit ran the parse inline on an ordinary 2 MiB thread. Every
+/// threaded platform now parses on a `PARSE_STACK_SIZE` stack, so *that*
+/// part of this constant is calibrated against a stack the library owns —
+/// the `to_ir()`/`plain_text()` cliff is not, and never can be, since it
+/// runs on the caller's own stack.
+///
+/// Re-measure if the parser or IR-conversion structs grow — this moves with
+/// the frame size, and it moved once already: earlier releases' cliffs were
+/// measured only against the XML-parse layer and were 5,000-10,000 (release)
+/// / 512-1,024 (debug) before this release's added fields (and before the
+/// conversion-layer `DepthGuard`s existed at all) pulled the real, tighter
+/// limit down to what's measured above.
+pub const MAX_NESTING_DEPTH: usize = 100;
 
 thread_local! {
     static NESTING_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TRUNCATED_SUBTREES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// RAII guard tracking recursion depth in the parsers.
@@ -508,10 +526,17 @@ pub struct DepthGuard(());
 
 impl DepthGuard {
     /// Enter one level of nesting, or return `None` when the limit is hit.
+    ///
+    /// Every `None` also increments the thread-local truncated-subtree
+    /// counter (see [`truncated_subtrees`]) — content past the bound used
+    /// to be dropped with only a `log::warn!`, leaving a caller with no
+    /// way to learn that the document they just wrote or read is missing
+    /// content.
     pub fn enter() -> Option<Self> {
         NESTING_DEPTH.with(|d| {
             let cur = d.get();
             if cur >= MAX_NESTING_DEPTH {
+                TRUNCATED_SUBTREES.with(|t| t.set(t.get() + 1));
                 None
             } else {
                 d.set(cur + 1);
@@ -519,6 +544,19 @@ impl DepthGuard {
             }
         })
     }
+}
+
+/// Number of subtrees truncated by [`DepthGuard::enter`] returning `None`
+/// on this thread since the last [`reset_truncated_subtrees`] call.
+pub fn truncated_subtrees() -> usize {
+    TRUNCATED_SUBTREES.with(std::cell::Cell::get)
+}
+
+/// Reset the truncation counter. Called at the start of a top-level
+/// write/parse so its count reflects only that call, not a previous one
+/// on the same thread.
+pub fn reset_truncated_subtrees() {
+    TRUNCATED_SUBTREES.with(|t| t.set(0));
 }
 
 impl Drop for DepthGuard {
@@ -618,6 +656,15 @@ pub fn skip_element_fast(reader: &mut quick_xml::Reader<&[u8]>) -> Result<()> {
 /// Returns `None` if the data is already UTF-8 (the common case), or `Some(transcoded)`
 /// if transcoding was needed. Callers should use the returned buffer for parsing.
 pub fn ensure_utf8(data: &[u8]) -> Option<Vec<u8>> {
+    // UTF-16 must be settled before the valid-UTF-8 check below. A UTF-16
+    // part whose characters are all ASCII is a run of NUL-interleaved bytes,
+    // and NUL is itself valid UTF-8 — so `from_utf8` accepts it, the real
+    // encoding is never noticed, and every tag name arrives split by nulls.
+    // That silently emptied a UTF-16BE `xl/workbook.xml`.
+    if let Some(decoded) = decode_utf16_xml(data) {
+        return Some(decoded);
+    }
+
     // Quick check: if it's valid UTF-8 already, skip everything
     if std::str::from_utf8(data).is_ok() {
         return None;
@@ -652,7 +699,15 @@ pub fn ensure_utf8(data: &[u8]) -> Option<Vec<u8>> {
     }
 
     // Replace the encoding declaration with utf-8 so the XML parser doesn't complain
-    let mut utf8 = result.into_owned().into_bytes();
+    Some(rewrite_encoding_decl(result.into_owned().into_bytes()))
+}
+
+/// Rewrite an XML declaration's `encoding="..."` value to `utf-8`.
+///
+/// Called after transcoding: leaving the original label in place makes the
+/// bytes self-contradictory, and a strict downstream processor would reject
+/// them.
+fn rewrite_encoding_decl(mut utf8: Vec<u8>) -> Vec<u8> {
     if let Some(pos) = utf8
         .windows(9)
         .position(|w| w.eq_ignore_ascii_case(b"encoding="))
@@ -668,8 +723,37 @@ pub fn ensure_utf8(data: &[u8]) -> Option<Vec<u8>> {
             }
         }
     }
+    utf8
+}
 
-    Some(utf8)
+/// Decode a UTF-16 XML part to UTF-8, or `None` if `data` isn't UTF-16.
+///
+/// Endianness comes from a byte-order mark when one is present. Without a
+/// BOM, XML 1.0 §4.3.3 requires a UTF-16 document to begin with the text
+/// declaration, so the NUL-interleaved `<?` prolog identifies it
+/// unambiguously.
+fn decode_utf16_xml(data: &[u8]) -> Option<Vec<u8>> {
+    let big_endian = match data {
+        [0xFE, 0xFF, ..] => true,
+        [0xFF, 0xFE, ..] => false,
+        // BOM-less: `<?` as UTF-16BE / UTF-16LE code units.
+        [0x00, 0x3C, 0x00, 0x3F, ..] => true,
+        [0x3C, 0x00, 0x3F, 0x00, ..] => false,
+        _ => return None,
+    };
+
+    let encoding = if big_endian {
+        encoding_rs::UTF_16BE
+    } else {
+        encoding_rs::UTF_16LE
+    };
+    // `decode` strips a leading BOM itself, so the result never carries one.
+    let (result, _, had_errors) = encoding.decode(data);
+    if had_errors {
+        return None;
+    }
+
+    Some(rewrite_encoding_decl(result.into_owned().into_bytes()))
 }
 
 #[cfg(test)]
@@ -689,17 +773,17 @@ mod attr_tests {
     }
 
     #[test]
-    fn unescapes_predefined_and_numeric_entities() {
+    fn test_unescapes_predefined_and_numeric_entities() {
         assert_eq!(attr_value(r#"v="a &amp; b &lt;x&gt; &#65;""#, "v"), "a & b <x> A");
     }
 
     #[test]
-    fn passes_plain_value_through_unchanged() {
+    fn test_passes_plain_value_through_unchanged() {
         assert_eq!(attr_value(r#"r:id="rId7""#, "r:id"), "rId7");
     }
 
     #[test]
-    fn unescapes_ampersand_in_hyperlink_target() {
+    fn test_unescapes_ampersand_in_hyperlink_target() {
         assert_eq!(
             attr_value(r#"Target="https://x/?a=1&amp;b=2""#, "Target"),
             "https://x/?a=1&b=2"

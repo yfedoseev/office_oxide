@@ -16,8 +16,11 @@
 //!
 //! The `grpprl` is decoded by [`super::sprm::extract_pap_props`].
 
-use super::piece_table::{Piece, decode_cp_range, sanitize_text};
-use super::sprm::PapProps;
+use super::chpx::{FkpRun, resolve_chp_cp_runs, resolve_chp_segments};
+use super::piece_table::{
+    HyperlinkSpan, Piece, decode_cp_range, sanitize_text_with_hyperlinks_and_chp,
+};
+use super::sprm::{ChpProps, PapProps};
 
 /// A paragraph descriptor recovered from a PAPX FKP page.
 #[derive(Debug, Clone)]
@@ -41,6 +44,16 @@ pub struct DocParagraph {
     pub terminator: char,
     /// Distilled PAP flags (`fInTable`, row-mark, list, …).
     pub props: PapProps,
+    /// `HYPERLINK` field display-text spans (byte ranges into `text`)
+    /// paired with their target URLs.
+    pub hyperlinks: Vec<HyperlinkSpan>,
+    /// Character-property run boundaries (byte ranges into `text`) from
+    /// CHPX: bold/italic/underline/color/font-size per run.
+    /// Always covers the whole of `text` when `text` is non-empty — a
+    /// document with no CHPX FKP at all naturally collapses to a single
+    /// span with `ChpProps::default()` (see `resolve_chp_segments`), so
+    /// callers never need a separate "no formatting info" case.
+    pub chp_runs: Vec<(std::ops::Range<usize>, ChpProps)>,
 }
 
 /// Parse every PAPX FKP page referenced by the PlcfBtePapx.
@@ -182,42 +195,6 @@ fn extract_grpprl(page: &[u8], word_off: usize) -> Vec<u8> {
     page[grpprl_start..grpprl_end].to_vec()
 }
 
-/// Convert a character position to a real byte offset in the WordDocument
-/// stream (i.e. with the compressed-encoding bit 30 stripped).
-#[allow(dead_code)] // kept for API symmetry with `fc_to_cp` and future list work
-pub fn cp_to_fc(cp: u32, pieces: &[Piece]) -> Option<u32> {
-    for p in pieces {
-        // A malformed piece (non-monotonic CP range) must not drive an
-        // underflow; skip it. parse_plc_pcd also rejects these up front.
-        if p.cp_end < p.cp_start {
-            continue;
-        }
-        if cp >= p.cp_start && cp < p.cp_end {
-            let (base, stride) = piece_byte_base(p);
-            let off = (cp - p.cp_start) as u64 * stride as u64;
-            let byte = base as u64 + off;
-            if byte <= u32::MAX as u64 {
-                return Some(byte as u32);
-            }
-        }
-    }
-    // Allow cp == final cp_end for "one past the end" lookups.
-    if let Some(p) = pieces.last() {
-        if p.cp_end < p.cp_start {
-            return None;
-        }
-        if cp == p.cp_end {
-            let (base, stride) = piece_byte_base(p);
-            let off = (cp - p.cp_start) as u64 * stride as u64;
-            let byte = base as u64 + off;
-            if byte <= u32::MAX as u64 {
-                return Some(byte as u32);
-            }
-        }
-    }
-    None
-}
-
 /// Convert a file character position (FC) to a character position (CP).
 ///
 /// The FC is normalised to a real byte offset (bit 30 stripped when set)
@@ -280,6 +257,8 @@ pub fn build_paragraphs(
     pieces: &[Piece],
     fkp: &[FkpParagraph],
     text_len: u32,
+    lid: u16,
+    chp_runs: &[FkpRun],
 ) -> Vec<DocParagraph> {
     let mut keyed: Vec<(u32, &FkpParagraph)> = fkp
         .iter()
@@ -288,6 +267,13 @@ pub fn build_paragraphs(
         .collect();
     keyed.sort_by_key(|(cp, _)| *cp);
 
+    // FC→CP-convert and decode every CHPX run exactly once for the whole
+    // document — `resolve_chp_segments` is called once per paragraph below,
+    // and both `fc_to_cp` and `extract_chp_props` are real work; doing
+    // either of them per paragraph instead of once here turned a real
+    // corpus sweep into a multi-minute hang.
+    let sorted_chp_runs = resolve_chp_cp_runs(chp_runs, pieces);
+
     let mut out = Vec::with_capacity(keyed.len());
     for (cp_start, fp) in keyed {
         let cp_end = fc_to_cp(fp.fc_end, pieces).unwrap_or(cp_start + 1);
@@ -295,20 +281,45 @@ pub fn build_paragraphs(
         if cp_end <= cp_start {
             continue;
         }
-        // Decode this paragraph's CP range directly; sanitise the inner text
-        // but keep the trailing terminator raw (it drives table grouping).
-        let decoded = decode_cp_range(word_doc, pieces, cp_start, cp_end);
+        // Decode per CHP-props segment, not the whole
+        // paragraph range in one call, so each decoded char can be
+        // attributed to the right `ChpProps`. Concatenating these
+        // sub-range decodes is byte-for-byte identical to one bulk decode
+        // over `[cp_start, cp_end)` — `decode_cp_range` is a pure function
+        // of its own CP range with no cross-call state — so a paragraph
+        // whose CHPX segments collapse to "one segment, all default" (the
+        // common case for a document with no CHPX at all: `resolve_chp_segments`
+        // returns a single default-props segment spanning the whole range
+        // when `chp_runs` is empty) costs nothing extra and produces
+        // exactly the pre-CHPX output.
+        let segments = resolve_chp_segments(&sorted_chp_runs, cp_start, cp_end);
+        let mut decoded = String::new();
+        let mut char_props: Vec<ChpProps> = Vec::with_capacity((cp_end - cp_start) as usize);
+        for (seg_start, seg_end, props) in &segments {
+            let chunk = decode_cp_range(word_doc, pieces, *seg_start, *seg_end, lid);
+            let new_len = char_props.len() + chunk.chars().count();
+            char_props.resize(new_len, props.clone());
+            decoded.push_str(&chunk);
+        }
         let chars: Vec<char> = decoded.chars().collect();
         if chars.is_empty() {
             continue;
         }
+        // Drop the trailing terminator from both the text and its parallel
+        // props entry before sanitizing (it's kept raw, below, since it
+        // drives table/row grouping rather than being visible content).
         let terminator = chars[chars.len() - 1];
-        let content: String = sanitize_text(&chars[..chars.len() - 1].iter().collect::<String>());
+        let content_str: String = chars[..chars.len() - 1].iter().collect();
+        let content_props = &char_props[..char_props.len().saturating_sub(1)];
+        let (content, hyperlinks, chp_spans) =
+            sanitize_text_with_hyperlinks_and_chp(&content_str, content_props);
         let props = super::sprm::extract_pap_props(&fp.grpprl);
         out.push(DocParagraph {
             text: content,
             terminator,
             props,
+            hyperlinks,
+            chp_runs: chp_spans,
         });
     }
     out
@@ -330,20 +341,16 @@ mod tests {
     }
 
     #[test]
-    fn cp_to_fc_and_back_unicode() {
+    fn test_fc_to_cp_unicode() {
         // table.doc: one Unicode piece, fc = 0x800, text_len = 23.
         let pieces = [unicode_piece(0x800, 23)];
-        // cp 1 → byte 0x800 + 1*2 = 0x802.
-        assert_eq!(cp_to_fc(1, &pieces), Some(0x802));
-        // cp 0 → 0x800.
-        assert_eq!(cp_to_fc(0, &pieces), Some(0x800));
-        // Round-trip.
+        // byte 0x800 + 1*2 = 0x802 → cp 1.
         assert_eq!(fc_to_cp(0x802, &pieces), Some(1));
         assert_eq!(fc_to_cp(0x800, &pieces), Some(0));
     }
 
     #[test]
-    fn fc_to_cp_strips_compressed_bit() {
+    fn test_fc_to_cp_strips_compressed_bit() {
         // A compressed piece with bit 30 set; FC carries the same bit.
         let pieces = [Piece {
             cp_start: 0,
@@ -358,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_grpprl_handles_word8_reread() {
+    fn test_extract_grpprl_handles_word8_reread() {
         // Build a 512-byte page with one paragraph PAPX at word offset 247.
         // cw=6, istd=0000, grpprl = [16 24 01 49 66 01 00 00 00] (9 bytes).
         let mut page = vec![0u8; 512];
@@ -383,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_papx_when_word_off_zero() {
+    fn test_empty_papx_when_word_off_zero() {
         let mut page = vec![0u8; 512];
         page[511] = 1;
         page[0..4].copy_from_slice(&0x800u32.to_le_bytes());
@@ -396,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn build_paragraphs_slices_text_and_flags() {
+    fn test_build_paragraphs_slices_text_and_flags() {
         // cp0..6: a leading '\r' mark, cell "1", cell "2", then a row mark.
         // One Unicode piece whose bytes live at fc=0x800 in `word_doc`.
         let raw = "\r1\u{7}2\u{7}\u{7}";
@@ -423,7 +430,7 @@ mod tests {
             mk(5, 6, &rowmark), // "\u{7}" row mark
         ];
 
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 6);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 6, 0, &[]);
         assert_eq!(paras.len(), 4);
         // leading mark
         assert_eq!(paras[0].text, "");
@@ -447,7 +454,7 @@ mod tests {
     /// paragraph. Decoding each CP range directly must keep alignment. Each
     /// paragraph ends with a terminator (`\r`) as a real `.doc` does.
     #[test]
-    fn build_paragraphs_keeps_astral_alignment() {
+    fn test_build_paragraphs_keeps_astral_alignment() {
         // "Hi 😀\r" (cp0..6) then "there\r" (cp6..12). The emoji occupies
         // cp3 and cp4 (two UTF-16 units) but is one char.
         let raw = "Hi 😀\rthere\r";
@@ -463,7 +470,7 @@ mod tests {
         };
         let fkp = vec![mk(0, 6), mk(6, 12)];
 
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 12);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 12, 0, &[]);
         assert_eq!(paras.len(), 2);
         assert_eq!(paras[0].text, "Hi 😀", "emoji must not desync the range");
         assert_eq!(paras[0].terminator, '\r');
@@ -473,8 +480,15 @@ mod tests {
 
     /// Regression: field codes (0x13/0x14/0x15) in a paragraph must be
     /// stripped from the IR text, matching the sanitised plain-text path.
+    ///
+    /// The instruction text between `0x13` and `0x14`
+    /// ("HYPERLINK ...", the field's own code, never shown by Word) must
+    /// be dropped entirely, not just its boundary markers; only the cached
+    /// result (between `0x14` and `0x15`) is visible text. This test used
+    /// to assert the opposite (`"SeeHYPERLINKresulthere"`, keeping both
+    /// halves) — that was the bug, not the contract.
     #[test]
-    fn build_paragraphs_strips_field_codes() {
+    fn test_build_paragraphs_strips_field_codes() {
         // A HYPERLINK field run inside one paragraph, terminated by '\r'.
         let raw = "See\x13HYPERLINK\x14result\x15here\r";
         let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
@@ -488,15 +502,18 @@ mod tests {
             grpprl: Vec::new(),
         };
         let fkp = vec![mk(0, raw.chars().count() as u32)];
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, 0, &[]);
         assert_eq!(paras.len(), 1);
         assert_eq!(paras[0].terminator, '\r');
         let t = &paras[0].text;
         assert!(!t.contains('\u{13}'), "field begin must be stripped");
         assert!(!t.contains('\u{14}'), "field separator must be stripped");
         assert!(!t.contains('\u{15}'), "field end must be stripped");
-        assert!(t.contains("HYPERLINK"), "field result text survives");
-        assert_eq!(t, "SeeHYPERLINKresulthere");
+        assert!(
+            !t.contains("HYPERLINK"),
+            "field instruction text must not leak into visible text"
+        );
+        assert_eq!(t, "Seeresulthere");
     }
 
     /// Regression: the `cw == 0` Word8 re-read branch must not drop the trailing
@@ -508,10 +525,10 @@ mod tests {
     /// drop it).
     /// When the last SPRM is `sprmTDefTable`, dropping that byte truncates the
     /// TAP and the cell-merge spans vanish. The existing
-    /// `extract_grpprl_handles_word8_reread` test uses `cw = 6`, so it never
+    /// `test_extract_grpprl_handles_word8_reread` test uses `cw = 6`, so it never
     /// exercises this branch.
     #[test]
-    fn papx_cw_zero_reread_extracts_trailing_tdef_table() {
+    fn test_papx_cw_zero_reread_extracts_trailing_tdef_table() {
         // 512-byte FKP page with the PAPX at word offset 0.
         let mut page = vec![0u8; 512];
         // PAPX: 0x00 (cw re-read marker), cw' = 17, istd = 0000, grpprl (32 bytes).
@@ -546,7 +563,7 @@ mod tests {
     /// `catch_unwind` because the failure mode is a panic; debug builds have
     /// overflow-checks enabled (AGENTS.md rule 6: no input may panic).
     #[test]
-    fn fc_to_cp_huge_range_does_not_panic() {
+    fn test_fc_to_cp_huge_range_does_not_panic() {
         let pieces = [Piece {
             cp_start: 0,
             cp_end: u32::MAX,
@@ -563,7 +580,7 @@ mod tests {
     /// The walk dedupes visited pages and clamps `n` to the number of physical
     /// pages, so the work stays bounded even with a hostile large `lcb`.
     #[test]
-    fn papx_fkp_walk_is_bounded() {
+    fn test_papx_fkp_walk_is_bounded() {
         // One real 512-byte page holding a single empty PAPX.
         let mut word_doc = vec![0u8; 512];
         word_doc[511] = 1; // crun = 1

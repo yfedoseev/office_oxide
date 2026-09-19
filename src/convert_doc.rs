@@ -1,4 +1,7 @@
-use crate::doc::{DocDocument, DocParagraph, TapCellInfo, TapInfo};
+use crate::doc::{
+    ChpProps, DocDocument, DocParagraph, HyperlinkSpan, ListFormatting, PapProps, TapCellInfo,
+    TapInfo,
+};
 use crate::format::DocumentFormat;
 use crate::ir::*;
 
@@ -24,18 +27,27 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // the first `Element::Heading` below.
     let has_structured_headings = paragraphs.iter().any(|p| p.props.outline_level.is_some());
     if !paragraphs.is_empty() {
-        walk_paragraphs(paragraphs, has_structured_headings, &mut elements);
+        walk_paragraphs(paragraphs, has_structured_headings, &mut elements, doc.list_formatting());
     } else {
         line_heuristic(doc.plain_text_ref(), &mut elements);
     }
 
-    let title = elements.iter().find_map(|e| match e {
+    let heading_title = elements.iter().find_map(|e| match e {
         Element::Heading(h) => h.content.first().and_then(|c| match c {
             InlineContent::Text(t) => Some(t.text.clone()),
             _ => None,
         }),
         _ => None,
     });
+    // The file's own declared title (from `\x05SummaryInformation`) beats
+    // a line-shape guess whenever both exist — a document can style
+    // *some* headings and still use plain ALL-CAPS lines for others
+    //, but the declared title is never a guess.
+    let summary = doc.summary_properties();
+    let title = summary
+        .and_then(|s| s.title.clone())
+        .filter(|t| !t.is_empty())
+        .or(heading_title);
 
     let mut sections = vec![Section {
         title: title.clone(),
@@ -43,40 +55,135 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
         ..Default::default()
     }];
 
+    // The header document's PlcfHdd-delimited stories for the first
+    // section — this crate models only one `ir::Section` per DOC
+    // document, so a document with 2+ sections only surfaces the first
+    // one's headers/footers here. When PlcfHdd yielded
+    // nothing (older/malformed files), every field below is `None` and
+    // the generic-TextBox fallback in the loop below still applies.
+    let hf = doc.header_footer();
+    if let Some(section) = sections.last_mut() {
+        section.even_page_header = hf.even_header.as_deref().map(text_to_header_footer);
+        section.header = hf.odd_header.as_deref().map(text_to_header_footer);
+        section.even_page_footer = hf.even_footer.as_deref().map(text_to_header_footer);
+        section.footer = hf.odd_footer.as_deref().map(text_to_header_footer);
+        section.first_page_header = hf.first_header.as_deref().map(text_to_header_footer);
+        section.first_page_footer = hf.first_footer.as_deref().map(text_to_header_footer);
+    }
+    let header_footer_structured = !hf.is_empty();
+
     // Footnotes, headers, comments, endnotes and text boxes live after the
     // main text in the same character space. Their `ccp*` lengths were
     // parsed and never used, so none of this reached a consumer.
     if let Some(section) = sections.last_mut() {
-        for (i, sub) in doc.subdocuments().iter().enumerate() {
-            let content: Vec<Element> = sub
-                .text
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| {
-                    Element::Paragraph(Paragraph {
-                        content: vec![InlineContent::Text(TextSpan::plain(l))],
-                        ..Default::default()
-                    })
-                })
-                .collect();
-            if content.is_empty() {
+        let mut next_id = 0u32;
+        for sub in doc.subdocuments() {
+            // Already represented structurally on `Section.header`/
+            // `.footer`/etc above — don't also dump the merged blob as a
+            // generic TextBox.
+            if sub.kind == crate::doc::SubDocumentKind::HeadersFooters && header_footer_structured {
                 continue;
             }
-            let note = Note {
-                id: i as u32,
-                marker: Some(subdocument_label(sub.kind).to_string()),
-                content,
+            // `PlcfandTxt`/`PlcfandRef` successfully split this document's
+            // Comments substory into individual, correctly-attributed
+            // comments — emit one `Element::Endnote` per comment instead
+            // of falling through to the generic merged-substory path
+            // below.
+            if sub.kind == crate::doc::SubDocumentKind::Comments && !doc.comments().is_empty() {
+                for comment in doc.comments() {
+                    let content: Vec<Element> = comment
+                        .text
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .map(|l| {
+                            Element::Paragraph(Paragraph {
+                                content: vec![InlineContent::Text(TextSpan::plain(l))],
+                                ..Default::default()
+                            })
+                        })
+                        .collect();
+                    if content.is_empty() {
+                        continue;
+                    }
+                    section.elements.push(Element::Endnote(Note {
+                        id: next_id,
+                        marker: Some(subdocument_label(sub.kind).to_string()),
+                        content,
+                        author: comment.author.clone(),
+                    }));
+                    next_id += 1;
+                }
+                continue;
+            }
+            // Footnote/endnote bodies are self-delimited: each one starts
+            // with the literal auto-number reference-mark character
+            // (`\u{2}`) in the substory's own text — confirmed on the full
+            // local corpus (footnotes 49/51 files, endnotes 5/5 files that
+            // had one). Comments carry no such marker in their substory
+            // (0/12 files); they're split above via `PlcfandTxt` instead
+            // when that PLC parses cleanly. This is the
+            // fallback path for a Comments substory whose `doc.comments()`
+            // came back empty (PLC absent/malformed/mismatched) — it stays
+            // merged into one Note, same as before endnote/comment splitting existed.
+            let splittable = matches!(
+                sub.kind,
+                crate::doc::SubDocumentKind::Footnotes | crate::doc::SubDocumentKind::Endnotes
+            ) && sub.text.contains('\u{2}');
+
+            let bodies: Vec<&str> = if splittable {
+                sub.text
+                    .split('\u{2}')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            } else {
+                vec![sub.text.as_str()]
             };
-            section.elements.push(match sub.kind {
-                crate::doc::SubDocumentKind::Footnotes => Element::Footnote(note),
-                crate::doc::SubDocumentKind::HeadersFooters
-                | crate::doc::SubDocumentKind::TextBoxes
-                | crate::doc::SubDocumentKind::HeaderTextBoxes => Element::TextBox(TextBox {
-                    content: note.content,
-                    ..Default::default()
-                }),
-                _ => Element::Endnote(note),
-            });
+
+            for body in bodies {
+                let content: Vec<Element> = body
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| {
+                        Element::Paragraph(Paragraph {
+                            content: vec![InlineContent::Text(TextSpan::plain(l))],
+                            ..Default::default()
+                        })
+                    })
+                    .collect();
+                if content.is_empty() {
+                    continue;
+                }
+                // A single name in GrpXstAtnOwners unambiguously authored
+                // every comment in the document — real-world common case.
+                // Multiple names would need per-comment PlcfAtn/ATRD
+                // correlation (not yet implemented) to attribute
+                // correctly, so leave it unset rather than guess.
+                let author = match sub.kind {
+                    crate::doc::SubDocumentKind::Comments => match doc.comment_authors() {
+                        [single] => Some(single.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let note = Note {
+                    id: next_id,
+                    marker: Some(subdocument_label(sub.kind).to_string()),
+                    content,
+                    author,
+                };
+                next_id += 1;
+                section.elements.push(match sub.kind {
+                    crate::doc::SubDocumentKind::Footnotes => Element::Footnote(note),
+                    crate::doc::SubDocumentKind::HeadersFooters
+                    | crate::doc::SubDocumentKind::TextBoxes
+                    | crate::doc::SubDocumentKind::HeaderTextBoxes => Element::TextBox(TextBox {
+                        content: note.content,
+                        ..Default::default()
+                    }),
+                    _ => Element::Endnote(note),
+                });
+            }
         }
     }
     // Extracted pictures never reached the IR, so every image in a legacy
@@ -84,13 +191,49 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // were already in hand.
     crate::convert_xls::append_legacy_images(&mut sections, doc.images());
 
+    // Embedded OLE objects — at minimum, recognize each
+    // object exists and surface its identity, even without extracting
+    // its native payload. Mirrors the identical fix for legacy PPT OLE objects:
+    // a data-less Element::Image with a descriptive alt_text, the same
+    // precedent PPTX established for a data-less AutoShape placeholder.
+    if !doc.ole_objects().is_empty() {
+        if sections.is_empty() {
+            sections.push(Section::default());
+        }
+        let last = sections.last_mut().expect("just ensured non-empty");
+        for obj in doc.ole_objects() {
+            last.elements.push(Element::Image(Image {
+                alt_text: Some(obj.description.clone()),
+                data: None,
+                ..Default::default()
+            }));
+        }
+    }
+
     DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Doc,
             title,
-            ..Default::default()
+            author: summary
+                .and_then(|s| s.author.clone())
+                .filter(|s| !s.is_empty()),
+            subject: summary
+                .and_then(|s| s.subject.clone())
+                .filter(|s| !s.is_empty()),
+            keywords: summary
+                .and_then(|s| s.keywords.as_deref())
+                .map(crate::convert_docx::split_keywords)
+                .unwrap_or_default(),
+            description: summary
+                .and_then(|s| s.comments.clone())
+                .filter(|s| !s.is_empty()),
+            created: summary.and_then(|s| s.created.clone()),
+            modified: summary.and_then(|s| s.modified.clone()),
+            has_macros: doc.has_macros(),
+            text_truncated: !doc.text_complete(),
         },
         sections,
+        defined_names: Vec::new(),
     }
 }
 
@@ -160,11 +303,17 @@ impl TableBuilder {
         self.ensure_open();
         if !p.text.is_empty() {
             self.cell.push(Element::Paragraph(Paragraph {
-                content: inline_content_for(&p.text),
+                content: inline_content_for(&p.text, &p.hyperlinks, &p.chp_runs),
                 // `tabs` is always empty in the tables-only build (it is
                 // populated by the list/tab-stop PR); cloning keeps the IR
                 // shape uniform with the list path.
                 tabs: p.props.tabs.clone(),
+                alignment: p.props.alignment.clone(),
+                indent_left_twips: p.props.indent_left_twips,
+                indent_right_twips: p.props.indent_right_twips,
+                first_line_indent_twips: p.props.first_line_indent_twips,
+                space_before_twips: p.props.space_before_twips,
+                space_after_twips: p.props.space_after_twips,
                 ..Default::default()
             }));
         }
@@ -428,47 +577,82 @@ fn walk_paragraphs(
     paragraphs: &[DocParagraph],
     has_structured_headings: bool,
     elements: &mut Vec<Element>,
+    list_formatting: &ListFormatting,
 ) {
     let mut table = TableBuilder::new();
     let mut list_items: Vec<(u8, Vec<InlineContent>)> = Vec::new();
+    // The run's own `ilfo` — every item in one contiguous list
+    // run shares the same `ilfo`/`ilvl`-derived list identity in practice
+    // (a change of `ilfo` mid-run would itself interrupt list-item
+    // membership via `is_doc_list_item`), so the first item's value is
+    // enough to resolve `start_number`/`ordered` for the whole run.
+    let mut list_ilfo: Option<i16> = None;
 
     for p in paragraphs {
         if p.props.is_table_trailing_mark {
-            flush_list(&mut list_items, elements);
+            flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
             table.end_row(p.props.tap.clone(), p.props.itap);
         } else if p.props.f_in_table {
-            flush_list(&mut list_items, elements);
+            flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
             table.add_cell_paragraph(p);
+        } else if let Some(lvl) = p.props.outline_level {
+            // Outline level wins over list membership, exactly like the
+            // DOCX converter: Word's multilevel-list "Heading" gallery
+            // attaches an ilfo to the heading styles themselves, so a
+            // numbered heading ("1. Introduction") is the normal shape of
+            // a heading in real documents. Checking ilfo first turned
+            // every one of them into a list item and left no Headings in
+            // the IR at all.
+            table.flush(elements);
+            flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
+            emit_heading(&p.text, lvl + 1, elements, &p.hyperlinks, &p.chp_runs);
         } else if is_doc_list_item(p.props.ilfo) {
             // List membership is keyed on `ilfo` (sprmPIlfo, `0x460B`), not on
             // `ilvl`: per [MS-DOC] §2.4.6.3 a paragraph is a list item only when
             // its `ilfo` is a valid list index. `ilvl` still drives nesting.
             table.flush(elements);
             let ilvl = p.props.ilvl.unwrap_or(0);
-            list_items.push((ilvl, inline_content_for(&p.text)));
+            if list_ilfo.is_none() {
+                list_ilfo = p.props.ilfo;
+            }
+            list_items.push((ilvl, inline_content_for(&p.text, &p.hyperlinks, &p.chp_runs)));
         } else {
             table.flush(elements);
-            flush_list(&mut list_items, elements);
-            match p.props.outline_level {
-                // A real outline level: use it, and never guess alongside it.
-                Some(lvl) => emit_heading(&p.text, lvl + 1, elements),
-                None if has_structured_headings => {
-                    elements.push(Element::Paragraph(Paragraph {
-                        content: inline_content_for(&p.text),
-                        tabs: p.props.tabs.clone(),
-                        ..Default::default()
-                    }));
-                },
-                None => emit_prose(&p.text, &p.props.tabs, elements),
+            flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
+            if has_structured_headings {
+                elements.push(Element::Paragraph(Paragraph {
+                    content: inline_content_for(&p.text, &p.hyperlinks, &p.chp_runs),
+                    tabs: p.props.tabs.clone(),
+                    alignment: p.props.alignment.clone(),
+                    indent_left_twips: p.props.indent_left_twips,
+                    indent_right_twips: p.props.indent_right_twips,
+                    first_line_indent_twips: p.props.first_line_indent_twips,
+                    space_before_twips: p.props.space_before_twips,
+                    space_after_twips: p.props.space_after_twips,
+                    ..Default::default()
+                }));
+            } else {
+                emit_prose(&p.text, &p.props, elements, &p.hyperlinks, &p.chp_runs);
             }
         }
     }
     table.flush(elements);
-    flush_list(&mut list_items, elements);
+    flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
 }
 
 /// Emit the accumulated list run as an `Element::List` and clear it.
-fn flush_list(items: &mut Vec<(u8, Vec<InlineContent>)>, elements: &mut Vec<Element>) {
+///
+/// `ilfo` is the run's own list identity: resolved through
+/// `list_formatting` to the declared start-at value and number format for
+/// the run's base level. `None` (no `PlfLst`/`PlfLfo` data, or an `ilfo`
+/// that doesn't resolve) degrades to the pre-list-format contract — bullet,
+/// `start_number: None` — rather than erroring.
+fn flush_list(
+    items: &mut Vec<(u8, Vec<InlineContent>)>,
+    ilfo: Option<i16>,
+    list_formatting: &ListFormatting,
+    elements: &mut Vec<Element>,
+) {
     if items.is_empty() {
         return;
     }
@@ -477,8 +661,14 @@ fn flush_list(items: &mut Vec<(u8, Vec<InlineContent>)>, elements: &mut Vec<Elem
     // collapsed by `build_nested_list` (which would otherwise treat every
     // item as a child of the first and drop the rest when base_level is 0).
     let base_level = items.iter().map(|(lvl, _)| *lvl).min().unwrap_or(0);
-    // `ordered = false` (bullet) — see `walk_paragraphs` for the limitation.
-    let list = build_nested_list(false, items, base_level);
+    let level = ilfo.and_then(|ilfo| list_formatting.level_for(ilfo, base_level));
+    let ordered = level.is_some_and(|l| l.is_numbered());
+    let start_number = level
+        .filter(|l| l.is_numbered() && l.start_at != 1)
+        .map(|l| l.start_at as u32);
+
+    let mut list = build_nested_list(ordered, items, base_level);
+    list.start_number = start_number;
     elements.push(Element::List(list));
     items.clear();
 }
@@ -489,12 +679,23 @@ fn flush_list(items: &mut Vec<(u8, Vec<InlineContent>)>, elements: &mut Vec<Elem
 /// within a single structured paragraph's inner text that is the only source
 /// of `'\n'`, so each `'\n'` becomes an `InlineContent::LineBreak` instead of
 /// being flattened into one run.
-fn inline_content_for(text: &str) -> Vec<InlineContent> {
+///
+/// `hyperlinks` are `HYPERLINK` field display-text spans as byte ranges into
+/// `text`; `chp_runs` are character-property run boundaries,
+/// also byte ranges into `text` — both empty for callers with
+/// no per-paragraph data (e.g. the line-shape heading heuristic, which
+/// works over the flat, already-sanitized document text rather than a
+/// single `DocParagraph`).
+fn inline_content_for(
+    text: &str,
+    hyperlinks: &[HyperlinkSpan],
+    chp_runs: &[(std::ops::Range<usize>, ChpProps)],
+) -> Vec<InlineContent> {
     let mut out = Vec::new();
+    let mut base = 0usize;
     for seg in text.split('\n') {
-        if !seg.is_empty() {
-            out.push(InlineContent::Text(TextSpan::plain(seg)));
-        }
+        push_segment(seg, base, hyperlinks, chp_runs, &mut out);
+        base += seg.len() + 1; // +1 for the '\n' the split consumed
         out.push(InlineContent::LineBreak);
     }
     // Drop the trailing `LineBreak` appended after the final segment.
@@ -509,17 +710,150 @@ fn inline_content_for(text: &str) -> Vec<InlineContent> {
     out
 }
 
+/// Apply one `ChpProps` to a plain `TextSpan` built from `text`.
+fn styled_span(text: &str, props: &ChpProps) -> TextSpan {
+    TextSpan {
+        bold: props.bold,
+        italic: props.italic,
+        underline: props.underline.clone(),
+        color: props.color,
+        font_size_half_pt: props.font_size_half_pt,
+        ..TextSpan::plain(text)
+    }
+}
+
+/// Push one line-break-free segment of text as one or more `TextSpan`s,
+/// splitting on every hyperlink and character-property run
+/// boundary that overlaps it. `base` is `seg`'s own byte offset within the
+/// original (pre-split) text, so `hyperlinks`'/`chp_runs`' ranges (computed
+/// against that same original text) line up correctly.
+fn push_segment(
+    seg: &str,
+    base: usize,
+    hyperlinks: &[HyperlinkSpan],
+    chp_runs: &[(std::ops::Range<usize>, ChpProps)],
+    out: &mut Vec<InlineContent>,
+) {
+    if seg.is_empty() {
+        return;
+    }
+    let seg_start = base;
+    let seg_end = base + seg.len();
+
+    // Every point where either a hyperlink or a CHP run starts/ends within
+    // this segment is a potential span boundary; walking the sorted, deduped
+    // union of both (plus the segment's own bounds) guarantees each
+    // resulting sub-slice has one unambiguous hyperlink state and one
+    // unambiguous `ChpProps` — `resolve_chp_segments` already guarantees
+    // `chp_runs` fully and contiguously covers the paragraph, so no
+    // sub-slice here can straddle two different CHP runs.
+    let mut breakpoints: Vec<usize> = vec![seg_start, seg_end];
+    for h in hyperlinks {
+        if h.range.start > seg_start && h.range.start < seg_end {
+            breakpoints.push(h.range.start);
+        }
+        if h.range.end > seg_start && h.range.end < seg_end {
+            breakpoints.push(h.range.end);
+        }
+    }
+    for (r, _) in chp_runs {
+        if r.start > seg_start && r.start < seg_end {
+            breakpoints.push(r.start);
+        }
+        if r.end > seg_start && r.end < seg_end {
+            breakpoints.push(r.end);
+        }
+    }
+    breakpoints.sort_unstable();
+    breakpoints.dedup();
+
+    for pair in breakpoints.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if a >= b {
+            continue;
+        }
+        let slice = &seg[a - seg_start..b - seg_start];
+        if slice.is_empty() {
+            continue;
+        }
+        let hyperlink = hyperlinks
+            .iter()
+            .find(|h| h.range.start <= a && b <= h.range.end);
+        let props = chp_runs
+            .iter()
+            .find(|(r, _)| r.start <= a && b <= r.end)
+            .map(|(_, p)| p);
+        let mut span = match props {
+            Some(p) => styled_span(slice, p),
+            None => TextSpan::plain(slice),
+        };
+        if let Some(h) = hyperlink {
+            span.hyperlink = Some(h.url.clone());
+        }
+        out.push(InlineContent::Text(span));
+    }
+}
+
+/// Shift `hyperlinks`' byte ranges by `-trim_start` (the number of bytes
+/// `text.trim()` removed from the front) and clip them to
+/// `[0, trimmed_len]`, dropping any span that trimming removed entirely.
+/// Needed because `emit_heading`/`emit_prose` call `inline_content_for` on
+/// `text.trim()`, not `text` itself, so the spans (computed against the
+/// untrimmed paragraph text) would otherwise point at the wrong bytes.
+fn shift_hyperlinks_for_trim(
+    hyperlinks: &[HyperlinkSpan],
+    trim_start: usize,
+    trimmed_len: usize,
+) -> Vec<HyperlinkSpan> {
+    hyperlinks
+        .iter()
+        .filter_map(|h| {
+            let start = h.range.start.saturating_sub(trim_start).min(trimmed_len);
+            let end = h.range.end.saturating_sub(trim_start).min(trimmed_len);
+            (start < end).then(|| HyperlinkSpan {
+                range: start..end,
+                url: h.url.clone(),
+            })
+        })
+        .collect()
+}
+
+/// As [`shift_hyperlinks_for_trim`], for CHP run boundaries.
+fn shift_chp_runs_for_trim(
+    chp_runs: &[(std::ops::Range<usize>, ChpProps)],
+    trim_start: usize,
+    trimmed_len: usize,
+) -> Vec<(std::ops::Range<usize>, ChpProps)> {
+    chp_runs
+        .iter()
+        .filter_map(|(r, props)| {
+            let start = r.start.saturating_sub(trim_start).min(trimmed_len);
+            let end = r.end.saturating_sub(trim_start).min(trimmed_len);
+            (start < end).then(|| (start..end, props.clone()))
+        })
+        .collect()
+}
+
 /// Classify a prose paragraph as a heading or paragraph and push it.
 ///
 /// Mirrors the line-based heuristic so a PAPX-bearing document keeps the same
 /// heading/title detection as the fallback path.
 /// Emit a heading at an explicit level, honouring soft line breaks.
-fn emit_heading(text: &str, level: u8, elements: &mut Vec<Element>) {
+fn emit_heading(
+    text: &str,
+    level: u8,
+    elements: &mut Vec<Element>,
+    hyperlinks: &[HyperlinkSpan],
+    chp_runs: &[(std::ops::Range<usize>, ChpProps)],
+) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return;
     }
-    let mut content = inline_content_for(trimmed);
+    let trim_start = text.len() - text.trim_start().len();
+    let hyperlinks = shift_hyperlinks_for_trim(hyperlinks, trim_start, trimmed.len());
+    let chp_runs = shift_chp_runs_for_trim(chp_runs, trim_start, trimmed.len());
+    let mut content = inline_content_for(trimmed, &hyperlinks, &chp_runs);
     for ic in &mut content {
         if let InlineContent::Text(t) = ic {
             t.bold = true;
@@ -538,7 +872,13 @@ fn emit_heading(text: &str, level: u8, elements: &mut Vec<Element>) {
 /// This is a guess and is only reached for documents that carry no
 /// `sprmPOutLvl` at all. Running it alongside real outline levels produced
 /// two disagreeing answers for the same paragraphs in one document.
-fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>) {
+fn emit_prose(
+    text: &str,
+    props: &PapProps,
+    elements: &mut Vec<Element>,
+    hyperlinks: &[HyperlinkSpan],
+    chp_runs: &[(std::ops::Range<usize>, ChpProps)],
+) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return;
@@ -547,6 +887,7 @@ fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>) {
     let is_heading = trimmed.len() < 100
         && !trimmed.ends_with('.')
         && !trimmed.ends_with(',')
+        && !is_heading_guess_junk(trimmed)
         && (trimmed
             .chars()
             .filter(|c| c.is_alphabetic())
@@ -556,7 +897,10 @@ fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>) {
     if is_heading {
         // Honour soft line breaks inside headings too: split on `'\n'` (the
         // sanitised form of `0x0B`) and keep each segment bold.
-        let mut content = inline_content_for(trimmed);
+        let trim_start = text.len() - text.trim_start().len();
+        let shifted = shift_hyperlinks_for_trim(hyperlinks, trim_start, trimmed.len());
+        let shifted_chp = shift_chp_runs_for_trim(chp_runs, trim_start, trimmed.len());
+        let mut content = inline_content_for(trimmed, &shifted, &shifted_chp);
         for ic in &mut content {
             if let InlineContent::Text(t) = ic {
                 t.bold = true;
@@ -569,11 +913,81 @@ fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>) {
         }));
     } else {
         elements.push(Element::Paragraph(Paragraph {
-            content: inline_content_for(text),
-            tabs: tabs.to_vec(),
+            content: inline_content_for(text, hyperlinks, chp_runs),
+            tabs: props.tabs.clone(),
+            alignment: props.alignment.clone(),
+            indent_left_twips: props.indent_left_twips,
+            indent_right_twips: props.indent_right_twips,
+            first_line_indent_twips: props.first_line_indent_twips,
+            space_before_twips: props.space_before_twips,
+            space_after_twips: props.space_after_twips,
             ..Default::default()
         }));
     }
+}
+
+/// Reject line shapes the ALL-CAPS / short-opening-line heading guess in
+/// `emit_prose` otherwise misclassifies as headings: pure separator lines,
+/// bare dates, UK postcodes, and "CCY - symbol" currency labels — all
+/// confirmed junk from the 246-file `.doc` corpus sweep that tightened the heading guess
+/// (`______________________________________________`, `11/16/2016`,
+/// `SW8 5NQ`, `GBP - £`). The guess otherwise stays as-is — no reference
+/// implementation does line-shape heading detection at all, so this only
+/// narrows an already-approximate fallback rather than trying to perfect
+/// it (`DRAFT`, a single common ALL-CAPS word, is left uncaught).
+fn is_heading_guess_junk(line: &str) -> bool {
+    (!line.chars().any(|c| c.is_alphanumeric()))
+        || is_bare_date(line)
+        || is_uk_postcode(line)
+        || is_currency_label(line)
+}
+
+/// A line that is *only* `D[D]/-M[M]/-Y[YYY]`-shaped — a whole date with no
+/// other text around it. Deliberately narrow: real headings almost never
+/// consist of exactly three all-digit, slash/dash-separated groups.
+fn is_bare_date(line: &str) -> bool {
+    let parts: Vec<&str> = line.split(['/', '-']).collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        && parts[0].len() <= 2
+        && parts[1].len() <= 2
+        && matches!(parts[2].len(), 2 | 4)
+}
+
+/// A UK postcode shape: `<1-2 letters><digit>[letter/digit] <digit><2
+/// letters>` (e.g. `SW8 5NQ`). Not a full validator, just narrow enough
+/// that a genuine heading is unlikely to match it by accident.
+fn is_uk_postcode(line: &str) -> bool {
+    let Some((outward, inward)) = line.rsplit_once(' ') else {
+        return false;
+    };
+    let mut inward_chars = inward.chars();
+    let inward_ok = inward.chars().count() == 3
+        && inward_chars.next().is_some_and(|c| c.is_ascii_digit())
+        && inward_chars.all(|c| c.is_ascii_uppercase());
+    if !inward_ok {
+        return false;
+    }
+    let outward: Vec<char> = outward.chars().collect();
+    (2..=4).contains(&outward.len())
+        && outward[0].is_ascii_uppercase()
+        && outward.iter().any(|c| c.is_ascii_digit())
+        && outward.iter().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// A `"CCY - symbol"`-shaped currency label (`GBP - £`, `EUR - €`): a
+/// 3-letter uppercase code followed by nothing but a currency symbol.
+fn is_currency_label(line: &str) -> bool {
+    let Some((code, rest)) = line.split_once(' ') else {
+        return false;
+    };
+    if code.len() != 3 || !code.chars().all(|c| c.is_ascii_uppercase()) {
+        return false;
+    }
+    let rest = rest.trim().strip_prefix('-').unwrap_or(rest).trim();
+    !rest.is_empty() && !rest.chars().any(|c| c.is_alphanumeric())
 }
 
 // ---------------------------------------------------------------------------
@@ -582,7 +996,24 @@ fn emit_prose(text: &str, tabs: &[TabStop], elements: &mut Vec<Element>) {
 
 fn line_heuristic(text: &str, elements: &mut Vec<Element>) {
     for line in text.lines() {
-        emit_prose(line, &[], elements);
+        emit_prose(line, &PapProps::default(), elements, &[], &[]);
+    }
+}
+
+/// Build a `HeaderFooter` from one `PlcfHdd`-delimited story's already
+/// sanitized text.
+fn text_to_header_footer(s: &str) -> HeaderFooter {
+    HeaderFooter {
+        content: s
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(l))],
+                    ..Default::default()
+                })
+            })
+            .collect(),
     }
 }
 
@@ -621,7 +1052,7 @@ mod tests {
     /// across rows (Word rounds per row) must be snapped together, otherwise
     /// a spurious grid edge inflates `col_span` for every cell spanning it.
     #[test]
-    fn column_edge_tolerance_collapses_near_boundaries() {
+    fn test_column_edge_tolerance_collapses_near_boundaries() {
         // Row 0 and row 1 share edges 0/2000; row 1's middle edge is 3 twips
         // off (1003 vs 1000) — within `EDGE_TOLERANCE_TWIPS`.
         let rows = vec![
@@ -652,14 +1083,171 @@ mod tests {
             text: text.to_string(),
             terminator: '\r',
             props,
+            hyperlinks: Vec::new(),
+            chp_runs: Vec::new(),
         }
+    }
+
+    /// A `HYPERLINK` field's display text must reach
+    /// `TextSpan::hyperlink` in the IR, with the surrounding plain text on
+    /// either side kept as ordinary, unlinked runs.
+    #[test]
+    fn test_hyperlink_span_reaches_textspan_hyperlink_in_the_ir() {
+        let text = "Before text; Hyperlink text; after text.".to_string();
+        let link_start = text.find("Hyperlink text").unwrap();
+        let link_end = link_start + "Hyperlink text".len();
+        let p = DocParagraph {
+            text,
+            terminator: '\r',
+            props: PapProps::default(),
+            hyperlinks: vec![crate::doc::HyperlinkSpan {
+                range: link_start..link_end,
+                url: "http://testuri.org/".to_string(),
+            }],
+            chp_runs: Vec::new(),
+        };
+        let mut els = Vec::new();
+        walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
+        let Element::Paragraph(par) = &els[0] else {
+            panic!("expected a paragraph, got {:?}", els[0]);
+        };
+        let spans: Vec<&TextSpan> = par
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                InlineContent::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        let linked = spans
+            .iter()
+            .find(|s| s.hyperlink.is_some())
+            .expect("a hyperlinked span must be present");
+        assert_eq!(linked.text, "Hyperlink text");
+        assert_eq!(linked.hyperlink.as_deref(), Some("http://testuri.org/"));
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.hyperlink.is_none() && s.text.contains("Before text")),
+            "surrounding plain text must stay unlinked: {spans:?}"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.hyperlink.is_none() && s.text.contains("after text")),
+            "surrounding plain text must stay unlinked: {spans:?}"
+        );
+    }
+
+    /// Regression: real per-run character formatting
+    /// (bold/italic/underline/color/font-size) from CHPX reaches the IR's
+    /// `TextSpan`s, split at exactly the right byte boundaries — not the
+    /// always-`false`/`None` defaults from before this fix.
+    #[test]
+    fn test_chp_runs_reach_textspan_formatting_split_at_the_right_boundaries() {
+        let text = "Plain bold italic.".to_string();
+        let bold_start = text.find("bold").unwrap();
+        let bold_end = bold_start + "bold".len();
+        let italic_start = text.find("italic").unwrap();
+        let italic_end = italic_start + "italic".len();
+        let p = DocParagraph {
+            text,
+            terminator: '\r',
+            props: PapProps::default(),
+            hyperlinks: Vec::new(),
+            chp_runs: vec![
+                (
+                    bold_start..bold_end,
+                    ChpProps {
+                        bold: true,
+                        color: Some([255, 0, 0]),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    italic_start..italic_end,
+                    ChpProps {
+                        italic: true,
+                        underline: Some(crate::ir::UnderlineStyle::Single),
+                        font_size_half_pt: Some(28),
+                        ..Default::default()
+                    },
+                ),
+            ],
+        };
+        let mut els = Vec::new();
+        walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
+        let Element::Paragraph(par) = &els[0] else {
+            panic!("expected a paragraph, got {:?}", els[0]);
+        };
+        let spans: Vec<&TextSpan> = par
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                InlineContent::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+
+        let plain = spans
+            .iter()
+            .find(|s| s.text == "Plain ")
+            .expect("leading plain span");
+        assert!(!plain.bold && !plain.italic, "unformatted text must stay unformatted");
+
+        let bold = spans.iter().find(|s| s.text == "bold").expect("bold span");
+        assert!(bold.bold);
+        assert!(!bold.italic);
+        assert_eq!(bold.color, Some([255, 0, 0]));
+
+        let italic = spans
+            .iter()
+            .find(|s| s.text == "italic")
+            .expect("italic span");
+        assert!(italic.italic);
+        assert!(!italic.bold);
+        assert_eq!(italic.underline, Some(crate::ir::UnderlineStyle::Single));
+        assert_eq!(italic.font_size_half_pt, Some(28));
+
+        assert!(
+            spans.iter().any(|s| s.text == " " && !s.bold && !s.italic),
+            "the gap between the two formatted runs must stay a separate, unformatted span: {spans:?}"
+        );
+    }
+
+    /// Regression: paragraph alignment/indentation/spacing
+    /// from PAP SPRMs reach the IR's `Paragraph`, not the always-`None`
+    /// defaults from before this fix.
+    #[test]
+    fn test_pap_alignment_indent_and_spacing_reach_the_ir_paragraph() {
+        let props = PapProps {
+            alignment: Some(crate::ir::ParagraphAlignment::Center),
+            indent_left_twips: Some(720),
+            indent_right_twips: Some(360),
+            first_line_indent_twips: Some(-360),
+            space_before_twips: Some(200),
+            space_after_twips: Some(100),
+            ..Default::default()
+        };
+        let p = para("A centered, indented paragraph.", props);
+        let mut els = Vec::new();
+        walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
+        let Element::Paragraph(par) = &els[0] else {
+            panic!("expected a paragraph, got {:?}", els[0]);
+        };
+        assert_eq!(par.alignment, Some(crate::ir::ParagraphAlignment::Center));
+        assert_eq!(par.indent_left_twips, Some(720));
+        assert_eq!(par.indent_right_twips, Some(360));
+        assert_eq!(par.first_line_indent_twips, Some(-360));
+        assert_eq!(par.space_before_twips, Some(200));
+        assert_eq!(par.space_after_twips, Some(100));
     }
 
     /// Medium #4: a soft line break (`0x0B`, which `sanitize_text` maps to
     /// `'\n'`) inside a paragraph must survive as an `InlineContent::LineBreak`
     /// rather than being flattened into one run.
     #[test]
-    fn soft_line_break_becomes_inline_break() {
+    fn test_soft_line_break_becomes_inline_break() {
         // Trailing '.' keeps this out of the heading heuristic so it routes to
         // a Paragraph (where soft breaks are honoured).
         let p = para(
@@ -667,7 +1255,7 @@ mod tests {
             PapProps::default(),
         );
         let mut els = Vec::new();
-        walk_paragraphs(&[p], false, &mut els);
+        walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
         let Element::Paragraph(par) = &els[0] else {
             panic!("expected a paragraph, got {:?}", els[0]);
         };
@@ -697,7 +1285,7 @@ mod tests {
     /// Medium #2: a nested table (`itap > 1`) is flattened, not silently
     /// mis-rendered — a visible notice paragraph must accompany the table.
     #[test]
-    fn nested_table_itap_emits_notice() {
+    fn test_nested_table_itap_emits_notice() {
         let props = PapProps {
             is_table_trailing_mark: true,
             itap: 2, // nested
@@ -707,7 +1295,7 @@ mod tests {
         let row = para("", props);
 
         let mut els = Vec::new();
-        walk_paragraphs(&[row], false, &mut els);
+        walk_paragraphs(&[row], false, &mut els, &ListFormatting::default());
 
         assert!(
             els.iter().any(|e| matches!(e, Element::Table(_))),
@@ -730,7 +1318,7 @@ mod tests {
     /// [MS-DOC] §2.4.6.3. `0x0000` and `0xF801` mean "not in a list" and the
     /// paragraph must be ordinary prose even when an `ilvl` SPRM is present.
     #[test]
-    fn ilfo_not_in_list_bands_are_prose() {
+    fn test_ilfo_not_in_list_bands_are_prose() {
         // `0x0000` (0) and `0xF801` (-2047 as signed i16) are the two
         // documented "not in a list" markers. A non-spec value (2047) is also
         // prose because it falls outside every valid band.
@@ -742,7 +1330,7 @@ mod tests {
             };
             let p = para("Not a list item.", props);
             let mut els = Vec::new();
-            walk_paragraphs(&[p], false, &mut els);
+            walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
             assert!(
                 !els.iter().any(|e| matches!(e, Element::List(_))),
                 "ilfo {ilfo:#06x} must not build a list"
@@ -754,10 +1342,38 @@ mod tests {
         }
     }
 
+    /// A paragraph with a real outline level (heading) that
+    /// *also* carries a valid `ilfo` (Word's multilevel-list "Heading"
+    /// gallery attaches numPr/ilfo to the heading styles themselves) must
+    /// come out as a Heading, not a ListItem — this is the normal shape
+    /// of a numbered heading ("1. Introduction") in real documents.
+    #[test]
+    fn test_numbered_heading_wins_over_list_membership() {
+        let props = PapProps {
+            ilvl: Some(0),
+            ilfo: Some(1),          // valid 1-based list index
+            outline_level: Some(0), // Heading 1
+            ..PapProps::default()
+        };
+        let p = para("1. Introduction", props);
+        let mut els = Vec::new();
+        walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
+
+        assert!(
+            els.iter()
+                .any(|e| matches!(e, Element::Heading(h) if h.level == 1)),
+            "a numbered Heading 1 must be emitted as a Heading, got {els:#?}"
+        );
+        assert!(
+            !els.iter().any(|e| matches!(e, Element::List(_))),
+            "list membership must be dropped once the paragraph is a heading, got {els:#?}"
+        );
+    }
+
     /// `0xF802`–`0xFFFF` is the negation of a 1-based index and is still a list
     /// item (see TODO(ilfo-negated)); it must not be dropped to prose.
     #[test]
-    fn ilfo_negated_band_is_list() {
+    fn test_ilfo_negated_band_is_list() {
         let props = PapProps {
             ilvl: Some(0),
             ilfo: Some(-2046), // 0xF802
@@ -765,17 +1381,137 @@ mod tests {
         };
         let p = para("A list item via the negated band.", props);
         let mut els = Vec::new();
-        walk_paragraphs(&[p], false, &mut els);
+        walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
         assert!(
             els.iter().any(|e| matches!(e, Element::List(_))),
             "0xF802 (negated index) must still be a list item"
         );
     }
 
+    /// A list run's `ilfo` must resolve through `PlfLfo`'s
+    /// `lsid` to the matching `PlfLst` entry's `LVL`, surfacing a real
+    /// `start_number` and `ordered = true` instead of always `None`/bullet.
+    #[test]
+    fn test_list_start_number_and_ordered_resolve_from_list_formatting() {
+        let list_formatting = crate::doc::ListFormatting::from_parts(
+            vec![(
+                0x44F53D09, // lsid
+                vec![
+                    crate::doc::ListLevel {
+                        start_at: 5,
+                        nfc: 0x00,
+                    }, // level 0: numbered, starts at 5
+                    crate::doc::ListLevel {
+                        start_at: 1,
+                        nfc: 0xFF,
+                    }, // level 1: bullet
+                ],
+            )],
+            vec![0x44F53D09], // lfo_lsids[0] == lsid above, so ilfo=1 resolves to it
+        );
+        let props = PapProps {
+            ilvl: Some(0),
+            ilfo: Some(1),
+            ..PapProps::default()
+        };
+        let p = para("First", props);
+        let mut els = Vec::new();
+        walk_paragraphs(&[p], false, &mut els, &list_formatting);
+
+        let Element::List(list) = &els[0] else {
+            panic!("expected a List element, got {els:#?}");
+        };
+        assert!(list.ordered, "nfc != 0xFF must render as an ordered list");
+        assert_eq!(list.start_number, Some(5), "iStartAt = 5 must reach List::start_number");
+    }
+
+    /// A level whose `nfc == 0xFF` (a bullet level) must never report
+    /// `start_number`, even when its `iStartAt` happens to be non-1.
+    #[test]
+    fn test_bullet_level_never_gets_a_start_number() {
+        let list_formatting = crate::doc::ListFormatting::from_parts(
+            vec![(
+                1,
+                vec![crate::doc::ListLevel {
+                    start_at: 7,
+                    nfc: 0xFF,
+                }],
+            )],
+            vec![1],
+        );
+        let props = PapProps {
+            ilvl: Some(0),
+            ilfo: Some(1),
+            ..PapProps::default()
+        };
+        let p = para("Bulleted", props);
+        let mut els = Vec::new();
+        walk_paragraphs(&[p], false, &mut els, &list_formatting);
+
+        let Element::List(list) = &els[0] else {
+            panic!("expected a List element, got {els:#?}");
+        };
+        assert!(!list.ordered);
+        assert_eq!(list.start_number, None);
+    }
+
+    /// A declared `iStartAt == 1` (the default) must not set
+    /// `start_number` — only an explicit override is worth surfacing,
+    /// mirroring DOCX's identical contract.
+    #[test]
+    fn test_start_at_one_is_not_surfaced_as_an_override() {
+        let list_formatting = crate::doc::ListFormatting::from_parts(
+            vec![(
+                1,
+                vec![crate::doc::ListLevel {
+                    start_at: 1,
+                    nfc: 0x00,
+                }],
+            )],
+            vec![1],
+        );
+        let props = PapProps {
+            ilvl: Some(0),
+            ilfo: Some(1),
+            ..PapProps::default()
+        };
+        let p = para("Numbered from 1", props);
+        let mut els = Vec::new();
+        walk_paragraphs(&[p], false, &mut els, &list_formatting);
+
+        let Element::List(list) = &els[0] else {
+            panic!("expected a List element, got {els:#?}");
+        };
+        assert!(list.ordered);
+        assert_eq!(list.start_number, None, "start_at == 1 is the default, not an override");
+    }
+
+    /// An `ilfo` with no matching `PlfLfo`/`PlfLst` data (the common case
+    /// for most existing tests, and for a real file with no `PlfLst` at
+    /// all) must degrade to the pre-list-format contract — bullet, no
+    /// start_number — not panic or produce a wrong-but-confident answer.
+    #[test]
+    fn test_missing_list_formatting_degrades_to_the_old_contract() {
+        let props = PapProps {
+            ilvl: Some(0),
+            ilfo: Some(1),
+            ..PapProps::default()
+        };
+        let p = para("Item", props);
+        let mut els = Vec::new();
+        walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
+
+        let Element::List(list) = &els[0] else {
+            panic!("expected a List element, got {els:#?}");
+        };
+        assert!(!list.ordered);
+        assert_eq!(list.start_number, None);
+    }
+
     /// `sprmPChgTabs` tab stops decoded onto `PapProps` must surface on the
     /// produced paragraph's `tabs`.
     #[test]
-    fn pchg_tabs_surfaced_on_paragraph() {
+    fn test_pchg_tabs_surfaced_on_paragraph() {
         let props = PapProps {
             tabs: vec![TabStop {
                 position_twips: 1440,
@@ -787,7 +1523,7 @@ mod tests {
         let p = para("Indented text carrying tab stops.", props);
 
         let mut els = Vec::new();
-        walk_paragraphs(&[p], false, &mut els);
+        walk_paragraphs(&[p], false, &mut els, &ListFormatting::default());
         let Element::Paragraph(par) = &els[0] else {
             panic!("expected a paragraph, got {:?}", els[0]);
         };
@@ -801,7 +1537,7 @@ mod tests {
     /// dispatch branch. A lone cell paragraph makes no row, so wrap it between
     /// two row-terminators the way a real `.doc` lays out a one-cell table.
     #[test]
-    fn in_table_paragraph_becomes_cell() {
+    fn test_in_table_paragraph_becomes_cell() {
         let mark = |itap: u8| DocParagraph {
             text: String::new(),
             terminator: '\r',
@@ -810,6 +1546,8 @@ mod tests {
                 itap,
                 ..PapProps::default()
             },
+            hyperlinks: Vec::new(),
+            chp_runs: Vec::new(),
         };
         let cell = DocParagraph {
             text: "cell text".into(),
@@ -818,10 +1556,12 @@ mod tests {
                 f_in_table: true,
                 ..PapProps::default()
             },
+            hyperlinks: Vec::new(),
+            chp_runs: Vec::new(),
         };
         let paragraphs = [mark(1), cell, mark(1)];
         let mut els = Vec::new();
-        walk_paragraphs(&paragraphs, false, &mut els);
+        walk_paragraphs(&paragraphs, false, &mut els, &ListFormatting::default());
         assert!(
             els.iter().any(|e| matches!(e, Element::Table(_))),
             "f_in_table cell paragraph must be emitted inside a table"
@@ -856,7 +1596,7 @@ mod tests {
     /// each merge is 2 rows; both restart cells must be rendered and rows 1&3
     /// (the `fvmMerge` continuations) absorbed.
     #[test]
-    fn two_independent_two_row_merges_do_not_fold() {
+    fn test_two_independent_two_row_merges_do_not_fold() {
         let rows = vec![
             vmerge_row(0x0060), // merge A restart
             vmerge_row(0x0020), // merge A continuation
@@ -885,7 +1625,7 @@ mod tests {
     /// merge above it, which is exactly the wrong output the old heuristic
     /// produced for two independent adjacent merges.
     #[test]
-    fn restart_after_restart_is_distinct_merge() {
+    fn test_restart_after_restart_is_distinct_merge() {
         let rows = vec![vmerge_row(0x0060), vmerge_row(0x0060), vmerge_row(0x0020)];
 
         let out = build_table_rows(&rows);
@@ -902,7 +1642,7 @@ mod tests {
 
     /// Plain single 3-row merge via `[fvmRestart, fvmMerge, fvmMerge]`.
     #[test]
-    fn single_three_row_merge_spans_three() {
+    fn test_single_three_row_merge_spans_three() {
         let rows = vec![vmerge_row(0x0060), vmerge_row(0x0020), vmerge_row(0x0020)];
 
         let out = build_table_rows(&rows);
@@ -910,5 +1650,64 @@ mod tests {
         assert_eq!(out[0].cells[0].row_span, 3, "one continuous 3-row merge");
         assert!(out[1].cells.is_empty());
         assert!(out[2].cells.is_empty());
+    }
+
+    // ── Line-shape heading guess tightening ────────────────────
+
+    fn is_heading_guess(text: &str) -> bool {
+        let mut els = Vec::new();
+        emit_prose(text, &PapProps::default(), &mut els, &[], &[]);
+        matches!(els.as_slice(), [Element::Heading(_)])
+    }
+
+    /// A pure separator/underscore line must never become a heading —
+    /// found ×4 in a real corpus file (`ob_is.doc`) during the heading-guess sweep.
+    #[test]
+    fn test_underscore_separator_line_is_not_a_heading() {
+        assert!(!is_heading_guess("______________________________________________"));
+    }
+
+    /// A bare `MM/DD/YYYY` date, found as a false-positive heading in a
+    /// real corpus file during the heading-guess sweep, must not be promoted.
+    #[test]
+    fn test_bare_date_is_not_a_heading() {
+        assert!(!is_heading_guess("11/16/2016"));
+    }
+
+    /// A UK postcode shape (`SW8 5NQ`), found as a false-positive heading
+    /// in a real corpus file during the heading-guess sweep, must not be promoted.
+    #[test]
+    fn test_uk_postcode_is_not_a_heading() {
+        assert!(!is_heading_guess("SW8 5NQ"));
+    }
+
+    /// `"CCY - symbol"` currency labels (`GBP - £`, `EUR - €`), found as
+    /// false-positive headings during the heading-guess sweep, must not be promoted.
+    #[test]
+    fn test_currency_label_is_not_a_heading() {
+        assert!(!is_heading_guess("GBP - £"));
+        assert!(!is_heading_guess("EUR - €"));
+    }
+
+    /// The tightening must not touch real ALL-CAPS section headers the
+    /// guess correctly caught before the tightening (e.g. `parentinvguid.doc`'s
+    /// un-styled section headings).
+    #[test]
+    fn test_genuine_all_caps_headings_still_promoted() {
+        for heading in [
+            "INTRODUCTION",
+            "TABLE OF CONTENTS",
+            "A. GENERAL INFORMATION",
+        ] {
+            assert!(is_heading_guess(heading), "{heading:?} must still be promoted");
+        }
+    }
+
+    /// The bare-date rule only rejects a line that is *entirely* a date —
+    /// a date-shaped substring inside otherwise heading-shaped text must
+    /// still be promoted.
+    #[test]
+    fn test_date_substring_inside_otherwise_heading_shaped_text_is_unaffected() {
+        assert!(is_heading_guess("Report 11/16/2016 Summary"));
     }
 }

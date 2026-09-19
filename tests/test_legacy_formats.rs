@@ -35,11 +35,11 @@ fn expect_err(r: office_oxide::Result<Document>, why: &str) -> office_oxide::Off
 }
 
 // ---------------------------------------------------------------------------
-// #167 — Word 6.0/95
+// Word 6.0/95
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_word_6_or_95_file_is_refused_rather_than_read_with_word_97_offsets() {
+fn test_a_word_6_or_95_file_is_refused_rather_than_read_with_word_97_offsets() {
     // 0xA5DC has a completely different FIB layout; reading Word 97 offsets
     // out of it produced a confident empty result for a real document.
     let bytes = build_doc_full(
@@ -59,11 +59,11 @@ fn a_word_6_or_95_file_is_refused_rather_than_read_with_word_97_offsets() {
 }
 
 // ---------------------------------------------------------------------------
-// #169 — encrypted legacy files
+// Encrypted legacy files
 // ---------------------------------------------------------------------------
 
 #[test]
-fn an_encrypted_document_reports_encryption_not_emptiness() {
+fn test_an_encrypted_document_reports_encryption_not_emptiness() {
     let bytes = build_doc_full(
         &[para("ciphertext")],
         &Subdocs::default(),
@@ -77,17 +77,17 @@ fn an_encrypted_document_reports_encryption_not_emptiness() {
 }
 
 #[test]
-fn an_unencrypted_document_still_parses() {
+fn test_an_unencrypted_document_still_parses() {
     let doc = open_doc(build_doc(&[para("plain text")])).expect("parse");
     assert!(doc.plain_text().contains("plain text"));
 }
 
 // ---------------------------------------------------------------------------
-// #195 — subdocuments
+// Subdocuments
 // ---------------------------------------------------------------------------
 
 #[test]
-fn footnotes_headers_comments_and_text_boxes_reach_the_ir() {
+fn test_footnotes_headers_comments_and_text_boxes_reach_the_ir() {
     // The FIB's `ccp*` lengths delimit these; they were parsed and then
     // never used, so none of this content reached a consumer.
     let bytes = build_doc_full(
@@ -129,10 +129,52 @@ fn footnotes_headers_comments_and_text_boxes_reach_the_ir() {
     assert!(kinds.contains(&"footnote"), "no footnote element: {kinds:?}");
     assert!(kinds.contains(&"endnote"), "no endnote element: {kinds:?}");
     assert!(kinds.contains(&"textbox"), "no textbox element: {kinds:?}");
+
+    // A comment and a real endnote both land as
+    // `Element::Endnote` (there is no dedicated comment variant), but their
+    // `marker` must distinguish them: the comment's text ("REVIEW NOTE")
+    // must carry marker "comment", and the real endnote's text ("ENDNOTE
+    // ONE") must carry marker "endnote" — not the other way around, which
+    // is what the FIB offset bug produced (comments always read
+    // zero-length, and a real endnote's content surfaced under the
+    // textbox slot instead).
+    let note_markers: Vec<(Option<&str>, String)> = ir.sections[0]
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            Element::Endnote(n) => {
+                let text: String = n
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        Element::Paragraph(p) => p.content.iter().find_map(|ic| match ic {
+                            office_oxide::ir::InlineContent::Text(t) => Some(t.text.clone()),
+                            _ => None,
+                        }),
+                        _ => None,
+                    })
+                    .collect();
+                Some((n.marker.as_deref(), text))
+            },
+            _ => None,
+        })
+        .collect();
+    assert!(
+        note_markers
+            .iter()
+            .any(|(marker, text)| *marker == Some("comment") && text.contains("REVIEW NOTE")),
+        "the comment must carry marker \"comment\", got {note_markers:?}"
+    );
+    assert!(
+        note_markers
+            .iter()
+            .any(|(marker, text)| *marker == Some("endnote") && text.contains("ENDNOTE ONE")),
+        "the real endnote must carry marker \"endnote\", got {note_markers:?}"
+    );
 }
 
 #[test]
-fn a_document_with_no_subdocuments_gains_no_extra_elements() {
+fn test_a_document_with_no_subdocuments_gains_no_extra_elements() {
     let doc = open_doc(build_doc(&[para("just body")])).expect("parse");
     let ir = doc.to_ir();
     assert!(
@@ -145,11 +187,11 @@ fn a_document_with_no_subdocuments_gains_no_extra_elements() {
 }
 
 // ---------------------------------------------------------------------------
-// #168 — a read failure is an error, not an empty document
+// A read failure is an error, not an empty document
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_document_whose_piece_table_is_out_of_bounds_reports_the_failure() {
+fn test_a_document_whose_piece_table_is_out_of_bounds_reports_the_failure() {
     // Point fcClx far past the end of the table stream.
     let bytes = build_doc_full(
         &[para("hello")],
@@ -169,7 +211,7 @@ fn a_document_whose_piece_table_is_out_of_bounds_reports_the_failure() {
 }
 
 // ---------------------------------------------------------------------------
-// #139 — the line-shape heading guess is gated on real outline data
+// The line-shape heading guess is gated on real outline data
 // ---------------------------------------------------------------------------
 
 /// `sprmPOutLvl` (0x2640), 1-byte operand: 0 = Heading 1 … 8 = Heading 9.
@@ -178,7 +220,7 @@ fn outline_grpprl(level: u8) -> Vec<u8> {
 }
 
 #[test]
-fn a_document_with_real_outline_levels_uses_them_and_does_not_guess() {
+fn test_a_document_with_real_outline_levels_uses_them_and_does_not_guess() {
     // "ALL CAPS" would be guessed as a heading by the line-shape rule. With
     // real outline data present, the guess must not run alongside it —
     // otherwise one document emits real levels and ALL-CAPS guesses that
@@ -227,7 +269,7 @@ fn a_document_with_real_outline_levels_uses_them_and_does_not_guess() {
 }
 
 #[test]
-fn a_document_with_no_outline_data_still_gets_the_line_shape_guess() {
+fn test_a_document_with_no_outline_data_still_gets_the_line_shape_guess() {
     // The 88 documents that would otherwise lose their headings — and with
     // them `metadata.title` — under a stylesheet-based gate.
     let doc = open_doc(build_doc(&[

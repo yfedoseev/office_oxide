@@ -14,7 +14,7 @@ use office_oxide::core::units::{Angle60k, Emu, HalfPoint, Percentage1000, Twip};
 // ---------------------------------------------------------------------------
 
 #[test]
-fn full_round_trip() {
+fn test_full_round_trip() {
     let buf = Vec::new();
     let cursor = Cursor::new(buf);
     let mut writer = OpcWriter::new(cursor).unwrap();
@@ -179,7 +179,7 @@ fn full_round_trip() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn part_name_case_insensitive_content_type_lookup() {
+fn test_part_name_case_insensitive_content_type_lookup() {
     let mut builder = ContentTypesBuilder::new();
     builder.add_override(PartName::new("/Word/Document.xml").unwrap(), "application/vnd.test");
     let ct = builder.build();
@@ -190,7 +190,7 @@ fn part_name_case_insensitive_content_type_lookup() {
 }
 
 #[test]
-fn content_types_default_extension_case_insensitive() {
+fn test_content_types_default_extension_case_insensitive() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="PNG" ContentType="image/png"/>
@@ -203,7 +203,7 @@ fn content_types_default_extension_case_insensitive() {
 }
 
 #[test]
-fn relationships_external_target_mode() {
+fn test_relationships_external_target_mode() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"
@@ -216,7 +216,7 @@ fn relationships_external_target_mode() {
 }
 
 #[test]
-fn relationships_empty() {
+fn test_relationships_empty() {
     let rels = Relationships::empty();
     assert!(rels.all().is_empty());
     assert!(rels.get_by_id("rId1").is_none());
@@ -224,7 +224,7 @@ fn relationships_empty() {
 }
 
 #[test]
-fn missing_part_returns_error() {
+fn test_missing_part_returns_error() {
     let buf = Vec::new();
     let cursor = Cursor::new(buf);
     let mut writer = OpcWriter::new(cursor).unwrap();
@@ -244,7 +244,7 @@ fn missing_part_returns_error() {
 }
 
 #[test]
-fn missing_rels_returns_empty() {
+fn test_missing_rels_returns_empty() {
     let buf = Vec::new();
     let cursor = Cursor::new(buf);
     let mut writer = OpcWriter::new(cursor).unwrap();
@@ -266,7 +266,7 @@ fn missing_rels_returns_empty() {
 }
 
 #[test]
-fn relative_uri_resolution_with_dotdot() {
+fn test_relative_uri_resolution_with_dotdot() {
     let source = PartName::new("/word/document.xml").unwrap();
 
     // Simple relative
@@ -291,7 +291,7 @@ fn relative_uri_resolution_with_dotdot() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn theme_color_ref_with_shade() {
+fn test_theme_color_ref_with_shade() {
     let theme_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="T">
   <a:themeElements>
@@ -345,7 +345,7 @@ fn theme_color_ref_with_shade() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn unit_conversion_invariants() {
+fn test_unit_conversion_invariants() {
     // US Letter dimensions in twips
     let letter_width = Twip(12240);
     let letter_height = Twip(15840);
@@ -377,7 +377,7 @@ fn unit_conversion_invariants() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn content_types_builder_has_standard_defaults() {
+fn test_content_types_builder_has_standard_defaults() {
     let builder = ContentTypesBuilder::new();
     let ct = builder.build();
 
@@ -397,7 +397,7 @@ fn content_types_builder_has_standard_defaults() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn relationships_builder_generates_sequential_ids() {
+fn test_relationships_builder_generates_sequential_ids() {
     let mut builder = RelationshipsBuilder::new();
     let id1 = builder.add(rel_types::OFFICE_DOCUMENT, "word/document.xml");
     let id2 = builder.add(rel_types::CORE_PROPERTIES, "docProps/core.xml");
@@ -422,7 +422,7 @@ fn relationships_builder_generates_sequential_ids() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn core_properties_empty() {
+fn test_core_properties_empty() {
     let props = CoreProperties::default();
     let xml = props.serialize();
     let parsed = CoreProperties::parse(&xml).unwrap();
@@ -432,7 +432,7 @@ fn core_properties_empty() {
 }
 
 #[test]
-fn app_properties_empty() {
+fn test_app_properties_empty() {
     let props = AppProperties::default();
     let xml = props.serialize();
     let parsed = AppProperties::parse(&xml).unwrap();
@@ -445,19 +445,19 @@ fn app_properties_empty() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn part_name_root_slash_only_is_valid() {
+fn test_part_name_root_slash_only_is_valid() {
     // Single slash "/" is a valid part name (represents root)
     assert!(PartName::new("/").is_ok());
 }
 
 #[test]
-fn part_name_extension_none_for_no_dot() {
+fn test_part_name_extension_none_for_no_dot() {
     let pn = PartName::new("/data/noext").unwrap();
     assert_eq!(pn.extension(), None);
 }
 
 #[test]
-fn part_name_deep_nesting() {
+fn test_part_name_deep_nesting() {
     let pn = PartName::new("/a/b/c/d/e/file.xml").unwrap();
     assert_eq!(pn.directory(), "/a/b/c/d/e/");
     assert_eq!(pn.filename(), "file.xml");

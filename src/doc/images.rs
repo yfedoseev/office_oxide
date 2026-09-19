@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_finds_jpeg_in_data_stream() {
+    fn test_scan_finds_jpeg_in_data_stream() {
         let data = make_blip_in_data(0xF01D, 0x46A, b"\xff\xd8\xff\xe0JFIF");
         let images = extract_images(&data);
         assert_eq!(images.len(), 1);
@@ -138,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_finds_png_in_data_stream() {
+    fn test_scan_finds_png_in_data_stream() {
         let data = make_blip_in_data(0xF01E, 0x6E0, b"\x89PNG\r\n\x1a\nIHDR");
         let images = extract_images(&data);
         assert_eq!(images.len(), 1);
@@ -147,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_finds_multiple_images() {
+    fn test_scan_finds_multiple_images() {
         let mut data = make_blip_in_data(0xF01D, 0x46A, b"\xff\xd8\xff\xe0JPEG1");
         data.extend(make_blip_in_data(0xF01E, 0x6E0, b"\x89PNG\r\n\x1a\nPNG2"));
         let images = extract_images(&data);
@@ -157,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_false_positive() {
+    fn test_rejects_false_positive() {
         // Data that happens to have a BLIP type at the right offset but no valid image sig.
         let mut data = vec![0u8; 100];
         data[2] = 0x1D;
@@ -172,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_data_stream() {
+    fn test_empty_data_stream() {
         assert!(extract_images(&[]).is_empty());
     }
 }

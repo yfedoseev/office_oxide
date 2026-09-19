@@ -433,12 +433,11 @@ dependencies = [
 
 [[package]]
 name = "office_oxide"
-version = "0.1.9"
+version = "0.1.12"
 dependencies = [
  "atoi_simd",
  "encoding_rs 0.8.35",
  "fast-float2",
- "libc",
  "log",
  "quick-xml 0.41.0",
  "serde",

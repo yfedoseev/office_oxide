@@ -36,7 +36,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         // First pass: parse all rows into `CellData` — the rendered display
         // string plus the structured facts (semantic type, raw value, number
         // format) that the grid path threads into the IR so `to_ir()`
-        // consumers can tell numbers/dates from text (issue #72).
+        // consumers can tell numbers/dates from text.
         // Cap eager row materialisation: an unbounded sheet would build
         // millions of IR cell allocations and then stall the single-table
         // render downstream. Excess rows are dropped and flagged below.
@@ -59,10 +59,59 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             })
             .collect();
 
+        // `merged_cells` ("A1:C1") was parsed and then never read on this
+        // path: every TableCell got col_span/row_span hardcoded to 1, so
+        // a merged header or label flattened to an ordinary unspanned
+        // grid. Reduce each range to the anchor's span plus
+        // the set of positions it covers, so the anchor carries the real
+        // span and covered positions are excluded from the row entirely
+        // — the same sparse, span-driven model every other format's
+        // TableRow already uses (matches ir_render.rs's table_grid,
+        // which resolves col_span/row_span by walking row.cells and
+        // skipping ahead over covered columns).
+        let mut merge_span: std::collections::HashMap<(u32, u32), (u32, u32)> =
+            std::collections::HashMap::new();
+        let mut merge_covered: std::collections::HashSet<(u32, u32)> =
+            std::collections::HashSet::new();
+        for range in &ws.merged_cells {
+            let Some((start, end)) = range.split_once(':') else {
+                continue;
+            };
+            let (Some(s), Some(e)) =
+                (crate::xlsx::CellRef::parse(start), crate::xlsx::CellRef::parse(end))
+            else {
+                continue;
+            };
+            let (row_lo, row_hi) = (s.row.min(e.row), s.row.max(e.row));
+            let (col_lo, col_hi) = (s.col.min(e.col), s.col.max(e.col));
+            let row_span = row_hi - row_lo + 1;
+            let col_span = col_hi - col_lo + 1;
+            if row_span <= 1 && col_span <= 1 {
+                continue;
+            }
+            merge_span.insert((row_lo, col_lo), (row_span, col_span));
+            for r in row_lo..=row_hi {
+                for c in col_lo..=col_hi {
+                    if (r, c) != (row_lo, col_lo) {
+                        merge_covered.insert((r, c));
+                    }
+                }
+            }
+        }
+
         let total_rows = ws.rows.len();
         let mut parsed_rows: Vec<Vec<CellData>> =
             Vec::with_capacity(total_rows.min(MAX_ROWS_PER_SHEET));
+        // Absolute 0-based sheet row number per `parsed_rows` entry, kept
+        // alongside rather than folded into `CellData` (only the merge
+        // lookup below needs it). `merged_cells` ranges like "A5:C5" are
+        // sheet-absolute, and `parsed_rows`'s own index is only sheet-row-
+        // aligned when there's no gap of fully-empty rows — the same
+        // assumption `grid_width`/`is_header` already make elsewhere in
+        // this function, not a new limitation introduced here.
+        let mut row_numbers: Vec<u32> = Vec::with_capacity(total_rows.min(MAX_ROWS_PER_SHEET));
         for row in ws.rows.iter().take(MAX_ROWS_PER_SHEET) {
+            row_numbers.push(row.index.saturating_sub(1));
             let mut cells: Vec<CellData> = Vec::with_capacity(row.cells.len());
             for cell in &row.cells {
                 buf.clear();
@@ -74,6 +123,17 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 };
                 let (data_type, raw_number, number_format, number_format_id) =
                     cell_semantics(doc, cell, &date_indices);
+                let rich_runs = match &cell.value {
+                    crate::xlsx::cell::CellValue::SharedString(idx) => doc
+                        .shared_strings
+                        .get_shared(*idx)
+                        .and_then(|s| s.rich_text.clone()),
+                    // An inline (`t="inlineStr"`) string cell carries its
+                    // own rich runs directly on the raw `Cell`, not via
+                    // the shared string table.
+                    crate::xlsx::cell::CellValue::String(_) => cell.rich_runs.clone(),
+                    _ => None,
+                };
                 cells.push(CellData {
                     col: cell.reference.col,
                     hyperlink: links
@@ -85,10 +145,15 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                     raw_number,
                     number_format,
                     number_format_id,
+                    formula: cell.formula.clone(),
+                    rich_runs,
                 });
             }
             // Drop trailing empty cells.
-            while cells.last().is_some_and(|cd| cd.text.is_empty()) {
+            while cells
+                .last()
+                .is_some_and(|cd| cd.text.is_empty() && cd.formula.is_none())
+            {
                 cells.pop();
             }
             parsed_rows.push(cells);
@@ -118,7 +183,10 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         let mut prose_score = 0usize;
         let mut nonempty_rows = 0usize;
         for cells in &parsed_rows {
-            let nc = cells.iter().filter(|cd| !cd.text.is_empty()).count();
+            let nc = cells
+                .iter()
+                .filter(|cd| !cd.text.is_empty() || cd.formula.is_some())
+                .count();
             if nc == 0 {
                 continue;
             }
@@ -206,12 +274,17 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             // (they were just visual separators).
             let mut out: Vec<Element> = Vec::new();
             for cells in &parsed_rows {
-                // Find the first non-empty cell.
-                let Some(cd) = cells.iter().find(|cd| !cd.text.is_empty()) else {
+                // Find the first non-empty cell (a formula with no cached
+                // value counts too — it has real content, just no cached
+                // display text).
+                let Some(cd) = cells
+                    .iter()
+                    .find(|cd| !cd.text.is_empty() || cd.formula.is_some())
+                else {
                     continue;
                 };
                 out.push(Element::Paragraph(Paragraph {
-                    content: vec![InlineContent::Text(cell_span(doc, cd))],
+                    content: cell_spans(doc, cd),
                     ..Default::default()
                 }));
             }
@@ -225,13 +298,13 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 // stays under the `B` header even when `A2` is absent.
                 let mut tcells: Vec<TableCell> = Vec::with_capacity(grid_width);
                 for cd in cells {
-                    let content = if cd.text.is_empty() {
+                    let content = if cd.text.is_empty() && cd.formula.is_none() {
                         Vec::new()
                     } else {
                         // Cell font formatting reached the IR in prose mode
                         // but not here, so the same cell rendered differently
                         // depending on the shape of the sheet around it.
-                        vec![InlineContent::Text(cell_span(doc, cd))]
+                        cell_spans(doc, cd)
                     };
                     let cell = TableCell {
                         content: vec![Element::Paragraph(Paragraph {
@@ -244,6 +317,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                         raw_number: cd.raw_number,
                         number_format: cd.number_format.clone(),
                         number_format_id: cd.number_format_id,
+                        formula: cd.formula.clone(),
                         ..Default::default()
                     };
                     while tcells.len() < cd.col as usize {
@@ -265,6 +339,30 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 while tcells.len() < grid_width {
                     tcells.push(empty_cell());
                 }
+                // Apply merges: set the anchor's real span, then drop
+                // every position the merge covers from the row entirely
+                // (dense-grid -> sparse, span-driven row) rather than
+                // rebuilding the placement loop above around them.
+                let true_row = row_numbers.get(row_idx).copied().unwrap_or(row_idx as u32);
+                if !merge_span.is_empty() {
+                    for (col, cell) in tcells.iter_mut().enumerate() {
+                        if let Some(&(row_span, col_span)) = merge_span.get(&(true_row, col as u32))
+                        {
+                            cell.row_span = row_span;
+                            cell.col_span = col_span;
+                        }
+                    }
+                }
+                let tcells: Vec<TableCell> = if merge_covered.is_empty() {
+                    tcells
+                } else {
+                    tcells
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(col, _)| !merge_covered.contains(&(true_row, *col as u32)))
+                        .map(|(_, cell)| cell)
+                        .collect()
+                };
                 rows.push(TableRow {
                     cells: tcells,
                     is_header: row_idx == 0,
@@ -342,6 +440,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             combined.push(Element::Endnote(Note {
                 id: i as u32,
                 marker: Some(marker),
+                author: c.author.clone(),
                 content: vec![Element::Paragraph(Paragraph {
                     content: vec![InlineContent::Text(TextSpan::plain(c.text.clone()))],
                     ..Default::default()
@@ -373,6 +472,8 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 .sheets
                 .get(ws_idx)
                 .is_some_and(|s| s.state != crate::xlsx::SheetState::Visible),
+            conditional_formats: ws.conditional_formats.clone(),
+            data_validations: ws.data_validations.clone(),
             ..Default::default()
         });
     }
@@ -426,8 +527,21 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             created: cp.and_then(|c| c.created.clone()),
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
+            has_macros: doc.has_macros,
+            text_truncated: false,
         },
         sections,
+        defined_names: doc
+            .workbook
+            .defined_names
+            .iter()
+            .map(|dn| DefinedName {
+                name: dn.name.clone(),
+                value: dn.value.clone(),
+                local_sheet_id: dn.local_sheet_id,
+                hidden: dn.hidden,
+            })
+            .collect(),
     }
 }
 
@@ -454,7 +568,7 @@ fn empty_cell() -> TableCell {
 /// weight from the workbook stylesheet, and the sheet's hyperlink target if
 /// the cell has one.
 fn cell_span(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> TextSpan {
-    let mut span = TextSpan::plain(cd.text.clone());
+    let mut span = TextSpan::plain(display_text(cd).into_owned());
     span.hyperlink = cd.hyperlink.clone();
     let Some(font) = cd.style_index.and_then(|idx| font_for(doc, idx)) else {
         return span;
@@ -470,9 +584,42 @@ fn cell_span(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> TextSpan {
     span
 }
 
+/// Build a cell's paragraph content: one `TextSpan` per rich-text run
+/// when the cell's shared string carries per-run formatting (e.g. a
+/// bold superscript footnote marker within otherwise-plain text) —
+/// previously discarded entirely, flattening to a single unformatted
+/// span regardless of how many differently-formatted runs the source
+/// actually had. Falls back to the single-span `cell_span`
+/// path for a plain string or any non-string cell.
+fn cell_spans(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> Vec<InlineContent> {
+    let Some(runs) = cd.rich_runs.as_ref().filter(|r| !r.is_empty()) else {
+        return vec![InlineContent::Text(cell_span(doc, cd))];
+    };
+    runs.iter()
+        .map(|r| {
+            let mut span = TextSpan::plain(r.text.clone());
+            span.hyperlink = cd.hyperlink.clone();
+            span.bold = r.bold.unwrap_or(false);
+            span.italic = r.italic.unwrap_or(false);
+            if let Some(size_pt) = r.font_size {
+                span.font_size_half_pt =
+                    Some(crate::core::units::HalfPoint::from_points_rounded(size_pt).0);
+            }
+            span.font_name = r.font_name.clone();
+            span.color = r
+                .color
+                .as_ref()
+                .and_then(|c| c.resolve_opt(doc.theme.as_ref()))
+                .map(|rgb| rgb.0);
+            span.vertical_align = r.vert_align.clone();
+            InlineContent::Text(span)
+        })
+        .collect()
+}
+
 /// A parsed spreadsheet cell carried through `xlsx_to_ir`: the rendered
 /// display string plus the structured facts needed to populate the IR's
-/// semantic `TableCell` fields (issue #72).
+/// semantic `TableCell` fields.
 struct CellData {
     /// 0-based grid column this cell occupies. Without it, cells were
     /// emitted in encounter order, so a row that skips a column (perfectly
@@ -493,6 +640,29 @@ struct CellData {
     number_format: Option<String>,
     /// Number-format ID, when the cell has a non-General format.
     number_format_id: Option<u32>,
+    /// Formula text (`<f>` content, shared-formula followers already
+    /// reconstructed by `xlsx::shared_formula`), when present.
+    formula: Option<String>,
+    /// Per-run rich-text formatting, when this cell's value is a shared
+    /// string with `<r><rPr>…</rPr><t>…</t></r>` sub-runs (e.g. a bold
+    /// superscript footnote marker within otherwise-plain text). `None`
+    /// for a plain (non-rich) string or any non-string cell.
+    rich_runs: Option<Vec<crate::xlsx::shared_strings::RichTextRun>>,
+}
+
+/// The text a cell should show when it has no cached value: `=formula`
+/// when one exists, otherwise empty. A formula cell with no `<v>` (common
+/// output shape from closedxml and similar writers that never cache
+/// values) used to render as a blank cell indistinguishable from a
+/// genuinely empty one.
+fn display_text(cd: &CellData) -> std::borrow::Cow<'_, str> {
+    if !cd.text.is_empty() {
+        std::borrow::Cow::Borrowed(&cd.text)
+    } else if let Some(f) = &cd.formula {
+        std::borrow::Cow::Owned(format!("={f}"))
+    } else {
+        std::borrow::Cow::Borrowed("")
+    }
 }
 
 /// Derive a cell's semantic type, raw numeric value, and number-format
@@ -503,7 +673,7 @@ struct CellData {
 ///
 /// Format metadata is surfaced for every non-empty cell — not just numbers —
 /// so a caller can tell, for instance, that a *text* cell sits in a
-/// date-formatted column (issue #72's "is it a date/number column, and
+/// date-formatted column (the "is it a date/number column, and
 /// formatting?"). The format string prefers the workbook's custom `<numFmts>`
 /// entry and falls back to the canonical code for built-in IDs, which never
 /// appear in `<numFmts>`.

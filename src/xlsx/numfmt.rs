@@ -86,9 +86,13 @@ pub fn apply_format(n: f64, fmt_id: u32, fmt_str: Option<&str>) -> String {
         11 => return format_scientific(n),          // 0.00E+00
         12 => return format_general(n),             // # ?/? (fractions — approx)
         13 => return format_general(n),             // # ??/??
-        37 | 38 => return format_commas(n, 0),      // #,##0 accounting variants
-        39 | 40 => return format_commas(n, 2),      // #,##0.00 accounting variants
-        41..=44 => return format_commas(n, 2),      // _(* ...) accounting
+        // Accounting/comma built-ins wrap negatives in parentheses rather
+        // than using a leading minus — the codes this file's own
+        // `builtin_format_code` declares for them (`#,##0 ;(#,##0)`) say so,
+        // per ECMA-376 §18.8.30.
+        37 | 38 => return format_accounting(n, 0), // #,##0 accounting variants
+        39 | 40 => return format_accounting(n, 2), // #,##0.00 accounting variants
+        41..=44 => return format_accounting(n, 2), // _(* ...) accounting
         _ => {},
     }
 
@@ -167,6 +171,16 @@ pub fn format_commas(n: f64, decimals: u8) -> String {
     }
 }
 
+/// Format a number the way Excel's accounting/comma built-ins (ids 37-44)
+/// do: negatives are parenthesised rather than signed with a leading minus.
+pub fn format_accounting(n: f64, decimals: u8) -> String {
+    if n < 0.0 {
+        format!("({})", format_commas(n.abs(), decimals))
+    } else {
+        format_commas(n, decimals)
+    }
+}
+
 fn format_currency(n: f64, symbol: &str, decimals: u8) -> String {
     // Put any minus sign before the currency symbol so callers see
     // "-$99.50" rather than "$-99.50".
@@ -188,9 +202,18 @@ pub fn format_percent(n: f64, decimals: u8) -> String {
 }
 
 fn format_scientific(n: f64) -> String {
-    // Excel uses E+XX notation (no leading zero in exponent on some locales, but
-    // two-digit exponent is safest for matching).
-    format!("{:.2E}", n)
+    // Excel's `0.00E+00` always signs the exponent and pads it to two
+    // digits. Rust's `{:E}` does neither (`1.23E4`, `1.23E-3`), so the
+    // exponent is reassembled by hand.
+    let s = format!("{:.2E}", n);
+    let Some((mantissa, exp)) = s.split_once('E') else {
+        return s;
+    };
+    let (sign, digits) = match exp.strip_prefix('-') {
+        Some(d) => ('-', d),
+        None => ('+', exp.strip_prefix('+').unwrap_or(exp)),
+    };
+    format!("{mantissa}E{sign}{digits:0>2}")
 }
 
 fn insert_commas(n: u64) -> String {
@@ -401,7 +424,14 @@ fn apply_custom(n: f64, fmt: &str) -> String {
             c if !in_num_part && !c.is_ascii_whitespace() => {
                 currency_prefix.push(c);
             },
-            _ => {},
+            // ...and after it, a suffix. Dropping these lost the closing
+            // paren of a custom `#,##0;(#,##0)` and any bare trailing
+            // literal, so the rendered string didn't match the format.
+            c => {
+                if in_num_part {
+                    suffix.push(c);
+                }
+            },
         }
     }
 
@@ -545,7 +575,7 @@ mod tests {
     /// roles: reading them positionally scaled every value by 1e6 and
     /// rendered 1.02 as `0M`.
     #[test]
-    fn conditional_sections_select_by_comparison_not_by_position() {
+    fn test_conditional_sections_select_by_comparison_not_by_position() {
         let fmt = Some(r#"[>999999]#,,"M";[>999]#,"K";#"#);
         assert_eq!(apply_format(1.02, 164, fmt), "1");
         assert_eq!(apply_format(102.0, 164, fmt), "102");
@@ -560,7 +590,7 @@ mod tests {
     /// Not handling `?` sent the section down the literal path and printed
     /// `??-` — 3,950 cells in one corpus file.
     #[test]
-    fn the_accounting_zero_section_renders_a_bare_dash() {
+    fn test_the_accounting_zero_section_renders_a_bare_dash() {
         let fmt = Some(r#"_-* #,##0.00_-;-* #,##0.00_-;_-* "-"??_-;_-@_-"#);
         let out = apply_format(0.0, 164, fmt);
         assert!(!out.contains('?'), "digit placeholders leaked into the value: {out}");
@@ -569,7 +599,7 @@ mod tests {
 
     /// `?` is a digit placeholder wherever it appears, not a literal.
     #[test]
-    fn question_mark_is_a_digit_placeholder() {
+    fn test_question_mark_is_a_digit_placeholder() {
         assert_eq!(apply_format(42.0, 164, Some("??")), "42");
         assert_eq!(apply_format(7.0, 164, Some("???")), "7");
     }
@@ -577,13 +607,13 @@ mod tests {
     /// A value that rounds to zero shows nothing when the integer part has
     /// only optional placeholders, and shows `0` when a `0` forces it.
     #[test]
-    fn optional_placeholders_suppress_a_zero_that_a_forced_digit_keeps() {
+    fn test_optional_placeholders_suppress_a_zero_that_a_forced_digit_keeps() {
         assert_eq!(apply_format(0.0, 164, Some("#")), "");
         assert_eq!(apply_format(0.0, 164, Some("0")), "0");
     }
 
     #[test]
-    fn a_colour_or_locale_directive_is_not_a_condition() {
+    fn test_a_colour_or_locale_directive_is_not_a_condition() {
         // `[Red]` and `[$-409]` must leave the positional
         // positive;negative;zero reading intact.
         let fmt = Some(r#"#,##0;[Red]-#,##0"#);
@@ -596,7 +626,7 @@ mod tests {
     /// where it produced no digit placeholder and rendered every numeric
     /// cell in the sheet as an empty string.
     #[test]
-    fn a_general_format_code_is_not_a_literal() {
+    fn test_a_general_format_code_is_not_a_literal() {
         for code in ["GENERAL", "General", "general"] {
             assert_eq!(apply_format(70.0, 164, Some(code)), "70");
             assert_eq!(apply_format(3.5, 164, Some(code)), "3.5");
@@ -607,7 +637,7 @@ mod tests {
     /// Treating the whole code as a literal printed `General` and dropped
     /// the cell's value.
     #[test]
-    fn general_behind_bracket_directives_is_still_general() {
+    fn test_general_behind_bracket_directives_is_still_general() {
         assert_eq!(apply_format(12323.0, 180, Some("[DBNum1][$-804]General")), "12323");
         assert_eq!(apply_format(1.5, 180, Some("[$-409]General")), "1.5");
     }
@@ -616,7 +646,7 @@ mod tests {
     /// value rather than a literal: echoing its letters printed the format
     /// code where the data should be.
     #[test]
-    fn a_time_format_does_not_echo_its_own_code() {
+    fn test_a_time_format_does_not_echo_its_own_code() {
         let out = apply_format(0.5555671296296296, 179, Some(r#"h"时"mm"分"ss"秒";@"#));
         assert!(
             !out.contains('h') && !out.contains('时'),
@@ -626,20 +656,20 @@ mod tests {
     }
 
     #[test]
-    fn an_unrecognised_literal_format_keeps_its_text() {
+    fn test_an_unrecognised_literal_format_keeps_its_text() {
         // Unquoted literal characters accumulate separately from quoted
         // ones; dropping them turned the cell into an empty string.
         assert_eq!(apply_format(1.0, 164, Some("ABC")), "ABC");
     }
 
     #[test]
-    fn builtin_general() {
+    fn test_builtin_general() {
         assert_eq!(apply_format(42.0, 0, None), "42");
         assert_eq!(apply_format(4.25, 0, None), "4.25");
     }
 
     #[test]
-    fn builtin_format_code_lookup() {
+    fn test_builtin_format_code_lookup() {
         assert_eq!(builtin_format_code(0), Some("General"));
         assert_eq!(builtin_format_code(4), Some("#,##0.00"));
         assert_eq!(builtin_format_code(14), Some("m/d/yyyy"));
@@ -650,91 +680,91 @@ mod tests {
     }
 
     #[test]
-    fn builtin_integer() {
+    fn test_builtin_integer() {
         assert_eq!(apply_format(42.7, 1, None), "43");
     }
 
     #[test]
-    fn builtin_fixed_two() {
+    fn test_builtin_fixed_two() {
         assert_eq!(apply_format(4.25678, 2, None), "4.26");
     }
 
     #[test]
-    fn builtin_commas_zero() {
+    fn test_builtin_commas_zero() {
         assert_eq!(apply_format(1234567.0, 3, None), "1,234,567");
     }
 
     #[test]
-    fn builtin_commas_two() {
+    fn test_builtin_commas_two() {
         assert_eq!(apply_format(1234567.891, 4, None), "1,234,567.89");
     }
 
     #[test]
-    fn builtin_percent_zero() {
+    fn test_builtin_percent_zero() {
         assert_eq!(apply_format(0.75, 9, None), "75%");
     }
 
     #[test]
-    fn builtin_percent_two() {
+    fn test_builtin_percent_two() {
         assert_eq!(apply_format(0.1234, 10, None), "12.34%");
     }
 
     #[test]
-    fn builtin_currency_usd() {
+    fn test_builtin_currency_usd() {
         assert_eq!(apply_format(1234.5, 7, None), "$1,234.50");
     }
 
     #[test]
-    fn custom_thousands() {
+    fn test_custom_thousands() {
         assert_eq!(apply_format(1234567.0, 164, Some("#,##0")), "1,234,567");
     }
 
     #[test]
-    fn custom_thousands_two_decimals() {
+    fn test_custom_thousands_two_decimals() {
         assert_eq!(apply_format(1234.5, 164, Some("#,##0.00")), "1,234.50");
     }
 
     #[test]
-    fn custom_percent() {
+    fn test_custom_percent() {
         assert_eq!(apply_format(0.5, 164, Some("0%")), "50%");
     }
 
     #[test]
-    fn custom_percent_decimals() {
+    fn test_custom_percent_decimals() {
         assert_eq!(apply_format(0.1256, 164, Some("0.00%")), "12.56%");
     }
 
     #[test]
-    fn custom_euro() {
+    fn test_custom_euro() {
         let result = apply_format(1234.5, 164, Some("[$€-407]#,##0.00"));
         assert!(result.contains("€"), "expected euro symbol, got: {result}");
         assert!(result.contains("1,234.50"), "expected formatted number, got: {result}");
     }
 
     #[test]
-    fn custom_dollar_prefix() {
+    fn test_custom_dollar_prefix() {
         assert_eq!(apply_format(99.9, 164, Some("$#,##0.00")), "$99.90");
     }
 
     #[test]
-    fn negative_commas() {
+    fn test_negative_commas() {
         assert_eq!(apply_format(-1234.5, 4, None), "-1,234.50");
     }
 
     #[test]
-    fn zero_percent() {
+    fn test_zero_percent() {
         assert_eq!(apply_format(0.0, 9, None), "0%");
     }
 
     #[test]
-    fn large_commas() {
+    fn test_large_commas() {
         assert_eq!(apply_format(1_000_000_000.0, 3, None), "1,000,000,000");
     }
 
     // ── Edge cases ──────────────────────────────────────────────────────
 
     #[test]
-    fn nan_renders_as_label() {
+    fn test_nan_renders_as_label() {
         // Returning the literal "NaN" rather than an empty string keeps
         // anomalous cells visible in extracted text so they're not
         // mistaken for empty data.
@@ -742,45 +772,45 @@ mod tests {
     }
 
     #[test]
-    fn infinity_renders_as_label() {
+    fn test_infinity_renders_as_label() {
         assert_eq!(apply_format(f64::INFINITY, 0, None), "Infinity");
         assert_eq!(apply_format(f64::NEG_INFINITY, 0, None), "-Infinity");
     }
 
     #[test]
-    fn zero_renders_uniformly() {
+    fn test_zero_renders_uniformly() {
         assert_eq!(apply_format(0.0, 0, None), "0");
         assert_eq!(apply_format(0.0, 2, None), "0.00");
         assert_eq!(apply_format(0.0, 4, None), "0.00");
     }
 
     #[test]
-    fn negative_percent() {
+    fn test_negative_percent() {
         assert_eq!(apply_format(-0.25, 9, None), "-25%");
         assert_eq!(apply_format(-0.1234, 10, None), "-12.34%");
     }
 
     #[test]
-    fn negative_currency() {
+    fn test_negative_currency() {
         assert_eq!(apply_format(-99.5, 7, None), "-$99.50");
     }
 
     #[test]
-    fn scientific_builtin() {
+    fn test_scientific_builtin() {
         // Format id 11 = 0.00E+00 → uses Rust's "{:.2E}" wrapper.
         let s = apply_format(12345.6789, 11, None);
         assert!(s.contains('E'), "scientific got: {s}");
     }
 
     #[test]
-    fn accounting_alias() {
+    fn test_accounting_alias() {
         // 37–40 map to comma formats matching #,##0 family.
         assert_eq!(apply_format(1234.0, 37, None), "1,234");
         assert_eq!(apply_format(1234.5, 39, None), "1,234.50");
     }
 
     #[test]
-    fn accounting_paren_range() {
+    fn test_accounting_paren_range() {
         // 41..=44 are accounting variants → commas with 2 decimals.
         for id in 41u32..=44 {
             assert_eq!(apply_format(1234.5, id, None), "1,234.50", "fmt id {id}");
@@ -788,40 +818,40 @@ mod tests {
     }
 
     #[test]
-    fn fraction_falls_back_to_general() {
+    fn test_fraction_falls_back_to_general() {
         // Fraction formats (12,13) currently render as general.
         assert_eq!(apply_format(1.5, 12, None), "1.5");
         assert_eq!(apply_format(2.0, 13, None), "2");
     }
 
     #[test]
-    fn custom_general_falls_through_to_default() {
+    fn test_custom_general_falls_through_to_default() {
         // "General" and "@" should fall back to General formatting.
         assert_eq!(apply_format(42.5, 164, Some("General")), "42.5");
         assert_eq!(apply_format(42.0, 164, Some("@")), "42");
     }
 
     #[test]
-    fn custom_blank_falls_back_to_general() {
+    fn test_custom_blank_falls_back_to_general() {
         assert_eq!(apply_format(4.25, 164, Some("")), "4.25");
         assert_eq!(apply_format(4.25, 164, Some("   ")), "4.25");
     }
 
     #[test]
-    fn custom_multi_section_uses_first() {
+    fn test_custom_multi_section_uses_first() {
         // Multi-section format: positives use first section only.
         assert_eq!(apply_format(1234.5, 164, Some("#,##0.00;-#,##0.00")), "1,234.50");
     }
 
     #[test]
-    fn custom_with_quoted_literal_suffix() {
+    fn test_custom_with_quoted_literal_suffix() {
         let result = apply_format(42.0, 164, Some(r#"0" units""#));
         assert!(result.contains("42"), "got: {result}");
         assert!(result.contains("units"), "got: {result}");
     }
 
     #[test]
-    fn custom_color_directive_is_stripped() {
+    fn test_custom_color_directive_is_stripped() {
         // [Red] is a color directive — should be ignored, not emitted.
         let result = apply_format(123.0, 164, Some("[Red]#,##0"));
         assert!(!result.contains("Red"));
@@ -829,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn format_general_keeps_integers_unsuffixed() {
+    fn test_format_general_keeps_integers_unsuffixed() {
         // Whole-number floats render without ".0".
         assert_eq!(format_general(42.0), "42");
         assert_eq!(format_general(-7.0), "-7");
@@ -837,31 +867,68 @@ mod tests {
     }
 
     #[test]
-    fn format_general_keeps_decimal_for_fraction() {
+    fn test_format_general_keeps_decimal_for_fraction() {
         assert_eq!(format_general(4.25), "4.25");
         assert_eq!(format_general(-2.5), "-2.5");
     }
 
     #[test]
-    fn format_commas_negative_with_decimals() {
+    fn test_format_commas_negative_with_decimals() {
         assert_eq!(format_commas(-1234.5, 2), "-1,234.50");
     }
 
     #[test]
-    fn format_commas_zero() {
+    fn test_format_commas_zero() {
         assert_eq!(format_commas(0.0, 0), "0");
         assert_eq!(format_commas(0.0, 2), "0.00");
     }
 
     #[test]
-    fn format_percent_negative() {
+    fn test_format_percent_negative() {
         assert_eq!(format_percent(-0.5, 0), "-50%");
     }
 
     #[test]
-    fn format_percent_zero_decimals() {
+    fn test_format_percent_zero_decimals() {
         // 50% with 0 decimals.
         assert_eq!(format_percent(0.5, 0), "50%");
+    }
+
+    /// Built-in accounting/comma ids 37-44 parenthesise negatives, as the
+    /// format codes this file's own `builtin_format_code` declares for them
+    /// specify (`#,##0 ;(#,##0)`). The fast path emitted a leading minus
+    /// instead.
+    #[test]
+    fn test_accounting_builtins_parenthesize_negatives() {
+        assert_eq!(apply_format(-1234.0, 37, None), "(1,234)");
+        assert_eq!(apply_format(-1234.0, 38, None), "(1,234)");
+        assert_eq!(apply_format(-1234.5, 39, None), "(1,234.50)");
+        assert_eq!(apply_format(-1234.5, 40, None), "(1,234.50)");
+        assert_eq!(apply_format(-1234.5, 41, None), "(1,234.50)");
+        assert_eq!(apply_format(-1234.5, 44, None), "(1,234.50)");
+        // Positives and zero are untouched.
+        assert_eq!(apply_format(1234.0, 37, None), "1,234");
+        assert_eq!(apply_format(0.0, 37, None), "0");
+    }
+
+    /// A literal character after the digit placeholders is part of the
+    /// output. The interpreter dropped everything past the number part it
+    /// did not recognise as a format token, losing the closing paren of an
+    /// explicitly-declared `#,##0;(#,##0)`.
+    #[test]
+    fn test_custom_format_keeps_trailing_literal_characters() {
+        assert_eq!(apply_format(-1234.0, 164, Some("#,##0;(#,##0)")), "(1,234)");
+        assert_eq!(apply_format(42.0, 164, Some(r#"0"x")"#)), "42x)");
+    }
+
+    /// Excel's `0.00E+00` always signs the exponent and pads it to two
+    /// digits; Rust's `{:E}` does neither.
+    #[test]
+    fn test_scientific_exponent_is_signed_and_padded() {
+        assert_eq!(apply_format(12345.6789, 11, None), "1.23E+04");
+        assert_eq!(apply_format(0.0012345, 11, None), "1.23E-03");
+        assert_eq!(apply_format(1.5, 11, None), "1.50E+00");
+        assert_eq!(apply_format(1.23e120, 11, None), "1.23E+120");
     }
 }
 
@@ -874,7 +941,7 @@ mod builtin_code_tests {
     /// `apply_custom`, which is not a general format engine: id 47's
     /// `mm:ss.0` came out as the literal `mm:ss0.6`.
     #[test]
-    fn a_builtin_code_is_not_fed_back_in_as_a_custom_format() {
+    fn test_a_builtin_code_is_not_fed_back_in_as_a_custom_format() {
         let v = 0.563_138_888_888_888_9;
         // No declared override: the built-in table decides, and id 47 is not
         // one apply_format renders, so the raw value must survive.

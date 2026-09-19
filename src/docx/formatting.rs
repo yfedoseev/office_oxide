@@ -38,6 +38,11 @@ pub struct RunProperties {
     /// `TextSpan::highlight`, so reading it back is what closes the
     /// write→read loop for highlighted text.
     pub shading_fill: Option<String>,
+    /// `<w:vanish/>` — Word never renders this run at all (draft notes,
+    /// comment-reference glyph scaffolding, TOC/index field-code
+    /// internals). Converters use this to exclude the run from every
+    /// extraction surface, the same way a run-level `w:del` already is.
+    pub hidden: Option<bool>,
 }
 
 /// Paragraph-level formatting properties (`w:pPr`).
@@ -55,28 +60,31 @@ pub struct ParagraphProperties {
     pub numbering_ref: Option<NumberingRef>,
     /// Outline level (0 = Heading 1, 1 = Heading 2, …).
     pub outline_level: Option<u8>,
-    /// Paragraph-mark run properties (`w:rPr` inside `w:pPr`).
-    pub run_properties: Option<RunProperties>,
+    /// Paragraph-mark run properties (`w:rPr` inside `w:pPr`). Boxed:
+    /// present on only a small minority of real paragraphs, but
+    /// `Option<T>` reserves `size_of(T)` even when `None`.
+    pub run_properties: Option<Box<RunProperties>>,
     /// Frame position from `<w:framePr>`. When present this paragraph is
     /// absolutely positioned on the page (used by layout-preserving
     /// PDF-derived DOCX, e.g. pdf_oxide's `to_docx_bytes_layout`).
     pub frame_position: Option<FrameProps>,
     /// Section properties from `<w:sectPr>` inside this paragraph's `<w:pPr>`.
     /// When present this paragraph terminates a section — the properties
-    /// describe the section that ends here.
-    pub section_properties: Option<super::SectionProperties>,
+    /// describe the section that ends here. Boxed: only the last
+    /// paragraph of each section carries this.
+    pub section_properties: Option<Box<super::SectionProperties>>,
     /// True when the paragraph has a `<w:pBdr><w:bottom .../></w:pBdr>`.
     /// Used to recover horizontal rules: pdf_to_ir emits
     /// `Element::ThematicBreak` which round-trips through DOCX as an
     /// empty paragraph with a single bottom border. Without
     /// preserving this flag the rule would be silently dropped on
     /// re-parse and turned into a plain empty paragraph.
-    #[allow(dead_code)]
     pub has_bottom_border: bool,
     /// Full `<w:pBdr>` edge styling. `has_bottom_border` stays as the
     /// cheap horizontal-rule probe; this carries the actual widths,
-    /// colours and styles so they survive a read.
-    pub borders: Option<ParagraphBorders>,
+    /// colours and styles so they survive a read. Boxed: rare on real
+    /// paragraphs.
+    pub borders: Option<Box<ParagraphBorders>>,
     /// `<w:keepNext/>` — keep with the following paragraph. `None` when the
     /// element is absent, so a style-inherited value is distinguishable from
     /// an explicit `w:val="0"` that turns it off.
@@ -85,8 +93,9 @@ pub struct ParagraphProperties {
     pub keep_lines: Option<bool>,
     /// `<w:pageBreakBefore/>` — force a page break before this paragraph.
     pub page_break_before: Option<bool>,
-    /// Paragraph shading (`<w:shd>`) — background fill.
-    pub shading: Option<super::table::Shading>,
+    /// Paragraph shading (`<w:shd>`) — background fill. Boxed: rare on
+    /// real paragraphs.
+    pub shading: Option<Box<super::table::Shading>>,
     /// Custom tab stops from `<w:tabs>`.
     pub tabs: Vec<TabStopDef>,
 }
@@ -197,6 +206,7 @@ impl RunProperties {
             small_caps,
             char_spacing,
             shading_fill,
+            hidden,
         );
     }
 }
@@ -454,6 +464,10 @@ pub(crate) fn parse_run_properties(
                             }
                             xml::skip_element(reader)?;
                         },
+                        b"vanish" => {
+                            props.hidden = Some(parse_toggle(e));
+                            xml::skip_element(reader)?;
+                        },
                         _ => {
                             xml::skip_element(reader)?;
                         },
@@ -501,6 +515,9 @@ pub(crate) fn parse_run_properties(
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             props.style_id = Some(val.into_owned());
                         }
+                    },
+                    b"vanish" => {
+                        props.hidden = Some(parse_toggle(e));
                     },
                     _ => {},
                 }
@@ -562,7 +579,7 @@ pub(crate) fn parse_paragraph_properties(
                             xml::skip_element(reader)?;
                         },
                         b"rPr" => {
-                            props.run_properties = Some(parse_run_properties(reader)?);
+                            props.run_properties = Some(Box::new(parse_run_properties(reader)?));
                         },
                         _ => {
                             xml::skip_element(reader)?;
@@ -703,6 +720,10 @@ pub(crate) fn parse_run_properties_fast(
                             .map(|v| v.into_owned());
                         xml::skip_element_fast(reader)?;
                     },
+                    b"vanish" => {
+                        props.hidden = Some(parse_toggle(e));
+                        xml::skip_element_fast(reader)?;
+                    },
                     _ => {
                         xml::skip_element_fast(reader)?;
                     },
@@ -714,6 +735,7 @@ pub(crate) fn parse_run_properties_fast(
                     b"caps" => props.caps = Some(parse_toggle(e)),
                     b"smallCaps" => props.small_caps = Some(parse_toggle(e)),
                     b"spacing" => props.char_spacing = parse_signed_val(e),
+                    b"vanish" => props.hidden = Some(parse_toggle(e)),
                     b"shd" => {
                         props.shading_fill = xml::optional_attr_str(e, b"w:fill")
                             .ok()
@@ -811,7 +833,7 @@ pub(crate) fn parse_paragraph_properties_fast(
                         xml::skip_element_fast(reader)?;
                     },
                     b"rPr" => {
-                        props.run_properties = Some(parse_run_properties_fast(reader)?);
+                        props.run_properties = Some(Box::new(parse_run_properties_fast(reader)?));
                     },
                     b"framePr" => {
                         props.frame_position = parse_frame_pr(e);
@@ -819,7 +841,7 @@ pub(crate) fn parse_paragraph_properties_fast(
                     },
                     b"sectPr" => {
                         props.section_properties =
-                            Some(super::parse_section_properties(reader, e)?);
+                            Some(Box::new(super::parse_section_properties(reader, e)?));
                     },
                     b"pBdr" => {
                         // Capture every `<w:pBdr>` edge with its full
@@ -830,7 +852,7 @@ pub(crate) fn parse_paragraph_properties_fast(
                         // instead of being narrowed to that one boolean.
                         let borders = parse_paragraph_borders_fast(reader)?;
                         props.has_bottom_border = borders.bottom.is_some();
-                        props.borders = Some(borders);
+                        props.borders = Some(Box::new(borders));
                     },
                     b"keepNext" => {
                         props.keep_next = Some(parse_toggle(e));
@@ -845,7 +867,7 @@ pub(crate) fn parse_paragraph_properties_fast(
                         xml::skip_element_fast(reader)?;
                     },
                     b"shd" => {
-                        props.shading = Some(parse_shading(e));
+                        props.shading = Some(Box::new(parse_shading(e)));
                         xml::skip_element_fast(reader)?;
                     },
                     b"tabs" => {
@@ -862,7 +884,7 @@ pub(crate) fn parse_paragraph_properties_fast(
                     b"keepNext" => props.keep_next = Some(parse_toggle(e)),
                     b"keepLines" => props.keep_lines = Some(parse_toggle(e)),
                     b"pageBreakBefore" => props.page_break_before = Some(parse_toggle(e)),
-                    b"shd" => props.shading = Some(parse_shading(e)),
+                    b"shd" => props.shading = Some(Box::new(parse_shading(e))),
                     b"pStyle" => {
                         if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
                             props.style_id = Some(val.into_owned());
@@ -1287,8 +1309,33 @@ fn parse_num_pr(reader: &mut quick_xml::NsReader<&[u8]>) -> crate::core::Result<
 mod tests {
     use super::*;
 
+    /// Regression: `ParagraphProperties`'s rarely-populated
+    /// sub-structs must stay boxed, not silently regress back to
+    /// `Option<T>` (which reserves `size_of(T)` even when `None`).
+    /// `Paragraph` (paragraph.rs) was 896 bytes before this fix, dominated
+    /// by an unboxed `ParagraphProperties` at 872 bytes; both are checked
+    /// here with headroom above the measured post-fix sizes (176B /
+    /// 200B) so an unrelated new field doesn't make this test flaky, but
+    /// a *large struct un-boxed back into `Option<T>`* — the actual
+    /// regression this guards against — still trips it.
     #[test]
-    fn parse_toggle_bare() {
+    fn test_paragraph_properties_size_stays_boxed() {
+        assert!(
+            std::mem::size_of::<ParagraphProperties>() <= 250,
+            "ParagraphProperties grew to {} bytes — check borders/run_properties/\
+             section_properties/shading are still Option<Box<T>>, not Option<T>",
+            std::mem::size_of::<ParagraphProperties>()
+        );
+        assert!(
+            std::mem::size_of::<super::super::paragraph::Paragraph>() <= 300,
+            "Paragraph grew to {} bytes — a ParagraphProperties field regression \
+             would show up here too",
+            std::mem::size_of::<super::super::paragraph::Paragraph>()
+        );
+    }
+
+    #[test]
+    fn test_parse_toggle_bare() {
         let xml =
             br#"<w:b xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
         let mut reader = xml::make_reader(xml);
@@ -1305,7 +1352,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_toggle_false() {
+    fn test_parse_toggle_false() {
         let xml = br#"<w:b w:val="0" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
         let mut reader = xml::make_reader(xml);
         loop {
@@ -1321,7 +1368,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_run_props_bold_italic() {
+    fn test_parse_run_props_bold_italic() {
         let xml =
             br#"<w:rPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
             <w:b/>
@@ -1342,7 +1389,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_paragraph_props_style_justification() {
+    fn test_parse_paragraph_props_style_justification() {
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
             <w:pStyle w:val="Heading1"/>
@@ -1362,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_indent_values() {
+    fn test_parse_indent_values() {
         let xml = br#"<w:ind w:left="720" w:hanging="360" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
         let mut reader = xml::make_reader(xml);
         loop {
@@ -1397,7 +1444,7 @@ mod tests {
     // ── framePr ─────────────────────────────────────────────────────────
 
     #[test]
-    fn parse_frame_pr_empty_element() {
+    fn test_parse_frame_pr_empty_element() {
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
           <w:framePr w:x="720" w:y="1080" w:w="3000" w:h="500"/>
@@ -1412,7 +1459,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_frame_pr_missing_attrs_returns_none() {
+    fn test_parse_frame_pr_missing_attrs_returns_none() {
         // Missing w:h → frame_position must be None.
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -1424,7 +1471,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_frame_pr_inside_start_form() {
+    fn test_parse_frame_pr_inside_start_form() {
         // Start/End form (rather than Empty) — should still parse.
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -1440,7 +1487,7 @@ mod tests {
     // ── pBdr / has_bottom_border ────────────────────────────────────────
 
     #[test]
-    fn parse_p_bdr_with_bottom() {
+    fn test_parse_p_bdr_with_bottom() {
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
           <w:pBdr>
@@ -1453,7 +1500,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_p_bdr_without_bottom() {
+    fn test_parse_p_bdr_without_bottom() {
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
           <w:pBdr>
@@ -1467,7 +1514,7 @@ mod tests {
     }
 
     #[test]
-    fn paragraph_properties_default_has_no_frame_or_border() {
+    fn test_paragraph_properties_default_has_no_frame_or_border() {
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
           <w:pStyle w:val="Normal"/>

@@ -26,7 +26,7 @@ Both validators exit non-zero on any finding. CI runs exactly this.
 
 | | catches |
 |---|---|
-| `validate.py` | missing required elements, wrong element order, out-of-range attribute values — the class behind #199, #200, #202, #204 |
+| `validate.py` | missing required elements, wrong element order, out-of-range attribute values — the class behind the PPTX `clrMap` and DOCX schema-order defects |
 | `opccheck.py` | every part has a content type; every non-external relationship target resolves. Needs no schemas. |
 | `gen_validation_corpus.rs` | the inputs. Exercises the builder APIs, not only `create_from_markdown`. |
 

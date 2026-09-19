@@ -99,7 +99,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn blip_type_recognition() {
+    fn test_blip_type_recognition() {
         assert!(is_blip_type(0xF01D));
         assert!(is_blip_type(0xF01E));
         assert!(is_blip_type(0xF02A));
@@ -108,7 +108,7 @@ mod tests {
     }
 
     #[test]
-    fn uid_size_secondary_uid() {
+    fn test_uid_size_secondary_uid() {
         // Bit 0 of inst signals a secondary UID — adds 16 bytes.
         assert_eq!(uid_size(0xF01D, 0b00), 17);
         assert_eq!(uid_size(0xF01D, 0b01), 33);
@@ -118,7 +118,7 @@ mod tests {
     }
 
     #[test]
-    fn metafile_header_only_for_metafile_types() {
+    fn test_metafile_header_only_for_metafile_types() {
         assert_eq!(metafile_header_size(0xF01A), 34);
         assert_eq!(metafile_header_size(0xF01B), 34);
         assert_eq!(metafile_header_size(0xF01C), 34);
@@ -127,7 +127,7 @@ mod tests {
     }
 
     #[test]
-    fn signature_validation() {
+    fn test_signature_validation() {
         // JPEG starts with FFD8.
         assert!(has_valid_signature(0xF01D, &[0xFF, 0xD8, 0x00]));
         assert!(!has_valid_signature(0xF01D, &[0x00, 0x00]));
@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn to_format_mapping() {
+    fn test_to_format_mapping() {
         assert!(matches!(to_format(0xF01A), ImageFormat::Emf));
         assert!(matches!(to_format(0xF01B), ImageFormat::Wmf));
         assert!(matches!(to_format(0xF01C), ImageFormat::Pict));
@@ -155,14 +155,14 @@ mod tests {
     }
 
     #[test]
-    fn extract_images_skips_non_blip_bytes() {
+    fn test_extract_images_skips_non_blip_bytes() {
         // Random non-BLIP bytes produce no images and never crash.
         let data = vec![0u8; 64];
         assert!(extract_images(&data).is_empty());
     }
 
     #[test]
-    fn extract_images_finds_embedded_png() {
+    fn test_extract_images_finds_embedded_png() {
         // Synthesize a record header followed by a PNG signature so the
         // scanner descends into a valid BLIP payload.
         let rec_type: u16 = 0xF01E; // PNG

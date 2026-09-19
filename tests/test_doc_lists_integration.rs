@@ -1,4 +1,4 @@
-//! Integration tests for legacy `.doc` list extraction (issue #115).
+//! Integration tests for legacy `.doc` list extraction.
 //!
 //! The document is built **in code** by a minimal synthetic `.doc` writer
 //! (`tests/common/mod.rs`) — no third-party fixture blob is committed
@@ -80,7 +80,7 @@ fn synthetic_list_doc() -> Vec<u8> {
 }
 
 #[test]
-fn doc_list_produces_a_list_element() {
+fn test_doc_list_produces_a_list_element() {
     let bytes = synthetic_list_doc();
     let doc = open_doc(&bytes);
     let ir = doc.to_ir();
@@ -90,7 +90,7 @@ fn doc_list_produces_a_list_element() {
 }
 
 #[test]
-fn doc_list_item_texts_match_fixture() {
+fn test_doc_list_item_texts_match_fixture() {
     let bytes = synthetic_list_doc();
     let doc = open_doc(&bytes);
     let ir = doc.to_ir();
@@ -104,7 +104,7 @@ fn doc_list_item_texts_match_fixture() {
 }
 
 #[test]
-fn doc_list_is_surrounded_by_paragraphs() {
+fn test_doc_list_is_surrounded_by_paragraphs() {
     let bytes = synthetic_list_doc();
     let doc = open_doc(&bytes);
     let ir = doc.to_ir();
