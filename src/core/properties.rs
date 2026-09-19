@@ -56,18 +56,18 @@ impl CoreProperties {
                     let local_bytes = local.as_ref();
 
                     ctx = match local_bytes {
-                        b"title" => Ctx::Title,
-                        b"subject" => Ctx::Subject,
-                        b"creator" => Ctx::Creator,
-                        b"description" => Ctx::Description,
-                        b"language" => Ctx::Language,
-                        b"created" => Ctx::Created,
-                        b"modified" => Ctx::Modified,
-                        b"keywords" => Ctx::Keywords,
-                        b"lastModifiedBy" => Ctx::LastModifiedBy,
-                        b"revision" => Ctx::Revision,
-                        b"category" => Ctx::Category,
-                        b"contentStatus" => Ctx::ContentStatus,
+                        "title" => Ctx::Title,
+                        "subject" => Ctx::Subject,
+                        "creator" => Ctx::Creator,
+                        "description" => Ctx::Description,
+                        "language" => Ctx::Language,
+                        "created" => Ctx::Created,
+                        "modified" => Ctx::Modified,
+                        "keywords" => Ctx::Keywords,
+                        "lastModifiedBy" => Ctx::LastModifiedBy,
+                        "revision" => Ctx::Revision,
+                        "category" => Ctx::Category,
+                        "contentStatus" => Ctx::ContentStatus,
                         _ => Ctx::None,
                     };
                 },
@@ -402,7 +402,7 @@ impl AppProperties {
                 Event::Start(ref e) => {
                     let local = e.local_name();
                     let local_bytes = local.as_ref();
-                    current_tag = Some(String::from_utf8_lossy(local_bytes).into_owned());
+                    current_tag = Some(local_bytes.to_string());
                 },
                 Event::Text(ref e) => {
                     let text = crate::core::xml::unescape_text(e)?;

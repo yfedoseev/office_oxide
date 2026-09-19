@@ -84,12 +84,12 @@ impl NumberingDefinitions {
         loop {
             match reader.read_event()? {
                 Event::Start(ref e) => match e.local_name().as_ref() {
-                    b"abstractNum" => {
+                    "abstractNum" => {
                         if let Some(an) = parse_abstract_num(&mut reader, e)? {
                             defs.abstract_nums.insert(an.abstract_num_id, an);
                         }
                     },
-                    b"num" => {
+                    "num" => {
                         if let Some(inst) = parse_num_instance(&mut reader, e)? {
                             defs.instances.insert(inst.num_id, inst);
                         }
@@ -130,7 +130,7 @@ fn parse_abstract_num(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
 ) -> crate::core::Result<Option<AbstractNum>> {
-    let abstract_num_id = match xml::optional_attr_str(start, b"w:abstractNumId")? {
+    let abstract_num_id = match xml::optional_attr_str(start, "w:abstractNumId")? {
         Some(id) => id.parse().unwrap_or(0),
         None => return Ok(None),
     };
@@ -139,8 +139,8 @@ fn parse_abstract_num(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"lvl" {
-                    let ilvl = xml::optional_attr_str(e, b"w:ilvl")?
+                if e.local_name().as_ref() == "lvl" {
+                    let ilvl = xml::optional_attr_str(e, "w:ilvl")?
                         .and_then(|v| v.parse::<u8>().ok())
                         .unwrap_or(0);
                     let level = parse_numbering_level(reader)?;
@@ -149,7 +149,7 @@ fn parse_abstract_num(
                     xml::skip_element_fast(reader)?;
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"abstractNum" => {
+            Event::End(ref e) if e.local_name().as_ref() == "abstractNum" => {
                 break;
             },
             Event::Eof => break,
@@ -175,34 +175,34 @@ fn parse_numbering_level(
         match reader.read_event()? {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 match e.local_name().as_ref() {
-                    b"start" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "start" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             start_val = val.parse().unwrap_or(1);
                         }
                     },
-                    b"numFmt" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "numFmt" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             format = parse_number_format(&val);
                         }
                     },
-                    b"lvlText" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "lvlText" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             level_text = val.into_owned();
                         }
                     },
-                    b"lvlJc" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "lvlJc" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             justification =
                                 Some(super::formatting::parse_justification_value(&val));
                         }
                     },
-                    b"pPr" | b"rPr" => {
+                    "pPr" | "rPr" => {
                         // Skip sub-properties for now (they apply to the numbering marker)
                     },
                     _ => {},
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"lvl" => {
+            Event::End(ref e) if e.local_name().as_ref() == "lvl" => {
                 break;
             },
             Event::Eof => break,
@@ -235,7 +235,7 @@ fn parse_num_instance(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
 ) -> crate::core::Result<Option<NumberingInstance>> {
-    let num_id = match xml::optional_attr_str(start, b"w:numId")? {
+    let num_id = match xml::optional_attr_str(start, "w:numId")? {
         Some(id) => id.parse().unwrap_or(0),
         None => return Ok(None),
     };
@@ -247,31 +247,31 @@ fn parse_num_instance(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) | Event::Empty(ref e)
-                if e.local_name().as_ref() == b"abstractNumId" =>
+                if e.local_name().as_ref() == "abstractNumId" =>
             {
-                if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                     abstract_num_id = val.parse().unwrap_or(0);
                 }
             },
-            Event::Start(ref e) if e.local_name().as_ref() == b"lvlOverride" => {
+            Event::Start(ref e) if e.local_name().as_ref() == "lvlOverride" => {
                 in_lvl_override =
-                    xml::optional_attr_str(e, b"w:ilvl")?.and_then(|v| v.parse::<u8>().ok());
+                    xml::optional_attr_str(e, "w:ilvl")?.and_then(|v| v.parse::<u8>().ok());
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"lvlOverride" => {
+            Event::End(ref e) if e.local_name().as_ref() == "lvlOverride" => {
                 in_lvl_override = None;
             },
             Event::Start(ref e) | Event::Empty(ref e)
-                if e.local_name().as_ref() == b"startOverride" =>
+                if e.local_name().as_ref() == "startOverride" =>
             {
                 if let Some(ilvl) = in_lvl_override {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         if let Ok(start) = val.parse::<u32>() {
                             start_overrides.insert(ilvl, start);
                         }
                     }
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"num" => {
+            Event::End(ref e) if e.local_name().as_ref() == "num" => {
                 break;
             },
             Event::Eof => break,

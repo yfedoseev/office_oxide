@@ -440,7 +440,7 @@ fn extract_chart_text(xml: &[u8]) -> String {
     let mut buf = Vec::new();
 
     // Tag-context stack — push localname on Start, pop on End.
-    let mut stack: Vec<Vec<u8>> = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
     // Most recently seen text inside a `<t>` (rich-text run) — used to
     // build the chart title and axis-title strings.
     let mut current_title: String = String::new();
@@ -460,28 +460,28 @@ fn extract_chart_text(xml: &[u8]) -> String {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(quick_xml::events::Event::Start(e)) => {
-                let local = e.local_name().as_ref().to_vec();
-                if local == b"ser" {
+                let local = e.local_name().as_ref().to_string();
+                if local == "ser" {
                     cur_series = Some(ChartSeries::default());
                     cur_cat_buf.clear();
                 }
                 stack.push(local);
             },
             Ok(quick_xml::events::Event::End(e)) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().to_string();
                 let _ = stack.pop();
-                match local.as_slice() {
-                    b"t" => {
+                match local.as_str() {
+                    "t" => {
                         // End of a rich-text run — accumulate into current_title
                         // if we're inside a chart-level or axis title.
                     },
-                    b"title" => {
+                    "title" => {
                         if !current_title.trim().is_empty() {
                             titles.push(current_title.trim().to_string());
                         }
                         current_title.clear();
                     },
-                    b"v" => {
+                    "v" => {
                         let val = cur_v.trim().to_string();
                         cur_v.clear();
                         if val.is_empty() {
@@ -490,19 +490,17 @@ fn extract_chart_text(xml: &[u8]) -> String {
                         if let Some(s) = cur_series.as_mut() {
                             // Decide whether this <c:v> is series-name, category,
                             // or value based on the enclosing scope.
-                            let in_tx = stack.iter().any(|t| t.as_slice() == b"tx");
+                            let in_tx = stack.iter().any(|t| t == "tx");
                             // Scatter charts carry their points in
                             // `<c:xVal>`/`<c:yVal>` and bubble charts add
                             // `<c:bubbleSize>` rather than the
                             // `<c:cat>`/`<c:val>` bar/line/pie/area charts
                             // use. Checking only the latter dropped every
                             // scatter/bubble data point.
-                            let in_cat = stack
-                                .iter()
-                                .any(|t| matches!(t.as_slice(), b"cat" | b"xVal"));
+                            let in_cat = stack.iter().any(|t| matches!(t.as_str(), "cat" | "xVal"));
                             let in_val = stack
                                 .iter()
-                                .any(|t| matches!(t.as_slice(), b"val" | b"yVal" | b"bubbleSize"));
+                                .any(|t| matches!(t.as_str(), "val" | "yVal" | "bubbleSize"));
                             if in_tx && s.name.is_empty() {
                                 s.name = val;
                             } else if in_cat {
@@ -512,7 +510,7 @@ fn extract_chart_text(xml: &[u8]) -> String {
                             }
                         }
                     },
-                    b"ser" => {
+                    "ser" => {
                         if let Some(mut s) = cur_series.take() {
                             // Fold the per-series categories into shared_categories
                             // (first series wins — they are typically identical).
@@ -534,17 +532,17 @@ fn extract_chart_text(xml: &[u8]) -> String {
             // keeps `&amp;` in a chart title from disappearing.
             Ok(quick_xml::events::Event::GeneralRef(ref r)) => {
                 if let Ok(s) = crate::core::xml::resolve_general_ref(r) {
-                    let top = stack.last().map(|v| v.as_slice());
+                    let top = stack.last().map(|v| v.as_str());
                     match top {
-                        Some(b"t") => current_title.push_str(&s),
-                        Some(b"v") => cur_v.push_str(&s),
+                        Some("t") => current_title.push_str(&s),
+                        Some("v") => cur_v.push_str(&s),
                         _ => {},
                     }
                 }
             },
             Ok(quick_xml::events::Event::Text(t)) => {
                 if let Ok(s) = crate::core::xml::unescape_text(&t) {
-                    let top = stack.last().map(|v| v.as_slice());
+                    let top = stack.last().map(|v| v.as_str());
                     // Appended verbatim. A title Excel split across runs
                     // carries the space *between* two runs as leading or
                     // trailing whitespace on one of them, so trimming each
@@ -554,10 +552,10 @@ fn extract_chart_text(xml: &[u8]) -> String {
                     // The assembled string is trimmed once, where it is
                     // flushed at `</c:title>` / `</c:v>`.
                     match top {
-                        Some(b"t") => {
+                        Some("t") => {
                             current_title.push_str(&s);
                         },
-                        Some(b"v") => {
+                        Some("v") => {
                             cur_v.push_str(&s);
                         },
                         _ => {},
@@ -865,33 +863,33 @@ fn parse_rich_value_metadata(
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 let name = e.local_name();
                 match name.as_ref() {
-                    b"metadataTypes" => section = Section::MetadataTypes,
-                    b"futureMetadata"
-                        if xml::optional_attr_str(e, b"name").ok().flatten().as_deref()
+                    "metadataTypes" => section = Section::MetadataTypes,
+                    "futureMetadata"
+                        if xml::optional_attr_str(e, "name").ok().flatten().as_deref()
                             == Some("XLRICHVALUE") =>
                     {
                         section = Section::FutureMetadataRich;
                     },
-                    b"futureMetadata" => section = Section::None,
-                    b"valueMetadata" => section = Section::ValueMetadata,
-                    b"metadataType" if section == Section::MetadataTypes => {
+                    "futureMetadata" => section = Section::None,
+                    "valueMetadata" => section = Section::ValueMetadata,
+                    "metadataType" if section == Section::MetadataTypes => {
                         metadata_type_count += 1;
-                        if xml::optional_attr_str(e, b"name").ok().flatten().as_deref()
+                        if xml::optional_attr_str(e, "name").ok().flatten().as_deref()
                             == Some("XLRICHVALUE")
                         {
                             rich_type_id = Some(metadata_type_count);
                         }
                     },
-                    b"bk" if section == Section::FutureMetadataRich => {
+                    "bk" if section == Section::FutureMetadataRich => {
                         future_rvb.push(None);
                         in_bk = true;
                     },
-                    b"bk" if section == Section::ValueMetadata => {
+                    "bk" if section == Section::ValueMetadata => {
                         value_metadata.push(None);
                         in_bk = true;
                     },
-                    b"rvb" if section == Section::FutureMetadataRich && in_bk => {
-                        if let Some(i) = xml::optional_attr_str(e, b"i")
+                    "rvb" if section == Section::FutureMetadataRich && in_bk => {
+                        if let Some(i) = xml::optional_attr_str(e, "i")
                             .ok()
                             .flatten()
                             .and_then(|v| v.parse::<u32>().ok())
@@ -901,12 +899,12 @@ fn parse_rich_value_metadata(
                             }
                         }
                     },
-                    b"rc" if section == Section::ValueMetadata && in_bk => {
-                        let t = xml::optional_attr_str(e, b"t")
+                    "rc" if section == Section::ValueMetadata && in_bk => {
+                        let t = xml::optional_attr_str(e, "t")
                             .ok()
                             .flatten()
                             .and_then(|v| v.parse::<u32>().ok());
-                        let v = xml::optional_attr_str(e, b"v")
+                        let v = xml::optional_attr_str(e, "v")
                             .ok()
                             .flatten()
                             .and_then(|v| v.parse::<u32>().ok());
@@ -922,10 +920,8 @@ fn parse_rich_value_metadata(
             Ok(Event::End(ref e)) => {
                 let name = e.local_name();
                 match name.as_ref() {
-                    b"bk" => in_bk = false,
-                    b"metadataTypes" | b"futureMetadata" | b"valueMetadata" => {
-                        section = Section::None
-                    },
+                    "bk" => in_bk = false,
+                    "metadataTypes" | "futureMetadata" | "valueMetadata" => section = Section::None,
                     _ => {},
                 }
             },
@@ -949,15 +945,15 @@ fn parse_rdrichvalue(xml: &[u8]) -> Vec<(u32, Vec<String>)> {
     let mut out: Vec<(u32, Vec<String>)> = Vec::new();
     loop {
         match reader.read_event() {
-            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"rv" => {
-                let s = xml::optional_attr_str(e, b"s")
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == "rv" => {
+                let s = xml::optional_attr_str(e, "s")
                     .ok()
                     .flatten()
                     .and_then(|v| v.parse::<u32>().ok())
                     .unwrap_or(0);
                 out.push((s, Vec::new()));
             },
-            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"v" => {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == "v" => {
                 if let Ok(text) = xml::read_text_content_fast(&mut reader) {
                     if let Some((_, values)) = out.last_mut() {
                         values.push(text);
@@ -986,14 +982,12 @@ fn parse_rich_value_structures(xml: &[u8]) -> Vec<Option<usize>> {
     let mut current: Option<(usize, Option<usize>)> = None; // (key count so far, image key position)
     loop {
         match reader.read_event() {
-            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"s" => {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == "s" => {
                 current = Some((0, None));
             },
-            Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e))
-                if e.local_name().as_ref() == b"k" =>
-            {
+            Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) if e.local_name().as_ref() == "k" => {
                 if let Some((count, image_pos)) = current.as_mut() {
-                    if xml::optional_attr_str(e, b"n").ok().flatten().as_deref()
+                    if xml::optional_attr_str(e, "n").ok().flatten().as_deref()
                         == Some("_rvRel:LocalImageIdentifier")
                     {
                         *image_pos = Some(*count);
@@ -1001,7 +995,7 @@ fn parse_rich_value_structures(xml: &[u8]) -> Vec<Option<usize>> {
                     *count += 1;
                 }
             },
-            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"s" => {
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == "s" => {
                 if let Some((_, image_pos)) = current.take() {
                     out.push(image_pos);
                 }
@@ -1026,9 +1020,9 @@ fn parse_rich_value_rel(xml: &[u8]) -> Vec<String> {
     loop {
         match reader.read_event() {
             Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e))
-                if e.local_name().as_ref() == b"rel" =>
+                if e.local_name().as_ref() == "rel" =>
             {
-                if let Some(rid) = xml::optional_attr_str(e, b"r:id").ok().flatten() {
+                if let Some(rid) = xml::optional_attr_str(e, "r:id").ok().flatten() {
                     out.push(rid.into_owned());
                 }
             },
@@ -1142,9 +1136,9 @@ fn parse_drawing_anchors(xml_data: &[u8]) -> crate::core::Result<DrawingAnchors>
         let evt = reader.read_event()?;
         match evt {
             Event::Start(ref e) => {
-                let local = e.local_name().as_ref().to_vec();
-                match local.as_slice() {
-                    b"absoluteAnchor" | b"oneCellAnchor" | b"twoCellAnchor" => {
+                let local = e.local_name().as_ref().to_string();
+                match local.as_str() {
+                    "absoluteAnchor" | "oneCellAnchor" | "twoCellAnchor" => {
                         in_anchor = true;
                         kind = AnchorKind::Unknown;
                         x_emu = 0;
@@ -1164,44 +1158,44 @@ fn parse_drawing_anchors(xml_data: &[u8]) -> crate::core::Result<DrawingAnchors>
                         color_hex = None;
                         in_solid_fill = false;
                     },
-                    b"pic" if in_anchor => {
+                    "pic" if in_anchor => {
                         kind = AnchorKind::Picture;
                     },
-                    b"sp" if in_anchor => {
+                    "sp" if in_anchor => {
                         kind = AnchorKind::Text;
                     },
-                    b"txBody" if in_anchor => {
+                    "txBody" if in_anchor => {
                         in_txbody = true;
                     },
-                    b"r" if in_txbody => {
+                    "r" if in_txbody => {
                         in_run = true;
                     },
-                    b"t" if in_run => {
+                    "t" if in_run => {
                         in_a_t = true;
                     },
-                    b"rPr" if in_run => {
+                    "rPr" if in_run => {
                         for attr in e.attributes().with_checks(false) {
                             let attr = attr.map_err(crate::core::Error::from)?;
                             let key = attr.key.as_ref();
                             let raw = crate::core::xml::unescape_attr_value(&attr)?;
                             match key {
-                                b"sz" => {
+                                "sz" => {
                                     // sz is in hundredths of a pt.
                                     if let Ok(n) = raw.parse::<i32>() {
                                         font_size_pt = Some(n as f32 / 100.0);
                                     }
                                 },
-                                b"b" => bold = raw == "1" || raw == "true",
-                                b"i" => italic = raw == "1" || raw == "true",
+                                "b" => bold = raw == "1" || raw == "true",
+                                "i" => italic = raw == "1" || raw == "true",
                                 _ => {},
                             }
                         }
                     },
-                    b"solidFill" if in_run => {
+                    "solidFill" if in_run => {
                         in_solid_fill = true;
                     },
-                    b"cNvPr" if in_anchor => {
-                        if let Some(d) = crate::core::xml::optional_attr_str(e, b"descr")? {
+                    "cNvPr" if in_anchor => {
+                        if let Some(d) = crate::core::xml::optional_attr_str(e, "descr")? {
                             alt_text = Some(d.into_owned());
                         }
                     },
@@ -1212,25 +1206,25 @@ fn parse_drawing_anchors(xml_data: &[u8]) -> crate::core::Result<DrawingAnchors>
                 if !in_anchor {
                     continue;
                 }
-                let local = e.local_name().as_ref().to_vec();
-                match local.as_slice() {
-                    b"pos" => {
-                        if let Some(v) = crate::core::xml::optional_attr_str(e, b"x")? {
+                let local = e.local_name().as_ref().to_string();
+                match local.as_str() {
+                    "pos" => {
+                        if let Some(v) = crate::core::xml::optional_attr_str(e, "x")? {
                             x_emu = v.parse().unwrap_or(0);
                         }
-                        if let Some(v) = crate::core::xml::optional_attr_str(e, b"y")? {
+                        if let Some(v) = crate::core::xml::optional_attr_str(e, "y")? {
                             y_emu = v.parse().unwrap_or(0);
                         }
                     },
-                    b"ext" => {
-                        if let Some(v) = crate::core::xml::optional_attr_str(e, b"cx")? {
+                    "ext" => {
+                        if let Some(v) = crate::core::xml::optional_attr_str(e, "cx")? {
                             cx_emu = v.parse().unwrap_or(0);
                         }
-                        if let Some(v) = crate::core::xml::optional_attr_str(e, b"cy")? {
+                        if let Some(v) = crate::core::xml::optional_attr_str(e, "cy")? {
                             cy_emu = v.parse().unwrap_or(0);
                         }
                     },
-                    b"off" if cx_emu == 0 && cy_emu == 0 && matches!(kind, AnchorKind::Unknown) => {
+                    "off" if cx_emu == 0 && cy_emu == 0 && matches!(kind, AnchorKind::Unknown) => {
                         // Honour `<off>` only at the outermost anchor level,
                         // before we've descended into `<xdr:pic>` or
                         // `<xdr:sp>`. Otherwise the `<a:off>` inside a
@@ -1238,51 +1232,51 @@ fn parse_drawing_anchors(xml_data: &[u8]) -> crate::core::Result<DrawingAnchors>
                         // local to the shape, not the anchor origin) would
                         // overwrite the absolute coordinates parsed from
                         // `<xdr:pos>`.
-                        if let Some(v) = crate::core::xml::optional_attr_str(e, b"x")? {
+                        if let Some(v) = crate::core::xml::optional_attr_str(e, "x")? {
                             x_emu = v.parse().unwrap_or(x_emu);
                         }
-                        if let Some(v) = crate::core::xml::optional_attr_str(e, b"y")? {
+                        if let Some(v) = crate::core::xml::optional_attr_str(e, "y")? {
                             y_emu = v.parse().unwrap_or(y_emu);
                         }
                     },
-                    b"blip" => {
+                    "blip" => {
                         for attr in e.attributes().with_checks(false) {
                             let attr = attr.map_err(crate::core::Error::from)?;
                             let key = attr.key.as_ref();
-                            if key == b"r:embed" || key.ends_with(b":embed") || key == b"embed" {
+                            if key == "r:embed" || key.ends_with(":embed") || key == "embed" {
                                 embed_rid = Some(crate::core::xml::unescape_attr_value(&attr)?);
                                 break;
                             }
                         }
                     },
-                    b"cNvPr" => {
-                        if let Some(d) = crate::core::xml::optional_attr_str(e, b"descr")? {
+                    "cNvPr" => {
+                        if let Some(d) = crate::core::xml::optional_attr_str(e, "descr")? {
                             alt_text = Some(d.into_owned());
                         }
                     },
-                    b"latin" if in_run => {
-                        if let Some(t) = crate::core::xml::optional_attr_str(e, b"typeface")? {
+                    "latin" if in_run => {
+                        if let Some(t) = crate::core::xml::optional_attr_str(e, "typeface")? {
                             font_name = Some(t.into_owned());
                         }
                     },
-                    b"srgbClr" if in_solid_fill => {
-                        if let Some(v) = crate::core::xml::optional_attr_str(e, b"val")? {
+                    "srgbClr" if in_solid_fill => {
+                        if let Some(v) = crate::core::xml::optional_attr_str(e, "val")? {
                             color_hex = Some(v.into_owned().to_uppercase());
                         }
                     },
-                    b"rPr" if in_run => {
+                    "rPr" if in_run => {
                         for attr in e.attributes().with_checks(false) {
                             let attr = attr.map_err(crate::core::Error::from)?;
                             let key = attr.key.as_ref();
                             let raw = crate::core::xml::unescape_attr_value(&attr)?;
                             match key {
-                                b"sz" => {
+                                "sz" => {
                                     if let Ok(n) = raw.parse::<i32>() {
                                         font_size_pt = Some(n as f32 / 100.0);
                                     }
                                 },
-                                b"b" => bold = raw == "1" || raw == "true",
-                                b"i" => italic = raw == "1" || raw == "true",
+                                "b" => bold = raw == "1" || raw == "true",
+                                "i" => italic = raw == "1" || raw == "true",
                                 _ => {},
                             }
                         }
@@ -1298,13 +1292,13 @@ fn parse_drawing_anchors(xml_data: &[u8]) -> crate::core::Result<DrawingAnchors>
                 text_buf.push_str(&crate::core::xml::resolve_general_ref(e)?);
             },
             Event::End(ref e) => {
-                let local = e.local_name().as_ref().to_vec();
-                match local.as_slice() {
-                    b"t" => in_a_t = false,
-                    b"r" => in_run = false,
-                    b"txBody" => in_txbody = false,
-                    b"solidFill" => in_solid_fill = false,
-                    s if matches!(s, b"absoluteAnchor" | b"oneCellAnchor" | b"twoCellAnchor")
+                let local = e.local_name().as_ref().to_string();
+                match local.as_str() {
+                    "t" => in_a_t = false,
+                    "r" => in_run = false,
+                    "txBody" => in_txbody = false,
+                    "solidFill" => in_solid_fill = false,
+                    s if matches!(s, "absoluteAnchor" | "oneCellAnchor" | "twoCellAnchor")
                         && in_anchor =>
                     {
                         in_anchor = false;

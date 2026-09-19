@@ -32,14 +32,14 @@ impl ContentTypes {
                     let local_bytes = local.as_ref();
 
                     match local_bytes {
-                        b"Default" => {
-                            let ext = xml::required_attr_str(e, b"Extension")?;
-                            let ct = xml::required_attr_str(e, b"ContentType")?;
+                        "Default" => {
+                            let ext = xml::required_attr_str(e, "Extension")?;
+                            let ct = xml::required_attr_str(e, "ContentType")?;
                             defaults.insert(ext.to_ascii_lowercase(), ct.into_owned());
                         },
-                        b"Override" => {
-                            let pn = xml::required_attr_str(e, b"PartName")?;
-                            let ct = xml::required_attr_str(e, b"ContentType")?;
+                        "Override" => {
+                            let pn = xml::required_attr_str(e, "PartName")?;
+                            let ct = xml::required_attr_str(e, "ContentType")?;
                             let part_name = PartName::new(&pn)?;
                             overrides.insert(part_name, ct.into_owned());
                         },

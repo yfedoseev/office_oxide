@@ -35,20 +35,20 @@ struct RunProps {
 
 /// Read the `<a:rPr>` attributes shared by the Start and Empty forms.
 fn run_props_from_attrs(e: &quick_xml::events::BytesStart) -> CoreResult<RunProps> {
-    let strike = xml::optional_attr_str(e, b"strike")?;
+    let strike = xml::optional_attr_str(e, "strike")?;
     Ok(RunProps {
-        bold: parse_bool_attr(e, b"b")?,
-        italic: parse_bool_attr(e, b"i")?,
+        bold: parse_bool_attr(e, "b")?,
+        italic: parse_bool_attr(e, "i")?,
         strikethrough: strike.as_deref().is_some_and(|v| v != "noStrike"),
-        font_size_hundredths_pt: parse_u32_attr(e, b"sz")?,
+        font_size_hundredths_pt: parse_u32_attr(e, "sz")?,
         // `u`, `baseline`, `cap` and `spc` were parsed by no one, so
         // underline in particular — the third most common piece of direct
         // formatting — never reached the IR from PPTX even though it did
         // from DOCX.
-        underline: xml::optional_attr_str(e, b"u")?.map(|v| v.into_owned()),
-        baseline: xml::optional_attr_str(e, b"baseline")?.and_then(|v| v.parse().ok()),
-        caps: xml::optional_attr_str(e, b"cap")?.map(|v| v.into_owned()),
-        char_spacing_hundredths_pt: xml::optional_attr_str(e, b"spc")?.and_then(|v| v.parse().ok()),
+        underline: xml::optional_attr_str(e, "u")?.map(|v| v.into_owned()),
+        baseline: xml::optional_attr_str(e, "baseline")?.and_then(|v| v.parse().ok()),
+        caps: xml::optional_attr_str(e, "cap")?.map(|v| v.into_owned()),
+        char_spacing_hundredths_pt: xml::optional_attr_str(e, "spc")?.and_then(|v| v.parse().ok()),
         ..Default::default()
     })
 }
@@ -112,14 +112,14 @@ impl Slide {
 
         loop {
             match reader.read_event()? {
-                Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"sld" => {
-                    hidden = xml::optional_attr_str(e, b"show")?
+                Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == "sld" => {
+                    hidden = xml::optional_attr_str(e, "show")?
                         .is_some_and(|v| matches!(v.as_ref(), "0" | "false"));
                 },
-                Event::Start(ref e) if e.local_name().as_ref() == b"bg" => {
+                Event::Start(ref e) if e.local_name().as_ref() == "bg" => {
                     background_rgb = parse_slide_bg(&mut reader)?;
                 },
-                Event::Start(ref e) if e.local_name().as_ref() == b"spTree" => {
+                Event::Start(ref e) if e.local_name().as_ref() == "spTree" => {
                     shapes = parse_shape_tree(&mut reader, rels, media, charts)?;
                 },
                 Event::Eof => break,
@@ -153,19 +153,19 @@ fn parse_slide_bg(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<[u
         match reader.read_event()? {
             Event::Start(ref e) => {
                 depth += 1;
-                if e.local_name().as_ref() == b"solidFill" {
+                if e.local_name().as_ref() == "solidFill" {
                     in_solid_fill = true;
                 }
             },
             Event::Empty(ref e) => {
-                if in_solid_fill && e.local_name().as_ref() == b"srgbClr" {
-                    if let Some(val) = xml::optional_attr_str(e, b"val")? {
+                if in_solid_fill && e.local_name().as_ref() == "srgbClr" {
+                    if let Some(val) = xml::optional_attr_str(e, "val")? {
                         rgb = parse_hex_rgb(val.as_ref());
                     }
                 }
             },
             Event::End(ref e) => {
-                if e.local_name().as_ref() == b"solidFill" {
+                if e.local_name().as_ref() == "solidFill" {
                     in_solid_fill = false;
                 }
                 depth -= 1;
@@ -212,7 +212,7 @@ fn parse_shape_tree(
     media: &std::collections::HashMap<String, (Vec<u8>, String)>,
     charts: &std::collections::HashMap<String, Vec<String>>,
 ) -> CoreResult<Vec<Shape>> {
-    parse_shape_tree_until(reader, rels, media, charts, b"spTree")
+    parse_shape_tree_until(reader, rels, media, charts, "spTree")
 }
 
 /// Shared shape-tree loop, parameterized on the closing tag so it can also
@@ -223,19 +223,19 @@ fn parse_shape_tree_until(
     rels: &Relationships,
     media: &std::collections::HashMap<String, (Vec<u8>, String)>,
     charts: &std::collections::HashMap<String, Vec<String>>,
-    end_local: &[u8],
+    end_local: &str,
 ) -> CoreResult<Vec<Shape>> {
     let mut shapes = Vec::new();
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"sp" => shapes.push(parse_auto_shape(reader, rels)?),
-                b"pic" => shapes.push(parse_picture(reader, rels, media)?),
-                b"grpSp" => shapes.push(parse_group_shape(reader, rels, media, charts)?),
-                b"graphicFrame" => shapes.push(parse_graphic_frame(reader, rels, charts)?),
-                b"cxnSp" => shapes.push(parse_connector(reader)?),
-                b"AlternateContent" => {
+                "sp" => shapes.push(parse_auto_shape(reader, rels)?),
+                "pic" => shapes.push(parse_picture(reader, rels, media)?),
+                "grpSp" => shapes.push(parse_group_shape(reader, rels, media, charts)?),
+                "graphicFrame" => shapes.push(parse_graphic_frame(reader, rels, charts)?),
+                "cxnSp" => shapes.push(parse_connector(reader)?),
+                "AlternateContent" => {
                     shapes.extend(parse_alternate_content(reader, rels, media, charts)?);
                 },
                 _ => {
@@ -273,15 +273,15 @@ fn parse_alternate_content(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"Choice" => {
-                    let s = parse_shape_tree_until(reader, rels, media, charts, b"Choice")?;
+                "Choice" => {
+                    let s = parse_shape_tree_until(reader, rels, media, charts, "Choice")?;
                     if !s.is_empty() {
                         shapes = s;
                         have_choice = true;
                     }
                 },
-                b"Fallback" => {
-                    let s = parse_shape_tree_until(reader, rels, media, charts, b"Fallback")?;
+                "Fallback" => {
+                    let s = parse_shape_tree_until(reader, rels, media, charts, "Fallback")?;
                     if !have_choice && shapes.is_empty() {
                         shapes = s;
                     }
@@ -290,7 +290,7 @@ fn parse_alternate_content(
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"AlternateContent" => {
+            Event::End(ref e) if e.local_name().as_ref() == "AlternateContent" => {
                 break;
             },
             Event::Eof => break,
@@ -320,7 +320,7 @@ fn parse_auto_shape(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"nvSpPr" => {
+                "nvSpPr" => {
                     let props = parse_nv_common_props(reader, rels)?;
                     id = props.0;
                     name = props.1;
@@ -328,17 +328,17 @@ fn parse_auto_shape(
                     placeholder = props.3;
                     hyperlink = props.4;
                 },
-                b"spPr" => {
-                    position = parse_shape_properties(reader, b"spPr")?;
+                "spPr" => {
+                    position = parse_shape_properties(reader, "spPr")?;
                 },
-                b"txBody" => {
+                "txBody" => {
                     text_body = Some(parse_text_body(reader, rels)?);
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"sp" => {
+            Event::End(ref e) if e.local_name().as_ref() == "sp" => {
                 break;
             },
             Event::Eof => break,
@@ -376,24 +376,24 @@ fn parse_picture(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"nvPicPr" => {
+                "nvPicPr" => {
                     let props = parse_nv_pic_props(reader, rels)?;
                     id = props.0;
                     name = props.1;
                     alt_text = props.2;
                     hyperlink = props.3;
                 },
-                b"blipFill" => {
+                "blipFill" => {
                     embed_rid = parse_blip_fill_embed(reader)?;
                 },
-                b"spPr" => {
-                    position = parse_shape_properties(reader, b"spPr")?;
+                "spPr" => {
+                    position = parse_shape_properties(reader, "spPr")?;
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"pic" => {
+            Event::End(ref e) if e.local_name().as_ref() == "pic" => {
                 break;
             },
             Event::Eof => break,
@@ -428,13 +428,13 @@ fn parse_blip_fill_embed(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Op
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"blip" && embed.is_none() {
+                if e.local_name().as_ref() == "blip" && embed.is_none() {
                     embed = read_blip_embed_attr(e)?;
                 }
                 depth += 1;
             },
             Event::Empty(ref e) => {
-                if e.local_name().as_ref() == b"blip" && embed.is_none() {
+                if e.local_name().as_ref() == "blip" && embed.is_none() {
                     embed = read_blip_embed_attr(e)?;
                 }
             },
@@ -458,7 +458,7 @@ fn read_blip_embed_attr(e: &quick_xml::events::BytesStart) -> CoreResult<Option<
     for attr in e.attributes().with_checks(false) {
         let attr = attr.map_err(crate::core::Error::from)?;
         let key = attr.key.as_ref();
-        let is_embed = key == b"r:embed" || key.ends_with(b":embed") || key == b"embed";
+        let is_embed = key == "r:embed" || key.ends_with(":embed") || key == "embed";
         if is_embed {
             return Ok(Some(crate::core::xml::unescape_attr_value(&attr)?));
         }
@@ -496,27 +496,27 @@ fn parse_group_shape(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"nvGrpSpPr" => {
-                    let props = parse_nv_id_name(reader, b"nvGrpSpPr")?;
+                "nvGrpSpPr" => {
+                    let props = parse_nv_id_name(reader, "nvGrpSpPr")?;
                     id = props.0;
                     name = props.1;
                 },
-                b"grpSpPr" => {
-                    position = parse_shape_properties(reader, b"grpSpPr")?;
+                "grpSpPr" => {
+                    position = parse_shape_properties(reader, "grpSpPr")?;
                 },
-                b"sp" => children.push(parse_auto_shape(reader, rels)?),
-                b"pic" => children.push(parse_picture(reader, rels, media)?),
-                b"grpSp" => children.push(parse_group_shape(reader, rels, media, charts)?),
-                b"graphicFrame" => children.push(parse_graphic_frame(reader, rels, charts)?),
-                b"cxnSp" => children.push(parse_connector(reader)?),
-                b"AlternateContent" => {
+                "sp" => children.push(parse_auto_shape(reader, rels)?),
+                "pic" => children.push(parse_picture(reader, rels, media)?),
+                "grpSp" => children.push(parse_group_shape(reader, rels, media, charts)?),
+                "graphicFrame" => children.push(parse_graphic_frame(reader, rels, charts)?),
+                "cxnSp" => children.push(parse_connector(reader)?),
+                "AlternateContent" => {
                     children.extend(parse_alternate_content(reader, rels, media, charts)?);
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"grpSp" => {
+            Event::End(ref e) if e.local_name().as_ref() == "grpSp" => {
                 break;
             },
             Event::Eof => break,
@@ -541,14 +541,14 @@ fn parse_group_shape(
 /// structurally (SmartArt, charts) so their words still reach the IR.
 fn collect_a_t_text(
     reader: &mut quick_xml::Reader<&[u8]>,
-    end_local: &[u8],
+    end_local: &str,
 ) -> CoreResult<Vec<String>> {
     let mut out = Vec::new();
     let mut depth = 1i32;
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"t" {
+                if e.local_name().as_ref() == "t" {
                     let t = xml::read_text_content_fast(reader)?;
                     let t = t.trim();
                     if !t.is_empty() {
@@ -580,23 +580,23 @@ fn collect_a_t_text(
 /// correct either way).
 fn find_chart_rid(
     reader: &mut quick_xml::Reader<&[u8]>,
-    end_local: &[u8],
+    end_local: &str,
 ) -> CoreResult<Option<String>> {
     let mut rid = None;
     let mut depth = 1i32;
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if rid.is_none() && e.local_name().as_ref() == b"chart" {
-                    rid = xml::optional_attr_str(e, b"r:id")?
+                if rid.is_none() && e.local_name().as_ref() == "chart" {
+                    rid = xml::optional_attr_str(e, "r:id")?
                         .filter(|v| !v.is_empty())
                         .map(|v| v.into_owned());
                 }
                 depth += 1;
             },
             Event::Empty(ref e) => {
-                if rid.is_none() && e.local_name().as_ref() == b"chart" {
-                    rid = xml::optional_attr_str(e, b"r:id")?
+                if rid.is_none() && e.local_name().as_ref() == "chart" {
+                    rid = xml::optional_attr_str(e, "r:id")?
                         .filter(|v| !v.is_empty())
                         .map(|v| v.into_owned());
                 }
@@ -631,18 +631,18 @@ fn parse_graphic_frame(
         match reader.read_event()? {
             Event::Start(ref e) => {
                 match e.local_name().as_ref() {
-                    b"nvGraphicFramePr" => {
-                        let props = parse_nv_id_name(reader, b"nvGraphicFramePr")?;
+                    "nvGraphicFramePr" => {
+                        let props = parse_nv_id_name(reader, "nvGraphicFramePr")?;
                         id = props.0;
                         name = props.1;
                     },
-                    b"xfrm" => {
+                    "xfrm" => {
                         position = parse_xfrm(reader)?;
                     },
                     // <a:graphic> is a wrapper — keep parsing to find <a:graphicData>
-                    b"graphic" => {},
-                    b"graphicData" => {
-                        let uri = xml::optional_attr_str(e, b"uri")?;
+                    "graphic" => {},
+                    "graphicData" => {
+                        let uri = xml::optional_attr_str(e, "uri")?;
                         if uri.as_deref()
                             == Some("http://schemas.openxmlformats.org/drawingml/2006/table")
                         {
@@ -657,7 +657,7 @@ fn parse_graphic_frame(
                             // separate part that id resolves to
                             // (ppt/charts/chartN.xml), pre-read into
                             // `charts`.
-                            let rid = find_chart_rid(reader, b"graphicData")?;
+                            let rid = find_chart_rid(reader, "graphicData")?;
                             let texts = rid.and_then(|r| charts.get(&r)).cloned();
                             content = match texts {
                                 Some(t) if !t.is_empty() => GraphicContent::Text(t),
@@ -668,7 +668,7 @@ fn parse_graphic_frame(
                             // objects — used to be skipped wholesale along
                             // with charts. We can't render them, but their
                             // `<a:t>` runs are document text.
-                            let texts = collect_a_t_text(reader, b"graphicData")?;
+                            let texts = collect_a_t_text(reader, "graphicData")?;
                             content = if texts.is_empty() {
                                 GraphicContent::Unknown
                             } else {
@@ -681,7 +681,7 @@ fn parse_graphic_frame(
                     },
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"graphicFrame" => {
+            Event::End(ref e) if e.local_name().as_ref() == "graphicFrame" => {
                 break;
             },
             Event::Eof => break,
@@ -703,13 +703,13 @@ fn parse_graphic_data_table(
 ) -> CoreResult<GraphicContent> {
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) if e.local_name().as_ref() == b"tbl" => {
+            Event::Start(ref e) if e.local_name().as_ref() == "tbl" => {
                 let table = parse_table(reader, rels)?;
                 // Skip to end of graphicData
-                skip_to_end_of(reader, b"graphicData")?;
+                skip_to_end_of(reader, "graphicData")?;
                 return Ok(GraphicContent::Table(table));
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"graphicData" => {
+            Event::End(ref e) if e.local_name().as_ref() == "graphicData" => {
                 break;
             },
             Event::Eof => break,
@@ -721,7 +721,7 @@ fn parse_graphic_data_table(
 }
 
 /// Skip remaining events until the end tag for the given element.
-fn skip_to_end_of(reader: &mut quick_xml::Reader<&[u8]>, local: &[u8]) -> CoreResult<()> {
+fn skip_to_end_of(reader: &mut quick_xml::Reader<&[u8]>, local: &str) -> CoreResult<()> {
     let mut depth = 1u32;
     loop {
         match reader.read_event()? {
@@ -750,19 +750,19 @@ fn parse_connector(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Shape> {
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"nvCxnSpPr" => {
-                    let props = parse_nv_id_name(reader, b"nvCxnSpPr")?;
+                "nvCxnSpPr" => {
+                    let props = parse_nv_id_name(reader, "nvCxnSpPr")?;
                     id = props.0;
                     name = props.1;
                 },
-                b"spPr" => {
-                    position = parse_shape_properties(reader, b"spPr")?;
+                "spPr" => {
+                    position = parse_shape_properties(reader, "spPr")?;
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"cxnSp" => {
+            Event::End(ref e) if e.local_name().as_ref() == "cxnSp" => {
                 break;
             },
             Event::Eof => break,
@@ -802,18 +802,18 @@ fn parse_nv_common_props(
             Event::Start(ref e) => {
                 {
                     match e.local_name().as_ref() {
-                        b"cNvPr" => {
-                            id = xml::optional_attr_str(e, b"id")?
+                        "cNvPr" => {
+                            id = xml::optional_attr_str(e, "id")?
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(0);
-                            name = xml::optional_attr_str(e, b"name")?
+                            name = xml::optional_attr_str(e, "name")?
                                 .map(|v| v.into_owned())
                                 .unwrap_or_default();
-                            alt_text = xml::optional_attr_str(e, b"descr")?.map(|v| v.into_owned());
+                            alt_text = xml::optional_attr_str(e, "descr")?.map(|v| v.into_owned());
                             hyperlink = parse_cnvpr_hyperlink(reader, rels)?;
                         },
                         // p:nvPr contains p:ph — don't skip, keep parsing
-                        b"nvPr" => {},
+                        "nvPr" => {},
                         _ => {
                             xml::skip_element_fast(reader)?;
                         },
@@ -821,24 +821,24 @@ fn parse_nv_common_props(
                 }
             },
             Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"cNvPr" => {
-                    id = xml::optional_attr_str(e, b"id")?
+                "cNvPr" => {
+                    id = xml::optional_attr_str(e, "id")?
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0);
-                    name = xml::optional_attr_str(e, b"name")?
+                    name = xml::optional_attr_str(e, "name")?
                         .map(|v| v.into_owned())
                         .unwrap_or_default();
-                    alt_text = xml::optional_attr_str(e, b"descr")?.map(|v| v.into_owned());
+                    alt_text = xml::optional_attr_str(e, "descr")?.map(|v| v.into_owned());
                 },
-                b"ph" => {
+                "ph" => {
                     placeholder = Some(PlaceholderInfo {
-                        ph_type: xml::optional_attr_str(e, b"type")?.map(|v| v.into_owned()),
-                        idx: xml::optional_attr_str(e, b"idx")?.and_then(|v| v.parse().ok()),
+                        ph_type: xml::optional_attr_str(e, "type")?.map(|v| v.into_owned()),
+                        idx: xml::optional_attr_str(e, "idx")?.and_then(|v| v.parse().ok()),
                     });
                 },
                 _ => {},
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"nvSpPr" => {
+            Event::End(ref e) if e.local_name().as_ref() == "nvSpPr" => {
                 break;
             },
             Event::Eof => break,
@@ -870,24 +870,24 @@ fn parse_cnvpr_hyperlink(
     let mut click: Option<HyperlinkInfo> = None;
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) if e.local_name().as_ref() == b"hlinkClick" => {
+            Event::Start(ref e) if e.local_name().as_ref() == "hlinkClick" => {
                 click = parse_hlink_click(e, rels)?;
                 // A non-empty `<a:hlinkClick>...</a:hlinkClick>` can carry
                 // an `<a:snd>` child (Action Button sound); its content
                 // has no IR representation, so skip it.
                 xml::skip_element_fast(reader)?;
             },
-            Event::Empty(ref e) if e.local_name().as_ref() == b"hlinkClick" => {
+            Event::Empty(ref e) if e.local_name().as_ref() == "hlinkClick" => {
                 click = parse_hlink_click(e, rels)?;
             },
-            Event::Start(ref e) if e.local_name().as_ref() == b"hlinkHover" => {
+            Event::Start(ref e) if e.local_name().as_ref() == "hlinkHover" => {
                 hover = parse_hlink_click(e, rels)?;
                 xml::skip_element_fast(reader)?;
             },
-            Event::Empty(ref e) if e.local_name().as_ref() == b"hlinkHover" => {
+            Event::Empty(ref e) if e.local_name().as_ref() == "hlinkHover" => {
                 hover = parse_hlink_click(e, rels)?;
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"cNvPr" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "cNvPr" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -907,26 +907,26 @@ fn parse_nv_pic_props(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) if e.local_name().as_ref() == b"cNvPr" => {
-                id = xml::optional_attr_str(e, b"id")?
+            Event::Start(ref e) if e.local_name().as_ref() == "cNvPr" => {
+                id = xml::optional_attr_str(e, "id")?
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
-                name = xml::optional_attr_str(e, b"name")?
+                name = xml::optional_attr_str(e, "name")?
                     .map(|v| v.into_owned())
                     .unwrap_or_default();
-                alt_text = xml::optional_attr_str(e, b"descr")?.map(|v| v.into_owned());
+                alt_text = xml::optional_attr_str(e, "descr")?.map(|v| v.into_owned());
                 hyperlink = parse_cnvpr_hyperlink(reader, rels)?;
             },
-            Event::Empty(ref e) if e.local_name().as_ref() == b"cNvPr" => {
-                id = xml::optional_attr_str(e, b"id")?
+            Event::Empty(ref e) if e.local_name().as_ref() == "cNvPr" => {
+                id = xml::optional_attr_str(e, "id")?
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
-                name = xml::optional_attr_str(e, b"name")?
+                name = xml::optional_attr_str(e, "name")?
                     .map(|v| v.into_owned())
                     .unwrap_or_default();
-                alt_text = xml::optional_attr_str(e, b"descr")?.map(|v| v.into_owned());
+                alt_text = xml::optional_attr_str(e, "descr")?.map(|v| v.into_owned());
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"nvPicPr" => {
+            Event::End(ref e) if e.local_name().as_ref() == "nvPicPr" => {
                 break;
             },
             Event::Eof => break,
@@ -942,18 +942,18 @@ fn parse_nv_pic_props(
 /// wrapper's local name, which is the only thing that differs between them.
 fn parse_nv_id_name(
     reader: &mut quick_xml::Reader<&[u8]>,
-    end_tag: &[u8],
+    end_tag: &str,
 ) -> CoreResult<(u32, String)> {
     let mut id = 0u32;
     let mut name = String::new();
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"cNvPr" => {
-                id = xml::optional_attr_str(e, b"id")?
+            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == "cNvPr" => {
+                id = xml::optional_attr_str(e, "id")?
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
-                name = xml::optional_attr_str(e, b"name")?
+                name = xml::optional_attr_str(e, "name")?
                     .map(|v| v.into_owned())
                     .unwrap_or_default();
             },
@@ -976,13 +976,13 @@ fn parse_nv_id_name(
 /// `end_tag` is the wrapper's local name.
 fn parse_shape_properties(
     reader: &mut quick_xml::Reader<&[u8]>,
-    end_tag: &[u8],
+    end_tag: &str,
 ) -> CoreResult<Option<ShapePosition>> {
     let mut position = None;
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) if e.local_name().as_ref() == b"xfrm" => {
+            Event::Start(ref e) if e.local_name().as_ref() == "xfrm" => {
                 position = Some(parse_xfrm_contents(reader)?);
             },
             Event::End(ref e) if e.local_name().as_ref() == end_tag => {
@@ -1011,19 +1011,19 @@ fn parse_xfrm_contents(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Shap
     loop {
         match reader.read_event()? {
             Event::Start(ref e) | Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"off" => {
-                    x = xml::optional_attr_str(e, b"x")?
+                "off" => {
+                    x = xml::optional_attr_str(e, "x")?
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0);
-                    y = xml::optional_attr_str(e, b"y")?
+                    y = xml::optional_attr_str(e, "y")?
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0);
                 },
-                b"ext" => {
-                    cx = xml::optional_attr_str(e, b"cx")?
+                "ext" => {
+                    cx = xml::optional_attr_str(e, "cx")?
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0);
-                    cy = xml::optional_attr_str(e, b"cy")?
+                    cy = xml::optional_attr_str(e, "cy")?
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0);
                 },
@@ -1055,7 +1055,7 @@ fn parse_text_body(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"p" => {
+                "p" => {
                     paragraphs.push(parse_text_paragraph(reader, rels)?);
                 },
                 _ => {
@@ -1087,7 +1087,7 @@ fn parse_text_paragraph(
     let mut content = Vec::new();
 
     let parse_algn = |e: &quick_xml::events::BytesStart| -> CoreResult<Option<ParagraphAlignment>> {
-        Ok(xml::optional_attr_str(e, b"algn")?.and_then(|v| match v.as_ref() {
+        Ok(xml::optional_attr_str(e, "algn")?.and_then(|v| match v.as_ref() {
             "l" => Some(ParagraphAlignment::Left),
             "ctr" => Some(ParagraphAlignment::Center),
             "r" => Some(ParagraphAlignment::Right),
@@ -1100,8 +1100,8 @@ fn parse_text_paragraph(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"pPr" => {
-                    level = xml::optional_attr_str(e, b"lvl")?
+                "pPr" => {
+                    level = xml::optional_attr_str(e, "lvl")?
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0);
                     alignment = parse_algn(e)?;
@@ -1114,7 +1114,7 @@ fn parse_text_paragraph(
                         match reader.read_event()? {
                             Event::Start(ref ee) => {
                                 depth += 1;
-                                if ee.local_name().as_ref() == b"spcBef" {
+                                if ee.local_name().as_ref() == "spcBef" {
                                     in_spc_bef = true;
                                 }
                                 if let Some(b) = parse_bullet(ee)? {
@@ -1122,8 +1122,8 @@ fn parse_text_paragraph(
                                 }
                             },
                             Event::Empty(ref ee) => {
-                                if in_spc_bef && ee.local_name().as_ref() == b"spcPts" {
-                                    if let Some(v) = xml::optional_attr_str(ee, b"val")? {
+                                if in_spc_bef && ee.local_name().as_ref() == "spcPts" {
+                                    if let Some(v) = xml::optional_attr_str(ee, "val")? {
                                         if let Ok(n) = v.parse::<u32>() {
                                             space_before_hundredths_pt = Some(n);
                                         }
@@ -1135,10 +1135,10 @@ fn parse_text_paragraph(
                             },
                             Event::End(ref ee) => {
                                 depth -= 1;
-                                if ee.local_name().as_ref() == b"spcBef" {
+                                if ee.local_name().as_ref() == "spcBef" {
                                     in_spc_bef = false;
                                 }
-                                if depth <= 0 && ee.local_name().as_ref() == b"pPr" {
+                                if depth <= 0 && ee.local_name().as_ref() == "pPr" {
                                     break;
                                 }
                             },
@@ -1147,14 +1147,14 @@ fn parse_text_paragraph(
                         }
                     }
                 },
-                b"r" => {
+                "r" => {
                     content.push(TextContent::Run(parse_text_run(reader, rels)?));
                 },
-                b"br" => {
+                "br" => {
                     content.push(TextContent::LineBreak);
                     xml::skip_element_fast(reader)?;
                 },
-                b"fld" => {
+                "fld" => {
                     content.push(TextContent::Field(parse_text_field(reader, e)?));
                 },
                 // `<a14:m>` wraps an OMML equation (`<m:oMath>`/`<m:oMathPara>`)
@@ -1162,8 +1162,8 @@ fn parse_text_paragraph(
                 // math model, so pull out every `<m:t>` run so the equation's
                 // text isn't silently dropped (PPTX analogue of
                 // the DOCX OMML fix).
-                b"m" => {
-                    let text = collect_a_t_text(reader, b"m")?.concat();
+                "m" => {
+                    let text = collect_a_t_text(reader, "m")?.concat();
                     if !text.is_empty() {
                         content.push(TextContent::Run(TextRun {
                             text,
@@ -1176,18 +1176,18 @@ fn parse_text_paragraph(
                 },
             },
             Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"pPr" => {
-                    level = xml::optional_attr_str(e, b"lvl")?
+                "pPr" => {
+                    level = xml::optional_attr_str(e, "lvl")?
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0);
                     alignment = parse_algn(e)?;
                 },
-                b"br" => {
+                "br" => {
                     content.push(TextContent::LineBreak);
                 },
                 _ => {},
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"p" => {
+            Event::End(ref e) if e.local_name().as_ref() == "p" => {
                 break;
             },
             Event::Eof => break,
@@ -1215,20 +1215,20 @@ fn parse_text_run(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"rPr" => {
+                "rPr" => {
                     props = parse_run_properties(reader, e, rels)?;
                 },
-                b"t" => {
+                "t" => {
                     text = xml::read_text_content_fast(reader)?;
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::Empty(ref e) if e.local_name().as_ref() == b"rPr" => {
+            Event::Empty(ref e) if e.local_name().as_ref() == "rPr" => {
                 props = run_props_from_attrs(e)?;
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"r" => {
+            Event::End(ref e) if e.local_name().as_ref() == "r" => {
                 break;
             },
             Event::Eof => break,
@@ -1271,28 +1271,28 @@ fn parse_run_properties(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"solidFill" {
+                if e.local_name().as_ref() == "solidFill" {
                     in_solid_fill = true;
-                } else if e.local_name().as_ref() == b"hlinkClick" {
+                } else if e.local_name().as_ref() == "hlinkClick" {
                     hyperlink = parse_hlink_click(e, rels)?;
                 }
             },
             Event::Empty(ref e) => {
-                if e.local_name().as_ref() == b"hlinkClick" {
+                if e.local_name().as_ref() == "hlinkClick" {
                     hyperlink = parse_hlink_click(e, rels)?;
-                } else if e.local_name().as_ref() == b"latin" && font_name.is_none() {
-                    font_name = xml::optional_attr_str(e, b"typeface")?.map(|v| v.into_owned());
+                } else if e.local_name().as_ref() == "latin" && font_name.is_none() {
+                    font_name = xml::optional_attr_str(e, "typeface")?.map(|v| v.into_owned());
                 } else if in_solid_fill
-                    && e.local_name().as_ref() == b"srgbClr"
+                    && e.local_name().as_ref() == "srgbClr"
                     && color_rgb.is_none()
                 {
                     color_rgb = parse_srgb_clr(e);
                 }
             },
             Event::End(ref e) => {
-                if e.local_name().as_ref() == b"solidFill" {
+                if e.local_name().as_ref() == "solidFill" {
                     in_solid_fill = false;
-                } else if e.local_name().as_ref() == b"rPr" {
+                } else if e.local_name().as_ref() == "rPr" {
                     break;
                 }
             },
@@ -1311,7 +1311,7 @@ fn parse_run_properties(
 /// to a `[u8; 3]`. Returns `None` when the attribute is absent or
 /// malformed.
 fn parse_srgb_clr(e: &quick_xml::events::BytesStart) -> Option<[u8; 3]> {
-    let val = xml::optional_attr_str(e, b"val").ok().flatten()?;
+    let val = xml::optional_attr_str(e, "val").ok().flatten()?;
     let s = val.as_ref();
     if s.len() != 6 {
         return None;
@@ -1324,12 +1324,12 @@ fn parse_srgb_clr(e: &quick_xml::events::BytesStart) -> Option<[u8; 3]> {
 
 /// Parse a non-negative integer DrawingML attribute (e.g. `sz="1800"`).
 /// Returns `None` if the attribute is absent or not parseable.
-fn parse_u32_attr(e: &quick_xml::events::BytesStart, key: &[u8]) -> CoreResult<Option<u32>> {
+fn parse_u32_attr(e: &quick_xml::events::BytesStart, key: &str) -> CoreResult<Option<u32>> {
     Ok(xml::optional_attr_str(e, key)?.and_then(|v| v.parse::<u32>().ok()))
 }
 
 /// Parse a DrawingML boolean attribute: `b="1"` → Some(true), `b="0"` → Some(false), absent → None.
-fn parse_bool_attr(e: &quick_xml::events::BytesStart, key: &[u8]) -> CoreResult<Option<bool>> {
+fn parse_bool_attr(e: &quick_xml::events::BytesStart, key: &str) -> CoreResult<Option<bool>> {
     Ok(xml::optional_attr_str(e, key)?.map(|v| v.as_ref() != "0"))
 }
 
@@ -1344,9 +1344,9 @@ fn parse_hlink_click(
     // still writes an empty r:id. Treating it the same as a real,
     // unresolvable id used to give up entirely instead of falling
     // through to `action`, losing the shape completely.
-    let r_id = xml::optional_attr_str(e, b"r:id")?.filter(|v| !v.is_empty());
-    let tooltip = xml::optional_attr_str(e, b"tooltip")?.map(|v| v.into_owned());
-    let action = xml::optional_attr_str(e, b"action")?;
+    let r_id = xml::optional_attr_str(e, "r:id")?.filter(|v| !v.is_empty());
+    let tooltip = xml::optional_attr_str(e, "tooltip")?.map(|v| v.into_owned());
+    let action = xml::optional_attr_str(e, "action")?;
 
     let target = if let Some(ref r_id) = r_id {
         if let Some(rel) = rels.get_by_id(r_id) {
@@ -1373,15 +1373,15 @@ fn parse_text_field(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
 ) -> CoreResult<TextField> {
-    let field_type = xml::optional_attr_str(start, b"type")?.map(|v| v.into_owned());
+    let field_type = xml::optional_attr_str(start, "type")?.map(|v| v.into_owned());
     let mut text = String::new();
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) if e.local_name().as_ref() == b"t" => {
+            Event::Start(ref e) if e.local_name().as_ref() == "t" => {
                 text = xml::read_text_content_fast(reader)?;
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"fld" => {
+            Event::End(ref e) if e.local_name().as_ref() == "fld" => {
                 break;
             },
             Event::Eof => break,
@@ -1404,27 +1404,27 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>, rels: &Relationships) -> C
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"tblPr" => {
+            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == "tblPr" => {
                 // `firstRow` is how a DrawingML table declares a header row.
                 // Assuming row 0 is always a header labelled data rows as
                 // headers in every table that does not have one.
-                first_row_header = xml::optional_attr_str(e, b"firstRow")?
+                first_row_header = xml::optional_attr_str(e, "firstRow")?
                     .is_some_and(|v| v.as_ref() == "1" || v.as_ref() == "true");
-                last_row_header = xml::optional_attr_str(e, b"lastRow")?
+                last_row_header = xml::optional_attr_str(e, "lastRow")?
                     .is_some_and(|v| v.as_ref() == "1" || v.as_ref() == "true");
                 if matches!(reader.read_event()?, Event::Eof) {
                     break;
                 }
             },
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"tr" => {
+                "tr" => {
                     rows.push(parse_table_row(reader, rels)?);
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"tbl" => {
+            Event::End(ref e) if e.local_name().as_ref() == "tbl" => {
                 break;
             },
             Event::Eof => break,
@@ -1443,17 +1443,17 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>, rels: &Relationships) -> C
 /// `<a:buAutoNum type="…" startAt="…"/>`.
 fn parse_bullet(e: &quick_xml::events::BytesStart) -> CoreResult<Option<BulletStyle>> {
     Ok(match e.local_name().as_ref() {
-        b"buNone" => Some(BulletStyle::None),
-        b"buChar" => Some(BulletStyle::Char(
-            xml::optional_attr_str(e, b"char")?
+        "buNone" => Some(BulletStyle::None),
+        "buChar" => Some(BulletStyle::Char(
+            xml::optional_attr_str(e, "char")?
                 .map(|v| v.into_owned())
                 .unwrap_or_else(|| "\u{2022}".to_string()),
         )),
-        b"buAutoNum" => Some(BulletStyle::AutoNum {
-            scheme: xml::optional_attr_str(e, b"type")?
+        "buAutoNum" => Some(BulletStyle::AutoNum {
+            scheme: xml::optional_attr_str(e, "type")?
                 .map(|v| v.into_owned())
                 .unwrap_or_else(|| "arabicPeriod".to_string()),
-            start_at: xml::optional_attr_str(e, b"startAt")?.and_then(|v| v.parse().ok()),
+            start_at: xml::optional_attr_str(e, "startAt")?.and_then(|v| v.parse().ok()),
         }),
         _ => None,
     })
@@ -1468,10 +1468,10 @@ fn parse_table_row(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) if e.local_name().as_ref() == b"tc" => {
+            Event::Start(ref e) if e.local_name().as_ref() == "tc" => {
                 cells.push(parse_table_cell(reader, e, rels)?);
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"tr" => {
+            Event::End(ref e) if e.local_name().as_ref() == "tr" => {
                 break;
             },
             Event::Eof => break,
@@ -1493,27 +1493,27 @@ fn parse_table_cell(
     // gridSpan * rowSpan times, so a hostile deck could hang save_as
     // indefinitely without allocating anything.
     const MAX_SPAN: u32 = 1_000;
-    let grid_span: u32 = xml::optional_attr_str(start, b"gridSpan")?
+    let grid_span: u32 = xml::optional_attr_str(start, "gridSpan")?
         .and_then(|v| v.parse().ok())
         .unwrap_or(1)
         .clamp(1, MAX_SPAN);
-    let row_span: u32 = xml::optional_attr_str(start, b"rowSpan")?
+    let row_span: u32 = xml::optional_attr_str(start, "rowSpan")?
         .and_then(|v| v.parse().ok())
         .unwrap_or(1)
         .clamp(1, MAX_SPAN);
-    let h_merge = xml::optional_attr_str(start, b"hMerge")?
+    let h_merge = xml::optional_attr_str(start, "hMerge")?
         .is_some_and(|v| v.as_ref() == "1" || v.as_ref() == "true");
-    let v_merge = xml::optional_attr_str(start, b"vMerge")?
+    let v_merge = xml::optional_attr_str(start, "vMerge")?
         .is_some_and(|v| v.as_ref() == "1" || v.as_ref() == "true");
 
     let mut text_body = None;
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) if e.local_name().as_ref() == b"txBody" => {
+            Event::Start(ref e) if e.local_name().as_ref() == "txBody" => {
                 text_body = Some(parse_text_body(reader, rels)?);
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"tc" => {
+            Event::End(ref e) if e.local_name().as_ref() == "tc" => {
                 break;
             },
             Event::Eof => break,
@@ -1550,11 +1550,11 @@ pub(crate) fn parse_comments(xml_data: &[u8]) -> Vec<SlideComment> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => match e.local_name().as_ref() {
-                b"cm" => {
+                "cm" => {
                     depth_in_comment = 1;
                     current.clear();
                 },
-                b"text" | b"t" if depth_in_comment > 0 => {
+                "text" | "t" if depth_in_comment > 0 => {
                     if let Ok(t) = xml::read_text_content_fast(&mut reader) {
                         if !t.trim().is_empty() {
                             if !current.is_empty() {
@@ -1566,7 +1566,7 @@ pub(crate) fn parse_comments(xml_data: &[u8]) -> Vec<SlideComment> {
                 },
                 _ => {},
             },
-            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"cm" => {
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == "cm" => {
                 depth_in_comment = 0;
                 if !current.is_empty() {
                     out.push(SlideComment {
@@ -1595,7 +1595,7 @@ pub(crate) fn extract_notes_body(xml_data: &[u8]) -> Option<TextBody> {
     // Parse the notes slide's shape tree
     loop {
         match reader.read_event() {
-            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"spTree" => {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == "spTree" => {
                 shapes = parse_shape_tree(
                     &mut reader,
                     &rels,

@@ -61,8 +61,8 @@ pub(crate) fn parse_master_text_styles(xml_data: &[u8]) -> MasterTextStyles {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
                 let target = match e.local_name().as_ref() {
-                    b"titleStyle" => Some(&mut styles.title),
-                    b"bodyStyle" => Some(&mut styles.body),
+                    "titleStyle" => Some(&mut styles.title),
+                    "bodyStyle" => Some(&mut styles.body),
                     _ => None,
                 };
                 if let Some(target) = target {
@@ -90,10 +90,10 @@ fn parse_level0_defaults(
     let mut result = None;
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) if e.local_name().as_ref() == b"lvl1pPr" => {
+            Event::Start(ref e) if e.local_name().as_ref() == "lvl1pPr" => {
                 result = Some(parse_lvl_pr(reader, e)?);
             },
-            Event::Empty(ref e) if e.local_name().as_ref() == b"lvl1pPr" => {
+            Event::Empty(ref e) if e.local_name().as_ref() == "lvl1pPr" => {
                 result = Some(MasterRunDefaults {
                     alignment: parse_algn(e)?,
                     ..Default::default()
@@ -108,7 +108,7 @@ fn parse_level0_defaults(
 }
 
 fn parse_algn(e: &quick_xml::events::BytesStart) -> CoreResult<Option<ParagraphAlignment>> {
-    Ok(xml::optional_attr_str(e, b"algn")?.and_then(|v| match v.as_ref() {
+    Ok(xml::optional_attr_str(e, "algn")?.and_then(|v| match v.as_ref() {
         "l" => Some(ParagraphAlignment::Left),
         "ctr" => Some(ParagraphAlignment::Center),
         "r" => Some(ParagraphAlignment::Right),
@@ -132,13 +132,13 @@ fn parse_lvl_pr(
     };
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) if e.local_name().as_ref() == b"defRPr" => {
+            Event::Start(ref e) if e.local_name().as_ref() == "defRPr" => {
                 parse_def_rpr(reader, e, &mut defaults)?;
             },
-            Event::Empty(ref e) if e.local_name().as_ref() == b"defRPr" => {
+            Event::Empty(ref e) if e.local_name().as_ref() == "defRPr" => {
                 apply_rpr_attrs(e, &mut defaults)?;
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"lvl1pPr" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "lvl1pPr" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -161,18 +161,18 @@ fn parse_def_rpr(
     let mut in_solid_fill = false;
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) if e.local_name().as_ref() == b"solidFill" => {
+            Event::Start(ref e) if e.local_name().as_ref() == "solidFill" => {
                 in_solid_fill = true;
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"solidFill" => {
+            Event::End(ref e) if e.local_name().as_ref() == "solidFill" => {
                 in_solid_fill = false;
             },
-            Event::Empty(ref e) if in_solid_fill && e.local_name().as_ref() == b"srgbClr" => {
+            Event::Empty(ref e) if in_solid_fill && e.local_name().as_ref() == "srgbClr" => {
                 if defaults.color_rgb.is_none() {
                     defaults.color_rgb = parse_srgb_clr(e);
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"defRPr" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "defRPr" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -184,23 +184,23 @@ fn apply_rpr_attrs(
     e: &quick_xml::events::BytesStart,
     defaults: &mut MasterRunDefaults,
 ) -> CoreResult<()> {
-    if let Some(v) = xml::optional_attr_str(e, b"b")? {
+    if let Some(v) = xml::optional_attr_str(e, "b")? {
         defaults.bold = Some(v.as_ref() != "0");
     }
-    if let Some(v) = xml::optional_attr_str(e, b"i")? {
+    if let Some(v) = xml::optional_attr_str(e, "i")? {
         defaults.italic = Some(v.as_ref() != "0");
     }
-    if let Some(v) = xml::optional_attr_str(e, b"u")? {
+    if let Some(v) = xml::optional_attr_str(e, "u")? {
         defaults.underline = Some(v.into_owned());
     }
-    if let Some(v) = xml::optional_attr_str(e, b"sz")? {
+    if let Some(v) = xml::optional_attr_str(e, "sz")? {
         defaults.font_size_hundredths_pt = v.parse::<u32>().ok();
     }
     Ok(())
 }
 
 fn parse_srgb_clr(e: &quick_xml::events::BytesStart) -> Option<[u8; 3]> {
-    let val = xml::optional_attr_str(e, b"val").ok().flatten()?;
+    let val = xml::optional_attr_str(e, "val").ok().flatten()?;
     let s = val.as_ref();
     if s.len() != 6 {
         return None;

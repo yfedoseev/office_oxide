@@ -68,15 +68,15 @@ pub fn parse_comments(xml_data: &[u8]) -> crate::core::Result<Vec<SheetComment>>
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"authors" => in_authors = true,
-                b"author" if in_authors => {
+                "authors" => in_authors = true,
+                "author" if in_authors => {
                     authors.push(xml::read_text_content_fast(&mut reader)?);
                 },
-                b"comment" => {
-                    let cell_ref = xml::optional_attr_str(e, b"ref")?
+                "comment" => {
+                    let cell_ref = xml::optional_attr_str(e, "ref")?
                         .map(|v| v.into_owned())
                         .unwrap_or_default();
-                    let author_id = xml::optional_attr_str(e, b"authorId")?
+                    let author_id = xml::optional_attr_str(e, "authorId")?
                         .and_then(|v| v.parse::<usize>().ok());
                     let text = xml::read_text_content_fast(&mut reader)?;
                     let text = text.trim().to_string();
@@ -90,7 +90,7 @@ pub fn parse_comments(xml_data: &[u8]) -> crate::core::Result<Vec<SheetComment>>
                 },
                 _ => {},
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"authors" => in_authors = false,
+            Event::End(ref e) if e.local_name().as_ref() == "authors" => in_authors = false,
             Event::Eof => break,
             _ => {},
         }
@@ -117,12 +117,12 @@ pub(crate) fn parse_threaded_comments(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) if e.local_name().as_ref() == b"threadedComment" => {
-                let cell_ref = xml::optional_attr_str(e, b"ref")?
+            Event::Start(ref e) if e.local_name().as_ref() == "threadedComment" => {
+                let cell_ref = xml::optional_attr_str(e, "ref")?
                     .map(|v| v.into_owned())
                     .unwrap_or_default();
-                let parent_id = xml::optional_attr_str(e, b"parentId")?.map(|v| v.into_owned());
-                let person_id = xml::optional_attr_str(e, b"personId")?.map(|v| v.into_owned());
+                let parent_id = xml::optional_attr_str(e, "parentId")?.map(|v| v.into_owned());
+                let person_id = xml::optional_attr_str(e, "personId")?.map(|v| v.into_owned());
                 let text = xml::read_text_content_fast(&mut reader)?;
                 let text = text.trim().to_string();
                 if !text.is_empty() {
@@ -151,9 +151,9 @@ pub(crate) fn parse_persons(
 
     loop {
         match reader.read_event()? {
-            Event::Empty(ref e) | Event::Start(ref e) if e.local_name().as_ref() == b"person" => {
-                let id = xml::optional_attr_str(e, b"id")?.map(|v| v.into_owned());
-                let name = xml::optional_attr_str(e, b"displayName")?.map(|v| v.into_owned());
+            Event::Empty(ref e) | Event::Start(ref e) if e.local_name().as_ref() == "person" => {
+                let id = xml::optional_attr_str(e, "id")?.map(|v| v.into_owned());
+                let name = xml::optional_attr_str(e, "displayName")?.map(|v| v.into_owned());
                 if let (Some(id), Some(name)) = (id, name) {
                     out.insert(id, name);
                 }
@@ -359,63 +359,63 @@ impl Worksheet {
         loop {
             match reader.read_event()? {
                 Event::Start(ref e) => match e.local_name().as_ref() {
-                    b"dimension" => {
-                        dimension = xml::optional_attr_str(e, b"ref")?.map(|v| v.into_owned());
+                    "dimension" => {
+                        dimension = xml::optional_attr_str(e, "ref")?.map(|v| v.into_owned());
                         reader.read_to_end(e.to_end().name())?;
                     },
-                    b"row" => {
+                    "row" => {
                         // A <row> without r= is implicitly the one after the
                         // previous row (ECMA-376 18.3.1.73); some writers omit
                         // it throughout the sheet.
                         let implied = rows.last().map_or(1, |r: &Row| r.index + 1);
                         rows.push(parse_row_fast(&mut reader, e, implied, &mut shared)?);
                     },
-                    b"mergeCell" => {
-                        if let Some(range) = xml::optional_attr_str(e, b"ref")? {
+                    "mergeCell" => {
+                        if let Some(range) = xml::optional_attr_str(e, "ref")? {
                             merged_cells.push(range.into_owned());
                         }
                         reader.read_to_end(e.to_end().name())?;
                     },
-                    b"hyperlink" => {
+                    "hyperlink" => {
                         if let Some(hl) = parse_hyperlink(e, rels)? {
                             hyperlinks.push(hl);
                         }
                         reader.read_to_end(e.to_end().name())?;
                     },
-                    b"pageMargins" => {
+                    "pageMargins" => {
                         margins_in = parse_page_margins(e)?;
                         reader.read_to_end(e.to_end().name())?;
                     },
-                    b"pageSetup" => {
+                    "pageSetup" => {
                         page_setup_raw = parse_page_setup_attrs(e)?;
                         reader.read_to_end(e.to_end().name())?;
                     },
-                    b"conditionalFormatting" => {
+                    "conditionalFormatting" => {
                         conditional_formats.extend(parse_conditional_formatting(&mut reader, e)?);
                     },
-                    b"dataValidations" => {
+                    "dataValidations" => {
                         data_validations.extend(parse_data_validations(&mut reader)?);
                     },
                     _ => {},
                 },
                 Event::Empty(ref e) => match e.local_name().as_ref() {
-                    b"dimension" => {
-                        dimension = xml::optional_attr_str(e, b"ref")?.map(|v| v.into_owned());
+                    "dimension" => {
+                        dimension = xml::optional_attr_str(e, "ref")?.map(|v| v.into_owned());
                     },
-                    b"mergeCell" => {
-                        if let Some(range) = xml::optional_attr_str(e, b"ref")? {
+                    "mergeCell" => {
+                        if let Some(range) = xml::optional_attr_str(e, "ref")? {
                             merged_cells.push(range.into_owned());
                         }
                     },
-                    b"hyperlink" => {
+                    "hyperlink" => {
                         if let Some(hl) = parse_hyperlink(e, rels)? {
                             hyperlinks.push(hl);
                         }
                     },
-                    b"pageMargins" => {
+                    "pageMargins" => {
                         margins_in = parse_page_margins(e)?;
                     },
-                    b"pageSetup" => {
+                    "pageSetup" => {
                         page_setup_raw = parse_page_setup_attrs(e)?;
                     },
                     _ => {},
@@ -471,18 +471,18 @@ fn parse_conditional_formatting(
 ) -> crate::core::Result<Vec<crate::ir::ConditionalFormat>> {
     use quick_xml::events::Event;
 
-    let sqref = xml::optional_attr_str(start, b"sqref")?
+    let sqref = xml::optional_attr_str(start, "sqref")?
         .map(|v| v.into_owned())
         .unwrap_or_default();
     let mut out = Vec::new();
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) if e.local_name().as_ref() == b"cfRule" => {
-                let rule_type = xml::optional_attr_str(e, b"type")?
+            Event::Start(ref e) if e.local_name().as_ref() == "cfRule" => {
+                let rule_type = xml::optional_attr_str(e, "type")?
                     .map(|v| v.into_owned())
                     .unwrap_or_default();
-                let operator = xml::optional_attr_str(e, b"operator")?.map(|v| v.into_owned());
+                let operator = xml::optional_attr_str(e, "operator")?.map(|v| v.into_owned());
                 let formulas = read_cf_rule_formulas(reader)?;
                 out.push(crate::ir::ConditionalFormat {
                     range: sqref.clone(),
@@ -491,13 +491,13 @@ fn parse_conditional_formatting(
                     formulas,
                 });
             },
-            Event::Empty(ref e) if e.local_name().as_ref() == b"cfRule" => {
+            Event::Empty(ref e) if e.local_name().as_ref() == "cfRule" => {
                 // A rule with no children at all (no formula, no colour
                 // scale/data bar/icon set) — rare, but structurally valid.
-                let rule_type = xml::optional_attr_str(e, b"type")?
+                let rule_type = xml::optional_attr_str(e, "type")?
                     .map(|v| v.into_owned())
                     .unwrap_or_default();
-                let operator = xml::optional_attr_str(e, b"operator")?.map(|v| v.into_owned());
+                let operator = xml::optional_attr_str(e, "operator")?.map(|v| v.into_owned());
                 out.push(crate::ir::ConditionalFormat {
                     range: sqref.clone(),
                     rule_type,
@@ -505,7 +505,7 @@ fn parse_conditional_formatting(
                     formulas: Vec::new(),
                 });
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"conditionalFormatting" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "conditionalFormatting" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -528,7 +528,7 @@ fn read_cf_rule_formulas(
         match reader.read_event()? {
             Event::Start(ref e) => {
                 depth += 1;
-                if e.local_name().as_ref() == b"formula" {
+                if e.local_name().as_ref() == "formula" {
                     formulas.push(xml::read_text_content_fast(reader)?);
                     depth -= 1; // read_text_content_fast already consumed </formula>
                 }
@@ -557,13 +557,13 @@ fn parse_data_validations(
     let mut out = Vec::new();
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) if e.local_name().as_ref() == b"dataValidation" => {
+            Event::Start(ref e) if e.local_name().as_ref() == "dataValidation" => {
                 out.push(parse_data_validation_with_body(reader, e)?);
             },
-            Event::Empty(ref e) if e.local_name().as_ref() == b"dataValidation" => {
+            Event::Empty(ref e) if e.local_name().as_ref() == "dataValidation" => {
                 out.push(data_validation_from_attrs(e)?);
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"dataValidations" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "dataValidations" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -579,22 +579,22 @@ fn parse_data_validations(
 fn data_validation_from_attrs(
     e: &quick_xml::events::BytesStart,
 ) -> crate::core::Result<crate::ir::DataValidation> {
-    let range = xml::optional_attr_str(e, b"sqref")?
+    let range = xml::optional_attr_str(e, "sqref")?
         .map(|v| v.into_owned())
         .unwrap_or_default();
-    let validation_type = xml::optional_attr_str(e, b"type")?
+    let validation_type = xml::optional_attr_str(e, "type")?
         .map(|v| v.into_owned())
         .unwrap_or_else(|| "none".to_string());
     let operator = if matches!(validation_type.as_str(), "list" | "custom" | "none") {
         None
     } else {
         Some(
-            xml::optional_attr_str(e, b"operator")?
+            xml::optional_attr_str(e, "operator")?
                 .map(|v| v.into_owned())
                 .unwrap_or_else(|| "between".to_string()),
         )
     };
-    let allow_blank = xml::optional_attr_str(e, b"allowBlank")?.as_deref() == Some("1");
+    let allow_blank = xml::optional_attr_str(e, "allowBlank")?.as_deref() == Some("1");
     Ok(crate::ir::DataValidation {
         range,
         validation_type,
@@ -617,13 +617,13 @@ fn parse_data_validation_with_body(
     let mut dv = data_validation_from_attrs(start)?;
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) if e.local_name().as_ref() == b"formula1" => {
+            Event::Start(ref e) if e.local_name().as_ref() == "formula1" => {
                 dv.formula1 = Some(xml::read_text_content_fast(reader)?);
             },
-            Event::Start(ref e) if e.local_name().as_ref() == b"formula2" => {
+            Event::Start(ref e) if e.local_name().as_ref() == "formula2" => {
                 dv.formula2 = Some(xml::read_text_content_fast(reader)?);
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"dataValidation" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "dataValidation" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -667,16 +667,16 @@ struct PageSetupRaw {
 fn parse_page_margins(
     e: &quick_xml::events::BytesStart,
 ) -> crate::core::Result<Option<PageMarginsIn>> {
-    let parse = |k: &[u8]| -> crate::core::Result<Option<f64>> {
+    let parse = |k: &str| -> crate::core::Result<Option<f64>> {
         Ok(xml::optional_attr_str(e, k)?
             .and_then(|v| fast_float2::parse::<f64, _>(v.as_ref()).ok()))
     };
-    let left = parse(b"left")?;
-    let right = parse(b"right")?;
-    let top = parse(b"top")?;
-    let bottom = parse(b"bottom")?;
-    let header = parse(b"header")?;
-    let footer = parse(b"footer")?;
+    let left = parse("left")?;
+    let right = parse("right")?;
+    let top = parse("top")?;
+    let bottom = parse("bottom")?;
+    let header = parse("header")?;
+    let footer = parse("footer")?;
     if left.is_none() && right.is_none() && top.is_none() && bottom.is_none() {
         return Ok(None);
     }
@@ -740,11 +740,11 @@ fn paper_size_enum_to_twips(id: u32) -> (u32, u32) {
 fn parse_page_setup_attrs(
     e: &quick_xml::events::BytesStart,
 ) -> crate::core::Result<Option<PageSetupRaw>> {
-    let pw = xml::optional_attr_str(e, b"paperWidth")?.and_then(|v| dim_to_twips(v.as_ref()));
-    let ph = xml::optional_attr_str(e, b"paperHeight")?.and_then(|v| dim_to_twips(v.as_ref()));
-    let paper_size = xml::optional_attr_str(e, b"paperSize")?
+    let pw = xml::optional_attr_str(e, "paperWidth")?.and_then(|v| dim_to_twips(v.as_ref()));
+    let ph = xml::optional_attr_str(e, "paperHeight")?.and_then(|v| dim_to_twips(v.as_ref()));
+    let paper_size = xml::optional_attr_str(e, "paperSize")?
         .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok());
-    let orientation = xml::optional_attr_str(e, b"orientation")?;
+    let orientation = xml::optional_attr_str(e, "orientation")?;
     let landscape = matches!(orientation.as_deref(), Some("landscape"));
 
     let (width_twips, height_twips) = match (pw, ph) {
@@ -798,15 +798,15 @@ fn parse_hyperlink(
     e: &quick_xml::events::BytesStart,
     rels: &crate::core::relationships::Relationships,
 ) -> crate::core::Result<Option<HyperlinkInfo>> {
-    let cell_ref = match xml::optional_attr_str(e, b"ref")? {
+    let cell_ref = match xml::optional_attr_str(e, "ref")? {
         Some(v) => v.into_owned(),
         None => return Ok(None),
     };
-    let tooltip = xml::optional_attr_str(e, b"tooltip")?.map(|v| v.into_owned());
+    let tooltip = xml::optional_attr_str(e, "tooltip")?.map(|v| v.into_owned());
 
     // r:id → external hyperlink via relationships
-    let r_id = xml::optional_attr_str(e, b"r:id")?;
-    let location = xml::optional_attr_str(e, b"location")?;
+    let r_id = xml::optional_attr_str(e, "r:id")?;
+    let location = xml::optional_attr_str(e, "location")?;
 
     let target = if let Some(rid) = r_id {
         if let Some(rel) = rels.get_by_id(&rid) {
@@ -834,7 +834,7 @@ fn parse_row_fast(
     implied_index: u32,
     shared: &mut SharedFormulas,
 ) -> crate::core::Result<Row> {
-    let index: u32 = xml::optional_attr_str(start, b"r")?
+    let index: u32 = xml::optional_attr_str(start, "r")?
         .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok())
         .unwrap_or(implied_index);
     let mut cells = Vec::new();
@@ -845,7 +845,7 @@ fn parse_row_fast(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"c" {
+                if e.local_name().as_ref() == "c" {
                     let cell = parse_cell_fast(reader, e, index, next_col, shared)?;
                     next_col = cell.reference.col.saturating_add(1);
                     cells.push(cell);
@@ -853,12 +853,12 @@ fn parse_row_fast(
                     reader.read_to_end(e.to_end().name())?;
                 }
             },
-            Event::Empty(ref e) if e.local_name().as_ref() == b"c" => {
+            Event::Empty(ref e) if e.local_name().as_ref() == "c" => {
                 let cell = parse_empty_cell(e, index, next_col)?;
                 next_col = cell.reference.col.saturating_add(1);
                 cells.push(cell);
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"row" => {
+            Event::End(ref e) if e.local_name().as_ref() == "row" => {
                 break;
             },
             Event::Eof => break,
@@ -874,14 +874,14 @@ fn parse_empty_cell(
     row: u32,
     implied_col: u32,
 ) -> crate::core::Result<Cell> {
-    let ref_str = xml::optional_attr_str(e, b"r")?
+    let ref_str = xml::optional_attr_str(e, "r")?
         .map(|v| v.into_owned())
         .unwrap_or_default();
     let reference = CellRef::parse(&ref_str).unwrap_or(CellRef {
         col: implied_col,
         row,
     });
-    let style_index = xml::optional_attr_str(e, b"s")?
+    let style_index = xml::optional_attr_str(e, "s")?
         .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok());
 
     Ok(Cell {
@@ -898,10 +898,10 @@ fn parse_empty_cell(
 /// is a shared formula (`t="shared"`). Array and dataTable formulas also
 /// carry a `ref`, and a plain formula carries neither.
 fn shared_si(e: &quick_xml::events::BytesStart) -> crate::core::Result<Option<u32>> {
-    if xml::optional_attr_str(e, b"t")?.as_deref() != Some("shared") {
+    if xml::optional_attr_str(e, "t")?.as_deref() != Some("shared") {
         return Ok(None);
     }
-    Ok(xml::optional_attr_str(e, b"si")?
+    Ok(xml::optional_attr_str(e, "si")?
         .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok()))
 }
 
@@ -913,7 +913,7 @@ fn parse_cell_fast(
     implied_col: u32,
     shared: &mut SharedFormulas,
 ) -> crate::core::Result<Cell> {
-    let ref_str = xml::optional_attr_str(start, b"r")?
+    let ref_str = xml::optional_attr_str(start, "r")?
         .map(|v| v.into_owned())
         .unwrap_or_default();
     let reference = CellRef::parse(&ref_str).unwrap_or(CellRef {
@@ -921,10 +921,10 @@ fn parse_cell_fast(
         row,
     });
 
-    let cell_type = xml::optional_attr_str(start, b"t")?.map(|v| v.into_owned());
-    let style_index = xml::optional_attr_str(start, b"s")?
+    let cell_type = xml::optional_attr_str(start, "t")?.map(|v| v.into_owned());
+    let style_index = xml::optional_attr_str(start, "s")?
         .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok());
-    let vm = xml::optional_attr_str(start, b"vm")?
+    let vm = xml::optional_attr_str(start, "vm")?
         .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok());
 
     let mut raw_value: Option<String> = None;
@@ -934,10 +934,10 @@ fn parse_cell_fast(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"v" => {
+                "v" => {
                     raw_value = Some(read_text_fast(reader)?);
                 },
-                b"f" => {
+                "f" => {
                     let si = shared_si(e)?;
                     let text = read_text_fast(reader)?;
                     // A shared group's master carries the text once, here.
@@ -946,7 +946,7 @@ fn parse_cell_fast(
                     }
                     formula = Some(text);
                 },
-                b"is" => {
+                "is" => {
                     let (text, runs) = parse_inline_string_fast(reader)?;
                     raw_value = Some(text);
                     inline_rich_runs = runs;
@@ -955,7 +955,7 @@ fn parse_cell_fast(
                     reader.read_to_end(e.to_end().name())?;
                 },
             },
-            Event::Empty(ref e) if e.local_name().as_ref() == b"f" => {
+            Event::Empty(ref e) if e.local_name().as_ref() == "f" => {
                 // A bare `<f t="shared" si="N"/>` is a follower: no text of
                 // its own, but its formula is the group master's translated
                 // by the row/column offset. Discarding it made a formula
@@ -965,7 +965,7 @@ fn parse_cell_fast(
                     None => None,
                 };
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"c" => {
+            Event::End(ref e) if e.local_name().as_ref() == "c" => {
                 break;
             },
             Event::Eof => break,
@@ -1053,21 +1053,21 @@ fn read_inline_string_body(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"t" => plain_text.push_str(&read_text_fast(reader)?),
+                "t" => plain_text.push_str(&read_text_fast(reader)?),
                 // A rich inline string wraps each run in `<r>`, exactly
                 // like a shared string's `<si>` — reuse the same parser
                 // so a run's `<rPr>` (bold/italic/size/font/color) isn't
                 // discarded here the way it used to be (the rich-text
                 // fix covered shared strings but missed this
                 // structurally identical inline-string path entirely).
-                b"r" => {
+                "r" => {
                     runs.push(crate::xlsx::shared_strings::parse_rich_text_run(reader)?);
                 },
                 _ => {
                     reader.read_to_end(e.to_end().name())?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"is" => {
+            Event::End(ref e) if e.local_name().as_ref() == "is" => {
                 break;
             },
             Event::Eof => break,

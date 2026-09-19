@@ -68,10 +68,10 @@ impl StyleSheet {
         loop {
             match reader.read_event()? {
                 Event::Start(ref e) => match e.local_name().as_ref() {
-                    b"docDefaults" => {
+                    "docDefaults" => {
                         sheet.doc_defaults = Some(parse_doc_defaults(&mut reader)?);
                     },
-                    b"style" => {
+                    "style" => {
                         if let Some(style) = parse_style(&mut reader, e)? {
                             sheet.styles.insert(style.style_id.clone(), style);
                         }
@@ -193,11 +193,11 @@ fn parse_doc_defaults(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Res
         match reader.read_event()? {
             Event::Start(ref e) => {
                 match e.local_name().as_ref() {
-                    b"rPrDefault" => {
+                    "rPrDefault" => {
                         // contains w:rPr
                         defaults.run_properties = parse_nested_rpr(reader)?;
                     },
-                    b"pPrDefault" => {
+                    "pPrDefault" => {
                         defaults.paragraph_properties = parse_nested_ppr(reader)?;
                     },
                     _ => {
@@ -205,7 +205,7 @@ fn parse_doc_defaults(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Res
                     },
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"docDefaults" => {
+            Event::End(ref e) if e.local_name().as_ref() == "docDefaults" => {
                 break;
             },
             Event::Eof => break,
@@ -224,13 +224,13 @@ fn parse_nested_rpr(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"rPr" {
+                if e.local_name().as_ref() == "rPr" {
                     result = Some(parse_run_properties_fast(reader)?);
                 } else {
                     xml::skip_element_fast(reader)?;
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"rPrDefault" => {
+            Event::End(ref e) if e.local_name().as_ref() == "rPrDefault" => {
                 break;
             },
             Event::Eof => break,
@@ -249,13 +249,13 @@ fn parse_nested_ppr(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"pPr" {
+                if e.local_name().as_ref() == "pPr" {
                     result = Some(parse_paragraph_properties_fast(reader)?);
                 } else {
                     xml::skip_element_fast(reader)?;
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"pPrDefault" => {
+            Event::End(ref e) if e.local_name().as_ref() == "pPrDefault" => {
                 break;
             },
             Event::Eof => break,
@@ -269,11 +269,11 @@ fn parse_style(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
 ) -> crate::core::Result<Option<Style>> {
-    let style_id = match xml::optional_attr_str(start, b"w:styleId")? {
+    let style_id = match xml::optional_attr_str(start, "w:styleId")? {
         Some(id) => id.into_owned(),
         None => return Ok(None),
     };
-    let style_type = match xml::optional_attr_str(start, b"w:type")? {
+    let style_type = match xml::optional_attr_str(start, "w:type")? {
         Some(ref t) => match t.as_ref() {
             "paragraph" => StyleType::Paragraph,
             "character" => StyleType::Character,
@@ -292,22 +292,22 @@ fn parse_style(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"name" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "name" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         name = Some(val.into_owned());
                     }
                     xml::skip_element_fast(reader)?;
                 },
-                b"basedOn" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "basedOn" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         based_on = Some(val.into_owned());
                     }
                     xml::skip_element_fast(reader)?;
                 },
-                b"rPr" => {
+                "rPr" => {
                     run_properties = Some(parse_run_properties_fast(reader)?);
                 },
-                b"pPr" => {
+                "pPr" => {
                     paragraph_properties = Some(parse_paragraph_properties_fast(reader)?);
                 },
                 _ => {
@@ -315,19 +315,19 @@ fn parse_style(
                 },
             },
             Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"name" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "name" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         name = Some(val.into_owned());
                     }
                 },
-                b"basedOn" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "basedOn" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         based_on = Some(val.into_owned());
                     }
                 },
                 _ => {},
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"style" => {
+            Event::End(ref e) if e.local_name().as_ref() == "style" => {
                 break;
             },
             Event::Eof => break,

@@ -62,18 +62,18 @@ impl WorkbookInfo {
             match reader.read_event()? {
                 Event::Start(ref e) => {
                     match e.local_name().as_ref() {
-                        b"sheet" => {
-                            let name = xml::required_attr_str(e, b"name")?.into_owned();
-                            let sheet_id: u32 = xml::required_attr_str(e, b"sheetId")?.parse()?;
+                        "sheet" => {
+                            let name = xml::required_attr_str(e, "name")?.into_owned();
+                            let sheet_id: u32 = xml::required_attr_str(e, "sheetId")?.parse()?;
                             // Try r:id first, then fall back to any prefixed `id` attribute
                             // (some files use d3p1:id or other namespace prefixes)
-                            let rel_id = match xml::optional_attr_str(e, b"r:id")? {
+                            let rel_id = match xml::optional_attr_str(e, "r:id")? {
                                 Some(v) => v.into_owned(),
-                                None => xml::optional_prefixed_attr_str(e, b"id")?
+                                None => xml::optional_prefixed_attr_str(e, "id")?
                                     .map(|v| v.into_owned())
                                     .unwrap_or_default(),
                             };
-                            let state = match xml::optional_attr_str(e, b"state")? {
+                            let state = match xml::optional_attr_str(e, "state")? {
                                 Some(ref v) => match v.as_ref() {
                                     "hidden" => SheetState::Hidden,
                                     "veryHidden" => SheetState::VeryHidden,
@@ -89,17 +89,17 @@ impl WorkbookInfo {
                             });
                             xml::skip_element_fast(&mut reader)?;
                         },
-                        b"workbookPr" => {
-                            if let Some(val) = xml::optional_attr_str(e, b"date1904")? {
+                        "workbookPr" => {
+                            if let Some(val) = xml::optional_attr_str(e, "date1904")? {
                                 date1904 = matches!(val.as_ref(), "1" | "true");
                             }
                             xml::skip_element_fast(&mut reader)?;
                         },
-                        b"definedName" => {
-                            let name = xml::required_attr_str(e, b"name")?.into_owned();
-                            let local_sheet_id = xml::optional_attr_str(e, b"localSheetId")?
+                        "definedName" => {
+                            let name = xml::required_attr_str(e, "name")?.into_owned();
+                            let local_sheet_id = xml::optional_attr_str(e, "localSheetId")?
                                 .and_then(|v| v.parse().ok());
-                            let hidden = xml::optional_attr_str(e, b"hidden")?
+                            let hidden = xml::optional_attr_str(e, "hidden")?
                                 .is_some_and(|v| matches!(v.as_ref(), "1" | "true"));
                             let value = xml::read_text_content_fast(&mut reader)?;
                             defined_names.push(DefinedName {
@@ -113,16 +113,16 @@ impl WorkbookInfo {
                     }
                 },
                 Event::Empty(ref e) => match e.local_name().as_ref() {
-                    b"sheet" => {
-                        let name = xml::required_attr_str(e, b"name")?.into_owned();
-                        let sheet_id: u32 = xml::required_attr_str(e, b"sheetId")?.parse()?;
-                        let rel_id = match xml::optional_attr_str(e, b"r:id")? {
+                    "sheet" => {
+                        let name = xml::required_attr_str(e, "name")?.into_owned();
+                        let sheet_id: u32 = xml::required_attr_str(e, "sheetId")?.parse()?;
+                        let rel_id = match xml::optional_attr_str(e, "r:id")? {
                             Some(v) => v.into_owned(),
-                            None => xml::optional_prefixed_attr_str(e, b"id")?
+                            None => xml::optional_prefixed_attr_str(e, "id")?
                                 .map(|v| v.into_owned())
                                 .unwrap_or_default(),
                         };
-                        let state = match xml::optional_attr_str(e, b"state")? {
+                        let state = match xml::optional_attr_str(e, "state")? {
                             Some(ref v) => match v.as_ref() {
                                 "hidden" => SheetState::Hidden,
                                 "veryHidden" => SheetState::VeryHidden,
@@ -137,8 +137,8 @@ impl WorkbookInfo {
                             state,
                         });
                     },
-                    b"workbookPr" => {
-                        if let Some(val) = xml::optional_attr_str(e, b"date1904")? {
+                    "workbookPr" => {
+                        if let Some(val) = xml::optional_attr_str(e, "date1904")? {
                             date1904 = matches!(val.as_ref(), "1" | "true");
                         }
                     },

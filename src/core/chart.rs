@@ -54,7 +54,7 @@ pub fn chart_text_lines(xml: &[u8]) -> Vec<String> {
     // Local names of the open elements, innermost last. Pushed on Start and
     // popped on End, so on an End event the stack already describes the
     // *parent* scope of the element that just closed.
-    let mut stack: Vec<Vec<u8>> = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
     // How deep we are inside `<c:title>` elements (chart title and axis
     // titles both use it). Rich text only counts as a title when > 0.
     let mut title_depth: u32 = 0;
@@ -73,29 +73,29 @@ pub fn chart_text_lines(xml: &[u8]) -> Vec<String> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(quick_xml::events::Event::Start(e)) => {
-                let local = e.local_name().as_ref().to_vec();
-                match local.as_slice() {
-                    b"ser" => {
+                let local = e.local_name().as_ref().to_string();
+                match local.as_str() {
+                    "ser" => {
                         cur_series = Some(Series::default());
                         cur_cats.clear();
                     },
-                    b"title" => title_depth += 1,
+                    "title" => title_depth += 1,
                     _ => {},
                 }
                 stack.push(local);
             },
             Ok(quick_xml::events::Event::End(e)) => {
-                let local = e.local_name().as_ref().to_vec();
+                let local = e.local_name().as_ref().to_string();
                 stack.pop();
-                match local.as_slice() {
+                match local.as_str() {
                     // A title's runs are grouped into `<a:p>` paragraphs;
                     // without a separator "Sales" + "2024" would fuse.
-                    b"p" if title_depth > 0 => {
+                    "p" if title_depth > 0 => {
                         if !title_buf.is_empty() && !title_buf.ends_with(' ') {
                             title_buf.push(' ');
                         }
                     },
-                    b"title" => {
+                    "title" => {
                         title_depth = title_depth.saturating_sub(1);
                         let t = title_buf.trim();
                         if !t.is_empty() {
@@ -103,7 +103,7 @@ pub fn chart_text_lines(xml: &[u8]) -> Vec<String> {
                         }
                         title_buf.clear();
                     },
-                    b"v" => {
+                    "v" => {
                         let val = cur_v.trim().to_string();
                         cur_v.clear();
                         if val.is_empty() {
@@ -119,28 +119,28 @@ pub fn chart_text_lines(xml: &[u8]) -> Vec<String> {
                         let Some(s) = cur_series.as_mut() else {
                             continue;
                         };
-                        let scope = |tag: &[u8]| stack.iter().any(|t| t.as_slice() == tag);
-                        if scope(b"tx") {
+                        let scope = |tag: &str| stack.iter().any(|t| t == tag);
+                        if scope("tx") {
                             if s.name.is_empty() {
                                 s.name = val;
                             }
-                        } else if scope(b"cat") || scope(b"xVal") {
+                        } else if scope("cat") || scope("xVal") {
                             // Scatter charts have no `<c:cat>`; their x
                             // values play the same role.
                             if cur_cats.len() < MAX_CATEGORIES {
                                 cur_cats.push(val);
                             }
-                        } else if scope(b"bubbleSize") {
+                        } else if scope("bubbleSize") {
                             if s.sizes.len() < MAX_VALUES_PER_SERIES {
                                 s.sizes.push(val);
                             }
-                        } else if scope(b"val") || scope(b"yVal") {
+                        } else if scope("val") || scope("yVal") {
                             if s.values.len() < MAX_VALUES_PER_SERIES {
                                 s.values.push(val);
                             }
                         }
                     },
-                    b"ser" => {
+                    "ser" => {
                         if let Some(mut s) = cur_series.take() {
                             // Every series in a chart normally repeats the
                             // same category list; keep the first non-empty
@@ -174,7 +174,7 @@ pub fn chart_text_lines(xml: &[u8]) -> Vec<String> {
                 }
             },
             Ok(quick_xml::events::Event::CData(t)) => {
-                let s = String::from_utf8_lossy(&t).into_owned();
+                let s = t.to_string();
                 append_scoped(&mut stack, title_depth, &s, &mut title_buf, &mut cur_v);
             },
             Ok(quick_xml::events::Event::Eof) => break,
@@ -213,17 +213,17 @@ pub fn extract_chart_text(xml: &[u8]) -> String {
 /// Route a text fragment to the title buffer or the current `<c:v>` buffer,
 /// depending on which element is currently open.
 fn append_scoped(
-    stack: &mut [Vec<u8>],
+    stack: &mut [String],
     title_depth: u32,
     s: &str,
     title_buf: &mut String,
     cur_v: &mut String,
 ) {
-    match stack.last().map(|v| v.as_slice()) {
+    match stack.last().map(|v| v.as_str()) {
         // `<a:t>` is DrawingML rich text. It appears in data labels too, so
         // only count it when a `<c:title>` is open.
-        Some(b"t") if title_depth > 0 => push_capped(title_buf, s),
-        Some(b"v") => {
+        Some("t") if title_depth > 0 => push_capped(title_buf, s),
+        Some("v") => {
             if cur_v.len() < MAX_CELL_LEN {
                 cur_v.push_str(s);
             }

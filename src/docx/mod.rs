@@ -378,7 +378,7 @@ impl DocxDocument {
         // Footnotes, endnotes and comments are separate parts referenced
         // from the document relationships. They were never read, which made
         // `ir::Element::Footnote` unreachable and dropped every note body.
-        let mut read_notes = |rel_type: &str, end: &[u8]| -> Vec<NoteBody> {
+        let mut read_notes = |rel_type: &str, end: &str| -> Vec<NoteBody> {
             let Some(rel) = doc_rels.first_by_type(rel_type) else {
                 return Vec::new();
             };
@@ -404,9 +404,9 @@ impl DocxDocument {
             }
             notes
         };
-        let footnotes = read_notes(rel_types::FOOTNOTES, b"footnote");
-        let endnotes = read_notes(rel_types::ENDNOTES, b"endnote");
-        let comments = read_notes(rel_types::COMMENTS, b"comment");
+        let footnotes = read_notes(rel_types::FOOTNOTES, "footnote");
+        let endnotes = read_notes(rel_types::ENDNOTES, "endnote");
+        let comments = read_notes(rel_types::COMMENTS, "comment");
 
         // Scan `word/fonts/` for embedded font programs. Files there are
         // typically `font_<n>_<name>.ttf` (written by our own `DocxWriter`)
@@ -505,10 +505,10 @@ fn parse_body_elements(xml_data: &[u8]) -> CoreResult<Vec<BlockElement>> {
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"p" => {
+                "p" => {
                     elements.push(BlockElement::Paragraph(parse_paragraph(&mut reader)?));
                 },
-                b"tbl" => {
+                "tbl" => {
                     elements.push(BlockElement::Table(parse_table(&mut reader)?));
                 },
                 _ => {},
@@ -620,18 +620,18 @@ fn strip_html_tags(html: &str) -> String {
 /// `comment`). Word emits two pseudo-notes at ids 0 and -1 (the separator
 /// and continuation marks) with `w:type` set; those are not document
 /// content and are filtered out.
-fn parse_notes_part(xml_data: &[u8], end: &[u8]) -> CoreResult<Vec<NoteBody>> {
+fn parse_notes_part(xml_data: &[u8], end: &str) -> CoreResult<Vec<NoteBody>> {
     let mut reader = make_content_reader(xml_data);
     let mut notes = Vec::new();
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) if e.local_name().as_ref() == end => {
-                let note_type = xml::optional_attr_str(e, b"w:type")?;
-                let id: i64 = xml::optional_attr_str(e, b"w:id")?
+                let note_type = xml::optional_attr_str(e, "w:type")?;
+                let id: i64 = xml::optional_attr_str(e, "w:id")?
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
-                let author = xml::optional_attr_str(e, b"w:author")?.map(|v| v.into_owned());
+                let author = xml::optional_attr_str(e, "w:author")?.map(|v| v.into_owned());
                 let content = parse_block_elements_until(&mut reader, end)?;
                 let is_pseudo = note_type.as_deref().is_some_and(|t| t != "normal") || id < 0;
                 if !is_pseudo {
@@ -654,14 +654,14 @@ fn parse_notes_part(xml_data: &[u8], end: &[u8]) -> CoreResult<Vec<NoteBody>> {
 /// document content inside a shape.
 fn parse_block_elements_until(
     reader: &mut quick_xml::Reader<&[u8]>,
-    end_local: &[u8],
+    end_local: &str,
 ) -> CoreResult<Vec<BlockElement>> {
     let mut elements = Vec::new();
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"p" => elements.push(BlockElement::Paragraph(parse_paragraph(reader)?)),
-                b"tbl" => elements.push(BlockElement::Table(parse_table(reader)?)),
+                "p" => elements.push(BlockElement::Paragraph(parse_paragraph(reader)?)),
+                "tbl" => elements.push(BlockElement::Table(parse_table(reader)?)),
                 _ => xml::skip_element_fast(reader)?,
             },
             Event::End(ref e) if e.local_name().as_ref() == end_local => break,
@@ -737,7 +737,7 @@ impl VmlContent {
 /// Read a VML `<v:shape style="width:191pt;height:88pt">` size. VML uses
 /// CSS-ish lengths, so the unit has to be honoured.
 fn vml_style_size(e: &quick_xml::events::BytesStart) -> Option<(Emu, Emu)> {
-    let style = xml::optional_attr_str(e, b"style").ok()??;
+    let style = xml::optional_attr_str(e, "style").ok()??;
     fn dim(style: &str, key: &str) -> Option<i64> {
         // Match `width:` but not `mso-wrap-width:`; a leading `;` or the
         // string start must precede it.
@@ -783,7 +783,7 @@ fn vml_style_size(e: &quick_xml::events::BytesStart) -> Option<(Emu, Emu)> {
 /// reading through the matching closing tag.
 fn parse_vml_content_in(
     reader: &mut quick_xml::Reader<&[u8]>,
-    end_local: &[u8],
+    end_local: &str,
 ) -> CoreResult<VmlContent> {
     let mut out = VmlContent::default();
     let mut depth = 1i32;
@@ -809,21 +809,21 @@ fn parse_vml_content_in(
             _ => continue,
         };
         match e.local_name().as_ref() {
-            b"txbxContent" if is_start => {
+            "txbxContent" if is_start => {
                 out.boxes
-                    .push(parse_block_elements_until(reader, b"txbxContent")?);
+                    .push(parse_block_elements_until(reader, "txbxContent")?);
                 // The subtree is fully consumed, so depth is unchanged.
                 continue;
             },
-            b"shape" | b"rect" | b"roundrect" | b"oval" | b"line" | b"polyline" => {
+            "shape" | "rect" | "roundrect" | "oval" | "line" | "polyline" => {
                 if let Some(sz) = vml_style_size(&e) {
                     shape_size = sz;
                 }
             },
-            b"imagedata" => {
+            "imagedata" => {
                 // Word writes `r:id`; some producers write `o:relid`.
-                let rid = xml::optional_attr_str(&e, b"r:id")?
-                    .or(xml::optional_attr_str(&e, b"o:relid")?)
+                let rid = xml::optional_attr_str(&e, "r:id")?
+                    .or(xml::optional_attr_str(&e, "o:relid")?)
                     .map(|v| v.into_owned());
                 if let Some(rid) = rid.filter(|r| !r.is_empty()) {
                     out.images.push((rid, shape_size.0, shape_size.1));
@@ -831,18 +831,18 @@ fn parse_vml_content_in(
             },
             // WordArt keeps its text in an *attribute*, so neither the
             // text-box nor the run path ever reached it.
-            b"textpath" => {
-                if let Some(s) = xml::optional_attr_str(&e, b"string")? {
+            "textpath" => {
+                if let Some(s) = xml::optional_attr_str(&e, "string")? {
                     let s = s.into_owned();
                     if !s.trim().is_empty() {
                         out.wordart.push(s);
                     }
                 }
             },
-            b"OLEObject" => {
-                let embedded = xml::optional_attr_str(&e, b"Type")?
+            "OLEObject" => {
+                let embedded = xml::optional_attr_str(&e, "Type")?
                     .is_none_or(|t| t.eq_ignore_ascii_case("Embed"));
-                let rid = xml::optional_attr_str(&e, b"r:id")?.map(|v| v.into_owned());
+                let rid = xml::optional_attr_str(&e, "r:id")?.map(|v| v.into_owned());
                 if let Some(rid) = rid.filter(|_| embedded) {
                     out.ole_rids.push(rid);
                 }
@@ -869,11 +869,11 @@ fn parse_alternate_content(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"Choice" => chosen.merge(parse_vml_content_in(reader, b"Choice")?),
-                b"Fallback" => fallback.merge(parse_vml_content_in(reader, b"Fallback")?),
+                "Choice" => chosen.merge(parse_vml_content_in(reader, "Choice")?),
+                "Fallback" => fallback.merge(parse_vml_content_in(reader, "Fallback")?),
                 _ => xml::skip_element_fast(reader)?,
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"AlternateContent" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "AlternateContent" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -888,7 +888,7 @@ fn parse_alternate_content(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<
 /// bullet-ish equivalent rather than emitting an unrenderable PUA code
 /// point, and pass everything else through unchanged.
 fn parse_sym_char(e: &quick_xml::events::BytesStart) -> Option<char> {
-    let raw = xml::optional_attr_str(e, b"w:char").ok().flatten()?;
+    let raw = xml::optional_attr_str(e, "w:char").ok().flatten()?;
     let code = u32::from_str_radix(raw.trim(), 16).ok()?;
     let mapped = match code {
         0xF0B7 | 0xF0A7 => 0x2022, // Wingdings/Symbol bullet
@@ -941,20 +941,20 @@ fn parse_document(
                     continue;
                 }
                 match e.local_name().as_ref() {
-                    b"body" => {
+                    "body" => {
                         in_body = true;
                     },
-                    b"p" if in_body => {
+                    "p" if in_body => {
                         elements.push(BlockElement::Paragraph(parse_paragraph(&mut reader)?));
                     },
-                    b"tbl" if in_body => {
+                    "tbl" if in_body => {
                         elements.push(BlockElement::Table(parse_table(&mut reader)?));
                     },
-                    b"sectPr" if in_body => {
+                    "sectPr" if in_body => {
                         sections.push(parse_section_properties(&mut reader, e)?);
                     },
-                    b"altChunk" if in_body => {
-                        if let Ok(Some(rid)) = xml::optional_attr_str(e, b"r:id") {
+                    "altChunk" if in_body => {
+                        if let Ok(Some(rid)) = xml::optional_attr_str(e, "r:id") {
                             alt_chunk_rids.push(rid.into_owned());
                             // Record the insertion point so the chunk's
                             // content lands where the document puts it.
@@ -964,15 +964,15 @@ fn parse_document(
                     _ => {},
                 }
             },
-            Event::Empty(ref e) if in_body && e.local_name().as_ref() == b"altChunk" => {
+            Event::Empty(ref e) if in_body && e.local_name().as_ref() == "altChunk" => {
                 if guard.accepts(e) {
-                    if let Ok(Some(rid)) = xml::optional_attr_str(e, b"r:id") {
+                    if let Ok(Some(rid)) = xml::optional_attr_str(e, "r:id") {
                         alt_chunk_rids.push(rid.into_owned());
                         alt_chunk_positions.push(elements.len());
                     }
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"body" => {
+            Event::End(ref e) if e.local_name().as_ref() == "body" => {
                 in_body = false;
             },
             Event::Eof => break,
@@ -1099,21 +1099,21 @@ fn resolve_hyperlinks_in_run(run: &mut Run, rels: &crate::core::relationships::R
 ///
 /// `w:del` is deliberately absent: its `w:delText` children are *deleted*
 /// text and are not part of the document.
-fn is_transparent_paragraph_wrapper(local: &[u8]) -> bool {
+fn is_transparent_paragraph_wrapper(local: &str) -> bool {
     matches!(
         local,
-        b"ins"
-            | b"moveTo"
-            | b"fldSimple"
-            | b"smartTag"
-            | b"sdt"
-            | b"sdtContent"
-            | b"ruby"
-            | b"rt"
-            | b"rubyBase"
-            | b"bdo"
-            | b"dir"
-            | b"customXml"
+        "ins"
+            | "moveTo"
+            | "fldSimple"
+            | "smartTag"
+            | "sdt"
+            | "sdtContent"
+            | "ruby"
+            | "rt"
+            | "rubyBase"
+            | "bdo"
+            | "dir"
+            | "customXml"
     )
 }
 
@@ -1129,10 +1129,10 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"pPr" => {
+                "pPr" => {
                     paragraph.properties = Some(parse_paragraph_properties_fast(reader)?);
                 },
-                b"r" => {
+                "r" => {
                     let mut parts = Vec::new();
                     let run = parse_run(reader, &mut parts)?;
                     apply_field_parts(&parts, &mut paragraph.content, &mut fields);
@@ -1140,7 +1140,7 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
                         paragraph.content.push(ParagraphContent::Run(run));
                     }
                 },
-                b"hyperlink" => {
+                "hyperlink" => {
                     paragraph
                         .content
                         .push(ParagraphContent::Hyperlink(parse_hyperlink(reader, e)?));
@@ -1149,13 +1149,13 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
                 // mechanism; its `w:instr` attribute holds the URL of a
                 // HYPERLINK field. Other field types keep the
                 // existing transparent-wrapper behaviour.
-                b"fldSimple" => {
-                    let target = xml::optional_attr_str(e, b"w:instr")?
+                "fldSimple" => {
+                    let target = xml::optional_attr_str(e, "w:instr")?
                         .as_deref()
                         .and_then(hyperlink_target_from_instr);
                     match target {
                         Some(target) => {
-                            let runs = collect_runs_until(reader, b"fldSimple")?;
+                            let runs = collect_runs_until(reader, "fldSimple")?;
                             paragraph
                                 .content
                                 .push(ParagraphContent::Hyperlink(Hyperlink {
@@ -1170,11 +1170,11 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
                 },
                 // OMML equations: no structural model, but every `<m:t>`
                 // inside one is real, visible text.
-                b"oMath" | b"oMathPara" => {
-                    let end: &[u8] = if e.local_name().as_ref() == b"oMathPara" {
-                        b"oMathPara"
+                "oMath" | "oMathPara" => {
+                    let end: &str = if e.local_name().as_ref() == "oMathPara" {
+                        "oMathPara"
                     } else {
-                        b"oMath"
+                        "oMath"
                     };
                     let text = collect_omml_text(reader, end)?;
                     if !text.is_empty() {
@@ -1184,7 +1184,7 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
                         }));
                     }
                 },
-                b"del" | b"moveFrom" => {
+                "del" | "moveFrom" => {
                     // Tracked deletions are not document content.
                     xml::skip_element_fast(reader)?;
                 },
@@ -1197,12 +1197,12 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
             },
             Event::End(ref e) => {
                 let local = e.local_name();
-                if local.as_ref() == b"p" && wrapper_depth == 0 {
+                if local.as_ref() == "p" && wrapper_depth == 0 {
                     break;
                 }
                 if is_transparent_paragraph_wrapper(local.as_ref()) {
                     wrapper_depth = wrapper_depth.saturating_sub(1);
-                } else if local.as_ref() == b"p" {
+                } else if local.as_ref() == "p" {
                     // A malformed file closed the paragraph while a wrapper
                     // was still open; stop rather than swallow the rest.
                     break;
@@ -1315,16 +1315,13 @@ fn apply_field_parts(
 /// `<m:oMathPara>`), concatenated with no separators. This is not a
 /// structural math model — just enough to stop 100% content loss on a
 /// document whose only content is a formula.
-fn collect_omml_text(
-    reader: &mut quick_xml::Reader<&[u8]>,
-    end_local: &[u8],
-) -> CoreResult<String> {
+fn collect_omml_text(reader: &mut quick_xml::Reader<&[u8]>, end_local: &str) -> CoreResult<String> {
     let mut text = String::new();
     let mut depth = 1i32;
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"t" {
+                if e.local_name().as_ref() == "t" {
                     text.push_str(&xml::read_text_content_fast(reader)?);
                 } else {
                     depth += 1;
@@ -1355,17 +1352,17 @@ fn parse_run(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"rPr" => {
+                "rPr" => {
                     run.properties = Some(parse_run_properties_fast(reader)?);
                 },
-                b"t" => {
+                "t" => {
                     let text = xml::read_text_content_fast(reader)?;
                     if !text.is_empty() {
                         run.content.push(RunContent::Text(text));
                     }
                 },
-                b"br" => {
-                    let break_type = match xml::optional_attr_str(e, b"w:type")? {
+                "br" => {
+                    let break_type = match xml::optional_attr_str(e, "w:type")? {
                         Some(ref t) => match t.as_ref() {
                             "page" => BreakType::Page,
                             "column" => BreakType::Column,
@@ -1376,7 +1373,7 @@ fn parse_run(
                     run.content.push(RunContent::Break(break_type));
                     xml::skip_element_fast(reader)?;
                 },
-                b"drawing" => {
+                "drawing" => {
                     // A `<w:drawing>` may wrap a picture *or* a shape whose
                     // `<wps:txbx>` holds real prose. Collect both.
                     let (drawing, boxes) = parse_drawing_and_text_boxes(reader)?;
@@ -1394,27 +1391,27 @@ fn parse_run(
                 // is not extracted twice (once per branch), and picks up the
                 // *other* payloads a VML shape can carry: legacy images
                 //, WordArt and embedded packages.
-                b"pict" | b"object" => {
-                    let end: &[u8] = if e.local_name().as_ref() == b"object" {
-                        b"object"
+                "pict" | "object" => {
+                    let end: &str = if e.local_name().as_ref() == "object" {
+                        "object"
                     } else {
-                        b"pict"
+                        "pict"
                     };
                     parse_vml_content_in(reader, end)?.push_into(&mut run.content);
                 },
-                b"AlternateContent" => {
+                "AlternateContent" => {
                     parse_alternate_content(reader)?.push_into(&mut run.content);
                 },
                 // A note's reference mark. The mark *is* content: it is
                 // where the note is cited.
-                b"footnoteReference" | b"endnoteReference" | b"commentReference" => {
+                "footnoteReference" | "endnoteReference" | "commentReference" => {
                     push_note_reference(e, &mut run.content)?;
                     xml::skip_element_fast(reader)?;
                 },
                 // Complex field codes. The `begin` char also carries
                 // `<w:ffData>` for legacy form fields, whose state exists
                 // nowhere else in the document.
-                b"fldChar" => {
+                "fldChar" => {
                     fields.push(fld_char_part(e)?);
                     if let Some(mut ff) = parse_fld_char_body(reader)? {
                         ff.display_text = ff.value_text();
@@ -1423,24 +1420,24 @@ fn parse_run(
                 },
                 // The field instruction — for a HYPERLINK field this holds
                 // the URL, which was previously unreachable.
-                b"instrText" => {
+                "instrText" => {
                     fields.push(FieldPart::Instr(xml::read_text_content_fast(reader)?));
                 },
                 // `<w:sym>` carries its character in the `w:char` attribute
                 // as a hex code point, usually in the Wingdings private-use
                 // range. Dropping it silently deleted bullet glyphs and
                 // maths symbols from the text.
-                b"sym" => {
+                "sym" => {
                     if let Some(c) = parse_sym_char(e) {
                         run.content.push(RunContent::Text(c.to_string()));
                     }
                     xml::skip_element_fast(reader)?;
                 },
-                b"cr" => {
+                "cr" => {
                     run.content.push(RunContent::Break(BreakType::Line));
                     xml::skip_element_fast(reader)?;
                 },
-                b"noBreakHyphen" => {
+                "noBreakHyphen" => {
                     run.content.push(RunContent::Text("\u{2011}".to_string()));
                     xml::skip_element_fast(reader)?;
                 },
@@ -1453,10 +1450,10 @@ fn parse_run(
                 // what every mainstream extractor does. `w:noBreakHyphen`
                 // above is the opposite case: a hyphen the document actually
                 // draws, so it is kept.
-                b"softHyphen" => {
+                "softHyphen" => {
                     xml::skip_element_fast(reader)?;
                 },
-                b"delText" => {
+                "delText" => {
                     // Deleted revision text is not document content.
                     xml::skip_element_fast(reader)?;
                 },
@@ -1465,8 +1462,8 @@ fn parse_run(
                 },
             },
             Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"br" => {
-                    let break_type = match xml::optional_attr_str(e, b"w:type")? {
+                "br" => {
+                    let break_type = match xml::optional_attr_str(e, "w:type")? {
                         Some(ref t) => match t.as_ref() {
                             "page" => BreakType::Page,
                             "column" => BreakType::Column,
@@ -1476,31 +1473,31 @@ fn parse_run(
                     };
                     run.content.push(RunContent::Break(break_type));
                 },
-                b"tab" => {
+                "tab" => {
                     run.content.push(RunContent::Tab);
                 },
-                b"cr" => {
+                "cr" => {
                     run.content.push(RunContent::Break(BreakType::Line));
                 },
-                b"noBreakHyphen" => {
+                "noBreakHyphen" => {
                     run.content.push(RunContent::Text("\u{2011}".to_string()));
                 },
                 // See the Start arm: a discretionary hyphen is not content.
-                b"softHyphen" => {},
-                b"sym" => {
+                "softHyphen" => {},
+                "sym" => {
                     if let Some(c) = parse_sym_char(e) {
                         run.content.push(RunContent::Text(c.to_string()));
                     }
                 },
-                b"footnoteReference" | b"endnoteReference" | b"commentReference" => {
+                "footnoteReference" | "endnoteReference" | "commentReference" => {
                     push_note_reference(e, &mut run.content)?;
                 },
-                b"fldChar" => {
+                "fldChar" => {
                     fields.push(fld_char_part(e)?);
                 },
                 _ => {},
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"r" => {
+            Event::End(ref e) if e.local_name().as_ref() == "r" => {
                 break;
             },
             Event::Eof => break,
@@ -1516,7 +1513,7 @@ fn push_note_reference(
     e: &quick_xml::events::BytesStart,
     out: &mut Vec<RunContent>,
 ) -> CoreResult<()> {
-    let id: u32 = xml::optional_attr_str(e, b"w:id")?
+    let id: u32 = xml::optional_attr_str(e, "w:id")?
         .and_then(|v| v.trim().parse::<i64>().ok())
         .map(|v| v.max(0) as u32)
         .unwrap_or(0);
@@ -1525,11 +1522,11 @@ fn push_note_reference(
     // a custom footnote mark ("*", "†") has nowhere in the IR to land, and
     // downstream conversion has no way to distinguish it from an ordinary
     // leading run of note-body text.
-    let custom_mark = xml::optional_attr_str(e, b"w:customMarkFollows")?
+    let custom_mark = xml::optional_attr_str(e, "w:customMarkFollows")?
         .is_some_and(|v| matches!(v.as_ref(), "1" | "true" | "on"));
     out.push(match e.local_name().as_ref() {
-        b"footnoteReference" => RunContent::FootnoteRef(id, custom_mark),
-        b"endnoteReference" => RunContent::EndnoteRef(id, custom_mark),
+        "footnoteReference" => RunContent::FootnoteRef(id, custom_mark),
+        "endnoteReference" => RunContent::EndnoteRef(id, custom_mark),
         _ => RunContent::CommentRef(id),
     });
     Ok(())
@@ -1539,7 +1536,7 @@ fn push_note_reference(
 /// unrecognised type is treated as `begin`, which is what Word writes when
 /// the attribute is omitted.
 fn fld_char_part(e: &quick_xml::events::BytesStart) -> CoreResult<FieldPart> {
-    Ok(match xml::optional_attr_str(e, b"w:fldCharType")?.as_deref() {
+    Ok(match xml::optional_attr_str(e, "w:fldCharType")?.as_deref() {
         Some("separate") => FieldPart::Separate,
         Some("end") => FieldPart::End,
         _ => FieldPart::Begin,
@@ -1553,13 +1550,13 @@ fn parse_fld_char_body(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Opti
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"ffData" {
+                if e.local_name().as_ref() == "ffData" {
                     form = Some(parse_ff_data(reader)?);
                 } else {
                     xml::skip_element_fast(reader)?;
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"fldChar" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "fldChar" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -1593,22 +1590,22 @@ fn parse_ff_data(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<FormField>
     loop {
         match reader.read_event()? {
             Event::Start(ref e) | Event::Empty(ref e) => {
-                let val = xml::optional_attr_str(e, b"w:val")?.map(|v| v.into_owned());
+                let val = xml::optional_attr_str(e, "w:val")?.map(|v| v.into_owned());
                 match e.local_name().as_ref() {
-                    b"name" => name = val,
-                    b"checkBox" => kind = Kind::CheckBox,
-                    b"ddList" => kind = Kind::DdList,
-                    b"textInput" => kind = Kind::TextInput,
-                    b"checked" => checked = Some(xml::parse_toggle(e, b"w:val")),
-                    b"listEntry" => entries.push(val.unwrap_or_default()),
-                    b"result" => {
+                    "name" => name = val,
+                    "checkBox" => kind = Kind::CheckBox,
+                    "ddList" => kind = Kind::DdList,
+                    "textInput" => kind = Kind::TextInput,
+                    "checked" => checked = Some(xml::parse_toggle(e, "w:val")),
+                    "listEntry" => entries.push(val.unwrap_or_default()),
+                    "result" => {
                         if let Some(v) = val.as_deref().and_then(|v| v.trim().parse::<usize>().ok())
                         {
                             selected = v;
                         }
                     },
-                    b"default" => match kind {
-                        Kind::CheckBox => cb_default = xml::parse_toggle(e, b"w:val"),
+                    "default" => match kind {
+                        Kind::CheckBox => cb_default = xml::parse_toggle(e, "w:val"),
                         Kind::DdList => {
                             if let Some(v) =
                                 val.as_deref().and_then(|v| v.trim().parse::<usize>().ok())
@@ -1622,7 +1619,7 @@ fn parse_ff_data(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<FormField>
                     _ => {},
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"ffData" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "ffData" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -1724,9 +1721,9 @@ fn parse_hyperlink(
     start: &quick_xml::events::BytesStart,
 ) -> CoreResult<Hyperlink> {
     // Determine target: r:id for external, w:anchor for internal
-    let r_id = xml::optional_attr_str(start, b"r:id")?.map(|v| v.into_owned());
-    let anchor = xml::optional_attr_str(start, b"w:anchor")?.map(|v| v.into_owned());
-    let tooltip = xml::optional_attr_str(start, b"w:tooltip")?.map(|v| v.into_owned());
+    let r_id = xml::optional_attr_str(start, "r:id")?.map(|v| v.into_owned());
+    let anchor = xml::optional_attr_str(start, "w:anchor")?.map(|v| v.into_owned());
+    let tooltip = xml::optional_attr_str(start, "w:tooltip")?.map(|v| v.into_owned());
 
     // `r:id` wins when both attributes are present: ECMA-376 makes
     // `w:anchor` a *fragment* of the relationship's target in that case
@@ -1743,7 +1740,7 @@ fn parse_hyperlink(
         (None, None) => (HyperlinkTarget::Internal(String::new()), None),
     };
 
-    let runs = collect_runs_until(reader, b"hyperlink")?;
+    let runs = collect_runs_until(reader, "hyperlink")?;
 
     Ok(Hyperlink {
         target,
@@ -1758,13 +1755,13 @@ fn parse_hyperlink(
 /// `w:fldSimple` HYPERLINK path.
 fn collect_runs_until(
     reader: &mut quick_xml::Reader<&[u8]>,
-    end_local: &[u8],
+    end_local: &str,
 ) -> CoreResult<Vec<Run>> {
     let mut runs = Vec::new();
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"r" {
+                if e.local_name().as_ref() == "r" {
                     // A field cannot legally nest inside w:fldSimple's own
                     // display runs, so field-part tracking is a fresh,
                     // throwaway vec here.
@@ -1940,7 +1937,7 @@ fn diagram_text_lines(xml: &[u8]) -> Vec<String> {
     let mut lines = Vec::new();
     loop {
         match reader.read_event() {
-            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"t" => {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == "t" => {
                 if let Ok(text) = xml::read_text_content_fast(&mut reader) {
                     let text = text.trim();
                     if !text.is_empty() {
@@ -1980,21 +1977,21 @@ fn parse_drawing_and_text_boxes(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"inline" => {
+                "inline" => {
                     info = parse_inline_or_anchor_body(
-                        reader, /*inline=*/ true, b"inline", &mut boxes,
+                        reader, /*inline=*/ true, "inline", &mut boxes,
                     )?;
                 },
-                b"anchor" => {
+                "anchor" => {
                     info = parse_inline_or_anchor_body(
-                        reader, /*inline=*/ false, b"anchor", &mut boxes,
+                        reader, /*inline=*/ false, "anchor", &mut boxes,
                     )?;
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"drawing" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "drawing" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -2009,7 +2006,7 @@ fn parse_drawing_and_text_boxes(
 fn parse_inline_or_anchor_body(
     reader: &mut quick_xml::Reader<&[u8]>,
     inline: bool,
-    end_local: &[u8],
+    end_local: &str,
     text_boxes: &mut Vec<Vec<BlockElement>>,
 ) -> CoreResult<Option<DrawingInfo>> {
     use crate::docx::image::{AnchorFrame, AnchorPosition};
@@ -2030,29 +2027,29 @@ fn parse_inline_or_anchor_body(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"extent" => {
+                "extent" => {
                     parse_extent_attrs(e, &mut width, &mut height);
                     xml::skip_element_fast(reader)?;
                 },
-                b"docPr" => {
-                    if let Some(desc) = xml::optional_attr_str(e, b"descr")? {
+                "docPr" => {
+                    if let Some(desc) = xml::optional_attr_str(e, "descr")? {
                         description = Some(desc.into_owned());
                     }
                     xml::skip_element_fast(reader)?;
                 },
-                b"positionH" => {
-                    if let Some(rf) = xml::optional_attr_str(e, b"relativeFrom")? {
+                "positionH" => {
+                    if let Some(rf) = xml::optional_attr_str(e, "relativeFrom")? {
                         h_frame = parse_anchor_frame(&rf);
                     }
-                    anchor_x = parse_position_offset(reader, b"positionH")?;
+                    anchor_x = parse_position_offset(reader, "positionH")?;
                 },
-                b"positionV" => {
-                    if let Some(rf) = xml::optional_attr_str(e, b"relativeFrom")? {
+                "positionV" => {
+                    if let Some(rf) = xml::optional_attr_str(e, "relativeFrom")? {
                         v_frame = parse_anchor_frame(&rf);
                     }
-                    anchor_y = parse_position_offset(reader, b"positionV")?;
+                    anchor_y = parse_position_offset(reader, "positionV")?;
                 },
-                b"graphic" => {
+                "graphic" => {
                     let g = parse_graphic(reader, text_boxes)?;
                     if let Some(rid) = g.relationship_id {
                         relationship_id = Some(rid);
@@ -2072,9 +2069,9 @@ fn parse_inline_or_anchor_body(
                 },
             },
             Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"extent" => parse_extent_attrs(e, &mut width, &mut height),
-                b"docPr" => {
-                    if let Some(desc) = xml::optional_attr_str(e, b"descr")? {
+                "extent" => parse_extent_attrs(e, &mut width, &mut height),
+                "docPr" => {
+                    if let Some(desc) = xml::optional_attr_str(e, "descr")? {
                         description = Some(desc.into_owned());
                     }
                 },
@@ -2128,13 +2125,13 @@ fn parse_inline_or_anchor_body(
 /// closing tag (`end_local`).
 fn parse_position_offset(
     reader: &mut quick_xml::Reader<&[u8]>,
-    end_local: &[u8],
+    end_local: &str,
 ) -> CoreResult<Option<i64>> {
     let mut offset: Option<i64> = None;
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) if e.local_name().as_ref() == b"posOffset" => {
+            Event::Start(ref e) if e.local_name().as_ref() == "posOffset" => {
                 let text = xml::read_text_content_fast(reader)?;
                 if let Ok(v) = text.trim().parse::<i64>() {
                     offset = Some(v);
@@ -2178,12 +2175,12 @@ fn parse_graphic(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"pic" => {
+                "pic" => {
                     if let Some(rid) = parse_pic(reader)? {
                         relationship_id = Some(rid);
                     }
                 },
-                b"wsp" => {
+                "wsp" => {
                     if let Some(s) = parse_wsp(reader, text_boxes)? {
                         shape = Some(s);
                     }
@@ -2192,8 +2189,8 @@ fn parse_graphic(
                 // pointing at `word/charts/chartN.xml`, where all of its
                 // text actually lives. Usually the empty form, but the
                 // element is allowed children (`<c:extLst>`).
-                b"chart" => {
-                    if let Some(rid) = xml::optional_prefixed_attr_str(e, b"id")? {
+                "chart" => {
+                    if let Some(rid) = xml::optional_prefixed_attr_str(e, "id")? {
                         chart_rel_id = Some(rid.into_owned());
                     }
                     xml::skip_element_fast(reader)?;
@@ -2201,32 +2198,32 @@ fn parse_graphic(
                 // A SmartArt diagram: `<dgm:relIds r:dm="…" r:lo="…" .../>`
                 // — `r:dm` points at the data part (`word/diagrams/dataN.xml`)
                 // where the diagram's actual text lives.
-                b"relIds" => {
-                    if let Some(rid) = xml::optional_prefixed_attr_str(e, b"dm")? {
+                "relIds" => {
+                    if let Some(rid) = xml::optional_prefixed_attr_str(e, "dm")? {
                         dgm_data_rel_id = Some(rid.into_owned());
                     }
                     xml::skip_element_fast(reader)?;
                 },
                 // A group shape nests further `<wps:wsp>` children; descend
                 // so text boxes inside groups are not lost.
-                b"grpSp" | b"wgp" => continue,
+                "grpSp" | "wgp" => continue,
                 // <a:graphicData> is just a wrapper; descend into it.
-                b"graphicData" => continue,
+                "graphicData" => continue,
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::Empty(ref e) if e.local_name().as_ref() == b"chart" => {
-                if let Some(rid) = xml::optional_prefixed_attr_str(e, b"id")? {
+            Event::Empty(ref e) if e.local_name().as_ref() == "chart" => {
+                if let Some(rid) = xml::optional_prefixed_attr_str(e, "id")? {
                     chart_rel_id = Some(rid.into_owned());
                 }
             },
-            Event::Empty(ref e) if e.local_name().as_ref() == b"relIds" => {
-                if let Some(rid) = xml::optional_prefixed_attr_str(e, b"dm")? {
+            Event::Empty(ref e) if e.local_name().as_ref() == "relIds" => {
+                if let Some(rid) = xml::optional_prefixed_attr_str(e, "dm")? {
                     dgm_data_rel_id = Some(rid.into_owned());
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"graphic" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "graphic" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -2254,8 +2251,8 @@ fn parse_pic(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<String>
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"blip" {
-                    if let Some(embed) = xml::optional_attr_str(e, b"r:embed")? {
+                if e.local_name().as_ref() == "blip" {
+                    if let Some(embed) = xml::optional_attr_str(e, "r:embed")? {
                         rid = Some(embed.into_owned());
                     }
                     // Skip over blip's own children (e.g. <a:extLst>).
@@ -2264,8 +2261,8 @@ fn parse_pic(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<String>
                     depth += 1;
                 }
             },
-            Event::Empty(ref e) if e.local_name().as_ref() == b"blip" => {
-                if let Some(embed) = xml::optional_attr_str(e, b"r:embed")? {
+            Event::Empty(ref e) if e.local_name().as_ref() == "blip" => {
+                if let Some(embed) = xml::optional_attr_str(e, "r:embed")? {
                     rid = Some(embed.into_owned());
                 }
             },
@@ -2307,7 +2304,7 @@ fn parse_wsp(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"spPr" => {
+                "spPr" => {
                     parse_sp_pr(
                         reader,
                         &mut kind,
@@ -2318,16 +2315,16 @@ fn parse_wsp(
                 },
                 // `<wps:txbx>` is a wrapper; `<w:txbxContent>` inside it is
                 // ordinary block content.
-                b"txbx" => continue,
-                b"txbxContent" => {
-                    text_boxes.push(parse_block_elements_until(reader, b"txbxContent")?);
+                "txbx" => continue,
+                "txbxContent" => {
+                    text_boxes.push(parse_block_elements_until(reader, "txbxContent")?);
                     has_text_box = true;
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"wsp" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "wsp" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -2360,8 +2357,8 @@ fn parse_sp_pr(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"prstGeom" => {
-                    if let Some(prst) = xml::optional_attr_str(e, b"prst")? {
+                "prstGeom" => {
+                    if let Some(prst) = xml::optional_attr_str(e, "prst")? {
                         *kind = match prst.as_ref() {
                             "line" | "straightConnector1" => Some(ShapeKind::Line),
                             "rect" => Some(ShapeKind::Rect),
@@ -2370,13 +2367,13 @@ fn parse_sp_pr(
                     }
                     xml::skip_element_fast(reader)?;
                 },
-                b"ln" => {
-                    if let Some(w) = xml::optional_attr_str(e, b"w")? {
+                "ln" => {
+                    if let Some(w) = xml::optional_attr_str(e, "w")? {
                         *stroke_w_emu = w.parse().ok();
                     }
                     *stroke_rgb = parse_line_color(reader)?.or(*stroke_rgb);
                 },
-                b"solidFill" => {
+                "solidFill" => {
                     *fill_rgb = parse_solid_fill_color(reader)?.or(*fill_rgb);
                 },
                 _ => {
@@ -2384,8 +2381,8 @@ fn parse_sp_pr(
                 },
             },
             Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"prstGeom" => {
-                    if let Some(prst) = xml::optional_attr_str(e, b"prst")? {
+                "prstGeom" => {
+                    if let Some(prst) = xml::optional_attr_str(e, "prst")? {
                         *kind = match prst.as_ref() {
                             "line" | "straightConnector1" => Some(ShapeKind::Line),
                             "rect" => Some(ShapeKind::Rect),
@@ -2393,14 +2390,14 @@ fn parse_sp_pr(
                         };
                     }
                 },
-                b"ln" => {
-                    if let Some(w) = xml::optional_attr_str(e, b"w")? {
+                "ln" => {
+                    if let Some(w) = xml::optional_attr_str(e, "w")? {
                         *stroke_w_emu = w.parse().ok();
                     }
                 },
                 _ => {},
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"spPr" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "spPr" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -2417,7 +2414,7 @@ fn parse_line_color(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"solidFill" => {
+                "solidFill" => {
                     if let Some(c) = parse_solid_fill_color(reader)? {
                         rgb = Some(c);
                     }
@@ -2426,7 +2423,7 @@ fn parse_line_color(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"ln" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "ln" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -2445,8 +2442,8 @@ fn parse_solid_fill_color(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"srgbClr" {
-                    if let Some(val) = xml::optional_attr_str(e, b"val")? {
+                if e.local_name().as_ref() == "srgbClr" {
+                    if let Some(val) = xml::optional_attr_str(e, "val")? {
                         if let Some(parsed) = parse_hex_rgb(&val) {
                             rgb = Some(parsed);
                         }
@@ -2454,14 +2451,14 @@ fn parse_solid_fill_color(
                 }
                 xml::skip_element_fast(reader)?;
             },
-            Event::Empty(ref e) if e.local_name().as_ref() == b"srgbClr" => {
-                if let Some(val) = xml::optional_attr_str(e, b"val")? {
+            Event::Empty(ref e) if e.local_name().as_ref() == "srgbClr" => {
+                if let Some(val) = xml::optional_attr_str(e, "val")? {
                     if let Some(parsed) = parse_hex_rgb(&val) {
                         rgb = Some(parsed);
                     }
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"solidFill" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "solidFill" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -2505,10 +2502,10 @@ fn parse_hex_rgb(s: &str) -> Option<(u8, u8, u8)> {
 }
 
 fn parse_extent_attrs(e: &quick_xml::events::BytesStart, width: &mut Emu, height: &mut Emu) {
-    if let Ok(Some(cx)) = xml::optional_attr_str(e, b"cx") {
+    if let Ok(Some(cx)) = xml::optional_attr_str(e, "cx") {
         *width = Emu(cx.parse().unwrap_or(0));
     }
-    if let Ok(Some(cy)) = xml::optional_attr_str(e, b"cy") {
+    if let Ok(Some(cy)) = xml::optional_attr_str(e, "cy") {
         *height = Emu(cy.parse().unwrap_or(0));
     }
 }
@@ -2562,16 +2559,16 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Table> {
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"tblPr" => {
+                "tblPr" => {
                     properties = Some(parse_table_properties(reader)?);
                 },
-                b"tblGrid" => {
+                "tblGrid" => {
                     grid = parse_table_grid(reader)?;
                 },
-                b"tr" => {
+                "tr" => {
                     rows.push(parse_table_row(reader)?);
                 },
-                b"sdt" | b"sdtContent" => {
+                "sdt" | "sdtContent" => {
                     wrapper_depth += 1;
                 },
                 _ => {
@@ -2580,12 +2577,12 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Table> {
             },
             Event::End(ref e) => {
                 let local = e.local_name();
-                if local.as_ref() == b"tbl" && wrapper_depth == 0 {
+                if local.as_ref() == "tbl" && wrapper_depth == 0 {
                     break;
                 }
-                if matches!(local.as_ref(), b"sdt" | b"sdtContent") {
+                if matches!(local.as_ref(), "sdt" | "sdtContent") {
                     wrapper_depth = wrapper_depth.saturating_sub(1);
-                } else if local.as_ref() == b"tbl" {
+                } else if local.as_ref() == "tbl" {
                     break;
                 }
             },
@@ -2607,36 +2604,36 @@ fn parse_table_properties(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<T
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"tblW" => {
+                "tblW" => {
                     props.width = parse_table_width(e)?;
                     xml::skip_element_fast(reader)?;
                 },
-                b"jc" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "jc" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.justification =
                             Some(self::formatting::parse_justification_value(&val));
                     }
                     xml::skip_element_fast(reader)?;
                 },
-                b"tblStyle" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "tblStyle" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.style_id = Some(val.into_owned());
                     }
                     xml::skip_element_fast(reader)?;
                 },
-                b"tblBorders" => {
+                "tblBorders" => {
                     props.borders =
-                        Some(self::formatting::parse_table_borders_fast(reader, b"tblBorders")?);
+                        Some(self::formatting::parse_table_borders_fast(reader, "tblBorders")?);
                 },
-                b"tblCellMar" => {
-                    props.cell_margins = Some(parse_cell_margins(reader, b"tblCellMar")?);
+                "tblCellMar" => {
+                    props.cell_margins = Some(parse_cell_margins(reader, "tblCellMar")?);
                 },
-                b"tblInd" => {
+                "tblInd" => {
                     props.indent = parse_measure_w(e);
                     xml::skip_element_fast(reader)?;
                 },
-                b"tblCaption" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "tblCaption" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.caption = Some(val.into_owned());
                     }
                     xml::skip_element_fast(reader)?;
@@ -2646,31 +2643,31 @@ fn parse_table_properties(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<T
                 },
             },
             Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"tblInd" => {
+                "tblInd" => {
                     props.indent = parse_measure_w(e);
                 },
-                b"tblCaption" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "tblCaption" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.caption = Some(val.into_owned());
                     }
                 },
-                b"tblW" => {
+                "tblW" => {
                     props.width = parse_table_width(e)?;
                 },
-                b"jc" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "jc" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.justification =
                             Some(self::formatting::parse_justification_value(&val));
                     }
                 },
-                b"tblStyle" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "tblStyle" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.style_id = Some(val.into_owned());
                     }
                 },
                 _ => {},
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"tblPr" => {
+            Event::End(ref e) if e.local_name().as_ref() == "tblPr" => {
                 break;
             },
             Event::Eof => break,
@@ -2687,13 +2684,13 @@ fn parse_table_grid(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"gridCol" => {
-                if let Ok(Some(w)) = xml::optional_attr_str(e, b"w:w") {
+            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == "gridCol" => {
+                if let Ok(Some(w)) = xml::optional_attr_str(e, "w:w") {
                     let val: i32 = w.parse().unwrap_or(0);
                     cols.push(crate::core::units::Twip(val));
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"tblGrid" => {
+            Event::End(ref e) if e.local_name().as_ref() == "tblGrid" => {
                 break;
             },
             Event::Eof => break,
@@ -2716,13 +2713,13 @@ fn parse_table_row(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableRow
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"trPr" => {
+                "trPr" => {
                     properties = Some(parse_table_row_properties(reader)?);
                 },
-                b"tc" => {
+                "tc" => {
                     cells.push(parse_table_cell(reader)?);
                 },
-                b"sdt" | b"sdtContent" => {
+                "sdt" | "sdtContent" => {
                     wrapper_depth += 1;
                 },
                 _ => {
@@ -2731,12 +2728,12 @@ fn parse_table_row(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableRow
             },
             Event::End(ref e) => {
                 let local = e.local_name();
-                if local.as_ref() == b"tr" && wrapper_depth == 0 {
+                if local.as_ref() == "tr" && wrapper_depth == 0 {
                     break;
                 }
-                if matches!(local.as_ref(), b"sdt" | b"sdtContent") {
+                if matches!(local.as_ref(), "sdt" | "sdtContent") {
                     wrapper_depth = wrapper_depth.saturating_sub(1);
-                } else if local.as_ref() == b"tr" {
+                } else if local.as_ref() == "tr" {
                     break;
                 }
             },
@@ -2756,19 +2753,19 @@ fn parse_table_row_properties(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) | Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"tblHeader" => {
-                    props.is_header = xml::parse_toggle(e, b"w:val");
+                "tblHeader" => {
+                    props.is_header = xml::parse_toggle(e, "w:val");
                 },
-                b"cantSplit" => {
-                    props.cant_split = xml::parse_toggle(e, b"w:val");
+                "cantSplit" => {
+                    props.cant_split = xml::parse_toggle(e, "w:val");
                 },
-                b"trHeight" => {
-                    props.height = xml::optional_attr_str(e, b"w:val")
+                "trHeight" => {
+                    props.height = xml::optional_attr_str(e, "w:val")
                         .ok()
                         .flatten()
                         .and_then(|v| v.parse().ok());
                     props.height_rule =
-                        xml::optional_attr_str(e, b"w:hRule")
+                        xml::optional_attr_str(e, "w:hRule")
                             .ok()
                             .flatten()
                             .map(|v| match v.as_ref() {
@@ -2779,7 +2776,7 @@ fn parse_table_row_properties(
                 },
                 _ => {},
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"trPr" => {
+            Event::End(ref e) if e.local_name().as_ref() == "trPr" => {
                 break;
             },
             Event::Eof => break,
@@ -2796,20 +2793,20 @@ fn parse_table_cell(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableCe
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"tcPr" => {
+                "tcPr" => {
                     properties = Some(parse_table_cell_properties(reader)?);
                 },
-                b"p" => {
+                "p" => {
                     content.push(BlockElement::Paragraph(parse_paragraph(reader)?));
                 },
-                b"tbl" => {
+                "tbl" => {
                     content.push(BlockElement::Table(parse_table(reader)?));
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"tc" => {
+            Event::End(ref e) if e.local_name().as_ref() == "tc" => {
                 break;
             },
             Event::Eof => break,
@@ -2831,54 +2828,54 @@ fn parse_table_cell_properties(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"tcW" => {
+                "tcW" => {
                     props.width = parse_table_width(e)?;
                     xml::skip_element_fast(reader)?;
                 },
-                b"vMerge" => {
-                    let val = xml::optional_attr_str(e, b"w:val")?;
+                "vMerge" => {
+                    let val = xml::optional_attr_str(e, "w:val")?;
                     props.vertical_merge = Some(match val.as_deref() {
                         Some("restart") => MergeType::Restart,
                         _ => MergeType::Continue,
                     });
                     xml::skip_element_fast(reader)?;
                 },
-                b"gridSpan" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "gridSpan" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.grid_span = val.parse().ok();
                     }
                     xml::skip_element_fast(reader)?;
                 },
-                b"shd" => {
+                "shd" => {
                     props.shading = Some(Box::new(Shading {
-                        fill: xml::optional_attr_str(e, b"w:fill")?.map(|v| v.into_owned()),
-                        color: xml::optional_attr_str(e, b"w:color")?.map(|v| v.into_owned()),
-                        pattern: xml::optional_attr_str(e, b"w:val")?.map(|v| v.into_owned()),
+                        fill: xml::optional_attr_str(e, "w:fill")?.map(|v| v.into_owned()),
+                        color: xml::optional_attr_str(e, "w:color")?.map(|v| v.into_owned()),
+                        pattern: xml::optional_attr_str(e, "w:val")?.map(|v| v.into_owned()),
                     }));
                     xml::skip_element_fast(reader)?;
                 },
-                b"tcBorders" => {
+                "tcBorders" => {
                     props.borders = Some(Box::new(self::formatting::parse_table_borders_fast(
                         reader,
-                        b"tcBorders",
+                        "tcBorders",
                     )?));
                 },
-                b"tcMar" => {
-                    props.margins = Some(parse_cell_margins(reader, b"tcMar")?);
+                "tcMar" => {
+                    props.margins = Some(parse_cell_margins(reader, "tcMar")?);
                 },
-                b"vAlign" => {
+                "vAlign" => {
                     props.v_align = parse_cell_v_align(e);
                     xml::skip_element_fast(reader)?;
                 },
-                b"textDirection" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "textDirection" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.text_direction = Some(val.into_owned());
                     }
                     xml::skip_element_fast(reader)?;
                 },
                 // `<w:cellDel>` marks the whole cell deleted via tracked
                 // changes, pending acceptance.
-                b"cellDel" => {
+                "cellDel" => {
                     props.deleted = true;
                     xml::skip_element_fast(reader)?;
                 },
@@ -2887,42 +2884,42 @@ fn parse_table_cell_properties(
                 },
             },
             Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"tcW" => {
+                "tcW" => {
                     props.width = parse_table_width(e)?;
                 },
-                b"cellDel" => {
+                "cellDel" => {
                     props.deleted = true;
                 },
-                b"vMerge" => {
-                    let val = xml::optional_attr_str(e, b"w:val")?;
+                "vMerge" => {
+                    let val = xml::optional_attr_str(e, "w:val")?;
                     props.vertical_merge = Some(match val.as_deref() {
                         Some("restart") => MergeType::Restart,
                         _ => MergeType::Continue,
                     });
                 },
-                b"gridSpan" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "gridSpan" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.grid_span = val.parse().ok();
                     }
                 },
-                b"shd" => {
+                "shd" => {
                     props.shading = Some(Box::new(Shading {
-                        fill: xml::optional_attr_str(e, b"w:fill")?.map(|v| v.into_owned()),
-                        color: xml::optional_attr_str(e, b"w:color")?.map(|v| v.into_owned()),
-                        pattern: xml::optional_attr_str(e, b"w:val")?.map(|v| v.into_owned()),
+                        fill: xml::optional_attr_str(e, "w:fill")?.map(|v| v.into_owned()),
+                        color: xml::optional_attr_str(e, "w:color")?.map(|v| v.into_owned()),
+                        pattern: xml::optional_attr_str(e, "w:val")?.map(|v| v.into_owned()),
                     }));
                 },
-                b"vAlign" => {
+                "vAlign" => {
                     props.v_align = parse_cell_v_align(e);
                 },
-                b"textDirection" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "textDirection" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.text_direction = Some(val.into_owned());
                     }
                 },
                 _ => {},
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"tcPr" => {
+            Event::End(ref e) if e.local_name().as_ref() == "tcPr" => {
                 break;
             },
             Event::Eof => break,
@@ -2935,7 +2932,7 @@ fn parse_table_cell_properties(
 /// Read a `w:w` twip measure off an element (`w:tblInd`, `w:top` in
 /// `w:tblCellMar`, …).
 fn parse_measure_w(e: &quick_xml::events::BytesStart) -> Option<crate::core::units::Twip> {
-    xml::optional_attr_str(e, b"w:w")
+    xml::optional_attr_str(e, "w:w")
         .ok()
         .flatten()
         .and_then(|v| v.parse().ok())
@@ -2943,7 +2940,7 @@ fn parse_measure_w(e: &quick_xml::events::BytesStart) -> Option<crate::core::uni
 }
 
 fn parse_cell_v_align(e: &quick_xml::events::BytesStart) -> Option<CellVAlign> {
-    xml::optional_attr_str(e, b"w:val")
+    xml::optional_attr_str(e, "w:val")
         .ok()
         .flatten()
         .map(|v| match v.as_ref() {
@@ -2955,20 +2952,17 @@ fn parse_cell_v_align(e: &quick_xml::events::BytesStart) -> Option<CellVAlign> {
 
 /// Parse the children of `w:tblCellMar` / `w:tcMar`. The caller has consumed
 /// the start tag; `end` names the closing element to stop at.
-fn parse_cell_margins(
-    reader: &mut quick_xml::Reader<&[u8]>,
-    end: &[u8],
-) -> CoreResult<CellMargins> {
+fn parse_cell_margins(reader: &mut quick_xml::Reader<&[u8]>, end: &str) -> CoreResult<CellMargins> {
     let mut m = CellMargins::default();
     loop {
         match reader.read_event()? {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 let v = parse_measure_w(e).map(|t| t.0);
                 match e.local_name().as_ref() {
-                    b"top" => m.top = v,
-                    b"bottom" => m.bottom = v,
-                    b"left" | b"start" => m.left = v,
-                    b"right" | b"end" => m.right = v,
+                    "top" => m.top = v,
+                    "bottom" => m.bottom = v,
+                    "left" | "start" => m.left = v,
+                    "right" | "end" => m.right = v,
                     _ => {},
                 }
             },
@@ -2981,8 +2975,8 @@ fn parse_cell_margins(
 }
 
 fn parse_table_width(e: &quick_xml::events::BytesStart) -> CoreResult<Option<TableWidth>> {
-    let w = xml::optional_attr_str(e, b"w:w")?;
-    let t = xml::optional_attr_str(e, b"w:type")?;
+    let w = xml::optional_attr_str(e, "w:w")?;
+    let t = xml::optional_attr_str(e, "w:type")?;
 
     if let Some(ref w_val) = w {
         let value: i32 = w_val.parse().unwrap_or(0);
@@ -3012,87 +3006,86 @@ pub(crate) fn parse_section_properties(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) | Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"pgSz" => {
-                    let w: i32 = xml::optional_attr_str(e, b"w:w")?
+                "pgSz" => {
+                    let w: i32 = xml::optional_attr_str(e, "w:w")?
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(12240);
-                    let h: i32 = xml::optional_attr_str(e, b"w:h")?
+                    let h: i32 = xml::optional_attr_str(e, "w:h")?
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(15840);
-                    let orient =
-                        xml::optional_attr_str(e, b"w:orient")?.map(|v| match v.as_ref() {
-                            "landscape" => PageOrientation::Landscape,
-                            _ => PageOrientation::Portrait,
-                        });
+                    let orient = xml::optional_attr_str(e, "w:orient")?.map(|v| match v.as_ref() {
+                        "landscape" => PageOrientation::Landscape,
+                        _ => PageOrientation::Portrait,
+                    });
                     props.page_size = Some(PageSize {
                         width: crate::core::units::Twip(w),
                         height: crate::core::units::Twip(h),
                         orient,
                     });
                 },
-                b"pgMar" => {
+                "pgMar" => {
                     props.margins = Some(PageMargins {
                         top: crate::core::units::Twip(
-                            xml::optional_attr_str(e, b"w:top")?
+                            xml::optional_attr_str(e, "w:top")?
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(1440),
                         ),
                         bottom: crate::core::units::Twip(
-                            xml::optional_attr_str(e, b"w:bottom")?
+                            xml::optional_attr_str(e, "w:bottom")?
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(1440),
                         ),
                         left: crate::core::units::Twip(
-                            xml::optional_attr_str(e, b"w:left")?
+                            xml::optional_attr_str(e, "w:left")?
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(1440),
                         ),
                         right: crate::core::units::Twip(
-                            xml::optional_attr_str(e, b"w:right")?
+                            xml::optional_attr_str(e, "w:right")?
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(1440),
                         ),
-                        header: xml::optional_attr_str(e, b"w:header")?
+                        header: xml::optional_attr_str(e, "w:header")?
                             .and_then(|v| v.parse().ok())
                             .map(crate::core::units::Twip),
-                        footer: xml::optional_attr_str(e, b"w:footer")?
+                        footer: xml::optional_attr_str(e, "w:footer")?
                             .and_then(|v| v.parse().ok())
                             .map(crate::core::units::Twip),
-                        gutter: xml::optional_attr_str(e, b"w:gutter")?
+                        gutter: xml::optional_attr_str(e, "w:gutter")?
                             .and_then(|v| v.parse().ok())
                             .map(crate::core::units::Twip),
                     });
                 },
-                b"headerReference" => {
+                "headerReference" => {
                     let hf_type = parse_hf_type(e)?;
-                    if let Ok(Some(rid)) = xml::optional_attr_str(e, b"r:id") {
+                    if let Ok(Some(rid)) = xml::optional_attr_str(e, "r:id") {
                         props.header_refs.push(HeaderFooterRef {
                             hf_type,
                             relationship_id: rid.into_owned(),
                         });
                     }
                 },
-                b"footerReference" => {
+                "footerReference" => {
                     let hf_type = parse_hf_type(e)?;
-                    if let Ok(Some(rid)) = xml::optional_attr_str(e, b"r:id") {
+                    if let Ok(Some(rid)) = xml::optional_attr_str(e, "r:id") {
                         props.footer_refs.push(HeaderFooterRef {
                             hf_type,
                             relationship_id: rid.into_owned(),
                         });
                     }
                 },
-                b"cols" => {
-                    if let Ok(Some(num)) = xml::optional_attr_str(e, b"w:num") {
+                "cols" => {
+                    if let Ok(Some(num)) = xml::optional_attr_str(e, "w:num") {
                         props.columns = num.parse().ok();
                     }
                     props.column_layout = Some(ColumnDefs {
-                        space: xml::optional_attr_str(e, b"w:space")
+                        space: xml::optional_attr_str(e, "w:space")
                             .ok()
                             .flatten()
                             .and_then(|v| v.parse().ok()),
                         // Absent `w:sep` means no separator; present-with-no-val
                         // means true, which is what `parse_toggle` gives us.
-                        separator: xml::optional_attr_str(e, b"w:sep")
+                        separator: xml::optional_attr_str(e, "w:sep")
                             .ok()
                             .flatten()
                             .is_some_and(|v| matches!(v.as_ref(), "1" | "true" | "on")),
@@ -3102,18 +3095,18 @@ pub(crate) fn parse_section_properties(
                 // `<w:col>` children of a non-self-closing `<w:cols>` arrive
                 // through this same loop; `</w:cols>` is ignored and only
                 // `</w:sectPr>` ends it.
-                b"col" => {
+                "col" => {
                     if let Some(layout) = props.column_layout.as_mut() {
-                        if let Ok(Some(w)) = xml::optional_attr_str(e, b"w:w") {
+                        if let Ok(Some(w)) = xml::optional_attr_str(e, "w:w") {
                             if let Ok(v) = w.parse::<u32>() {
                                 layout.widths.push(v);
                             }
                         }
                     }
                 },
-                b"type" => {
+                "type" => {
                     props.break_type =
-                        xml::optional_attr_str(e, b"w:val")?.map(|v| match v.as_ref() {
+                        xml::optional_attr_str(e, "w:val")?.map(|v| match v.as_ref() {
                             "continuous" => SectionBreakKind::Continuous,
                             "evenPage" => SectionBreakKind::EvenPage,
                             "oddPage" => SectionBreakKind::OddPage,
@@ -3121,12 +3114,12 @@ pub(crate) fn parse_section_properties(
                             _ => SectionBreakKind::NextPage,
                         });
                 },
-                b"titlePg" => {
-                    props.title_page = xml::parse_toggle(e, b"w:val");
+                "titlePg" => {
+                    props.title_page = xml::parse_toggle(e, "w:val");
                 },
                 _ => {},
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"sectPr" => {
+            Event::End(ref e) if e.local_name().as_ref() == "sectPr" => {
                 break;
             },
             Event::Eof => break,
@@ -3167,7 +3160,7 @@ pub(crate) fn strip_embedded_font_filename(basename: &str) -> String {
 }
 
 fn parse_hf_type(e: &quick_xml::events::BytesStart) -> CoreResult<HeaderFooterType> {
-    Ok(match xml::optional_attr_str(e, b"w:type")? {
+    Ok(match xml::optional_attr_str(e, "w:type")? {
         Some(ref val) => match val.as_ref() {
             "first" => HeaderFooterType::First,
             "even" => HeaderFooterType::Even,
@@ -3643,7 +3636,7 @@ mod tests {
         // depth=1 already accounting for that wrapper).
         loop {
             match reader.read_event().unwrap() {
-                quick_xml::events::Event::Start(ref e) if e.local_name().as_ref() == b"drawing" => {
+                quick_xml::events::Event::Start(ref e) if e.local_name().as_ref() == "drawing" => {
                     break;
                 },
                 quick_xml::events::Event::Eof => panic!("no drawing"),
@@ -3688,7 +3681,7 @@ mod tests {
         let mut reader = make_content_reader(xml);
         loop {
             match reader.read_event().unwrap() {
-                quick_xml::events::Event::Start(ref e) if e.local_name().as_ref() == b"drawing" => {
+                quick_xml::events::Event::Start(ref e) if e.local_name().as_ref() == "drawing" => {
                     break;
                 },
                 quick_xml::events::Event::Eof => panic!("no drawing"),

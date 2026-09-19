@@ -50,20 +50,18 @@ impl PresentationInfo {
 
         loop {
             match reader.read_event()? {
-                Event::Start(ref e) if e.local_name().as_ref() == b"extLst" => {
+                Event::Start(ref e) if e.local_name().as_ref() == "extLst" => {
                     ext_lst_depth += 1;
                 },
-                Event::End(ref e) if e.local_name().as_ref() == b"extLst" => {
+                Event::End(ref e) if e.local_name().as_ref() == "extLst" => {
                     ext_lst_depth = ext_lst_depth.saturating_sub(1);
                 },
                 Event::Start(ref e)
-                    if ext_lst_depth == 0 && e.local_name().as_ref() == b"sldIdLst" =>
+                    if ext_lst_depth == 0 && e.local_name().as_ref() == "sldIdLst" =>
                 {
                     slides = parse_slide_id_list(&mut reader)?;
                 },
-                Event::Empty(ref e)
-                    if ext_lst_depth == 0 && e.local_name().as_ref() == b"sldSz" =>
-                {
+                Event::Empty(ref e) if ext_lst_depth == 0 && e.local_name().as_ref() == "sldSz" => {
                     slide_size = Some(parse_slide_size(e)?);
                 },
                 Event::Eof => break,
@@ -80,20 +78,20 @@ fn parse_slide_id_list(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Vec<
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"sldId" => {
-                let id: u32 = xml::optional_attr_str(e, b"id")?
+            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == "sldId" => {
+                let id: u32 = xml::optional_attr_str(e, "id")?
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
                 // r:id may be missing in some files (LibreOffice test fixtures)
                 // or use a different prefix like d3p1:id instead of r:id
-                let rel_id = xml::optional_attr_str(e, b"r:id")?
+                let rel_id = xml::optional_attr_str(e, "r:id")?
                     .map(|v| v.into_owned())
                     .unwrap_or_default();
                 // Always add the slide — if r:id is missing, we'll try to
                 // resolve by position (convention: rId2 = slide1, rId3 = slide2, etc.)
                 slides.push(SlideId { id, rel_id });
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"sldIdLst" => {
+            Event::End(ref e) if e.local_name().as_ref() == "sldIdLst" => {
                 break;
             },
             Event::Eof => break,
@@ -105,10 +103,10 @@ fn parse_slide_id_list(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Vec<
 }
 
 fn parse_slide_size(e: &quick_xml::events::BytesStart) -> CoreResult<SlideSize> {
-    let cx: i64 = xml::optional_attr_str(e, b"cx")?
+    let cx: i64 = xml::optional_attr_str(e, "cx")?
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    let cy: i64 = xml::optional_attr_str(e, b"cy")?
+    let cy: i64 = xml::optional_attr_str(e, "cy")?
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     Ok(SlideSize { cx, cy })

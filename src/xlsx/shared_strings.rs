@@ -57,7 +57,7 @@ impl SharedStringTable {
 
         loop {
             match reader.read_event()? {
-                Event::Start(ref e) if e.local_name().as_ref() == b"si" => {
+                Event::Start(ref e) if e.local_name().as_ref() == "si" => {
                     strings.push(parse_si(&mut reader)?);
                 },
                 Event::Eof => break,
@@ -91,17 +91,17 @@ fn parse_si(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Shared
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"t" => {
+                "t" => {
                     plain_text = Some(xml::read_text_content_fast(reader)?);
                 },
-                b"r" => {
+                "r" => {
                     runs.push(parse_rich_text_run(reader)?);
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"si" => {
+            Event::End(ref e) if e.local_name().as_ref() == "si" => {
                 break;
             },
             Event::Eof => break,
@@ -140,29 +140,29 @@ pub(crate) fn parse_rich_text_run(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) if e.local_name().as_ref() == b"t" => {
+            Event::Start(ref e) if e.local_name().as_ref() == "t" => {
                 text = xml::read_text_content_fast(reader)?;
             },
-            Event::Start(ref e) if e.local_name().as_ref() == b"rPr" => loop {
+            Event::Start(ref e) if e.local_name().as_ref() == "rPr" => loop {
                 match reader.read_event()? {
                     Event::Start(ref p) | Event::Empty(ref p) => match p.local_name().as_ref() {
-                        b"b" => bold = Some(xml::parse_toggle(p, b"val")),
-                        b"i" => italic = Some(xml::parse_toggle(p, b"val")),
-                        b"sz" => {
+                        "b" => bold = Some(xml::parse_toggle(p, "val")),
+                        "i" => italic = Some(xml::parse_toggle(p, "val")),
+                        "sz" => {
                             font_size =
-                                xml::optional_attr_str(p, b"val")?.and_then(|v| v.parse().ok());
+                                xml::optional_attr_str(p, "val")?.and_then(|v| v.parse().ok());
                         },
                         // Run properties use `<rFont>`, not `<name>` (a
                         // different schema from styles.xml's `<font><name>`).
-                        b"rFont" => {
-                            font_name = xml::optional_attr_str(p, b"val")?.map(|v| v.into_owned());
+                        "rFont" => {
+                            font_name = xml::optional_attr_str(p, "val")?.map(|v| v.into_owned());
                         },
-                        b"color" => {
+                        "color" => {
                             color = parse_color_ref(p)?;
                         },
-                        b"vertAlign" => {
+                        "vertAlign" => {
                             vert_align =
-                                xml::optional_attr_str(p, b"val")?.and_then(|v| match v.as_ref() {
+                                xml::optional_attr_str(p, "val")?.and_then(|v| match v.as_ref() {
                                     "superscript" => Some(crate::ir::VerticalAlign::Superscript),
                                     "subscript" => Some(crate::ir::VerticalAlign::Subscript),
                                     "baseline" => Some(crate::ir::VerticalAlign::Baseline),
@@ -171,7 +171,7 @@ pub(crate) fn parse_rich_text_run(
                         },
                         _ => {},
                     },
-                    Event::End(ref p) if p.local_name().as_ref() == b"rPr" => break,
+                    Event::End(ref p) if p.local_name().as_ref() == "rPr" => break,
                     Event::Eof => break,
                     _ => {},
                 }
@@ -179,7 +179,7 @@ pub(crate) fn parse_rich_text_run(
             Event::Start(_) => {
                 xml::skip_element_fast(reader)?;
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"r" => {
+            Event::End(ref e) if e.local_name().as_ref() == "r" => {
                 break;
             },
             Event::Eof => break,
@@ -203,7 +203,7 @@ pub(crate) fn parse_color_ref(
     e: &quick_xml::events::BytesStart,
 ) -> crate::core::Result<Option<ColorRef>> {
     // Check for direct RGB color
-    if let Some(rgb_val) = xml::optional_attr_str(e, b"rgb")? {
+    if let Some(rgb_val) = xml::optional_attr_str(e, "rgb")? {
         let hex = rgb_val.as_ref();
         // ARGB format: "FF4472C4" — strip alpha prefix if 8 chars
         let hex = if hex.len() == 8 { &hex[2..] } else { hex };
@@ -213,7 +213,7 @@ pub(crate) fn parse_color_ref(
     }
 
     // Check for theme color
-    if let Some(theme_val) = xml::optional_attr_str(e, b"theme")? {
+    if let Some(theme_val) = xml::optional_attr_str(e, "theme")? {
         if let Ok(theme_idx) = theme_val.parse::<u32>() {
             let slot = match theme_idx {
                 0 => Some(ThemeColorSlot::Lt1),
@@ -231,7 +231,7 @@ pub(crate) fn parse_color_ref(
                 _ => None,
             };
             if let Some(slot) = slot {
-                let tint = xml::optional_attr_str(e, b"tint")?.and_then(|v| v.parse().ok());
+                let tint = xml::optional_attr_str(e, "tint")?.and_then(|v| v.parse().ok());
                 return Ok(Some(ColorRef::Theme {
                     slot,
                     tint,
@@ -243,7 +243,7 @@ pub(crate) fn parse_color_ref(
     }
 
     // Check for indexed color (simplified — just return None for now)
-    if xml::optional_attr_str(e, b"auto")?.is_some() {
+    if xml::optional_attr_str(e, "auto")?.is_some() {
         return Ok(Some(ColorRef::Auto));
     }
 
