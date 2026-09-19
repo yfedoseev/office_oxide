@@ -49,6 +49,11 @@ pub struct DocDocument {
     /// parsed from a FIB pointer that was previously read and then never
     /// used anywhere in the crate (issue #250).
     list_formatting: ListFormatting,
+    /// Comment author names, parsed from `GrpXstAtnOwners`. The FIB
+    /// fields locating this array (`fcGrpXstAtnOwners`/
+    /// `lcbGrpXstAtnOwners`) were never parsed at all before, so every
+    /// `.doc` comment's authorship was unrecoverable (issue #298).
+    comment_authors: Vec<String>,
 }
 
 /// One of the subdocuments stored after the main text in a `.doc`.
@@ -188,6 +193,12 @@ impl DocDocument {
             .ok()
             .and_then(|data| parse_summary_information(&data));
 
+        let comment_authors = parse_grp_xst_atn_owners(
+            &table_stream,
+            fib.fc_grp_xst_atn_owners,
+            fib.lcb_grp_xst_atn_owners,
+        );
+
         Ok(Self {
             text,
             images,
@@ -197,6 +208,7 @@ impl DocDocument {
             text_complete,
             summary_properties,
             list_formatting,
+            comment_authors,
         })
     }
 
@@ -215,6 +227,15 @@ impl DocDocument {
     /// the file stores them.
     pub fn subdocuments(&self) -> &[SubDocument] {
         &self.subdocuments
+    }
+
+    /// Comment author names declared by `GrpXstAtnOwners`, in file order.
+    /// Empty when the document has no comments. There is no per-comment
+    /// author correlation here (that needs `PlcfAtn`/`ATRD`, tracked
+    /// separately) — when this holds exactly one name, every comment in
+    /// the document was written by that single author (issue #298).
+    pub(crate) fn comment_authors(&self) -> &[String] {
+        &self.comment_authors
     }
 
     /// `true` when the file carries a `_VBA_PROJECT` storage — a cheap
@@ -329,6 +350,38 @@ fn clx_size_zero_or_oob(clx_size: u32, clx_start: usize, stream_len: usize) -> b
     clx_size == 0 || clx_start + clx_size as usize > stream_len + 1024 // allow some slack
 }
 
+/// Parse `GrpXstAtnOwners`: an array of XSTs (comment author names) packed
+/// back-to-back at `fc` for `lcb` bytes in the Table stream. Each entry is
+/// a `u16` character count `cch` followed by `cch` UTF-16LE code units —
+/// no STTBF-style count/extra-data header, per [MS-DOC] §2.5.5's
+/// description of `fcGrpXstAtnOwners`. Issue #298.
+fn parse_grp_xst_atn_owners(table_stream: &[u8], fc: u32, lcb: u32) -> Vec<String> {
+    if lcb == 0 {
+        return Vec::new();
+    }
+    let start = fc as usize;
+    let end = start.saturating_add(lcb as usize).min(table_stream.len());
+    if start >= end {
+        return Vec::new();
+    }
+
+    let mut names = Vec::new();
+    let mut pos = start;
+    while pos + 2 <= end {
+        let cch = u16::from_le_bytes([table_stream[pos], table_stream[pos + 1]]) as usize;
+        pos += 2;
+        let byte_len = cch * 2;
+        if pos + byte_len > end {
+            break;
+        }
+        let units: Vec<u16> =
+            table_stream[pos..pos + byte_len].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        pos += byte_len;
+        names.push(String::from_utf16_lossy(&units));
+    }
+    names
+}
+
 impl crate::core::OfficeDocument for DocDocument {
     fn plain_text(&self) -> String {
         self.plain_text()
@@ -351,6 +404,7 @@ mod tests {
             text_complete: true,
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
+            comment_authors: Vec::new(),
             images: Vec::new(),
             text: "First paragraph\nSecond paragraph\n\nAfter gap".into(),
             paragraphs: Vec::new(),
@@ -369,6 +423,7 @@ mod tests {
             text_complete: true,
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
+            comment_authors: Vec::new(),
             images: Vec::new(),
             text: "Hello World".into(),
             paragraphs: Vec::new(),
@@ -393,6 +448,7 @@ mod tests {
             text_complete: true,
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
+            comment_authors: Vec::new(),
             images: Vec::new(),
             text: "Main body text".into(),
             paragraphs: Vec::new(),
@@ -417,6 +473,7 @@ mod tests {
             text_complete: true,
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
+            comment_authors: Vec::new(),
             images: Vec::new(),
             text: "Body".into(),
             paragraphs: Vec::new(),
@@ -436,6 +493,7 @@ mod tests {
             text_complete: false,
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
+            comment_authors: Vec::new(),
             images: Vec::new(),
             text: "only the recovered fragment".into(),
             paragraphs: Vec::new(),
@@ -464,6 +522,7 @@ mod tests {
             text_complete: true,
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
+            comment_authors: Vec::new(),
             images: Vec::new(),
             text: text.to_string(),
             paragraphs: Vec::new(),
@@ -480,6 +539,7 @@ mod tests {
             text_complete: true,
             summary_properties: None,
             list_formatting: crate::doc::list_format::ListFormatting::default(),
+            comment_authors: Vec::new(),
             images: Vec::new(),
             text: String::new(),
             paragraphs: paras,
@@ -659,5 +719,68 @@ mod tests {
         });
         let ir = crate::convert_doc::doc_to_ir(&doc);
         assert_eq!(ir.metadata.title.as_deref(), Some("A HEADING LINE"));
+    }
+
+    /// issue #298 — `GrpXstAtnOwners` is an array of XSTs packed
+    /// back-to-back with no STTBF-style header: each entry is a `cch`
+    /// `u16` followed by `cch` UTF-16LE code units.
+    #[test]
+    fn grp_xst_atn_owners_parses_multiple_packed_entries() {
+        let mut data = Vec::new();
+        for name in ["Michael McCandless", "Miklos Vajna"] {
+            let units: Vec<u16> = name.encode_utf16().collect();
+            data.extend_from_slice(&(units.len() as u16).to_le_bytes());
+            for u in units {
+                data.extend_from_slice(&u.to_le_bytes());
+            }
+        }
+        let names = parse_grp_xst_atn_owners(&data, 0, data.len() as u32);
+        assert_eq!(names, vec!["Michael McCandless".to_string(), "Miklos Vajna".to_string()]);
+    }
+
+    #[test]
+    fn grp_xst_atn_owners_zero_length_is_empty() {
+        let data = vec![0u8; 32];
+        assert!(parse_grp_xst_atn_owners(&data, 4, 0).is_empty());
+    }
+
+    /// issue #298 — a single declared comment author unambiguously
+    /// attributes every comment in the document; `doc_to_ir` must carry
+    /// it onto the merged Comments `Note` via the new `author` field.
+    #[test]
+    fn a_single_comment_author_reaches_the_comments_note() {
+        use crate::ir::Element;
+        let mut doc = make_doc("Body text.");
+        doc.subdocuments =
+            vec![SubDocument { kind: SubDocumentKind::Comments, text: "Here is a comment".into() }];
+        doc.comment_authors = vec!["Michael McCandless".to_string()];
+
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        let note = ir.sections[0]
+            .elements
+            .iter()
+            .find_map(|e| if let Element::Endnote(n) = e { Some(n) } else { None })
+            .expect("expected a comments Endnote");
+        assert_eq!(note.author.as_deref(), Some("Michael McCandless"));
+    }
+
+    /// Two or more declared authors cannot be attributed to this merged,
+    /// per-subdocument (not per-comment) `Note` without `PlcfAtn`/`ATRD`
+    /// correlation — leave `author` unset rather than guess wrong.
+    #[test]
+    fn multiple_comment_authors_leave_the_note_author_unset() {
+        use crate::ir::Element;
+        let mut doc = make_doc("Body text.");
+        doc.subdocuments =
+            vec![SubDocument { kind: SubDocumentKind::Comments, text: "Inner\nOuter".into() }];
+        doc.comment_authors = vec!["vmiklos".to_string(), "Miklos Vajna".to_string()];
+
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        let note = ir.sections[0]
+            .elements
+            .iter()
+            .find_map(|e| if let Element::Endnote(n) = e { Some(n) } else { None })
+            .expect("expected a comments Endnote");
+        assert_eq!(note.author, None);
     }
 }

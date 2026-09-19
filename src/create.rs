@@ -1797,6 +1797,7 @@ mod xlsx_table_write_tests {
         let comment = Element::Endnote(Note {
             id: 1,
             marker: Some("B1 (Jane Doe)".to_string()),
+            author: None,
             content: vec![Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan {
                     text: "This needs review".to_string(),

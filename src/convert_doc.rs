@@ -71,10 +71,24 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             if content.is_empty() {
                 continue;
             }
+            // A single name in GrpXstAtnOwners unambiguously authored every
+            // comment in the document — real-world common case. Multiple
+            // names would need per-comment PlcfAtn/ATRD correlation (not
+            // yet implemented, would need to split this merged blob into
+            // one Note per comment first) to attribute correctly, so leave
+            // it unset rather than guess (issue #298).
+            let author = match sub.kind {
+                crate::doc::SubDocumentKind::Comments => match doc.comment_authors() {
+                    [single] => Some(single.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
             let note = Note {
                 id: i as u32,
                 marker: Some(subdocument_label(sub.kind).to_string()),
                 content,
+                author,
             };
             section.elements.push(match sub.kind {
                 crate::doc::SubDocumentKind::Footnotes => Element::Footnote(note),

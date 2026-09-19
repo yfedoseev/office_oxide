@@ -469,6 +469,11 @@ pub struct Note {
     pub content: Vec<Element>,
     /// Optional custom marker text (when absent the auto-number is used).
     pub marker: Option<String>,
+    /// Comment author, when the source format records one. Distinct from
+    /// `marker` — some converters also fold the author into `marker` for
+    /// backward-compatible display text, but this field is the structured
+    /// value (issue #298).
+    pub author: Option<String>,
 }
 
 /// An inline reference mark pointing to a footnote or endnote.

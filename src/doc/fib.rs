@@ -58,6 +58,12 @@ pub struct Fib {
     pub fc_plf_lfo: u32,
     /// Byte length of the PlfLfo in the Table stream (0x02EE).
     pub lcb_plf_lfo: u32,
+    /// Offset of the GrpXstAtnOwners (comment author name array) in the
+    /// Table stream (0x01BA). Zero when the document has no comments.
+    /// Issue #298.
+    pub fc_grp_xst_atn_owners: u32,
+    /// Byte length of the GrpXstAtnOwners in the Table stream (0x01BE).
+    pub lcb_grp_xst_atn_owners: u32,
 }
 
 impl Fib {
@@ -160,6 +166,21 @@ impl Fib {
             (0, 0)
         };
 
+        // fcGrpXstAtnOwners / lcbGrpXstAtnOwners — comment author names
+        // (0x01BA / 0x01BE). Derived from FibRgFcLcb97's fixed field order
+        // ([MS-DOC] §2.5.5): each entry is 4 bytes, starting at absolute
+        // offset 0x9A (fcStshfOrig); fcGrpXstAtnOwners is the 73rd entry
+        // (0-based index 72), landing at 0x9A + 72*4 = 0x1BA. Cross-checked
+        // against the two already-verified anchors above: fcPlcfBtePapx
+        // (index 26) lands at 0x9A + 26*4 = 0x102, and fcClx (index 66)
+        // lands at 0x9A + 66*4 = 0x1A2 — both match their hard-coded
+        // offsets already in this file. Issue #298.
+        let (fc_grp_xst_atn_owners, lcb_grp_xst_atn_owners) = if data.len() > 0x01C2 {
+            (read_u32(data, 0x01BA), read_u32(data, 0x01BE))
+        } else {
+            (0, 0)
+        };
+
         Ok(Self {
             version,
             lid,
@@ -179,6 +200,8 @@ impl Fib {
             lcb_plcf_lst,
             fc_plf_lfo,
             lcb_plf_lfo,
+            fc_grp_xst_atn_owners,
+            lcb_grp_xst_atn_owners,
         })
     }
 }
@@ -294,5 +317,21 @@ mod tests {
             fib.header_textbox_len, 66,
             "must read the real ccpHdrTxbx at 0x68, previously never read at all"
         );
+    }
+
+    /// issue #298 — `fcGrpXstAtnOwners`/`lcbGrpXstAtnOwners` (comment
+    /// author names) were never parsed at all. Offset derived from
+    /// FibRgFcLcb97's fixed field order; cross-checked against the two
+    /// offsets already verified elsewhere in this file (`fcPlcfBtePapx`
+    /// at 0x0102, `fcClx` at 0x01A2).
+    #[test]
+    fn grp_xst_atn_owners_read_from_its_real_offset() {
+        let mut data = build_minimal_fib();
+        data[0x01BA..0x01BE].copy_from_slice(&700u32.to_le_bytes());
+        data[0x01BE..0x01C2].copy_from_slice(&40u32.to_le_bytes());
+
+        let fib = Fib::parse(&data).unwrap();
+        assert_eq!(fib.fc_grp_xst_atn_owners, 700);
+        assert_eq!(fib.lcb_grp_xst_atn_owners, 40);
     }
 }

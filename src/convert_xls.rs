@@ -228,6 +228,7 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
             elements.push(Element::Endnote(Note {
                 id: i as u32,
                 marker: Some(marker),
+                author: c.author.clone(),
                 content: vec![Element::Paragraph(Paragraph {
                     content: vec![InlineContent::Text(TextSpan::plain(c.text.clone()))],
                     ..Default::default()

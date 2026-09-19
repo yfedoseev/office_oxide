@@ -162,6 +162,7 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
                     id: n.id,
                     content,
                     marker,
+                    author: None,
                 }));
             }
         }
@@ -174,11 +175,13 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
                     id: n.id,
                     content,
                     marker,
+                    author: None,
                 }));
             }
         }
         // Comments are annotations rather than body text; carry them as
-        // endnotes with the author kept in the marker so nothing is lost.
+        // endnotes with the author kept in the marker so nothing is lost,
+        // and in the structured `author` field (issue #298).
         for n in &doc.comments {
             let mut content = Vec::new();
             convert_block_elements(&n.content, &mut content, doc);
@@ -187,6 +190,7 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
                     id: n.id,
                     content,
                     marker: n.author.clone(),
+                    author: n.author.clone(),
                 }));
             }
         }

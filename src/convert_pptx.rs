@@ -65,6 +65,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             elements.push(Element::Endnote(Note {
                 id: i as u32,
                 marker: c.author.clone(),
+                author: c.author.clone(),
                 content: vec![Element::Paragraph(Paragraph {
                     content: vec![InlineContent::Text(TextSpan::plain(c.text.clone()))],
                     ..Default::default()

@@ -4751,6 +4751,7 @@ mod tests {
                     crate::ir::Element::Footnote(crate::ir::Note {
                         id: 1,
                         marker: Some("*".to_string()),
+                        author: None,
                         content: vec![crate::ir::Element::Paragraph(crate::ir::Paragraph {
                             content: vec![crate::ir::InlineContent::Text(
                                 crate::ir::TextSpan::plain("custom marked note"),

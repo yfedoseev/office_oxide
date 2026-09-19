@@ -105,12 +105,14 @@ fn element_to_json(elem: &office_oxide::ir::Element) -> serde_json::Value {
             "type": "footnote",
             "id": n.id,
             "marker": n.marker,
+            "author": n.author,
             "elements": n.content.iter().map(element_to_json).collect::<Vec<_>>(),
         }),
         Element::Endnote(n) => json!({
             "type": "endnote",
             "id": n.id,
             "marker": n.marker,
+            "author": n.author,
             "elements": n.content.iter().map(element_to_json).collect::<Vec<_>>(),
         }),
         Element::CodeBlock(cb) => json!({
@@ -310,11 +312,13 @@ mod tests {
                     Element::Endnote(Note {
                         id: 0,
                         marker: Some("comment".to_string()),
+                        author: None,
                         content: vec![],
                     }),
                     Element::Footnote(Note {
                         id: 1,
                         marker: Some("footnote".to_string()),
+                        author: None,
                         content: vec![],
                     }),
                 ],
@@ -331,6 +335,31 @@ mod tests {
         assert!(
             rendered.contains(r#""marker":"footnote""#),
             "a footnote's marker must also reach the projection: {rendered}"
+        );
+    }
+
+    /// issue #298 — `Note::author` (comment authorship) reached no
+    /// consumer at all, including the `ir` command's own JSON projection.
+    #[test]
+    fn test_note_author_reaches_the_json_projection() {
+        let ir = DocumentIR {
+            metadata: Metadata { format: DocumentFormat::Doc, title: None, ..Default::default() },
+            sections: vec![Section {
+                elements: vec![Element::Endnote(Note {
+                    id: 0,
+                    marker: Some("comment".to_string()),
+                    author: Some("Michael McCandless".to_string()),
+                    content: vec![],
+                })],
+                ..Default::default()
+            }],
+            defined_names: Vec::new(),
+        };
+        let json = ir_to_json(&ir);
+        let rendered = serde_json::to_string(&json).unwrap();
+        assert!(
+            rendered.contains(r#""author":"Michael McCandless""#),
+            "a comment's author must reach the projection: {rendered}"
         );
     }
 

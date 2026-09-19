@@ -1468,11 +1468,13 @@ fn ir_footnote_endnote_round_trip() {
                     id: 1,
                     content: footnote_content,
                     marker: None,
+                    author: None,
                 }),
                 Element::Endnote(Note {
                     id: 2,
                     content: endnote_content,
                     marker: None,
+                    author: None,
                 }),
             ],
             ..Default::default()
