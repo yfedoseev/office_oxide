@@ -123,6 +123,13 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 };
                 let (data_type, raw_number, number_format, number_format_id) =
                     cell_semantics(doc, cell, &date_indices);
+                let rich_runs = match &cell.value {
+                    crate::xlsx::cell::CellValue::SharedString(idx) => doc
+                        .shared_strings
+                        .get_shared(*idx)
+                        .and_then(|s| s.rich_text.clone()),
+                    _ => None,
+                };
                 cells.push(CellData {
                     col: cell.reference.col,
                     hyperlink: links
@@ -135,6 +142,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                     number_format,
                     number_format_id,
                     formula: cell.formula.clone(),
+                    rich_runs,
                 });
             }
             // Drop trailing empty cells.
@@ -266,7 +274,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                     continue;
                 };
                 out.push(Element::Paragraph(Paragraph {
-                    content: vec![InlineContent::Text(cell_span(doc, cd))],
+                    content: cell_spans(doc, cd),
                     ..Default::default()
                 }));
             }
@@ -286,7 +294,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                         // Cell font formatting reached the IR in prose mode
                         // but not here, so the same cell rendered differently
                         // depending on the shape of the sheet around it.
-                        vec![InlineContent::Text(cell_span(doc, cd))]
+                        cell_spans(doc, cd)
                     };
                     let cell = TableCell {
                         content: vec![Element::Paragraph(Paragraph {
@@ -566,6 +574,36 @@ fn cell_span(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> TextSpan {
     span
 }
 
+/// Build a cell's paragraph content: one `TextSpan` per rich-text run
+/// when the cell's shared string carries per-run formatting (e.g. a
+/// bold superscript footnote marker within otherwise-plain text) —
+/// previously discarded entirely, flattening to a single unformatted
+/// span regardless of how many differently-formatted runs the source
+/// actually had (issue #303). Falls back to the single-span `cell_span`
+/// path for a plain string or any non-string cell.
+fn cell_spans(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> Vec<InlineContent> {
+    let Some(runs) = cd.rich_runs.as_ref().filter(|r| !r.is_empty()) else {
+        return vec![InlineContent::Text(cell_span(doc, cd))];
+    };
+    runs.iter()
+        .map(|r| {
+            let mut span = TextSpan::plain(r.text.clone());
+            span.hyperlink = cd.hyperlink.clone();
+            span.bold = r.bold.unwrap_or(false);
+            span.italic = r.italic.unwrap_or(false);
+            if let Some(size_pt) = r.font_size {
+                span.font_size_half_pt =
+                    Some(crate::core::units::HalfPoint::from_points_rounded(size_pt).0);
+            }
+            span.font_name = r.font_name.clone();
+            span.color =
+                r.color.as_ref().and_then(|c| c.resolve_opt(doc.theme.as_ref())).map(|rgb| rgb.0);
+            span.vertical_align = r.vert_align.clone();
+            InlineContent::Text(span)
+        })
+        .collect()
+}
+
 /// A parsed spreadsheet cell carried through `xlsx_to_ir`: the rendered
 /// display string plus the structured facts needed to populate the IR's
 /// semantic `TableCell` fields (issue #72).
@@ -592,6 +630,11 @@ struct CellData {
     /// Formula text (`<f>` content, shared-formula followers already
     /// reconstructed by `xlsx::shared_formula`), when present.
     formula: Option<String>,
+    /// Per-run rich-text formatting, when this cell's value is a shared
+    /// string with `<r><rPr>…</rPr><t>…</t></r>` sub-runs (e.g. a bold
+    /// superscript footnote marker within otherwise-plain text). `None`
+    /// for a plain (non-rich) string or any non-string cell (issue #303).
+    rich_runs: Option<Vec<crate::xlsx::shared_strings::RichTextRun>>,
 }
 
 /// The text a cell should show when it has no cached value: `=formula`
