@@ -59,6 +59,7 @@ use zip::read::ZipArchive;
 use crate::core::opc::{self, OpcReader};
 use crate::core::relationships::{Relationships, rel_types};
 use crate::core::theme::Theme;
+use crate::core::xml;
 
 /// A parsed XLSX document.
 #[derive(Debug, Clone)]
@@ -314,13 +315,36 @@ impl XlsxDocument {
         }
 
         // Phase 2: parse worksheets (parallel when feature enabled)
-        let worksheets = crate::core::parallel::map_collect(bundles, |b| -> Result<Worksheet> {
+        let mut worksheets = crate::core::parallel::map_collect(bundles, |b| -> Result<Worksheet> {
             let mut ws = Worksheet::parse(&b.data, b.name, &b.rels)?;
             ws.images = b.images;
             ws.text_shapes = b.text_shapes;
             ws.comments = b.comments;
             Ok(ws)
         })?;
+
+        // Resolve any in-cell rich-value images (issue #302): a `vm`-
+        // tagged `t="e"` cell whose `vm` maps through the workbook's
+        // metadata/richData chain is a real embedded image, not a
+        // genuine formula error — swap its fabricated `#VALUE!` text
+        // for the actual picture.
+        let rich_value_images = read_rich_value_images(&mut archive);
+        if !rich_value_images.is_empty() {
+            for ws in &mut worksheets {
+                for row in &mut ws.rows {
+                    for cell in &mut row.cells {
+                        let Some(vm) = cell.vm else { continue };
+                        if !matches!(cell.value, CellValue::Error(_)) {
+                            continue;
+                        }
+                        if let Some(pic) = rich_value_images.get(&vm) {
+                            ws.images.push(pic.clone());
+                            cell.value = CellValue::Empty;
+                        }
+                    }
+                }
+            }
+        }
 
         // Scan for chart XML parts (xl/charts/chart*.xml) and extract their
         // visible text — title, axis titles, series names, category labels,
@@ -887,6 +911,285 @@ fn read_drawing_for_sheet<R: Read + Seek>(
         .collect();
 
     (pictures, text_shapes)
+}
+
+/// Workbook-level in-cell rich-value images (Excel 365's
+/// `=IMAGE(...)`/"Place in Cell"), keyed by the 1-based `vm` value a
+/// cell carries. Excel stores these as a `t="e"` cell with a literal
+/// `<v>#VALUE!</v>` fallback for old readers, plus `vm` pointing through
+/// a chain of small parts to the real image: `xl/metadata.xml`
+/// (`vm` -> `valueMetadata` bk -> `futureMetadata` bk -> `rvb.i`) ->
+/// `xl/richData/rdrichvalue.xml` (`i` -> one `<rv>`'s struct + values) ->
+/// `rdrichvaluestructure.xml` (which value is the image identifier) ->
+/// `richValueRel.xml` (+ its own `.rels`) -> `xl/media/*`. Any missing or
+/// malformed part along the way yields an empty map — this is a
+/// best-effort recovery, not a hard requirement for opening the file
+/// (issue #302).
+fn read_rich_value_images<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+) -> std::collections::HashMap<u32, crate::xlsx::worksheet::WorksheetPicture> {
+    let mut out = std::collections::HashMap::new();
+
+    let Ok(metadata_xml) = XlsxDocument::read_xml_entry(archive, "xl/metadata.xml") else {
+        return out;
+    };
+    let Some((rich_type_id, future_rvb, value_metadata)) = parse_rich_value_metadata(&metadata_xml)
+    else {
+        return out;
+    };
+
+    let Ok(rv_xml) = XlsxDocument::read_xml_entry(archive, "xl/richData/rdrichvalue.xml") else {
+        return out;
+    };
+    let rv_list = parse_rdrichvalue(&rv_xml);
+
+    let Ok(struct_xml) = XlsxDocument::read_xml_entry(archive, "xl/richData/rdrichvaluestructure.xml")
+    else {
+        return out;
+    };
+    let image_key_positions = parse_rich_value_structures(&struct_xml);
+
+    let rel_path = "xl/richData/richValueRel.xml";
+    let Ok(rel_xml) = XlsxDocument::read_xml_entry(archive, rel_path) else {
+        return out;
+    };
+    let rel_rids = parse_rich_value_rel(&rel_xml);
+
+    let rel_rels_path = sheet_rels_path(rel_path);
+    let rel_rels = match XlsxDocument::read_xml_entry(archive, &rel_rels_path) {
+        Ok(d) => Relationships::parse(&d).unwrap_or_else(|_| Relationships::empty()),
+        Err(_) => return out,
+    };
+
+    for (position, rvb_index) in value_metadata.iter().enumerate() {
+        // `rc.t` must reference the metadataType we identified as
+        // XLRICHVALUE — a `<bk>` referencing a different metadata type
+        // (e.g. dynamic-array spill markers) isn't an image at all.
+        let Some((rc_type, v)) = rvb_index else { continue };
+        if *rc_type != rich_type_id {
+            continue;
+        }
+        let Some(Some(rv_index)) = future_rvb.get(*v as usize) else { continue };
+        let Some((struct_idx, values)) = rv_list.get(*rv_index as usize) else { continue };
+        let Some(Some(key_pos)) = image_key_positions.get(*struct_idx as usize) else { continue };
+        let Some(local_id_str) = values.get(*key_pos) else { continue };
+        let Ok(local_id) = local_id_str.parse::<usize>() else { continue };
+        let Some(rid) = rel_rids.get(local_id) else { continue };
+        let Some(rel) = rel_rels.get_by_id(rid) else { continue };
+        let media_path = resolve_relative_zip_path(rel_path, &rel.target);
+        let Ok(bytes) = opc::read_zip_entry(archive, &media_path) else { continue };
+        let ext = Path::new(&rel.target)
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_else(|| guess_image_format_from_bytes(&bytes).to_string());
+
+        // No anchor coordinates exist for an in-cell rich value — it has
+        // no `<xdr:from>`/`<xdr:to>` at all, unlike a drawing-anchored
+        // picture. Zero EMUs is the same "position unknown" sentinel
+        // `convert_xlsx.rs` already falls back on for a cell-anchored
+        // drawing picture it couldn't place: the image still reaches the
+        // IR, just inline rather than pixel-positioned.
+        out.insert(
+            (position as u32) + 1,
+            crate::xlsx::worksheet::WorksheetPicture {
+                data: bytes,
+                format: ext,
+                x_emu: 0,
+                y_emu: 0,
+                cx_emu: 0,
+                cy_emu: 0,
+                alt_text: None,
+            },
+        );
+    }
+
+    out
+}
+
+/// Parse `xl/metadata.xml`. Returns `(rich_type_id, future_rvb,
+/// value_metadata)`:
+/// - `rich_type_id`: the 1-based `<metadataType>` index whose `name` is
+///   `"XLRICHVALUE"`.
+/// - `future_rvb[v]`: the `<xlrd:rvb i="…">` value at position `v`
+///   (0-based) of `<futureMetadata name="XLRICHVALUE">`'s `<bk>` array.
+/// - `value_metadata[p]`: the `(t, v)` of the first `<rc>` in
+///   `<valueMetadata>`'s `<bk>` at position `p` (0-based) — `p + 1` is
+///   the cell's own `vm` value.
+fn parse_rich_value_metadata(xml: &[u8]) -> Option<(u32, Vec<Option<u32>>, Vec<Option<(u32, u32)>>)> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+
+    #[derive(PartialEq)]
+    enum Section {
+        None,
+        MetadataTypes,
+        FutureMetadataRich,
+        ValueMetadata,
+    }
+    let mut section = Section::None;
+    let mut metadata_type_count = 0u32;
+    let mut rich_type_id = None;
+    let mut future_rvb: Vec<Option<u32>> = Vec::new();
+    let mut value_metadata: Vec<Option<(u32, u32)>> = Vec::new();
+    let mut in_bk = false;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                let name = e.local_name();
+                match name.as_ref() {
+                    b"metadataTypes" => section = Section::MetadataTypes,
+                    b"futureMetadata" if xml::optional_attr_str(e, b"name").ok().flatten().as_deref() == Some("XLRICHVALUE") => {
+                        section = Section::FutureMetadataRich;
+                    },
+                    b"futureMetadata" => section = Section::None,
+                    b"valueMetadata" => section = Section::ValueMetadata,
+                    b"metadataType" if section == Section::MetadataTypes => {
+                        metadata_type_count += 1;
+                        if xml::optional_attr_str(e, b"name").ok().flatten().as_deref() == Some("XLRICHVALUE") {
+                            rich_type_id = Some(metadata_type_count);
+                        }
+                    },
+                    b"bk" if section == Section::FutureMetadataRich => {
+                        future_rvb.push(None);
+                        in_bk = true;
+                    },
+                    b"bk" if section == Section::ValueMetadata => {
+                        value_metadata.push(None);
+                        in_bk = true;
+                    },
+                    b"rvb" if section == Section::FutureMetadataRich && in_bk => {
+                        if let Some(i) = xml::optional_attr_str(e, b"i")
+                            .ok()
+                            .flatten()
+                            .and_then(|v| v.parse::<u32>().ok())
+                        {
+                            if let Some(slot) = future_rvb.last_mut() {
+                                *slot = Some(i);
+                            }
+                        }
+                    },
+                    b"rc" if section == Section::ValueMetadata && in_bk => {
+                        let t = xml::optional_attr_str(e, b"t").ok().flatten().and_then(|v| v.parse::<u32>().ok());
+                        let v = xml::optional_attr_str(e, b"v").ok().flatten().and_then(|v| v.parse::<u32>().ok());
+                        if let (Some(t), Some(v)) = (t, v) {
+                            if let Some(slot @ None) = value_metadata.last_mut() {
+                                *slot = Some((t, v));
+                            }
+                        }
+                    },
+                    _ => {},
+                }
+            },
+            Ok(Event::End(ref e)) => {
+                let name = e.local_name();
+                match name.as_ref() {
+                    b"bk" => in_bk = false,
+                    b"metadataTypes" | b"futureMetadata" | b"valueMetadata" => section = Section::None,
+                    _ => {},
+                }
+            },
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {},
+        }
+    }
+
+    Some((rich_type_id?, future_rvb, value_metadata))
+}
+
+/// Parse `xl/richData/rdrichvalue.xml`: one `(struct_index, values)` per
+/// `<rv>`, in document order (index `i` in `xlrd:rvb` refers to this
+/// position).
+fn parse_rdrichvalue(xml: &[u8]) -> Vec<(u32, Vec<String>)> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut out: Vec<(u32, Vec<String>)> = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"rv" => {
+                let s = xml::optional_attr_str(e, b"s").ok().flatten().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+                out.push((s, Vec::new()));
+            },
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"v" => {
+                if let Ok(text) = xml::read_text_content_fast(&mut reader) {
+                    if let Some((_, values)) = out.last_mut() {
+                        values.push(text);
+                    }
+                }
+            },
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {},
+        }
+    }
+    out
+}
+
+/// Parse `xl/richData/rdrichvaluestructure.xml`: for each `<s>` (struct
+/// type, in document order), the 0-based position of its
+/// `<k n="_rvRel:LocalImageIdentifier">` key among that struct's `<k>`
+/// children, or `None` if the struct has no such key (it isn't an
+/// image-carrying rich-value type).
+fn parse_rich_value_structures(xml: &[u8]) -> Vec<Option<usize>> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut out = Vec::new();
+    let mut current: Option<(usize, Option<usize>)> = None; // (key count so far, image key position)
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"s" => {
+                current = Some((0, None));
+            },
+            Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"k" => {
+                if let Some((count, image_pos)) = current.as_mut() {
+                    if xml::optional_attr_str(e, b"n").ok().flatten().as_deref() == Some("_rvRel:LocalImageIdentifier") {
+                        *image_pos = Some(*count);
+                    }
+                    *count += 1;
+                }
+            },
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"s" => {
+                if let Some((_, image_pos)) = current.take() {
+                    out.push(image_pos);
+                }
+            },
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {},
+        }
+    }
+    out
+}
+
+/// Parse `xl/richData/richValueRel.xml`: the `r:id` of each `<rel>`, in
+/// document order (a rich value's `_rvRel:LocalImageIdentifier` is a
+/// 0-based index into this array).
+fn parse_rich_value_rel(xml: &[u8]) -> Vec<String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut out = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"rel" => {
+                if let Some(rid) = xml::optional_attr_str(e, b"r:id").ok().flatten() {
+                    out.push(rid.into_owned());
+                }
+            },
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {},
+        }
+    }
+    out
 }
 
 /// Resolve a `..`-relative target inside an OPC package back to an
@@ -1819,5 +2122,71 @@ mod tests {
         );
         let opc = crate::core::opc::OpcReader::new(std::io::Cursor::new(bytes)).unwrap();
         assert!(XlsxDocument::from_opc(opc).is_err());
+    }
+
+    /// issue #302 — a `vm`-tagged `t="e"` cell whose fallback `<v>` is
+    /// the literal `"#VALUE!"` is Excel 365's in-cell rich-value image
+    /// (`=IMAGE(...)`/"Place in Cell"), not a real formula error. The
+    /// real image is reachable by resolving `vm` through `xl/
+    /// metadata.xml` -> `xl/richData/{rdrichvalue,
+    /// rdrichvaluestructure,richValueRel}.xml` -> `xl/media/*`. This
+    /// fixture mirrors the exact shape of the real-corpus reproducer
+    /// (`phpspreadsheet_drawing_in_cell.xlsx`) byte for byte.
+    #[test]
+    fn a_rich_value_image_cell_resolves_to_a_real_image_not_a_value_error() {
+        const PNG: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
+            0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+
+        let sheet_xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="2"><c r="B2" t="e" vm="1"><v>#VALUE!</v></c></row>
+  </sheetData>
+</worksheet>"#;
+
+        let metadata_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:xlrd="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata"><metadataTypes count="1"><metadataType name="XLRICHVALUE" minSupportedVersion="120000"/></metadataTypes><futureMetadata name="XLRICHVALUE" count="1"><bk><extLst><ext uri="{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}"><xlrd:rvb i="0"/></ext></extLst></bk></futureMetadata><valueMetadata count="1"><bk><rc t="1" v="0"/></bk></valueMetadata></metadata>"#;
+
+        let rdrichvalue_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<rvData xmlns="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata" count="1"><rv s="0"><v>0</v><v>5</v></rv></rvData>"#;
+
+        let rdrichvaluestructure_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<rvStructures xmlns="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata" count="1"><s t="_localImage"><k n="_rvRel:LocalImageIdentifier" t="i"/><k n="CalcOrigin" t="i"/></s></rvStructures>"#;
+
+        let richvaluerel_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<richValueRels xmlns="http://schemas.microsoft.com/office/spreadsheetml/2022/richvaluerel" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><rel r:id="rId1"/></richValueRels>"#;
+
+        let richvaluerel_rels = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/></Relationships>"#;
+
+        let bytes = single_sheet_xlsx(
+            std::str::from_utf8(sheet_xml).unwrap(),
+            &[
+                ("xl/metadata.xml", metadata_xml.as_slice()),
+                ("xl/richData/rdrichvalue.xml", rdrichvalue_xml.as_slice()),
+                ("xl/richData/rdrichvaluestructure.xml", rdrichvaluestructure_xml.as_slice()),
+                ("xl/richData/richValueRel.xml", richvaluerel_xml.as_slice()),
+                ("xl/richData/_rels/richValueRel.xml.rels", richvaluerel_rels.as_slice()),
+                ("xl/media/image1.png", PNG),
+            ],
+        );
+        let doc = open_bytes(bytes);
+        let ws = &doc.worksheets[0];
+
+        assert_eq!(ws.images.len(), 1, "the rich-value image must reach ws.images");
+        assert_eq!(ws.images[0].data, PNG);
+        assert_eq!(ws.images[0].format, "png");
+
+        let cell = &ws.rows[0].cells[0];
+        assert!(
+            !matches!(cell.value, CellValue::Error(_)),
+            "the fabricated #VALUE! error must be cleared: {:?}",
+            cell.value
+        );
     }
 }

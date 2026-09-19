@@ -99,6 +99,14 @@ pub struct Cell {
     pub style_index: Option<u32>,
     /// Formula content from the `<f>` element, if present.
     pub formula: Option<String>,
+    /// The cell's `vm` attribute: a 1-based index into the workbook's
+    /// `xl/metadata.xml` `<valueMetadata>` array. Excel 365's in-cell
+    /// rich-value images (`=IMAGE(...)`/"Place in Cell") are stored as a
+    /// `t="e"` cell with a literal `<v>#VALUE!</v>` fallback for old
+    /// readers, plus this `vm` pointer to the real rich-value chain —
+    /// without it, that fallback text was indistinguishable from a
+    /// genuine formula error (issue #302).
+    pub vm: Option<u32>,
 }
 
 #[cfg(test)]

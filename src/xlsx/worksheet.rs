@@ -863,6 +863,7 @@ fn parse_empty_cell(
         value: CellValue::Empty,
         style_index,
         formula: None,
+        vm: None,
     })
 }
 
@@ -895,6 +896,8 @@ fn parse_cell_fast(
 
     let cell_type = xml::optional_attr_str(start, b"t")?.map(|v| v.into_owned());
     let style_index = xml::optional_attr_str(start, b"s")?
+        .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok());
+    let vm = xml::optional_attr_str(start, b"vm")?
         .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok());
 
     let mut raw_value: Option<String> = None;
@@ -977,6 +980,7 @@ fn parse_cell_fast(
         value,
         style_index,
         formula,
+        vm,
     })
 }
 
