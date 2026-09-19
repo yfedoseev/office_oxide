@@ -56,50 +56,73 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // main text in the same character space. Their `ccp*` lengths were
     // parsed and never used, so none of this reached a consumer.
     if let Some(section) = sections.last_mut() {
-        for (i, sub) in doc.subdocuments().iter().enumerate() {
-            let content: Vec<Element> = sub
-                .text
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| {
-                    Element::Paragraph(Paragraph {
-                        content: vec![InlineContent::Text(TextSpan::plain(l))],
-                        ..Default::default()
+        let mut next_id = 0u32;
+        for sub in doc.subdocuments() {
+            // Footnote/endnote bodies are self-delimited: each one starts
+            // with the literal auto-number reference-mark character
+            // (`\u{2}`) in the substory's own text — confirmed on the full
+            // local corpus (footnotes 49/51 files, endnotes 5/5 files that
+            // had one). Comments carry no such marker in their substory
+            // (0/12 files) — the reference point lives only in the main
+            // text via `PlcfAtn`, not duplicated here — so they stay
+            // merged into one Note per document until that PLC is parsed
+            // (issue #286 tracks that remaining gap).
+            let splittable = matches!(
+                sub.kind,
+                crate::doc::SubDocumentKind::Footnotes | crate::doc::SubDocumentKind::Endnotes
+            ) && sub.text.contains('\u{2}');
+
+            let bodies: Vec<&str> = if splittable {
+                sub.text.split('\u{2}').map(str::trim).filter(|s| !s.is_empty()).collect()
+            } else {
+                vec![sub.text.as_str()]
+            };
+
+            for body in bodies {
+                let content: Vec<Element> = body
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| {
+                        Element::Paragraph(Paragraph {
+                            content: vec![InlineContent::Text(TextSpan::plain(l))],
+                            ..Default::default()
+                        })
                     })
-                })
-                .collect();
-            if content.is_empty() {
-                continue;
-            }
-            // A single name in GrpXstAtnOwners unambiguously authored every
-            // comment in the document — real-world common case. Multiple
-            // names would need per-comment PlcfAtn/ATRD correlation (not
-            // yet implemented, would need to split this merged blob into
-            // one Note per comment first) to attribute correctly, so leave
-            // it unset rather than guess (issue #298).
-            let author = match sub.kind {
-                crate::doc::SubDocumentKind::Comments => match doc.comment_authors() {
-                    [single] => Some(single.clone()),
+                    .collect();
+                if content.is_empty() {
+                    continue;
+                }
+                // A single name in GrpXstAtnOwners unambiguously authored
+                // every comment in the document — real-world common case.
+                // Multiple names would need per-comment PlcfAtn/ATRD
+                // correlation (not yet implemented) to attribute
+                // correctly, so leave it unset rather than guess (issue
+                // #298).
+                let author = match sub.kind {
+                    crate::doc::SubDocumentKind::Comments => match doc.comment_authors() {
+                        [single] => Some(single.clone()),
+                        _ => None,
+                    },
                     _ => None,
-                },
-                _ => None,
-            };
-            let note = Note {
-                id: i as u32,
-                marker: Some(subdocument_label(sub.kind).to_string()),
-                content,
-                author,
-            };
-            section.elements.push(match sub.kind {
-                crate::doc::SubDocumentKind::Footnotes => Element::Footnote(note),
-                crate::doc::SubDocumentKind::HeadersFooters
-                | crate::doc::SubDocumentKind::TextBoxes
-                | crate::doc::SubDocumentKind::HeaderTextBoxes => Element::TextBox(TextBox {
-                    content: note.content,
-                    ..Default::default()
-                }),
-                _ => Element::Endnote(note),
-            });
+                };
+                let note = Note {
+                    id: next_id,
+                    marker: Some(subdocument_label(sub.kind).to_string()),
+                    content,
+                    author,
+                };
+                next_id += 1;
+                section.elements.push(match sub.kind {
+                    crate::doc::SubDocumentKind::Footnotes => Element::Footnote(note),
+                    crate::doc::SubDocumentKind::HeadersFooters
+                    | crate::doc::SubDocumentKind::TextBoxes
+                    | crate::doc::SubDocumentKind::HeaderTextBoxes => Element::TextBox(TextBox {
+                        content: note.content,
+                        ..Default::default()
+                    }),
+                    _ => Element::Endnote(note),
+                });
+            }
         }
     }
     // Extracted pictures never reached the IR, so every image in a legacy

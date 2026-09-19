@@ -783,4 +783,74 @@ mod tests {
             .expect("expected a comments Endnote");
         assert_eq!(note.author, None);
     }
+
+    /// issue #286 — every footnote in a document used to collapse into a
+    /// single `Element::Footnote` holding all footnotes concatenated.
+    /// Each footnote is self-delimited in its own substory text by a
+    /// leading `\u{2}` (auto-number reference-mark) character — verified
+    /// present in 49/51 real-corpus files with footnotes, 5/5 with
+    /// endnotes, and absent in all 12 real-corpus files with comments
+    /// (comments' reference point lives only in the main text via
+    /// `PlcfAtn`, not duplicated into the substory).
+    #[test]
+    fn footnotes_split_into_one_element_per_reference_mark() {
+        use crate::ir::{Element, InlineContent, Note};
+        let mut doc = make_doc("Body text.");
+        doc.subdocuments = vec![SubDocument {
+            kind: SubDocumentKind::Footnotes,
+            text: "\u{2} First footnote.\n\u{2} Second footnote.\n\u{2} Third footnote.\n".into(),
+        }];
+
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        let footnotes: Vec<&Note> = ir.sections[0]
+            .elements
+            .iter()
+            .filter_map(|e| if let Element::Footnote(n) = e { Some(n) } else { None })
+            .collect();
+        assert_eq!(footnotes.len(), 3, "expected one Footnote element per reference mark");
+        let text_of = |n: &Note| -> String {
+            n.content
+                .iter()
+                .filter_map(|e| match e {
+                    Element::Paragraph(p) => p.content.first().map(|c| match c {
+                        InlineContent::Text(t) => t.text.clone(),
+                        _ => String::new(),
+                    }),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(text_of(footnotes[0]), "First footnote.");
+        assert_eq!(text_of(footnotes[1]), "Second footnote.");
+        assert_eq!(text_of(footnotes[2]), "Third footnote.");
+        assert_eq!(footnotes[0].id, 0);
+        assert_eq!(footnotes[1].id, 1);
+        assert_eq!(footnotes[2].id, 2);
+    }
+
+    /// Comments never carry the `\u{2}` marker in their own substory (see
+    /// above), so they must keep the old merged-into-one-Note behavior —
+    /// splitting on a marker that isn't there would either no-op safely
+    /// or (if some other document ever used `\u{2}` differently inside
+    /// comment text) corrupt real content, so the split path is gated on
+    /// `SubDocumentKind` as well as the marker's presence.
+    #[test]
+    fn comments_stay_merged_into_a_single_note() {
+        use crate::ir::{Element, Note};
+        let mut doc = make_doc("Body text.");
+        doc.subdocuments = vec![SubDocument {
+            kind: SubDocumentKind::Comments,
+            text: "First comment.\nSecond comment.\n".into(),
+        }];
+
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        let comments: Vec<&Note> = ir.sections[0]
+            .elements
+            .iter()
+            .filter_map(|e| if let Element::Endnote(n) = e { Some(n) } else { None })
+            .collect();
+        assert_eq!(comments.len(), 1, "comments must stay merged until PlcfAtn is parsed (#286)");
+        assert_eq!(comments[0].content.len(), 2, "both lines must still reach the one Note");
+    }
 }
