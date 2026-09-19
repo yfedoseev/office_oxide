@@ -83,6 +83,11 @@ pub struct Fib {
     pub fc_plcf_and_txt: u32,
     /// Byte length of the PlcfandTxt in the Table stream (0x00C6).
     pub lcb_plcf_and_txt: u32,
+    /// Offset of the PlcBteChpx (CHPX FKP page index) in the Table stream
+    /// (0x00FA). Zero when the file has no CHPX FKP. Issue #287/#288.
+    pub fc_plcf_bte_chpx: u32,
+    /// Byte length of the PlcBteChpx in the Table stream (0x00FE).
+    pub lcb_plcf_bte_chpx: u32,
 }
 
 impl Fib {
@@ -230,6 +235,20 @@ impl Fib {
             (0, 0)
         };
 
+        // fcPlcfBteChpx/lcbPlcfBteChpx (0x00FA/0x00FE) — CHPX FKP page index.
+        // FibRgFcLcb97's fixed field order places fcPlcfBteChpx/
+        // lcbPlcfBteChpx immediately before fcPlcfBtePapx/lcbPlcfBtePapx
+        // (confirmed against the live [MS-DOC] §2.5.6 field-order table:
+        // ... fcPlcfHdd, lcbPlcfHdd, fcPlcfBteChpx, lcbPlcfBteChpx,
+        // fcPlcfBtePapx, lcbPlcfBtePapx, ...). fieldIndex 24 (0x9A + 24*4 =
+        // 0xFA), one pair before fcPlcfBtePapx's already-verified fieldIndex
+        // 26 (0x9A + 26*4 = 0x102). Issue #287/#288.
+        let (fc_plcf_bte_chpx, lcb_plcf_bte_chpx) = if data.len() > 0x0102 {
+            (read_u32(data, 0x00FA), read_u32(data, 0x00FE))
+        } else {
+            (0, 0)
+        };
+
         Ok(Self {
             version,
             lid,
@@ -257,6 +276,8 @@ impl Fib {
             lcb_plcf_and_ref,
             fc_plcf_and_txt,
             lcb_plcf_and_txt,
+            fc_plcf_bte_chpx,
+            lcb_plcf_bte_chpx,
         })
     }
 }
@@ -320,6 +341,23 @@ mod tests {
         assert_eq!(fib.lcb_plcf_lst, 12);
         assert_eq!(fib.fc_plf_lfo, 0x000007E1);
         assert_eq!(fib.lcb_plf_lfo, 0x00000018);
+    }
+
+    /// Regression: `fcPlcfBteChpx`/`lcbPlcfBteChpx` must land at 0x00FA/
+    /// 0x00FE — immediately before `fcPlcfBtePapx` at 0x0102, per
+    /// [MS-DOC] §2.5.6's field-order table. Issue #287/#288.
+    #[test]
+    fn test_fc_plcf_bte_chpx_offset() {
+        let mut data = build_minimal_fib();
+        data[0x00FA..0x00FE].copy_from_slice(&700u32.to_le_bytes());
+        data[0x00FE..0x0102].copy_from_slice(&40u32.to_le_bytes());
+        let fib = Fib::parse(&data).unwrap();
+        assert_eq!(fib.fc_plcf_bte_chpx, 700);
+        assert_eq!(fib.lcb_plcf_bte_chpx, 40);
+        // The already-verified PAPX pointer must be unaffected by the new
+        // field landing immediately before it.
+        assert_eq!(fib.fc_plcf_bte_papx, 300);
+        assert_eq!(fib.lcb_plcf_bte_papx, 28);
     }
 
     #[test]

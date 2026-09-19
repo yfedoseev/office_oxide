@@ -9,6 +9,7 @@
 //! println!("{}", doc.plain_text());
 //! ```
 
+mod chpx;
 mod codepage;
 mod document;
 mod error;

@@ -513,6 +513,90 @@ pub fn extract_pap_props(grpprl: &[u8]) -> PapProps {
     props
 }
 
+/// Character-property flags distilled from a CHP grpprl (`sgc` == 2).
+///
+/// Only the revision-mark SPRMs are tracked (issue #288): a run's other
+/// character formatting (#287, bold/italic/font/color/…) is a larger,
+/// separate scope that this minimal CHPX-walking pass does not attempt.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChpProps {
+    /// `sprmCFRMarkDel` (0x0800): the run is formatted as deleted
+    /// revision-mark text. The "accepted" view (what `plain_text()` and
+    /// the IR both show) excludes it, mirroring the policy already
+    /// applied to DOCX's `w:del`.
+    pub f_rmark_del: bool,
+    /// `sprmCFRMarkIns` (0x0801): the run is formatted as inserted
+    /// revision-mark text. Inserted text is part of the accepted view
+    /// (kept, not filtered); tracked here only so the registry enumerates
+    /// every CHP opcode this crate recognizes, not just the ones that
+    /// currently change extraction behavior.
+    pub f_rmark_ins: bool,
+}
+
+/// Declare the character SPRM dispatch and its identity registry from one
+/// source, mirroring [`pap_sprm_dispatch`] for `sgc == 2` (CHP) opcodes.
+macro_rules! chp_sprm_dispatch {
+    (
+        $(
+            $(#[$meta:meta])*
+            $spec_name:literal @ $section:literal => [$($opcode:literal),+ $(,)?]
+                ($props:ident, $operand:ident) $body:block
+        )*
+    ) => {
+        /// Every character SPRM this crate decodes: `(opcode, spec name,
+        /// [MS-DOC] section)`. Derived from the dispatch below, never
+        /// maintained alongside it.
+        #[allow(dead_code)]
+        pub const CHP_SPRM_REGISTRY: &[(u16, &str, &str)] = &[
+            $($(($opcode, $spec_name, $section),)+)*
+        ];
+
+        fn dispatch_chp_sprm(props: &mut ChpProps, opcode: u16, operand: &[u8]) {
+            match opcode {
+                $(
+                    $($opcode)|+ => {
+                        let $props = props;
+                        let $operand = operand;
+                        $body
+                    },
+                )*
+                _ => {},
+            }
+        }
+    };
+}
+
+chp_sprm_dispatch! {
+    /// ToggleOperand (1 byte, spra 0): non-zero means deleted revision-mark
+    /// text.
+    "sprmCFRMarkDel" @ "2.6.1" => [0x0800] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.f_rmark_del = b != 0;
+        }
+    }
+
+    /// ToggleOperand (1 byte, spra 0): non-zero means inserted
+    /// revision-mark text.
+    "sprmCFRMarkIns" @ "2.6.1" => [0x0801] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.f_rmark_ins = b != 0;
+        }
+    }
+}
+
+/// Decode a CHP `grpprl` into the character flags we care about.
+///
+/// Unknown SPRMs are ignored. An empty `grpprl` yields the default
+/// (all-false) `ChpProps`, which classifies the run as ordinary,
+/// non-revision-marked text.
+pub fn extract_chp_props(grpprl: &[u8]) -> ChpProps {
+    let mut props = ChpProps::default();
+    for sprm in parse_grpprl(grpprl) {
+        dispatch_chp_sprm(&mut props, sprm.opcode, &sprm.operand);
+    }
+    props
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1093,5 +1177,69 @@ mod tests {
                 .is_empty(),
             "0xD632 = sprmTCellPadding"
         );
+    }
+
+    /// [MS-DOC] transcription for the CHP registry, mirroring
+    /// `MS_DOC_SPRM_TABLE` above. Issue #287/#288.
+    const MS_DOC_CHP_SPRM_TABLE: &[(u16, &str)] = &[
+        (0x0800, "sprmCFRMarkDel"),
+        (0x0801, "sprmCFRMarkIns"),
+    ];
+
+    #[test]
+    fn test_chp_registry_matches_the_spec_table() {
+        for &(opcode, name, section) in CHP_SPRM_REGISTRY {
+            let expected = MS_DOC_CHP_SPRM_TABLE
+                .iter()
+                .find(|(o, _)| *o == opcode)
+                .map(|(_, n)| *n);
+            assert_eq!(
+                expected,
+                Some(name),
+                "opcode 0x{opcode:04X} is decoded as {name}, but [MS-DOC] calls it {expected:?}"
+            );
+            assert!(
+                section.starts_with("2.6"),
+                "0x{opcode:04X} ({name}) must cite its [MS-DOC] §2.6.x section, got {section:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_chp_registry_has_no_duplicate_opcodes() {
+        let mut seen: Vec<u16> = CHP_SPRM_REGISTRY.iter().map(|(o, _, _)| *o).collect();
+        seen.sort_unstable();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(before, seen.len(), "duplicate opcode in the CHP dispatch");
+    }
+
+    #[test]
+    fn test_extract_chp_props_marks_deleted_and_inserted_runs() {
+        // sprmCFRMarkDel = 1
+        let props = extract_chp_props(&[0x00, 0x08, 0x01]);
+        assert!(props.f_rmark_del);
+        assert!(!props.f_rmark_ins);
+
+        // sprmCFRMarkIns = 1
+        let props = extract_chp_props(&[0x01, 0x08, 0x01]);
+        assert!(!props.f_rmark_del);
+        assert!(props.f_rmark_ins);
+
+        // A zero operand toggles the flag off, not on.
+        let props = extract_chp_props(&[0x00, 0x08, 0x00]);
+        assert!(!props.f_rmark_del);
+    }
+
+    #[test]
+    fn test_extract_chp_props_empty_grpprl_is_default() {
+        assert_eq!(extract_chp_props(&[]), ChpProps::default());
+    }
+
+    #[test]
+    fn test_extract_chp_props_ignores_unknown_opcodes() {
+        // 0x2416 = sprmPFInTable — a PAP opcode, must not affect CHP props.
+        let props = extract_chp_props(&[0x16, 0x24, 0x01]);
+        assert_eq!(props, ChpProps::default());
     }
 }

@@ -131,13 +131,6 @@ fn parse_plc_pcd(data: &[u8]) -> Result<Vec<Piece>> {
     Ok(pieces)
 }
 
-/// Extract text from the WordDocument stream using the piece table.
-/// `lid` is the FIB's language id (`Fib::lid`), which selects the
-/// codepage compressed (8-bit) runs decode with (issue #310).
-pub fn extract_text(word_doc: &[u8], pieces: &[Piece], max_chars: u32, lid: u16) -> String {
-    extract_text_range(word_doc, pieces, 0, max_chars, lid)
-}
-
 /// Whether `pieces` fully covers `[0, text_len)` with no gaps.
 ///
 /// A well-formed piece table starts at CP 0 and each piece picks up exactly
@@ -174,9 +167,9 @@ pub fn covers_declared_length(pieces: &[Piece], text_len: u32) -> bool {
 /// main document *and* every subdocument in a fixed order: main (`ccpText`),
 /// footnotes (`ccpFtn`), headers/footers (`ccpHdd`), comments (`ccpAtn`),
 /// endnotes (`ccpEdn`), text boxes (`ccpTxbx`) and header text boxes
-/// (`ccpHdrTxbx`). Reading only `[0, ccpText)` — which is all
-/// [`extract_text`] does — leaves every one of those unread, which is why
-/// the FIB's `ccp*` lengths were parsed and then never used.
+/// (`ccpHdrTxbx`). Reading only `[0, ccpText)` leaves every one of those
+/// unread, which is why the FIB's `ccp*` lengths were parsed and then never
+/// used.
 pub fn extract_text_range(
     word_doc: &[u8],
     pieces: &[Piece],
@@ -232,6 +225,47 @@ pub fn extract_text_range(
     text
 }
 
+/// Extract the text for `[range_start, range_end)`, skipping any CP
+/// sub-ranges named in `excluded` (already sorted, disjoint, and clipped
+/// to `[range_start, range_end)` by the caller — see
+/// `chpx::resolve_deleted_cp_ranges`).
+///
+/// This is what applies the "accepted view" policy for DOC's deleted
+/// revision-mark text (issue #288, the same policy already applied to
+/// DOCX's `w:del`): the excluded ranges are simply never read, rather than
+/// read and then filtered out of the decoded string, so a deleted range
+/// straddling a piece boundary or a multi-byte encoding still slices
+/// cleanly on a CP boundary.
+pub fn extract_text_range_excluding(
+    word_doc: &[u8],
+    pieces: &[Piece],
+    range_start: u32,
+    range_end: u32,
+    lid: u16,
+    excluded: &[(u32, u32)],
+) -> String {
+    if excluded.is_empty() {
+        return extract_text_range(word_doc, pieces, range_start, range_end, lid);
+    }
+    let mut text = String::new();
+    let mut cursor = range_start;
+    for &(ex_start, ex_end) in excluded {
+        let ex_start = ex_start.max(range_start);
+        let ex_end = ex_end.min(range_end);
+        if ex_end <= ex_start || ex_start >= range_end {
+            continue;
+        }
+        if cursor < ex_start {
+            text.push_str(&extract_text_range(word_doc, pieces, cursor, ex_start, lid));
+        }
+        cursor = cursor.max(ex_end);
+    }
+    if cursor < range_end {
+        text.push_str(&extract_text_range(word_doc, pieces, cursor, range_end, lid));
+    }
+    text
+}
+
 /// The largest CP of `piece` that is actually backed by bytes in a stream of
 /// `word_doc_len` bytes.
 ///
@@ -264,7 +298,7 @@ pub(crate) fn piece_backed_cp_end(piece: &Piece, word_doc_len: usize) -> u32 {
 /// Decode the text in character-position range `[cp_start, cp_end)` straight
 /// from `word_doc`, walking the piece table.
 ///
-/// Unlike [`extract_text`] this is *per range*: callers slice by CP without
+/// Unlike [`extract_text_range`] this is *per range*: callers slice by CP without
 /// first collapsing the whole document into a flat `String`, so a surrogate
 /// pair (2 UTF-16 code units) in a Unicode piece is decoded into one `char`
 /// exactly where it belongs, and compressed (CP1252) pieces are decoded by
@@ -555,8 +589,56 @@ mod tests {
             is_compressed: true,
         }];
 
-        let text = extract_text(&word_doc, &pieces, 5, 0);
+        let text = extract_text_range(&word_doc, &pieces, 0, 5, 0);
         assert_eq!(text, "Hello");
+    }
+
+    /// Regression (issue #288): a deleted-revision-mark sub-range in the
+    /// middle of the text is skipped entirely, not decoded and then
+    /// filtered — the two flanking ranges are still joined correctly.
+    #[test]
+    fn test_extract_text_range_excluding_skips_middle_range() {
+        let mut word_doc = vec![0u8; 256];
+        word_doc[0..7].copy_from_slice(b"ABCDEFG");
+        let pieces = vec![Piece {
+            cp_start: 0,
+            cp_end: 7,
+            fc: 0x4000_0000, // compressed, offset = 0
+            is_compressed: true,
+        }];
+
+        let text = extract_text_range_excluding(&word_doc, &pieces, 0, 7, 0, &[(2, 5)]);
+        assert_eq!(text, "ABFG");
+    }
+
+    #[test]
+    fn test_extract_text_range_excluding_no_ranges_matches_plain_extract() {
+        let mut word_doc = vec![0u8; 256];
+        word_doc[0..5].copy_from_slice(b"Hello");
+        let pieces = vec![Piece {
+            cp_start: 0,
+            cp_end: 5,
+            fc: 0x4000_0000,
+            is_compressed: true,
+        }];
+        assert_eq!(
+            extract_text_range_excluding(&word_doc, &pieces, 0, 5, 0, &[]),
+            extract_text_range(&word_doc, &pieces, 0, 5, 0)
+        );
+    }
+
+    /// A deletion covering the whole range leaves nothing.
+    #[test]
+    fn test_extract_text_range_excluding_covers_whole_range() {
+        let mut word_doc = vec![0u8; 256];
+        word_doc[0..5].copy_from_slice(b"Hello");
+        let pieces = vec![Piece {
+            cp_start: 0,
+            cp_end: 5,
+            fc: 0x4000_0000,
+            is_compressed: true,
+        }];
+        assert_eq!(extract_text_range_excluding(&word_doc, &pieces, 0, 5, 0, &[(0, 5)]), "");
     }
 
     #[test]
@@ -576,7 +658,7 @@ mod tests {
             is_compressed: false,
         }];
 
-        let text = extract_text(&word_doc, &pieces, 2, 0);
+        let text = extract_text_range(&word_doc, &pieces, 0, 2, 0);
         assert_eq!(text, "Hi");
     }
 
@@ -605,7 +687,7 @@ mod tests {
             },
         ];
 
-        let text = extract_text(&word_doc, &pieces, 4, 0);
+        let text = extract_text_range(&word_doc, &pieces, 0, 4, 0);
         assert_eq!(text, "ABCD");
     }
 
@@ -691,7 +773,7 @@ mod tests {
             is_compressed: true,
         }];
 
-        let text = extract_text(&word_doc, &pieces, 3, 0);
+        let text = extract_text_range(&word_doc, &pieces, 0, 3, 0);
         assert_eq!(text, "Hel");
     }
 
@@ -958,7 +1040,7 @@ mod multi_piece_tests {
 
         let pieces = parse_clx(&c).expect("parse");
         assert_eq!(pieces.len(), 3);
-        assert_eq!(extract_text(&word_doc, &pieces, 6, 0), "ABCDEF");
+        assert_eq!(extract_text_range(&word_doc, &pieces, 0, 6, 0), "ABCDEF");
     }
 
     /// Ranges must be clipped at both ends, which is what lets the

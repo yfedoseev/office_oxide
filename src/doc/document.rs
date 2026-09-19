@@ -9,7 +9,10 @@ use super::fib::Fib;
 use super::images::{DocImage, extract_images};
 use super::list_format::ListFormatting;
 use super::papx::{DocParagraph, build_paragraphs, parse_papx_paragraphs};
-use super::piece_table::{covers_declared_length, extract_text, parse_clx, sanitize_text};
+use super::chpx::resolve_deleted_cp_ranges;
+use super::piece_table::{
+    covers_declared_length, extract_text_range_excluding, parse_clx, sanitize_text,
+};
 
 /// A parsed legacy Word document.
 #[derive(Debug)]
@@ -195,7 +198,34 @@ impl DocDocument {
         let pieces = parse_clx(clx_data)?;
         let text_complete = covers_declared_length(&pieces, fib.text_len);
 
-        let raw_text = extract_text(&word_doc, &pieces, fib.text_len, fib.lid);
+        // Deleted revision-mark text (`sprmCFRMarkDel`) is excluded from the
+        // main text up front, at extraction time — the same "accepted view"
+        // policy already applied to DOCX's `w:del` (issue #288). Structured
+        // paragraph text (`paragraphs()`, used by `doc_to_ir`) is left
+        // unfiltered for now: splicing deletions out of a multi-run
+        // paragraph while preserving field-code (`HYPERLINK`) boundaries is
+        // part of the larger CHP-formatting work tracked by issue #287, not
+        // this minimal fix.
+        let deleted_ranges = if fib.fc_plcf_bte_chpx != 0 && fib.lcb_plcf_bte_chpx != 0 {
+            resolve_deleted_cp_ranges(
+                &word_doc,
+                &table_stream,
+                &pieces,
+                fib.fc_plcf_bte_chpx,
+                fib.lcb_plcf_bte_chpx,
+                fib.text_len,
+            )
+        } else {
+            Vec::new()
+        };
+        let raw_text = extract_text_range_excluding(
+            &word_doc,
+            &pieces,
+            0,
+            fib.text_len,
+            fib.lid,
+            &deleted_ranges,
+        );
         let text = sanitize_text(&raw_text);
 
         // Needed inside the loop below to resolve each comment's author by
