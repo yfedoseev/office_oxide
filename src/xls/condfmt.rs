@@ -2,7 +2,7 @@
 //! rule group over a cell range, followed by `ccf` `CF` (`0x01B1`) records,
 //! one per rule. No record handling for either existed at all before this
 //! module — conditional formatting was a total scope gap, not merely an
-//! extraction bug (issue #252).
+//! extraction bug.
 //!
 //! Byte layouts verified against the published [MS-XLS] `CondFmt` and `CF`
 //! spec pages, including their own worked byte examples.
@@ -139,7 +139,7 @@ mod tests {
     /// The exact byte shape from [MS-XLS]'s own "Structure of CondFmt"
     /// worked example: ccf=1, one range B2:B2 (0-based row/col 1,1).
     #[test]
-    fn parses_the_spec_worked_example() {
+    fn test_parses_the_spec_worked_example() {
         let data = condfmt_record(1, &[(1, 1, 0, 0)]);
         let (range, ccf) = parse_condfmt(&data).unwrap();
         assert_eq!(range, "A2");
@@ -147,19 +147,19 @@ mod tests {
     }
 
     #[test]
-    fn multi_range_sqref_is_space_joined() {
+    fn test_multi_range_sqref_is_space_joined() {
         let data = condfmt_record(1, &[(0, 0, 0, 0), (2, 4, 1, 2)]);
         let (range, _) = parse_condfmt(&data).unwrap();
         assert_eq!(range, "A1 B3:C5");
     }
 
     #[test]
-    fn truncated_condfmt_is_none_not_a_panic() {
+    fn test_truncated_condfmt_is_none_not_a_panic() {
         assert!(parse_condfmt(&[0u8; 4]).is_none());
     }
 
     #[test]
-    fn cell_is_between_rule() {
+    fn test_cell_is_between_rule() {
         let cf = parse_cf("A1:A10", &[0x01, 0x01]).unwrap();
         assert_eq!(cf.range, "A1:A10");
         assert_eq!(cf.rule_type, "cellIs");
@@ -168,19 +168,19 @@ mod tests {
     }
 
     #[test]
-    fn expression_rule_has_no_operator() {
+    fn test_expression_rule_has_no_operator() {
         let cf = parse_cf("B1:B5", &[0x02, 0x00]).unwrap();
         assert_eq!(cf.rule_type, "expression");
         assert!(cf.operator.is_none());
     }
 
     #[test]
-    fn truncated_cf_is_none_not_a_panic() {
+    fn test_truncated_cf_is_none_not_a_panic() {
         assert!(parse_cf("A1", &[0x01]).is_none());
     }
 
     #[test]
-    fn col_name_basic() {
+    fn test_col_name_basic() {
         assert_eq!(col_name(0), "A");
         assert_eq!(col_name(25), "Z");
         assert_eq!(col_name(26), "AA");

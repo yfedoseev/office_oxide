@@ -5,8 +5,7 @@
 //! *separate* part, reachable only through the drawing's
 //! `<c:chart r:id="…"/>` relationship. The referencing part itself holds no
 //! text at all, so a reader that never opens the chart part loses the chart
-//! title, the axis titles, every category label and every cached data value
-//! (issues #239 / #273).
+//! title, the axis titles, every category label and every cached data value.
 //!
 //! This module holds the reader for that part. It is deliberately
 //! independent of the XLSX reader's own `extract_chart_text` (which does the

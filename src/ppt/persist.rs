@@ -254,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_directory_entry_bit_layout() {
+    fn test_persist_directory_entry_bit_layout() {
         // persistId=5 (low 20 bits), cPersist=3 (high 12 bits), 3 offsets.
         let pd = persist_directory_bytes(&[(5, 100), (6, 200), (7, 300)]);
         let mut stream = vec![0u8; 16];
@@ -264,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_current_edit_via_current_user_stream() {
+    fn test_resolves_current_edit_via_current_user_stream() {
         let mut stream = Vec::new();
         let pd_offset = stream.len() as u32;
         stream.extend(persist_directory_bytes(&[(1, 0), (2, 42)]));
@@ -280,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_brute_force_scan_without_current_user_stream() {
+    fn test_falls_back_to_brute_force_scan_without_current_user_stream() {
         let mut stream = Vec::new();
         let pd_offset = stream.len() as u32;
         stream.extend(persist_directory_bytes(&[(1, 0), (2, 42)]));
@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn newer_edit_entry_wins_over_older_edit_for_same_persist_id() {
+    fn test_newer_edit_entry_wins_over_older_edit_for_same_persist_id() {
         let mut stream = Vec::new();
 
         // Oldest edit: persist id 2 -> stale offset 10.
@@ -312,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn cyclic_offset_last_edit_does_not_hang() {
+    fn test_cyclic_offset_last_edit_does_not_hang() {
         let mut stream = Vec::new();
         let pd_offset = stream.len() as u32;
         stream.extend(persist_directory_bytes(&[(1, 0)]));
@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn no_user_edit_atom_returns_none() {
+    fn test_no_user_edit_atom_returns_none() {
         assert!(build(&[], None).is_none());
         assert!(build(b"not a ppt stream at all", None).is_none());
     }

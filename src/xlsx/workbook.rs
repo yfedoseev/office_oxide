@@ -162,7 +162,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_workbook_with_sheets() {
+    fn test_parse_workbook_with_sheets() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_workbook_date1904() {
+    fn test_parse_workbook_date1904() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -196,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_workbook_defined_names() {
+    fn test_parse_workbook_defined_names() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">

@@ -263,7 +263,7 @@ mod determinism_tests {
     /// time, because parts, part rels and content-type overrides were all
     /// iterated out of `HashMap`s.
     #[test]
-    fn saving_the_same_package_twice_produces_the_same_bytes() {
+    fn test_saving_the_same_package_twice_produces_the_same_bytes() {
         let mut wb = crate::xlsx::write::XlsxWriter::new();
         for n in ["Alpha", "Beta", "Gamma", "Delta"] {
             wb.add_sheet(n)

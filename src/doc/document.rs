@@ -33,48 +33,44 @@ pub struct DocDocument {
     /// consumer.
     subdocuments: Vec<SubDocument>,
     /// `true` when the CFB container has a top-level `_VBA_PROJECT`
-    /// storage — a cheap macro-presence signal, no VBA interpretation
-    /// (issue #283).
+    /// storage — a cheap macro-presence signal, no VBA interpretation.
     has_macros: bool,
     /// `false` when the piece table has a gap before the FIB's declared
     /// `ccpText` — text in that gap is silently absent from `plain_text()`/
     /// `paragraphs()` with no other signal, so a caller who cares can at
-    /// least tell "genuinely short document" apart from "84% missing"
-    /// (issue #230).
+    /// least tell "genuinely short document" apart from "84% missing".
     text_complete: bool,
     /// Title/author/subject/keywords/comments/dates from the
     /// `\x05SummaryInformation` OLE property-set stream every real
     /// `.doc` carries by default — parsed and then never read anywhere
-    /// in the crate before (issue #244).
+    /// in the crate before.
     summary_properties: Option<SummaryProperties>,
     /// `PlfLst`/`PlfLfo` list definitions, resolving a paragraph's
     /// `(ilfo, ilvl)` to its declared start-at value and number format —
     /// parsed from a FIB pointer that was previously read and then never
-    /// used anywhere in the crate (issue #250).
+    /// used anywhere in the crate.
     list_formatting: ListFormatting,
     /// Comment author names, parsed from `GrpXstAtnOwners`. The FIB
     /// fields locating this array (`fcGrpXstAtnOwners`/
     /// `lcbGrpXstAtnOwners`) were never parsed at all before, so every
-    /// `.doc` comment's authorship was unrecoverable (issue #298).
+    /// `.doc` comment's authorship was unrecoverable.
     comment_authors: Vec<String>,
     /// The first section's header/footer content, parsed from `PlcfHdd`.
     /// Before this, the entire header document collapsed into one
     /// unlabeled, duplicated blob with no way to tell header from
-    /// footer, first-page from default, or one section from another
-    /// (issue #285).
+    /// footer, first-page from default, or one section from another.
     header_footer: HeaderFooterStories,
     /// Individual comments, split from the merged Comments substory using
     /// `PlcfandTxt`'s CP boundaries and attributed via `PlcfandRef`'s
     /// `ATRDPre10.ibst` index into `comment_authors`. Empty when either
     /// PLC is absent, malformed, or the two disagree on comment count —
-    /// callers fall back to the merged-substory behavior in that case
-    /// (issue #345).
+    /// callers fall back to the merged-substory behavior in that case.
     comments: Vec<ParsedComment>,
     /// Embedded OLE objects (Excel workbooks, Equation Editor/MathType,
     /// OLE Package, embedded Word/PowerPoint, etc.) found under the
     /// root's `ObjectPool` storage, identified by presence of a
     /// well-known stream name. Empty when there's no `ObjectPool` at
-    /// all (issue #284).
+    /// all.
     ole_objects: Vec<super::ole_objects::EmbeddedOleObject>,
 }
 
@@ -88,7 +84,7 @@ pub struct SubDocument {
 }
 
 /// One comment, split out of the merged Comments substory by `PlcfandTxt`
-/// and attributed by the matching `PlcfandRef` entry (issue #345).
+/// and attributed by the matching `PlcfandRef` entry.
 #[derive(Debug, Clone)]
 pub struct ParsedComment {
     /// Sanitised body text of this one comment.
@@ -101,8 +97,7 @@ pub struct ParsedComment {
 /// The first document section's header/footer content, split out of the
 /// merged header-document blob using `PlcfHdd`'s story boundaries. Only
 /// the first section's 6 stories are captured — matches this crate's DOC
-/// model, which builds exactly one `ir::Section` for the whole document
-/// (issue #285).
+/// model, which builds exactly one `ir::Section` for the whole document.
 #[derive(Debug, Clone, Default)]
 pub struct HeaderFooterStories {
     /// Even-page header (story 0 of a section's group).
@@ -200,7 +195,7 @@ impl DocDocument {
 
         // The CHPX FKP is parsed once here (rather than separately by each
         // consumer) since both the deleted-revision-mark filter below and
-        // `build_paragraphs`'s per-run character formatting (issue #287)
+        // `build_paragraphs`'s per-run character formatting
         // need it, and a CHPX FKP walk is not cheap to repeat.
         let chpx_runs = if fib.fc_plcf_bte_chpx != 0 && fib.lcb_plcf_bte_chpx != 0 {
             parse_chpx_runs(&word_doc, &table_stream, fib.fc_plcf_bte_chpx, fib.lcb_plcf_bte_chpx)
@@ -210,13 +205,13 @@ impl DocDocument {
 
         // Deleted revision-mark text (`sprmCFRMarkDel`) is excluded from the
         // main flat text up front, at extraction time — the same "accepted
-        // view" policy already applied to DOCX's `w:del` (issue #288).
+        // view" policy already applied to DOCX's `w:del`.
         // Structured paragraph text (`paragraphs()`, used by `doc_to_ir`) is
         // left unfiltered: splicing deletions out of a multi-run paragraph
         // while preserving field-code (`HYPERLINK`) boundaries, on top of
         // the per-run character formatting `build_paragraphs` now also
-        // carries (issue #287), is more than this fix attempts — it stays a
-        // deliberately separate, still-open piece of #288's own scope.
+        // carries, is more than this fix attempts — it stays a
+        // deliberately separate, still-open piece of revision-mark handling.
         let deleted_ranges = resolve_deleted_cp_ranges_from_runs(&chpx_runs, &pieces, fib.text_len);
         let raw_text = extract_text_range_excluding(
             &word_doc,
@@ -230,7 +225,7 @@ impl DocDocument {
 
         // Needed inside the loop below to resolve each comment's author by
         // `ibst` index — parsed here (it only needs `table_stream`/`fib`,
-        // not anything the loop computes) rather than after it. Issue #298.
+        // not anything the loop computes) rather than after it.
         let comment_authors = parse_grp_xst_atn_owners(
             &table_stream,
             fib.fc_grp_xst_atn_owners,
@@ -315,7 +310,7 @@ impl DocDocument {
         // At minimum, recognize an embedded OLE object exists and
         // surface its identity — before this, `ObjectPool` was never
         // traversed at all, so an embedded Excel workbook, Equation
-        // Editor object, etc. left no trace anywhere (issue #284).
+        // Editor object, etc. left no trace anywhere.
         let ole_objects = super::ole_objects::extract_ole_objects(&cfb);
         let summary_properties = cfb
             .open_stream("\u{5}SummaryInformation")
@@ -359,7 +354,7 @@ impl DocDocument {
     /// Empty when the document has no comments. There is no per-comment
     /// author correlation here (that needs `PlcfAtn`/`ATRD`, tracked
     /// separately) — when this holds exactly one name, every comment in
-    /// the document was written by that single author (issue #298).
+    /// the document was written by that single author.
     pub(crate) fn comment_authors(&self) -> &[String] {
         &self.comment_authors
     }
@@ -367,7 +362,7 @@ impl DocDocument {
     /// The first section's header/footer content, split from `PlcfHdd`.
     /// All fields are `None` when the document has no header document at
     /// all, or its `PlcfHdd` doesn't cover a full section's worth of
-    /// stories (issue #285).
+    /// stories.
     pub(crate) fn header_footer(&self) -> &HeaderFooterStories {
         &self.header_footer
     }
@@ -375,42 +370,40 @@ impl DocDocument {
     /// Individual comments split from the merged Comments substory, each
     /// with its own resolved author. Empty when `PlcfandTxt`/`PlcfandRef`
     /// couldn't be parsed or disagreed on comment count — callers must
-    /// fall back to the merged-substory behavior in that case (issue
-    /// #345).
+    /// fall back to the merged-substory behavior in that case.
     pub(crate) fn comments(&self) -> &[ParsedComment] {
         &self.comments
     }
 
     /// Embedded OLE objects found under `ObjectPool`, identified by
     /// presence of a well-known stream name. Empty when there's no
-    /// `ObjectPool` at all, or it's empty/unrecognizable (issue #284).
+    /// `ObjectPool` at all, or it's empty/unrecognizable.
     pub(crate) fn ole_objects(&self) -> &[super::ole_objects::EmbeddedOleObject] {
         &self.ole_objects
     }
 
     /// `true` when the file carries a `_VBA_PROJECT` storage — a cheap
-    /// macro-presence signal, no VBA interpretation (issue #283).
+    /// macro-presence signal, no VBA interpretation.
     pub fn has_macros(&self) -> bool {
         self.has_macros
     }
 
     /// `false` when the piece table has a gap before the FIB's declared
     /// text length, meaning `plain_text()`/`paragraphs()` are missing real
-    /// content that could not be safely recovered (issue #230).
+    /// content that could not be safely recovered.
     pub fn text_complete(&self) -> bool {
         self.text_complete
     }
 
     /// Title/author/subject/keywords/comments/dates from the file's
     /// `\x05SummaryInformation` OLE property set, when present and
-    /// well-formed (issue #244).
+    /// well-formed.
     pub fn summary_properties(&self) -> Option<&crate::cfb::SummaryProperties> {
         self.summary_properties.as_ref()
     }
 
     /// `PlfLst`/`PlfLfo` list definitions, resolving a paragraph's
-    /// `(ilfo, ilvl)` to its declared start-at value and number format
-    /// (issue #250).
+    /// `(ilfo, ilvl)` to its declared start-at value and number format.
     pub(crate) fn list_formatting(&self) -> &ListFormatting {
         &self.list_formatting
     }
@@ -420,7 +413,7 @@ impl DocDocument {
     /// Includes footnote/endnote/comment/textbox bodies — `to_ir()` (via
     /// `doc_to_ir`) already carries this content as its own elements, and
     /// leaving it out here made this renderer disagree with that one, the
-    /// same gap already fixed for DOCX in #240 (issue #248).
+    /// same gap already fixed for DOCX.
     pub fn plain_text(&self) -> String {
         let mut out = self.text.clone();
         for sub in &self.subdocuments {
@@ -453,7 +446,7 @@ impl DocDocument {
     /// Convert to markdown (basic: paragraphs separated by blank lines).
     ///
     /// Includes footnote/endnote/comment/textbox bodies — see the
-    /// identical note on `plain_text()` (issue #248).
+    /// identical note on `plain_text()`.
     pub fn to_markdown(&self) -> String {
         let mut result = text_to_markdown_blocks(&self.text);
         for sub in &self.subdocuments {
@@ -504,7 +497,7 @@ fn clx_size_zero_or_oob(clx_size: u32, clx_start: usize, stream_len: usize) -> b
 /// back-to-back at `fc` for `lcb` bytes in the Table stream. Each entry is
 /// a `u16` character count `cch` followed by `cch` UTF-16LE code units —
 /// no STTBF-style count/extra-data header, per [MS-DOC] §2.5.5's
-/// description of `fcGrpXstAtnOwners`. Issue #298.
+/// description of `fcGrpXstAtnOwners`.
 fn parse_grp_xst_atn_owners(table_stream: &[u8], fc: u32, lcb: u32) -> Vec<String> {
     if lcb == 0 {
         return Vec::new();
@@ -548,7 +541,7 @@ fn parse_grp_xst_atn_owners(table_stream: &[u8], fc: u32, lcb: u32) -> Vec<Strin
 /// so `aCP[0..=n]` (`n + 1` values) are the usual PLC boundary CPs for
 /// `n` elements, per [MS-DOC] "Plcfhdd". This crate models only one
 /// `ir::Section` for the whole document, so only the first section's
-/// group (stories 6..12) is extracted (issue #285).
+/// group (stories 6..12) is extracted.
 fn parse_plcf_hdd_stories(
     table_stream: &[u8],
     raw_header_text: &str,
@@ -615,7 +608,7 @@ fn parse_plcf_hdd_stories(
 /// `Vec` (meaning "fall back to the merged substory") whenever either
 /// PLC is absent/malformed, or the two disagree on comment count — that
 /// mismatch means the file doesn't match the fixed-size assumptions
-/// here closely enough to trust a per-comment split (issue #345).
+/// here closely enough to trust a per-comment split.
 fn parse_comments(
     table_stream: &[u8],
     raw_comment_text: &str,
@@ -750,7 +743,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn markdown_double_spacing() {
+    fn test_markdown_double_spacing() {
         let doc = DocDocument {
             subdocuments: Vec::new(),
             has_macros: false,
@@ -772,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_access() {
+    fn test_plain_text_access() {
         let doc = DocDocument {
             subdocuments: Vec::new(),
             has_macros: false,
@@ -790,13 +783,13 @@ mod tests {
         assert_eq!(doc.plain_text(), "Hello World");
     }
 
-    /// issue #248 — `plain_text()`/`to_markdown()` only ever walked
+    /// `plain_text()`/`to_markdown()` only ever walked
     /// `self.text` (the main body), never `self.subdocuments`, so a
     /// footnote/endnote/comment/textbox-only document silently vanished
     /// from both renderers even though `to_ir()` (via `doc_to_ir`) already
     /// carried the content correctly.
     #[test]
-    fn plain_text_and_markdown_include_subdocument_bodies() {
+    fn test_plain_text_and_markdown_include_subdocument_bodies() {
         let doc = DocDocument {
             subdocuments: vec![
                 SubDocument { kind: SubDocumentKind::Footnotes, text: "FOOTNOTE ONE".into() },
@@ -828,7 +821,7 @@ mod tests {
     /// An empty subdocument body must contribute nothing — no stray blank
     /// paragraphs or extra separators.
     #[test]
-    fn empty_subdocuments_are_skipped_in_both_renderers() {
+    fn test_empty_subdocuments_are_skipped_in_both_renderers() {
         let doc = DocDocument {
             subdocuments: vec![SubDocument { kind: SubDocumentKind::Comments, text: "  \n ".into() }],
             has_macros: false,
@@ -849,9 +842,9 @@ mod tests {
 
     /// `text_complete()` reaches `to_ir()`'s `Metadata::text_truncated` so
     /// a caller who never inspects `DocDocument` directly can still tell a
-    /// piece-table gap apart from a genuinely short document (issue #230).
+    /// piece-table gap apart from a genuinely short document.
     #[test]
-    fn incomplete_text_reaches_metadata_as_truncated() {
+    fn test_incomplete_text_reaches_metadata_as_truncated() {
         let doc = DocDocument {
             subdocuments: Vec::new(),
             has_macros: false,
@@ -876,7 +869,7 @@ mod tests {
 
     /// The common case: a complete piece table must not be flagged.
     #[test]
-    fn complete_text_is_not_flagged_truncated() {
+    fn test_complete_text_is_not_flagged_truncated() {
         let doc = make_doc("Hello World");
         assert!(doc.text_complete());
         let ir = crate::convert_doc::doc_to_ir(&doc);
@@ -942,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_list_emits_nested_list_from_ilvl_paragraphs() {
+    fn test_ir_list_emits_nested_list_from_ilvl_paragraphs() {
         use crate::ir::Element;
         let doc = make_doc_with_paragraphs(vec![
             pap("Intro.", Default::default()),
@@ -971,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_consecutive_list_runs_split_on_prose() {
+    fn test_ir_consecutive_list_runs_split_on_prose() {
         use crate::ir::Element;
         let doc = make_doc_with_paragraphs(vec![
             pap("A1", list_props(0)),
@@ -990,14 +983,14 @@ mod tests {
     }
 
     #[test]
-    fn ir_empty_doc_produces_empty_section() {
+    fn test_ir_empty_doc_produces_empty_section() {
         let ir = crate::convert_doc::doc_to_ir(&make_doc(""));
         assert!(ir.sections[0].elements.is_empty());
         assert!(ir.metadata.title.is_none());
     }
 
     #[test]
-    fn ir_allcaps_first_line_becomes_h1() {
+    fn test_ir_allcaps_first_line_becomes_h1() {
         use crate::ir::Element;
         let ir = crate::convert_doc::doc_to_ir(&make_doc("INTRODUCTION\nSome text here."));
         assert_eq!(ir.metadata.title.as_deref(), Some("INTRODUCTION"));
@@ -1005,34 +998,34 @@ mod tests {
     }
 
     #[test]
-    fn ir_first_short_line_no_punct_becomes_h1() {
+    fn test_ir_first_short_line_no_punct_becomes_h1() {
         use crate::ir::Element;
         let ir = crate::convert_doc::doc_to_ir(&make_doc("My Document Title\nThis is body text."));
         assert!(matches!(ir.sections[0].elements[0], Element::Heading(ref h) if h.level == 1));
     }
 
     #[test]
-    fn ir_allcaps_non_first_line_becomes_h2() {
+    fn test_ir_allcaps_non_first_line_becomes_h2() {
         use crate::ir::Element;
         let ir = crate::convert_doc::doc_to_ir(&make_doc("Title\nSECTION TWO\nBody text."));
         assert!(matches!(ir.sections[0].elements[1], Element::Heading(ref h) if h.level == 2));
     }
 
     #[test]
-    fn ir_line_ending_with_period_becomes_paragraph() {
+    fn test_ir_line_ending_with_period_becomes_paragraph() {
         use crate::ir::Element;
         let ir = crate::convert_doc::doc_to_ir(&make_doc("This is a sentence."));
         assert!(matches!(ir.sections[0].elements[0], Element::Paragraph(_)));
     }
 
     #[test]
-    fn ir_blank_lines_are_skipped() {
+    fn test_ir_blank_lines_are_skipped() {
         let ir = crate::convert_doc::doc_to_ir(&make_doc("Title\n\n\nText"));
         assert_eq!(ir.sections[0].elements.len(), 2);
     }
 
     #[test]
-    fn ir_list_run_with_nonzero_base_level_keeps_every_item() {
+    fn test_ir_list_run_with_nonzero_base_level_keeps_every_item() {
         // Regression: `.doc` list levels are not guaranteed to start at 0.
         // Word's `simple-list.doc` fixture writes `ilvl = 1` for a flat list,
         // which used to collapse the run to a single item because
@@ -1054,15 +1047,15 @@ mod tests {
     }
 
     #[test]
-    fn ir_format_is_doc() {
+    fn test_ir_format_is_doc() {
         let ir = crate::convert_doc::doc_to_ir(&make_doc("content"));
         assert_eq!(ir.metadata.format, crate::format::DocumentFormat::Doc);
     }
 
-    /// issue #244 — `SummaryInformation` fields must reach `Metadata`, and
+    /// `SummaryInformation` fields must reach `Metadata`, and
     /// the declared title must beat the heading-guess title.
     #[test]
-    fn ir_summary_properties_reach_metadata() {
+    fn test_ir_summary_properties_reach_metadata() {
         let mut doc = make_doc("SOME ALL-CAPS HEADING\nBody text follows.");
         doc.summary_properties = Some(SummaryProperties {
             title: Some("Declared Title".to_string()),
@@ -1084,9 +1077,9 @@ mod tests {
     }
 
     /// A missing/empty title in `SummaryInformation` must not shadow the
-    /// heading-guess fallback (issue #244 must not regress issue #224).
+    /// heading-guess fallback (metadata must not regress the heading guess).
     #[test]
-    fn ir_empty_summary_title_falls_back_to_heading_guess() {
+    fn test_ir_empty_summary_title_falls_back_to_heading_guess() {
         let mut doc = make_doc("A HEADING LINE\nBody text follows.");
         doc.summary_properties = Some(SummaryProperties {
             title: Some(String::new()),
@@ -1096,11 +1089,11 @@ mod tests {
         assert_eq!(ir.metadata.title.as_deref(), Some("A HEADING LINE"));
     }
 
-    /// issue #298 — `GrpXstAtnOwners` is an array of XSTs packed
+    /// `GrpXstAtnOwners` is an array of XSTs packed
     /// back-to-back with no STTBF-style header: each entry is a `cch`
     /// `u16` followed by `cch` UTF-16LE code units.
     #[test]
-    fn grp_xst_atn_owners_parses_multiple_packed_entries() {
+    fn test_grp_xst_atn_owners_parses_multiple_packed_entries() {
         let mut data = Vec::new();
         for name in ["Michael McCandless", "Miklos Vajna"] {
             let units: Vec<u16> = name.encode_utf16().collect();
@@ -1114,16 +1107,16 @@ mod tests {
     }
 
     #[test]
-    fn grp_xst_atn_owners_zero_length_is_empty() {
+    fn test_grp_xst_atn_owners_zero_length_is_empty() {
         let data = vec![0u8; 32];
         assert!(parse_grp_xst_atn_owners(&data, 4, 0).is_empty());
     }
 
-    /// issue #298 — a single declared comment author unambiguously
+    /// A single declared comment author unambiguously
     /// attributes every comment in the document; `doc_to_ir` must carry
     /// it onto the merged Comments `Note` via the new `author` field.
     #[test]
-    fn a_single_comment_author_reaches_the_comments_note() {
+    fn test_a_single_comment_author_reaches_the_comments_note() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
         doc.subdocuments =
@@ -1143,7 +1136,7 @@ mod tests {
     /// per-subdocument (not per-comment) `Note` without `PlcfAtn`/`ATRD`
     /// correlation — leave `author` unset rather than guess wrong.
     #[test]
-    fn multiple_comment_authors_leave_the_note_author_unset() {
+    fn test_multiple_comment_authors_leave_the_note_author_unset() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
         doc.subdocuments =
@@ -1159,7 +1152,7 @@ mod tests {
         assert_eq!(note.author, None);
     }
 
-    /// issue #286 — every footnote in a document used to collapse into a
+    /// Every footnote in a document used to collapse into a
     /// single `Element::Footnote` holding all footnotes concatenated.
     /// Each footnote is self-delimited in its own substory text by a
     /// leading `\u{2}` (auto-number reference-mark) character — verified
@@ -1168,7 +1161,7 @@ mod tests {
     /// (comments' reference point lives only in the main text via
     /// `PlcfAtn`, not duplicated into the substory).
     #[test]
-    fn footnotes_split_into_one_element_per_reference_mark() {
+    fn test_footnotes_split_into_one_element_per_reference_mark() {
         use crate::ir::{Element, InlineContent, Note};
         let mut doc = make_doc("Body text.");
         doc.subdocuments = vec![SubDocument {
@@ -1206,11 +1199,11 @@ mod tests {
 
     /// Comments never carry the `\u{2}` marker in their own substory (see
     /// above) — real per-comment splitting comes from `PlcfandTxt`
-    /// instead (issue #345, tested separately). When that PLC is absent
+    /// instead (tested separately). When that PLC is absent
     /// (as here, with `doc.comments()` at its default empty `Vec`), the
     /// old merged-into-one-Note behavior is the only safe fallback.
     #[test]
-    fn comments_stay_merged_into_a_single_note() {
+    fn test_comments_stay_merged_into_a_single_note() {
         use crate::ir::{Element, Note};
         let mut doc = make_doc("Body text.");
         doc.subdocuments = vec![SubDocument {
@@ -1224,18 +1217,18 @@ mod tests {
             .iter()
             .filter_map(|e| if let Element::Endnote(n) = e { Some(n) } else { None })
             .collect();
-        assert_eq!(comments.len(), 1, "comments must stay merged until PlcfAtn is parsed (#286)");
+        assert_eq!(comments.len(), 1, "comments must stay merged until PlcfAtn is parsed");
         assert_eq!(comments[0].content.len(), 2, "both lines must still reach the one Note");
     }
 
-    /// issue #285 — byte-level `PlcfHdd` parsing for a single-section
+    /// byte-level `PlcfHdd` parsing for a single-section
     /// document. `aCP` has `n + 2 = 14` entries for `n = 12` stories (the
     /// 6 fixed separators + this one section's 6 header/footer stories):
     /// the first 6 (indices 0..6) are all-empty separators, story 6..12
     /// hold the real content, `aCP[12]` closes the last story, and
     /// `aCP[13]` is the spec's own "undefined, must be ignored" filler.
     #[test]
-    fn plcf_hdd_splits_the_first_sections_six_stories() {
+    fn test_plcf_hdd_splits_the_first_sections_six_stories() {
         let raw = "EVEN HEADERODD HEADEREVEN FOOTERODD FOOTERFIRST HEADERFIRST FOOTERX";
         assert_eq!(raw.chars().count(), 67, "fixture text must match the cps below exactly");
 
@@ -1255,13 +1248,13 @@ mod tests {
     }
 
     #[test]
-    fn plcf_hdd_zero_length_yields_no_stories() {
+    fn test_plcf_hdd_zero_length_yields_no_stories() {
         let stories = parse_plcf_hdd_stories(&[0u8; 8], "", 0, 0);
         assert!(stories.is_empty());
     }
 
     #[test]
-    fn plcf_hdd_shorter_than_one_section_yields_no_stories() {
+    fn test_plcf_hdd_shorter_than_one_section_yields_no_stories() {
         // Only the 6 fixed separators (n=6, needs n+2=8 CPs) — no
         // section's worth of header/footer stories at all.
         let table_stream = vec![0u8; 8 * 4];
@@ -1269,12 +1262,12 @@ mod tests {
         assert!(stories.is_empty());
     }
 
-    /// issue #285 — `doc_to_ir` must attach `PlcfHdd`-derived stories to
+    /// `doc_to_ir` must attach `PlcfHdd`-derived stories to
     /// the real `Section.header`/`.footer`/etc fields instead of dumping
     /// the merged blob as a generic `TextBox`, and must still fall back
     /// to the old behavior when no structured data is available.
     #[test]
-    fn header_footer_stories_reach_the_section_fields() {
+    fn test_header_footer_stories_reach_the_section_fields() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
         doc.subdocuments = vec![SubDocument {
@@ -1300,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    fn header_footer_falls_back_to_a_textbox_when_plcf_hdd_is_absent() {
+    fn test_header_footer_falls_back_to_a_textbox_when_plcf_hdd_is_absent() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
         doc.subdocuments = vec![SubDocument {
@@ -1319,13 +1312,13 @@ mod tests {
         );
     }
 
-    /// issue #345 — byte-level `PlcfandTxt`/`PlcfandRef` parsing for a
+    /// byte-level `PlcfandTxt`/`PlcfandRef` parsing for a
     /// 2-comment document. `PlcfandTxt.aCP` has `n + 2 = 4` entries for
     /// `n = 2` comment ranges within the Comments substory's own
     /// character space; `PlcfandRef`'s data elements are 30-byte
     /// `ATRDPre10`s whose `ibst` (offset 20) indexes `comment_authors`.
     #[test]
-    fn parse_comments_splits_and_attributes_two_comments() {
+    fn test_parse_comments_splits_and_attributes_two_comments() {
         let raw = "\u{5}First comment\r\u{5}Second comment\r";
         let first_len = "\u{5}First comment\r".chars().count();
         let total_len = raw.chars().count();
@@ -1378,7 +1371,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_comments_falls_back_to_empty_on_a_count_mismatch() {
+    fn test_parse_comments_falls_back_to_empty_on_a_count_mismatch() {
         // A PlcfandTxt describing 2 ranges but a PlcfandRef describing
         // only 1 ATRDPre10 must not be trusted at all.
         let and_txt_cps: [u32; 4] = [0, 5, 10, 0];
@@ -1407,12 +1400,12 @@ mod tests {
         assert!(comments.is_empty(), "count mismatch must fall back to empty: {comments:?}");
     }
 
-    /// issue #345 — `doc_to_ir` must emit one `Element::Endnote` per
+    /// `doc_to_ir` must emit one `Element::Endnote` per
     /// `doc.comments()` entry (each with its own resolved author) instead
     /// of falling through to the generic merged-substory path, whenever
     /// `PlcfandTxt`/`PlcfandRef` successfully split the document.
     #[test]
-    fn split_comments_reach_the_ir_as_separate_notes() {
+    fn test_split_comments_reach_the_ir_as_separate_notes() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
         doc.subdocuments = vec![SubDocument {

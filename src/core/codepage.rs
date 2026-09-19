@@ -1,6 +1,6 @@
 //! Shared Windows single-byte codepage support, used by both XLS's BIFF5
-//! `CODEPAGE` record (issue #309) and DOC's FIB `lid`-derived codepage
-//! (issue #310) to decode legacy 8-bit text.
+//! `CODEPAGE` record and DOC's FIB `lid`-derived codepage
+//! to decode legacy 8-bit text.
 
 /// Map a Windows codepage identifier to the `encoding_rs` encoding that
 /// decodes it. Only codepages a real corpus file has been confirmed to
@@ -43,13 +43,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn known_codepage_decodes_via_encoding_rs() {
+    fn test_known_codepage_decodes_via_encoding_rs() {
         let (encoded, _, _) = encoding_rs::WINDOWS_1251.encode("Привет");
         assert_eq!(decode_windows_codepage(&encoded, 1251), "Привет");
     }
 
     #[test]
-    fn unmapped_codepage_falls_back_to_raw_byte_promotion() {
+    fn test_unmapped_codepage_falls_back_to_raw_byte_promotion() {
         assert_eq!(decode_windows_codepage(&[0x41, 0xE9], 65535), "A\u{00E9}");
     }
 }

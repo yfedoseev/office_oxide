@@ -693,7 +693,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn valid_part_names() {
+    fn test_valid_part_names() {
         assert!(PartName::new("/word/document.xml").is_ok());
         assert!(PartName::new("/xl/worksheets/sheet1.xml").is_ok());
         assert!(PartName::new("/docProps/core.xml").is_ok());
@@ -701,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_part_names() {
+    fn test_invalid_part_names() {
         assert!(PartName::new("word/document.xml").is_err()); // no leading /
         assert!(PartName::new("/word/document.xml/").is_err()); // trailing /
         assert!(PartName::new("/word//document.xml").is_err()); // empty segment
@@ -714,14 +714,14 @@ mod tests {
     }
 
     #[test]
-    fn part_name_case_insensitive_eq() {
+    fn test_part_name_case_insensitive_eq() {
         let a = PartName::new("/Word/Document.xml").unwrap();
         let b = PartName::new("/word/document.xml").unwrap();
         assert_eq!(a, b);
     }
 
     #[test]
-    fn part_name_case_insensitive_hash() {
+    fn test_part_name_case_insensitive_hash() {
         use std::collections::HashSet;
         let mut set = HashSet::new();
         set.insert(PartName::new("/Word/Document.xml").unwrap());
@@ -729,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn part_name_components() {
+    fn test_part_name_components() {
         let pn = PartName::new("/word/document.xml").unwrap();
         assert_eq!(pn.directory(), "/word/");
         assert_eq!(pn.filename(), "document.xml");
@@ -738,28 +738,28 @@ mod tests {
     }
 
     #[test]
-    fn resolve_relative_simple() {
+    fn test_resolve_relative_simple() {
         let source = PartName::new("/word/document.xml").unwrap();
         let resolved = source.resolve_relative("media/image1.png").unwrap();
         assert_eq!(resolved.as_str(), "/word/media/image1.png");
     }
 
     #[test]
-    fn resolve_relative_parent() {
+    fn test_resolve_relative_parent() {
         let source = PartName::new("/word/document.xml").unwrap();
         let resolved = source.resolve_relative("../docProps/core.xml").unwrap();
         assert_eq!(resolved.as_str(), "/docProps/core.xml");
     }
 
     #[test]
-    fn resolve_relative_absolute() {
+    fn test_resolve_relative_absolute() {
         let source = PartName::new("/word/document.xml").unwrap();
         let resolved = source.resolve_relative("/xl/workbook.xml").unwrap();
         assert_eq!(resolved.as_str(), "/xl/workbook.xml");
     }
 
     #[test]
-    fn opc_round_trip() {
+    fn test_opc_round_trip() {
         use std::io::Cursor;
 
         let buf = Vec::new();

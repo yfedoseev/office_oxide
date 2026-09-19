@@ -91,7 +91,7 @@ pub struct Run {
     pub font_name: Option<String>,
     /// When set, this run is a hard line break (`<a:br/>`) rather than text.
     pub line_break: bool,
-    /// External hyperlink target URL, if any (issue #262 — this writer
+    /// External hyperlink target URL, if any (this writer
     /// had no hyperlink concept at all, so a run's URL was silently
     /// dropped, unconditionally, on every write).
     pub hyperlink: Option<String>,
@@ -208,18 +208,18 @@ pub(crate) enum BodyItem {
     Text(String),
     RichText(Vec<Run>, ParaProps),
     /// Bullet list items paired with their nesting level (0 = top level).
-    /// Each item is a paragraph's worth of styled `Run`s — issue #341:
+    /// Each item is a paragraph's worth of styled `Run`s:
     /// this used to be a bare `String`, so a hyperlink or any character
     /// formatting on a list item's text was silently dropped on write.
     BulletList(Vec<(u8, Vec<Run>)>),
     /// A real table: rows of cells, each cell a paragraph's worth of
     /// styled `Run`s. Flattening a table into tab-joined plain text lost
-    /// the grid entirely; flattening each cell to a bare `String` (issue
-    /// #341) then lost every run's formatting, including hyperlinks.
+    /// the grid entirely; flattening each cell to a bare `String`
+    /// then lost every run's formatting, including hyperlinks.
     Table(Vec<Vec<Vec<Run>>>),
     /// Free-floating text box: (paragraphs, x_emu, y_emu, cx_emu, cy_emu).
     /// Each paragraph is its own `(runs, props)` pair — a text box can
-    /// hold more than one paragraph (issue #264: the writer used to
+    /// hold more than one paragraph (the writer used to
     /// support only a single flat run list here, which is why the fix
     /// for that issue converts a source `TextBox`'s multiple block
     /// elements into multiple paragraphs rather than losing all but one).
@@ -244,7 +244,7 @@ pub struct SlideData {
     /// Speaker notes for this slide. Written to `ppt/notesSlides/`, never
     /// onto the slide surface. Structured `BodyItem`s (not a flat
     /// `String`) so bold/italic/bullets/numbering in notes get the same
-    /// fidelity ordinary body text already does (issue #290).
+    /// fidelity ordinary body text already does.
     pub(crate) notes: Option<Vec<BodyItem>>,
     body_items: Vec<BodyItem>,
 }
@@ -271,7 +271,7 @@ impl SlideData {
 
     /// Attach speaker notes carrying real paragraph/run structure (bold,
     /// italic, bullets, numbering) — the same fidelity ordinary slide
-    /// body text already has (issue #290).
+    /// body text already has.
     pub(crate) fn set_notes_structured(&mut self, items: Vec<BodyItem>) -> &mut Self {
         self.notes = Some(items);
         self
@@ -345,7 +345,7 @@ impl SlideData {
     /// Every item used to be emitted at level 0 with no `marL`/`indent`, so
     /// nesting was lost and the bullet glyph sat at the same x as its text
     /// — and every item used to be a bare `String`, so run formatting was
-    /// lost too (issue #341).
+    /// lost too.
     pub fn add_nested_bullet_list(&mut self, items: Vec<(u8, Vec<Run>)>) -> &mut Self {
         self.body_items.push(BodyItem::BulletList(items));
         self
@@ -353,7 +353,7 @@ impl SlideData {
 
     /// Add a table as a real `a:tbl`, not tab-joined text. Each cell is a
     /// paragraph's worth of styled `Run`s, so hyperlinks and character
-    /// formatting survive (issue #341).
+    /// formatting survive.
     pub fn add_table(&mut self, rows: Vec<Vec<Vec<Run>>>) -> &mut Self {
         if !rows.is_empty() {
             self.body_items.push(BodyItem::Table(rows));
@@ -396,7 +396,7 @@ impl SlideData {
     }
 
     /// Add a free-floating text box with multiple paragraphs, each with
-    /// its own runs and paragraph properties (issue #264 — a `TextBox`
+    /// its own runs and paragraph properties (a `TextBox`
     /// read from a real PPTX can hold more than one block of text, e.g.
     /// a heading paragraph followed by body paragraphs).
     pub(crate) fn add_multi_paragraph_text_box(
@@ -686,7 +686,7 @@ impl PptxWriter {
                     // A per-part Override alone is spec-legal, but real
                     // SDK validators flag a package with many overrides
                     // and no matching Default — XLSX's own image-writing
-                    // path already registers one; PPTX's didn't (issue #295).
+                    // path already registers one; PPTX's didn't.
                     opc.register_default_content_type(ext, fmt.content_type());
                     opc.add_part(&media_part, fmt.content_type(), data)?;
                     img_rids.push((rid, *x, *y, *cx, *cy, alt.clone()));
@@ -697,7 +697,7 @@ impl PptxWriter {
             // One external relationship per distinct hyperlink URL used
             // on this slide, scoped to this slide's own `_rels` file —
             // an r:id registered against one slide part doesn't resolve
-            // inside another slide's XML (issue #262).
+            // inside another slide's XML.
             let mut hyperlink_rids: HashMap<String, String> = HashMap::new();
             for url in collect_slide_hyperlinks(&slide.body_items) {
                 let rid = opc.add_part_rel_with_mode(
@@ -1061,7 +1061,7 @@ fn generate_theme_xml() -> Vec<u8> {
 /// `cSld, clrMapOvr?, ...`; the body placeholder carries the note text.
 /// Renders each `BodyItem` the same way `write_body_shape` does for an
 /// ordinary slide body, so notes get the same bold/italic/bullet/
-/// numbering fidelity (issue #290).
+/// numbering fidelity.
 fn generate_notes_slide_xml(notes: &[BodyItem], hyperlink_rids: &HashMap<String, String>) -> Vec<u8> {
     let mut w = Writer::new(Vec::new());
     write_decl(&mut w);
@@ -1391,7 +1391,7 @@ fn write_layout_placeholder(
 // ---------------------------------------------------------------------------
 
 /// Every distinct hyperlink URL reachable from `items`' runs, in
-/// first-seen order (issue #262, extended by #341 to also look inside
+/// first-seen order (extended to also look inside
 /// `BulletList`/`Table` cells — both now carry real `Run`s too, and a
 /// run whose hyperlink URL was never registered here has no relationship
 /// id for `write_dml_run` to find, so its `<a:hlinkClick>` would
@@ -1500,7 +1500,7 @@ fn generate_slide_xml(
 // don't resolve placeholder geometry from the slide layout — notably LibreOffice
 // Impress — still position title/body text correctly. PowerPoint already resolves
 // from the layout, so this is a no-op there. Fractions keep the geometry correct
-// when the slide size is customised via `set_presentation_size`. See issue #69.
+// when the slide size is customised via `set_presentation_size`.
 const TITLE_X_FRAC: f64 = 838_200.0 / 12_192_000.0;
 const TITLE_Y_FRAC: f64 = 365_125.0 / 6_858_000.0;
 const TITLE_CX_FRAC: f64 = 10_515_600.0 / 12_192_000.0;
@@ -1512,7 +1512,7 @@ const BODY_CY_FRAC: f64 = 4_351_338.0 / 6_858_000.0;
 
 /// Write `<p:spPr>` containing an explicit `<a:xfrm>` with the given EMU
 /// offset/extent. Used for placeholder shapes so their position/size are
-/// self-contained rather than inherited from the layout (see issue #69).
+/// self-contained rather than inherited from the layout.
 fn write_sp_pr_with_xfrm(w: &mut Writer<Vec<u8>>, x: i64, y: i64, cx: i64, cy: i64) {
     w.write_event(Event::Start(BytesStart::new("p:spPr")))
         .expect("write");
@@ -2058,7 +2058,7 @@ mod tests {
     }
 
     #[test]
-    fn rich_runs_roundtrip() {
+    fn test_rich_runs_roundtrip() {
         let mut writer = PptxWriter::new();
         writer
             .add_slide()
@@ -2071,7 +2071,7 @@ mod tests {
     }
 
     #[test]
-    fn text_box_roundtrip() {
+    fn test_text_box_roundtrip() {
         let mut writer = PptxWriter::new();
         writer
             .add_slide()
@@ -2082,7 +2082,7 @@ mod tests {
     }
 
     #[test]
-    fn set_presentation_size_written() {
+    fn test_set_presentation_size_written() {
         let mut writer = PptxWriter::new();
         writer.set_presentation_size(9_144_000, 6_858_000);
         writer.add_slide().add_text("test");
@@ -2109,13 +2109,13 @@ mod tests {
         xml
     }
 
-    /// issue #262 — pptx::write had no hyperlink concept at all; a run's
+    /// pptx::write had no hyperlink concept at all; a run's
     /// URL was silently dropped, unconditionally, on every write. Checks
     /// both the raw XML shape (`<a:hlinkClick r:id="...">` + the slide's
     /// own `_rels` external relationship) and that the crate's own
     /// reader resolves it back to a URL.
     #[test]
-    fn run_hyperlink_round_trips() {
+    fn test_run_hyperlink_round_trips() {
         let mut writer = PptxWriter::new();
         writer
             .add_slide()
@@ -2171,14 +2171,14 @@ mod tests {
         );
     }
 
-    /// issue #341 — `BodyItem::Table`/`BulletList` used to flatten every
+    /// `BodyItem::Table`/`BulletList` used to flatten every
     /// cell/item to a bare `String`, so a hyperlink (or any other run
     /// formatting) inside a table cell or bullet-list item was silently
     /// dropped on write. Both now carry real `Run`s, and
     /// `collect_slide_hyperlinks` must find URLs inside them too, or the
     /// relationship id `write_dml_run` looks up would never exist.
     #[test]
-    fn table_and_bullet_list_hyperlinks_round_trip() {
+    fn test_table_and_bullet_list_hyperlinks_round_trip() {
         let mut writer = PptxWriter::new();
         {
             let slide = writer.add_slide();
@@ -2244,7 +2244,7 @@ mod tests {
     /// write schema-invalid and leaves PowerPoint with no colour mapping to
     /// recover, so its repair fails.
     #[test]
-    fn slide_master_carries_required_colour_map_before_the_layout_list() {
+    fn test_slide_master_carries_required_colour_map_before_the_layout_list() {
         let mut writer = PptxWriter::new();
         writer.add_slide().set_title("Hello");
         let xml = part_xml(writer, "ppt/slideMasters/slideMaster1.xml");
@@ -2292,7 +2292,7 @@ mod tests {
     /// implicit relationship to a Slide Master part. Without it the layout is
     /// orphaned, which is what defeats PowerPoint's repair.
     #[test]
-    fn slide_layout_relates_back_to_the_slide_master() {
+    fn test_slide_layout_relates_back_to_the_slide_master() {
         let mut writer = PptxWriter::new();
         writer.add_slide().set_title("Hello");
         let names = part_names(writer);
@@ -2312,7 +2312,7 @@ mod tests {
     /// A `clrMap` naming theme slots is meaningless without a theme, and the
     /// spec lists the theme among the minimum parts of a presentation.
     #[test]
-    fn package_carries_a_theme_reachable_from_the_master() {
+    fn test_package_carries_a_theme_reachable_from_the_master() {
         let mut writer = PptxWriter::new();
         writer.add_slide().set_title("Hello");
         let names = part_names(writer);
@@ -2337,7 +2337,7 @@ mod tests {
     /// [ISO/IEC 29500-1] §13.3.7: a package **shall contain exactly one**
     /// Presentation Properties part, targeted from the presentation part.
     #[test]
-    fn package_carries_presentation_properties() {
+    fn test_package_carries_presentation_properties() {
         let mut writer = PptxWriter::new();
         writer.add_slide().set_title("Hello");
         let names = part_names(writer);
@@ -2353,7 +2353,7 @@ mod tests {
     /// part and must never appear on the slide surface, where an audience
     /// would see them.
     #[test]
-    fn speaker_notes_go_to_the_notes_part_and_never_onto_the_slide() {
+    fn test_speaker_notes_go_to_the_notes_part_and_never_onto_the_slide() {
         const SECRET: &str = "CONFIDENTIAL do not read aloud";
 
         let mut writer = PptxWriter::new();
@@ -2392,11 +2392,11 @@ mod tests {
         assert!(notes_xml.contains(SECRET), "notes part must carry the text");
     }
 
-    /// issue #290 — structured speaker notes (bold runs, bullet lists)
+    /// Structured speaker notes (bold runs, bullet lists)
     /// must reach the written notes slide XML with real formatting, not
     /// as plain unstyled text.
     #[test]
-    fn structured_speaker_notes_carry_bold_and_bullets_to_the_notes_xml() {
+    fn test_structured_speaker_notes_carry_bold_and_bullets_to_the_notes_xml() {
         let mut writer = PptxWriter::new();
         {
             let slide = writer.add_slide();
@@ -2417,7 +2417,7 @@ mod tests {
 
     /// A deck with no notes gains no notes parts.
     #[test]
-    fn deck_without_notes_has_no_notes_parts() {
+    fn test_deck_without_notes_has_no_notes_parts() {
         let mut writer = PptxWriter::new();
         writer.add_slide().set_title("x");
         let names = part_names(writer);
@@ -2432,7 +2432,7 @@ mod tests {
     /// Every value the writer splices into a restricted XSD simple type must
     /// be clamped or dropped — never written through and left invalid.
     #[test]
-    fn out_of_range_values_are_clamped_not_written_through() {
+    fn test_out_of_range_values_are_clamped_not_written_through() {
         // ST_SlideSizeCoordinate: 914400..=51206400
         let mut writer = PptxWriter::new();
         writer.set_presentation_size(1000, 99_000_000);
@@ -2489,11 +2489,11 @@ mod tests {
         xml
     }
 
-    /// Regression for issue #69: placeholder title/body shapes must carry an
+    /// Regression: placeholder title/body shapes must carry an
     /// explicit `<a:xfrm>` (off + ext) so LibreOffice, which doesn't resolve
     /// placeholder geometry from the layout, renders their text.
     #[test]
-    fn placeholders_have_explicit_xfrm() {
+    fn test_placeholders_have_explicit_xfrm() {
         let mut writer = PptxWriter::new();
         writer.add_slide().set_title("Hello").add_text("World");
         let xml = slide1_xml(writer);
@@ -2514,7 +2514,7 @@ mod tests {
 
     /// Placeholder geometry scales with a custom presentation size.
     #[test]
-    fn placeholder_xfrm_scales_with_presentation_size() {
+    fn test_placeholder_xfrm_scales_with_presentation_size() {
         let mut writer = PptxWriter::new();
         writer.set_presentation_size(9_144_000, 6_858_000); // 4:3
         writer.add_slide().set_title("T").add_text("B");
@@ -2525,7 +2525,7 @@ mod tests {
     }
 
     #[test]
-    fn add_image_embeds_media_part() {
+    fn test_add_image_embeds_media_part() {
         use crate::ir::ImageFormat;
         // Minimal 1x1 PNG
         let png_bytes: Vec<u8> = vec![
@@ -2550,7 +2550,7 @@ mod tests {
         assert!(zip.by_name("ppt/media/image1.png").is_ok(), "media part missing");
     }
 
-    /// issue #295 — an image part got only a per-part Override
+    /// An image part got only a per-part Override
     /// content-type declaration, no matching Default (an inconsistency
     /// with XLSX's own image-writing path, which already registers
     /// one). Spec-legal on its own, but real SDK validators flag a
@@ -2585,7 +2585,7 @@ mod tests {
     }
 
     #[test]
-    fn rich_text_box_roundtrip() {
+    fn test_rich_text_box_roundtrip() {
         let mut writer = PptxWriter::new();
         writer.add_slide().add_rich_text_box(
             &[

@@ -7,15 +7,12 @@ use super::error::{DocError, Result};
 
 /// Parsed FIB fields needed for text extraction.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Fib {
-    /// Word version identifier.
-    pub version: u16,
     /// FibBase `lid`: the document's default language ID (Windows LCID),
     /// e.g. `0x0419` = Russian. Determines which codepage compressed
     /// (8-bit) text runs are stored in — before this field existed,
     /// every compressed run was decoded as CP1252 regardless of the
-    /// document's actual authoring locale (issue #310).
+    /// document's actual authoring locale.
     pub lid: u16,
     /// Which table stream to use: true = "1Table", false = "0Table".
     pub use_table1: bool,
@@ -45,7 +42,7 @@ pub struct Fib {
     /// Offset of the PlfLst (list definitions: LSTF + LVL arrays) in the
     /// Table stream (0x02E2). Zero when the file defines no lists. Named
     /// `fc_plcf_lst` here (not `fc_plf_lst`) for historical reasons — the
-    /// struct/field spelling predates issue #250, which is the first
+    /// struct/field spelling predates list-format support, which is the first
     /// consumer of the pointer it holds.
     pub fc_plcf_lst: u32,
     /// Byte length of the PlfLst in the Table stream (0x02E6).
@@ -53,38 +50,36 @@ pub struct Fib {
     /// Offset of the PlfLfo (list format overrides: LFO array, one per
     /// `ilfo`) in the Table stream (0x02EA). `sprmPIlfo`'s value is a
     /// 1-based index into this array, not into `PlfLst` directly — an
-    /// `LFO.lsid` is what actually selects the matching `LSTF` (issue
-    /// #250). Zero when the file uses no lists.
+    /// `LFO.lsid` is what actually selects the matching `LSTF`. Zero when the file uses no lists.
     pub fc_plf_lfo: u32,
     /// Byte length of the PlfLfo in the Table stream (0x02EE).
     pub lcb_plf_lfo: u32,
     /// Offset of the GrpXstAtnOwners (comment author name array) in the
     /// Table stream (0x01BA). Zero when the document has no comments.
-    /// Issue #298.
+    ///
     pub fc_grp_xst_atn_owners: u32,
     /// Byte length of the GrpXstAtnOwners in the Table stream (0x01BE).
     pub lcb_grp_xst_atn_owners: u32,
     /// Offset of the PlcfHdd (header/footer story delimiter PLC) in the
     /// Table stream (0x00F2). Zero when the document has no header
-    /// document at all. Issue #285.
+    /// document at all.
     pub fc_plcf_hdd: u32,
     /// Byte length of the PlcfHdd in the Table stream (0x00F6).
     pub lcb_plcf_hdd: u32,
     /// Offset of the PlcfandRef (comment reference-point PLC, main
     /// document CPs + `ATRDPre10` author/bookmark data) in the Table
-    /// stream (0x00BA). Zero when the document has no comments. Issue
-    /// #345.
+    /// stream (0x00BA). Zero when the document has no comments.
     pub fc_plcf_and_ref: u32,
     /// Byte length of the PlcfandRef in the Table stream (0x00BE).
     pub lcb_plcf_and_ref: u32,
     /// Offset of the PlcfandTxt (comment-body boundary PLC, CPs within
     /// the Comments substory's own character space) in the Table stream
-    /// (0x00C2). Zero when the document has no comments. Issue #345.
+    /// (0x00C2). Zero when the document has no comments.
     pub fc_plcf_and_txt: u32,
     /// Byte length of the PlcfandTxt in the Table stream (0x00C6).
     pub lcb_plcf_and_txt: u32,
     /// Offset of the PlcBteChpx (CHPX FKP page index) in the Table stream
-    /// (0x00FA). Zero when the file has no CHPX FKP. Issue #287/#288.
+    /// (0x00FA). Zero when the file has no CHPX FKP.
     pub fc_plcf_bte_chpx: u32,
     /// Byte length of the PlcBteChpx in the Table stream (0x00FE).
     pub lcb_plcf_bte_chpx: u32,
@@ -115,7 +110,6 @@ impl Fib {
             return Err(DocError::InvalidFib(format!("unknown wIdent: 0x{wident:04X}")));
         }
 
-        let version = u16::from_le_bytes([data[2], data[3]]);
         // FibBase.lid, absolute offset 0x06 (u16 LE) — verified against
         // FibBase's field layout (wIdent, nFib, unused, lid, ...).
         let lid = u16::from_le_bytes([data[0x06], data[0x07]]);
@@ -136,7 +130,7 @@ impl Fib {
         // Text lengths in FibRgLw97 ([MS-DOC] FibRgLw97): cbMac, reserved1,
         // reserved2, ccpText, ccpFtn, ccpHdd, reserved3 (MUST be zero, MUST
         // be ignored — NOT ccpAtn), ccpAtn, ccpEdn, ccpTxbx, ccpHdrTxbx.
-        // Issue #247: every field from `comment_len` on used to be read one
+        // Every field from `comment_len` on used to be read one
         // slot early (`comment_len` landed on the always-zero `reserved3`,
         // so it silently read as 0 for every `.doc` ever opened; comments
         // ended up mislabeled as endnotes, endnotes as textboxes, and the
@@ -198,7 +192,7 @@ impl Fib {
         // against the two already-verified anchors above: fcPlcfBtePapx
         // (index 26) lands at 0x9A + 26*4 = 0x102, and fcClx (index 66)
         // lands at 0x9A + 66*4 = 0x1A2 — both match their hard-coded
-        // offsets already in this file. Issue #298.
+        // offsets already in this file.
         let (fc_grp_xst_atn_owners, lcb_grp_xst_atn_owners) = if data.len() > 0x01C2 {
             (read_u32(data, 0x01BA), read_u32(data, 0x01BE))
         } else {
@@ -208,7 +202,7 @@ impl Fib {
         // fcPlcfHdd / lcbPlcfHdd — header/footer story delimiter PLC
         // (0x00F2 / 0x00F6). Derived the same way as fcGrpXstAtnOwners
         // above: index 22 in FibRgFcLcb97's fixed field order, base 0x9A,
-        // 0x9A + 22*4 = 0xF2. Issue #285.
+        // 0x9A + 22*4 = 0xF2.
         let (fc_plcf_hdd, lcb_plcf_hdd) = if data.len() > 0x00FA {
             (read_u32(data, 0x00F2), read_u32(data, 0x00F6))
         } else {
@@ -223,7 +217,7 @@ impl Fib {
         // that exact sequence. 0x9A + 4*8 = 0xBA, 0x9A + 5*8 = 0xC2,
         // consistent with the pair-index formula already cross-checked
         // above for fcPlcfHdd/fcPlcfBtePapx/fcClx/fcGrpXstAtnOwners.
-        // Issue #345.
+        //
         let (fc_plcf_and_ref, lcb_plcf_and_ref) = if data.len() > 0x00C2 {
             (read_u32(data, 0x00BA), read_u32(data, 0x00BE))
         } else {
@@ -242,7 +236,7 @@ impl Fib {
         // ... fcPlcfHdd, lcbPlcfHdd, fcPlcfBteChpx, lcbPlcfBteChpx,
         // fcPlcfBtePapx, lcbPlcfBtePapx, ...). fieldIndex 24 (0x9A + 24*4 =
         // 0xFA), one pair before fcPlcfBtePapx's already-verified fieldIndex
-        // 26 (0x9A + 26*4 = 0x102). Issue #287/#288.
+        // 26 (0x9A + 26*4 = 0x102).
         let (fc_plcf_bte_chpx, lcb_plcf_bte_chpx) = if data.len() > 0x0102 {
             (read_u32(data, 0x00FA), read_u32(data, 0x00FE))
         } else {
@@ -250,7 +244,6 @@ impl Fib {
         };
 
         Ok(Self {
-            version,
             lid,
             use_table1,
             clx_offset,
@@ -320,17 +313,16 @@ mod tests {
         data[0x02E2..0x02E6].copy_from_slice(&400u32.to_le_bytes());
         data[0x02E6..0x02EA].copy_from_slice(&12u32.to_le_bytes());
         // fcPlfLfo / lcbPlfLfo — the exact values from [MS-DOC]'s own
-        // "Example of a List" worked example (issue #250).
+        // "Example of a List" worked example.
         data[0x02EA..0x02EE].copy_from_slice(&0x000007E1u32.to_le_bytes());
         data[0x02EE..0x02F2].copy_from_slice(&0x00000018u32.to_le_bytes());
         data
     }
 
     #[test]
-    fn parse_valid_fib() {
+    fn test_parse_valid_fib() {
         let data = build_minimal_fib();
         let fib = Fib::parse(&data).unwrap();
-        assert_eq!(fib.version, 0x00C1);
         assert!(fib.use_table1);
         assert_eq!(fib.text_len, 100);
         assert_eq!(fib.clx_offset, 512);
@@ -345,7 +337,7 @@ mod tests {
 
     /// Regression: `fcPlcfBteChpx`/`lcbPlcfBteChpx` must land at 0x00FA/
     /// 0x00FE — immediately before `fcPlcfBtePapx` at 0x0102, per
-    /// [MS-DOC] §2.5.6's field-order table. Issue #287/#288.
+    /// [MS-DOC] §2.5.6's field-order table.
     #[test]
     fn test_fc_plcf_bte_chpx_offset() {
         let mut data = build_minimal_fib();
@@ -361,34 +353,34 @@ mod tests {
     }
 
     #[test]
-    fn bad_wident_rejected() {
+    fn test_bad_wident_rejected() {
         let mut data = build_minimal_fib();
         data[0..2].copy_from_slice(&0x1234u16.to_le_bytes());
         assert!(Fib::parse(&data).is_err());
     }
 
     #[test]
-    fn too_short_rejected() {
+    fn test_too_short_rejected() {
         let data = vec![0u8; 100];
         assert!(Fib::parse(&data).is_err());
     }
 
     #[test]
-    fn use_table0() {
+    fn test_use_table0() {
         let mut data = build_minimal_fib();
         data[0x0A..0x0C].copy_from_slice(&0u16.to_le_bytes()); // clear bit 9
         let fib = Fib::parse(&data).unwrap();
         assert!(!fib.use_table1);
     }
 
-    /// issue #247 — every `FibRgLw97` field from `comment_len` on used to be
+    /// Every `FibRgLw97` field from `comment_len` on used to be
     /// read one slot early (landing on `reserved3`, spec-mandated always
     /// zero, at 0x58) instead of its real offset. Each field below gets a
     /// distinct value so a shift in either direction is caught, and
     /// `reserved3` itself is set to a nonzero value to prove it's never
     /// read at all.
     #[test]
-    fn fibrglw97_fields_read_from_their_real_spec_offsets() {
+    fn test_fibrglw97_fields_read_from_their_real_spec_offsets() {
         let mut data = build_minimal_fib();
         data[0x4C..0x50].copy_from_slice(&100u32.to_le_bytes()); // ccpText
         data[0x50..0x54].copy_from_slice(&11u32.to_le_bytes()); // ccpFtn
@@ -412,13 +404,13 @@ mod tests {
         );
     }
 
-    /// issue #298 — `fcGrpXstAtnOwners`/`lcbGrpXstAtnOwners` (comment
+    /// `fcGrpXstAtnOwners`/`lcbGrpXstAtnOwners` (comment
     /// author names) were never parsed at all. Offset derived from
     /// FibRgFcLcb97's fixed field order; cross-checked against the two
     /// offsets already verified elsewhere in this file (`fcPlcfBtePapx`
     /// at 0x0102, `fcClx` at 0x01A2).
     #[test]
-    fn grp_xst_atn_owners_read_from_its_real_offset() {
+    fn test_grp_xst_atn_owners_read_from_its_real_offset() {
         let mut data = build_minimal_fib();
         data[0x01BA..0x01BE].copy_from_slice(&700u32.to_le_bytes());
         data[0x01BE..0x01C2].copy_from_slice(&40u32.to_le_bytes());
@@ -428,10 +420,10 @@ mod tests {
         assert_eq!(fib.lcb_grp_xst_atn_owners, 40);
     }
 
-    /// issue #285 — `fcPlcfHdd`/`lcbPlcfHdd` (header/footer story
+    /// `fcPlcfHdd`/`lcbPlcfHdd` (header/footer story
     /// delimiter PLC) were never parsed at all.
     #[test]
-    fn plcf_hdd_read_from_its_real_offset() {
+    fn test_plcf_hdd_read_from_its_real_offset() {
         let mut data = build_minimal_fib();
         data[0x00F2..0x00F6].copy_from_slice(&800u32.to_le_bytes());
         data[0x00F6..0x00FA].copy_from_slice(&56u32.to_le_bytes());
@@ -441,10 +433,10 @@ mod tests {
         assert_eq!(fib.lcb_plcf_hdd, 56);
     }
 
-    /// issue #345 — `fcPlcfandRef`/`lcbPlcfandRef` and `fcPlcfandTxt`/
+    /// `fcPlcfandRef`/`lcbPlcfandRef` and `fcPlcfandTxt`/
     /// `lcbPlcfandTxt` were never parsed at all.
     #[test]
-    fn plcf_and_ref_and_txt_read_from_their_real_offsets() {
+    fn test_plcf_and_ref_and_txt_read_from_their_real_offsets() {
         let mut data = build_minimal_fib();
         data[0x00BA..0x00BE].copy_from_slice(&900u32.to_le_bytes());
         data[0x00BE..0x00C2].copy_from_slice(&64u32.to_le_bytes());

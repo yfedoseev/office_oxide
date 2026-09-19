@@ -60,8 +60,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         //
         // Converted through the same `convert_text_body` ordinary slide
         // body text already uses, so bold/italic/bullets/numbering in
-        // notes survive instead of being flattened to plain lines
-        // (issue #290).
+        // notes survive instead of being flattened to plain lines.
         let speaker_notes = slide.notes.as_ref().and_then(|tb| {
             let mut converted = Vec::new();
             convert_text_body(tb, &mut converted);
@@ -180,7 +179,7 @@ fn is_title_placeholder(ph_type: Option<&str>) -> bool {
 /// self-inflicted explicit position was indistinguishable from a real,
 /// deliberately positioned free-floating text box, so this content got
 /// wrapped in a spurious `Element::TextBox` on every write→reread cycle
-/// (issue #342). `dt`/`ftr`/`sldNum`/`pic`/`chart`/`tbl`/`media`
+///. `dt`/`ftr`/`sldNum`/`pic`/`chart`/`tbl`/`media`
 /// placeholders are deliberately excluded — this crate's writer never
 /// emits those on a slide (only `write_layout_placeholder`, a separate,
 /// unrelated slide-*layout* writer, uses other `ph_type`s), so an
@@ -264,8 +263,7 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
                     // slide number, footer, object, …) on every paragraph
                     // built from it — richer than `TextType`'s 8 values
                     // and, unlike it, not thrown away after the
-                    // title/body classification above is done with it
-                    // (issue #258).
+                    // title/body classification above is done with it.
                     if let Some(ph_type) = auto.placeholder.as_ref().and_then(|ph| ph.ph_type.as_deref()) {
                         tag_placeholder_role(&mut inner, ph_type);
                     }
@@ -282,8 +280,8 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
             // all — not even a placeholder, unlike Picture shapes,
             // where alt text already survives. Action Buttons are drawn
             // as icons with no text by convention, so for those the
-            // click target *is* the shape's entire purpose (issue #299,
-            // #300). Emit the same kind of data-less Image placeholder
+            // click target *is* the shape's entire purpose).
+            // Emit the same kind of data-less Image placeholder
             // Picture already falls back to when its own relationship
             // can't be resolved, so the description, click action and
             // position all survive.
@@ -363,8 +361,8 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
 
 /// Set `placeholder_role` on every `Paragraph` reachable from `elements`
 /// (recursing into `List` items and `TextBox` content, the two other
-/// block containers a placeholder's own text can be wrapped in) — issue
-/// #258. `Heading` is deliberately left untouched: title/centered-title
+/// block containers a placeholder's own text can be wrapped in).
+/// `Heading` is deliberately left untouched: title/centered-title
 /// placeholders already have a reliable, unambiguous signal via
 /// `is_title_placeholder`/`TextType`, so this only adds real information
 /// for the roles that `TextType`'s 8 values can't express.
@@ -686,7 +684,7 @@ mod tests {
             .collect()
     }
 
-    /// issue #300 — a non-text AutoShape (decorative icon, action
+    /// A non-text AutoShape (decorative icon, action
     /// button, …) whose only content is its accessibility description
     /// used to produce zero IR output at all, unlike Picture shapes,
     /// where alt text already survives.
@@ -713,7 +711,7 @@ mod tests {
         }
     }
 
-    /// issue #342 — this crate's own PPTX writer always gives a body/
+    /// This crate's own PPTX writer always gives a body/
     /// title placeholder shape an explicit `<a:xfrm>` (for consistent
     /// rendering across viewers that don't resolve slide-layout
     /// inheritance), which used to be indistinguishable on read from a
@@ -723,7 +721,7 @@ mod tests {
     /// content must flow as ordinary elements even when it carries a
     /// real (non-zero) position.
     #[test]
-    fn a_body_placeholder_with_an_explicit_position_still_flows_not_wraps() {
+    fn test_a_body_placeholder_with_an_explicit_position_still_flows_not_wraps() {
         use crate::pptx::shape::{AutoShape, PlaceholderInfo, ShapePosition, TextBody};
         let shape = crate::pptx::Shape::AutoShape(AutoShape {
             id: 2,
@@ -746,13 +744,13 @@ mod tests {
         );
     }
 
-    /// issue #258 — a placeholder's `ph_type` (subtitle/date/footer/etc.,
+    /// A placeholder's `ph_type` (subtitle/date/footer/etc.,
     /// richer than the title/body split `is_title_placeholder`/
     /// `is_body_placeholder` collapse everything else into) must reach
     /// `Paragraph::placeholder_role` in the IR, not be discarded after
     /// the title/body classification above is done with it.
     #[test]
-    fn placeholder_ph_type_reaches_paragraph_placeholder_role() {
+    fn test_placeholder_ph_type_reaches_paragraph_placeholder_role() {
         use crate::pptx::shape::{AutoShape, PlaceholderInfo, ShapePosition, TextBody};
         let shape = crate::pptx::Shape::AutoShape(AutoShape {
             id: 4,
@@ -790,7 +788,7 @@ mod tests {
     /// its positioned-`TextBox` wrap even though it carries the exact
     /// same kind of real position a body placeholder now flows past.
     #[test]
-    fn a_non_placeholder_shape_with_a_position_still_wraps() {
+    fn test_a_non_placeholder_shape_with_a_position_still_wraps() {
         use crate::pptx::shape::{AutoShape, ShapePosition, TextBody};
         let shape = crate::pptx::Shape::AutoShape(AutoShape {
             id: 3,
@@ -813,7 +811,7 @@ mod tests {
     /// PowerPoint, and the shape that used to lose every bullet after the
     /// first when the flat run was folded into the IR list tree.
     #[test]
-    fn uniformly_indented_bullets_all_survive() {
+    fn test_uniformly_indented_bullets_all_survive() {
         let body = TextBody {
             paragraphs: vec![bullet(1, "first"), bullet(1, "second"), bullet(1, "third")],
         };

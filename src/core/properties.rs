@@ -127,7 +127,7 @@ impl CoreProperties {
         // authoring an invalid docProps/core.xml out of a file someone
         // else broke. Normalize leniently where the intent is unambiguous,
         // and drop the element (both are optional) rather than emit
-        // something the W3CDTF restricted union rejects (issue #217).
+        // something the W3CDTF restricted union rejects.
         if let Some(created) = self.created.as_deref().and_then(normalize_w3cdtf) {
             write_datetime_element(&mut w, "dcterms:created", &created);
         }
@@ -157,7 +157,7 @@ fn write_optional_element(w: &mut Writer<Vec<u8>>, tag: &str, value: Option<&str
 /// form, or return `None` when it can't be recovered as a valid one.
 ///
 /// Handles the two shapes found in a 6,062-file real-world corpus sweep
-/// (issue #217): a stray non-digit character mixed into a numeric
+///: a stray non-digit character mixed into a numeric
 /// component (`2014aaa-10-28T11:34:00Z` — not recoverable, the intent is
 /// ambiguous) and a single-digit month/day/hour written with a leading
 /// space instead of zero-padding (`2021- 9- 3T20:25:22Z` — a known
@@ -333,7 +333,7 @@ pub fn read_core_properties<R: std::io::Read + std::io::Seek>(
 ///
 /// `AppProperties::parse` already existed, fully tested, but nothing on
 /// the read side ever called it — company name and every count field were
-/// unreachable through any public API (issue #245).
+/// unreachable through any public API.
 pub fn read_app_properties<R: std::io::Read + std::io::Seek>(
     opc: &mut super::opc::OpcReader<R>,
 ) -> Option<AppProperties> {
@@ -515,7 +515,7 @@ mod tests {
 </cp:coreProperties>"#;
 
     #[test]
-    fn parse_core_properties() {
+    fn test_parse_core_properties() {
         let props = CoreProperties::parse(SAMPLE_CORE).unwrap();
         assert_eq!(props.title.as_deref(), Some("Quarterly Report"));
         assert_eq!(props.creator.as_deref(), Some("Jane Smith"));
@@ -526,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn core_properties_round_trip() {
+    fn test_core_properties_round_trip() {
         let original = CoreProperties {
             title: Some("Test Doc".to_string()),
             creator: Some("Test Author".to_string()),
@@ -542,7 +542,7 @@ mod tests {
 
     #[test]
     fn test_space_padded_single_digit_date_is_normalized_not_dropped() {
-        // issue #217 — a real-world PHP writer's quirk: single-digit
+        // A real-world PHP writer's quirk: single-digit
         // month/day written with a leading space instead of zero-padding.
         // The intent is unambiguous, so this must be recovered, not
         // dropped.
@@ -562,7 +562,7 @@ mod tests {
 
     #[test]
     fn test_unrecoverably_malformed_date_is_dropped_not_copied_verbatim() {
-        // issue #217 — garbage mixed into a numeric component (a
+        // Garbage mixed into a numeric component (a
         // deliberately corrupt OpenXML SDK test fixture) has no
         // unambiguous recovery; the invalid element must be omitted
         // entirely rather than authoring an invalid docProps/core.xml.
@@ -594,7 +594,7 @@ mod tests {
 </Properties>"#;
 
     #[test]
-    fn parse_app_properties() {
+    fn test_parse_app_properties() {
         let props = AppProperties::parse(SAMPLE_APP).unwrap();
         assert_eq!(props.application.as_deref(), Some("Microsoft Office Word"));
         assert_eq!(props.app_version.as_deref(), Some("16.0000"));
@@ -605,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn app_properties_round_trip() {
+    fn test_app_properties_round_trip() {
         let original = AppProperties {
             application: Some("office_oxide".to_string()),
             app_version: Some("0.1.0".to_string()),

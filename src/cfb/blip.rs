@@ -86,7 +86,7 @@ pub struct BlipImage {
     /// same array position an `OfficeArtFOPT` shape's `pib` ("Blip to
     /// display") property references, per [MS-ODRAW]. Every top-level
     /// entry counts toward this position, including an `OfficeArtFBSE`
-    /// wrapper entry that didn't yield an image (issue #336) — the
+    /// wrapper entry that didn't yield an image — the
     /// index is *not* simply "how many images have been extracted so
     /// far", since that would drift out of alignment with `pib` as soon
     /// as any entry is skipped.
@@ -149,7 +149,7 @@ fn extract_one_blip(
 ///
 /// Works for both PPT Pictures streams and DOC Data streams. Each
 /// top-level entry — a raw `OfficeArtBlip`, an `OfficeArtFBSE` wrapper
-/// (issue #336), or anything unrecognized — counts as one array slot
+///, or anything unrecognized — counts as one array slot
 /// toward [`BlipImage::index`], whether or not it actually yielded an
 /// image; only "descend into a container" steps into the array rather
 /// than past a sibling of it, so those don't count.
@@ -243,7 +243,7 @@ mod tests {
         buf
     }
 
-    /// Build an `OfficeArtFBSE` record (issue #336) wrapping the given
+    /// Build an `OfficeArtFBSE` record wrapping the given
     /// embedded `OfficeArtBlip` bytes (from [`make_blip`]).
     fn make_fbse(name: &str, embedded_blip: &[u8]) -> Vec<u8> {
         let name_utf16: Vec<u8> =
@@ -273,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn fbse_wrapped_blip_is_extracted() {
+    fn test_fbse_wrapped_blip_is_extracted() {
         let jpeg = make_blip(0xF01D, 0x46A, b"\xff\xd8\xff\xe0FBSE_JPEG");
         let stream = make_fbse("pic.jpg", &jpeg);
         let images = extract_blip_images(&stream);
@@ -283,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn fbse_entry_before_a_raw_blip_does_not_shift_its_index() {
+    fn test_fbse_entry_before_a_raw_blip_does_not_shift_its_index() {
         // FBSE entry (slot 0) + a raw blip (slot 1) — the raw blip's
         // index must be 1, matching its real array position, not 0
         // (which is what "count of successfully extracted images so
@@ -300,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_fbse_slot_still_advances_the_index() {
+    fn test_empty_fbse_slot_still_advances_the_index() {
         // cRef=0 (an "empty slot" per spec) with no embedded blip at
         // all — it must still consume slot 0 so the following real
         // image correctly reports index 1.
@@ -331,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_jpeg() {
+    fn test_extract_jpeg() {
         let jpeg_data = b"\xff\xd8\xff\xe0JFIF_DATA";
         let stream = make_blip(0xF01D, 0x46A, jpeg_data);
         let images = extract_blip_images(&stream);
@@ -341,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_png() {
+    fn test_extract_png() {
         let png_data = b"\x89PNG\r\n\x1a\nIHDR_DATA";
         let stream = make_blip(0xF01E, 0x6E0, png_data);
         let images = extract_blip_images(&stream);
@@ -351,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_multiple() {
+    fn test_extract_multiple() {
         let mut stream = make_blip(0xF01D, 0x46A, b"\xff\xd8\xff\xe0JPEG1");
         stream.extend(make_blip(0xF01E, 0x6E0, b"\x89PNGPNG2"));
         let images = extract_blip_images(&stream);
@@ -362,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_with_secondary_uid() {
+    fn test_extract_with_secondary_uid() {
         let jpeg_data = b"\xff\xd8\xff\xe0TEST";
         let stream = make_blip(0xF01D, 0x46B, jpeg_data); // bit 0 set
         let images = extract_blip_images(&stream);
@@ -371,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_container_records() {
+    fn test_skips_container_records() {
         // Container (ver=0xF) wrapping a BLIP
         let blip = make_blip(0xF01D, 0x46A, b"\xff\xd8\xff\xe0test");
         let mut stream = Vec::new();
@@ -388,12 +388,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_stream() {
+    fn test_empty_stream() {
         assert!(extract_blip_images(&[]).is_empty());
     }
 
     #[test]
-    fn format_metadata() {
+    fn test_format_metadata() {
         assert_eq!(BlipFormat::Jpeg.extension(), "jpg");
         assert_eq!(BlipFormat::Png.mime_type(), "image/png");
         assert!(BlipFormat::Jpeg.is_image());

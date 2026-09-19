@@ -151,13 +151,13 @@ fn extract_chpx_grpprl(page: &[u8], word_off: usize) -> Vec<u8> {
 /// Resolve the CP ranges within `[0, text_len)` whose CHP marks them as
 /// deleted revision-mark text (`sprmCFRMarkDel`), merged and sorted.
 ///
-/// This is the "at minimum" fix for issue #288: the accepted-view policy
+/// This is the "at minimum" fix for deleted revision-mark text: the accepted-view policy
 /// already applied to DOCX's `w:del` extended to DOC, without attempting
-/// the larger #287 (full character-formatting fidelity).
+/// the larger goal of full character-formatting fidelity.
 ///
 /// Takes an already-parsed run list, produced once by [`parse_chpx_runs`]
 /// — the caller (`document.rs`) also needs those same runs for
-/// [`resolve_chp_segments`] (issue #287) and must not re-walk the whole
+/// [`resolve_chp_segments`] and must not re-walk the whole
 /// CHPX FKP once per consumer.
 pub fn resolve_deleted_cp_ranges_from_runs(
     runs: &[FkpRun],
@@ -184,7 +184,7 @@ pub fn resolve_deleted_cp_ranges_from_runs(
 }
 
 /// Resolve the character-property segments covering
-/// `[para_cp_start, para_cp_end)` for one paragraph (issue #287).
+/// `[para_cp_start, para_cp_end)` for one paragraph.
 ///
 /// Fully contiguous and gap-filled: any CP within the paragraph's range
 /// that no CHPX run covers gets `ChpProps::default()`, so callers never

@@ -531,7 +531,7 @@ mod tests {
 </a:theme>"#;
 
     #[test]
-    fn parse_theme() {
+    fn test_parse_theme() {
         let theme = Theme::parse(SAMPLE_THEME).unwrap();
         assert_eq!(theme.name, "Office Theme");
         assert_eq!(theme.color_scheme.name, "Office");
@@ -539,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_theme_colors() {
+    fn test_parse_theme_colors() {
         let theme = Theme::parse(SAMPLE_THEME).unwrap();
         let cs = &theme.color_scheme;
 
@@ -556,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_theme_fonts() {
+    fn test_parse_theme_fonts() {
         let theme = Theme::parse(SAMPLE_THEME).unwrap();
         assert_eq!(theme.font_scheme.major_latin, "Calibri Light");
         assert_eq!(theme.font_scheme.minor_latin, "Calibri");
@@ -565,14 +565,14 @@ mod tests {
     }
 
     #[test]
-    fn color_ref_resolve_rgb() {
+    fn test_color_ref_resolve_rgb() {
         let theme = Theme::parse(SAMPLE_THEME).unwrap();
         let color = ColorRef::Rgb(RgbColor([128, 64, 32]));
         assert_eq!(color.resolve(&theme), RgbColor([128, 64, 32]));
     }
 
     #[test]
-    fn color_ref_resolve_theme() {
+    fn test_color_ref_resolve_theme() {
         let theme = Theme::parse(SAMPLE_THEME).unwrap();
         let color = ColorRef::Theme {
             fallback: None,
@@ -584,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn color_ref_resolve_theme_with_tint() {
+    fn test_color_ref_resolve_theme_with_tint() {
         let theme = Theme::parse(SAMPLE_THEME).unwrap();
         let color = ColorRef::Theme {
             fallback: None,
@@ -598,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn rgb_hex_round_trip() {
+    fn test_rgb_hex_round_trip() {
         let rgb = RgbColor::from_hex("4472C4").unwrap();
         assert_eq!(rgb.to_hex(), "4472C4");
         assert_eq!(rgb.red(), 0x44);
@@ -607,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn theme_color_slot_from_scheme_val() {
+    fn test_theme_color_slot_from_scheme_val() {
         assert_eq!(ThemeColorSlot::from_scheme_val("accent1"), Some(ThemeColorSlot::Accent1));
         assert_eq!(ThemeColorSlot::from_scheme_val("dk1"), Some(ThemeColorSlot::Dk1));
         // tx1 maps to dk1 (text1 = dark1)

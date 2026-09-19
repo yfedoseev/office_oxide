@@ -20,8 +20,7 @@ pub mod edit;
 /// Error types for PPTX parsing and creation.
 pub mod error;
 /// Slide-master `<p:txStyles>` default formatting — a placeholder's
-/// fallback when its own direct formatting leaves a property unset
-/// (issue #291).
+/// fallback when its own direct formatting leaves a property unset.
 pub(crate) mod master;
 /// `ppt/presentation.xml` data model.
 pub mod presentation;
@@ -69,11 +68,11 @@ pub struct PptxDocument {
     pub core_properties: Option<crate::core::properties::CoreProperties>,
     /// Parsed `docProps/app.xml` (company, producing application, template,
     /// slide/notes/hidden-slide counts). `None` when the package carries no
-    /// extended-properties part (issue #245).
+    /// extended-properties part.
     pub app_properties: Option<crate::core::properties::AppProperties>,
     /// `true` when the presentation part's own relationships include a
     /// `vbaProject` entry — a cheap macro-presence signal, no VBA
-    /// interpretation (issue #283).
+    /// interpretation.
     pub has_macros: bool,
 }
 
@@ -94,8 +93,7 @@ impl PptxDocument {
     /// Open a PPTX document from any `Read + Seek` source.
     pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
         // A password-protected PPTX is a CFB container, not a zip at all.
-        // See the identical check in docx::DocxDocument::from_reader
-        // (issue #232).
+        // See the identical check in docx::DocxDocument::from_reader.
         if crate::cfb::is_cfb_container(&mut reader).map_err(crate::core::Error::from)? {
             return Err(crate::core::Error::Unsupported(
                 "the file is a password-protected (encrypted) OOXML package; \
@@ -164,17 +162,16 @@ impl PptxDocument {
             /// axis labels, category names and cached data values live in
             /// the separate part that id resolves to
             /// (`ppt/charts/chartN.xml`), which nothing opened at all
-            /// before (issue #239). Pre-resolved here for the same reason
+            /// before. Pre-resolved here for the same reason
             /// `media` is.
             charts: std::collections::HashMap<String, Vec<String>>,
             /// This slide's resolved master title/body level-0 defaults,
             /// via its layout's own `SLIDE_MASTER` relationship — `None`
-            /// when the layout/master chain can't be resolved at all
-            /// (issue #291).
+            /// when the layout/master chain can't be resolved at all.
             master_styles: Option<master::MasterTextStyles>,
         }
         // Many slides share one layout/master — resolve and parse each
-        // unique master part at most once (issue #291).
+        // unique master part at most once.
         let mut master_styles_cache: std::collections::HashMap<String, master::MasterTextStyles> =
             std::collections::HashMap::new();
         let mut bundles = Vec::with_capacity(presentation.slides.len());
@@ -202,7 +199,7 @@ impl PptxDocument {
             // Slide -> layout -> master, resolved through their own
             // relationships exactly like every other part this reader
             // already follows (images, notes, charts) — never opened at
-            // all before this (issue #291).
+            // all before this.
             let master_styles = slide_rels
                 .first_by_type(rel_types::SLIDE_LAYOUT)
                 .and_then(|rel| part_name.resolve_relative(&rel.target).ok())
@@ -267,7 +264,7 @@ impl PptxDocument {
             }
 
             // Pre-load and extract every embedded chart part the slide
-            // references (issue #239).
+            // references.
             let mut charts = std::collections::HashMap::new();
             for rel in slide_rels.all() {
                 if rel.rel_type != rel_types::CHART {
@@ -409,8 +406,8 @@ fn extract_notes_body(xml_data: &[u8]) -> Option<TextBody> {
 /// Fill any unset (`None`) character/paragraph-formatting field on
 /// every Title/Body placeholder shape's runs from the resolved slide
 /// master's level-0 defaults — never overriding a field the run/
-/// paragraph already specified directly (issue #291, the PPTX analogue
-/// of the legacy `.ppt` fix in issue #335).
+/// paragraph already specified directly (the PPTX analogue
+/// of the legacy `.ppt` master-inheritance fix).
 fn apply_master_inheritance(shapes: &mut [Shape], styles: &master::MasterTextStyles) {
     for shape in shapes {
         match shape {
@@ -560,7 +557,7 @@ mod content_type_tests {
         assert!(super::PptxDocument::from_reader(Cursor::new(bytes)).is_err());
     }
 
-    /// issue #232 — same gap as DOCX/XLSX, confirmed independently for PPTX.
+    /// Same gap as DOCX/XLSX, confirmed independently for PPTX.
     #[test]
     fn test_encrypted_pptx_gives_a_friendly_error_via_the_format_specific_reader() {
         let mut cfb = vec![0u8; 512];

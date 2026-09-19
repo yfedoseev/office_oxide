@@ -168,7 +168,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn emu_conversions() {
+    fn test_emu_conversions() {
         let one_inch = Emu::from_inches(1.0);
         assert_eq!(one_inch.0, 914_400);
         assert!((one_inch.to_inches() - 1.0).abs() < f64::EPSILON);
@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn emu_to_twip_roundtrip() {
+    fn test_emu_to_twip_roundtrip() {
         let emu = Emu::from_inches(1.0);
         let twip = emu.to_twip();
         assert_eq!(twip.0, 1440);
@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn twip_conversions() {
+    fn test_twip_conversions() {
         let us_letter_width = Twip(12240); // 8.5 inches
         assert!((us_letter_width.to_inches() - 8.5).abs() < f64::EPSILON);
 
@@ -200,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    fn half_point_conversions() {
+    fn test_half_point_conversions() {
         let twelve_pt = HalfPoint(24);
         assert!((twelve_pt.to_points() - 12.0).abs() < f64::EPSILON);
 
@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn half_point_from_points_rounded() {
+    fn test_half_point_from_points_rounded() {
         // 10.1pt → 20.2 half-pts → rounds to 20.
         assert_eq!(HalfPoint::from_points_rounded(10.1).0, 20);
         // 10.3pt → 20.6 half-pts → rounds to 21.
@@ -222,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn half_point_from_word_sz() {
+    fn test_half_point_from_word_sz() {
         // <w:sz w:val="24"/> means 24 half-points → 12pt.
         let sz = HalfPoint::from_word_sz(24);
         assert_eq!(sz.0, 24);
@@ -230,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn half_point_from_drawingml_sz() {
+    fn test_half_point_from_drawingml_sz() {
         // <a:rPr sz="1200"/> means 1200 hundredths of a point → 12pt → 24 half-pts.
         let sz = HalfPoint::from_drawingml_sz(1200);
         assert_eq!(sz.0, 24);
@@ -242,14 +242,14 @@ mod tests {
     }
 
     #[test]
-    fn half_point_to_drawingml_sz() {
+    fn test_half_point_to_drawingml_sz() {
         // 24 half-pts (=12pt) → 1200 hundredths.
         assert_eq!(HalfPoint(24).to_drawingml_sz(), 1200);
         assert_eq!(HalfPoint(36).to_drawingml_sz(), 1800);
     }
 
     #[test]
-    fn half_point_drawingml_round_trip() {
+    fn test_half_point_drawingml_round_trip() {
         for hundredths in [100u32, 600, 1100, 1200, 1800, 2400, 3600] {
             let hp = HalfPoint::from_drawingml_sz(hundredths);
             // Round-trip is lossless when hundredths is divisible by 50.
@@ -260,14 +260,14 @@ mod tests {
     }
 
     #[test]
-    fn percentage_conversions() {
+    fn test_percentage_conversions() {
         let fifty = Percentage1000(50_000);
         assert!((fifty.to_percent() - 50.0).abs() < f64::EPSILON);
         assert!((fifty.to_fraction() - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn angle_conversions() {
+    fn test_angle_conversions() {
         let right_angle = Angle60k(5_400_000);
         assert!((right_angle.to_degrees() - 90.0).abs() < f64::EPSILON);
 

@@ -30,7 +30,7 @@ pub struct AutoShape {
     pub placeholder: Option<PlaceholderInfo>,
     /// Click-action hyperlink from `p:cNvPr > a:hlinkClick` — the
     /// shape's own navigation target, separate from any hyperlink on
-    /// text inside it (issue #299).
+    /// text inside it.
     pub hyperlink: Option<HyperlinkInfo>,
 }
 
@@ -53,7 +53,7 @@ pub struct PictureShape {
     /// Image format inferred from the relationship target extension or
     /// byte signature (e.g. `"png"`, `"jpeg"`, `"gif"`, `"emf"`).
     pub format: Option<String>,
-    /// Click-action hyperlink from `p:cNvPr > a:hlinkClick` (issue #299).
+    /// Click-action hyperlink from `p:cNvPr > a:hlinkClick`.
     pub hyperlink: Option<HyperlinkInfo>,
 }
 

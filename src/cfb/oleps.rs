@@ -8,7 +8,7 @@
 //! OLEPS/VARIANT decoder: no vectors, arrays, non-simple (storage-backed)
 //! properties, or code-page-aware string decoding (`VT_LPSTR`'s bytes are
 //! read as Latin-1/CP1252, the same simplification this crate's other
-//! legacy-format readers already make — see #309/#310 for the tracked,
+//! legacy-format readers already make — the XLS/DOC codepage work tracks the
 //! separate gap in real code-page support).
 //!
 //! Byte layouts verified against the published [MS-OLEPS] spec pages
@@ -382,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_lpstr_title_and_author() {
+    fn test_decodes_lpstr_title_and_author() {
         let stream = build_stream(&[
             (PIDSI_TITLE, lpstr("Hello World")),
             (PIDSI_AUTHOR, lpstr("Jane Doe")),
@@ -394,14 +394,14 @@ mod tests {
     }
 
     #[test]
-    fn decodes_lpwstr_unicode_title() {
+    fn test_decodes_lpwstr_unicode_title() {
         let stream = build_stream(&[(PIDSI_TITLE, lpwstr("Café Résumé"))]);
         let props = parse_summary_information(&stream).expect("must parse");
         assert_eq!(props.title.as_deref(), Some("Café Résumé"));
     }
 
     #[test]
-    fn decodes_filetime_dates() {
+    fn test_decodes_filetime_dates() {
         // 2006-09-05T00:00:00Z, a value already used as a reference date
         // elsewhere in this crate's own XLS date tests.
         // Unix seconds for 2006-09-05T00:00:00Z = 1157414400.
@@ -412,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_filetime_is_none_not_the_1601_epoch() {
+    fn test_zero_filetime_is_none_not_the_1601_epoch() {
         let stream = build_stream(&[(PIDSI_CREATE_DTM, filetime(0))]);
         // Every other property absent too, and a zero FILETIME resolves
         // to None, so this whole stream carries nothing usable.
@@ -420,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_byte_order_is_rejected() {
+    fn test_wrong_byte_order_is_rejected() {
         let mut stream = build_stream(&[(PIDSI_TITLE, lpstr("x"))]);
         stream[0] = 0x00;
         stream[1] = 0x00;
@@ -428,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_stream_does_not_panic() {
+    fn test_truncated_stream_does_not_panic() {
         let stream = build_stream(&[(PIDSI_TITLE, lpstr("Hello World"))]);
         for cut in 0..stream.len() {
             let _ = parse_summary_information(&stream[..cut]);
@@ -436,12 +436,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_stream_is_none() {
+    fn test_empty_stream_is_none() {
         assert!(parse_summary_information(&[]).is_none());
     }
 
     #[test]
-    fn unknown_property_ids_are_ignored_not_misread() {
+    fn test_unknown_property_ids_are_ignored_not_misread() {
         let stream = build_stream(&[
             (999, lpstr("unrelated property")),
             (PIDSI_SUBJECT, lpstr("Real Subject")),
@@ -451,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn civil_from_days_matches_known_dates() {
+    fn test_civil_from_days_matches_known_dates() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(13_396), (2006, 9, 5));
         assert_eq!(civil_from_days(-1), (1969, 12, 31));

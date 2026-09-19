@@ -6,7 +6,7 @@
 //! selects the matching `LSTF` (list definition) in `PlfLst`, and that
 //! `LSTF`'s `LVL` array (one entry per level, unless `fSimpleList`) carries
 //! each level's declared start-at value and number-format code. Before this
-//! module (issue #250), `Fib::fc_plcf_lst`/`lcb_plcf_lst` were parsed and
+//! module, `Fib::fc_plcf_lst`/`lcb_plcf_lst` were parsed and
 //! then never read again anywhere in the crate, so `List::start_number` was
 //! always `None` and every list was rendered unordered regardless of its
 //! real number format.
@@ -79,7 +79,7 @@ impl ListFormatting {
     /// Parse `PlfLst` (at `fc_plf_lst`/`lcb_plf_lst`) and `PlfLfo` (at
     /// `fc_plf_lfo`/`lcb_plf_lfo`) from the Table stream. Any parse failure
     /// (truncated/malformed data) degrades to an empty formatting table —
-    /// every lookup then returns `None`, matching the pre-#250 behaviour
+    /// every lookup then returns `None`, matching the pre-list-format behaviour
     /// rather than erroring the whole document.
     pub fn parse(
         table_stream: &[u8],
@@ -374,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_start_at_and_nfc_from_the_spec_worked_example() {
+    fn test_resolves_start_at_and_nfc_from_the_spec_worked_example() {
         let table = spec_example_table_stream();
         let fmt = ListFormatting::parse(&table, 0x0536, 0x001E, 0x07E1, 0x0018);
 
@@ -390,14 +390,14 @@ mod tests {
         assert!(!lvl2.is_numbered(), "nfc=0xFF must report as unnumbered (a bullet level)");
     }
 
-    /// issue #250 — the real-world override shape: a corpus file literally
+    /// The real-world override shape: a corpus file literally
     /// named `apache_tika__testWORD_override_list_numbering.doc` turned out
     /// to express its start-at override via a `LFOLVL` entry on the `LFO`
     /// (`fStartAt == 1`), not via a second `LSTF`/`LVL` pair with a
     /// different declared `iStartAt`. Byte layout verified against the
     /// published `LFOLVL` structure page.
     #[test]
-    fn lfolvl_start_at_override_takes_precedence_over_the_lstfs_own_value() {
+    fn test_lfolvl_start_at_override_takes_precedence_over_the_lstfs_own_value() {
         let mut data = spec_example_table_stream();
 
         // Rewrite the LFO's clfolvl from 0 to 1, and append one LFOLVL
@@ -427,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn ilfo_zero_or_negative_is_not_in_a_list() {
+    fn test_ilfo_zero_or_negative_is_not_in_a_list() {
         let table = spec_example_table_stream();
         let fmt = ListFormatting::parse(&table, 0x0536, 0x001E, 0x07E1, 0x0018);
         assert!(fmt.level_for(0, 0).is_none());
@@ -435,20 +435,20 @@ mod tests {
     }
 
     #[test]
-    fn unknown_ilfo_resolves_to_none_not_a_panic() {
+    fn test_unknown_ilfo_resolves_to_none_not_a_panic() {
         let table = spec_example_table_stream();
         let fmt = ListFormatting::parse(&table, 0x0536, 0x001E, 0x07E1, 0x0018);
         assert!(fmt.level_for(99, 0).is_none());
     }
 
     #[test]
-    fn empty_table_stream_never_panics() {
+    fn test_empty_table_stream_never_panics() {
         let fmt = ListFormatting::parse(&[], 0, 0, 0, 0);
         assert!(fmt.level_for(1, 0).is_none());
     }
 
     #[test]
-    fn truncated_plf_lst_degrades_gracefully() {
+    fn test_truncated_plf_lst_degrades_gracefully() {
         // Claims a large lcb but the actual data is short — must not panic
         // or read out of bounds.
         let table = vec![0xFFu8; 16];
@@ -460,7 +460,7 @@ mod tests {
     /// referenced at ilvl > 0) must fall back to the list's first level
     /// rather than returning `None`.
     #[test]
-    fn ilvl_past_the_lists_own_depth_falls_back_to_the_first_level() {
+    fn test_ilvl_past_the_lists_own_depth_falls_back_to_the_first_level() {
         let table = spec_example_table_stream();
         let fmt = ListFormatting::parse(&table, 0x0536, 0x001E, 0x07E1, 0x0018);
         let deep = fmt.level_for(1, 50).expect("out-of-range ilvl must fall back, not None");

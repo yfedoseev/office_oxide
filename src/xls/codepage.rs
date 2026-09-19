@@ -9,7 +9,7 @@
 //! ISO-8859-1/Latin-1), which is wrong even for the *default* codepage:
 //! Windows-1252 and Latin-1 only agree below 0x80 and above 0x9F; the
 //! 0x80-0x9F range (smart quotes, em dash, bullet, ellipsis — common
-//! punctuation) differs between them (issue #309).
+//! punctuation) differs between them.
 //!
 //! Scope: BIFF8 strings are unaffected — their "compressed" flag means
 //! "low byte of a UTF-16 code unit," an entirely different (and already
@@ -76,24 +76,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_codepage_reads_the_u16() {
+    fn test_parse_codepage_reads_the_u16() {
         assert_eq!(parse_codepage(&[0xE5, 0x04]), Some(1253)); // 1253 = 0x04E5
     }
 
     #[test]
-    fn truncated_codepage_is_none() {
+    fn test_truncated_codepage_is_none() {
         assert!(parse_codepage(&[0x01]).is_none());
     }
 
     #[test]
-    fn greek_codepage_1253_decodes_correctly() {
+    fn test_greek_codepage_1253_decodes_correctly() {
         // Windows-1253 bytes for "Προμηθευτής" ("Supplier").
         let (encoded, _, _) = encoding_rs::WINDOWS_1253.encode("Προμηθευτής");
         assert_eq!(decode_biff5_text(&encoded, Some(1253)), "Προμηθευτής");
     }
 
     #[test]
-    fn mac_central_europe_codepage_10029_decodes_correctly() {
+    fn test_mac_central_europe_codepage_10029_decodes_correctly() {
         // Spot-check a few entries against the official CENTEURO.TXT
         // mapping, then decode a whole word through the public API.
         assert_eq!(mac_central_europe_char(0xFC), '\u{0141}'); // Ł
@@ -106,14 +106,14 @@ mod tests {
     }
 
     #[test]
-    fn ascii_bytes_are_unchanged_regardless_of_codepage() {
+    fn test_ascii_bytes_are_unchanged_regardless_of_codepage() {
         assert_eq!(decode_biff5_text(b"Hello", Some(1253)), "Hello");
         assert_eq!(decode_biff5_text(b"Hello", Some(10029)), "Hello");
         assert_eq!(decode_biff5_text(b"Hello", None), "Hello");
     }
 
     #[test]
-    fn windows_1252_high_bytes_differ_from_raw_latin1() {
+    fn test_windows_1252_high_bytes_differ_from_raw_latin1() {
         // 0x93/0x94 are curly quotes in windows-1252, not the C1 control
         // codes ISO-8859-1/raw-Latin1 promotion would produce.
         let decoded = decode_biff5_text(&[0x93, b'x', 0x94], Some(1252));
@@ -122,14 +122,14 @@ mod tests {
     }
 
     #[test]
-    fn unmapped_codepage_falls_back_to_raw_byte_promotion() {
+    fn test_unmapped_codepage_falls_back_to_raw_byte_promotion() {
         // No behavior regression for a codepage this crate doesn't know:
         // still the pre-existing raw-Latin1 behavior, not a panic or loss.
         assert_eq!(decode_biff5_text(&[0x41, 0xE9], Some(65535)), "A\u{00E9}");
     }
 
     #[test]
-    fn default_codepage_is_windows_1252_not_raw_latin1() {
+    fn test_default_codepage_is_windows_1252_not_raw_latin1() {
         let decoded = decode_biff5_text(&[0x93], None);
         assert_eq!(decoded, "\u{201C}");
     }

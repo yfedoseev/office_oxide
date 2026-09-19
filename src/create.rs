@@ -99,8 +99,7 @@ pub fn create_from_ir_to_writer<W: Write + Seek>(
 /// from anywhere, including untrusted input). Call
 /// [`crate::docx::write::DocxWriter::truncated_subtrees`] on the
 /// returned writer, after `write_to`/`save`, to learn whether that
-/// happened — it used to be a silent `Ok` with only a `log::warn!`
-/// (issue #218).
+/// happened — it used to be a silent `Ok` with only a `log::warn!`.
 pub fn ir_to_docx(ir: &DocumentIR) -> crate::docx::write::DocxWriter {
     use crate::docx::write::{DocxWriter, IrParaProps, Run};
 
@@ -130,8 +129,8 @@ pub fn ir_to_docx(ir: &DocumentIR) -> crate::docx::write::DocxWriter {
         // round-trip idempotence. This used to check only
         // `section.elements.first()`, so a section whose heading wasn't
         // its literal first element (e.g. a byline or date line before
-        // it) got the heading duplicated on every round trip (issue
-        // #259) — checking the whole element list instead of just the
+        // it) got the heading duplicated on every round trip —
+        // checking the whole element list instead of just the
         // first entry fixes it without changing behavior for the common
         // leading-heading case.
         let title_already_present = section.elements.iter().any(|e| {
@@ -543,7 +542,7 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                     // uses), so every cell after the gap silently shifted
                     // left, misplacing content and hyperlinks onto the
                     // wrong column instead of skipping over the claimed
-                    // one (issue #340).
+                    // one.
                     let mut active_spans: std::collections::BTreeMap<usize, usize> =
                         std::collections::BTreeMap::new();
                     for row in &t.rows {
@@ -610,7 +609,7 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                         // cells) doesn't track which specific sub-line a
                         // hyperlink's own span covers, matching the
                         // simplification `cell_hyperlink` already makes
-                        // for a real table cell's content (issue #262).
+                        // for a real table cell's content.
                         let hyperlink = p.content.iter().find_map(|c| match c {
                             InlineContent::Text(t) => t.hyperlink.clone(),
                             _ => None,
@@ -710,7 +709,7 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                 // ({author})"). Written back as a real cell comment
                 // instead of falling into the generic wildcard below,
                 // which dumped every comment's text as a spurious extra
-                // row with no cell reference at all (issue #344).
+                // row with no cell reference at all.
                 Element::Endnote(n) => {
                     let placed = parse_xlsx_comment_marker(n.marker.as_deref())
                         .and_then(|(cell_ref, author)| {
@@ -925,7 +924,7 @@ fn emit_pptx_slide_from_section(writer: &mut crate::pptx::write::PptxWriter, sec
     // Speaker notes round-trip into ppt/notesSlides/, never onto the
     // slide. Structured (bold/italic/bullets/numbering), not flattened
     // to a plain string — matches the fidelity ordinary slide body text
-    // already gets (issue #290).
+    // already gets.
     if let Some(ref notes) = section.speaker_notes {
         let items = pptx_notes_body_items(notes);
         if !items.is_empty() {
@@ -945,7 +944,7 @@ fn emit_pptx_slide_from_section(writer: &mut crate::pptx::write::PptxWriter, sec
     // heading as body text would both pollute the body and duplicate it
     // on a write→parse cycle (breaking round-trip idempotence). This
     // used to only check `section.elements.first()` — the same bug
-    // shape as #259 on the DOCX side — so a slide whose title heading
+    // shape as the DOCX title duplication — so a slide whose title heading
     // wasn't its literal first shape (a decorative or subtitle shape
     // ahead of it in z-order) got the title duplicated into the body on
     // every round trip. Find the matching heading wherever it is and
@@ -982,7 +981,7 @@ pub(crate) const PPTX_THEMATIC_BREAK_MARKER: &str = "\u{2500}\u{2500}\u{2500}\u{
 /// same shape `convert_text_body` produces for ordinary slide body
 /// text) into `pptx::write::BodyItem`s for `set_notes_structured`, so
 /// bold/italic/bullets/numbering in notes reach the written file
-/// instead of being flattened to plain lines (issue #290).
+/// instead of being flattened to plain lines.
 fn pptx_notes_body_items(notes: &[Element]) -> Vec<crate::pptx::write::BodyItem> {
     use crate::pptx::write::BodyItem;
 
@@ -1071,7 +1070,7 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
             // writer, so every item below level 0 was silently dropped.
             // Each item's runs (not just its plain text) now carry
             // through, so a hyperlink or bold/italic/color on a list
-            // item's text survives the write (issue #341).
+            // item's text survives the write.
             fn flatten(
                 list: &crate::ir::List,
                 level: u8,
@@ -1100,7 +1099,7 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
         },
         Element::Table(t) => {
             // A real a:tbl, not tab-joined text: the previous form lost the
-            // grid, every cell boundary, and (until issue #341) all
+            // grid, every cell boundary, and (until table cells carried runs) all
             // per-cell run formatting including hyperlinks.
             let rows: Vec<Vec<Vec<crate::pptx::write::Run>>> =
                 t.rows.iter().map(|row| row.cells.iter().map(cell_runs).collect()).collect();
@@ -1140,7 +1139,7 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
             // merged multiple independent text boxes' content into one
             // undifferentiated stream — or conjured a spurious empty box
             // out of unrelated body content once that flattening was
-            // "fixed" to stop dropping text (issue #264). Paragraph/
+            // "fixed" to stop dropping text. Paragraph/
             // Heading content — the common "this really is just a text
             // box" case — is now emitted as its own positioned shape,
             // the same way `Element::Image` already does. A nested
@@ -1161,7 +1160,7 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
                     // — routing it through `emit_pptx_element` like the
                     // other fallback cases would silently move it there,
                     // discarding the *wrapping* text box's real position
-                    // (issue #264 — confirmed on real corpus files: a
+                    // (confirmed on real corpus files: a
                     // positioned image inside a TextBox lost its position
                     // and stopped counting as a positioned shape at all).
                     Element::Image(img) => {
@@ -1408,7 +1407,7 @@ fn cell_text(cell: &TableCell) -> String {
 
 /// A PPTX table cell's content as styled `Run`s instead of `cell_text`'s
 /// plain string — needed so a cell's hyperlink/bold/italic/color reaches
-/// the PPTX writer at all (issue #341).
+/// the PPTX writer at all.
 fn cell_runs(cell: &TableCell) -> Vec<crate::pptx::write::Run> {
     cell.content
         .iter()
@@ -1420,7 +1419,7 @@ fn cell_runs(cell: &TableCell) -> Vec<crate::pptx::write::Run> {
 }
 
 /// The first hyperlink URL found anywhere in a cell's content, if any
-/// (issue #262 — xlsx::write had no hyperlink concept at all, so a
+/// (xlsx::write had no hyperlink concept at all, so a
 /// cell's `TextSpan.hyperlink` — the same field DOCX/PPTX runs already
 /// use — was silently dropped on every write).
 fn cell_hyperlink(cell: &TableCell) -> Option<String> {
@@ -1478,9 +1477,9 @@ fn ir_cell_to_cell_data(cell: &TableCell, text: &str) -> crate::xlsx::write::Cel
 /// rich only when at least one run carries real character formatting
 /// (bold/italic/underline/color/font), keeping the common (plain) case's
 /// written XML exactly as before. Closes the write side of the
-/// read-only gap issue #303 left on the read path: a cell's own
+/// read-only gap the rich-text reader left: a cell's own
 /// bold/italic/color/font (single- or multi-run) used to be silently
-/// discarded on write regardless of how it reached the IR (issue #346).
+/// discarded on write regardless of how it reached the IR.
 fn text_cell_data(cell: &TableCell, text: &str) -> crate::xlsx::write::CellData {
     use crate::xlsx::write::CellData;
     if text.is_empty() {
@@ -1504,7 +1503,7 @@ fn text_cell_data(cell: &TableCell, text: &str) -> crate::xlsx::write::CellData 
 
 /// A table cell's paragraphs/spans as `xlsx::write::RichRun`s — the
 /// per-run mirror of `cell_text`'s flattening, with the same
-/// paragraph-join-by-space behavior (issue #346).
+/// paragraph-join-by-space behavior.
 fn ir_cell_rich_runs(cell: &TableCell) -> Vec<crate::xlsx::write::RichRun> {
     use crate::xlsx::write::RichRun;
     let mut runs: Vec<RichRun> = Vec::new();
@@ -1588,8 +1587,7 @@ fn first_inline_font_name(content: &[InlineContent]) -> Option<String> {
 /// generates for every `Element::Endnote` it builds from a real cell
 /// comment — back into `(cell_ref, author)`. Returns `None` for any
 /// other shape (no marker, or one that doesn't parse this way), so the
-/// caller can fall back to treating it as ordinary endnote content
-/// (issue #344).
+/// caller can fall back to treating it as ordinary endnote content.
 fn parse_xlsx_comment_marker(marker: Option<&str>) -> Option<(String, Option<String>)> {
     let marker = marker?;
     match marker.split_once(" (") {
@@ -1689,7 +1687,7 @@ fn xlsx_cell_style(
 }
 
 /// Convert a `TextBox`'s block content into the `(runs, ParaProps)`
-/// pairs `SlideData::add_multi_paragraph_text_box` needs (issue #264).
+/// pairs `SlideData::add_multi_paragraph_text_box` needs.
 ///
 /// Handles `Paragraph`/`Heading` (the common case — a real text box's
 /// content is ordinary flowed paragraphs) as real paragraphs, each with
@@ -1700,7 +1698,7 @@ fn xlsx_cell_style(
 /// flattening, so it isn't silently dropped, at the cost of its own
 /// rich formatting.
 /// Convert `Paragraph`/`Heading` elements into the `(runs, ParaProps)`
-/// pairs `SlideData::add_multi_paragraph_text_box` needs (issue #264).
+/// pairs `SlideData::add_multi_paragraph_text_box` needs.
 /// Callers only pass paragraph-like content here — a nested `List`/
 /// `Table`/`TextBox` inside a `TextBox` is emitted separately (see
 /// `emit_pptx_element`'s own `Element::TextBox` arm), since it has no
@@ -1793,7 +1791,7 @@ mod xlsx_table_write_tests {
     use super::*;
     use std::io::Cursor;
 
-    /// issue #340 — a row-spanning merge (`row_span > 1`) claims its
+    /// A row-spanning merge (`row_span > 1`) claims its
     /// column for every row it covers. The covered rows' own `cells`
     /// correctly exclude that column (the sparse, span-driven model
     /// every reader uses), but the writer used to compute each cell's
@@ -1803,7 +1801,7 @@ mod xlsx_table_write_tests {
     /// shifted left, misplacing its content and hyperlink onto the
     /// wrong column instead of the one actually claimed by the merge.
     #[test]
-    fn a_cell_after_a_row_spanning_merge_keeps_its_own_column_and_hyperlink() {
+    fn test_a_cell_after_a_row_spanning_merge_keeps_its_own_column_and_hyperlink() {
         let cell = |text: &str, url: &str, row_span: u32| TableCell {
             content: vec![Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan {
@@ -1882,7 +1880,7 @@ mod xlsx_table_write_tests {
         );
     }
 
-    /// issue #344 — the XLSX reader turns every real cell comment into an
+    /// The XLSX reader turns every real cell comment into an
     /// `Element::Endnote` whose marker is `"{cell_ref}"` or
     /// `"{cell_ref} ({author})"` (see `convert_xlsx.rs`). The writer used
     /// to have nowhere to put endnote content in a spreadsheet and fell
@@ -1892,7 +1890,7 @@ mod xlsx_table_write_tests {
     /// now write a real `xl/comments*.xml` + `vmlDrawing*.vml` pair and
     /// leave the sheet's own grid untouched.
     #[test]
-    fn a_cell_comment_round_trips_as_a_real_comment_not_an_extra_row() {
+    fn test_a_cell_comment_round_trips_as_a_real_comment_not_an_extra_row() {
         let cell = |text: &str| TableCell {
             content: vec![Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan { text: text.to_string(), ..Default::default() })],
@@ -1965,17 +1963,17 @@ mod xlsx_table_write_tests {
         assert!(has_comment_endnote, "the comment must round-trip back onto cell B1: {:?}", ir2.sections[0].elements);
     }
 
-    /// issue #346 — a table cell's own character formatting (bold/
+    /// A table cell's own character formatting (bold/
     /// italic/color) was silently discarded on write no matter how it
     /// reached the IR: `ir_cell_to_cell_data` built a `CellData` from
     /// the cell's flattened text and a style derived only from
     /// `is_header`/`background_color`/`number_format`, never the
     /// cell's own `TextSpan`s. Both a single formatted run and a
-    /// multi-run cell (the exact shape #303 taught the reader to
+    /// multi-run cell (the exact shape the rich-text fix taught the reader to
     /// parse, with no write-side counterpart until now) must survive a
     /// write->reread round trip with per-run fidelity.
     #[test]
-    fn cell_character_formatting_round_trips_including_multi_run() {
+    fn test_cell_character_formatting_round_trips_including_multi_run() {
         let span = |text: &str, bold: bool, color: Option<[u8; 3]>| InlineContent::Text(TextSpan {
             text: text.to_string(),
             bold,
@@ -2052,7 +2050,7 @@ mod docx_section_title_tests {
     use super::*;
     use std::io::Cursor;
 
-    /// issue #338 — `convert_docx.rs` derives `section.title` from a
+    /// `convert_docx.rs` derives `section.title` from a
     /// heading using a narrower text extraction (only `InlineContent::
     /// Text`, silently dropping `LineBreak`) than `ir_to_docx`'s "is the
     /// title already present in the elements" check (`inline_to_text`,
@@ -2062,7 +2060,7 @@ mod docx_section_title_tests {
     /// copy of the heading got written on every round trip. Both sides
     /// must now agree by construction — they share `ir::inline_to_text`.
     #[test]
-    fn a_heading_with_a_line_break_is_not_duplicated_as_a_second_title() {
+    fn test_a_heading_with_a_line_break_is_not_duplicated_as_a_second_title() {
         let heading = Element::Heading(Heading {
             level: 1,
             content: vec![InlineContent::LineBreak, InlineContent::Text(TextSpan::plain("Individual Elements"))],
@@ -2110,11 +2108,11 @@ mod pptx_notes_write_tests {
     use super::*;
     use std::io::Cursor;
 
-    /// issue #290 — a bold run in `Section::speaker_notes` must survive
+    /// A bold run in `Section::speaker_notes` must survive
     /// a full write→reread round trip, not just reach the writer's own
     /// intermediate representation.
     #[test]
-    fn bold_speaker_notes_round_trip() {
+    fn test_bold_speaker_notes_round_trip() {
         let notes = vec![Element::Paragraph(Paragraph {
             content: vec![InlineContent::Text(TextSpan {
                 text: "THIS LINE IS BOLD".to_string(),

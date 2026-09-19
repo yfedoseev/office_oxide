@@ -126,11 +126,11 @@ pub struct DocxDocument {
     /// Parsed `docProps/app.xml` (company, producing application, template,
     /// page/word/character/paragraph counts). `None` when the package
     /// carries no extended-properties part. The parser already existed;
-    /// nothing on the read side called it until now (issue #245).
+    /// nothing on the read side called it until now.
     pub app_properties: Option<crate::core::properties::AppProperties>,
     /// `true` when the document part's own relationships include a
     /// `vbaProject` entry — a cheap macro-presence signal, no VBA
-    /// interpretation (issue #283).
+    /// interpretation.
     pub has_macros: bool,
     /// Footnote bodies from `word/footnotes.xml`, in document order.
     /// Separator/continuation pseudo-notes are filtered out.
@@ -172,7 +172,7 @@ impl DocxDocument {
         // Without this check, opening one here (rather than through the
         // unified `Document::from_reader`, which already has it) failed
         // with a confusing low-level "Could not find EOCD" zip error
-        // instead of naming the real cause (issue #232).
+        // instead of naming the real cause.
         if crate::cfb::is_cfb_container(&mut reader).map_err(crate::core::Error::from)? {
             return Err(crate::core::Error::Unsupported(
                 "the file is a password-protected (encrypted) OOXML package; \
@@ -291,7 +291,7 @@ impl DocxDocument {
         // the chart's title, axis titles, category labels, series names and
         // cached data values all live in the separate part that id resolves
         // to (`word/charts/chartN.xml`), which was never opened, so none of
-        // that text reached any consumer (issue #273).
+        // that text reached any consumer.
         let mut chart_text_by_rid: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for rel in doc_rels.all() {
@@ -313,7 +313,7 @@ impl DocxDocument {
             }
         }
         // Resolve every SmartArt diagram the body references, the same
-        // way charts are resolved just above (issue #271).
+        // way charts are resolved just above.
         let mut dgm_text_by_rid: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for rel in doc_rels.all() {
@@ -339,7 +339,7 @@ impl DocxDocument {
         }
 
         // Resolve every embedded native OOXML package object
-        // (`<o:OLEObject Type="Embed">`, issue #304) by opening its bytes
+        // (`<o:OLEObject Type="Embed">`) by opening its bytes
         // with the appropriate format reader and folding in its text.
         resolve_deferred_parts(&mut body.elements, &mut opc, &main_part, &doc_rels);
 
@@ -396,7 +396,7 @@ impl DocxDocument {
             // footnote/endnote/comment resolves against *that* part's
             // `_rels`, not `document.xml.rels`. Resolving against the
             // document's relationships left the raw `rIdN` string as the
-            // "URL" for every note hyperlink (issue #293).
+            // "URL" for every note hyperlink.
             if let Ok(note_rels) = opc.read_rels_for(&part) {
                 for n in &mut notes {
                     resolve_hyperlinks(&mut n.content, &note_rels);
@@ -675,7 +675,7 @@ fn parse_block_elements_until(
 /// Everything a legacy VML `<w:pict>` / `<w:object>` subtree can carry.
 ///
 /// Only `<w:txbxContent>` used to be read, so a `w:pict` wrapping an
-/// image (#268), WordArt (#274) or an embedded package (#304) contributed
+/// image, WordArt or an embedded package contributed
 /// nothing at all to the document.
 #[derive(Default)]
 struct VmlContent {
@@ -1147,7 +1147,7 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
                 },
                 // `w:fldSimple` is the one-element form of the same field
                 // mechanism; its `w:instr` attribute holds the URL of a
-                // HYPERLINK field (issue #267). Other field types keep the
+                // HYPERLINK field. Other field types keep the
                 // existing transparent-wrapper behaviour.
                 b"fldSimple" => {
                     let target = xml::optional_attr_str(e, b"w:instr")?
@@ -1167,7 +1167,7 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
                     }
                 },
                 // OMML equations: no structural model, but every `<m:t>`
-                // inside one is real, visible text (issue #270).
+                // inside one is real, visible text.
                 b"oMath" | b"oMathPara" => {
                     let end: &[u8] = if e.local_name().as_ref() == b"oMathPara" {
                         b"oMathPara"
@@ -1247,7 +1247,7 @@ struct OpenField {
 
 /// Fold one run's field-code events into the paragraph's open-field stack,
 /// resolving a completed field into a `ParagraphContent::Hyperlink` when it
-/// turns out to be a `HYPERLINK` field (issue #267).
+/// turns out to be a `HYPERLINK` field.
 ///
 /// Fields nest in principle (a field's instruction can itself contain
 /// another field), so `fields` is a stack — but only the outermost
@@ -1312,7 +1312,7 @@ fn apply_field_parts(
 /// Collect every `<m:t>` text run inside an OMML equation (`<m:oMath>` or
 /// `<m:oMathPara>`), concatenated with no separators. This is not a
 /// structural math model — just enough to stop 100% content loss on a
-/// document whose only content is a formula (issue #270).
+/// document whose only content is a formula.
 fn collect_omml_text(reader: &mut quick_xml::Reader<&[u8]>, end_local: &[u8]) -> CoreResult<String> {
     let mut text = String::new();
     let mut depth = 1i32;
@@ -1388,7 +1388,7 @@ fn parse_run(
                 // AlternateContent to its `<mc:Choice>` branch so shape text
                 // is not extracted twice (once per branch), and picks up the
                 // *other* payloads a VML shape can carry: legacy images
-                // (issue #268), WordArt (#274) and embedded packages (#304).
+                //, WordArt and embedded packages.
                 b"pict" | b"object" => {
                     let end: &[u8] = if e.local_name().as_ref() == b"object" {
                         b"object"
@@ -1401,14 +1401,14 @@ fn parse_run(
                     parse_alternate_content(reader)?.push_into(&mut run.content);
                 },
                 // A note's reference mark. The mark *is* content: it is
-                // where the note is cited (issue #241).
+                // where the note is cited.
                 b"footnoteReference" | b"endnoteReference" | b"commentReference" => {
                     push_note_reference(e, &mut run.content)?;
                     xml::skip_element_fast(reader)?;
                 },
                 // Complex field codes. The `begin` char also carries
                 // `<w:ffData>` for legacy form fields, whose state exists
-                // nowhere else in the document (issue #276).
+                // nowhere else in the document.
                 b"fldChar" => {
                     fields.push(fld_char_part(e)?);
                     if let Some(mut ff) = parse_fld_char_body(reader)? {
@@ -1417,7 +1417,7 @@ fn parse_run(
                     }
                 },
                 // The field instruction — for a HYPERLINK field this holds
-                // the URL, which was previously unreachable (issue #267).
+                // the URL, which was previously unreachable.
                 b"instrText" => {
                     fields.push(FieldPart::Instr(xml::read_text_content_fast(reader)?));
                 },
@@ -1519,7 +1519,7 @@ fn push_note_reference(
     // mark glyph instead of the auto-number; without threading this back,
     // a custom footnote mark ("*", "†") has nowhere in the IR to land, and
     // downstream conversion has no way to distinguish it from an ordinary
-    // leading run of note-body text (issue #219).
+    // leading run of note-body text.
     let custom_mark = xml::optional_attr_str(e, b"w:customMarkFollows")?
         .is_some_and(|v| matches!(v.as_ref(), "1" | "true" | "on"));
     out.push(match e.local_name().as_ref() {
@@ -1728,7 +1728,7 @@ fn parse_hyperlink(
     // (`externalURL#fragment`). Taking the anchor branch unconditionally
     // discarded the real URL and left a dead same-document reference
     // behind — the single most prevalent hyperlink defect in the corpus
-    // (issues #242, #292). The anchor is kept in `fragment` and appended
+    //. The anchor is kept in `fragment` and appended
     // by `resolve_hyperlinks` once the relationship is known.
     let (target, fragment) = match (r_id, anchor) {
         // Will be resolved to the actual URL after parsing via
@@ -1838,7 +1838,7 @@ fn attach_chart_text(
 
 /// Replace every `RunContent::DeferredPart(rid)` in the tree with the
 /// extracted plain text of the OOXML package it refers to
-/// (`<o:OLEObject Type="Embed">`, issue #304), wrapped as a `TextBox` so
+/// (`<o:OLEObject Type="Embed">`), wrapped as a `TextBox` so
 /// it flows as ordinary block content. A reference that can't be resolved
 /// (unknown relationship, unreadable part, unrecognised extension, or the
 /// nested document fails to open) is left as `DeferredPart` and every
@@ -1929,8 +1929,7 @@ fn resolve_one_deferred_part<R: Read + Seek>(
 }
 
 /// Collect every `<a:t>` text node inside a SmartArt data part
-/// (`word/diagrams/dataN.xml`), in document order, one per line
-/// (issue #271).
+/// (`word/diagrams/dataN.xml`), in document order, one per line.
 fn diagram_text_lines(xml: &[u8]) -> Vec<String> {
     let mut reader = xml::make_fast_reader(xml);
     let mut lines = Vec::new();
@@ -2095,7 +2094,7 @@ fn parse_inline_or_anchor_body(
 
     // A chart-only or diagram-only graphic has neither a blip nor a
     // `prstGeom`, so without these two conditions the whole drawing was
-    // discarded and the chart/diagram part was never reachable (#273, #271).
+    // discarded and the chart/diagram part was never reachable.
     if relationship_id.is_some()
         || shape.is_some()
         || chart_rel_id.is_some()
@@ -2156,7 +2155,7 @@ struct GraphicPayload {
     /// `r:id` of a `<c:chart>` reference, when the graphic is a chart.
     chart_rel_id: Option<String>,
     /// `r:dm` of a `<dgm:relIds>` reference, when the graphic is a
-    /// SmartArt diagram (issue #271).
+    /// SmartArt diagram.
     dgm_data_rel_id: Option<String>,
 }
 
@@ -2196,7 +2195,7 @@ fn parse_graphic(
                 },
                 // A SmartArt diagram: `<dgm:relIds r:dm="…" r:lo="…" .../>`
                 // — `r:dm` points at the data part (`word/diagrams/dataN.xml`)
-                // where the diagram's actual text lives (issue #271).
+                // where the diagram's actual text lives.
                 b"relIds" => {
                     if let Some(rid) = xml::optional_prefixed_attr_str(e, b"dm")? {
                         dgm_data_rel_id = Some(rid.into_owned());
@@ -2297,7 +2296,7 @@ fn parse_wsp(
     // standard way Word encodes a text box — not a shape that happens to
     // also carry a text box. Emitting both `Element::Shape` and
     // `Element::TextBox` for the one drawing doubled it into a
-    // content-free phantom shape plus the real text box (issue #263).
+    // content-free phantom shape plus the real text box.
     let mut has_text_box = false;
 
     loop {
@@ -2552,7 +2551,7 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Table> {
     let mut rows = Vec::new();
     // A whole row can be wrapped the same way a cell can
     // (`<w:tbl><w:sdt><w:sdtContent><w:tr>`) — same transparent-wrapper
-    // treatment as `parse_table_row` gives `<w:tc>` (issue #277).
+    // treatment as `parse_table_row` gives `<w:tc>`.
     let mut wrapper_depth = 0usize;
 
     loop {
@@ -2705,7 +2704,7 @@ fn parse_table_row(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableRow
     // A cell can be wrapped in a content control (`<w:tr><w:sdt><w:sdtContent>
     // <w:tc>`). Treating `sdt`/`sdtContent` as opaque dropped the whole cell,
     // shifting every subsequent cell in the row into the wrong column
-    // (issue #277) — descend into them instead, matching how
+    // — descend into them instead, matching how
     // `parse_paragraph` already treats them as transparent wrappers.
     let mut wrapper_depth = 0usize;
 
@@ -2871,7 +2870,7 @@ fn parse_table_cell_properties(
                     xml::skip_element_fast(reader)?;
                 },
                 // `<w:cellDel>` marks the whole cell deleted via tracked
-                // changes, pending acceptance (issue #266).
+                // changes, pending acceptance.
                 b"cellDel" => {
                     props.deleted = true;
                     xml::skip_element_fast(reader)?;
@@ -3247,7 +3246,7 @@ mod tests {
 
     #[test]
     fn test_embedded_package_object_text_is_extracted() {
-        // issue #304 — an embedded native OOXML package
+        // An embedded native OOXML package
         // (<o:OLEObject Type="Embed">) was never opened at all.
         let mut xlsx_writer = crate::xlsx::write::XlsxWriter::new();
         {
@@ -3308,7 +3307,7 @@ mod tests {
 
     #[test]
     fn test_numbered_list_resumed_after_interruption_continues_counting() {
-        // issue #243 — a numbered list interrupted by a plain paragraph
+        // A numbered list interrupted by a plain paragraph
         // then resumed later with the same numId (no explicit override)
         // restarted at 1 instead of continuing where it left off.
         let numbering_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -3381,7 +3380,7 @@ mod tests {
 
     #[test]
     fn test_smartart_diagram_text_is_extracted() {
-        // issue #271 — word/diagrams/dataN.xml was never opened, so
+        // word/diagrams/dataN.xml was never opened, so
         // SmartArt text was completely invisible.
         let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -3413,7 +3412,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_empty_document() {
+    fn test_parse_empty_document() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body/>
@@ -3425,7 +3424,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_single_paragraph() {
+    fn test_parse_single_paragraph() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -3443,7 +3442,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_multiple_paragraphs() {
+    fn test_parse_multiple_paragraphs() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -3462,7 +3461,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_multiple_runs() {
+    fn test_parse_multiple_runs() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -3478,7 +3477,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_break_and_tab() {
+    fn test_parse_break_and_tab() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -3497,7 +3496,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_table_basic() {
+    fn test_parse_table_basic() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -3526,7 +3525,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_paragraph_with_formatting() {
+    fn test_parse_paragraph_with_formatting() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -3566,7 +3565,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_bold_italic() {
+    fn test_markdown_bold_italic() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -3591,7 +3590,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_table() {
+    fn test_markdown_table() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -3616,7 +3615,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_drawing_anchor_position() {
+    fn test_parse_drawing_anchor_position() {
         let xml =
             br#"<w:drawing xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
                 xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
@@ -3659,7 +3658,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_drawing_wsp_line_shape() {
+    fn test_parse_drawing_wsp_line_shape() {
         let xml =
             br#"<w:drawing xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
                 xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
@@ -3702,7 +3701,7 @@ mod tests {
     }
 
     #[test]
-    fn section_properties() {
+    fn test_section_properties() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -3727,7 +3726,7 @@ mod tests {
     // ── strip_embedded_font_filename ────────────────────────────────────
 
     #[test]
-    fn strip_embedded_font_writer_convention() {
+    fn test_strip_embedded_font_writer_convention() {
         // Writer convention: font_<n>_<face>.<ext>
         assert_eq!(
             strip_embedded_font_filename("font_4_TeXGyreTermesX-Regular.ttf"),
@@ -3738,27 +3737,27 @@ mod tests {
     }
 
     #[test]
-    fn strip_embedded_font_no_prefix_keeps_stem() {
+    fn test_strip_embedded_font_no_prefix_keeps_stem() {
         // No `font_<n>_` prefix → return the stem unchanged.
         assert_eq!(strip_embedded_font_filename("Arial.ttf"), "Arial");
         assert_eq!(strip_embedded_font_filename("MyFont.otf"), "MyFont");
     }
 
     #[test]
-    fn strip_embedded_font_no_extension() {
+    fn test_strip_embedded_font_no_extension() {
         // No extension → use the whole input.
         assert_eq!(strip_embedded_font_filename("font_1_Calibri"), "Calibri");
         assert_eq!(strip_embedded_font_filename("Calibri"), "Calibri");
     }
 
     #[test]
-    fn strip_embedded_font_non_digit_prefix_keeps_stem() {
+    fn test_strip_embedded_font_non_digit_prefix_keeps_stem() {
         // `font_xxx_<face>` where xxx isn't digits → don't strip.
         assert_eq!(strip_embedded_font_filename("font_abc_Foo.ttf"), "font_abc_Foo");
     }
 
     #[test]
-    fn strip_embedded_font_alphabetic_face_preserved() {
+    fn test_strip_embedded_font_alphabetic_face_preserved() {
         // Regression: greedy trim_end_matches(alphabetic) used to eat
         // the face name. Verify a face with trailing alphabetic chars
         // survives intact.
@@ -3769,12 +3768,12 @@ mod tests {
     }
 
     #[test]
-    fn strip_embedded_font_empty() {
+    fn test_strip_embedded_font_empty() {
         assert_eq!(strip_embedded_font_filename(""), "");
     }
 
     #[test]
-    fn strip_embedded_font_no_face_after_prefix() {
+    fn test_strip_embedded_font_no_face_after_prefix() {
         // `font_<n>_` with nothing after the underscore → empty face.
         // Caller of this helper falls back to the full basename.
         assert_eq!(strip_embedded_font_filename("font_5_.ttf"), "");
@@ -3814,7 +3813,7 @@ mod tests {
 
     #[test]
     fn test_ffdata_checkbox_state_is_captured() {
-        // issue #276 — a FORMCHECKBOX's checked state exists nowhere else
+        // A FORMCHECKBOX's checked state exists nowhere else
         // in the document; skipping w:ffData lost it unrecoverably.
         let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:r><w:fldChar w:fldCharType="begin"><w:ffData>
@@ -3838,7 +3837,7 @@ mod tests {
 
     #[test]
     fn test_ffdata_dropdown_full_option_list_is_captured() {
-        // issue #276 — the full option list, not just the selected value,
+        // The full option list, not just the selected value,
         // must survive even when the field also has a cached display run.
         let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:r><w:fldChar w:fldCharType="begin"><w:ffData>
@@ -3871,7 +3870,7 @@ mod tests {
 
     #[test]
     fn test_omml_math_text_is_not_dropped() {
-        // issue #270 — every <m:t> inside an m:oMath is real, visible text.
+        // Every <m:t> inside an m:oMath is real, visible text.
         let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
   <m:d><m:e><m:r><m:t>x</m:t></m:r></m:e><m:e><m:r><m:t>y</m:t></m:r></m:e></m:d>
@@ -3885,7 +3884,7 @@ mod tests {
 
     #[test]
     fn test_vml_imagedata_is_extracted_as_an_image() {
-        // issue #268 — v:imagedata's r:id was only ever read for text
+        // v:imagedata's r:id was only ever read for text
         // boxes; a v:shape wrapping an image, not a text box, vanished.
         let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:r><w:pict xmlns:v="urn:schemas-microsoft-com:vml" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -3907,7 +3906,7 @@ mod tests {
 
     #[test]
     fn test_wordart_textpath_string_is_extracted_as_text() {
-        // issue #274 — WordArt's visible text lives in an XML attribute,
+        // WordArt's visible text lives in an XML attribute,
         // not element content, so it was never read at all.
         let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:r><w:pict xmlns:v="urn:schemas-microsoft-com:vml">
@@ -3921,7 +3920,7 @@ mod tests {
 
     #[test]
     fn test_hyperlink_with_both_rid_and_anchor_keeps_the_external_target() {
-        // issues #242, #292 — the anchor branch was checked first and
+        // The anchor branch was checked first and
         // unconditionally taken, discarding a real external r:id whenever
         // a w:anchor fragment was also present.
         let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -3943,7 +3942,7 @@ mod tests {
 
     #[test]
     fn test_hyperlink_field_code_instrtext_url_is_captured() {
-        // issue #267 — a HYPERLINK expressed via fldChar/instrText (common
+        // A HYPERLINK expressed via fldChar/instrText (common
         // pandoc/older-tool output) had its URL completely unreachable.
         let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:r><w:fldChar w:fldCharType="begin"/></w:r>
@@ -3976,7 +3975,7 @@ mod tests {
 
     #[test]
     fn test_sdt_wrapped_table_cell_is_not_dropped() {
-        // issue #277 — a cell wrapped in a content control
+        // A cell wrapped in a content control
         // (<w:tr><w:sdt><w:sdtContent><w:tc>) was entirely dropped by the
         // catch-all, shifting every subsequent cell in the row into the
         // wrong column.
@@ -4007,7 +4006,7 @@ mod tests {
 
     #[test]
     fn test_tracked_change_deleted_cell_is_excluded_from_accepted_view() {
-        // issue #266 — a cell marked <w:cellDel> (deleted via tracked
+        // A cell marked <w:cellDel> (deleted via tracked
         // changes, pending acceptance) still appeared in the accepted
         // output, same bug w:del was already fixed for at the run level.
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -4039,7 +4038,7 @@ mod tests {
 
     #[test]
     fn test_text_box_with_prstgeom_is_not_double_extracted_as_a_phantom_shape() {
-        // issue #263 — a <wps:wsp> carrying both <a:prstGeom> (required by
+        // A <wps:wsp> carrying both <a:prstGeom> (required by
         // schema) and real <wps:txbx> text content produced a content-free
         // phantom Shape(Rect) in addition to the real TextBox.
         let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -4079,7 +4078,7 @@ mod tests {
 
     #[test]
     fn test_table_cell_jc_is_mapped_back_to_text_align() {
-        // issue #215 gap: the writer emits <w:jc> inside a cell's paragraph
+        // gap: the writer emits <w:jc> inside a cell's paragraph
         // from TableCell::text_align, but nothing read it back on open.
         let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -4112,7 +4111,7 @@ mod tests {
 
     #[test]
     fn test_outline_level_promotion_keeps_the_rest_of_the_paragraph_properties() {
-        // issue #215 gap: promoting a paragraph to a Heading via
+        // gap: promoting a paragraph to a Heading via
         // <w:outlineLvl> used to keep only level/content/frame_position/
         // alignment, discarding indent, spacing, keep-with-next and every
         // other property in the same step.
@@ -4149,7 +4148,7 @@ mod tests {
 
     #[test]
     fn test_table_caption_does_not_duplicate_across_round_trips() {
-        // issue #311 — a table's caption is written both as w:tblCaption
+        // A table's caption is written both as w:tblCaption
         // (accessibility metadata) and as a visible "Caption"-styled
         // paragraph immediately before <w:tbl>. Reading it back turned
         // that paragraph into an ordinary sibling, so the next write
@@ -4192,7 +4191,7 @@ mod tests {
 
     #[test]
     fn test_numbered_heading_wins_over_list_membership() {
-        // issue #223 — Word's multilevel-list "Heading" gallery attaches
+        // Word's multilevel-list "Heading" gallery attaches
         // numPr to the heading styles themselves, so a numbered heading
         // ("1. Introduction") is the normal shape of a heading in real
         // documents. Checking list membership before outlineLvl turned
@@ -4268,7 +4267,7 @@ mod tests {
 
     #[test]
     fn test_num_start_override_is_read_back() {
-        // issue #260 — the writer emits <w:num><w:lvlOverride><w:startOverride>
+        // The writer emits <w:num><w:lvlOverride><w:startOverride>
         // (confirmed present in real numbering.xml output) but nothing read
         // it back; List.start_number always came back None.
         let numbering_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -4336,7 +4335,7 @@ mod tests {
 
     #[test]
     fn test_encrypted_docx_gives_a_friendly_error_via_the_format_specific_reader() {
-        // issue #232 — opening an encrypted OOXML file directly through
+        // Opening an encrypted OOXML file directly through
         // DocxDocument::from_reader (bypassing the unified Document
         // entry point, which already had this check) gave a confusing
         // "Could not find EOCD" zip error instead of naming the real
@@ -4353,7 +4352,7 @@ mod tests {
 
     #[test]
     fn test_vba_project_relationship_sets_metadata_has_macros() {
-        // issue #283 — no API surface reported whether a document
+        // No API surface reported whether a document
         // contains macros. A vbaProject relationship on the document
         // part must set Metadata::has_macros.
         let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -4388,7 +4387,7 @@ mod tests {
 
     #[test]
     fn test_vanish_run_is_excluded_from_extraction() {
-        // issue #305 — <w:vanish/> (Word never renders this run at all)
+        // <w:vanish/> (Word never renders this run at all)
         // was never read anywhere; hidden text leaked into every
         // extraction surface as if it were ordinary visible content.
         let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -4422,7 +4421,7 @@ mod tests {
 
     #[test]
     fn test_markdown_ordered_list_increments_instead_of_repeating_the_start_value() {
-        // issue #316 — docx/text.rs's markdown_blocks printed the same
+        // docx/text.rs's markdown_blocks printed the same
         // literal <w:start> value for every item in an ordered list,
         // instead of incrementing. 4th instance of the "two renderers
         // disagree" flaw (ir_render.rs already increments correctly).
@@ -4480,7 +4479,7 @@ mod tests {
 
     #[test]
     fn test_app_properties_are_read_on_open() {
-        // issue #245 — AppProperties::parse existed, fully tested, but
+        // AppProperties::parse existed, fully tested, but
         // nothing on the read side ever called it; company name and every
         // word/page/paragraph count were unreachable through any public
         // API.
@@ -4527,7 +4526,7 @@ mod tests {
 
     #[test]
     fn test_docx_chart_text_is_extracted() {
-        // issue #273 — a native DrawingML chart embedded in a DOCX had its
+        // A native DrawingML chart embedded in a DOCX had its
         // title/category/series text never extracted at all: the chart
         // part (word/charts/chartN.xml) was never opened. The extraction
         // engine itself (core::chart::chart_text_lines) was already
@@ -4610,7 +4609,7 @@ mod tests {
 
     #[test]
     fn test_plain_text_and_markdown_include_footnote_body_content() {
-        // issue #240 — plain_text()/to_markdown() only walked body.elements
+        // plain_text()/to_markdown() only walked body.elements
         // and headers/footers, never self.footnotes/endnotes/comments. A
         // footnote-only document returned "" from both even though to_ir()
         // (via docx_to_ir) already carried the note body correctly.
@@ -4666,7 +4665,7 @@ mod tests {
     /// A hyperlink's `r:id` inside a footnote is scoped to
     /// `word/_rels/footnotes.xml.rels`, not `word/_rels/document.xml.rels` —
     /// resolving it against the document's own relationships left the raw
-    /// `rIdN` string as the "URL" for every note hyperlink (issue #293).
+    /// `rIdN` string as the "URL" for every note hyperlink.
     #[test]
     fn test_footnote_hyperlink_resolves_against_the_footnotes_parts_own_rels() {
         let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -4703,7 +4702,7 @@ mod tests {
             .unwrap();
         writer.add_part_rel(&doc_part, rel_types::FOOTNOTES, "footnotes.xml");
         // The hyperlink's rId is only ever declared in the footnotes
-        // part's own rels, not the document's — this is the crux of #293.
+        // part's own rels, not the document's — this is the crux of the bug.
         writer.add_part_rel_with_mode(
             &footnotes_part,
             rel_types::HYPERLINK,
@@ -4732,7 +4731,7 @@ mod tests {
 
     #[test]
     fn test_footnote_custom_mark_round_trips() {
-        // issue #219 item 1 — a custom mark ("*") became an auto-number on
+        // A custom mark ("*") became an auto-number on
         // write (nothing carried it into word/footnotes.xml), and nothing
         // read it back even where it was written correctly by other tools.
         let ir = crate::ir::DocumentIR {
@@ -4816,7 +4815,7 @@ mod tests {
 
     #[test]
     fn test_footnote_reference_mark_reaches_run_content() {
-        // issue #241 — to_ir() carried the note body but lost where in
+        // to_ir() carried the note body but lost where in
         // the text it was actually cited.
         let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:r><w:t>see</w:t></w:r>

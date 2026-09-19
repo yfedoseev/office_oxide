@@ -43,16 +43,15 @@ pub enum RunContent {
     /// A `w:txbxContent` text-box body found inside a `w:pict` /
     /// `w:drawing` / `mc:AlternateContent` shape. Text boxes are ordinary
     /// block content that happens to be drawn in a frame; leaving them
-    /// unread dropped whole documents' worth of prose (issue #102: 90% of
+    /// unread dropped whole documents' worth of prose (90% of
     /// the reporter's text lived here).
     TextBox(Vec<super::document::BlockElement>),
     /// A `w:footnoteReference` mark: the citation point in the body text.
     /// Carries the referenced note's `w:id`. The note *body* was already
     /// read from `footnotes.xml`; without this the IR could not say where
-    /// it was cited (issue #241). The second field mirrors
+    /// it was cited. The second field mirrors
     /// `w:customMarkFollows`: `true` means the note body supplies its own
-    /// mark glyph as a leading run instead of Word's auto-number
-    /// (issue #219).
+    /// mark glyph as a leading run instead of Word's auto-number.
     FootnoteRef(u32, bool),
     /// A `w:endnoteReference` mark. See [`RunContent::FootnoteRef`].
     EndnoteRef(u32, bool),
@@ -60,12 +59,12 @@ pub enum RunContent {
     CommentRef(u32),
     /// Legacy form-field state parsed out of `<w:fldChar><w:ffData>`.
     /// A checkbox's checked state exists nowhere else in the document, so
-    /// skipping `w:ffData` lost it unrecoverably (issue #276).
+    /// skipping `w:ffData` lost it unrecoverably.
     FormField(FormField),
     /// A reference to a separate OPC part whose content is folded in once
     /// the package is readable: a SmartArt `word/diagrams/dataN.xml`
-    /// (issue #271) or an embedded OOXML package from `<o:OLEObject>`
-    /// (issue #304). Replaced with [`RunContent::TextBox`] during
+    /// or an embedded OOXML package from `<o:OLEObject>`
+    ///. Replaced with [`RunContent::TextBox`] during
     /// `DocxDocument::from_opc`; an unresolvable reference is dropped.
     DeferredPart(String),
 }

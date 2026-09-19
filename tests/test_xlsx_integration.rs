@@ -108,7 +108,7 @@ fn parse(data: &[u8]) -> XlsxDocument {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn simple_worksheet() {
+fn test_simple_worksheet() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -157,7 +157,7 @@ fn simple_worksheet() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn shared_strings_round_trip() {
+fn test_shared_strings_round_trip() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -206,7 +206,7 @@ fn shared_strings_round_trip() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn date_detection() {
+fn test_date_detection() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -271,7 +271,7 @@ fn date_detection() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn merged_cells() {
+fn test_merged_cells() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -309,7 +309,7 @@ fn merged_cells() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn multiple_sheets() {
+fn test_multiple_sheets() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -365,7 +365,7 @@ fn multiple_sheets() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn hyperlinks() {
+fn test_hyperlinks() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -421,7 +421,7 @@ fn hyperlinks() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn formulas_with_cached_values() {
+fn test_formulas_with_cached_values() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -460,7 +460,7 @@ fn formulas_with_cached_values() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn styles_resolution() {
+fn test_styles_resolution() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -517,7 +517,7 @@ fn styles_resolution() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn csv_output() {
+fn test_csv_output() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -574,7 +574,7 @@ fn csv_output() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn markdown_output() {
+fn test_markdown_output() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -630,7 +630,7 @@ fn markdown_output() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn empty_workbook() {
+fn test_empty_workbook() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -660,7 +660,7 @@ fn empty_workbook() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn hidden_sheets() {
+fn test_hidden_sheets() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -694,7 +694,7 @@ fn hidden_sheets() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn large_cell_reference() {
+fn test_large_cell_reference() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -731,7 +731,7 @@ fn large_cell_reference() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn error_cells() {
+fn test_error_cells() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -773,7 +773,7 @@ fn error_cells() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn missing_optional_parts() {
+fn test_missing_optional_parts() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -809,7 +809,7 @@ fn missing_optional_parts() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn missing_workbook_part() {
+fn test_missing_workbook_part() {
     let cursor = Cursor::new(Vec::new());
     let mut writer = OpcWriter::new(cursor).unwrap();
     let part = PartName::new("/xl/other.xml").unwrap();
@@ -827,7 +827,7 @@ fn missing_workbook_part() {
 /// date check consulted the id before the workbook's own declaration, so a
 /// number formatted `0.00" kg"` under id 14 was rendered as a 1900 date.
 #[test]
-fn an_explicit_num_fmt_overrides_the_builtin_meaning_of_its_id() {
+fn test_an_explicit_num_fmt_overrides_the_builtin_meaning_of_its_id() {
     let styles = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <numFmts count="1"><numFmt numFmtId="14" formatCode="0.00&quot; kg&quot;"/></numFmts>

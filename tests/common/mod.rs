@@ -178,7 +178,7 @@ pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> V
     let wd_sectors = wd_len.div_ceil(512);
     let mut word_doc = vec![0u8; wd_sectors * 512];
     write_fib(&mut word_doc, text_len, fc_plcf, lcb_plcf);
-    // [MS-DOC] FibRgLw97 real offsets for these fields (issue #247): 0x58
+    // [MS-DOC] FibRgLw97 real offsets for these fields: 0x58
     // is `reserved3`, MUST be zero/ignored, and sits between ccpHdd and
     // ccpAtn — not a slot in this array, so the mapping isn't a flat
     // `0x50 + i*4` stride.
@@ -310,7 +310,7 @@ fn build_cfb(word_doc: &[u8], table: &[u8]) -> Vec<u8> {
     let dir_off = 512;
     // Root Entry's `child` points to entry 1 (WordDocument), which links
     // to entry 2 (0Table) as its right sibling — a minimal but real tree,
-    // not just 3 unlinked entries (issue #226).
+    // not just 3 unlinked entries.
     write_dir_entry(&mut file[dir_off..dir_off + 128], "Root Entry", 5, 1, END_OF_CHAIN, 0);
     let wd_start = 2u32;
     let zt_start = (2 + wd_sectors) as u32;
@@ -416,7 +416,7 @@ fn write_dir_entry(
 /// `CfbReader::find_entry` walks the directory as a real red-black tree
 /// from the root entry's own `child` pointer, not a flat scan — so a
 /// stream with no sibling link from the root is present in the file but
-/// unreachable, and `open_stream` reports it missing (issue #226). Every
+/// unreachable, and `open_stream` reports it missing. Every
 /// entry after the first one under a given parent needs a `right` link
 /// to the next, or it simply never gets visited.
 fn write_dir_entry_with_sibling(

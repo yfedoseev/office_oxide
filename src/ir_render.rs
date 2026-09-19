@@ -1220,10 +1220,10 @@ mod tests {
         InlineContent::Text(TextSpan::plain(text))
     }
 
-    /// issue #221 — a field added as a sibling of `Section::elements`
+    /// A field added as a sibling of `Section::elements`
     /// (not inside it, like `speaker_notes`) is invisible to any renderer
     /// that was never explicitly taught about it, and nothing enforces
-    /// that every renderer was. #203 added `speaker_notes` and broke two
+    /// that every renderer was. Adding `speaker_notes` broke two
     /// of four consumers (render_section_html and the CLI's `ir` JSON
     /// projection) silently — a corpus sweep found them, not the unit
     /// suite. This test populates every text-bearing sibling field at
@@ -1280,13 +1280,13 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_paragraph() {
+    fn test_plain_text_paragraph() {
         let ir = simple_ir(vec![para("Hello world")]);
         assert_eq!(ir.plain_text(), "Hello world");
     }
 
     #[test]
-    fn markdown_heading() {
+    fn test_markdown_heading() {
         let ir = simple_ir(vec![Element::Heading(Heading {
             level: 2,
             content: vec![span("Title")],
@@ -1296,7 +1296,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_formatting() {
+    fn test_markdown_formatting() {
         let ir = simple_ir(vec![Element::Paragraph(Paragraph {
             content: vec![
                 InlineContent::Text(TextSpan {
@@ -1329,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_table() {
+    fn test_markdown_table() {
         let ir = simple_ir(vec![Element::Table(Table {
             rows: vec![
                 TableRow {
@@ -1352,7 +1352,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_list() {
+    fn test_markdown_list() {
         let ir = simple_ir(vec![Element::List(List {
             ordered: false,
             items: vec![
@@ -1371,7 +1371,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_hyperlink() {
+    fn test_markdown_hyperlink() {
         let ir = simple_ir(vec![Element::Paragraph(Paragraph {
             content: vec![InlineContent::Text(TextSpan {
                 text: "click".to_string(),
@@ -1384,7 +1384,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_section_separator() {
+    fn test_multi_section_separator() {
         let ir = DocumentIR {
             metadata: Metadata {
                 format: DocumentFormat::Xlsx,
@@ -1415,13 +1415,13 @@ mod tests {
     }
 
     #[test]
-    fn html_paragraph() {
+    fn test_html_paragraph() {
         let ir = simple_ir(vec![para("Hello world")]);
         assert_eq!(ir.to_html(), "<p>Hello world</p>");
     }
 
     #[test]
-    fn html_formatting() {
+    fn test_html_formatting() {
         let ir = simple_ir(vec![Element::Paragraph(Paragraph {
             content: vec![
                 InlineContent::Text(TextSpan {
@@ -1445,14 +1445,14 @@ mod tests {
     }
 
     #[test]
-    fn html_escaping() {
+    fn test_html_escaping() {
         let ir = simple_ir(vec![para("<script>alert('xss')</script>")]);
         assert!(ir.to_html().contains("&lt;script&gt;"));
         assert!(!ir.to_html().contains("<script>"));
     }
 
     #[test]
-    fn html_table() {
+    fn test_html_table() {
         let ir = simple_ir(vec![Element::Table(Table {
             rows: vec![TableRow {
                 cells: vec![cell("A")],
@@ -1468,7 +1468,7 @@ mod tests {
     }
 
     #[test]
-    fn html_list() {
+    fn test_html_list() {
         let ir = simple_ir(vec![Element::List(List {
             ordered: true,
             items: vec![
@@ -1489,7 +1489,7 @@ mod tests {
         assert!(html.contains("<li><p>Second</p></li>"));
     }
 
-    /// #318: `to_html()` had no image-embedding option at all, so an image
+    /// `to_html()` had no image-embedding option at all, so an image
     /// never reached the HTML surface — only a `<figcaption>` when it
     /// happened to carry alt text.
     #[test]
@@ -1546,7 +1546,7 @@ mod tests {
         assert!(!ir.to_html().contains("<img"));
     }
 
-    /// #317: numId fragmentation splits visually-continuous bullets into one
+    /// numId fragmentation splits visually-continuous bullets into one
     /// `Element::List` each; HTML emitted a separate one-item `<ul>` per
     /// fragment where markdown showed one continuous list.
     #[test]
@@ -1622,7 +1622,7 @@ mod tests {
         assert!(html.contains("<ol start=\"5\">"), "{html}");
     }
 
-    /// #314: `render_inline_html` read only bold/italic/strikethrough/
+    /// `render_inline_html` read only bold/italic/strikethrough/
     /// hyperlink, so underline, super/subscript, highlight, colour, font and
     /// the caps variants vanished from `to_html()` while the IR carried them.
     #[test]
@@ -1675,7 +1675,7 @@ mod tests {
         assert_eq!(styled(|_| {}), "<p>X</p>");
     }
 
-    /// #314: the new attribute values must not be able to break out of the
+    /// The new attribute values must not be able to break out of the
     /// `style="…"` they sit in, and text content stays escaped.
     #[test]
     fn test_html_span_style_values_are_escaped() {
@@ -1699,7 +1699,7 @@ mod tests {
         assert_eq!(&html[open..close], "font-family:'Evil colorred x'");
     }
 
-    /// #315: `List.start_number` was parsed and then ignored by both
+    /// `List.start_number` was parsed and then ignored by both
     /// renderers, so a list the document starts at 3 rendered as 1, 2, 3.
     #[test]
     fn test_list_start_number_is_honoured() {
@@ -1762,19 +1762,19 @@ mod tests {
     // ── Defaults centralized in `block_default` ──────────────────────
 
     #[test]
-    fn thematic_break_renders_as_a_form_feed_in_plain() {
+    fn test_thematic_break_renders_as_a_form_feed_in_plain() {
         let ir = simple_ir(vec![Element::ThematicBreak]);
         assert_eq!(ir.plain_text(), PLAIN_BREAK);
     }
 
     #[test]
-    fn thematic_break_renders_in_markdown() {
+    fn test_thematic_break_renders_in_markdown() {
         let ir = simple_ir(vec![Element::ThematicBreak]);
         assert!(ir.to_markdown().contains("---"));
     }
 
     #[test]
-    fn page_break_invisible_in_plain() {
+    fn test_page_break_invisible_in_plain() {
         // PageBreak/ColumnBreak/Shape/Image have no plain-text counterpart
         // — they collapse to empty so plain_text shows only the surrounding
         // content.
@@ -1785,7 +1785,7 @@ mod tests {
     }
 
     #[test]
-    fn shape_invisible_in_plain() {
+    fn test_shape_invisible_in_plain() {
         let ir = simple_ir(vec![
             para("before"),
             Element::Shape(Shape::default()),
@@ -1797,7 +1797,7 @@ mod tests {
     }
 
     #[test]
-    fn text_box_recursively_renders_children() {
+    fn test_text_box_recursively_renders_children() {
         let ir = simple_ir(vec![Element::TextBox(TextBox {
             content: vec![para("inside")],
             ..Default::default()
@@ -1807,7 +1807,7 @@ mod tests {
     }
 
     #[test]
-    fn html_thematic_break() {
+    fn test_html_thematic_break() {
         let ir = simple_ir(vec![Element::ThematicBreak]);
         let html = ir.to_html();
         assert!(html.contains("<hr"), "html: {html}");
@@ -1822,7 +1822,7 @@ mod speaker_notes_render_tests {
     /// `elements` fixed the leak on the write side but dropped them from
     /// HTML, which a corpus sweep against v0.1.10 caught.
     #[test]
-    fn every_renderer_surfaces_speaker_notes() {
+    fn test_every_renderer_surfaces_speaker_notes() {
         let ir = DocumentIR {
             sections: vec![Section {
                 elements: vec![Element::Paragraph(Paragraph {

@@ -78,20 +78,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sanitize_keeps_alphanumeric() {
+    fn test_sanitize_keeps_alphanumeric() {
         assert_eq!(sanitize_font_filename("Calibri"), "Calibri");
         assert_eq!(sanitize_font_filename("Arial123"), "Arial123");
     }
 
     #[test]
-    fn sanitize_keeps_dash_and_underscore() {
+    fn test_sanitize_keeps_dash_and_underscore() {
         assert_eq!(sanitize_font_filename("Times-Roman"), "Times-Roman");
         assert_eq!(sanitize_font_filename("TeXGyreTermesX-Regular"), "TeXGyreTermesX-Regular");
         assert_eq!(sanitize_font_filename("my_font"), "my_font");
     }
 
     #[test]
-    fn sanitize_replaces_path_unsafe_chars() {
+    fn test_sanitize_replaces_path_unsafe_chars() {
         assert_eq!(sanitize_font_filename("Arial/Bold"), "Arial_Bold");
         assert_eq!(sanitize_font_filename("a*b?c"), "a_b_c");
         assert_eq!(sanitize_font_filename("Noto Sans"), "Noto_Sans");
@@ -99,13 +99,13 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_replaces_non_ascii() {
+    fn test_sanitize_replaces_non_ascii() {
         // Non-ASCII alphanumeric is replaced with '_'.
         assert_eq!(sanitize_font_filename("Café"), "Caf_");
     }
 
     #[test]
-    fn sanitize_clamps_to_40_chars() {
+    fn test_sanitize_clamps_to_40_chars() {
         let long = "A".repeat(100);
         let s = sanitize_font_filename(&long);
         assert_eq!(s.len(), 40);
@@ -113,7 +113,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_empty_input() {
+    fn test_sanitize_empty_input() {
         assert_eq!(sanitize_font_filename(""), "");
     }
 }

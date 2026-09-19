@@ -6,11 +6,11 @@
 //! `<p:txStyles>` (`titleStyle`/`bodyStyle`/`otherStyle`, one
 //! `<a:lvlNpPr>` per outline level). This module resolves only the
 //! master's level-0 (`<a:lvl1pPr>`) title/body defaults — the same
-//! "outline level 0 only" scope the legacy `.ppt` analogue (issue #335,
+//! "outline level 0 only" scope the legacy `.ppt` analogue (
 //! `TxMasterStyleAtom`) settled on — and only the character/paragraph
 //! properties this crate's IR already has a field for (bold, italic,
 //! underline, size, color, alignment). Layout-level overrides and
-//! levels 1-8 are a follow-up (issue #291).
+//! levels 1-8 are a follow-up.
 
 use quick_xml::events::Event;
 
@@ -210,7 +210,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn title_and_body_level0_defaults_parsed() {
+    fn test_title_and_body_level0_defaults_parsed() {
         let xml = br#"<?xml version="1.0"?>
 <p:txStyles xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
             xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
@@ -245,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn self_closing_lvl1_ppr_with_only_algn_is_not_an_error() {
+    fn test_self_closing_lvl1_ppr_with_only_algn_is_not_an_error() {
         let xml = br#"<?xml version="1.0"?>
 <p:txStyles xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
             xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
@@ -257,14 +257,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_tx_styles_yields_empty() {
+    fn test_missing_tx_styles_yields_empty() {
         let xml = br#"<?xml version="1.0"?><p:sldMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"/>"#;
         let styles = parse_master_text_styles(xml);
         assert!(styles.is_empty());
     }
 
     #[test]
-    fn truncated_xml_does_not_panic() {
+    fn test_truncated_xml_does_not_panic() {
         let styles = parse_master_text_styles(b"<p:txStyles><p:titleStyle><a:lvl1pPr");
         assert!(styles.is_empty());
     }

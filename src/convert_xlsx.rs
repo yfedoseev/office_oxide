@@ -36,7 +36,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         // First pass: parse all rows into `CellData` — the rendered display
         // string plus the structured facts (semantic type, raw value, number
         // format) that the grid path threads into the IR so `to_ir()`
-        // consumers can tell numbers/dates from text (issue #72).
+        // consumers can tell numbers/dates from text.
         // Cap eager row materialisation: an unbounded sheet would build
         // millions of IR cell allocations and then stall the single-table
         // render downstream. Excess rows are dropped and flagged below.
@@ -62,7 +62,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         // `merged_cells` ("A1:C1") was parsed and then never read on this
         // path: every TableCell got col_span/row_span hardcoded to 1, so
         // a merged header or label flattened to an ordinary unspanned
-        // grid (issue #235). Reduce each range to the anchor's span plus
+        // grid. Reduce each range to the anchor's span plus
         // the set of positions it covers, so the anchor carries the real
         // span and covered positions are excluded from the row entirely
         // — the same sparse, span-driven model every other format's
@@ -130,7 +130,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                         .and_then(|s| s.rich_text.clone()),
                     // An inline (`t="inlineStr"`) string cell carries its
                     // own rich runs directly on the raw `Cell`, not via
-                    // the shared string table (issue #346).
+                    // the shared string table.
                     crate::xlsx::cell::CellValue::String(_) => cell.rich_runs.clone(),
                     _ => None,
                 };
@@ -584,7 +584,7 @@ fn cell_span(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> TextSpan {
 /// bold superscript footnote marker within otherwise-plain text) —
 /// previously discarded entirely, flattening to a single unformatted
 /// span regardless of how many differently-formatted runs the source
-/// actually had (issue #303). Falls back to the single-span `cell_span`
+/// actually had. Falls back to the single-span `cell_span`
 /// path for a plain string or any non-string cell.
 fn cell_spans(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> Vec<InlineContent> {
     let Some(runs) = cd.rich_runs.as_ref().filter(|r| !r.is_empty()) else {
@@ -611,7 +611,7 @@ fn cell_spans(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> Vec<InlineConte
 
 /// A parsed spreadsheet cell carried through `xlsx_to_ir`: the rendered
 /// display string plus the structured facts needed to populate the IR's
-/// semantic `TableCell` fields (issue #72).
+/// semantic `TableCell` fields.
 struct CellData {
     /// 0-based grid column this cell occupies. Without it, cells were
     /// emitted in encounter order, so a row that skips a column (perfectly
@@ -638,7 +638,7 @@ struct CellData {
     /// Per-run rich-text formatting, when this cell's value is a shared
     /// string with `<r><rPr>…</rPr><t>…</t></r>` sub-runs (e.g. a bold
     /// superscript footnote marker within otherwise-plain text). `None`
-    /// for a plain (non-rich) string or any non-string cell (issue #303).
+    /// for a plain (non-rich) string or any non-string cell.
     rich_runs: Option<Vec<crate::xlsx::shared_strings::RichTextRun>>,
 }
 
@@ -646,7 +646,7 @@ struct CellData {
 /// when one exists, otherwise empty. A formula cell with no `<v>` (common
 /// output shape from closedxml and similar writers that never cache
 /// values) used to render as a blank cell indistinguishable from a
-/// genuinely empty one (issue #279).
+/// genuinely empty one.
 fn display_text(cd: &CellData) -> std::borrow::Cow<'_, str> {
     if !cd.text.is_empty() {
         std::borrow::Cow::Borrowed(&cd.text)
@@ -665,7 +665,7 @@ fn display_text(cd: &CellData) -> std::borrow::Cow<'_, str> {
 ///
 /// Format metadata is surfaced for every non-empty cell — not just numbers —
 /// so a caller can tell, for instance, that a *text* cell sits in a
-/// date-formatted column (issue #72's "is it a date/number column, and
+/// date-formatted column (the "is it a date/number column, and
 /// formatting?"). The format string prefers the workbook's custom `<numFmts>`
 /// entry and falls back to the canonical code for built-in IDs, which never
 /// appear in `<numFmts>`.

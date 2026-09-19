@@ -40,7 +40,7 @@ pub use reader::CfbReader;
 /// caller using the format-specific reader directly gets the same
 /// friendly "password-protected" error instead of a confusing low-level
 /// zip error ("Could not find EOCD") that says nothing about the real
-/// cause (issue #232).
+/// cause.
 pub fn is_cfb_container<R: std::io::Read + std::io::Seek>(
     reader: &mut R,
 ) -> std::io::Result<bool> {

@@ -41,7 +41,7 @@ impl TextType {
     /// slot low (5 read as CenterTitle, 6 as HalfBody, …), which swapped a
     /// title-slide layout's real title (6, CenterTitle) and subtitle (5,
     /// CenterBody) — the single most common slide layout in real
-    /// presentations (issue #253). Verified against the published
+    /// presentations. Verified against the published
     /// [MS-PPT] TextTypeEnum spec page and its own worked byte example.
     pub fn from_u32(val: u32) -> Self {
         match val {
@@ -67,14 +67,12 @@ pub struct TextRun {
     /// The URL target of the shape's own `InteractiveInfo` click action
     /// (`II_HyperlinkAction`/`II_JumpAction`/`II_CustomShowAction`),
     /// resolved through the document's `ExObjList`. `None` when the shape
-    /// has no interactive info, or its action has no hyperlink to resolve
-    /// (issue #257).
+    /// has no interactive info, or its action has no hyperlink to resolve.
     pub hyperlink: Option<String>,
     /// Direct character-level formatting (bold/italic/underline/size/
     /// color/position), resolved from this run's `StyleTextPropAtom` if
     /// one was present. Empty when no such atom was found — callers must
-    /// treat that as "no formatting info", not "definitely unformatted"
-    /// (issue #254).
+    /// treat that as "no formatting info", not "definitely unformatted".
     pub char_formats: Vec<CharFormatSpan>,
     /// Direct paragraph-level formatting (currently: alignment only),
     /// resolved the same way. Empty when no `StyleTextPropAtom` was found.
@@ -83,7 +81,7 @@ pub struct TextRun {
     /// mapped to the same `ST_PlaceholderType` string vocabulary PPTX's own
     /// `<p:ph type="...">` uses), resolved from the shape actually carrying
     /// it — `None` when the shape has no `OEPlaceholderAtom`, or its
-    /// `placeholderId` has no OOXML-equivalent role (issue #258).
+    /// `placeholderId` has no OOXML-equivalent role.
     pub placeholder_role: Option<String>,
 }
 
@@ -249,13 +247,13 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
     // The current DocumentContainer's own ExObjListContainer — not a raw
     // whole-stream scan, which could resolve a stale, superseded copy left
     // behind by an earlier incremental save (the same hazard the persist
-    // directory itself exists to route around for slides) (issue #257).
+    // directory itself exists to route around for slides).
     let hyperlinks = parse_ex_hyperlinks(&doc_children);
     let ole_objects = parse_ex_ole_objects(&doc_children);
     // The deck's header/footer/user-date text, applied uniformly to every
     // slide ("Apply to All" in PowerPoint's own Header and Footer dialog)
     // rather than stored per-slide — confirmed by direct inspection of a
-    // real corpus file's DocumentContainer (issue #308).
+    // real corpus file's DocumentContainer.
     let headers_footers = parse_headers_footers(&doc_children);
 
     let mut slides = Vec::new();
@@ -397,7 +395,7 @@ fn resolve_slide(
 
             // Placeholder character/paragraph formatting a direct
             // StyleTextPropAtom left unset falls back to the slide's
-            // main master (issue #335). Best-effort: any missing piece
+            // main master. Best-effort: any missing piece
             // of this chain (no SlideAtom, no master, no matching
             // TxMasterStyleAtom) just leaves direct formatting as-is.
             if let Some(master_id) = find_master_id(&children) {
@@ -445,7 +443,7 @@ fn find_master_id(slide_children: &[u8]) -> Option<u32> {
 
 /// Resolve `master_id` through the persist directory to its
 /// `MainMaster` container, then parse its `TxMasterStyleAtom` children
-/// for the Title/Body text types' level-0 style (issue #335).
+/// for the Title/Body text types' level-0 style.
 fn resolve_master_styles(stream: &[u8], dir: &PersistDirectory, master_id: u32) -> Option<MasterStyles> {
     let offset = dir.resolve(master_id)?;
     let children = bounded_container_children(stream, offset, RT_MAIN_MASTER)?;
@@ -475,8 +473,7 @@ fn resolve_master_styles(stream: &[u8], dir: &PersistDirectory, master_id: u32) 
 /// Fill any unset `CharFormat`/`ParaFormat` field on every Title/Body
 /// `TextRun` from the resolved master style — a run with no direct
 /// formatting spans at all gets one synthetic whole-text span carrying
-/// pure master formatting, matching what PowerPoint itself renders
-/// (issue #335).
+/// pure master formatting, matching what PowerPoint itself renders.
 fn apply_master_inheritance(text_runs: &mut [TextRun], styles: &MasterStyles) {
     for run in text_runs {
         let Some((master_pf, master_cf)) = (match run.text_type {
@@ -548,7 +545,7 @@ fn extract_shape_text(
         return;
     }
     let mut current_type = TextType::Other;
-    // Text-run-level hyperlink state (issue #257): a `MouseClick/
+    // Text-run-level hyperlink state: a `MouseClick/
     // MouseOverInteractiveInfoContainer` appearing directly as a *sibling*
     // of the text atoms (not nested in `RT_CLIENT_DATA`, which is the
     // separate whole-shape mechanism `RT_SHAPE` below already handles) is
@@ -660,18 +657,18 @@ fn extract_shape_text(
                 // walking its subtree, so every TextRun produced from it
                 // — including nested containers like a group's own child
                 // shapes, which are siblings under a group, not children
-                // of THIS shape's own text — carries it (issue #257).
+                // of THIS shape's own text — carries it.
                 let shape_hyperlink = resolve_shape_hyperlink(&rec.data, hyperlinks);
                 let hyperlink_ref = shape_hyperlink.as_deref().or(current_hyperlink);
                 // This shape's own placeholder role, if it has one — same
                 // "resolve at the shape actually carrying it, fall back to
                 // whatever the enclosing group/shape already had" pattern
-                // as the hyperlink just above (issue #258).
+                // as the hyperlink just above.
                 let shape_placeholder_role = resolve_shape_placeholder_role(&rec.data);
                 let placeholder_role_ref =
                     shape_placeholder_role.as_deref().or(current_placeholder_role);
                 // This shape's own picture reference, if it has one
-                // (issue #256) — resolved here, at the shape actually
+                // — resolved here, at the shape actually
                 // carrying it, not inferred from whichever slide
                 // happens to be processed last.
                 if let Some(idx) = resolve_shape_pib(&rec.data) {
@@ -680,7 +677,7 @@ fn extract_shape_text(
                 // This shape's own embedded/linked/ActiveX OLE object
                 // identity, if it has one — the same "resolve at the
                 // shape actually carrying it" reasoning as the picture
-                // case just above (issue #337).
+                // case just above.
                 if let Some(info) = resolve_shape_ole_object(&rec.data, ole_objects) {
                     ole_object_refs.push(info);
                 }
@@ -700,7 +697,7 @@ fn extract_shape_text(
             },
             RT_SPGR_CONTAINER => {
                 // A group whose members form a clean rectangular grid is
-                // a reconstructed table (issue #255); anything less
+                // a reconstructed table; anything less
                 // certain falls through to the ordinary flat-paragraph
                 // group walk below, unchanged from before this existed.
                 if let Some(table) = try_extract_table_from_spgr(
@@ -750,7 +747,7 @@ fn extract_shape_text(
 /// Try to recognize `spgr_data` (an `OfficeArtSpgrContainer`'s own
 /// children) as a table: every `RT_SHAPE` after the group's own leading
 /// placeholder shape must carry an `RT_CHILD_ANCHOR`, and the resulting
-/// positions must form a clean rectangular grid (issue #255). Returns
+/// positions must form a clean rectangular grid. Returns
 /// `None` on the first sign this isn't a simple table (a member with no
 /// anchor, or a grid [`table::build_table`] can't make sense of) — the
 /// caller falls back to the ordinary flat-paragraph group walk.
@@ -933,7 +930,7 @@ fn find_descendant(data: &[u8], rec_type: u16, instance: u16, depth: usize) -> O
 /// Document" stream passed to [`extract_slides_text`]. Each entry comes
 /// from one `ExHyperlinkContainer`'s `ExHyperlinkAtom.exHyperlinkId` and
 /// its sibling `TargetAtom` (a `RT_CSTRING` at
-/// [`CSTRING_INSTANCE_TARGET`]) (issue #257).
+/// [`CSTRING_INSTANCE_TARGET`]).
 fn parse_ex_hyperlinks(stream: &[u8]) -> HashMap<u32, String> {
     let mut out = HashMap::new();
     let Some(ex_obj_list) = find_descendant(stream, RT_EXTERNAL_OBJECT_LIST, 0, 0) else {
@@ -990,7 +987,7 @@ fn parse_one_ex_hyperlink(data: &[u8]) -> Option<(u32, String)> {
 }
 
 /// One embedded/linked/ActiveX OLE object's identity, resolved from its
-/// `ExOleObjAtom` (issue #337).
+/// `ExOleObjAtom`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OleObjectInfo {
     /// `ExOleObjAtom.subType` — 0-15; see `describe_ole_subtype` in
@@ -1001,8 +998,8 @@ pub struct OleObjectInfo {
 }
 
 /// Build the document-wide `objID -> OleObjectInfo` table from the
-/// `ExObjListContainer`'s `ExOleObjAtom` records (issue #337) — the same
-/// container #257 already partially parses for hyperlinks, walked again
+/// `ExObjListContainer`'s `ExOleObjAtom` records — the same
+/// container the hyperlink resolver already partially parses, walked again
 /// here for its `ExEmbed`/`ExOleObjAtom` children instead.
 fn parse_ex_ole_objects(stream: &[u8]) -> HashMap<u32, OleObjectInfo> {
     let mut out = HashMap::new();
@@ -1047,7 +1044,7 @@ fn parse_one_ex_ole_obj_atom(data: &[u8]) -> Option<(u32, OleObjectInfo)> {
 
 /// Resolve a shape's own OLE object reference (if any): its
 /// `RT_CLIENT_DATA`'s direct `ExObjRefAtom` child, joined against the
-/// document-wide `ole_objects` table by `objID` (issue #337).
+/// document-wide `ole_objects` table by `objID`.
 fn resolve_shape_ole_object(
     shape_data: &[u8],
     ole_objects: &HashMap<u32, OleObjectInfo>,
@@ -1063,7 +1060,7 @@ fn resolve_shape_ole_object(
 
 /// Resolve a shape's own placeholder role (if any): its `RT_CLIENT_DATA`'s
 /// direct `OEPlaceholderAtom` child's `placeholderId` byte, mapped to the
-/// OOXML `ST_PlaceholderType` string vocabulary (issue #258).
+/// OOXML `ST_PlaceholderType` string vocabulary.
 ///
 /// Scoped to the "regular presentation slide" context only, per Apache
 /// POI's `org.apache.poi.sl.usermodel.Placeholder` enum (the authoritative
@@ -1150,7 +1147,7 @@ fn resolve_shape_hyperlink(shape_data: &[u8], hyperlinks: &HashMap<u32, String>)
 /// Returns the *0-based* image index (into the document's own
 /// `Pictures`-stream-derived image list, [`BlipImage::index`]) — `pib`
 /// itself is a documented ONE-based index into that same array, and
-/// `0x00000000` means "no picture" per [MS-ODRAW] (issue #256).
+/// `0x00000000` means "no picture" per [MS-ODRAW].
 fn resolve_shape_pib(shape_data: &[u8]) -> Option<usize> {
     let fopt = RecordIter::new(shape_data)
         .filter_map(Result::ok)
@@ -1187,7 +1184,7 @@ fn resolve_shape_pib(shape_data: &[u8]) -> Option<usize> {
 /// hyperlinked `[begin, end)` slice, and the unlinked suffix (if any) — the
 /// text-run-level hyperlink mechanism, where a hyperlink covers only part
 /// of a run's text (e.g. a URL appearing mid-sentence) rather than the
-/// whole shape (issue #257).
+/// whole shape.
 ///
 /// `begin`/`end` are [MS-PPT]'s `TextPosition` character offsets, which
 /// this slices via `char` count rather than UTF-16 code units — an exact
@@ -1288,7 +1285,7 @@ fn slice_para_formats(spans: &[ParaFormatSpan], range: std::ops::Range<usize>) -
 
 /// Parse `data` as a `StyleTextPropAtom` body and attach the resulting
 /// character-/paragraph-formatting spans to `run`, clamped against
-/// `run.text`'s own character count (issue #254).
+/// `run.text`'s own character count.
 fn apply_style_text_prop(run: &mut TextRun, data: &[u8]) {
     let text_char_len = run.text.chars().count();
     let (para_spans, char_spans) = style::parse_style_text_prop(data, text_char_len);
@@ -1301,7 +1298,7 @@ fn apply_style_text_prop(run: &mut TextRun, data: &[u8]) {
 pub struct SlideText {
     /// All text runs belonging to this slide.
     pub text_runs: Vec<TextRun>,
-    /// Shape groups recognized as tables (issue #255). Rendered after
+    /// Shape groups recognized as tables. Rendered after
     /// `text_runs` in the IR — the binary format has no single unified
     /// reading-order concept to interleave them with, so this is a
     /// deliberate simplification, not a claim of true document order.
@@ -1309,22 +1306,21 @@ pub struct SlideText {
     /// 0-based indices into the document's `Pictures`-stream-derived
     /// image list ([`super::images::PptImage::index`]) for every
     /// picture shape resolved on this slide, in shape-tree encounter
-    /// order (issue #256 — these used to be silently dumped onto
+    /// order (these used to be silently dumped onto
     /// whichever slide happened to be last, regardless of which slide
     /// actually contains the shape referencing them).
     pub image_refs: Vec<usize>,
     /// Every embedded/linked/ActiveX OLE object resolved on this slide,
     /// in shape-tree encounter order — a slide with an embedded Excel
     /// workbook, Word document, Equation Editor object, etc. previously
-    /// surfaced nothing at all indicating the object even existed
-    /// (issue #337).
+    /// surfaced nothing at all indicating the object even existed.
     pub ole_object_refs: Vec<OleObjectInfo>,
     /// Whether the slide is marked hidden (not shown during a slide
     /// show) via a `SlideShowSlideInfoAtom` HIDDEN_BIT sibling of the
     /// `Slide` container. The content is still extracted — a consumer
     /// indexing a deck usually wants it — but a caller can now tell the
-    /// author didn't intend it to be seen (issue #297, the `.ppt`
-    /// analogue of the already-fixed XLSX/PPTX #193).
+    /// author didn't intend it to be seen (the `.ppt`
+    /// analogue of the XLSX/PPTX hidden flags).
     pub hidden: bool,
 }
 
@@ -1381,7 +1377,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_text_chars() {
+    fn test_extract_text_chars() {
         // TextHeaderAtom(type=0=Title) + TextCharsAtom("Hi")
         let mut stream = make_atom(RT_TEXT_HEADER, 0, &0u32.to_le_bytes());
         // "Hi" in UTF-16LE
@@ -1406,7 +1402,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_text_bytes() {
+    fn test_extract_text_bytes() {
         let mut stream = make_atom(RT_TEXT_HEADER, 0, &1u32.to_le_bytes()); // Body
         stream.extend(make_atom(RT_TEXT_BYTES, 0, b"Hello World"));
         let mut runs = Vec::new();
@@ -1429,7 +1425,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_multiple_runs() {
+    fn test_extract_multiple_runs() {
         let mut stream = make_atom(RT_TEXT_HEADER, 0, &0u32.to_le_bytes());
         stream.extend(make_atom(RT_TEXT_BYTES, 0, b"Title"));
         stream.extend(make_atom(RT_TEXT_HEADER, 0, &1u32.to_le_bytes()));
@@ -1491,9 +1487,9 @@ mod tests {
         make_container(RT_SHAPE, 0, &shape_children)
     }
 
-    // ── #256: picture-shape `pib` resolution ──
+    // ── picture-shape `pib` resolution ──
 
-    /// Build an `OfficeArtFOPT` record (issue #256) with a single
+    /// Build an `OfficeArtFOPT` record with a single
     /// `Blip:pib` property entry (`opid.opid = 0x0104`, `fBid = 1`,
     /// `fComplex = 0`), `op = pib_value` (the documented ONE-based
     /// index).
@@ -1514,24 +1510,24 @@ mod tests {
     }
 
     #[test]
-    fn resolve_shape_pib_finds_the_pib_property() {
+    fn test_resolve_shape_pib_finds_the_pib_property() {
         let shape_data = make_fopt_with_pib(3); // one-based
         assert_eq!(resolve_shape_pib(&shape_data), Some(2)); // zero-based
     }
 
     #[test]
-    fn resolve_shape_pib_zero_means_no_picture() {
+    fn test_resolve_shape_pib_zero_means_no_picture() {
         let shape_data = make_fopt_with_pib(0);
         assert_eq!(resolve_shape_pib(&shape_data), None);
     }
 
     #[test]
-    fn resolve_shape_pib_none_without_fopt() {
+    fn test_resolve_shape_pib_none_without_fopt() {
         assert_eq!(resolve_shape_pib(&[]), None);
     }
 
     #[test]
-    fn resolve_shape_pib_skips_unrelated_properties() {
+    fn test_resolve_shape_pib_skips_unrelated_properties() {
         // Two properties: an unrelated one (pid=0x0080, some Shape
         // Boolean property) first, then pib — the scan must not stop at
         // the first entry.
@@ -1554,7 +1550,7 @@ mod tests {
     }
 
     #[test]
-    fn shape_with_pib_reaches_image_refs_end_to_end() {
+    fn test_shape_with_pib_reaches_image_refs_end_to_end() {
         let mut shape_children = make_fopt_with_pib(1); // zero-based index 0
         let mut textbox_children = make_atom(RT_TEXT_HEADER, 0, &4u32.to_le_bytes());
         textbox_children.extend(make_atom(RT_TEXT_BYTES, 0, b"caption"));
@@ -1596,12 +1592,12 @@ mod tests {
         make_atom(RT_EXTERNAL_OLE_OBJECT_ATOM, 0, &data)
     }
 
-    /// issue #337 — a shape whose `RT_CLIENT_DATA` carries an
+    /// A shape whose `RT_CLIENT_DATA` carries an
     /// `ExObjRefAtom` (`exObjIdRef`), joined against the document's
     /// `ExObjListContainer` -> `ExEmbed` -> `ExOleObjAtom` chain by
     /// `objID`.
     #[test]
-    fn parse_ex_ole_objects_resolves_id_to_subtype_and_kind() {
+    fn test_parse_ex_ole_objects_resolves_id_to_subtype_and_kind() {
         let ole_atom = make_ex_ole_obj_atom(1, 3, 0); // objID=1, Excel, embedded
         let ex_embed = make_container(RT_EXTERNAL_OLE_EMBED, 0, &ole_atom);
         let ex_obj_list = make_container(RT_EXTERNAL_OBJECT_LIST, 0, &ex_embed);
@@ -1614,10 +1610,10 @@ mod tests {
 
     /// End-to-end: a shape referencing an OLE object via `ExObjRefAtom`
     /// inside its `RT_CLIENT_DATA` resolves through to `ole_object_refs`,
-    /// alongside its own ordinary text (issue #337 — mirrors #256's
-    /// `shape_with_pib_reaches_image_refs_end_to_end` for the OLE case).
+    /// alongside its own ordinary text (mirrors
+    /// `test_shape_with_pib_reaches_image_refs_end_to_end` for the OLE case).
     #[test]
-    fn shape_with_ex_obj_ref_reaches_ole_object_refs_end_to_end() {
+    fn test_shape_with_ex_obj_ref_reaches_ole_object_refs_end_to_end() {
         let mut ole_objects = HashMap::new();
         ole_objects.insert(1u32, super::OleObjectInfo { subtype: 3, kind: 0 });
 
@@ -1653,7 +1649,7 @@ mod tests {
     /// A shape with no `ExObjRefAtom` at all must not resolve anything,
     /// even when the document has real OLE objects elsewhere.
     #[test]
-    fn resolve_shape_ole_object_none_without_ex_obj_ref() {
+    fn test_resolve_shape_ole_object_none_without_ex_obj_ref() {
         let mut ole_objects = HashMap::new();
         ole_objects.insert(1u32, super::OleObjectInfo { subtype: 3, kind: 0 });
 
@@ -1709,7 +1705,7 @@ mod tests {
         assert!(resolve_shape_placeholder_role(&client_data).is_none());
     }
 
-    /// End-to-end (issue #258): a shape carrying an `OEPlaceholderAtom`
+    /// End-to-end: a shape carrying an `OEPlaceholderAtom`
     /// for "Footer" produces a `TextRun` whose `placeholder_role` is
     /// `Some("ftr")`.
     #[test]
@@ -1742,7 +1738,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_ex_hyperlinks_resolves_id_to_target_url() {
+    fn test_parse_ex_hyperlinks_resolves_id_to_target_url() {
         let ex_obj_list =
             make_container(RT_EXTERNAL_OBJECT_LIST, 0, &make_ex_hyperlink(1, "http://example.com"));
         let map = parse_ex_hyperlinks(&ex_obj_list);
@@ -1750,7 +1746,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_ex_hyperlinks_multiple_entries() {
+    fn test_parse_ex_hyperlinks_multiple_entries() {
         let mut ex_obj_list_children = make_ex_hyperlink(1, "http://a.example/");
         ex_obj_list_children.extend(make_ex_hyperlink(2, "http://b.example/"));
         let ex_obj_list = make_container(RT_EXTERNAL_OBJECT_LIST, 0, &ex_obj_list_children);
@@ -1761,16 +1757,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_stream_yields_no_hyperlinks() {
+    fn test_empty_stream_yields_no_hyperlinks() {
         assert!(parse_ex_hyperlinks(&[]).is_empty());
     }
 
-    /// issue #257 — the real end-to-end chain: a shape's own
+    /// The real end-to-end chain: a shape's own
     /// `InteractiveInfoAtom` (`exHyperlinkIdRef` + `II_HyperlinkAction`)
     /// resolves through the document's `ExObjList` to a real URL, which
     /// ends up on the shape's own `TextRun::hyperlink`.
     #[test]
-    fn shape_with_interactive_info_resolves_its_hyperlink() {
+    fn test_shape_with_interactive_info_resolves_its_hyperlink() {
         let mut hyperlinks = HashMap::new();
         hyperlinks.insert(1u32, "http://testuri.org/".to_string());
 
@@ -1795,14 +1791,14 @@ mod tests {
         assert_eq!(runs[0].hyperlink.as_deref(), Some("http://testuri.org/"));
     }
 
-    /// issue #257 — the far more common, real-world shape: a hyperlink
+    /// The far more common, real-world shape: a hyperlink
     /// covering only PART of a text run's characters, via a sibling
     /// `MouseClickInteractiveInfoContainer` + `MouseClickTextInteractiveInfoAtom`
     /// pair in the `ClientTextbox` (not nested in `RT_CLIENT_DATA` at all —
     /// confirmed against real corpus bytes, not just the spec). The run
     /// must split into unlinked-prefix / linked / unlinked-suffix pieces.
     #[test]
-    fn text_range_hyperlink_splits_the_run() {
+    fn test_text_range_hyperlink_splits_the_run() {
         let mut hyperlinks = HashMap::new();
         hyperlinks.insert(7u32, "http://example.com/".to_string());
 
@@ -1849,7 +1845,7 @@ mod tests {
     /// The hyperlinked range can cover the WHOLE run (no unlinked prefix
     /// or suffix) — must produce exactly one run, not empty placeholders.
     #[test]
-    fn text_range_hyperlink_covering_the_whole_run_produces_one_run() {
+    fn test_text_range_hyperlink_covering_the_whole_run_produces_one_run() {
         let mut hyperlinks = HashMap::new();
         hyperlinks.insert(1u32, "http://example.com/".to_string());
 
@@ -1888,7 +1884,7 @@ mod tests {
         assert_eq!(runs[0].hyperlink.as_deref(), Some("http://example.com/"));
     }
 
-    // ── #255: grid-of-shapes table reconstruction ──
+    // ── grid-of-shapes table reconstruction ──
 
     fn make_child_anchor(left: i32, top: i32, right: i32, bottom: i32) -> Vec<u8> {
         let mut body = Vec::new();
@@ -1908,11 +1904,11 @@ mod tests {
         make_container(RT_SHAPE, 0, &children)
     }
 
-    /// issue #255 — a group whose members form a clean 2x2 grid must
+    /// A group whose members form a clean 2x2 grid must
     /// become one `TableBlock`, and the cell text must NOT also appear as
     /// flat paragraphs (that would duplicate it in the IR).
     #[test]
-    fn spgr_container_with_clean_grid_becomes_a_table() {
+    fn test_spgr_container_with_clean_grid_becomes_a_table() {
         let mut spgr_children = make_container(RT_SHAPE, 0, &[]); // group's own placeholder shape
         spgr_children.extend(make_table_cell_shape(0, 0, b"A1"));
         spgr_children.extend(make_table_cell_shape(100, 0, b"B1"));
@@ -1947,12 +1943,12 @@ mod tests {
         assert_eq!(t.rows[1][1][0].text, "B2");
     }
 
-    /// issue #255 — a group that ISN'T a clean grid (here: only 3
+    /// A group that ISN'T a clean grid (here: only 3
     /// members, one short of a 2x2) must fall back to the ordinary
     /// flat-paragraph group walk, unchanged from before this feature
     /// existed — no text lost, just no table structure.
     #[test]
-    fn spgr_container_that_is_not_a_grid_falls_back_to_flat_paragraphs() {
+    fn test_spgr_container_that_is_not_a_grid_falls_back_to_flat_paragraphs() {
         let mut spgr_children = make_container(RT_SHAPE, 0, &[]);
         spgr_children.extend(make_table_cell_shape(0, 0, b"One"));
         spgr_children.extend(make_table_cell_shape(100, 0, b"Two"));
@@ -1979,11 +1975,11 @@ mod tests {
         assert_eq!(runs.len(), 3);
     }
 
-    /// issue #255 — a group member with no `RT_CHILD_ANCHOR` at all (an
+    /// A group member with no `RT_CHILD_ANCHOR` at all (an
     /// odd/unexpected shape) must also bail to the flat-paragraph
     /// fallback rather than guessing a position for it.
     #[test]
-    fn spgr_container_member_without_child_anchor_falls_back() {
+    fn test_spgr_container_member_without_child_anchor_falls_back() {
         let mut spgr_children = make_container(RT_SHAPE, 0, &[]);
         spgr_children.extend(make_table_cell_shape(0, 0, b"A1"));
         spgr_children.extend(make_table_cell_shape(100, 0, b"B1"));
@@ -2018,7 +2014,7 @@ mod tests {
     /// A shape with no `InteractiveInfo` at all must never get a
     /// hyperlink, even when the document has some hyperlinks elsewhere.
     #[test]
-    fn shape_without_interactive_info_has_no_hyperlink() {
+    fn test_shape_without_interactive_info_has_no_hyperlink() {
         let mut hyperlinks = HashMap::new();
         hyperlinks.insert(1u32, "http://testuri.org/".to_string());
 
@@ -2049,7 +2045,7 @@ mod tests {
     /// `exHyperlinkIdRef` happens to name a real entry — the action type
     /// gates whether the id is meaningful at all ([MS-PPT] 2.6.10).
     #[test]
-    fn non_hyperlink_action_does_not_resolve_a_hyperlink() {
+    fn test_non_hyperlink_action_does_not_resolve_a_hyperlink() {
         let mut hyperlinks = HashMap::new();
         hyperlinks.insert(1u32, "http://testuri.org/".to_string());
 
@@ -2084,14 +2080,14 @@ mod tests {
         assert_eq!(runs[0].hyperlink, None);
     }
 
-    /// issue #257 — full public pipeline: `extract_slides_text` on a
+    /// Full public pipeline: `extract_slides_text` on a
     /// synthetic "PowerPoint Document" stream carrying both an
     /// `ExObjListContainer` and a hyperlinked shape (with no persist
     /// directory or `SlideListWithText` — the "last resort" fallback,
     /// which still builds `hyperlinks` from the *whole* stream first)
     /// resolves the shape's `TextRun::hyperlink` end to end.
     #[test]
-    fn extract_slides_text_resolves_hyperlinks_end_to_end() {
+    fn test_extract_slides_text_resolves_hyperlinks_end_to_end() {
         let shape = make_hyperlinked_shape(1, b"Hyperlink text", 1);
         let mut stream = make_container(
             RT_EXTERNAL_OBJECT_LIST,
@@ -2107,7 +2103,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_text_from_nested_shape_containers() {
+    fn test_extract_text_from_nested_shape_containers() {
         // Text nested a few containers deep (shape -> group -> textbox),
         // as it actually appears inside a real Slide record.
         let header = make_atom(RT_TEXT_HEADER, 0, &0u32.to_le_bytes());
@@ -2138,7 +2134,7 @@ mod tests {
     /// all, slide boundaries are derived from a `SlideListWithText`'s own
     /// inline text cache.
     #[test]
-    fn slide_list_cache_fallback_without_persist_directory() {
+    fn test_slide_list_cache_fallback_without_persist_directory() {
         // Build a SlideListWithText container with 2 slides.
         let mut children = Vec::new();
         // Slide 1
@@ -2157,10 +2153,10 @@ mod tests {
         assert_eq!(slides[1].text_runs[0].text, "Slide 2 Title");
     }
 
-    /// issue #297 — a `SlideShowSlideInfoAtom` HIDDEN_BIT sibling of the
+    /// A `SlideShowSlideInfoAtom` HIDDEN_BIT sibling of the
     /// `Slide` container's real content must reach `SlideText::hidden`.
     #[test]
-    fn hidden_slide_is_flagged() {
+    fn test_hidden_slide_is_flagged() {
         let stream = hidden_slide_container_bytes("Hidden Slide");
         let slides = extract_slides_text(&stream, None);
         assert_eq!(slides.len(), 1);
@@ -2171,7 +2167,7 @@ mod tests {
     /// A slide with no `SlideShowSlideInfoAtom` at all — the overwhelming
     /// majority of real slides — must not be flagged hidden.
     #[test]
-    fn ordinary_slide_is_not_hidden() {
+    fn test_ordinary_slide_is_not_hidden() {
         let stream = slide_container_bytes("Ordinary Slide");
         let slides = extract_slides_text(&stream, None);
         assert_eq!(slides.len(), 1);
@@ -2182,7 +2178,7 @@ mod tests {
     /// slide that merely has a custom transition) must not be flagged
     /// hidden either.
     #[test]
-    fn slide_info_atom_without_hidden_bit_is_not_hidden() {
+    fn test_slide_info_atom_without_hidden_bit_is_not_hidden() {
         let header = make_atom(RT_TEXT_HEADER, 0, &0u32.to_le_bytes());
         let mut textbox_children = header;
         textbox_children.extend(make_atom(RT_TEXT_BYTES, 0, b"Visible Slide"));
@@ -2207,20 +2203,20 @@ mod tests {
     }
 
     #[test]
-    fn text_type_variants() {
+    fn test_text_type_variants() {
         assert_eq!(TextType::from_u32(0), TextType::Title);
         assert_eq!(TextType::from_u32(1), TextType::Body);
         assert_eq!(TextType::from_u32(2), TextType::Notes);
         assert_eq!(TextType::from_u32(99), TextType::Other);
     }
 
-    /// issue #253 — every `TextTypeEnum` value from 3 upward was shifted
+    /// Every `TextTypeEnum` value from 3 upward was shifted
     /// one slot low (5 misread as `CenterTitle`, 6 as `HalfBody`, …),
     /// swapping a title slide's real title and subtitle. Values verified
     /// against the published [MS-PPT] `TextTypeEnum` spec page directly:
     /// 3 is genuinely undefined (the enum jumps from 2 to 4).
     #[test]
-    fn text_type_values_3_and_up_match_the_spec_not_the_old_shifted_mapping() {
+    fn test_text_type_values_3_and_up_match_the_spec_not_the_old_shifted_mapping() {
         assert_eq!(TextType::from_u32(3), TextType::Other, "3 is undefined in the spec");
         assert_eq!(TextType::from_u32(4), TextType::Other, "4 = Tx_TYPE_OTHER");
         assert_eq!(TextType::from_u32(5), TextType::CenterBody, "5 = Tx_TYPE_CENTERBODY");
@@ -2230,13 +2226,13 @@ mod tests {
     }
 
     #[test]
-    fn decode_utf16le_basic() {
+    fn test_decode_utf16le_basic() {
         let data = [0x41, 0x00, 0x42, 0x00, 0x43, 0x00]; // "ABC"
         assert_eq!(decode_utf16le(&data), "ABC");
     }
 
     #[test]
-    fn fallback_when_no_slide_list() {
+    fn test_fallback_when_no_slide_list() {
         // Just raw text atoms without SlideListWithText or a persist directory.
         let mut stream = make_atom(RT_TEXT_HEADER, 0, &0u32.to_le_bytes());
         stream.extend(make_atom(RT_TEXT_BYTES, 0, b"Fallback text"));
@@ -2371,7 +2367,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_resolution_ignores_stale_orphaned_slide_copy() {
+    fn test_persist_resolution_ignores_stale_orphaned_slide_copy() {
         let (stream, current_user) = build_persist_regression_fixture();
         let slides = extract_slides_text(&stream, Some(&current_user));
 
@@ -2386,14 +2382,14 @@ mod tests {
         );
     }
 
-    /// issue #257 — `ExObjListContainer` resolution must go through the
+    /// `ExObjListContainer` resolution must go through the
     /// same persist-directory mechanism slides do, not a raw whole-stream
     /// scan: a stale/orphaned `ExObjListContainer` left behind by an
     /// earlier incremental save (mapping the same `exHyperlinkId` to a
     /// *different*, superseded URL) must never win over the current,
     /// persist-resolved one.
     #[test]
-    fn persist_resolution_uses_the_current_exobjlist_not_a_stale_one() {
+    fn test_persist_resolution_uses_the_current_exobjlist_not_a_stale_one() {
         let mut stream = Vec::new();
 
         // Stale, orphaned ExObjListContainer — not reachable from the
@@ -2443,7 +2439,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_resolution_works_without_current_user_stream() {
+    fn test_persist_resolution_works_without_current_user_stream() {
         let (stream, _current_user) = build_persist_regression_fixture();
         let slides = extract_slides_text(&stream, None);
 
@@ -2464,12 +2460,12 @@ mod tests {
         make_container(RT_HEADER_FOOTER, 3, &children)
     }
 
-    /// issue #308 — a `DocumentContainer`-level `HeadersFootersContainer`'s
+    /// A `DocumentContainer`-level `HeadersFootersContainer`'s
     /// date/footer text must reach every slide's text runs, matching the
     /// real corpus file this was verified against
     /// (`26 August 2004` / `Transport CDM Workshop`, repeated per slide).
     #[test]
-    fn header_footer_text_reaches_every_slide() {
+    fn test_header_footer_text_reaches_every_slide() {
         let mut stream = Vec::new();
 
         let hf = header_footer_container_bytes("26 August 2004", "Transport CDM Workshop");
@@ -2509,7 +2505,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_record_length_before_real_content_does_not_lose_it() {
+    fn test_corrupted_record_length_before_real_content_does_not_lose_it() {
         // Same shape as build_persist_regression_fixture, with a corrupt
         // top-level record spliced in right after the stale block.
         let mut stream = Vec::new();
@@ -2539,7 +2535,7 @@ mod tests {
     }
 
     #[test]
-    fn outline_text_ref_atom_resolves_indexed_placeholder_text() {
+    fn test_outline_text_ref_atom_resolves_indexed_placeholder_text() {
         // A shape whose ClientTextbox holds only an OutlineTextRefAtom
         // (index 1) instead of embedding its own TextHeaderAtom/TextChars —
         // the placeholder-text-by-reference pattern real PPT97 title/body
@@ -2599,7 +2595,7 @@ mod tests {
     /// (`CFMasks` bit 17) — the same two bits `style.rs`'s own
     /// `parse_pf_body`/`parse_cf_body` decode. `text_type` `0`
     /// (`Title`)/`1` (`Body`) are both `< 5`, so no per-level
-    /// `indentLevel` field is present (issue #335).
+    /// `indentLevel` field is present.
     fn master_style_bytes(text_type: u16, alignment: u16, font_size: i16) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&1u16.to_le_bytes()); // levels = 1
@@ -2613,13 +2609,13 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_formatting_inherits_from_master_when_direct_formatting_is_absent() {
+    fn test_placeholder_formatting_inherits_from_master_when_direct_formatting_is_absent() {
         // A Title placeholder with no StyleTextPropAtom of its own at
         // all (no direct formatting) whose slide's SlideAtom.masterIdRef
         // points — with the USES_MASTER_SLIDE_ID flag bit (0x80000000)
         // set, exactly as every real corpus file does — at a MainMaster
         // carrying a Title TxMasterStyleAtom. The run must end up with
-        // the master's alignment/font_size (issue #335).
+        // the master's alignment/font_size.
         let mut stream = Vec::new();
 
         let doc_offset = stream.len() as u32;
@@ -2668,7 +2664,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_resolution_follows_outline_text_ref_atom() {
+    fn test_persist_resolution_follows_outline_text_ref_atom() {
         // A Slide container whose only shape holds an OutlineTextRefAtom, with
         // the actual text living in the SlideListWithText's per-slide outline
         // cache rather than embedded in the shape itself.
@@ -2701,7 +2697,7 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_inline_cache_when_persist_resolved_slides_are_all_textless() {
+    fn test_falls_back_to_inline_cache_when_persist_resolved_slides_are_all_textless() {
         // Persist resolution structurally succeeds (valid directory, valid
         // Slide offset) but the resolved Slide container has no extractable
         // text at all — as happens when directory corruption points at the

@@ -139,8 +139,8 @@ fn parse_plc_pcd(data: &[u8]) -> Result<Vec<Piece>> {
 /// two pieces, or the pieces stop short of `text_len` — every CP the gap
 /// covers is silently absent from `extract_text`'s output with no error:
 /// a `.doc` can end up 84% shorter than its own FIB says it is, and look
-/// identical to a document that genuinely has that little text (issue
-/// #230). This doesn't attempt to recover the missing text (a fallback
+/// identical to a document that genuinely has that little text. This
+/// doesn't attempt to recover the missing text (a fallback
 /// byte-range read risks producing *wrong*, garbled text for other files,
 /// which is worse than an accurate partial extraction) — it only gives a
 /// caller a way to tell the two cases apart.
@@ -231,7 +231,7 @@ pub fn extract_text_range(
 /// `chpx::resolve_deleted_cp_ranges`).
 ///
 /// This is what applies the "accepted view" policy for DOC's deleted
-/// revision-mark text (issue #288, the same policy already applied to
+/// revision-mark text (the same policy already applied to
 /// DOCX's `w:del`): the excluded ranges are simply never read, rather than
 /// read and then filtered out of the decoded string, so a deleted range
 /// straddling a piece boundary or a multi-byte encoding still slices
@@ -392,7 +392,7 @@ pub(crate) fn cp1252_to_char(b: u8) -> char {
 
 /// A `HYPERLINK` field's display-text span, as a byte range into the string
 /// [`sanitize_text_with_hyperlinks_and_chp`] returned it alongside, paired
-/// with the URL parsed from the field's own instruction text (issue #249).
+/// with the URL parsed from the field's own instruction text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HyperlinkSpan {
     pub range: std::ops::Range<usize>,
@@ -406,16 +406,16 @@ pub struct HyperlinkSpan {
 /// `DATE \@ "..."`, …) and its cached result between the boundary markers.
 /// Only the cached result — the part between `0x14` and `0x15` — is what
 /// Word itself displays; the instruction text must be dropped entirely,
-/// not just the three boundary characters around it (issue #249).
+/// not just the three boundary characters around it.
 pub fn sanitize_text(text: &str) -> String {
     strip_fields(text, None).0
 }
 
 /// As [`sanitize_text`], but also returns character-property run
-/// boundaries (byte ranges in the *returned* string, issue #287) alongside
+/// boundaries (byte ranges in the *returned* string) alongside
 /// each `HYPERLINK` field's display text as a [`HyperlinkSpan`] paired
 /// with its target URL, so a caller building structured inline content can
-/// attach both `TextSpan::hyperlink` (issue #249) and the real per-run
+/// attach both `TextSpan::hyperlink` and the real per-run
 /// formatting to exactly the right spans.
 /// `char_props[i]` is the [`ChpProps`] of `text.chars().nth(i)`; the two
 /// MUST have the same length (every char in `text`, including ones that get
@@ -580,7 +580,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_clx_with_one_piece() {
+    fn test_parse_clx_with_one_piece() {
         let mut clx = Vec::new();
         // Pcdt marker.
         clx.push(0x02);
@@ -603,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_clx_with_grpprl_prefix() {
+    fn test_parse_clx_with_grpprl_prefix() {
         let mut clx = Vec::new();
         // Grpprl: type=0x01, size=3, data=[0,0,0]
         clx.push(0x01);
@@ -624,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_compressed_text() {
+    fn test_extract_compressed_text() {
         // Build a word_doc with "Hello" at byte offset 0x80 (fc=0x40000100, offset = 0x100/2 = 0x80)
         let mut word_doc = vec![0u8; 256];
         let text_offset = 0x80;
@@ -641,7 +641,7 @@ mod tests {
         assert_eq!(text, "Hello");
     }
 
-    /// Regression (issue #288): a deleted-revision-mark sub-range in the
+    /// Regression: a deleted-revision-mark sub-range in the
     /// middle of the text is skipped entirely, not decoded and then
     /// filtered — the two flanking ranges are still joined correctly.
     #[test]
@@ -690,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_unicode_text() {
+    fn test_extract_unicode_text() {
         let mut word_doc = vec![0u8; 256];
         let fc = 100u32;
         // "Hi" in UTF-16LE at offset 100
@@ -711,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_multiple_pieces() {
+    fn test_extract_multiple_pieces() {
         let mut word_doc = vec![0u8; 512];
         // Piece 1: compressed "AB" at offset 0x80
         word_doc[0x80] = b'A';
@@ -740,26 +740,26 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_paragraph_marks() {
+    fn test_sanitize_paragraph_marks() {
         assert_eq!(sanitize_text("Hello\rWorld"), "Hello\nWorld");
         assert_eq!(sanitize_text("A\x0CB"), "A\nB");
         assert_eq!(sanitize_text("A\x07B"), "A\tB");
     }
 
-    /// issue #249 — the instruction text between `0x13` and `0x14` is
+    /// The instruction text between `0x13` and `0x14` is
     /// never visible in Word; only the cached result (between `0x14` and
     /// `0x15`) is. The old behaviour kept both, mashed together.
     #[test]
-    fn sanitize_field_codes_stripped() {
+    fn test_sanitize_field_codes_stripped() {
         assert_eq!(sanitize_text("before\x13FIELD\x14result\x15after"), "beforeresultafter");
     }
 
-    /// The real corpus shape from `hyperlink.doc` (issue #249): a
+    /// The real corpus shape from `hyperlink.doc`: a
     /// `HYPERLINK` field's instruction and quoted URL must vanish from
     /// visible text, its cached display text must survive, and the URL
     /// must be recovered as a `HyperlinkSpan` over exactly that text.
     #[test]
-    fn hyperlink_field_strips_instruction_and_yields_url_span() {
+    fn test_hyperlink_field_strips_instruction_and_yields_url_span() {
         let raw = "Before text; \x13 HYPERLINK \"http://testuri.org/\" \x14Hyperlink text\x15; after text";
         let char_props = vec![super::super::sprm::ChpProps::default(); raw.chars().count()];
         let (text, links, _spans) = sanitize_text_with_hyperlinks_and_chp(raw, &char_props);
@@ -773,7 +773,7 @@ mod tests {
     /// surfaced as a `#bookmark`-shaped target the way a browser-style
     /// consumer would expect.
     #[test]
-    fn hyperlink_field_with_bookmark_switch_gets_hash_prefix() {
+    fn test_hyperlink_field_with_bookmark_switch_gets_hash_prefix() {
         let raw = "\x13 HYPERLINK \\l \"SectionTwo\" \x14Jump to Section Two\x15";
         let char_props = vec![super::super::sprm::ChpProps::default(); raw.chars().count()];
         let (text, links, _spans) = sanitize_text_with_hyperlinks_and_chp(raw, &char_props);
@@ -781,7 +781,7 @@ mod tests {
         assert_eq!(links[0].url, "#SectionTwo");
     }
 
-    /// Regression (issue #287): consecutive chars with equal `ChpProps`
+    /// Regression: consecutive chars with equal `ChpProps`
     /// merge into one span; a props change starts a new one, at the right
     /// byte offset.
     #[test]
@@ -816,7 +816,7 @@ mod tests {
     /// A non-`HYPERLINK` field (e.g. `CREATEDATE`) must still have its
     /// instruction text stripped, but must never produce a hyperlink span.
     #[test]
-    fn non_hyperlink_field_produces_no_hyperlink_span() {
+    fn test_non_hyperlink_field_produces_no_hyperlink_span() {
         let raw = "\x13 CREATEDATE   \\* MERGEFORMAT \x1419/11/2010 14:49:00\x15";
         let char_props = vec![super::super::sprm::ChpProps::default(); raw.chars().count()];
         let (text, links, _spans) = sanitize_text_with_hyperlinks_and_chp(raw, &char_props);
@@ -830,14 +830,14 @@ mod tests {
     /// swallowed as part of the outer instruction, and only the outer
     /// field's own cached result becomes visible.
     #[test]
-    fn nested_field_does_not_confuse_the_outer_fields_boundary() {
+    fn test_nested_field_does_not_confuse_the_outer_fields_boundary() {
         let raw = "\x13 IF \x13 PAGE \x141\x15 > 1 \"yes\" \"no\" \x14no\x15";
         let text = sanitize_text(raw);
         assert_eq!(text, "no");
     }
 
     #[test]
-    fn cp1252_special_chars() {
+    fn test_cp1252_special_chars() {
         assert_eq!(cp1252_to_char(0x80), '€');
         assert_eq!(cp1252_to_char(0x93), '\u{201C}');
         assert_eq!(cp1252_to_char(0x94), '\u{201D}');
@@ -845,7 +845,7 @@ mod tests {
     }
 
     #[test]
-    fn max_chars_limits_output() {
+    fn test_max_chars_limits_output() {
         let mut word_doc = vec![0u8; 256];
         word_doc[0x80..0x85].copy_from_slice(b"Hello");
 
@@ -872,7 +872,7 @@ mod tests {
     /// returns `Err` on a reversed range, so the later subtraction is always
     /// on a well-ordered piece.
     #[test]
-    fn parse_clx_rejects_nonmonotonic_cps() {
+    fn test_parse_clx_rejects_nonmonotonic_cps() {
         // CLX: Pcdt marker, PlcPcd size 16, CP[0]=10, CP[1]=5 (reversed), one PCD.
         let mut clx = Vec::new();
         clx.push(0x02); // Pcdt marker
@@ -896,7 +896,7 @@ mod tests {
     /// catch a regression. These assertions pin `piece_backed_cp_end` directly —
     /// that value changes the moment the clamp is dropped.
     #[test]
-    fn decode_cp_range_backing_is_clamped_not_just_output() {
+    fn test_decode_cp_range_backing_is_clamped_not_just_output() {
         let word_doc = vec![0u8; 64];
 
         // Fully unbacked: declared range starts at fc=4096 but the stream is
@@ -960,7 +960,7 @@ mod tests {
     /// The unbacked/partial tests above all use `cp_start == 0` and `fc == 0`,
     /// so neither the `saturating_add` nor the offset mask was exercised there.
     #[test]
-    fn piece_backed_cp_end_nonzero_cp_start_and_offset() {
+    fn test_piece_backed_cp_end_nonzero_cp_start_and_offset() {
         let word_doc = [0u8; 64];
 
         // Unicode piece with cp_start=100: backed end = 100 + 32.
@@ -1012,7 +1012,7 @@ mod tests {
     /// other tests only decode from `cp_start` (offset 0), so the in-range
     /// offset arithmetic was never directly asserted.
     #[test]
-    fn decode_cp_range_mid_range_into_backed_piece() {
+    fn test_decode_cp_range_mid_range_into_backed_piece() {
         // "HelloWorld" in UTF-16LE (10 chars = 20 bytes) at fc=0.
         let mut word_doc = vec![0u8; 20];
         let text = b"HelloWorld";
@@ -1034,7 +1034,7 @@ mod tests {
     /// Each fixture exercises one of the truncation / wrong-marker branches in
     /// `parse_clx` that the happy-path fixtures never reach.
     #[test]
-    fn parse_clx_truncation_is_err() {
+    fn test_parse_clx_truncation_is_err() {
         // Grpprl marker (0x01) with no size bytes at all -> "Grpprl truncated".
         assert!(parse_clx(&[0x01]).is_err());
         // Marker that is neither Grpprl nor Pcdt -> "expected Pcdt".
@@ -1053,7 +1053,7 @@ mod tests {
     /// the documented multi-byte code points must be correct. The conversion
     /// table's individual arms are otherwise only partially exercised.
     #[test]
-    fn cp1252_special_bytes_all_covered() {
+    fn test_cp1252_special_bytes_all_covered() {
         for b in 0x80u8..=0x9F {
             let _ = cp1252_to_char(b);
         }
@@ -1072,10 +1072,10 @@ mod tests {
     /// `sanitize_text` must map every classified control character to its
     /// documented replacement, including the field-code markers it strips.
     #[test]
-    fn sanitize_all_control_marks() {
+    fn test_sanitize_all_control_marks() {
         assert_eq!(sanitize_text("A\x01B"), "AB"); // picture placeholder stripped
         assert_eq!(sanitize_text("A\x08B"), "AB"); // historic field-mark stripped
-        // An unclosed field (issue #249): "B" is instruction text with no
+        // An unclosed field: "B" is instruction text with no
         // matching separator/end, so it's never promoted to visible output.
         assert_eq!(sanitize_text("A\x13B"), "A");
         assert_eq!(sanitize_text("A\x14B"), "AB"); // stray separator (no open field): dropped, "B" is plain text
@@ -1108,9 +1108,10 @@ mod multi_piece_tests {
 
     /// A document acquires multiple pieces through ordinary editing
     /// history, so this is a common shape rather than an exotic one.
-    /// `lcbClx = 45` is exactly the three-piece size from issue #168.
+    /// `lcbClx = 45` is exactly the three-piece size from the
+    /// original Word 6.0/95 reproducer.
     #[test]
-    fn a_three_piece_table_extracts_every_piece() {
+    fn test_a_three_piece_table_extracts_every_piece() {
         let text: Vec<u8> = "ABCDEF"
             .encode_utf16()
             .flat_map(|u| u.to_le_bytes())
@@ -1129,7 +1130,7 @@ mod multi_piece_tests {
     /// Ranges must be clipped at both ends, which is what lets the
     /// subdocuments be read out of the same character space.
     #[test]
-    fn a_range_starting_mid_piece_is_clipped_at_both_ends() {
+    fn test_a_range_starting_mid_piece_is_clipped_at_both_ends() {
         let text: Vec<u8> = "ABCDEF"
             .encode_utf16()
             .flat_map(|u| u.to_le_bytes())
@@ -1141,7 +1142,7 @@ mod multi_piece_tests {
         assert_eq!(extract_text_range(&word_doc, &pieces, 2, 5, 0), "CDE");
     }
 
-    // ── Piece table coverage vs the FIB's declared text length (#230) ──────
+    // ── Piece table coverage vs the FIB's declared text length ──────
 
     fn piece(cp_start: u32, cp_end: u32) -> Piece {
         Piece { cp_start, cp_end, fc: 0, is_compressed: true }
@@ -1149,7 +1150,7 @@ mod multi_piece_tests {
 
     /// A single piece that covers the whole declared range.
     #[test]
-    fn covers_declared_length_true_for_a_full_single_piece() {
+    fn test_covers_declared_length_true_for_a_full_single_piece() {
         assert!(covers_declared_length(&[piece(0, 100)], 100));
         // Covering more than declared is fine too.
         assert!(covers_declared_length(&[piece(0, 200)], 100));
@@ -1157,7 +1158,7 @@ mod multi_piece_tests {
 
     /// Several contiguous pieces that together reach the declared length.
     #[test]
-    fn covers_declared_length_true_for_contiguous_pieces() {
+    fn test_covers_declared_length_true_for_contiguous_pieces() {
         assert!(covers_declared_length(&[piece(0, 40), piece(40, 70), piece(70, 100)], 100));
     }
 
@@ -1167,33 +1168,33 @@ mod multi_piece_tests {
     /// leaves the first 2816 of 3390 declared characters completely
     /// unmapped.
     #[test]
-    fn covers_declared_length_false_when_the_only_piece_starts_past_zero() {
+    fn test_covers_declared_length_false_when_the_only_piece_starts_past_zero() {
         assert!(!covers_declared_length(&[piece(2816, 3390)], 3368));
     }
 
     /// A gap between two otherwise-valid pieces.
     #[test]
-    fn covers_declared_length_false_for_a_gap_between_pieces() {
+    fn test_covers_declared_length_false_for_a_gap_between_pieces() {
         assert!(!covers_declared_length(&[piece(0, 40), piece(50, 100)], 100));
     }
 
     /// Pieces that stop short of the declared length with no gap before
     /// that point.
     #[test]
-    fn covers_declared_length_false_when_pieces_stop_short() {
+    fn test_covers_declared_length_false_when_pieces_stop_short() {
         assert!(!covers_declared_length(&[piece(0, 40)], 100));
     }
 
     /// No pieces at all, but the FIB declares text — an empty piece table
     /// with a nonzero `ccpText` is definitionally a gap, not "no text".
     #[test]
-    fn covers_declared_length_false_for_no_pieces_with_nonzero_text_len() {
+    fn test_covers_declared_length_false_for_no_pieces_with_nonzero_text_len() {
         assert!(!covers_declared_length(&[], 100));
     }
 
     /// `text_len == 0` trivially has nothing to cover.
     #[test]
-    fn covers_declared_length_true_when_text_len_is_zero() {
+    fn test_covers_declared_length_true_when_text_len_is_zero() {
         assert!(covers_declared_length(&[], 0));
         assert!(covers_declared_length(&[piece(0, 10)], 0));
     }

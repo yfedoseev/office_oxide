@@ -7,7 +7,6 @@ fn default_true() -> bool {
 // ── Enums ────────────────────────────────────────────────────────────────────
 
 /// Underline style for a text span.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnderlineStyle {
@@ -34,7 +33,6 @@ pub enum UnderlineStyle {
 }
 
 /// Paragraph text alignment.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParagraphAlignment {
@@ -53,7 +51,6 @@ pub enum ParagraphAlignment {
 /// Line spacing rule for a paragraph.
 /// `Auto(240)` = single, `Auto(360)` = 1.5×, `Auto(480)` = double.
 /// `Multiple` uses the same OOXML rule as `Auto`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LineSpacing {
@@ -68,7 +65,6 @@ pub enum LineSpacing {
 }
 
 /// Border style.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BorderStyle {
@@ -95,7 +91,6 @@ pub enum BorderStyle {
 }
 
 /// Vertical alignment within a table cell.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CellVerticalAlign {
@@ -108,7 +103,6 @@ pub enum CellVerticalAlign {
 }
 
 /// Horizontal alignment of a table on the page.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TableAlignment {
@@ -121,7 +115,6 @@ pub enum TableAlignment {
 }
 
 /// Text direction within a cell or frame.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TextDirection {
@@ -134,7 +127,6 @@ pub enum TextDirection {
 }
 
 /// Raster / vector image format.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageFormat {
@@ -183,7 +175,6 @@ impl ImageFormat {
 }
 
 /// How an image is positioned relative to surrounding text.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImagePositioning {
@@ -195,7 +186,6 @@ pub enum ImagePositioning {
 }
 
 /// Section break type.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SectionBreakType {
@@ -211,7 +201,6 @@ pub enum SectionBreakType {
 }
 
 /// Vertical text alignment (superscript / subscript).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerticalAlign {
@@ -224,7 +213,6 @@ pub enum VerticalAlign {
 }
 
 /// Anchor reference for a floating object.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FloatAnchor {
@@ -240,7 +228,6 @@ pub enum FloatAnchor {
 }
 
 /// Text wrap mode around a floating object.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TextWrap {
@@ -260,7 +247,6 @@ pub enum TextWrap {
 }
 
 /// List marker style.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ListStyle {
@@ -287,7 +273,6 @@ pub enum ListStyle {
 // ── New structs ───────────────────────────────────────────────────────────────
 
 /// A single border line definition.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BorderLine {
     /// Border line style.
@@ -301,7 +286,6 @@ pub struct BorderLine {
 }
 
 /// Full border set for a table (all six edges).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TableBorder {
     /// Top border of the table.
@@ -319,7 +303,6 @@ pub struct TableBorder {
 }
 
 /// Page geometry and margins (all values in twips).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PageSetup {
     /// Page width in twips.
@@ -359,7 +342,6 @@ impl Default for PageSetup {
 }
 
 /// Multi-column layout for a section.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ColumnLayout {
     /// Number of columns.
@@ -374,7 +356,6 @@ pub struct ColumnLayout {
 }
 
 /// Paragraph border (four sides plus between-paragraph rule).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ParagraphBorder {
     /// Top border of the paragraph.
@@ -390,7 +371,6 @@ pub struct ParagraphBorder {
 }
 
 /// Per-edge cell padding (all values in twips).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CellPadding {
     /// Top cell padding in twips.
@@ -404,7 +384,6 @@ pub struct CellPadding {
 }
 
 /// Positioning data for a floating (non-inline) image.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FloatingImage {
     /// Horizontal offset from the anchor in EMUs.
@@ -427,7 +406,6 @@ pub struct FloatingImage {
 }
 
 /// A header or footer containing block elements.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct HeaderFooter {
     /// Block elements that make up the header or footer.
@@ -435,7 +413,6 @@ pub struct HeaderFooter {
 }
 
 /// A floating text box containing block elements.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TextBox {
     /// Block elements inside the text box.
@@ -460,7 +437,6 @@ pub struct TextBox {
 }
 
 /// A footnote or endnote body.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Note {
     /// Numeric identifier matching the inline reference mark.
@@ -472,12 +448,11 @@ pub struct Note {
     /// Comment author, when the source format records one. Distinct from
     /// `marker` — some converters also fold the author into `marker` for
     /// backward-compatible display text, but this field is the structured
-    /// value (issue #298).
+    /// value.
     pub author: Option<String>,
 }
 
 /// An inline reference mark pointing to a footnote or endnote.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct FootnoteRef {
     /// Numeric identifier of the referenced note.
@@ -487,7 +462,6 @@ pub struct FootnoteRef {
 }
 
 /// A preformatted code block with an optional language tag.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct CodeBlock {
     /// Optional language identifier for syntax highlighting.
@@ -499,7 +473,7 @@ pub struct CodeBlock {
     /// `w:tag`), which was judged not worth the compatibility risk for a
     /// syntax-highlighting hint. HTML and Markdown *do* preserve it (via
     /// `<pre><code class="language-…">` and the fence's language token,
-    /// respectively) — this limitation is DOCX-specific (issue #219).
+    /// respectively) — this limitation is DOCX-specific.
     pub language: Option<String>,
     /// The preformatted code text.
     pub content: String,
@@ -518,7 +492,7 @@ pub struct DocumentIR {
     /// for XLSX/XLS only. Parsed correctly by both format readers but
     /// unreachable through any documented API before this: XLSX's own
     /// parser output was discarded before reaching the IR, and XLS had
-    /// no NAME-record parser at all (issue #251).
+    /// no NAME-record parser at all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub defined_names: Vec<DefinedName>,
 }
@@ -564,15 +538,15 @@ pub struct Metadata {
     /// OOXML part reached via a `vbaProject` relationship, or a legacy
     /// CFB file's top-level `_VBA_PROJECT` storage. A cheap presence-only
     /// signal for content-safety use cases; office_oxide never
-    /// interprets or executes the macro content itself (issue #283).
+    /// interprets or executes the macro content itself.
     #[serde(default)]
     pub has_macros: bool,
     /// `true` when parsing hit a known, detectable cause of missing
     /// content this crate could not safely recover, and no other signal
     /// would tell a caller that anything is wrong: DOC (the piece table
-    /// has a gap before the FIB's declared text length, issue #230) and
+    /// has a gap before the FIB's declared text length) and
     /// XLS (the record-parsing safety cap cut the Workbook stream short,
-    /// dropping trailing sheets or the whole workbook, issue #236).
+    /// dropping trailing sheets or the whole workbook).
     /// `false` (the default) means either the format has no such
     /// self-check, or the check passed.
     #[serde(default)]
@@ -587,8 +561,7 @@ pub struct Metadata {
 /// only the fact that the workbook has this metadata at all. Colour
 /// scales, data bars and icon sets are captured by `rule_type` alone
 /// (their own gradient/icon-set stops are not parsed); cell-value and
-/// formula rules additionally carry their comparison `formulas` (issue
-/// #252).
+/// formula rules additionally carry their comparison `formulas`.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ConditionalFormat {
     /// The cell range(s) this rule applies to, e.g. `"A1:B10"` or a
@@ -615,7 +588,7 @@ pub struct ConditionalFormat {
 /// A data validation rule from a worksheet (XLSX `<dataValidation>`, XLS
 /// `DV` records grouped under a `DVAL`).
 ///
-/// Same scope tier as [`ConditionalFormat`] (issue #252): an
+/// Same scope tier as [`ConditionalFormat`]: an
 /// awareness/scope gap, not a value-correctness one — no cell's own value
 /// is affected by a validation rule being invisible, only the fact the
 /// workbook defines the constraint at all. XLS's `formula1`/`formula2` are
@@ -624,7 +597,7 @@ pub struct ConditionalFormat {
 /// `ConditionalFormat` for XLS's `CF` records); the type/operator/range/
 /// allow-blank metadata is still extracted, but XLS's `formula1`/
 /// `formula2` are always `None`. XLSX's `<formula1>`/`<formula2>` are
-/// already plain text in the XML and are populated directly (issue #275).
+/// already plain text in the XML and are populated directly.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct DataValidation {
     /// The cell range(s) this rule applies to, e.g. `"A1:B10"` or a
@@ -688,8 +661,7 @@ pub struct Section {
     /// notes carry the exact same bold/italic/bullet/numbering
     /// formatting slide body text already does, via the same
     /// `TextBody`/run model, but used to be flattened to plain lines
-    /// before ever reaching the IR, silently losing all of it (issue
-    /// #290).
+    /// before ever reaching the IR, silently losing all of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker_notes: Option<Vec<Element>>,
     /// Solid background colour for this section (RGB).
@@ -708,12 +680,12 @@ pub struct Section {
     pub hidden: bool,
     /// Conditional formatting rules defined on this worksheet (XLSX/XLS
     /// only). Empty for every other format, and for a worksheet that
-    /// defines none (issue #252).
+    /// defines none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditional_formats: Vec<ConditionalFormat>,
     /// Data validation rules defined on this worksheet (XLSX/XLS only).
     /// Empty for every other format, and for a worksheet that defines
-    /// none (issue #275).
+    /// none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data_validations: Vec<DataValidation>,
 }
@@ -798,7 +770,7 @@ impl Drop for Element {
     /// items, and `List` nests further through `ListItem::nested`), so a
     /// sufficiently deep value overflowed the stack on drop independent of
     /// any writer's own depth guard — an abort, not a catchable error
-    /// (issue #218's "Additional context"). This walks the tree with an
+    /// (the "Additional context"). This walks the tree with an
     /// explicit heap-allocated stack instead of the call stack: every
     /// popped node's own children are drained into the stack *before* it
     /// is allowed to actually drop, so that drop is O(1) rather than
@@ -829,7 +801,6 @@ impl Drop for Element {
 }
 
 /// A vector shape anchored at absolute page coordinates.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Shape {
@@ -861,7 +832,6 @@ pub struct Shape {
 }
 
 /// Vector-shape geometry kinds we currently round-trip.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShapeGeom {
@@ -1096,7 +1066,7 @@ pub enum InlineContent {
 /// with this function on any heading containing a line break, so the
 /// write-side "is the title already present in the elements" check
 /// always came back `false` for such headings and duplicated them on
-/// every write (issue #338).
+/// every write.
 pub fn inline_to_text(content: &[InlineContent]) -> String {
     let mut out = String::new();
     for item in content {
@@ -1292,7 +1262,7 @@ pub struct TableCell {
     /// carries a formula — present alongside `content` even when a cached
     /// value made `content` non-empty, so a consumer isn't forced to
     /// choose between seeing the computed value and knowing a formula
-    /// produced it (issue #279).
+    /// produced it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub formula: Option<String>,
 }
@@ -1443,7 +1413,7 @@ pub struct Image {
     /// Click-action target (PPTX `p:cNvPr > a:hlinkClick`) — the shape's
     /// own navigation/URL target, distinct from any hyperlink on text
     /// inside the shape. Action Buttons and "click this icon to
-    /// navigate" shapes carry their entire purpose here (issue #299).
+    /// navigate" shapes carry their entire purpose here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hyperlink: Option<String>,
 }
@@ -1452,7 +1422,7 @@ pub struct Image {
 mod tests {
     use super::*;
 
-    /// issue #218 ("Additional context") — the compiler-generated drop
+    /// The compiler-generated drop
     /// glue recurses through every nested Vec<Element>, so a sufficiently
     /// deep value overflowed the stack on drop alone, independent of any
     /// writer's own depth guard (DocumentIR is Deserialize, so this can
@@ -1494,7 +1464,7 @@ mod tests {
     // ── first_inline_font_size_pt ────────────────────────────────────
 
     #[test]
-    fn first_font_size_returns_half_pt_as_pt() {
+    fn test_first_font_size_returns_half_pt_as_pt() {
         let content = vec![InlineContent::Text(TextSpan {
             text: "hi".into(),
             font_size_half_pt: Some(24), // 12pt
@@ -1504,7 +1474,7 @@ mod tests {
     }
 
     #[test]
-    fn first_font_size_picks_first_declared() {
+    fn test_first_font_size_picks_first_declared() {
         // Second span's size is ignored — the first declared one wins.
         let content = vec![
             InlineContent::Text(TextSpan {
@@ -1522,7 +1492,7 @@ mod tests {
     }
 
     #[test]
-    fn first_font_size_skips_unsized_runs() {
+    fn test_first_font_size_skips_unsized_runs() {
         // First run has no size; second does → returns the second's size.
         let content = vec![
             InlineContent::Text(TextSpan {
@@ -1539,12 +1509,12 @@ mod tests {
     }
 
     #[test]
-    fn first_font_size_empty_returns_none() {
+    fn test_first_font_size_empty_returns_none() {
         assert_eq!(first_inline_font_size_pt(&[]), None);
     }
 
     #[test]
-    fn first_font_size_all_unsized_returns_none() {
+    fn test_first_font_size_all_unsized_returns_none() {
         let content = vec![
             InlineContent::Text(TextSpan::plain("a")),
             InlineContent::Text(TextSpan::plain("b")),
@@ -1555,13 +1525,13 @@ mod tests {
     // ── inline_to_element_block ──────────────────────────────────────
 
     #[test]
-    fn inline_to_element_block_empty_returns_empty() {
+    fn test_inline_to_element_block_empty_returns_empty() {
         let result = inline_to_element_block(vec![]);
         assert!(result.is_empty());
     }
 
     #[test]
-    fn inline_to_element_block_wraps_in_paragraph() {
+    fn test_inline_to_element_block_wraps_in_paragraph() {
         let inline = vec![InlineContent::Text(TextSpan::plain("hello"))];
         let result = inline_to_element_block(inline);
         assert_eq!(result.len(), 1);
@@ -1598,7 +1568,7 @@ mod tests {
     }
 
     #[test]
-    fn build_nested_list_flat() {
+    fn test_build_nested_list_flat() {
         let items = vec![item(0, "A"), item(0, "B"), item(0, "C")];
         let list = build_nested_list(false, &items, 0);
         assert!(!list.ordered);
@@ -1608,7 +1578,7 @@ mod tests {
     }
 
     #[test]
-    fn build_nested_list_two_levels() {
+    fn test_build_nested_list_two_levels() {
         // Top:   A
         //   sub: A.1, A.2
         // Top:   B
@@ -1625,7 +1595,7 @@ mod tests {
     }
 
     #[test]
-    fn build_nested_list_three_levels() {
+    fn test_build_nested_list_three_levels() {
         let items = vec![item(0, "A"), item(1, "A.1"), item(2, "A.1.x"), item(0, "B")];
         let list = build_nested_list(false, &items, 0);
         let l1 = list.items[0].nested.as_ref().unwrap();
@@ -1636,7 +1606,7 @@ mod tests {
     }
 
     #[test]
-    fn build_nested_list_empty() {
+    fn test_build_nested_list_empty() {
         let list = build_nested_list(false, &[], 0);
         assert!(list.items.is_empty());
     }
@@ -1644,7 +1614,7 @@ mod tests {
     // ── TextSpan::plain ──────────────────────────────────────────────
 
     #[test]
-    fn text_span_plain_has_default_styling() {
+    fn test_text_span_plain_has_default_styling() {
         let s = TextSpan::plain("hi");
         assert_eq!(s.text, "hi");
         assert!(!s.bold);
@@ -1656,7 +1626,7 @@ mod tests {
     // ── FramePosition / Shape defaults ───────────────────────────────
 
     #[test]
-    fn shape_default_is_line_at_origin() {
+    fn test_shape_default_is_line_at_origin() {
         let s = Shape::default();
         assert!(matches!(s.kind, ShapeGeom::Line));
         assert_eq!(s.x_emu, 0);
@@ -1665,7 +1635,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_position_round_trips_via_serde() {
+    fn test_frame_position_round_trips_via_serde() {
         let fp = FramePosition {
             x_twips: 720,
             y_twips: 1080,
@@ -1682,7 +1652,7 @@ mod tests {
     /// `<a:p lvl="1">`. Every item must survive; grouping keyed off
     /// `base_level` used to keep only the first and silently drop the rest.
     #[test]
-    fn uniformly_indented_run_keeps_every_item() {
+    fn test_uniformly_indented_run_keeps_every_item() {
         let items = vec![item(1, "A"), item(1, "B"), item(1, "C")];
         let list = build_nested_list(false, &items, 0);
         assert_eq!(list.items.len(), 3, "no item may be dropped");
@@ -1695,7 +1665,7 @@ mod tests {
     /// A shallower item following a deeper run must close the run rather than
     /// be absorbed into it.
     #[test]
-    fn deeper_run_closes_when_a_shallower_item_follows() {
+    fn test_deeper_run_closes_when_a_shallower_item_follows() {
         let items = vec![item(1, "A"), item(2, "A.1"), item(1, "B")];
         let list = build_nested_list(false, &items, 0);
         assert_eq!(list.items.len(), 2, "A and B are siblings");
@@ -1708,7 +1678,7 @@ mod tests {
 
     /// Levels that skip a depth (0 then 2) must not lose the deeper item.
     #[test]
-    fn skipped_depth_keeps_the_deeper_item() {
+    fn test_skipped_depth_keeps_the_deeper_item() {
         let items = vec![item(0, "A"), item(2, "A.1"), item(0, "B")];
         let list = build_nested_list(false, &items, 0);
         assert_eq!(list.items.len(), 2);

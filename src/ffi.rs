@@ -1122,7 +1122,7 @@ mod write_status_tests {
     /// was fixed for: an out-of-range index discarded every value it wrote
     /// while the caller saw success.
     #[test]
-    fn an_out_of_range_write_reports_a_status_instead_of_vanishing() {
+    fn test_an_out_of_range_write_reports_a_status_instead_of_vanishing() {
         let h = office_xlsx_writer_new();
         assert!(!h.is_null());
         let name = std::ffi::CString::new("Data").unwrap();
@@ -1158,7 +1158,7 @@ mod write_status_tests {
     /// `CellData::Boolean` and `CellData::Formula` were unreachable from any
     /// binding: no `value_type` mapped to them.
     #[test]
-    fn booleans_and_formulas_are_reachable_over_the_ffi() {
+    fn test_booleans_and_formulas_are_reachable_over_the_ffi() {
         let h = office_xlsx_writer_new();
         let name = std::ffi::CString::new("S").unwrap();
         office_xlsx_writer_add_sheet(h, name.as_ptr());

@@ -382,14 +382,14 @@ mod tests {
 </w:styles>"#;
 
     #[test]
-    fn parse_stylesheet() {
+    fn test_parse_stylesheet() {
         let sheet = StyleSheet::parse(SAMPLE_STYLES).unwrap();
         assert_eq!(sheet.styles.len(), 3);
         assert!(sheet.doc_defaults.is_some());
     }
 
     #[test]
-    fn parse_doc_defaults_font_size() {
+    fn test_parse_doc_defaults_font_size() {
         let sheet = StyleSheet::parse(SAMPLE_STYLES).unwrap();
         let defaults = sheet.doc_defaults.as_ref().unwrap();
         let rp = defaults.run_properties.as_ref().unwrap();
@@ -397,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_heading1_style() {
+    fn test_parse_heading1_style() {
         let sheet = StyleSheet::parse(SAMPLE_STYLES).unwrap();
         let h1 = sheet.styles.get("Heading1").unwrap();
         assert_eq!(h1.name.as_deref(), Some("heading 1"));
@@ -413,7 +413,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_outline_level() {
+    fn test_resolve_outline_level() {
         let sheet = StyleSheet::parse(SAMPLE_STYLES).unwrap();
         assert_eq!(sheet.resolve_outline_level("Heading1"), Some(0));
         assert_eq!(sheet.resolve_outline_level("Normal"), None);

@@ -36,15 +36,14 @@ pub struct Sprm {
     pub operand: Vec<u8>,
 }
 
+#[cfg(test)]
 impl Sprm {
     /// `spra` — operand-size class (bits 15..13 of the opcode).
-    #[allow(dead_code)] // diagnostic helper; used in tests
     pub fn spra(&self) -> u8 {
         ((self.opcode >> 13) & 0x7) as u8
     }
 
     /// `sgc` — property class (bits 12..10): `1` = PAP, `5` = TAP, …
-    #[allow(dead_code)] // diagnostic helper; used in tests
     pub fn sgc(&self) -> u8 {
         ((self.opcode >> 10) & 0x7) as u8
     }
@@ -184,7 +183,7 @@ pub fn parse_grpprl(grpprl: &[u8]) -> Vec<Sprm> {
 
 /// Paragraph-property flags distilled from a PAP grpprl.
 ///
-/// Table/list reconstruction fields plus, since issue #287,
+/// Table/list reconstruction fields plus
 /// alignment/indentation/spacing.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PapProps {
@@ -252,7 +251,6 @@ pub struct TapCellInfo {
     pub rgf: u16,
     /// Preferred cell width in twips (0 = derive from `rgdxaCenter`).
     /// Kept for completeness; spans are computed from `rgdxaCenter` alone.
-    #[allow(dead_code)]
     pub w_width: u16,
 }
 
@@ -408,7 +406,7 @@ fn tab_from_tbd(position_twips: i32, tbd: u8) -> TabStop {
 /// Generating both the `match` and [`PAP_SPRM_REGISTRY`] from the same
 /// invocation makes the check fail closed: an arm added without naming the
 /// property and its [MS-DOC] section does not compile, and one that names
-/// the wrong property fails `registry_matches_the_spec_table`.
+/// the wrong property fails `test_registry_matches_the_spec_table`.
 macro_rules! pap_sprm_dispatch {
     (
         $(
@@ -423,7 +421,7 @@ macro_rules! pap_sprm_dispatch {
         ///
         /// Consumed by the identity tests; the value of enumerating it is
         /// that the enumeration cannot drift from the dispatch.
-        #[allow(dead_code)]
+        #[cfg(test)]
         pub const PAP_SPRM_REGISTRY: &[(u16, &str, &str)] = &[
             $($(($opcode, $spec_name, $section),)+)*
         ];
@@ -629,7 +627,7 @@ pub fn extract_pap_props(grpprl: &[u8]) -> PapProps {
 
 /// Character-property flags distilled from a CHP grpprl (`sgc` == 2).
 ///
-/// Issue #288 added the revision-mark flags; issue #287 added
+/// Revision-mark flags and
 /// bold/italic/underline/color/font-size. Font *name* (`sprmCRgFtc0` — an
 /// index into the `SttbfFfn` font table) is deliberately not attempted
 /// here: resolving it needs a whole separate STTB+FFN parser that nothing
@@ -677,7 +675,7 @@ macro_rules! chp_sprm_dispatch {
         /// Every character SPRM this crate decodes: `(opcode, spec name,
         /// [MS-DOC] section)`. Derived from the dispatch below, never
         /// maintained alongside it.
-        #[allow(dead_code)]
+        #[cfg(test)]
         pub const CHP_SPRM_REGISTRY: &[(u16, &str, &str)] = &[
             $($(($opcode, $spec_name, $section),)+)*
         ];
@@ -828,7 +826,7 @@ mod tests {
     /// Every opcode the dispatch claims must name the property [MS-DOC]
     /// gives it, and must cite a section.
     #[test]
-    fn registry_matches_the_spec_table() {
+    fn test_registry_matches_the_spec_table() {
         for &(opcode, name, section) in PAP_SPRM_REGISTRY {
             let expected = MS_DOC_SPRM_TABLE
                 .iter()
@@ -849,7 +847,7 @@ mod tests {
     /// No opcode may be dispatched twice — two arms claiming the same
     /// constant means one of them never runs.
     #[test]
-    fn registry_has_no_duplicate_opcodes() {
+    fn test_registry_has_no_duplicate_opcodes() {
         let mut seen: Vec<u16> = PAP_SPRM_REGISTRY.iter().map(|(o, _, _)| *o).collect();
         seen.sort_unstable();
         let before = seen.len();
@@ -862,7 +860,7 @@ mod tests {
     /// occurs 758 times in a 246-file corpus; reading it as an outline
     /// level marked most of those paragraphs as headings.
     #[test]
-    fn known_confusable_opcodes_are_not_claimed() {
+    fn test_known_confusable_opcodes_are_not_claimed() {
         for confusable in [0x6412u16, 0x640A] {
             assert!(
                 !PAP_SPRM_REGISTRY.iter().any(|(o, _, _)| *o == confusable),
@@ -874,7 +872,7 @@ mod tests {
     /// The registry must actually be reachable from the decoder, so a
     /// registry that drifts away from the dispatch cannot pass silently.
     #[test]
-    fn every_registered_opcode_changes_the_decoded_props() {
+    fn test_every_registered_opcode_changes_the_decoded_props() {
         // A one-byte operand is enough for the flag/level SPRMs; the
         // multi-byte ones get four bytes.
         for &(opcode, name, _) in PAP_SPRM_REGISTRY {
@@ -915,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn walks_fixed_and_variable_sprms() {
+    fn test_walks_fixed_and_variable_sprms() {
         let sprms = parse_grpprl(&cell_grpprl());
         assert_eq!(sprms.len(), 2);
         assert_eq!(sprms[0].opcode, 0x2416);
@@ -925,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn row_mark_walk_consumes_every_byte() {
+    fn test_row_mark_walk_consumes_every_byte() {
         let grpprl = row_mark_grpprl();
         let sprms = parse_grpprl(&grpprl);
         // No byte left behind: re-encoding the walked SPRMs — re-inserting the
@@ -959,7 +957,7 @@ mod tests {
     /// `cb = 4 + 22·itcMac = 268` (>= 256). The walker must read the 2-byte
     /// `cb`, decode the full TAP, and still reach the trailing SPRM.
     #[test]
-    fn d608_two_byte_cb_decodes_wide_tables() {
+    fn test_d608_two_byte_cb_decodes_wide_tables() {
         let itc: usize = 12;
         let mut tap = vec![itc as u8]; // itcMac
         for _ in 0..=itc {
@@ -995,7 +993,7 @@ mod tests {
     }
 
     #[test]
-    fn extracts_cell_props() {
+    fn test_extracts_cell_props() {
         let props = extract_pap_props(&cell_grpprl());
         assert!(props.f_in_table);
         assert!(!props.is_table_trailing_mark);
@@ -1003,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn extracts_row_mark_props() {
+    fn test_extracts_row_mark_props() {
         let props = extract_pap_props(&row_mark_grpprl());
         assert!(props.f_in_table);
         assert!(props.is_table_trailing_mark);
@@ -1011,7 +1009,7 @@ mod tests {
         assert!(props.tap.is_some(), "0xD608 operand must parse into a TapInfo");
     }
 
-    /// Regression (issue #287): alignment/indentation/spacing SPRMs decode
+    /// Regression: alignment/indentation/spacing SPRMs decode
     /// to their real values, not the always-`None`/`0` they were before.
     #[test]
     fn test_extract_pap_props_alignment_indent_and_spacing() {
@@ -1058,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_grpprl_is_ordinary_prose() {
+    fn test_empty_grpprl_is_ordinary_prose() {
         let props = extract_pap_props(&[]);
         assert!(!props.f_in_table);
         assert!(!props.is_table_trailing_mark);
@@ -1069,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_pchg_tabs_new_stops() {
+    fn test_decodes_pchg_tabs_new_stops() {
         // PChgTabsOperand (0xC615): PchgTabsDelClose (cDel=0) then PchgTabsAdd
         // (cAdd=2). Positions are 2-byte XAS (signed twips); each TBD is 1
         // byte with `jc` in bits 0..2. new[0]: jc=2 (Right), pos=2000;
@@ -1090,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn pchg_tabs_malformed_operand_is_empty() {
+    fn test_pchg_tabs_malformed_operand_is_empty() {
         // Truncated operand: cDel=2 but no rgdxaDel/rgdxaClose bytes, so the
         // Add list is unreachable — must degrade to empty, not panic.
         assert!(decode_pchg_tabs(0xC615, &[0x02]).is_empty());
@@ -1106,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_tdef_table_boundaries() {
+    fn test_parses_tdef_table_boundaries() {
         // 0xD608 operand bytes captured from a real Word document (the source
         // .doc is not distributed in this repo): itcMac=2, boundaries
         // [0, 6872, 9302]. (The 2-byte `cb` prefix is stripped by parse_grpprl,
@@ -1123,7 +1121,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_tdef_table_vertical_merge_flags() {
+    fn test_parses_tdef_table_vertical_merge_flags() {
         // 0xD608 operand bytes captured from a real Word document (source .doc
         // not distributed): itcMac=4; the first cell descriptor carries
         // fVertMerge | fVertRestart (0x0060). (cb prefix stripped — operand
@@ -1140,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_truncated_tdef_table() {
+    fn test_rejects_truncated_tdef_table() {
         assert!(parse_tdef_table(&[]).is_none());
         // itcMac=4 but only 2 further bytes — needs far more for rgdxaCenter
         // + rgtc, so it must fail.
@@ -1156,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    fn spra_and_sgc_fields() {
+    fn test_spra_and_sgc_fields() {
         let cell = Sprm {
             opcode: 0x2416,
             operand: vec![1],
@@ -1174,7 +1172,7 @@ mod tests {
 
     // --------------------------------------------------------------------
     // Regression tests for the opcode-identity defects in `extract_pap_props`
-    // (PR #116 blind review). Every fixture uses the opcode *as Word writes it
+    // (from a blind review). Every fixture uses the opcode *as Word writes it
     // per [MS-DOC]*, not the project's own constants, so the tests fail while
     // the decoder mislabels opcodes and turn green once dispatch is corrected.
     // --------------------------------------------------------------------
@@ -1182,7 +1180,7 @@ mod tests {
     /// `0x460B` is `sprmPIlfo` (2-byte operand). The decoder must populate
     /// `ilfo`. Today it is dispatched as `sprmPIlvl`, so `ilfo` stays `None`.
     #[test]
-    fn sprm_pilfo_opcode_460b_populates_ilfo() {
+    fn test_sprm_pilfo_opcode_460b_populates_ilfo() {
         // sprmPIlfo (0x460B), operand = 0x0005 (ilfo index 5).
         let grpprl = [0x0B, 0x46, 0x05, 0x00];
         let props = extract_pap_props(&grpprl);
@@ -1193,7 +1191,7 @@ mod tests {
     /// `0x260A` is `sprmPIlvl` (1-byte operand). The decoder must populate
     /// `ilvl`. Today it is never read (falls through to `_`).
     #[test]
-    fn sprm_pilvl_opcode_260a_populates_ilvl() {
+    fn test_sprm_pilvl_opcode_260a_populates_ilvl() {
         // sprmPIlvl (0x260A), operand = 0x01 (level 1).
         let grpprl = [0x0A, 0x26, 0x01];
         let props = extract_pap_props(&grpprl);
@@ -1202,7 +1200,7 @@ mod tests {
 
     /// `0xC615` is `sprmPChgTabs`. The decoder must populate tab stops from it.
     #[test]
-    fn sprm_pchg_tabs_opcode_c615_populates_tabs() {
+    fn test_sprm_pchg_tabs_opcode_c615_populates_tabs() {
         // Per [MS-DOC] §2.9.182 the operand is a `PChgTabsOperand`:
         // `PchgTabsDelClose` (cDel, then 4 bytes per delete) followed by
         // `PchgTabsAdd` (cAdd, then 2-byte positions + 1-byte TBD per add).
@@ -1242,7 +1240,7 @@ mod tests {
     /// "255-byte operand" read would overrun and desync the rest of the grpprl;
     /// the byte-level round trip must reproduce the input exactly.
     #[test]
-    fn sprm_pchg_tabs_c615_cb_255_escape_round_trips() {
+    fn test_sprm_pchg_tabs_c615_cb_255_escape_round_trips() {
         // cDel = 1 (delete block = 1 + 4*1 = 5 bytes), cAdd = 2 (add block =
         // 1 + 2*2 + 2 = 7 bytes). Total body = 12 bytes.
         let body: Vec<u8> = vec![
@@ -1281,7 +1279,7 @@ mod tests {
     /// rgdxaDel=[16]}` + `PChgTabsAdd{cTabs=1, pos=2000, TBD jc=2}`, followed by
     /// a `sprmPFInTable` so we can prove the walker does NOT swallow it.
     #[test]
-    fn sprm_pchg_tabs_papx_c60d_populates_tabs() {
+    fn test_sprm_pchg_tabs_papx_c60d_populates_tabs() {
         // PchgTabsDel: cTabs=1, rgdxaDel=[16] (2-byte XAS) -> 3 bytes.
         // PchgTabsAdd: cTabs=1, rgdxaAdd=[2000], rgtbdAdd=[jc=2] -> 4 bytes.
         // Body = 7 bytes, so the 1-byte cb prefix is 7.
@@ -1311,7 +1309,7 @@ mod tests {
     /// as tab stops. Today it is dispatched as `sprmPChgTabs`, so `tabs` is
     /// populated — the inverse of the correct behaviour.
     #[test]
-    fn sprm_tcell_padding_opcode_d632_does_not_populate_tabs() {
+    fn test_sprm_tcell_padding_opcode_d632_does_not_populate_tabs() {
         // PChgTabsOperand-style bytes tagged with the TCellPadding opcode
         // (0xD632): 1-byte length prefix = 8, then cDel=0, cAdd=2, two
         // positions, two TBDs.
@@ -1329,7 +1327,7 @@ mod tests {
     /// (AGENTS.md rule 6). A grpprl holding only the opcode (no cb byte) and one
     /// holding the cb but no body are both malformed inputs.
     #[test]
-    fn sprm_pchg_tabs_c615_truncated_cb_is_empty() {
+    fn test_sprm_pchg_tabs_c615_truncated_cb_is_empty() {
         // Opcode only, no cb byte: the 1-byte cb read is out of bounds -> stop.
         let sprms = parse_grpprl(&[0x15, 0xC6]);
         assert!(sprms.is_empty(), "truncated 0xC615 (no cb) must yield no SPRM, not panic");
@@ -1348,7 +1346,7 @@ mod tests {
     /// misreading caused: a one-byte shift would desync the rest of the grpprl
     /// and either drop or mis-parse the trailing SPRM.
     #[test]
-    fn sprm_pchg_tabs_c615_255_escape_followed_by_sprm() {
+    fn test_sprm_pchg_tabs_c615_255_escape_followed_by_sprm() {
         // cDel=1, cAdd=2 (12-byte body), then a trailing sprmPFInTable
         // (0x2416, 1-byte operand 0x01).
         let body: Vec<u8> = vec![
@@ -1376,7 +1374,7 @@ mod tests {
     /// `break` for each special variable encoding: 0xD608 (2-byte cb), 0xC615
     /// (1-byte cb), and 0xC60D (1-byte cb).
     #[test]
-    fn parse_grpprl_truncated_variable_sprm_prefixes() {
+    fn test_parse_grpprl_truncated_variable_sprm_prefixes() {
         assert!(
             parse_grpprl(&[0x08, 0xD6]).is_empty(),
             "0xD608 with no 2-byte cb must stop, not panic"
@@ -1394,7 +1392,7 @@ mod tests {
     /// `pchg_tabs_operand_len` must bound itself against a short buffer instead
     /// of indexing out of range (AGENTS.md rule 6).
     #[test]
-    fn pchg_tabs_operand_len_truncated() {
+    fn test_pchg_tabs_operand_len_truncated() {
         // start beyond the buffer -> 0.
         assert_eq!(pchg_tabs_operand_len(&[], 0), 0);
         // cDel present but its rgdxa/rgdxaClose block runs past the end -> the
@@ -1407,7 +1405,7 @@ mod tests {
     /// misroutes `0x460B` (as `ilvl`) and `0xD632` (as tabs) and never reads
     /// `0x260A` / `0xC615`.
     #[test]
-    fn opcode_conformance_gate() {
+    fn test_opcode_conformance_gate() {
         // 0x460B = sprmPIlfo -> ilfo
         assert_eq!(
             extract_pap_props(&[0x0B, 0x46, 0x03, 0x00]).ilfo,
@@ -1426,7 +1424,7 @@ mod tests {
     }
 
     /// [MS-DOC] transcription for the CHP registry, mirroring
-    /// `MS_DOC_SPRM_TABLE` above. Issue #287/#288.
+    /// `MS_DOC_SPRM_TABLE` above.
     const MS_DOC_CHP_SPRM_TABLE: &[(u16, &str)] = &[
         (0x0800, "sprmCFRMarkDel"),
         (0x0801, "sprmCFRMarkIns"),
@@ -1456,7 +1454,7 @@ mod tests {
         }
     }
 
-    /// Mirrors `every_registered_opcode_changes_the_decoded_props`, but for
+    /// Mirrors `test_every_registered_opcode_changes_the_decoded_props`, but for
     /// the CHP registry. `sprmCHps` needs its own payload since a generic
     /// `[1, 0, 0, 0]` operand (font size `1` half-point) falls outside its
     /// valid `2..=3276` range and would be silently ignored, not stored.

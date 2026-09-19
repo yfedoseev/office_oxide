@@ -86,7 +86,7 @@ impl PptxDocument {
         if let Some(ref notes) = slide.notes {
             // Same `markdown_from_body` ordinary slide body text already
             // uses, so bold/italic/strikethrough/bullets in notes get
-            // rendered too, not flattened to plain lines (issue #290).
+            // rendered too, not flattened to plain lines.
             let md = markdown_from_body(notes);
             if !md.is_empty() {
                 for line in md.lines() {
@@ -153,8 +153,8 @@ fn collect_text_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePositio
                 // SmartArt and embedded-chart text: `Document::plain_text()`
                 // dispatches here, a separate path from `to_ir()` (which
                 // already reads `GraphicContent::Text` correctly) — the
-                // same dual-renderer gap already hit for XLS dates (#233)
-                // and XLSX formulas (#279), this time for #239's own fix.
+                // same dual-renderer gap already hit for XLS dates
+                // and XLSX formulas, this time for chart text.
                 GraphicContent::Text(lines) => {
                     let text = lines.join("\n");
                     if !text.is_empty() {
@@ -189,8 +189,7 @@ fn plain_text_from_body(body: &TextBody) -> String {
 /// shifting left to fill the gap. Mirrors `ir_render.rs::table_grid`
 /// exactly — this crate hit the identical "flat cell list, not a grid"
 /// bug shape a third time here, on PPTX's own default text/markdown
-/// renderers, after DOCX's read side (#137, closed) and the write path
-/// (#265) (issue #289).
+/// renderers, after DOCX's read side and the write path.
 fn pptx_table_grid(table: &Table) -> Vec<Vec<Option<&TableCell>>> {
     // A raw PPTX row's `cells` includes h_merge/v_merge *continuation*
     // placeholders alongside the real, span-owning cell — unlike the IR's
@@ -598,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn spatial_sort_order() {
+    fn test_spatial_sort_order() {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![
@@ -616,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_with_notes() {
+    fn test_plain_text_with_notes() {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![text_shape("Text", "Hello", 0, 0)],
@@ -630,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_multi_slide() {
+    fn test_plain_text_multi_slide() {
         let doc = make_doc(vec![
             Slide {
                 name: String::new(),
@@ -653,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_with_title() {
+    fn test_markdown_with_title() {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![
@@ -673,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_formatting() {
+    fn test_markdown_formatting() {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![Shape::AutoShape(AutoShape {
@@ -739,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_notes_blockquote() {
+    fn test_markdown_notes_blockquote() {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![text_shape("Text", "Content", 0, 0)],
@@ -752,13 +751,13 @@ mod tests {
         assert!(md.contains("> Note line 1\n> Note line 2"));
     }
 
-    /// issue #290 — speaker notes used to be flattened to plain text
+    /// Speaker notes used to be flattened to plain text
     /// before ever reaching a renderer, so a bold run in notes rendered
     /// as plain text even though the identical formatting survives for
     /// ordinary slide body text via the same `TextRun`/`markdown_run`
     /// path.
     #[test]
-    fn markdown_notes_preserve_bold_formatting() {
+    fn test_markdown_notes_preserve_bold_formatting() {
         let notes = TextBody {
             paragraphs: vec![TextParagraph {
                 level: 0,
@@ -793,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_table() {
+    fn test_markdown_table() {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![Shape::GraphicFrame(GraphicFrame {
@@ -959,19 +958,19 @@ mod tests {
         }
     }
 
-    /// issue #289 — merged-cell tables rendered with the wrong column
+    /// merged-cell tables rendered with the wrong column
     /// count and shifted/misaligned content: both plain_text_from_table
     /// and markdown_table filtered out h_merge/v_merge continuation
     /// cells and then just pushed the *remaining* cells into a flat
     /// list (`col_count = cells.len()`), with no grid/covered-position
     /// tracking — the same "flat cell list, not a grid" bug shape
-    /// already found and fixed for DOCX's read side (#137) and write
-    /// path (#265). A 2x2 grid where row 0's first cell spans both
+    /// already found and fixed for DOCX's read side and write
+    /// path. A 2x2 grid where row 0's first cell spans both
     /// columns must still show row 1's two cells at their true
     /// positions, with row 0's merged cell's content followed by one
     /// blank slot, not shifted left.
     #[test]
-    fn markdown_and_plain_text_tables_handle_merged_cells() {
+    fn test_markdown_and_plain_text_tables_handle_merged_cells() {
         let table = Table {
             first_row_header: false,
             last_row_header: false,
@@ -1022,10 +1021,10 @@ mod tests {
     /// `Document::plain_text()`/`to_markdown()` dispatch to this module, a
     /// separate path from `to_ir()` (which already read
     /// `GraphicContent::Text` correctly). `GraphicContent::Text` covers
-    /// both SmartArt and embedded-chart text (#239) — neither reached
+    /// both SmartArt and embedded-chart text — neither reached
     /// plain_text/markdown before this fix.
     #[test]
-    fn graphic_content_text_reaches_plain_text_and_markdown() {
+    fn test_graphic_content_text_reaches_plain_text_and_markdown() {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![Shape::GraphicFrame(super::super::shape::GraphicFrame {
@@ -1051,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_hyperlink() {
+    fn test_markdown_hyperlink() {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![Shape::AutoShape(AutoShape {

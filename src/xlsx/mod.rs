@@ -56,7 +56,7 @@ use std::path::Path;
 use log::debug;
 use zip::read::ZipArchive;
 
-use crate::core::opc::{self, OpcReader};
+use crate::core::opc;
 use crate::core::relationships::{Relationships, rel_types};
 use crate::core::theme::Theme;
 use crate::core::xml;
@@ -92,11 +92,11 @@ pub struct XlsxDocument {
     pub core_properties: Option<crate::core::properties::CoreProperties>,
     /// Parsed `docProps/app.xml` (company, producing application, template,
     /// page/word/character/paragraph counts). `None` when the package
-    /// carries no extended-properties part (issue #245).
+    /// carries no extended-properties part.
     pub app_properties: Option<crate::core::properties::AppProperties>,
     /// `true` when the workbook part's own relationships include a
     /// `vbaProject` entry — a cheap macro-presence signal, no VBA
-    /// interpretation (issue #283).
+    /// interpretation.
     pub has_macros: bool,
     // Raw bytes for lazy parsing (None after parsing or if not present)
     styles_data: Option<Vec<u8>>,
@@ -147,8 +147,7 @@ impl XlsxDocument {
     /// Open an XLSX document from any `Read + Seek` source.
     pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
         // A password-protected XLSX is a CFB container, not a zip at all.
-        // See the identical check in docx::DocxDocument::from_reader
-        // (issue #232).
+        // See the identical check in docx::DocxDocument::from_reader.
         if crate::cfb::is_cfb_container(&mut reader).map_err(crate::core::Error::from)? {
             return Err(crate::core::Error::Unsupported(
                 "the file is a password-protected (encrypted) OOXML package; \
@@ -217,7 +216,7 @@ impl XlsxDocument {
         let workbook = WorkbookInfo::parse(&wb_data)?;
 
         // The threaded-comments person list (personId -> display name) is a
-        // workbook-level part, not per-sheet (issue #301).
+        // workbook-level part, not per-sheet.
         let persons = wb_rels
             .first_by_type(rel_types::PERSONS)
             .map(|rel| resolve_relative_zip_path("xl/workbook.xml", &rel.target))
@@ -295,7 +294,7 @@ impl XlsxDocument {
                 .unwrap_or_default();
             // Modern (Excel 2016+) threaded comments, when present,
             // replace the legacy compatibility-boilerplate text for the
-            // same cell with the real thread text (issue #301).
+            // same cell with the real thread text.
             let threaded_comments = ws_rels
                 .first_by_type(rel_types::THREADED_COMMENTS)
                 .map(|rel| resolve_relative_zip_path(&sheet_path, &rel.target))
@@ -323,7 +322,7 @@ impl XlsxDocument {
             Ok(ws)
         })?;
 
-        // Resolve any in-cell rich-value images (issue #302): a `vm`-
+        // Resolve any in-cell rich-value images: a `vm`-
         // tagged `t="e"` cell whose `vm` maps through the workbook's
         // metadata/richData chain is a real embedded image, not a
         // genuine formula error — swap its fabricated `#VALUE!` text
@@ -401,202 +400,6 @@ impl XlsxDocument {
             styles,
             theme: None,
             chart_text,
-            embedded_fonts,
-            core_properties,
-            app_properties,
-            has_macros,
-            styles_data: None,
-            theme_data,
-        })
-    }
-
-    /// OPC-based fallback path (used by the unified office_oxide crate when OPC is needed).
-    #[allow(dead_code)]
-    pub(crate) fn from_opc<R: Read + Seek>(mut opc: OpcReader<R>) -> Result<Self> {
-        debug!("XlsxDocument: OPC parsing started");
-        opc.verify_main_content_type(
-            &[
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
-                "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
-                "application/vnd.ms-excel.template.macroEnabled.main+xml",
-                // `.xlam` (macro-enabled add-in) was missing from the
-                // whitelist.
-                "application/vnd.ms-excel.addin.macroEnabled.main+xml",
-            ],
-            "a SpreadsheetML workbook",
-        )?;
-        let core_properties = crate::core::properties::read_core_properties(&mut opc);
-        let app_properties = crate::core::properties::read_app_properties(&mut opc);
-        let main_part = opc.main_document_part()?;
-        let wb_rels = opc.read_rels_for(&main_part)?;
-        let has_macros = wb_rels.first_by_type(rel_types::VBA_PROJECT).is_some();
-
-        let shared_strings = if let Some(rel) = wb_rels.first_by_type(rel_types::SHARED_STRINGS) {
-            let part_name = main_part.resolve_relative(&rel.target)?;
-            let data = opc.read_part(&part_name)?;
-            SharedStringTable::parse(&data)?
-        } else {
-            SharedStringTable::empty()
-        };
-
-        let theme_data = if let Some(rel) = wb_rels.first_by_type(rel_types::THEME) {
-            let part_name = main_part.resolve_relative(&rel.target)?;
-            opc.read_part(&part_name).ok()
-        } else {
-            None
-        };
-
-        let styles = if let Some(rel) = wb_rels.first_by_type(rel_types::STYLES) {
-            let part_name = main_part.resolve_relative(&rel.target)?;
-            let data = opc.read_part(&part_name)?;
-            Some(StyleSheet::parse(&data)?)
-        } else {
-            None
-        };
-
-        let wb_data = opc.read_part(&main_part)?;
-        let workbook = WorkbookInfo::parse(&wb_data)?;
-
-        // Workbook-level person list for threaded-comment author
-        // resolution (issue #301).
-        let persons = if let Some(rel) = wb_rels.first_by_type(rel_types::PERSONS) {
-            main_part
-                .resolve_relative(&rel.target)
-                .ok()
-                .and_then(|part_name| opc.read_part(&part_name).ok())
-                .and_then(|data| worksheet::parse_persons(&data).ok())
-                .unwrap_or_default()
-        } else {
-            Default::default()
-        };
-
-        struct SheetBundle {
-            name: String,
-            data: Vec<u8>,
-            rels: Relationships,
-            comments: Vec<crate::xlsx::worksheet::SheetComment>,
-        }
-        let mut bundles = Vec::with_capacity(workbook.sheets.len());
-        for sheet in &workbook.sheets {
-            if sheet.rel_id.is_empty() {
-                continue;
-            }
-            let part_name = match wb_rels.resolve_target(&sheet.rel_id, &main_part) {
-                Ok(pn) => pn,
-                Err(_) => {
-                    let idx = bundles.len() + 1;
-                    let candidates = [
-                        format!("/xl/worksheets/sheet{}.xml", idx),
-                        format!("/xl/worksheets/sheet{}.xml", sheet.sheet_id),
-                    ];
-                    match candidates.iter().find_map(|c| {
-                        crate::core::opc::PartName::new(c)
-                            .ok()
-                            .filter(|pn| opc.has_part(pn))
-                    }) {
-                        Some(pn) => {
-                            debug!("worksheet fallback: '{}' -> '{}'", sheet.rel_id, pn);
-                            pn
-                        },
-                        None => continue,
-                    }
-                },
-            };
-            let ws_rels = opc
-                .read_rels_for(&part_name)
-                .unwrap_or_else(|_| Relationships::empty());
-            let ws_data = match opc.read_part(&part_name) {
-                Ok(data) => data,
-                Err(_) => continue,
-            };
-            let comments = ws_rels
-                .first_by_type(rel_types::COMMENTS)
-                .and_then(|rel| part_name.resolve_relative(&rel.target).ok())
-                .filter(|pn| opc.has_part(pn))
-                .and_then(|pn| opc.read_part(&pn).ok())
-                .and_then(|data| worksheet::parse_comments(&data).ok())
-                .unwrap_or_default();
-            let threaded_comments = ws_rels
-                .first_by_type(rel_types::THREADED_COMMENTS)
-                .and_then(|rel| part_name.resolve_relative(&rel.target).ok())
-                .filter(|pn| opc.has_part(pn))
-                .and_then(|pn| opc.read_part(&pn).ok())
-                .and_then(|data| worksheet::parse_threaded_comments(&data).ok())
-                .unwrap_or_default();
-            let comments = worksheet::merge_threaded_comments(comments, threaded_comments, &persons);
-            bundles.push(SheetBundle {
-                name: sheet.name.clone(),
-                data: ws_data,
-                rels: ws_rels,
-                comments,
-            });
-        }
-
-        #[cfg(feature = "parallel")]
-        let worksheets: Result<Vec<Worksheet>> = {
-            use rayon::prelude::*;
-            bundles
-                .into_par_iter()
-                .map(|b| {
-                    let mut ws = Worksheet::parse(&b.data, b.name, &b.rels)?;
-                    ws.comments = b.comments;
-                    Ok(ws)
-                })
-                .collect()
-        };
-        #[cfg(not(feature = "parallel"))]
-        let worksheets: Result<Vec<Worksheet>> = bundles
-            .into_iter()
-            .map(|b| {
-                let mut ws = Worksheet::parse(&b.data, b.name, &b.rels)?;
-                ws.comments = b.comments;
-                Ok(ws)
-            })
-            .collect();
-        let worksheets = worksheets?;
-
-        // Mirror the zip-path embedded-fonts scan over the OPC part
-        // listing. Loading via OPC is the slow path used when a
-        // caller hands us a pre-built `OpcReader`, so duplicating
-        // the cheap scan keeps font fidelity working there too.
-        let mut embedded_fonts: Vec<(String, Vec<u8>)> = Vec::new();
-        for name in opc.part_names() {
-            let s = name.to_string();
-            if !s.starts_with("/xl/fonts/") {
-                continue;
-            }
-            let lower = s.to_lowercase();
-            if !(lower.ends_with(".ttf") || lower.ends_with(".otf")) {
-                continue;
-            }
-            if let Ok(data) = opc.read_part(&name) {
-                let basename = s.rsplit('/').next().unwrap_or("font");
-                let face = crate::docx::strip_embedded_font_filename(basename);
-                let font_name = if face.is_empty() {
-                    basename.to_string()
-                } else {
-                    face
-                };
-                embedded_fonts.push((font_name, data));
-            }
-        }
-
-        debug!(
-            "XlsxDocument: {} worksheets parsed (OPC path), {} embedded fonts",
-            worksheets.len(),
-            embedded_fonts.len()
-        );
-        Ok(XlsxDocument {
-            workbook,
-            worksheets,
-            shared_strings,
-            styles,
-            theme: None,
-            // OPC path doesn't extract chart text yet; the zip path is the
-            // hot one used by Document::from_reader. Charts via OPC can be
-            // added if a use case appears.
-            chart_text: Vec::new(),
             embedded_fonts,
             core_properties,
             app_properties,
@@ -691,7 +494,7 @@ fn extract_chart_text(xml: &[u8]) -> String {
                             // `<c:bubbleSize>` rather than the
                             // `<c:cat>`/`<c:val>` bar/line/pie/area charts
                             // use. Checking only the latter dropped every
-                            // scatter/bubble data point (#281).
+                            // scatter/bubble data point.
                             let in_cat = stack
                                 .iter()
                                 .any(|t| matches!(t.as_slice(), b"cat" | b"xVal"));
@@ -745,7 +548,7 @@ fn extract_chart_text(xml: &[u8]) -> String {
                     // trailing whitespace on one of them, so trimming each
                     // run before concatenating ran the words together —
                     // "Chart Title - with additional formatting" came back
-                    // as "ChartTitle-withadditionalformatting" (#280).
+                    // as "ChartTitle-withadditionalformatting".
                     // The assembled string is trimmed once, where it is
                     // flushed at `</c:title>` / `</c:v>`.
                     match top {
@@ -923,8 +726,7 @@ fn read_drawing_for_sheet<R: Read + Seek>(
 /// `rdrichvaluestructure.xml` (which value is the image identifier) ->
 /// `richValueRel.xml` (+ its own `.rels`) -> `xl/media/*`. Any missing or
 /// malformed part along the way yields an empty map — this is a
-/// best-effort recovery, not a hard requirement for opening the file
-/// (issue #302).
+/// best-effort recovery, not a hard requirement for opening the file.
 fn read_rich_value_images<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
 ) -> std::collections::HashMap<u32, crate::xlsx::worksheet::WorksheetPicture> {
@@ -1582,12 +1384,12 @@ mod tests {
     use super::test_support::*;
     use super::*;
 
-    /// issue #235 — TableCell::col_span/row_span were hardcoded to 1
+    /// TableCell::col_span/row_span were hardcoded to 1
     /// on every spreadsheet cell; merged_cells was parsed and then
     /// never read on the to_ir() path.
     #[test]
     fn test_merged_cell_range_sets_col_span_on_the_anchor_and_excludes_covered_cells() {
-        // issue #235 — TableCell::col_span/row_span were hardcoded to 1
+        // TableCell::col_span/row_span were hardcoded to 1
         // on every spreadsheet cell; merged_cells was parsed and then
         // never read on the to_ir() path, so a merged header/label
         // flattened to an ordinary unspanned grid.
@@ -1634,7 +1436,7 @@ mod tests {
         assert_eq!(data_row.cells.len(), 3, "an unmerged row must keep all 3 cells");
     }
 
-    /// issue #279 — a formula cell with no cached `<v>` (the default output
+    /// A formula cell with no cached `<v>` (the default output
     /// shape of closedxml and similar writers) rendered as a blank cell
     /// indistinguishable from a genuinely empty one, and the formula text
     /// never reached any consumer at all.
@@ -1675,7 +1477,7 @@ mod tests {
     /// own renderer (`xlsx/text.rs`), a separate path from `to_ir()` —
     /// fixing only the IR side left the CLI's default `text`/`markdown`
     /// output still blank for an uncached formula cell. Both paths must
-    /// show the fallback (issue #279).
+    /// show the fallback.
     #[test]
     fn test_uncached_formula_cell_shows_formula_text_via_the_low_level_xlsx_renderer() {
         let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1701,7 +1503,7 @@ mod tests {
 
     /// A formula cell that *does* have a cached value keeps showing that
     /// value (unaffected default behaviour) while also exposing the
-    /// formula text on `TableCell::formula` (issue #279).
+    /// formula text on `TableCell::formula`.
     #[test]
     fn test_cached_formula_cell_keeps_its_value_and_also_exposes_the_formula() {
         let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1732,7 +1534,7 @@ mod tests {
         );
     }
 
-    /// issue #232 — same gap as DOCX, confirmed independently for XLSX.
+    /// Same gap as DOCX, confirmed independently for XLSX.
     #[test]
     fn test_encrypted_xlsx_gives_a_friendly_error_via_the_format_specific_reader() {
         let mut cfb = vec![0u8; 512];
@@ -1745,7 +1547,7 @@ mod tests {
         );
     }
 
-    /// issue #245 — AppProperties::parse existed, fully tested, but
+    /// AppProperties::parse existed, fully tested, but
     /// nothing on the read side ever called it (fast zip path).
     #[test]
     fn test_app_properties_are_read_on_open() {
@@ -1764,7 +1566,7 @@ mod tests {
         assert_eq!(app.words, Some(1250));
     }
 
-    /// #229 — a UTF-16BE `xl/workbook.xml` used to parse as a stream of
+    /// A UTF-16BE `xl/workbook.xml` used to parse as a stream of
     /// unrecognised tags and yield zero sheets, silently, with `Ok`.
     #[test]
     fn test_utf16be_workbook_xml_decodes_instead_of_yielding_zero_sheets() {
@@ -1803,7 +1605,7 @@ mod tests {
         assert_eq!(doc.plain_text(), "1");
     }
 
-    /// #225 (XLSX half) — a huge number under a style whose `<numFmt>`
+    /// XLSX half of the date-overflow hang — a huge number under a style whose `<numFmt>`
     /// override makes a built-in *date* id (50) mean something else must
     /// render as a number, promptly. Before the fix the cell was classified
     /// as a date and `from_serial` spun for ~2.5e16 iterations.
@@ -1835,7 +1637,7 @@ mod tests {
     }
 
     #[test]
-    fn sheet_rels_path_top_level() {
+    fn test_sheet_rels_path_top_level() {
         assert_eq!(
             sheet_rels_path("xl/worksheets/sheet1.xml"),
             "xl/worksheets/_rels/sheet1.xml.rels"
@@ -1844,7 +1646,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_relative_zip_path_absolute() {
+    fn test_resolve_relative_zip_path_absolute() {
         assert_eq!(
             resolve_relative_zip_path("xl/worksheets/sheet1.xml", "/xl/media/img1.png"),
             "xl/media/img1.png"
@@ -1852,7 +1654,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_relative_zip_path_dotdot() {
+    fn test_resolve_relative_zip_path_dotdot() {
         assert_eq!(
             resolve_relative_zip_path("xl/worksheets/sheet1.xml", "../drawings/drawing1.xml"),
             "xl/drawings/drawing1.xml"
@@ -1860,7 +1662,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_relative_zip_path_dot_segment() {
+    fn test_resolve_relative_zip_path_dot_segment() {
         assert_eq!(
             resolve_relative_zip_path("xl/worksheets/sheet1.xml", "./local.xml"),
             "xl/worksheets/local.xml"
@@ -1868,12 +1670,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_relative_zip_path_source_at_root() {
+    fn test_resolve_relative_zip_path_source_at_root() {
         assert_eq!(resolve_relative_zip_path("file.xml", "sub/x.xml"), "sub/x.xml");
     }
 
     #[test]
-    fn guess_image_format_signatures() {
+    fn test_guess_image_format_signatures() {
         assert_eq!(guess_image_format_from_bytes(&[0x89, b'P', b'N', b'G', 13, 10, 26, 10]), "png");
         assert_eq!(guess_image_format_from_bytes(&[0xFF, 0xD8, 0xFF, 0xE0]), "jpeg");
         assert_eq!(guess_image_format_from_bytes(b"GIF89a..."), "gif");
@@ -1888,7 +1690,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_chart_text_minimal_title() {
+    fn test_extract_chart_text_minimal_title() {
         let xml = br#"<?xml version="1.0"?>
 <c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
               xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
@@ -1907,7 +1709,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_chart_text_series_and_categories() {
+    fn test_extract_chart_text_series_and_categories() {
         let xml = br#"<?xml version="1.0"?>
 <c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
               xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
@@ -1932,7 +1734,7 @@ mod tests {
         assert!(out.contains("Budget: 1000, 2000"), "got: {out}");
     }
 
-    /// #280 — Excel splits a formatted title across runs, sometimes
+    /// Excel splits a formatted title across runs, sometimes
     /// mid-word; the inter-run space rides on one run's edge, so trimming
     /// each run before concatenating deleted it.
     #[test]
@@ -1960,7 +1762,7 @@ mod tests {
         assert_eq!(out, "Title: Chart Title - with additional formatting", "got: {out}");
     }
 
-    /// #281 — scatter/bubble series hold their points in
+    /// scatter/bubble series hold their points in
     /// `<c:xVal>`/`<c:yVal>`/`<c:bubbleSize>`, not `<c:cat>`/`<c:val>`.
     #[test]
     fn test_scatter_and_bubble_series_data_points_are_captured() {
@@ -2003,7 +1805,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_drawing_anchors_picture_one_cell() {
+    fn test_parse_drawing_anchors_picture_one_cell() {
         let xml = br#"<?xml version="1.0"?>
 <xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
           xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -2031,7 +1833,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_drawing_anchors_text_shape() {
+    fn test_parse_drawing_anchors_text_shape() {
         let xml = br#"<?xml version="1.0"?>
 <xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
           xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
@@ -2052,7 +1854,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_drawing_anchors_empty_doc_is_ok() {
+    fn test_parse_drawing_anchors_empty_doc_is_ok() {
         let xml = br#"<?xml version="1.0"?>
 <xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>"#;
         let parsed = parse_drawing_anchors(xml).expect("parse ok");
@@ -2062,69 +1864,7 @@ mod tests {
 
     /// Build a minimal SpreadsheetML package whose main part carries
     /// `content_type`.
-    fn minimal_package(content_type: &str) -> Vec<u8> {
-        use std::io::Write;
-        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
-
-        zip.start_file("[Content_Types].xml", opts).unwrap();
-        zip.write_all(
-            format!(
-                r#"<?xml version="1.0"?><Types
-                     xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-                   <Override PartName="/xl/workbook.xml" ContentType="{content_type}"/>
-                 </Types>"#
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-
-        zip.start_file("_rels/.rels", opts).unwrap();
-        zip.write_all(
-            format!(
-                r#"<?xml version="1.0"?><Relationships
-                     xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-                   <Relationship Id="rId1" Type="{}" Target="xl/workbook.xml"/>
-                 </Relationships>"#,
-                rel_types::OFFICE_DOCUMENT
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-
-        zip.start_file("xl/workbook.xml", opts).unwrap();
-        zip.write_all(
-            br#"<?xml version="1.0"?><workbook
-                  xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-                <sheets/></workbook>"#,
-        )
-        .unwrap();
-
-        zip.finish().unwrap().into_inner()
-    }
-
-    /// `.xlam`'s real content type was missing from the OPC whitelist.
-    #[test]
-    fn test_xlam_content_type_accepted() {
-        for ct in [
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
-            "application/vnd.ms-excel.addin.macroEnabled.main+xml",
-            "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
-        ] {
-            let bytes = minimal_package(ct);
-            let opc = crate::core::opc::OpcReader::new(std::io::Cursor::new(bytes)).unwrap();
-            XlsxDocument::from_opc(opc)
-                .unwrap_or_else(|e| panic!("content type {ct} should be accepted, got {e}"));
-        }
-        // A non-SpreadsheetML main part is still refused.
-        let bytes = minimal_package(
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
-        );
-        let opc = crate::core::opc::OpcReader::new(std::io::Cursor::new(bytes)).unwrap();
-        assert!(XlsxDocument::from_opc(opc).is_err());
-    }
-
-    /// issue #302 — a `vm`-tagged `t="e"` cell whose fallback `<v>` is
+    /// A `vm`-tagged `t="e"` cell whose fallback `<v>` is
     /// the literal `"#VALUE!"` is Excel 365's in-cell rich-value image
     /// (`=IMAGE(...)`/"Place in Cell"), not a real formula error. The
     /// real image is reachable by resolving `vm` through `xl/
@@ -2133,7 +1873,7 @@ mod tests {
     /// fixture mirrors the exact shape of the real-corpus reproducer
     /// (`phpspreadsheet_drawing_in_cell.xlsx`) byte for byte.
     #[test]
-    fn a_rich_value_image_cell_resolves_to_a_real_image_not_a_value_error() {
+    fn test_a_rich_value_image_cell_resolves_to_a_real_image_not_a_value_error() {
         const PNG: &[u8] = &[
             0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
             0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,

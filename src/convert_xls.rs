@@ -29,11 +29,11 @@ const MAX_CELLS_PER_SHEET: usize = 5_000;
 /// (row, col) -> (row_span, col_span) map plus the set of positions
 /// each range covers — the same split `convert_xlsx.rs` uses, so both
 /// formats feed the sparse, span-driven TableRow model
-/// ir_render.rs's table_grid expects (issue #235, XLS half).
+/// ir_render.rs's table_grid expects (XLS half).
 /// Reduce `Sheet::hyperlinks` (one entry per `HLINK` record, which can
 /// cover a whole range, not just a single cell) to a per-cell lookup —
 /// the same shape `convert_xlsx.rs` already builds from its own
-/// `Worksheet::hyperlinks` (issue #306).
+/// `Worksheet::hyperlinks`.
 fn hyperlink_lookup(
     hyperlinks: &[crate::xls::XlsHyperlink],
 ) -> std::collections::HashMap<(u16, u16), String> {
@@ -216,7 +216,7 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
         }
 
         // Cell comments are document content, and were never surfaced at
-        // all before (issue #307) — appended as endnotes so every
+        // all before — appended as endnotes so every
         // renderer sees them, the same convention convert_xlsx.rs uses
         // for its own comments.
         for (i, c) in sheet.comments.iter().enumerate() {
@@ -257,8 +257,7 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
     // trendline names/labels, axis/chart titles) was recovered from
     // `SeriesText` records — surfacing it as a dedicated section keeps
     // every human-meaningful word in the workbook reachable, the same
-    // contract `convert_xlsx` already honours for its own charts
-    // (issue #246).
+    // contract `convert_xlsx` already honours for its own charts.
     if !doc.chart_text().is_empty() {
         let mut chart_elements: Vec<Element> = Vec::new();
         for (i, text) in doc.chart_text().iter().enumerate() {
@@ -282,7 +281,7 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
     // The workbook's own declared title (from `\x05SummaryInformation`)
     // beats the first sheet's name — a sheet name is not a document
     // title, it's just the only thing that was ever there to fall back
-    // to (issue #244).
+    // to.
     let summary = doc.summary_properties();
     let title = summary
         .and_then(|s| s.title.clone())
@@ -403,12 +402,12 @@ mod tests {
             .collect()
     }
 
-    /// issue #235 (XLS half) — TableCell::col_span/row_span were
+    /// XLS half of the merged-cell gap — TableCell::col_span/row_span were
     /// hardcoded to 1 on every cell; the MERGEDCELLS record wasn't even
     /// parsed, so merge information was discarded before it was in
     /// memory, not just dropped at IR conversion.
     #[test]
-    fn merged_cells_set_col_span_on_the_anchor_and_exclude_covered_cells() {
+    fn test_merged_cells_set_col_span_on_the_anchor_and_exclude_covered_cells() {
         let sheet = Sheet {
             name: "S".into(),
             display: Vec::new(),
@@ -452,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn data_past_the_old_row_limit_survives_in_a_mostly_empty_grid() {
+    fn test_data_past_the_old_row_limit_survives_in_a_mostly_empty_grid() {
         // A BIFF sheet is padded to its declared used range, so a row limit
         // was measured against padding: a value at row 20,000 of an
         // otherwise-empty 30,000-row grid was dropped by a cap that exists
@@ -466,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn a_grid_of_padding_emits_no_rows_and_claims_no_truncation() {
+    fn test_a_grid_of_padding_emits_no_rows_and_claims_no_truncation() {
         // Every row empty: there is nothing to show and nothing was dropped,
         // so a truncation notice would be a false report. The real files that
         // motivated this are 65,536 x 256; the shape is what matters here.
@@ -480,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sheet_denser_than_the_budget_is_capped_and_says_so() {
+    fn test_a_sheet_denser_than_the_budget_is_capped_and_says_so() {
         // The cap still has to exist: an unbounded grid built 16.7M IR cells
         // and ran the process out of memory.
         let rows = MAX_CELLS_PER_SHEET / 100 + 50;
@@ -498,11 +497,11 @@ mod tests {
         assert!(notice.contains(&rows.to_string()), "notice: {notice}");
     }
 
-    /// issue #306 — `Sheet::hyperlinks` (from `HLINK` records) must reach
+    /// `Sheet::hyperlinks` (from `HLINK` records) must reach
     /// the cell's own `TextSpan::hyperlink`, the same IR shape
     /// `convert_xlsx.rs` already uses.
     #[test]
-    fn hyperlink_reaches_the_cells_text_span() {
+    fn test_hyperlink_reaches_the_cells_text_span() {
         let sheet = Sheet {
             name: "S".into(),
             display: Vec::new(),
@@ -533,7 +532,7 @@ mod tests {
     /// format allows it) must apply to every cell in that range, not
     /// just the anchor.
     #[test]
-    fn hyperlink_range_applies_to_every_covered_cell() {
+    fn test_hyperlink_range_applies_to_every_covered_cell() {
         let sheet = Sheet {
             name: "S".into(),
             display: Vec::new(),
@@ -565,11 +564,11 @@ mod tests {
         }
     }
 
-    /// issue #307 — `Sheet::comments` (resolved from NOTE/TXO/OBJ
+    /// `Sheet::comments` (resolved from NOTE/TXO/OBJ
     /// records) must reach the sheet's elements as endnotes, the same
     /// convention convert_xlsx.rs uses for its own cell comments.
     #[test]
-    fn comments_reach_the_sheet_as_endnotes() {
+    fn test_comments_reach_the_sheet_as_endnotes() {
         let sheet = Sheet {
             name: "S".into(),
             display: Vec::new(),

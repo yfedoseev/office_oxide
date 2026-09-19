@@ -109,7 +109,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn from_extension() {
+    fn test_from_extension() {
         assert_eq!(DocumentFormat::from_extension("docx"), Some(DocumentFormat::Docx));
         assert_eq!(DocumentFormat::from_extension("XLSX"), Some(DocumentFormat::Xlsx));
         assert_eq!(DocumentFormat::from_extension("pptx"), Some(DocumentFormat::Pptx));
@@ -155,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn from_path() {
+    fn test_from_path() {
         assert_eq!(DocumentFormat::from_path(Path::new("report.docx")), Some(DocumentFormat::Docx));
         assert_eq!(
             DocumentFormat::from_path(Path::new("/tmp/data.xlsx")),

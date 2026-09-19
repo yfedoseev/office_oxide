@@ -131,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_root_entry() {
+    fn test_parse_root_entry() {
         let mut buf = build_entry("Root Entry", 5);
         // start sector = 0, size = 1024
         buf[0x74..0x78].copy_from_slice(&0u32.to_le_bytes());
@@ -143,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_stream_entry() {
+    fn test_parse_stream_entry() {
         let mut buf = build_entry("Workbook", 2);
         buf[0x74..0x78].copy_from_slice(&5u32.to_le_bytes());
         buf[0x78..0x7C].copy_from_slice(&8192u32.to_le_bytes());
@@ -155,14 +155,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_empty_entry() {
+    fn test_parse_empty_entry() {
         let buf = build_entry("", 0);
         let entry = DirEntry::parse(&buf, 3).unwrap();
         assert_eq!(entry.entry_type, EntryType::Empty);
     }
 
     #[test]
-    fn v4_stream_size_64bit() {
+    fn test_v4_stream_size_64bit() {
         let mut buf = build_entry("BigStream", 2);
         // 5 GB stream: low = 0x40000000, high = 0x01
         buf[0x78..0x7C].copy_from_slice(&0x40000000u32.to_le_bytes());
@@ -172,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_multiple_entries() {
+    fn test_parse_multiple_entries() {
         let mut data = build_entry("Root Entry", 5);
         data.extend_from_slice(&build_entry("Workbook", 2));
         data.extend_from_slice(&build_entry("", 0));

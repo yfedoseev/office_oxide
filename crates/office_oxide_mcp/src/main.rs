@@ -118,7 +118,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn batch_of_two_valid_requests_returns_an_array_of_two_responses() {
+    fn test_batch_of_two_valid_requests_returns_an_array_of_two_responses() {
         let batch = json!([
             {"jsonrpc": "2.0", "id": 200, "method": "tools/list"},
             {"jsonrpc": "2.0", "id": 201, "method": "initialize"}
@@ -133,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_batch_returns_a_single_invalid_request_error() {
+    fn test_empty_batch_returns_a_single_invalid_request_error() {
         let out = handle_line(json!([])).expect("empty batch should still respond");
         let arr = out.as_array().expect("response must be a JSON array");
         assert_eq!(arr.len(), 1);
@@ -141,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_notification_gets_no_entry_in_the_response_array() {
+    fn test_batch_notification_gets_no_entry_in_the_response_array() {
         let batch = json!([
             {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
             {"jsonrpc": "2.0", "method": "notifications/initialized"}
@@ -153,45 +153,45 @@ mod tests {
     }
 
     #[test]
-    fn batch_of_only_notifications_produces_no_output() {
+    fn test_batch_of_only_notifications_produces_no_output() {
         let batch = json!([{"jsonrpc": "2.0", "method": "notifications/initialized"}]);
         assert!(handle_line(batch).is_none());
     }
 
     #[test]
-    fn missing_jsonrpc_field_is_invalid_request() {
+    fn test_missing_jsonrpc_field_is_invalid_request() {
         let out = handle_line(json!({"id": 1, "method": "tools/list"})).unwrap();
         assert_eq!(out["error"]["code"], json!(-32600));
         assert_eq!(out["id"], json!(1));
     }
 
     #[test]
-    fn wrong_jsonrpc_version_is_invalid_request() {
+    fn test_wrong_jsonrpc_version_is_invalid_request() {
         let out = handle_line(json!({"jsonrpc": "1.0", "id": 400, "method": "tools/list"})).unwrap();
         assert_eq!(out["error"]["code"], json!(-32600));
         assert_eq!(out["id"], json!(400));
     }
 
     #[test]
-    fn non_string_method_is_invalid_request_not_unknown_method() {
+    fn test_non_string_method_is_invalid_request_not_unknown_method() {
         let out = handle_line(json!({"jsonrpc": "2.0", "id": 5, "method": 12345})).unwrap();
         assert_eq!(out["error"]["code"], json!(-32600));
     }
 
     #[test]
-    fn single_well_formed_request_still_works() {
+    fn test_single_well_formed_request_still_works() {
         let out = handle_line(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"})).unwrap();
         assert_eq!(out["id"], json!(1));
         assert!(out["result"]["protocolVersion"].is_string());
     }
 
     #[test]
-    fn lone_notification_produces_no_output() {
+    fn test_lone_notification_produces_no_output() {
         assert!(handle_line(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());
     }
 
     #[test]
-    fn unknown_method_still_uses_method_not_found() {
+    fn test_unknown_method_still_uses_method_not_found() {
         let out = handle_line(json!({"jsonrpc": "2.0", "id": 9, "method": "bogus"})).unwrap();
         assert_eq!(out["error"]["code"], json!(-32601));
     }

@@ -37,24 +37,24 @@ const XLSX_MD: &str = "# Sheet1\n\n| Item | Qty |\n|------|-----|\n| Apple | 10 
 const PPTX_MD: &str = "# Slide One\n\n- Bullet A\n- Bullet B\n\n# Slide Two\n\nBody text here.\n";
 
 #[test]
-fn docx_ir_roundtrip_is_idempotent() {
+fn test_docx_ir_roundtrip_is_idempotent() {
     assert_idempotent(DocumentFormat::Docx, DOCX_MD);
 }
 
 #[test]
-fn xlsx_ir_roundtrip_is_idempotent() {
+fn test_xlsx_ir_roundtrip_is_idempotent() {
     assert_idempotent(DocumentFormat::Xlsx, XLSX_MD);
 }
 
 #[test]
-fn pptx_ir_roundtrip_is_idempotent() {
+fn test_pptx_ir_roundtrip_is_idempotent() {
     assert_idempotent(DocumentFormat::Pptx, PPTX_MD);
 }
 
 /// Focused guard for the PPTX body-text-loss defect: the slide body content
 /// (bullets) must survive a round-trip, not be replaced by the title.
 #[test]
-fn pptx_roundtrip_preserves_slide_body() {
+fn test_pptx_roundtrip_preserves_slide_body() {
     let ir0 = DocumentIR::from_markdown(PPTX_MD, DocumentFormat::Pptx);
     let (ir1, _) = write_parse(&ir0, DocumentFormat::Pptx);
     let text = {
@@ -70,12 +70,12 @@ fn pptx_roundtrip_preserves_slide_body() {
     }
 }
 
-/// issue #259 — `section.title` must not be re-emitted as a duplicate
+/// `section.title` must not be re-emitted as a duplicate
 /// heading when the heading it came from isn't the section's literal
 /// first element (e.g. a byline or date line ahead of it). The old
 /// check only looked at `section.elements.first()`.
 #[test]
-fn docx_heading_not_first_element_does_not_duplicate_on_roundtrip() {
+fn test_docx_heading_not_first_element_does_not_duplicate_on_roundtrip() {
     use office_oxide::ir::{Element, Heading, InlineContent, Metadata, Paragraph, Section, TextSpan};
 
     let ir = DocumentIR {
@@ -112,11 +112,11 @@ fn docx_heading_not_first_element_does_not_duplicate_on_roundtrip() {
     );
 }
 
-/// issue #264 — independent text boxes on one slide must not merge into
+/// Independent text boxes on one slide must not merge into
 /// one (or spawn a spurious empty one) on a write→reread round trip;
 /// each keeps its own position.
 #[test]
-fn pptx_independent_text_boxes_stay_independent_on_roundtrip() {
+fn test_pptx_independent_text_boxes_stay_independent_on_roundtrip() {
     use office_oxide::ir::{Element, InlineContent, Metadata, Paragraph, Section, TextBox, TextSpan};
 
     fn textbox(text: &str, x: i64) -> Element {
@@ -180,10 +180,10 @@ fn pptx_independent_text_boxes_stay_independent_on_roundtrip() {
     assert!(texts.contains(&"Welcome".to_string()), "{texts:?}");
 }
 
-/// issue #259's PPTX analogue — the title heading duplicating into the
-/// slide body when it isn't the section's first element.
+/// PPTX analogue of the DOCX title duplication — the title heading
+/// duplicating into the slide body when it isn't the section's first element.
 #[test]
-fn pptx_title_heading_not_first_element_does_not_duplicate_on_roundtrip() {
+fn test_pptx_title_heading_not_first_element_does_not_duplicate_on_roundtrip() {
     use office_oxide::ir::{Element, Heading, InlineContent, Metadata, Paragraph, Section, TextSpan};
 
     let ir = DocumentIR {

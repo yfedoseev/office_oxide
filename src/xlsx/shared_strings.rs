@@ -35,7 +35,7 @@ pub struct RichTextRun {
     /// Text color.
     pub color: Option<ColorRef>,
     /// Superscript/subscript alignment (`<vertAlign val="…"/>`), e.g. a
-    /// footnote-marker run within otherwise-plain body text (issue #303).
+    /// footnote-marker run within otherwise-plain body text.
     pub vert_align: Option<crate::ir::VerticalAlign>,
 }
 
@@ -125,7 +125,7 @@ fn parse_si(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Shared
 }
 
 /// Parse a single `<r>` rich text run element, including its `<rPr>`
-/// formatting (issue #303 — this used to be skipped entirely, discarding
+/// formatting (this used to be skipped entirely, discarding
 /// every run's bold/italic/size/font/color/superscript, permanently).
 pub(crate) fn parse_rich_text_run(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<RichTextRun> {
     let mut text = String::new();
@@ -244,7 +244,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_plain_strings() {
+    fn test_parse_plain_strings() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="3" uniqueCount="3">
   <si><t>Hello</t></si>
@@ -260,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_rich_text_strings() {
+    fn test_parse_rich_text_strings() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1">
   <si>
@@ -283,12 +283,12 @@ mod tests {
         assert_eq!(rich[1].text, " normal");
     }
 
-    /// issue #303 — `<rPr>` was skipped entirely; every run's own
+    /// `<rPr>` was skipped entirely; every run's own
     /// bold/size/font/superscript formatting must now survive parsing,
     /// matching the exact real-file shape from the issue's own repro
     /// (a plain run followed by a bold superscript footnote marker).
     #[test]
-    fn parse_rich_text_run_properties() {
+    fn test_parse_rich_text_run_properties() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1">
   <si>
@@ -320,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_empty_sst() {
+    fn test_parse_empty_sst() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0">
 </sst>"#;
@@ -330,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn index_lookup() {
+    fn test_index_lookup() {
         let sst = SharedStringTable {
             strings: vec![
                 SharedString {

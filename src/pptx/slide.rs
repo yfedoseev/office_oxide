@@ -63,7 +63,7 @@ pub struct Slide {
     /// Speaker notes body, if a notes slide is present. Kept as the
     /// structured `TextBody` (same model ordinary slide body text uses)
     /// rather than flattened text, so bold/italic/bullets/numbering in
-    /// notes survive through to the IR (issue #290).
+    /// notes survive through to the IR.
     pub notes: Option<TextBody>,
     /// Solid background colour (RGB) extracted from the slide's
     /// `<p:cSld><p:bg><p:bgPr><a:solidFill>` element. Only the solid
@@ -260,7 +260,7 @@ fn parse_shape_tree_until(
 /// negotiation here: this takes the first `Choice` branch that actually
 /// yields a recognized shape, and falls back to `Fallback` otherwise —
 /// strictly better than the old behavior of skipping the whole block,
-/// which silently dropped shapes like equation text boxes (issue #272).
+/// which silently dropped shapes like equation text boxes.
 fn parse_alternate_content(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
@@ -329,7 +329,7 @@ fn parse_auto_shape(
                     hyperlink = props.4;
                 },
                 b"spPr" => {
-                    position = parse_shape_properties(reader)?;
+                    position = parse_shape_properties(reader, b"spPr")?;
                 },
                 b"txBody" => {
                     text_body = Some(parse_text_body(reader, rels)?);
@@ -387,7 +387,7 @@ fn parse_picture(
                     embed_rid = parse_blip_fill_embed(reader)?;
                 },
                 b"spPr" => {
-                    position = parse_shape_properties(reader)?;
+                    position = parse_shape_properties(reader, b"spPr")?;
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
@@ -497,12 +497,12 @@ fn parse_group_shape(
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
                 b"nvGrpSpPr" => {
-                    let props = parse_nv_grp_props(reader)?;
+                    let props = parse_nv_id_name(reader, b"nvGrpSpPr")?;
                     id = props.0;
                     name = props.1;
                 },
                 b"grpSpPr" => {
-                    position = parse_grp_shape_properties(reader)?;
+                    position = parse_shape_properties(reader, b"grpSpPr")?;
                 },
                 b"sp" => children.push(parse_auto_shape(reader, rels)?),
                 b"pic" => children.push(parse_picture(reader, rels, media)?),
@@ -632,7 +632,7 @@ fn parse_graphic_frame(
             Event::Start(ref e) => {
                 match e.local_name().as_ref() {
                     b"nvGraphicFramePr" => {
-                        let props = parse_nv_graphic_frame_props(reader)?;
+                        let props = parse_nv_id_name(reader, b"nvGraphicFramePr")?;
                         id = props.0;
                         name = props.1;
                     },
@@ -656,7 +656,7 @@ fn parse_graphic_frame(
                             // and cached data values all live in the
                             // separate part that id resolves to
                             // (ppt/charts/chartN.xml), pre-read into
-                            // `charts` (issue #239).
+                            // `charts`.
                             let rid = find_chart_rid(reader, b"graphicData")?;
                             let texts = rid.and_then(|r| charts.get(&r)).cloned();
                             content = match texts {
@@ -751,12 +751,12 @@ fn parse_connector(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Shape> {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
                 b"nvCxnSpPr" => {
-                    let props = parse_nv_cxn_props(reader)?;
+                    let props = parse_nv_id_name(reader, b"nvCxnSpPr")?;
                     id = props.0;
                     name = props.1;
                 },
                 b"spPr" => {
-                    position = parse_shape_properties(reader)?;
+                    position = parse_shape_properties(reader, b"spPr")?;
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
@@ -861,7 +861,7 @@ fn parse_nv_common_props(
 /// handles. Both `p:nvSpPr` (AutoShape) and `p:nvPicPr` (PictureShape)
 /// used to skip this subtree entirely, so a shape whose only purpose
 /// was its click action (typical for Action Buttons, which are drawn
-/// as icons with no text) vanished from the IR completely (issue #299).
+/// as icons with no text) vanished from the IR completely.
 fn parse_cnvpr_hyperlink(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
@@ -937,35 +937,12 @@ fn parse_nv_pic_props(
     Ok((id, name, alt_text, hyperlink))
 }
 
-/// Parse `p:nvGrpSpPr` → (id, name)
-fn parse_nv_grp_props(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<(u32, String)> {
-    let mut id = 0u32;
-    let mut name = String::new();
-
-    loop {
-        match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"cNvPr" => {
-                id = xml::optional_attr_str(e, b"id")?
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                name = xml::optional_attr_str(e, b"name")?
-                    .map(|v| v.into_owned())
-                    .unwrap_or_default();
-            },
-            Event::End(ref e) if e.local_name().as_ref() == b"nvGrpSpPr" => {
-                break;
-            },
-            Event::Eof => break,
-            _ => {},
-        }
-    }
-
-    Ok((id, name))
-}
-
-/// Parse `p:nvGraphicFramePr` → (id, name)
-fn parse_nv_graphic_frame_props(
+/// Parse a non-visual-properties wrapper (`p:nvGrpSpPr`, `p:nvGraphicFramePr`,
+/// `p:nvCxnSpPr`) → (id, name) from its `p:cNvPr` child. `end_tag` is the
+/// wrapper's local name, which is the only thing that differs between them.
+fn parse_nv_id_name(
     reader: &mut quick_xml::Reader<&[u8]>,
+    end_tag: &[u8],
 ) -> CoreResult<(u32, String)> {
     let mut id = 0u32;
     let mut name = String::new();
@@ -980,33 +957,7 @@ fn parse_nv_graphic_frame_props(
                     .map(|v| v.into_owned())
                     .unwrap_or_default();
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"nvGraphicFramePr" => {
-                break;
-            },
-            Event::Eof => break,
-            _ => {},
-        }
-    }
-
-    Ok((id, name))
-}
-
-/// Parse `p:nvCxnSpPr` → (id, name)
-fn parse_nv_cxn_props(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<(u32, String)> {
-    let mut id = 0u32;
-    let mut name = String::new();
-
-    loop {
-        match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"cNvPr" => {
-                id = xml::optional_attr_str(e, b"id")?
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                name = xml::optional_attr_str(e, b"name")?
-                    .map(|v| v.into_owned())
-                    .unwrap_or_default();
-            },
-            Event::End(ref e) if e.local_name().as_ref() == b"nvCxnSpPr" => {
+            Event::End(ref e) if e.local_name().as_ref() == end_tag => {
                 break;
             },
             Event::Eof => break,
@@ -1021,9 +972,11 @@ fn parse_nv_cxn_props(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<(u32,
 // Shape properties (a:xfrm within p:spPr or p:grpSpPr)
 // ---------------------------------------------------------------------------
 
-/// Parse `p:spPr` → extract position from `a:xfrm`.
+/// Parse `p:spPr` or `p:grpSpPr` → extract position from `a:xfrm`.
+/// `end_tag` is the wrapper's local name.
 fn parse_shape_properties(
     reader: &mut quick_xml::Reader<&[u8]>,
+    end_tag: &[u8],
 ) -> CoreResult<Option<ShapePosition>> {
     let mut position = None;
 
@@ -1032,29 +985,7 @@ fn parse_shape_properties(
             Event::Start(ref e) if e.local_name().as_ref() == b"xfrm" => {
                 position = Some(parse_xfrm_contents(reader)?);
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"spPr" => {
-                break;
-            },
-            Event::Eof => break,
-            _ => {},
-        }
-    }
-
-    Ok(position)
-}
-
-/// Parse `p:grpSpPr` → extract position from `a:xfrm`.
-fn parse_grp_shape_properties(
-    reader: &mut quick_xml::Reader<&[u8]>,
-) -> CoreResult<Option<ShapePosition>> {
-    let mut position = None;
-
-    loop {
-        match reader.read_event()? {
-            Event::Start(ref e) if e.local_name().as_ref() == b"xfrm" => {
-                position = Some(parse_xfrm_contents(reader)?);
-            },
-            Event::End(ref e) if e.local_name().as_ref() == b"grpSpPr" => {
+            Event::End(ref e) if e.local_name().as_ref() == end_tag => {
                 break;
             },
             Event::Eof => break,
@@ -1229,8 +1160,8 @@ fn parse_text_paragraph(
                 // `<a14:m>` wraps an OMML equation (`<m:oMath>`/`<m:oMathPara>`)
                 // as a markup-compatibility extension; there's no structural
                 // math model, so pull out every `<m:t>` run so the equation's
-                // text isn't silently dropped (issue #272, PPTX analogue of
-                // the DOCX OMML fix, #270).
+                // text isn't silently dropped (PPTX analogue of
+                // the DOCX OMML fix).
                 b"m" => {
                     let text = collect_a_t_text(reader, b"m")?.concat();
                     if !text.is_empty() {
@@ -1409,7 +1340,7 @@ fn parse_hlink_click(
     // (e.g. `action="ppaction://noaction"` on a sound-effect button)
     // still writes an empty r:id. Treating it the same as a real,
     // unresolvable id used to give up entirely instead of falling
-    // through to `action`, losing the shape completely (issue #299).
+    // through to `action`, losing the shape completely.
     let r_id = xml::optional_attr_str(e, b"r:id")?.filter(|v| !v.is_empty());
     let tooltip = xml::optional_attr_str(e, b"tooltip")?.map(|v| v.into_owned());
     let action = xml::optional_attr_str(e, b"action")?;
@@ -1652,8 +1583,7 @@ pub(crate) fn parse_comments(xml_data: &[u8]) -> Vec<SlideComment> {
 /// body placeholder (`type="body"`) and returns its structured
 /// `TextBody` — the same model ordinary slide body text uses, so a
 /// caller converting it (see `convert_text_body` in `convert_pptx.rs`)
-/// gets the same bold/italic/bullet/numbering fidelity for free
-/// (issue #290).
+/// gets the same bold/italic/bullet/numbering fidelity for free.
 pub(crate) fn extract_notes_body(xml_data: &[u8]) -> Option<TextBody> {
     let rels = Relationships::empty();
     let mut reader = make_content_reader(xml_data);
@@ -1743,7 +1673,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_auto_shape_with_text() {
+    fn test_parse_auto_shape_with_text() {
         let xml = make_slide_xml(
             r#"<p:sp>
   <p:nvSpPr>
@@ -1796,7 +1726,7 @@ mod tests {
         }
     }
 
-    /// issue #299 — a shape's own click action (`p:cNvPr > a:hlinkClick`)
+    /// A shape's own click action (`p:cNvPr > a:hlinkClick`)
     /// used to be discarded entirely (the cNvPr Start branch called
     /// `skip_element_fast`); an Action Button (drawn as an icon with no
     /// text, whose entire purpose is the click target) vanished from the
@@ -1804,7 +1734,7 @@ mod tests {
     /// text, an `action="ppaction://hlinksldjump"` jump resolved via
     /// `r:id`.
     #[test]
-    fn parse_auto_shape_shape_level_hyperlink() {
+    fn test_parse_auto_shape_shape_level_hyperlink() {
         let xml = make_slide_xml(
             r#"<p:sp>
   <p:nvSpPr>
@@ -1846,7 +1776,7 @@ mod tests {
     /// not desync the reader — the child content itself has no IR
     /// representation and is simply skipped.
     #[test]
-    fn parse_auto_shape_hlink_click_with_child_element() {
+    fn test_parse_auto_shape_hlink_click_with_child_element() {
         let xml = make_slide_xml(
             r#"<p:sp>
   <p:nvSpPr>
@@ -1882,7 +1812,7 @@ mod tests {
         );
     }
 
-    /// issue #299 — a *present but empty* `r:id=""` (real PowerPoint
+    /// A *present but empty* `r:id=""` (real PowerPoint
     /// output for an Action Button whose only target is its own
     /// `action` attribute, e.g. `action="ppaction://noaction"`) used to
     /// be treated the same as a genuinely unresolvable id and give up
@@ -1890,7 +1820,7 @@ mod tests {
     /// shape completely. Mirrors the real corpus file
     /// aspose-slides_HyperlinkSound.pptx exactly.
     #[test]
-    fn parse_hlink_click_empty_r_id_falls_back_to_action() {
+    fn test_parse_hlink_click_empty_r_id_falls_back_to_action() {
         let xml = make_slide_xml(
             r#"<p:sp>
   <p:nvSpPr>
@@ -1928,11 +1858,11 @@ mod tests {
     /// no text — so `parse_graphic_frame` must resolve it against the
     /// pre-extracted `charts` map (keyed by that same rId) rather than
     /// finding nothing via the generic `<a:t>` scan every other
-    /// non-table graphic falls back to (issue #239). XML shape matches
+    /// non-table graphic falls back to. XML shape matches
     /// a real corpus file (docx4j_pptx-chart.pptx) byte-for-byte on the
     /// graphicData/c:chart structure.
     #[test]
-    fn parse_graphic_frame_resolves_chart_text_from_the_charts_map() {
+    fn test_parse_graphic_frame_resolves_chart_text_from_the_charts_map() {
         let xml = make_slide_xml(
             r#"<p:graphicFrame>
   <p:nvGraphicFramePr>
@@ -1984,7 +1914,7 @@ mod tests {
     /// to open) must not panic — just fall through to Unknown, same as any
     /// other unresolvable graphic.
     #[test]
-    fn parse_graphic_frame_chart_with_no_matching_charts_entry_is_unknown() {
+    fn test_parse_graphic_frame_chart_with_no_matching_charts_entry_is_unknown() {
         let xml = make_slide_xml(
             r#"<p:graphicFrame>
   <p:nvGraphicFramePr>
@@ -2019,7 +1949,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_group_shape() {
+    fn test_parse_group_shape() {
         let xml = make_slide_xml(
             r#"<p:grpSp>
   <p:nvGrpSpPr>
@@ -2069,12 +1999,12 @@ mod tests {
         }
     }
 
-    /// issue #272 — an `<m:oMath>` equation reaches the slide text via the
+    /// An `<m:oMath>` equation reaches the slide text via the
     /// `<mc:AlternateContent><mc:Choice Requires="a14"><p:sp>...<a14:m>`
     /// wrapper real PowerPoint output uses (poi-legacy_stress013.pptx,
     /// slides 5/9/10), mirroring the real file's structure exactly.
     #[test]
-    fn omml_equation_inside_alternate_content_is_not_dropped() {
+    fn test_omml_equation_inside_alternate_content_is_not_dropped() {
         let xml = make_slide_xml(
             r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:a14="http://schemas.microsoft.com/office/drawing/2010/main">
   <mc:Choice Requires="a14">
@@ -2130,7 +2060,7 @@ mod tests {
     /// doesn't recognize (yielding zero shapes), the `mc:Fallback` branch
     /// must still be used instead of losing the shape altogether.
     #[test]
-    fn alternate_content_falls_back_to_fallback_branch_when_choice_yields_nothing() {
+    fn test_alternate_content_falls_back_to_fallback_branch_when_choice_yields_nothing() {
         let xml = make_slide_xml(
             r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">
   <mc:Choice Requires="somethingUnknown">
@@ -2171,7 +2101,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_table_shape() {
+    fn test_parse_table_shape() {
         let xml = make_slide_xml(
             r#"<p:graphicFrame>
   <p:nvGraphicFramePr>
@@ -2246,7 +2176,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_picture_shape() {
+    fn test_parse_picture_shape() {
         let xml = make_slide_xml(
             r#"<p:pic>
   <p:nvPicPr>
@@ -2284,7 +2214,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_connector_shape() {
+    fn test_parse_connector_shape() {
         let xml = make_slide_xml(
             r#"<p:cxnSp>
   <p:nvCxnSpPr>
@@ -2317,7 +2247,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_text_formatting() {
+    fn test_parse_text_formatting() {
         let xml = make_slide_xml(
             r#"<p:sp>
   <p:nvSpPr>
@@ -2354,7 +2284,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_text_field() {
+    fn test_parse_text_field() {
         let xml = make_slide_xml(
             r#"<p:sp>
   <p:nvSpPr>
@@ -2391,7 +2321,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_notes_text() {
+    fn test_parse_notes_text() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <p:notes xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
          xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
@@ -2436,7 +2366,7 @@ mod tests {
     // ── New: blip rId extraction, font size, alignment, space_before, bg ─
 
     #[test]
-    fn run_carries_font_size_from_sz_attr() {
+    fn test_run_carries_font_size_from_sz_attr() {
         // <a:rPr sz="1800"/> means 18 pt — should land on the run as
         // 1800 hundredths-of-a-point.
         let xml = make_slide_xml(
@@ -2469,7 +2399,7 @@ mod tests {
     }
 
     #[test]
-    fn run_font_size_absent_when_sz_missing() {
+    fn test_run_font_size_absent_when_sz_missing() {
         let xml = make_slide_xml(
             r#"<p:sp>
   <p:nvSpPr><p:cNvPr id="8" name="T"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
@@ -2495,7 +2425,7 @@ mod tests {
     }
 
     #[test]
-    fn paragraph_alignment_parsed_from_algn_attr() {
+    fn test_paragraph_alignment_parsed_from_algn_attr() {
         use crate::ir::ParagraphAlignment;
         let xml = make_slide_xml(
             r#"<p:sp>
@@ -2521,7 +2451,7 @@ mod tests {
     }
 
     #[test]
-    fn paragraph_alignment_all_variants() {
+    fn test_paragraph_alignment_all_variants() {
         use crate::ir::ParagraphAlignment;
         let cases = [
             ("l", ParagraphAlignment::Left),
@@ -2560,7 +2490,7 @@ mod tests {
     }
 
     #[test]
-    fn paragraph_space_before_parsed_from_spc_bef() {
+    fn test_paragraph_space_before_parsed_from_spc_bef() {
         let xml = make_slide_xml(
             r#"<p:sp>
   <p:nvSpPr><p:cNvPr id="11" name="T"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
@@ -2587,7 +2517,7 @@ mod tests {
     }
 
     #[test]
-    fn picture_embed_resolves_via_media_map() {
+    fn test_picture_embed_resolves_via_media_map() {
         // Build a media map keyed by the rId used in the slide xml so
         // parse_picture can resolve the embed → bytes.
         let xml = make_slide_xml(
@@ -2627,7 +2557,7 @@ mod tests {
     }
 
     #[test]
-    fn picture_embed_without_media_still_carries_rid() {
+    fn test_picture_embed_without_media_still_carries_rid() {
         // Empty media map: rId is captured but data/format are None.
         let xml = make_slide_xml(
             r#"<p:pic>
@@ -2659,7 +2589,7 @@ mod tests {
     }
 
     #[test]
-    fn slide_background_solid_rgb() {
+    fn test_slide_background_solid_rgb() {
         // <p:bg><p:bgPr><a:solidFill><a:srgbClr val="FF8800"/>…
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -2689,7 +2619,7 @@ mod tests {
     }
 
     #[test]
-    fn slide_no_background_returns_none() {
+    fn test_slide_no_background_returns_none() {
         let xml = make_slide_xml("");
         let slide = Slide::parse(
             &xml,
@@ -2703,14 +2633,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_hex_rgb_valid() {
+    fn test_parse_hex_rgb_valid() {
         assert_eq!(parse_hex_rgb("FF8800"), Some([0xFF, 0x88, 0x00]));
         assert_eq!(parse_hex_rgb("000000"), Some([0, 0, 0]));
         assert_eq!(parse_hex_rgb("ffffff"), Some([0xFF, 0xFF, 0xFF]));
     }
 
     #[test]
-    fn parse_hex_rgb_invalid() {
+    fn test_parse_hex_rgb_invalid() {
         assert_eq!(parse_hex_rgb("FF88"), None); // too short
         assert_eq!(parse_hex_rgb("ZZZZZZ"), None); // not hex
         assert_eq!(parse_hex_rgb(""), None);
@@ -2730,7 +2660,7 @@ mod tests {
     }
 
     #[test]
-    fn blip_embed_attr_with_r_prefix() {
+    fn test_blip_embed_attr_with_r_prefix() {
         let e = first_start_elem(
             br#"<a:blip xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
                        xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -2741,7 +2671,7 @@ mod tests {
     }
 
     #[test]
-    fn blip_embed_attr_arbitrary_prefix() {
+    fn test_blip_embed_attr_arbitrary_prefix() {
         // Some writers use an unrelated prefix bound to the rels namespace.
         let e = first_start_elem(
             br#"<a:blip xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -2753,7 +2683,7 @@ mod tests {
     }
 
     #[test]
-    fn blip_embed_attr_absent() {
+    fn test_blip_embed_attr_absent() {
         let e = first_start_elem(
             br#"<a:blip xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"/>"#,
         );

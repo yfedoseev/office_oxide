@@ -2,9 +2,9 @@
 //! MathType, OLE Package, embedded Word/PowerPoint, etc.) inside a
 //! DOC's `Storage:ObjectPool` storage.
 //!
-//! At minimum (issue #284): recognize that an embedded object exists
+//! At minimum: recognize that an embedded object exists
 //! and surface its identity, even without extracting its native
-//! payload — the DOC analogue of the PPT fix in issue #337. Before
+//! payload — the DOC analogue of the PPT OLE fix. Before
 //! this, `ObjectPool` was never traversed at all, so a file with (for
 //! example) 12 embedded Excel workbooks showed no trace of any of them
 //! anywhere in the IR.
@@ -25,8 +25,7 @@ const NO_ENTRY: u32 = 0xFFFF_FFFF;
 const MAX_ENTRIES_WALKED: usize = 50_000;
 
 /// One embedded OLE object found under `ObjectPool`, identified only by
-/// the presence of a well-known stream name within its own storage
-/// (issue #284).
+/// the presence of a well-known stream name within its own storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddedOleObject {
     /// Human-readable identity, e.g. `"Embedded Microsoft Excel
@@ -165,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn finds_one_embedded_excel_workbook() {
+    fn test_finds_one_embedded_excel_workbook() {
         let entries = build_tree_with_one_excel_object();
         // Exercise the free functions directly — CfbReader construction
         // needs real sector data, which this test isn't building.
@@ -187,13 +186,13 @@ mod tests {
     }
 
     #[test]
-    fn no_object_pool_yields_empty() {
+    fn test_no_object_pool_yields_empty() {
         let entries = vec![entry("Root Entry", EntryType::RootStorage, NO_ENTRY, NO_ENTRY, NO_ENTRY)];
         assert!(find_direct_child(&entries, entries[0].child, "ObjectPool").is_none());
     }
 
     #[test]
-    fn classify_recognizes_every_known_type() {
+    fn test_classify_recognizes_every_known_type() {
         assert_eq!(classify(&["Workbook"]).as_deref(), Some("Embedded Microsoft Excel Workbook"));
         assert_eq!(
             classify(&["Equation Native"]).as_deref(),
@@ -212,7 +211,7 @@ mod tests {
 
     /// A sibling cycle (corrupted/adversarial file) must not hang.
     #[test]
-    fn cyclic_siblings_do_not_hang() {
+    fn test_cyclic_siblings_do_not_hang() {
         let entries = vec![
             entry("Root Entry", EntryType::RootStorage, 1, NO_ENTRY, NO_ENTRY),
             // node 1's right sibling points back to itself.

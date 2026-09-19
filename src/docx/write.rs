@@ -153,7 +153,7 @@ pub struct Run {
     /// Custom footnote/endnote mark (e.g. `*`, `†`) for whichever of
     /// `footnote_ref`/`endnote_ref` is set. When present, the reference
     /// carries `w:customMarkFollows="1"` and the note body gets the glyph
-    /// as its own leading run instead of an auto-number (issue #219).
+    /// as its own leading run instead of an auto-number.
     pub note_ref_marker: Option<String>,
 }
 
@@ -357,15 +357,10 @@ struct DocxImage {
     positioning: ImagePositioning,
 }
 
-#[allow(dead_code)]
 struct DocxSectPr {
     page_setup: Option<PageSetup>,
     columns: Option<ColumnLayout>,
     break_type: SectionBreakType,
-    header_rids: Vec<(String, String)>,
-    footer_rids: Vec<(String, String)>,
-    footnote_rid: Option<String>,
-    endnote_rid: Option<String>,
 }
 
 /// The type of header or footer section to add.
@@ -460,13 +455,13 @@ fn split_hyperlink_fragment(url: &str) -> (&str, Option<&str>) {
 /// first-seen order. A same-document-only link (`#anchor`, empty base)
 /// needs no relationship at all — registering one fabricated a bogus
 /// `TargetMode="External"` entry pointing at `"#anchor"` for every such
-/// link, which is not a URL (issue #292).
+/// link, which is not a URL.
 /// Register one external relationship per distinct hyperlink URL in
 /// `elements`, scoped to `part`'s own rels file. Each OPC part (the main
 /// document, a header/footer, footnotes.xml, endnotes.xml) has its own
 /// `_rels/<part>.xml.rels`; an r:id registered against one part does not
 /// resolve inside another's XML, so this must be called once per part
-/// rather than reusing a single package-wide map (issue #293).
+/// rather than reusing a single package-wide map.
 fn register_hyperlink_rids<W: Write + Seek>(
     opc: &mut OpcWriter<W>,
     part: &PartName,
@@ -764,10 +759,6 @@ impl DocxWriter {
             page_setup,
             columns,
             break_type,
-            header_rids: Vec::new(),
-            footer_rids: Vec::new(),
-            footnote_rid: None,
-            endnote_rid: None,
         }));
         self
     }
@@ -791,7 +782,7 @@ impl DocxWriter {
     /// per spec: one logical list keeps one `numId` across all its levels)
     /// re-parsed as an unrelated *sibling* top-level list instead of a
     /// child of the parent item, losing the parent/child relationship (and
-    /// sometimes the `ordered` flag) on every round trip (issue #261).
+    /// sometimes the `ordered` flag) on every round trip.
     fn add_ir_list_at(&mut self, list: &crate::ir::List, level: u8, num_id: u32) {
         let start_number = list.start_number.unwrap_or(1);
         let style = list.style.clone();
@@ -935,7 +926,7 @@ impl DocxWriter {
     /// `add_header_footer`, or `create::ir_to_docx`, which resets the
     /// count at its start) or the `write_to`/`save` call itself. `0`
     /// means nothing was truncated. Call this *after* `write_to`/`save`
-    /// to see both phases' total (issue #218).
+    /// to see both phases' total.
     pub fn truncated_subtrees(&self) -> usize {
         crate::core::xml::truncated_subtrees()
     }
@@ -979,7 +970,7 @@ impl DocxWriter {
             // A per-part Override alone is spec-legal, but real SDK
             // validators flag a package with many overrides and no
             // matching Default — XLSX's own image-writing path already
-            // registers one; DOCX's didn't (issue #295).
+            // registers one; DOCX's didn't.
             opc.register_default_content_type(ext, ct);
             opc.add_part(&img_part, ct, &img.data)?;
 
@@ -1022,8 +1013,7 @@ impl DocxWriter {
                 let target_abs = format!("/word/fonts/font_{n}_{safe}.ttf");
                 let part = PartName::new(&target_abs)?;
                 // Matches core::embedded_fonts's own Default-registration
-                // convention, which this hand-rolled path had missed
-                // (issue #295).
+                // convention, which this hand-rolled path had missed.
                 opc.register_default_content_type("ttf", "application/x-font-ttf");
                 opc.add_part(&part, "application/x-font-ttf", data)?;
                 let rid = opc.add_part_rel(&font_table_part, rel_types::FONT, &target_rel);
@@ -1041,7 +1031,7 @@ impl DocxWriter {
         // for header/footer/footnote/endnote parts emitted an r:id that
         // does not exist in *those* parts' own rels files — a dangling
         // relationship in every header, footer, footnote and endnote
-        // hyperlink (issue #293). Each part below gets its own map,
+        // hyperlink. Each part below gets its own map,
         // registered against that part.
         let hyperlink_rids: HyperlinkRids = register_hyperlink_rids(&mut opc, &doc_part, &self.elements);
 
@@ -1120,8 +1110,7 @@ impl DocxWriter {
                     columns: sp.columns.clone(),
                     break_type: sp.break_type.clone(),
                     hf_rids: hf_rids.clone(),
-                    footnote_rid: footnote_rid.clone(),
-                    endnote_rid: endnote_rid.clone(),
+                    has_footnotes: footnote_rid.is_some(),
                 });
             }
         }
@@ -1133,8 +1122,7 @@ impl DocxWriter {
                 columns: None,
                 break_type: SectionBreakType::Continuous,
                 hf_rids: hf_rids.clone(),
-                footnote_rid: footnote_rid.clone(),
-                endnote_rid: endnote_rid.clone(),
+                has_footnotes: footnote_rid.is_some(),
             });
         }
 
@@ -1236,7 +1224,7 @@ impl DocxWriter {
         // 146 KB as JSON, 99.75% of it whitespace. Word doesn't care
         // about XML formatting; this writer's own reader doesn't either.
         // Removing indentation removes the amplification entirely rather
-        // than merely capping it (issue #220).
+        // than merely capping it.
         let mut w = Writer::new(Vec::new());
 
         w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
@@ -1320,7 +1308,7 @@ impl DocxWriter {
     /// boxes, and each header/footer/footnote/endnote's own element tree.
     /// `generate_numbering_xml` used to scan only the top-level
     /// `self.elements`, so a list nested in a cell/text box/header never
-    /// got its own `abstractNum`/`num` definitions at all — before #339's
+    /// got its own `abstractNum`/`num` definitions at all — before the
     /// fix gave such lists their own `RichList` entries in the first
     /// place, this had no effect (they were flat paragraphs), but without
     /// this recursive collection that fix would still have produced
@@ -1380,11 +1368,11 @@ impl DocxWriter {
         write_abstract_num(&mut w, 1, &[(0, "decimal", "%1.".to_string())]);
 
         // One logical list's recursive nesting levels now share a single
-        // `numId` (issue #261), so group by `num_id` here rather than
+        // `numId`, so group by `num_id` here rather than
         // emitting one abstractNum/num pair per `RichList` entry — that
         // would redefine the same numId's abstractNumId repeatedly and,
         // worse, only ever define level 0. Collected from everywhere a
-        // `RichList` can appear (issue #339), not just top-level elements.
+        // `RichList` can appear, not just top-level elements.
         let rich_lists = self.all_rich_lists();
         let mut num_ids: Vec<u32> = Vec::new();
         for rl in &rich_lists {
@@ -1484,7 +1472,7 @@ fn convert_ir_table(table: &crate::ir::Table, next_num_id: &mut u32) -> DocxRich
     // (unmerged) entries but a smaller total span. That undercount
     // starved the grid-fill loop below of columns, silently dropping a
     // real cell with content from every row past the miscomputed width
-    // (issue #265). Each cell's own contribution to the sum is clamped
+    //. Each cell's own contribution to the sum is clamped
     // first, not just the final max, so a single huge col_span can't
     // overflow or dominate the sum before the clamp ever applies.
     let num_cols = table
@@ -1643,8 +1631,8 @@ fn convert_ir_element_to_docx_elements(
             // bullet/decimal definitions) made every unrelated ordered list
             // anywhere in these contexts share one numbering sequence, so
             // Word continued list B's numbers from wherever list A left off
-            // instead of restarting at 1 (issue #339, split off from #261
-            // which fixed the analogous top-level-list bug).
+            // instead of restarting at 1 (split off from the
+            // analogous top-level-list bug).
             let num_id = *next_num_id;
             *next_num_id += 1;
             convert_ir_list_at(l, l.level, num_id, out, next_num_id);
@@ -1689,8 +1677,7 @@ fn convert_ir_element_to_docx_elements(
 /// `RichList` entries into. `num_id` is shared across every recursive call
 /// for one logical list (only the `E::List` match arm that calls this
 /// mints a fresh one), matching `add_ir_list_at`'s contract that one
-/// logical list keeps one `numId` across all its nesting levels (issue
-/// #339).
+/// logical list keeps one `numId` across all its nesting levels.
 fn convert_ir_list_at(
     list: &crate::ir::List,
     level: u8,
@@ -1808,14 +1795,13 @@ fn ir_paragraph_to_props(p: &crate::ir::Paragraph) -> IrParaProps {
 // SectPr info helper
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 struct SectPrInfo {
     page_setup: Option<PageSetup>,
     columns: Option<ColumnLayout>,
     break_type: SectionBreakType,
     hf_rids: Vec<(HfType, String)>,
-    footnote_rid: Option<String>,
-    endnote_rid: Option<String>,
+    /// Presence only: sectPr's `<w:footnotePr/>` carries no relationship id.
+    has_footnotes: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2110,7 +2096,7 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph, links: &
         // fragment (`https://…#section`) keeps the relationship on the
         // fragment-free base and carries the fragment as `w:anchor`
         // alongside `r:id`, matching how real Word documents (and this
-        // reader, since #242/#292) encode "external page, jump to
+        // reader) encode "external page, jump to
         // bookmark within it" instead of losing the relationship.
         let split = url.map(split_hyperlink_fragment);
         let wrap = match split {
@@ -2338,8 +2324,7 @@ fn write_run(w: &mut Writer<Vec<u8>>, run: &Run) {
         // no xml:space="preserve" at all — a whitespace-only text node
         // without it may be normalized/collapsed by a consuming
         // processor per XML 1.0 §2.10. The space-only check below never
-        // caught it, since it only looked for ' ', not '\t'/'\r'/'\n'
-        // (issue #294).
+        // caught it, since it only looked for ' ', not '\t'/'\r'/'\n'.
         if text.starts_with(' ')
             || text.ends_with(' ')
             || text.contains("  ")
@@ -2385,7 +2370,7 @@ fn write_footnote_ref_run(
     let mut ref_elem = BytesStart::new(tag);
     // A custom mark (e.g. "*") replaces Word's own auto-number only when
     // this flag says so; without it Word renders the sequential number
-    // regardless of what the note body itself contains (issue #219).
+    // regardless of what the note body itself contains.
     if marker.is_some() {
         ref_elem.push_attribute(("w:customMarkFollows", "1"));
     }
@@ -3470,10 +3455,9 @@ fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
         w.write_event(Event::Empty(elem)).expect("write hfRef");
     }
 
-    if let Some(ref rid) = sp.footnote_rid {
-        let elem = BytesStart::new("w:footnotePr");
-        let _ = rid;
-        w.write_event(Event::Empty(elem)).expect("write footnotePr");
+    if sp.has_footnotes {
+        w.write_event(Event::Empty(BytesStart::new("w:footnotePr")))
+            .expect("write footnotePr");
     }
 
     match sp.break_type {
@@ -3712,7 +3696,7 @@ fn generate_notes_xml(
         w.write_event(Event::Start(note_elem))
             .expect("write note start");
 
-        // A custom mark (issue #219) gets its own leading paragraph rather
+        // A custom mark gets its own leading paragraph rather
         // than being spliced into the first content paragraph's runs — a
         // cosmetic simplification (Word shows it on its own line instead
         // of inline before the note text), not a content-loss one. The
@@ -4077,7 +4061,7 @@ fn write_character_style(w: &mut Writer<Vec<u8>>, style_id: &str, name: &str) {
 
 /// Write one `abstractNum` with one `w:lvl` per entry in `levels`
 /// (`(ilvl, numFmt, lvlText)`). A logical list now keeps a single
-/// `numId`/`abstractNum` across every nesting level (issue #261), so
+/// `numId`/`abstractNum` across every nesting level, so
 /// this must define every level actually used, not just level 0 — a
 /// paragraph referencing an `ilvl` this abstractNum never defines falls
 /// back to Word's own default numbering behavior instead of the level's
@@ -4198,7 +4182,7 @@ fn border_style_val(style: &BorderStyle) -> &'static str {
 /// placeholder in `lvlText` refers to — each nesting level counts
 /// independently (`%1.` at level 0, `%2.` at level 1, …), matching how a
 /// nested list restarts its own numbering rather than continuing the
-/// parent's (issue #261 — every level used to render the same `%1.`
+/// parent's (every level used to render the same `%1.`
 /// regardless of depth, which only happened to look right because each
 /// level got its own, disconnected `numId` before this fix).
 fn list_style_to_fmt(style: Option<&ListStyle>, ordered: bool, ilvl: u8) -> (&'static str, String) {
@@ -4276,7 +4260,7 @@ mod tests {
     /// emitted only when explicit column widths were known, so every table
     /// built from markdown (which carries none) was schema-invalid.
     #[test]
-    fn table_without_explicit_widths_still_carries_a_grid() {
+    fn test_table_without_explicit_widths_still_carries_a_grid() {
         let mut doc = DocxWriter::new();
         let table = crate::ir::Table {
             rows: vec![crate::ir::TableRow {
@@ -4298,7 +4282,7 @@ mod tests {
 
     /// The simple `add_table` writer emitted neither `tblPr` nor `tblGrid`.
     #[test]
-    fn simple_table_carries_properties_and_grid() {
+    fn test_simple_table_carries_properties_and_grid() {
         let mut doc = DocxWriter::new();
         doc.add_table(&[vec!["a", "b"], vec!["c", "d"]]);
         let xml = part_xml(doc, "word/document.xml");
@@ -4312,7 +4296,7 @@ mod tests {
         assert_eq!(xml.matches("<w:gridCol").count(), 2);
     }
 
-    /// issue #265 — `num_cols` used to come from the max literal
+    /// `num_cols` used to come from the max literal
     /// `TableCell` *count* per row, not the max col_span-summed grid
     /// width. A single row with a merged cell (spans 1, 2, 1 = grid
     /// width 4, but only 3 `TableCell` entries) computed `num_cols = 3`,
@@ -4320,7 +4304,7 @@ mod tests {
     /// the row's last cell and silently dropped it — even though no
     /// OTHER row had more literal cells either.
     #[test]
-    fn a_row_with_a_merged_cell_does_not_lose_its_last_real_cell() {
+    fn test_a_row_with_a_merged_cell_does_not_lose_its_last_real_cell() {
         use crate::ir::{Element, InlineContent, Paragraph, Table, TableCell, TableRow, TextSpan};
 
         fn cell(text: &str, col_span: u32) -> TableCell {
@@ -4359,7 +4343,7 @@ mod tests {
     /// `abstractNum` must precede every `num`. Emitting them interleaved,
     /// one pair per list, put an `abstractNum` after a `num`.
     #[test]
-    fn numbering_puts_every_abstract_definition_before_every_instance() {
+    fn test_numbering_puts_every_abstract_definition_before_every_instance() {
         let mut doc = DocxWriter::new();
         for ordered in [true, false, true] {
             doc.add_ir_list(&crate::ir::List {
@@ -4389,7 +4373,7 @@ mod tests {
     /// `CT_Anchor` orders the wrap group before `docPr`. Both anchor writers
     /// emitted `docPr` first.
     #[test]
-    fn floating_anchor_puts_the_wrap_before_doc_pr() {
+    fn test_floating_anchor_puts_the_wrap_before_doc_pr() {
         let mut doc = DocxWriter::new();
         doc.add_text_box(&crate::ir::TextBox::default());
         let xml = part_xml(doc, "word/document.xml");
@@ -4403,7 +4387,7 @@ mod tests {
 
     /// `CT_PageMar` declares seven attributes, all `use="required"`.
     #[test]
-    fn page_margins_carry_every_required_attribute() {
+    fn test_page_margins_carry_every_required_attribute() {
         let mut doc = DocxWriter::new();
         doc.add_paragraph("x");
         doc.set_section_props(
@@ -4425,7 +4409,7 @@ mod tests {
 
     /// `CT_PPrBase` orders `spacing` before `ind`.
     #[test]
-    fn paragraph_properties_put_spacing_before_indent() {
+    fn test_paragraph_properties_put_spacing_before_indent() {
         let mut doc = DocxWriter::new();
         doc.add_ir_paragraph(
             &[Run::new("x")],
@@ -4442,14 +4426,14 @@ mod tests {
         assert!(spacing < ind, "CT_PPrBase requires spacing before ind");
     }
 
-    /// issue #261 — a nested list's items used to get a brand-new,
+    /// A nested list's items used to get a brand-new,
     /// unrelated `numId` per level, so the reader (which groups
     /// consecutive paragraphs by matching `numId`, per spec) re-parsed
     /// the nested sub-list as an unrelated sibling top-level list rather
     /// than a child of the parent item. All levels of one logical list
     /// must share a single `numId`, varying only `w:ilvl`.
     #[test]
-    fn nested_list_items_share_one_num_id_across_levels() {
+    fn test_nested_list_items_share_one_num_id_across_levels() {
         let mut doc = DocxWriter::new();
         let nested = crate::ir::List {
             ordered: false,
@@ -4491,12 +4475,12 @@ mod tests {
         assert!(xml.contains(r#"w:ilvl w:val="1""#), "nested item must be at ilvl 1: {xml}");
     }
 
-    /// issue #261 — the shared numId's abstractNum must define BOTH
+    /// The shared numId's abstractNum must define BOTH
     /// levels actually used (not just ilvl 0), so a nested level's real
     /// ordered/bullet style is honored instead of falling back to
     /// whatever Word does with an undefined level.
     #[test]
-    fn nested_list_abstract_num_defines_both_levels() {
+    fn test_nested_list_abstract_num_defines_both_levels() {
         let mut doc = DocxWriter::new();
         let nested = crate::ir::List {
             ordered: false,
@@ -4554,15 +4538,15 @@ mod tests {
         })
     }
 
-    /// issue #292 — a pure same-document anchor (`#anchor`, no external
+    /// A pure same-document anchor (`#anchor`, no external
     /// URL) used to get a fabricated `TargetMode="External"` relationship
     /// pointing at the literal string `"#anchor"`, which is not a URL.
     /// It must instead be `<w:hyperlink w:anchor="…">` with no
     /// relationship at all.
-    /// issue #218 — content past MAX_NESTING_DEPTH was dropped with only
+    /// Content past MAX_NESTING_DEPTH was dropped with only
     /// a log::warn!; a caller had no way to learn the document they just
     /// wrote was missing content. truncated_subtrees() must report it.
-    /// issue #295 — a DOCX image part got only a per-part Override
+    /// A DOCX image part got only a per-part Override
     /// content-type declaration, no matching Default (an inconsistency
     /// with XLSX's own image-writing path).
     #[test]
@@ -4588,7 +4572,7 @@ mod tests {
         );
     }
 
-    /// issue #295 — DOCX's hand-rolled font-embedding path (which
+    /// DOCX's hand-rolled font-embedding path (which
     /// duplicates the shared core::embedded_fonts logic) omitted the
     /// matching Default-registration call too.
     #[test]
@@ -4603,7 +4587,7 @@ mod tests {
         );
     }
 
-    /// issue #220 — pretty-printed indentation made document.xml grow
+    /// pretty-printed indentation made document.xml grow
     /// Θ(depth²): 2 x nesting_level spaces per line, ~9 XML levels per
     /// text-box level. Compares output size at two nesting depths; a
     /// roughly-doubled depth must not roughly-quadruple the output.
@@ -4698,7 +4682,7 @@ mod tests {
 
     #[test]
     fn test_tab_only_run_gets_xml_space_preserve() {
-        // issue #294 — a run whose text is a tab character was written
+        // A run whose text is a tab character was written
         // as <w:t>\t</w:t> with no xml:space="preserve"; a whitespace-only
         // text node without it may be collapsed by a consuming processor.
         let mut doc = DocxWriter::new();
@@ -4745,7 +4729,7 @@ mod tests {
         );
     }
 
-    /// issue #292 — an external URL with a fragment (`https://…#section`,
+    /// An external URL with a fragment (`https://…#section`,
     /// the standard "external doc, jump to bookmark" shape, and how real
     /// Word TOC/cross-reference entries always look) must keep BOTH the
     /// relationship (on the fragment-free base) and the fragment itself,
@@ -4783,7 +4767,7 @@ mod tests {
     /// A footnote hyperlink's `r:id` must resolve within footnotes.xml's
     /// own rels, not document.xml's — reusing one package-wide map
     /// registered against document.xml left a dangling relationship in
-    /// every footnote/endnote/header/footer hyperlink on write (#293).
+    /// every footnote/endnote/header/footer hyperlink on write.
     #[test]
     fn test_footnote_hyperlink_gets_a_relationship_in_its_own_rels_part() {
         use crate::ir::{Element, InlineContent, Paragraph, TextSpan};
@@ -4829,8 +4813,8 @@ mod tests {
     }
 
     /// Same bug, header side: a header hyperlink's r:id must resolve
-    /// within header1.xml's own rels, not document.xml's (#293's write-
-    /// side bug class, same fix applied to headers/footers too).
+    /// within header1.xml's own rels, not document.xml's (the footnote
+    /// write-side bug class, same fix applied to headers/footers too).
     #[test]
     fn test_header_hyperlink_gets_a_relationship_in_its_own_rels_part() {
         use crate::ir::{Element, InlineContent, Paragraph, TextSpan};
@@ -4865,7 +4849,7 @@ mod tests {
     }
 
     /// End-to-end: a footnote hyperlink written out and read back resolves
-    /// to its real URL, not a dangling relationship id (#293, write side).
+    /// to its real URL, not a dangling relationship id (write side).
     #[test]
     fn test_footnote_hyperlink_round_trips_to_the_real_url() {
         use crate::ir::{Element, InlineContent, Paragraph, TextSpan};
@@ -4927,7 +4911,7 @@ mod tests {
     /// the style were gated on the body alone. The result is schema-valid
     /// and has a `w:numId` pointing at a part that does not exist.
     #[test]
-    fn a_list_outside_the_body_still_gets_its_numbering_and_style() {
+    fn test_a_list_outside_the_body_still_gets_its_numbering_and_style() {
         let mut doc = DocxWriter::new();
         doc.add_paragraph("body text, no lists at top level");
         doc.add_section_header(HfType::DefaultHeader, vec![ir_list(false, "hdr item")]);
@@ -4954,7 +4938,7 @@ mod tests {
     /// A run may carry a footnote reference with no matching note part, so
     /// the reference character styles must always be defined.
     #[test]
-    fn note_reference_styles_are_always_defined() {
+    fn test_note_reference_styles_are_always_defined() {
         let mut doc = DocxWriter::new();
         doc.add_ir_paragraph(
             &[
@@ -4979,7 +4963,7 @@ mod tests {
 
     /// Word expects the separator and continuationSeparator notes.
     #[test]
-    fn notes_part_carries_the_separator_notes() {
+    fn test_notes_part_carries_the_separator_notes() {
         let mut doc = DocxWriter::new();
         doc.add_footnote(1, &[crate::ir::Element::Paragraph(Default::default())], None);
         let parts = all_parts(doc);
@@ -4993,7 +4977,7 @@ mod tests {
 
     /// An ordered list nested in a cell must not silently become bullets.
     #[test]
-    fn a_nested_ordered_list_uses_the_ordered_numbering_definition() {
+    fn test_a_nested_ordered_list_uses_the_ordered_numbering_definition() {
         let mut doc = DocxWriter::new();
         let table = crate::ir::Table {
             rows: vec![crate::ir::TableRow {
@@ -5011,7 +4995,7 @@ mod tests {
         // A list nested in a table cell now mints its own numId (>= 3),
         // not the shared reserved decimal definition (numId 2) — reusing
         // numId 2 for every such list cross-contaminated numbering between
-        // unrelated lists (issue #339). numId 1 is reserved for bullets,
+        // unrelated lists. numId 1 is reserved for bullets,
         // so this list must not use it either.
         assert!(
             xml.contains(r#"<w:numId w:val="3"/>"#),
@@ -5032,12 +5016,12 @@ mod tests {
         );
     }
 
-    /// issue #339 — two unrelated ordered lists nested in two different
+    /// Two unrelated ordered lists nested in two different
     /// table cells must get two different `numId`s, not share the one
     /// reserved decimal definition (which made Word continue list B's
     /// numbers from wherever list A left off instead of restarting at 1).
     #[test]
-    fn two_unrelated_nested_lists_in_different_cells_get_different_num_ids() {
+    fn test_two_unrelated_nested_lists_in_different_cells_get_different_num_ids() {
         let mut doc = DocxWriter::new();
         let table = crate::ir::Table {
             rows: vec![crate::ir::TableRow {
@@ -5067,7 +5051,7 @@ mod tests {
     /// `w:type="first"` does nothing without `w:titlePg`; a `w:type="even"`
     /// header does nothing without `w:evenAndOddHeaders` in settings.xml.
     #[test]
-    fn first_and_even_page_headers_carry_the_switches_that_enable_them() {
+    fn test_first_and_even_page_headers_carry_the_switches_that_enable_them() {
         let mut doc = DocxWriter::new();
         doc.add_paragraph("x");
         doc.add_section_header(HfType::FirstPageHeader, vec![]);
@@ -5093,7 +5077,7 @@ mod tests {
 
     /// At most one header/footer reference of each type per section.
     #[test]
-    fn section_properties_carry_one_reference_per_type() {
+    fn test_section_properties_carry_one_reference_per_type() {
         let mut doc = DocxWriter::new();
         doc.add_paragraph("x");
         for _ in 0..3 {
@@ -5114,7 +5098,7 @@ mod tests {
     }
 
     #[test]
-    fn rich_run_bold_italic() {
+    fn test_rich_run_bold_italic() {
         let mut doc = DocxWriter::new();
         doc.add_rich_paragraph(&[
             Run::new("Hello ").bold(),
@@ -5127,7 +5111,7 @@ mod tests {
     }
 
     #[test]
-    fn alignment_center() {
+    fn test_alignment_center() {
         let mut doc = DocxWriter::new();
         doc.add_paragraph_aligned("Centred", Alignment::Center);
         let parsed = roundtrip(doc);
@@ -5135,7 +5119,7 @@ mod tests {
     }
 
     #[test]
-    fn page_break_roundtrip() {
+    fn test_page_break_roundtrip() {
         let mut doc = DocxWriter::new();
         doc.add_paragraph("Before");
         doc.add_page_break();
@@ -5147,7 +5131,7 @@ mod tests {
     }
 
     #[test]
-    fn font_size_and_name() {
+    fn test_font_size_and_name() {
         let mut doc = DocxWriter::new();
         doc.add_rich_paragraph(&[Run::new("Big text").font_size(24.0).font("Arial")]);
         let parsed = roundtrip(doc);
@@ -5155,7 +5139,7 @@ mod tests {
     }
 
     #[test]
-    fn underline_strikethrough() {
+    fn test_underline_strikethrough() {
         let mut doc = DocxWriter::new();
         doc.add_rich_paragraph(&[
             Run::new("under").underline(),
@@ -5168,7 +5152,7 @@ mod tests {
     }
 
     #[test]
-    fn column_break_roundtrip() {
+    fn test_column_break_roundtrip() {
         let mut doc = DocxWriter::new();
         doc.add_paragraph("Col 1");
         doc.add_column_break();
@@ -5180,7 +5164,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_paragraph_with_props() {
+    fn test_ir_paragraph_with_props() {
         let mut doc = DocxWriter::new();
         let props = IrParaProps {
             alignment: Some(ParagraphAlignment::Center),
@@ -5193,7 +5177,7 @@ mod tests {
     }
 
     #[test]
-    fn code_block_roundtrip() {
+    fn test_code_block_roundtrip() {
         let mut doc = DocxWriter::new();
         doc.add_code_block("fn main() {\n    println!(\"hello\");\n}");
         let parsed = roundtrip(doc);

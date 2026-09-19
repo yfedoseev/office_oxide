@@ -172,7 +172,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_compressed_sst() {
+    fn test_parse_compressed_sst() {
         // SST: total=2, unique=2, then two compressed strings "AB" and "CD".
         let mut data = Vec::new();
         data.extend_from_slice(&2u32.to_le_bytes()); // total
@@ -193,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_wide_sst() {
+    fn test_parse_wide_sst() {
         let mut data = Vec::new();
         data.extend_from_slice(&1u32.to_le_bytes());
         data.extend_from_slice(&1u32.to_le_bytes());
@@ -210,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_sst_with_rich_text() {
+    fn test_parse_sst_with_rich_text() {
         let mut data = Vec::new();
         data.extend_from_slice(&1u32.to_le_bytes());
         data.extend_from_slice(&1u32.to_le_bytes());
@@ -228,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn read_short_compressed() {
+    fn test_read_short_compressed() {
         // "Test" as short string: len=4, flags=0, "Test"
         let data = [4, 0x00, b'T', b'e', b's', b't'];
         let (s, pos) = read_short_unicode_string(&data, 0).unwrap();
@@ -237,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn read_short_wide() {
+    fn test_read_short_wide() {
         let mut data = vec![2u8, 0x01]; // 2 chars, wide
         data.extend_from_slice(&(b'O' as u16).to_le_bytes());
         data.extend_from_slice(&(b'K' as u16).to_le_bytes());

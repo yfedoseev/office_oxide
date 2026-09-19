@@ -64,7 +64,7 @@ fn table_row_count(ir: &DocumentIR) -> usize {
 }
 
 #[test]
-fn oversized_sheet_is_capped_with_notice() {
+fn test_oversized_sheet_is_capped_with_notice() {
     // 5 rows over the cap. This also completes quickly, demonstrating the sheet
     // no longer builds an unbounded IR.
     let ir = roundtrip_sheet(CAP + 5);
@@ -94,7 +94,7 @@ fn oversized_sheet_is_capped_with_notice() {
 }
 
 #[test]
-fn ordinary_sheet_is_untouched() {
+fn test_ordinary_sheet_is_untouched() {
     let ir = roundtrip_sheet(5);
     assert_eq!(table_row_count(&ir), 5, "small sheet must keep all rows");
     let has_notice = ir

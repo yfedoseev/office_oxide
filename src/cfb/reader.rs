@@ -89,7 +89,7 @@ impl<R: Read + Seek> CfbReader<R> {
     /// confusing "piece table outside the stream" error (the wrong,
     /// smaller stream was returned), 2 silently extracted the embedded
     /// object's content as if it were the document's own, both with
-    /// `Ok`/no signal anything was substituted (issue #226).
+    /// `Ok`/no signal anything was substituted.
     pub fn find_entry(&self, name: &str) -> Option<usize> {
         if self.entries.is_empty() || self.entries[0].entry_type != EntryType::RootStorage {
             return None;
@@ -506,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn open_minimal_cfb() {
+    fn test_open_minimal_cfb() {
         let data = build_minimal_cfb();
         let cursor = Cursor::new(data);
         let reader = CfbReader::new(cursor).unwrap();
@@ -517,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn read_stream_by_name() {
+    fn test_read_stream_by_name() {
         let data = build_minimal_cfb();
         let cursor = Cursor::new(data);
         let mut reader = CfbReader::new(cursor).unwrap();
@@ -587,7 +587,7 @@ mod tests {
         file
     }
 
-    /// issue #226 — find_entry/open_stream used to flat-scan the
+    /// find_entry/open_stream used to flat-scan the
     /// directory array in on-disk order, so an embedded sub-document's
     /// same-named stream at a lower array index silently won over the
     /// top-level document's own stream of the same name.
@@ -602,7 +602,7 @@ mod tests {
         );
     }
 
-    /// issue #283 — a `_VBA_PROJECT` (or here, "ObjectPool") root-level
+    /// A `_VBA_PROJECT` (or here, "ObjectPool") root-level
     /// entry is a STORAGE, not a stream; `find_entry`/`has_stream` alone
     /// can never see it, since they only match streams. `has_root_entry`
     /// must find it regardless of type, and must not match a nested
@@ -616,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn read_stream_case_insensitive() {
+    fn test_read_stream_case_insensitive() {
         let data = build_minimal_cfb();
         let cursor = Cursor::new(data);
         let mut reader = CfbReader::new(cursor).unwrap();
@@ -625,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_not_found() {
+    fn test_stream_not_found() {
         let data = build_minimal_cfb();
         let cursor = Cursor::new(data);
         let mut reader = CfbReader::new(cursor).unwrap();
@@ -633,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn has_stream() {
+    fn test_has_stream() {
         let data = build_minimal_cfb();
         let cursor = Cursor::new(data);
         let reader = CfbReader::new(cursor).unwrap();
@@ -730,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn read_mini_stream() {
+    fn test_read_mini_stream() {
         let data = build_cfb_with_mini_stream();
         let cursor = Cursor::new(data);
         let mut reader = CfbReader::new(cursor).unwrap();
@@ -739,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn find_entry_by_path_simple() {
+    fn test_find_entry_by_path_simple() {
         let data = build_minimal_cfb();
         let cursor = Cursor::new(data);
         let reader = CfbReader::new(cursor).unwrap();

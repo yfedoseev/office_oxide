@@ -134,9 +134,9 @@ fn element_to_json(elem: &office_oxide::ir::Element) -> serde_json::Value {
         // the fallback of last resort: it at least carries the Debug
         // dump, so a new variant is *visibly incomplete* on this surface
         // rather than indistinguishable from a variant that was properly
-        // handled (issue #221; #221's own maximal-Section round-trip
-        // test, and this crate's Shape-specific test, are what actually
-        // catch a future miss like this one).
+        // handled (the maximal-Section round-trip test and this crate's
+        // Shape-specific test are what actually catch a future miss like
+        // this one).
         other => json!({ "type": "unimplemented", "debug": format!("{other:?}") }),
     }
 }
@@ -175,7 +175,7 @@ fn inline_to_json(content: &[office_oxide::ir::InlineContent]) -> Vec<serde_json
                 "id": r.note_id,
             }),
             // `InlineContent` is also `#[non_exhaustive]`; same reasoning
-            // as element_to_json above (issue #221).
+            // as element_to_json above.
             other => json!({ "type": "unimplemented", "debug": format!("{other:?}") }),
         })
         .collect()
@@ -209,7 +209,7 @@ mod tests {
 
     use super::ir_to_json;
 
-    /// issue #221 — speaker_notes is a sibling of `Section::elements`, not
+    /// speaker_notes is a sibling of `Section::elements`, not
     /// one of its items; the CLI's JSON projection missed it once already
     /// (only caught by a multi-thousand-file corpus sweep). Locked in here
     /// as a fast unit test.
@@ -268,10 +268,10 @@ mod tests {
         assert!(!rendered.contains("unknown"), "no element should render as unknown: {rendered}");
     }
 
-    /// issue #299 — `Image::hyperlink` (a shape's own click action) was
+    /// `Image::hyperlink` (a shape's own click action) was
     /// added to the IR but the CLI's JSON projection only ever surfaced
     /// `alt_text`, the same "field added, one consumer missed" shape
-    /// #221 already found once for `speaker_notes`.
+    /// already found once for `speaker_notes`.
     #[test]
     fn test_image_hyperlink_reaches_the_json_projection() {
         let ir = DocumentIR {
@@ -297,7 +297,7 @@ mod tests {
         );
     }
 
-    /// issue #332 — `.doc` comments and real endnotes both reach the IR as
+    /// `.doc` comments and real endnotes both reach the IR as
     /// `Element::Endnote` (there's no dedicated `Element::Comment`), and
     /// `Note::marker` ("comment" vs "endnote") is the only thing that tells
     /// them apart. The JSON projection dropped it, making the two
@@ -341,7 +341,7 @@ mod tests {
         );
     }
 
-    /// issue #298 — `Note::author` (comment authorship) reached no
+    /// `Note::author` (comment authorship) reached no
     /// consumer at all, including the `ir` command's own JSON projection.
     #[test]
     fn test_note_author_reaches_the_json_projection() {
@@ -366,7 +366,7 @@ mod tests {
         );
     }
 
-    /// issue #333 — `inline_to_json` used to project only `text`/`bold`/
+    /// `inline_to_json` used to project only `text`/`bold`/
     /// `italic`/`strikethrough`/`hyperlink` from a `TextSpan`, silently
     /// dropping every other formatting field the IR actually carries.
     #[test]
@@ -408,7 +408,7 @@ mod tests {
         assert!(rendered.contains(r#""alignment":"center""#), "{rendered}");
     }
 
-    /// issue #252 — a worksheet's conditional formatting rules must reach
+    /// A worksheet's conditional formatting rules must reach
     /// the `ir` command's JSON output.
     #[test]
     fn test_conditional_formats_reach_the_json_projection() {
@@ -437,7 +437,7 @@ mod tests {
         );
     }
 
-    /// issue #275 — a worksheet's data validation rules must reach the
+    /// A worksheet's data validation rules must reach the
     /// `ir` command's JSON output.
     #[test]
     fn test_data_validations_reach_the_json_projection() {

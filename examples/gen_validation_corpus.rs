@@ -185,7 +185,7 @@ fn maximal_properties_corpus(out: &str) {
             height_twips: 400,
         }),
         // Not exercised here: no writer currently emits `<p:ph type="...">`
-        // from this field (issue #258 is read-only: PPTX/PPT -> IR).
+        // from this field (placeholder roles are read-only: PPTX/PPT -> IR).
         placeholder_role: None,
     };
 

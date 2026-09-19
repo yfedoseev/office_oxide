@@ -74,7 +74,7 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         // Must use the same extraction the write path's "is the title
         // already present in the elements" check uses (`inline_to_text`),
         // or a heading containing a `LineBreak` disagrees between the two
-        // and gets duplicated on every write (issue #338).
+        // and gets duplicated on every write.
         let title = elements.iter().find_map(|e| {
             if let Element::Heading(h) = e { Some(inline_to_text(&h.content)) } else { None }
         });
@@ -173,7 +173,7 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         }
         // Comments are annotations rather than body text; carry them as
         // endnotes with the author kept in the marker so nothing is lost,
-        // and in the structured `author` field (issue #298).
+        // and in the structured `author` field.
         for n in &doc.comments {
             let mut content = Vec::new();
             convert_block_elements(&n.content, &mut content, doc);
@@ -396,8 +396,7 @@ fn apply_paragraph_properties(pp: &crate::docx::ParagraphProperties, out: &mut P
 /// ("FootnoteReference"/"EndnoteReference") with the literal glyph as its
 /// only content — so a real Word auto-number run (which carries the same
 /// style but no `w:t`, just an empty `<w:footnoteRef/>`) is never mistaken
-/// for a custom mark: `content` there stays empty, `Text` never appears
-/// (issue #219).
+/// for a custom mark: `content` there stays empty, `Text` never appears.
 fn extract_note_marker<'a>(
     content: &'a [crate::docx::BlockElement],
     style_name: &str,
@@ -424,7 +423,7 @@ fn extract_note_marker<'a>(
 /// `Heading`. Outline-level promotion used to keep only the heading's level,
 /// content, frame position and alignment — indent, spacing, line spacing,
 /// keep-with-next/together, shading, borders and tabs all vanished in the
-/// same step, since `Heading` had no fields to receive them (issue #215).
+/// same step, since `Heading` had no fields to receive them.
 fn apply_paragraph_properties_to_heading(pp: &crate::docx::ParagraphProperties, out: &mut Heading) {
     if let Some(ind) = pp.indent.as_ref() {
         out.indent_left_twips = ind.left.map(|t| t.0);
@@ -522,7 +521,7 @@ fn convert_block_elements(
     // paragraph interrupts it) with no explicit override continues
     // counting from where it left off, per OOXML/Word semantics — not a
     // fresh 1. Tracks the next start number per numId across the several
-    // `convert_list_group` calls this loop makes (issue #243).
+    // `convert_list_group` calls this loop makes.
     let mut numbering_counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     while i < blocks.len() {
         match &blocks[i] {
@@ -541,7 +540,7 @@ fn convert_block_elements(
                 // headings in real documents — checking list membership
                 // first turned every one of them into a ListItem, leaving
                 // the IR with no Headings, no Section.title, no guessed
-                // metadata.title (issue #223).
+                // metadata.title.
                 let heading_level = resolve_heading_level(p, doc);
 
                 // Check if this is a list item — group consecutive list
@@ -642,7 +641,7 @@ fn convert_block_elements(
                 // part (`word/charts/chartN.xml`). The reader resolves it
                 // at open time; hoist the recovered lines to paragraph
                 // siblings so the chart's title, categories, series names
-                // and data values reach the IR (issue #273).
+                // and data values reach the IR.
                 collect_paragraph_chart_text(p, elements);
                 i += 1;
             },
@@ -659,7 +658,7 @@ fn convert_block_elements(
                 // BOTH, growing by one duplicate paragraph every
                 // round trip. Absorbing the immediately-preceding
                 // matching paragraph here instead keeps the caption
-                // represented exactly once (issue #311).
+                // represented exactly once.
                 if let Element::Table(Table { caption: Some(cap), .. }) = &table_elem {
                     let cap = cap.trim();
                     let last_matches = matches!(
@@ -1054,7 +1053,7 @@ fn convert_run(
     // renderer to filter separately) keeps plain_text/to_markdown/to_html
     // and the CLI's JSON projection automatically in agreement, instead
     // of risking a 5th instance of this crate's "two renderers disagree"
-    // flaw (issue #305).
+    // flaw.
     if effective.and_then(|rp| rp.hidden).unwrap_or(false) {
         return;
     }
@@ -1175,7 +1174,7 @@ fn convert_run(
             },
             // The citation point in body text — the note *body* is
             // converted separately into `Element::Footnote`/`Endnote`.
-            // Carrying the reference mark here is what #241 was about:
+            // Carrying the reference mark here is the whole point:
             // before this, to_ir() had the note body but no record of
             // where it was cited.
             crate::docx::RunContent::FootnoteRef(id, _) => {
@@ -1215,8 +1214,8 @@ fn convert_run(
                 }
             },
             // Resolved into a TextBox sibling during from_opc when the
-            // reference could be followed (SmartArt #271, embedded
-            // package #304); an unresolvable one is dropped, matching the
+            // reference could be followed (SmartArt, embedded
+            // package); an unresolvable one is dropped, matching the
             // type's documented intent.
             crate::docx::RunContent::DeferredPart(_) => {},
         }
@@ -1283,7 +1282,8 @@ fn convert_list_group(
     let mut items = Vec::new();
     let mut is_ordered = false;
     // How many items at the group's own (shallowest) level this group
-    // contributes — used to advance `numbering_counts` for issue #243.
+    // contributes — used to advance `numbering_counts` for
+    // interrupted-list continuation.
     let mut top_level_item_count: u32 = 0;
     // The marker style and start value of the *shallowest* level in the
     // group describe the list the IR is about to build. Both used to be
@@ -1321,7 +1321,7 @@ fn convert_list_group(
                             top_ilvl = Some(nr.ilvl);
                             style = number_format_to_list_style(&level.format);
                             // Honour this instance's own `<w:startOverride>`
-                            // when present (issue #260), falling back to the
+                            // when present, falling back to the
                             // abstract level's own `<w:start>`. `w:start`
                             // defaults to 1; only report an explicit
                             // non-default so renderers that ignore the
@@ -1355,7 +1355,7 @@ fn convert_list_group(
 
     // A numId seen earlier in this same block sequence, with no explicit
     // `w:start`/`w:startOverride` this time, continues counting from where
-    // the previous group left off rather than restarting at 1 (issue #243).
+    // the previous group left off rather than restarting at 1.
     if start_number.is_none() {
         if let Some(&prev_count) = numbering_counts.get(&num_id) {
             start_number = Some(prev_count + 1);
@@ -1406,7 +1406,7 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
     // already bounded to `MAX_NESTING_DEPTH`. That bound protects parsing
     // (which runs on its own larger stack), but to_ir() runs on whatever
     // stack the caller has, and re-walking a tree that deep overflowed it
-    // (issue #329, the same defect class as an unguarded XML parse, one
+    // (the same defect class as an unguarded XML parse, one
     // layer downstream of it).
     let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
         return Element::Table(Table {
@@ -1531,8 +1531,7 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
             // from the accepted view — same policy already applied to
             // run-level `w:del` — but its grid position still needs to be
             // accounted for, exactly like a vMerge-continue cell, so later
-            // real cells in the row don't shift into the wrong column
-            // (issue #266).
+            // real cells in the row don't shift into the wrong column.
             let is_deleted = cell.properties.as_ref().is_some_and(|p| p.deleted);
             if is_deleted {
                 grid_col += col_span as usize;
@@ -1552,8 +1551,7 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
             // from `TableCell::text_align` (`docx/write.rs`), but nothing
             // read it back — take the first paragraph's alignment as the
             // cell's own, the same convention the writer uses when it
-            // stamps every paragraph in the cell with this one value
-            // (issue #215).
+            // stamps every paragraph in the cell with this one value.
             let text_align = cell_elements.iter().find_map(|e| match e {
                 Element::Paragraph(p) => p.alignment.clone(),
                 _ => None,

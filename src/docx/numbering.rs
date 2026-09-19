@@ -50,7 +50,7 @@ pub struct NumberingInstance {
     /// — the common, partial-override form that changes only where this
     /// specific numbering instance starts counting, leaving the abstract
     /// level's format/text/justification untouched. The writer already
-    /// emits this; nothing read it back (issue #260).
+    /// emits this; nothing read it back.
     pub start_overrides: HashMap<u8, u32>,
 }
 
@@ -115,7 +115,7 @@ impl NumberingDefinitions {
 
     /// Resolve the *effective* starting value for a numId + ilvl, honouring
     /// this instance's own `<w:startOverride>` when present and falling
-    /// back to the abstract level's `<w:start>` otherwise (issue #260).
+    /// back to the abstract level's `<w:start>` otherwise.
     pub fn resolve_start(&self, num_id: u32, ilvl: u8) -> Option<u32> {
         if let Some(instance) = self.instances.get(&num_id) {
             if let Some(&start) = instance.start_overrides.get(&ilvl) {
@@ -311,7 +311,7 @@ mod tests {
 </w:numbering>"#;
 
     #[test]
-    fn parse_numbering_defs() {
+    fn test_parse_numbering_defs() {
         let defs = NumberingDefinitions::parse(SAMPLE_NUMBERING).unwrap();
         assert_eq!(defs.abstract_nums.len(), 1);
         assert_eq!(defs.instances.len(), 1);
@@ -324,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_numbering_level() {
+    fn test_resolve_numbering_level() {
         let defs = NumberingDefinitions::parse(SAMPLE_NUMBERING).unwrap();
         let level = defs.resolve_level(1, 0).unwrap();
         assert_eq!(level.format, NumberFormat::Bullet);

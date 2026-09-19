@@ -43,7 +43,7 @@ impl PresentationInfo {
         // namespace-aware parsing) let it match that element too, and since
         // `p:extLst` comes after the real `p:sldIdLst` in document order,
         // each `p14:sldIdLst` overwrote the correct slide list in turn,
-        // leaving only the last section's slides (issue #228). `p:sldSz`
+        // leaving only the last section's slides. `p:sldSz`
         // has no `extLst` analogue to collide with, but is guarded the same
         // way for consistency and against a future extension reusing it.
         let mut ext_lst_depth: u32 = 0;
@@ -119,7 +119,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_slide_list() {
+    fn test_parse_slide_list() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
                 xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_no_slides() {
+    fn test_parse_no_slides() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
   <p:sldIdLst/>
@@ -153,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_with_slide_size_only() {
+    fn test_parse_with_slide_size_only() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
   <p:sldSz cx="12192000" cy="6858000"/>
@@ -170,10 +170,10 @@ mod tests {
     /// element that merely shares a local name with the real `p:sldIdLst`.
     /// Matching by local name alone let each section's list overwrite the
     /// real one in turn, so a presentation with N sections lost everything
-    /// but the last section's slides (issue #228). This is the issue's own
+    /// but the last section's slides. This is the issue's own
     /// minimal reproducer XML shape.
     #[test]
-    fn sections_extension_does_not_overwrite_the_real_slide_list() {
+    fn test_sections_extension_does_not_overwrite_the_real_slide_list() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
                 xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">

@@ -7,7 +7,7 @@
 //! by the row/column offset between the two cells — which is what Excel,
 //! openpyxl, and every other serious reader do. office_oxide used to set
 //! `Cell.formula = None` for every follower, making a formula cell
-//! indistinguishable from a cell with no formula at all (#278).
+//! indistinguishable from a cell with no formula at all.
 
 use std::collections::HashMap;
 

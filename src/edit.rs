@@ -30,7 +30,7 @@ impl EditableDocument {
         // `File::open` on a directory succeeds on Linux — only a later
         // `read()` fails, and the zip crate's EOCD scan swallows that IO
         // error into a generic "could not find EOCD" that says nothing
-        // about the real problem. Name it here instead (issue #319).
+        // about the real problem. Name it here instead.
         if path.is_dir() {
             return Err(crate::OfficeError::UnsupportedFormat(format!(
                 "'{}' is a directory, not a document file",
@@ -46,11 +46,11 @@ impl EditableDocument {
             )
         })?;
         // A password-protected OOXML file is a CFB container, not a zip at
-        // all — the same gap #232 fixed for the read-only readers. Unlike
+        // all — the same gap already closed for the read-only readers. Unlike
         // Document::open, this entry point never falls back to a legacy
         // parser, so there's no "genuinely misnamed legacy file" case to
         // distinguish: any CFB-signature file reaching here with an OOXML
-        // extension is unsupported either way (issue #319).
+        // extension is unsupported either way.
         if matches!(format, DocumentFormat::Docx | DocumentFormat::Xlsx | DocumentFormat::Pptx)
             && let Ok(mut file) = std::fs::File::open(path)
             && crate::cfb::is_cfb_container(&mut file).unwrap_or(false)
@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn docx_replace_text_roundtrip() {
+    fn test_docx_replace_text_roundtrip() {
         let data = make_docx_bytes();
         let mut doc =
             EditableDocument::from_reader(Cursor::new(data), DocumentFormat::Docx).unwrap();
@@ -221,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn xlsx_set_cell_roundtrip() {
+    fn test_xlsx_set_cell_roundtrip() {
         let data = make_xlsx_bytes();
         let mut doc =
             EditableDocument::from_reader(Cursor::new(data), DocumentFormat::Xlsx).unwrap();
@@ -233,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn pptx_replace_text_roundtrip() {
+    fn test_pptx_replace_text_roundtrip() {
         let data = make_pptx_bytes();
         let mut doc =
             EditableDocument::from_reader(Cursor::new(data), DocumentFormat::Pptx).unwrap();
@@ -245,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn xlsx_replace_text_is_an_error_not_a_silent_zero() {
+    fn test_xlsx_replace_text_is_an_error_not_a_silent_zero() {
         // Returning 0 was indistinguishable from "the text was not present",
         // so the CLI and MCP server reported success and rewrote the file for
         // an operation that cannot work at all.
@@ -263,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn set_cell_on_docx_returns_error() {
+    fn test_set_cell_on_docx_returns_error() {
         let data = make_docx_bytes();
         let mut doc =
             EditableDocument::from_reader(Cursor::new(data), DocumentFormat::Docx).unwrap();
@@ -274,12 +274,12 @@ mod tests {
     }
 
     #[test]
-    fn from_reader_unsupported_format_returns_error() {
+    fn test_from_reader_unsupported_format_returns_error() {
         let data = vec![0u8; 16];
         assert!(EditableDocument::from_reader(Cursor::new(data), DocumentFormat::Doc).is_err());
     }
 
-    /// issue #319 — EditableDocument::open (the CLI 'replace' subcommand's
+    /// EditableDocument::open (the CLI 'replace' subcommand's
     /// only entry point) had zero magic-byte sniffing, so an encrypted
     /// OOXML file produced a low-level "Could not find EOCD" zip error
     /// instead of naming the real cause.
@@ -300,7 +300,7 @@ mod tests {
         );
     }
 
-    /// issue #319 — a directory passed as the file argument produced the
+    /// A directory passed as the file argument produced the
     /// same confusing "Could not find EOCD" message (File::open on a
     /// directory succeeds on Linux; only a later read() fails).
     #[test]

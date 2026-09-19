@@ -2,7 +2,7 @@
 //! position and author; the actual comment text lives in a `TXO` record
 //! (`0x01B6`) attached to an `OBJ` record (`0x005D`) declaring the
 //! comment's drawing shape. None of the three had any record handling at
-//! all before this module (issue #307).
+//! all before this module.
 //!
 //! Byte layouts verified against Apache POI's `NoteRecord`,
 //! `TextObjectRecord`, and `CommonObjectDataSubRecord` (a mature,
@@ -25,7 +25,7 @@
 //! Scope: `TXO`'s own rich-text formatting runs and its rare "linked to a
 //! cell formula" variant (used by some textboxes/chart elements, not
 //! ordinary comments) are not decoded — a comment's plain text is what's
-//! needed here, matching the same tier of extraction #256/#274 already
+//! needed here, matching the same tier of extraction the PPT picture and WordArt paths already
 //! use for other embedded-text formats.
 
 /// One resolved cell comment: position, author (if present), and text.
@@ -182,47 +182,47 @@ mod tests {
     }
 
     #[test]
-    fn obj_id_reads_the_ftcmo_object_id() {
+    fn test_obj_id_reads_the_ftcmo_object_id() {
         assert_eq!(obj_id(&obj_record(42)), Some(42));
     }
 
     #[test]
-    fn obj_id_rejects_a_non_ftcmo_first_subrecord() {
+    fn test_obj_id_rejects_a_non_ftcmo_first_subrecord() {
         let mut d = obj_record(1);
         d[0] = 0xFF; // corrupt the ft field
         assert_eq!(obj_id(&d), None);
     }
 
     #[test]
-    fn txo_text_compressed_round_trips() {
+    fn test_txo_text_compressed_round_trips() {
         assert_eq!(txo_text(&txo_record("Schroeder: a. GWA", true)).as_deref(), Some("Schroeder: a. GWA"));
     }
 
     #[test]
-    fn txo_text_uncompressed_round_trips() {
+    fn test_txo_text_uncompressed_round_trips() {
         assert_eq!(txo_text(&txo_record("caf\u{e9}", false)).as_deref(), Some("caf\u{e9}"));
     }
 
     #[test]
-    fn txo_text_empty_is_empty_string_not_none() {
+    fn test_txo_text_empty_is_empty_string_not_none() {
         assert_eq!(txo_text(&txo_record("", true)).as_deref(), Some(""));
     }
 
     #[test]
-    fn parse_note_extracts_row_col_shapeid_and_author() {
+    fn test_parse_note_extracts_row_col_shapeid_and_author() {
         let (row, col, shapeid, author) = parse_note(&note_record(5, 2, 42, Some("Elemar"))).unwrap();
         assert_eq!((row, col, shapeid), (5, 2, 42));
         assert_eq!(author.as_deref(), Some("Elemar"));
     }
 
     #[test]
-    fn parse_note_with_no_author_is_none() {
+    fn test_parse_note_with_no_author_is_none() {
         let (_, _, _, author) = parse_note(&note_record(0, 0, 1, None)).unwrap();
         assert!(author.is_none());
     }
 
     #[test]
-    fn truncated_records_are_none_not_a_panic() {
+    fn test_truncated_records_are_none_not_a_panic() {
         assert!(obj_id(&[0u8; 4]).is_none());
         assert!(txo_text(&[0u8; 10]).is_none());
         assert!(parse_note(&[0u8; 5]).is_none());

@@ -3,7 +3,7 @@
 //! crate's earliest days but never matched anywhere until now. Every
 //! "bold title" or "aligned paragraph" previously visible in the IR was
 //! synthetic, keyed off `TextType` classification alone, never actually
-//! read from the file (issue #254).
+//! read from the file.
 //!
 //! Byte layouts verified against the published [MS-PPT] `StyleTextPropAtom`,
 //! `TextPFRun`/`TextCFRun`, `TextPFException`/`TextCFException`, and
@@ -179,8 +179,8 @@ fn parse_pf_run(c: &mut Cursor) -> Option<(usize, ParaFormat)> {
     Some((count, parse_pf_body(c, masks)?))
 }
 
-/// The `TextPFException` body shared by `TextPFRun` (issue #254) and each
-/// level of a `TxMasterStyleAtom` (issue #335) — same `masks: u32` +
+/// The `TextPFException` body shared by `TextPFRun` and each
+/// level of a `TxMasterStyleAtom` — same `masks: u32` +
 /// mask-selected fields, just with a different prefix before this point
 /// (`count: u32` + `indentLevel: u16` for a run; a conditional 2-byte
 /// `indentLevel` for a master style level, see
@@ -259,8 +259,8 @@ fn parse_cf_run(c: &mut Cursor) -> Option<(usize, CharFormat)> {
     Some((count, parse_cf_body(c, masks)?))
 }
 
-/// The `TextCFException` body shared by `TextCFRun` (issue #254) and each
-/// level of a `TxMasterStyleAtom` (issue #335) — same `masks: u32` +
+/// The `TextCFException` body shared by `TextCFRun` and each
+/// level of a `TxMasterStyleAtom` — same `masks: u32` +
 /// mask-selected fields, just with a different prefix (a `count: u32` for
 /// a run; nothing for a master style level, see
 /// [`parse_master_style_level`]).
@@ -334,7 +334,7 @@ fn parse_master_style_level(c: &mut Cursor, has_indent_level_field: bool) -> Opt
 /// own `TxMasterStyleAtom.MAX_INDENT`. `text_type_native_id` is the
 /// record's own `recInstance` — "the atom instance value is the text
 /// type" (POI's own doc comment on this record), encoded exactly like
-/// `TextHeaderAtom`'s `txType` (issue #335).
+/// `TextHeaderAtom`'s `txType`.
 ///
 /// Stops (returning whatever levels parsed cleanly so far) on any
 /// malformed/truncated level rather than propagating an error — master
@@ -359,7 +359,7 @@ impl CharFormat {
     /// keeping every field this format *did* specify untouched — the
     /// "only fill in what's missing" inheritance [MS-PPT] describes for
     /// a placeholder shape falling back to its master's
-    /// `TextMasterStyleAtom` (issue #335).
+    /// `TextMasterStyleAtom`.
     pub fn inherit_from(&self, master: &CharFormat) -> CharFormat {
         CharFormat {
             bold: self.bold.or(master.bold),
@@ -438,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_worked_example_pf_run_with_bullet_size_and_color() {
+    fn test_spec_worked_example_pf_run_with_bullet_size_and_color() {
         // [MS-PPT] "Paragraph Formatting" 3.9.1 worked example: count=42,
         // indentLevel=0, masks has bulletHasSize+bulletColor+bulletSize
         // set, bulletFlags=0x..., bulletSize=0x0032, bulletColor=4 bytes.
@@ -464,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn bold_italic_underline_decoded_from_cf_run() {
+    fn test_bold_italic_underline_decoded_from_cf_run() {
         let mut data = Vec::new();
         // One PF run covering everything, no optional fields.
         data.extend(le32(6));
@@ -483,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn two_char_runs_with_different_formatting_split_correctly() {
+    fn test_two_char_runs_with_different_formatting_split_correctly() {
         let mut data = Vec::new();
         data.extend(le32(10));
         data.extend(le16(0));
@@ -510,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_rgb_color_decoded_scheme_index_left_unset() {
+    fn test_explicit_rgb_color_decoded_scheme_index_left_unset() {
         let mut data = Vec::new();
         data.extend(le32(2));
         data.extend(le16(0));
@@ -535,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn alignment_decoded_from_pf_run() {
+    fn test_alignment_decoded_from_pf_run() {
         let mut data = Vec::new();
         data.extend(le32(5));
         data.extend(le16(0));
@@ -549,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_stops_are_skipped_without_desyncing_later_fields() {
+    fn test_tab_stops_are_skipped_without_desyncing_later_fields() {
         let mut data = Vec::new();
         // PF run with tabStops (2 entries = 8 bytes) followed by align,
         // to prove the fontAlign/align fields after tabStops still parse
@@ -574,14 +574,14 @@ mod tests {
     }
 
     #[test]
-    fn truncated_atom_does_not_panic() {
+    fn test_truncated_atom_does_not_panic() {
         let (para, chars) = parse_style_text_prop(&[0xFF, 0x00], 10);
         assert!(para.is_empty());
         assert!(chars.is_empty());
     }
 
     #[test]
-    fn zero_length_run_does_not_infinite_loop() {
+    fn test_zero_length_run_does_not_infinite_loop() {
         let mut data = Vec::new();
         data.extend(le32(0));
         data.extend(le16(0));
@@ -590,12 +590,12 @@ mod tests {
         assert_eq!(para.len(), 0); // zero-length span isn't pushed, but parsing terminates
     }
 
-    /// issue #335 — a `TxMasterStyleAtom` body with one indent level
+    /// A `TxMasterStyleAtom` body with one indent level
     /// (Title/Body text types carry no per-level `indentLevel` field,
     /// per Apache POI's own `TxMasterStyleAtom#init()`), setting
     /// alignment + font size.
     #[test]
-    fn tx_master_style_atom_single_level_no_indent_field() {
+    fn test_tx_master_style_atom_single_level_no_indent_field() {
         let mut data = Vec::new();
         data.extend(le16(1)); // levels = 1
         data.extend(le32(PF_ALIGN));
@@ -614,7 +614,7 @@ mod tests {
     /// paragraph mask — getting this wrong would desync every field
     /// after it.
     #[test]
-    fn tx_master_style_atom_center_body_has_indent_level_field() {
+    fn test_tx_master_style_atom_center_body_has_indent_level_field() {
         let mut data = Vec::new();
         data.extend(le16(1)); // levels = 1
         data.extend(le16(0)); // indentLevel (present for type >= 5)
@@ -627,13 +627,13 @@ mod tests {
     }
 
     #[test]
-    fn tx_master_style_atom_truncated_does_not_panic() {
+    fn test_tx_master_style_atom_truncated_does_not_panic() {
         let levels = parse_tx_master_style_atom(&[0x01, 0x00], 0);
         assert!(levels.is_empty());
     }
 
     #[test]
-    fn char_format_inherit_from_fills_only_unset_fields() {
+    fn test_char_format_inherit_from_fills_only_unset_fields() {
         let direct = CharFormat { bold: Some(true), ..Default::default() };
         let master = CharFormat { bold: Some(false), font_size: Some(44), ..Default::default() };
         let merged = direct.inherit_from(&master);
@@ -642,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn para_format_inherit_from_fills_only_unset_fields() {
+    fn test_para_format_inherit_from_fills_only_unset_fields() {
         let direct = ParaFormat { alignment: Some(0) };
         let master = ParaFormat { alignment: Some(2) };
         assert_eq!(direct.inherit_from(&master).alignment, Some(0));

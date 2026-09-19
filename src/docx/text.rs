@@ -31,7 +31,7 @@ impl DocxDocument {
         // walking them here too, a footnote-only document returned "" even
         // though it visibly has text, and a document's word count changed
         // depending on which of plain_text()/to_markdown()/to_ir() a caller
-        // used (issue #240).
+        // used.
         for n in self.footnotes.iter().chain(self.endnotes.iter()).chain(self.comments.iter()) {
             plain_text_blocks(&n.content, &mut out);
         }
@@ -63,7 +63,7 @@ impl DocxDocument {
 
         markdown_blocks(&self.body.elements, &ctx, &mut out, 0);
 
-        // See the identical note on plain_text() (issue #240): footnote,
+        // See the identical note on plain_text(): footnote,
         // endnote and comment bodies are real content that to_ir() already
         // carries, and dropping them here made this renderer disagree with
         // that one.
@@ -148,7 +148,7 @@ fn plain_text_blocks(elements: &[BlockElement], out: &mut String) {
 }
 
 fn plain_text_run(run: &Run, out: &mut String) {
-    // `<w:vanish/>` — Word never renders this run at all (issue #305).
+    // `<w:vanish/>` — Word never renders this run at all.
     if run.properties.as_ref().and_then(|rp| rp.hidden).unwrap_or(false) {
         return;
     }
@@ -160,7 +160,7 @@ fn plain_text_run(run: &Run, out: &mut String) {
             RunContent::Tab => out.push('\t'),
             // A drawing has no text of its own — except a native chart or
             // SmartArt diagram, whose text was resolved from the separate
-            // referenced part at open time (issues #273, #271).
+            // referenced part at open time.
             RunContent::Drawing(d) => {
                 let lines: Vec<&str> = d
                     .chart_text
@@ -177,7 +177,7 @@ fn plain_text_run(run: &Run, out: &mut String) {
                 }
             },
             // Text-box prose is document content — in some real files it is
-            // most of the document (issue #102). It is *block* content, so
+            // most of the document. It is *block* content, so
             // it must be separated from the surrounding run: pasting it in
             // bare fused the last word of a text box to the first word after
             // it (`Linz` + `ANTRAG` -> `LinzANTRAG`).
@@ -194,8 +194,8 @@ fn plain_text_run(run: &Run, out: &mut String) {
                 }
             },
             // The reference mark itself carries no text of its own — the
-            // note *body* is walked separately (issue #240); this is only
-            // the citation point (issue #241), nothing to render here.
+            // note *body* is walked separately; this is only
+            // the citation point, nothing to render here.
             RunContent::FootnoteRef(..) | RunContent::EndnoteRef(..) | RunContent::CommentRef(_) => {},
             RunContent::FormField(ff) => {
                 if let Some(text) = &ff.display_text {
@@ -219,7 +219,7 @@ fn plain_text_table(table: &Table, out: &mut String) {
     // which gets its own larger stack) is still deep enough to overflow.
     // Past the cap, stop descending rather than crash the whole process —
     // the same defect class as an unguarded XML parse, just one layer
-    // downstream of it (issue #329).
+    // downstream of it.
     let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
         out.push_str(&format!(
             "[nested table deeper than {} levels not shown — document truncated]\n",
@@ -230,7 +230,7 @@ fn plain_text_table(table: &Table, out: &mut String) {
     for row in &table.rows {
         // A cell deleted via tracked changes is excluded from the
         // accepted view, same policy already applied to run-level
-        // `w:del` (issue #266).
+        // `w:del`.
         let cells: Vec<_> = row
             .cells
             .iter()
@@ -263,9 +263,9 @@ fn markdown_blocks(elements: &[BlockElement], ctx: &MarkdownCtx, out: &mut Strin
     // This renderer processes one paragraph at a time with no notion of
     // "list group" the way convert_docx.rs's IR path has, so each level's
     // count is simply "one more than last time this exact level was
-    // seen" — matching #243's own per-numId continuation semantics.
+    // seen" — matching the per-numId continuation semantics of the reader.
     // Without this every item printed the abstract level's bare
-    // `<w:start>` value forever (issue #316, the 4th instance of this
+    // `<w:start>` value forever (the 4th instance of this
     // crate's "two renderers disagree" flaw).
     let mut numbering_counts: std::collections::HashMap<(u32, u8), u32> =
         std::collections::HashMap::new();
@@ -306,7 +306,7 @@ fn markdown_blocks_inner(
                     // than the last time this exact (num_id, ilvl) was
                     // seen, or the effective start (honoring
                     // startOverride) on first encounter — not the bare
-                    // abstract-level start reprinted forever (issue #316).
+                    // abstract-level start reprinted forever.
                     let mut next_ordinal = || {
                         let key = (nr.num_id, nr.ilvl);
                         let next = match numbering_counts.get(&key) {
@@ -477,7 +477,7 @@ fn flush_run(pending: &mut Option<(RunStyle, String)>, out: &mut String) {
 
 /// Collect a run's text content (no emphasis delimiters).
 fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, text: &mut String) {
-    // `<w:vanish/>` — Word never renders this run at all (issue #305).
+    // `<w:vanish/>` — Word never renders this run at all.
     if run.properties.as_ref().and_then(|rp| rp.hidden).unwrap_or(false) {
         return;
     }
@@ -555,7 +555,7 @@ fn markdown_table(table: &Table, _ctx: &MarkdownCtx, out: &mut String) {
 
     for row in &table.rows {
         let mut cells: Vec<String> = Vec::new();
-        // Same tracked-changes policy as plain_text_table (issue #266).
+        // Same tracked-changes policy as plain_text_table.
         for cell in row
             .cells
             .iter()

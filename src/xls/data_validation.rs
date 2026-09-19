@@ -2,7 +2,7 @@
 //! header (`0x01B2`). No record handling for either existed at all before
 //! this module — data validation was a total scope gap, not merely an
 //! extraction bug, matching the already-fixed conditional-formatting gap
-//! (issue #252) at the same severity tier (issue #275).
+//! at the same severity tier.
 //!
 //! Byte layout verified against Apache POI's `DVRecord`/`DVALRecord`
 //! (a mature, independent reference implementation of the same [MS-XLS]
@@ -158,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn whole_number_between_rule() {
+    fn test_whole_number_between_rule() {
         // data_type=0x01 (whole), operator bits=0 (between), allow_blank set.
         let flags = 0x01 | 0x0000_0100;
         let data = dv_record(flags, &[0xAA; 4], &[0xBB; 4], &[(0, 0, 0, 0)]);
@@ -172,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn list_type_has_no_operator() {
+    fn test_list_type_has_no_operator() {
         let flags = 0x03; // list, allow_blank unset
         let data = dv_record(flags, &[], &[], &[(1, 1, 1, 1)]);
         let dv = parse_dv(&data).unwrap();
@@ -183,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn greater_than_operator_decoded() {
+    fn test_greater_than_operator_decoded() {
         // data_type=0x02 (decimal), operator bits=4 (greaterThan).
         let flags = 0x02 | (4u32 << 20);
         let data = dv_record(flags, &[0xCC; 2], &[], &[(0, 4, 0, 0)]);
@@ -194,20 +194,20 @@ mod tests {
     }
 
     #[test]
-    fn multi_range_sqref_is_space_joined() {
+    fn test_multi_range_sqref_is_space_joined() {
         let data = dv_record(0x04, &[], &[], &[(0, 0, 0, 0), (2, 4, 1, 2)]);
         let dv = parse_dv(&data).unwrap();
         assert_eq!(dv.range, "A1 B3:C5");
     }
 
     #[test]
-    fn truncated_record_is_none_not_a_panic() {
+    fn test_truncated_record_is_none_not_a_panic() {
         assert!(parse_dv(&[0u8; 3]).is_none());
         assert!(parse_dv(&[0u8; 10]).is_none());
     }
 
     #[test]
-    fn no_ranges_is_none() {
+    fn test_no_ranges_is_none() {
         let data = dv_record(0x01, &[], &[], &[]);
         assert!(parse_dv(&data).is_none());
     }

@@ -42,7 +42,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // The file's own declared title (from `\x05SummaryInformation`) beats
     // a line-shape guess whenever both exist — a document can style
     // *some* headings and still use plain ALL-CAPS lines for others
-    // (#224), but the declared title is never a guess (issue #244).
+    //, but the declared title is never a guess.
     let summary = doc.summary_properties();
     let title = summary
         .and_then(|s| s.title.clone())
@@ -58,7 +58,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // The header document's PlcfHdd-delimited stories for the first
     // section — this crate models only one `ir::Section` per DOC
     // document, so a document with 2+ sections only surfaces the first
-    // one's headers/footers here (issue #285). When PlcfHdd yielded
+    // one's headers/footers here. When PlcfHdd yielded
     // nothing (older/malformed files), every field below is `None` and
     // the generic-TextBox fallback in the loop below still applies.
     let hf = doc.header_footer();
@@ -80,7 +80,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
         for sub in doc.subdocuments() {
             // Already represented structurally on `Section.header`/
             // `.footer`/etc above — don't also dump the merged blob as a
-            // generic TextBox (issue #285).
+            // generic TextBox.
             if sub.kind == crate::doc::SubDocumentKind::HeadersFooters && header_footer_structured
             {
                 continue;
@@ -89,7 +89,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             // Comments substory into individual, correctly-attributed
             // comments — emit one `Element::Endnote` per comment instead
             // of falling through to the generic merged-substory path
-            // below (issue #345).
+            // below.
             if sub.kind == crate::doc::SubDocumentKind::Comments && !doc.comments().is_empty() {
                 for comment in doc.comments() {
                     let content: Vec<Element> = comment
@@ -122,10 +122,10 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             // local corpus (footnotes 49/51 files, endnotes 5/5 files that
             // had one). Comments carry no such marker in their substory
             // (0/12 files); they're split above via `PlcfandTxt` instead
-            // when that PLC parses cleanly (issue #345). This is the
+            // when that PLC parses cleanly. This is the
             // fallback path for a Comments substory whose `doc.comments()`
             // came back empty (PLC absent/malformed/mismatched) — it stays
-            // merged into one Note, same as before #345.
+            // merged into one Note, same as before endnote/comment splitting existed.
             let splittable = matches!(
                 sub.kind,
                 crate::doc::SubDocumentKind::Footnotes | crate::doc::SubDocumentKind::Endnotes
@@ -155,8 +155,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
                 // every comment in the document — real-world common case.
                 // Multiple names would need per-comment PlcfAtn/ATRD
                 // correlation (not yet implemented) to attribute
-                // correctly, so leave it unset rather than guess (issue
-                // #298).
+                // correctly, so leave it unset rather than guess.
                 let author = match sub.kind {
                     crate::doc::SubDocumentKind::Comments => match doc.comment_authors() {
                         [single] => Some(single.clone()),
@@ -189,11 +188,11 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // were already in hand.
     crate::convert_xls::append_legacy_images(&mut sections, doc.images());
 
-    // Embedded OLE objects (issue #284) — at minimum, recognize each
+    // Embedded OLE objects — at minimum, recognize each
     // object exists and surface its identity, even without extracting
-    // its native payload. Mirrors #337's identical fix for legacy PPT:
+    // its native payload. Mirrors the identical fix for legacy PPT OLE objects:
     // a data-less Element::Image with a descriptive alt_text, the same
-    // precedent #300 established for a data-less AutoShape placeholder.
+    // precedent PPTX established for a data-less AutoShape placeholder.
     if !doc.ole_objects().is_empty() {
         if sections.is_empty() {
             sections.push(Section::default());
@@ -574,7 +573,7 @@ fn walk_paragraphs(
 ) {
     let mut table = TableBuilder::new();
     let mut list_items: Vec<(u8, Vec<InlineContent>)> = Vec::new();
-    // The run's own `ilfo` (issue #250) — every item in one contiguous list
+    // The run's own `ilfo` — every item in one contiguous list
     // run shares the same `ilfo`/`ilvl`-derived list identity in practice
     // (a change of `ilfo` mid-run would itself interrupt list-item
     // membership via `is_doc_list_item`), so the first item's value is
@@ -595,7 +594,7 @@ fn walk_paragraphs(
             // numbered heading ("1. Introduction") is the normal shape of
             // a heading in real documents. Checking ilfo first turned
             // every one of them into a list item and left no Headings in
-            // the IR at all (issue #223).
+            // the IR at all.
             table.flush(elements);
             flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
             emit_heading(&p.text, lvl + 1, elements, &p.hyperlinks, &p.chp_runs);
@@ -635,10 +634,10 @@ fn walk_paragraphs(
 
 /// Emit the accumulated list run as an `Element::List` and clear it.
 ///
-/// `ilfo` is the run's own list identity (issue #250): resolved through
+/// `ilfo` is the run's own list identity: resolved through
 /// `list_formatting` to the declared start-at value and number format for
 /// the run's base level. `None` (no `PlfLst`/`PlfLfo` data, or an `ilfo`
-/// that doesn't resolve) degrades to the pre-#250 contract — bullet,
+/// that doesn't resolve) degrades to the pre-list-format contract — bullet,
 /// `start_number: None` — rather than erroring.
 fn flush_list(
     items: &mut Vec<(u8, Vec<InlineContent>)>,
@@ -673,8 +672,8 @@ fn flush_list(
 /// being flattened into one run.
 ///
 /// `hyperlinks` are `HYPERLINK` field display-text spans as byte ranges into
-/// `text` (issue #249); `chp_runs` are character-property run boundaries,
-/// also byte ranges into `text` (issue #287) — both empty for callers with
+/// `text`; `chp_runs` are character-property run boundaries,
+/// also byte ranges into `text` — both empty for callers with
 /// no per-paragraph data (e.g. the line-shape heading heuristic, which
 /// works over the flat, already-sanitized document text rather than a
 /// single `DocParagraph`).
@@ -715,7 +714,7 @@ fn styled_span(text: &str, props: &ChpProps) -> TextSpan {
 }
 
 /// Push one line-break-free segment of text as one or more `TextSpan`s,
-/// splitting on every hyperlink and character-property (issue #287) run
+/// splitting on every hyperlink and character-property run
 /// boundary that overlaps it. `base` is `seg`'s own byte offset within the
 /// original (pre-split) text, so `hyperlinks`'/`chp_runs`' ranges (computed
 /// against that same original text) line up correctly.
@@ -803,7 +802,7 @@ fn shift_hyperlinks_for_trim(
         .collect()
 }
 
-/// As [`shift_hyperlinks_for_trim`], for CHP run boundaries (issue #287).
+/// As [`shift_hyperlinks_for_trim`], for CHP run boundaries.
 fn shift_chp_runs_for_trim(
     chp_runs: &[(std::ops::Range<usize>, ChpProps)],
     trim_start: usize,
@@ -914,7 +913,7 @@ fn emit_prose(
 /// Reject line shapes the ALL-CAPS / short-opening-line heading guess in
 /// `emit_prose` otherwise misclassifies as headings: pure separator lines,
 /// bare dates, UK postcodes, and "CCY - symbol" currency labels — all
-/// confirmed junk from the 246-file `.doc` corpus sweep behind issue #224
+/// confirmed junk from the 246-file `.doc` corpus sweep that tightened the heading guess
 /// (`______________________________________________`, `11/16/2016`,
 /// `SW8 5NQ`, `GBP - £`). The guess otherwise stays as-is — no reference
 /// implementation does line-shape heading detection at all, so this only
@@ -984,7 +983,7 @@ fn line_heuristic(text: &str, elements: &mut Vec<Element>) {
 }
 
 /// Build a `HeaderFooter` from one `PlcfHdd`-delimited story's already
-/// sanitized text (issue #285).
+/// sanitized text.
 fn text_to_header_footer(s: &str) -> HeaderFooter {
     HeaderFooter {
         content: s
@@ -1035,7 +1034,7 @@ mod tests {
     /// across rows (Word rounds per row) must be snapped together, otherwise
     /// a spurious grid edge inflates `col_span` for every cell spanning it.
     #[test]
-    fn column_edge_tolerance_collapses_near_boundaries() {
+    fn test_column_edge_tolerance_collapses_near_boundaries() {
         // Row 0 and row 1 share edges 0/2000; row 1's middle edge is 3 twips
         // off (1003 vs 1000) — within `EDGE_TOLERANCE_TWIPS`.
         let rows = vec![
@@ -1071,11 +1070,11 @@ mod tests {
         }
     }
 
-    /// issue #249 — a `HYPERLINK` field's display text must reach
+    /// A `HYPERLINK` field's display text must reach
     /// `TextSpan::hyperlink` in the IR, with the surrounding plain text on
     /// either side kept as ordinary, unlinked runs.
     #[test]
-    fn hyperlink_span_reaches_textspan_hyperlink_in_the_ir() {
+    fn test_hyperlink_span_reaches_textspan_hyperlink_in_the_ir() {
         let text = "Before text; Hyperlink text; after text.".to_string();
         let link_start = text.find("Hyperlink text").unwrap();
         let link_end = link_start + "Hyperlink text".len();
@@ -1118,7 +1117,7 @@ mod tests {
         );
     }
 
-    /// Regression (issue #287): real per-run character formatting
+    /// Regression: real per-run character formatting
     /// (bold/italic/underline/color/font-size) from CHPX reaches the IR's
     /// `TextSpan`s, split at exactly the right byte boundaries — not the
     /// always-`false`/`None` defaults from before this fix.
@@ -1184,7 +1183,7 @@ mod tests {
         );
     }
 
-    /// Regression (issue #287): paragraph alignment/indentation/spacing
+    /// Regression: paragraph alignment/indentation/spacing
     /// from PAP SPRMs reach the IR's `Paragraph`, not the always-`None`
     /// defaults from before this fix.
     #[test]
@@ -1216,7 +1215,7 @@ mod tests {
     /// `'\n'`) inside a paragraph must survive as an `InlineContent::LineBreak`
     /// rather than being flattened into one run.
     #[test]
-    fn soft_line_break_becomes_inline_break() {
+    fn test_soft_line_break_becomes_inline_break() {
         // Trailing '.' keeps this out of the heading heuristic so it routes to
         // a Paragraph (where soft breaks are honoured).
         let p = para(
@@ -1254,7 +1253,7 @@ mod tests {
     /// Medium #2: a nested table (`itap > 1`) is flattened, not silently
     /// mis-rendered — a visible notice paragraph must accompany the table.
     #[test]
-    fn nested_table_itap_emits_notice() {
+    fn test_nested_table_itap_emits_notice() {
         let props = PapProps {
             is_table_trailing_mark: true,
             itap: 2, // nested
@@ -1287,7 +1286,7 @@ mod tests {
     /// [MS-DOC] §2.4.6.3. `0x0000` and `0xF801` mean "not in a list" and the
     /// paragraph must be ordinary prose even when an `ilvl` SPRM is present.
     #[test]
-    fn ilfo_not_in_list_bands_are_prose() {
+    fn test_ilfo_not_in_list_bands_are_prose() {
         // `0x0000` (0) and `0xF801` (-2047 as signed i16) are the two
         // documented "not in a list" markers. A non-spec value (2047) is also
         // prose because it falls outside every valid band.
@@ -1311,7 +1310,7 @@ mod tests {
         }
     }
 
-    /// issue #223 — a paragraph with a real outline level (heading) that
+    /// A paragraph with a real outline level (heading) that
     /// *also* carries a valid `ilfo` (Word's multilevel-list "Heading"
     /// gallery attaches numPr/ilfo to the heading styles themselves) must
     /// come out as a Heading, not a ListItem — this is the normal shape
@@ -1341,7 +1340,7 @@ mod tests {
     /// `0xF802`–`0xFFFF` is the negation of a 1-based index and is still a list
     /// item (see TODO(ilfo-negated)); it must not be dropped to prose.
     #[test]
-    fn ilfo_negated_band_is_list() {
+    fn test_ilfo_negated_band_is_list() {
         let props = PapProps {
             ilvl: Some(0),
             ilfo: Some(-2046), // 0xF802
@@ -1356,11 +1355,11 @@ mod tests {
         );
     }
 
-    /// issue #250 — a list run's `ilfo` must resolve through `PlfLfo`'s
+    /// A list run's `ilfo` must resolve through `PlfLfo`'s
     /// `lsid` to the matching `PlfLst` entry's `LVL`, surfacing a real
     /// `start_number` and `ordered = true` instead of always `None`/bullet.
     #[test]
-    fn list_start_number_and_ordered_resolve_from_list_formatting() {
+    fn test_list_start_number_and_ordered_resolve_from_list_formatting() {
         let list_formatting = crate::doc::ListFormatting::from_parts(
             vec![(
                 0x44F53D09, // lsid
@@ -1390,7 +1389,7 @@ mod tests {
     /// A level whose `nfc == 0xFF` (a bullet level) must never report
     /// `start_number`, even when its `iStartAt` happens to be non-1.
     #[test]
-    fn bullet_level_never_gets_a_start_number() {
+    fn test_bullet_level_never_gets_a_start_number() {
         let list_formatting = crate::doc::ListFormatting::from_parts(
             vec![(1, vec![crate::doc::ListLevel { start_at: 7, nfc: 0xFF }])],
             vec![1],
@@ -1415,7 +1414,7 @@ mod tests {
     /// `start_number` — only an explicit override is worth surfacing,
     /// mirroring DOCX's identical contract.
     #[test]
-    fn start_at_one_is_not_surfaced_as_an_override() {
+    fn test_start_at_one_is_not_surfaced_as_an_override() {
         let list_formatting = crate::doc::ListFormatting::from_parts(
             vec![(1, vec![crate::doc::ListLevel { start_at: 1, nfc: 0x00 }])],
             vec![1],
@@ -1438,10 +1437,10 @@ mod tests {
 
     /// An `ilfo` with no matching `PlfLfo`/`PlfLst` data (the common case
     /// for most existing tests, and for a real file with no `PlfLst` at
-    /// all) must degrade to the pre-#250 contract — bullet, no
+    /// all) must degrade to the pre-list-format contract — bullet, no
     /// start_number — not panic or produce a wrong-but-confident answer.
     #[test]
-    fn missing_list_formatting_degrades_to_the_old_contract() {
+    fn test_missing_list_formatting_degrades_to_the_old_contract() {
         let props = PapProps {
             ilvl: Some(0),
             ilfo: Some(1),
@@ -1461,7 +1460,7 @@ mod tests {
     /// `sprmPChgTabs` tab stops decoded onto `PapProps` must surface on the
     /// produced paragraph's `tabs`.
     #[test]
-    fn pchg_tabs_surfaced_on_paragraph() {
+    fn test_pchg_tabs_surfaced_on_paragraph() {
         let props = PapProps {
             tabs: vec![TabStop {
                 position_twips: 1440,
@@ -1487,7 +1486,7 @@ mod tests {
     /// dispatch branch. A lone cell paragraph makes no row, so wrap it between
     /// two row-terminators the way a real `.doc` lays out a one-cell table.
     #[test]
-    fn in_table_paragraph_becomes_cell() {
+    fn test_in_table_paragraph_becomes_cell() {
         let mark = |itap: u8| DocParagraph {
             text: String::new(),
             terminator: '\r',
@@ -1546,7 +1545,7 @@ mod tests {
     /// each merge is 2 rows; both restart cells must be rendered and rows 1&3
     /// (the `fvmMerge` continuations) absorbed.
     #[test]
-    fn two_independent_two_row_merges_do_not_fold() {
+    fn test_two_independent_two_row_merges_do_not_fold() {
         let rows = vec![
             vmerge_row(0x0060), // merge A restart
             vmerge_row(0x0020), // merge A continuation
@@ -1575,7 +1574,7 @@ mod tests {
     /// merge above it, which is exactly the wrong output the old heuristic
     /// produced for two independent adjacent merges.
     #[test]
-    fn restart_after_restart_is_distinct_merge() {
+    fn test_restart_after_restart_is_distinct_merge() {
         let rows = vec![vmerge_row(0x0060), vmerge_row(0x0060), vmerge_row(0x0020)];
 
         let out = build_table_rows(&rows);
@@ -1592,7 +1591,7 @@ mod tests {
 
     /// Plain single 3-row merge via `[fvmRestart, fvmMerge, fvmMerge]`.
     #[test]
-    fn single_three_row_merge_spans_three() {
+    fn test_single_three_row_merge_spans_three() {
         let rows = vec![vmerge_row(0x0060), vmerge_row(0x0020), vmerge_row(0x0020)];
 
         let out = build_table_rows(&rows);
@@ -1602,7 +1601,7 @@ mod tests {
         assert!(out[2].cells.is_empty());
     }
 
-    // ── Line-shape heading guess tightening (issue #224) ────────────────────
+    // ── Line-shape heading guess tightening ────────────────────
 
     fn is_heading_guess(text: &str) -> bool {
         let mut els = Vec::new();
@@ -1611,39 +1610,39 @@ mod tests {
     }
 
     /// A pure separator/underscore line must never become a heading —
-    /// found ×4 in a real corpus file (`ob_is.doc`) behind #224.
+    /// found ×4 in a real corpus file (`ob_is.doc`) during the heading-guess sweep.
     #[test]
-    fn underscore_separator_line_is_not_a_heading() {
+    fn test_underscore_separator_line_is_not_a_heading() {
         assert!(!is_heading_guess("______________________________________________"));
     }
 
     /// A bare `MM/DD/YYYY` date, found as a false-positive heading in a
-    /// real corpus file behind #224, must not be promoted.
+    /// real corpus file during the heading-guess sweep, must not be promoted.
     #[test]
-    fn bare_date_is_not_a_heading() {
+    fn test_bare_date_is_not_a_heading() {
         assert!(!is_heading_guess("11/16/2016"));
     }
 
     /// A UK postcode shape (`SW8 5NQ`), found as a false-positive heading
-    /// in a real corpus file behind #224, must not be promoted.
+    /// in a real corpus file during the heading-guess sweep, must not be promoted.
     #[test]
-    fn uk_postcode_is_not_a_heading() {
+    fn test_uk_postcode_is_not_a_heading() {
         assert!(!is_heading_guess("SW8 5NQ"));
     }
 
     /// `"CCY - symbol"` currency labels (`GBP - £`, `EUR - €`), found as
-    /// false-positive headings behind #224, must not be promoted.
+    /// false-positive headings during the heading-guess sweep, must not be promoted.
     #[test]
-    fn currency_label_is_not_a_heading() {
+    fn test_currency_label_is_not_a_heading() {
         assert!(!is_heading_guess("GBP - £"));
         assert!(!is_heading_guess("EUR - €"));
     }
 
     /// The tightening must not touch real ALL-CAPS section headers the
-    /// guess correctly caught before #224 (e.g. `parentinvguid.doc`'s
+    /// guess correctly caught before the tightening (e.g. `parentinvguid.doc`'s
     /// un-styled section headings).
     #[test]
-    fn genuine_all_caps_headings_still_promoted() {
+    fn test_genuine_all_caps_headings_still_promoted() {
         for heading in ["INTRODUCTION", "TABLE OF CONTENTS", "A. GENERAL INFORMATION"] {
             assert!(is_heading_guess(heading), "{heading:?} must still be promoted");
         }
@@ -1653,7 +1652,7 @@ mod tests {
     /// a date-shaped substring inside otherwise heading-shaped text must
     /// still be promoted.
     #[test]
-    fn date_substring_inside_otherwise_heading_shaped_text_is_unaffected() {
+    fn test_date_substring_inside_otherwise_heading_shaped_text_is_unaffected() {
         assert!(is_heading_guess("Report 11/16/2016 Summary"));
     }
 }

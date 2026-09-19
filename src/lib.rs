@@ -216,7 +216,7 @@ where
 ///
 /// Leaves the reader rewound to the start. Thin wrapper around
 /// `cfb::is_cfb_container`, which is also called directly by each OOXML
-/// format's own `from_reader` (issue #232) — kept here too so this
+/// format's own `from_reader` — kept here too so this
 /// module's existing `Result` (`OfficeError`) call sites don't change.
 fn is_cfb_container<R: Read + Seek>(reader: &mut R) -> Result<bool> {
     Ok(crate::cfb::is_cfb_container(reader).map_err(core::Error::from)?)
@@ -280,7 +280,7 @@ impl Document {
         // failed looking for a stream that was never there ("missing
         // stream: WordDocument stream not found") instead of surfacing
         // the real cause. Distinguish the two by the MS-OFFCRYPTO streams
-        // an encrypted package actually carries (issue #320).
+        // an encrypted package actually carries.
         if matches!(format, DocumentFormat::Doc | DocumentFormat::Xls | DocumentFormat::Ppt)
             && matches!(
                 ext_format,
@@ -689,7 +689,7 @@ mod tests {
         write_dir_entry(&mut file[dir_offset + 128..dir_offset + 256], name1, 2, NO_ENTRY, 2, 4);
         write_dir_entry(&mut file[dir_offset + 256..dir_offset + 384], name2, 2, NO_ENTRY, 3, 4);
         // Sibling-link entry 1 ("name1") to entry 2 ("name2") so both are
-        // reachable from Root's tree — find_entry (#226) walks the tree
+        // reachable from Root's tree — find_entry walks the tree
         // via child/sibling pointers, not a flat directory-array scan.
         file[dir_offset + 128 + 0x48..dir_offset + 128 + 0x4C].copy_from_slice(&2u32.to_le_bytes());
         file[dir_offset + 384 + 0x42] = 0; // empty 4th entry
@@ -713,7 +713,7 @@ mod tests {
         file
     }
 
-    /// issue #320 — an encrypted OOXML file has the same CFB magic bytes
+    /// An encrypted OOXML file has the same CFB magic bytes
     /// as a genuine legacy .doc/.xls/.ppt, so `sniff_format`'s
     /// "wrong-extension" branch silently remapped it to the legacy
     /// parser, which then failed looking for a stream that was never
@@ -735,12 +735,12 @@ mod tests {
         );
     }
 
-    /// issue #296 — an encrypted .pptx used to succeed with Ok and a
+    /// An encrypted .pptx used to succeed with Ok and a
     /// silently EMPTY (zero-slide) presentation rather than erroring,
     /// because sniff_format remapped it to the legacy PPT parser, which
     /// (unlike the DOC/XLS legacy readers) doesn't detect encryption
     /// itself and just parsed whatever little structure it could find.
-    /// The #320 fix runs before any legacy-parser dispatch at all, so
+    /// The encrypted-OOXML check runs before any legacy-parser dispatch at all, so
     /// this is the same code path with a .pptx extension.
     #[test]
     fn test_open_encrypted_pptx_gives_a_friendly_error_not_an_empty_presentation() {
@@ -761,7 +761,7 @@ mod tests {
     /// The same CFB-magic-on-a-.docx-path shape, but WITHOUT the
     /// MS-OFFCRYPTO streams, must still fall through to the legacy
     /// parser (a genuinely misnamed legacy file) — the new check must
-    /// not misfire on the case #232/sniff_format already handled
+    /// not misfire on the case `sniff_format` already handled
     /// correctly.
     #[test]
     fn test_open_cfb_without_offcrypto_streams_still_falls_through_to_legacy_parser() {

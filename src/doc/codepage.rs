@@ -1,6 +1,6 @@
 //! DOC FIB `lid` (language ID) to codepage mapping, applied to
-//! compressed (8-bit) text runs. Mirrors #309's XLS `CODEPAGE` fix, and
-//! is source-confirmed rather than corpus-demonstrated (issue #310):
+//! compressed (8-bit) text runs. Mirrors the XLS `CODEPAGE` fix, and
+//! is source-confirmed rather than corpus-demonstrated:
 //! `Fib` had no field consulting the document's language at all before
 //! this, so any compressed non-Western-European text was corrupted by
 //! construction, whether or not a real example was on hand to prove it.
@@ -52,30 +52,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn english_lid_maps_to_1252() {
+    fn test_english_lid_maps_to_1252() {
         assert_eq!(codepage_for_lid(0x0409), 1252); // en-US
     }
 
     #[test]
-    fn russian_lid_maps_to_1251() {
+    fn test_russian_lid_maps_to_1251() {
         assert_eq!(codepage_for_lid(0x0419), 1251); // ru-RU
     }
 
     #[test]
-    fn sublanguage_region_does_not_change_the_codepage() {
+    fn test_sublanguage_region_does_not_change_the_codepage() {
         // Mexican Spanish (0x080A) and Spanish Spanish (0x0C0A) share a
         // primary language id and must map to the same codepage.
         assert_eq!(codepage_for_lid(0x080A), codepage_for_lid(0x0C0A));
     }
 
     #[test]
-    fn greek_lid_decodes_a_byte_correctly() {
+    fn test_greek_lid_decodes_a_byte_correctly() {
         // Windows-1253 0xE1 = alpha (α).
         assert_eq!(decode_byte(0xE1, 0x0408), 'α');
     }
 
     #[test]
-    fn default_lid_matches_the_old_cp1252_behavior() {
+    fn test_default_lid_matches_the_old_cp1252_behavior() {
         assert_eq!(decode_byte(0x93, 0x0409), '\u{201C}');
         assert_eq!(decode_byte(0x93, 0x0409), super::super::piece_table::cp1252_to_char(0x93));
     }

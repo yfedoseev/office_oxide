@@ -486,7 +486,7 @@ pub fn sanitize_xml_text(s: &str) -> std::borrow::Cow<'_, str> {
 /// `convert_table`/`plain_text_table` recurse with a much larger frame
 /// (multiple local `Vec`s and struct literals per level) than the XML
 /// event-loop's `parse_table` does — so they carry their own `DepthGuard`
-/// too (issue #329), and it's the tighter of the two cliffs, not the
+/// too, and it's the tighter of the two cliffs, not the
 /// parse-stack one, that this constant must stay under.
 ///
 /// 100 is chosen with real margin under the 150-200 debug/2 MiB `to_ir()`
@@ -531,7 +531,7 @@ impl DepthGuard {
     /// counter (see [`truncated_subtrees`]) — content past the bound used
     /// to be dropped with only a `log::warn!`, leaving a caller with no
     /// way to learn that the document they just wrote or read is missing
-    /// content (issue #218).
+    /// content.
     pub fn enter() -> Option<Self> {
         NESTING_DEPTH.with(|d| {
             let cur = d.get();
@@ -660,7 +660,7 @@ pub fn ensure_utf8(data: &[u8]) -> Option<Vec<u8>> {
     // part whose characters are all ASCII is a run of NUL-interleaved bytes,
     // and NUL is itself valid UTF-8 — so `from_utf8` accepts it, the real
     // encoding is never noticed, and every tag name arrives split by nulls.
-    // That silently emptied a UTF-16BE `xl/workbook.xml` (#229).
+    // That silently emptied a UTF-16BE `xl/workbook.xml`.
     if let Some(decoded) = decode_utf16_xml(data) {
         return Some(decoded);
     }
@@ -773,17 +773,17 @@ mod attr_tests {
     }
 
     #[test]
-    fn unescapes_predefined_and_numeric_entities() {
+    fn test_unescapes_predefined_and_numeric_entities() {
         assert_eq!(attr_value(r#"v="a &amp; b &lt;x&gt; &#65;""#, "v"), "a & b <x> A");
     }
 
     #[test]
-    fn passes_plain_value_through_unchanged() {
+    fn test_passes_plain_value_through_unchanged() {
         assert_eq!(attr_value(r#"r:id="rId7""#, "r:id"), "rId7");
     }
 
     #[test]
-    fn unescapes_ampersand_in_hyperlink_target() {
+    fn test_unescapes_ampersand_in_hyperlink_target() {
         assert_eq!(
             attr_value(r#"Target="https://x/?a=1&amp;b=2""#, "Target"),
             "https://x/?a=1&b=2"

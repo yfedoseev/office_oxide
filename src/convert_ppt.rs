@@ -11,8 +11,9 @@ use crate::ppt::{CharFormatSpan, ParaFormatSpan, TextRun, TextType};
 /// `str::lines()` only splits on `\n` or `\r\n`, so a lone `\r` was never
 /// being treated as a paragraph break at all: the whole multi-bullet body
 /// was reaching the IR as a single paragraph/line with literal `\r`
-/// characters embedded in it. Fixed here (found while implementing #254,
-/// since `TextPFRun` paragraph boundaries are defined in terms of these
+/// characters embedded in it. Fixed here (found while implementing direct
+/// character/paragraph formatting, since `TextPFRun` paragraph boundaries
+/// are defined in terms of these
 /// same delimiters) and filed as its own issue since the root cause
 /// (`.lines()` on raw PPT text) is distinct from "no formatting is ever
 /// read".
@@ -144,8 +145,7 @@ fn alignment_at(para_formats: &[ParaFormatSpan], at: usize) -> Option<ParagraphA
 }
 
 /// Build a table cell's block content from its shape's own text runs,
-/// reusing the same paragraph/formatting-span logic as ordinary body text
-/// (issue #255).
+/// reusing the same paragraph/formatting-span logic as ordinary body text.
 fn table_cell_content(runs: &[TextRun]) -> Vec<Element> {
     let mut elements = Vec::new();
     for run in runs {
@@ -174,7 +174,7 @@ fn table_cell_content(runs: &[TextRun]) -> Vec<Element> {
     elements
 }
 
-/// Convert a reconstructed grid-of-shapes table (issue #255) into
+/// Convert a reconstructed grid-of-shapes table into
 /// `Element::Table`.
 fn table_block_to_element(table: &crate::ppt::TableBlock) -> Element {
     let rows = table
@@ -196,7 +196,7 @@ fn table_block_to_element(table: &crate::ppt::TableBlock) -> Element {
     Element::Table(Table { rows, ..Default::default() })
 }
 
-/// Human-readable identity for an `ExOleObjAtom` (issue #337) — the
+/// Human-readable identity for an `ExOleObjAtom` — the
 /// `subType`/`type` values per [MS-PPT] 2.10.20, cross-checked against
 /// Apache POI's `ExOleObjAtom.Subtype`/`OleType` enums.
 fn describe_ole_object(info: &crate::ppt::OleObjectInfo) -> String {
@@ -229,7 +229,7 @@ fn describe_ole_object(info: &crate::ppt::OleObjectInfo) -> String {
 pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
     let mut sections = Vec::new();
     // Every picture shape successfully resolved to a specific image
-    // (issue #256) — excluded from the old whole-file dump-onto-last-
+    // — excluded from the old whole-file dump-onto-last-
     // slide fallback below, so an image isn't attached twice.
     let mut resolved_image_indices = std::collections::HashSet::new();
 
@@ -238,7 +238,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
         let mut slide_title: Option<String> = None;
         // Presenter-only text, kept out of `elements` (which is "what the
         // audience sees") and routed to the dedicated field instead — the
-        // PPTX side of this was already fixed in #203; #238 is the same
+        // PPTX side of this was already fixed; this is the same
         // defect on the legacy binary .ppt path, which had never been
         // ported to route TextType::Notes there at all.
         let mut notes_lines: Vec<&str> = Vec::new();
@@ -337,7 +337,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
             }
         }
 
-        // Reconstructed grid-of-shapes tables (issue #255) always land
+        // Reconstructed grid-of-shapes tables always land
         // after the slide's ordinary text — the binary format has no
         // single reading-order concept spanning both, so this is a
         // deliberate simplification rather than a claim of true order.
@@ -346,7 +346,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
         }
 
         // Picture shapes resolved to a specific image via their own
-        // `pib` property (issue #256) — attached to the slide that
+        // `pib` property — attached to the slide that
         // actually contains the shape, instead of every image in the
         // whole file landing on whichever slide happened to be last.
         for &idx in &slide.image_refs {
@@ -360,11 +360,11 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
             }
         }
 
-        // Embedded/linked/ActiveX OLE objects (issue #337) — at minimum,
+        // Embedded/linked/ActiveX OLE objects — at minimum,
         // recognize the object exists and surface its identity, even
         // without extracting the object's own payload (that needs
         // ObjStgDataRef -> the Ole10Native/native storage, a separate,
-        // larger mechanism). Mirrors #300's precedent for a data-less
+        // larger mechanism). Mirrors the PPTX precedent for a data-less
         // AutoShape: an Image placeholder with no bytes but a
         // descriptive alt_text, so the object's presence and kind still
         // reach plain-text/markdown/HTML output.
@@ -381,7 +381,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
         // for notes text (unlike PPTX's XML-based TextBody), so each
         // line becomes a plain paragraph — matches the old
         // newline-joined-string behavior content-wise, just typed to
-        // match Section::speaker_notes's structured shape (issue #290).
+        // match Section::speaker_notes's structured shape.
         let speaker_notes: Vec<Element> = notes_lines
             .iter()
             .map(|s| s.trim())
@@ -404,7 +404,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
         });
     }
 
-    // Any image no shape's `pib` property resolved to (issue #256's
+    // Any image no shape's `pib` property resolved to (the
     // still-imperfect leftover case: masters, unresolved/complex
     // references, etc.) still reaches the IR rather than vanishing —
     // just without a specific slide to attribute it to.
@@ -419,7 +419,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
     // The deck's own declared title (from `\x05SummaryInformation`) beats
     // the first slide's own title — a slide title is not a document
     // title, it's just the only thing that was ever there to fall back
-    // to (issue #244).
+    // to.
     let summary = doc.summary_properties();
     let title = summary
         .and_then(|s| s.title.clone())

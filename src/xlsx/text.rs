@@ -16,7 +16,7 @@ impl XlsxDocument {
             }
         }
         // `to_markdown()` already surfaces chart text (axis titles, series
-        // names); `plain_text()` silently dropped it entirely (issue #331).
+        // names); `plain_text()` silently dropped it entirely.
         for text in &self.chart_text {
             if !text.trim().is_empty() {
                 parts.push(text.trim().to_string());
@@ -181,7 +181,7 @@ impl XlsxDocument {
             // A formula cell with no cached `<v>` (the default output shape
             // of closedxml and similar writers) rendered as a blank cell
             // indistinguishable from a genuinely empty one, and the formula
-            // text never reached any consumer at all (issue #279).
+            // text never reached any consumer at all.
             CellValue::Empty => {
                 if let Some(f) = &cell.formula {
                     buf.push('=');
@@ -248,7 +248,7 @@ impl XlsxDocument {
                 // id — [ECMA-376] §18.8.30 lets a workbook redefine ids
                 // 0-163. Same precedence as `date::is_date_cell`; testing the
                 // id first made `0.00000E+0` declared under id 50 render as a
-                // 1900 date (#207, #225).
+                // 1900 date.
                 if let Some(fmt_str) = styles.number_format_override_for(idx) {
                     return date::is_date_format_string(fmt_str);
                 }
@@ -266,7 +266,7 @@ impl XlsxDocument {
         date_indices: &std::collections::HashSet<u32>,
     ) {
         match &cell.value {
-            // See `write_cell_value`'s identical arm (issue #279).
+            // See `write_cell_value`'s identical arm.
             CellValue::Empty => {
                 if let Some(f) = &cell.formula {
                     buf.push('=');
@@ -350,22 +350,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn csv_escape_plain() {
+    fn test_csv_escape_plain() {
         assert_eq!(csv_escape("hello"), "hello");
     }
 
     #[test]
-    fn csv_escape_with_comma() {
+    fn test_csv_escape_with_comma() {
         assert_eq!(csv_escape("a,b"), "\"a,b\"");
     }
 
     #[test]
-    fn csv_escape_with_quotes() {
+    fn test_csv_escape_with_quotes() {
         assert_eq!(csv_escape("say \"hi\""), "\"say \"\"hi\"\"\"");
     }
 
     #[test]
-    fn csv_escape_with_newline() {
+    fn test_csv_escape_with_newline() {
         assert_eq!(csv_escape("line1\nline2"), "\"line1\nline2\"");
     }
 
@@ -376,19 +376,19 @@ mod tests {
     }
 
     #[test]
-    fn format_number_integer() {
+    fn test_format_number_integer() {
         assert_eq!(fmt_num(42.0), "42");
         assert_eq!(fmt_num(0.0), "0");
         assert_eq!(fmt_num(-10.0), "-10");
     }
 
     #[test]
-    fn format_number_float() {
+    fn test_format_number_float() {
         assert_eq!(fmt_num(3.15), "3.15");
         assert_eq!(fmt_num(0.5), "0.5");
     }
 
-    /// #225 / #207 — `date_style_indices` backs `to_ir()`'s cell renderer
+    /// `date_style_indices` backs `to_ir()`'s cell renderer
     /// and tested the built-in meaning of a `numFmtId` before the workbook's
     /// own `<numFmt>` override of that id, so `0.00000E+0` declared under id
     /// 50 was still treated as a date.
@@ -431,7 +431,7 @@ mod tests {
         assert!(idx.contains(&2), "an un-overridden built-in date id is a date");
     }
 
-    /// issue #331 — `to_markdown()` already surfaced chart text; `plain_text()`
+    /// `to_markdown()` already surfaced chart text; `plain_text()`
     /// silently dropped it, so the CLI's default `text` output (and anything
     /// built on `plain_text()`, like PDF export) lost every chart's words.
     #[test]

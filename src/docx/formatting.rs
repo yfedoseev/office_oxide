@@ -41,8 +41,7 @@ pub struct RunProperties {
     /// `<w:vanish/>` — Word never renders this run at all (draft notes,
     /// comment-reference glyph scaffolding, TOC/index field-code
     /// internals). Converters use this to exclude the run from every
-    /// extraction surface, the same way a run-level `w:del` already is
-    /// (issue #305).
+    /// extraction surface, the same way a run-level `w:del` already is.
     pub hidden: Option<bool>,
 }
 
@@ -63,7 +62,7 @@ pub struct ParagraphProperties {
     pub outline_level: Option<u8>,
     /// Paragraph-mark run properties (`w:rPr` inside `w:pPr`). Boxed:
     /// present on only a small minority of real paragraphs, but
-    /// `Option<T>` reserves `size_of(T)` even when `None` — issue #328.
+    /// `Option<T>` reserves `size_of(T)` even when `None`.
     pub run_properties: Option<Box<RunProperties>>,
     /// Frame position from `<w:framePr>`. When present this paragraph is
     /// absolutely positioned on the page (used by layout-preserving
@@ -72,7 +71,7 @@ pub struct ParagraphProperties {
     /// Section properties from `<w:sectPr>` inside this paragraph's `<w:pPr>`.
     /// When present this paragraph terminates a section — the properties
     /// describe the section that ends here. Boxed: only the last
-    /// paragraph of each section carries this (issue #328).
+    /// paragraph of each section carries this.
     pub section_properties: Option<Box<super::SectionProperties>>,
     /// True when the paragraph has a `<w:pBdr><w:bottom .../></w:pBdr>`.
     /// Used to recover horizontal rules: pdf_to_ir emits
@@ -80,12 +79,11 @@ pub struct ParagraphProperties {
     /// empty paragraph with a single bottom border. Without
     /// preserving this flag the rule would be silently dropped on
     /// re-parse and turned into a plain empty paragraph.
-    #[allow(dead_code)]
     pub has_bottom_border: bool,
     /// Full `<w:pBdr>` edge styling. `has_bottom_border` stays as the
     /// cheap horizontal-rule probe; this carries the actual widths,
     /// colours and styles so they survive a read. Boxed: rare on real
-    /// paragraphs (issue #328).
+    /// paragraphs.
     pub borders: Option<Box<ParagraphBorders>>,
     /// `<w:keepNext/>` — keep with the following paragraph. `None` when the
     /// element is absent, so a style-inherited value is distinguishable from
@@ -96,7 +94,7 @@ pub struct ParagraphProperties {
     /// `<w:pageBreakBefore/>` — force a page break before this paragraph.
     pub page_break_before: Option<bool>,
     /// Paragraph shading (`<w:shd>`) — background fill. Boxed: rare on
-    /// real paragraphs (issue #328).
+    /// real paragraphs.
     pub shading: Option<Box<super::table::Shading>>,
     /// Custom tab stops from `<w:tabs>`.
     pub tabs: Vec<TabStopDef>,
@@ -1311,7 +1309,7 @@ fn parse_num_pr(reader: &mut quick_xml::NsReader<&[u8]>) -> crate::core::Result<
 mod tests {
     use super::*;
 
-    /// Regression (issue #328): `ParagraphProperties`'s rarely-populated
+    /// Regression: `ParagraphProperties`'s rarely-populated
     /// sub-structs must stay boxed, not silently regress back to
     /// `Option<T>` (which reserves `size_of(T)` even when `None`).
     /// `Paragraph` (paragraph.rs) was 896 bytes before this fix, dominated
@@ -1337,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_toggle_bare() {
+    fn test_parse_toggle_bare() {
         let xml =
             br#"<w:b xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
         let mut reader = xml::make_reader(xml);
@@ -1354,7 +1352,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_toggle_false() {
+    fn test_parse_toggle_false() {
         let xml = br#"<w:b w:val="0" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
         let mut reader = xml::make_reader(xml);
         loop {
@@ -1370,7 +1368,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_run_props_bold_italic() {
+    fn test_parse_run_props_bold_italic() {
         let xml =
             br#"<w:rPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
             <w:b/>
@@ -1391,7 +1389,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_paragraph_props_style_justification() {
+    fn test_parse_paragraph_props_style_justification() {
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
             <w:pStyle w:val="Heading1"/>
@@ -1411,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_indent_values() {
+    fn test_parse_indent_values() {
         let xml = br#"<w:ind w:left="720" w:hanging="360" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"/>"#;
         let mut reader = xml::make_reader(xml);
         loop {
@@ -1446,7 +1444,7 @@ mod tests {
     // ── framePr ─────────────────────────────────────────────────────────
 
     #[test]
-    fn parse_frame_pr_empty_element() {
+    fn test_parse_frame_pr_empty_element() {
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
           <w:framePr w:x="720" w:y="1080" w:w="3000" w:h="500"/>
@@ -1461,7 +1459,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_frame_pr_missing_attrs_returns_none() {
+    fn test_parse_frame_pr_missing_attrs_returns_none() {
         // Missing w:h → frame_position must be None.
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -1473,7 +1471,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_frame_pr_inside_start_form() {
+    fn test_parse_frame_pr_inside_start_form() {
         // Start/End form (rather than Empty) — should still parse.
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -1489,7 +1487,7 @@ mod tests {
     // ── pBdr / has_bottom_border ────────────────────────────────────────
 
     #[test]
-    fn parse_p_bdr_with_bottom() {
+    fn test_parse_p_bdr_with_bottom() {
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
           <w:pBdr>
@@ -1502,7 +1500,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_p_bdr_without_bottom() {
+    fn test_parse_p_bdr_without_bottom() {
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
           <w:pBdr>
@@ -1516,7 +1514,7 @@ mod tests {
     }
 
     #[test]
-    fn paragraph_properties_default_has_no_frame_or_border() {
+    fn test_paragraph_properties_default_has_no_frame_or_border() {
         let xml =
             br#"<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
           <w:pStyle w:val="Normal"/>

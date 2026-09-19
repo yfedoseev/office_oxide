@@ -2,7 +2,7 @@
 //! handling existed at all before this module — the hyperlink target
 //! behind a cell (its own display text, e.g. `"Stacie@ABC.com"`, always
 //! survived as an ordinary string cell) was completely invisible, not
-//! merely dropped in conversion (issue #306).
+//! merely dropped in conversion.
 //!
 //! Byte layout verified against Apache POI's `HyperlinkRecord` (a mature,
 //! independent implementation of the same structure, which itself
@@ -243,7 +243,7 @@ mod tests {
     /// set): the plainest possible shape, no moniker at all. Matches how
     /// a plain external URL like `http://example.com` is commonly stored.
     #[test]
-    fn unc_path_style_url_is_decoded() {
+    fn test_unc_path_style_url_is_decoded() {
         let mut d = range_bytes(1, 1, 2, 2);
         d.extend_from_slice(&[0u8; 16]); // guid
         d.extend_from_slice(&2u32.to_le_bytes()); // streamVersion
@@ -260,7 +260,7 @@ mod tests {
 
     /// URL_MONIKER shape, no trailing tail bytes (`length == remaining`).
     #[test]
-    fn url_moniker_without_tail_is_decoded() {
+    fn test_url_moniker_without_tail_is_decoded() {
         let mut d = range_bytes(0, 0, 0, 0);
         d.extend_from_slice(&[0u8; 16]); // guid
         d.extend_from_slice(&2u32.to_le_bytes());
@@ -279,7 +279,7 @@ mod tests {
     /// URL_MONIKER shape WITH the 24-byte tail present (`length` covers
     /// the tail too, so `length != remaining`).
     #[test]
-    fn url_moniker_with_tail_is_decoded() {
+    fn test_url_moniker_with_tail_is_decoded() {
         let mut d = range_bytes(3, 3, 0, 0);
         d.extend_from_slice(&[0u8; 16]);
         d.extend_from_slice(&2u32.to_le_bytes());
@@ -299,7 +299,7 @@ mod tests {
     /// FILE_MONIKER shape, no extended (relative) address — falls back to
     /// the 8.3 short filename.
     #[test]
-    fn file_moniker_falls_back_to_short_filename() {
+    fn test_file_moniker_falls_back_to_short_filename() {
         let mut d = range_bytes(0, 0, 0, 0);
         d.extend_from_slice(&[0u8; 16]);
         d.extend_from_slice(&2u32.to_le_bytes());
@@ -320,7 +320,7 @@ mod tests {
     /// FILE_MONIKER shape WITH an extended address — the long-path
     /// Unicode form wins over the short filename.
     #[test]
-    fn file_moniker_extended_address_wins_over_short_filename() {
+    fn test_file_moniker_extended_address_wins_over_short_filename() {
         let mut d = range_bytes(0, 0, 0, 0);
         d.extend_from_slice(&[0u8; 16]);
         d.extend_from_slice(&2u32.to_le_bytes());
@@ -344,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_record_is_none_not_a_panic() {
+    fn test_truncated_record_is_none_not_a_panic() {
         assert!(parse_hlink(&[0u8; 8]).is_none());
         assert!(parse_hlink(&[]).is_none());
         let mut d = range_bytes(0, 0, 0, 0);
@@ -354,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_stream_version_is_none() {
+    fn test_wrong_stream_version_is_none() {
         let mut d = range_bytes(0, 0, 0, 0);
         d.extend_from_slice(&[0u8; 16]);
         d.extend_from_slice(&1u32.to_le_bytes()); // not 2
@@ -362,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn unrecognized_moniker_is_none() {
+    fn test_unrecognized_moniker_is_none() {
         let mut d = range_bytes(0, 0, 0, 0);
         d.extend_from_slice(&[0u8; 16]);
         d.extend_from_slice(&2u32.to_le_bytes());

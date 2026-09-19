@@ -22,28 +22,26 @@ pub struct XlsDocument {
     /// Named ranges from `NAME` (`0x0018`) records ([MS-XLS] §2.4.174),
     /// resolved via `EXTERNSHEET`/`SUPBOOK`. A name whose formula isn't a
     /// single (possibly 3-D) cell or area reference resolves with an empty
-    /// `value` rather than a guessed one (issue #251, XLS half).
+    /// `value` rather than a guessed one (XLS half).
     pub defined_names: Vec<DefinedName>,
     images: Vec<XlsImage>,
     has_macros: bool,
     /// `true` when the record-parsing safety cap ran out before the
     /// Workbook stream did — trailing sheets, or the whole workbook, are
     /// missing from `sheets` with no other signal a caller could use to
-    /// tell that apart from a file that genuinely ended there (issue
-    /// #236).
+    /// tell that apart from a file that genuinely ended there.
     truncated: bool,
     /// Title/author/subject/keywords/comments/dates from the
     /// `\x05SummaryInformation` OLE property-set stream every real `.xls`
     /// carries by default — parsed and then never read anywhere in the
-    /// crate before (issue #244).
+    /// crate before.
     summary_properties: Option<crate::cfb::SummaryProperties>,
     /// Text (series names, trendline names/labels, axis titles, chart
     /// titles) recovered from `SeriesText` records (`0x100D`, [MS-XLS]
     /// §2.4.254) inside every embedded chart's nested `BOF..EOF`
     /// substream. No BIFF chart-record handling existed at all before
     /// this — a chart's own text never reached `to_ir()`/`plain_text()`
-    /// in any form, unlike the crate's working XLSX equivalent (issue
-    /// #246).
+    /// in any form, unlike the crate's working XLSX equivalent.
     chart_text: Vec<String>,
 }
 
@@ -99,19 +97,19 @@ pub struct Sheet {
     /// `(row_first, row_last, col_first, col_last)` tuples. The record
     /// wasn't parsed at all before — merge information for a legacy
     /// `.xls` was discarded before it was even in memory, not just
-    /// dropped at IR conversion (issue #235, XLS half).
+    /// dropped at IR conversion (XLS half).
     pub merged_cells: Vec<(u16, u16, u16, u16)>,
     /// Conditional formatting rules from `CONDFMT`/`CF` records. No
-    /// record handling for either existed at all before (issue #252).
+    /// record handling for either existed at all before.
     pub conditional_formats: Vec<crate::ir::ConditionalFormat>,
     /// Data validation rules from `DV` records. No record handling
-    /// existed at all before (issue #275).
+    /// existed at all before.
     pub data_validations: Vec<crate::ir::DataValidation>,
     /// Cell hyperlinks from `HLINK` records. No record handling existed
-    /// at all before (issue #306).
+    /// at all before.
     pub hyperlinks: Vec<super::hyperlink::XlsHyperlink>,
     /// Cell comments from `NOTE`/`TXO`/`OBJ` records. No record handling
-    /// existed at all before (issue #307).
+    /// existed at all before.
     pub comments: Vec<XlsComment>,
 }
 
@@ -119,8 +117,6 @@ pub struct Sheet {
 #[derive(Debug)]
 struct SheetInfo {
     name: String,
-    #[allow(dead_code)]
-    offset: u32,
     hidden: bool,
 }
 
@@ -180,7 +176,7 @@ impl XlsDocument {
     }
 
     /// As `parse_workbook_stream`, with the record-parsing safety cap
-    /// (issue #236) as an explicit parameter so tests can exercise the
+    /// as an explicit parameter so tests can exercise the
     /// exhausted-budget path without a multi-million-record fixture.
     fn parse_workbook_stream_with_budget(data: &[u8], record_budget: u32) -> Result<Self> {
         let mut sheet_infos: Vec<SheetInfo> = Vec::new();
@@ -194,11 +190,11 @@ impl XlsDocument {
         // day (Excel epoch delta) offset if unaccounted for. Defaults to
         // false (1900 system) when absent, matching Excel's own default
         // and every date-serial-carrying record parsed before DATEMODE
-        // appears (issue #233).
+        // appears.
         let mut date1904 = false;
         // BIFF5 8-bit text's declared codepage ([MS-XLS] §2.4.53).
         // `None` means "not yet seen" and defers to the BIFF5 default
-        // (Windows-1252) at decode time, not "no codepage" (issue #309).
+        // (Windows-1252) at decode time, not "no codepage".
         let mut codepage: Option<u16> = None;
 
         // Quick check: if the first BOF indicates BIFF5 or earlier, limit processing.
@@ -218,7 +214,7 @@ impl XlsDocument {
         let mut merged_cells: Vec<(u16, u16, u16, u16)> = Vec::new();
         let mut conditional_formats: Vec<crate::ir::ConditionalFormat> = Vec::new();
         // The active CONDFMT group: its resolved sqref, and how many CF
-        // records are still expected to follow it (issue #252). A CF
+        // records are still expected to follow it. A CF
         // record outside any open CONDFMT group (`None`/exhausted) is
         // ignored rather than misattributed to the wrong range.
         let mut pending_cf: Option<(String, u16)> = None;
@@ -229,7 +225,7 @@ impl XlsDocument {
         // each id belongs to. Resolved into `comments` at end-of-sheet
         // rather than as each NOTE is seen, since a sheet's NOTE records
         // commonly all sit together near the end of its record stream,
-        // after every OBJ/TXO pair (issue #307).
+        // after every OBJ/TXO pair.
         let mut last_obj_id: Option<u16> = None;
         let mut obj_text: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
         let mut pending_notes: Vec<(u16, u16, u16, Option<String>)> = Vec::new();
@@ -243,18 +239,17 @@ impl XlsDocument {
         // ([MS-XLS] §2.1.7.20.1, dt=0x0020 for a chart sheet). Without
         // tracking nesting depth, the chart's own closing EOF was mistaken
         // for the worksheet's, truncating the sheet's data and permanently
-        // desyncing `sheet_idx` from `sheet_infos` for every sheet after it
-        // (issue #237).
+        // desyncing `sheet_idx` from `sheet_infos` for every sheet after it.
         let mut nested_bof_depth = 0u32;
         // Text recovered from `SeriesText` records inside chart substreams
-        // (issue #246) — collected across every sheet's embedded charts.
+        // — collected across every sheet's embedded charts.
         let mut chart_text: Vec<String> = Vec::new();
         // Safety cap against a pathologically record-dense file (millions of
         // minimal, near-empty records), not against ordinary large ones.
         // 500,000 was low enough to hit on real, legitimate workbooks —
         // aspose-cells_Sample.xls's 101 sheets truncated to 69 mid-parse
         // with no signal at all, and 3 govdocs1 corpus files (7-29 MB) lost
-        // their *entire* content this way (issue #236). The default caller
+        // their *entire* content this way. The default caller
         // (`parse_workbook_stream`) passes 20,000,000, which still bounds a
         // crafted file's worst-case work (tens of millions of cheap
         // record-type dispatches is well under a second), while
@@ -388,7 +383,7 @@ impl XlsDocument {
                         // ShortXLUnicodeString covering series names,
                         // trendline names/labels, axis titles, and chart
                         // titles alike — no need to track which is which
-                        // to surface the human-meaningful words (#246).
+                        // to surface the human-meaningful words.
                         if let Ok((s, _)) = read_short_unicode_string(&rec.data, 2) {
                             let s = s.trim();
                             if !s.is_empty() {
@@ -580,27 +575,27 @@ impl XlsDocument {
     }
 
     /// `true` when the file carries a `_VBA_PROJECT` storage — a cheap
-    /// macro-presence signal, no VBA interpretation (issue #283).
+    /// macro-presence signal, no VBA interpretation.
     pub fn has_macros(&self) -> bool {
         self.has_macros
     }
 
     /// `true` when the record-parsing safety cap cut the Workbook stream
     /// short — trailing sheets, or the whole workbook, are missing from
-    /// `sheets` (issue #236).
+    /// `sheets`.
     pub fn truncated(&self) -> bool {
         self.truncated
     }
 
     /// Title/author/subject/keywords/comments/dates from the file's
     /// `\x05SummaryInformation` OLE property set, when present and
-    /// well-formed (issue #244).
+    /// well-formed.
     pub fn summary_properties(&self) -> Option<&crate::cfb::SummaryProperties> {
         self.summary_properties.as_ref()
     }
 
     /// Text recovered from every embedded chart's `SeriesText` records —
-    /// series/trendline names, axis titles, chart titles (issue #246).
+    /// series/trendline names, axis titles, chart titles.
     pub fn chart_text(&self) -> &[String] {
         &self.chart_text
     }
@@ -623,8 +618,8 @@ impl XlsDocument {
             }
         }
         // Chart text (series names, axis/chart titles) recovered from
-        // embedded charts (issue #246) — keep it out of both renderers,
-        // not just one (see #331 for the XLSX-side version of this gap).
+        // embedded charts — keep it out of both renderers,
+        // not just one (the XLSX side had the same gap).
         for text in &self.chart_text {
             let text = text.trim();
             if !text.is_empty() {
@@ -752,14 +747,14 @@ fn parse_boundsheet(data: &[u8]) -> Result<SheetInfo> {
     if data.len() < 8 {
         return Err(XlsError::InvalidRecord("BOUNDSHEET too short".into()));
     }
-    let offset = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    // Bytes 0..4 are the sheet's stream offset; the reader walks the
+    // record stream sequentially and never seeks to it.
     let visibility = data[4]; // 0=visible, 1=hidden, 2=very hidden
     let _sheet_type = data[5]; // 0=worksheet, 2=chart, 6=VBA
     let (name, _) = read_short_unicode_string(data, 6)?;
 
     Ok(SheetInfo {
         name,
-        offset,
         hidden: visibility != 0,
     })
 }
@@ -1001,7 +996,7 @@ fn parse_format_record(data: &[u8]) -> Option<(u16, String)> {
 /// bypassing `build_display`'s number-format/date rendering entirely — a
 /// date cell came out as a raw serial (`38971`) from the CLI's default
 /// `text`/`markdown` output even though `to_ir()` got it right, the same
-/// dual-renderer gap fixed for XLSX formula text in #279. The fallback to
+/// dual-renderer gap fixed for XLSX formula text. The fallback to
 /// raw text covers the (normally unreachable) case where `display` and
 /// `rows` disagree in shape.
 fn cell_display_text(sheet: &Sheet, r: usize, c: usize) -> String {
@@ -1040,8 +1035,7 @@ fn build_display(
                     // scientific-notation cell whose id-50 format the file
                     // overrode to `0.00000E+0` as a date, and the date
                     // conversion then ran for minutes on its magnitude.
-                    // Mirrors `date::is_date_cell`, fixed the same way in
-                    // #207.
+                    // Mirrors `date::is_date_cell`, fixed the same way.
                     let is_date = match code {
                         Some(c) => date::is_date_format_string(c),
                         None => date::is_date_format_id(fmt_id as u32),
@@ -1257,7 +1251,7 @@ mod tests {
     /// A hidden sheet's records were parsed and then discarded, so the
     /// sheet vanished from `to_ir()` entirely — silent deletion of data its
     /// author only hid. XLSX keeps and flags such a sheet; XLS now does
-    /// too (#231).
+    /// too.
     #[test]
     fn test_xls_hidden_sheets_kept_and_flagged() {
         let stream = workbook_stream(&[
@@ -1293,7 +1287,7 @@ mod tests {
     }
 
     /// An embedded chart is its own nested `BOF..EOF` substream inside the
-    /// parent worksheet's substream. Before #237, its `EOF` was mistaken
+    /// parent worksheet's substream. Its `EOF` used to be mistaken
     /// for the worksheet's own: the sheet's remaining cells were dropped,
     /// `sheet_idx` desynced from `sheet_infos`, and every sheet after it
     /// got the wrong name/visibility.
@@ -1342,7 +1336,7 @@ mod tests {
         biff_rec(RT_SERIESTEXT, &d)
     }
 
-    /// issue #246 — a chart's own `SeriesText` records (series names, axis/
+    /// A chart's own `SeriesText` records (series names, axis/
     /// chart titles) must reach `chart_text()`, `plain_text()`,
     /// `to_markdown()`, and the IR, not just be silently skipped along with
     /// the rest of the chart substream.
@@ -1408,7 +1402,7 @@ mod tests {
         assert!(doc.chart_text().is_empty());
     }
 
-    // ── Conditional formatting (issue #252) ─────────────────────────────────
+    // ── Conditional formatting ─────────────────────────────────
 
     /// A `CONDFMT`/`CF` record pair, exactly [MS-XLS]'s own worked example
     /// shape: one range, one `cellIs`/`between` rule.
@@ -1488,7 +1482,7 @@ mod tests {
         assert!(doc.sheets[0].conditional_formats.is_empty());
     }
 
-    // ── Record-parsing safety cap (issue #236) ──────────────────────────────
+    // ── Record-parsing safety cap ──────────────────────────────
 
     /// A budget of 0 must not panic or hang — just truncate before any
     /// record is processed at all.
@@ -1528,7 +1522,7 @@ mod tests {
     }
 
     /// The truncation flag reaches `to_ir()`'s `Metadata::text_truncated`,
-    /// the same signal DOC's piece-table gap (#230) already surfaces.
+    /// the same signal DOC's piece-table gap already surfaces.
     #[test]
     fn test_truncation_reaches_metadata() {
         let stream = workbook_stream(&[
@@ -1541,7 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn build_grid_from_cells() {
+    fn test_build_grid_from_cells() {
         let mut cells = vec![
             Cell {
                 xf_index: 0,
@@ -1572,13 +1566,13 @@ mod tests {
     }
 
     #[test]
-    fn build_grid_empty() {
+    fn test_build_grid_empty() {
         let grid = build_grid(&mut Vec::new());
         assert!(grid.is_empty());
     }
 
     #[test]
-    fn parse_boundsheet_record() {
+    fn test_parse_boundsheet_record() {
         let mut data = Vec::new();
         data.extend_from_slice(&100u32.to_le_bytes()); // offset
         data.push(0); // visible
@@ -1589,12 +1583,11 @@ mod tests {
         data.extend_from_slice(b"Sheet1");
         let info = parse_boundsheet(&data).unwrap();
         assert_eq!(info.name, "Sheet1");
-        assert_eq!(info.offset, 100);
         assert!(!info.hidden);
     }
 
     #[test]
-    fn plain_text_output() {
+    fn test_plain_text_output() {
         let doc = XlsDocument {
             images: Vec::new(),
             has_macros: false,
@@ -1622,7 +1615,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_output() {
+    fn test_markdown_output() {
         let doc = XlsDocument {
             images: Vec::new(),
             has_macros: false,
@@ -1653,9 +1646,9 @@ mod tests {
     /// `sheet.rows` directly (raw `CellValue::as_text()`), so a date cell
     /// showed its raw serial (`38971`) here even when `to_ir()`/`markdown`
     /// via the shared IR renderer got it right — the same dual-renderer
-    /// gap already hit for XLSX formula text (#279).
+    /// gap already hit for XLSX formula text.
     #[test]
-    fn plain_text_and_markdown_prefer_the_format_aware_display_text() {
+    fn test_plain_text_and_markdown_prefer_the_format_aware_display_text() {
         let sheet = Sheet {
             name: "Sheet1".into(),
             rows: vec![vec![CellValue::Number(38971.0)]],
@@ -1692,14 +1685,14 @@ mod tests {
     }
 
     #[test]
-    fn ir_empty_doc_produces_no_sections() {
+    fn test_ir_empty_doc_produces_no_sections() {
         let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![]));
         assert!(ir.sections.is_empty());
         assert!(ir.metadata.title.is_none());
     }
 
     #[test]
-    fn ir_empty_sheet_has_no_table() {
+    fn test_ir_empty_sheet_has_no_table() {
         let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![Sheet {
             display: Vec::new(),
             name: "Empty".into(),
@@ -1711,7 +1704,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_sheet_with_data_produces_table_with_header_row() {
+    fn test_ir_sheet_with_data_produces_table_with_header_row() {
         use crate::ir::Element;
         let rows = vec![
             vec![
@@ -1737,7 +1730,7 @@ mod tests {
     /// An empty cell *between* populated ones keeps its column position and
     /// renders as an empty paragraph. Only trailing empties are trimmed.
     #[test]
-    fn ir_empty_cell_value_produces_empty_paragraph_content() {
+    fn test_ir_empty_cell_value_produces_empty_paragraph_content() {
         use crate::ir::Element;
         let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![Sheet {
             display: Vec::new(),
@@ -1765,7 +1758,7 @@ mod tests {
     /// empty cells and rows are dropped — the same trim `convert_xlsx` has
     /// always done.
     #[test]
-    fn ir_trailing_empty_cells_and_rows_are_trimmed() {
+    fn test_ir_trailing_empty_cells_and_rows_are_trimmed() {
         use crate::ir::Element;
         let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![Sheet {
             display: Vec::new(),
@@ -1788,7 +1781,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_a_wholly_empty_sheet_produces_no_table() {
+    fn test_ir_a_wholly_empty_sheet_produces_no_table() {
         let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![Sheet {
             display: Vec::new(),
             name: "S".into(),
@@ -1799,7 +1792,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_multiple_sheets_produce_multiple_sections() {
+    fn test_ir_multiple_sheets_produce_multiple_sections() {
         let doc = make_doc(vec![
             Sheet {
                 display: Vec::new(),
@@ -1821,7 +1814,7 @@ mod tests {
 
     /// A raw BIFF2/3/4 stream has no CFB container, so the CFB layer used
     /// to reject it with "bad magic signature" — indistinguishable from a
-    /// corrupt or unrelated file. Name the format instead (#227).
+    /// corrupt or unrelated file. Name the format instead.
     #[test]
     fn test_raw_biff2_4_reports_the_unsupported_legacy_format() {
         for (sid, label) in [(0x0009u16, "BIFF2"), (0x0209, "BIFF3"), (0x0409, "BIFF4")] {
@@ -1860,7 +1853,7 @@ mod tests {
     /// permits it for ids 0-163, and a real Gnumeric file redefines id 50
     /// (nominally a locale date) as `0.00000E+0`. Testing the id before the
     /// declared code classified such a cell as a date and handed its
-    /// magnitude to the calendar walk, which ran for minutes (#225).
+    /// magnitude to the calendar walk, which ran for minutes.
     #[test]
     fn test_xls_overridden_builtin_date_id_is_not_treated_as_a_date() {
         let mut formats = std::collections::HashMap::new();
@@ -1905,8 +1898,8 @@ mod tests {
     }
 
     /// The same date serial renders a different calendar date depending on
-    /// `date1904` — the 1900/1904 epoch delta is exactly 1462 days. Before
-    /// #233, `build_display` had no `date1904` parameter at all and always
+    /// `date1904` — the 1900/1904 epoch delta is exactly 1462 days. Previously
+    /// `build_display` had no `date1904` parameter at all and always
     /// rendered as if the workbook were 1900-mode.
     #[test]
     fn test_build_display_honours_the_date1904_flag() {
@@ -1930,7 +1923,7 @@ mod tests {
     /// End-to-end: a real `DATEMODE` record (`0x0022`) in the globals
     /// substream must reach the cell that renders the date, via the full
     /// `parse_workbook_stream` record walk — not just `build_display`
-    /// called directly (issue #233).
+    /// called directly.
     #[test]
     fn test_datemode_record_reaches_the_rendered_cell() {
         // ifmt=14 (built-in "m/d/yyyy") at offset 2 of a minimal XF record.
@@ -1954,15 +1947,15 @@ mod tests {
     }
 
     #[test]
-    fn ir_format_is_xls() {
+    fn test_ir_format_is_xls() {
         let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![]));
         assert_eq!(ir.metadata.format, crate::format::DocumentFormat::Xls);
     }
 
-    /// issue #244 — `SummaryInformation` fields must reach `Metadata`, and
+    /// `SummaryInformation` fields must reach `Metadata`, and
     /// the declared title must beat the first-sheet-name fallback.
     #[test]
-    fn ir_summary_properties_reach_metadata() {
+    fn test_ir_summary_properties_reach_metadata() {
         let mut doc = make_doc(vec![Sheet { name: "Sheet1".to_string(), ..Default::default() }]);
         doc.summary_properties = Some(crate::cfb::SummaryProperties {
             title: Some("Declared Title".to_string()),
@@ -1986,7 +1979,7 @@ mod tests {
     /// A missing/empty title in `SummaryInformation` must not shadow the
     /// first-sheet-name fallback.
     #[test]
-    fn ir_empty_summary_title_falls_back_to_sheet_name() {
+    fn test_ir_empty_summary_title_falls_back_to_sheet_name() {
         let mut doc = make_doc(vec![Sheet { name: "Sheet1".to_string(), ..Default::default() }]);
         doc.summary_properties = Some(crate::cfb::SummaryProperties {
             title: Some(String::new()),
@@ -1996,7 +1989,7 @@ mod tests {
         assert_eq!(ir.metadata.title.as_deref(), Some("Sheet1"));
     }
 
-    // ── NAME record (defined names, #251 XLS half) ─────────────────────────
+    // ── NAME record (defined names, XLS half) ─────────────────────────
 
     fn supbook_internal_record(ctab: u16) -> Vec<u8> {
         let mut d = Vec::new();
@@ -2079,7 +2072,7 @@ mod tests {
 
     /// A global name over an area, and a sheet-local name over a single
     /// cell, both resolve through `SUPBOOK`/`EXTERNSHEET` to real
-    /// `Sheet!$A$1`-style text and the right `local_sheet_id` (#251).
+    /// `Sheet!$A$1`-style text and the right `local_sheet_id`.
     #[test]
     fn test_name_records_resolve_area_and_cell_refs_via_externsheet() {
         let globals = vec![

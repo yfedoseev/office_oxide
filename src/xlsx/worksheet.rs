@@ -35,10 +35,10 @@ pub struct Worksheet {
     /// `<xdr:sp>` shapes (the common XLSX case).
     pub text_shapes: Vec<WorksheetTextShape>,
     /// Conditional formatting rules from `<conditionalFormatting>`/
-    /// `<cfRule>`. Empty when the worksheet defines none (issue #252).
+    /// `<cfRule>`. Empty when the worksheet defines none.
     pub conditional_formats: Vec<crate::ir::ConditionalFormat>,
     /// Data validation rules from `<dataValidations>`/`<dataValidation>`.
-    /// Empty when the worksheet defines none (issue #275).
+    /// Empty when the worksheet defines none.
     pub data_validations: Vec<crate::ir::DataValidation>,
 }
 
@@ -172,7 +172,7 @@ pub(crate) fn parse_persons(
 /// thread uses that clean text (every message in the thread, root
 /// first, author-resolved via `persons`) instead of the legacy
 /// boilerplate; a `ref` with no threaded entry (a genuine, non-threaded
-/// legacy "Note") keeps its own legacy text unchanged (issue #301).
+/// legacy "Note") keeps its own legacy text unchanged.
 pub(crate) fn merge_threaded_comments(
     legacy: Vec<SheetComment>,
     threaded: Vec<RawThreadedComment>,
@@ -454,7 +454,7 @@ impl Worksheet {
 /// `<cfRule type="cellIs" operator="greaterThan"><formula>100</formula></cfRule>`
 /// is the common shape; colour-scale/data-bar/icon-set rules instead carry
 /// a `<colorScale>`/`<dataBar>`/`<iconSet>` child with no `<formula>` at
-/// all, which is fine — `formulas` is just empty for those (issue #252).
+/// all, which is fine — `formulas` is just empty for those.
 fn parse_conditional_formatting(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
@@ -933,7 +933,7 @@ fn parse_cell_fast(
                 // A bare `<f t="shared" si="N"/>` is a follower: no text of
                 // its own, but its formula is the group master's translated
                 // by the row/column offset. Discarding it made a formula
-                // cell indistinguishable from one with no formula (#278).
+                // cell indistinguishable from one with no formula.
                 formula = match shared_si(e)? {
                     Some(si) => shared.follower(si, &reference),
                     None => None,
@@ -1001,7 +1001,7 @@ fn read_text_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<
 /// reference as its own event, splitting the literal text around it into
 /// separate `Event::Text` fragments, and trimming each fragment
 /// independently eats the space that sat at the entity boundary, so
-/// `AT&amp;T &lt;tag&gt;` read back as `AT&T<tag>` (#269). This matches the
+/// `AT&amp;T &lt;tag&gt;` read back as `AT&T<tag>`. This matches the
 /// non-trimming reader `shared_strings.rs` already uses for the same
 /// content model.
 fn parse_inline_string_fast(
@@ -1031,8 +1031,8 @@ fn read_inline_string_body(
                 // A rich inline string wraps each run in `<r>`, exactly
                 // like a shared string's `<si>` — reuse the same parser
                 // so a run's `<rPr>` (bold/italic/size/font/color) isn't
-                // discarded here the way it used to be (issue #346;
-                // #303 fixed this for shared strings but missed this
+                // discarded here the way it used to be (the rich-text
+                // fix covered shared strings but missed this
                 // structurally identical inline-string path entirely).
                 b"r" => {
                     runs.push(crate::xlsx::shared_strings::parse_rich_text_run(reader)?);
@@ -1067,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_simple_worksheet() {
+    fn test_parse_simple_worksheet() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <dimension ref="A1:B2"/>
@@ -1097,7 +1097,7 @@ mod tests {
         assert!(matches!(&ws.rows[1].cells[1].value, CellValue::Error(e) if e == "#DIV/0!"));
     }
 
-    /// #278 — a shared-formula group carries its text once, on the master;
+    /// A shared-formula group carries its text once, on the master;
     /// every follower is a bare `<f t="shared" si="N"/>` that used to set
     /// `formula = None`, indistinguishable from a cell with no formula.
     #[test]
@@ -1151,7 +1151,7 @@ mod tests {
         assert_eq!(ws.rows[0].cells[1].formula, None);
     }
 
-    /// #269 — the sheet reader trims text, and quick-xml emits every entity
+    /// The sheet reader trims text, and quick-xml emits every entity
     /// reference as its own event, so the literal text around `&amp;`/`&lt;`
     /// arrived as separate fragments that were each trimmed independently.
     /// Every space touching an escaped character was deleted.
@@ -1200,11 +1200,11 @@ mod tests {
         );
     }
 
-    /// issue #346 — an inline (`t="inlineStr"`) rich-text cell's run
+    /// An inline (`t="inlineStr"`) rich-text cell's run
     /// formatting (bold/italic/color/font) used to be silently
     /// discarded — the reader concatenated each run's text (see the
     /// test above) but skipped `<rPr>` wholesale via the generic
-    /// unknown-element fallback. #303 fixed this exact gap for shared
+    /// unknown-element fallback. The rich-text fix closed this exact gap for shared
     /// strings (`sst.xml`) but missed this structurally identical
     /// inline-string path entirely, since it lives in a completely
     /// different parser (`parse_cell_fast`/`parse_inline_string_fast`
@@ -1233,7 +1233,7 @@ mod tests {
         assert!(runs[1].bold.is_none(), "the second run must not inherit the first run's bold");
     }
 
-    /// issue #252 — a `cellIs`/`greaterThan` rule's sqref, type, operator,
+    /// A `cellIs`/`greaterThan` rule's sqref, type, operator,
     /// and single comparison formula must all reach the IR.
     #[test]
     fn test_conditional_formatting_cell_is_rule_reaches_the_ir() {
@@ -1330,7 +1330,7 @@ mod tests {
         assert!(ws.conditional_formats.is_empty());
     }
 
-    /// issue #275 — a `whole`/`between` rule's sqref, type, operator, both
+    /// A `whole`/`between` rule's sqref, type, operator, both
     /// comparison formulas, and `allowBlank` must all reach the IR.
     #[test]
     fn test_data_validation_whole_between_rule_reaches_the_ir() {
@@ -1438,7 +1438,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_worksheet_with_formula() {
+    fn test_parse_worksheet_with_formula() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <sheetData>
@@ -1455,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_worksheet_page_setup() {
+    fn test_parse_worksheet_page_setup() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <sheetData/>
@@ -1474,7 +1474,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_worksheet_page_setup_paper_enum() {
+    fn test_parse_worksheet_page_setup_paper_enum() {
         // paperSize=9 = A4 (11906x16838 twips portrait), rotated because
         // orientation="landscape" — `paperSize` names a portrait stock.
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -1491,7 +1491,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_worksheet_merged_cells() {
+    fn test_parse_worksheet_merged_cells() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <sheetData>
@@ -1510,28 +1510,28 @@ mod tests {
     // ── dim_to_twips ─────────────────────────────────────────────────────
 
     #[test]
-    fn dim_to_twips_inches() {
+    fn test_dim_to_twips_inches() {
         // 1 inch = 1440 twips.
         assert_eq!(dim_to_twips("1in"), Some(1440));
         assert_eq!(dim_to_twips("8.5in"), Some(12240));
     }
 
     #[test]
-    fn dim_to_twips_millimeters() {
+    fn test_dim_to_twips_millimeters() {
         // 210mm = 11906 twips (A4 width); allow ±1 for rounding.
         let twips = dim_to_twips("210mm").unwrap();
         assert!((twips as i32 - 11906).abs() <= 1, "got {twips}");
     }
 
     #[test]
-    fn dim_to_twips_centimeters() {
+    fn test_dim_to_twips_centimeters() {
         // 1cm = 1440/2.54 ≈ 567 twips.
         let twips = dim_to_twips("1cm").unwrap();
         assert!((twips as i32 - 567).abs() <= 1, "got {twips}");
     }
 
     #[test]
-    fn dim_to_twips_bare_number_assumed_mm() {
+    fn test_dim_to_twips_bare_number_assumed_mm() {
         // Bare numeric defaults to mm.
         let a = dim_to_twips("210mm").unwrap();
         let b = dim_to_twips("210").unwrap();
@@ -1539,7 +1539,7 @@ mod tests {
     }
 
     #[test]
-    fn dim_to_twips_empty_and_zero() {
+    fn test_dim_to_twips_empty_and_zero() {
         assert_eq!(dim_to_twips(""), None);
         assert_eq!(dim_to_twips("   "), None);
         // Zero / negative dimensions are nonsensical: rejected.
@@ -1548,7 +1548,7 @@ mod tests {
     }
 
     #[test]
-    fn dim_to_twips_invalid_string() {
+    fn test_dim_to_twips_invalid_string() {
         assert_eq!(dim_to_twips("garbage"), None);
         assert_eq!(dim_to_twips("abcmm"), None);
     }
@@ -1556,34 +1556,34 @@ mod tests {
     // ── paper_size_enum_to_twips ────────────────────────────────────────
 
     #[test]
-    fn paper_size_letter() {
+    fn test_paper_size_letter() {
         assert_eq!(paper_size_enum_to_twips(1), (12240, 15840));
     }
 
     #[test]
-    fn paper_size_legal() {
+    fn test_paper_size_legal() {
         assert_eq!(paper_size_enum_to_twips(5), (12240, 20160));
     }
 
     #[test]
-    fn paper_size_a4() {
+    fn test_paper_size_a4() {
         assert_eq!(paper_size_enum_to_twips(9), (11906, 16838));
     }
 
     #[test]
-    fn paper_size_unknown_falls_back_to_a4() {
+    fn test_paper_size_unknown_falls_back_to_a4() {
         assert_eq!(paper_size_enum_to_twips(9999), (11906, 16838));
     }
 
     // ── build_page_setup ────────────────────────────────────────────────
 
     #[test]
-    fn build_page_setup_returns_none_when_both_missing() {
+    fn test_build_page_setup_returns_none_when_both_missing() {
         assert!(build_page_setup(None, None).is_none());
     }
 
     #[test]
-    fn build_page_setup_margins_only_zeroes_dimensions() {
+    fn test_build_page_setup_margins_only_zeroes_dimensions() {
         // <pageMargins> without <pageSetup> → dimensions left at 0 so
         // a downstream consumer falls back to its default page size.
         let margins = Some(PageMarginsIn {
@@ -1604,7 +1604,7 @@ mod tests {
     }
 
     #[test]
-    fn build_page_setup_dimensions_only_uses_default_margins() {
+    fn test_build_page_setup_dimensions_only_uses_default_margins() {
         // <pageSetup> alone uses ECMA-376 default 0.7/0.7/0.75/0.75 inch margins.
         let raw = Some(PageSetupRaw {
             width_twips: 12240,
@@ -1621,7 +1621,7 @@ mod tests {
     }
 
     #[test]
-    fn build_page_setup_combines_both() {
+    fn test_build_page_setup_combines_both() {
         let margins = Some(PageMarginsIn {
             left: 0.5,
             right: 0.5,
@@ -1642,7 +1642,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_worksheet_landscape_with_paper_enum() {
+    fn test_parse_worksheet_landscape_with_paper_enum() {
         // Verifies that landscape attribute survives the parse_page_setup_attrs path.
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
@@ -1658,7 +1658,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_worksheet_default_when_no_setup() {
+    fn test_parse_worksheet_default_when_no_setup() {
         // No <pageMargins> or <pageSetup> → no page_setup at all.
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
@@ -1668,10 +1668,10 @@ mod tests {
         assert!(ws.page_setup.is_none());
     }
 
-    // ── Threaded comments (issue #301) ──
+    // ── Threaded comments ──
 
     #[test]
-    fn parse_threaded_comments_reads_ref_person_and_text() {
+    fn test_parse_threaded_comments_reads_ref_person_and_text() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <ThreadedComments xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments">
   <threadedComment ref="C2" personId="{P1}" id="{ID1}">
@@ -1688,7 +1688,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_persons_maps_id_to_display_name() {
+    fn test_parse_persons_maps_id_to_display_name() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <personList xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments">
   <person displayName="Pankaj Chaudhary" id="{P1}" userId="S::x" providerId="AD"/>
@@ -1697,14 +1697,14 @@ mod tests {
         assert_eq!(out.get("{P1}").map(String::as_str), Some("Pankaj Chaudhary"));
     }
 
-    /// issue #301 — a `ref` with a resolved threaded-comment thread must
+    /// A `ref` with a resolved threaded-comment thread must
     /// use the clean thread text (author-resolved) instead of the
     /// legacy ~290-char compatibility boilerplate for the same cell;
     /// a `ref` with no threaded entry must keep its own legacy text
     /// unchanged. Mirrors the real corpus file this was verified
     /// against (poi_64759.xlsx: C2 threaded, B3 a genuine legacy Note).
     #[test]
-    fn merge_prefers_threaded_text_and_keeps_untouched_legacy_notes() {
+    fn test_merge_prefers_threaded_text_and_keeps_untouched_legacy_notes() {
         let legacy = vec![
             SheetComment {
                 cell_ref: "C2".to_string(),
@@ -1744,7 +1744,7 @@ mod tests {
     /// produce a root-first, multi-line thread rather than dropping the
     /// reply — the issue's own secondary, not-corpus-confirmed concern.
     #[test]
-    fn merge_orders_reply_after_root_in_a_thread() {
+    fn test_merge_orders_reply_after_root_in_a_thread() {
         let threaded = vec![
             RawThreadedComment {
                 cell_ref: "A1".to_string(),
@@ -1765,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn no_threaded_comments_leaves_legacy_list_unchanged() {
+    fn test_no_threaded_comments_leaves_legacy_list_unchanged() {
         let legacy = vec![SheetComment {
             cell_ref: "A1".to_string(),
             author: None,

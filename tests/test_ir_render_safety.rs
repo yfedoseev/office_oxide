@@ -35,11 +35,11 @@ fn ir_with(elements: Vec<Element>) -> DocumentIR {
 }
 
 // ---------------------------------------------------------------------------
-// #157 — URL scheme filtering
+// URL scheme filtering
 // ---------------------------------------------------------------------------
 
 #[test]
-fn dangerous_url_schemes_are_dropped_from_links() {
+fn test_dangerous_url_schemes_are_dropped_from_links() {
     for url in [
         "javascript:alert(1)",
         "JavaScript:alert(1)",
@@ -64,7 +64,7 @@ fn dangerous_url_schemes_are_dropped_from_links() {
 }
 
 #[test]
-fn a_control_character_cannot_smuggle_a_scheme_past_the_filter() {
+fn test_a_control_character_cannot_smuggle_a_scheme_past_the_filter() {
     let ir = ir_with(vec![Element::Paragraph(Paragraph {
         content: vec![linked("x", "java\u{0}script:alert(1)")],
         ..Default::default()
@@ -73,7 +73,7 @@ fn a_control_character_cannot_smuggle_a_scheme_past_the_filter() {
 }
 
 #[test]
-fn ordinary_urls_still_render_as_links() {
+fn test_ordinary_urls_still_render_as_links() {
     for url in [
         "https://example.com/a?b=1",
         "mailto:someone@example.com",
@@ -90,11 +90,11 @@ fn ordinary_urls_still_render_as_links() {
 }
 
 // ---------------------------------------------------------------------------
-// #157 — markdown metacharacters in document text
+// Markdown metacharacters in document text
 // ---------------------------------------------------------------------------
 
 #[test]
-fn document_text_cannot_inject_markdown_structure() {
+fn test_document_text_cannot_inject_markdown_structure() {
     let ir = ir_with(vec![Element::Paragraph(Paragraph {
         content: vec![span("a | b [x](javascript:alert(1)) *not emphasis*")],
         ..Default::default()
@@ -108,7 +108,7 @@ fn document_text_cannot_inject_markdown_structure() {
 }
 
 // ---------------------------------------------------------------------------
-// #166 — the three renderers must agree
+// The three renderers must agree
 // ---------------------------------------------------------------------------
 
 fn hf(text: &str) -> HeaderFooter {
@@ -121,7 +121,7 @@ fn hf(text: &str) -> HeaderFooter {
 }
 
 #[test]
-fn all_three_renderers_include_headers_and_footers() {
+fn test_all_three_renderers_include_headers_and_footers() {
     let ir = DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Docx,
@@ -150,7 +150,7 @@ fn all_three_renderers_include_headers_and_footers() {
 }
 
 #[test]
-fn plain_text_does_not_emit_markdown_syntax_as_a_separator() {
+fn test_plain_text_does_not_emit_markdown_syntax_as_a_separator() {
     let ir = DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Pptx,
@@ -174,7 +174,7 @@ fn plain_text_does_not_emit_markdown_syntax_as_a_separator() {
 }
 
 #[test]
-fn an_image_with_no_source_does_not_render_as_a_broken_reference() {
+fn test_an_image_with_no_source_does_not_render_as_a_broken_reference() {
     let ir = ir_with(vec![Element::Image(Image {
         alt_text: Some("A chart".to_string()),
         ..Default::default()
@@ -188,7 +188,7 @@ fn an_image_with_no_source_does_not_render_as_a_broken_reference() {
 }
 
 #[test]
-fn an_image_with_neither_source_nor_alt_text_renders_nothing() {
+fn test_an_image_with_neither_source_nor_alt_text_renders_nothing() {
     let ir = ir_with(vec![Element::Image(Image::default())]);
     assert_eq!(ir.to_markdown().trim(), "");
     assert_eq!(ir.to_html().trim(), "");
@@ -199,7 +199,7 @@ fn an_image_with_neither_source_nor_alt_text_renders_nothing() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn an_all_whitespace_span_does_not_panic() {
+fn test_an_all_whitespace_span_does_not_panic() {
     // Leading and trailing whitespace are split out of the emphasis
     // delimiters. Computing the two spans independently makes them overlap
     // on an all-whitespace run, which inverts the slice range and aborts the
@@ -224,7 +224,7 @@ fn an_all_whitespace_span_does_not_panic() {
 }
 
 #[test]
-fn whitespace_between_two_emphasised_runs_survives() {
+fn test_whitespace_between_two_emphasised_runs_survives() {
     // The whitespace-only run sits between two bold runs; it must neither
     // panic nor swallow the space that separates the words.
     let bold = |t: &str| {

@@ -98,11 +98,10 @@ pub struct TableCellProperties {
     /// Horizontal grid span (number of columns spanned).
     pub grid_span: Option<u32>,
     /// Cell shading/background. Boxed: rare on real cells in a large
-    /// table — `Option<T>` reserves `size_of(T)` even when `None`
-    /// (issue #328).
+    /// table — `Option<T>` reserves `size_of(T)` even when `None`.
     pub shading: Option<Box<Shading>>,
     /// Cell border edges (`w:tcBorders`). Boxed: rare on real cells in a
-    /// large table (issue #328).
+    /// large table.
     pub borders: Option<Box<TableBorders>>,
     /// Vertical alignment of cell content (`w:vAlign`).
     pub v_align: Option<CellVAlign>,
@@ -112,7 +111,7 @@ pub struct TableCellProperties {
     pub margins: Option<CellMargins>,
     /// `true` when the cell carries `<w:cellDel>` — deleted via tracked
     /// changes, pending acceptance. Mirrors the policy already applied to
-    /// run-level `w:del`: excluded from the accepted view (issue #266).
+    /// run-level `w:del`: excluded from the accepted view.
     pub deleted: bool,
 }
 
@@ -173,7 +172,7 @@ pub struct Shading {
 mod tests {
     use super::*;
 
-    /// Regression (issue #328): `TableCellProperties`'s `shading`/
+    /// Regression: `TableCellProperties`'s `shading`/
     /// `borders` must stay boxed. `TableCellProperties` was 536 bytes
     /// before this fix (dominated by an unboxed `Shading` + `TableBorders`
     /// pair), and `TableCell` (which every cell in a large table pays for)

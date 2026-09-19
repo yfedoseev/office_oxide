@@ -3,7 +3,7 @@
 //! Legacy binary PowerPoint (97–2003) has no native "table" shape record
 //! at all — [MS-ODRAW]'s `MSOSPT` preset-shape enumeration has no table
 //! entry, and grepping the crate confirms no table-parsing code ever
-//! existed here (issue #255). A PowerPoint 2000+ table is authored as an
+//! existed here. A PowerPoint 2000+ table is authored as an
 //! ordinary `OfficeArtSpgrContainer` *group* whose member shapes are laid
 //! out in a rectangular grid — each cell is just a shape with its own
 //! text, positioned via `OfficeArtChildAnchor` ([MS-ODRAW] §2.2.16 group
@@ -141,13 +141,13 @@ mod tests {
     }
 
     #[test]
-    fn cluster_positions_groups_exact_duplicates() {
+    fn test_cluster_positions_groups_exact_duplicates() {
         let c = cluster_positions(vec![100, 100, 100, 500, 500, 500]);
         assert_eq!(c, vec![100, 500]);
     }
 
     #[test]
-    fn cluster_positions_tolerates_small_jitter() {
+    fn test_cluster_positions_tolerates_small_jitter() {
         // Real files can be off by a handful of units per cell due to
         // rounding in whatever authored them; 3/4/5 must still cluster
         // with a far-away 500 group as two bands, not four.
@@ -156,12 +156,12 @@ mod tests {
     }
 
     #[test]
-    fn cluster_positions_empty_input() {
+    fn test_cluster_positions_empty_input() {
         assert!(cluster_positions(vec![]).is_empty());
     }
 
     #[test]
-    fn build_table_recognizes_a_clean_2x2_grid() {
+    fn test_build_table_recognizes_a_clean_2x2_grid() {
         let cells = vec![cell(0, 0), cell(100, 0), cell(0, 50), cell(100, 50)];
         let table = build_table(&cells).expect("should detect a 2x2 grid");
         assert_eq!(table.rows.len(), 2);
@@ -169,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn build_table_recognizes_a_3x2_grid_regardless_of_input_order() {
+    fn test_build_table_recognizes_a_3x2_grid_regardless_of_input_order() {
         // 3 rows, 2 columns, shuffled input order.
         let cells = vec![
             cell(100, 100),
@@ -185,27 +185,27 @@ mod tests {
     }
 
     #[test]
-    fn build_table_rejects_a_single_row() {
+    fn test_build_table_rejects_a_single_row() {
         // 1x3: a line-up of shapes, not a table.
         let cells = vec![cell(0, 0), cell(100, 0), cell(200, 0)];
         assert!(build_table(&cells).is_none());
     }
 
     #[test]
-    fn build_table_rejects_a_single_column() {
+    fn test_build_table_rejects_a_single_column() {
         let cells = vec![cell(0, 0), cell(0, 100), cell(0, 200)];
         assert!(build_table(&cells).is_none());
     }
 
     #[test]
-    fn build_table_rejects_a_grid_with_a_missing_cell() {
+    fn test_build_table_rejects_a_grid_with_a_missing_cell() {
         // 2x2 grid minus its bottom-right cell: 3 shapes, not 4.
         let cells = vec![cell(0, 0), cell(100, 0), cell(0, 50)];
         assert!(build_table(&cells).is_none());
     }
 
     #[test]
-    fn build_table_rejects_a_merged_cell_collision() {
+    fn test_build_table_rejects_a_merged_cell_collision() {
         // A wide top cell spanning both columns collides with both
         // bottom cells' column slot once clustered — two cells can't
         // land in the same (row, col) slot, so this must bail rather
@@ -224,12 +224,12 @@ mod tests {
     }
 
     #[test]
-    fn build_table_rejects_fewer_than_four_cells() {
+    fn test_build_table_rejects_fewer_than_four_cells() {
         assert!(build_table(&[cell(0, 0), cell(1, 1), cell(2, 2)]).is_none());
     }
 
     #[test]
-    fn build_table_preserves_cell_text_by_position() {
+    fn test_build_table_preserves_cell_text_by_position() {
         let mut a = cell(0, 0);
         a.runs = vec![TextRun {
             text: "A".to_string(),

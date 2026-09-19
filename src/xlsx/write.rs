@@ -231,10 +231,10 @@ pub enum CellData {
     String(String),
     /// A string made of multiple differently-formatted runs (written as
     /// an inline rich string, one `<r>` per run) — closes the write
-    /// side of the read-only gap issue #303 left: a cell with several
+    /// side of the read-only gap the rich-text reader left: a cell with several
     /// runs of distinct bold/italic/color/font formatting used to have
     /// nowhere to go but a single flattened `CellData::String`, silently
-    /// dropping every run's own formatting (issue #346).
+    /// dropping every run's own formatting.
     RichString(Vec<RichRun>),
     /// A numeric value.
     Number(f64),
@@ -244,7 +244,7 @@ pub enum CellData {
     Formula(String),
 }
 
-/// One run of a multi-run cell's inline rich text (issue #346) — the
+/// One run of a multi-run cell's inline rich text — the
 /// write-side mirror of `shared_strings::RichTextRun` (read). Fields
 /// intentionally simpler than the read side's (a plain hex color
 /// string, not a theme-resolving `ColorRef`) since a caller building a
@@ -319,7 +319,7 @@ pub struct PageSetup {
 /// A cell comment to write back as a real legacy Excel comment
 /// (`xl/comments*.xml` + a companion VML shape), not the plain-text row
 /// dump the writer used to fall back to for `Element::Endnote` content
-/// with nowhere else to go (issue #344).
+/// with nowhere else to go.
 #[derive(Debug, Clone)]
 pub struct SheetCommentOut {
     /// 0-based row.
@@ -400,12 +400,12 @@ struct SheetDataInner {
     /// Text shapes anchored on this sheet via a DrawingML drawing part.
     /// Used by the layout-preserving PDF→XLSX path.
     pub text_shapes: Vec<SheetTextShape>,
-    /// Per-cell external hyperlink targets (issue #262 — this writer had
+    /// Per-cell external hyperlink targets (this writer had
     /// no hyperlink concept at all, so a cell's URL was silently dropped
     /// on every write, unconditionally).
     pub hyperlinks: HashMap<(usize, usize), String>,
     /// Cell comments to write as real `xl/comments*.xml` + VML entries
-    /// (issue #344 — these used to have nowhere to go and fell through
+    /// (these used to have nowhere to go and fell through
     /// to being dumped as plain extra rows below the table).
     pub comments: Vec<SheetCommentOut>,
 }
@@ -476,7 +476,7 @@ impl SheetDataInner {
     }
 
     /// Set (or overwrite) the external hyperlink target for a cell
-    /// (issue #262). Silently ignored outside the sheet grid, matching
+    ///. Silently ignored outside the sheet grid, matching
     /// `set_cell`/`set_cell_styled`.
     pub fn set_cell_hyperlink(
         &mut self,
@@ -491,7 +491,7 @@ impl SheetDataInner {
         self
     }
 
-    /// Add a real cell comment (issue #344). Silently ignored outside
+    /// Add a real cell comment. Silently ignored outside
     /// the sheet grid, matching `set_cell`/`set_cell_styled`.
     pub fn set_cell_comment(
         &mut self,
@@ -592,7 +592,7 @@ fn in_grid(row: usize, col: usize) -> bool {
 /// any C-based extractor) plus `[Content_Types].xml` and the drawing's
 /// `.rels` unescapably, making both non-well-formed XML while `save()`
 /// still returned `Ok(())`. Falls back to `"bin"` when nothing in the
-/// input survives filtering (issue #220).
+/// input survives filtering.
 fn sanitize_image_extension(format: &str) -> String {
     let cleaned: String =
         format.chars().filter(|c| c.is_ascii_alphanumeric()).take(10).collect();
@@ -690,8 +690,7 @@ impl<'a> SheetData<'a> {
         self
     }
 
-    /// Set (or overwrite) the external hyperlink target for a cell
-    /// (issue #262).
+    /// Set (or overwrite) the external hyperlink target for a cell.
     pub fn set_cell_hyperlink(
         &mut self,
         row: usize,
@@ -702,7 +701,7 @@ impl<'a> SheetData<'a> {
         self
     }
 
-    /// Add a real cell comment (issue #344).
+    /// Add a real cell comment.
     pub fn set_cell_comment(
         &mut self,
         row: usize,
@@ -1029,8 +1028,7 @@ impl XlsxWriter {
             // One external relationship per cell hyperlink, scoped to
             // this sheet's own `_rels` file (each worksheet part has
             // its own relationships part; an r:id registered against
-            // one sheet doesn't resolve inside another's XML) (issue
-            // #262).
+            // one sheet doesn't resolve inside another's XML).
             let mut hyperlink_rids: HashMap<(usize, usize), String> = HashMap::new();
             for (&(row, col), url) in &sheet.hyperlinks {
                 let rid = opc.add_part_rel_with_mode(
@@ -1045,7 +1043,7 @@ impl XlsxWriter {
             // Real legacy Excel comments: xl/comments<n>.xml (the
             // content) plus xl/drawings/vmlDrawing<n>.vml (the popup
             // shape Excel needs to render an indicator at all) — sheets
-            // with no comments get neither part (issue #344).
+            // with no comments get neither part.
             let legacy_drawing_rid = if !sheet.comments.is_empty() {
                 Some(Self::write_comments_for_sheet(opc, &part_name, i + 1, &sheet.comments)?)
             } else {
@@ -1196,7 +1194,7 @@ impl XlsxWriter {
         // `<hyperlinks>` (CT_Worksheet, ECMA-376 §18.3.1.48) MUST appear
         // after `mergeCells` and before `pageMargins`/`pageSetup`/
         // `printOptions` per the worksheet child-order schema — same
-        // constraint as `<drawing>` below (issue #262).
+        // constraint as `<drawing>` below.
         if !sheet.hyperlinks.is_empty() {
             let mut sorted: Vec<(&(usize, usize), &String)> = hyperlink_rids.iter().collect();
             sorted.sort_unstable_by_key(|&(&(r, c), _)| (r, c));
@@ -1267,7 +1265,7 @@ impl XlsxWriter {
 
         // `<legacyDrawing>` (the VML part carrying comment popup shapes)
         // comes after `<drawing>`, the last child CT_Worksheet allows
-        // before `</worksheet>` for what this writer emits (issue #344).
+        // before `</worksheet>` for what this writer emits.
         if let Some(rid) = legacy_drawing_rid {
             let mut ld = BytesStart::new("legacyDrawing");
             ld.push_attribute(("r:id", rid));
@@ -2278,7 +2276,7 @@ fn format_number(n: f64) -> String {
 mod tests {
     use super::*;
 
-    /// issue #220 — a control character (a raw NUL in particular) in the
+    /// A control character (a raw NUL in particular) in the
     /// image extension reached the ZIP entry name, the relationship
     /// target and [Content_Types].xml unescapably, producing a
     /// non-well-formed package while save() still returned Ok(()).
@@ -2323,7 +2321,7 @@ mod tests {
     }
 
     #[test]
-    fn col_name_basic() {
+    fn test_col_name_basic() {
         assert_eq!(col_name(0), "A");
         assert_eq!(col_name(25), "Z");
         assert_eq!(col_name(26), "AA");
@@ -2331,7 +2329,7 @@ mod tests {
     }
 
     #[test]
-    fn formula_cell_roundtrip() {
+    fn test_formula_cell_roundtrip() {
         let mut wb = XlsxWriter::new();
         let mut sheet = wb.add_sheet("Test");
         sheet.set_cell(0, 0, CellData::Number(10.0));
@@ -2344,7 +2342,7 @@ mod tests {
     }
 
     #[test]
-    fn styled_cells() {
+    fn test_styled_cells() {
         let mut wb = XlsxWriter::new();
         let mut sheet = wb.add_sheet("Styled");
         sheet.set_cell_styled(
@@ -2372,7 +2370,7 @@ mod tests {
     }
 
     #[test]
-    fn all_number_formats() {
+    fn test_all_number_formats() {
         let mut wb = XlsxWriter::new();
         let mut sheet = wb.add_sheet("Fmts");
         let formats = [
@@ -2399,7 +2397,7 @@ mod tests {
     }
 
     #[test]
-    fn page_setup_round_trip() {
+    fn test_page_setup_round_trip() {
         // Letter portrait, 0.5" margins. The on-wire format is mm in
         // <pageSetup paperWidth/paperHeight> + inches in <pageMargins>;
         // verify both elements appear and that the parser recovers
@@ -2439,7 +2437,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_cells_xml() {
+    fn test_merge_cells_xml() {
         let mut wb = XlsxWriter::new();
         let mut sheet = wb.add_sheet("MergeTest");
         sheet.set_cell(0, 0, CellData::String("Merged".into()));
@@ -2460,13 +2458,13 @@ mod tests {
         assert!(sheet_xml.contains(r#"ref="A1:B1""#), "wrong ref");
     }
 
-    /// issue #262 — xlsx::write had no hyperlink concept at all; a cell's
+    /// xlsx::write had no hyperlink concept at all; a cell's
     /// URL was silently dropped, unconditionally, on every write. Checks
     /// both the raw XML shape (worksheet `<hyperlinks>` + its own
     /// `_rels` external relationship) and that the crate's own reader
     /// resolves it back to a URL.
     #[test]
-    fn cell_hyperlink_round_trips() {
+    fn test_cell_hyperlink_round_trips() {
         let mut wb = XlsxWriter::new();
         let mut sheet = wb.add_sheet("Links");
         sheet.set_cell(0, 0, CellData::String("Contact".into()));
@@ -2544,7 +2542,7 @@ mod validity_tests {
     /// `sanitize_xml_text` guarded element text but never an attribute, so a
     /// control character in a sheet name made `workbook.xml` unparseable.
     #[test]
-    fn control_characters_in_a_sheet_name_do_not_break_the_workbook_part() {
+    fn test_control_characters_in_a_sheet_name_do_not_break_the_workbook_part() {
         let mut wb = XlsxWriter::new();
         wb.add_sheet("ctl\u{1}chr")
             .add_row(vec![CellData::Number(1.0)]);
@@ -2555,7 +2553,7 @@ mod validity_tests {
 
     /// `ST_UnsignedIntHex` is exactly four hex bytes.
     #[test]
-    fn colours_that_are_not_six_hex_digits_are_not_written() {
+    fn test_colours_that_are_not_six_hex_digits_are_not_written() {
         let mut wb = XlsxWriter::new();
         {
             let mut s = wb.add_sheet("S");
@@ -2572,7 +2570,7 @@ mod validity_tests {
     /// `CT_Col/@width` is an `xsd:double`; `inf` has no lexical form there,
     /// and Excel caps width at 255.
     #[test]
-    fn non_finite_or_out_of_range_column_widths_are_dropped() {
+    fn test_non_finite_or_out_of_range_column_widths_are_dropped() {
         let mut wb = XlsxWriter::new();
         {
             let mut s = wb.add_sheet("S");
@@ -2592,7 +2590,7 @@ mod validity_tests {
 
     /// `CT_Sheets` requires at least one `sheet`.
     #[test]
-    fn a_workbook_with_no_sheets_still_writes_one() {
+    fn test_a_workbook_with_no_sheets_still_writes_one() {
         let wb = XlsxWriter::new();
         let xml = part(&wb, "xl/workbook.xml");
         assert!(xml.contains("<sheet "), "workbook must carry a sheet: {xml}");
@@ -2601,7 +2599,7 @@ mod validity_tests {
 
     /// `col + col_span` with a caller-supplied `usize` overflowed.
     #[test]
-    fn merge_spans_are_clamped_to_the_grid_and_never_overflow() {
+    fn test_merge_spans_are_clamped_to_the_grid_and_never_overflow() {
         let mut wb = XlsxWriter::new();
         {
             let mut s = wb.add_sheet("S");
@@ -2617,7 +2615,7 @@ mod validity_tests {
 
     /// `add_row` must gate on the grid the way `set_cell` does.
     #[test]
-    fn add_row_does_not_write_cells_past_the_last_column() {
+    fn test_add_row_does_not_write_cells_past_the_last_column() {
         let mut wb = XlsxWriter::new();
         {
             let mut s = wb.add_sheet("S");
@@ -2634,7 +2632,7 @@ mod validity_tests {
 
     /// [ECMA-376] §18.3.1.40: `<f>` content excludes the leading `=`.
     #[test]
-    fn a_formula_keeps_no_leading_equals_sign() {
+    fn test_a_formula_keeps_no_leading_equals_sign() {
         let mut wb = XlsxWriter::new();
         wb.add_sheet("S")
             .add_row(vec![CellData::Formula("=SUM(A1:A2)".into())]);
@@ -2644,7 +2642,7 @@ mod validity_tests {
 
     /// Formatting a blank cell must actually write the style.
     #[test]
-    fn a_styled_empty_cell_is_written_with_its_style() {
+    fn test_a_styled_empty_cell_is_written_with_its_style() {
         let mut wb = XlsxWriter::new();
         {
             let mut s = wb.add_sheet("S");
@@ -2657,7 +2655,7 @@ mod validity_tests {
 
     /// Half-point sizes are real; integer division threw them away.
     #[test]
-    fn half_point_font_sizes_survive_and_out_of_range_ones_clamp() {
+    fn test_half_point_font_sizes_survive_and_out_of_range_ones_clamp() {
         let mut wb = XlsxWriter::new();
         {
             let mut s = wb.add_sheet("S");
@@ -2673,7 +2671,7 @@ mod validity_tests {
 
     /// The same input must produce the same bytes.
     #[test]
-    fn styles_are_written_deterministically() {
+    fn test_styles_are_written_deterministically() {
         let build = || {
             let mut wb = XlsxWriter::new();
             {
@@ -2707,7 +2705,7 @@ mod validity_tests {
 
     /// Truncating a name at 31 characters can put an apostrophe back on the end.
     #[test]
-    fn sheet_name_truncation_does_not_reintroduce_a_trailing_apostrophe() {
+    fn test_sheet_name_truncation_does_not_reintroduce_a_trailing_apostrophe() {
         let name = format!("{}'{}", "a".repeat(30), "z".repeat(9));
         let cleaned = sanitize_sheet_name(&name, &[]);
         assert!(!cleaned.ends_with('\''), "trailing apostrophe survived: {cleaned}");

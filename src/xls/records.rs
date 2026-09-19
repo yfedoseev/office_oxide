@@ -1,7 +1,5 @@
 //! BIFF8 record types and low-level record iterator.
 
-#![allow(dead_code)]
-
 use super::error::Result;
 
 // ── Record type IDs ──
@@ -32,33 +30,32 @@ pub const RT_NAME: u16 = 0x0018;
 pub const RT_EXTERNSHEET: u16 = 0x0017;
 pub const RT_SUPBOOK: u16 = 0x01AE;
 /// Chart series/trendline/axis/chart title text ([MS-XLS] §2.4.254), found
-/// inside a chart's nested `BOF..EOF` substream (issue #246).
+/// inside a chart's nested `BOF..EOF` substream.
 pub const RT_SERIESTEXT: u16 = 0x100D;
 /// Begins a conditional-formatting rule group: the cell range(s) it
 /// applies to, plus how many `CF` records follow ([MS-XLS] §2.4.56,
-/// record type 432 = 0x1B0). Issue #252.
+/// record type 432 = 0x1B0).
 pub const RT_CONDFMT: u16 = 0x01B0;
 /// One conditional-formatting rule within the group opened by the
 /// preceding `CONDFMT` ([MS-XLS] §2.4.42, record type 433 = 0x1B1).
 pub const RT_CF: u16 = 0x01B1;
 
 /// One data validation rule ([MS-XLS] §2.4.44, record type 446 = 0x1BE).
-/// Issue #275.
 pub const RT_DV: u16 = 0x01BE;
 
 /// A cell (or cell range's) hyperlink target ([MS-XLS] §2.4.130, record
-/// type 440 = 0x1B8). Issue #306.
+/// type 440 = 0x1B8).
 pub const RT_HLINK: u16 = 0x01B8;
 
 /// Declares a drawing shape/object and its object id ([MS-XLS] §2.4.181,
 /// record type 93 = 0x5D). Only used here to correlate a `NOTE`'s
-/// `shapeid` to its comment text (issue #307).
+/// `shapeid` to its comment text.
 pub const RT_OBJ: u16 = 0x005D;
 /// A cell comment's position and author ([MS-XLS] §2.4.178, record type
-/// 28 = 0x1C). Issue #307.
+/// 28 = 0x1C).
 pub const RT_NOTE: u16 = 0x001C;
 /// The text of the drawing shape declared by the immediately preceding
-/// `OBJ` record ([MS-XLS] §2.4.326, record type 438 = 0x1B6). Issue #307.
+/// `OBJ` record ([MS-XLS] §2.4.326, record type 438 = 0x1B6).
 pub const RT_TXO: u16 = 0x01B6;
 
 /// A raw BIFF record: type + data (may span CONTINUE records).
@@ -156,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn iterate_single_record() {
+    fn test_iterate_single_record() {
         let stream = make_record(RT_BOF, &[0x00, 0x06, 0x05, 0x00]);
         let records: Vec<_> = RecordIter::new(&stream)
             .collect::<std::result::Result<_, _>>()
@@ -167,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn iterate_multiple_records() {
+    fn test_iterate_multiple_records() {
         let mut stream = make_record(RT_BOF, &[0x00, 0x06]);
         stream.extend(make_record(RT_EOF, &[]));
         let records: Vec<_> = RecordIter::new(&stream)
@@ -179,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn continue_records_merged() {
+    fn test_continue_records_merged() {
         let mut stream = make_record(RT_SST, &[0x01, 0x02]);
         stream.extend(make_record(RT_CONTINUE, &[0x03, 0x04]));
         stream.extend(make_record(RT_CONTINUE, &[0x05]));
@@ -193,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_record_tolerant() {
+    fn test_truncated_record_tolerant() {
         // Record says 10 bytes but only 2 available — should return partial data.
         let mut stream = Vec::new();
         stream.extend_from_slice(&RT_BOF.to_le_bytes());
@@ -208,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_stream() {
+    fn test_empty_stream() {
         let records: Vec<_> = RecordIter::new(&[])
             .collect::<std::result::Result<_, _>>()
             .unwrap();

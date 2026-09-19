@@ -18,7 +18,7 @@ pub struct PptDocument {
     /// Title/author/subject/keywords/comments/dates from the
     /// `\x05SummaryInformation` OLE property-set stream every real `.ppt`
     /// carries by default — parsed and then never read anywhere in the
-    /// crate before (issue #244).
+    /// crate before.
     summary_properties: Option<SummaryProperties>,
 }
 
@@ -60,14 +60,14 @@ impl PptDocument {
     }
 
     /// `true` when the file carries a `_VBA_PROJECT` storage — a cheap
-    /// macro-presence signal, no VBA interpretation (issue #283).
+    /// macro-presence signal, no VBA interpretation.
     pub fn has_macros(&self) -> bool {
         self.has_macros
     }
 
     /// Title/author/subject/keywords/comments/dates from the file's
     /// `\x05SummaryInformation` OLE property set, when present and
-    /// well-formed (issue #244).
+    /// well-formed.
     pub fn summary_properties(&self) -> Option<&SummaryProperties> {
         self.summary_properties.as_ref()
     }
@@ -146,7 +146,7 @@ mod tests {
     use crate::ppt::text::TextRun;
 
     #[test]
-    fn plain_text_basic() {
+    fn test_plain_text_basic() {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
@@ -187,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_basic() {
+    fn test_markdown_basic() {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
@@ -217,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn notes_excluded_from_plain_text() {
+    fn test_notes_excluded_from_plain_text() {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
@@ -261,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_empty_doc_has_no_sections() {
+    fn test_ir_empty_doc_has_no_sections() {
         let doc = PptDocument {
             images: Vec::new(),
             slides: Vec::new(),
@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_title_becomes_heading_and_section_title() {
+    fn test_ir_title_becomes_heading_and_section_title() {
         use crate::ir::Element;
         let doc = PptDocument {
             images: Vec::new(),
@@ -287,12 +287,12 @@ mod tests {
         assert!(matches!(ir.sections[0].elements[0], Element::Heading(_)));
     }
 
-    /// issue #253 — a title-slide layout's real title (`textType=6`) and
+    /// A title-slide layout's real title (`textType=6`) and
     /// subtitle (`textType=5`) must not be swapped: the document title
     /// must come from the real title text, and the subtitle must not
     /// become a bold `Heading`.
     #[test]
-    fn ir_title_slide_title_and_subtitle_are_not_swapped() {
+    fn test_ir_title_slide_title_and_subtitle_are_not_swapped() {
         use crate::ir::Element;
         let doc = PptDocument {
             images: Vec::new(),
@@ -330,11 +330,11 @@ mod tests {
         );
     }
 
-    /// issue #257 — a `TextRun::hyperlink` resolved from `InteractiveInfo`
+    /// A `TextRun::hyperlink` resolved from `InteractiveInfo`
     /// must reach `TextSpan::hyperlink` in the IR, for every text type
     /// that hyperlink can attach to (not just plain body paragraphs).
     #[test]
-    fn ir_hyperlink_reaches_textspan_hyperlink() {
+    fn test_ir_hyperlink_reaches_textspan_hyperlink() {
         use crate::ir::{Element, InlineContent};
         let doc = PptDocument {
             images: Vec::new(),
@@ -361,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_center_title_treated_like_title() {
+    fn test_ir_center_title_treated_like_title() {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
@@ -372,13 +372,13 @@ mod tests {
         assert_eq!(ir.sections[0].title.as_deref(), Some("Centered"));
     }
 
-    /// The PPTX side of this was already fixed in #203; #238 is the same
+    /// The PPTX side of this was already fixed; this is the same
     /// defect on the legacy binary .ppt path — `TextType::Notes` runs must
     /// land on `Section.speaker_notes`, not leak into `elements` as
     /// ordinary (if italicized) paragraphs indistinguishable from body
     /// text to most IR consumers.
     #[test]
-    fn ir_notes_go_to_speaker_notes_not_elements() {
+    fn test_ir_notes_go_to_speaker_notes_not_elements() {
         use crate::ir::{Element, InlineContent};
         let doc = PptDocument {
             images: Vec::new(),
@@ -413,7 +413,7 @@ mod tests {
 
     /// A slide with no notes at all gets `None`, not an empty string.
     #[test]
-    fn ir_no_notes_is_none_not_empty_string() {
+    fn test_ir_no_notes_is_none_not_empty_string() {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
@@ -427,7 +427,7 @@ mod tests {
     /// Multiple `TextType::Notes` runs on one slide are joined, not just
     /// the last one kept.
     #[test]
-    fn ir_multiple_notes_runs_are_joined() {
+    fn test_ir_multiple_notes_runs_are_joined() {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
@@ -462,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_body_half_quarter_produce_paragraphs() {
+    fn test_ir_body_half_quarter_produce_paragraphs() {
         use crate::ir::Element;
         let doc = PptDocument {
             images: Vec::new(),
@@ -480,8 +480,8 @@ mod tests {
     }
 
     #[test]
-    fn ir_notes_produce_no_visible_elements() {
-        // Superseded by #238: notes used to become an italic Element::
+    fn test_ir_notes_produce_no_visible_elements() {
+        // Superseded: notes used to become an italic Element::
         // Paragraph in `elements`; they now route to Section::speaker_notes
         // instead (see ir_notes_go_to_speaker_notes_not_elements above) and
         // a notes-only slide has no visible elements at all.
@@ -500,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_other_text_type_produces_paragraph() {
+    fn test_ir_other_text_type_produces_paragraph() {
         use crate::ir::Element;
         let doc = PptDocument {
             images: Vec::new(),
@@ -513,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_slide_without_title_gets_fallback_name() {
+    fn test_ir_slide_without_title_gets_fallback_name() {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
@@ -525,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn ir_format_is_ppt() {
+    fn test_ir_format_is_ppt() {
         let doc = PptDocument {
             images: Vec::new(),
             slides: Vec::new(),
@@ -536,10 +536,10 @@ mod tests {
         assert_eq!(ir.metadata.format, crate::format::DocumentFormat::Ppt);
     }
 
-    /// issue #244 — `SummaryInformation` fields must reach `Metadata`, and
+    /// `SummaryInformation` fields must reach `Metadata`, and
     /// the declared title must beat the first-slide-title fallback.
     #[test]
-    fn ir_summary_properties_reach_metadata() {
+    fn test_ir_summary_properties_reach_metadata() {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
@@ -567,7 +567,7 @@ mod tests {
     /// A missing/empty title in `SummaryInformation` must not shadow the
     /// first-slide-title fallback.
     #[test]
-    fn ir_empty_summary_title_falls_back_to_slide_title() {
+    fn test_ir_empty_summary_title_falls_back_to_slide_title() {
         let doc = PptDocument {
             images: Vec::new(),
             has_macros: false,
@@ -581,13 +581,13 @@ mod tests {
         assert_eq!(ir.metadata.title.as_deref(), Some("Slide Title"));
     }
 
-    // ── #254: direct character/paragraph formatting ──
+    // ── Direct character/paragraph formatting ──
 
-    /// issue #254 — real `bold: Some(false)` from a `StyleTextPropAtom`
+    /// Real `bold: Some(false)` from a `StyleTextPropAtom`
     /// must override the old synthetic "titles are always bold" default,
     /// not just be ignored in its favor.
     #[test]
-    fn ir_real_char_formatting_overrides_synthetic_title_bold() {
+    fn test_ir_real_char_formatting_overrides_synthetic_title_bold() {
         use crate::ir::{Element, InlineContent};
         use crate::ppt::{CharFormat, CharFormatSpan};
 
@@ -621,12 +621,12 @@ mod tests {
         assert!(!span.bold, "explicit bold:false from the file must win over the old synthetic default");
     }
 
-    /// issue #254 — two `TextCFRun`s with different formatting over the
+    /// Two `TextCFRun`s with different formatting over the
     /// same run of text must produce two separately-formatted `TextSpan`s,
     /// not one span with the first (or last) run's formatting applied to
     /// everything.
     #[test]
-    fn ir_char_formatting_produces_multiple_spans_within_one_paragraph() {
+    fn test_ir_char_formatting_produces_multiple_spans_within_one_paragraph() {
         use crate::ir::{Element, InlineContent};
         use crate::ppt::{CharFormat, CharFormatSpan};
 
@@ -664,9 +664,9 @@ mod tests {
         assert!(!second.bold);
     }
 
-    /// issue #254 — a `TextPFRun`'s alignment must reach `Paragraph::alignment`.
+    /// A `TextPFRun`'s alignment must reach `Paragraph::alignment`.
     #[test]
-    fn ir_paragraph_alignment_reaches_ir() {
+    fn test_ir_paragraph_alignment_reaches_ir() {
         use crate::ir::{Element, ParagraphAlignment};
         use crate::ppt::{ParaFormat, ParaFormatSpan};
 
@@ -697,10 +697,10 @@ mod tests {
         assert_eq!(p.alignment, Some(ParagraphAlignment::Center));
     }
 
-    /// issue #258 — a run's resolved placeholder role must reach
+    /// A run's resolved placeholder role must reach
     /// `Paragraph::placeholder_role` in the IR.
     #[test]
-    fn ir_placeholder_role_reaches_the_paragraph() {
+    fn test_ir_placeholder_role_reaches_the_paragraph() {
         use crate::ir::Element;
 
         let doc = PptDocument {
@@ -726,13 +726,13 @@ mod tests {
         assert_eq!(p.placeholder_role.as_deref(), Some("ftr"));
     }
 
-    /// issue #334 — a lone `\r` inside one text atom (the standard PPT97
+    /// A lone `\r` inside one text atom (the standard PPT97
     /// multi-bullet layout, per [MS-PPT]'s own worked example) must split
     /// into separate `Paragraph` elements, not survive as a literal `\r`
     /// embedded in one giant paragraph (`str::lines()` alone doesn't split
     /// on a bare `\r`).
     #[test]
-    fn ir_bare_cr_splits_into_multiple_paragraphs() {
+    fn test_ir_bare_cr_splits_into_multiple_paragraphs() {
         use crate::ir::{Element, InlineContent};
 
         let doc = PptDocument {
@@ -764,10 +764,10 @@ mod tests {
         assert!(!texts.iter().any(|t| t.contains('\r')), "no leftover literal \\r: {texts:?}");
     }
 
-    /// issue #255 — a reconstructed grid-of-shapes table must reach the
+    /// A reconstructed grid-of-shapes table must reach the
     /// IR as `Element::Table`, with each cell's text in the right slot.
     #[test]
-    fn ir_reconstructed_table_becomes_element_table() {
+    fn test_ir_reconstructed_table_becomes_element_table() {
         use crate::ir::Element;
         use crate::ppt::TableBlock;
 
@@ -811,11 +811,11 @@ mod tests {
         assert_eq!(cell_text(1, 1), "B2");
     }
 
-    /// issue #256 — a picture shape's own `pib`-resolved image must
+    /// A picture shape's own `pib`-resolved image must
     /// attach to the slide that actually contains it, not every slide's
     /// images landing on whichever slide happens to be last.
     #[test]
-    fn ir_image_attaches_to_its_own_slide_not_the_last_one() {
+    fn test_ir_image_attaches_to_its_own_slide_not_the_last_one() {
         use crate::cfb::blip::{BlipFormat, BlipImage};
         use crate::ir::Element;
 
@@ -850,10 +850,10 @@ mod tests {
         assert_eq!(image_data(&ir.sections[2]), vec![b"JPEG1".to_vec()]);
     }
 
-    /// issue #256 — an image no shape resolved via `pib` must still
+    /// An image no shape resolved via `pib` must still
     /// reach the IR (the old fallback behavior), not vanish entirely.
     #[test]
-    fn ir_unresolved_image_still_reaches_the_ir_as_a_leftover() {
+    fn test_ir_unresolved_image_still_reaches_the_ir_as_a_leftover() {
         use crate::cfb::blip::{BlipFormat, BlipImage};
         use crate::ir::Element;
 
