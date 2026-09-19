@@ -235,6 +235,11 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
     // behind by an earlier incremental save (the same hazard the persist
     // directory itself exists to route around for slides) (issue #257).
     let hyperlinks = parse_ex_hyperlinks(&doc_children);
+    // The deck's header/footer/user-date text, applied uniformly to every
+    // slide ("Apply to All" in PowerPoint's own Header and Footer dialog)
+    // rather than stored per-slide — confirmed by direct inspection of a
+    // real corpus file's DocumentContainer (issue #308).
+    let headers_footers = parse_headers_footers(&doc_children);
 
     let mut slides = Vec::new();
     let mut current_persist_id: Option<u32> = None;
@@ -293,7 +298,47 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
         slides.push(resolve_slide(stream, dir, persist_id_ref, &outline_texts, &hyperlinks));
     }
 
+    if !headers_footers.is_empty() {
+        for slide in &mut slides {
+            for text in &headers_footers {
+                slide.text_runs.push(TextRun {
+                    text_type: TextType::Other,
+                    text: text.clone(),
+                    hyperlink: None,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
     Some(slides)
+}
+
+/// Extract the header/footer/user-date `CString` text from every
+/// `HeadersFootersContainer` (0x0FD9) directly under `doc_children`. A
+/// `DocumentContainer` commonly carries two — one for slides, one for
+/// notes/handouts — collected together (deduplicated) since a deck's
+/// slide-facing header/footer is what's relevant here.
+fn parse_headers_footers(doc_children: &[u8]) -> Vec<String> {
+    let mut texts = Vec::new();
+    for rec in RecordIter::new(doc_children) {
+        let Ok(rec) = rec else { break };
+        if rec.header.rec_type != RT_HEADER_FOOTER {
+            continue;
+        }
+        for child in RecordIter::new(&rec.data) {
+            let Ok(child) = child else { break };
+            if child.header.rec_type != RT_CSTRING {
+                continue;
+            }
+            let text = decode_utf16le(&child.data);
+            let text = text.trim();
+            if !text.is_empty() && !texts.iter().any(|t: &String| t == text) {
+                texts.push(text.to_string());
+            }
+        }
+    }
+    texts
 }
 
 /// Resolve one slide's shape text: locate its `Slide` container via the
@@ -1898,6 +1943,52 @@ mod tests {
 
         assert_eq!(slides.len(), 1);
         assert_eq!(slides[0].text_runs[0].text, "REAL SLIDE TEXT");
+    }
+
+    /// Real byte shape confirmed against a live corpus file's
+    /// `DocumentContainer`: a `HeadersFootersContainer` (0x0FD9) holding
+    /// a `HeadersFootersAtom` (0x0FDA) plus `CString` (0x0FBA) children
+    /// for the user date (instance 0) and footer (instance 2) text.
+    fn header_footer_container_bytes(date: &str, footer: &str) -> Vec<u8> {
+        let mut children = make_atom(RT_HEADER_FOOTER_ATOM, 0, &[0u8; 4]);
+        let date_bytes: Vec<u8> = date.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        children.extend(make_atom(RT_CSTRING, 0, &date_bytes));
+        let footer_bytes: Vec<u8> = footer.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        children.extend(make_atom(RT_CSTRING, 2, &footer_bytes));
+        make_container(RT_HEADER_FOOTER, 3, &children)
+    }
+
+    /// issue #308 — a `DocumentContainer`-level `HeadersFootersContainer`'s
+    /// date/footer text must reach every slide's text runs, matching the
+    /// real corpus file this was verified against
+    /// (`26 August 2004` / `Transport CDM Workshop`, repeated per slide).
+    #[test]
+    fn header_footer_text_reaches_every_slide() {
+        let mut stream = Vec::new();
+
+        let hf = header_footer_container_bytes("26 August 2004", "Transport CDM Workshop");
+        let slide_persist = slide_persist_atom_bytes(2, 256);
+        let slide_list = make_container(RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES, &slide_persist);
+        let mut doc_children = hf;
+        doc_children.extend(slide_list);
+        let doc_offset = stream.len() as u32;
+        stream.extend(make_container(RT_DOCUMENT, 0, &doc_children));
+
+        let real_slide_offset = stream.len() as u32;
+        stream.extend(slide_container_bytes("Slide Title"));
+
+        let pd_offset = stream.len() as u32;
+        stream.extend(persist_directory_bytes(&[(1, doc_offset), (2, real_slide_offset)]));
+        let edit_offset = stream.len() as u32;
+        stream.extend(user_edit_atom_bytes(0, pd_offset, 1));
+        let current_user = current_user_bytes(edit_offset);
+
+        let slides = extract_slides_text(&stream, Some(&current_user));
+        assert_eq!(slides.len(), 1);
+        let texts: Vec<&str> = slides[0].text_runs.iter().map(|r| r.text.as_str()).collect();
+        assert!(texts.contains(&"Slide Title"), "{texts:?}");
+        assert!(texts.contains(&"26 August 2004"), "{texts:?}");
+        assert!(texts.contains(&"Transport CDM Workshop"), "{texts:?}");
     }
 
     fn corrupt_record() -> Vec<u8> {

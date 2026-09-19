@@ -36,7 +36,19 @@ pub const RT_USER_EDIT_ATOM: u16 = 0x0FF5;
 /// PersistDirectoryAtom ([MS-PPT] 2.3.4).
 pub const RT_PERSIST_DIRECTORY_ATOM: u16 = 0x1772;
 pub const RT_CURRENT_USER_ATOM: u16 = 0x0FF6;
-pub const RT_HEADER_FOOTER: u16 = 0x0FDA;
+/// HeadersFootersContainer: the header/footer/user-date text applied to
+/// a presentation ([MS-PPT] 2.4.16, `HeadersFootersContainer`, record
+/// type 4057 = 0x0FD9). The pre-existing constant here had the wrong
+/// value (0x0FDA, which is actually `HeadersFootersAtom` — the small
+/// flags atom nested *inside* this container, not the container itself)
+/// — verified byte-for-byte against a real corpus file's `DocumentContainer`
+/// child (issue #308).
+pub const RT_HEADER_FOOTER: u16 = 0x0FD9;
+/// `HeadersFootersAtom`: the flags atom nested inside a
+/// `HeadersFootersContainer` ([MS-PPT] 2.4.17, record type 4058 =
+/// 0x0FDA). Not decoded — this fix only surfaces the container's
+/// `CString` text children, not the show/hide flag bits.
+pub const RT_HEADER_FOOTER_ATOM: u16 = 0x0FDA;
 pub const RT_TEXT_SPECIAL_INFO: u16 = 0x0FAA;
 pub const RT_TEXT_RULER: u16 = 0x0FA2;
 pub const RT_STYLE_TEXT_PROP: u16 = 0x0FA1;
