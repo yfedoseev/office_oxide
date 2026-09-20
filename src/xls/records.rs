@@ -32,6 +32,12 @@ pub const RT_SUPBOOK: u16 = 0x01AE;
 /// Chart series/trendline/axis/chart title text ([MS-XLS] §2.4.254), found
 /// inside a chart's nested `BOF..EOF` substream.
 pub const RT_SERIESTEXT: u16 = 0x100D;
+/// Marks the start of a chart's cached series values ([MS-XLS] §2.4.264 —
+/// `SIIndex`); the `NUMBER`/`LABEL` cells that follow belong to the chart.
+/// The parser skips every record inside a chart substream without naming
+/// them, so this only appears in the fixture that proves it does.
+#[cfg(test)]
+pub const RT_SIINDEX: u16 = 0x1065;
 /// Begins a conditional-formatting rule group: the cell range(s) it
 /// applies to, plus how many `CF` records follow ([MS-XLS] §2.4.56,
 /// record type 432 = 0x1B0).
@@ -63,6 +69,13 @@ pub const RT_TXO: u16 = 0x01B6;
 pub struct BiffRecord {
     pub record_type: u16,
     pub data: Vec<u8>,
+    /// Offsets into `data` at which each merged `CONTINUE` record began,
+    /// ascending. Almost every record has none; the ones that do (`SST`
+    /// above all) need them, because a string cut by a `CONTINUE`
+    /// boundary restarts with its own option-flags byte there
+    /// ([MS-XLS] §2.5.293) — a byte that is *not* character data and
+    /// that plain concatenation leaves in the middle of the string.
+    pub continue_at: Vec<usize>,
 }
 
 /// Iterate over BIFF records in a byte stream, merging CONTINUE records.
@@ -116,7 +129,9 @@ impl<'a> Iterator for RecordIter<'a> {
 
         self.last_type = rt;
 
-        // Merge subsequent CONTINUE records into this record's data.
+        // Merge subsequent CONTINUE records into this record's data,
+        // remembering where each one began.
+        let mut continue_at = Vec::new();
         loop {
             if self.pos + 4 > self.data.len() {
                 break;
@@ -127,7 +142,10 @@ impl<'a> Iterator for RecordIter<'a> {
             }
             // Consume the CONTINUE record.
             match self.read_raw() {
-                Some(Ok((_rt, cont_data))) => data.extend_from_slice(&cont_data),
+                Some(Ok((_rt, cont_data))) => {
+                    continue_at.push(data.len());
+                    data.extend_from_slice(&cont_data);
+                },
                 Some(Err(e)) => return Some(Err(e)),
                 None => break,
             }
@@ -136,6 +154,7 @@ impl<'a> Iterator for RecordIter<'a> {
         Some(Ok(BiffRecord {
             record_type: rt,
             data,
+            continue_at,
         }))
     }
 }

@@ -387,6 +387,7 @@ mod tests {
         let rec = BiffRecord {
             record_type: RT_LABELSST,
             data,
+            continue_at: Vec::new(),
         };
         let cells = parse_cell_record(&rec, &sst, None).unwrap();
         assert_eq!(cells.len(), 1);
@@ -405,6 +406,7 @@ mod tests {
         let rec = BiffRecord {
             record_type: RT_NUMBER,
             data,
+            continue_at: Vec::new(),
         };
         let cells = parse_cell_record(&rec, &[], None).unwrap();
         assert_eq!(cells[0].value, CellValue::Number(42.5));
@@ -421,6 +423,7 @@ mod tests {
         let rec = BiffRecord {
             record_type: RT_BOOLERR,
             data,
+            continue_at: Vec::new(),
         };
         let cells = parse_cell_record(&rec, &[], None).unwrap();
         assert_eq!(cells[0].value, CellValue::Bool(true));
@@ -437,6 +440,7 @@ mod tests {
         let rec = BiffRecord {
             record_type: RT_BOOLERR,
             data,
+            continue_at: Vec::new(),
         };
         let cells = parse_cell_record(&rec, &[], None).unwrap();
         assert_eq!(cells[0].value, CellValue::Error(0x07));
@@ -461,6 +465,7 @@ mod tests {
         let rec = BiffRecord {
             record_type: RT_MULRK,
             data,
+            continue_at: Vec::new(),
         };
         let cells = parse_cell_record(&rec, &[], None).unwrap();
         assert_eq!(cells.len(), 2);

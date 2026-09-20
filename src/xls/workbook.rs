@@ -284,7 +284,7 @@ impl XlsDocument {
                         }
                     },
                     RT_SST => {
-                        sst = parse_sst(&rec.data)?;
+                        sst = parse_sst(&rec.data, &rec.continue_at)?;
                     },
                     // `FORMAT` maps a format id to its code string; `XF`
                     // maps a cell's `ixfe` to a format id. Both are needed
@@ -392,6 +392,14 @@ impl XlsDocument {
                             }
                         }
                     },
+                    // Everything else inside a nested chart substream belongs
+                    // to the chart, not the sheet. In particular a chart
+                    // caches its series values as ordinary NUMBER/LABEL
+                    // records ([MS-XLS] §2.4.264 SIIndex, then the cached
+                    // cells) at (point, series) coordinates; parsed as sheet
+                    // cells they overwrote the worksheet's own A1:Cn with a
+                    // copy of whatever the chart plotted.
+                    _ if nested_bof_depth > 0 => {},
                     RT_EOF => {
                         let (name, hidden) = match sheet_infos.get(sheet_idx) {
                             Some(info) => (info.name.clone(), info.hidden),
@@ -618,6 +626,14 @@ impl XlsDocument {
                 out.push_str(&trimmed);
                 out.push('\n');
             }
+            // Cell comments are document content; `to_ir()` carries them
+            // as endnotes, and this direct renderer dropped them.
+            for c in &sheet.comments {
+                out.push_str(&comment_marker(c));
+                out.push_str(": ");
+                out.push_str(&c.text);
+                out.push('\n');
+            }
         }
         // Chart text (series names, axis/chart titles) recovered from
         // embedded charts — keep it out of both renderers,
@@ -685,6 +701,9 @@ impl XlsDocument {
                     out.push_str(" |");
                 }
                 out.push('\n');
+            }
+            for c in &sheet.comments {
+                out.push_str(&format!("\n> **{}:** {}\n", comment_marker(c), c.text.trim()));
             }
         }
         for (i, text) in self.chart_text.iter().enumerate() {
@@ -866,6 +885,15 @@ fn builtin_name(id: u8) -> Option<&'static str> {
 
 /// Render a 0-based column index as spreadsheet letters (0 -> "A", 25 ->
 /// "Z", 26 -> "AA").
+/// `B2 (Author)` — the same marker `convert_xls` puts on a comment's endnote.
+fn comment_marker(c: &XlsComment) -> String {
+    let cell_ref = super::condfmt::col_name(c.col) + &(c.row + 1).to_string();
+    match c.author.as_deref() {
+        Some(a) => format!("{cell_ref} ({a})"),
+        None => cell_ref,
+    }
+}
+
 fn col_letters(mut col: u32) -> String {
     let mut s = Vec::new();
     loop {
@@ -1348,6 +1376,69 @@ mod tests {
             "cells after the embedded chart must not be dropped, text: {text}"
         );
         assert!(text.contains("Sheet2A1"), "text: {text}");
+    }
+
+    /// Regression: a chart's cached series values are ordinary
+    /// `NUMBER`/`LABEL` records inside its nested substream, addressed
+    /// (point, series) from (0, 0). Parsed as cells of the enclosing
+    /// worksheet, they replaced the sheet's own top-left block — on a real
+    /// file, A1:C12 of a 236-row sheet became a copy of the plotted data
+    /// and the sheet's title rows were gone.
+    #[test]
+    fn test_chart_cached_values_do_not_overwrite_the_parent_sheets_cells() {
+        let mut sheet1_body = label(0, 0, "Title row");
+        sheet1_body.extend(label(1, 0, "Subtitle row"));
+        sheet1_body.extend(number(10, 1, 0, 186.5));
+        sheet1_body.extend(bof(0x0020)); // embedded chart
+        sheet1_body.extend(biff_rec(RT_SIINDEX, &1u16.to_le_bytes()));
+        sheet1_body.extend(number(0, 0, 0, 3.67)); // cached point 0 of series 0
+        sheet1_body.extend(number(1, 0, 0, 21.9)); // cached point 1 of series 0
+        sheet1_body.extend(label(0, 1, "cached category"));
+        sheet1_body.extend(eof());
+        sheet1_body.extend(label(2, 0, "after chart"));
+
+        let stream = workbook_stream(&[("Sheet1", 0, sheet1_body)]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+        let sheet = &doc.sheets[0];
+        let cell = |r: usize, c: usize| sheet.display.get(r).and_then(|row| row.get(c)).cloned();
+        assert_eq!(cell(0, 0).as_deref(), Some("Title row"), "display: {:?}", sheet.display);
+        assert_eq!(cell(1, 0).as_deref(), Some("Subtitle row"));
+        assert_eq!(cell(2, 0).as_deref(), Some("after chart"));
+        let text = doc.plain_text();
+        assert!(!text.contains("3.67") && !text.contains("21.9"), "chart cache leaked: {text}");
+        assert!(!text.contains("cached category"), "chart cache leaked: {text}");
+        assert!(text.contains("186.5"), "the sheet's own number must survive: {text}");
+    }
+
+    /// Regression: a cell comment reached the IR (as an endnote) and so
+    /// the HTML surface, but the direct `plain_text()`/`to_markdown()`
+    /// renderers dropped it — the same text present on one surface and
+    /// absent on another, the dual-renderer shape this crate keeps hitting.
+    #[test]
+    fn test_comments_reach_plain_text_and_markdown() {
+        let sheet = Sheet {
+            name: "S".into(),
+            display: vec![vec!["data".to_string()]],
+            rows: vec![vec![CellValue::String("data".to_string())]],
+            comments: vec![XlsComment {
+                row: 1,
+                col: 1,
+                author: Some("Reviewer".to_string()),
+                text: "a real cell comment".to_string(),
+            }],
+            ..Default::default()
+        };
+        let doc = XlsDocument::from_sheets(vec![sheet]);
+        let text = doc.plain_text();
+        assert!(
+            text.contains("B2 (Reviewer): a real cell comment"),
+            "plain_text must carry the comment with its cell and author: {text}"
+        );
+        let md = doc.to_markdown();
+        assert!(
+            md.contains("> **B2 (Reviewer):** a real cell comment"),
+            "to_markdown must carry the comment: {md}"
+        );
     }
 
     /// [MS-XLS] §2.4.254: `SeriesText` = 2 bytes reserved + a
