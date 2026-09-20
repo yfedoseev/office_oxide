@@ -162,9 +162,10 @@ impl XlsxDocument {
     /// Read a ZIP entry by name with UTF-8 transcoding for XML parts.
     fn read_xml_entry<R: Read + Seek>(
         archive: &mut ZipArchive<R>,
+        entries: &opc::ZipEntryIndex,
         name: &str,
     ) -> std::result::Result<Vec<u8>, crate::core::Error> {
-        let data = opc::read_zip_entry(archive, name)?;
+        let data = opc::read_zip_entry(archive, entries, name)?;
         if name.ends_with(".xml") || name.ends_with(".rels") {
             if let Some(utf8_data) = crate::core::xml::ensure_utf8(&data) {
                 return Ok(utf8_data);
@@ -177,41 +178,44 @@ impl XlsxDocument {
     /// bypassing OPC content-types and package-level relationships.
     fn from_zip<R: Read + Seek>(mut archive: ZipArchive<R>) -> Result<Self> {
         debug!("XlsxDocument: fast path parsing started ({} ZIP entries)", archive.len());
+        let entries = opc::ZipEntryIndex::new(&archive);
 
         // Document metadata lives at the conventional path in every package
         // Excel writes; the fast path doesn't consult package relationships,
         // so read it by name here.
-        let core_properties = Self::read_xml_entry(&mut archive, "docProps/core.xml")
+        let core_properties = Self::read_xml_entry(&mut archive, &entries, "docProps/core.xml")
             .ok()
             .and_then(|d| crate::core::properties::CoreProperties::parse(&d).ok());
-        let app_properties = Self::read_xml_entry(&mut archive, "docProps/app.xml")
+        let app_properties = Self::read_xml_entry(&mut archive, &entries, "docProps/app.xml")
             .ok()
             .and_then(|d| crate::core::properties::AppProperties::parse(&d).ok());
 
         // Read workbook relationships to resolve sheet targets
-        let wb_rels = match Self::read_xml_entry(&mut archive, "xl/_rels/workbook.xml.rels") {
-            Ok(data) => Relationships::parse(&data)?,
-            Err(_) => Relationships::empty(),
-        };
+        let wb_rels =
+            match Self::read_xml_entry(&mut archive, &entries, "xl/_rels/workbook.xml.rels") {
+                Ok(data) => Relationships::parse(&data)?,
+                Err(_) => Relationships::empty(),
+            };
         let has_macros = wb_rels.first_by_type(rel_types::VBA_PROJECT).is_some();
 
         // Parse shared strings (must be first — cells reference by index)
-        let shared_strings = match Self::read_xml_entry(&mut archive, "xl/sharedStrings.xml") {
-            Ok(data) => SharedStringTable::parse(&data)?,
-            Err(_) => SharedStringTable::empty(),
-        };
+        let shared_strings =
+            match Self::read_xml_entry(&mut archive, &entries, "xl/sharedStrings.xml") {
+                Ok(data) => SharedStringTable::parse(&data)?,
+                Err(_) => SharedStringTable::empty(),
+            };
 
         // Parse styles eagerly — needed for date detection in format_cell_value().
-        let styles = match Self::read_xml_entry(&mut archive, "xl/styles.xml") {
+        let styles = match Self::read_xml_entry(&mut archive, &entries, "xl/styles.xml") {
             Ok(data) => StyleSheet::parse(&data).ok(),
             Err(_) => None,
         };
 
         // Read theme data lazily
-        let theme_data = Self::read_xml_entry(&mut archive, "xl/theme/theme1.xml").ok();
+        let theme_data = Self::read_xml_entry(&mut archive, &entries, "xl/theme/theme1.xml").ok();
 
         // Parse workbook
-        let wb_data = Self::read_xml_entry(&mut archive, "xl/workbook.xml")?;
+        let wb_data = Self::read_xml_entry(&mut archive, &entries, "xl/workbook.xml")?;
         let workbook = WorkbookInfo::parse(&wb_data)?;
 
         // The threaded-comments person list (personId -> display name) is a
@@ -220,7 +224,7 @@ impl XlsxDocument {
             .first_by_type(rel_types::PERSONS)
             .map(|rel| resolve_relative_zip_path("xl/workbook.xml", &rel.target))
             .or_else(|| Some("xl/persons/person.xml".to_string()))
-            .and_then(|path| Self::read_xml_entry(&mut archive, &path).ok())
+            .and_then(|path| Self::read_xml_entry(&mut archive, &entries, &path).ok())
             .and_then(|data| worksheet::parse_persons(&data).ok())
             .unwrap_or_default();
 
@@ -256,13 +260,13 @@ impl XlsxDocument {
                 format!("xl/worksheets/sheet{}.xml", idx)
             };
 
-            let ws_data = match Self::read_xml_entry(&mut archive, &sheet_path) {
+            let ws_data = match Self::read_xml_entry(&mut archive, &entries, &sheet_path) {
                 Ok(data) => data,
                 Err(_) => {
                     // Try alternate index-based name
                     let idx = bundles.len() + 1;
                     let alt = format!("xl/worksheets/sheet{}.xml", idx);
-                    match Self::read_xml_entry(&mut archive, &alt) {
+                    match Self::read_xml_entry(&mut archive, &entries, &alt) {
                         Ok(data) => data,
                         Err(_) => continue,
                     }
@@ -271,7 +275,7 @@ impl XlsxDocument {
 
             // Read worksheet relationships (for hyperlinks)
             let rels_path = sheet_rels_path(&sheet_path);
-            let ws_rels = match Self::read_xml_entry(&mut archive, &rels_path) {
+            let ws_rels = match Self::read_xml_entry(&mut archive, &entries, &rels_path) {
                 Ok(data) => Relationships::parse(&data).unwrap_or_else(|_| Relationships::empty()),
                 Err(_) => Relationships::empty(),
             };
@@ -281,14 +285,15 @@ impl XlsxDocument {
             // `<xdr:pic>` and `<xdr:sp>` anchors and the underlying
             // media bytes so Phase 2's parallel parser doesn't need
             // the archive.
-            let (images, text_shapes) = read_drawing_for_sheet(&mut archive, &sheet_path, &ws_rels);
+            let (images, text_shapes) =
+                read_drawing_for_sheet(&mut archive, &entries, &sheet_path, &ws_rels);
 
             // Cell comments live in a separate part reached through the
             // sheet's own relationships.
             let comments = ws_rels
                 .first_by_type(rel_types::COMMENTS)
                 .map(|rel| resolve_relative_zip_path(&sheet_path, &rel.target))
-                .and_then(|path| Self::read_xml_entry(&mut archive, &path).ok())
+                .and_then(|path| Self::read_xml_entry(&mut archive, &entries, &path).ok())
                 .and_then(|data| worksheet::parse_comments(&data).ok())
                 .unwrap_or_default();
             // Modern (Excel 2016+) threaded comments, when present,
@@ -297,7 +302,7 @@ impl XlsxDocument {
             let threaded_comments = ws_rels
                 .first_by_type(rel_types::THREADED_COMMENTS)
                 .map(|rel| resolve_relative_zip_path(&sheet_path, &rel.target))
-                .and_then(|path| Self::read_xml_entry(&mut archive, &path).ok())
+                .and_then(|path| Self::read_xml_entry(&mut archive, &entries, &path).ok())
                 .and_then(|data| worksheet::parse_threaded_comments(&data).ok())
                 .unwrap_or_default();
             let comments =
@@ -328,7 +333,7 @@ impl XlsxDocument {
         // metadata/richData chain is a real embedded image, not a
         // genuine formula error — swap its fabricated `#VALUE!` text
         // for the actual picture.
-        let rich_value_images = read_rich_value_images(&mut archive);
+        let rich_value_images = read_rich_value_images(&mut archive, &entries);
         if !rich_value_images.is_empty() {
             for ws in &mut worksheets {
                 for row in &mut ws.rows {
@@ -357,7 +362,7 @@ impl XlsxDocument {
             .filter(|n| n.starts_with("xl/charts/chart") && n.ends_with(".xml"))
             .collect();
         for name in chart_names {
-            if let Ok(data) = Self::read_xml_entry(&mut archive, &name) {
+            if let Ok(data) = Self::read_xml_entry(&mut archive, &entries, &name) {
                 let text = extract_chart_text(&data);
                 if !text.is_empty() {
                     chart_text.push(text);
@@ -376,7 +381,7 @@ impl XlsxDocument {
             })
             .collect();
         for name in font_names {
-            if let Ok(data) = opc::read_zip_entry(&mut archive, &name) {
+            if let Ok(data) = opc::read_zip_entry(&mut archive, &entries, &name) {
                 let basename = name.rsplit('/').next().unwrap_or("font");
                 let face = crate::docx::strip_embedded_font_filename(basename);
                 let font_name = if face.is_empty() {
@@ -628,6 +633,7 @@ impl crate::core::OfficeDocument for XlsxDocument {
 /// best-effort extras and shouldn't fail worksheet loading.
 fn read_drawing_for_sheet<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
     sheet_path: &str,
     sheet_rels: &Relationships,
 ) -> (
@@ -641,7 +647,7 @@ fn read_drawing_for_sheet<R: Read + Seek>(
 
     let drawing_path = resolve_relative_zip_path(sheet_path, &drawing_rel.target);
 
-    let drawing_xml = match XlsxDocument::read_xml_entry(archive, &drawing_path) {
+    let drawing_xml = match XlsxDocument::read_xml_entry(archive, entries, &drawing_path) {
         Ok(d) => d,
         Err(e) => {
             debug!("XlsxDocument: drawing part {} unreadable ({}); skipping", drawing_path, e);
@@ -650,7 +656,7 @@ fn read_drawing_for_sheet<R: Read + Seek>(
     };
 
     let drawing_rels_path = sheet_rels_path(&drawing_path);
-    let drawing_rels = match XlsxDocument::read_xml_entry(archive, &drawing_rels_path) {
+    let drawing_rels = match XlsxDocument::read_xml_entry(archive, entries, &drawing_rels_path) {
         Ok(d) => Relationships::parse(&d).unwrap_or_else(|_| Relationships::empty()),
         Err(_) => Relationships::empty(),
     };
@@ -674,7 +680,7 @@ fn read_drawing_for_sheet<R: Read + Seek>(
             None => continue,
         };
         let media_path = resolve_relative_zip_path(&drawing_path, &rel.target);
-        let bytes = match opc::read_zip_entry(archive, &media_path) {
+        let bytes = match opc::read_zip_entry(archive, entries, &media_path) {
             Ok(b) => b,
             Err(_) => continue,
         };
@@ -728,10 +734,11 @@ fn read_drawing_for_sheet<R: Read + Seek>(
 /// best-effort recovery, not a hard requirement for opening the file.
 fn read_rich_value_images<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
 ) -> std::collections::HashMap<u32, crate::xlsx::worksheet::WorksheetPicture> {
     let mut out = std::collections::HashMap::new();
 
-    let Ok(metadata_xml) = XlsxDocument::read_xml_entry(archive, "xl/metadata.xml") else {
+    let Ok(metadata_xml) = XlsxDocument::read_xml_entry(archive, entries, "xl/metadata.xml") else {
         return out;
     };
     let Some((rich_type_id, future_rvb, value_metadata)) = parse_rich_value_metadata(&metadata_xml)
@@ -739,26 +746,27 @@ fn read_rich_value_images<R: Read + Seek>(
         return out;
     };
 
-    let Ok(rv_xml) = XlsxDocument::read_xml_entry(archive, "xl/richData/rdrichvalue.xml") else {
+    let Ok(rv_xml) = XlsxDocument::read_xml_entry(archive, entries, "xl/richData/rdrichvalue.xml")
+    else {
         return out;
     };
     let rv_list = parse_rdrichvalue(&rv_xml);
 
     let Ok(struct_xml) =
-        XlsxDocument::read_xml_entry(archive, "xl/richData/rdrichvaluestructure.xml")
+        XlsxDocument::read_xml_entry(archive, entries, "xl/richData/rdrichvaluestructure.xml")
     else {
         return out;
     };
     let image_key_positions = parse_rich_value_structures(&struct_xml);
 
     let rel_path = "xl/richData/richValueRel.xml";
-    let Ok(rel_xml) = XlsxDocument::read_xml_entry(archive, rel_path) else {
+    let Ok(rel_xml) = XlsxDocument::read_xml_entry(archive, entries, rel_path) else {
         return out;
     };
     let rel_rids = parse_rich_value_rel(&rel_xml);
 
     let rel_rels_path = sheet_rels_path(rel_path);
-    let rel_rels = match XlsxDocument::read_xml_entry(archive, &rel_rels_path) {
+    let rel_rels = match XlsxDocument::read_xml_entry(archive, entries, &rel_rels_path) {
         Ok(d) => Relationships::parse(&d).unwrap_or_else(|_| Relationships::empty()),
         Err(_) => return out,
     };
@@ -795,7 +803,7 @@ fn read_rich_value_images<R: Read + Seek>(
             continue;
         };
         let media_path = resolve_relative_zip_path(rel_path, &rel.target);
-        let Ok(bytes) = opc::read_zip_entry(archive, &media_path) else {
+        let Ok(bytes) = opc::read_zip_entry(archive, entries, &media_path) else {
             continue;
         };
         let ext = Path::new(&rel.target)
@@ -1422,6 +1430,53 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    /// Every sheet probes for its optional `_rels`, drawing and comments
+    /// parts; when the probe missed the exact name it scanned the whole
+    /// archive, so a workbook of N trivial sheets cost O(N²): 2,000 sheets
+    /// took 6 s in release and 8,000 took 56 s; 4,000 took ~20 s in a debug
+    /// build against this budget, which the indexed lookup meets 4× over.
+    #[test]
+    fn test_many_sheet_workbook_opens_in_linear_time() {
+        const N: usize = 4000;
+        let mut rels = String::from(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        );
+        let mut sheets = String::new();
+        let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 1..=N {
+            rels.push_str(&format!(
+                r#"<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>"#
+            ));
+            sheets.push_str(&format!(r#"<sheet name="S{i}" sheetId="{i}" r:id="rId{i}"/>"#));
+            parts.push((
+                format!("xl/worksheets/sheet{i}.xml"),
+                format!(
+                    r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><v>{i}</v></c></row></sheetData></worksheet>"#
+                )
+                .into_bytes(),
+            ));
+        }
+        rels.push_str("</Relationships>");
+        let workbook = format!(
+            r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{sheets}</sheets></workbook>"#
+        );
+        let mut all: Vec<(&str, &[u8])> = vec![
+            ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+            ("xl/workbook.xml", workbook.as_bytes()),
+        ];
+        all.extend(parts.iter().map(|(n, d)| (n.as_str(), d.as_slice())));
+        let bytes = zip_parts(&all);
+
+        let started = std::time::Instant::now();
+        let doc = open_bytes(bytes);
+        assert_eq!(doc.workbook.sheets.len(), N);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "{N} one-cell sheets took {:?} to open",
+            started.elapsed()
+        );
+    }
 
     /// TableCell::col_span/row_span were hardcoded to 1
     /// on every spreadsheet cell; merged_cells was parsed and then
