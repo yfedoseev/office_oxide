@@ -63,12 +63,22 @@ pub const RT_NOTE: u16 = 0x001C;
 /// The text of the drawing shape declared by the immediately preceding
 /// `OBJ` record ([MS-XLS] §2.4.326, record type 438 = 0x1B6).
 pub const RT_TXO: u16 = 0x01B6;
+/// `MsoDrawingGroup` ([MS-XLS] §2.4.154): the workbook-global OfficeArt
+/// container — the `OfficeArtBStoreContainer` that holds every embedded
+/// picture's BLIP lives here, spread over the record's CONTINUEs.
+pub const RT_MSODRAWINGGROUP: u16 = 0x00EB;
+/// `MsoDrawing` ([MS-XLS] §2.4.152): a sheet's OfficeArt shape container.
+pub const RT_MSODRAWING: u16 = 0x00EC;
 
 /// A raw BIFF record: type + data (may span CONTINUE records).
+///
+/// `data` borrows the stream unless a `CONTINUE` had to be merged in;
+/// every cell is its own record, so copying each one into a `Vec` was an
+/// allocation per cell on top of the cell's own.
 #[derive(Debug, Clone)]
-pub struct BiffRecord {
+pub struct BiffRecord<'a> {
     pub record_type: u16,
-    pub data: Vec<u8>,
+    pub data: std::borrow::Cow<'a, [u8]>,
     /// Offsets into `data` at which each merged `CONTINUE` record began,
     /// ascending. Almost every record has none; the ones that do (`SST`
     /// above all) need them, because a string cut by a `CONTINUE`
@@ -95,7 +105,7 @@ impl<'a> RecordIter<'a> {
     }
 
     /// Read the next raw record (without merging CONTINUE).
-    fn read_raw(&mut self) -> Option<Result<(u16, Vec<u8>)>> {
+    fn read_raw(&mut self) -> Option<Result<(u16, &'a [u8])>> {
         if self.pos + 4 > self.data.len() {
             return None;
         }
@@ -106,26 +116,26 @@ impl<'a> RecordIter<'a> {
 
         if self.pos + size > self.data.len() {
             // Truncated record — use what's available instead of erroring.
-            let available = self.data.len() - self.pos;
-            let data = self.data[self.pos..self.pos + available].to_vec();
+            let data = &self.data[self.pos..];
             self.pos = self.data.len();
             return Some(Ok((rt, data)));
         }
 
-        let data = self.data[self.pos..self.pos + size].to_vec();
+        let data = &self.data[self.pos..self.pos + size];
         self.pos += size;
         Some(Ok((rt, data)))
     }
 }
 
 impl<'a> Iterator for RecordIter<'a> {
-    type Item = Result<BiffRecord>;
+    type Item = Result<BiffRecord<'a>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (rt, mut data) = match self.read_raw()? {
+        let (rt, first) = match self.read_raw()? {
             Ok(v) => v,
             Err(e) => return Some(Err(e)),
         };
+        let mut data = std::borrow::Cow::Borrowed(first);
 
         self.last_type = rt;
 
@@ -144,7 +154,7 @@ impl<'a> Iterator for RecordIter<'a> {
             match self.read_raw() {
                 Some(Ok((_rt, cont_data))) => {
                     continue_at.push(data.len());
-                    data.extend_from_slice(&cont_data);
+                    data.to_mut().extend_from_slice(cont_data);
                 },
                 Some(Err(e)) => return Some(Err(e)),
                 None => break,
@@ -179,7 +189,7 @@ mod tests {
             .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].record_type, RT_BOF);
-        assert_eq!(records[0].data, &[0x00, 0x06, 0x05, 0x00]);
+        assert_eq!(&*records[0].data, &[0x00, 0x06, 0x05, 0x00]);
     }
 
     #[test]
@@ -205,7 +215,7 @@ mod tests {
             .unwrap();
         assert_eq!(records.len(), 2); // SST (merged) + EOF
         assert_eq!(records[0].record_type, RT_SST);
-        assert_eq!(records[0].data, &[0x01, 0x02, 0x03, 0x04, 0x05]);
+        assert_eq!(&*records[0].data, &[0x01, 0x02, 0x03, 0x04, 0x05]);
     }
 
     #[test]

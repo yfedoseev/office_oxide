@@ -24,7 +24,13 @@ pub struct XlsDocument {
     /// single (possibly 3-D) cell or area reference resolves with an empty
     /// `value` rather than a guessed one (XLS half).
     pub defined_names: Vec<DefinedName>,
-    images: Vec<XlsImage>,
+    /// Payloads of every `MsoDrawingGroup`/`MsoDrawing` record, CONTINUEs
+    /// merged — the only places [MS-XLS] puts a picture. Decoded into
+    /// `images` on first request rather than at `open()`: scanning the
+    /// whole Workbook stream byte by byte for BLIP headers was a seventh
+    /// of `plain_text()` on a large file that never asked for a picture.
+    drawing_bytes: Vec<u8>,
+    images: std::sync::OnceLock<Vec<XlsImage>>,
     has_macros: bool,
     /// `true` when the record-parsing safety cap ran out before the
     /// Workbook stream did — trailing sheets, or the whole workbook, are
@@ -65,7 +71,8 @@ impl XlsDocument {
         Self {
             sheets,
             defined_names: Vec::new(),
-            images: Vec::new(),
+            drawing_bytes: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             truncated: false,
             summary_properties: None,
@@ -79,12 +86,6 @@ impl XlsDocument {
 pub struct Sheet {
     /// Sheet display name.
     pub name: String,
-    /// Rendered display text per cell, mirroring `rows`.
-    ///
-    /// XLS stores dates as plain numbers whose *format* makes them a date;
-    /// `FORMAT` and `XF` were never parsed, so `38971` came out as `38971`
-    /// rather than `2006-09-05`. `rows` still carries the raw values.
-    pub display: Vec<Vec<String>>,
     /// Cell values by row, then column.
     ///
     /// Jagged: each row holds cells only up to its last non-empty one, and
@@ -93,6 +94,19 @@ pub struct Sheet {
     /// Padding the grid to the sheet's declared extent cost hundreds of
     /// megabytes for a sheet with a few far-apart cells.
     pub rows: Vec<Vec<CellValue>>,
+    /// Each cell's `XF` index ([MS-XLS] §2.4.353), jagged exactly like
+    /// `rows`. Together with `formats` it is what [`Self::display_text`]
+    /// needs to render a number the way Excel shows it — a date serial as
+    /// a date, `0.5` under a percent format as `50%`.
+    ///
+    /// A rendered-text grid used to sit here instead (`display`), one
+    /// `String` per cell for the whole sheet built at `open()`; a string
+    /// cell was thereby held three times over. Rendering on demand
+    /// instead is the difference between the allocator being half of a
+    /// large workbook's runtime and not.
+    pub xf: Vec<Vec<u16>>,
+    /// The workbook's number-format tables, shared by every sheet.
+    pub formats: std::sync::Arc<NumberFormats>,
     /// Whether `BOUNDSHEET` marked this sheet hidden or very hidden.
     ///
     /// "Hidden" means "not shown in the UI by default", not "deleted": the
@@ -165,7 +179,6 @@ impl XlsDocument {
         drop(cfb);
 
         let mut doc = Self::parse_workbook_stream(&stream_data)?;
-        doc.images = extract_images(&stream_data);
         doc.has_macros = has_macros;
         doc.summary_properties = summary_properties;
         Ok(doc)
@@ -266,6 +279,9 @@ impl XlsDocument {
         // with no other signal a caller could use to tell that apart from
         // a file that genuinely ended there.
         let mut record_budget_exhausted = false;
+        let mut number_formats: Option<std::sync::Arc<NumberFormats>> = None;
+        // OfficeArt payloads, kept for the lazy picture decode.
+        let mut drawing_bytes: Vec<u8> = Vec::new();
 
         for rec in RecordIter::new(data) {
             if record_budget == 0 {
@@ -274,6 +290,9 @@ impl XlsDocument {
             }
             record_budget -= 1;
             let rec = rec?;
+            if matches!(rec.record_type, RT_MSODRAWINGGROUP | RT_MSODRAWING) {
+                drawing_bytes.extend_from_slice(&rec.data);
+            }
             match phase {
                 Phase::Globals => match rec.record_type {
                     RT_FILEPASS => {
@@ -417,12 +436,22 @@ impl XlsDocument {
                         // no error and no notice. Excel round-trips such a
                         // sheet perfectly; keep it and flag it, the way the
                         // XLSX reader already does.
-                        let display = build_display(&cells, &formats, &xf_numfmt, date1904);
-                        let rows = build_grid(&mut cells);
+                        // The format tables live in the globals substream,
+                        // complete before the first sheet closes; share
+                        // one copy across the sheets.
+                        let formats = number_formats.get_or_insert_with(|| {
+                            std::sync::Arc::new(NumberFormats {
+                                formats: std::mem::take(&mut formats),
+                                xf_numfmt: std::mem::take(&mut xf_numfmt),
+                                date1904,
+                            })
+                        });
+                        let (rows, xf) = build_grid(&mut cells);
                         sheets.push(Sheet {
                             name,
-                            display,
                             rows,
+                            xf,
+                            formats: std::sync::Arc::clone(formats),
                             hidden,
                             merged_cells: std::mem::take(&mut merged_cells),
                             conditional_formats: std::mem::take(&mut conditional_formats),
@@ -533,9 +562,8 @@ impl XlsDocument {
                                 continue;
                             }
                         }
-                        if let Ok(parsed) = parse_cell_record(&rec, &sst, codepage) {
-                            cells.extend(parsed);
-                        }
+                        // A malformed cell record is skipped, as before.
+                        let _ = parse_cell_record(&rec, &sst, codepage, &mut cells);
                     },
                     _ => {
                         pending_formula_string = None;
@@ -560,8 +588,8 @@ impl XlsDocument {
                                     value: CellValue::String(s),
                                 });
                             }
-                        } else if let Ok(parsed) = parse_cell_record(&rec, &sst, codepage) {
-                            cells.extend(parsed);
+                        } else {
+                            let _ = parse_cell_record(&rec, &sst, codepage, &mut cells);
                         }
                     },
                 },
@@ -574,7 +602,8 @@ impl XlsDocument {
         Ok(Self {
             sheets,
             defined_names,
-            images: Vec::new(),
+            drawing_bytes,
+            images: std::sync::OnceLock::new(),
             // Set by the caller (from_reader), which has the CfbReader
             // this function doesn't.
             has_macros: false,
@@ -586,7 +615,8 @@ impl XlsDocument {
 
     /// Get all extracted images.
     pub fn images(&self) -> &[XlsImage] {
-        &self.images
+        self.images
+            .get_or_init(|| extract_images(&self.drawing_bytes))
     }
 
     /// `true` when the file carries a `_VBA_PROJECT` storage — a cheap
@@ -625,11 +655,15 @@ impl XlsDocument {
             out.push_str(&sheet.name);
             out.push('\n');
             for (r, row) in sheet.rows.iter().enumerate() {
-                let line: Vec<String> = (0..row.len())
-                    .map(|c| cell_display_text(sheet, r, c))
-                    .collect();
-                let trimmed = line.join("\t").trim_end().to_string();
-                out.push_str(&trimmed);
+                let line_start = out.len();
+                for c in 0..row.len() {
+                    if c > 0 {
+                        out.push('\t');
+                    }
+                    out.push_str(&cell_display_text(sheet, r, c));
+                }
+                let trimmed = out[line_start..].trim_end().len();
+                out.truncate(line_start + trimmed);
                 out.push('\n');
             }
             // Cell comments are document content; `to_ir()` carries them
@@ -1040,33 +1074,23 @@ fn parse_format_record(data: &[u8]) -> Option<(u16, String)> {
     Some((id, code))
 }
 
-/// The format-aware text for `sheet.rows[r][c]`: `sheet.display[r][c]` when
+/// The format-aware text for `sheet.rows[r][c]`: `sheet.display_text(r, c)` when
 /// present, falling back to the cell's raw `CellValue::as_text()`.
 ///
 /// `Document::plain_text()`/`to_markdown()` dispatch to `XlsDocument`'s own
 /// `plain_text()`/`to_markdown()` below, a separate path from `to_ir()`
-/// (`convert_xls.rs`, which already read `sheet.display` correctly). Those
+/// (`convert_xls.rs`, which already rendered format-aware text). Those
 /// two methods read `sheet.rows` directly via `CellValue::as_text()`,
-/// bypassing `build_display`'s number-format/date rendering entirely — a
+/// bypassing the number-format/date rendering entirely — a
 /// date cell came out as a raw serial (`38971`) from the CLI's default
 /// `text`/`markdown` output even though `to_ir()` got it right, the same
-/// dual-renderer gap fixed for XLSX formula text. The fallback to
-/// raw text covers the (normally unreachable) case where `display` and
-/// `rows` disagree in shape.
-fn cell_display_text(sheet: &Sheet, r: usize, c: usize) -> String {
+/// dual-renderer gap fixed for XLSX formula text. A position past the
+/// row's last cell is an empty cell. Borrows for everything but a
+/// formatted number, so rendering a sheet is not an allocation per cell.
+fn cell_display_text(sheet: &Sheet, r: usize, c: usize) -> std::borrow::Cow<'_, str> {
     sheet
-        .display
-        .get(r)
-        .and_then(|row| row.get(c))
-        .cloned()
-        .unwrap_or_else(|| {
-            sheet
-                .rows
-                .get(r)
-                .and_then(|row| row.get(c))
-                .map(CellValue::as_text)
-                .unwrap_or_default()
-        })
+        .display_text(r, c)
+        .unwrap_or(std::borrow::Cow::Borrowed(""))
 }
 
 /// Render each cell's display text, applying the workbook's number formats.
@@ -1074,68 +1098,68 @@ fn cell_display_text(sheet: &Sheet, r: usize, c: usize) -> String {
 /// Mirrors the XLSX side: a number whose format is a date format renders as
 /// an ISO date, and any other non-General format is applied to the value.
 /// Everything else falls back to `CellValue::as_text`.
-fn build_display(
-    cells: &[Cell],
-    formats: &std::collections::HashMap<u16, String>,
-    xf_numfmt: &[u16],
+/// The workbook-global number-format tables: `FORMAT` codes by id and
+/// each `XF`'s format id ([MS-XLS] §2.4.126, §2.4.353), plus `DATEMODE`.
+#[derive(Debug, Default)]
+pub struct NumberFormats {
+    formats: std::collections::HashMap<u16, String>,
+    xf_numfmt: Vec<u16>,
     date1904: bool,
-) -> Vec<Vec<String>> {
-    use crate::xlsx::{date, numfmt};
-
-    let format_for = |xf: u16| -> Option<(u16, Option<&str>)> {
-        let fmt_id = *xf_numfmt.get(xf as usize)?;
-        Some((fmt_id, formats.get(&fmt_id).map(|s| s.as_str())))
-    };
-
-    let mut grid: Vec<Vec<String>> = Vec::new();
-    for cell in cells {
-        let text = match &cell.value {
-            CellValue::Number(n) => match format_for(cell.xf_index) {
-                Some((fmt_id, code)) => {
-                    // A workbook may redefine a built-in id — [ECMA-376]
-                    // §18.8.30 permits ids 0-163 to be overridden — so an
-                    // explicit `FORMAT` code wins over the built-in meaning
-                    // of its id. Testing the id first classified a
-                    // scientific-notation cell whose id-50 format the file
-                    // overrode to `0.00000E+0` as a date, and the date
-                    // conversion then ran for minutes on its magnitude.
-                    // Mirrors `date::is_date_cell`, fixed the same way.
-                    let is_date = match code {
-                        Some(c) => date::is_date_format_string(c),
-                        None => date::is_date_format_id(fmt_id as u32),
-                    };
-                    if is_date {
-                        match date::DateTimeValue::from_serial(*n, date1904) {
-                            Some(dt) => dt.to_iso_string(),
-                            None => cell.value.as_text(),
-                        }
-                    } else if fmt_id != 0 {
-                        numfmt::apply_format(*n, fmt_id as u32, code)
-                    } else {
-                        cell.value.as_text()
-                    }
-                },
-                None => cell.value.as_text(),
-            },
-            other => other.as_text(),
-        };
-        let (r, c) = (cell.row as usize, cell.col as usize);
-        if r > 65535 || c > 255 {
-            continue;
-        }
-        if grid.len() <= r {
-            grid.resize(r + 1, Vec::new());
-        }
-        if grid[r].len() <= c {
-            grid[r].resize(c + 1, String::new());
-        }
-        grid[r][c] = text;
-    }
-    grid
 }
 
-fn build_grid(cells: &mut [Cell]) -> Vec<Vec<CellValue>> {
-    // Jagged, like `build_display` and like every other spreadsheet
+impl NumberFormats {
+    /// Render `value` the way Excel displays it under XF `xf`. Only a
+    /// number needs work; everything else borrows.
+    pub fn display<'v>(&self, value: &'v CellValue, xf: u16) -> std::borrow::Cow<'v, str> {
+        use crate::xlsx::{date, numfmt};
+        let CellValue::Number(n) = value else {
+            return value.as_text_cow();
+        };
+        let Some(&fmt_id) = self.xf_numfmt.get(xf as usize) else {
+            return value.as_text_cow();
+        };
+        let code = self.formats.get(&fmt_id).map(|s| s.as_str());
+        // A workbook may redefine a built-in id — [ECMA-376] §18.8.30
+        // permits ids 0-163 to be overridden — so an explicit `FORMAT`
+        // code wins over the built-in meaning of its id. Testing the id
+        // first classified a scientific-notation cell whose id-50 format
+        // the file overrode to `0.00000E+0` as a date, and the date
+        // conversion then ran for minutes on its magnitude. Mirrors
+        // `date::is_date_cell`, fixed the same way.
+        let is_date = match code {
+            Some(c) => date::is_date_format_string(c),
+            None => date::is_date_format_id(fmt_id as u32),
+        };
+        if is_date {
+            match date::DateTimeValue::from_serial(*n, self.date1904) {
+                Some(dt) => dt.to_iso_string().into(),
+                None => value.as_text_cow(),
+            }
+        } else if fmt_id != 0 {
+            numfmt::apply_format(*n, fmt_id as u32, code).into()
+        } else {
+            value.as_text_cow()
+        }
+    }
+}
+
+impl Sheet {
+    /// The cell's text as Excel displays it — number formats and dates
+    /// applied — or `None` for a position past the row's last cell.
+    pub fn display_text(&self, row: usize, col: usize) -> Option<std::borrow::Cow<'_, str>> {
+        let value = self.rows.get(row)?.get(col)?;
+        let xf = self
+            .xf
+            .get(row)
+            .and_then(|r| r.get(col))
+            .copied()
+            .unwrap_or(0);
+        Some(self.formats.display(value, xf))
+    }
+}
+
+fn build_grid(cells: &mut [Cell]) -> (Vec<Vec<CellValue>>, Vec<Vec<u16>>) {
+    // Jagged, like every other spreadsheet
     // reader's storage (POI keeps a sparse map of rows, each holding cells
     // up to its last used column): a row is only as long as its last
     // non-empty cell, and trailing empty rows are dropped. The grid used to
@@ -1143,6 +1167,7 @@ fn build_grid(cells: &mut [Cell]) -> Vec<Vec<CellValue>> {
     // corner cells in a 65,536 x 256 sheet held 16.7M `CellValue`s — 392 MB
     // — before a single byte of text was extracted.
     let mut grid: Vec<Vec<CellValue>> = Vec::new();
+    let mut xf: Vec<Vec<u16>> = Vec::new();
     for cell in cells.iter_mut() {
         let (r, c) = (cell.row as usize, cell.col as usize);
         if r > 65535 || c > 255 || matches!(cell.value, CellValue::Empty) {
@@ -1150,23 +1175,29 @@ fn build_grid(cells: &mut [Cell]) -> Vec<Vec<CellValue>> {
         }
         if grid.len() <= r {
             grid.resize_with(r + 1, Vec::new);
+            xf.resize_with(r + 1, Vec::new);
         }
         let row = &mut grid[r];
         if row.len() <= c {
             row.resize(c + 1, CellValue::Empty);
+            xf[r].resize(c + 1, 0);
         }
         row[c] = std::mem::take(&mut cell.value);
+        xf[r][c] = cell.xf_index;
     }
-    for row in &mut grid {
+    for (row, xf_row) in grid.iter_mut().zip(xf.iter_mut()) {
         while row.last().is_some_and(|v| matches!(v, CellValue::Empty)) {
             row.pop();
+            xf_row.pop();
         }
         row.shrink_to_fit();
+        xf_row.shrink_to_fit();
     }
     while grid.last().is_some_and(|row| row.is_empty()) {
         grid.pop();
+        xf.pop();
     }
-    grid
+    (grid, xf)
 }
 
 impl crate::core::OfficeDocument for XlsDocument {
@@ -1271,6 +1302,48 @@ mod tests {
         s
     }
 
+    /// An OfficeArt PNG BLIP record (`OfficeArtBlipPNG`, [MS-ODRAW]
+    /// §2.2.32) wrapping `body`, split across a `MsoDrawingGroup` record
+    /// and one `CONTINUE` when `split` is set.
+    fn blip_png_records(body: &[u8], split: bool) -> Vec<u8> {
+        let mut blip = Vec::new();
+        blip.extend_from_slice(&0u16.to_le_bytes()); // ver/inst: no secondary UID
+        blip.extend_from_slice(&0xF01Eu16.to_le_bytes());
+        blip.extend_from_slice(&((17 + body.len()) as u32).to_le_bytes());
+        blip.extend_from_slice(&[0u8; 17]);
+        blip.extend_from_slice(body);
+        if split {
+            let (a, b) = blip.split_at(12);
+            let mut v = biff_rec(RT_MSODRAWINGGROUP, a);
+            v.extend(biff_rec(RT_CONTINUE, b));
+            v
+        } else {
+            biff_rec(RT_MSODRAWINGGROUP, &blip)
+        }
+    }
+
+    /// Pictures were found by scanning every byte of the Workbook stream
+    /// for a BLIP header at `open()` — a seventh of `plain_text()` on a
+    /// large sheet that never asked for one. They now come from the
+    /// `MsoDrawingGroup`/`MsoDrawing` records, where [MS-XLS] puts them,
+    /// on first request; a BLIP split by a `CONTINUE` is still one picture.
+    #[test]
+    fn test_pictures_decode_lazily_from_the_drawing_records() {
+        let png = b"\x89PNG\r\n\x1a\nIHDRfakebody";
+        let stream = workbook_stream_with_globals(
+            &[blip_png_records(png, true)],
+            &[("Sheet1", 0, label(0, 0, "cell text"))],
+        );
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+        assert!(doc.images.get().is_none(), "nothing decoded at open()");
+        let text = doc.plain_text();
+        assert!(text.contains("cell text"), "{text}");
+        assert!(doc.images.get().is_none(), "plain_text() does not decode pictures");
+        let images = doc.images();
+        assert_eq!(images.len(), 1, "one picture, reassembled across the CONTINUE");
+        assert_eq!(images[0].data, png);
+    }
+
     /// A hidden sheet's records were parsed and then discarded, so the
     /// sheet vanished from `to_ir()` entirely — silent deletion of data its
     /// author only hid. XLSX keeps and flags such a sheet; XLS now does
@@ -1362,7 +1435,6 @@ mod tests {
         grid[499][2] = CellValue::String("tail".into());
         let doc = XlsDocument::from_sheets(vec![Sheet {
             name: "S".into(),
-            display: Vec::new(),
             rows: grid,
             ..Default::default()
         }]);
@@ -1394,8 +1466,8 @@ mod tests {
         let stream = workbook_stream(&[("Sheet1", 0, sheet1_body)]);
         let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
         let sheet = &doc.sheets[0];
-        let cell = |r: usize, c: usize| sheet.display.get(r).and_then(|row| row.get(c)).cloned();
-        assert_eq!(cell(0, 0).as_deref(), Some("Title row"), "display: {:?}", sheet.display);
+        let cell = |r: usize, c: usize| sheet.display_text(r, c).map(|t| t.into_owned());
+        assert_eq!(cell(0, 0).as_deref(), Some("Title row"), "rows: {:?}", sheet.rows);
         assert_eq!(cell(1, 0).as_deref(), Some("Subtitle row"));
         assert_eq!(cell(2, 0).as_deref(), Some("after chart"));
         let text = doc.plain_text();
@@ -1412,7 +1484,6 @@ mod tests {
     fn test_comments_reach_plain_text_and_markdown() {
         let sheet = Sheet {
             name: "S".into(),
-            display: vec![vec!["data".to_string()]],
             rows: vec![vec![CellValue::String("data".to_string())]],
             comments: vec![XlsComment {
                 row: 1,
@@ -1671,7 +1742,7 @@ mod tests {
                 value: CellValue::String("A2".into()),
             },
         ];
-        let grid = build_grid(&mut cells);
+        let (grid, _) = build_grid(&mut cells);
         assert_eq!(grid.len(), 2);
         assert_eq!(grid[0].len(), 2);
         assert_eq!(grid[0][0], CellValue::String("A1".into()));
@@ -1696,7 +1767,7 @@ mod tests {
             mk(65535, 0, "BL"),
             mk(65535, 255, "BR"),
         ];
-        let grid = build_grid(&mut cells);
+        let (grid, _) = build_grid(&mut cells);
         assert_eq!(grid.len(), 65536);
         assert_eq!(grid[0].len(), 256);
         assert_eq!(grid[65535].len(), 256);
@@ -1707,7 +1778,7 @@ mod tests {
 
     #[test]
     fn test_build_grid_empty() {
-        let grid = build_grid(&mut Vec::new());
+        let (grid, _) = build_grid(&mut Vec::new());
         assert!(grid.is_empty());
     }
 
@@ -1729,14 +1800,14 @@ mod tests {
     #[test]
     fn test_plain_text_output() {
         let doc = XlsDocument {
-            images: Vec::new(),
+            drawing_bytes: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             defined_names: Vec::new(),
             truncated: false,
             summary_properties: None,
             chart_text: Vec::new(),
             sheets: vec![Sheet {
-                display: Vec::new(),
                 name: "Sheet1".into(),
                 rows: vec![
                     vec![
@@ -1757,14 +1828,14 @@ mod tests {
     #[test]
     fn test_markdown_output() {
         let doc = XlsDocument {
-            images: Vec::new(),
+            drawing_bytes: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             defined_names: Vec::new(),
             truncated: false,
             summary_properties: None,
             chart_text: Vec::new(),
             sheets: vec![Sheet {
-                display: Vec::new(),
                 name: "Data".into(),
                 rows: vec![
                     vec![CellValue::String("X".into()), CellValue::String("Y".into())],
@@ -1792,7 +1863,12 @@ mod tests {
         let sheet = Sheet {
             name: "Sheet1".into(),
             rows: vec![vec![CellValue::Number(38971.0)]],
-            display: vec![vec!["2006-09-11".to_string()]],
+            xf: vec![vec![0]],
+            formats: std::sync::Arc::new(NumberFormats {
+                formats: Default::default(),
+                xf_numfmt: vec![14],
+                date1904: false,
+            }),
             ..Default::default()
         };
         let doc = make_doc(vec![sheet]);
@@ -1814,7 +1890,8 @@ mod tests {
 
     fn make_doc(sheets: Vec<Sheet>) -> XlsDocument {
         XlsDocument {
-            images: Vec::new(),
+            drawing_bytes: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             defined_names: Vec::new(),
             truncated: false,
@@ -1834,7 +1911,6 @@ mod tests {
     #[test]
     fn test_ir_empty_sheet_has_no_table() {
         let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![Sheet {
-            display: Vec::new(),
             name: "Empty".into(),
             rows: vec![],
             ..Default::default()
@@ -1854,7 +1930,6 @@ mod tests {
             vec![CellValue::String("Alice".into()), CellValue::Number(95.0)],
         ];
         let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![Sheet {
-            display: Vec::new(),
             name: "Results".into(),
             rows,
             ..Default::default()
@@ -1873,7 +1948,6 @@ mod tests {
     fn test_ir_empty_cell_value_produces_empty_paragraph_content() {
         use crate::ir::Element;
         let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![Sheet {
-            display: Vec::new(),
             name: "S".into(),
             rows: vec![vec![
                 CellValue::String("a".into()),
@@ -1901,7 +1975,6 @@ mod tests {
     fn test_ir_trailing_empty_cells_and_rows_are_trimmed() {
         use crate::ir::Element;
         let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![Sheet {
-            display: Vec::new(),
             name: "S".into(),
             rows: vec![
                 vec![
@@ -1923,7 +1996,6 @@ mod tests {
     #[test]
     fn test_ir_a_wholly_empty_sheet_produces_no_table() {
         let ir = crate::convert_xls::xls_to_ir(&make_doc(vec![Sheet {
-            display: Vec::new(),
             name: "S".into(),
             rows: vec![vec![CellValue::Empty; 8]; 4],
             ..Default::default()
@@ -1935,13 +2007,11 @@ mod tests {
     fn test_ir_multiple_sheets_produce_multiple_sections() {
         let doc = make_doc(vec![
             Sheet {
-                display: Vec::new(),
                 name: "A".into(),
                 rows: vec![vec![CellValue::Number(1.0)]],
                 ..Default::default()
             },
             Sheet {
-                display: Vec::new(),
                 name: "B".into(),
                 rows: vec![vec![CellValue::String("x".into())]],
                 ..Default::default()
@@ -2001,67 +2071,80 @@ mod tests {
         // xf 0 -> fmt id 50.
         let xf_numfmt = vec![50u16];
 
-        let cells = vec![Cell {
+        let cell = Cell {
             xf_index: 0,
             row: 0,
             col: 0,
             value: CellValue::Number(4.052_85e199),
-        }];
+        };
 
         let started = std::time::Instant::now();
-        let display = build_display(&cells, &formats, &xf_numfmt, false);
+        let table = NumberFormats {
+            formats,
+            xf_numfmt,
+            date1904: false,
+        };
+        let display = table.display(&cell.value, cell.xf_index);
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
-            "build_display took {:?}",
+            "display took {:?}",
             started.elapsed()
         );
         assert!(
-            !display[0][0].starts_with("1900-") && !display[0][0].starts_with("9999-"),
-            "the overridden format is not a date: {}",
-            display[0][0]
+            !display.starts_with("1900-") && !display.starts_with("9999-"),
+            "the overridden format is not a date: {display}"
         );
-        assert!(
-            display[0][0].contains('E'),
-            "expected scientific notation, got {}",
-            display[0][0]
-        );
+        assert!(display.contains('E'), "expected scientific notation, got {}", display);
 
         // A built-in date id with *no* declared override is still a date.
-        let cells = vec![Cell {
+        let cell = Cell {
             xf_index: 0,
             row: 0,
             col: 0,
             value: CellValue::Number(38971.0),
-        }];
-        let display = build_display(&cells, &std::collections::HashMap::new(), &[14u16], false);
-        assert_eq!(display[0][0], "2006-09-11");
+        };
+        let table = NumberFormats {
+            formats: Default::default(),
+            xf_numfmt: vec![14],
+            date1904: false,
+        };
+        assert_eq!(table.display(&cell.value, 0), "2006-09-11");
     }
 
     /// The same date serial renders a different calendar date depending on
     /// `date1904` — the 1900/1904 epoch delta is exactly 1462 days. Previously
-    /// `build_display` had no `date1904` parameter at all and always
+    /// the display rendering had no `date1904` input at all and always
     /// rendered as if the workbook were 1900-mode.
     #[test]
-    fn test_build_display_honours_the_date1904_flag() {
-        let cells = vec![Cell {
+    fn test_display_honours_the_date1904_flag() {
+        let cell = Cell {
             xf_index: 0,
             row: 0,
             col: 0,
             value: CellValue::Number(38971.0),
-        }];
-        let display_1900 =
-            build_display(&cells, &std::collections::HashMap::new(), &[14u16], false);
-        let display_1904 = build_display(&cells, &std::collections::HashMap::new(), &[14u16], true);
-        assert_eq!(display_1900[0][0], "2006-09-11");
+        };
+        let table_1900 = NumberFormats {
+            formats: Default::default(),
+            xf_numfmt: vec![14],
+            date1904: false,
+        };
+        let table_1904 = NumberFormats {
+            formats: Default::default(),
+            xf_numfmt: vec![14],
+            date1904: true,
+        };
+        let display_1900 = table_1900.display(&cell.value, 0);
+        let display_1904 = table_1904.display(&cell.value, 0);
+        assert_eq!(display_1900, "2006-09-11");
         assert_ne!(
-            display_1900[0][0], display_1904[0][0],
+            display_1900, display_1904,
             "the same serial must render differently under the 1904 date system"
         );
     }
 
     /// End-to-end: a real `DATEMODE` record (`0x0022`) in the globals
     /// substream must reach the cell that renders the date, via the full
-    /// `parse_workbook_stream` record walk — not just `build_display`
+    /// `parse_workbook_stream` record walk — not just `NumberFormats::display`
     /// called directly.
     #[test]
     fn test_datemode_record_reaches_the_rendered_cell() {
@@ -2078,9 +2161,10 @@ mod tests {
         let stream_1904 = workbook_stream_with_globals(&globals_1904, &[("Sheet1", 0, cell)]);
         let doc_1904 = XlsDocument::parse_workbook_stream(&stream_1904).expect("parses");
 
-        assert_eq!(doc_1900.sheets[0].display[0][0], "2006-09-11");
+        assert_eq!(doc_1900.sheets[0].display_text(0, 0).unwrap(), "2006-09-11");
         assert_ne!(
-            doc_1900.sheets[0].display[0][0], doc_1904.sheets[0].display[0][0],
+            doc_1900.sheets[0].display_text(0, 0).unwrap(),
+            doc_1904.sheets[0].display_text(0, 0).unwrap(),
             "a DATEMODE=1904 record must change the rendered date"
         );
     }

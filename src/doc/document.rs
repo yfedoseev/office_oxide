@@ -19,8 +19,12 @@ use super::piece_table::{
 pub struct DocDocument {
     /// The raw extracted text (after sanitization).
     text: String,
-    /// Extracted images from the Data stream.
-    images: Vec<DocImage>,
+    /// The `Data` stream, decoded into `images` on first request. Every
+    /// picture in a Word 97 file lives here, so the stream is the whole
+    /// image payload; decoding it eagerly made `plain_text()` on a
+    /// picture-heavy file pay for pictures it never emits.
+    data_stream: Vec<u8>,
+    images: std::sync::OnceLock<Vec<DocImage>>,
     /// Structured main-text paragraphs with PAP (paragraph property) flags.
     /// Populated only when the FIB advertises a PlcfBtePapx (PAPX FKP index);
     /// empty for very old or minimal files, in which case `doc_to_ir` falls
@@ -309,11 +313,8 @@ impl DocDocument {
             fib.lcb_plf_lfo,
         );
 
-        // Extract images from the Data stream (if present).
-        let images = match cfb.open_stream("Data") {
-            Ok(data_stream) => extract_images(&data_stream),
-            Err(_) => Vec::new(),
-        };
+        // The Data stream (if present) holds the pictures; decoded lazily.
+        let data_stream = cfb.open_stream("Data").unwrap_or_default();
         let has_macros = cfb.has_root_entry("_VBA_PROJECT");
         // At minimum, recognize an embedded OLE object exists and
         // surface its identity — before this, `ObjectPool` was never
@@ -327,7 +328,8 @@ impl DocDocument {
 
         Ok(Self {
             text,
-            images,
+            data_stream,
+            images: std::sync::OnceLock::new(),
             paragraphs,
             subdocuments,
             has_macros,
@@ -349,7 +351,8 @@ impl DocDocument {
 
     /// Get all extracted images.
     pub fn images(&self) -> &[DocImage] {
-        &self.images
+        self.images
+            .get_or_init(|| extract_images(&self.data_stream))
     }
 
     /// Footnotes, headers, comments, endnotes and text boxes, in the order
@@ -787,7 +790,8 @@ mod tests {
             comments: Vec::new(),
             ole_objects: Vec::new(),
             header_footer: HeaderFooterStories::default(),
-            images: Vec::new(),
+            data_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             text: "First paragraph\nSecond paragraph\n\nAfter gap".into(),
             paragraphs: Vec::new(),
         };
@@ -809,7 +813,8 @@ mod tests {
             comments: Vec::new(),
             ole_objects: Vec::new(),
             header_footer: HeaderFooterStories::default(),
-            images: Vec::new(),
+            data_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             text: "Hello World".into(),
             paragraphs: Vec::new(),
         };
@@ -846,7 +851,8 @@ mod tests {
             comments: Vec::new(),
             ole_objects: Vec::new(),
             header_footer: HeaderFooterStories::default(),
-            images: Vec::new(),
+            data_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             text: "Main body text".into(),
             paragraphs: Vec::new(),
         };
@@ -877,7 +883,8 @@ mod tests {
             comments: Vec::new(),
             ole_objects: Vec::new(),
             header_footer: HeaderFooterStories::default(),
-            images: Vec::new(),
+            data_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             text: "Body".into(),
             paragraphs: Vec::new(),
         };
@@ -900,7 +907,8 @@ mod tests {
             comments: Vec::new(),
             ole_objects: Vec::new(),
             header_footer: HeaderFooterStories::default(),
-            images: Vec::new(),
+            data_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             text: "only the recovered fragment".into(),
             paragraphs: Vec::new(),
         };
@@ -932,7 +940,8 @@ mod tests {
             comments: Vec::new(),
             ole_objects: Vec::new(),
             header_footer: HeaderFooterStories::default(),
-            images: Vec::new(),
+            data_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             text: text.to_string(),
             paragraphs: Vec::new(),
         }
@@ -952,7 +961,8 @@ mod tests {
             comments: Vec::new(),
             ole_objects: Vec::new(),
             header_footer: HeaderFooterStories::default(),
-            images: Vec::new(),
+            data_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             text: String::new(),
             paragraphs: paras,
         }

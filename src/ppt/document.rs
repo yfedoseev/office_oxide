@@ -13,7 +13,10 @@ use super::text::{SlideText, TextType, extract_slides_text};
 pub struct PptDocument {
     /// Text content extracted from each slide.
     pub slides: Vec<SlideText>,
-    images: Vec<PptImage>,
+    /// The `Pictures` stream, decoded into `images` on first request —
+    /// see `DocDocument::data_stream` for why.
+    pictures_stream: Vec<u8>,
+    images: std::sync::OnceLock<Vec<PptImage>>,
     has_macros: bool,
     /// Title/author/subject/keywords/comments/dates from the
     /// `\x05SummaryInformation` OLE property-set stream every real `.ppt`
@@ -62,15 +65,13 @@ impl PptDocument {
         };
         let slides = extract_slides_text(&stream, current_user.as_deref());
 
-        // Extract images from Pictures stream (if present).
-        let images = match cfb.open_stream("Pictures") {
-            Ok(pictures) => extract_images(&pictures),
-            Err(_) => Vec::new(),
-        };
+        // The Pictures stream (if present) holds the images; decoded lazily.
+        let pictures_stream = cfb.open_stream("Pictures").unwrap_or_default();
 
         Ok(Self {
             slides,
-            images,
+            pictures_stream,
+            images: std::sync::OnceLock::new(),
             has_macros,
             summary_properties,
         })
@@ -97,7 +98,8 @@ impl PptDocument {
 
     /// Get all extracted images.
     pub fn images(&self) -> &[PptImage] {
-        &self.images
+        self.images
+            .get_or_init(|| extract_images(&self.pictures_stream))
     }
 
     /// Extract plain text.
@@ -279,6 +281,51 @@ mod tests {
         rec(crate::ppt::records::RT_SLIDE, 0x000F, &textbox)
     }
 
+    /// The `Pictures` stream was decoded into images at `open()`, so
+    /// `plain_text()` on a picture-heavy deck paid for pictures it never
+    /// emits (12 % of a 17 MB corpus file). It is decoded on first
+    /// request now, and still yields the same pictures.
+    #[test]
+    fn test_pictures_decode_lazily_on_first_request() {
+        let png_body = b"\x89PNG\r\n\x1a\nIHDRfakebody";
+        let mut blip = Vec::new();
+        blip.extend_from_slice(&0u16.to_le_bytes());
+        blip.extend_from_slice(&0xF01Eu16.to_le_bytes());
+        blip.extend_from_slice(&((17 + png_body.len()) as u32).to_le_bytes());
+        blip.extend_from_slice(&[0u8; 17]);
+        blip.extend_from_slice(png_body);
+        let bytes = build_cfb(&[
+            Entry {
+                name: "Root Entry",
+                kind: 5,
+                right: NO_ENTRY,
+                child: 1,
+                data: vec![],
+            },
+            Entry {
+                name: "PowerPoint Document",
+                kind: 2,
+                right: 2,
+                child: NO_ENTRY,
+                data: slide_stream("Slide text"),
+            },
+            Entry {
+                name: "Pictures",
+                kind: 2,
+                right: NO_ENTRY,
+                child: NO_ENTRY,
+                data: blip,
+            },
+        ]);
+        let doc = PptDocument::from_reader(std::io::Cursor::new(bytes)).expect("opens");
+        assert!(doc.images.get().is_none(), "nothing decoded at open()");
+        assert!(doc.plain_text().contains("Slide text"));
+        assert!(doc.images.get().is_none(), "plain_text() does not decode pictures");
+        let images = doc.images();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data, png_body);
+    }
+
     /// Regression: a PowerPoint 95 "dual storage" file keeps a PowerPoint
     /// 97 rendition of the deck under the `PP97_DUALSTORAGE` storage, and
     /// a PowerPoint 95 stream (which this parser cannot read) at the root.
@@ -342,7 +389,8 @@ mod tests {
     #[test]
     fn test_plain_text_basic() {
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![
@@ -383,7 +431,8 @@ mod tests {
     #[test]
     fn test_markdown_basic() {
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![SlideText {
@@ -413,7 +462,8 @@ mod tests {
     #[test]
     fn test_notes_excluded_from_plain_text() {
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![SlideText {
@@ -457,7 +507,8 @@ mod tests {
     #[test]
     fn test_ir_empty_doc_has_no_sections() {
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             slides: Vec::new(),
             has_macros: false,
             summary_properties: None,
@@ -471,7 +522,8 @@ mod tests {
     fn test_ir_title_becomes_heading_and_section_title() {
         use crate::ir::Element;
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![make_slide(vec![(TextType::Title, "My Slide")])],
@@ -489,7 +541,8 @@ mod tests {
     fn test_ir_title_slide_title_and_subtitle_are_not_swapped() {
         use crate::ir::Element;
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![make_slide(vec![
@@ -531,7 +584,8 @@ mod tests {
     fn test_ir_hyperlink_reaches_textspan_hyperlink() {
         use crate::ir::{Element, InlineContent};
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![SlideText {
@@ -557,7 +611,8 @@ mod tests {
     #[test]
     fn test_ir_center_title_treated_like_title() {
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![make_slide(vec![(TextType::CenterTitle, "Centered")])],
@@ -575,7 +630,8 @@ mod tests {
     fn test_ir_notes_go_to_speaker_notes_not_elements() {
         use crate::ir::{Element, InlineContent};
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![make_slide(vec![
@@ -609,7 +665,8 @@ mod tests {
     #[test]
     fn test_ir_no_notes_is_none_not_empty_string() {
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![make_slide(vec![(TextType::Body, "Just body text")])],
@@ -623,7 +680,8 @@ mod tests {
     #[test]
     fn test_ir_multiple_notes_runs_are_joined() {
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![make_slide(vec![
@@ -659,7 +717,8 @@ mod tests {
     fn test_ir_body_half_quarter_produce_paragraphs() {
         use crate::ir::Element;
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![make_slide(vec![
@@ -680,7 +739,8 @@ mod tests {
         // instead (see ir_notes_go_to_speaker_notes_not_elements above) and
         // a notes-only slide has no visible elements at all.
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![make_slide(vec![(TextType::Notes, "Speaker note")])],
@@ -697,7 +757,8 @@ mod tests {
     fn test_ir_other_text_type_produces_paragraph() {
         use crate::ir::Element;
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![make_slide(vec![(TextType::Other, "misc text")])],
@@ -709,7 +770,8 @@ mod tests {
     #[test]
     fn test_ir_slide_without_title_gets_fallback_name() {
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![make_slide(vec![(TextType::Body, "content")])],
@@ -721,7 +783,8 @@ mod tests {
     #[test]
     fn test_ir_format_is_ppt() {
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             slides: Vec::new(),
             has_macros: false,
             summary_properties: None,
@@ -735,7 +798,8 @@ mod tests {
     #[test]
     fn test_ir_summary_properties_reach_metadata() {
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: Some(crate::cfb::SummaryProperties {
                 title: Some("Declared Title".to_string()),
@@ -763,7 +827,8 @@ mod tests {
     #[test]
     fn test_ir_empty_summary_title_falls_back_to_slide_title() {
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: Some(crate::cfb::SummaryProperties {
                 title: Some(String::new()),
@@ -786,7 +851,8 @@ mod tests {
         use crate::ppt::{CharFormat, CharFormatSpan};
 
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![SlideText {
@@ -831,7 +897,8 @@ mod tests {
         use crate::ppt::{CharFormat, CharFormatSpan};
 
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![SlideText {
@@ -889,7 +956,8 @@ mod tests {
         use crate::ppt::{ParaFormat, ParaFormatSpan};
 
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![SlideText {
@@ -922,7 +990,8 @@ mod tests {
         use crate::ir::Element;
 
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![SlideText {
@@ -954,7 +1023,8 @@ mod tests {
         use crate::ir::{Element, InlineContent};
 
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![SlideText {
@@ -1002,7 +1072,8 @@ mod tests {
         }
 
         let doc = PptDocument {
-            images: Vec::new(),
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
             slides: vec![SlideText {
@@ -1046,7 +1117,8 @@ mod tests {
         use crate::ir::Element;
 
         let doc = PptDocument {
-            images: vec![
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::from(vec![
                 BlipImage {
                     format: BlipFormat::Png,
                     data: b"PNG0".to_vec(),
@@ -1057,7 +1129,7 @@ mod tests {
                     data: b"JPEG1".to_vec(),
                     index: 1,
                 },
-            ],
+            ]),
             has_macros: false,
             summary_properties: None,
             slides: vec![
@@ -1100,11 +1172,12 @@ mod tests {
         use crate::ir::Element;
 
         let doc = PptDocument {
-            images: vec![BlipImage {
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::from(vec![BlipImage {
                 format: BlipFormat::Png,
                 data: b"ORPHAN".to_vec(),
                 index: 0,
-            }],
+            }]),
             has_macros: false,
             summary_properties: None,
             slides: vec![SlideText {

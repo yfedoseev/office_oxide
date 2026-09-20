@@ -23,27 +23,33 @@ pub enum CellValue {
 impl CellValue {
     /// Get the display text of a cell value.
     pub fn as_text(&self) -> String {
+        self.as_text_cow().into_owned()
+    }
+
+    /// [`Self::as_text`] without the copy: string, boolean, empty and the
+    /// named error cells borrow; only a number is formatted into a new
+    /// `String`.
+    pub fn as_text_cow(&self) -> std::borrow::Cow<'_, str> {
+        use std::borrow::Cow;
         match self {
-            Self::Empty => String::new(),
-            Self::Number(n) => {
-                if *n == (*n as i64) as f64 && n.abs() < 1e15 {
-                    format!("{}", *n as i64)
-                } else {
-                    format!("{n}")
-                }
-            },
-            Self::String(s) => s.clone(),
-            Self::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-            Self::Error(code) => match code {
-                0x00 => "#NULL!".into(),
-                0x07 => "#DIV/0!".into(),
-                0x0F => "#VALUE!".into(),
-                0x17 => "#REF!".into(),
-                0x1D => "#NAME?".into(),
-                0x24 => "#NUM!".into(),
-                0x2A => "#N/A".into(),
-                _ => format!("#ERR({code})"),
-            },
+            Self::Empty => Cow::Borrowed(""),
+            Self::Number(n) => Cow::Owned(if *n == (*n as i64) as f64 && n.abs() < 1e15 {
+                format!("{}", *n as i64)
+            } else {
+                format!("{n}")
+            }),
+            Self::String(s) => Cow::Borrowed(s),
+            Self::Bool(b) => Cow::Borrowed(if *b { "TRUE" } else { "FALSE" }),
+            Self::Error(code) => Cow::Borrowed(match code {
+                0x00 => "#NULL!",
+                0x07 => "#DIV/0!",
+                0x0F => "#VALUE!",
+                0x17 => "#REF!",
+                0x1D => "#NAME?",
+                0x24 => "#NUM!",
+                0x2A => "#N/A",
+                _ => return Cow::Owned(format!("#ERR({code})")),
+            }),
         }
     }
 }
@@ -64,26 +70,29 @@ pub struct Cell {
     pub value: CellValue,
 }
 
-/// Parse cells from a BIFF record.
+/// Parse the cells of one BIFF record into `out`.
 ///
-/// Returns a list of cells extracted from a single record.
+/// Appends rather than returns: every cell is its own record in a BIFF8
+/// sheet, so a `Vec` per record was an allocation per cell.
 pub fn parse_cell_record(
     record: &BiffRecord,
     sst: &[String],
     codepage: Option<u16>,
-) -> Result<Vec<Cell>> {
+    out: &mut Vec<Cell>,
+) -> Result<()> {
     match record.record_type {
-        RT_LABELSST => parse_labelsst(&record.data, sst),
-        RT_NUMBER => parse_number(&record.data),
-        RT_RK => parse_rk_record(&record.data),
-        RT_MULRK => parse_mulrk(&record.data),
-        RT_BOOLERR => parse_boolerr(&record.data),
-        RT_LABEL | RT_RSTRING => parse_label(&record.data, codepage),
-        RT_BLANK => parse_blank(&record.data),
-        RT_MULBLANK => parse_mulblank(&record.data),
-        RT_FORMULA => parse_formula(&record.data),
-        _ => Ok(Vec::new()),
+        RT_LABELSST => out.push(parse_labelsst(&record.data, sst)?),
+        RT_NUMBER => out.push(parse_number(&record.data)?),
+        RT_RK => out.push(parse_rk_record(&record.data)?),
+        RT_MULRK => parse_mulrk(&record.data, out)?,
+        RT_BOOLERR => out.push(parse_boolerr(&record.data)?),
+        RT_LABEL | RT_RSTRING => out.push(parse_label(&record.data, codepage)?),
+        RT_BLANK => out.push(parse_blank(&record.data)?),
+        RT_MULBLANK => parse_mulblank(&record.data, out)?,
+        RT_FORMULA => out.push(parse_formula(&record.data)?),
+        _ => {},
     }
+    Ok(())
 }
 
 /// The 6-byte header every single-cell BIFF record starts with
@@ -100,7 +109,7 @@ fn cell_header(data: &[u8], record: &str, min_len: usize) -> Result<(u16, u16, u
     Ok((row, col, xf_index))
 }
 
-fn parse_labelsst(data: &[u8], sst: &[String]) -> Result<Vec<Cell>> {
+fn parse_labelsst(data: &[u8], sst: &[String]) -> Result<Cell> {
     let (row, col, xf_index) = cell_header(data, "LABELSST", 10)?;
     let sst_index = u32::from_le_bytes([data[6], data[7], data[8], data[9]]) as usize;
 
@@ -110,40 +119,40 @@ fn parse_labelsst(data: &[u8], sst: &[String]) -> Result<Vec<Cell>> {
         CellValue::String(String::new())
     };
 
-    Ok(vec![Cell {
+    Ok(Cell {
         xf_index,
         row,
         col,
         value,
-    }])
+    })
 }
 
-fn parse_number(data: &[u8]) -> Result<Vec<Cell>> {
+fn parse_number(data: &[u8]) -> Result<Cell> {
     let (row, col, xf_index) = cell_header(data, "NUMBER", 14)?;
     let value = f64::from_le_bytes([
         data[6], data[7], data[8], data[9], data[10], data[11], data[12], data[13],
     ]);
-    Ok(vec![Cell {
+    Ok(Cell {
         xf_index,
         row,
         col,
         value: CellValue::Number(value),
-    }])
+    })
 }
 
-fn parse_rk_record(data: &[u8]) -> Result<Vec<Cell>> {
+fn parse_rk_record(data: &[u8]) -> Result<Cell> {
     let (row, col, xf_index) = cell_header(data, "RK", 10)?;
     let rk_val = u32::from_le_bytes([data[6], data[7], data[8], data[9]]);
     let value = decode_rk(rk_val);
-    Ok(vec![Cell {
+    Ok(Cell {
         xf_index,
         row,
         col,
         value: CellValue::Number(value),
-    }])
+    })
 }
 
-fn parse_mulrk(data: &[u8]) -> Result<Vec<Cell>> {
+fn parse_mulrk(data: &[u8], cells: &mut Vec<Cell>) -> Result<()> {
     if data.len() < 6 {
         return Err(XlsError::InvalidRecord("MULRK too short".into()));
     }
@@ -154,7 +163,7 @@ fn parse_mulrk(data: &[u8]) -> Result<Vec<Cell>> {
     let rk_data = &data[4..data.len() - 2];
     let count = rk_data.len() / 6;
 
-    let mut cells = Vec::with_capacity(count);
+    cells.reserve(count);
     for i in 0..count {
         let off = i * 6;
         // Each MULRK entry carries its own `ixfe`.
@@ -172,10 +181,10 @@ fn parse_mulrk(data: &[u8]) -> Result<Vec<Cell>> {
             value: CellValue::Number(decode_rk(rk_val)),
         });
     }
-    Ok(cells)
+    Ok(())
 }
 
-fn parse_boolerr(data: &[u8]) -> Result<Vec<Cell>> {
+fn parse_boolerr(data: &[u8]) -> Result<Cell> {
     let (row, col, xf_index) = cell_header(data, "BOOLERR", 8)?;
     let val = data[6];
     let is_error = data[7];
@@ -184,15 +193,15 @@ fn parse_boolerr(data: &[u8]) -> Result<Vec<Cell>> {
     } else {
         CellValue::Bool(val != 0)
     };
-    Ok(vec![Cell {
+    Ok(Cell {
         xf_index,
         row,
         col,
         value,
-    }])
+    })
 }
 
-fn parse_label(data: &[u8], codepage: Option<u16>) -> Result<Vec<Cell>> {
+fn parse_label(data: &[u8], codepage: Option<u16>) -> Result<Cell> {
     let (row, col, xf_index) = cell_header(data, "LABEL", 8)?;
     // Try BIFF8 unicode string first; fall back to raw bytes for BIFF5.
     let s = match read_unicode_string(data, 6) {
@@ -206,25 +215,25 @@ fn parse_label(data: &[u8], codepage: Option<u16>) -> Result<Vec<Cell>> {
             super::codepage::decode_biff5_text(&data[start..end], codepage)
         },
     };
-    Ok(vec![Cell {
+    Ok(Cell {
         xf_index,
         row,
         col,
         value: CellValue::String(s),
-    }])
+    })
 }
 
-fn parse_blank(data: &[u8]) -> Result<Vec<Cell>> {
+fn parse_blank(data: &[u8]) -> Result<Cell> {
     let (row, col, xf_index) = cell_header(data, "BLANK", 6)?;
-    Ok(vec![Cell {
+    Ok(Cell {
         xf_index,
         row,
         col,
         value: CellValue::Empty,
-    }])
+    })
 }
 
-fn parse_mulblank(data: &[u8]) -> Result<Vec<Cell>> {
+fn parse_mulblank(data: &[u8], cells: &mut Vec<Cell>) -> Result<()> {
     if data.len() < 6 {
         return Err(XlsError::InvalidRecord("MULBLANK too short".into()));
     }
@@ -233,8 +242,8 @@ fn parse_mulblank(data: &[u8]) -> Result<Vec<Cell>> {
     let last_col = u16::from_le_bytes([data[data.len() - 2], data[data.len() - 1]]);
     let count = (last_col.saturating_sub(first_col) + 1) as usize;
     let ixfe = &data[4..data.len().saturating_sub(2)];
-    let cells = (0..count)
-        .map(|i| Cell {
+    cells.extend((0..count).map(|i| {
+        Cell {
             xf_index: ixfe
                 .get(i * 2..i * 2 + 2)
                 .map(|b| u16::from_le_bytes([b[0], b[1]]))
@@ -242,12 +251,12 @@ fn parse_mulblank(data: &[u8]) -> Result<Vec<Cell>> {
             row,
             col: first_col + i as u16,
             value: CellValue::Empty,
-        })
-        .collect();
-    Ok(cells)
+        }
+    }));
+    Ok(())
 }
 
-fn parse_formula(data: &[u8]) -> Result<Vec<Cell>> {
+fn parse_formula(data: &[u8]) -> Result<Cell> {
     // Use the cached result value from the FORMULA record.
     let (row, col, xf_index) = cell_header(data, "FORMULA", 14)?;
     // Cached result is at bytes 6..14 (8 bytes).
@@ -262,37 +271,37 @@ fn parse_formula(data: &[u8]) -> Result<Vec<Cell>> {
             0 => {
                 // String follows in a STRING record — we'll handle this at a higher level.
                 // For now, return empty.
-                Ok(vec![Cell {
+                Ok(Cell {
                     xf_index,
                     row,
                     col,
                     value: CellValue::String(String::new()),
-                }])
+                })
             },
-            1 => Ok(vec![Cell {
+            1 => Ok(Cell {
                 xf_index,
                 row,
                 col,
                 value: CellValue::Bool(val_bytes[2] != 0),
-            }]),
-            2 => Ok(vec![Cell {
+            }),
+            2 => Ok(Cell {
                 xf_index,
                 row,
                 col,
                 value: CellValue::Error(val_bytes[2]),
-            }]),
-            3 => Ok(vec![Cell {
+            }),
+            3 => Ok(Cell {
                 xf_index,
                 row,
                 col,
                 value: CellValue::Empty,
-            }]),
-            _ => Ok(vec![Cell {
+            }),
+            _ => Ok(Cell {
                 xf_index,
                 row,
                 col,
                 value: CellValue::Empty,
-            }]),
+            }),
         }
     } else {
         // It's a regular IEEE 754 double.
@@ -306,12 +315,12 @@ fn parse_formula(data: &[u8]) -> Result<Vec<Cell>> {
             val_bytes[6],
             val_bytes[7],
         ]);
-        Ok(vec![Cell {
+        Ok(Cell {
             xf_index,
             row,
             col,
             value: CellValue::Number(value),
-        }])
+        })
     }
 }
 
@@ -386,10 +395,11 @@ mod tests {
         data.extend_from_slice(&1u32.to_le_bytes()); // SST index 1
         let rec = BiffRecord {
             record_type: RT_LABELSST,
-            data,
+            data: data.into(),
             continue_at: Vec::new(),
         };
-        let cells = parse_cell_record(&rec, &sst, None).unwrap();
+        let mut cells = Vec::new();
+        parse_cell_record(&rec, &sst, None, &mut cells).unwrap();
         assert_eq!(cells.len(), 1);
         assert_eq!(cells[0].row, 0);
         assert_eq!(cells[0].col, 1);
@@ -405,10 +415,11 @@ mod tests {
         data.extend_from_slice(&42.5f64.to_le_bytes());
         let rec = BiffRecord {
             record_type: RT_NUMBER,
-            data,
+            data: data.into(),
             continue_at: Vec::new(),
         };
-        let cells = parse_cell_record(&rec, &[], None).unwrap();
+        let mut cells = Vec::new();
+        parse_cell_record(&rec, &[], None, &mut cells).unwrap();
         assert_eq!(cells[0].value, CellValue::Number(42.5));
     }
 
@@ -422,10 +433,11 @@ mod tests {
         data.push(0); // is_error = false (it's a bool)
         let rec = BiffRecord {
             record_type: RT_BOOLERR,
-            data,
+            data: data.into(),
             continue_at: Vec::new(),
         };
-        let cells = parse_cell_record(&rec, &[], None).unwrap();
+        let mut cells = Vec::new();
+        parse_cell_record(&rec, &[], None, &mut cells).unwrap();
         assert_eq!(cells[0].value, CellValue::Bool(true));
     }
 
@@ -439,10 +451,11 @@ mod tests {
         data.push(1); // is_error = true
         let rec = BiffRecord {
             record_type: RT_BOOLERR,
-            data,
+            data: data.into(),
             continue_at: Vec::new(),
         };
-        let cells = parse_cell_record(&rec, &[], None).unwrap();
+        let mut cells = Vec::new();
+        parse_cell_record(&rec, &[], None, &mut cells).unwrap();
         assert_eq!(cells[0].value, CellValue::Error(0x07));
     }
 
@@ -464,10 +477,11 @@ mod tests {
 
         let rec = BiffRecord {
             record_type: RT_MULRK,
-            data,
+            data: data.into(),
             continue_at: Vec::new(),
         };
-        let cells = parse_cell_record(&rec, &[], None).unwrap();
+        let mut cells = Vec::new();
+        parse_cell_record(&rec, &[], None, &mut cells).unwrap();
         assert_eq!(cells.len(), 2);
         assert_eq!(cells[0].col, 0);
         assert_eq!(cells[0].value, CellValue::Number(10.0));

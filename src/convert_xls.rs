@@ -91,17 +91,11 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
             .rows
             .iter()
             .enumerate()
-            .rposition(|(row_idx, row)| {
-                row.iter().enumerate().any(|(col_idx, cell_value)| {
-                    // Matches the emptiness test the emit loop applies, but
-                    // without rendering every cell of the declared grid.
-                    let has_display = sheet
-                        .display
-                        .get(row_idx)
-                        .and_then(|r| r.get(col_idx))
-                        .is_some_and(|s| !s.is_empty());
-                    has_display || !matches!(cell_value, crate::xls::CellValue::Empty)
-                })
+            .rposition(|(_, row)| {
+                // Matches the emptiness test the emit loop applies, but
+                // without rendering every cell of the declared grid.
+                row.iter()
+                    .any(|cell_value| !matches!(cell_value, crate::xls::CellValue::Empty))
             })
             .map_or(0, |i| i + 1);
         let mut budget = MAX_CELLS_PER_SHEET;
@@ -122,29 +116,16 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
             // (~75 KB): 4.9 GB for a 42 KB file whose IR is 6 MB.
             let width = row
                 .iter()
-                .enumerate()
-                .rposition(|(col_idx, cell_value)| {
-                    let has_display = sheet
-                        .display
-                        .get(row_idx)
-                        .and_then(|r| r.get(col_idx))
-                        .is_some_and(|s| !s.is_empty());
-                    has_display || !matches!(cell_value, crate::xls::CellValue::Empty)
-                })
+                .rposition(|cell_value| !matches!(cell_value, crate::xls::CellValue::Empty))
                 .map_or(0, |i| i + 1);
             let mut cells = Vec::with_capacity(width);
-            for (col_idx, cell_value) in row.iter().take(width).enumerate() {
-                // `display` carries the number-format-aware rendering: a
-                // date cell is an ISO date rather than its raw serial.
-                // Fall back to the raw rendering when the sheet had no
-                // format tables.
+            for col_idx in 0..width {
+                // Number-format-aware rendering: a date cell is an ISO
+                // date rather than its raw serial.
                 let text = sheet
-                    .display
-                    .get(row_idx)
-                    .and_then(|r| r.get(col_idx))
-                    .filter(|s| !s.is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| cell_value.as_text());
+                    .display_text(row_idx, col_idx)
+                    .map(std::borrow::Cow::into_owned)
+                    .unwrap_or_default();
                 let hyperlink = links.get(&(row_idx as u16, col_idx as u16)).cloned();
                 cells.push(TableCell {
                     content: vec![Element::Paragraph(Paragraph {
@@ -388,7 +369,6 @@ mod tests {
         grid[data_row][0] = CellValue::String(text.to_string());
         Sheet {
             name: "S".into(),
-            display: Vec::new(),
             rows: grid,
             ..Default::default()
         }
@@ -435,7 +415,6 @@ mod tests {
     fn test_merged_cells_set_col_span_on_the_anchor_and_exclude_covered_cells() {
         let sheet = Sheet {
             name: "S".into(),
-            display: Vec::new(),
             rows: vec![
                 vec![
                     CellValue::String("Header".to_string()),
@@ -496,7 +475,6 @@ mod tests {
         // motivated this are 65,536 x 256; the shape is what matters here.
         let ir = xls_to_ir(&XlsDocument::from_sheets(vec![Sheet {
             name: "S".into(),
-            display: Vec::new(),
             rows: vec![vec![CellValue::Empty; 64]; 2_000],
             ..Default::default()
         }]));
@@ -518,7 +496,6 @@ mod tests {
         grid[rows - 1][cols - 1] = CellValue::String("Bottom Right".into());
         let ir = xls_to_ir(&XlsDocument::from_sheets(vec![Sheet {
             name: "S".into(),
-            display: Vec::new(),
             rows: grid,
             ..Default::default()
         }]));
@@ -541,7 +518,6 @@ mod tests {
         let grid = vec![vec![CellValue::Number(1.0); 100]; rows];
         let ir = xls_to_ir(&XlsDocument::from_sheets(vec![Sheet {
             name: "S".into(),
-            display: Vec::new(),
             rows: grid,
             ..Default::default()
         }]));
@@ -559,7 +535,6 @@ mod tests {
     fn test_hyperlink_reaches_the_cells_text_span() {
         let sheet = Sheet {
             name: "S".into(),
-            display: Vec::new(),
             rows: vec![vec![CellValue::String("Stacie@ABC.com".to_string())]],
             hyperlinks: vec![crate::xls::XlsHyperlink {
                 row_first: 0,
@@ -590,7 +565,6 @@ mod tests {
     fn test_hyperlink_range_applies_to_every_covered_cell() {
         let sheet = Sheet {
             name: "S".into(),
-            display: Vec::new(),
             rows: vec![vec![
                 CellValue::String("A".to_string()),
                 CellValue::String("B".to_string()),
@@ -626,7 +600,6 @@ mod tests {
     fn test_comments_reach_the_sheet_as_endnotes() {
         let sheet = Sheet {
             name: "S".into(),
-            display: Vec::new(),
             rows: vec![vec![CellValue::String("data".to_string())]],
             comments: vec![crate::xls::XlsComment {
                 row: 0,
