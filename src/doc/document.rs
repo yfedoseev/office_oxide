@@ -251,9 +251,18 @@ impl DocDocument {
             }
             let end = cp.saturating_add(len);
             let raw = super::piece_table::extract_text_range(&word_doc, &pieces, cp, end, fib.lid);
+            // The header document opens with six fixed stories — the
+            // footnote/endnote separators and "continued" notices Word
+            // shows only when a note spans pages ([MS-DOC] "Headers").
+            // They are not header text; keep them out of the flat text
+            // the way the split below already keeps them out of the IR.
+            let mut text_start = 0;
             if kind == SubDocumentKind::HeadersFooters {
                 header_footer =
                     parse_plcf_hdd_stories(&table_stream, &raw, fib.fc_plcf_hdd, fib.lcb_plcf_hdd);
+                text_start =
+                    plcf_hdd_first_section_cp(&table_stream, fib.fc_plcf_hdd, fib.lcb_plcf_hdd)
+                        .unwrap_or(0);
             }
             if kind == SubDocumentKind::Comments {
                 comments = parse_comments(
@@ -266,7 +275,11 @@ impl DocDocument {
                     &comment_authors,
                 );
             }
-            let sub = sanitize_text(&raw);
+            let sub = if text_start > 0 {
+                sanitize_text(&raw.chars().skip(text_start).collect::<String>())
+            } else {
+                sanitize_text(&raw)
+            };
             if !sub.trim().is_empty() {
                 subdocuments.push(SubDocument { kind, text: sub });
             }
@@ -548,36 +561,9 @@ fn parse_plcf_hdd_stories(
     lcb: u32,
 ) -> HeaderFooterStories {
     let mut result = HeaderFooterStories::default();
-    if lcb == 0 {
+    let Some(cps) = plcf_hdd_cps(table_stream, fc, lcb) else {
         return result;
-    }
-    let start = fc as usize;
-    let byte_len = lcb as usize;
-    let end = start.saturating_add(byte_len).min(table_stream.len());
-    if start >= end || !(end - start).is_multiple_of(4) {
-        return result;
-    }
-    let total_cps = (end - start) / 4;
-    if total_cps < 2 {
-        return result;
-    }
-    let n = total_cps - 2;
-    // Need at least the 6 fixed separator stories plus one full
-    // section's group of 6 header/footer stories.
-    if n < 12 {
-        return result;
-    }
-
-    let cps: Vec<usize> = (0..=n)
-        .map(|i| {
-            u32::from_le_bytes([
-                table_stream[start + i * 4],
-                table_stream[start + i * 4 + 1],
-                table_stream[start + i * 4 + 2],
-                table_stream[start + i * 4 + 3],
-            ]) as usize
-        })
-        .collect();
+    };
 
     let char_range = |lo: usize, hi: usize| -> Option<String> {
         if hi <= lo {
@@ -603,6 +589,46 @@ fn parse_plcf_hdd_stories(
     result.first_header = char_range(cps[base + 4], cps[base + 5]);
     result.first_footer = char_range(cps[base + 5], cps[base + 6]);
     result
+}
+
+/// The `aCP[0..=n]` boundary CPs of `PlcfHdd`, or `None` when the PLC is
+/// absent, malformed, or shorter than the 6 fixed separator stories plus
+/// one full section's group of 6 header/footer stories.
+fn plcf_hdd_cps(table_stream: &[u8], fc: u32, lcb: u32) -> Option<Vec<usize>> {
+    if lcb == 0 {
+        return None;
+    }
+    let start = fc as usize;
+    let end = start.saturating_add(lcb as usize).min(table_stream.len());
+    if start >= end || !(end - start).is_multiple_of(4) {
+        return None;
+    }
+    let total_cps = (end - start) / 4;
+    if total_cps < 2 {
+        return None;
+    }
+    let n = total_cps - 2;
+    if n < 12 {
+        return None;
+    }
+    Some(
+        (0..=n)
+            .map(|i| {
+                u32::from_le_bytes([
+                    table_stream[start + i * 4],
+                    table_stream[start + i * 4 + 1],
+                    table_stream[start + i * 4 + 2],
+                    table_stream[start + i * 4 + 3],
+                ]) as usize
+            })
+            .collect(),
+    )
+}
+
+/// The header-document CP where the first section's own stories begin —
+/// i.e. the end of the 6 fixed footnote/endnote separator stories.
+fn plcf_hdd_first_section_cp(table_stream: &[u8], fc: u32, lcb: u32) -> Option<usize> {
+    plcf_hdd_cps(table_stream, fc, lcb).map(|cps| cps[6])
 }
 
 /// Split the merged Comments substory into individual comments using
@@ -1292,6 +1318,24 @@ mod tests {
         assert_eq!(stories.odd_footer.as_deref(), Some("ODD FOOTER"));
         assert_eq!(stories.first_header.as_deref(), Some("FIRST HEADER"));
         assert_eq!(stories.first_footer.as_deref(), Some("FIRST FOOTER"));
+    }
+
+    /// Regression: the six fixed stories ahead of the first section's
+    /// group are Word's footnote/endnote separators and "(continued from
+    /// previous page)" notices. `to_ir()` never carried them; the flat
+    /// text did, so `plain_text()` showed a notice the document never
+    /// displays and the two surfaces disagreed.
+    #[test]
+    fn test_plcf_hdd_first_section_cp_skips_the_six_separator_stories() {
+        // Stories 0..6 hold a continuation notice (chars 0..9); the real
+        // headers start at CP 9.
+        let cps: [u32; 14] = [0, 0, 0, 9, 9, 9, 9, 20, 30, 41, 51, 63, 75, 76];
+        let mut table_stream = Vec::new();
+        for cp in cps {
+            table_stream.extend_from_slice(&cp.to_le_bytes());
+        }
+        assert_eq!(plcf_hdd_first_section_cp(&table_stream, 0, table_stream.len() as u32), Some(9));
+        assert_eq!(plcf_hdd_first_section_cp(&[0u8; 8], 0, 0), None);
     }
 
     #[test]
