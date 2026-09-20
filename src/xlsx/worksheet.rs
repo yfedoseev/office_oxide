@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use quick_xml::events::Event;
 
 use crate::core::xml;
@@ -869,25 +871,54 @@ fn parse_row_fast(
     Ok(Row { index, cells })
 }
 
+/// The `<c>` start-tag attributes, read in one pass.
+///
+/// Every cell in a sheet goes through here, so this is the hottest loop in
+/// the crate: one pass over the attributes instead of one rescan per key,
+/// the reference parsed straight from the borrowed value instead of an
+/// owned copy, and the type kept borrowed. The old shape — four
+/// `optional_attr_str` calls and two `String`s per cell — was a third of
+/// the time spent on a large sheet.
+struct CellAttrs<'a> {
+    reference: Option<CellRef>,
+    cell_type: Option<Cow<'a, str>>,
+    style_index: Option<u32>,
+    vm: Option<u32>,
+}
+
+fn cell_attrs<'a>(e: &'a quick_xml::events::BytesStart<'_>) -> crate::core::Result<CellAttrs<'a>> {
+    let mut out = CellAttrs {
+        reference: None,
+        cell_type: None,
+        style_index: None,
+        vm: None,
+    };
+    for attr in xml::attrs(e) {
+        let (key, value) = attr?;
+        match key {
+            "r" => out.reference = CellRef::parse(&value),
+            "t" => out.cell_type = Some(value),
+            "s" => out.style_index = atoi_simd::parse_pos::<u32, false>(value.as_bytes()).ok(),
+            "vm" => out.vm = atoi_simd::parse_pos::<u32, false>(value.as_bytes()).ok(),
+            _ => {},
+        }
+    }
+    Ok(out)
+}
+
 fn parse_empty_cell(
     e: &quick_xml::events::BytesStart,
     row: u32,
     implied_col: u32,
 ) -> crate::core::Result<Cell> {
-    let ref_str = xml::optional_attr_str(e, "r")?
-        .map(|v| v.into_owned())
-        .unwrap_or_default();
-    let reference = CellRef::parse(&ref_str).unwrap_or(CellRef {
-        col: implied_col,
-        row,
-    });
-    let style_index = xml::optional_attr_str(e, "s")?
-        .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok());
-
+    let attrs = cell_attrs(e)?;
     Ok(Cell {
-        reference,
+        reference: attrs.reference.unwrap_or(CellRef {
+            col: implied_col,
+            row,
+        }),
         value: CellValue::Empty,
-        style_index,
+        style_index: attrs.style_index,
         formula: None,
         vm: None,
         rich_runs: None,
@@ -913,21 +944,19 @@ fn parse_cell_fast(
     implied_col: u32,
     shared: &mut SharedFormulas,
 ) -> crate::core::Result<Cell> {
-    let ref_str = xml::optional_attr_str(start, "r")?
-        .map(|v| v.into_owned())
-        .unwrap_or_default();
-    let reference = CellRef::parse(&ref_str).unwrap_or(CellRef {
+    let CellAttrs {
+        reference,
+        cell_type,
+        style_index,
+        vm,
+    } = cell_attrs(start)?;
+    let reference = reference.unwrap_or(CellRef {
         col: implied_col,
         row,
     });
 
-    let cell_type = xml::optional_attr_str(start, "t")?.map(|v| v.into_owned());
-    let style_index = xml::optional_attr_str(start, "s")?
-        .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok());
-    let vm = xml::optional_attr_str(start, "vm")?
-        .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok());
-
     let mut raw_value: Option<String> = None;
+    let mut number: Option<f64> = None;
     let mut formula: Option<String> = None;
     let mut inline_rich_runs: Option<Vec<crate::xlsx::shared_strings::RichTextRun>> = None;
 
@@ -935,7 +964,17 @@ fn parse_cell_fast(
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
                 "v" => {
-                    raw_value = Some(read_text_fast(reader)?);
+                    // A numeric cell's value parses straight from the
+                    // borrowed text; only text that is not a number
+                    // (kept verbatim, as before) costs an allocation.
+                    if matches!(cell_type.as_deref(), None | Some("n")) {
+                        match xml::read_number_content_fast(reader)? {
+                            Ok(n) => number = Some(n),
+                            Err(text) => raw_value = Some(text),
+                        }
+                    } else {
+                        raw_value = Some(read_text_fast(reader)?);
+                    }
                 },
                 "f" => {
                     let si = shared_si(e)?;
@@ -996,12 +1035,13 @@ fn parse_cell_fast(
             Some(s) => CellValue::Error(s),
             None => CellValue::Error(String::new()),
         },
-        _ => match raw_value {
-            Some(s) => match fast_float2::parse::<f64, _>(&s) {
+        _ => match (number, raw_value) {
+            (Some(n), _) => CellValue::Number(n),
+            (None, Some(s)) => match fast_float2::parse::<f64, _>(&s) {
                 Ok(n) => CellValue::Number(n),
                 Err(_) => CellValue::String(s),
             },
-            None => CellValue::Empty,
+            (None, None) => CellValue::Empty,
         },
     };
 

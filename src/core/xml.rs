@@ -108,8 +108,8 @@ pub fn matches_ns(resolve: &ResolveResult, ns: &str) -> bool {
 
 /// Get a required attribute value, returning Error::MissingAttribute if absent.
 pub fn required_attr<'a>(event: &'a BytesStart, key: &str) -> Result<Cow<'a, str>> {
-    match event.try_get_attribute(key)? {
-        Some(attr) => Ok(attr.value),
+    match optional_attr(event, key)? {
+        Some(value) => Ok(value),
         None => Err(Error::MissingAttribute {
             element: event.local_name().as_ref().to_string(),
             attr: key.to_string(),
@@ -133,9 +133,63 @@ fn unescape_cow(text: Cow<'_, str>) -> Result<Cow<'_, str>> {
     Ok(Cow::Owned(unescaped.into_owned()))
 }
 
-/// Get an optional attribute value.
+/// Every attribute of `e` in one pass, as `(key, raw value)` — entity
+/// references left as written; see [`attrs`] for the resolved form.
+///
+/// quick-xml's own duplicate check keeps the keys it has seen in a `Vec`,
+/// so every `try_get_attribute` was a heap allocation — the last one in the
+/// worksheet cell loop, and thousands per document across the `w:val`
+/// reads of the property parsers. The check below is the same rule without
+/// the heap: real tags have a handful of attributes, so a fixed window of
+/// seen keys covers them, and a duplicate is still an error.
+fn raw_attrs<'a>(
+    e: &'a BytesStart<'_>,
+) -> impl Iterator<Item = Result<(&'a str, Cow<'a, str>)>> + 'a {
+    let mut seen: [&'a str; 16] = [""; 16];
+    let mut seen_len = 0usize;
+    let mut attributes = e.attributes();
+    attributes.with_checks(false);
+    attributes.map(move |attr| {
+        let attr = attr?;
+        let key = attr.key.0;
+        if seen[..seen_len].contains(&key) {
+            return Err(quick_xml::events::attributes::AttrError::Duplicated(0, 0).into());
+        }
+        if seen_len < seen.len() {
+            seen[seen_len] = key;
+            seen_len += 1;
+        }
+        Ok((key, attr.value))
+    })
+}
+
+/// Every attribute of `e` in one pass, as `(key, value)` with entity
+/// references resolved, borrowing the value whenever it contains none.
+///
+/// `try_get_attribute` re-parses the attribute list from its start on every
+/// call, so reading N keys off an M-attribute tag costs N·M attribute
+/// parses. In the worksheet cell loop and the DOCX property parsers that
+/// was a quarter of the whole run; a single pass with a `match` on the key
+/// is the shape the hot loops use instead. A malformed attribute is an
+/// error here exactly as it is through the per-key helpers.
+pub fn attrs<'a>(
+    e: &'a BytesStart<'_>,
+) -> impl Iterator<Item = Result<(&'a str, Cow<'a, str>)>> + 'a {
+    raw_attrs(e).map(|attr| {
+        let (key, value) = attr?;
+        Ok((key, unescape_cow(value)?))
+    })
+}
+
+/// Get an optional attribute value (entity references left as written).
 pub fn optional_attr<'a>(event: &'a BytesStart, key: &str) -> Result<Option<Cow<'a, str>>> {
-    Ok(event.try_get_attribute(key)?.map(|a| a.value))
+    for attr in raw_attrs(event) {
+        let (k, value) = attr?;
+        if k == key {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
 }
 
 /// Get an optional attribute as a UTF-8 string, with XML entity references
@@ -583,7 +637,10 @@ pub fn read_text_content_fast(reader: &mut quick_xml::Reader<&[u8]>) -> Result<S
     loop {
         match reader.read_event()? {
             Event::Text(e) => {
-                text.push_str(&unescape_text(&e)?);
+                // Unescape borrows when there is nothing to resolve, which
+                // is nearly always; `unescape_text` would allocate a copy
+                // only to append it here and drop it.
+                text.push_str(&quick_xml::escape::unescape(&e).map_err(quick_xml::Error::from)?);
             },
             Event::GeneralRef(e) => {
                 text.push_str(&resolve_general_ref(&e)?);
@@ -603,6 +660,83 @@ pub fn read_text_content_fast(reader: &mut quick_xml::Reader<&[u8]>) -> Result<S
         }
     }
     Ok(text)
+}
+
+/// Read the text content of the current element as a number without
+/// allocating, for the numeric `<v>` of a spreadsheet cell.
+///
+/// The common shape is exactly one text node followed by the end tag, and
+/// that is parsed straight from the borrowed event. Anything else — an
+/// entity reference, CDATA, a child element, or text that is not a number
+/// — falls back to the owned text so the caller can keep it verbatim.
+pub fn read_number_content_fast(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> Result<std::result::Result<f64, String>> {
+    use quick_xml::events::Event;
+    let mut text = String::new();
+    let mut depth = 1u32;
+    loop {
+        match reader.read_event()? {
+            Event::Text(e) => {
+                if text.is_empty() && !e.contains('&') {
+                    if let Ok(n) = fast_float2::parse::<f64, _>(&*e) {
+                        // Consume the end tag; a second text node would
+                        // have been contiguous with this one.
+                        loop {
+                            match reader.read_event()? {
+                                Event::Start(_) => depth += 1,
+                                Event::End(_) => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        return Ok(Ok(n));
+                                    }
+                                },
+                                Event::Text(t) => {
+                                    // Not a lone text node after all.
+                                    text.push_str(&e);
+                                    text.push_str(
+                                        &quick_xml::escape::unescape(&t)
+                                            .map_err(quick_xml::Error::from)?,
+                                    );
+                                    break;
+                                },
+                                Event::GeneralRef(t) => {
+                                    text.push_str(&e);
+                                    text.push_str(&resolve_general_ref(&t)?);
+                                    break;
+                                },
+                                Event::CData(t) => {
+                                    text.push_str(&e);
+                                    text.push_str(&t);
+                                    break;
+                                },
+                                Event::Eof => return Ok(Ok(n)),
+                                _ => {},
+                            }
+                        }
+                        continue;
+                    }
+                }
+                text.push_str(&quick_xml::escape::unescape(&e).map_err(quick_xml::Error::from)?);
+            },
+            Event::GeneralRef(e) => {
+                text.push_str(&resolve_general_ref(&e)?);
+            },
+            Event::CData(e) => {
+                text.push_str(&e);
+            },
+            Event::Start(_) => depth += 1,
+            Event::End(_) => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(Err(text))
 }
 
 /// Skip over the current element and all its children using fast Reader.

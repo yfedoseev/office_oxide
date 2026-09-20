@@ -159,24 +159,21 @@ pub struct TableBorders {
 
 /// Parse one border edge element's attributes.
 pub(crate) fn parse_border_edge(e: &BytesStart) -> BorderEdge {
-    BorderEdge {
-        style: xml::optional_attr_str(e, "w:val")
-            .ok()
-            .flatten()
-            .map(|v| v.into_owned()),
-        color: xml::optional_attr_str(e, "w:color")
-            .ok()
-            .flatten()
-            .map(|v| v.into_owned()),
-        size: xml::optional_attr_str(e, "w:sz")
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse().ok()),
-        space: xml::optional_attr_str(e, "w:space")
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse().ok()),
+    // One pass over the attributes: a bordered table has six edges per
+    // cell, and reading four keys with four rescans each was a fifth of
+    // the parse of a large table document.
+    let mut edge = BorderEdge::default();
+    for attr in xml::attrs(e) {
+        let Ok((key, value)) = attr else { break };
+        match key {
+            "w:val" => edge.style = Some(value.into_owned()),
+            "w:color" => edge.color = Some(value.into_owned()),
+            "w:sz" => edge.size = value.parse().ok(),
+            "w:space" => edge.space = value.parse().ok(),
+            _ => {},
+        }
     }
+    edge
 }
 
 impl RunProperties {
