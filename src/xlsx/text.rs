@@ -4,15 +4,32 @@ use super::date;
 use super::numfmt;
 use super::worksheet::Row;
 
+/// `B2 (Author)` — the same marker `to_ir()` puts on a comment's endnote.
+pub(crate) fn comment_marker(cell_ref: &str, author: Option<&str>) -> String {
+    match author {
+        Some(a) => format!("{cell_ref} ({a})"),
+        None => cell_ref.to_string(),
+    }
+}
+
 impl XlsxDocument {
     /// Extract all text as a plain string (one sheet per section, tab-separated cells).
     pub fn plain_text(&self) -> String {
         let mut parts = Vec::new();
-        for i in 0..self.worksheets.len() {
+        for (i, ws) in self.worksheets.iter().enumerate() {
             if let Some(text) = self.sheet_plain_text(i) {
                 if !text.is_empty() {
                     parts.push(text);
                 }
+            }
+            // Cell comments are document content; `to_ir()` carries them
+            // as endnotes, and this direct renderer dropped them.
+            for c in &ws.comments {
+                parts.push(format!(
+                    "{}: {}",
+                    comment_marker(&c.cell_ref, c.author.as_deref()),
+                    c.text
+                ));
             }
         }
         // `to_markdown()` already surfaces chart text (axis titles, series
@@ -72,11 +89,18 @@ impl XlsxDocument {
     /// Convert to markdown (pipe-delimited tables).
     pub fn to_markdown(&self) -> String {
         let mut parts = Vec::new();
-        for i in 0..self.worksheets.len() {
+        for (i, ws) in self.worksheets.iter().enumerate() {
             if let Some(md) = self.sheet_to_markdown(i) {
                 if !md.is_empty() {
                     parts.push(md);
                 }
+            }
+            for c in &ws.comments {
+                parts.push(format!(
+                    "> **{}:** {}",
+                    comment_marker(&c.cell_ref, c.author.as_deref()),
+                    c.text.trim()
+                ));
             }
         }
         // Charts: emit each chart's extracted text under a "## Chart N" heading

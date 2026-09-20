@@ -1518,6 +1518,47 @@ mod tests {
     /// fixing only the IR side left the CLI's default `text`/`markdown`
     /// output still blank for an uncached formula cell. Both paths must
     /// show the fallback.
+    /// Regression: a cell comment reached the IR (as an endnote) and so
+    /// the HTML surface, but the direct `plain_text()`/`to_markdown()`
+    /// renderers dropped it — the same text present on one surface and
+    /// absent on another.
+    #[test]
+    fn test_comments_reach_plain_text_and_markdown() {
+        let sheet = r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>data</t></is></c></row></sheetData>
+</worksheet>"#;
+        let sheet_rels = br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1"
+    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
+    Target="../comments1.xml"/>
+</Relationships>"#;
+        let comments = br#"<?xml version="1.0" encoding="UTF-8"?>
+<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <authors><author>Reviewer</author></authors>
+  <commentList><comment ref="B2" authorId="0"><text><t>a real cell comment</t></text></comment></commentList>
+</comments>"#;
+        let doc = open_bytes(single_sheet_xlsx(
+            sheet,
+            &[
+                ("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels),
+                ("xl/comments1.xml", comments),
+            ],
+        ));
+        assert_eq!(doc.worksheets[0].comments.len(), 1, "fixture must parse its comment");
+        let text = doc.plain_text();
+        assert!(
+            text.contains("B2 (Reviewer): a real cell comment"),
+            "plain_text must carry the comment with its cell and author: {text}"
+        );
+        let md = doc.to_markdown();
+        assert!(
+            md.contains("> **B2 (Reviewer):** a real cell comment"),
+            "to_markdown must carry the comment: {md}"
+        );
+    }
+
     #[test]
     fn test_uncached_formula_cell_shows_formula_text_via_the_low_level_xlsx_renderer() {
         let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
