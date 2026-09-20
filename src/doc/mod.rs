@@ -20,6 +20,7 @@ mod ole_objects;
 mod papx;
 mod piece_table;
 mod sprm;
+mod word6;
 
 pub use crate::core::OfficeDocument;
 pub use document::{DocDocument, SubDocument, SubDocumentKind};

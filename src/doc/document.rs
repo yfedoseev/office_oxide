@@ -158,9 +158,17 @@ impl DocDocument {
             .open_stream("WordDocument")
             .map_err(|_| DocError::MissingStream("WordDocument stream not found".into()))?;
 
+        // Word 6.0/95 has its own FIB layout, no table stream and 8-bit
+        // text; it gets its own reader rather than Word 97's offsets.
+        if word_doc.len() >= 2
+            && super::word6::is_word6_magic(u16::from_le_bytes([word_doc[0], word_doc[1]]))
+        {
+            return Self::from_word6(&mut cfb, &word_doc);
+        }
+
         // Propagate FIB errors. Swallowing them into an empty document with
-        // `Ok` is what made an encrypted file and a Word 6.0/95 file both
-        // look like documents that simply had no text.
+        // `Ok` is what made an encrypted file look like a document that
+        // simply had no text.
         let fib = Fib::parse(&word_doc)?;
 
         // Open the appropriate table stream; try preferred first, then fallback.
@@ -340,6 +348,53 @@ impl DocDocument {
             header_footer,
             comments,
             ole_objects,
+        })
+    }
+
+    /// Word 6.0/95: the text of every story, decoded from the document's
+    /// code page, with no paragraph structure (there is no PAPX index
+    /// this reader understands for the format) — `doc_to_ir` falls back
+    /// to its line heuristic, as it does for any Word 97 file without one.
+    fn from_word6<R: Read + Seek>(cfb: &mut CfbReader<R>, word_doc: &[u8]) -> Result<Self> {
+        let fib = super::word6::parse_fib(word_doc)?;
+        let pieces = super::word6::pieces(word_doc, &fib)?;
+        let text_complete = covers_declared_length(&pieces, fib.ccp[0]);
+        let (text, subs) = super::word6::stories(word_doc, &fib, &pieces);
+        let subdocuments = subs
+            .into_iter()
+            .filter_map(|(story, text)| {
+                let kind = match story {
+                    1 => SubDocumentKind::Footnotes,
+                    2 => SubDocumentKind::HeadersFooters,
+                    4 => SubDocumentKind::Comments,
+                    5 => SubDocumentKind::Endnotes,
+                    6 => SubDocumentKind::TextBoxes,
+                    7 => SubDocumentKind::HeaderTextBoxes,
+                    // Story 3 is the macro text (`ccpMcr`), not document content.
+                    _ => return None,
+                };
+                Some(SubDocument { kind, text })
+            })
+            .collect();
+        let has_macros = cfb.has_root_entry("_VBA_PROJECT") || fib.ccp[3] != 0;
+        let summary_properties = cfb
+            .open_stream("\u{5}SummaryInformation")
+            .ok()
+            .and_then(|data| parse_summary_information(&data));
+        Ok(Self {
+            text,
+            data_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
+            paragraphs: Vec::new(),
+            subdocuments,
+            has_macros,
+            text_complete,
+            summary_properties,
+            list_formatting: ListFormatting::default(),
+            comment_authors: Vec::new(),
+            header_footer: HeaderFooterStories::default(),
+            comments: Vec::new(),
+            ole_objects: super::ole_objects::extract_ole_objects(cfb),
         })
     }
 

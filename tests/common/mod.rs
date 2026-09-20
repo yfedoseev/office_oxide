@@ -228,6 +228,26 @@ pub fn open_doc(bytes: &[u8]) -> Document {
         .expect("synthetic .doc must parse")
 }
 
+/// Build a synthetic Word 6.0/95 `.doc`: the Word 6 FIB layout (text from
+/// `fcMin`, story lengths at 0x34, no table stream), `wident` for the
+/// family variant, `text` as one-byte characters in a `\r`-delimited
+/// story sequence.
+#[allow(dead_code)]
+pub fn build_word6_doc(wident: u16, text: &[u8]) -> Vec<u8> {
+    let fc_min = 0x300u32;
+    let mut wd = vec![0u8; fc_min as usize];
+    wd[0..2].copy_from_slice(&wident.to_le_bytes());
+    wd[2..4].copy_from_slice(&101u16.to_le_bytes()); // nFib: Word 6.0
+    wd[6..8].copy_from_slice(&0x0409u16.to_le_bytes());
+    wd[0x18..0x1C].copy_from_slice(&fc_min.to_le_bytes());
+    wd[0x1C..0x20].copy_from_slice(&(fc_min + text.len() as u32).to_le_bytes());
+    wd[0x34..0x38].copy_from_slice(&(text.len() as u32).to_le_bytes());
+    wd.extend_from_slice(text);
+    let pad = (512 - wd.len() % 512) % 512;
+    wd.extend(std::iter::repeat_n(0u8, pad));
+    build_cfb(&wd, &[0u8; 512])
+}
+
 // ── CFB / DOC byte construction ──
 
 /// Write the FIB into the first 512 bytes of `word_doc`.

@@ -11,7 +11,7 @@ mod common;
 use std::io::Cursor;
 
 #[allow(unused_imports)]
-use common::{FibTweaks, Para, Subdocs, build_doc, build_doc_full, prose_grpprl};
+use common::{FibTweaks, Para, Subdocs, build_doc, build_doc_full, build_word6_doc, prose_grpprl};
 use office_oxide::ir::Element;
 use office_oxide::{Document, DocumentFormat};
 
@@ -38,45 +38,43 @@ fn expect_err(r: office_oxide::Result<Document>, why: &str) -> office_oxide::Off
 // Word 6.0/95
 // ---------------------------------------------------------------------------
 
+/// Word 6.0/95 used to be refused outright (after an earlier release read
+/// it with Word 97 offsets and returned nothing with `Ok`). Its text is
+/// read now: one byte per character from `fcMin`, story lengths from the
+/// Word 6 FIB, no table stream — the shape every other reader handles.
 #[test]
-fn test_a_word_6_or_95_file_is_refused_rather_than_read_with_word_97_offsets() {
-    // 0xA5DC has a completely different FIB layout; reading Word 97 offsets
-    // out of it produced a confident empty result for a real document.
-    let bytes = build_doc_full(
-        &[para("hello")],
-        &Subdocs::default(),
-        FibTweaks {
-            wident: Some(0xA5DC),
-            ..Default::default()
-        },
-    );
-    let err = expect_err(open_doc(bytes), "Word 6.0/95 must not parse to an empty Ok");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("unsupported Word version") && msg.contains("A5DC"),
-        "the error must name the version, got {msg}"
-    );
+fn test_a_word_6_or_95_file_extracts_its_text() {
+    let bytes = build_word6_doc(0xA5DC, b"Hello from Word 6.\rSecond paragraph.\r");
+    let doc = open_doc(bytes).expect("a Word 6 file opens");
+    assert_eq!(doc.plain_text(), "Hello from Word 6.\nSecond paragraph.\n");
+    let ir = doc.to_ir();
+    assert_eq!(ir.sections.len(), 1);
+    assert!(!ir.sections[0].elements.is_empty());
 }
 
 /// The Macintosh Word 6/95 magics (0xA697–0xA699, `nFib` 0x65/0x68) are
-/// the same family and used to get the generic "unknown wIdent" instead.
+/// the same family and used to get the generic "unknown wIdent" refusal.
 #[test]
-fn test_mac_word_6_or_95_magics_are_named_as_that_family() {
+fn test_mac_word_6_or_95_magics_are_read_as_that_family() {
     for wident in [0xA697u16, 0xA698, 0xA699] {
-        let bytes = build_doc_full(
-            &[para("hello")],
-            &Subdocs::default(),
-            FibTweaks {
-                wident: Some(wident),
-                ..Default::default()
-            },
-        );
-        let msg = expect_err(open_doc(bytes), "a Word 6/95 file is refused").to_string();
-        assert!(
-            msg.contains("Word 6.0/95") && msg.contains(&format!("{wident:04X}")),
-            "wIdent 0x{wident:04X}: {msg}"
-        );
+        let bytes = build_word6_doc(wident, b"Mac Word text.\r");
+        let doc = open_doc(bytes).unwrap_or_else(|e| panic!("wIdent 0x{wident:04X}: {e}"));
+        assert_eq!(doc.plain_text(), "Mac Word text.\n", "wIdent 0x{wident:04X}");
     }
+}
+
+/// `fEncrypted` sits in the same flags word in both FIB layouts; an
+/// encrypted Word 6/95 file is refused as encrypted, not read as
+/// ciphertext.
+#[test]
+fn test_an_encrypted_word_6_file_reports_encryption() {
+    let mut bytes = build_word6_doc(0xA5DC, b"ciphertext\r");
+    // The WordDocument stream starts at sector 2 (header + dir + FAT);
+    // flip fEncrypted (0x0100) in its flags word at 0x0A.
+    let wd = 512 * 3;
+    bytes[wd + 0x0B] |= 0x01;
+    let err = expect_err(open_doc(bytes), "an encrypted Word 6 file must be refused");
+    assert!(err.to_string().to_lowercase().contains("encrypt"), "{err}");
 }
 
 // ---------------------------------------------------------------------------
