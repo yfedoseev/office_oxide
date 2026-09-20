@@ -322,10 +322,18 @@ impl<R: Read + Seek> CfbReader<R> {
     /// sector. On a 14 MB `.doc` that was ~28,000 syscalls and half the
     /// open time.
     fn read_chain(reader: &mut R, header: &CfbHeader, fat: &[u32], start: u32) -> Result<Vec<u8>> {
+        let file_len = reader.seek(SeekFrom::End(0))?;
         let max_sectors = fat.len() + 1; // safety limit
         let mut chain: Vec<u32> = Vec::new();
         let mut sector = start;
         while sector <= MAX_REG_SECT {
+            // Tolerate truncated files: a sector past the end of the file
+            // ends the stream, as the read that came back empty did when
+            // the chain was followed one read at a time — and before a
+            // cycle further along it could be reported.
+            if header.sector_offset(sector) >= file_len {
+                break;
+            }
             if chain.len() > max_sectors {
                 return Err(CfbError::CorruptedStream("FAT chain cycle detected".into()));
             }
@@ -338,7 +346,6 @@ impl<R: Read + Seek> CfbReader<R> {
 
         // A FAT can name far more sectors than the file holds; never
         // reserve past the end of the file for it.
-        let file_len = reader.seek(SeekFrom::End(0))?;
         let sector_size = header.sector_size;
         let wanted = (chain.len() * sector_size) as u64;
         let mut data = Vec::with_capacity(wanted.min(file_len) as usize);
@@ -639,6 +646,22 @@ mod tests {
             .expect("refused");
         let msg = err.to_string();
         assert!(msg.contains("not a compound file") && msg.contains("464"), "{msg}");
+    }
+
+    /// A fuzzed deck's stream chain continued past the end of the file
+    /// and then looped. Reading sector by sector, the first empty read
+    /// ended the stream with the bytes so far; walking the whole chain up
+    /// front reported the cycle instead and a file that used to open
+    /// stopped opening. Truncation still ends the stream first.
+    #[test]
+    fn test_a_chain_that_leaves_the_file_before_it_cycles_is_truncated_not_an_error() {
+        let (mut file, payload) = build_cfb_with_contiguous_stream(1);
+        let fat_offset = 512 + 512;
+        write_fat_entry(&mut file, fat_offset, 2, 50); // past the 3-sector file
+        write_fat_entry(&mut file, fat_offset, 50, 2); // ...and back: a cycle
+        let mut cfb = CfbReader::new(Cursor::new(file)).unwrap();
+        let data = cfb.open_stream("BigStream").unwrap();
+        assert_eq!(data, payload);
     }
 
     /// A stream was read one sector at a time — a 512-byte buffer, a
