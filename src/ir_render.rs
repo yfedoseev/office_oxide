@@ -697,9 +697,34 @@ fn table_grid(table: &Table) -> Vec<Vec<Option<&TableCell>>> {
     grid
 }
 
+/// A table with one row and one cell whose content holds a table is a
+/// layout frame — Word documents wrap whole forms in one to draw a
+/// border around them. Markdown cannot nest tables, so rendering the
+/// frame flattened the real table into a single cell; the frame's
+/// content is rendered in its place.
+fn layout_frame_content(table: &Table) -> Option<&[Element]> {
+    let [row] = table.rows.as_slice() else {
+        return None;
+    };
+    let [cell] = row.cells.as_slice() else {
+        return None;
+    };
+    cell.content
+        .iter()
+        .any(|e| matches!(e, Element::Table(_)))
+        .then_some(cell.content.as_slice())
+}
+
 fn render_table_markdown(table: &Table) -> String {
     if table.rows.is_empty() {
         return String::new();
+    }
+    if let Some(content) = layout_frame_content(table) {
+        return content
+            .iter()
+            .map(render_element_markdown)
+            .collect::<Vec<_>>()
+            .join("\n\n");
     }
 
     let grid = table_grid(table);

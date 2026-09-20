@@ -164,6 +164,35 @@ fn test_markdown_table_cells_keep_inline_formatting() {
     assert!(md.contains("| Ada | Engineer |"), "{md}");
 }
 
+/// Word documents wrap whole forms in a one-cell table to draw a border
+/// around them. Markdown cannot nest tables, so both markdown renderers
+/// flattened the real table into that single cell — 1 row where the
+/// document has 77. The frame's content is rendered in its place.
+#[test]
+fn test_markdown_unwraps_a_one_cell_layout_frame_around_a_table() {
+    let document = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:tbl><w:tr><w:tc>
+  <w:p><w:r><w:t>Form title</w:t></w:r></w:p>
+  <w:tbl><w:tr><w:tc><w:p><w:r><w:t>Name</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Role</w:t></w:r></w:p></w:tc></w:tr>
+  <w:tr><w:tc><w:p><w:r><w:t>Ada</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Engineer</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+</w:tc></w:tr></w:tbl>
+</w:body></w:document>"#;
+    let bytes = make_minimal_docx(document);
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+    for (surface, md) in [
+        ("direct", doc.to_markdown()),
+        ("ir", doc.to_markdown_with(office_oxide::ir_render::MarkdownOptions::default())),
+    ] {
+        assert!(md.contains("Form title"), "{surface}: {md}");
+        assert!(md.contains("| Name | Role |"), "{surface}: {md}");
+        assert!(md.contains("| Ada | Engineer |"), "{surface}: {md}");
+        assert_eq!(md.lines().filter(|l| l.starts_with('|')).count(), 3, "{surface}: {md}");
+    }
+    // The HTML surface still nests, as HTML can.
+    assert_eq!(doc.to_html().matches("<table").count(), 2);
+}
+
 /// A heading style's `<w:b/>`/`<w:sz>` *are* the heading. Folding them
 /// into the spans rendered `<h1><strong>…</strong></h1>` and `# **…**` for
 /// every styled heading; direct formatting inside a heading still shows.

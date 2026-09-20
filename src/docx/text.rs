@@ -630,6 +630,18 @@ fn markdown_table(table: &Table, ctx: &MarkdownCtx, out: &mut String) {
     if table.rows.is_empty() {
         return;
     }
+    // A one-cell table holding a table is a layout frame; render what is
+    // inside it (see `ir_render::layout_frame_content`).
+    if let [row] = table.rows.as_slice()
+        && let [cell] = row.cells.as_slice()
+        && cell
+            .content
+            .iter()
+            .any(|e| matches!(e, BlockElement::Table(_)))
+    {
+        markdown_blocks(&cell.content, ctx, out, 1);
+        return;
+    }
 
     // Collect all cell texts
     let mut row_texts: Vec<Vec<String>> = Vec::new();
