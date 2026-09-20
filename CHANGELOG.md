@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.12] - 2026-09-20
+## [0.1.12] - 2026-09-21
 
 > Read-path fidelity across all six formats, and the first real fidelity work on the legacy binaries. 130 issues closed.
 >
