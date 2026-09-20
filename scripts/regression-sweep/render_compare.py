@@ -22,8 +22,10 @@ HEADING = re.compile(r"^#{1,6} \S", re.M)
 LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)]) \S", re.M)
 TABLE_ROW = re.compile(r"^\|.*\|\s*$", re.M)
 TABLE_SEP = re.compile(r"^\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\s*$", re.M)
-BOLD = re.compile(r"\*\*\S")
-ITALIC = re.compile(r"(?<![*\w])\*(?!\*)\S|(?<!\w)_\S")
+BOLD = re.compile(r"(?<!\\)\*\*\S")
+# pandoc escapes literal underscores and asterisks as `\_`/`\*`; those are
+# not emphasis.
+ITALIC = re.compile(r"(?<![*\w\\])\*(?!\*)\S|(?<![\w\\])_\S")
 LINK = re.compile(r"\]\((?!#)")
 IMAGE = re.compile(r"!\[")
 CODE = re.compile(r"^```", re.M)
@@ -32,7 +34,10 @@ def counts(md):
     return {
         "headings": len(HEADING.findall(md)),
         "list_items": len(LIST_ITEM.findall(md)),
-        "table_rows": len(TABLE_ROW.findall(md)) - len(TABLE_SEP.findall(md)),
+        # pandoc's GFM writer falls back to an HTML table for anything a
+        # pipe table cannot hold (multi-paragraph cells, spans), so count
+        # both forms.
+        "table_rows": len(TABLE_ROW.findall(md)) - len(TABLE_SEP.findall(md)) + md.count("<tr"),
         "bold": len(BOLD.findall(md)),
         "italic": len(ITALIC.findall(md)),
         "links": len(LINK.findall(md)),

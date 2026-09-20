@@ -643,9 +643,17 @@ fn markdown_table(table: &Table, ctx: &MarkdownCtx, out: &mut String) {
             .iter()
             .filter(|c| !c.properties.as_ref().is_some_and(|p| p.deleted))
         {
+            // Cells keep their inline formatting, as the IR renderer's
+            // cells do; rendering them as plain text dropped every bold
+            // and italic span inside a table on this surface alone.
             let mut cell_text = String::new();
-            plain_text_blocks(&cell.content, ctx.styles, &mut cell_text);
-            let cell_text = cell_text.trim().replace('\n', " ");
+            markdown_blocks(&cell.content, ctx, &mut cell_text, 1);
+            let cell_text = cell_text
+                .split('\n')
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
             cells.push(cell_text);
         }
         max_cols = max_cols.max(cells.len());

@@ -147,6 +147,23 @@ fn test_markdown_applies_run_formatting_inherited_from_styles() {
     assert_eq!(html.matches("<strong>").count(), 2, "{html}");
 }
 
+/// Table cells were rendered as plain text by the direct markdown
+/// renderer — every bold or italic span inside a table vanished on that
+/// surface while `to_html()` kept it (162 vs 2 on one corpus file).
+#[test]
+fn test_markdown_table_cells_keep_inline_formatting() {
+    let document = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:tbl><w:tr><w:tc><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Name</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:rPr><w:i/></w:rPr><w:t>Role</w:t></w:r></w:p></w:tc></w:tr>
+<w:tr><w:tc><w:p><w:r><w:t>Ada</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Engineer</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+</w:body></w:document>"#;
+    let bytes = make_minimal_docx(document);
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+    let md = doc.to_markdown();
+    assert!(md.contains("| **Name** | *Role* |"), "{md}");
+    assert!(md.contains("| Ada | Engineer |"), "{md}");
+}
+
 /// A heading style's `<w:b/>`/`<w:sz>` *are* the heading. Folding them
 /// into the spans rendered `<h1><strong>…</strong></h1>` and `# **…**` for
 /// every styled heading; direct formatting inside a heading still shows.
