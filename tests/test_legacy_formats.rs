@@ -58,6 +58,27 @@ fn test_a_word_6_or_95_file_is_refused_rather_than_read_with_word_97_offsets() {
     );
 }
 
+/// The Macintosh Word 6/95 magics (0xA697–0xA699, `nFib` 0x65/0x68) are
+/// the same family and used to get the generic "unknown wIdent" instead.
+#[test]
+fn test_mac_word_6_or_95_magics_are_named_as_that_family() {
+    for wident in [0xA697u16, 0xA698, 0xA699] {
+        let bytes = build_doc_full(
+            &[para("hello")],
+            &Subdocs::default(),
+            FibTweaks {
+                wident: Some(wident),
+                ..Default::default()
+            },
+        );
+        let msg = expect_err(open_doc(bytes), "a Word 6/95 file is refused").to_string();
+        assert!(
+            msg.contains("Word 6.0/95") && msg.contains(&format!("{wident:04X}")),
+            "wIdent 0x{wident:04X}: {msg}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Encrypted legacy files
 // ---------------------------------------------------------------------------

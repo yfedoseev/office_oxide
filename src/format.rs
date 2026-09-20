@@ -71,9 +71,13 @@ impl DocumentFormat {
             // PresentationML: presentation, macro-enabled presentation,
             // templates, slideshows.
             "pptx" | "pptm" | "potx" | "potm" | "ppsx" | "ppsm" => Some(Self::Pptx),
-            "doc" => Some(Self::Doc),
-            "xls" => Some(Self::Xls),
-            "ppt" => Some(Self::Ppt),
+            // The legacy compound files: document and template; workbook,
+            // template and add-in; presentation, template and show. Each
+            // extension is the same container as its sibling — Word 97
+            // writes a `.dot` exactly as it writes a `.doc`.
+            "doc" | "dot" => Some(Self::Doc),
+            "xls" | "xlt" | "xla" => Some(Self::Xls),
+            "ppt" | "pot" | "pps" => Some(Self::Ppt),
             _ => None,
         }
     }
@@ -118,6 +122,25 @@ mod tests {
         assert_eq!(DocumentFormat::from_extension("ppt"), Some(DocumentFormat::Ppt));
         assert_eq!(DocumentFormat::from_extension("txt"), None);
         assert_eq!(DocumentFormat::from_extension("pdf"), None);
+    }
+
+    /// The legacy template/show/add-in extensions were missed when the
+    /// OOXML ones were added: a Word 97 template (`.dot`), a PowerPoint
+    /// show (`.pps`) and an Excel add-in (`.xla`) failed with
+    /// `unsupported format` although each is byte-for-byte the same
+    /// container as its `.doc`/`.ppt`/`.xls` sibling.
+    #[test]
+    fn test_from_extension_legacy_templates_shows_and_add_ins() {
+        for (ext, want) in [
+            ("dot", DocumentFormat::Doc),
+            ("DOT", DocumentFormat::Doc),
+            ("xlt", DocumentFormat::Xls),
+            ("xla", DocumentFormat::Xls),
+            ("pot", DocumentFormat::Ppt),
+            ("pps", DocumentFormat::Ppt),
+        ] {
+            assert_eq!(DocumentFormat::from_extension(ext), Some(want), "{ext}");
+        }
     }
 
     /// Macro-enabled and template extensions used to return `None`, so

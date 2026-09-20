@@ -101,10 +101,13 @@ impl Fib {
         // wrong for it. Accepting the file and then reading Word 97 offsets
         // out of it produced a confident empty result — a 426 KB document
         // extracted as the empty string with `Ok`. Say what it is instead.
-        if wident == 0xA5DC {
-            return Err(DocError::UnsupportedVersion(
-                "Word 6.0/95 (wIdent 0xA5DC); only Word 97 and later are supported".into(),
-            ));
+        // 0xA697/0xA698/0xA699 are the Macintosh Word 6/95 magics
+        // (`nFib` 0x65/0x68), the same family; they used to fall through
+        // to "unknown wIdent", which hid what the file was.
+        if matches!(wident, 0xA5DC | 0xA697..=0xA699) {
+            return Err(DocError::UnsupportedVersion(format!(
+                "Word 6.0/95 (wIdent 0x{wident:04X}); only Word 97 and later are supported"
+            )));
         }
         if wident != 0xA5EC {
             return Err(DocError::InvalidFib(format!("unknown wIdent: 0x{wident:04X}")));

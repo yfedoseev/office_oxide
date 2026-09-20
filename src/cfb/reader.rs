@@ -23,9 +23,16 @@ pub struct CfbReader<R> {
 impl<R: Read + Seek> CfbReader<R> {
     /// Open and parse a CFB file.
     pub fn new(mut reader: R) -> Result<Self> {
-        // Read header.
+        // Read header. A file shorter than the header is not a compound
+        // file at all (a text file under a `.doc`/`.dot` name, say); say
+        // so rather than "failed to fill whole buffer".
         let mut header_buf = [0u8; 512];
-        reader.read_exact(&mut header_buf)?;
+        let got = read_fully(&mut reader, &mut header_buf)?;
+        if got < header_buf.len() {
+            return Err(CfbError::InvalidHeader(format!(
+                "not a compound file: {got} bytes, shorter than the 512-byte header"
+            )));
+        }
         let header = CfbHeader::parse(&header_buf)?;
 
         // Build the FAT.
@@ -620,6 +627,18 @@ mod tests {
         fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
             self.inner.seek(pos)
         }
+    }
+
+    /// A 464-byte JSON file under a `.doc` name failed with the I/O
+    /// layer's "failed to fill whole buffer"; it is simply not a compound
+    /// file, and the error says so.
+    #[test]
+    fn test_a_file_shorter_than_the_header_is_named_not_a_compound_file() {
+        let err = CfbReader::new(Cursor::new(vec![b'['; 464]))
+            .err()
+            .expect("refused");
+        let msg = err.to_string();
+        assert!(msg.contains("not a compound file") && msg.contains("464"), "{msg}");
     }
 
     /// A stream was read one sector at a time — a 512-byte buffer, a
