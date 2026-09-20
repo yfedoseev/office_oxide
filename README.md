@@ -295,6 +295,19 @@ use office_oxide::xls::XlsDocument;
 use office_oxide::ppt::PptDocument;
 ```
 
+### Limits for untrusted input
+
+A spreadsheet can reference one shared string from every cell, so its
+rendered text can be the string times the cell count — gigabytes from a
+few hundred kilobytes. Every renderer stops at a per-document text budget
+(256 Mi characters by default) and appends a visible `[output truncated: …]`
+notice; the `.xls` reader also flags `Metadata::text_truncated`. A process
+that reads larger workbooks whole raises the limit once at startup:
+
+```rust
+office_oxide::limits::set_max_text_chars(1 << 30);
+```
+
 ## Installation
 
 ### Python
