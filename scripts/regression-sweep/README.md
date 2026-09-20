@@ -99,3 +99,49 @@ depth cap) or to the new arm recovering *more* text than the old one.
 of `compare.py` hardcoded `next.jsonl`, so re-running it after a fix
 silently re-read the pre-fix sweep and reported the old numbers as though
 nothing had changed.
+
+## Whole-corpus sweep with an independent reference panel (0.1.12)
+
+The scripts above take a flat directory of files and compare only the
+two arms. The 0.1.12 release used a second generation that walks the
+nested `~/projects/office_oxide_tests` tree, keeps every surface's
+output on disk, and adds the external panel the section above says is
+"the next step". It found the largest content-loss defect the crate has
+had (`.xls` shared strings cut by a `CONTINUE` record: 80 files at
+2–58 % of every reference) — a defect present in *both* arms, which the
+two-arm diff is blind to by construction.
+
+```sh
+# both arms; outputs land in OUT/out/<relpath>.<surface>.gz + OUT/sweep.jsonl
+python3 scripts/regression-sweep/sweep_tree.py /tmp/target-prev/release/office-oxide ~/projects/office_oxide_tests /tmp/sweep/prev --jobs 6
+python3 scripts/regression-sweep/sweep_tree.py target/release/office-oxide          ~/projects/office_oxide_tests /tmp/sweep/next --jobs 6
+python3 scripts/regression-sweep/compare_tree.py /tmp/sweep/prev /tmp/sweep/next /tmp/sweep/report
+
+# the reference panel (once per corpus; results are reusable across releases)
+uv venv /tmp/refvenv && uv pip install --python /tmp/refvenv/bin/python python-docx openpyxl python-pptx xlrd python-calamine
+/tmp/refvenv/bin/python scripts/regression-sweep/refpanel.py ~/projects/office_oxide_tests /tmp/panel --jobs 5
+java -Xmx2g -jar tika-app.jar -t -i <dir of symlinks to the six format dirs> -o /tmp/tika_out -numConsumers 2 -timeoutThresholdMillis 120000
+
+# who is the odd one out?
+python3 scripts/regression-sweep/quorum.py /tmp/sweep/prev /tmp/sweep/next /tmp/tika_out /tmp/panel ~/projects/office_oxide_tests/metadata/manifest.json /tmp/sweep/quorum.json
+```
+
+`quorum.py` flags a file when at least two references agree with each
+other (≥ 0.85 recall both ways) while office_oxide recovers < 70 % of
+their words, when office_oxide is empty or errors against real
+references, or when it emits 3× more than every reference.
+
+Traps this generation hit, so they don't get re-discovered:
+
+- **OOM kills and timeouts under a 6-way sweep are not verdicts.**
+  Re-measure the file serially with `measure.py` before calling it a
+  regression; the kernel killed workers at 3–10 GB that finish alone.
+- **`<span>`-per-run HTML tokenises as loss** if inline tags are
+  replaced with a space: `xxxx` becomes `x x x x`. Strip inline tags with
+  nothing. The `html` axis in `compare_tree.py` does this.
+- **Revision-aware vs not.** catdoc, antiword, pandoc and Tika show
+  `sprmCFRMarkDel` deletions and `w:vanish` hidden text; the crate hides
+  both by policy. A "loss" made of whole sentences and `1.\t` fragments is
+  a tracked-changes document — dump the deleted CP ranges before filing.
+- **The `ir` surface is not comparable across a projection change**, and
+  sheets of one-letter cells score badly under a ≥ 3-letter tokenizer.
