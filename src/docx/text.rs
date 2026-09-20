@@ -19,12 +19,13 @@ impl DocxDocument {
     /// changed depending on which method they called.
     pub fn plain_text(&self) -> String {
         let mut out = String::new();
+        let styles = self.styles.as_ref();
         for hf in self.headers_footers.iter().filter(|h| h.is_header) {
-            plain_text_blocks(&hf.content, &mut out);
+            plain_text_blocks(&hf.content, styles, &mut out);
         }
-        plain_text_blocks(&self.body.elements, &mut out);
+        plain_text_blocks(&self.body.elements, styles, &mut out);
         for hf in self.headers_footers.iter().filter(|h| !h.is_header) {
-            plain_text_blocks(&hf.content, &mut out);
+            plain_text_blocks(&hf.content, styles, &mut out);
         }
         // Footnote/endnote/comment bodies are real document content that
         // to_ir() already carries (as Element::Footnote/Endnote) — without
@@ -38,7 +39,7 @@ impl DocxDocument {
             .chain(self.endnotes.iter())
             .chain(self.comments.iter())
         {
-            plain_text_blocks(&n.content, &mut out);
+            plain_text_blocks(&n.content, styles, &mut out);
         }
         // Trim trailing newlines
         while out.ends_with('\n') {
@@ -134,16 +135,42 @@ fn split_headers_footers(doc: &DocxDocument, ctx: &MarkdownCtx) -> (Vec<String>,
     (headers, footers)
 }
 
-fn plain_text_blocks(elements: &[BlockElement], out: &mut String) {
+/// What a run needs to decide whether it is hidden: the stylesheet and
+/// the enclosing paragraph's style, since `<w:vanish/>` is inherited from
+/// a character or paragraph style as readily as set directly on the run.
+#[derive(Clone, Copy)]
+struct HiddenCtx<'a> {
+    styles: Option<&'a StyleSheet>,
+    paragraph_style_id: Option<&'a str>,
+}
+
+impl HiddenCtx<'_> {
+    fn is_hidden(&self, run: &Run) -> bool {
+        match self.styles {
+            Some(sheet) => sheet.effective_hidden(self.paragraph_style_id, run.properties.as_ref()),
+            None => run
+                .properties
+                .as_ref()
+                .and_then(|rp| rp.hidden)
+                .unwrap_or(false),
+        }
+    }
+}
+
+fn plain_text_blocks(elements: &[BlockElement], styles: Option<&StyleSheet>, out: &mut String) {
     for elem in elements {
         match elem {
             BlockElement::Paragraph(p) => {
+                let ctx = HiddenCtx {
+                    styles,
+                    paragraph_style_id: p.properties.as_ref().and_then(|pp| pp.style_id.as_deref()),
+                };
                 for content in &p.content {
                     match content {
-                        ParagraphContent::Run(run) => plain_text_run(run, out),
+                        ParagraphContent::Run(run) => plain_text_run(run, ctx, out),
                         ParagraphContent::Hyperlink(hl) => {
                             for run in &hl.runs {
-                                plain_text_run(run, out);
+                                plain_text_run(run, ctx, out);
                             }
                         },
                     }
@@ -151,20 +178,17 @@ fn plain_text_blocks(elements: &[BlockElement], out: &mut String) {
                 out.push('\n');
             },
             BlockElement::Table(table) => {
-                plain_text_table(table, out);
+                plain_text_table(table, styles, out);
             },
         }
     }
 }
 
-fn plain_text_run(run: &Run, out: &mut String) {
-    // `<w:vanish/>` — Word never renders this run at all.
-    if run
-        .properties
-        .as_ref()
-        .and_then(|rp| rp.hidden)
-        .unwrap_or(false)
-    {
+fn plain_text_run(run: &Run, ctx: HiddenCtx<'_>, out: &mut String) {
+    // `<w:vanish/>` — Word never renders this run at all. The IR path
+    // resolves this through the style chain; reading only the run's own
+    // `w:rPr` here showed text that a character style hides.
+    if ctx.is_hidden(run) {
         return;
     }
     for content in &run.content {
@@ -198,7 +222,7 @@ fn plain_text_run(run: &Run, out: &mut String) {
             // it (`Linz` + `ANTRAG` -> `LinzANTRAG`).
             RunContent::TextBox(blocks) => {
                 let mut inner = String::new();
-                plain_text_blocks(blocks, &mut inner);
+                plain_text_blocks(blocks, ctx.styles, &mut inner);
                 let inner = inner.trim();
                 if !inner.is_empty() {
                     if !out.is_empty() && !out.ends_with(['\n', ' ', '\t']) {
@@ -227,7 +251,7 @@ fn plain_text_run(run: &Run, out: &mut String) {
     }
 }
 
-fn plain_text_table(table: &Table, out: &mut String) {
+fn plain_text_table(table: &Table, styles: Option<&StyleSheet>, out: &mut String) {
     // A table cell can hold another table, so this recurses (via
     // `plain_text_blocks` -> `plain_text_table` -> `plain_text_blocks` ...)
     // on whatever it's given — including a tree the XML parser already
@@ -258,7 +282,7 @@ fn plain_text_table(table: &Table, out: &mut String) {
                 out.push('\t');
             }
             let mut cell_text = String::new();
-            plain_text_blocks(&cell.content, &mut cell_text);
+            plain_text_blocks(&cell.content, styles, &mut cell_text);
             // Replace internal newlines with spaces for table cell text
             out.push_str(&cell_text.trim_end_matches('\n').replace('\n', " "));
         }
@@ -366,12 +390,16 @@ fn markdown_blocks_inner(
                 // routinely and wrapping each separately emits `****`,
                 // which CommonMark reads as four literal asterisks.
                 let mut pending: Option<(RunStyle, String)> = None;
+                let hidden = HiddenCtx {
+                    styles: ctx.styles,
+                    paragraph_style_id: p.properties.as_ref().and_then(|pp| pp.style_id.as_deref()),
+                };
                 for content in &p.content {
                     match content {
                         ParagraphContent::Run(run) => {
                             let style = RunStyle::of(run);
                             let mut text = String::new();
-                            markdown_run_text(run, ctx, &mut text);
+                            markdown_run_text(run, ctx, hidden, &mut text);
                             if text.is_empty() {
                                 continue;
                             }
@@ -385,7 +413,7 @@ fn markdown_blocks_inner(
                         },
                         ParagraphContent::Hyperlink(hl) => {
                             flush_run(&mut pending, out);
-                            let text = runs_to_plain_text(&hl.runs);
+                            let text = runs_to_plain_text(&hl.runs, hidden);
                             match &hl.target {
                                 HyperlinkTarget::External(url) => {
                                     out.push('[');
@@ -493,14 +521,10 @@ fn flush_run(pending: &mut Option<(RunStyle, String)>, out: &mut String) {
 }
 
 /// Collect a run's text content (no emphasis delimiters).
-fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, text: &mut String) {
-    // `<w:vanish/>` — Word never renders this run at all.
-    if run
-        .properties
-        .as_ref()
-        .and_then(|rp| rp.hidden)
-        .unwrap_or(false)
-    {
+fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, hidden: HiddenCtx<'_>, text: &mut String) {
+    // `<w:vanish/>` — Word never renders this run at all. Resolved through
+    // the style chain, as the IR path does.
+    if hidden.is_hidden(run) {
         return;
     }
     for content in &run.content {
@@ -568,7 +592,7 @@ fn markdown_drawing(drawing: &DrawingInfo, out: &mut String) {
     out.push(')');
 }
 
-fn markdown_table(table: &Table, _ctx: &MarkdownCtx, out: &mut String) {
+fn markdown_table(table: &Table, ctx: &MarkdownCtx, out: &mut String) {
     if table.rows.is_empty() {
         return;
     }
@@ -586,7 +610,7 @@ fn markdown_table(table: &Table, _ctx: &MarkdownCtx, out: &mut String) {
             .filter(|c| !c.properties.as_ref().is_some_and(|p| p.deleted))
         {
             let mut cell_text = String::new();
-            plain_text_blocks(&cell.content, &mut cell_text);
+            plain_text_blocks(&cell.content, ctx.styles, &mut cell_text);
             let cell_text = cell_text.trim().replace('\n', " ");
             cells.push(cell_text);
         }
@@ -632,10 +656,10 @@ fn markdown_table(table: &Table, _ctx: &MarkdownCtx, out: &mut String) {
     out.push('\n');
 }
 
-fn runs_to_plain_text(runs: &[Run]) -> String {
+fn runs_to_plain_text(runs: &[Run], ctx: HiddenCtx<'_>) -> String {
     let mut text = String::new();
     for run in runs {
-        plain_text_run(run, &mut text);
+        plain_text_run(run, ctx, &mut text);
     }
     text
 }

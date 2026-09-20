@@ -142,6 +142,42 @@ impl StyleSheet {
         out
     }
 
+    /// Whether a run is hidden (`<w:vanish/>`) once document defaults, the
+    /// paragraph style chain, the run's character style and its own
+    /// `w:rPr` are folded together — the same precedence as
+    /// [`Self::effective_run_properties`], without materialising the whole
+    /// property set for renderers that only need this one bit.
+    pub fn effective_hidden(
+        &self,
+        paragraph_style_id: Option<&str>,
+        direct: Option<&RunProperties>,
+    ) -> bool {
+        let mut hidden = self
+            .doc_defaults
+            .as_ref()
+            .and_then(|d| d.run_properties.as_ref())
+            .and_then(|rp| rp.hidden);
+        let chain_hidden = |sid: &str| {
+            self.chain(sid)
+                .into_iter()
+                .rev()
+                .find_map(|style| style.run_properties.as_ref().and_then(|rp| rp.hidden))
+        };
+        if let Some(h) = paragraph_style_id.and_then(chain_hidden) {
+            hidden = Some(h);
+        }
+        if let Some(h) = direct
+            .and_then(|d| d.style_id.as_deref())
+            .and_then(chain_hidden)
+        {
+            hidden = Some(h);
+        }
+        if let Some(h) = direct.and_then(|d| d.hidden) {
+            hidden = Some(h);
+        }
+        hidden.unwrap_or(false)
+    }
+
     /// Fold the effective paragraph formatting: document defaults, then the
     /// style chain, then the paragraph's own `w:pPr`.
     pub fn effective_paragraph_properties(

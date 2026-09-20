@@ -662,6 +662,11 @@ fn parse_block_elements_until(
             Event::Start(ref e) => match e.local_name().as_ref() {
                 "p" => elements.push(BlockElement::Paragraph(parse_paragraph(reader)?)),
                 "tbl" => elements.push(BlockElement::Table(parse_table(reader)?)),
+                // A content control is a transparent wrapper around its
+                // `w:sdtContent` blocks, here exactly as in the body. Word's
+                // own "quote" text-box templates wrap the whole box in one;
+                // skipping it dropped every such text box entirely.
+                "sdt" | "sdtContent" => {},
                 _ => xml::skip_element_fast(reader)?,
             },
             Event::End(ref e) if e.local_name().as_ref() == end_local => break,
@@ -4371,6 +4376,104 @@ mod tests {
         assert!(doc.has_macros, "DocxDocument::has_macros must be true");
         let ir = crate::convert_docx::docx_to_ir(&doc);
         assert!(ir.metadata.has_macros, "Metadata::has_macros must be true");
+    }
+
+    /// Regression: `<w:vanish/>` inherited from a character style (a
+    /// glossary popup styled `acicollapsed1`, say) was honoured by the IR
+    /// path but not by the direct `plain_text()`/`to_markdown()` renderers,
+    /// which only read the run's own `w:rPr` — so `to_html()` hid the text
+    /// and `plain_text()` showed it.
+    #[test]
+    fn test_vanish_inherited_from_a_character_style_is_excluded_everywhere() {
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:r><w:t xml:space="preserve">Visible before. </w:t></w:r>
+      <w:r><w:rPr><w:rStyle w:val="collapsed"/></w:rPr><w:t xml:space="preserve">Hidden </w:t></w:r>
+      <w:r><w:t xml:space="preserve">Visible after.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let styles_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="character" w:styleId="collapsed">
+    <w:name w:val="collapsed"/>
+    <w:rPr><w:vanish/></w:rPr>
+  </w:style>
+</w:styles>"#;
+        let mut writer = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let styles_part = PartName::new("/word/styles.xml").unwrap();
+        writer
+            .add_part(
+                &styles_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml",
+                styles_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::STYLES, "styles.xml");
+        let data = writer.finish().unwrap().into_inner();
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        assert!(doc.styles.is_some(), "fixture must load its stylesheet");
+
+        let plain = doc.plain_text();
+        assert!(
+            !plain.contains("Hidden"),
+            "plain_text() must exclude style-hidden text: {plain:?}"
+        );
+        assert!(plain.contains("Visible before.") && plain.contains("Visible after."));
+        let md = doc.to_markdown();
+        assert!(!md.contains("Hidden"), "to_markdown() must exclude style-hidden text: {md:?}");
+        let ir_text = crate::convert_docx::docx_to_ir(&doc).plain_text();
+        assert!(!ir_text.contains("Hidden"), "{ir_text:?}");
+    }
+
+    /// Regression: a text box whose paragraphs sit inside a content
+    /// control (`w:txbxContent > w:sdt > w:sdtContent > w:p`) — the shape
+    /// of every "quote" text box Word inserts from its gallery — was
+    /// dropped whole, because the text-box block parser skipped anything
+    /// that was not directly a `w:p`/`w:tbl`. Three corpus files lost
+    /// their only text this way.
+    #[test]
+    fn test_text_box_content_inside_a_content_control_is_extracted() {
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+            xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+            xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+  <w:body>
+    <w:p><w:r><w:t>Body text.</w:t></w:r></w:p>
+    <w:p><w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing>
+      <wp:anchor><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+        <wps:wsp><wps:txbx><w:txbxContent>
+          <w:sdt><w:sdtPr><w:id w:val="1"/></w:sdtPr><w:sdtContent>
+            <w:p><w:r><w:t>Grab your reader's attention with a great quote.</w:t></w:r></w:p>
+          </w:sdtContent></w:sdt>
+        </w:txbxContent></wps:txbx></wps:wsp>
+      </a:graphicData></a:graphic></wp:anchor>
+    </w:drawing></mc:Choice><mc:Fallback/></mc:AlternateContent></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let data = make_minimal_docx(document_xml);
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let plain = doc.plain_text();
+        assert!(plain.contains("Body text."), "{plain:?}");
+        assert!(
+            plain.contains("Grab your reader's attention"),
+            "text box content wrapped in a content control must be extracted: {plain:?}"
+        );
+        let ir_text = crate::convert_docx::docx_to_ir(&doc).plain_text();
+        assert!(ir_text.contains("Grab your reader's attention"), "{ir_text:?}");
     }
 
     #[test]
