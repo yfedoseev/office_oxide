@@ -7,7 +7,7 @@ Record: {path, fmt, surface, status(ok|err|timeout|crash), code, bytes, sha, ms,
 Outputs land in OUTDIR/out/<relpath>.<surface>.gz so compare/diff scripts can
 read them without re-running either arm.
 """
-import collections, gzip, hashlib, json, os, subprocess, sys, time
+import collections, gzip, hashlib, json, os, select, subprocess, sys, time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 SURFACES = ["text", "markdown", "html", "ir"]
@@ -31,12 +31,17 @@ def run_one(args):
             with subprocess.Popen([bin_, surface, path], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p, \
                  gzip.open(op, "wb", compresslevel=1) as f:
                 h = hashlib.sha256(); n = 0
+                fd = p.stdout.fileno()
                 try:
                     while True:
-                        chunk = p.stdout.read(1 << 20)
+                        # A child that hangs before writing anything must
+                        # time out too, so wait on the pipe with a deadline.
+                        remaining = TIMEOUT - (time.perf_counter() - t0)
+                        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                            raise subprocess.TimeoutExpired(bin_, TIMEOUT)
+                        chunk = os.read(fd, 1 << 20)
                         if not chunk: break
                         h.update(chunk); f.write(chunk); n += len(chunk)
-                        if time.perf_counter() - t0 > TIMEOUT: raise subprocess.TimeoutExpired(bin_, TIMEOUT)
                     err = p.stderr.read()
                     p.wait(timeout=max(1, TIMEOUT - (time.perf_counter() - t0)))
                 except subprocess.TimeoutExpired:
