@@ -228,6 +228,58 @@ fn test_duplicate_part_names_are_refused_by_the_xlsx_fast_path() {
     assert!(err.to_string().contains("duplicate part"), "got {err}");
 }
 
+/// A cell reference past the grid (`ZZZZZZ1` is column 321,272,405)
+/// reached the IR converter, which sized every table row to the widest
+/// column seen: a 95 GB allocation and an abort from a 2 KB package,
+/// through `to_ir()` on every binding. The reader refuses the reference
+/// (the cell takes the implied column) and the converter is capped at
+/// the grid's width regardless.
+#[test]
+fn test_a_cell_reference_past_the_grid_does_not_size_the_table_to_it() {
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    zip.start_file("xl/workbook.xml", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0"?><workbook
+             xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+           <sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+    )
+    .unwrap();
+    zip.start_file("xl/_rels/workbook.xml.rels", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0"?><Relationships
+             xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+           <Relationship Id="rId1"
+             Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+             Target="worksheets/sheet1.xml"/></Relationships>"#,
+    )
+    .unwrap();
+    zip.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0"?><worksheet
+             xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+           <sheetData><row r="1"><c r="A1"><v>1</v></c><c r="ZZZZZZ1"><v>2</v></c></row>
+           <row r="2"><c r="A2"><v>3</v></c></row></sheetData></worksheet>"#,
+    )
+    .unwrap();
+    let bytes = zip.finish().unwrap().into_inner();
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx).unwrap();
+    let ir = doc.to_ir();
+    let text = doc.plain_text();
+    assert!(text.contains('1') && text.contains('2') && text.contains('3'), "{text}");
+    let widest = ir.sections[0]
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            office_oxide::ir::Element::Table(t) => t.rows.iter().map(|r| r.cells.len()).max(),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    assert!(widest <= 2, "table sized to the bogus column: {widest} cells wide");
+}
+
 // ---------------------------------------------------------------------------
 // Unbounded recursion
 // ---------------------------------------------------------------------------

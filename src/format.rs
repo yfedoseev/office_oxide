@@ -67,7 +67,7 @@ impl DocumentFormat {
             "docx" | "docm" | "dotx" | "dotm" => Some(Self::Docx),
             // SpreadsheetML: workbook, macro-enabled workbook, templates,
             // macro-enabled add-in.
-            "xlsx" | "xlsm" | "xltx" | "xltm" | "xlam" => Some(Self::Xlsx),
+            "xlsx" | "xlsm" | "xltx" | "xltm" | "xlam" | "xlsb" => Some(Self::Xlsx),
             // PresentationML: presentation, macro-enabled presentation,
             // templates, slideshows.
             "pptx" | "pptm" | "potx" | "potm" | "ppsx" | "ppsm" => Some(Self::Pptx),

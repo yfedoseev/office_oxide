@@ -23,7 +23,7 @@ mod sst;
 mod workbook;
 
 pub use crate::core::OfficeDocument;
-pub use cell::{Cell, CellValue};
+pub use cell::{Cell, CellValue, decode_rk};
 pub use comment::XlsComment;
 pub use error::{Result, XlsError};
 pub use hyperlink::XlsHyperlink;

@@ -168,7 +168,10 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             .iter()
             .filter_map(|cells| cells.iter().map(|cd| cd.col as usize + 1).max())
             .max()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            // The readers already refuse a column past XFD; this is the
+            // bound the allocation below relies on, kept next to it.
+            .min(crate::xlsx::cell::MAX_COL as usize + 1);
 
         // Decide row layout: a worksheet whose rows mostly have at most one
         // non-empty cell is "document style" — flowing text laid out one

@@ -11,6 +11,11 @@ pub struct CellRef {
     pub row: u32,
 }
 
+/// The last column of the grid, `XFD` (0-based).
+pub const MAX_COL: u32 = 16_383;
+/// The last row of the grid (1-based).
+pub const MAX_ROWS: u32 = 1_048_576;
+
 impl CellRef {
     /// Parse a cell reference string like "A1" into zero-based indices.
     pub fn parse(reference: &str) -> Option<Self> {
@@ -26,7 +31,11 @@ impl CellRef {
 
         let col = Self::parse_col(col_str)?;
         let row: u32 = row_str.parse().ok()?;
-        if row == 0 {
+        // Excel's grid ends at XFD1048576. A reference past it is not a
+        // cell: `ZZZZZZ1` parsed to column 321,272,405 and the IR
+        // converter sized every row of the table to it — a 95 GB
+        // allocation from a 2 KB package, and an abort.
+        if row == 0 || row > MAX_ROWS || col > MAX_COL {
             return None;
         }
 
@@ -180,5 +189,22 @@ mod tests {
         assert!(CellRef::parse("1").is_none());
         assert!(CellRef::parse("A").is_none());
         assert!(CellRef::parse("A0").is_none());
+    }
+
+    /// The grid ends at XFD1048576; a reference past it is not a cell.
+    /// `ZZZZZZ1` parsed to column 321,272,405 and the converter sized
+    /// every row to it.
+    #[test]
+    fn test_references_past_the_grid_are_not_cells() {
+        assert_eq!(
+            CellRef::parse("XFD1048576"),
+            Some(CellRef {
+                col: 16_383,
+                row: 1_048_575
+            })
+        );
+        assert!(CellRef::parse("XFE1").is_none());
+        assert!(CellRef::parse("A1048577").is_none());
+        assert!(CellRef::parse("ZZZZZZ1").is_none());
     }
 }

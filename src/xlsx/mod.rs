@@ -40,6 +40,7 @@ pub mod workbook;
 pub mod worksheet;
 /// XLSX creation (write) API.
 pub mod write;
+mod xlsb;
 
 pub use cell::{Cell, CellRef, CellValue};
 pub use date::DateTimeValue;
@@ -160,7 +161,7 @@ impl XlsxDocument {
     }
 
     /// Read a ZIP entry by name with UTF-8 transcoding for XML parts.
-    fn read_xml_entry<R: Read + Seek>(
+    pub(super) fn read_xml_entry<R: Read + Seek>(
         archive: &mut ZipArchive<R>,
         entries: &opc::ZipEntryIndex,
         name: &str,
@@ -179,6 +180,11 @@ impl XlsxDocument {
     fn from_zip<R: Read + Seek>(mut archive: ZipArchive<R>) -> Result<Self> {
         debug!("XlsxDocument: fast path parsing started ({} ZIP entries)", archive.len());
         let entries = opc::ZipEntryIndex::new(&archive);
+        // An Excel Binary Workbook is the same package with BIFF12 parts
+        // in place of the XML ones; it decodes into this same model.
+        if xlsb::is_xlsb(&archive, &entries) {
+            return xlsb::from_zip(&mut archive, &entries);
+        }
 
         // Document metadata lives at the conventional path in every package
         // Excel writes; the fast path doesn't consult package relationships,
@@ -1045,7 +1051,7 @@ fn parse_rich_value_rel(xml: &[u8]) -> Vec<String> {
 /// absolute ZIP-entry path. Mirrors `PartName::resolve_relative` but
 /// operates on plain ZIP paths (the `from_zip` fast path doesn't use
 /// `PartName`).
-fn resolve_relative_zip_path(source: &str, target: &str) -> String {
+pub(super) fn resolve_relative_zip_path(source: &str, target: &str) -> String {
     if target.starts_with('/') {
         return target.trim_start_matches('/').to_string();
     }
