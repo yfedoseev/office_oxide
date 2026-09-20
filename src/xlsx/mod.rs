@@ -129,7 +129,7 @@ impl XlsxDocument {
     /// Open an XLSX file from a file path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let file = File::open(path).map_err(crate::core::Error::from)?;
-        let archive = ZipArchive::new(file).map_err(crate::core::Error::from)?;
+        let archive = opc::open_zip_rejecting_duplicates(file)?;
         Self::from_zip(archive)
     }
 
@@ -139,8 +139,7 @@ impl XlsxDocument {
         let file = File::open(path).map_err(crate::core::Error::from)?;
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(crate::core::Error::from)? };
         debug!("XLSX fast path: mmap opened ({} bytes)", mmap.len());
-        let archive =
-            ZipArchive::new(std::io::Cursor::new(mmap)).map_err(crate::core::Error::from)?;
+        let archive = opc::open_zip_rejecting_duplicates(std::io::Cursor::new(mmap))?;
         Self::from_zip(archive)
     }
 
@@ -156,7 +155,7 @@ impl XlsxDocument {
             )
             .into());
         }
-        let archive = ZipArchive::new(reader).map_err(crate::core::Error::from)?;
+        let archive = opc::open_zip_rejecting_duplicates(reader)?;
         Self::from_zip(archive)
     }
 

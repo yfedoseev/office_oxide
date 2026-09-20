@@ -234,31 +234,9 @@ impl OpcReader<std::io::Cursor<memmap2::Mmap>> {
 
 impl<R: Read + Seek> OpcReader<R> {
     /// Create an OPC reader from any `Read + Seek` source.
-    pub fn new(mut reader: R) -> Result<Self> {
-        // Count the central-directory records *before* handing the reader to
-        // the zip crate, which collapses duplicate names into one entry.
-        let declared_entries = central_directory_entry_count(&mut reader)?;
-        reader.seek(std::io::SeekFrom::Start(0))?;
-
-        let mut archive = ZipArchive::new(reader)?;
+    pub fn new(reader: R) -> Result<Self> {
+        let mut archive = open_zip_rejecting_duplicates(reader)?;
         debug!("OPC package opened, {} entries", archive.len());
-
-        // Reject packages with duplicate entry names.
-        //
-        // A ZIP may hold two entries with the same name; which one a reader
-        // returns is unspecified, so two implementations reading the same
-        // bytes can see two different documents. That is the shape of
-        // CVE-2025-31672 and of every "scanner reads one copy, renderer
-        // reads the other" bypass. Whichever copy we picked would be
-        // accidental, so refuse the package.
-        if let Some(declared) = declared_entries {
-            if declared > archive.len() {
-                return Err(Error::DuplicatePart(format!(
-                    "{declared} central-directory entries collapse to {} unique names",
-                    archive.len()
-                )));
-            }
-        }
 
         // Eagerly parse [Content_Types].xml
         let ct_data = read_zip_entry(&mut archive, "[Content_Types].xml")?;
@@ -459,6 +437,38 @@ fn central_directory_entry_count<R: Read + Seek>(reader: &mut R) -> Result<Optio
         return Ok(None);
     }
     Ok(Some(total as usize))
+}
+
+/// Open a ZIP archive, refusing one that holds two entries with the same
+/// name.
+///
+/// Which of two same-named entries a reader returns is unspecified, so two
+/// implementations reading the same bytes can see two different
+/// documents. That is the shape of CVE-2025-31672 and of every "scanner
+/// reads one copy, renderer reads the other" bypass. Whichever copy we
+/// picked would be accidental, so the package is refused. The
+/// central-directory record count is read *before* the zip crate sees the
+/// reader, because the crate keys entries by name and collapses duplicates
+/// before any caller can notice.
+///
+/// Every OOXML reader must open its archive through this — `OpcReader`
+/// does, and so does the XLSX fast path, which bypasses `OpcReader` for
+/// speed and for a while bypassed this check with it.
+pub(crate) fn open_zip_rejecting_duplicates<R: Read + Seek>(
+    mut reader: R,
+) -> Result<ZipArchive<R>> {
+    let declared_entries = central_directory_entry_count(&mut reader)?;
+    reader.seek(std::io::SeekFrom::Start(0))?;
+    let archive = ZipArchive::new(reader)?;
+    if let Some(declared) = declared_entries {
+        if declared > archive.len() {
+            return Err(Error::DuplicatePart(format!(
+                "{declared} central-directory entries collapse to {} unique names",
+                archive.len()
+            )));
+        }
+    }
+    Ok(archive)
 }
 
 /// Maximum uncompressed size accepted for a single OPC part.

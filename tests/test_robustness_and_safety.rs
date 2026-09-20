@@ -175,6 +175,59 @@ fn test_duplicate_part_names_are_refused() {
     assert!(err.to_string().contains("duplicate part"), "got {err}");
 }
 
+/// The XLSX reader opens its archive directly for speed, bypassing
+/// `OpcReader` — and, until this test, bypassing the duplicate-entry
+/// refusal with it: a workbook with two `xl/worksheets/sheet1.xml` entries
+/// opened cleanly and silently showed whichever copy the zip crate resolved
+/// to (the second). DOCX and PPTX refused the same construction. Same
+/// CVE-2025-31672 shape, same answer for all three.
+#[test]
+fn test_duplicate_part_names_are_refused_by_the_xlsx_fast_path() {
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    zip.start_file("xl/workbook.xml", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0"?><workbook
+             xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+           <sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+    )
+    .unwrap();
+    zip.start_file("xl/_rels/workbook.xml.rels", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0"?><Relationships
+             xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+           <Relationship Id="rId1"
+             Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+             Target="worksheets/sheet1.xml"/></Relationships>"#,
+    )
+    .unwrap();
+    for (name, text) in [
+        ("xl/worksheets/sheet1.xml", "SAFE_FIRST_COPY"),
+        ("xl/worksheets/sheet2.xml", "EVIL_SECOND_COPY"),
+    ] {
+        zip.start_file(name, opts).unwrap();
+        zip.write_all(
+            format!(
+                r#"<?xml version="1.0"?><worksheet
+                     xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+                   <sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>{text}</t></is></c></row>
+                   </sheetData></worksheet>"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    }
+    let mut bytes = zip.finish().unwrap().into_inner();
+    rename_entry(&mut bytes, b"xl/worksheets/sheet2.xml", b"xl/worksheets/sheet1.xml");
+
+    let err = expect_err(
+        Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx),
+        "an XLSX with duplicate parts must be refused, not silently resolved to one copy",
+    );
+    assert!(err.to_string().contains("duplicate part"), "got {err}");
+}
+
 // ---------------------------------------------------------------------------
 // Unbounded recursion
 // ---------------------------------------------------------------------------

@@ -146,20 +146,29 @@ impl<R: Read + Seek> CfbReader<R> {
 
     /// Search the red-black tree rooted at `node_id` for an entry matching `name`.
     fn find_in_tree(&self, node_id: u32, name: &str) -> Option<usize> {
-        if node_id == NO_ENTRY || node_id as usize >= self.entries.len() {
-            return None;
-        }
-
-        let entry = &self.entries[node_id as usize];
+        // An explicit stack and a visited set, not recursion: a malformed
+        // directory whose sibling pointers form a cycle recursed without
+        // bound and overflowed the stack — an abort no caller can catch,
+        // reachable from `open_stream` on every legacy format. Each entry
+        // is visited at most once, so the walk is bounded by the directory.
         let lower = name.to_ascii_lowercase();
-
-        if entry.name.to_ascii_lowercase() == lower {
-            return Some(node_id as usize);
+        let mut visited = vec![false; self.entries.len()];
+        let mut stack = vec![node_id];
+        while let Some(id) = stack.pop() {
+            if id == NO_ENTRY || id as usize >= self.entries.len() || visited[id as usize] {
+                continue;
+            }
+            visited[id as usize] = true;
+            let entry = &self.entries[id as usize];
+            if entry.name.to_ascii_lowercase() == lower {
+                return Some(id as usize);
+            }
+            // Search both subtrees (the tree may not be well-ordered in
+            // malformed files); left first, so it is popped first.
+            stack.push(entry.right_sibling);
+            stack.push(entry.left_sibling);
         }
-
-        // Search both subtrees (the tree may not be well-ordered in malformed files).
-        self.find_in_tree(entry.left_sibling, name)
-            .or_else(|| self.find_in_tree(entry.right_sibling, name))
+        None
     }
 
     /// Read a stream by directory entry index.
@@ -223,9 +232,23 @@ impl<R: Read + Seek> CfbReader<R> {
             .collect();
 
         // Follow the DIFAT chain for large files.
+        //
+        // Bounded like every other chain walk in this file. A chain cannot
+        // visit more distinct sectors than the file holds, so walking past
+        // that many is a cycle (a sector whose "next" pointer refers back to
+        // one already visited — trivially, to itself). Without the bound this
+        // loop had no exit condition a cycle could satisfy, and a 1.5 KB file
+        // hung `Document::open` forever.
+        let file_len = reader.seek(SeekFrom::End(0))?;
+        let sectors_in_file = (file_len / header.sector_size as u64).saturating_add(1);
         let mut difat_sector = header.first_difat_sector;
         let entries_per_difat = header.sector_size / 4 - 1; // last u32 is next DIFAT sector
+        let mut visited_difat = 0u64;
         while difat_sector <= MAX_REG_SECT {
+            if visited_difat >= sectors_in_file {
+                return Err(CfbError::CorruptedStream("DIFAT chain cycle detected".into()));
+            }
+            visited_difat += 1;
             let mut sector_buf = vec![0u8; header.sector_size];
             reader.seek(SeekFrom::Start(header.sector_offset(difat_sector)))?;
             let n = read_fully(reader, &mut sector_buf)?;
@@ -503,6 +526,52 @@ mod tests {
     fn write_fat_entry(file: &mut [u8], fat_offset: usize, index: usize, value: u32) {
         let off = fat_offset + index * 4;
         file[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// Regression: a DIFAT chain whose last sector's "next" pointer refers
+    /// back to a sector already visited (here: to itself) had no exit
+    /// condition — `Document::open` on a 1.5 KB file never returned. The
+    /// walk is now bounded by the sectors the file holds and reports a
+    /// cycle.
+    #[test]
+    fn test_cyclic_difat_chain_is_an_error_not_a_hang() {
+        let mut file = build_minimal_cfb();
+        // Add a sector 3 that is a DIFAT sector: every FAT pointer free,
+        // and its trailing "next DIFAT" entry pointing at itself.
+        file.extend(std::iter::repeat_n(0xFFu8, 512));
+        let s3 = 512 + 3 * 512;
+        file[s3 + 508..s3 + 512].copy_from_slice(&3u32.to_le_bytes());
+        // Header: first DIFAT sector = 3, one DIFAT sector.
+        file[0x44..0x48].copy_from_slice(&3u32.to_le_bytes());
+        file[0x48..0x4C].copy_from_slice(&1u32.to_le_bytes());
+
+        let err = match CfbReader::new(Cursor::new(file)) {
+            Err(e) => e,
+            Ok(_) => panic!("a cyclic DIFAT chain must fail"),
+        };
+        assert!(
+            matches!(err, CfbError::CorruptedStream(ref m) if m.contains("DIFAT chain cycle")),
+            "got {err:?}"
+        );
+    }
+
+    /// Regression: a directory entry whose sibling pointer refers to
+    /// itself (or an ancestor) made the recursive tree search overflow the
+    /// stack — an abort no caller can catch, reachable from `open_stream`
+    /// on every legacy format. The search visits each entry once now.
+    #[test]
+    fn test_cyclic_directory_siblings_do_not_recurse_forever() {
+        let mut file = build_minimal_cfb();
+        // Entry 1 ("TestStream"): left sibling -> itself, right -> root.
+        let e1 = 512 + 128;
+        file[e1 + 0x44..e1 + 0x48].copy_from_slice(&1u32.to_le_bytes());
+        file[e1 + 0x48..e1 + 0x4C].copy_from_slice(&0u32.to_le_bytes());
+        let mut reader = CfbReader::new(Cursor::new(file)).unwrap();
+        // The stream is still found through the cycle...
+        assert_eq!(reader.open_stream("TestStream").unwrap(), b"Hello, CFB!");
+        // ...and a name that is not there terminates instead of recursing.
+        assert!(reader.open_stream("Missing").is_err());
+        assert!(!reader.has_root_entry("Missing"));
     }
 
     #[test]
