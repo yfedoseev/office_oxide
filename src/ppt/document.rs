@@ -4,7 +4,7 @@ use std::io::{Read, Seek};
 
 use crate::cfb::{CfbReader, SummaryProperties, parse_summary_information};
 
-use super::error::Result;
+use super::error::{PptError, Result};
 use super::images::{PptImage, extract_images};
 use super::text::{SlideText, TextType, extract_slides_text};
 
@@ -32,22 +32,34 @@ impl PptDocument {
             .ok()
             .and_then(|data| parse_summary_information(&data));
 
-        let stream = match cfb
-            .open_stream("PowerPoint Document")
-            .or_else(|_| cfb.open_stream("PP97_DUALSTORAGE"))
-        {
-            Ok(s) => s,
-            Err(_) => {
-                return Ok(Self {
-                    slides: Vec::new(),
-                    images: Vec::new(),
-                    has_macros,
-                    summary_properties,
-                });
-            },
+        // Without the main stream there is no presentation to read. This
+        // used to return an empty document with `Ok`, indistinguishable
+        // from a deck that simply has no text — the same silent-empty shape
+        // `.doc` and `.xls` already refuse for their own missing streams.
+        // A PowerPoint 95 "dual storage" file keeps its PowerPoint 95
+        // stream at the root and the PowerPoint 97 rendition of the same
+        // deck under the `PP97_DUALSTORAGE` *storage*. That one is the
+        // stream this parser reads, so it is looked up first — asking for
+        // `PP97_DUALSTORAGE` as a root-level stream name never matched,
+        // and the root PPT 95 stream then parsed as an empty deck.
+        let dual = cfb
+            .open_stream_by_path("PP97_DUALSTORAGE/PowerPoint Document")
+            .ok();
+        let (stream, current_user) = match dual {
+            Some(stream) => (
+                stream,
+                cfb.open_stream_by_path("PP97_DUALSTORAGE/Current User")
+                    .ok(),
+            ),
+            None => (
+                cfb.open_stream("PowerPoint Document").map_err(|_| {
+                    PptError::MissingStream(
+                        "neither PowerPoint Document nor PP97_DUALSTORAGE/PowerPoint Document stream found".into(),
+                    )
+                })?,
+                cfb.open_stream("Current User").ok(),
+            ),
         };
-
-        let current_user = cfb.open_stream("Current User").ok();
         let slides = extract_slides_text(&stream, current_user.as_deref());
 
         // Extract images from Pictures stream (if present).
@@ -149,6 +161,183 @@ impl crate::core::OfficeDocument for PptDocument {
 mod tests {
     use super::*;
     use crate::ppt::text::TextRun;
+
+    /// One directory entry of a hand-built CFB: name, `1` storage / `2`
+    /// stream, right-sibling index, child index, and stream bytes (a
+    /// storage's are ignored). Entry 0 is the root; stream data is laid
+    /// out one sector per stream in entry order.
+    struct Entry {
+        name: &'static str,
+        kind: u8,
+        right: u32,
+        child: u32,
+        data: Vec<u8>,
+    }
+
+    /// Assemble a minimal 512-byte-sector CFB (v3, no mini stream, no
+    /// DIFAT beyond the header) from `entries`.
+    fn build_cfb(entries: &[Entry]) -> Vec<u8> {
+        const END_OF_CHAIN: u32 = 0xFFFF_FFFE;
+        const FAT_SECT: u32 = 0xFFFF_FFFD;
+        const FREE_SECT: u32 = 0xFFFF_FFFF;
+        const NO_ENTRY: u32 = 0xFFFF_FFFF;
+        let streams: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.kind == 2)
+            .map(|(i, _)| i)
+            .collect();
+        // sector 0: directory, sector 1: FAT, then one sector per stream.
+        let sectors = 2 + streams.len();
+        let mut file = vec![0u8; 512 * (1 + sectors)];
+        file[0..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        file[0x18..0x1A].copy_from_slice(&0x003Eu16.to_le_bytes());
+        file[0x1A..0x1C].copy_from_slice(&3u16.to_le_bytes());
+        file[0x1C..0x1E].copy_from_slice(&0xFFFEu16.to_le_bytes());
+        file[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
+        file[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
+        file[0x2C..0x30].copy_from_slice(&1u32.to_le_bytes());
+        file[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());
+        file[0x38..0x3C].copy_from_slice(&4096u32.to_le_bytes());
+        file[0x3C..0x40].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+        file[0x44..0x48].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+        file[0x4C..0x50].copy_from_slice(&1u32.to_le_bytes());
+        for i in 1..109 {
+            file[0x4C + i * 4..0x50 + i * 4].copy_from_slice(&FREE_SECT.to_le_bytes());
+        }
+        let fat = 1024;
+        let mut fat_entries = vec![END_OF_CHAIN, FAT_SECT];
+        for (n, e) in entries.iter().enumerate() {
+            let buf = &mut file[512 + n * 128..512 + (n + 1) * 128];
+            for (i, unit) in e.name.encode_utf16().enumerate() {
+                buf[i * 2..i * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+            }
+            let name_size = ((e.name.encode_utf16().count() + 1) * 2) as u16;
+            buf[0x40..0x42].copy_from_slice(&name_size.to_le_bytes());
+            buf[0x42] = if n == 0 { 5 } else { e.kind };
+            buf[0x43] = 1;
+            buf[0x44..0x48].copy_from_slice(&NO_ENTRY.to_le_bytes());
+            buf[0x48..0x4C].copy_from_slice(&e.right.to_le_bytes());
+            buf[0x4C..0x50].copy_from_slice(&e.child.to_le_bytes());
+            let (start, size) = if e.kind == 2 {
+                let sector = 2 + streams.iter().position(|&s| s == n).unwrap();
+                let off = 512 + sector * 512;
+                file[off..off + e.data.len()].copy_from_slice(&e.data);
+                fat_entries.push(END_OF_CHAIN);
+                (sector as u32, e.data.len() as u32)
+            } else {
+                (END_OF_CHAIN, 0)
+            };
+            let buf = &mut file[512 + n * 128..512 + (n + 1) * 128];
+            buf[0x74..0x78].copy_from_slice(&start.to_le_bytes());
+            buf[0x78..0x7C].copy_from_slice(&size.to_le_bytes());
+        }
+        for i in 0..128 {
+            let v = fat_entries.get(i).copied().unwrap_or(FREE_SECT);
+            file[fat + i * 4..fat + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        file
+    }
+
+    const NO_ENTRY: u32 = 0xFFFF_FFFF;
+
+    /// A CFB whose root holds only a `Current User` stream — the shape a
+    /// container with a broken directory tree presents once the reader
+    /// walks the tree properly instead of scanning the flat array.
+    fn cfb_without_main_stream() -> Vec<u8> {
+        build_cfb(&[
+            Entry {
+                name: "Root Entry",
+                kind: 5,
+                right: NO_ENTRY,
+                child: 1,
+                data: vec![],
+            },
+            Entry {
+                name: "Current User",
+                kind: 2,
+                right: NO_ENTRY,
+                child: NO_ENTRY,
+                data: vec![0; 8],
+            },
+        ])
+    }
+
+    /// The smallest record stream `extract_slides_text` reads text from: a
+    /// `Slide` container holding a `ClientTextbox` with a `TextBytesAtom`.
+    fn slide_stream(text: &str) -> Vec<u8> {
+        fn rec(rec_type: u16, ver: u16, data: &[u8]) -> Vec<u8> {
+            let mut b = ver.to_le_bytes().to_vec();
+            b.extend_from_slice(&rec_type.to_le_bytes());
+            b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            b.extend_from_slice(data);
+            b
+        }
+        let mut textbox = rec(crate::ppt::records::RT_TEXT_HEADER, 0, &0u32.to_le_bytes());
+        textbox.extend(rec(crate::ppt::records::RT_TEXT_BYTES, 0, text.as_bytes()));
+        let textbox = rec(0xF00D, 0x000F, &textbox);
+        rec(crate::ppt::records::RT_SLIDE, 0x000F, &textbox)
+    }
+
+    /// Regression: a PowerPoint 95 "dual storage" file keeps a PowerPoint
+    /// 97 rendition of the deck under the `PP97_DUALSTORAGE` storage, and
+    /// a PowerPoint 95 stream (which this parser cannot read) at the root.
+    /// Looking for `PP97_DUALSTORAGE` as a root-level *stream* never
+    /// matched, so the root stream was parsed instead and a 105-slide
+    /// corpus deck came back with zero sections and `Ok`.
+    #[test]
+    fn test_dual_storage_file_reads_the_pp97_rendition() {
+        let bytes = build_cfb(&[
+            Entry {
+                name: "Root Entry",
+                kind: 5,
+                right: NO_ENTRY,
+                child: 1,
+                data: vec![],
+            },
+            // The storage is the root's child; the root-level PPT 95
+            // stream is its right sibling.
+            Entry {
+                name: "PP97_DUALSTORAGE",
+                kind: 1,
+                right: 2,
+                child: 3,
+                data: vec![],
+            },
+            Entry {
+                name: "PowerPoint Document",
+                kind: 2,
+                right: NO_ENTRY,
+                child: NO_ENTRY,
+                data: b"PowerPoint 95 records this parser does not read".to_vec(),
+            },
+            Entry {
+                name: "PowerPoint Document",
+                kind: 2,
+                right: NO_ENTRY,
+                child: NO_ENTRY,
+                data: slide_stream("Text from the PP97 rendition"),
+            },
+        ]);
+        let doc = PptDocument::from_reader(std::io::Cursor::new(bytes)).expect("opens");
+        let text = doc.plain_text();
+        assert!(
+            text.contains("Text from the PP97 rendition"),
+            "the PP97_DUALSTORAGE rendition must be the one read: {text:?}"
+        );
+    }
+
+    /// Regression: a container with no `PowerPoint Document` stream (a
+    /// fuzzer-corrupted directory tree left it unreachable) opened as an
+    /// empty deck with `Ok`, so a file that could not be read looked like
+    /// one that simply had no slides. It must fail like `.doc`/`.xls` do.
+    #[test]
+    fn test_missing_main_stream_is_an_error_not_an_empty_deck() {
+        let bytes = cfb_without_main_stream();
+        let err = PptDocument::from_reader(std::io::Cursor::new(bytes))
+            .expect_err("a .ppt without its main stream must not open");
+        assert!(matches!(err, PptError::MissingStream(_)), "expected MissingStream, got {err:?}");
+    }
 
     #[test]
     fn test_plain_text_basic() {
