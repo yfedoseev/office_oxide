@@ -10,8 +10,12 @@ Tools by format (each writes OUT_ROOT/<tool>/<relpath>.txt, or .err):
   doc:  catdoc, antiword
   xls:  xlrd, python-calamine, xls2csv
   ppt:  catppt
+
+Each record also carries wall_ms and cpu_ms (user+sys of this worker plus
+its children, measured as a delta around the call), so the panel doubles as
+the peer-timing baseline for perf_sweep.py.
 """
-import os, sys, json, subprocess, signal, traceback
+import os, sys, json, subprocess, signal, traceback, time, resource
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 TIMEOUT = 120
@@ -136,27 +140,50 @@ def run_one(args):
         op = os.path.join(out_root, tool, rel)
         os.makedirs(os.path.dirname(op), exist_ok=True)
         signal.signal(signal.SIGALRM, _alarm); signal.alarm(TIMEOUT)
+        def cpu():
+            a = resource.getrusage(resource.RUSAGE_SELF); b = resource.getrusage(resource.RUSAGE_CHILDREN)
+            return a.ru_utime + a.ru_stime + b.ru_utime + b.ru_stime
+        t0 = time.perf_counter(); c0 = cpu()
+        def timing():
+            return {"wall_ms": round((time.perf_counter() - t0) * 1000, 1), "cpu_ms": round((cpu() - c0) * 1000, 1)}
         try:
             text = fn(path)
             signal.alarm(0)
             open(op + ".txt", "w", encoding="utf-8", errors="replace").write(text)
-            res.append({"path": rel, "tool": tool, "status": "ok", "chars": len(text)})
+            res.append({"path": rel, "tool": tool, "status": "ok", "chars": len(text), **timing()})
         except TO:
-            res.append({"path": rel, "tool": tool, "status": "timeout"})
+            res.append({"path": rel, "tool": tool, "status": "timeout", **timing()})
         except BaseException as e:
             signal.alarm(0)
             msg = f"{type(e).__name__}: {str(e)[:200]}"
             open(op + ".err", "w").write(msg)
-            res.append({"path": rel, "tool": tool, "status": "err", "err": msg})
+            res.append({"path": rel, "tool": tool, "status": "err", "err": msg, **timing()})
     return res
+
+def _cap_memory(gb):
+    # A reference library that balloons on one workbook must fail with
+    # MemoryError inside its own record, not be SIGKILLed: a killed worker
+    # breaks the pool and every pending future is lost with it.
+    lim = int(gb * (1 << 30))
+    resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
 
 def main():
     root, out_root = sys.argv[1:3]
-    jobs = 6; listfile = None; a = sys.argv[3:]
+    jobs = 6; listfile = None; mem_gb = 6.0; append = False; one = None; a = sys.argv[3:]
     while a:
         k = a.pop(0)
         if k == "--jobs": jobs = int(a.pop(0))
         elif k == "--list": listfile = a.pop(0)
+        elif k == "--mem-gb": mem_gb = float(a.pop(0))
+        elif k == "--append": append = True
+        elif k == "--one": one = a.pop(0)
+    if one is not None:
+        # Worker mode: one document, records on stdout. A reference library
+        # that segfaults or gets OOM-killed takes down only this process.
+        _cap_memory(mem_gb)
+        for r in run_one((root, out_root, one)):
+            print(json.dumps(r), flush=True)
+        return
     if listfile:
         files = [l.strip() for l in open(listfile) if l.strip()]
     else:
@@ -167,15 +194,29 @@ def main():
                 rel = os.path.relpath(os.path.join(d, f), root)
                 if rel.split("/", 1)[0] in FMT_DIRS: files.append(rel)
     os.makedirs(out_root, exist_ok=True)
-    jl = open(os.path.join(out_root, "panel.jsonl"), "w")
+    jl = open(os.path.join(out_root, "panel.jsonl"), "a" if append else "w")
     done = 0
-    with ProcessPoolExecutor(jobs) as ex:
-        futs = [ex.submit(run_one, (root, out_root, rel)) for rel in files]
-        for fut in as_completed(futs):
-            try:
-                for r in fut.result(): jl.write(json.dumps(r) + "\n")
-            except Exception as e:
-                jl.write(json.dumps({"status": "crash", "err": str(e)[:200]}) + "\n")
+
+    def worker(rel):
+        cmd = [sys.executable, os.path.abspath(__file__), root, out_root, "--one", rel, "--mem-gb", str(mem_gb)]
+        try:
+            p = subprocess.run(cmd, capture_output=True, timeout=TIMEOUT * 4)
+        except subprocess.TimeoutExpired:
+            return [{"path": rel, "tool": t, "status": "timeout"} for t, _ in TOOLS.get(rel.split("/", 1)[0], [])]
+        recs = []
+        for line in p.stdout.decode("utf-8", "replace").splitlines():
+            try: recs.append(json.loads(line))
+            except Exception: pass
+        seen = {r["tool"] for r in recs}
+        for t, _ in TOOLS.get(rel.split("/", 1)[0], []):
+            if t not in seen:
+                recs.append({"path": rel, "tool": t, "status": "crash", "err": f"worker exited {p.returncode}: {p.stderr.decode('utf-8','replace')[-200:]}"})
+        return recs
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(jobs) as ex:
+        for recs in ex.map(worker, files):
+            for r in recs: jl.write(json.dumps(r) + "\n")
             done += 1
             if done % 250 == 0: jl.flush(); print(f"  {done}/{len(files)}", file=sys.stderr, flush=True)
     jl.close()

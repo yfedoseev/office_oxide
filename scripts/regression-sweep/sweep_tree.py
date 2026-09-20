@@ -1,7 +1,7 @@
 """Parallel two-arm sweep: run one CLI over the whole corpus tree, store every
 surface's stdout (gzipped) and one JSON line per (file, surface).
 
-  python3 sweep2.py BIN CORPUS_ROOT OUTDIR [--jobs N] [--list FILE]
+  python3 sweep_tree.py BIN CORPUS_ROOT OUTDIR [--jobs N] [--list FILE] [--surfaces text,markdown,html,ir]
 
 Record: {path, fmt, surface, status(ok|err|timeout|crash), code, bytes, sha, ms, err}
 Outputs land in OUTDIR/out/<relpath>.<surface>.gz so compare/diff scripts can
@@ -15,11 +15,11 @@ TIMEOUT = 120
 SKIP_DIRS = {"metadata", "scripts", "test_outputs", "__pycache__", ".git", ".venv"}
 
 def run_one(args):
-    bin_, root, out_root, rel = args
+    bin_, root, out_root, rel, surfaces = args
     path = os.path.join(root, rel)
     fmt = rel.split("/", 1)[0]
     recs = []
-    for surface in SURFACES:
+    for surface in surfaces:
         rec = {"path": rel, "fmt": fmt, "surface": surface}
         t0 = time.perf_counter()
         op = os.path.join(out_root, rel + "." + surface + ".gz")
@@ -61,11 +61,13 @@ def main():
     bin_, root, outdir = sys.argv[1:4]
     jobs = 7
     listfile = None
+    surfaces = SURFACES
     a = sys.argv[4:]
     while a:
         k = a.pop(0)
         if k == "--jobs": jobs = int(a.pop(0))
         elif k == "--list": listfile = a.pop(0)
+        elif k == "--surfaces": surfaces = a.pop(0).split(",")
     if not os.access(bin_, os.X_OK):
         sys.exit(f"binary not executable: {bin_}")
     if listfile:
@@ -88,11 +90,11 @@ def main():
             for line in f:
                 try: done_files[json.loads(line)["path"]] += 1
                 except Exception: pass
-    files = [f for f in files if done_files.get(f, 0) < len(SURFACES)]
+    files = [f for f in files if done_files.get(f, 0) < len(surfaces)]
     jl = open(jl_path, "a")
     done = 0
     with ProcessPoolExecutor(jobs) as ex:
-        futs = [ex.submit(run_one, (bin_, root, out_root, rel)) for rel in files]
+        futs = [ex.submit(run_one, (bin_, root, out_root, rel, surfaces)) for rel in files]
         for fut in as_completed(futs):
             for rec in fut.result():
                 jl.write(json.dumps(rec) + "\n")
@@ -100,7 +102,7 @@ def main():
             if done % 250 == 0:
                 jl.flush(); print(f"  {done}/{len(files)}", file=sys.stderr, flush=True)
     jl.close()
-    print(f"swept {len(files)} files x {len(SURFACES)} surfaces -> {outdir}", file=sys.stderr)
+    print(f"swept {len(files)} files x {len(surfaces)} surfaces -> {outdir}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
