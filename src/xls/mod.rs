@@ -9,6 +9,7 @@
 //! println!("{}", doc.plain_text());
 //! ```
 
+mod biff_old;
 mod cell;
 mod codepage;
 pub mod comment;

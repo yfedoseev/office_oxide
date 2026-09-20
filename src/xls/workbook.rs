@@ -63,11 +63,14 @@ pub struct DefinedName {
     pub hidden: bool,
 }
 
-#[cfg(test)]
 impl XlsDocument {
-    /// Build a document from sheets alone, so conversion can be exercised on
-    /// a grid shape without a BIFF fixture to encode it in.
-    pub(crate) fn from_sheets(sheets: Vec<Sheet>) -> Self {
+    /// A workbook of exactly one sheet and nothing else — what a BIFF2–4
+    /// file is.
+    pub(super) fn from_one_sheet(sheet: Sheet) -> Self {
+        Self::from_sheets_inner(vec![sheet])
+    }
+
+    fn from_sheets_inner(sheets: Vec<Sheet>) -> Self {
         Self {
             sheets,
             defined_names: Vec::new(),
@@ -78,6 +81,13 @@ impl XlsDocument {
             summary_properties: None,
             chart_text: Vec::new(),
         }
+    }
+
+    /// Build a document from sheets alone, so conversion can be exercised on
+    /// a grid shape without a BIFF fixture to encode it in.
+    #[cfg(test)]
+    pub(crate) fn from_sheets(sheets: Vec<Sheet>) -> Self {
+        Self::from_sheets_inner(sheets)
     }
 }
 
@@ -145,19 +155,12 @@ impl XlsDocument {
     pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
         // A pre-OLE2 Excel file (BIFF2/3/4 — Excel 2.x through 4.x) has no
         // compound-file container at all: it is a raw record stream that
-        // starts with its own `BOF`. `CfbReader` rejects it with "bad magic
-        // signature", which is indistinguishable from a corrupt or
-        // unrelated file. Name the format instead, mirroring the Word
-        // 6.0/95 case in `doc::fib`.
+        // starts with its own `BOF`, holding one worksheet. It used to be
+        // refused by name; it is read now.
         if let Some(biff) = detect_raw_biff(&mut reader)? {
-            return Err(XlsError::UnsupportedVersion(format!(
-                "BIFF{biff} (pre-OLE2 Excel {}); only BIFF8 (Excel 97 and later) is supported",
-                match biff {
-                    2 => "2.x",
-                    3 => "3.0",
-                    _ => "4.0",
-                }
-            )));
+            let mut data = Vec::new();
+            reader.take(MAX_RAW_BIFF_BYTES).read_to_end(&mut data)?;
+            return super::biff_old::parse(&data, biff);
         }
 
         let mut cfb = CfbReader::new(reader)?;
@@ -777,6 +780,10 @@ enum Phase {
 /// `SID` names the generation — `0x0009` (BIFF2), `0x0209` (BIFF3),
 /// `0x0409` (BIFF4) — followed by that record's own small length, which is
 /// what distinguishes it from arbitrary bytes that happen to collide.
+/// A BIFF2–4 file is one worksheet of 16,384 rows at most; 64 MB is far
+/// beyond anything Excel 4.0 could write, and bounds the read.
+const MAX_RAW_BIFF_BYTES: u64 = 64 << 20;
+
 fn detect_raw_biff<R: Read + Seek>(reader: &mut R) -> Result<Option<u8>> {
     let start = reader.stream_position()?;
     let mut head = [0u8; 4];
@@ -1158,7 +1165,7 @@ impl Sheet {
     }
 }
 
-fn build_grid(cells: &mut [Cell]) -> (Vec<Vec<CellValue>>, Vec<Vec<u16>>) {
+pub(super) fn build_grid(cells: &mut [Cell]) -> (Vec<Vec<CellValue>>, Vec<Vec<u16>>) {
     // Jagged, like every other spreadsheet
     // reader's storage (POI keeps a sparse map of rows, each holding cells
     // up to its last used column): a row is only as long as its last
@@ -2022,28 +2029,35 @@ mod tests {
         assert_eq!(ir.sections[1].title.as_deref(), Some("B"));
     }
 
-    /// A raw BIFF2/3/4 stream has no CFB container, so the CFB layer used
-    /// to reject it with "bad magic signature" — indistinguishable from a
-    /// corrupt or unrelated file. Name the format instead.
+    /// A raw BIFF2/3/4 stream has no CFB container. It used to be refused
+    /// by name (and before that, rejected by the CFB layer with "bad magic
+    /// signature"); its one worksheet is read now, through `from_reader`
+    /// like any other `.xls`.
     #[test]
-    fn test_raw_biff2_4_reports_the_unsupported_legacy_format() {
-        for (sid, label) in [(0x0009u16, "BIFF2"), (0x0209, "BIFF3"), (0x0409, "BIFF4")] {
+    fn test_raw_biff2_4_streams_open_as_a_one_sheet_workbook() {
+        for (sid, biff) in [(0x0009u16, 2u8), (0x0209, 3), (0x0409, 4)] {
             let mut stream = Vec::new();
             stream.extend_from_slice(&sid.to_le_bytes());
             stream.extend_from_slice(&6u16.to_le_bytes()); // BOF body length
             stream.extend_from_slice(&[0x00, 0x04, 0x10, 0x00, 0x00, 0x00]);
+            // One label cell in the version's own layout.
+            if biff == 2 {
+                let mut l = vec![0, 0, 0, 0, 0, 0, 0, 2];
+                l.extend_from_slice(b"hi");
+                stream.extend(biff_rec(0x0004, &l));
+            } else {
+                let mut l = vec![0, 0, 0, 0, 0, 0];
+                l.extend_from_slice(&2u16.to_le_bytes());
+                l.extend_from_slice(b"hi");
+                stream.extend(biff_rec(0x0204, &l));
+            }
             stream.extend_from_slice(&RT_EOF.to_le_bytes());
             stream.extend_from_slice(&0u16.to_le_bytes());
 
-            let err = XlsDocument::from_reader(std::io::Cursor::new(stream))
-                .expect_err("a pre-OLE2 file cannot be read");
-            let msg = err.to_string();
-            assert!(
-                matches!(err, XlsError::UnsupportedVersion(_)),
-                "expected UnsupportedVersion for {label}, got: {msg}"
-            );
-            assert!(msg.contains(label), "error must name {label}: {msg}");
-            assert!(!msg.contains("magic"), "the CFB-layer message must not leak: {msg}");
+            let doc = XlsDocument::from_reader(std::io::Cursor::new(stream))
+                .unwrap_or_else(|e| panic!("BIFF{biff}: {e}"));
+            assert_eq!(doc.sheets.len(), 1, "BIFF{biff}");
+            assert_eq!(doc.sheets[0].display_text(0, 0).as_deref(), Some("hi"), "BIFF{biff}");
         }
     }
 
