@@ -9,17 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.12] - 2026-09-21
 
-> Read-path fidelity across all six formats, and the first real fidelity work on the legacy binaries. 130 issues closed.
+> Read-path fidelity across all six formats, and the first real fidelity work on the legacy binaries. 141 issues closed, every dependency at its latest release, and a corpus verification that compares against independent readers, not just the previous version.
 >
 > The legacy `.doc`/`.xls`/`.ppt` readers went from "extracts the text" to structured: per-note footnotes, endnotes, comments and headers/footers in `.doc`; character and paragraph formatting from CHPX/PAPX; list identity via `PlfLst`/`PlfLfo`; `.ppt` direct formatting, master inheritance, hyperlinks, hidden slides, OLE objects and grid-of-shapes tables; `.xls` comments, hyperlinks, data validation, chart text and the 1904 date system. On the OOXML side the recurring shape was *parsed-then-discarded*: the parser had it, a converter or one of the four renderers dropped it — rich-text runs, merged cells, defined names, formula text, speaker-note formatting, OMML equations, SmartArt, embedded charts, shape click actions.
 >
-> Verified against **10,583 real Office documents** arm-to-arm with v0.1.11 — **0 regressions**, 3 hangs and 8 timeouts in the baseline gone, zero panics.
+> Verified against **10,599 real Office documents** — arm-to-arm with v0.1.11 (5 crashes and 5 timeouts in the baseline, **0** here) and against ten independent readers, which is how the largest content-loss defect in the crate's history (80 `.xls` files at 2–58 % of every reference) was found and fixed *before* this shipped.
 
 ### Verified
 
-Full-corpus sweep of `~/projects/office_oxide_tests/` (10,583 files, all six formats plus their macro/template variants) with the new `examples/corpus_validate` harness — every file through `open → to_ir → plain_text → to_markdown → to_html` and, for OOXML, the write round trip `to_ir → create_from_ir_to_writer → re-open` — compared step-for-step against the same sweep at `v0.1.11`.
+Two passes over `~/projects/office_oxide_tests/` — **10,599 real Office documents**, all six formats plus their macro/template/strict/encrypted variants, 38 sources.
 
-**Zero regressions.** Every "worse" transition traces to one of two confirmed-good changes: 7 password-protected `.pptx` files that at v0.1.11 "succeeded" in under 1 ms with empty output now report an honest "decryption is not supported" error ([#296](https://github.com/yfedoseev/office_oxide/issues/296), [#320](https://github.com/yfedoseev/office_oxide/issues/320)); ~146 macro-enabled `.docm`/`.dotm` files that failed to open at all now open ([#282](https://github.com/yfedoseev/office_oxide/issues/282)). v0.1.11 additionally hit 3 confirmed hangs on this corpus (a multi-minute infinite loop, a 9 GB+ RSS blow-up, an indefinite round-trip-write hang) and 8 borderline-slow files that tripped the rescue timeout; the current build has **zero panics and zero timeouts** across the same files.
+**Pass 1 — release regression sweep, after every dependency was bumped.** v0.1.11 and this branch, each over every file on four surfaces (`text`, `markdown`, `html`, `ir`) — 42,396 observations per arm, compared on status, on word multisets with split/join awareness (a `\w+` tokenizer misreads restored entities as loss), and on timing, using `scripts/regression-sweep/sweep_tree.py` + `compare_tree.py`.
+
+| | v0.1.11 | 0.1.12 |
+|---|---|---|
+| `ok` observations | 40,202 | **40,716** |
+| crashes (SIGKILL/abort) | 5 | **0** |
+| timeouts (120 s) | 5 | **0** |
+| `err` | 2,184 | 1,680 |
+
+Every `ok → err` (20 files) replaced a 0-byte "success": 7 encrypted `.pptx` now say so ([#296](https://github.com/yfedoseev/office_oxide/issues/296), [#320](https://github.com/yfedoseev/office_oxide/issues/320)), 12 `.ppt` files with no readable PowerPoint stream (PowerPoint 4.0/95-only files and fuzzer artefacts) now say so ([#351](https://github.com/yfedoseev/office_oxide/issues/351)), and POI's own duplicate-entry `.xlsx` is refused rather than silently resolved to one copy. Every `err → ok` (146 files) is a macro-enabled or template extension that used to be rejected ([#282](https://github.com/yfedoseev/office_oxide/issues/282)). The sweep's first run was *not* clean — it found the `ir` memory regression ([#349](https://github.com/yfedoseev/office_oxide/issues/349)), the TOC-entries regression ([#350](https://github.com/yfedoseev/office_oxide/issues/350)) and two smaller ones ([#355](https://github.com/yfedoseev/office_oxide/issues/355), [#356](https://github.com/yfedoseev/office_oxide/issues/356)) that this release had introduced, all fixed before this section was written.
+
+**Pass 2 — quorum check against independent readers.** The same corpus through Apache Tika 3.3.2 (POI), python-docx 1.2.0, pandoc, openpyxl 3.1.5, python-calamine, xlrd 2.0.2, catdoc, antiword, xls2csv and catppt (`scripts/regression-sweep/refpanel.py` + `quorum.py`). A file is flagged when at least two references agree with each other while office_oxide recovers under 70 % of their words. This is the pass a two-arm diff cannot do, and it found the defects present in v0.1.11 too: **80 `.xls` files at 2–58 % of every reference** — one shared-string parsing bug ([#353](https://github.com/yfedoseev/office_oxide/issues/353)) — plus [#352](https://github.com/yfedoseev/office_oxide/issues/352), [#357](https://github.com/yfedoseev/office_oxide/issues/357), [#358](https://github.com/yfedoseev/office_oxide/issues/358). Flagged files went from 149 to 64; the `.xls` odd-one-out count from 80 to **0**. What remains flagged is explained and deliberate: Word 6.0/95 `.doc` rejected with a clear error (23), hidden text (`w:vanish`, including style-inherited) and tracked deletions the reference tools show and Word does not, `.xlsx` sheet names ([#359](https://github.com/yfedoseev/office_oxide/issues/359)), and fuzzer artefacts.
+
+Plus: 986 library tests + the workspace suites green (`--all-features`), clippy `-D warnings` clean, rustdoc `-D warnings` clean, `cargo fmt --check` clean, `cargo audit` and `cargo deny` clean, C# (xUnit runner 4.0) and Node (koffi 3.3.1) suites green, and the `house-rules` gate green.
 
 ### Added
 
