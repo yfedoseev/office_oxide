@@ -434,12 +434,15 @@ pub(crate) fn sanitize_text_with_hyperlinks_and_chp(
 
 /// Shared implementation for `sanitize_text`/`sanitize_text_with_hyperlinks_and_chp`.
 ///
-/// A `depth` counter tracks field nesting (a field's instruction can itself
-/// contain another field, e.g. `{ IF {PAGE} > 1 "yes" "no" }`) so an inner
-/// field's own `0x14`/`0x15` never gets mistaken for the outer field's.
-/// Only the OUTERMOST field's own separator/end are meaningful here: its
-/// instruction text (which may itself contain nested fields) is dropped in
-/// full, and its cached result becomes visible text.
+/// Fields nest, and where they nest decides what is visible. A field inside
+/// another field's *instruction* (`{ IF {PAGE} > 1 "yes" "no" }`) is hidden
+/// with the rest of that instruction. A field inside another field's
+/// *result* — every entry of a `{ TOC }` is its own `{ HYPERLINK }` field,
+/// and Word displays each entry's cached text — is visible exactly as a
+/// top-level field would be. So each open field is tracked on a stack, and
+/// a character is visible when every field on the stack is past its own
+/// `0x14`. Collapsing that to a single depth counter hid every TOC entry,
+/// leaving a table of contents as a run of blank lines.
 /// Before pushing the char at `idx` onto `out`, close the currently open
 /// CHP run if its props differ from this char's (or none is open yet) and
 /// open a new one starting at `out.len()` — the same "compare to current,
@@ -477,53 +480,64 @@ fn strip_fields(
     // its props). Only touched when `char_props` is `Some`.
     let mut open_run: Option<(usize, super::sprm::ChpProps)> = None;
 
-    let mut depth: u32 = 0;
-    let mut in_result = false; // past the outermost field's own 0x14
-    let mut instruction = String::new(); // outermost field's instruction text
-    let mut result_start: usize = 0; // byte offset in `out` where the result began
+    /// One open field: whether its `0x14` has been seen, its instruction
+    /// text so far, and the byte offset in `out` where its result began.
+    struct OpenField {
+        in_result: bool,
+        instruction: String,
+        result_start: usize,
+    }
+    let mut stack: Vec<OpenField> = Vec::new();
+    // Visible iff no field is open, or every open field is in its result.
+    let visible = |stack: &[OpenField]| stack.iter().all(|f| f.in_result);
 
     for (idx, ch) in text.chars().enumerate() {
         match ch {
-            '\x13' => {
-                depth += 1;
-                if depth == 1 {
-                    instruction.clear();
-                }
-            },
-            // A stray separator (depth == 0) or a nested field's own
-            // separator (depth > 1) is never a boundary that matters here
-            // — dropped either way, same as every other field control char.
+            '\x13' => stack.push(OpenField {
+                in_result: false,
+                instruction: String::new(),
+                result_start: 0,
+            }),
+            // A stray separator (no field open) or a second separator in
+            // the same field is never a boundary that matters here —
+            // dropped either way, same as every other field control char.
             '\x14' => {
-                if depth == 1 {
-                    in_result = true;
-                    result_start = out.len();
+                if let Some(top) = stack.last_mut() {
+                    if !top.in_result {
+                        top.in_result = true;
+                        top.result_start = out.len();
+                    }
                 }
             },
             '\x15' => {
-                if depth >= 1 {
-                    if depth == 1 {
-                        if in_result {
-                            if let Some(url) = parse_hyperlink_url(&instruction) {
-                                hyperlinks.push(HyperlinkSpan {
-                                    range: result_start..out.len(),
-                                    url,
-                                });
-                            }
+                if let Some(field) = stack.pop() {
+                    // Its result reached `out` only if every enclosing field
+                    // was in its result too — otherwise `result_start` is an
+                    // offset into text that was never emitted.
+                    if field.in_result && visible(&stack) {
+                        if let Some(url) = parse_hyperlink_url(&field.instruction) {
+                            hyperlinks.push(HyperlinkSpan {
+                                range: field.result_start..out.len(),
+                                url,
+                            });
                         }
-                        in_result = false;
                     }
-                    depth -= 1;
                 }
             },
             '\x01' | '\x08' => {}, // Picture placeholder, historic field-mark — always skip
             _ => {
-                if depth == 0 || (depth == 1 && in_result) {
+                if visible(&stack) {
                     track_chp_run(char_props, idx, &out, &mut chp_spans, &mut open_run);
-                    push_mapped(ch, &mut out); // depth == 0: plain text; depth == 1 && in_result: outermost cached result
-                } else if depth == 1 && !in_result {
-                    instruction.push(ch); // outermost instruction text
+                    push_mapped(ch, &mut out);
+                } else if let Some(top) = stack.last_mut() {
+                    if !top.in_result {
+                        // The innermost field's own instruction text. Only
+                        // consulted (for `HYPERLINK`) when this field's
+                        // result turns out to be visible.
+                        top.instruction.push(ch);
+                    }
+                    // Otherwise: a hidden field's result — never visible.
                 }
-                // depth > 1: nested field's own instruction/result — never visible.
             },
         }
     }
@@ -838,6 +852,41 @@ mod tests {
         let raw = "\x13 IF \x13 PAGE \x141\x15 > 1 \"yes\" \"no\" \x14no\x15";
         let text = sanitize_text(raw);
         assert_eq!(text, "no");
+    }
+
+    /// Regression: a field nested inside another field's *result* is
+    /// visible. Every entry of a `{ TOC }` is its own `{ HYPERLINK \l
+    /// "_Toc…" }` field, and Word displays each entry's cached text. A
+    /// depth counter that hid everything below the outermost field turned
+    /// a whole table of contents into blank lines — 251 words down to 23
+    /// on one real document. The nested `HYPERLINK`s must also still yield
+    /// their spans, over exactly the text that reached the output.
+    #[test]
+    fn test_field_nested_in_a_result_is_visible_and_keeps_its_hyperlink() {
+        let raw = "\x13 TOC \\o \"1-3\" \\h \x14\
+                   \x13 HYPERLINK \\l \"_Toc1\" \x141 Intro\t5\x15\r\
+                   \x13 HYPERLINK \\l \"_Toc2\" \x142 Method\t9\x15\r\
+                   \x15after";
+        let char_props = vec![super::super::sprm::ChpProps::default(); raw.chars().count()];
+        let (text, links, _spans) = sanitize_text_with_hyperlinks_and_chp(raw, &char_props);
+        assert_eq!(text, "1 Intro\t5\n2 Method\t9\nafter");
+        assert_eq!(links.len(), 2, "each nested HYPERLINK yields its own span: {links:?}");
+        assert_eq!(links[0].url, "#_Toc1");
+        assert_eq!(&text[links[0].range.clone()], "1 Intro\t5");
+        assert_eq!(links[1].url, "#_Toc2");
+        assert_eq!(&text[links[1].range.clone()], "2 Method\t9");
+    }
+
+    /// The instruction-nested case again, but with a `HYPERLINK` as the
+    /// hidden inner field: its result never reached the output, so it must
+    /// not yield a span pointing at text that is not there.
+    #[test]
+    fn test_hyperlink_nested_in_an_instruction_yields_no_span() {
+        let raw = "\x13 IF \x13 HYPERLINK \"http://x/\" \x14x\x15 = 1 \"yes\" \"no\" \x14no\x15";
+        let char_props = vec![super::super::sprm::ChpProps::default(); raw.chars().count()];
+        let (text, links, _spans) = sanitize_text_with_hyperlinks_and_chp(raw, &char_props);
+        assert_eq!(text, "no");
+        assert!(links.is_empty(), "{links:?}");
     }
 
     #[test]
