@@ -85,7 +85,13 @@ pub struct Sheet {
     /// `FORMAT` and `XF` were never parsed, so `38971` came out as `38971`
     /// rather than `2006-09-05`. `rows` still carries the raw values.
     pub display: Vec<Vec<String>>,
-    /// Cell values, indexed as `rows[row][col]`.
+    /// Cell values by row, then column.
+    ///
+    /// Jagged: each row holds cells only up to its last non-empty one, and
+    /// rows past the last non-empty row are absent, so index with `.get()`
+    /// rather than `rows[r][c]` (a missing position is an empty cell).
+    /// Padding the grid to the sheet's declared extent cost hundreds of
+    /// megabytes for a sheet with a few far-apart cells.
     pub rows: Vec<Vec<CellValue>>,
     /// Whether `BOUNDSHEET` marked this sheet hidden or very hidden.
     ///
@@ -1129,78 +1135,37 @@ fn build_display(
 }
 
 fn build_grid(cells: &mut [Cell]) -> Vec<Vec<CellValue>> {
-    if cells.is_empty() {
-        return Vec::new();
-    }
-
-    let max_row = cells.iter().map(|c| c.row).max().unwrap_or(0) as usize;
-    let max_col = cells.iter().map(|c| c.col).max().unwrap_or(0) as usize;
-
-    // Cap to prevent OOM on pathological files. If the grid would exceed 4M cells, use
-    // a compact representation: only allocate rows that have data.
-    let max_row = max_row.min(65535);
-    let max_col = max_col.min(255);
-    let grid_size = (max_row + 1) * (max_col + 1);
-
-    if grid_size > 4_000_000 {
-        // Sparse: only create rows with actual data.
-        return build_grid_sparse(cells, max_col);
-    }
-
-    let mut grid = vec![vec![CellValue::Empty; max_col + 1]; max_row + 1];
-    for cell in cells.iter_mut() {
-        let r = cell.row as usize;
-        let c = cell.col as usize;
-        if r <= max_row && c <= max_col {
-            grid[r][c] = std::mem::take(&mut cell.value);
-        }
-    }
-
-    // Trim trailing empty rows.
-    while grid
-        .last()
-        .is_some_and(|row| row.iter().all(|c| matches!(c, CellValue::Empty)))
-    {
-        grid.pop();
-    }
-
-    grid
-}
-
-/// Sparse grid builder for large/sparse sheets.
-fn build_grid_sparse(cells: &mut [Cell], max_col: usize) -> Vec<Vec<CellValue>> {
-    // Sort cells by row, then column.
-    cells.sort_unstable_by(|a, b| a.row.cmp(&b.row).then(a.col.cmp(&b.col)));
-
+    // Jagged, like `build_display` and like every other spreadsheet
+    // reader's storage (POI keeps a sparse map of rows, each holding cells
+    // up to its last used column): a row is only as long as its last
+    // non-empty cell, and trailing empty rows are dropped. The grid used to
+    // be padded to the sheet's declared extent, so a 42 KB file with four
+    // corner cells in a 65,536 x 256 sheet held 16.7M `CellValue`s — 392 MB
+    // — before a single byte of text was extracted.
     let mut grid: Vec<Vec<CellValue>> = Vec::new();
-    let mut current_row = u16::MAX;
-
     for cell in cells.iter_mut() {
-        let r = cell.row as usize;
-        let c = cell.col as usize;
-        if c > max_col {
+        let (r, c) = (cell.row as usize, cell.col as usize);
+        if r > 65535 || c > 255 || matches!(cell.value, CellValue::Empty) {
             continue;
         }
-
-        // Fill missing rows.
-        while grid.len() <= r {
-            grid.push(vec![CellValue::Empty; max_col + 1]);
+        if grid.len() <= r {
+            grid.resize_with(r + 1, Vec::new);
         }
-
-        if cell.row != current_row {
-            current_row = cell.row;
+        let row = &mut grid[r];
+        if row.len() <= c {
+            row.resize(c + 1, CellValue::Empty);
         }
-        grid[r][c] = std::mem::take(&mut cell.value);
+        row[c] = std::mem::take(&mut cell.value);
     }
-
-    // Trim trailing empty rows.
-    while grid
-        .last()
-        .is_some_and(|row| row.iter().all(|c| matches!(c, CellValue::Empty)))
-    {
+    for row in &mut grid {
+        while row.last().is_some_and(|v| matches!(v, CellValue::Empty)) {
+            row.pop();
+        }
+        row.shrink_to_fit();
+    }
+    while grid.last().is_some_and(|row| row.is_empty()) {
         grid.pop();
     }
-
     grid
 }
 
@@ -1711,8 +1676,33 @@ mod tests {
         assert_eq!(grid[0].len(), 2);
         assert_eq!(grid[0][0], CellValue::String("A1".into()));
         assert_eq!(grid[0][1], CellValue::Number(42.0));
-        assert_eq!(grid[1][0], CellValue::String("A2".into()));
-        assert_eq!(grid[1][1], CellValue::Empty);
+        assert_eq!(grid[1], vec![CellValue::String("A2".into())], "rows are jagged");
+    }
+
+    /// Regression: the grid was padded to the declared extent, so four
+    /// corner cells in a 65,536 x 256 sheet allocated 16.7M values. Memory
+    /// must follow the cells, not the extent.
+    #[test]
+    fn test_build_grid_is_jagged_not_padded_to_the_extent() {
+        let mk = |row: u16, col: u16, t: &str| Cell {
+            xf_index: 0,
+            row,
+            col,
+            value: CellValue::String(t.into()),
+        };
+        let mut cells = vec![
+            mk(0, 0, "TL"),
+            mk(0, 255, "TR"),
+            mk(65535, 0, "BL"),
+            mk(65535, 255, "BR"),
+        ];
+        let grid = build_grid(&mut cells);
+        assert_eq!(grid.len(), 65536);
+        assert_eq!(grid[0].len(), 256);
+        assert_eq!(grid[65535].len(), 256);
+        let padding: usize = grid[1..65535].iter().map(|r| r.capacity()).sum();
+        assert_eq!(padding, 0, "interior empty rows must hold nothing");
+        assert_eq!(grid[65535][255], CellValue::String("BR".into()));
     }
 
     #[test]

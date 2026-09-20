@@ -652,7 +652,7 @@ fn test_empty_workbook() {
 
     assert_eq!(doc.worksheets.len(), 1);
     assert!(doc.worksheets[0].rows.is_empty());
-    assert_eq!(doc.plain_text(), "");
+    assert_eq!(doc.plain_text(), "Empty", "an empty sheet is still named, as for .xls");
 }
 
 // ---------------------------------------------------------------------------
@@ -801,7 +801,7 @@ fn test_missing_optional_parts() {
 
     assert!(doc.styles.is_none());
     assert_eq!(doc.shared_strings.strings.len(), 0);
-    assert_eq!(doc.plain_text(), "Inline only\t42");
+    assert_eq!(doc.plain_text(), "Minimal\nInline only\t42");
 }
 
 // ---------------------------------------------------------------------------

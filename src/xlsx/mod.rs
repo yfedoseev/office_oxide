@@ -1571,7 +1571,7 @@ mod tests {
         let doc = open_bytes(single_sheet_xlsx(sheet_xml, &[]));
         assert_eq!(
             doc.plain_text().trim(),
-            "=1+2",
+            "Sheet1\n=1+2",
             "XlsxDocument::plain_text() must fall back to the formula, not blank"
         );
         assert!(
@@ -1684,7 +1684,7 @@ mod tests {
         assert_eq!(doc.workbook.sheets.len(), 1, "the one declared sheet must survive");
         assert_eq!(doc.workbook.sheets[0].name, "Utf16");
         assert_eq!(doc.worksheets.len(), 1);
-        assert_eq!(doc.plain_text(), "1");
+        assert_eq!(doc.plain_text(), "Utf16\n1");
     }
 
     /// XLSX half of the date-overflow hang — a huge number under a style whose `<numFmt>`

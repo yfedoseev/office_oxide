@@ -833,24 +833,31 @@ mod tests {
     /// cap would leak and eventually deadlock every later parse.
     #[test]
     fn test_parse_slot_released_after_panic() {
-        // `PARSE_THREADS` is a process-wide live gauge shared with every
-        // other test in this binary, and `cargo test` runs tests
-        // concurrently by default — a single before/after snapshot is
-        // racy against unrelated tests bumping the same counter between
-        // the two reads. Repeat the panicking call several times instead:
-        // a genuine per-call leak would ratchet the gauge up by roughly
-        // that many slots, which is far outside what ordinary concurrent
-        // test-suite noise could plausibly explain.
-        const ITERATIONS: usize = 20;
-        let before = *PARSE_THREADS.lock().unwrap_or_else(|e| e.into_inner());
-        for _ in 0..ITERATIONS {
-            let r: Result<()> = with_parse_stack(|| panic!("boom"));
-            assert!(matches!(r, Err(OfficeError::Panic(_))), "panic should surface as itself");
+        // `PARSE_THREADS` is a process-wide gauge shared with every other
+        // test in this binary, and it never exceeds `max_parse_threads()`,
+        // so sampling it before and after is noise, not evidence: the old
+        // `after < before + 20` assertion failed whenever the rest of the
+        // suite happened to hold twenty slots at once. The deterministic
+        // property is what a leak would *do*: once leaked slots reach the
+        // cap, the next acquire waits forever. So make more calls than the
+        // cap, on a helper thread, and fail if it does not come back.
+        let calls = max_parse_threads() + 8;
+        let worker = std::thread::spawn(move || {
+            for _ in 0..calls {
+                let r: Result<()> = with_parse_stack(|| panic!("boom"));
+                assert!(matches!(r, Err(OfficeError::Panic(_))), "panic should surface as itself");
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !worker.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a panicking parse leaked its slot: {calls} calls did not complete \
+                 (the cap is {})",
+                max_parse_threads()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let after = *PARSE_THREADS.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(
-            after < before + ITERATIONS,
-            "slot leaked across {ITERATIONS} panicking calls: {before} -> {after}"
-        );
+        worker.join().expect("worker panicked");
     }
 }

@@ -278,10 +278,13 @@ pub struct BorderLine {
     /// Border line style.
     pub style: BorderStyle,
     /// Border colour (RGB), if specified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<[u8; 3]>,
     /// Line width in eighths of a point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u32>,
     /// Spacing between border and content in points.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space: Option<u32>,
 }
 
@@ -289,16 +292,22 @@ pub struct BorderLine {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TableBorder {
     /// Top border of the table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top: Option<BorderLine>,
     /// Bottom border of the table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bottom: Option<BorderLine>,
     /// Left border of the table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub left: Option<BorderLine>,
     /// Right border of the table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub right: Option<BorderLine>,
     /// Horizontal interior borders between rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inside_h: Option<BorderLine>,
     /// Vertical interior borders between columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inside_v: Option<BorderLine>,
 }
 
@@ -318,6 +327,7 @@ pub struct PageSetup {
     /// Right margin in twips.
     pub margin_right_twips: u32,
     /// Whether the page is in landscape orientation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub landscape: bool,
     /// Distance from top edge to header in twips (default 720 = 0.5").
     pub header_distance_twips: u32,
@@ -347,8 +357,10 @@ pub struct ColumnLayout {
     /// Number of columns.
     pub count: u32,
     /// Space between columns in twips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_twips: Option<u32>,
     /// Whether a vertical separator line is drawn between columns.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub separator: bool,
     /// Per-column widths in twips (overrides uniform spacing when non-empty).
     #[serde(default)]
@@ -359,14 +371,19 @@ pub struct ColumnLayout {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ParagraphBorder {
     /// Top border of the paragraph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top: Option<BorderLine>,
     /// Bottom border of the paragraph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bottom: Option<BorderLine>,
     /// Left border of the paragraph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub left: Option<BorderLine>,
     /// Right border of the paragraph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub right: Option<BorderLine>,
     /// Border drawn between consecutive bordered paragraphs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub between: Option<BorderLine>,
 }
 
@@ -374,12 +391,16 @@ pub struct ParagraphBorder {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CellPadding {
     /// Top cell padding in twips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_twips: Option<u32>,
     /// Bottom cell padding in twips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bottom_twips: Option<u32>,
     /// Left cell padding in twips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub left_twips: Option<u32>,
     /// Right cell padding in twips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub right_twips: Option<u32>,
 }
 
@@ -401,7 +422,7 @@ pub struct FloatingImage {
     /// Text wrap mode around the image.
     pub text_wrap: TextWrap,
     /// Whether the image may overlap other floating objects.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_overlap: bool,
 }
 
@@ -418,12 +439,16 @@ pub struct TextBox {
     /// Block elements inside the text box.
     pub content: Vec<Element>,
     /// Width of the text box in EMUs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub width_emu: Option<u64>,
     /// Height of the text box in EMUs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height_emu: Option<u64>,
     /// Horizontal position in EMUs from the anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub x_emu: Option<i64>,
     /// Vertical position in EMUs from the anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub y_emu: Option<i64>,
     /// Horizontal anchor reference frame.
     #[serde(default)]
@@ -444,11 +469,13 @@ pub struct Note {
     /// Block elements comprising the note body.
     pub content: Vec<Element>,
     /// Optional custom marker text (when absent the auto-number is used).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marker: Option<String>,
     /// Comment author, when the source format records one. Distinct from
     /// `marker` — some converters also fold the author into `marker` for
     /// backward-compatible display text, but this field is the structured
     /// value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
 }
 
@@ -458,6 +485,7 @@ pub struct FootnoteRef {
     /// Numeric identifier of the referenced note.
     pub note_id: u32,
     /// Optional custom marker text (when absent the auto-number is used).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marker: Option<String>,
 }
 
@@ -474,6 +502,7 @@ pub struct CodeBlock {
     /// syntax-highlighting hint. HTML and Markdown *do* preserve it (via
     /// `<pre><code class="language-…">` and the fence's language token,
     /// respectively) — this limitation is DOCX-specific.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
     /// The preformatted code text.
     pub content: String,
@@ -510,7 +539,7 @@ pub struct DefinedName {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_sheet_id: Option<u32>,
     /// Whether this name is hidden in the Name Manager UI.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
 }
 
@@ -520,26 +549,32 @@ pub struct Metadata {
     /// The source format this document was parsed from.
     pub format: DocumentFormat,
     /// Optional document title from core properties.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// Document author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
     /// Document subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     /// Keywords / tags.
     #[serde(default)]
     pub keywords: Vec<String>,
     /// Creation date (ISO-8601 string).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created: Option<String>,
     /// Last-modified date (ISO-8601 string).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified: Option<String>,
     /// Document description / comments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// `true` when the source document carries a macro/VBA project — an
     /// OOXML part reached via a `vbaProject` relationship, or a legacy
     /// CFB file's top-level `_VBA_PROJECT` storage. A cheap presence-only
     /// signal for content-safety use cases; office_oxide never
     /// interprets or executes the macro content itself.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub has_macros: bool,
     /// `true` when parsing hit a known, detectable cause of missing
     /// content this crate could not safely recover, and no other signal
@@ -549,7 +584,7 @@ pub struct Metadata {
     /// dropping trailing sheets or the whole workbook).
     /// `false` (the default) means either the format has no such
     /// self-check, or the check passed.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub text_truncated: bool,
 }
 
@@ -576,6 +611,7 @@ pub struct ConditionalFormat {
     /// `"greaterThan"`, `"between"`). `None` for rule types with no
     /// operator (colour scales, data bars, icon sets, most `top10`/text
     /// rules).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator: Option<String>,
     /// Formula(s) driving the rule: the comparison value(s) for a
     /// `cellIs` rule, or the boolean expression for an `expression` rule.
@@ -611,16 +647,20 @@ pub struct DataValidation {
     /// The comparison operator, when the type uses one (e.g.
     /// `"between"`, `"greaterThan"`). `None` for types with no operator
     /// (`"list"`, `"custom"`, `"none"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator: Option<String>,
     /// The first comparison value / formula / explicit list source (e.g.
     /// `"Yes,No,Maybe"` for an inline list, or a cell reference/formula).
     /// `None` for XLS (see the type's own doc); populated for XLSX.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub formula1: Option<String>,
     /// The second comparison value, used only by the `"between"`/
     /// `"notBetween"` operators. `None` otherwise, and always `None` for
     /// XLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub formula2: Option<String>,
     /// Whether an empty cell is considered valid (`allowBlank`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_blank: bool,
 }
 
@@ -628,27 +668,36 @@ pub struct DataValidation {
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Section {
     /// Optional section title (e.g. slide title or worksheet name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// Content elements within this section.
     pub elements: Vec<Element>,
     /// Page geometry for this section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_setup: Option<PageSetup>,
     /// Multi-column layout, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub columns: Option<ColumnLayout>,
     /// How this section break was introduced.
     #[serde(default)]
     pub break_type: SectionBreakType,
     /// Default header for this section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header: Option<HeaderFooter>,
     /// Default footer for this section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub footer: Option<HeaderFooter>,
     /// Header used on the first page of this section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_page_header: Option<HeaderFooter>,
     /// Footer used on the first page of this section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_page_footer: Option<HeaderFooter>,
     /// Header used on even-numbered pages of this section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub even_page_header: Option<HeaderFooter>,
     /// Footer used on even-numbered pages of this section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub even_page_footer: Option<HeaderFooter>,
     /// Speaker notes attached to this section (PPTX notes slides).
     ///
@@ -676,7 +725,7 @@ pub struct Section {
     /// workbook usually wants it) but a renderer can now tell that the
     /// author did not intend it to be seen, which extracting it silently
     /// made impossible.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
     /// Conditional formatting rules defined on this worksheet (XLSX/XLS
     /// only). Empty for every other format, and for a worksheet that
@@ -903,15 +952,15 @@ pub struct Heading {
     pub tabs: Vec<TabStop>,
     /// Keep this heading on the same page as the next paragraph (mirrors
     /// `Paragraph::keep_with_next`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_with_next: bool,
     /// Prevent a page break within this heading (mirrors
     /// `Paragraph::keep_together`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_together: bool,
     /// Force a page break before this heading (mirrors
     /// `Paragraph::page_break_before`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub page_break_before: bool,
 }
 
@@ -978,35 +1027,44 @@ pub struct Paragraph {
     /// Inline runs making up this paragraph.
     pub content: Vec<InlineContent>,
     /// Horizontal alignment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alignment: Option<ParagraphAlignment>,
     /// Left indent in twips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indent_left_twips: Option<i32>,
     /// Right indent in twips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indent_right_twips: Option<i32>,
     /// First-line indent in twips (negative = hanging).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_line_indent_twips: Option<i32>,
     /// Space before the paragraph in twips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_before_twips: Option<u32>,
     /// Space after the paragraph in twips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_after_twips: Option<u32>,
     /// Line spacing rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_spacing: Option<LineSpacing>,
     /// Background / shading colour (RGB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_color: Option<[u8; 3]>,
     /// Paragraph borders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub border: Option<ParagraphBorder>,
     /// Tab stops set by `sprmPChgTabs` (positions in twips). Empty when the
     /// paragraph carries no tab-stop SPRM.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tabs: Vec<TabStop>,
     /// Keep this paragraph on the same page as the next paragraph.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_with_next: bool,
     /// Prevent a page break within this paragraph.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_together: bool,
     /// Force a page break before this paragraph.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub page_break_before: bool,
     /// Outline level, using ECMA-376 §17.3.1.20's value space: `0` is
     /// Heading 1, `1` is Heading 2, … and `9` means *no* outline level (body
@@ -1014,6 +1072,7 @@ pub struct Paragraph {
     /// absent. This comment used to state the range backwards, so a caller
     /// following it set `Some(0)` for body text and Word read every
     /// paragraph in the document as a Heading 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outline_level: Option<u8>,
     /// Absolute frame position (from `<w:framePr>`). Present when the
     /// DOCX uses page-anchored frames for layout-preserving content
@@ -1110,32 +1169,43 @@ pub struct TextSpan {
     /// The text content.
     pub text: String,
     /// Whether the text is bold.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub bold: bool,
     /// Whether the text is italic.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub italic: bool,
     /// Whether the text has strikethrough.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub strikethrough: bool,
     /// Optional hyperlink URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hyperlink: Option<String>,
     /// Font size in half-points (e.g. 24 = 12 pt).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_size_half_pt: Option<u32>,
     /// Foreground colour (RGB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<[u8; 3]>,
     /// Underline style, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub underline: Option<UnderlineStyle>,
     /// Font family name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_name: Option<String>,
     /// Highlight / background colour (RGB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub highlight: Option<[u8; 3]>,
     /// Superscript / subscript alignment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vertical_align: Option<VerticalAlign>,
     /// Whether all characters are rendered as uppercase.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub all_caps: bool,
     /// Whether lowercase letters are rendered as smaller capitals.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub small_caps: bool,
     /// Character spacing in half-points (negative = condensed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub char_spacing_half_pt: Option<i32>,
 }
 
@@ -1158,16 +1228,22 @@ pub struct Table {
     #[serde(default)]
     pub column_widths_twips: Vec<u32>,
     /// Table-level borders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub border: Option<TableBorder>,
     /// Horizontal alignment of the table on the page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alignment: Option<TableAlignment>,
     /// Default cell padding in twips (applied to all cells).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cell_padding_twips: Option<u32>,
     /// Optional caption string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caption: Option<String>,
     /// Total table width in twips (`None` = auto).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub width_twips: Option<u32>,
     /// Left indent of the table from the margin in twips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indent_left_twips: Option<i32>,
 }
 
@@ -1177,14 +1253,16 @@ pub struct TableRow {
     /// Cells within this row.
     pub cells: Vec<TableCell>,
     /// Whether this row is a header row.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_header: bool,
     /// Row height in twips, if set explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height_twips: Option<u32>,
     /// Whether the row may break across pages.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "Clone::clone")]
     pub allow_break: bool,
     /// Whether this row is repeated as a header on subsequent pages.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub repeat_as_header: bool,
 }
 
@@ -1233,18 +1311,25 @@ pub struct TableCell {
     /// Number of rows this cell spans.
     pub row_span: u32,
     /// Cell background / shading colour (RGB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_color: Option<[u8; 3]>,
     /// Cell-level borders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub border: Option<TableBorder>,
     /// Vertical alignment within the cell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vertical_align: Option<CellVerticalAlign>,
     /// Horizontal alignment of text within the cell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_align: Option<ParagraphAlignment>,
     /// Cell width in twips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub width_twips: Option<u32>,
     /// Per-edge cell padding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub padding: Option<CellPadding>,
     /// Text direction within the cell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_direction: Option<TextDirection>,
     /// Spreadsheet cell semantic type (XLSX only; `None` for prose formats).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1276,12 +1361,15 @@ pub struct TableCell {
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct List {
     /// `true` = numbered list, `false` = bullet list.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ordered: bool,
     /// Items in the list.
     pub items: Vec<ListItem>,
     /// Starting number for ordered lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_number: Option<u32>,
     /// Marker / numbering style.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub style: Option<ListStyle>,
     /// Nesting depth (0 = top-level).
     #[serde(default)]
@@ -1294,6 +1382,7 @@ pub struct ListItem {
     /// Block-level content of this item (typically a single Paragraph).
     pub content: Vec<Element>,
     /// Optional nested sub-list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nested: Option<List>,
 }
 
@@ -1396,21 +1485,28 @@ impl ImageFormat {
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Image {
     /// Optional alt-text description of the image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alt_text: Option<String>,
     /// Raw image bytes, if extracted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Vec<u8>>,
     /// Pixel format of the image data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<ImageFormat>,
     /// Display width in EMUs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_width_emu: Option<u64>,
     /// Display height in EMUs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_height_emu: Option<u64>,
     /// Source image pixel width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pixel_width: Option<u32>,
     /// Source image pixel height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pixel_height: Option<u32>,
     /// Whether the image is purely decorative (no semantic content).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub decorative: bool,
     /// Inline vs. floating positioning.
     #[serde(default)]
@@ -1690,5 +1786,37 @@ mod tests {
         let nested = list.items[0].nested.as_ref().expect("A has a child");
         assert_eq!(nested.items.len(), 1);
         assert_eq!(list_item_text(&nested.items[0]), "A.1");
+    }
+}
+
+#[cfg(test)]
+mod serde_shape_tests {
+    use super::*;
+
+    /// The JSON form omits fields at their default — every `None` and
+    /// every `false` (`allow_break` at `true`). A 14 MB `.xls` serialised
+    /// to 909 MB pretty-printed when each of 467k cells carried ~30
+    /// null/false keys. Absent keys deserialize back to the same value, so
+    /// the round trip is exact.
+    #[test]
+    fn test_default_fields_are_omitted_and_round_trip() {
+        let plain = TextSpan::plain("x");
+        let json = serde_json::to_string(&InlineContent::Text(plain.clone())).unwrap();
+        assert_eq!(json, r#"{"type":"text","text":"x"}"#, "{json}");
+        let back: InlineContent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, InlineContent::Text(plain));
+
+        let row = TableRow::default();
+        let json = serde_json::to_string(&row).unwrap();
+        assert_eq!(json, r#"{"cells":[]}"#, "{json}");
+        let back: TableRow = serde_json::from_str(&json).unwrap();
+        assert!(back.allow_break, "the default-true flag must survive omission");
+
+        let mut styled = TextSpan::plain("y");
+        styled.bold = true;
+        styled.color = Some([1, 2, 3]);
+        let json = serde_json::to_string(&styled).unwrap();
+        assert!(json.contains(r#""bold":true"#) && json.contains(r#""color":[1,2,3]"#), "{json}");
+        assert!(!json.contains("italic") && !json.contains("hyperlink"), "{json}");
     }
 }

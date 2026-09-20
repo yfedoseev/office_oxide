@@ -13,24 +13,34 @@ pub(crate) fn comment_marker(cell_ref: &str, author: Option<&str>) -> String {
 }
 
 impl XlsxDocument {
-    /// Extract all text as a plain string (one sheet per section, tab-separated cells).
+    /// Extract all text as a plain string: each sheet's name on its own
+    /// line, then its rows with tab-separated cells.
+    ///
+    /// The sheet name is emitted for every sheet, as the `.xls` reader,
+    /// `to_markdown()` and every other spreadsheet reader (POI, openpyxl,
+    /// xlrd, calamine) do — the same workbook used to name its sheets in
+    /// one format and not the other.
     pub fn plain_text(&self) -> String {
         let mut parts = Vec::new();
         for (i, ws) in self.worksheets.iter().enumerate() {
+            let mut sheet = ws.name.clone();
             if let Some(text) = self.sheet_plain_text(i) {
                 if !text.is_empty() {
-                    parts.push(text);
+                    sheet.push('\n');
+                    sheet.push_str(&text);
                 }
             }
             // Cell comments are document content; `to_ir()` carries them
             // as endnotes, and this direct renderer dropped them.
             for c in &ws.comments {
-                parts.push(format!(
+                sheet.push('\n');
+                sheet.push_str(&format!(
                     "{}: {}",
                     comment_marker(&c.cell_ref, c.author.as_deref()),
                     c.text
                 ));
             }
+            parts.push(sheet);
         }
         // `to_markdown()` already surfaces chart text (axis titles, series
         // names); `plain_text()` silently dropped it entirely.
