@@ -23,6 +23,17 @@ struct Cli {
 }
 
 fn main() {
+    // Rust ignores SIGPIPE at startup, so `office-oxide text f.docx | head`
+    // panicked with "failed printing to stdout: Broken pipe" once `head`
+    // closed the pipe. Restore the default disposition, as ripgrep and fd
+    // do: a closed stdout ends the process quietly, like every other
+    // text tool.
+    #[cfg(unix)]
+    // SAFETY: `signal` with SIG_DFL only resets a disposition; it is
+    // called once, before any other thread exists.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     if let Err(e) = commands::run(cli.command) {
         eprintln!("error: {e}");
