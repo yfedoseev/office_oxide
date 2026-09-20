@@ -20,7 +20,6 @@
 //!
 //! The `grpprl` is decoded by [`super::sprm::extract_chp_props`].
 
-use super::papx::fc_to_cp;
 use super::piece_table::Piece;
 use super::sprm::{ChpProps, extract_chp_props};
 
@@ -170,17 +169,9 @@ pub fn resolve_deleted_cp_ranges_from_runs(
             let props: ChpProps = extract_chp_props(&r.grpprl);
             props.f_rmark_del
         })
-        .filter_map(|r| {
-            let cp_start = fc_to_cp(r.fc_start, pieces)?;
-            let cp_end = fc_to_cp(r.fc_end, pieces).unwrap_or(cp_start);
-            let cp_start = cp_start.min(text_len);
-            let cp_end = cp_end.min(text_len);
-            if cp_end > cp_start {
-                Some((cp_start, cp_end))
-            } else {
-                None
-            }
-        })
+        .flat_map(|r| super::papx::fc_run_to_cp_ranges(r.fc_start, r.fc_end, pieces))
+        .map(|(a, b)| (a.min(text_len), b.min(text_len)))
+        .filter(|(a, b)| b > a)
         .collect();
 
     deleted.sort_unstable_by_key(|&(s, _)| s);
@@ -205,7 +196,7 @@ pub fn resolve_deleted_cp_ranges_from_runs(
 /// Takes `sorted_cp_runs` — every CHPX run for the *whole document*,
 /// already FC→CP-converted and sorted by `cp_start` via
 /// [`resolve_chp_cp_runs`]. This is deliberate: `build_paragraphs` calls
-/// this once per paragraph, and `fc_to_cp` is itself `O(pieces)`. Doing the
+/// this once per paragraph, and the FC→CP walk is itself `O(pieces)`. Doing the
 /// FC→CP conversion (and the `extract_chp_props` decode) per paragraph
 /// instead of once for the whole document turned a real corpus sweep into
 /// an effectively unbounded `O(runs × pieces × paragraphs)` — the exact
@@ -269,10 +260,11 @@ pub fn resolve_chp_segments(
 pub fn resolve_chp_cp_runs(runs: &[FkpRun], pieces: &[Piece]) -> Vec<(u32, u32, ChpProps)> {
     let mut out: Vec<(u32, u32, ChpProps)> = runs
         .iter()
-        .filter_map(|r| {
-            let cp_start = fc_to_cp(r.fc_start, pieces)?;
-            let cp_end = fc_to_cp(r.fc_end, pieces).unwrap_or(cp_start);
-            (cp_end > cp_start).then(|| (cp_start, cp_end, extract_chp_props(&r.grpprl)))
+        .flat_map(|r| {
+            let props = extract_chp_props(&r.grpprl);
+            super::papx::fc_run_to_cp_ranges(r.fc_start, r.fc_end, pieces)
+                .into_iter()
+                .map(move |(a, b)| (a, b, props.clone()))
         })
         .collect();
     out.sort_unstable_by_key(|&(s, _, _)| s);

@@ -563,7 +563,9 @@ fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, hidden: HiddenCtx<'_>, text: 
     }
     for content in &run.content {
         match content {
-            RunContent::Text(t) => text.push_str(t),
+            // Document text must not read as markdown: `*not bold*`
+            // rendered as emphasis and a `|` split its table row.
+            RunContent::Text(t) => text.push_str(&crate::core::markdown::escape_text(t)),
             RunContent::Break(BreakType::Line) => text.push_str("  \n"),
             RunContent::Break(BreakType::Page | BreakType::Column) => {
                 text.push_str("\n\n---\n\n");
@@ -619,7 +621,7 @@ fn markdown_drawing(drawing: &DrawingInfo, out: &mut String) {
     }
     out.push_str("![");
     if let Some(ref desc) = drawing.description {
-        out.push_str(desc);
+        out.push_str(&crate::core::markdown::image_alt(desc));
     }
     out.push_str("](");
     out.push_str(&drawing.relationship_id);
@@ -660,12 +662,15 @@ fn markdown_table(table: &Table, ctx: &MarkdownCtx, out: &mut String) {
             // and italic span inside a table on this surface alone.
             let mut cell_text = String::new();
             markdown_blocks(&cell.content, ctx, &mut cell_text, 1);
+            // The cell is already markdown (its own emphasis and
+            // escapes); only the line breaks still need taming, since a
+            // raw newline ends a GFM table row.
             let cell_text = cell_text
                 .split('\n')
                 .map(str::trim)
                 .filter(|l| !l.is_empty())
                 .collect::<Vec<_>>()
-                .join(" ");
+                .join("<br>");
             cells.push(cell_text);
         }
         max_cols = max_cols.max(cells.len());

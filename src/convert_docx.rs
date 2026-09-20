@@ -18,7 +18,12 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         }
         prev = end;
     }
-    if prev < total || windows.is_empty() {
+    // The body-level `<w:sectPr>` describes a final section even when
+    // no element follows the last break: its headers and footers are
+    // still that section's. Skipping the empty window shifted every
+    // `doc.sections[idx]` lookup below and dropped the trailing
+    // section's headers outright.
+    if prev < total || windows.len() < doc.sections.len() || windows.is_empty() {
         windows.push((prev, total));
     }
 
@@ -584,6 +589,14 @@ fn convert_block_elements(
                 let has_bottom_border = eff_ref.is_some_and(|pp| pp.has_bottom_border);
                 if is_empty_para && has_bottom_border {
                     elements.push(Element::ThematicBreak);
+                    // The paragraph has no text, not no content: a heading
+                    // style with a bottom border that holds only a chart,
+                    // a picture or a text box used to `continue` past the
+                    // collectors below and lose the drawing entirely.
+                    collect_paragraph_floats(p, doc, elements);
+                    collect_paragraph_inline_images(p, doc, elements);
+                    collect_paragraph_text_boxes(p, doc, elements);
+                    collect_paragraph_chart_text(p, elements);
                     i += 1;
                     continue;
                 }
@@ -601,33 +614,48 @@ fn convert_block_elements(
                     }
                     elements.push(Element::Heading(heading));
                 } else {
-                    // Check for page break in runs
-                    let (before_break, hard_break) = split_at_page_break(p, doc);
+                    // A hard break splits the paragraph: the runs before it,
+                    // the break, the runs after it. The runs after used to
+                    // be dropped — and Word writes a manual page break as
+                    // `<w:br w:type="page"/>` at the *start* of the next
+                    // paragraph, so that paragraph's whole text vanished
+                    // from every IR-backed surface while `plain_text()`
+                    // kept it (75 corpus files).
                     let frame_pos = paragraph_frame_position(p);
-                    if !before_break.is_empty() || hard_break.is_none() {
+                    let make_para = |content: Vec<InlineContent>| {
                         let mut para = Paragraph {
-                            content: if before_break.is_empty() && hard_break.is_none() {
-                                convert_paragraph_inline(p, doc)
-                            } else {
-                                before_break
-                            },
-                            frame_position: frame_pos,
-                            alignment,
+                            content,
+                            frame_position: frame_pos.clone(),
+                            alignment: alignment.clone(),
                             ..Default::default()
                         };
                         if let Some(pp) = eff_ref {
                             apply_paragraph_properties(pp, &mut para);
                         }
-                        elements.push(Element::Paragraph(para));
-                    }
-                    // A `<w:br w:type="page"/>` is a page break, not a
-                    // horizontal rule. Emitting `ThematicBreak` here used to
-                    // put a `---` in the markdown of every paginated document
-                    // and made `PageBreak`/`ColumnBreak` unreachable.
-                    match hard_break {
-                        Some(HardBreak::Page) => elements.push(Element::PageBreak),
-                        Some(HardBreak::Column) => elements.push(Element::ColumnBreak),
-                        None => {},
+                        Element::Paragraph(para)
+                    };
+                    let mut segments = split_at_hard_breaks(p, doc);
+                    if segments.len() == 1 && segments[0].1.is_none() {
+                        elements.push(make_para(convert_paragraph_inline(p, doc)));
+                    } else {
+                        // The paragraph's own slot is the first segment when
+                        // it holds text; later segments are paragraphs only
+                        // when they hold text, so a paragraph that is just
+                        // a page break stays just a page break.
+                        for (content, brk) in segments.drain(..) {
+                            if !content.is_empty() {
+                                elements.push(make_para(content));
+                            }
+                            // A `<w:br w:type="page"/>` is a page break, not
+                            // a horizontal rule. Emitting `ThematicBreak`
+                            // here used to put a `---` in the markdown of
+                            // every paginated document.
+                            match brk {
+                                Some(HardBreak::Page) => elements.push(Element::PageBreak),
+                                Some(HardBreak::Column) => elements.push(Element::ColumnBreak),
+                                None => {},
+                            }
+                        }
                     }
                 }
                 // Promote any floating drawings (anchored images, vector
@@ -1265,43 +1293,65 @@ enum HardBreak {
     Column,
 }
 
-fn split_at_page_break(
+/// The paragraph's inline content cut at every hard (page/column) break:
+/// `(content before the break, the break)`, with the final segment's
+/// break `None`. A paragraph without one is a single segment.
+fn split_at_hard_breaks(
     p: &crate::docx::Paragraph,
     doc: &crate::docx::DocxDocument,
-) -> (Vec<InlineContent>, Option<HardBreak>) {
+) -> Vec<(Vec<InlineContent>, Option<HardBreak>)> {
     let ctx = run_context(p, doc);
+    let mut segments: Vec<(Vec<InlineContent>, Option<HardBreak>)> = Vec::new();
     let mut content = Vec::new();
-    let mut has_break: Option<HardBreak> = None;
-
+    let convert_run_split =
+        |run: &crate::docx::Run,
+         url: Option<&str>,
+         content: &mut Vec<InlineContent>,
+         segments: &mut Vec<(Vec<InlineContent>, Option<HardBreak>)>| {
+            // A run holding a hard break is converted around it: the run's
+            // pieces before and after the break belong to different segments.
+            let mut piece = run.clone();
+            piece.content.clear();
+            for rc in &run.content {
+                let brk = match rc {
+                    crate::docx::RunContent::Break(crate::docx::BreakType::Page) => {
+                        Some(HardBreak::Page)
+                    },
+                    crate::docx::RunContent::Break(crate::docx::BreakType::Column) => {
+                        Some(HardBreak::Column)
+                    },
+                    _ => None,
+                };
+                match brk {
+                    Some(b) => {
+                        if !piece.content.is_empty() {
+                            convert_run(&piece, url, &ctx, content);
+                            piece.content.clear();
+                        }
+                        segments.push((std::mem::take(content), Some(b)));
+                    },
+                    None => piece.content.push(rc.clone()),
+                }
+            }
+            if !piece.content.is_empty() {
+                convert_run(&piece, url, &ctx, content);
+            }
+        };
     for pc in &p.content {
         match pc {
             crate::docx::ParagraphContent::Run(run) => {
-                for rc in &run.content {
-                    match rc {
-                        crate::docx::RunContent::Break(crate::docx::BreakType::Page) => {
-                            has_break.get_or_insert(HardBreak::Page);
-                        },
-                        crate::docx::RunContent::Break(crate::docx::BreakType::Column) => {
-                            has_break.get_or_insert(HardBreak::Column);
-                        },
-                        _ => {},
-                    }
-                }
-                if has_break.is_none() {
-                    convert_run(run, None, &ctx, &mut content);
-                }
+                convert_run_split(run, None, &mut content, &mut segments);
             },
             crate::docx::ParagraphContent::Hyperlink(hl) => {
-                if has_break.is_none() {
-                    let url = hyperlink_url(hl);
-                    for run in &hl.runs {
-                        convert_run(run, url.as_deref(), &ctx, &mut content);
-                    }
+                let url = hyperlink_url(hl);
+                for run in &hl.runs {
+                    convert_run_split(run, url.as_deref(), &mut content, &mut segments);
                 }
             },
         }
     }
-    (content, has_break)
+    segments.push((content, None));
+    segments
 }
 
 // ---------------------------------------------------------------------------

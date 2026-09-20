@@ -155,20 +155,25 @@ pub fn format_commas(n: f64, decimals: u8) -> String {
 
     let scaled_int = scaled as u64;
 
+    // One allocation per number: this runs once per formatted cell, and
+    // the `to_string` + `format!` pair it replaced was a measurable share
+    // of a large workbook's text extraction.
+    let mut out = String::with_capacity(28);
+    out.push_str(sign);
     if decimals == 0 {
-        format!("{}{}", sign, insert_commas(scaled_int))
+        push_commas(&mut out, scaled_int);
     } else {
         let divisor = factor as u64;
-        let int_part = scaled_int / divisor;
+        push_commas(&mut out, scaled_int / divisor);
+        out.push('.');
         let frac = scaled_int % divisor;
-        format!(
-            "{}{}.{:0>width$}",
-            sign,
-            insert_commas(int_part),
-            frac,
-            width = decimals as usize
-        )
+        let digits = frac.to_string();
+        for _ in digits.len()..decimals as usize {
+            out.push('0');
+        }
+        out.push_str(&digits);
     }
+    out
 }
 
 /// Format a number the way Excel's accounting/comma built-ins (ids 37-44)
@@ -216,18 +221,24 @@ fn format_scientific(n: f64) -> String {
     format!("{mantissa}E{sign}{digits:0>2}")
 }
 
-fn insert_commas(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    let mut out = String::with_capacity(len + len / 3);
-    for (i, &b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
+/// Append `n` with thousands separators, no intermediate allocation.
+fn push_commas(out: &mut String, mut n: u64) {
+    let mut digits = [0u8; 20];
+    let mut len = 0;
+    loop {
+        digits[len] = b'0' + (n % 10) as u8;
+        len += 1;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    for i in (0..len).rev() {
+        out.push(digits[i] as char);
+        if i > 0 && i.is_multiple_of(3) {
             out.push(',');
         }
-        out.push(b as char);
     }
-    out
 }
 
 // ── Custom format string interpreter ──────────────────────────────────────

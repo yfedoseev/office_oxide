@@ -2455,3 +2455,163 @@ fn test_table_cell_properties_follow_the_schema_sequence() {
     assert!(mar < td, "tcMar must precede textDirection");
     assert!(td < va, "textDirection must precede vAlign");
 }
+
+/// An image nested below the body — in a text box, a table cell, a header
+/// or a footnote — is written, and a part other than the main document
+/// gets the relationship in its own rels file. The nested converter used
+/// to skip every image ("needs the outer writer context"), so a picture
+/// anywhere but the top level vanished from the written file.
+#[test]
+fn test_images_nested_in_text_box_cell_header_and_note_survive_a_write() {
+    use office_oxide::ir::*;
+    use std::io::Read;
+
+    let png: Vec<u8> = vec![
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8,
+        0xcf, 0xc0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xe2, 0x21, 0xbc, 0x33, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+    let image = |alt: &str| {
+        Element::Image(Image {
+            alt_text: Some(alt.to_string()),
+            data: Some(png.clone()),
+            format: Some(ImageFormat::Png),
+            display_width_emu: Some(914400),
+            display_height_emu: Some(914400),
+            ..Default::default()
+        })
+    };
+    let para = |t: &str| {
+        Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan::plain(t))],
+            ..Default::default()
+        })
+    };
+    let ir = DocumentIR {
+        metadata: Metadata {
+            format: office_oxide::DocumentFormat::Docx,
+            ..Default::default()
+        },
+        sections: vec![Section {
+            header: Some(HeaderFooter {
+                content: vec![para("header"), image("header logo")],
+            }),
+            elements: vec![
+                Element::TextBox(TextBox {
+                    content: vec![para("boxed"), image("boxed picture")],
+                    ..Default::default()
+                }),
+                Element::Table(Table {
+                    rows: vec![TableRow {
+                        cells: vec![TableCell {
+                            content: vec![image("cell picture")],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                Element::Paragraph(Paragraph {
+                    content: vec![
+                        InlineContent::Text(TextSpan::plain("cited")),
+                        InlineContent::FootnoteRef(FootnoteRef {
+                            note_id: 1,
+                            marker: None,
+                        }),
+                    ],
+                    ..Default::default()
+                }),
+                Element::Footnote(Note {
+                    id: 1,
+                    content: vec![para("note"), image("note picture")],
+                    ..Default::default()
+                }),
+            ],
+            ..Default::default()
+        }],
+        defined_names: Vec::new(),
+    };
+
+    let mut buf = Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(
+        &ir,
+        office_oxide::DocumentFormat::Docx,
+        &mut buf,
+    )
+    .unwrap();
+    let bytes = buf.into_inner();
+
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes.clone())).unwrap();
+    let read = |zip: &mut zip::ZipArchive<Cursor<Vec<u8>>>, name: &str| {
+        let mut s = String::new();
+        zip.by_name(name)
+            .unwrap_or_else(|_| panic!("{name} missing"))
+            .read_to_string(&mut s)
+            .unwrap();
+        s
+    };
+    for part in [
+        "word/document.xml",
+        "word/header1.xml",
+        "word/footnotes.xml",
+    ] {
+        let xml = read(&mut zip, part);
+        assert!(xml.contains("<pic:pic"), "{part} should carry a picture:\n{xml}");
+    }
+    for rels in [
+        "word/_rels/header1.xml.rels",
+        "word/_rels/footnotes.xml.rels",
+    ] {
+        let xml = read(&mut zip, rels);
+        assert!(
+            xml.contains("relationships/image"),
+            "{rels} should relate the picture it shows:\n{xml}"
+        );
+    }
+
+    let doc =
+        office_oxide::Document::from_reader(Cursor::new(bytes), office_oxide::DocumentFormat::Docx)
+            .unwrap();
+    let back = doc.to_ir();
+    let text = back.plain_text();
+    for alt in [
+        "boxed picture",
+        "cell picture",
+        "header logo",
+        "note picture",
+    ] {
+        assert!(text.contains(alt), "{alt} lost on the way back:\n{text}");
+    }
+    let pictures = back
+        .sections
+        .iter()
+        .flat_map(|s| {
+            s.header
+                .iter()
+                .flat_map(|h| h.content.iter())
+                .chain(s.elements.iter())
+        })
+        .map(count_images)
+        .sum::<usize>();
+    assert_eq!(pictures, 4, "every nested picture should come back as an image element");
+}
+
+/// Images in `e` and, recursively, in the containers below it.
+fn count_images(e: &office_oxide::ir::Element) -> usize {
+    use office_oxide::ir::Element;
+    match e {
+        Element::Image(_) => 1,
+        Element::TextBox(tb) => tb.content.iter().map(count_images).sum(),
+        Element::Table(t) => t
+            .rows
+            .iter()
+            .flat_map(|r| r.cells.iter())
+            .flat_map(|c| c.content.iter())
+            .map(count_images)
+            .sum(),
+        Element::Footnote(n) | Element::Endnote(n) => n.content.iter().map(count_images).sum(),
+        _ => 0,
+    }
+}

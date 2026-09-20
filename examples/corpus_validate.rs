@@ -34,6 +34,51 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::time::Instant;
 
+/// Words (three or more letters) lost from `before` and gained in `after`,
+/// as multisets, plus `before`'s total — the same measure the release
+/// sweep's `compare_tree.py` uses.
+/// (lost, gained, total, sample of lost words) — word multisets of the
+/// original IR's text against the reread's.
+fn word_diff(before: &str, after: &str) -> (usize, usize, usize, Vec<String>) {
+    use std::collections::HashMap;
+    fn words(s: &str) -> HashMap<String, i64> {
+        let mut m = HashMap::new();
+        for w in s
+            .split(|c: char| !c.is_alphabetic())
+            .filter(|w| w.chars().count() >= 3)
+        {
+            *m.entry(w.to_lowercase()).or_insert(0) += 1;
+        }
+        m
+    }
+    let b = words(before);
+    let a = words(after);
+    let total: i64 = b.values().sum();
+    let lost: i64 = b
+        .iter()
+        .map(|(w, n)| (n - a.get(w).copied().unwrap_or(0)).max(0))
+        .sum();
+    let gained: i64 = a
+        .iter()
+        .map(|(w, n)| (n - b.get(w).copied().unwrap_or(0)).max(0))
+        .sum();
+    let mut sample: Vec<(String, i64)> = b
+        .iter()
+        .filter_map(|(w, n)| {
+            let d = n - a.get(w).copied().unwrap_or(0);
+            (d > 0).then(|| (w.clone(), d))
+        })
+        .collect();
+    sample.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
+    sample.truncate(10);
+    (
+        lost as usize,
+        gained as usize,
+        total as usize,
+        sample.into_iter().map(|(w, _)| w).collect(),
+    )
+}
+
 fn family(path: &Path) -> Option<DocumentFormat> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     Some(match ext.as_str() {
@@ -180,12 +225,34 @@ fn main() {
                     }),
                 );
                 if let Some(Ok(bytes)) = bytes {
-                    let _ = step(
+                    let reopened = step(
                         &mut out,
                         &a,
                         "rt_reopen",
                         AssertUnwindSafe(|| Document::from_reader(Cursor::new(bytes), fmt)),
                     );
+                    // --- fidelity: the words of the original IR against the
+                    // reread's. A write path that drops or duplicates content
+                    // succeeds at both steps above; only this sees it.
+                    if let Some(Ok(reopened)) = reopened {
+                        let diff = step(
+                            &mut out,
+                            &a,
+                            "rt_compare",
+                            AssertUnwindSafe(|| {
+                                word_diff(&ir.plain_text(), &reopened.to_ir().plain_text())
+                            }),
+                        );
+                        if let Some((lost, gained, total, sample)) = diff {
+                            let sample =
+                                serde_json::to_string(&sample).unwrap_or_else(|_| "[]".into());
+                            let _ = writeln!(
+                                out,
+                                "{{\"path\":{},\"step\":\"rt_words\",\"status\":\"ok\",\"lost\":{lost},\"gained\":{gained},\"total\":{total},\"lost_sample\":{sample}}}",
+                                esc(&a)
+                            );
+                        }
+                    }
                 } else if let Some(Err(e)) = bytes {
                     let _ = writeln!(
                         out,

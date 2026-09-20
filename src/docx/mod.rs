@@ -348,6 +348,11 @@ impl DocxDocument {
         // role; without that distinction, downstream consumers had to
         // back-derive headers-vs-footers from cumulative ref counts,
         // which silently misclassifies entries in multi-section docs.
+        // Images referenced from a part other than the main document
+        // (a header's logo, a picture in a footnote), keyed as
+        // `<part>:<rId>` — see `qualify_part_images`.
+        let mut part_images: std::collections::HashMap<String, (Vec<u8>, Option<String>)> =
+            std::collections::HashMap::new();
         let mut headers_footers = Vec::new();
         let mut parse_hf = |hf_ref: &HeaderFooterRef, is_header: bool| -> CoreResult<()> {
             if let Some(rel) = doc_rels.get_by_id(&hf_ref.relationship_id) {
@@ -355,7 +360,17 @@ impl DocxDocument {
                     let part_name = main_part.resolve_relative(&rel.target)?;
                     if opc.has_part(&part_name) {
                         let data = opc.read_part(&part_name)?;
-                        let content = parse_body_elements(&data)?;
+                        let mut content = parse_body_elements(&data)?;
+                        if let Ok(hf_rels) = opc.read_rels_for(&part_name) {
+                            resolve_hyperlinks(&mut content, &hf_rels);
+                            qualify_part_images(
+                                &mut content,
+                                &part_name,
+                                &hf_rels,
+                                &mut opc,
+                                &mut part_images,
+                            );
+                        }
                         headers_footers.push(HeaderFooter {
                             hf_type: hf_ref.hf_type,
                             content,
@@ -400,6 +415,13 @@ impl DocxDocument {
             if let Ok(note_rels) = opc.read_rels_for(&part) {
                 for n in &mut notes {
                     resolve_hyperlinks(&mut n.content, &note_rels);
+                    qualify_part_images(
+                        &mut n.content,
+                        &part,
+                        &note_rels,
+                        &mut opc,
+                        &mut part_images,
+                    );
                 }
             }
             notes
@@ -470,6 +492,7 @@ impl DocxDocument {
                 .map(|s| s.to_lowercase());
             images.insert(rel.id.clone(), (data, ext));
         }
+        images.extend(part_images);
 
         debug!(
             "DocxDocument: {} block elements, {} sections, {} embedded fonts, {} images",
@@ -1801,6 +1824,84 @@ fn collect_runs_until(
 /// Charts nest wherever drawings do — inside table cells and inside text
 /// boxes — so the walk recurses through both rather than only scanning
 /// top-level paragraphs.
+/// Load the images a header, footer or note part references and re-key
+/// the part's drawings to `<part>:<rId>` so they resolve against
+/// `DocxDocument::images` alongside the main document's own `rId`s.
+/// `r:id` is scoped per OPC part — a header's `rId3` and the body's
+/// `rId3` are unrelated — and the map used to hold the body's only, so
+/// every picture outside the body was dropped on read and a colliding id
+/// could have shown the wrong one.
+fn qualify_part_images<R: Read + Seek>(
+    elements: &mut [BlockElement],
+    part: &crate::core::opc::PartName,
+    rels: &crate::core::relationships::Relationships,
+    opc: &mut OpcReader<R>,
+    images: &mut std::collections::HashMap<String, (Vec<u8>, Option<String>)>,
+) {
+    let prefix = format!("{}:", part.as_str().rsplit('/').next().unwrap_or(""));
+    let mut any = false;
+    for rel in rels.get_by_type(rel_types::IMAGE) {
+        if rel.target_mode != TargetMode::Internal {
+            continue;
+        }
+        let Ok(image_part) = part.resolve_relative(&rel.target) else {
+            continue;
+        };
+        if !opc.has_part(&image_part) {
+            continue;
+        }
+        let Ok(data) = opc.read_part(&image_part) else {
+            continue;
+        };
+        let ext = image_part
+            .as_str()
+            .rsplit('.')
+            .next()
+            .map(|s| s.to_lowercase());
+        images.insert(format!("{prefix}{}", rel.id), (data, ext));
+        any = true;
+    }
+    if any {
+        prefix_drawing_rids(elements, &prefix);
+    }
+}
+
+fn prefix_drawing_rids(elements: &mut [BlockElement], prefix: &str) {
+    for elem in elements {
+        match elem {
+            BlockElement::Paragraph(p) => {
+                for pc in &mut p.content {
+                    let runs: &mut [Run] = match pc {
+                        ParagraphContent::Run(r) => std::slice::from_mut(r),
+                        ParagraphContent::Hyperlink(hl) => &mut hl.runs,
+                    };
+                    for run in runs {
+                        for rc in &mut run.content {
+                            match rc {
+                                RunContent::Drawing(d) => {
+                                    if !d.relationship_id.is_empty() {
+                                        d.relationship_id =
+                                            format!("{prefix}{}", d.relationship_id);
+                                    }
+                                },
+                                RunContent::TextBox(blocks) => prefix_drawing_rids(blocks, prefix),
+                                _ => {},
+                            }
+                        }
+                    }
+                }
+            },
+            BlockElement::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        prefix_drawing_rids(&mut cell.content, prefix);
+                    }
+                }
+            },
+        }
+    }
+}
+
 fn attach_chart_text(
     elements: &mut [BlockElement],
     chart_text_by_rid: &std::collections::HashMap<String, Vec<String>>,
@@ -4795,7 +4896,7 @@ mod tests {
             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
   <w:body>
     <w:p><w:r><w:t>Pie:</w:t></w:r></w:p>
-    <w:p><w:r><w:drawing>
+    <w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr></w:pPr><w:r><w:drawing>
       <wp:inline>
         <wp:extent cx="2000000" cy="1500000"/>
         <wp:docPr id="1" name="Chart 1"/>
@@ -4832,19 +4933,30 @@ mod tests {
         let data = writer.finish().unwrap().into_inner();
 
         let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
-        let text = doc.plain_text();
-        for expected in [
-            "Dollars per Group",
-            "Revenue",
-            "Group 1",
-            "Group 2",
-            "15.53",
-            "27.32",
+        // The chart's paragraph carries a bottom border and no text — the
+        // shape of a bordered heading style holding only a drawing. The
+        // IR path turned that into a ThematicBreak and skipped the
+        // drawing collectors, so the chart reached plain_text() and not
+        // to_ir()/to_html().
+        let ir = crate::convert_docx::docx_to_ir(&doc);
+        for (surface, text) in [
+            ("plain_text", doc.plain_text()),
+            ("to_ir", ir.plain_text()),
+            ("to_html", ir.to_html()),
         ] {
-            assert!(
-                text.contains(expected),
-                "chart text {expected:?} missing from plain_text(): {text:?}"
-            );
+            for expected in [
+                "Dollars per Group",
+                "Revenue",
+                "Group 1",
+                "Group 2",
+                "15.53",
+                "27.32",
+            ] {
+                assert!(
+                    text.contains(expected),
+                    "chart text {expected:?} missing from {surface}: {text:?}"
+                );
+            }
         }
     }
 

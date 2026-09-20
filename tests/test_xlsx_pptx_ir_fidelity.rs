@@ -219,6 +219,32 @@ fn test_a_row_that_skips_a_column_keeps_every_value_under_its_own_header() {
     assert_eq!(cell_text(&t.rows[2].cells[2]), "4");
 }
 
+/// A prose-shaped sheet (most rows one cell) may still have rows with
+/// several cells; prose mode kept only the first cell of such a row, so
+/// the rest vanished from every IR surface while `plain_text()` had it.
+#[test]
+fn test_prose_mode_keeps_every_cell_of_a_multi_cell_row() {
+    let cell = |r: &str, t: &str| format!(r#"<c r="{r}" t="inlineStr"><is><t>{t}</t></is></c>"#);
+    let body = format!(
+        "<row r=\"1\">{}</row><row r=\"2\">{}</row><row r=\"3\">{}</row><row r=\"4\">{}{}</row><row r=\"5\">{}</row>",
+        cell("A1", "Line one"),
+        cell("A2", "Line two"),
+        cell("A3", "Line three"),
+        cell("A4", "Left"),
+        cell("F4", "Right"),
+        cell("A5", "Line five"),
+    );
+    let ir = Xlsx::new(vec![Sheet::new("S", &body)]).ir();
+    let text = ir.plain_text();
+    for w in ["Line one", "Left", "Right", "Line five"] {
+        assert!(text.contains(w), "{w} missing: {text:?}");
+    }
+    assert!(
+        text.contains("Left\tRight"),
+        "the two cells of one row stay on one line, tab-separated: {text:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Cell fonts in table mode
 // ---------------------------------------------------------------------------
@@ -660,6 +686,10 @@ impl<'a> Slide<'a> {
 }
 
 fn pptx_ir(slides: Vec<Slide<'_>>) -> DocumentIR {
+    pptx_doc(slides).to_ir()
+}
+
+fn pptx_doc(slides: Vec<Slide<'_>>) -> Document {
     let mut w = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
     let pres = PartName::new("/ppt/presentation.xml").unwrap();
     w.add_package_rel(rel_types::OFFICE_DOCUMENT, "ppt/presentation.xml");
@@ -724,9 +754,7 @@ fn pptx_ir(slides: Vec<Slide<'_>>) -> DocumentIR {
     w.add_part(&pres, CT_PRES, pres_xml.as_bytes()).unwrap();
 
     let bytes = w.finish().unwrap().into_inner();
-    Document::from_reader(Cursor::new(bytes), DocumentFormat::Pptx)
-        .expect("parse pptx")
-        .to_ir()
+    Document::from_reader(Cursor::new(bytes), DocumentFormat::Pptx).expect("parse pptx")
 }
 
 /// A body placeholder carrying the given `<a:p>` paragraphs.
@@ -965,6 +993,30 @@ fn test_slide_comments_reach_the_ir() {
         "comment missing from {:?}",
         ir.plain_text()
     );
+}
+
+/// The direct `plain_text()`/`to_markdown()` renderers dropped slide
+/// comments that `to_ir()` carried — a slide whose only content was its
+/// review comments came back empty on the CLI's default surfaces.
+#[test]
+fn test_slide_comments_reach_plain_text_and_markdown() {
+    let tree = body_sp(r#"<a:p><a:r><a:t>BODY</a:t></a:r></a:p>"#);
+    let doc = pptx_doc(vec![Slide {
+        attrs: "",
+        tree: &tree,
+        notes: None,
+        comments: Some(
+            r#"<p:cm authorId="1" idx="1"><p:pos x="100" y="100"/>
+                 <p:text>Fix the axis label</p:text></p:cm>"#,
+        ),
+    }]);
+    for (surface, out) in [
+        ("plain_text", doc.plain_text()),
+        ("to_markdown", doc.to_markdown()),
+    ] {
+        assert!(out.contains("Fix the axis label"), "{surface}: {out:?}");
+        assert!(out.contains("Comment"), "{surface} labels the comment: {out:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------

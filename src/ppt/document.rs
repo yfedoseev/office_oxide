@@ -111,7 +111,10 @@ impl PptDocument {
             }
             for run in &slide.text_runs {
                 if run.text_type != TextType::Notes {
-                    out.push_str(&run.text);
+                    // A text atom keeps `\r` between its paragraphs and
+                    // `\x0B` for a soft return; both are line ends here,
+                    // not characters to hand to the caller.
+                    out.push_str(&run.text.replace(['\r', '\u{b}'], "\n"));
                     out.push('\n');
                 }
             }
@@ -132,14 +135,14 @@ impl PptDocument {
                 match run.text_type {
                     TextType::Title | TextType::CenterTitle => {
                         out.push_str("### ");
-                        out.push_str(&run.text);
+                        out.push_str(&markdown_run_text(&run.text));
                         out.push_str("\n\n");
                     },
                     TextType::Notes => {
                         // Skip notes in main content.
                     },
                     _ => {
-                        out.push_str(&run.text);
+                        out.push_str(&markdown_run_text(&run.text));
                         out.push_str("\n\n");
                     },
                 }
@@ -157,6 +160,21 @@ impl crate::core::OfficeDocument for PptDocument {
     fn to_markdown(&self) -> String {
         self.to_markdown()
     }
+}
+
+/// One text atom's markdown: paragraph separators (`\r`) become
+/// paragraph breaks, soft returns (`\x0B`) hard line breaks, and the text
+/// itself is escaped so it cannot read as markdown.
+fn markdown_run_text(text: &str) -> String {
+    text.split('\r')
+        .map(|para| {
+            para.split('\u{b}')
+                .map(crate::core::markdown::escape_text)
+                .collect::<Vec<_>>()
+                .join("  \n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 #[cfg(test)]
@@ -549,6 +567,65 @@ mod tests {
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
         assert!(ir.sections.is_empty());
         assert!(ir.metadata.title.is_none());
+    }
+
+    /// A vertical tab is a line break inside a paragraph ([MS-PPT] soft
+    /// return); the converter left it in the text, so the two lines fused
+    /// into one word on every IR surface while `plain_text()` broke them.
+    #[test]
+    fn test_ir_soft_return_is_a_line_break_not_a_glued_word() {
+        use crate::ir::{Element, InlineContent};
+        let doc = PptDocument {
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
+            has_macros: false,
+            summary_properties: None,
+            slides: vec![make_slide(vec![(
+                TextType::Body,
+                "Four Upload\u{b}Stations",
+            )])],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        let para = ir.sections[0]
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                Element::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .expect("a body paragraph");
+        assert!(
+            para.content
+                .iter()
+                .any(|c| matches!(c, InlineContent::LineBreak)),
+            "{:?}",
+            para.content
+        );
+        let text = ir.plain_text();
+        assert!(text.contains("Four Upload\nStations"), "{text:?}");
+        assert!(!ir.to_html().contains("UploadStations"));
+    }
+
+    /// The direct surfaces hand no raw `\r` or `\x0B` to the caller: a
+    /// text atom's paragraph separator and soft return are line ends in
+    /// `plain_text()` and paragraph/line breaks in `to_markdown()`.
+    #[test]
+    fn test_direct_surfaces_normalise_paragraph_separators() {
+        let doc = PptDocument {
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
+            has_macros: false,
+            summary_properties: None,
+            slides: vec![make_slide(vec![(
+                TextType::Body,
+                "First paragraph\rFour Upload\u{b}Stations",
+            )])],
+        };
+        let text = doc.plain_text();
+        assert_eq!(text, "First paragraph\nFour Upload\nStations\n");
+        let md = doc.to_markdown();
+        assert!(md.contains("First paragraph\n\nFour Upload  \nStations"), "{md:?}");
+        assert!(!md.contains('\r'));
     }
 
     #[test]

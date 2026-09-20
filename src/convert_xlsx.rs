@@ -292,17 +292,27 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             // (they were just visual separators).
             let mut out: Vec<Element> = Vec::new();
             for cells in &parsed_rows {
-                // Find the first non-empty cell (a formula with no cached
+                // Every non-empty cell of the row (a formula with no cached
                 // value counts too — it has real content, just no cached
-                // display text).
-                let Some(cd) = cells
+                // display text), tab-separated as `plain_text()` lays the
+                // row out. Prose mode allows one row in five to hold more
+                // than one cell, and taking only the first cell of such a
+                // row dropped the rest.
+                let mut content: Vec<InlineContent> = Vec::new();
+                for cd in cells
                     .iter()
-                    .find(|cd| !cd.text.is_empty() || cd.formula.is_some())
-                else {
+                    .filter(|cd| !cd.text.is_empty() || cd.formula.is_some())
+                {
+                    if !content.is_empty() {
+                        content.push(InlineContent::Text(TextSpan::plain("\t")));
+                    }
+                    content.extend(cell_spans(doc, cd));
+                }
+                if content.is_empty() {
                     continue;
-                };
+                }
                 out.push(Element::Paragraph(Paragraph {
-                    content: cell_spans(doc, cd),
+                    content,
                     ..Default::default()
                 }));
             }

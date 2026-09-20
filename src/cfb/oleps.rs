@@ -5,11 +5,11 @@
 //! Only the handful of well-known `PIDSI_*` properties `Metadata` has
 //! fields for are decoded — title, subject, author, keywords, comments
 //! and the two `FILETIME` dates. This is deliberately not a general
-//! OLEPS/VARIANT decoder: no vectors, arrays, non-simple (storage-backed)
-//! properties, or code-page-aware string decoding (`VT_LPSTR`'s bytes are
-//! read as Latin-1/CP1252, the same simplification this crate's other
-//! legacy-format readers already make — the XLS/DOC codepage work tracks the
-//! separate gap in real code-page support).
+//! OLEPS/VARIANT decoder: no vectors, arrays or non-simple
+//! (storage-backed) properties. `VT_LPSTR` bytes are decoded in the
+//! property set's own code page (`PID_CODEPAGE`, [MS-OLEPS] §2.18.2),
+//! Windows-1252 when it declares none: a Bulgarian title read as Latin-1
+//! came out as `ðóñåíñêè êëóá`.
 //!
 //! Byte layouts verified against the published [MS-OLEPS] spec pages
 //! (PropertySetStream, PropertySet, PropertyIdentifierAndOffset,
@@ -20,6 +20,12 @@
 
 /// Well-known property IDs in the `SummaryInformation` FMTID
 /// ({F29F85E0-4FF9-1068-AB91-08002B27B3D9}), [MS-OLEPS] §2.16.
+/// `PID_CODEPAGE` ([MS-OLEPS] §2.18.2): the code page of every
+/// `CodePageString` in the set, a `VT_I2`.
+const PID_CODEPAGE: u32 = 1;
+const VT_I2: u16 = 0x0002;
+/// `CP_WINUNICODE`: a `CodePageString` whose bytes are UTF-16LE.
+const CP_WINUNICODE: u16 = 1200;
 const PIDSI_TITLE: u32 = 2;
 const PIDSI_SUBJECT: u32 = 3;
 const PIDSI_AUTHOR: u32 = 4;
@@ -125,29 +131,40 @@ fn parse_property_set(data: &[u8], base: usize) -> Option<SummaryProperties> {
     // to what a real SummaryInformation set could ever hold.
     let num_properties = num_properties.min(64);
 
+    let entries: Vec<(u32, usize)> = (0..num_properties)
+        .filter_map(|i| {
+            let entry = header_end.checked_add(i.checked_mul(8)?)?;
+            if data.len() < entry + 8 {
+                return None;
+            }
+            let id = u32::from_le_bytes([
+                data[entry],
+                data[entry + 1],
+                data[entry + 2],
+                data[entry + 3],
+            ]);
+            let rel_offset = u32::from_le_bytes([
+                data[entry + 4],
+                data[entry + 5],
+                data[entry + 6],
+                data[entry + 7],
+            ]) as usize;
+            // Offset is relative to the start of *this* PropertySet packet
+            // (i.e. `base`, where its own Size field begins), not the stream.
+            Some((id, base.checked_add(rel_offset)?))
+        })
+        .collect();
+    // The code page applies to every string in the set wherever it is
+    // listed, so find it before decoding any.
+    let codepage = entries
+        .iter()
+        .find(|(id, _)| *id == PID_CODEPAGE)
+        .and_then(|&(_, at)| read_i2(data, at))
+        .map(|v| v as u16)
+        .unwrap_or(1252);
+
     let mut out = SummaryProperties::default();
-    for i in 0..num_properties {
-        let entry = header_end.checked_add(i.checked_mul(8)?)?;
-        if data.len() < entry + 8 {
-            break;
-        }
-        let id = u32::from_le_bytes([
-            data[entry],
-            data[entry + 1],
-            data[entry + 2],
-            data[entry + 3],
-        ]);
-        let rel_offset = u32::from_le_bytes([
-            data[entry + 4],
-            data[entry + 5],
-            data[entry + 6],
-            data[entry + 7],
-        ]) as usize;
-        // Offset is relative to the start of *this* PropertySet packet
-        // (i.e. `base`, where its own Size field begins), not the stream.
-        let Some(value_at) = base.checked_add(rel_offset) else {
-            continue;
-        };
+    for (id, value_at) in entries {
         let field = match id {
             PIDSI_TITLE => &mut out.title,
             PIDSI_SUBJECT => &mut out.subject,
@@ -164,7 +181,7 @@ fn parse_property_set(data: &[u8], base: usize) -> Option<SummaryProperties> {
             },
             _ => continue,
         };
-        if let Some(s) = read_string(data, value_at) {
+        if let Some(s) = read_string(data, value_at, codepage) {
             if !s.is_empty() {
                 *field = Some(s);
             }
@@ -173,10 +190,19 @@ fn parse_property_set(data: &[u8], base: usize) -> Option<SummaryProperties> {
     Some(out)
 }
 
+/// Read a `VT_I2` `TypedPropertyValue` at `pos`.
+fn read_i2(data: &[u8], pos: usize) -> Option<i16> {
+    if data.len() < pos + 6 {
+        return None;
+    }
+    let ty = u16::from_le_bytes([data[pos], data[pos + 1]]);
+    (ty == VT_I2).then(|| i16::from_le_bytes([data[pos + 4], data[pos + 5]]))
+}
+
 /// Read a `TypedPropertyValue` whose `Type` is `VT_LPSTR` or `VT_LPWSTR`
 /// at `pos`. Any other `Type` (or an out-of-bounds `pos`) yields `None`
 /// rather than misreading unrelated bytes as text.
-fn read_string(data: &[u8], pos: usize) -> Option<String> {
+fn read_string(data: &[u8], pos: usize, codepage: u16) -> Option<String> {
     if data.len() < pos + 4 {
         return None;
     }
@@ -202,9 +228,18 @@ fn read_string(data: &[u8], pos: usize) -> Option<String> {
                 return None;
             }
             let bytes = &data[start..end];
-            // Latin-1/CP1252 fallback (see module docs); strip the NUL
-            // terminator `cch` includes.
-            let s: String = bytes.iter().map(|&b| b as char).collect();
+            let s = if codepage == CP_WINUNICODE {
+                let units: Vec<u16> = bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| u16::from_le_bytes(*c))
+                    .collect();
+                String::from_utf16_lossy(&units)
+            } else {
+                crate::core::codepage::decode_windows_codepage(bytes, codepage)
+            };
+            // Strip the NUL terminator `cch` includes.
             Some(s.trim_end_matches('\0').to_string())
         },
         VT_LPWSTR => {
@@ -399,6 +434,52 @@ mod tests {
         assert_eq!(props.title.as_deref(), Some("Hello World"));
         assert_eq!(props.author.as_deref(), Some("Jane Doe"));
         assert!(props.subject.is_none());
+    }
+
+    fn lpstr_bytes(bytes: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&VT_LPSTR.to_le_bytes());
+        v.extend_from_slice(&0u16.to_le_bytes());
+        v.extend_from_slice(&((bytes.len() + 1) as u32).to_le_bytes());
+        v.extend_from_slice(bytes);
+        v.push(0);
+        while v.len() % 4 != 0 {
+            v.push(0);
+        }
+        v
+    }
+
+    fn i2(value: i16) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&VT_I2.to_le_bytes());
+        v.extend_from_slice(&0u16.to_le_bytes());
+        v.extend_from_slice(&value.to_le_bytes());
+        v.extend_from_slice(&0u16.to_le_bytes());
+        v
+    }
+
+    /// A `CodePageString` is in the set's `PID_CODEPAGE`, not Latin-1: a
+    /// Cyrillic title in a Windows-1251 set read as `ðóñåíñêè êëóá`.
+    #[test]
+    fn test_lpstr_is_decoded_in_the_sets_code_page() {
+        // "Русе" in Windows-1251.
+        let ruse = [0xD0u8, 0xF3, 0xF1, 0xE5];
+        let stream = build_stream(&[(PID_CODEPAGE, i2(1251)), (PIDSI_TITLE, lpstr_bytes(&ruse))]);
+        let props = parse_summary_information(&stream).expect("must parse");
+        assert_eq!(props.title.as_deref(), Some("Русе"));
+
+        // The code page applies wherever in the set it is listed.
+        let stream = build_stream(&[(PIDSI_TITLE, lpstr_bytes(&ruse)), (PID_CODEPAGE, i2(1251))]);
+        assert_eq!(parse_summary_information(&stream).unwrap().title.as_deref(), Some("Русе"));
+
+        // No code page: Windows-1252, whose 0x80-0x9F row is punctuation.
+        let stream = build_stream(&[(PIDSI_TITLE, lpstr_bytes(&[b'A', 0x96, b'B']))]);
+        assert_eq!(parse_summary_information(&stream).unwrap().title.as_deref(), Some("A–B"));
+
+        // CP_WINUNICODE: the bytes are UTF-16LE.
+        let utf16: Vec<u8> = "Café".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let stream = build_stream(&[(PID_CODEPAGE, i2(1200)), (PIDSI_TITLE, lpstr_bytes(&utf16))]);
+        assert_eq!(parse_summary_information(&stream).unwrap().title.as_deref(), Some("Café"));
     }
 
     #[test]

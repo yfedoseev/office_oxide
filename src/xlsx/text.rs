@@ -51,6 +51,15 @@ impl XlsxDocument {
                     c.text
                 ));
             }
+            // Text boxes and WordArt drawn on the sheet reached `to_ir()`
+            // as text boxes and this renderer not at all — a sheet whose
+            // content is a drawn note came back as its name alone.
+            for ts in &ws.text_shapes {
+                if !ts.text.trim().is_empty() {
+                    sheet.push('\n');
+                    sheet.push_str(ts.text.trim());
+                }
+            }
             parts.push(sheet);
         }
         // `to_markdown()` already surfaces chart text (axis titles, series
@@ -140,6 +149,12 @@ impl XlsxDocument {
             if let Some(md) = self.sheet_to_markdown_within(i, &mut budget) {
                 if !md.is_empty() {
                     parts.push(md);
+                } else if !ws.comments.is_empty()
+                    || ws.text_shapes.iter().any(|t| !t.text.trim().is_empty())
+                {
+                    // No cells, but comments or drawn text: they still
+                    // belong under the sheet's heading.
+                    parts.push(format!("## {}", ws.name));
                 }
             }
             if budget.exhausted() {
@@ -152,6 +167,11 @@ impl XlsxDocument {
                     comment_marker(&c.cell_ref, c.author.as_deref()),
                     c.text.trim()
                 ));
+            }
+            for ts in &ws.text_shapes {
+                if !ts.text.trim().is_empty() {
+                    parts.push(ts.text.trim().to_string());
+                }
             }
         }
         // Charts: emit each chart's extracted text under a "## Chart N" heading
@@ -189,7 +209,9 @@ impl XlsxDocument {
         // sheet at the cell that spent it.
         let mut cell_text = |cell: &Cell| -> Option<String> {
             let text = self.format_cell_value(cell);
-            budget.charge(text.len()).then_some(text)
+            budget
+                .charge(text.len())
+                .then(|| crate::core::markdown::escape_cell(&text))
         };
 
         let col_count = compute_column_count(&ws.rows);
@@ -216,7 +238,9 @@ impl XlsxDocument {
                 if let Some(cell) = row.cells.first() {
                     let Some(text) = cell_text(cell) else { break };
                     if !text.trim().is_empty() {
-                        out.push_str(text.trim());
+                        // `cell_text` escaped for a table cell; prose keeps
+                        // its line breaks as paragraphs.
+                        out.push_str(&text.replace("<br>", "\n"));
                         out.push_str("\n\n");
                     }
                 }
@@ -533,6 +557,65 @@ mod tests {
         assert!(!idx.contains(&0), "id 50 overridden to a numeric code is not a date");
         assert!(idx.contains(&1), "a custom yyyy-mm-dd code is a date");
         assert!(idx.contains(&2), "an un-overridden built-in date id is a date");
+    }
+
+    /// A text box or WordArt drawn on a sheet reached `to_ir()` as a text
+    /// box and the direct renderers not at all — a sheet whose only
+    /// content was a drawn note came back as its name alone, and the
+    /// markdown had no heading for it.
+    #[test]
+    fn test_drawn_text_shapes_reach_plain_text_and_markdown() {
+        let ws = super::super::worksheet::Worksheet {
+            name: "Notes".to_string(),
+            dimension: None,
+            rows: Vec::new(),
+            merged_cells: Vec::new(),
+            hyperlinks: Vec::new(),
+            page_setup: None,
+            images: Vec::new(),
+            comments: Vec::new(),
+            text_shapes: vec![super::super::worksheet::WorksheetTextShape {
+                text: "Lorem ipsum drawn in a text box".to_string(),
+                font_name: None,
+                font_size_pt: None,
+                bold: false,
+                italic: false,
+                color_hex: None,
+                x_emu: 0,
+                y_emu: 0,
+                cx_emu: 100,
+                cy_emu: 100,
+            }],
+            conditional_formats: Vec::new(),
+            data_validations: Vec::new(),
+        };
+        let doc = XlsxDocument {
+            workbook: super::super::WorkbookInfo {
+                sheets: Vec::new(),
+                defined_names: Vec::new(),
+                date1904: false,
+            },
+            worksheets: vec![ws],
+            shared_strings: super::super::SharedStringTable::empty(),
+            styles: None,
+            theme: None,
+            chart_text: Vec::new(),
+            embedded_fonts: Vec::new(),
+            core_properties: None,
+            app_properties: None,
+            has_macros: false,
+            styles_data: None,
+            theme_data: None,
+        };
+        let text = doc.plain_text();
+        assert!(text.starts_with("Notes\nLorem ipsum drawn"), "{text:?}");
+        let md = doc.to_markdown();
+        assert!(md.starts_with("## Notes\n\nLorem ipsum drawn"), "{md:?}");
+        assert!(
+            crate::convert_xlsx::xlsx_to_ir(&doc)
+                .plain_text()
+                .contains("Lorem ipsum drawn")
+        );
     }
 
     /// `plain_text()` starts each sheet with its name, as `.xls`,

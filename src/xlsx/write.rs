@@ -242,6 +242,18 @@ pub enum CellData {
     Boolean(bool),
     /// A formula, e.g. `"SUM(A1:A10)"`. Do not include the leading `=`.
     Formula(String),
+    /// A formula together with its last computed value, written as
+    /// `<f>` plus the cached `<v>` — what Excel itself saves, so a reader
+    /// that does not evaluate formulas (every extractor, including this
+    /// crate) still sees the number or text the cell showed. `cached`
+    /// is the value's own variant; a nested formula is written as its
+    /// text.
+    FormulaWithValue {
+        /// Formula text without the leading `=`.
+        formula: String,
+        /// The value the formula last produced.
+        cached: Box<CellData>,
+    },
 }
 
 /// One run of a multi-run cell's inline rich text — the
@@ -353,6 +365,10 @@ pub struct SheetImage {
     pub cx_emu: i64,
     /// Rendered height in EMU.
     pub cy_emu: i64,
+    /// Alternative text, written as `xdr:cNvPr/@descr`. The reader
+    /// surfaces it as `Image::alt_text`, so a workbook that goes through
+    /// the IR keeps the description every other reader shows.
+    pub alt_text: Option<String>,
 }
 
 /// A text shape anchored on a worksheet via a DrawingML drawing part.
@@ -798,6 +814,22 @@ impl<'a> SheetData<'a> {
         cx_emu: i64,
         cy_emu: i64,
     ) -> &mut Self {
+        self.add_image_with_alt(data, format, x_emu, y_emu, cx_emu, cy_emu, None)
+    }
+
+    /// As [`add_image`](Self::add_image), with the picture's alternative
+    /// text.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_image_with_alt(
+        &mut self,
+        data: Vec<u8>,
+        format: impl Into<String>,
+        x_emu: i64,
+        y_emu: i64,
+        cx_emu: i64,
+        cy_emu: i64,
+        alt_text: Option<String>,
+    ) -> &mut Self {
         self.0.images.push(SheetImage {
             data,
             format: sanitize_image_extension(&format.into()),
@@ -805,6 +837,7 @@ impl<'a> SheetData<'a> {
             y_emu,
             cx_emu,
             cy_emu,
+            alt_text,
         });
         self
     }
@@ -1566,6 +1599,48 @@ impl XlsxWriter {
                 w.write_event(Event::End(BytesEnd::new("f")))?;
                 w.write_event(Event::End(BytesEnd::new("c")))?;
             },
+            CellData::FormulaWithValue { formula, cached } => {
+                let body = formula.strip_prefix('=').unwrap_or(formula);
+                let mut c = BytesStart::new("c");
+                c.push_attribute(("r", cell_ref.as_str()));
+                // ECMA-376 §18.18.11 ST_CellType: a cached string result
+                // is `t="str"`, a boolean `t="b"`; numbers are the default.
+                let cached_text: Option<String> = match cached.as_ref() {
+                    CellData::Number(n) => Some(n.to_string()),
+                    CellData::Boolean(b) => {
+                        c.push_attribute(("t", "b"));
+                        Some(if *b { "1".into() } else { "0".into() })
+                    },
+                    CellData::String(t) => {
+                        c.push_attribute(("t", "str"));
+                        Some(t.clone())
+                    },
+                    CellData::RichString(runs) => {
+                        c.push_attribute(("t", "str"));
+                        Some(runs.iter().map(|r| r.text.as_str()).collect())
+                    },
+                    CellData::Formula(_) | CellData::FormulaWithValue { .. } | CellData::Empty => {
+                        None
+                    },
+                };
+                if let Some(ref s_val) = s_attr {
+                    c.push_attribute(("s", s_val.as_str()));
+                }
+                w.write_event(Event::Start(c))?;
+                w.write_event(Event::Start(BytesStart::new("f")))?;
+                w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(
+                    body,
+                ))))?;
+                w.write_event(Event::End(BytesEnd::new("f")))?;
+                if let Some(v) = cached_text {
+                    w.write_event(Event::Start(BytesStart::new("v")))?;
+                    w.write_event(Event::Text(BytesText::new(
+                        &crate::core::xml::sanitize_xml_text(&v),
+                    )))?;
+                    w.write_event(Event::End(BytesEnd::new("v")))?;
+                }
+                w.write_event(Event::End(BytesEnd::new("c")))?;
+            },
         }
 
         Ok(())
@@ -1712,6 +1787,9 @@ fn build_drawing_xml(
         let mut cnv_pr = BytesStart::new("xdr:cNvPr");
         cnv_pr.push_attribute(("id", pic_id.as_str()));
         cnv_pr.push_attribute(("name", pic_name.as_str()));
+        if let Some(alt) = img.alt_text.as_deref() {
+            cnv_pr.push_attribute(("descr", alt));
+        }
         w.write_event(Event::Empty(cnv_pr))?;
         w.write_event(Event::Empty(BytesStart::new("xdr:cNvPicPr")))?;
         w.write_event(Event::End(BytesEnd::new("xdr:nvPicPr")))?;
@@ -2318,6 +2396,43 @@ mod tests {
         );
     }
 
+    /// A picture's alternative text comes back from the written workbook.
+    /// The drawing writer named every picture `Picture N` and wrote no
+    /// `descr`, so the description every other reader shows — and the only
+    /// text an image contributes to `plain_text()` — was lost on write.
+    #[test]
+    fn test_image_alt_text_round_trips_through_the_drawing_part() {
+        let mut wb = XlsxWriter::new();
+        wb.add_sheet("S").add_image_with_alt(
+            vec![0x89, 0x50, 0x4e, 0x47],
+            "png",
+            0,
+            0,
+            500_000,
+            500_000,
+            Some("company logo".into()),
+        );
+        let mut buf = std::io::Cursor::new(Vec::new());
+        wb.write_to(&mut buf).expect("write xlsx");
+        let doc = crate::Document::from_reader(
+            std::io::Cursor::new(buf.into_inner()),
+            crate::DocumentFormat::Xlsx,
+        )
+        .expect("reopen");
+        let ir = doc.to_ir();
+        // The reader wraps a positioned picture in a `TextBox` carrying
+        // its anchor.
+        let alt = ir.sections[0].elements.iter().find_map(|e| match e {
+            crate::ir::Element::Image(img) => img.alt_text.clone(),
+            crate::ir::Element::TextBox(tb) => tb.content.iter().find_map(|e| match e {
+                crate::ir::Element::Image(img) => img.alt_text.clone(),
+                _ => None,
+            }),
+            _ => None,
+        });
+        assert_eq!(alt.as_deref(), Some("company logo"), "{ir:?}");
+    }
+
     /// A caller-supplied extension that's entirely non-alphanumeric must
     /// still produce a usable file, not an empty/invalid one.
     #[test]
@@ -2347,6 +2462,95 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         wb.write_to(&mut buf).expect("write xlsx");
         assert!(!buf.get_ref().is_empty());
+    }
+
+    /// A formula cell that went through the IR comes back as a formula
+    /// *and* keeps the value it showed. The IR writer used to keep only
+    /// the value (every formula became a constant) and, for a formula
+    /// with no cached value, nothing at all.
+    #[test]
+    fn test_formulas_survive_an_ir_round_trip_with_their_cached_values() {
+        let mut wb = XlsxWriter::new();
+        let mut sheet = wb.add_sheet("T");
+        sheet.set_cell(0, 0, CellData::Number(10.0));
+        sheet.set_cell(1, 0, CellData::Number(20.0));
+        sheet.set_cell(
+            2,
+            0,
+            CellData::FormulaWithValue {
+                formula: "SUM(A1:A2)".into(),
+                cached: Box::new(CellData::Number(30.0)),
+            },
+        );
+        sheet.set_cell(
+            3,
+            0,
+            CellData::FormulaWithValue {
+                formula: "A1&\"x\"".into(),
+                cached: Box::new(CellData::String("10x".into())),
+            },
+        );
+        sheet.set_cell(4, 0, CellData::Formula("NOW()".into()));
+        // A second column so the sheet converts as a table, not prose.
+        for r in 0..5 {
+            sheet.set_cell(r, 1, CellData::String(format!("row {r}")));
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        wb.write_to(&mut buf).expect("write xlsx");
+
+        let reread = |bytes: Vec<u8>| {
+            let doc = crate::Document::from_reader(
+                std::io::Cursor::new(bytes),
+                crate::DocumentFormat::Xlsx,
+            )
+            .expect("reopen");
+            let ir = doc.to_ir();
+            let table = ir.sections[0]
+                .elements
+                .iter()
+                .find_map(|e| match e {
+                    crate::ir::Element::Table(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .expect("the sheet is a table");
+            let cells: Vec<(String, Option<String>)> = table
+                .rows
+                .iter()
+                .map(|r| {
+                    let c = &r.cells[0];
+                    let text: String = c
+                        .content
+                        .iter()
+                        .map(|e| match e {
+                            crate::ir::Element::Paragraph(p) => {
+                                crate::ir::inline_to_text(&p.content)
+                            },
+                            _ => String::new(),
+                        })
+                        .collect();
+                    (text, c.formula.clone())
+                })
+                .collect();
+            (ir, cells)
+        };
+        let (ir, cells) = reread(buf.into_inner());
+        assert_eq!(
+            cells,
+            vec![
+                ("10".into(), None),
+                ("20".into(), None),
+                ("30".into(), Some("SUM(A1:A2)".into())),
+                ("10x".into(), Some("A1&\"x\"".into())),
+                ("=NOW()".into(), Some("NOW()".into())),
+            ]
+        );
+
+        // Second cycle through the IR: still formulas, still valued.
+        let mut buf = std::io::Cursor::new(Vec::new());
+        crate::create::create_from_ir_to_writer(&ir, crate::DocumentFormat::Xlsx, &mut buf)
+            .expect("write from ir");
+        let (_, again) = reread(buf.into_inner());
+        assert_eq!(again, cells, "formulas or cached values lost on the IR write path");
     }
 
     #[test]

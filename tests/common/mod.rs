@@ -123,6 +123,10 @@ pub struct FibTweaks {
     pub encrypted: bool,
     /// Override `fcClx`, to point the piece table outside the table stream.
     pub clx_offset: Option<u32>,
+    /// Start the first paragraph's FKP run this many bytes *before* the
+    /// text (Word leaves the first `rgfc` at the start of the text area,
+    /// not at `fcMin`).
+    pub first_fkp_fc_before_text: u32,
 }
 
 /// Build a synthetic `.doc`, optionally with subdocuments and FIB tweaks.
@@ -210,7 +214,10 @@ pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> V
         } else {
             text_len
         };
-        let fc0 = text_offset + cp0 * 2;
+        let mut fc0 = text_offset + cp0 * 2;
+        if i == 0 {
+            fc0 -= tweaks.first_fkp_fc_before_text;
+        }
         let fc1 = text_offset + cp1 * 2;
         let page = build_fkp_page(fc0, fc1, &p.grpprl);
         let off = (i + 1) * 512;

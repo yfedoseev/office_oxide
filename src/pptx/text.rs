@@ -44,6 +44,15 @@ impl PptxDocument {
                 result.push_str(&text);
             }
         }
+        // Slide comments are review content; `to_ir()` carries them as
+        // endnotes, and this direct renderer dropped them — a slide whose
+        // only content was its comments came back empty.
+        for c in &slide.comments {
+            result.push_str("\n\n");
+            result.push_str(&comment_marker(c.author.as_deref()));
+            result.push_str(": ");
+            result.push_str(c.text.trim());
+        }
 
         Some(result)
     }
@@ -96,6 +105,13 @@ impl PptxDocument {
                 }
                 result.push('\n');
             }
+        }
+        for c in &slide.comments {
+            result.push_str(&format!(
+                "> **{}:** {}\n\n",
+                comment_marker(c.author.as_deref()),
+                c.text.trim()
+            ));
         }
 
         // Trim trailing whitespace
@@ -165,6 +181,14 @@ fn collect_text_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePositio
             },
             Shape::Connector(_) => {},
         }
+    }
+}
+
+/// `Comment (Author)` — the label the IR's endnote carries as its marker.
+fn comment_marker(author: Option<&str>) -> String {
+    match author {
+        Some(a) => format!("Comment ({a})"),
+        None => "Comment".to_string(),
     }
 }
 
@@ -290,7 +314,10 @@ fn collect_markdown_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePos
             Shape::Picture(pic) => {
                 if let Some(ref alt) = pic.alt_text {
                     if !alt.is_empty() {
-                        entries.push((pic.position.clone(), format!("![{alt}]()")));
+                        entries.push((
+                            pic.position.clone(),
+                            format!("![{}]()", crate::core::markdown::image_alt(alt)),
+                        ));
                     }
                 }
             },
@@ -355,7 +382,8 @@ fn markdown_run(run: &super::shape::TextRun) -> String {
         return String::new();
     }
 
-    let mut text = run.text.clone();
+    // Document text must not read as markdown (`*not bold*`, `<tag>`).
+    let mut text = crate::core::markdown::escape_text(&run.text);
 
     // Apply inline formatting
     if run.strikethrough {
@@ -402,10 +430,7 @@ fn markdown_table(table: &Table) -> String {
                     slot.map(|cell| {
                         cell.text_body
                             .as_ref()
-                            .map(|tb| {
-                                // Flatten paragraphs for table cells — replace newlines with spaces
-                                plain_text_from_body(tb).replace('\n', " ")
-                            })
+                            .map(|tb| crate::core::markdown::escape_cell(&plain_text_from_body(tb)))
                             .unwrap_or_default()
                     })
                     .unwrap_or_default()

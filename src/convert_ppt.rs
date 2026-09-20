@@ -78,12 +78,26 @@ fn spans_for_range(
             cuts.insert(f.end);
         }
     }
+    // A vertical tab (0x0B) is a line break inside the paragraph
+    // ([MS-PPT] §2.9.43 text: the "soft return"). Left in the text it
+    // glued the two lines into one word on every IR surface
+    // (`UploadStations`) while `plain_text()` broke the line.
+    for (i, &c) in text_chars.iter().enumerate().take(e).skip(s) {
+        if c == '\u{b}' {
+            cuts.insert(i);
+            cuts.insert(i + 1);
+        }
+    }
     let cuts: Vec<usize> = cuts.into_iter().collect();
 
     let mut spans = Vec::with_capacity(cuts.len().saturating_sub(1));
     for w in cuts.windows(2) {
         let (a, b) = (w[0], w[1]);
         if a >= b {
+            continue;
+        }
+        if b == a + 1 && text_chars[a] == '\u{b}' {
+            spans.push(InlineContent::LineBreak);
             continue;
         }
         let seg: String = text_chars[a..b].iter().collect();

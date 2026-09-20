@@ -853,12 +853,11 @@ fn emit_heading(
     let trim_start = text.len() - text.trim_start().len();
     let hyperlinks = shift_hyperlinks_for_trim(hyperlinks, trim_start, trimmed.len());
     let chp_runs = shift_chp_runs_for_trim(chp_runs, trim_start, trimmed.len());
-    let mut content = inline_content_for(trimmed, &hyperlinks, &chp_runs);
-    for ic in &mut content {
-        if let InlineContent::Text(t) = ic {
-            t.bold = true;
-        }
-    }
+    // A heading is not also bold text: forcing `bold` on every span
+    // rendered `# **Title**` / `<h1><strong>` — the same defect the DOCX
+    // converter had for a heading style's own `<w:b/>`. Real per-run
+    // formatting inside the heading is kept.
+    let content = inline_content_for(trimmed, &hyperlinks, &chp_runs);
     elements.push(Element::Heading(Heading {
         level: level.clamp(1, 6),
         content,
@@ -900,12 +899,7 @@ fn emit_prose(
         let trim_start = text.len() - text.trim_start().len();
         let shifted = shift_hyperlinks_for_trim(hyperlinks, trim_start, trimmed.len());
         let shifted_chp = shift_chp_runs_for_trim(chp_runs, trim_start, trimmed.len());
-        let mut content = inline_content_for(trimmed, &shifted, &shifted_chp);
-        for ic in &mut content {
-            if let InlineContent::Text(t) = ic {
-                t.bold = true;
-            }
-        }
+        let content = inline_content_for(trimmed, &shifted, &shifted_chp);
         elements.push(Element::Heading(Heading {
             level: if elements.is_empty() { 1 } else { 2 },
             content,

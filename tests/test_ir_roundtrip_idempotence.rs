@@ -240,3 +240,84 @@ fn test_pptx_title_heading_not_first_element_does_not_duplicate_on_roundtrip() {
         "title duplicated into body on write, expected exactly one occurrence: {text:?}"
     );
 }
+
+/// Each section's headers and footers come back on *that* section.
+/// The writer used to reference every header from the final body-level
+/// `sectPr` only (one per type), so a two-section document lost the
+/// first section's header and the reader then filed what survived on
+/// the wrong section.
+#[test]
+fn test_docx_roundtrip_keeps_headers_on_their_own_sections() {
+    use office_oxide::ir::*;
+    fn para(text: &str) -> Element {
+        Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan {
+                text: text.to_string(),
+                ..Default::default()
+            })],
+            ..Default::default()
+        })
+    }
+    fn hf(text: &str) -> Option<HeaderFooter> {
+        Some(HeaderFooter {
+            content: vec![para(text)],
+        })
+    }
+    fn hf_text(hf: &Option<HeaderFooter>) -> String {
+        hf.as_ref()
+            .map(|h| {
+                h.content
+                    .iter()
+                    .map(|e| match e {
+                        Element::Paragraph(p) => inline_to_text(&p.content),
+                        _ => String::new(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default()
+    }
+    let ir = DocumentIR {
+        sections: vec![
+            Section {
+                elements: vec![para("body one")],
+                header: hf("alpha header"),
+                first_page_header: hf("alpha first page"),
+                ..Default::default()
+            },
+            Section {
+                elements: vec![para("body two")],
+                header: hf("beta header"),
+                footer: hf("beta footer"),
+                ..Default::default()
+            },
+            // A trailing section that is nothing but its header.
+            Section {
+                header: hf("gamma header"),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let (back, _) = write_parse(&ir, DocumentFormat::Docx);
+    let got: Vec<(String, String, String)> = back
+        .sections
+        .iter()
+        .map(|s| (hf_text(&s.header), hf_text(&s.first_page_header), hf_text(&s.footer)))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("alpha header".into(), "alpha first page".into(), String::new()),
+            ("beta header".into(), String::new(), "beta footer".into()),
+            ("gamma header".into(), String::new(), String::new()),
+        ],
+        "sections after a round trip: {back:#?}"
+    );
+    let text = back.plain_text();
+    for w in ["body one", "body two"] {
+        assert!(text.contains(w), "body text lost: {text:?}");
+    }
+    let (again, _) = write_parse(&back, DocumentFormat::Docx);
+    assert_eq!(back, again, "second cycle drifted");
+}

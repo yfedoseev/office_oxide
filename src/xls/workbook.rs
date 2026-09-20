@@ -719,13 +719,14 @@ impl XlsDocument {
             out.push_str(&sheet.name);
             out.push_str("\n\n");
 
-            if sheet.rows.is_empty() {
-                continue;
-            }
-
-            // Header row.
+            // A sheet with no cells can still carry comments (on cells
+            // that hold nothing else); `continue` here skipped them while
+            // `to_ir()` kept them.
             let col_count = sheet.rows.iter().map(|r| r.len()).max().unwrap_or(0);
             if col_count == 0 {
+                for c in &sheet.comments {
+                    out.push_str(&format!("\n> **{}:** {}\n", comment_marker(c), c.text.trim()));
+                }
                 continue;
             }
 
@@ -735,7 +736,7 @@ impl XlsDocument {
                 for c in 0..col_count {
                     let text = cell_display_text(sheet, 0, c);
                     out.push(' ');
-                    out.push_str(&text);
+                    out.push_str(&crate::core::markdown::escape_cell(&text));
                     out.push_str(" |");
                 }
             }
@@ -762,7 +763,7 @@ impl XlsDocument {
                 for c in 0..col_count {
                     let text = cell_display_text(sheet, r, c);
                     out.push(' ');
-                    out.push_str(&text);
+                    out.push_str(&crate::core::markdown::escape_cell(&text));
                     out.push_str(" |");
                 }
                 out.push('\n');
@@ -1187,33 +1188,31 @@ pub(super) fn build_grid(cells: &mut [Cell]) -> (Vec<Vec<CellValue>>, Vec<Vec<u1
     // be padded to the sheet's declared extent, so a 42 KB file with four
     // corner cells in a 65,536 x 256 sheet held 16.7M `CellValue`s — 392 MB
     // — before a single byte of text was extracted.
-    let mut grid: Vec<Vec<CellValue>> = Vec::new();
-    let mut xf: Vec<Vec<u16>> = Vec::new();
-    for cell in cells.iter_mut() {
+    // Size every row once, from a first pass over the cells: growing a
+    // row cell by cell reallocated it (and its XF twin) at every new
+    // column, which made a million-cell workbook a malloc benchmark —
+    // 2.5x slower than allocating the rows up front.
+    let in_grid = |cell: &Cell| cell.col <= 255 && !matches!(cell.value, CellValue::Empty);
+    let mut width: Vec<u16> = Vec::new();
+    for cell in cells.iter().filter(|c| in_grid(c)) {
+        let r = cell.row as usize;
+        if width.len() <= r {
+            width.resize(r + 1, 0);
+        }
+        width[r] = width[r].max(cell.col + 1);
+    }
+    let mut grid: Vec<Vec<CellValue>> = width
+        .iter()
+        .map(|&w| vec![CellValue::Empty; w as usize])
+        .collect();
+    let mut xf: Vec<Vec<u16>> = width.iter().map(|&w| vec![0u16; w as usize]).collect();
+    for cell in cells.iter_mut().filter(|c| in_grid(c)) {
         let (r, c) = (cell.row as usize, cell.col as usize);
-        if r > 65535 || c > 255 || matches!(cell.value, CellValue::Empty) {
-            continue;
-        }
-        if grid.len() <= r {
-            grid.resize_with(r + 1, Vec::new);
-            xf.resize_with(r + 1, Vec::new);
-        }
-        let row = &mut grid[r];
-        if row.len() <= c {
-            row.resize(c + 1, CellValue::Empty);
-            xf[r].resize(c + 1, 0);
-        }
-        row[c] = std::mem::take(&mut cell.value);
+        grid[r][c] = std::mem::take(&mut cell.value);
         xf[r][c] = cell.xf_index;
     }
-    for (row, xf_row) in grid.iter_mut().zip(xf.iter_mut()) {
-        while row.last().is_some_and(|v| matches!(v, CellValue::Empty)) {
-            row.pop();
-            xf_row.pop();
-        }
-        row.shrink_to_fit();
-        xf_row.shrink_to_fit();
-    }
+    // Each row already ends at its last non-empty cell; only trailing
+    // rows with nothing in them remain to drop.
     while grid.last().is_some_and(|row| row.is_empty()) {
         grid.pop();
         xf.pop();
@@ -1321,6 +1320,26 @@ mod tests {
             s.extend(eof());
         }
         s
+    }
+
+    /// A comment on a cell that holds nothing else is the whole content
+    /// of an otherwise empty sheet; `to_markdown()` left such a sheet
+    /// before reaching its comments while `to_ir()` kept them.
+    #[test]
+    fn test_markdown_keeps_comments_on_a_sheet_with_no_cells() {
+        let sheet = Sheet {
+            name: "S".into(),
+            comments: vec![XlsComment {
+                row: 0,
+                col: 0,
+                author: Some("Reviewer".to_string()),
+                text: "Check this figure".to_string(),
+            }],
+            ..Default::default()
+        };
+        let md = XlsDocument::from_sheets(vec![sheet]).to_markdown();
+        assert!(md.contains("## S"), "{md:?}");
+        assert!(md.contains("Check this figure"), "{md:?}");
     }
 
     /// An OfficeArt PNG BLIP record (`OfficeArtBlipPNG`, [MS-ODRAW]

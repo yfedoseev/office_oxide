@@ -361,6 +361,13 @@ struct DocxSectPr {
     page_setup: Option<PageSetup>,
     columns: Option<ColumnLayout>,
     break_type: SectionBreakType,
+    /// The headers/footers (indices into `DocxWriter::headers_footers`)
+    /// that belong to this section: those added since the previous
+    /// section's `sectPr`. Every section used to share one flat list
+    /// that was written on the final `sectPr` only, so a multi-section
+    /// document's per-section headers landed on the last section (one
+    /// per type) and the others vanished.
+    hf_range: std::ops::Range<usize>,
 }
 
 /// The type of header or footer section to add.
@@ -507,6 +514,64 @@ fn register_note_hyperlink_rids<W: Write + Seek>(
     rids
 }
 
+/// Register, on `part`, a relationship to every media part that
+/// `elements` reference, returning the part's own view of `doc_rids`.
+/// Image parts are added to the package once, against the main document;
+/// a header, footer or note that shows the same picture needs the
+/// relationship in *its* rels file, under whatever id that file assigns.
+fn register_part_image_rids<W: Write + Seek>(
+    opc: &mut OpcWriter<W>,
+    part: &PartName,
+    element_lists: &[&[DocxElement]],
+    doc_rids: &[ImageInfo],
+    images: &[DocxImage],
+) -> Vec<ImageInfo> {
+    let mut idxs = Vec::new();
+    for elements in element_lists {
+        collect_image_indices(elements, &mut idxs);
+    }
+    let mut out = Vec::new();
+    for idx in idxs {
+        let (Some(info), Some(img)) = (doc_rids.iter().find(|i| i.idx == idx), images.get(idx))
+        else {
+            continue;
+        };
+        let target = format!("media/image{}.{}", idx + 1, img.format.extension());
+        let rid = opc.add_part_rel(part, rel_types::IMAGE, &target);
+        out.push(ImageInfo {
+            rid,
+            ..info.clone()
+        });
+    }
+    out
+}
+
+fn collect_image_indices(elements: &[DocxElement], out: &mut Vec<usize>) {
+    for e in elements {
+        match e {
+            DocxElement::Image(idx) => {
+                if !out.contains(idx) {
+                    out.push(*idx);
+                }
+            },
+            DocxElement::RichList(l) => {
+                for item in &l.items {
+                    collect_image_indices(item, out);
+                }
+            },
+            DocxElement::RichTable(t) => {
+                for row in &t.rows {
+                    for c in &row.cells {
+                        collect_image_indices(&c.content, out);
+                    }
+                }
+            },
+            DocxElement::TextBox(tb) => collect_image_indices(&tb.content, out),
+            _ => {},
+        }
+    }
+}
+
 fn collect_hyperlinks(elements: &[DocxElement], out: &mut Vec<String>) {
     fn push_runs(runs: &[Run], out: &mut Vec<String>) {
         for r in runs {
@@ -539,6 +604,7 @@ fn collect_hyperlinks(elements: &[DocxElement], out: &mut Vec<String>) {
     }
 }
 
+#[derive(Clone)]
 struct ImageInfo {
     idx: usize,
     rid: String,
@@ -560,6 +626,9 @@ pub struct DocxWriter {
     /// Page background colour, written as `w:background`.
     background_rgb: Option<[u8; 3]>,
     headers_footers: Vec<DocxHf>,
+    /// Where the current (not yet closed) section's headers start in
+    /// `headers_footers`.
+    hf_section_start: usize,
     footnotes: Vec<DocxNote>,
     endnotes: Vec<DocxNote>,
     core_props: Option<CoreProps>,
@@ -579,6 +648,7 @@ impl DocxWriter {
             images: Vec::new(),
             background_rgb: None,
             headers_footers: Vec::new(),
+            hf_section_start: 0,
             footnotes: Vec::new(),
             endnotes: Vec::new(),
             core_props: None,
@@ -705,39 +775,16 @@ impl DocxWriter {
 
     /// Add a full IR table with borders, column widths, and cell styling.
     pub fn add_ir_table(&mut self, table: &crate::ir::Table) -> &mut Self {
-        let rich = convert_ir_table(table, &mut self.next_num_id);
+        let rich = convert_ir_table(table, &mut self.next_num_id, &mut self.images);
         self.elements.push(DocxElement::RichTable(rich));
         self
     }
 
     /// Add an inline image from IR. Skips silently if `image.data` is None.
     pub fn add_ir_image(&mut self, image: &crate::ir::Image) -> &mut Self {
-        let data = match &image.data {
-            Some(d) => d.clone(),
-            None => return self,
-        };
-        let format = image.format.clone().unwrap_or(ImageFormat::Png);
-
-        let (w_emu, h_emu) =
-            if let (Some(w), Some(h)) = (image.display_width_emu, image.display_height_emu) {
-                (w, h)
-            } else if let (Some(pw), Some(ph)) = (image.pixel_width, image.pixel_height) {
-                (px_to_emu(pw), px_to_emu(ph))
-            } else {
-                (914400u64, 685800u64)
-            };
-
-        let idx = self.images.len();
-        self.images.push(DocxImage {
-            data,
-            format,
-            display_width_emu: w_emu,
-            display_height_emu: h_emu,
-            alt_text: image.alt_text.clone(),
-            decorative: image.decorative,
-            positioning: image.positioning.clone(),
-        });
-        self.elements.push(DocxElement::Image(idx));
+        if let Some(idx) = register_ir_image(image, &mut self.images) {
+            self.elements.push(DocxElement::Image(idx));
+        }
         self
     }
 
@@ -755,10 +802,13 @@ impl DocxWriter {
         columns: Option<ColumnLayout>,
         break_type: SectionBreakType,
     ) -> &mut Self {
+        let hf_range = self.hf_section_start..self.headers_footers.len();
+        self.hf_section_start = self.headers_footers.len();
         self.elements.push(DocxElement::SectPr(DocxSectPr {
             page_setup,
             columns,
             break_type,
+            hf_range,
         }));
         self
     }
@@ -797,6 +847,7 @@ impl DocxWriter {
                         content_elem,
                         &mut elems,
                         &mut self.next_num_id,
+                        &mut self.images,
                     );
                 }
                 elems
@@ -834,7 +885,12 @@ impl DocxWriter {
     pub fn add_text_box(&mut self, tb: &crate::ir::TextBox) -> &mut Self {
         let mut inner: Vec<DocxElement> = Vec::new();
         for elem in &tb.content {
-            convert_ir_element_to_docx_elements(elem, &mut inner, &mut self.next_num_id);
+            convert_ir_element_to_docx_elements(
+                elem,
+                &mut inner,
+                &mut self.next_num_id,
+                &mut self.images,
+            );
         }
         let width_emu = tb.width_emu.unwrap_or(914400);
         let height_emu = tb.height_emu.unwrap_or(685800);
@@ -860,7 +916,12 @@ impl DocxWriter {
     ) -> &mut Self {
         let mut elems: Vec<DocxElement> = Vec::new();
         for elem in content {
-            convert_ir_element_to_docx_elements(elem, &mut elems, &mut self.next_num_id);
+            convert_ir_element_to_docx_elements(
+                elem,
+                &mut elems,
+                &mut self.next_num_id,
+                &mut self.images,
+            );
         }
         self.footnotes.push(DocxNote {
             id,
@@ -879,7 +940,12 @@ impl DocxWriter {
     ) -> &mut Self {
         let mut elems: Vec<DocxElement> = Vec::new();
         for elem in content {
-            convert_ir_element_to_docx_elements(elem, &mut elems, &mut self.next_num_id);
+            convert_ir_element_to_docx_elements(
+                elem,
+                &mut elems,
+                &mut self.next_num_id,
+                &mut self.images,
+            );
         }
         self.endnotes.push(DocxNote {
             id,
@@ -916,7 +982,12 @@ impl DocxWriter {
     ) -> &mut Self {
         let mut docx_elems: Vec<DocxElement> = Vec::new();
         for elem in &elements {
-            convert_ir_element_to_docx_elements(elem, &mut docx_elems, &mut self.next_num_id);
+            convert_ir_element_to_docx_elements(
+                elem,
+                &mut docx_elems,
+                &mut self.next_num_id,
+                &mut self.images,
+            );
         }
         self.headers_footers.push(DocxHf {
             hf_type,
@@ -1056,9 +1127,16 @@ impl DocxWriter {
             let part_name = format!("/word/{target}");
             let hf_part = PartName::new(&part_name)?;
             let hf_hyperlink_rids = register_hyperlink_rids(&mut opc, &hf_part, &hf.elements);
+            let hf_image_rids = register_part_image_rids(
+                &mut opc,
+                &hf_part,
+                &[&hf.elements],
+                &image_rids,
+                &self.images,
+            );
             let hf_xml = generate_hf_xml(
                 &hf.elements,
-                &image_rids,
+                &hf_image_rids,
                 matches!(
                     hf.hf_type,
                     HfType::DefaultHeader | HfType::FirstPageHeader | HfType::EvenPageHeader
@@ -1075,7 +1153,20 @@ impl DocxWriter {
             let rid = opc.add_part_rel(&doc_part, rel_types::FOOTNOTES, "footnotes.xml");
             let note_hyperlink_rids =
                 register_note_hyperlink_rids(&mut opc, &notes_part, &self.footnotes);
-            let xml = generate_footnotes_xml(&self.footnotes, &image_rids, &note_hyperlink_rids);
+            let note_elems: Vec<&[DocxElement]> = self
+                .footnotes
+                .iter()
+                .map(|n| n.elements.as_slice())
+                .collect();
+            let note_image_rids = register_part_image_rids(
+                &mut opc,
+                &notes_part,
+                &note_elems,
+                &image_rids,
+                &self.images,
+            );
+            let xml =
+                generate_footnotes_xml(&self.footnotes, &note_image_rids, &note_hyperlink_rids);
             opc.add_part(&notes_part, CT_FOOTNOTES, &xml)?;
             Some(rid)
         } else {
@@ -1087,7 +1178,19 @@ impl DocxWriter {
             let rid = opc.add_part_rel(&doc_part, rel_types::ENDNOTES, "endnotes.xml");
             let note_hyperlink_rids =
                 register_note_hyperlink_rids(&mut opc, &notes_part, &self.endnotes);
-            let xml = generate_endnotes_xml(&self.endnotes, &image_rids, &note_hyperlink_rids);
+            let note_elems: Vec<&[DocxElement]> = self
+                .endnotes
+                .iter()
+                .map(|n| n.elements.as_slice())
+                .collect();
+            let note_image_rids = register_part_image_rids(
+                &mut opc,
+                &notes_part,
+                &note_elems,
+                &image_rids,
+                &self.images,
+            );
+            let xml = generate_endnotes_xml(&self.endnotes, &note_image_rids, &note_hyperlink_rids);
             opc.add_part(&notes_part, CT_ENDNOTES, &xml)?;
             Some(rid)
         } else {
@@ -1110,11 +1213,15 @@ impl DocxWriter {
         let mut sectpr_info: Option<SectPrInfo> = None;
         for elem in &self.elements {
             if let DocxElement::SectPr(sp) = elem {
+                // The final section owns its own headers plus any added
+                // after its `set_section_props` call.
+                let mut own: Vec<(HfType, String)> = hf_rids[sp.hf_range.clone()].to_vec();
+                own.extend_from_slice(&hf_rids[sp.hf_range.end.max(self.hf_section_start)..]);
                 sectpr_info = Some(SectPrInfo {
                     page_setup: sp.page_setup.clone(),
                     columns: sp.columns.clone(),
                     break_type: sp.break_type.clone(),
-                    hf_rids: hf_rids.clone(),
+                    hf_rids: own,
                     has_footnotes: footnote_rid.is_some(),
                 });
             }
@@ -1135,6 +1242,7 @@ impl DocxWriter {
         let document_xml = self.generate_document_xml(
             &image_rids,
             sectpr_info.as_ref(),
+            &hf_rids,
             !self.images.is_empty(),
             self.has_text_boxes(),
             &hyperlink_rids,
@@ -1218,6 +1326,7 @@ impl DocxWriter {
         &self,
         image_rids: &[ImageInfo],
         sect_pr: Option<&SectPrInfo>,
+        hf_rids: &[(HfType, String)],
         has_images: bool,
         has_text_boxes: bool,
         links: &HyperlinkRids,
@@ -1290,7 +1399,7 @@ impl DocxWriter {
                     // below (uses the `sect_pr` info already gathered).
                     continue;
                 }
-                write_inline_section_break_paragraph(&mut w, sp);
+                write_inline_section_break_paragraph(&mut w, sp, &hf_rids[sp.hf_range.clone()]);
                 continue;
             }
             write_docx_element(&mut w, element, image_rids, &mut image_counter, links);
@@ -1469,7 +1578,11 @@ impl HfType {
 /// the (already-clamped) per-cell span loop below ever runs.
 const MAX_TABLE_COLS: usize = 4096;
 
-fn convert_ir_table(table: &crate::ir::Table, next_num_id: &mut u32) -> DocxRichTable {
+fn convert_ir_table(
+    table: &crate::ir::Table,
+    next_num_id: &mut u32,
+    images: &mut Vec<DocxImage>,
+) -> DocxRichTable {
     let num_rows = table.rows.len();
     // The real grid width is the sum of each row's col_spans, not its
     // literal TableCell *count* — a row with a horizontally-merged cell
@@ -1544,7 +1657,7 @@ fn convert_ir_table(table: &crate::ir::Table, next_num_id: &mut u32) -> DocxRich
             // Convert cell content
             let mut content_elems: Vec<DocxElement> = Vec::new();
             for elem in &cell.content {
-                convert_ir_element_to_docx_elements(elem, &mut content_elems, next_num_id);
+                convert_ir_element_to_docx_elements(elem, &mut content_elems, next_num_id, images);
             }
             if content_elems.is_empty() {
                 content_elems.push(DocxElement::Paragraph(DocxParagraph::plain("", None, None)));
@@ -1597,10 +1710,44 @@ fn convert_ir_table(table: &crate::ir::Table, next_num_id: &mut u32) -> DocxRich
     }
 }
 
+/// Store an IR image in the writer's media list and return its index,
+/// or `None` when the IR carries no bytes for it.
+fn register_ir_image(image: &crate::ir::Image, images: &mut Vec<DocxImage>) -> Option<usize> {
+    let data = image.data.clone()?;
+    let format = image.format.clone().unwrap_or(ImageFormat::Png);
+
+    let (w_emu, h_emu) =
+        if let (Some(w), Some(h)) = (image.display_width_emu, image.display_height_emu) {
+            (w, h)
+        } else if let (Some(pw), Some(ph)) = (image.pixel_width, image.pixel_height) {
+            (px_to_emu(pw), px_to_emu(ph))
+        } else {
+            (914400u64, 685800u64)
+        };
+
+    let idx = images.len();
+    images.push(DocxImage {
+        data,
+        format,
+        display_width_emu: w_emu,
+        display_height_emu: h_emu,
+        alt_text: image.alt_text.clone(),
+        decorative: image.decorative,
+        positioning: image.positioning.clone(),
+    });
+    Some(idx)
+}
+
+/// Convert one IR element nested below the body level — a table cell, a
+/// text box, a list item, a header/footer or a note — into writer
+/// elements. `images` is the writer's media list: an image met here is
+/// registered like a body-level one and referenced by index, so nested
+/// images are written rather than dropped.
 fn convert_ir_element_to_docx_elements(
     elem: &crate::ir::Element,
     out: &mut Vec<DocxElement>,
     next_num_id: &mut u32,
+    images: &mut Vec<DocxImage>,
 ) {
     // The readers bound nesting with DepthGuard (MAX_NESTING_DEPTH); the
     // writers never did, so a deeply nested IR — and DocumentIR is
@@ -1630,7 +1777,7 @@ fn convert_ir_element_to_docx_elements(
             };
             out.push(DocxElement::RichParagraph(DocxRichParagraph { runs, props }));
         },
-        E::Table(t) => out.push(DocxElement::RichTable(convert_ir_table(t, next_num_id))),
+        E::Table(t) => out.push(DocxElement::RichTable(convert_ir_table(t, next_num_id, images))),
         E::List(l) => {
             // A fresh numId per logical list nested in a cell, text box, or
             // header/footer/note — hardcoding numId 1/2 (the two reserved
@@ -1641,11 +1788,15 @@ fn convert_ir_element_to_docx_elements(
             // analogous top-level-list bug).
             let num_id = *next_num_id;
             *next_num_id += 1;
-            convert_ir_list_at(l, l.level, num_id, out, next_num_id);
+            convert_ir_list_at(l, l.level, num_id, out, next_num_id, images);
         },
-        E::Image(_img) => {
-            // Image embedding requires the outer DocxWriter context for index tracking.
-            // Skip in nested contexts (table cells, text boxes, headers).
+        E::Image(img) => {
+            // Every nested image used to be skipped here ("needs the outer
+            // writer context"), so a picture in a table cell, text box,
+            // header, footer or note vanished from the written file.
+            if let Some(idx) = register_ir_image(img, images) {
+                out.push(DocxElement::Image(idx));
+            }
         },
         E::ThematicBreak => {},
         E::PageBreak => out.push(DocxElement::PageBreak),
@@ -1653,7 +1804,7 @@ fn convert_ir_element_to_docx_elements(
         E::TextBox(tb) => {
             let mut inner: Vec<DocxElement> = Vec::new();
             for e in &tb.content {
-                convert_ir_element_to_docx_elements(e, &mut inner, next_num_id);
+                convert_ir_element_to_docx_elements(e, &mut inner, next_num_id, images);
             }
             out.push(DocxElement::TextBox(DocxTextBox {
                 content: inner,
@@ -1690,6 +1841,7 @@ fn convert_ir_list_at(
     num_id: u32,
     out: &mut Vec<DocxElement>,
     next_num_id: &mut u32,
+    images: &mut Vec<DocxImage>,
 ) {
     let start_number = list.start_number.unwrap_or(1);
     let style = list.style.clone();
@@ -1700,7 +1852,7 @@ fn convert_ir_list_at(
         .map(|item| {
             let mut elems: Vec<DocxElement> = Vec::new();
             for content_elem in &item.content {
-                convert_ir_element_to_docx_elements(content_elem, &mut elems, next_num_id);
+                convert_ir_element_to_docx_elements(content_elem, &mut elems, next_num_id, images);
             }
             elems
         })
@@ -1721,7 +1873,14 @@ fn convert_ir_list_at(
 
     for item in &list.items {
         if let Some(ref nested) = item.nested {
-            convert_ir_list_at(nested, level.saturating_add(1).min(8), num_id, out, next_num_id);
+            convert_ir_list_at(
+                nested,
+                level.saturating_add(1).min(8),
+                num_id,
+                out,
+                next_num_id,
+                images,
+            );
         }
     }
 }
@@ -3329,16 +3488,50 @@ fn write_floating_image_run(
 /// `<w:sectPr>` describes the section ending at this point. We don't
 /// emit hf / footnote references on inline sectPr (they're document-wide
 /// and live on the body-level final sectPr only).
-fn write_inline_section_break_paragraph(w: &mut Writer<Vec<u8>>, sp: &DocxSectPr) {
+fn write_inline_section_break_paragraph(
+    w: &mut Writer<Vec<u8>>,
+    sp: &DocxSectPr,
+    hf_rids: &[(HfType, String)],
+) {
     w.write_event(Event::Start(BytesStart::new("w:p")))
         .expect("write inline-section p start");
     w.write_event(Event::Start(BytesStart::new("w:pPr")))
         .expect("write inline-section pPr start");
-    write_section_pr_body(w, sp.page_setup.as_ref(), sp.columns.as_ref(), &sp.break_type);
+    write_section_pr_body(w, sp.page_setup.as_ref(), sp.columns.as_ref(), &sp.break_type, hf_rids);
     w.write_event(Event::End(BytesEnd::new("w:pPr")))
         .expect("write inline-section pPr end");
     w.write_event(Event::End(BytesEnd::new("w:p")))
         .expect("write inline-section p end");
+}
+
+/// The `w:headerReference`/`w:footerReference` elements of one section
+/// (ECMA-376 §17.10.5: at most one of each type), returning whether a
+/// first-page pair is among them so the caller can emit `w:titlePg`.
+fn write_hf_references(w: &mut Writer<Vec<u8>>, hf_rids: &[(HfType, String)]) -> bool {
+    let mut seen_types: Vec<HfType> = Vec::new();
+    let mut has_first_page = false;
+    for (hf_type, rid) in hf_rids {
+        if seen_types.contains(hf_type) {
+            continue;
+        }
+        seen_types.push(*hf_type);
+        if matches!(hf_type, HfType::FirstPageHeader | HfType::FirstPageFooter) {
+            has_first_page = true;
+        }
+        let (tag, type_val) = match hf_type {
+            HfType::DefaultHeader => ("w:headerReference", "default"),
+            HfType::FirstPageHeader => ("w:headerReference", "first"),
+            HfType::EvenPageHeader => ("w:headerReference", "even"),
+            HfType::DefaultFooter => ("w:footerReference", "default"),
+            HfType::FirstPageFooter => ("w:footerReference", "first"),
+            HfType::EvenPageFooter => ("w:footerReference", "even"),
+        };
+        let mut elem = BytesStart::new(tag);
+        elem.push_attribute(("w:type", type_val));
+        elem.push_attribute(("r:id", rid.as_str()));
+        w.write_event(Event::Empty(elem)).expect("write hfRef");
+    }
+    has_first_page
 }
 
 /// Shared `<w:sectPr>...</w:sectPr>` body writer — used by both the
@@ -3349,9 +3542,13 @@ fn write_section_pr_body(
     page_setup: Option<&PageSetup>,
     columns: Option<&ColumnLayout>,
     break_type: &SectionBreakType,
+    hf_rids: &[(HfType, String)],
 ) {
     w.write_event(Event::Start(BytesStart::new("w:sectPr")))
         .expect("write sectPr start");
+
+    // CT_SectPr orders the header/footer references first.
+    let has_first_page = write_hf_references(w, hf_rids);
 
     match break_type {
         SectionBreakType::Continuous => {
@@ -3429,6 +3626,11 @@ fn write_section_pr_body(
         }
     }
 
+    if has_first_page {
+        w.write_event(Event::Empty(BytesStart::new("w:titlePg")))
+            .expect("write titlePg");
+    }
+
     w.write_event(Event::End(BytesEnd::new("w:sectPr")))
         .expect("write sectPr end");
 }
@@ -3437,33 +3639,7 @@ fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
     w.write_event(Event::Start(BytesStart::new("w:sectPr")))
         .expect("write sectPr start");
 
-    // ECMA-376 §17.10.5 allows at most one reference of each type per
-    // section. headers_footers is a single flat list shared by every
-    // section, so without this a multi-section document emitted duplicate
-    // w:type values in the final sectPr.
-    let mut seen_types: Vec<HfType> = Vec::new();
-    let mut has_first_page = false;
-    for (hf_type, rid) in &sp.hf_rids {
-        if seen_types.contains(hf_type) {
-            continue;
-        }
-        seen_types.push(*hf_type);
-        if matches!(hf_type, HfType::FirstPageHeader | HfType::FirstPageFooter) {
-            has_first_page = true;
-        }
-        let (tag, type_val) = match hf_type {
-            HfType::DefaultHeader => ("w:headerReference", "default"),
-            HfType::FirstPageHeader => ("w:headerReference", "first"),
-            HfType::EvenPageHeader => ("w:headerReference", "even"),
-            HfType::DefaultFooter => ("w:footerReference", "default"),
-            HfType::FirstPageFooter => ("w:footerReference", "first"),
-            HfType::EvenPageFooter => ("w:footerReference", "even"),
-        };
-        let mut elem = BytesStart::new(tag);
-        elem.push_attribute(("w:type", type_val));
-        elem.push_attribute(("r:id", rid.as_str()));
-        w.write_event(Event::Empty(elem)).expect("write hfRef");
-    }
+    let has_first_page = write_hf_references(w, &sp.hf_rids);
 
     if sp.has_footnotes {
         w.write_event(Event::Empty(BytesStart::new("w:footnotePr")))

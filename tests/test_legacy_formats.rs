@@ -314,3 +314,123 @@ fn test_a_document_with_no_outline_data_still_gets_the_line_shape_guess() {
     );
     assert!(ir.metadata.title.is_some(), "and keeps its derived title");
 }
+
+/// A compound file is read as the document it holds, whatever its
+/// extension says: a workbook saved as `.doc` opens as a spreadsheet
+/// (MS-XLS `Workbook` stream) instead of failing with "WordDocument
+/// stream not found" — the way every other reader treats it.
+#[test]
+fn test_a_workbook_under_a_doc_extension_opens_as_a_spreadsheet() {
+    use common::{biff, cfb_with_stream};
+    // BIFF8: workbook globals (BOF, BOUNDSHEET, EOF) then one sheet with
+    // a LABEL cell (0x0204) "hello".
+    let bof = |kind: u16| {
+        let mut b = 0x0600u16.to_le_bytes().to_vec();
+        b.extend_from_slice(&kind.to_le_bytes());
+        b.extend_from_slice(&[0u8; 12]);
+        biff(0x0809, &b)
+    };
+    let mut s = bof(0x0005);
+    let mut bs = 0u32.to_le_bytes().to_vec();
+    bs.extend_from_slice(&[0, 0, 1, 0, b'S']);
+    s.extend(biff(0x0085, &bs));
+    s.extend(biff(0x000A, &[]));
+    s.extend(bof(0x0010));
+    let mut label = 0u16.to_le_bytes().to_vec();
+    label.extend_from_slice(&0u16.to_le_bytes());
+    label.extend_from_slice(&0u16.to_le_bytes());
+    label.extend_from_slice(&5u16.to_le_bytes());
+    label.push(0);
+    label.extend_from_slice(b"hello");
+    s.extend(biff(0x0204, &label));
+    s.extend(biff(0x000A, &[]));
+    let bytes = cfb_with_stream("Workbook", &s);
+
+    let doc = Document::from_reader(Cursor::new(bytes.clone()), DocumentFormat::Doc)
+        .expect("a compound file holding a Workbook stream is a spreadsheet");
+    assert_eq!(doc.format(), DocumentFormat::Xls);
+    assert!(doc.plain_text().contains("hello"), "{:?}", doc.plain_text());
+
+    let dir = std::env::temp_dir().join(format!("oo-mislabeled-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("workbook.doc");
+    std::fs::write(&path, &bytes).unwrap();
+    let doc = Document::open(&path).expect("same through the path API");
+    assert_eq!(doc.format(), DocumentFormat::Xls);
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // A compound file holding none of the three is still the extension's
+    // own error, not a silent success.
+    let other = cfb_with_stream("SomeStream", b"data");
+    assert!(Document::from_reader(Cursor::new(other), DocumentFormat::Doc).is_err());
+}
+
+/// Word for Windows 2.0 wrote flat files — the FIB at byte 0, no
+/// compound container — with CR LF paragraph marks and code-page text.
+/// They were refused as "not a compound file" while catdoc and antiword
+/// read them.
+#[test]
+fn test_a_word_2_flat_file_extracts_its_text() {
+    let text = b"Sonderaktion Winter 1990/1991\r\nWegen g\xfcnstiger Einkaufsm\xf6glichkeiten.\r\n\r\nEnde.\r\n";
+    let mut bytes = vec![0u8; 0x180];
+    bytes[0..2].copy_from_slice(&0xA5DBu16.to_le_bytes());
+    bytes[2..4].copy_from_slice(&45u16.to_le_bytes());
+    bytes[6..8].copy_from_slice(&0x0407u16.to_le_bytes());
+    bytes[0x18..0x1C].copy_from_slice(&0x180u32.to_le_bytes());
+    bytes[0x1C..0x20].copy_from_slice(&(0x180 + text.len() as u32).to_le_bytes());
+    bytes[0x34..0x38].copy_from_slice(&(text.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(text);
+
+    let doc = open_doc(bytes.clone()).expect("a Word 2.0 file opens");
+    assert_eq!(doc.format(), DocumentFormat::Doc);
+    assert_eq!(
+        doc.plain_text(),
+        "Sonderaktion Winter 1990/1991\nWegen günstiger Einkaufsmöglichkeiten.\n\nEnde.\n"
+    );
+    let ir = doc.to_ir();
+    assert!(
+        ir.sections[0].elements.len() >= 3,
+        "each paragraph mark ends a paragraph: {:?}",
+        ir.sections[0].elements
+    );
+
+    // Word 1.x has the same shape under its own magic.
+    bytes[0..2].copy_from_slice(&0xA59Bu16.to_le_bytes());
+    assert!(
+        open_doc(bytes)
+            .unwrap()
+            .plain_text()
+            .starts_with("Sonderaktion")
+    );
+}
+
+/// The first PAPX FKP run may start below the text's first piece — Word
+/// leaves `rgfc[0]` at the start of the text area rather than at
+/// `fcMin`. That start mapped to no CP, so the document's opening
+/// paragraph was missing from `to_ir()` (and `to_html()`) while
+/// `plain_text()` had it.
+#[test]
+fn test_an_opening_paragraph_whose_fkp_run_starts_before_the_text_is_kept() {
+    let bytes = build_doc_full(
+        &[para("Opening paragraph."), para("Second paragraph.")],
+        &Subdocs::default(),
+        FibTweaks {
+            first_fkp_fc_before_text: 512,
+            ..Default::default()
+        },
+    );
+    let doc = open_doc(bytes).unwrap();
+    assert!(doc.plain_text().starts_with("Opening paragraph."));
+    let ir = doc.to_ir();
+    let first = ir.sections[0]
+        .elements
+        .iter()
+        .find_map(|e| match e {
+            Element::Paragraph(p) => Some(office_oxide::ir::inline_to_text(&p.content)),
+            Element::Heading(h) => Some(office_oxide::ir::inline_to_text(&h.content)),
+            _ => None,
+        })
+        .unwrap_or_default();
+    assert_eq!(first, "Opening paragraph.", "{:?}", ir.sections[0].elements);
+    assert!(ir.to_html().contains("Opening paragraph."));
+}

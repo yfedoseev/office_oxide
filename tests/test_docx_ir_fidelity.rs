@@ -104,6 +104,39 @@ impl Docx {
         self
     }
 
+    /// Add a header part carrying a picture: the image part and its
+    /// relationship live on the *header*, under an id assigned by the
+    /// header's own rels file.
+    fn header_with_picture(mut self, placeholder: &str, png: &[u8]) -> Self {
+        let img_part = PartName::new("/word/media/logo.png").unwrap();
+        self.w.add_part(&img_part, "image/png", png).unwrap();
+        let part = PartName::new("/word/header1.xml").unwrap();
+        let img_rid = self
+            .w
+            .add_part_rel(&part, rel_types::IMAGE, "media/logo.png");
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+       xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:p><w:r><w:t>HEADER TEXT</w:t></w:r><w:r><w:drawing>
+    <wp:inline xmlns:wp="x">
+      <wp:extent cx="100" cy="100"/>
+      <wp:docPr id="1" name="Pic" descr="HEADER LOGO"/>
+      <a:graphic xmlns:a="y"><a:graphicData>
+        <pic:pic xmlns:pic="p"><pic:blipFill><a:blip r:embed="{img_rid}"/></pic:blipFill></pic:pic>
+      </a:graphicData></a:graphic>
+    </wp:inline>
+  </w:drawing></w:r></w:p>
+</w:hdr>"#
+        );
+        self.w.add_part(&part, CT_HF, xml.as_bytes()).unwrap();
+        let rid = self
+            .w
+            .add_part_rel(&self.doc_part, rel_types::HEADER, "header1.xml");
+        self.body = self.body.replace(placeholder, &rid);
+        self
+    }
+
     /// Add `word/footnotes.xml` / `endnotes.xml` / `comments.xml` with the
     /// given item elements already written out.
     fn notes(mut self, file: &str, rel_type: &str, ct: &str, inner: &str) -> Self {
@@ -765,6 +798,47 @@ fn test_a_based_on_cycle_does_not_hang() {
 // Heading detection via style id / name
 // ---------------------------------------------------------------------------
 
+/// Word writes a manual page break as `<w:br w:type="page"/>` at the
+/// *start* of the following paragraph. The converter kept only the runs
+/// before a break, so that paragraph's whole text vanished from
+/// `to_ir()`/`to_html()` while `plain_text()` kept it — 75 corpus files.
+/// A paragraph splits at every hard break; the text on both sides
+/// survives and the breaks keep their place.
+#[test]
+fn test_text_after_a_hard_break_in_the_same_paragraph_is_kept() {
+    let ir = Docx::new(
+        r#"<w:p><w:r><w:br w:type="page"/></w:r><w:r><w:t>After the page break</w:t></w:r></w:p>
+           <w:p><w:r><w:t>before</w:t></w:r><w:r><w:br w:type="column"/></w:r><w:r><w:t>after</w:t></w:r></w:p>
+           <w:p><w:r><w:br w:type="page"/></w:r></w:p>"#,
+    )
+    .ir();
+    let kinds: Vec<String> = ir.sections[0]
+        .elements
+        .iter()
+        .map(|e| match e {
+            Element::Paragraph(p) => format!("p:{}", para_text(p)),
+            Element::PageBreak => "page".into(),
+            Element::ColumnBreak => "column".into(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "page",
+            "p:After the page break",
+            "p:before",
+            "column",
+            "p:after",
+            "page"
+        ],
+        "{:?}",
+        ir.sections[0].elements
+    );
+    let html = ir.to_html();
+    assert!(html.contains("After the page break") && html.contains("after"), "{html}");
+}
+
 /// Word's multilevel-list "Heading" gallery attaches `w:numPr` to the
 /// heading styles, so a numbered heading (`1. Introduction`) is a list
 /// member *and* a heading. List membership used to win in this converter
@@ -1117,6 +1191,40 @@ fn test_image_alt_text_is_not_duplicated_as_body_text() {
     assert!(
         !body.contains("ALT TEXT"),
         "alt text must not appear as body text, got {body:?}"
+    );
+}
+
+/// A picture in a header resolves through the header part's own
+/// relationships. Images were loaded from the main document's rels only,
+/// so a header logo was dropped — and since `r:id`s are per part, the
+/// header's `rId1` is unrelated to the body's `rId1` (here: the header
+/// relationship itself).
+#[test]
+fn test_a_picture_in_a_header_is_read_through_the_header_parts_rels() {
+    const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3];
+    let ir = Docx::new(
+        r#"<w:p><w:r><w:t>BODY</w:t></w:r></w:p>
+           <w:sectPr><w:headerReference w:type="default" r:id="RID_H"/></w:sectPr>"#,
+    )
+    .header_with_picture("RID_H", PNG)
+    .ir();
+    let header = ir.sections[0]
+        .header
+        .as_ref()
+        .expect("section should carry its header");
+    let image = header
+        .content
+        .iter()
+        .find_map(|e| match e {
+            Element::Image(img) => Some(img),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("header should hold the picture: {header:?}"));
+    assert_eq!(image.alt_text.as_deref(), Some("HEADER LOGO"));
+    assert_eq!(
+        image.data.as_deref(),
+        Some(PNG),
+        "the bytes must come from the header's own image relationship"
     );
 }
 

@@ -23,6 +23,46 @@ pub(super) fn is_word6_magic(wident: u16) -> bool {
     matches!(wident, 0xA5DC | 0xA697..=0xA699)
 }
 
+/// Word for Windows 1.x (`0xA59B`) and 2.0 (`0xA5DB`). These are not
+/// compound files: the FIB is at byte 0 of a flat file, laid out like
+/// Word 6's up to the story lengths (`fcMin` 0x18, `fcMac` 0x1C, `ccpText`
+/// … `ccpAtn` from 0x34), and the text is one byte per character in the
+/// Windows code page from `fcMin`. catdoc and antiword read them; a
+/// `.doc` archive from the early 1990s is nothing but these.
+pub(super) fn is_word2_magic(wident: u16) -> bool {
+    matches!(wident, 0xA59B | 0xA5DB)
+}
+
+/// A Word 1.x/2.0 FIB: the Word 6 fields it shares, with the flags this
+/// format does not have (`fExtChar`) cleared and the CLX pointer unused —
+/// a fast-saved Word 2 file's piece table has its own layout this reader
+/// does not follow, so its text is read contiguously and reported as
+/// possibly incomplete.
+pub(super) fn parse_word2_fib(data: &[u8]) -> Result<Word6Fib> {
+    if data.len() < 0x180 {
+        return Err(DocError::InvalidFib(format!(
+            "file too short for a Word 2.0 FIB: {} bytes",
+            data.len()
+        )));
+    }
+    let mut padded;
+    let data = if data.len() < FIB_LEN {
+        padded = data.to_vec();
+        padded.resize(FIB_LEN, 0);
+        padded.as_slice()
+    } else {
+        data
+    };
+    let mut fib = parse_fib(data)?;
+    fib.ext_char = false;
+    // Only the five stories Word 2 has: main text, footnotes,
+    // headers/footers, macros, annotations.
+    for slot in fib.ccp.iter_mut().skip(5) {
+        *slot = 0;
+    }
+    Ok(fib)
+}
+
 /// The FIB fields the extractor needs, bounded to the stream.
 #[derive(Debug)]
 pub(super) struct Word6Fib {
@@ -86,7 +126,6 @@ fn compressed_fc(byte_offset: u32) -> Option<u32> {
 /// every piece UTF-16 when the FIB says `fExtChar`.
 pub(super) fn pieces(word_doc: &[u8], fib: &Word6Fib) -> Result<Vec<Piece>> {
     let stream_len = word_doc.len() as u32;
-    let unit = if fib.ext_char { 2 } else { 1 };
     if fib.complex && fib.lcb_clx != 0 {
         let start = fib.fc_clx as usize;
         let end = start.saturating_add(fib.lcb_clx as usize);
@@ -122,7 +161,14 @@ pub(super) fn pieces(word_doc: &[u8], fib: &Word6Fib) -> Result<Vec<Piece>> {
         }
         return Ok(pieces);
     }
-    // Non-complex: one contiguous story sequence from fcMin.
+    Ok(vec![contiguous_piece(word_doc, fib)])
+}
+
+/// One piece covering the stories laid out contiguously from `fcMin`,
+/// as a non-complex (not fast-saved) file stores them.
+pub(super) fn contiguous_piece(word_doc: &[u8], fib: &Word6Fib) -> Piece {
+    let stream_len = word_doc.len() as u32;
+    let unit = if fib.ext_char { 2 } else { 1 };
     let (fc_min, fc_mac) = (fib.fc_min.min(stream_len), fib.fc_mac.min(stream_len));
     let available = fc_mac.saturating_sub(fc_min) / unit;
     let declared = fib
@@ -131,7 +177,7 @@ pub(super) fn pieces(word_doc: &[u8], fib: &Word6Fib) -> Result<Vec<Piece>> {
         .try_fold(0u32, |a, &c| a.checked_add(c))
         .unwrap_or(u32::MAX);
     let cp_end = declared.min(available);
-    Ok(vec![if fib.ext_char {
+    if fib.ext_char {
         Piece {
             cp_start: 0,
             cp_end,
@@ -145,7 +191,7 @@ pub(super) fn pieces(word_doc: &[u8], fib: &Word6Fib) -> Result<Vec<Piece>> {
             fc: compressed_fc(fc_min).unwrap_or(0x4000_0000),
             is_compressed: true,
         }
-    }])
+    }
 }
 
 /// The main text and each non-empty subdocument, sanitised.
@@ -259,6 +305,33 @@ mod tests {
         assert!(fib.ext_char);
         let table = pieces(&doc, &fib).unwrap();
         assert_eq!(stories(&doc, &fib, &table).0, "Mac Word\n");
+    }
+
+    /// A Word 2.0 file is the FIB and the text with no container: the
+    /// text runs from `fcMin` in the Windows code page, the five story
+    /// lengths sit where Word 6 keeps its eight.
+    #[test]
+    fn test_word_2_text_is_read_from_a_flat_file() {
+        let text = b"Word 2.0 for Windows.\rZweite Zeile: \xfcber.\r";
+        let footnote = b"A footnote.\r";
+        let mut doc = vec![0u8; 0x180];
+        doc[0..2].copy_from_slice(&0xA5DBu16.to_le_bytes());
+        doc[2..4].copy_from_slice(&45u16.to_le_bytes());
+        doc[6..8].copy_from_slice(&0x0407u16.to_le_bytes());
+        doc[0x18..0x1C].copy_from_slice(&0x180u32.to_le_bytes());
+        let fc_mac = 0x180 + (text.len() + footnote.len()) as u32;
+        doc[0x1C..0x20].copy_from_slice(&fc_mac.to_le_bytes());
+        doc[0x34..0x38].copy_from_slice(&(text.len() as u32).to_le_bytes());
+        doc[0x38..0x3C].copy_from_slice(&(footnote.len() as u32).to_le_bytes());
+        doc.extend_from_slice(text);
+        doc.extend_from_slice(footnote);
+        let fib = parse_word2_fib(&doc).unwrap();
+        assert!(!fib.ext_char);
+        let table = vec![contiguous_piece(&doc, &fib)];
+        let (main, subs) = stories(&doc, &fib, &table);
+        assert_eq!(main, "Word 2.0 for Windows.\nZweite Zeile: über.\n");
+        assert_eq!(subs, vec![(1, "A footnote.\n".to_string())]);
+        assert!(parse_word2_fib(&doc[..0x100]).is_err(), "shorter than a FIB");
     }
 
     /// Fuzzed corpus files declare 1.8 GB of text and CLX offsets past

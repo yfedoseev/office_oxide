@@ -109,12 +109,18 @@ mod block_default {
                 .map(super::render_element_plain)
                 .collect::<Vec<_>>()
                 .join("\n\n"),
-            Element::Footnote(n) | Element::Endnote(n) => n
-                .content
-                .iter()
-                .map(super::render_element_plain)
-                .collect::<Vec<_>>()
-                .join("\n\n"),
+            Element::Footnote(n) | Element::Endnote(n) => {
+                let body = n
+                    .content
+                    .iter()
+                    .map(super::render_element_plain)
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                match super::authored_marker(n) {
+                    Some(m) => format!("{m}: {body}"),
+                    None => body,
+                }
+            },
             // A page or column break is a real boundary in the source, so
             // it gets the same form-feed marker a thematic break does.
             Element::PageBreak | Element::ColumnBreak => PLAIN_BREAK.to_string(),
@@ -146,12 +152,18 @@ mod block_default {
                 .map(super::render_element_markdown)
                 .collect::<Vec<_>>()
                 .join("\n\n"),
-            Element::Footnote(n) | Element::Endnote(n) => n
-                .content
-                .iter()
-                .map(super::render_element_markdown)
-                .collect::<Vec<_>>()
-                .join("\n\n"),
+            Element::Footnote(n) | Element::Endnote(n) => {
+                let body = n
+                    .content
+                    .iter()
+                    .map(super::render_element_markdown)
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                match super::authored_marker(n) {
+                    Some(m) => format!("**{}:** {body}", super::escape_markdown(&m)),
+                    None => body,
+                }
+            },
             Element::PageBreak | Element::ColumnBreak | Element::Shape(_) => String::new(),
             Element::Image(img) => {
                 // With `ImageEmbed::Base64` the bytes go inline at the
@@ -185,7 +197,13 @@ mod block_default {
             Element::ThematicBreak => "<hr />".to_string(),
             Element::TextBox(tb) => super::render_elements_html(&tb.content).join("\n"),
             Element::Footnote(n) | Element::Endnote(n) => {
-                super::render_elements_html(&n.content).join("\n")
+                let body = super::render_elements_html(&n.content).join("\n");
+                match super::authored_marker(n) {
+                    Some(m) => {
+                        format!("<p><strong>{}:</strong></p>\n{body}", super::escape_html(&m))
+                    },
+                    None => body,
+                }
             },
             Element::PageBreak | Element::ColumnBreak | Element::Shape(_) => String::new(),
             Element::Image(img) => {
@@ -312,10 +330,24 @@ fn section_title_is_redundant(section: &Section) -> bool {
     let Some(title) = section.title.as_deref().filter(|t| !t.is_empty()) else {
         return false;
     };
-    match section.elements.first() {
-        Some(Element::Heading(h)) => render_inline_plain(&h.content).trim() == title.trim(),
+    // The converters lift the title from the section's first *heading*,
+    // which need not be its first element — a blank paragraph or a byline
+    // often precedes it. Checking only `elements.first()` printed the title
+    // twice for exactly those documents (and made the rendered text change
+    // across a write/reread that drops the leading blank paragraph).
+    section.elements.iter().any(|e| match e {
+        Element::Heading(h) => render_inline_plain(&h.content).trim() == title.trim(),
         _ => false,
-    }
+    })
+}
+
+/// The marker of a note that records who wrote it — a spreadsheet or
+/// document comment (`C8 (Jane Doe)`). The direct renderers print it in
+/// front of the comment; the IR surfaces printed the body alone, so the
+/// cell and the author were lost on `to_ir()`/`to_html()`.
+fn authored_marker(n: &Note) -> Option<String> {
+    n.author.as_ref()?;
+    n.marker.clone().filter(|m| !m.is_empty())
 }
 
 fn section_headers(section: &Section) -> impl Iterator<Item = &HeaderFooter> {
@@ -767,14 +799,23 @@ fn render_table_markdown(table: &Table) -> String {
 }
 
 fn render_cell_markdown(cell: &TableCell) -> String {
-    cell.content
+    let text = cell
+        .content
         .iter()
         .map(|e| match e {
             Element::Paragraph(p) => render_inline_markdown(&p.content),
             other => render_element_markdown(other),
         })
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    // A line break inside a cell (a `LineBreak` renders as a newline, a
+    // nested block as a paragraph) ends a GFM table row; `<br>` is the
+    // form GitHub and pandoc understand.
+    text.split(['\r', '\n'])
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("<br>")
 }
 
 fn render_list_markdown(list: &List, indent: usize) -> String {
@@ -847,17 +888,7 @@ fn safe_url(url: &str) -> Option<String> {
 /// text inject structure into the rendered output — a cell containing
 /// `|` splitting a table row, or a literal `[x](y)` becoming a link.
 fn escape_markdown(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        // `_` is deliberately absent: CommonMark does not treat intra-word
-        // `_` as emphasis, and escaping it turns ordinary identifiers like
-        // `HEADER_TEXT` into unreadable `HEADER\_TEXT`.
-        if matches!(c, '\\' | '`' | '*' | '[' | ']' | '<' | '>' | '|' | '~') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
+    crate::core::markdown::escape_text(s)
 }
 
 /// Escape the characters that would terminate a markdown link target early.
@@ -1288,6 +1319,34 @@ mod tests {
     fn test_plain_text_paragraph() {
         let ir = simple_ir(vec![para("Hello world")]);
         assert_eq!(ir.plain_text(), "Hello world");
+    }
+
+    /// A section title lifted from a heading that is not the section's
+    /// first element (a blank paragraph precedes it, as Word documents
+    /// often start) is still that heading, not a second line of content.
+    #[test]
+    fn test_title_lifted_from_a_later_heading_is_not_rendered_twice() {
+        let mut ir = simple_ir(vec![
+            Element::Paragraph(Paragraph::default()),
+            Element::Heading(Heading {
+                level: 1,
+                content: vec![span("Annual Report")],
+                ..Default::default()
+            }),
+            para("Body"),
+        ]);
+        ir.sections[0].title = Some("Annual Report".into());
+        for (name, text) in [
+            ("plain_text", ir.plain_text()),
+            ("markdown", ir.to_markdown()),
+            ("html", ir.to_html()),
+        ] {
+            assert_eq!(
+                text.matches("Annual Report").count(),
+                1,
+                "{name} rendered the title and the heading it came from:\n{text}"
+            );
+        }
     }
 
     #[test]

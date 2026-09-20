@@ -190,10 +190,20 @@ pub fn ir_to_docx(ir: &DocumentIR) -> crate::docx::write::DocxWriter {
             add_element_to_docx(&mut writer, elem);
         }
 
-        // Section page setup / columns
+        // Section page setup / columns. A section that owns headers or
+        // footers needs its own `sectPr` too — they are referenced from
+        // it, and without one the section merged into its neighbour and
+        // the neighbour's `sectPr` claimed them.
+        let has_hf = section.header.is_some()
+            || section.footer.is_some()
+            || section.first_page_header.is_some()
+            || section.first_page_footer.is_some()
+            || section.even_page_header.is_some()
+            || section.even_page_footer.is_some();
         if section.page_setup.is_some()
             || section.columns.is_some()
             || section.break_type != SectionBreakType::Continuous
+            || has_hf
         {
             writer.set_section_props(
                 section.page_setup.clone(),
@@ -644,7 +654,15 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                     if let (Some(data), Some(fmt)) = (&img.data, &img.format) {
                         let cx = img.display_width_emu.unwrap_or(3_000_000) as i64;
                         let cy = img.display_height_emu.unwrap_or(2_000_000) as i64;
-                        sheet.add_image(data.clone(), fmt.extension(), 0, 0, cx, cy);
+                        sheet.add_image_with_alt(
+                            data.clone(),
+                            fmt.extension(),
+                            0,
+                            0,
+                            cx,
+                            cy,
+                            img.alt_text.clone(),
+                        );
                     }
                 },
                 Element::TextBox(tb) => {
@@ -669,7 +687,15 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                                 } else {
                                     img.display_height_emu.unwrap_or(2_000_000) as i64
                                 };
-                                sheet.add_image(data.clone(), fmt.extension(), x, y, icx, icy);
+                                sheet.add_image_with_alt(
+                                    data.clone(),
+                                    fmt.extension(),
+                                    x,
+                                    y,
+                                    icx,
+                                    icy,
+                                    img.alt_text.clone(),
+                                );
                             }
                         }
                     }
@@ -1452,6 +1478,29 @@ fn cell_hyperlink(cell: &TableCell) -> Option<String> {
 /// cell. The typed fields are only populated by the XLSX reader; prose formats
 /// leave them `None` and still fall back to sniffing the text.
 fn ir_cell_to_cell_data(cell: &TableCell, text: &str) -> crate::xlsx::write::CellData {
+    use crate::xlsx::write::CellData;
+
+    // A cell that carries a formula keeps it, with whatever value it
+    // showed as the cached result. Writing only the value silently turned
+    // every formula into a constant; writing only the formula blanked the
+    // cell for every reader that does not evaluate.
+    if let Some(f) = cell.formula.as_deref().filter(|f| !f.trim().is_empty()) {
+        // The converter shows `=formula` as the content of a cell with no
+        // cached value; that is not a result to cache.
+        let shown_formula = text.strip_prefix('=').is_some_and(|t| t == f);
+        if shown_formula {
+            return CellData::Formula(f.to_string());
+        }
+        return CellData::FormulaWithValue {
+            formula: f.to_string(),
+            cached: Box::new(ir_cell_value_data(cell, text)),
+        };
+    }
+    ir_cell_value_data(cell, text)
+}
+
+/// The cell's value alone, formula disregarded.
+fn ir_cell_value_data(cell: &TableCell, text: &str) -> crate::xlsx::write::CellData {
     use crate::ir::CellDataType;
     use crate::xlsx::write::CellData;
 

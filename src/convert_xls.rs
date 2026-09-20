@@ -626,5 +626,19 @@ mod tests {
             panic!("expected a text span");
         };
         assert_eq!(span.text, "a real cell comment");
+        // The IR surfaces name the cell and the author, as the direct
+        // renderers do; the body alone used to be all that reached them.
+        assert!(
+            ir.plain_text()
+                .contains("A1 (Gilsinei Hansen): a real cell comment")
+        );
+        assert!(
+            ir.to_markdown()
+                .contains("**A1 (Gilsinei Hansen):** a real cell comment")
+        );
+        assert!(
+            ir.to_html()
+                .contains("<strong>A1 (Gilsinei Hansen):</strong>")
+        );
     }
 }

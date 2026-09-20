@@ -23,6 +23,8 @@ pub mod editable;
 pub mod embedded_fonts;
 /// Core error type and `Result` alias used throughout OOXML parsing.
 pub mod error;
+/// Markdown escaping shared by every renderer.
+pub mod markdown;
 /// OPC (Open Packaging Conventions) reader and writer for ZIP-based packages.
 pub mod opc;
 /// Parallel processing helpers (Rayon-based, feature-gated).

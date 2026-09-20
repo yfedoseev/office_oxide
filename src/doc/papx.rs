@@ -195,39 +195,49 @@ fn extract_grpprl(page: &[u8], word_off: usize) -> Vec<u8> {
     page[grpprl_start..grpprl_end].to_vec()
 }
 
-/// Convert a file character position (FC) to a character position (CP).
+/// The CP ranges an FC run `[fc_start, fc_end)` covers, in CP order.
 ///
-/// The FC is normalised to a real byte offset (bit 30 stripped when set)
-/// before being matched against each piece's real byte range, so the lookup
-/// works whether or not a compressed piece's FKP FCs carry bit 30.
-///
-/// Arithmetic is performed in `u64` with saturating ops so a malformed piece
-/// (non-monotonic or huge CP range) degrades to "not in this piece" rather
-/// than overflowing (AGENTS.md rule 6).
-pub fn fc_to_cp(fc: u32, pieces: &[Piece]) -> Option<u32> {
-    let fbyte = if fc & 0x4000_0000 != 0 {
-        (fc & !0x4000_0000) / 2
-    } else {
-        fc
+/// In a fast-saved (complex) file the text of one FC run is not one CP
+/// range: the piece table scatters edits, so consecutive file bytes can
+/// be far apart in the character space and vice versa. Mapping a run by
+/// its two end points (CP of the start, CP of the end) silently took
+/// whatever CPs lay *between* those two points — a paragraph gained the
+/// text of its neighbours, a formatting run covered characters it did
+/// not format, a start below every piece mapped to nothing. Each piece is
+/// intersected with the run instead.
+pub fn fc_run_to_cp_ranges(fc_start: u32, fc_end: u32, pieces: &[Piece]) -> Vec<(u32, u32)> {
+    let norm = |fc: u32| {
+        if fc & 0x4000_0000 != 0 {
+            (fc & !0x4000_0000) / 2
+        } else {
+            fc
+        }
     };
+    let (run_start, run_end) = (norm(fc_start) as u64, norm(fc_end) as u64);
+    let mut out = Vec::new();
+    if run_end <= run_start {
+        return out;
+    }
     for p in pieces {
-        if p.cp_end < p.cp_start {
+        if p.cp_end <= p.cp_start {
             continue;
         }
         let (base, stride) = piece_byte_base(p);
-        let base_u = base as u64;
-        let stride_u = stride as u64;
-        let cp_start_u = p.cp_start as u64;
-        let cp_end_u = p.cp_end as u64;
-        let end_u = base_u.saturating_add((cp_end_u - cp_start_u).saturating_mul(stride_u));
-        let fbyte_u = fbyte as u64;
-        if fbyte_u >= base_u && fbyte_u <= end_u {
-            // Safe: `fbyte >= base` established above, both fit in u32.
-            let off = fbyte - base;
-            return Some(p.cp_start + off / stride);
+        let (base, stride) = (base as u64, stride as u64);
+        let piece_end = base.saturating_add((p.cp_end - p.cp_start) as u64 * stride);
+        let lo = run_start.max(base);
+        let hi = run_end.min(piece_end);
+        if hi <= lo {
+            continue;
+        }
+        let cp_lo = p.cp_start as u64 + (lo - base) / stride;
+        let cp_hi = p.cp_start as u64 + (hi - base).div_ceil(stride);
+        if cp_hi > cp_lo {
+            out.push((cp_lo.min(u32::MAX as u64) as u32, cp_hi.min(u32::MAX as u64) as u32));
         }
     }
-    None
+    out.sort_unstable();
+    out
 }
 
 /// Real byte offset and stride (bytes per character) of a piece's start.
@@ -260,69 +270,110 @@ pub fn build_paragraphs(
     lid: u16,
     chp_runs: &[FkpRun],
 ) -> Vec<DocParagraph> {
-    let mut keyed: Vec<(u32, &FkpParagraph)> = fkp
+    // PAPX runs in CP space: every FKP run intersected with every piece.
+    // A paragraph is then the text up to and including the next paragraph
+    // mark, and its properties are the run holding that mark ([MS-DOC]
+    // §2.4.6.1 — the PAPX applies to the paragraph whose mark it covers).
+    // Taking each FKP run as one paragraph instead, with its two FC end
+    // points mapped to CPs, was right only for a never-fast-saved file.
+    let mut pap: Vec<(u32, u32, &FkpParagraph)> = fkp
         .iter()
-        .filter_map(|fp| fc_to_cp(fp.fc_start, pieces).map(|cp| (cp, fp)))
-        .filter(|(cp, _)| *cp < text_len)
+        .flat_map(|fp| {
+            fc_run_to_cp_ranges(fp.fc_start, fp.fc_end, pieces)
+                .into_iter()
+                .map(move |(a, b)| (a.min(text_len), b.min(text_len), fp))
+        })
+        .filter(|(a, b, _)| b > a)
         .collect();
-    keyed.sort_by_key(|(cp, _)| *cp);
+    pap.sort_by_key(|&(a, b, _)| (a, b));
 
     // FC→CP-convert and decode every CHPX run exactly once for the whole
-    // document — `resolve_chp_segments` is called once per paragraph below,
-    // and both `fc_to_cp` and `extract_chp_props` are real work; doing
-    // either of them per paragraph instead of once here turned a real
-    // corpus sweep into a multi-minute hang.
+    // document — `resolve_chp_segments` is called once per interval
+    // below, and both the piece walk and `extract_chp_props` are real work;
+    // doing either of them per paragraph instead of once here turned a
+    // real corpus sweep into a multi-minute hang.
     let sorted_chp_runs = resolve_chp_cp_runs(chp_runs, pieces);
 
-    let mut out = Vec::with_capacity(keyed.len());
-    for (cp_start, fp) in keyed {
-        let cp_end = fc_to_cp(fp.fc_end, pieces).unwrap_or(cp_start + 1);
-        let cp_end = cp_end.min(text_len);
-        if cp_end <= cp_start {
-            continue;
+    let mut out = Vec::with_capacity(pap.len());
+    let mut buf: Vec<char> = Vec::new();
+    let mut buf_props: Vec<ChpProps> = Vec::new();
+    let mut cursor = 0u32;
+    let empty = FkpParagraph {
+        fc_start: 0,
+        fc_end: 0,
+        grpprl: Vec::new(),
+    };
+    for idx in 0..pap.len() {
+        let (a, b, fp) = pap[idx];
+        // Text no PAPX run covers still belongs to a paragraph: decode it
+        // with default properties rather than lose it from the structured
+        // view (the flat text has it).
+        let intervals: [(u32, u32, &FkpParagraph); 2] = [
+            (cursor, a.max(cursor), &empty),
+            (a.max(cursor), b.max(cursor), fp),
+        ];
+        for &(seg_a, seg_b, run) in &intervals {
+            if seg_b <= seg_a {
+                continue;
+            }
+            cursor = seg_b;
+            let segments = resolve_chp_segments(&sorted_chp_runs, seg_a, seg_b);
+            for (seg_start, seg_end, props) in &segments {
+                let chunk = decode_cp_range(word_doc, pieces, *seg_start, *seg_end, lid);
+                for ch in chunk.chars() {
+                    let is_mark = matches!(ch, '\r' | '\u{7}');
+                    // Deleted revision-mark text (`sprmCFRMarkDel`) is
+                    // not part of the accepted view: the flat text already
+                    // excludes it, and keeping it here made
+                    // `to_ir()`/`to_html()` show sentences `plain_text()`
+                    // did not. The paragraph mark itself stays, so a
+                    // wholly deleted paragraph still terminates.
+                    if props.f_rmark_del && !is_mark {
+                        continue;
+                    }
+                    buf.push(ch);
+                    buf_props.push(props.clone());
+                    if is_mark {
+                        emit_paragraph(&mut buf, &mut buf_props, run, &mut out);
+                    }
+                }
+            }
         }
-        // Decode per CHP-props segment, not the whole
-        // paragraph range in one call, so each decoded char can be
-        // attributed to the right `ChpProps`. Concatenating these
-        // sub-range decodes is byte-for-byte identical to one bulk decode
-        // over `[cp_start, cp_end)` — `decode_cp_range` is a pure function
-        // of its own CP range with no cross-call state — so a paragraph
-        // whose CHPX segments collapse to "one segment, all default" (the
-        // common case for a document with no CHPX at all: `resolve_chp_segments`
-        // returns a single default-props segment spanning the whole range
-        // when `chp_runs` is empty) costs nothing extra and produces
-        // exactly the pre-CHPX output.
-        let segments = resolve_chp_segments(&sorted_chp_runs, cp_start, cp_end);
-        let mut decoded = String::new();
-        let mut char_props: Vec<ChpProps> = Vec::with_capacity((cp_end - cp_start) as usize);
-        for (seg_start, seg_end, props) in &segments {
-            let chunk = decode_cp_range(word_doc, pieces, *seg_start, *seg_end, lid);
-            let new_len = char_props.len() + chunk.chars().count();
-            char_props.resize(new_len, props.clone());
-            decoded.push_str(&chunk);
-        }
-        let chars: Vec<char> = decoded.chars().collect();
-        if chars.is_empty() {
-            continue;
-        }
-        // Drop the trailing terminator from both the text and its parallel
-        // props entry before sanitizing (it's kept raw, below, since it
-        // drives table/row grouping rather than being visible content).
-        let terminator = chars[chars.len() - 1];
-        let content_str: String = chars[..chars.len() - 1].iter().collect();
-        let content_props = &char_props[..char_props.len().saturating_sub(1)];
-        let (content, hyperlinks, chp_spans) =
-            sanitize_text_with_hyperlinks_and_chp(&content_str, content_props);
-        let props = super::sprm::extract_pap_props(&fp.grpprl);
-        out.push(DocParagraph {
-            text: content,
-            terminator,
-            props,
-            hyperlinks,
-            chp_runs: chp_spans,
-        });
+    }
+    if !buf.is_empty() {
+        // Text after the last mark (a truncated or mark-less file): keep
+        // it as a final paragraph.
+        buf.push('\r');
+        buf_props.push(buf_props.last().cloned().unwrap_or_default());
+        let last = pap.last().map(|&(_, _, fp)| fp).unwrap_or(&empty);
+        emit_paragraph(&mut buf, &mut buf_props, last, &mut out);
     }
     out
+}
+
+/// Turn the buffered characters (ending with their paragraph mark) into a
+/// `DocParagraph` with `run`'s properties, and clear the buffers.
+fn emit_paragraph(
+    buf: &mut Vec<char>,
+    buf_props: &mut Vec<ChpProps>,
+    run: &FkpParagraph,
+    out: &mut Vec<DocParagraph>,
+) {
+    let terminator = buf[buf.len() - 1];
+    let content_str: String = buf[..buf.len() - 1].iter().collect();
+    let content_props = &buf_props[..buf_props.len() - 1];
+    let (content, hyperlinks, chp_spans) =
+        sanitize_text_with_hyperlinks_and_chp(&content_str, content_props);
+    let props = super::sprm::extract_pap_props(&run.grpprl);
+    out.push(DocParagraph {
+        text: content,
+        terminator,
+        props,
+        hyperlinks,
+        chp_runs: chp_spans,
+    });
+    buf.clear();
+    buf_props.clear();
 }
 
 #[cfg(test)]
@@ -341,27 +392,55 @@ mod tests {
     }
 
     #[test]
-    fn test_fc_to_cp_unicode() {
+    fn test_fc_run_maps_to_cp_ranges_in_a_unicode_piece() {
         // table.doc: one Unicode piece, fc = 0x800, text_len = 23.
         let pieces = [unicode_piece(0x800, 23)];
-        // byte 0x800 + 1*2 = 0x802 → cp 1.
-        assert_eq!(fc_to_cp(0x802, &pieces), Some(1));
-        assert_eq!(fc_to_cp(0x800, &pieces), Some(0));
+        // bytes 0x802..0x806 = cps 1..3.
+        assert_eq!(fc_run_to_cp_ranges(0x802, 0x806, &pieces), vec![(1, 3)]);
+        // A run reaching below and beyond the piece is clipped to it.
+        assert_eq!(fc_run_to_cp_ranges(0x700, 0x900, &pieces), vec![(0, 23)]);
+        assert!(fc_run_to_cp_ranges(0x900, 0x910, &pieces).is_empty());
     }
 
     #[test]
-    fn test_fc_to_cp_strips_compressed_bit() {
-        // A compressed piece with bit 30 set; FC carries the same bit.
+    fn test_fc_run_strips_the_compressed_bit() {
+        // A compressed piece with bit 30 set; an FC may carry the same bit.
         let pieces = [Piece {
             cp_start: 0,
             cp_end: 5,
             fc: 0x4000_0010, // compressed, real offset = 0x10/2 = 8
             is_compressed: true,
         }];
-        // fc with bit 30 → real byte 8 → cp 0.
-        assert_eq!(fc_to_cp(0x4000_0010, &pieces), Some(0));
+        assert_eq!(fc_run_to_cp_ranges(0x4000_0010, 0x4000_0014, &pieces), vec![(0, 2)]);
         // fc 9 (real byte, no bit) → cp 1.
-        assert_eq!(fc_to_cp(9, &pieces), Some(1));
+        assert_eq!(fc_run_to_cp_ranges(9, 11, &pieces), vec![(1, 3)]);
+    }
+
+    /// A fast-saved file scatters one paragraph's characters over the
+    /// pieces: the run's CPs are the union of its intersections with each
+    /// piece, in CP order, never "everything between the two end points".
+    #[test]
+    fn test_fc_run_across_scattered_pieces_yields_each_pieces_cps() {
+        // cp 0..10 at bytes 0x800.., cp 10..20 at bytes 0x100.. (edited
+        // later, stored earlier), both 8-bit.
+        let pieces = [
+            Piece {
+                cp_start: 0,
+                cp_end: 10,
+                fc: 0x4000_0000 | (0x800 * 2),
+                is_compressed: true,
+            },
+            Piece {
+                cp_start: 10,
+                cp_end: 20,
+                fc: 0x4000_0000 | (0x100 * 2),
+                is_compressed: true,
+            },
+        ];
+        // One FC run covering bytes 0x100..0x900: both pieces, in CP order.
+        assert_eq!(fc_run_to_cp_ranges(0x100, 0x900, &pieces), vec![(0, 10), (10, 20)]);
+        // A run over the later-stored piece only.
+        assert_eq!(fc_run_to_cp_ranges(0x105, 0x108, &pieces), vec![(15, 18)]);
     }
 
     #[test]
@@ -447,6 +526,39 @@ mod tests {
         assert_eq!(paras[3].terminator, '\u{7}');
         assert!(paras[3].props.f_in_table);
         assert!(paras[3].props.is_table_trailing_mark);
+    }
+
+    /// Text a tracked change deleted (`sprmCFRMarkDel`) is left out of
+    /// the structured paragraphs the way it is left out of the flat text,
+    /// so every surface agrees on what the document says.
+    #[test]
+    fn test_build_paragraphs_drops_deleted_revision_text() {
+        let raw = "Keep this deleted text here.\r";
+        let text_bytes: Vec<u8> = raw.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let mut word_doc = vec![0u8; 0x800 + text_bytes.len()];
+        word_doc[0x800..0x800 + text_bytes.len()].copy_from_slice(&text_bytes);
+        let n = raw.encode_utf16().count() as u32;
+        let pieces = [unicode_piece(0x800, n)];
+        let fkp = vec![FkpParagraph {
+            fc_start: 0x800,
+            fc_end: 0x800 + n * 2,
+            grpprl: Vec::new(),
+        }];
+        // "deleted text " (cp 10..23) carries sprmCFRMarkDel = 1.
+        let del = FkpRun {
+            fc_start: 0x800 + 10 * 2,
+            fc_end: 0x800 + 23 * 2,
+            grpprl: vec![0x00, 0x08, 0x01],
+        };
+        let plain = |a: u32, b: u32| FkpRun {
+            fc_start: 0x800 + a * 2,
+            fc_end: 0x800 + b * 2,
+            grpprl: Vec::new(),
+        };
+        let runs = vec![plain(0, 10), del, plain(23, n)];
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, n, 0, &runs);
+        assert_eq!(paras.len(), 1);
+        assert_eq!(paras[0].text, "Keep this here.");
     }
 
     /// Regression: an astral character (emoji) is a single `char` but two
@@ -558,21 +670,22 @@ mod tests {
     }
 
     /// A piece whose CP range spans nearly the whole `u32` space must not
-    /// trigger an arithmetic-overflow panic in `fc_to_cp` (the
-    /// `cp_end - cp_start` / `* stride` computation, papx.rs:197). Wrapped in
+    /// trigger an arithmetic-overflow panic in the FC→CP walk (the
+    /// `cp_end - cp_start` / `* stride` computation). Wrapped in
     /// `catch_unwind` because the failure mode is a panic; debug builds have
     /// overflow-checks enabled (AGENTS.md rule 6: no input may panic).
     #[test]
-    fn test_fc_to_cp_huge_range_does_not_panic() {
+    fn test_fc_run_huge_range_does_not_panic() {
         let pieces = [Piece {
             cp_start: 0,
             cp_end: u32::MAX,
             fc: 0,
             is_compressed: false,
         }];
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fc_to_cp(0, &pieces)));
-        assert!(result.is_ok(), "fc_to_cp must not overflow on a huge declared CP range");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fc_run_to_cp_ranges(0, u32::MAX, &pieces)
+        }));
+        assert!(result.is_ok(), "the FC walk must not overflow on a huge declared CP range");
     }
 
     /// Regression (AGENTS.md rule 6): a PlcfBtePapx listing many BTEs that all

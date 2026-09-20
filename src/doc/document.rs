@@ -151,7 +151,18 @@ pub enum SubDocumentKind {
 
 impl DocDocument {
     /// Open a DOC file from a reader.
-    pub fn from_reader<R: Read + Seek>(reader: R) -> Result<Self> {
+    pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
+        // Word for Windows 1.x/2.0 wrote flat files, the FIB first; they
+        // have no compound container to open.
+        let mut magic = [0u8; 2];
+        reader.seek(std::io::SeekFrom::Start(0))?;
+        let got = reader.read(&mut magic)?;
+        reader.seek(std::io::SeekFrom::Start(0))?;
+        if got == 2 && super::word6::is_word2_magic(u16::from_le_bytes(magic)) {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes)?;
+            return Self::from_word2(&bytes);
+        }
         let mut cfb = CfbReader::new(reader)?;
 
         let word_doc = cfb
@@ -398,6 +409,56 @@ impl DocDocument {
         })
     }
 
+    /// A Word 1.x/2.0 flat file: text and the stories it declares, no
+    /// formatting, no container streams (so no summary information, OLE
+    /// objects or macros storage to look at). A fast-saved file's text is
+    /// read contiguously and flagged incomplete, since this reader does
+    /// not follow the format's own piece table.
+    fn from_word2(bytes: &[u8]) -> Result<Self> {
+        let fib = super::word6::parse_word2_fib(bytes)?;
+        let pieces = vec![super::word6::contiguous_piece(bytes, &fib)];
+        let text_complete = !fib.complex && covers_declared_length(&pieces, fib.ccp[0]);
+        if fib.complex {
+            log::warn!("doc: fast-saved Word 2.0 file; text read contiguously may be incomplete");
+        }
+        let (text, subs) = super::word6::stories(bytes, &fib, &pieces);
+        // Word 1.x/2.0 end a paragraph with CR LF, not a lone CR; the
+        // shared sanitiser maps the CR to a newline and keeps the LF, so
+        // every paragraph mark came out doubled.
+        let crlf = |t: String| t.replace("\n\n", "\n");
+        let text = crlf(text);
+        let subdocuments = subs
+            .into_iter()
+            .filter_map(|(story, text)| {
+                let kind = match story {
+                    1 => SubDocumentKind::Footnotes,
+                    2 => SubDocumentKind::HeadersFooters,
+                    4 => SubDocumentKind::Comments,
+                    _ => return None,
+                };
+                Some(SubDocument {
+                    kind,
+                    text: crlf(text),
+                })
+            })
+            .collect();
+        Ok(Self {
+            text,
+            data_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
+            paragraphs: Vec::new(),
+            subdocuments,
+            has_macros: fib.ccp[3] != 0,
+            text_complete,
+            summary_properties: None,
+            list_formatting: ListFormatting::default(),
+            comment_authors: Vec::new(),
+            header_footer: HeaderFooterStories::default(),
+            comments: Vec::new(),
+            ole_objects: Vec::new(),
+        })
+    }
+
     /// Open a DOC file from a path.
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
         let file = std::fs::File::open(path)?;
@@ -509,50 +570,18 @@ impl DocDocument {
         &self.paragraphs
     }
 
-    /// Convert to markdown (basic: paragraphs separated by blank lines).
+    /// Convert to markdown: headings, lists, tables, hyperlinks and
+    /// character formatting from the paragraph structure, headers and
+    /// footers, footnotes, endnotes and comments.
     ///
-    /// Includes footnote/endnote/comment/textbox bodies — see the
-    /// identical note on `plain_text()`.
+    /// Rendered from the same structured view `to_ir()` and `to_html()`
+    /// use. The renderer this replaced worked from the flat text alone —
+    /// every paragraph a plain block, a table one tab-separated line — so
+    /// `to_markdown()` and `to_html()` of one `.doc` disagreed on both
+    /// structure and, when the structure hid something, content.
     pub fn to_markdown(&self) -> String {
-        let mut result = text_to_markdown_blocks(&self.text);
-        for sub in &self.subdocuments {
-            let block = text_to_markdown_blocks(&sub.text);
-            let block = block.trim();
-            if block.is_empty() {
-                continue;
-            }
-            if !result.ends_with("\n\n") && !result.is_empty() {
-                result.push('\n');
-            }
-            result.push_str(block);
-            result.push_str("\n\n");
-        }
-        result
+        crate::convert_doc::doc_to_ir(self).to_markdown()
     }
-}
-
-/// Split `text` into markdown paragraphs, each separated by a blank line —
-/// the shared rendering shape `to_markdown()` uses for both the main text
-/// and every subdocument body.
-fn text_to_markdown_blocks(text: &str) -> String {
-    let mut result = String::new();
-    let mut prev_empty = false;
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            if !prev_empty {
-                result.push('\n');
-            }
-            prev_empty = true;
-        } else {
-            result.push_str(trimmed);
-            result.push_str("\n\n");
-            prev_empty = false;
-        }
-    }
-
-    result
 }
 
 fn clx_size_zero_or_oob(clx_size: u32, clx_start: usize, stream_len: usize) -> bool {
@@ -851,9 +880,13 @@ mod tests {
             paragraphs: Vec::new(),
         };
         let md = doc.to_markdown();
-        assert!(md.contains("First paragraph\n\n"));
+        // The opening line reads as a title to the line-shape heuristic;
+        // what matters here is a blank line between paragraphs and none
+        // doubled.
+        assert!(md.contains("First paragraph\n\n"), "{md:?}");
+        assert!(!md.contains("\n\n\n"), "{md:?}");
         assert!(md.contains("Second paragraph\n\n"));
-        assert!(md.contains("After gap\n\n"));
+        assert!(md.trim_end().ends_with("After gap"));
     }
 
     #[test]
@@ -944,7 +977,8 @@ mod tests {
             paragraphs: Vec::new(),
         };
         assert_eq!(doc.plain_text(), "Body");
-        assert_eq!(doc.to_markdown(), "Body\n\n");
+        // One block for the body, nothing after it for the blank comment.
+        assert_eq!(doc.to_markdown().trim_end(), "# Body");
     }
 
     /// `text_complete()` reaches `to_ir()`'s `Metadata::text_truncated` so

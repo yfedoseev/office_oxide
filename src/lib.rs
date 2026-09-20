@@ -224,6 +224,35 @@ fn is_cfb_container<R: Read + Seek>(reader: &mut R) -> Result<bool> {
     Ok(crate::cfb::is_cfb_container(reader).map_err(core::Error::from)?)
 }
 
+/// Which legacy format a compound file holds, by the stream every
+/// application stores its document in: `WordDocument` (MS-DOC §2.1.1),
+/// `Workbook`/`Book` (MS-XLS §2.1.7.20), `PowerPoint Document` or the
+/// PowerPoint 95 dual-storage copy (MS-PPT §2.1.2). The extension is a
+/// claim; a workbook saved as `.doc` used to fail with "WordDocument
+/// stream not found" where every other reader opens it as a spreadsheet.
+/// Leaves the reader at the start. `None` when it is not a compound file
+/// or holds none of the three.
+fn cfb_stream_format<R: Read + Seek>(reader: &mut R) -> Option<DocumentFormat> {
+    if !matches!(crate::cfb::is_cfb_container(reader), Ok(true)) {
+        return None;
+    }
+    let found = crate::cfb::CfbReader::new(&mut *reader)
+        .ok()
+        .and_then(|cfb| {
+            if cfb.has_stream("WordDocument") {
+                Some(DocumentFormat::Doc)
+            } else if cfb.has_stream("Workbook") || cfb.has_stream("Book") {
+                Some(DocumentFormat::Xls)
+            } else if cfb.has_stream("PowerPoint Document") || cfb.has_stream("PP97_DUALSTORAGE") {
+                Some(DocumentFormat::Ppt)
+            } else {
+                None
+            }
+        });
+    let _ = reader.seek(std::io::SeekFrom::Start(0));
+    found
+}
+
 /// Dispatch a method call to the inner document type across all variants.
 macro_rules! dispatch_inner {
     ($self:expr, $method:ident) => {
@@ -316,25 +345,42 @@ impl Document {
                     inner: DocumentInner::Pptx(Box::new(doc)),
                 })
             },
-            DocumentFormat::Doc => {
-                let doc = doc::DocDocument::open(path)?;
-                Ok(Self {
-                    inner: DocumentInner::Doc(Box::new(doc)),
-                })
-            },
-            DocumentFormat::Xls => {
-                let doc = xls::XlsDocument::open(path)?;
-                Ok(Self {
-                    inner: DocumentInner::Xls(Box::new(doc)),
-                })
-            },
-            DocumentFormat::Ppt => {
-                let doc = ppt::PptDocument::open(path)?;
-                Ok(Self {
-                    inner: DocumentInner::Ppt(Box::new(doc)),
-                })
+            DocumentFormat::Doc | DocumentFormat::Xls | DocumentFormat::Ppt => {
+                match Self::open_legacy(path, format) {
+                    Ok(doc) => Ok(doc),
+                    // The extension is a claim. When the reader it names
+                    // fails, ask the container which document it holds and,
+                    // if that is a different one, read it as that; the
+                    // original error stands otherwise. Sniffing only on
+                    // failure keeps the common path free of a second parse
+                    // of the FAT and directory.
+                    Err(e) => match std::fs::File::open(path)
+                        .ok()
+                        .and_then(|mut f| cfb_stream_format(&mut f))
+                    {
+                        Some(held) if held != format => {
+                            info!("Document::open: compound file holds a {held:?} document");
+                            Self::open_legacy(path, held)
+                        },
+                        _ => Err(e),
+                    },
+                }
             },
         }
+    }
+
+    fn open_legacy(path: &Path, format: DocumentFormat) -> Result<Self> {
+        Ok(match format {
+            DocumentFormat::Doc => Self {
+                inner: DocumentInner::Doc(Box::new(doc::DocDocument::open(path)?)),
+            },
+            DocumentFormat::Xls => Self {
+                inner: DocumentInner::Xls(Box::new(xls::XlsDocument::open(path)?)),
+            },
+            _ => Self {
+                inner: DocumentInner::Ppt(Box::new(ppt::PptDocument::open(path)?)),
+            },
+        })
     }
 
     /// Open a document from a file path using memory-mapped I/O.
@@ -415,25 +461,37 @@ impl Document {
                     inner: DocumentInner::Pptx(Box::new(doc)),
                 })
             },
-            DocumentFormat::Doc => {
-                let doc = doc::DocDocument::from_reader(reader)?;
-                Ok(Self {
-                    inner: DocumentInner::Doc(Box::new(doc)),
-                })
-            },
-            DocumentFormat::Xls => {
-                let doc = xls::XlsDocument::from_reader(reader)?;
-                Ok(Self {
-                    inner: DocumentInner::Xls(Box::new(doc)),
-                })
-            },
-            DocumentFormat::Ppt => {
-                let doc = ppt::PptDocument::from_reader(reader)?;
-                Ok(Self {
-                    inner: DocumentInner::Ppt(Box::new(doc)),
-                })
+            DocumentFormat::Doc | DocumentFormat::Xls | DocumentFormat::Ppt => {
+                match Self::legacy_from_reader(&mut reader, format) {
+                    Ok(doc) => Ok(doc),
+                    // See `open_inner`: the container decides on failure.
+                    Err(e) => match cfb_stream_format(&mut reader) {
+                        Some(held) if held != format => {
+                            info!("Document::from_reader: compound file holds a {held:?} document");
+                            Self::legacy_from_reader(&mut reader, held)
+                        },
+                        _ => Err(e),
+                    },
+                }
             },
         }
+    }
+
+    fn legacy_from_reader<R: Read + Seek>(reader: &mut R, format: DocumentFormat) -> Result<Self> {
+        reader
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(core::Error::from)?;
+        Ok(match format {
+            DocumentFormat::Doc => Self {
+                inner: DocumentInner::Doc(Box::new(doc::DocDocument::from_reader(reader)?)),
+            },
+            DocumentFormat::Xls => Self {
+                inner: DocumentInner::Xls(Box::new(xls::XlsDocument::from_reader(reader)?)),
+            },
+            _ => Self {
+                inner: DocumentInner::Ppt(Box::new(ppt::PptDocument::from_reader(reader)?)),
+            },
+        })
     }
 
     /// Returns the document format.
