@@ -27,7 +27,7 @@ use super::workbook::{SheetInfo, SheetState, WorkbookInfo};
 use super::worksheet::{Row, Worksheet};
 use super::{Result, XlsxDocument};
 use crate::core::opc::{self, ZipEntryIndex};
-use crate::core::relationships::{Relationships, rel_types};
+use crate::core::relationships::Relationships;
 
 // Record ids ([MS-XLSB] §2.3, decimal as the specification lists them).
 const BRT_ROW_HDR: u32 = 0;
@@ -102,7 +102,7 @@ pub(super) fn from_zip<R: Read + Seek>(
     let app_properties = XlsxDocument::read_xml_entry(archive, entries, "docProps/app.xml")
         .ok()
         .and_then(|d| crate::core::properties::AppProperties::parse(&d).ok());
-    let has_macros = rels.first_by_type(rel_types::VBA_PROJECT).is_some();
+    let has_macros = rels.has_vba_project();
     Ok(XlsxDocument {
         workbook: WorkbookInfo {
             sheets,

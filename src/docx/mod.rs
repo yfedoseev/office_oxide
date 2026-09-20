@@ -203,7 +203,7 @@ impl DocxDocument {
         let app_properties = crate::core::properties::read_app_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let doc_rels = opc.read_rels_for(&main_part)?;
-        let has_macros = doc_rels.first_by_type(rel_types::VBA_PROJECT).is_some();
+        let has_macros = doc_rels.has_vba_project();
 
         // Parse theme
         // A theme is decoration: it supplies colour-scheme lookups and
@@ -3887,6 +3887,39 @@ mod tests {
         assert_eq!(ff.value_text().as_deref(), Some("\u{2612}"));
     }
 
+    /// A `FORMTEXT` field's `w:default` is the value the form shows until
+    /// the user types — the third of the three form-field kinds, and the
+    /// one whose state is the text itself.
+    #[test]
+    fn test_ffdata_text_input_default_value_is_captured() {
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:r><w:fldChar w:fldCharType="begin"><w:ffData>
+  <w:name w:val="Text1"/>
+  <w:textInput><w:default w:val="Enter your name"/></w:textInput>
+</w:ffData></w:fldChar></w:r>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let ff = p
+            .content
+            .iter()
+            .find_map(|c| match c {
+                ParagraphContent::Run(r) => r.content.iter().find_map(|rc| match rc {
+                    RunContent::FormField(ff) => Some(ff.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("FormField was not captured");
+        assert_eq!(ff.name.as_deref(), Some("Text1"));
+        assert_eq!(
+            ff.kind,
+            FormFieldKind::TextInput {
+                default: Some("Enter your name".to_string())
+            }
+        );
+        assert_eq!(ff.value_text().as_deref(), Some("Enter your name"));
+    }
+
     #[test]
     fn test_ffdata_dropdown_full_option_list_is_captured() {
         // The full option list, not just the selected value,
@@ -4418,7 +4451,9 @@ mod tests {
         writer
             .add_part(&vba_part, "application/vnd.ms-office.vbaProject", b"fake vba bytes")
             .unwrap();
-        writer.add_part_rel(&doc_part, rel_types::VBA_PROJECT, "vbaProject.bin");
+        // The relationship type Office writes — the crate's own constant
+        // is the OOXML-namespace form no real file carries.
+        writer.add_part_rel(&doc_part, rel_types::VBA_PROJECT_MS, "vbaProject.bin");
         let data = writer.finish().unwrap().into_inner();
 
         let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
@@ -4432,6 +4467,63 @@ mod tests {
     /// path but not by the direct `plain_text()`/`to_markdown()` renderers,
     /// which only read the run's own `w:rPr` — so `to_html()` hid the text
     /// and `plain_text()` showed it.
+    /// `w:vanish` in a *paragraph* style's `w:rPr` hides every run of the
+    /// paragraph — the other half of style-inherited hidden text, and the
+    /// shape that reached `to_html()` but not `plain_text()`/`to_markdown()`.
+    #[test]
+    fn test_vanish_inherited_from_a_paragraph_style_is_excluded_everywhere() {
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>Visible before.</w:t></w:r></w:p>
+    <w:p><w:pPr><w:pStyle w:val="Draft"/></w:pPr><w:r><w:t>Hidden by the paragraph style.</w:t></w:r></w:p>
+    <w:p><w:pPr><w:pStyle w:val="Draft"/></w:pPr><w:r><w:rPr><w:vanish w:val="0"/></w:rPr><w:t>Shown again by a direct override.</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Visible after.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let styles_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+  <w:style w:type="paragraph" w:styleId="Draft"><w:name w:val="Draft"/><w:basedOn w:val="Normal"/><w:rPr><w:vanish/></w:rPr></w:style>
+</w:styles>"#;
+        let mut writer = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let styles_part = PartName::new("/word/styles.xml").unwrap();
+        writer
+            .add_part(
+                &styles_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml",
+                styles_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::STYLES, "styles.xml");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let ir = crate::convert_docx::docx_to_ir(&doc);
+        for (surface, out) in [
+            ("plain_text", doc.plain_text()),
+            ("to_markdown", doc.to_markdown()),
+            ("to_ir", ir.plain_text()),
+            ("to_html", ir.to_html()),
+        ] {
+            assert!(!out.contains("Hidden by the paragraph style"), "{surface}: {out:?}");
+            assert!(out.contains("Shown again by a direct override"), "{surface}: {out:?}");
+            assert!(
+                out.contains("Visible before.") && out.contains("Visible after."),
+                "{surface}: {out:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_vanish_inherited_from_a_character_style_is_excluded_everywhere() {
         let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -4752,6 +4844,73 @@ mod tests {
             assert!(
                 text.contains(expected),
                 "chart text {expected:?} missing from plain_text(): {text:?}"
+            );
+        }
+    }
+
+    /// The same gap covered endnotes and comments, each in its own part;
+    /// the footnote test alone would let either regress.
+    #[test]
+    fn test_plain_text_and_markdown_include_endnote_and_comment_bodies() {
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>Body</w:t></w:r><w:r><w:endnoteReference w:id="1"/></w:r>
+      <w:commentRangeStart w:id="0"/><w:r><w:t> text</w:t></w:r><w:commentRangeEnd w:id="0"/>
+      <w:r><w:commentReference w:id="0"/></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let endnotes_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:endnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:endnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:endnote>
+  <w:endnote w:id="1"><w:p><w:r><w:t>The endnote body sentence.</w:t></w:r></w:p></w:endnote>
+</w:endnotes>"#;
+        let comments_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:comment w:id="0" w:author="Reviewer"><w:p><w:r><w:t>The comment body sentence.</w:t></w:r></w:p></w:comment>
+</w:comments>"#;
+        let mut writer = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let endnotes_part = PartName::new("/word/endnotes.xml").unwrap();
+        writer
+            .add_part(
+                &endnotes_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml",
+                endnotes_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::ENDNOTES, "endnotes.xml");
+        let comments_part = PartName::new("/word/comments.xml").unwrap();
+        writer
+            .add_part(
+                &comments_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml",
+                comments_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::COMMENTS, "comments.xml");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        for (surface, out) in [
+            ("plain_text", doc.plain_text()),
+            ("to_markdown", doc.to_markdown()),
+        ] {
+            assert!(
+                out.contains("The endnote body sentence."),
+                "{surface} lacks the endnote: {out:?}"
+            );
+            assert!(
+                out.contains("The comment body sentence."),
+                "{surface} lacks the comment: {out:?}"
             );
         }
     }

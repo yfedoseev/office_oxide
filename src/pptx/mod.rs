@@ -125,7 +125,7 @@ impl PptxDocument {
         let app_properties = crate::core::properties::read_app_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let pres_rels = opc.read_rels_for(&main_part)?;
-        let has_macros = pres_rels.first_by_type(rel_types::VBA_PROJECT).is_some();
+        let has_macros = pres_rels.has_vba_project();
 
         // Parse theme
         // See the DOCX reader: a malformed theme is not a reason to refuse
@@ -499,8 +499,34 @@ mod content_type_tests {
     /// Build a minimal PresentationML package whose main part carries
     /// `content_type`.
     fn minimal_package(content_type: &str) -> Vec<u8> {
+        minimal_package_with(content_type, &[], "")
+    }
+
+    /// As `minimal_package`, plus extra `(name, bytes)` entries and extra
+    /// `<Relationship …/>` elements in the presentation part's own rels.
+    fn minimal_package_with(
+        content_type: &str,
+        extra: &[(&str, &[u8])],
+        pres_rels: &str,
+    ) -> Vec<u8> {
         let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
         let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
+        for (name, data) in extra {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(data).unwrap();
+        }
+        if !pres_rels.is_empty() {
+            zip.start_file("ppt/_rels/presentation.xml.rels", opts)
+                .unwrap();
+            zip.write_all(
+                format!(
+                    r#"<?xml version="1.0"?><Relationships
+                         xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{pres_rels}</Relationships>"#
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        }
 
         zip.start_file("[Content_Types].xml", opts).unwrap();
         zip.write_all(
@@ -536,6 +562,47 @@ mod content_type_tests {
         .unwrap();
 
         zip.finish().unwrap().into_inner()
+    }
+
+    /// `docProps/app.xml` is read on open for presentations too — the
+    /// slide/notes/hidden-slide counts are the ones no other part carries.
+    #[test]
+    fn test_app_properties_are_read_on_open() {
+        let app_xml: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">
+  <Company>Acme Corp</Company>
+  <Slides>12</Slides>
+</Properties>"#;
+        let bytes = minimal_package_with(
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
+            &[("docProps/app.xml", app_xml)],
+            "",
+        );
+        let doc = super::PptxDocument::from_reader(Cursor::new(bytes)).unwrap();
+        let app = doc
+            .app_properties
+            .expect("app_properties must be populated");
+        assert_eq!(app.company.as_deref(), Some("Acme Corp"));
+        assert_eq!(app.slides, Some(12));
+    }
+
+    /// The macro-presence signal is the presentation part's `vbaProject`
+    /// relationship, under the type PowerPoint writes.
+    #[test]
+    fn test_vba_project_relationship_sets_has_macros() {
+        let bytes = minimal_package_with(
+            "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml",
+            &[("ppt/vbaProject.bin", b"fake vba bytes")],
+            r#"<Relationship Id="rId9" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/>"#,
+        );
+        let doc = super::PptxDocument::from_reader(Cursor::new(bytes)).unwrap();
+        assert!(doc.has_macros);
+        assert!(crate::convert_pptx::pptx_to_ir(&doc).metadata.has_macros);
+        let plain = super::PptxDocument::from_reader(Cursor::new(minimal_package(
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
+        )))
+        .unwrap();
+        assert!(!plain.has_macros);
     }
 
     /// `.potm`'s real content type was missing from the whitelist, so every

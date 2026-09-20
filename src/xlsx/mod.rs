@@ -202,7 +202,7 @@ impl XlsxDocument {
                 Ok(data) => Relationships::parse(&data)?,
                 Err(_) => Relationships::empty(),
             };
-        let has_macros = wb_rels.first_by_type(rel_types::VBA_PROJECT).is_some();
+        let has_macros = wb_rels.has_vba_project();
 
         // Parse shared strings (must be first — cells reference by index)
         let shared_strings =
@@ -1686,6 +1686,35 @@ mod tests {
             msg.contains("password-protected"),
             "expected a friendly password-protected message, got: {msg}"
         );
+    }
+
+    /// The macro-presence signal is the workbook part's own `vbaProject`
+    /// relationship; it was asserted for DOCX only.
+    #[test]
+    fn test_vba_project_relationship_sets_has_macros() {
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+</worksheet>"#;
+        let rels = br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/>
+</Relationships>"#;
+        let workbook = br#"<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#;
+        let with = open_bytes(zip_parts(&[
+            ("xl/_rels/workbook.xml.rels", rels),
+            ("xl/workbook.xml", workbook),
+            ("xl/worksheets/sheet1.xml", sheet_xml.as_bytes()),
+            ("xl/vbaProject.bin", b"fake vba bytes"),
+        ]));
+        assert!(with.has_macros);
+        assert!(crate::convert_xlsx::xlsx_to_ir(&with).metadata.has_macros);
+        let without = open_bytes(single_sheet_xlsx(sheet_xml, &[]));
+        assert!(!without.has_macros);
     }
 
     /// AppProperties::parse existed, fully tested, but

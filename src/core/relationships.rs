@@ -24,6 +24,13 @@ pub mod rel_types {
     /// required.
     pub const VBA_PROJECT: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vbaProject";
+    /// The `vbaProject` relationship type Word, Excel and PowerPoint
+    /// actually write ([MS-OI29500] §2.1.6): the VBA project part is a
+    /// Microsoft extension, so its relationship lives in the Microsoft
+    /// namespace. Every real `.docm`/`.xlsm`/`.pptm` carries this one;
+    /// looking for the OOXML-namespace form alone found macros in none.
+    pub const VBA_PROJECT_MS: &str =
+        "http://schemas.microsoft.com/office/2006/relationships/vbaProject";
     /// Relationship type for the package thumbnail.
     pub const THUMBNAIL: &str =
         "http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail";
@@ -239,6 +246,13 @@ impl Relationships {
             .get(rel_type)
             .map(|indices| indices.iter().map(|&i| &self.rels[i]).collect())
             .unwrap_or_default()
+    }
+
+    /// Whether the part carries a VBA project, under either relationship
+    /// type (see [`rel_types::VBA_PROJECT_MS`]).
+    pub fn has_vba_project(&self) -> bool {
+        self.first_by_type(rel_types::VBA_PROJECT_MS).is_some()
+            || self.first_by_type(rel_types::VBA_PROJECT).is_some()
     }
 
     /// Return the first relationship with the given type URI.
