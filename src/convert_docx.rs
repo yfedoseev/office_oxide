@@ -1037,6 +1037,9 @@ fn convert_paragraph_inline(
             },
         }
     }
+    // Slack from `Vec`'s minimum capacity: an inline slot is ~100 bytes
+    // and most paragraphs hold one span.
+    content.shrink_to_fit();
     content
 }
 
@@ -1556,6 +1559,9 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
 
             let mut cell_elements = Vec::new();
             convert_block_elements(&cell.content, &mut cell_elements, doc);
+            // One paragraph per cell is the norm; an `Element` slot is
+            // ~270 bytes and a fresh `Vec` reserves four of them.
+            cell_elements.shrink_to_fit();
 
             // The writer already emits `<w:jc>` inside a cell's paragraph
             // from `TableCell::text_align` (`docx/write.rs`), but nothing

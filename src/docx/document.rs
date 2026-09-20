@@ -16,14 +16,15 @@ pub struct Body {
 }
 
 /// A block-level element in the document body (or in a table cell).
-// `Paragraph` is ~320 bytes larger than `Table`. Boxing would force
-// a heap allocation on the hot parse path for every paragraph; we
-// accept the stack size in exchange for keeping parsing alloc-free.
-#[allow(clippy::large_enum_variant)]
+// `Table` is boxed: it is ~2.7× the size of `Paragraph`, and an enum is as
+// large as its largest variant, so an unboxed `Table` made every
+// paragraph slot — and the capacity-4 `Vec` behind every one-paragraph
+// table cell — pay for a table that was not there. A table is rare next
+// to a paragraph, so the one allocation per table is the cheap side.
 #[derive(Debug, Clone)]
 pub enum BlockElement {
     /// A paragraph (`w:p`).
     Paragraph(Paragraph),
     /// A table (`w:tbl`).
-    Table(Table),
+    Table(Box<Table>),
 }

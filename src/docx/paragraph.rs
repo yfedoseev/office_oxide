@@ -38,8 +38,11 @@ pub enum RunContent {
     Break(BreakType),
     /// A `w:tab` tab character.
     Tab,
-    /// A `w:drawing` inline or anchored image.
-    Drawing(DrawingInfo),
+    /// A `w:drawing` inline or anchored image. Boxed: `DrawingInfo` is
+    /// several times the size of a text run, and every `RunContent` slot
+    /// — four per run, thanks to `Vec`'s minimum capacity — was sized for
+    /// it.
+    Drawing(Box<DrawingInfo>),
     /// A `w:txbxContent` text-box body found inside a `w:pict` /
     /// `w:drawing` / `mc:AlternateContent` shape. Text boxes are ordinary
     /// block content that happens to be drawn in a frame; leaving them

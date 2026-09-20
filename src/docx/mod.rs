@@ -509,7 +509,7 @@ fn parse_body_elements(xml_data: &[u8]) -> CoreResult<Vec<BlockElement>> {
                     elements.push(BlockElement::Paragraph(parse_paragraph(&mut reader)?));
                 },
                 "tbl" => {
-                    elements.push(BlockElement::Table(parse_table(&mut reader)?));
+                    elements.push(BlockElement::Table(Box::new(parse_table(&mut reader)?)));
                 },
                 _ => {},
             },
@@ -661,7 +661,7 @@ fn parse_block_elements_until(
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
                 "p" => elements.push(BlockElement::Paragraph(parse_paragraph(reader)?)),
-                "tbl" => elements.push(BlockElement::Table(parse_table(reader)?)),
+                "tbl" => elements.push(BlockElement::Table(Box::new(parse_table(reader)?))),
                 // A content control is a transparent wrapper around its
                 // `w:sdtContent` blocks, here exactly as in the body. Word's
                 // own "quote" text-box templates wrap the whole box in one;
@@ -716,7 +716,7 @@ impl VmlContent {
             out.push(RunContent::Text(s));
         }
         for (rid, w, h) in self.images {
-            out.push(RunContent::Drawing(DrawingInfo {
+            out.push(RunContent::Drawing(Box::new(DrawingInfo {
                 relationship_id: rid,
                 description: None,
                 width: w,
@@ -728,7 +728,7 @@ impl VmlContent {
                 chart_text: Vec::new(),
                 dgm_data_rel_id: None,
                 dgm_text: Vec::new(),
-            }));
+            })));
         }
         for b in self.boxes {
             out.push(RunContent::TextBox(b));
@@ -953,7 +953,7 @@ fn parse_document(
                         elements.push(BlockElement::Paragraph(parse_paragraph(&mut reader)?));
                     },
                     "tbl" if in_body => {
-                        elements.push(BlockElement::Table(parse_table(&mut reader)?));
+                        elements.push(BlockElement::Table(Box::new(parse_table(&mut reader)?)));
                     },
                     "sectPr" if in_body => {
                         sections.push(parse_section_properties(&mut reader, e)?);
@@ -1217,6 +1217,11 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
             _ => {},
         }
     }
+    // `Vec::push` on an empty vector reserves four slots, and a paragraph
+    // slot is ~200 bytes; most paragraphs hold one run. Release the slack
+    // now, once, rather than carry it for the life of the document —
+    // it was most of the 4 KB a plain table cell cost.
+    paragraph.content.shrink_to_fit();
     Ok(paragraph)
 }
 
@@ -1383,7 +1388,7 @@ fn parse_run(
                     // `<wps:txbx>` holds real prose. Collect both.
                     let (drawing, boxes) = parse_drawing_and_text_boxes(reader)?;
                     if let Some(drawing) = drawing {
-                        run.content.push(RunContent::Drawing(drawing));
+                        run.content.push(RunContent::Drawing(Box::new(drawing)));
                     }
                     for b in boxes {
                         run.content.push(RunContent::TextBox(b));
@@ -1509,6 +1514,7 @@ fn parse_run(
             _ => {},
         }
     }
+    run.content.shrink_to_fit();
     Ok(run)
 }
 
@@ -2747,6 +2753,7 @@ fn parse_table_row(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableRow
         }
     }
 
+    cells.shrink_to_fit();
     Ok(TableRow { properties, cells })
 }
 
@@ -2805,7 +2812,7 @@ fn parse_table_cell(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableCe
                     content.push(BlockElement::Paragraph(parse_paragraph(reader)?));
                 },
                 "tbl" => {
-                    content.push(BlockElement::Table(parse_table(reader)?));
+                    content.push(BlockElement::Table(Box::new(parse_table(reader)?)));
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
@@ -2819,6 +2826,7 @@ fn parse_table_cell(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableCe
         }
     }
 
+    content.shrink_to_fit();
     Ok(TableCell {
         properties,
         content,
@@ -3192,6 +3200,47 @@ impl crate::core::OfficeDocument for DocxDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plain one-run paragraph in a one-paragraph cell cost ~4 KB even
+    /// after the property structs were boxed: `BlockElement` was 536
+    /// bytes (an unboxed `Table`), `RunContent`
+    /// 224 (an unboxed `DrawingInfo`), and each one-element content `Vec`
+    /// kept the four slots `push` reserves. 128,000 such cells were 524 MB
+    /// at `open()`. The sizes are budgeted with headroom; the capacities
+    /// are exact.
+    #[test]
+    fn test_one_run_cells_carry_no_variant_or_capacity_slack() {
+        assert!(
+            std::mem::size_of::<BlockElement>() <= 250,
+            "BlockElement is {} bytes — is `Table` still boxed?",
+            std::mem::size_of::<BlockElement>()
+        );
+        assert!(
+            std::mem::size_of::<RunContent>() <= 100,
+            "RunContent is {} bytes — is `DrawingInfo` still boxed?",
+            std::mem::size_of::<RunContent>()
+        );
+        let xml = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:tbl><w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+<w:p><w:r><w:t>para</w:t></w:r></w:p>
+</w:body></w:document>"#;
+        let rels = crate::core::relationships::Relationships::empty();
+        let parsed = parse_document(xml, &rels).unwrap();
+        let BlockElement::Table(table) = &parsed.0.elements[0] else {
+            panic!("first element is the table")
+        };
+        let cell = &table.rows[0].cells[0];
+        assert_eq!(cell.content.capacity(), 1, "cell content over-reserved");
+        assert_eq!(table.rows[0].cells.capacity(), 1, "row cells over-reserved");
+        let BlockElement::Paragraph(p) = &cell.content[0] else {
+            panic!("cell holds a paragraph")
+        };
+        assert_eq!(p.content.capacity(), 1, "paragraph content over-reserved");
+        let ParagraphContent::Run(run) = &p.content[0] else {
+            panic!("paragraph holds a run")
+        };
+        assert_eq!(run.content.capacity(), 1, "run content over-reserved");
+    }
     use std::io::Cursor;
 
     use crate::core::opc::{OpcWriter, PartName};
