@@ -115,8 +115,25 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
                 break;
             }
             rows_scanned += 1;
-            let mut cells = Vec::new();
-            for (col_idx, cell_value) in row.iter().enumerate() {
+            // Only the columns up to the last non-empty one are built. The
+            // trailing padding used to be materialised as full IR cells and
+            // then popped — but `Vec::pop` keeps the buffer, so every one of
+            // a 65,536-row grid's empty rows retained a 256-cell allocation
+            // (~75 KB): 4.9 GB for a 42 KB file whose IR is 6 MB.
+            let width = row
+                .iter()
+                .enumerate()
+                .rposition(|(col_idx, cell_value)| {
+                    let has_display = sheet
+                        .display
+                        .get(row_idx)
+                        .and_then(|r| r.get(col_idx))
+                        .is_some_and(|s| !s.is_empty());
+                    has_display || !matches!(cell_value, crate::xls::CellValue::Empty)
+                })
+                .map_or(0, |i| i + 1);
+            let mut cells = Vec::with_capacity(width);
+            for (col_idx, cell_value) in row.iter().take(width).enumerate() {
                 // `display` carries the number-format-aware rendering: a
                 // date cell is an ISO date rather than its raw serial.
                 // Fall back to the raw rendering when the sheet had no
@@ -484,6 +501,36 @@ mod tests {
             ..Default::default()
         }]));
         assert!(ir.sections[0].elements.is_empty());
+    }
+
+    /// Regression: the corner-cell shape of a real 42 KB file — a 65,536 x
+    /// 256 grid with text only in its four corners. Every empty row used to
+    /// allocate a 256-cell buffer, pop the cells, and keep the buffer
+    /// (`Vec::pop` does not shrink): 4.9 GB of retained capacity behind a
+    /// 6 MB IR. The IR must be small *and* must not hold that capacity.
+    #[test]
+    fn test_corner_cells_in_a_huge_grid_retain_no_padding_capacity() {
+        let (rows, cols) = (4_096, 256);
+        let mut grid = vec![vec![CellValue::Empty; cols]; rows];
+        grid[0][0] = CellValue::String("Top Left".into());
+        grid[0][cols - 1] = CellValue::String("Top Right".into());
+        grid[rows - 1][0] = CellValue::String("Bottom Left".into());
+        grid[rows - 1][cols - 1] = CellValue::String("Bottom Right".into());
+        let ir = xls_to_ir(&XlsDocument::from_sheets(vec![Sheet {
+            name: "S".into(),
+            display: Vec::new(),
+            rows: grid,
+            ..Default::default()
+        }]));
+        let Element::Table(t) = &ir.sections[0].elements[0] else {
+            panic!("expected a table");
+        };
+        assert_eq!(t.rows.len(), rows);
+        assert_eq!(t.rows[0].cells.len(), cols, "the top row keeps its far-right cell");
+        assert_eq!(t.rows[rows - 1].cells.len(), cols);
+        let retained: usize = t.rows[1..rows - 1].iter().map(|r| r.cells.capacity()).sum();
+        assert_eq!(retained, 0, "empty rows must not keep the padding's allocation");
+        assert!(cell_texts(&ir).iter().any(|s| s == "Bottom Right"));
     }
 
     #[test]

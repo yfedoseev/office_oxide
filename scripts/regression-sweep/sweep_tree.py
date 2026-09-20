@@ -7,7 +7,7 @@ Record: {path, fmt, surface, status(ok|err|timeout|crash), code, bytes, sha, ms,
 Outputs land in OUTDIR/out/<relpath>.<surface>.gz so compare/diff scripts can
 read them without re-running either arm.
 """
-import gzip, hashlib, json, os, subprocess, sys, time
+import collections, gzip, hashlib, json, os, subprocess, sys, time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 SURFACES = ["text", "markdown", "html", "ir"]
@@ -22,24 +22,36 @@ def run_one(args):
     for surface in SURFACES:
         rec = {"path": rel, "fmt": fmt, "surface": surface}
         t0 = time.perf_counter()
+        op = os.path.join(out_root, rel + "." + surface + ".gz")
+        os.makedirs(os.path.dirname(op), exist_ok=True)
         try:
-            p = subprocess.run([bin_, surface, path], capture_output=True, timeout=TIMEOUT)
+            # stdout is streamed to the gzip file in chunks: an `ir` dump of a
+            # large spreadsheet is hundreds of MB, and holding one per worker
+            # in memory got the sweep itself OOM-killed.
+            with subprocess.Popen([bin_, surface, path], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p, \
+                 gzip.open(op, "wb", compresslevel=1) as f:
+                h = hashlib.sha256(); n = 0
+                try:
+                    while True:
+                        chunk = p.stdout.read(1 << 20)
+                        if not chunk: break
+                        h.update(chunk); f.write(chunk); n += len(chunk)
+                        if time.perf_counter() - t0 > TIMEOUT: raise subprocess.TimeoutExpired(bin_, TIMEOUT)
+                    err = p.stderr.read()
+                    p.wait(timeout=max(1, TIMEOUT - (time.perf_counter() - t0)))
+                except subprocess.TimeoutExpired:
+                    p.kill(); p.wait(); raise
             rec["ms"] = round((time.perf_counter() - t0) * 1000, 1)
             rec["code"] = p.returncode
             if p.returncode == 0:
-                rec["status"] = "ok"
-                rec["bytes"] = len(p.stdout)
-                rec["sha"] = hashlib.sha256(p.stdout).hexdigest()[:16]
-                op = os.path.join(out_root, rel + "." + surface + ".gz")
-                os.makedirs(os.path.dirname(op), exist_ok=True)
-                with gzip.open(op, "wb", compresslevel=1) as f:
-                    f.write(p.stdout)
+                rec["status"] = "ok"; rec["bytes"] = n; rec["sha"] = h.hexdigest()[:16]
             else:
                 rec["status"] = "crash" if p.returncode < 0 else "err"
-                rec["err"] = p.stderr.decode("utf-8", "replace").strip()[:400]
+                rec["err"] = err.decode("utf-8", "replace").strip()[:400]
+                os.remove(op)
         except subprocess.TimeoutExpired:
-            rec["ms"] = TIMEOUT * 1000
-            rec["status"] = "timeout"
+            rec["ms"] = TIMEOUT * 1000; rec["status"] = "timeout"
+            if os.path.exists(op): os.remove(op)
         except Exception as e:
             rec["status"] = "crash"; rec["err"] = str(e)[:400]
         recs.append(rec)
@@ -68,7 +80,16 @@ def main():
                 files.append(rel)
     out_root = os.path.join(outdir, "out")
     os.makedirs(out_root, exist_ok=True)
-    jl = open(os.path.join(outdir, "sweep.jsonl"), "w")
+    # Resumable: a file with all its surfaces already recorded is skipped.
+    jl_path = os.path.join(outdir, "sweep.jsonl")
+    done_files = collections.Counter()
+    if os.path.exists(jl_path):
+        with open(jl_path) as f:
+            for line in f:
+                try: done_files[json.loads(line)["path"]] += 1
+                except Exception: pass
+    files = [f for f in files if done_files.get(f, 0) < len(SURFACES)]
+    jl = open(jl_path, "a")
     done = 0
     with ProcessPoolExecutor(jobs) as ex:
         futs = [ex.submit(run_one, (bin_, root, out_root, rel)) for rel in files]

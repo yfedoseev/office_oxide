@@ -691,8 +691,16 @@ impl XlsDocument {
             }
             out.push('\n');
 
-            // Data rows.
-            for (r, _) in sheet.rows.iter().enumerate().skip(1) {
+            // Data rows. A row with nothing in it is skipped: an XLSX
+            // sheet never has such rows (they are absent from its XML), and
+            // a BIFF grid declared 65,536 rows tall for four corner cells
+            // rendered 50 MB of `|  |  |` lines from a 42 KB file.
+            for (r, row) in sheet.rows.iter().enumerate().skip(1) {
+                if (0..col_count.min(row.len().max(1)))
+                    .all(|c| cell_display_text(sheet, r, c).is_empty())
+                {
+                    continue;
+                }
                 out.push('|');
                 for c in 0..col_count {
                     let text = cell_display_text(sheet, r, c);
@@ -1376,6 +1384,27 @@ mod tests {
             "cells after the embedded chart must not be dropped, text: {text}"
         );
         assert!(text.contains("Sheet2A1"), "text: {text}");
+    }
+
+    /// Regression: a 65,536-row grid with text only in its corners
+    /// rendered every empty row between them as a `|  |  |` line — 50 MB
+    /// of markdown from a 42 KB file. Empty rows are skipped, as they are
+    /// for an XLSX sheet, where such rows do not exist in the XML at all.
+    #[test]
+    fn test_markdown_skips_all_empty_rows() {
+        let mut grid = vec![vec![CellValue::Empty; 3]; 500];
+        grid[0][0] = CellValue::String("head".into());
+        grid[499][2] = CellValue::String("tail".into());
+        let doc = XlsDocument::from_sheets(vec![Sheet {
+            name: "S".into(),
+            display: Vec::new(),
+            rows: grid,
+            ..Default::default()
+        }]);
+        let md = doc.to_markdown();
+        let table_lines = md.lines().filter(|l| l.starts_with('|')).count();
+        assert_eq!(table_lines, 3, "header, separator, one data row: {md}");
+        assert!(md.contains("tail"));
     }
 
     /// Regression: a chart's cached series values are ordinary
