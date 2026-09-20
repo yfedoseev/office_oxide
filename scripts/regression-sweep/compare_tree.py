@@ -88,9 +88,14 @@ def main():
     reg = [r for r in rows if r["prev"] == "ok" and r["next"] != "ok" and r["prev_bytes"] > 0]
     print(f"  ok->not-ok replacing real bytes: {len(reg)}")
     # ---- axis 2
+    # Word diffs cover the three rendered surfaces. `ir` is JSON whose shape
+    # changes with the IR itself (and runs to gigabytes on big
+    # spreadsheets); its content is what the other three surfaces render.
+    MAX_DIFF_BYTES = 64 << 20
     changed = [(prev_d, next_d, k[0], k[1]) for k in keys
                if k in P and k in N and P[k]["status"] == "ok" and N[k]["status"] == "ok"
-               and P[k]["sha"] != N[k]["sha"]]
+               and P[k]["sha"] != N[k]["sha"] and k[1] != "ir"
+               and max(P[k].get("bytes", 0), N[k].get("bytes", 0)) <= MAX_DIFF_BYTES]
     print(f"== content: {len(changed)} (file,surface) pairs differ by hash; diffing words ==")
     with ProcessPoolExecutor(7) as ex:
         res = list(ex.map(content_one, changed, chunksize=32))
