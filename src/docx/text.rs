@@ -404,10 +404,21 @@ fn markdown_blocks_inner(
                     styles: ctx.styles,
                     paragraph_style_id: p.properties.as_ref().and_then(|pp| pp.style_id.as_deref()),
                 };
+                // A heading's own style supplies its look; only direct and
+                // character-style formatting become delimiters inside it
+                // (see `convert_heading_inline`).
+                let format_ctx = if heading_level.is_some() {
+                    HiddenCtx {
+                        styles: ctx.styles,
+                        paragraph_style_id: None,
+                    }
+                } else {
+                    hidden
+                };
                 for content in &p.content {
                     match content {
                         ParagraphContent::Run(run) => {
-                            let style = RunStyle::of(run, hidden);
+                            let style = RunStyle::of(run, format_ctx);
                             let mut text = String::new();
                             markdown_run_text(run, ctx, hidden, &mut text);
                             if text.is_empty() {

@@ -147,6 +147,28 @@ fn test_markdown_applies_run_formatting_inherited_from_styles() {
     assert_eq!(html.matches("<strong>").count(), 2, "{html}");
 }
 
+/// A heading style's `<w:b/>`/`<w:sz>` *are* the heading. Folding them
+/// into the spans rendered `<h1><strong>…</strong></h1>` and `# **…**` for
+/// every styled heading; direct formatting inside a heading still shows.
+#[test]
+fn test_heading_style_formatting_is_not_emphasis_but_direct_formatting_is() {
+    let document = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t xml:space="preserve">Plain </w:t></w:r><w:r><w:rPr><w:i/></w:rPr><w:t>italic</w:t></w:r></w:p>
+</w:body></w:document>"#;
+    let styles = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:pPr><w:outlineLvl w:val="0"/></w:pPr><w:rPr><w:b/><w:sz w:val="32"/></w:rPr></w:style>
+</w:styles>"#;
+    let bytes = make_docx_with_styles(document, styles);
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+    let md = doc.to_markdown();
+    assert!(md.starts_with("# Plain *italic*"), "{md}");
+    let html = doc.to_html();
+    assert!(html.starts_with("<h1>Plain <em>italic</em></h1>"), "{html}");
+}
+
 /// Word's own "List Bullet" / "List Number" styles carry the `w:numPr`
 /// in the *style*, not on each paragraph. `to_ir()` resolved that through
 /// the style chain; the direct `to_markdown()` renderer read the

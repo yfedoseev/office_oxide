@@ -591,7 +591,7 @@ fn convert_block_elements(
                 if let Some(level) = heading_level {
                     let mut heading = Heading {
                         level: (level + 1).min(6),
-                        content: convert_paragraph_inline(p, doc),
+                        content: convert_heading_inline(p, doc),
                         frame_position: paragraph_frame_position(p),
                         alignment,
                         ..Default::default()
@@ -1022,7 +1022,27 @@ fn convert_paragraph_inline(
     p: &crate::docx::Paragraph,
     doc: &crate::docx::DocxDocument,
 ) -> Vec<InlineContent> {
-    let ctx = run_context(p, doc);
+    convert_inline_with(p, run_context(p, doc))
+}
+
+/// A heading's spans, without the formatting its own paragraph style
+/// supplies. `Heading 1`'s `<w:b/>`/`<w:sz>` *are* the heading — folding
+/// them into every span rendered `<h1><strong>…</strong></h1>` and
+/// `# **…**` on every styled heading, which is not what Word shows and
+/// not what pandoc or python-docx report. Direct formatting and character
+/// styles still apply.
+fn convert_heading_inline(
+    p: &crate::docx::Paragraph,
+    doc: &crate::docx::DocxDocument,
+) -> Vec<InlineContent> {
+    let ctx = RunContext {
+        paragraph_style_id: None,
+        ..run_context(p, doc)
+    };
+    convert_inline_with(p, ctx)
+}
+
+fn convert_inline_with(p: &crate::docx::Paragraph, ctx: RunContext<'_>) -> Vec<InlineContent> {
     let mut content = Vec::new();
     for pc in &p.content {
         match pc {
