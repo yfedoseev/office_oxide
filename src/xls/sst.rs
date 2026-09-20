@@ -100,6 +100,17 @@ pub fn read_unicode_string_across(
     let mut remaining = char_count;
     let mut out = String::with_capacity(char_count);
     while remaining > 0 {
+        // Standing exactly on a boundary with characters still owed — the
+        // header filled the previous record to its last byte and every
+        // character is in the CONTINUE — is the same cut as one inside the
+        // characters: the CONTINUE opens with its flags byte.
+        if continue_at.contains(&offset) {
+            if offset >= data.len() {
+                return Err(XlsError::Corrupted("string continues past the data".into()));
+            }
+            is_wide = (data[offset] & 0x01) != 0;
+            offset += 1;
+        }
         // The next boundary past the current offset, if any.
         let next_boundary = continue_at.iter().copied().find(|&b| b > offset);
         let segment_end = next_boundary.unwrap_or(data.len()).min(data.len());
@@ -440,6 +451,24 @@ mod continue_tests {
         data.extend(compressed("plain"));
         let strings = parse_sst(&data, &[boundary]).unwrap();
         assert_eq!(strings, ["rich", "plain"]);
+    }
+
+    /// Regression: a header that ends exactly on the boundary, with every
+    /// character in the CONTINUE. A search for the next boundary *past*
+    /// the offset never consumed that record's flags byte, so a wide
+    /// string was read one byte off — `"696"` came out as `㘀㤀㘀` and a
+    /// remittance statement lost every name on it.
+    #[test]
+    fn test_header_ending_exactly_on_the_boundary_still_consumes_the_flags_byte() {
+        let mut data = sst_header(2);
+        data.extend(compressed("before"));
+        data.extend_from_slice(&3u16.to_le_bytes());
+        data.push(0x01); // wide — and that is the last byte of this record
+        let boundary = data.len();
+        data.push(0x01); // the CONTINUE's own flags byte: still wide
+        data.extend("696".encode_utf16().flat_map(|u| u.to_le_bytes()));
+        let strings = parse_sst(&data, &[boundary]).unwrap();
+        assert_eq!(strings, ["before", "696"]);
     }
 
     /// Two boundaries inside one long string.
