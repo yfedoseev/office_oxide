@@ -765,6 +765,47 @@ fn test_a_based_on_cycle_does_not_hang() {
 // Heading detection via style id / name
 // ---------------------------------------------------------------------------
 
+/// Word's multilevel-list "Heading" gallery attaches `w:numPr` to the
+/// heading styles, so a numbered heading (`1. Introduction`) is a list
+/// member *and* a heading. List membership used to win in this converter
+/// (as in the `.doc` one), turning every numbered heading into a list
+/// item and leaving the IR with no headings at all. Both the direct
+/// `w:numPr` and the style-inherited one must resolve to a Heading.
+#[test]
+fn test_numbered_heading_is_a_heading_not_a_list_item() {
+    let ir = Docx::new(
+        r#"<w:p><w:pPr><w:pStyle w:val="Heading1"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>Introduction</w:t></w:r></w:p>
+           <w:p><w:pPr><w:pStyle w:val="NumberedHeading"/></w:pPr><w:r><w:t>Scope</w:t></w:r></w:p>
+           <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>a plain item</w:t></w:r></w:p>"#,
+    )
+    .styles(
+        r#"<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:pPr><w:outlineLvl w:val="0"/></w:pPr></w:style>
+           <w:style w:type="paragraph" w:styleId="NumberedHeading"><w:name w:val="Numbered Heading"/><w:pPr><w:outlineLvl w:val="1"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr></w:style>"#,
+    )
+    .numbering(
+        r#"<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum>
+           <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#,
+    )
+    .ir();
+    let kinds: Vec<&str> = ir.sections[0]
+        .elements
+        .iter()
+        .map(|e| match e {
+            Element::Heading(h) => {
+                if h.level == 1 {
+                    "h1"
+                } else {
+                    "h2"
+                }
+            },
+            Element::List(_) => "list",
+            Element::Paragraph(_) => "para",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(kinds, ["h1", "h2", "list"], "{:?}", ir.sections[0].elements);
+}
+
 #[test]
 fn test_heading_style_id_without_outline_level_is_still_a_heading() {
     let ir = Docx::new(

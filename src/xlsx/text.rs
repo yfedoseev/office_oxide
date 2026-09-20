@@ -535,6 +535,60 @@ mod tests {
         assert!(idx.contains(&2), "an un-overridden built-in date id is a date");
     }
 
+    /// `plain_text()` starts each sheet with its name, as `.xls`,
+    /// `to_markdown()` and every other spreadsheet reader do — the same
+    /// workbook used to name its sheets in one format and not the other.
+    #[test]
+    fn test_plain_text_names_each_sheet() {
+        let sheet = |name: &str, text: &str| super::super::worksheet::Worksheet {
+            name: name.to_string(),
+            dimension: None,
+            rows: vec![Row {
+                index: 1,
+                cells: vec![Cell {
+                    reference: super::super::CellRef { col: 0, row: 0 },
+                    value: CellValue::String(text.to_string()),
+                    style_index: None,
+                    formula: None,
+                    rich_runs: None,
+                    vm: None,
+                }],
+            }],
+            merged_cells: Vec::new(),
+            hyperlinks: Vec::new(),
+            page_setup: None,
+            images: Vec::new(),
+            comments: Vec::new(),
+            text_shapes: Vec::new(),
+            conditional_formats: Vec::new(),
+            data_validations: Vec::new(),
+        };
+        let doc = XlsxDocument {
+            workbook: super::super::WorkbookInfo {
+                sheets: Vec::new(),
+                defined_names: Vec::new(),
+                date1904: false,
+            },
+            worksheets: vec![sheet("Revenue", "north"), sheet("Costs", "south")],
+            shared_strings: super::super::SharedStringTable::empty(),
+            styles: None,
+            theme: None,
+            chart_text: Vec::new(),
+            embedded_fonts: Vec::new(),
+            core_properties: None,
+            app_properties: None,
+            has_macros: false,
+            styles_data: None,
+            theme_data: None,
+        };
+        let text = doc.plain_text();
+        assert!(text.starts_with("Revenue\nnorth"), "{text:?}");
+        assert!(text.contains("\n\nCosts\nsouth"), "{text:?}");
+        // The two renderers agree on the names.
+        let md = doc.to_markdown();
+        assert!(md.contains("## Revenue") && md.contains("## Costs"), "{md:?}");
+    }
+
     /// `to_markdown()` already surfaced chart text; `plain_text()`
     /// silently dropped it, so the CLI's default `text` output (and anything
     /// built on `plain_text()`, like PDF export) lost every chart's words.

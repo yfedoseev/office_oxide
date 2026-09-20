@@ -372,7 +372,8 @@ office-oxide markdown report.docx --embed-images  # Markdown with inline base64 
 office-oxide html slides.pptx                    # Convert to HTML
 office-oxide ir document.docx                    # Dump IR as JSON
 office-oxide info report.docx                    # Show format and metadata
-office-oxide replace report.docx OLD NEW         # Find/replace text (DOCX/PPTX)
+office-oxide replace report.docx OLD NEW         # Find/replace text (DOCX/PPTX), in place
+office-oxide replace report.docx OLD NEW --output edited.docx   # …written to a new file
 ```
 
 All six formats are supported for reading (docx, xlsx, pptx, doc, xls, ppt); `replace` writes

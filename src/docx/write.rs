@@ -4706,6 +4706,38 @@ mod tests {
         assert_eq!(writer.truncated_subtrees(), 0);
     }
 
+    /// The same rule covers a carriage return — XML 1.0 §2.10 lets a
+    /// processor normalise any whitespace-only text node — while a bare
+    /// line feed is a `<w:br/>`, not text, and needs no attribute.
+    #[test]
+    fn test_cr_only_runs_get_xml_space_preserve_and_lf_is_a_break() {
+        for (text, needs_preserve) in [("\r", true), ("\r\n", true), (" \t ", true), ("\n", false)]
+        {
+            let mut doc = DocxWriter::new();
+            doc.add_ir_paragraph(
+                &[Run {
+                    text: text.to_string(),
+                    ..Default::default()
+                }],
+                None,
+            );
+            let parts = all_parts(doc);
+            let document_xml = &parts["word/document.xml"];
+            if needs_preserve {
+                assert!(
+                    document_xml.contains(r#"xml:space="preserve""#),
+                    "a {text:?}-only run must carry xml:space=\"preserve\": {document_xml}"
+                );
+            } else {
+                assert!(
+                    document_xml.contains("<w:br/>"),
+                    "{text:?} is a line break: {document_xml}"
+                );
+                assert!(!document_xml.contains("<w:t"), "{text:?} is not text: {document_xml}");
+            }
+        }
+    }
+
     #[test]
     fn test_tab_only_run_gets_xml_space_preserve() {
         // A run whose text is a tab character was written

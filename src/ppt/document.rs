@@ -281,6 +281,39 @@ mod tests {
         rec(crate::ppt::records::RT_SLIDE, 0x000F, &textbox)
     }
 
+    /// A legacy deck's macros live in a root-level `_VBA_PROJECT`
+    /// storage — a storage, not a stream, which is what
+    /// `has_root_entry` must see.
+    #[test]
+    fn test_vba_project_storage_sets_has_macros() {
+        let bytes = build_cfb(&[
+            Entry {
+                name: "Root Entry",
+                kind: 5,
+                right: NO_ENTRY,
+                child: 1,
+                data: vec![],
+            },
+            Entry {
+                name: "PowerPoint Document",
+                kind: 2,
+                right: 2,
+                child: NO_ENTRY,
+                data: slide_stream("Slide text"),
+            },
+            Entry {
+                name: "_VBA_PROJECT",
+                kind: 1,
+                right: NO_ENTRY,
+                child: NO_ENTRY,
+                data: vec![],
+            },
+        ]);
+        let doc = PptDocument::from_reader(std::io::Cursor::new(bytes)).expect("opens");
+        assert!(doc.has_macros());
+        assert!(crate::convert_ppt::ppt_to_ir(&doc).metadata.has_macros);
+    }
+
     /// The `Pictures` stream was decoded into images at `open()`, so
     /// `plain_text()` on a picture-heavy deck paid for pictures it never
     /// emits (12 % of a 17 MB corpus file). It is decoded on first
