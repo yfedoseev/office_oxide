@@ -51,33 +51,6 @@ thread_local! {
         }) };
 }
 
-/// Standard base64 (RFC 4648) with padding, no line breaks.
-fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
 /// The media type to put in an image's `data:` URI.
 ///
 /// `Image::format` is authoritative when the converter set it; otherwise the
@@ -185,7 +158,7 @@ mod block_default {
                 // image's position in the flow.
                 if super::MARKDOWN_OPTIONS.with(|o| o.get().image_embed) == ImageEmbed::Base64 {
                     if let Some(ref data) = img.data {
-                        return format!("[image-base64:{}]", super::base64_encode(data));
+                        return format!("[image-base64:{}]", crate::core::base64::encode(data));
                     }
                 }
                 // An `![alt]()` with an empty target renders as a broken
@@ -226,7 +199,7 @@ mod block_default {
                         let _ = write!(
                             out,
                             "<img src=\"data:{mime};base64,{}\" alt=\"{}\" />",
-                            super::base64_encode(data),
+                            crate::core::base64::encode(data),
                             super::escape_html(alt)
                         );
                         return out;
@@ -1519,7 +1492,7 @@ mod tests {
             image_embed: ImageEmbed::Base64,
         });
         assert!(embedded.contains("<img src=\"data:image/png;base64,"), "{embedded}");
-        assert!(embedded.contains(&base64_encode(&png)), "{embedded}");
+        assert!(embedded.contains(&crate::core::base64::encode(&png)), "{embedded}");
         // Alt text is escaped, not injected.
         assert!(embedded.contains("alt=\"A &lt;chart&gt;\""), "{embedded}");
 

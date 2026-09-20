@@ -1481,6 +1481,50 @@ impl ImageFormat {
     }
 }
 
+/// serde codec for [`Image::data`]: base64 out, base64 *or* the legacy
+/// number array in.
+mod image_bytes {
+    use serde::de::{self, Deserializer, SeqAccess, Visitor};
+    use serde::ser::Serializer;
+
+    pub fn serialize<S: Serializer>(data: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match data {
+            Some(bytes) => s.serialize_some(&crate::core::base64::encode(bytes)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        struct BytesVisitor;
+        impl<'de> Visitor<'de> for BytesVisitor {
+            type Value = Option<Vec<u8>>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a base64 string, an array of bytes, or null")
+            }
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+                d.deserialize_any(self)
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                crate::core::base64::decode(v).map(Some).map_err(E::custom)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(b) = seq.next_element::<u8>()? {
+                    out.push(b);
+                }
+                Ok(Some(out))
+            }
+        }
+        d.deserialize_option(BytesVisitor)
+    }
+}
+
 /// An embedded image reference.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Image {
@@ -1488,7 +1532,13 @@ pub struct Image {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alt_text: Option<String>,
     /// Raw image bytes, if extracted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Serialised as a base64 string. serde's default for `Vec<u8>` is a
+    /// JSON array of numbers, which the pretty-printing CLI and MCP
+    /// surfaces turned into one line per byte: a 1.2 MB `.docx` produced a
+    /// 140 MB, 8.3-million-line `ir` dump. Deserialisation still accepts
+    /// the number array so IR JSON written by earlier releases loads.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "image_bytes")]
     pub data: Option<Vec<u8>>,
     /// Pixel format of the image data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1792,6 +1842,31 @@ mod tests {
 #[cfg(test)]
 mod serde_shape_tests {
     use super::*;
+
+    /// `Image::data` went out as serde's default `Vec<u8>` shape — a JSON
+    /// number array — which the pretty-printing surfaces spread over one
+    /// line per byte (a 1.2 MB `.docx` → 140 MB of `ir`). It is a base64
+    /// string now, and the array is still accepted on the way in.
+    #[test]
+    fn test_image_bytes_serialize_as_base64_and_deserialize_from_either_shape() {
+        let image = Image {
+            data: Some(vec![0x89, b'P', b'N', b'G', 0, 1, 2]),
+            ..Image::default()
+        };
+        let json = serde_json::to_string(&image).unwrap();
+        assert!(json.contains(r#""data":"iVBORwABAg==""#), "{json}");
+        assert!(!json.contains('['), "no byte array: {json}");
+        let back: Image = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, image);
+
+        let legacy: Image = serde_json::from_str(r#"{"data":[137,80,78,71,0,1,2]}"#).unwrap();
+        assert_eq!(legacy, image);
+        let absent: Image = serde_json::from_str(r#"{"alt_text":"x"}"#).unwrap();
+        assert_eq!(absent.data, None);
+        let null: Image = serde_json::from_str(r#"{"data":null}"#).unwrap();
+        assert_eq!(null.data, None);
+        assert!(serde_json::from_str::<Image>(r#"{"data":"not base64!"}"#).is_err());
+    }
 
     /// The JSON form omits fields at their default — every `None` and
     /// every `false` (`allow_break` at `true`). A 14 MB `.xls` serialised

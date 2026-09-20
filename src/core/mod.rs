@@ -6,6 +6,8 @@
 //! DOCX, XLSX, and PPTX formats: ZIP archive handling, content types,
 //! relationships, core properties, and DrawingML shared types.
 
+/// Standard base64, shared by the IR JSON image codec and the renderers.
+pub(crate) mod base64;
 /// Text extraction from DrawingML chart parts (`c:chartSpace`), shared by
 /// the DOCX and PPTX readers for charts embedded via a drawing relationship.
 pub mod chart;
