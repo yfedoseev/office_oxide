@@ -31,8 +31,15 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     let mut buf = String::new();
 
     let mut sections = Vec::new();
+    // One text budget for the whole document (see `crate::limits`): a
+    // shared string referenced from every cell is copied into every
+    // cell's span here.
+    let mut budget = crate::limits::TextBudget::new();
 
     for (ws_idx, ws) in doc.worksheets.iter().enumerate() {
+        if budget.exhausted() {
+            break;
+        }
         // First pass: parse all rows into `CellData` — the rendered display
         // string plus the structured facts (semantic type, raw value, number
         // format) that the grid path threads into the IR so `to_ir()`
@@ -111,11 +118,19 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         // this function, not a new limitation introduced here.
         let mut row_numbers: Vec<u32> = Vec::with_capacity(total_rows.min(MAX_ROWS_PER_SHEET));
         for row in ws.rows.iter().take(MAX_ROWS_PER_SHEET) {
+            if budget.exhausted() {
+                break;
+            }
             row_numbers.push(row.index.saturating_sub(1));
             let mut cells: Vec<CellData> = Vec::with_capacity(row.cells.len());
             for cell in &row.cells {
                 buf.clear();
                 doc.write_cell_value_fast(cell, &mut buf, &date_indices);
+                // A row keeps the cells that fit the budget; the sheet
+                // ends after it.
+                if !budget.charge(buf.len()) {
+                    break;
+                }
                 let text = if buf.is_empty() {
                     String::new()
                 } else {
@@ -461,6 +476,12 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 content: vec![InlineContent::Text(TextSpan::plain(format!(
                     "[{omitted} of {total_rows} rows not shown — worksheet truncated at {MAX_ROWS_PER_SHEET} rows]"
                 )))],
+                ..Default::default()
+            }));
+        }
+        if budget.exhausted() {
+            combined.push(Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(budget.notice()))],
                 ..Default::default()
             }));
         }

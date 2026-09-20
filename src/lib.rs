@@ -71,6 +71,8 @@ mod ir_from_markdown;
 /// Format-agnostic renderers over [`DocumentIR`] — plain text, markdown
 /// and HTML — plus the options that steer them.
 pub mod ir_render;
+/// Resource limits for untrusted input (the per-document text budget).
+pub mod limits;
 
 #[cfg(not(target_family = "wasm"))]
 pub mod ffi;

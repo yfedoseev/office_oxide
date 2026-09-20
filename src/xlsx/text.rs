@@ -3,6 +3,7 @@ use super::cell::{Cell, CellValue};
 use super::date;
 use super::numfmt;
 use super::worksheet::Row;
+use crate::limits::TextBudget;
 
 /// `B2 (Author)` — the same marker `to_ir()` puts on a comment's endnote.
 pub(crate) fn comment_marker(cell_ref: &str, author: Option<&str>) -> String {
@@ -22,13 +23,23 @@ impl XlsxDocument {
     /// one format and not the other.
     pub fn plain_text(&self) -> String {
         let mut parts = Vec::new();
+        // One text budget for the whole document: a shared string
+        // referenced from every cell is rendered once per cell, and
+        // nothing else bounds that product (see `crate::limits`).
+        let mut budget = TextBudget::new();
         for (i, ws) in self.worksheets.iter().enumerate() {
             let mut sheet = ws.name.clone();
-            if let Some(text) = self.sheet_plain_text(i) {
+            if let Some(text) = self.sheet_plain_text_within(i, &mut budget) {
                 if !text.is_empty() {
                     sheet.push('\n');
                     sheet.push_str(&text);
                 }
+            }
+            if budget.exhausted() {
+                sheet.push('\n');
+                sheet.push_str(&budget.notice());
+                parts.push(sheet);
+                break;
             }
             // Cell comments are document content; `to_ir()` carries them
             // as endnotes, and this direct renderer dropped them.
@@ -54,6 +65,20 @@ impl XlsxDocument {
 
     /// Extract a single sheet as plain text.
     pub fn sheet_plain_text(&self, sheet_index: usize) -> Option<String> {
+        let mut budget = TextBudget::new();
+        let mut text = self.sheet_plain_text_within(sheet_index, &mut budget)?;
+        if budget.exhausted() {
+            text.push('\n');
+            text.push_str(&budget.notice());
+        }
+        Some(text)
+    }
+
+    fn sheet_plain_text_within(
+        &self,
+        sheet_index: usize,
+        budget: &mut TextBudget,
+    ) -> Option<String> {
         let ws = self.worksheets.get(sheet_index)?;
         let mut buf = String::with_capacity(ws.rows.len() * 64);
         for (row_idx, row) in ws.rows.iter().enumerate() {
@@ -64,7 +89,12 @@ impl XlsxDocument {
                 if col_idx > 0 {
                     buf.push('\t');
                 }
+                let before = buf.len();
                 self.write_cell_value(cell, &mut buf);
+                if !budget.charge(buf.len() - before) {
+                    buf.truncate(before);
+                    return Some(buf);
+                }
             }
         }
         Some(buf)
@@ -80,11 +110,17 @@ impl XlsxDocument {
         let ws = self.worksheets.get(sheet_index)?;
         let col_count = compute_column_count(&ws.rows);
         let mut lines = Vec::new();
+        let mut budget = TextBudget::new();
 
-        for row in &ws.rows {
+        'rows: for row in &ws.rows {
             let mut fields: Vec<String> = Vec::with_capacity(col_count);
             for cell in &row.cells {
-                fields.push(csv_escape(&self.format_cell_value(cell)));
+                let field = csv_escape(&self.format_cell_value(cell));
+                if !budget.charge(field.len()) {
+                    lines.push(budget.notice());
+                    break 'rows;
+                }
+                fields.push(field);
             }
             // Pad to column count
             while fields.len() < col_count {
@@ -99,11 +135,16 @@ impl XlsxDocument {
     /// Convert to markdown (pipe-delimited tables).
     pub fn to_markdown(&self) -> String {
         let mut parts = Vec::new();
+        let mut budget = TextBudget::new();
         for (i, ws) in self.worksheets.iter().enumerate() {
-            if let Some(md) = self.sheet_to_markdown(i) {
+            if let Some(md) = self.sheet_to_markdown_within(i, &mut budget) {
                 if !md.is_empty() {
                     parts.push(md);
                 }
+            }
+            if budget.exhausted() {
+                parts.push(budget.notice());
+                break;
             }
             for c in &ws.comments {
                 parts.push(format!(
@@ -126,10 +167,30 @@ impl XlsxDocument {
 
     /// Convert specific sheet to markdown.
     pub fn sheet_to_markdown(&self, sheet_index: usize) -> Option<String> {
+        let mut budget = TextBudget::new();
+        let mut md = self.sheet_to_markdown_within(sheet_index, &mut budget)?;
+        if budget.exhausted() {
+            md.push_str("\n\n");
+            md.push_str(&budget.notice());
+        }
+        Some(md)
+    }
+
+    fn sheet_to_markdown_within(
+        &self,
+        sheet_index: usize,
+        budget: &mut TextBudget,
+    ) -> Option<String> {
         let ws = self.worksheets.get(sheet_index)?;
         if ws.rows.is_empty() {
             return Some(String::new());
         }
+        // Every cell text passes through here; a spent budget ends the
+        // sheet at the cell that spent it.
+        let mut cell_text = |cell: &Cell| -> Option<String> {
+            let text = self.format_cell_value(cell);
+            budget.charge(text.len()).then_some(text)
+        };
 
         let col_count = compute_column_count(&ws.rows);
         if col_count == 0 {
@@ -153,7 +214,7 @@ impl XlsxDocument {
             out.push_str(&format!("## {}\n\n", ws.name));
             for row in &ws.rows {
                 if let Some(cell) = row.cells.first() {
-                    let text = self.format_cell_value(cell);
+                    let Some(text) = cell_text(cell) else { break };
                     if !text.trim().is_empty() {
                         out.push_str(text.trim());
                         out.push_str("\n\n");
@@ -170,33 +231,42 @@ impl XlsxDocument {
         lines.push(String::new());
 
         // First row as header
-        let header_row = &ws.rows[0];
-        let header_cells: Vec<String> = (0..col_count)
-            .map(|i| {
-                header_row
-                    .cells
-                    .get(i)
-                    .map(|c| self.format_cell_value(c))
-                    .unwrap_or_default()
-            })
-            .collect();
-        lines.push(format!("| {} |", header_cells.join(" | ")));
+        // A row keeps the cells that fit the budget (the rest empty) and
+        // reports that the budget is spent, so the table ends after it.
+        let mut row_line = |row: &Row| -> (String, bool) {
+            let mut cells: Vec<String> = Vec::with_capacity(col_count);
+            let mut spent = false;
+            for i in 0..col_count {
+                let text = match row.cells.get(i) {
+                    Some(c) if !spent => match cell_text(c) {
+                        Some(t) => t,
+                        None => {
+                            spent = true;
+                            String::new()
+                        },
+                    },
+                    _ => String::new(),
+                };
+                cells.push(text);
+            }
+            (format!("| {} |", cells.join(" | ")), spent)
+        };
+        let (header, spent) = row_line(&ws.rows[0]);
+        lines.push(header);
 
         // Separator row
         let sep: Vec<&str> = vec!["---"; col_count];
         lines.push(format!("| {} |", sep.join(" | ")));
 
         // Data rows
-        for row in ws.rows.iter().skip(1) {
-            let cells: Vec<String> = (0..col_count)
-                .map(|i| {
-                    row.cells
-                        .get(i)
-                        .map(|c| self.format_cell_value(c))
-                        .unwrap_or_default()
-                })
-                .collect();
-            lines.push(format!("| {} |", cells.join(" | ")));
+        if !spent {
+            for row in ws.rows.iter().skip(1) {
+                let (line, spent) = row_line(row);
+                lines.push(line);
+                if spent {
+                    break;
+                }
+            }
         }
 
         Some(lines.join("\n"))

@@ -9,6 +9,8 @@
 //!
 //! The counter is a global allocator, so this file is its own test binary.
 
+mod common;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{Cursor, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -146,90 +148,7 @@ fn test_empty_styled_cells_parse_without_a_heap_allocation_per_cell() {
 
 // ---------------------------------------------------------------- XLS
 
-/// Wrap `data` in a BIFF record header.
-fn biff(rt: u16, data: &[u8]) -> Vec<u8> {
-    let mut v = rt.to_le_bytes().to_vec();
-    v.extend_from_slice(&(data.len() as u16).to_le_bytes());
-    v.extend_from_slice(data);
-    v
-}
-
-/// A minimal CFB v3 container holding one stream at the root, in
-/// consecutive sectors.
-fn cfb_with_stream(name: &str, data: &[u8]) -> Vec<u8> {
-    const END_OF_CHAIN: u32 = 0xFFFF_FFFE;
-    const FAT_SECT: u32 = 0xFFFF_FFFD;
-    const FREE_SECT: u32 = 0xFFFF_FFFF;
-    const NO_ENTRY: u32 = 0xFFFF_FFFF;
-    let data_sectors = data.len().div_ceil(512).max(1);
-    let fat_sectors = (2 + data_sectors).div_ceil(128);
-    let total = 1 + fat_sectors + data_sectors; // directory + FAT + data
-    let mut file = vec![0u8; 512 * (1 + total)];
-    file[0..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
-    file[0x18..0x1A].copy_from_slice(&0x003Eu16.to_le_bytes());
-    file[0x1A..0x1C].copy_from_slice(&3u16.to_le_bytes());
-    file[0x1C..0x1E].copy_from_slice(&0xFFFEu16.to_le_bytes());
-    file[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
-    file[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
-    file[0x2C..0x30].copy_from_slice(&(fat_sectors as u32).to_le_bytes());
-    file[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());
-    file[0x38..0x3C].copy_from_slice(&4096u32.to_le_bytes());
-    file[0x3C..0x40].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
-    file[0x44..0x48].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
-    for i in 0..109 {
-        let v = if i < fat_sectors {
-            (1 + i) as u32
-        } else {
-            FREE_SECT
-        };
-        file[0x4C + i * 4..0x50 + i * 4].copy_from_slice(&v.to_le_bytes());
-    }
-    let first_data = (1 + fat_sectors) as u32;
-    // Directory: root (child = entry 1), then the stream.
-    let dir = 512;
-    let write_entry =
-        |file: &mut [u8], off: usize, name: &str, kind: u8, child: u32, start: u32, size: u32| {
-            let utf16: Vec<u16> = name.encode_utf16().collect();
-            for (i, ch) in utf16.iter().enumerate() {
-                file[off + i * 2..off + i * 2 + 2].copy_from_slice(&ch.to_le_bytes());
-            }
-            file[off + 0x40..off + 0x42]
-                .copy_from_slice(&(((utf16.len() + 1) * 2) as u16).to_le_bytes());
-            file[off + 0x42] = kind;
-            file[off + 0x43] = 1;
-            file[off + 0x44..off + 0x48].copy_from_slice(&NO_ENTRY.to_le_bytes());
-            file[off + 0x48..off + 0x4C].copy_from_slice(&NO_ENTRY.to_le_bytes());
-            file[off + 0x4C..off + 0x50].copy_from_slice(&child.to_le_bytes());
-            file[off + 0x74..off + 0x78].copy_from_slice(&start.to_le_bytes());
-            file[off + 0x78..off + 0x7C].copy_from_slice(&size.to_le_bytes());
-        };
-    write_entry(&mut file, dir, "Root Entry", 5, 1, END_OF_CHAIN, 0);
-    write_entry(&mut file, dir + 128, name, 2, NO_ENTRY, first_data, data.len() as u32);
-    // FAT.
-    let fat = 512 + 512;
-    let mut set = |sector: usize, v: u32| {
-        let off = fat + sector * 4;
-        file[off..off + 4].copy_from_slice(&v.to_le_bytes());
-    };
-    set(0, END_OF_CHAIN);
-    for i in 0..fat_sectors {
-        set(1 + i, FAT_SECT);
-    }
-    for i in 0..data_sectors {
-        let s = first_data as usize + i;
-        set(
-            s,
-            if i + 1 == data_sectors {
-                END_OF_CHAIN
-            } else {
-                (s + 1) as u32
-            },
-        );
-    }
-    let data_off = 512 + first_data as usize * 512;
-    file[data_off..data_off + data.len()].copy_from_slice(data);
-    file
-}
+use common::{biff, cfb_with_stream};
 
 /// A BIFF8 workbook with `strings` shared strings and one sheet of
 /// `rows` × `cols` cells alternating `LABELSST` and `NUMBER`.

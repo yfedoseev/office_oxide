@@ -79,9 +79,27 @@ pub fn parse_cell_record(
     sst: &[String],
     codepage: Option<u16>,
     out: &mut Vec<Cell>,
+    budget: &mut crate::limits::TextBudget,
 ) -> Result<()> {
     match record.record_type {
-        RT_LABELSST => out.push(parse_labelsst(&record.data, sst)?),
+        RT_LABELSST => {
+            // The shared string is copied into every cell that references
+            // it — the fan-out `crate::limits` bounds. Charged before the
+            // copy; a spent budget skips the cell (the caller flags the
+            // workbook truncated).
+            let (_, _, _) = cell_header(&record.data, "LABELSST", 10)?;
+            let idx = u32::from_le_bytes([
+                record.data[6],
+                record.data[7],
+                record.data[8],
+                record.data[9],
+            ]) as usize;
+            let chars = sst.get(idx).map_or(0, String::len);
+            if !budget.charge(chars) {
+                return Err(XlsError::InvalidRecord(budget.notice()));
+            }
+            out.push(parse_labelsst(&record.data, sst)?)
+        },
         RT_NUMBER => out.push(parse_number(&record.data)?),
         RT_RK => out.push(parse_rk_record(&record.data)?),
         RT_MULRK => parse_mulrk(&record.data, out)?,
@@ -399,7 +417,8 @@ mod tests {
             continue_at: Vec::new(),
         };
         let mut cells = Vec::new();
-        parse_cell_record(&rec, &sst, None, &mut cells).unwrap();
+        parse_cell_record(&rec, &sst, None, &mut cells, &mut crate::limits::TextBudget::new())
+            .unwrap();
         assert_eq!(cells.len(), 1);
         assert_eq!(cells[0].row, 0);
         assert_eq!(cells[0].col, 1);
@@ -419,7 +438,8 @@ mod tests {
             continue_at: Vec::new(),
         };
         let mut cells = Vec::new();
-        parse_cell_record(&rec, &[], None, &mut cells).unwrap();
+        parse_cell_record(&rec, &[], None, &mut cells, &mut crate::limits::TextBudget::new())
+            .unwrap();
         assert_eq!(cells[0].value, CellValue::Number(42.5));
     }
 
@@ -437,7 +457,8 @@ mod tests {
             continue_at: Vec::new(),
         };
         let mut cells = Vec::new();
-        parse_cell_record(&rec, &[], None, &mut cells).unwrap();
+        parse_cell_record(&rec, &[], None, &mut cells, &mut crate::limits::TextBudget::new())
+            .unwrap();
         assert_eq!(cells[0].value, CellValue::Bool(true));
     }
 
@@ -455,7 +476,8 @@ mod tests {
             continue_at: Vec::new(),
         };
         let mut cells = Vec::new();
-        parse_cell_record(&rec, &[], None, &mut cells).unwrap();
+        parse_cell_record(&rec, &[], None, &mut cells, &mut crate::limits::TextBudget::new())
+            .unwrap();
         assert_eq!(cells[0].value, CellValue::Error(0x07));
     }
 
@@ -481,7 +503,8 @@ mod tests {
             continue_at: Vec::new(),
         };
         let mut cells = Vec::new();
-        parse_cell_record(&rec, &[], None, &mut cells).unwrap();
+        parse_cell_record(&rec, &[], None, &mut cells, &mut crate::limits::TextBudget::new())
+            .unwrap();
         assert_eq!(cells.len(), 2);
         assert_eq!(cells[0].col, 0);
         assert_eq!(cells[0].value, CellValue::Number(10.0));

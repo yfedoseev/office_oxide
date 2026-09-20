@@ -282,6 +282,12 @@ impl XlsDocument {
         // with no other signal a caller could use to tell that apart from
         // a file that genuinely ended there.
         let mut record_budget_exhausted = false;
+        // The per-document text budget: a LABELSST cell copies its shared
+        // string, so a sheet of cells naming one 32 KB string is the
+        // string times the cell count in memory. Once it is spent the
+        // remaining string cells are skipped and the workbook is flagged
+        // truncated, as when the record budget runs out.
+        let mut text_budget = crate::limits::TextBudget::new();
         let mut number_formats: Option<std::sync::Arc<NumberFormats>> = None;
         // OfficeArt payloads, kept for the lazy picture decode.
         let mut drawing_bytes: Vec<u8> = Vec::new();
@@ -565,8 +571,10 @@ impl XlsDocument {
                                 continue;
                             }
                         }
-                        // A malformed cell record is skipped, as before.
-                        let _ = parse_cell_record(&rec, &sst, codepage, &mut cells);
+                        // A malformed cell record is skipped, as before; so
+                        // is a string cell past the text budget.
+                        let _ =
+                            parse_cell_record(&rec, &sst, codepage, &mut cells, &mut text_budget);
                     },
                     _ => {
                         pending_formula_string = None;
@@ -592,7 +600,13 @@ impl XlsDocument {
                                 });
                             }
                         } else {
-                            let _ = parse_cell_record(&rec, &sst, codepage, &mut cells);
+                            let _ = parse_cell_record(
+                                &rec,
+                                &sst,
+                                codepage,
+                                &mut cells,
+                                &mut text_budget,
+                            );
                         }
                     },
                 },
@@ -610,7 +624,7 @@ impl XlsDocument {
             // Set by the caller (from_reader), which has the CfbReader
             // this function doesn't.
             has_macros: false,
-            truncated: record_budget_exhausted,
+            truncated: record_budget_exhausted || text_budget.exhausted(),
             summary_properties: None,
             chart_text,
         })
