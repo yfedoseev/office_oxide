@@ -336,9 +336,19 @@ fn markdown_blocks_inner(
                     })
                     .map(|lvl| (lvl as usize) + 1);
 
-                // Check for numbering
-                let list_prefix = p.properties.as_ref().and_then(|pp| {
-                    let nr = pp.numbering_ref.as_ref()?;
+                // Check for numbering — on the *effective* properties: Word's
+                // own "List Bullet"/"List Number" styles carry the `w:numPr`
+                // in the style, not on the paragraph, and `to_ir()` already
+                // resolved it that way while this renderer read the direct
+                // `w:pPr` alone and rendered every such list as plain
+                // paragraphs. A `numId` of 0 is "no numbering", also as in
+                // the converter.
+                let effective = ctx
+                    .styles
+                    .map(|sheet| sheet.effective_paragraph_properties(p.properties.as_ref()))
+                    .or_else(|| p.properties.clone());
+                let list_prefix = effective.as_ref().and_then(|pp| {
+                    let nr = pp.numbering_ref.as_ref().filter(|nr| nr.num_id != 0)?;
                     let numbering = ctx.numbering?;
                     let level = numbering.resolve_level(nr.num_id, nr.ilvl)?;
                     let indent = "  ".repeat(nr.ilvl as usize);
@@ -397,7 +407,7 @@ fn markdown_blocks_inner(
                 for content in &p.content {
                     match content {
                         ParagraphContent::Run(run) => {
-                            let style = RunStyle::of(run);
+                            let style = RunStyle::of(run, hidden);
                             let mut text = String::new();
                             markdown_run_text(run, ctx, hidden, &mut text);
                             if text.is_empty() {
@@ -458,8 +468,21 @@ struct RunStyle {
 }
 
 impl RunStyle {
-    fn of(run: &Run) -> Self {
-        let rp = run.properties.as_ref();
+    /// The run's *effective* formatting: document defaults, the paragraph
+    /// style chain, the character style, then the direct `w:rPr`. Reading
+    /// the direct properties alone rendered a document whose bold lives
+    /// in its styles — every template, every "Strong" character style —
+    /// as unformatted text, while `to_ir()` resolved the chain.
+    fn of(run: &Run, hidden: HiddenCtx<'_>) -> Self {
+        let direct = run.properties.as_ref();
+        let effective;
+        let rp = match hidden.styles {
+            Some(sheet) => {
+                effective = sheet.effective_run_properties(hidden.paragraph_style_id, direct);
+                Some(&effective)
+            },
+            None => direct,
+        };
         Self {
             bold: rp.and_then(|rp| rp.bold).unwrap_or(false),
             italic: rp.and_then(|rp| rp.italic).unwrap_or(false),

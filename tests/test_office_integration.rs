@@ -77,6 +77,113 @@ fn make_docx_with_numbering(document_xml: &[u8], numbering_xml: &[u8]) -> Vec<u8
     writer.finish().unwrap().into_inner()
 }
 
+fn make_docx_with_styles_and_numbering(
+    document_xml: &[u8],
+    styles_xml: &[u8],
+    numbering_xml: &[u8],
+) -> Vec<u8> {
+    let cursor = Cursor::new(Vec::new());
+    let mut writer = OpcWriter::new(cursor).unwrap();
+    let doc_part = PartName::new("/word/document.xml").unwrap();
+    writer
+        .add_part(
+            &doc_part,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+            document_xml,
+        )
+        .unwrap();
+    writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+    let styles_part = PartName::new("/word/styles.xml").unwrap();
+    writer
+        .add_part(
+            &styles_part,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml",
+            styles_xml,
+        )
+        .unwrap();
+    writer.add_part_rel(&doc_part, rel_types::STYLES, "styles.xml");
+    let num_part = PartName::new("/word/numbering.xml").unwrap();
+    writer
+        .add_part(
+            &num_part,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml",
+            numbering_xml,
+        )
+        .unwrap();
+    writer.add_part_rel(&doc_part, rel_types::NUMBERING, "numbering.xml");
+    writer.finish().unwrap().into_inner()
+}
+
+/// Bold and italic that live in a paragraph style's `w:rPr` or in a
+/// character style (`w:rStyle`, Word's "Strong"/"Emphasis") reached
+/// `to_ir()` through the style chain but not the direct `to_markdown()`
+/// renderer, which read the run's own `w:rPr` alone — so a template whose
+/// formatting is all in styles rendered as plain text on one surface and
+/// bold on the other.
+#[test]
+fn test_markdown_applies_run_formatting_inherited_from_styles() {
+    let document = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:p><w:pPr><w:pStyle w:val="Strongish"/></w:pPr><w:r><w:t>para-style bold</w:t></w:r></w:p>
+<w:p><w:r><w:rPr><w:rStyle w:val="Strong"/></w:rPr><w:t>char-style bold italic</w:t></w:r></w:p>
+<w:p><w:pPr><w:pStyle w:val="Strongish"/></w:pPr><w:r><w:rPr><w:b w:val="0"/></w:rPr><w:t>switched off</w:t></w:r></w:p>
+</w:body></w:document>"#;
+    let styles = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+<w:style w:type="paragraph" w:styleId="Strongish"><w:name w:val="Strongish"/><w:basedOn w:val="Normal"/><w:rPr><w:b/></w:rPr></w:style>
+<w:style w:type="character" w:styleId="Strong"><w:name w:val="Strong"/><w:rPr><w:b/><w:i/></w:rPr></w:style>
+</w:styles>"#;
+    let bytes = make_docx_with_styles(document, styles);
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+    let md = doc.to_markdown();
+    assert!(md.contains("**para-style bold**"), "{md}");
+    assert!(md.contains("***char-style bold italic***"), "{md}");
+    assert!(
+        md.contains("switched off") && !md.contains("**switched off**"),
+        "direct w:b=0 wins: {md}"
+    );
+    let html = doc.to_html();
+    assert_eq!(html.matches("<strong>").count(), 2, "{html}");
+}
+
+/// Word's own "List Bullet" / "List Number" styles carry the `w:numPr`
+/// in the *style*, not on each paragraph. `to_ir()` resolved that through
+/// the style chain; the direct `to_markdown()` renderer read the
+/// paragraph's own `w:pPr` and rendered every such list as plain lines —
+/// a business-plan template with 157 bullet items came out with none.
+#[test]
+fn test_markdown_lists_paragraphs_whose_numbering_comes_from_their_style() {
+    let document = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:p><w:pPr><w:pStyle w:val="ListBullet"/></w:pPr><w:r><w:t>styled item</w:t></w:r></w:p>
+<w:p><w:pPr><w:pStyle w:val="ListBullet"/><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr><w:r><w:t>switched off</w:t></w:r></w:p>
+<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr></w:pPr><w:r><w:t>direct item</w:t></w:r></w:p>
+</w:body></w:document>"#;
+    let styles = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+<w:style w:type="paragraph" w:styleId="ListBullet"><w:name w:val="List Bullet"/><w:basedOn w:val="Normal"/><w:pPr><w:numPr><w:numId w:val="7"/></w:numPr></w:pPr></w:style>
+</w:styles>"#;
+    let numbering = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="&#8226;"/></w:lvl></w:abstractNum>
+<w:num w:numId="7"><w:abstractNumId w:val="0"/></w:num>
+</w:numbering>"#;
+    let bytes = make_docx_with_styles_and_numbering(document, styles, numbering);
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+    let md = doc.to_markdown();
+    assert!(md.contains("- styled item"), "style-level numPr: {md}");
+    assert!(md.contains("- direct item"), "direct numPr: {md}");
+    assert!(
+        !md.contains("- switched off") && md.contains("switched off"),
+        "numId 0 switches the style's list off: {md}"
+    );
+    // The IR-backed surface agrees, so the two renderers no longer diverge.
+    let html = doc.to_html();
+    assert_eq!(html.matches("<li>").count(), 2, "{html}");
+}
+
 struct XlsxBuilder {
     writer: OpcWriter<Cursor<Vec<u8>>>,
     workbook_part: PartName,

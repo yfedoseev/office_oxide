@@ -92,6 +92,7 @@ def main():
         co, ct = counts(ours), counts(theirs)
         return {"path": rel, "ours": co, "pandoc": ct, "flags": flags(co, ct)}
 
+    os.makedirs(os.path.dirname(os.path.abspath(outfile)), exist_ok=True)
     out = open(outfile, "w")
     flagged = []
     with ThreadPoolExecutor(jobs) as ex:

@@ -8,7 +8,9 @@ use std::process::{Command, Stdio};
 fn big_docx() -> Vec<u8> {
     let mut w = office_oxide::docx::write::DocxWriter::new();
     for i in 0..40_000 {
-        w.add_paragraph(&format!("Paragraph {i} with enough words to fill a pipe buffer many times over."));
+        w.add_paragraph(&format!(
+            "Paragraph {i} with enough words to fill a pipe buffer many times over."
+        ));
     }
     let mut out = Vec::new();
     w.write_to(&mut std::io::Cursor::new(&mut out)).unwrap();
@@ -43,7 +45,12 @@ fn test_closed_stdout_pipe_ends_quietly_without_a_panic() {
     drop(stdout);
     let status = child.wait().unwrap();
     let mut stderr = String::new();
-    child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
     std::fs::remove_dir_all(&dir).ok();
 
     assert!(!stderr.contains("panicked"), "stderr: {stderr}");
