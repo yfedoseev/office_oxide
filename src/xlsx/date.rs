@@ -35,6 +35,13 @@ impl fmt::Display for DateTimeValue {
     }
 }
 
+/// Largest serial day count `DateTimeValue::from_serial` will convert.
+///
+/// Excel's own last representable date, 9999-12-31, is serial 2,958,465;
+/// this sits well past it while keeping the calendar walk in
+/// `serial_to_date_1900`/`_1904` bounded to a few thousand iterations.
+pub const MAX_DATE_SERIAL: f64 = 5_000_000.0;
+
 impl DateTimeValue {
     /// Format as ISO 8601 string.
     pub fn to_iso_string(&self) -> String {
@@ -51,7 +58,25 @@ impl DateTimeValue {
     /// Serials 1-59 correspond to Jan 1 – Feb 28, 1900.
     /// Serials >= 61 are off by one day compared to reality.
     pub fn from_serial(serial: f64, date1904: bool) -> Option<Self> {
-        if serial < 0.0 {
+        if !(0.0..=MAX_DATE_SERIAL).contains(&serial) {
+            // NaN, negative, and out-of-calendar-range magnitudes all land
+            // here. The upper bound matters for more than tidiness: the
+            // year-by-year loops below are linear in the serial, and an `as
+            // i64` cast saturates rather than erroring, so a cell holding
+            // 1e300 under a date-classified style used to spin for
+            // ~2.5e16 iterations.
+            return None;
+        }
+        // `serial_to_date_*` walk the calendar a year at a time, so the work
+        // they do is proportional to the input. `serial.trunc() as i64`
+        // saturates rather than erroring for out-of-range floats, so a cell
+        // holding 1e300 asked for ~2.5e16 iterations — a hang, not a slow
+        // answer, on ordinary (non-adversarial) scientific-notation values
+        // that a misclassifying caller routed here. Bound the input itself
+        // so no caller, present or future, can reach that loop with a value
+        // outside any real calendar date (MAX_DATE_SERIAL is comfortably
+        // past 9999-12-31, which Excel itself caps at serial 2,958,465).
+        if !serial.is_finite() || serial > MAX_DATE_SERIAL {
             return None;
         }
 
@@ -105,7 +130,7 @@ fn is_leap_year(y: i32) -> bool {
 
 /// Convert 1900-system serial to (year, month, day).
 fn serial_to_date_1900(serial: i64) -> Option<(i32, u32, u32)> {
-    if serial < 1 {
+    if serial < 1 || serial > MAX_DATE_SERIAL as i64 {
         return None;
     }
     // Serial 60 is Excel's phantom "29 February 1900", kept for Lotus 1-2-3
@@ -150,7 +175,7 @@ fn serial_to_date_1900(serial: i64) -> Option<(i32, u32, u32)> {
 
 /// Convert 1904-system serial to (year, month, day).
 fn serial_to_date_1904(serial: i64) -> Option<(i32, u32, u32)> {
-    if serial < 0 {
+    if serial < 0 || serial > MAX_DATE_SERIAL as i64 {
         return None;
     }
     // Day 0 = Jan 1, 1904
@@ -267,7 +292,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serial_to_date_1900_basic() {
+    fn test_serial_to_date_1900_basic() {
         // Serial 1 = Jan 1, 1900
         let dt = DateTimeValue::from_serial(1.0, false).unwrap();
         assert_eq!(dt.year, 1900);
@@ -276,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn serial_to_date_1900_feb28() {
+    fn test_serial_to_date_1900_feb28() {
         // Serial 59 = Feb 28, 1900
         let dt = DateTimeValue::from_serial(59.0, false).unwrap();
         assert_eq!(dt.year, 1900);
@@ -285,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn serial_60_is_refused_rather_than_emitting_an_impossible_date() {
+    fn test_serial_60_is_refused_rather_than_emitting_an_impossible_date() {
         // Excel's phantom leap day. 1900-02-29 never existed, so returning
         // it hands downstream date parsers a string they must reject.
         assert!(DateTimeValue::from_serial(60.0, false).is_none());
@@ -295,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn serial_to_date_1900_mar1() {
+    fn test_serial_to_date_1900_mar1() {
         // Serial 61 = Mar 1, 1900
         let dt = DateTimeValue::from_serial(61.0, false).unwrap();
         assert_eq!(dt.year, 1900);
@@ -304,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn serial_to_date_2024_jan_15() {
+    fn test_serial_to_date_2024_jan_15() {
         // Jan 15, 2024 = serial 45306
         let dt = DateTimeValue::from_serial(45306.0, false).unwrap();
         assert_eq!(dt.year, 2024);
@@ -313,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn serial_to_date_with_time() {
+    fn test_serial_to_date_with_time() {
         // Serial 45306.5 = Jan 15, 2024 at 12:00:00
         let dt = DateTimeValue::from_serial(45306.5, false).unwrap();
         assert_eq!(dt.year, 2024);
@@ -325,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn serial_to_date_1904_system() {
+    fn test_serial_to_date_1904_system() {
         // Day 0 in 1904 system = Jan 1, 1904
         let dt = DateTimeValue::from_serial(0.0, true).unwrap();
         assert_eq!(dt.year, 1904);
@@ -334,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn iso_string_date_only() {
+    fn test_iso_string_date_only() {
         let dt = DateTimeValue {
             year: 2024,
             month: 1,
@@ -348,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn iso_string_with_time() {
+    fn test_iso_string_with_time() {
         let dt = DateTimeValue {
             year: 2024,
             month: 1,
@@ -362,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_date_format_ids() {
+    fn test_builtin_date_format_ids() {
         assert!(is_date_format_id(14));
         assert!(is_date_format_id(22));
         assert!(is_date_format_id(45));
@@ -372,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_date_format_detection() {
+    fn test_custom_date_format_detection() {
         assert!(is_date_format_string("yyyy-mm-dd"));
         assert!(is_date_format_string("dd/mm/yyyy"));
         assert!(is_date_format_string("h:mm:ss AM/PM"));
@@ -383,15 +408,52 @@ mod tests {
     }
 
     #[test]
-    fn date_format_ignores_quoted() {
+    fn test_date_format_ignores_quoted() {
         // Quoted text should not trigger date detection
         assert!(!is_date_format_string("\"day\""));
         assert!(!is_date_format_string("#,##0.00\" days\""));
     }
 
     #[test]
-    fn negative_serial_returns_none() {
+    fn test_negative_serial_returns_none() {
         assert!(DateTimeValue::from_serial(-1.0, false).is_none());
+    }
+
+    /// The year-by-year scan is linear in the serial and `as i64`
+    /// saturates rather than erroring, so an unbounded input meant an
+    /// effectively infinite loop. The bound lives in the converter itself,
+    /// so a future caller that misclassifies a cell as a date can't
+    /// reintroduce the hang.
+    #[test]
+    fn test_out_of_range_serial_is_rejected_promptly() {
+        let started = std::time::Instant::now();
+        for serial in [
+            MAX_DATE_SERIAL + 1.0,
+            1e12,
+            1e300,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NAN,
+        ] {
+            assert!(
+                DateTimeValue::from_serial(serial, false).is_none(),
+                "{serial} is not a calendar date"
+            );
+            assert!(
+                DateTimeValue::from_serial(serial, true).is_none(),
+                "{serial} is not a calendar date (1904)"
+            );
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "rejection must not loop: took {:?}",
+            started.elapsed()
+        );
+
+        // Every real Excel date still converts — the cap sits well above
+        // Excel's own maximum of 2_958_465 (9999-12-31).
+        let last = DateTimeValue::from_serial(2_958_465.0, false).expect("9999-12-31 converts");
+        assert_eq!((last.year, last.month, last.day), (9999, 12, 31));
     }
 }
 
@@ -403,7 +465,7 @@ mod override_tests {
     /// day. The day was never carried, so the value came out as hour 24 —
     /// which `chrono` and Python's `datetime` both reject.
     #[test]
-    fn a_time_that_rounds_up_to_a_full_day_carries_into_the_date() {
+    fn test_a_time_that_rounds_up_to_a_full_day_carries_into_the_date() {
         let v = DateTimeValue::from_serial(45000.9999999, false).expect("valid serial");
         assert!(v.hour < 24, "hour must stay in 0..=23, got {}", v.hour);
         assert_eq!((v.hour, v.minute, v.second), (0, 0, 0));
@@ -413,5 +475,33 @@ mod override_tests {
             (v.year, v.month, v.day) > (prev.year, prev.month, prev.day),
             "the rounded-up day must advance the date"
         );
+    }
+
+    /// The calendar walk costs one iteration per year, and `as i64`
+    /// saturates rather than erroring, so a cell holding 1e300 asked for
+    /// ~2.5e16 iterations and never returned. Out-of-calendar serials are
+    /// refused up front; callers then render the raw value.
+    #[test]
+    fn test_out_of_calendar_serials_are_refused_instead_of_hanging() {
+        for serial in [1e300, 1e12, 1e10, f64::MAX, MAX_DATE_SERIAL + 1.0] {
+            let started = std::time::Instant::now();
+            assert!(
+                DateTimeValue::from_serial(serial, false).is_none(),
+                "{serial} is not a calendar date"
+            );
+            assert!(DateTimeValue::from_serial(serial, true).is_none());
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "{serial} took {:?}",
+                started.elapsed()
+            );
+        }
+        assert!(DateTimeValue::from_serial(f64::NAN, false).is_none());
+        assert!(DateTimeValue::from_serial(f64::INFINITY, false).is_none());
+
+        // Every date Excel itself can hold still converts: 9999-12-31 is
+        // serial 2,958,465, comfortably inside the bound.
+        let last = DateTimeValue::from_serial(2_958_465.0, false).expect("9999-12-31");
+        assert_eq!((last.year, last.month, last.day), (9999, 12, 31));
     }
 }

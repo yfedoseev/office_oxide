@@ -1,4 +1,4 @@
-//! Integration tests for legacy `.doc` table extraction (issue #115).
+//! Integration tests for legacy `.doc` table extraction.
 //!
 //! The document is built **in code** by a minimal synthetic `.doc` writer
 //! (`tests/common/mod.rs`) — no third-party fixture blob is committed
@@ -80,7 +80,7 @@ fn synthetic_table_doc() -> Vec<u8> {
 }
 
 #[test]
-fn doc_table_produces_a_table_element() {
+fn test_doc_table_produces_a_table_element() {
     let bytes = synthetic_table_doc();
     let doc = open_doc(&bytes);
     let ir = doc.to_ir();
@@ -90,7 +90,7 @@ fn doc_table_produces_a_table_element() {
 }
 
 #[test]
-fn doc_table_has_three_cells_per_row() {
+fn test_doc_table_has_three_cells_per_row() {
     let bytes = synthetic_table_doc();
     let doc = open_doc(&bytes);
     let ir = doc.to_ir();
@@ -102,7 +102,7 @@ fn doc_table_has_three_cells_per_row() {
 }
 
 #[test]
-fn doc_table_cell_values_match_fixture() {
+fn test_doc_table_cell_values_match_fixture() {
     let bytes = synthetic_table_doc();
     let doc = open_doc(&bytes);
     let ir = doc.to_ir();

@@ -9,7 +9,7 @@ mod common;
 use common::{Para, build_doc, open_doc, prose_grpprl};
 
 #[test]
-fn synthetic_single_paragraph_round_trips() {
+fn test_synthetic_single_paragraph_round_trips() {
     let paras = [Para {
         text: "Hello from a synthetic doc.",
         terminator: '\r',
@@ -24,7 +24,7 @@ fn synthetic_single_paragraph_round_trips() {
 }
 
 #[test]
-fn synthetic_doc_is_a_real_cfb() {
+fn test_synthetic_doc_is_a_real_cfb() {
     let paras = [Para {
         text: "CFB container check.",
         terminator: '\r',
@@ -36,7 +36,7 @@ fn synthetic_doc_is_a_real_cfb() {
 }
 
 #[test]
-fn synthetic_table_and_prose_coexist() {
+fn test_synthetic_table_and_prose_coexist() {
     use common::{cell_grpprl, row_grpprl};
     use office_oxide::ir::Element;
 

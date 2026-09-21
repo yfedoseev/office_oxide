@@ -1,8 +1,11 @@
+use std::borrow::Cow;
+
 use quick_xml::events::Event;
 
 use crate::core::xml;
 
 use super::cell::{Cell, CellRef, CellValue};
+use super::shared_formula::SharedFormulas;
 
 /// A parsed worksheet from `xl/worksheets/sheetN.xml`.
 #[derive(Debug, Clone)]
@@ -33,6 +36,12 @@ pub struct Worksheet {
     /// `to_xlsx_bytes_layout`. Empty when the worksheet has no
     /// `<xdr:sp>` shapes (the common XLSX case).
     pub text_shapes: Vec<WorksheetTextShape>,
+    /// Conditional formatting rules from `<conditionalFormatting>`/
+    /// `<cfRule>`. Empty when the worksheet defines none.
+    pub conditional_formats: Vec<crate::ir::ConditionalFormat>,
+    /// Data validation rules from `<dataValidations>`/`<dataValidation>`.
+    /// Empty when the worksheet defines none.
+    pub data_validations: Vec<crate::ir::DataValidation>,
 }
 
 /// One cell comment from `xl/comments*.xml`.
@@ -61,15 +70,15 @@ pub fn parse_comments(xml_data: &[u8]) -> crate::core::Result<Vec<SheetComment>>
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"authors" => in_authors = true,
-                b"author" if in_authors => {
+                "authors" => in_authors = true,
+                "author" if in_authors => {
                     authors.push(xml::read_text_content_fast(&mut reader)?);
                 },
-                b"comment" => {
-                    let cell_ref = xml::optional_attr_str(e, b"ref")?
+                "comment" => {
+                    let cell_ref = xml::optional_attr_str(e, "ref")?
                         .map(|v| v.into_owned())
                         .unwrap_or_default();
-                    let author_id = xml::optional_attr_str(e, b"authorId")?
+                    let author_id = xml::optional_attr_str(e, "authorId")?
                         .and_then(|v| v.parse::<usize>().ok());
                     let text = xml::read_text_content_fast(&mut reader)?;
                     let text = text.trim().to_string();
@@ -83,12 +92,137 @@ pub fn parse_comments(xml_data: &[u8]) -> crate::core::Result<Vec<SheetComment>>
                 },
                 _ => {},
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"authors" => in_authors = false,
+            Event::End(ref e) if e.local_name().as_ref() == "authors" => in_authors = false,
             Event::Eof => break,
             _ => {},
         }
     }
     Ok(out)
+}
+
+/// One message from a modern (Excel 2016+) threaded comment thread —
+/// `xl/threadedComments/threadedComment*.xml`.
+pub(crate) struct RawThreadedComment {
+    cell_ref: String,
+    parent_id: Option<String>,
+    person_id: Option<String>,
+    text: String,
+}
+
+/// Parse a `xl/threadedComments/threadedComment*.xml` part.
+pub(crate) fn parse_threaded_comments(
+    xml_data: &[u8],
+) -> crate::core::Result<Vec<RawThreadedComment>> {
+    use quick_xml::events::Event;
+    let mut reader = xml::make_fast_reader(xml_data);
+    let mut out = Vec::new();
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) if e.local_name().as_ref() == "threadedComment" => {
+                let cell_ref = xml::optional_attr_str(e, "ref")?
+                    .map(|v| v.into_owned())
+                    .unwrap_or_default();
+                let parent_id = xml::optional_attr_str(e, "parentId")?.map(|v| v.into_owned());
+                let person_id = xml::optional_attr_str(e, "personId")?.map(|v| v.into_owned());
+                let text = xml::read_text_content_fast(&mut reader)?;
+                let text = text.trim().to_string();
+                if !text.is_empty() {
+                    out.push(RawThreadedComment {
+                        cell_ref,
+                        parent_id,
+                        person_id,
+                        text,
+                    });
+                }
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(out)
+}
+
+/// Parse a `xl/persons/person.xml` part: `personId -> displayName`.
+pub(crate) fn parse_persons(
+    xml_data: &[u8],
+) -> crate::core::Result<std::collections::HashMap<String, String>> {
+    use quick_xml::events::Event;
+    let mut reader = xml::make_fast_reader(xml_data);
+    let mut out = std::collections::HashMap::new();
+
+    loop {
+        match reader.read_event()? {
+            Event::Empty(ref e) | Event::Start(ref e) if e.local_name().as_ref() == "person" => {
+                let id = xml::optional_attr_str(e, "id")?.map(|v| v.into_owned());
+                let name = xml::optional_attr_str(e, "displayName")?.map(|v| v.into_owned());
+                if let (Some(id), Some(name)) = (id, name) {
+                    out.insert(id, name);
+                }
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(out)
+}
+
+/// Merge legacy `xl/comments*.xml` entries with modern threaded-comment
+/// entries for the same worksheet.
+///
+/// Excel 2016+ writes a real cell comment to BOTH parts: the clean text
+/// lives in `threadedComments`, while `comments.xml` carries only a
+/// fixed ~290-character compatibility disclaimer wrapping the same text
+/// ("[Threaded comment]... Comment:\n    <text>"), for older Excel
+/// versions that don't understand threading. A `ref` with a resolved
+/// thread uses that clean text (every message in the thread, root
+/// first, author-resolved via `persons`) instead of the legacy
+/// boilerplate; a `ref` with no threaded entry (a genuine, non-threaded
+/// legacy "Note") keeps its own legacy text unchanged.
+pub(crate) fn merge_threaded_comments(
+    legacy: Vec<SheetComment>,
+    threaded: Vec<RawThreadedComment>,
+    persons: &std::collections::HashMap<String, String>,
+) -> Vec<SheetComment> {
+    if threaded.is_empty() {
+        return legacy;
+    }
+
+    let mut by_ref: std::collections::HashMap<String, Vec<&RawThreadedComment>> =
+        std::collections::HashMap::new();
+    for tc in &threaded {
+        by_ref.entry(tc.cell_ref.clone()).or_default().push(tc);
+    }
+
+    let mut out: Vec<SheetComment> = legacy
+        .into_iter()
+        .filter(|c| !by_ref.contains_key(&c.cell_ref))
+        .collect();
+
+    for (cell_ref, mut msgs) in by_ref {
+        // The root message (no parentId) leads; replies follow in their
+        // original file order — a stable sort on "has a parent" keeps
+        // that order within each group.
+        msgs.sort_by_key(|m| m.parent_id.is_some());
+        let mut lines = Vec::with_capacity(msgs.len());
+        let mut thread_author = None;
+        for (i, m) in msgs.iter().enumerate() {
+            let author = m.person_id.as_ref().and_then(|id| persons.get(id).cloned());
+            if i == 0 {
+                thread_author = author.clone();
+            }
+            match author {
+                Some(a) => lines.push(format!("{a}: {}", m.text)),
+                None => lines.push(m.text.clone()),
+            }
+        }
+        out.push(SheetComment {
+            cell_ref,
+            author: thread_author,
+            text: lines.join("\n"),
+        });
+    }
+    out
 }
 
 /// A text shape anchored on a worksheet via a DrawingML drawing part.
@@ -220,61 +354,70 @@ impl Worksheet {
         // end iff at least one was seen.
         let mut margins_in: Option<PageMarginsIn> = None;
         let mut page_setup_raw: Option<PageSetupRaw> = None;
+        let mut shared = SharedFormulas::default();
+        let mut conditional_formats = Vec::new();
+        let mut data_validations = Vec::new();
 
         loop {
             match reader.read_event()? {
                 Event::Start(ref e) => match e.local_name().as_ref() {
-                    b"dimension" => {
-                        dimension = xml::optional_attr_str(e, b"ref")?.map(|v| v.into_owned());
+                    "dimension" => {
+                        dimension = xml::optional_attr_str(e, "ref")?.map(|v| v.into_owned());
                         reader.read_to_end(e.to_end().name())?;
                     },
-                    b"row" => {
+                    "row" => {
                         // A <row> without r= is implicitly the one after the
                         // previous row (ECMA-376 18.3.1.73); some writers omit
                         // it throughout the sheet.
                         let implied = rows.last().map_or(1, |r: &Row| r.index + 1);
-                        rows.push(parse_row_fast(&mut reader, e, implied)?);
+                        rows.push(parse_row_fast(&mut reader, e, implied, &mut shared)?);
                     },
-                    b"mergeCell" => {
-                        if let Some(range) = xml::optional_attr_str(e, b"ref")? {
+                    "mergeCell" => {
+                        if let Some(range) = xml::optional_attr_str(e, "ref")? {
                             merged_cells.push(range.into_owned());
                         }
                         reader.read_to_end(e.to_end().name())?;
                     },
-                    b"hyperlink" => {
+                    "hyperlink" => {
                         if let Some(hl) = parse_hyperlink(e, rels)? {
                             hyperlinks.push(hl);
                         }
                         reader.read_to_end(e.to_end().name())?;
                     },
-                    b"pageMargins" => {
+                    "pageMargins" => {
                         margins_in = parse_page_margins(e)?;
                         reader.read_to_end(e.to_end().name())?;
                     },
-                    b"pageSetup" => {
+                    "pageSetup" => {
                         page_setup_raw = parse_page_setup_attrs(e)?;
                         reader.read_to_end(e.to_end().name())?;
+                    },
+                    "conditionalFormatting" => {
+                        conditional_formats.extend(parse_conditional_formatting(&mut reader, e)?);
+                    },
+                    "dataValidations" => {
+                        data_validations.extend(parse_data_validations(&mut reader)?);
                     },
                     _ => {},
                 },
                 Event::Empty(ref e) => match e.local_name().as_ref() {
-                    b"dimension" => {
-                        dimension = xml::optional_attr_str(e, b"ref")?.map(|v| v.into_owned());
+                    "dimension" => {
+                        dimension = xml::optional_attr_str(e, "ref")?.map(|v| v.into_owned());
                     },
-                    b"mergeCell" => {
-                        if let Some(range) = xml::optional_attr_str(e, b"ref")? {
+                    "mergeCell" => {
+                        if let Some(range) = xml::optional_attr_str(e, "ref")? {
                             merged_cells.push(range.into_owned());
                         }
                     },
-                    b"hyperlink" => {
+                    "hyperlink" => {
                         if let Some(hl) = parse_hyperlink(e, rels)? {
                             hyperlinks.push(hl);
                         }
                     },
-                    b"pageMargins" => {
+                    "pageMargins" => {
                         margins_in = parse_page_margins(e)?;
                     },
-                    b"pageSetup" => {
+                    "pageSetup" => {
                         page_setup_raw = parse_page_setup_attrs(e)?;
                     },
                     _ => {},
@@ -286,6 +429,21 @@ impl Worksheet {
 
         let page_setup = build_page_setup(margins_in, page_setup_raw);
 
+        // A shared group's master usually precedes its followers, but not
+        // always — calamine ships a fixture with the records reversed — so
+        // followers that arrived first are filled in now.
+        if shared.has_pending() {
+            for (at, formula) in shared.resolve_pending() {
+                if let Some(cell) = rows
+                    .iter_mut()
+                    .find(|r| r.index == at.row + 1)
+                    .and_then(|r| r.cells.iter_mut().find(|c| c.reference == at))
+                {
+                    cell.formula = Some(formula);
+                }
+            }
+        }
+
         Ok(Worksheet {
             comments: Vec::new(),
             name,
@@ -296,8 +454,183 @@ impl Worksheet {
             page_setup,
             images: Vec::new(),
             text_shapes: Vec::new(),
+            conditional_formats,
+            data_validations,
         })
     }
+}
+
+/// Parse one `<conditionalFormatting sqref="...">` block: its `sqref`
+/// (which range(s) it applies to) and each `<cfRule>` child inside it.
+///
+/// `<cfRule type="cellIs" operator="greaterThan"><formula>100</formula></cfRule>`
+/// is the common shape; colour-scale/data-bar/icon-set rules instead carry
+/// a `<colorScale>`/`<dataBar>`/`<iconSet>` child with no `<formula>` at
+/// all, which is fine — `formulas` is just empty for those.
+fn parse_conditional_formatting(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    start: &quick_xml::events::BytesStart,
+) -> crate::core::Result<Vec<crate::ir::ConditionalFormat>> {
+    use quick_xml::events::Event;
+
+    let sqref = xml::optional_attr_str(start, "sqref")?
+        .map(|v| v.into_owned())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) if e.local_name().as_ref() == "cfRule" => {
+                let rule_type = xml::optional_attr_str(e, "type")?
+                    .map(|v| v.into_owned())
+                    .unwrap_or_default();
+                let operator = xml::optional_attr_str(e, "operator")?.map(|v| v.into_owned());
+                let formulas = read_cf_rule_formulas(reader)?;
+                out.push(crate::ir::ConditionalFormat {
+                    range: sqref.clone(),
+                    rule_type,
+                    operator,
+                    formulas,
+                });
+            },
+            Event::Empty(ref e) if e.local_name().as_ref() == "cfRule" => {
+                // A rule with no children at all (no formula, no colour
+                // scale/data bar/icon set) — rare, but structurally valid.
+                let rule_type = xml::optional_attr_str(e, "type")?
+                    .map(|v| v.into_owned())
+                    .unwrap_or_default();
+                let operator = xml::optional_attr_str(e, "operator")?.map(|v| v.into_owned());
+                out.push(crate::ir::ConditionalFormat {
+                    range: sqref.clone(),
+                    rule_type,
+                    operator,
+                    formulas: Vec::new(),
+                });
+            },
+            Event::End(ref e) if e.local_name().as_ref() == "conditionalFormatting" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(out)
+}
+
+/// Read every `<formula>...</formula>` child of the `<cfRule>` whose Start
+/// event was just consumed, up through its matching `</cfRule>`. A
+/// `between`/`notBetween` operator carries two `<formula>` children (the
+/// low and high bounds); most others carry one; colour-scale/data-bar/
+/// icon-set rules carry none.
+fn read_cf_rule_formulas(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> crate::core::Result<Vec<String>> {
+    use quick_xml::events::Event;
+    let mut formulas = Vec::new();
+    let mut depth = 1u32;
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => {
+                depth += 1;
+                if e.local_name().as_ref() == "formula" {
+                    formulas.push(xml::read_text_content_fast(reader)?);
+                    depth -= 1; // read_text_content_fast already consumed </formula>
+                }
+            },
+            Event::Empty(_) => {},
+            Event::End(_) => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(formulas)
+}
+
+/// Read the contents of `<dataValidations>` (already positioned just past
+/// its Start event): every `<dataValidation sqref="..." type="..."
+/// operator="...">` child, up through the matching `</dataValidations>`.
+fn parse_data_validations(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> crate::core::Result<Vec<crate::ir::DataValidation>> {
+    use quick_xml::events::Event;
+    let mut out = Vec::new();
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) if e.local_name().as_ref() == "dataValidation" => {
+                out.push(parse_data_validation_with_body(reader, e)?);
+            },
+            Event::Empty(ref e) if e.local_name().as_ref() == "dataValidation" => {
+                out.push(data_validation_from_attrs(e)?);
+            },
+            Event::End(ref e) if e.local_name().as_ref() == "dataValidations" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(out)
+}
+
+/// The attributes shared by both the Start and Empty forms of
+/// `<dataValidation>`: `sqref`, `type` (default `"none"`), `operator`
+/// (default `"between"`, only meaningful for types that use one — same
+/// `None`-for-list/custom/none convention as the XLS reader), and
+/// `allowBlank`.
+fn data_validation_from_attrs(
+    e: &quick_xml::events::BytesStart,
+) -> crate::core::Result<crate::ir::DataValidation> {
+    let range = xml::optional_attr_str(e, "sqref")?
+        .map(|v| v.into_owned())
+        .unwrap_or_default();
+    let validation_type = xml::optional_attr_str(e, "type")?
+        .map(|v| v.into_owned())
+        .unwrap_or_else(|| "none".to_string());
+    let operator = if matches!(validation_type.as_str(), "list" | "custom" | "none") {
+        None
+    } else {
+        Some(
+            xml::optional_attr_str(e, "operator")?
+                .map(|v| v.into_owned())
+                .unwrap_or_else(|| "between".to_string()),
+        )
+    };
+    let allow_blank = xml::optional_attr_str(e, "allowBlank")?.as_deref() == Some("1");
+    Ok(crate::ir::DataValidation {
+        range,
+        validation_type,
+        operator,
+        formula1: None,
+        formula2: None,
+        allow_blank,
+    })
+}
+
+/// The Start form of `<dataValidation>` additionally carries `<formula1>`/
+/// `<formula2>` children (a comparison value, an explicit list source
+/// like `"Yes,No,Maybe"`, or a cell-range/formula reference) up through
+/// the matching `</dataValidation>`.
+fn parse_data_validation_with_body(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    start: &quick_xml::events::BytesStart,
+) -> crate::core::Result<crate::ir::DataValidation> {
+    use quick_xml::events::Event;
+    let mut dv = data_validation_from_attrs(start)?;
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) if e.local_name().as_ref() == "formula1" => {
+                dv.formula1 = Some(xml::read_text_content_fast(reader)?);
+            },
+            Event::Start(ref e) if e.local_name().as_ref() == "formula2" => {
+                dv.formula2 = Some(xml::read_text_content_fast(reader)?);
+            },
+            Event::End(ref e) if e.local_name().as_ref() == "dataValidation" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(dv)
 }
 
 /// Raw `<pageMargins>` values in inches (per ECMA-376 §18.3.1.62).
@@ -336,16 +669,16 @@ struct PageSetupRaw {
 fn parse_page_margins(
     e: &quick_xml::events::BytesStart,
 ) -> crate::core::Result<Option<PageMarginsIn>> {
-    let parse = |k: &[u8]| -> crate::core::Result<Option<f64>> {
+    let parse = |k: &str| -> crate::core::Result<Option<f64>> {
         Ok(xml::optional_attr_str(e, k)?
             .and_then(|v| fast_float2::parse::<f64, _>(v.as_ref()).ok()))
     };
-    let left = parse(b"left")?;
-    let right = parse(b"right")?;
-    let top = parse(b"top")?;
-    let bottom = parse(b"bottom")?;
-    let header = parse(b"header")?;
-    let footer = parse(b"footer")?;
+    let left = parse("left")?;
+    let right = parse("right")?;
+    let top = parse("top")?;
+    let bottom = parse("bottom")?;
+    let header = parse("header")?;
+    let footer = parse("footer")?;
     if left.is_none() && right.is_none() && top.is_none() && bottom.is_none() {
         return Ok(None);
     }
@@ -409,11 +742,11 @@ fn paper_size_enum_to_twips(id: u32) -> (u32, u32) {
 fn parse_page_setup_attrs(
     e: &quick_xml::events::BytesStart,
 ) -> crate::core::Result<Option<PageSetupRaw>> {
-    let pw = xml::optional_attr_str(e, b"paperWidth")?.and_then(|v| dim_to_twips(v.as_ref()));
-    let ph = xml::optional_attr_str(e, b"paperHeight")?.and_then(|v| dim_to_twips(v.as_ref()));
-    let paper_size = xml::optional_attr_str(e, b"paperSize")?
+    let pw = xml::optional_attr_str(e, "paperWidth")?.and_then(|v| dim_to_twips(v.as_ref()));
+    let ph = xml::optional_attr_str(e, "paperHeight")?.and_then(|v| dim_to_twips(v.as_ref()));
+    let paper_size = xml::optional_attr_str(e, "paperSize")?
         .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok());
-    let orientation = xml::optional_attr_str(e, b"orientation")?;
+    let orientation = xml::optional_attr_str(e, "orientation")?;
     let landscape = matches!(orientation.as_deref(), Some("landscape"));
 
     let (width_twips, height_twips) = match (pw, ph) {
@@ -467,15 +800,15 @@ fn parse_hyperlink(
     e: &quick_xml::events::BytesStart,
     rels: &crate::core::relationships::Relationships,
 ) -> crate::core::Result<Option<HyperlinkInfo>> {
-    let cell_ref = match xml::optional_attr_str(e, b"ref")? {
+    let cell_ref = match xml::optional_attr_str(e, "ref")? {
         Some(v) => v.into_owned(),
         None => return Ok(None),
     };
-    let tooltip = xml::optional_attr_str(e, b"tooltip")?.map(|v| v.into_owned());
+    let tooltip = xml::optional_attr_str(e, "tooltip")?.map(|v| v.into_owned());
 
     // r:id → external hyperlink via relationships
-    let r_id = xml::optional_attr_str(e, b"r:id")?;
-    let location = xml::optional_attr_str(e, b"location")?;
+    let r_id = xml::optional_attr_str(e, "r:id")?;
+    let location = xml::optional_attr_str(e, "location")?;
 
     let target = if let Some(rid) = r_id {
         if let Some(rel) = rels.get_by_id(&rid) {
@@ -501,8 +834,9 @@ fn parse_row_fast(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
     implied_index: u32,
+    shared: &mut SharedFormulas,
 ) -> crate::core::Result<Row> {
-    let index: u32 = xml::optional_attr_str(start, b"r")?
+    let index: u32 = xml::optional_attr_str(start, "r")?
         .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok())
         .unwrap_or(implied_index);
     let mut cells = Vec::new();
@@ -513,20 +847,20 @@ fn parse_row_fast(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"c" {
-                    let cell = parse_cell_fast(reader, e, index, next_col)?;
+                if e.local_name().as_ref() == "c" {
+                    let cell = parse_cell_fast(reader, e, index, next_col, shared)?;
                     next_col = cell.reference.col.saturating_add(1);
                     cells.push(cell);
                 } else {
                     reader.read_to_end(e.to_end().name())?;
                 }
             },
-            Event::Empty(ref e) if e.local_name().as_ref() == b"c" => {
+            Event::Empty(ref e) if e.local_name().as_ref() == "c" => {
                 let cell = parse_empty_cell(e, index, next_col)?;
                 next_col = cell.reference.col.saturating_add(1);
                 cells.push(cell);
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"row" => {
+            Event::End(ref e) if e.local_name().as_ref() == "row" => {
                 break;
             },
             Event::Eof => break,
@@ -537,27 +871,69 @@ fn parse_row_fast(
     Ok(Row { index, cells })
 }
 
+/// The `<c>` start-tag attributes, read in one pass.
+///
+/// Every cell in a sheet goes through here, so this is the hottest loop in
+/// the crate: one pass over the attributes instead of one rescan per key,
+/// the reference parsed straight from the borrowed value instead of an
+/// owned copy, and the type kept borrowed. The old shape — four
+/// `optional_attr_str` calls and two `String`s per cell — was a third of
+/// the time spent on a large sheet.
+struct CellAttrs<'a> {
+    reference: Option<CellRef>,
+    cell_type: Option<Cow<'a, str>>,
+    style_index: Option<u32>,
+    vm: Option<u32>,
+}
+
+fn cell_attrs<'a>(e: &'a quick_xml::events::BytesStart<'_>) -> crate::core::Result<CellAttrs<'a>> {
+    let mut out = CellAttrs {
+        reference: None,
+        cell_type: None,
+        style_index: None,
+        vm: None,
+    };
+    for attr in xml::attrs(e) {
+        let (key, value) = attr?;
+        match key {
+            "r" => out.reference = CellRef::parse(&value),
+            "t" => out.cell_type = Some(value),
+            "s" => out.style_index = atoi_simd::parse_pos::<u32, false>(value.as_bytes()).ok(),
+            "vm" => out.vm = atoi_simd::parse_pos::<u32, false>(value.as_bytes()).ok(),
+            _ => {},
+        }
+    }
+    Ok(out)
+}
+
 fn parse_empty_cell(
     e: &quick_xml::events::BytesStart,
     row: u32,
     implied_col: u32,
 ) -> crate::core::Result<Cell> {
-    let ref_str = xml::optional_attr_str(e, b"r")?
-        .map(|v| v.into_owned())
-        .unwrap_or_default();
-    let reference = CellRef::parse(&ref_str).unwrap_or(CellRef {
-        col: implied_col,
-        row,
-    });
-    let style_index = xml::optional_attr_str(e, b"s")?
-        .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok());
-
+    let attrs = cell_attrs(e)?;
     Ok(Cell {
-        reference,
+        reference: attrs.reference.unwrap_or(CellRef {
+            col: implied_col,
+            row,
+        }),
         value: CellValue::Empty,
-        style_index,
+        style_index: attrs.style_index,
         formula: None,
+        vm: None,
+        rich_runs: None,
     })
+}
+
+/// Read the `si` group index of an `<f>` element, but only when it really
+/// is a shared formula (`t="shared"`). Array and dataTable formulas also
+/// carry a `ref`, and a plain formula carries neither.
+fn shared_si(e: &quick_xml::events::BytesStart) -> crate::core::Result<Option<u32>> {
+    if xml::optional_attr_str(e, "t")?.as_deref() != Some("shared") {
+        return Ok(None);
+    }
+    Ok(xml::optional_attr_str(e, "si")?
+        .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok()))
 }
 
 /// Fast cell parser using plain Reader (no namespace resolution).
@@ -566,42 +942,69 @@ fn parse_cell_fast(
     start: &quick_xml::events::BytesStart,
     row: u32,
     implied_col: u32,
+    shared: &mut SharedFormulas,
 ) -> crate::core::Result<Cell> {
-    let ref_str = xml::optional_attr_str(start, b"r")?
-        .map(|v| v.into_owned())
-        .unwrap_or_default();
-    let reference = CellRef::parse(&ref_str).unwrap_or(CellRef {
+    let CellAttrs {
+        reference,
+        cell_type,
+        style_index,
+        vm,
+    } = cell_attrs(start)?;
+    let reference = reference.unwrap_or(CellRef {
         col: implied_col,
         row,
     });
 
-    let cell_type = xml::optional_attr_str(start, b"t")?.map(|v| v.into_owned());
-    let style_index = xml::optional_attr_str(start, b"s")?
-        .and_then(|v| atoi_simd::parse_pos::<u32, false>(v.as_bytes()).ok());
-
     let mut raw_value: Option<String> = None;
+    let mut number: Option<f64> = None;
     let mut formula: Option<String> = None;
+    let mut inline_rich_runs: Option<Vec<crate::xlsx::shared_strings::RichTextRun>> = None;
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"v" => {
-                    raw_value = Some(read_text_fast(reader)?);
+                "v" => {
+                    // A numeric cell's value parses straight from the
+                    // borrowed text; only text that is not a number
+                    // (kept verbatim, as before) costs an allocation.
+                    if matches!(cell_type.as_deref(), None | Some("n")) {
+                        match xml::read_number_content_fast(reader)? {
+                            Ok(n) => number = Some(n),
+                            Err(text) => raw_value = Some(text),
+                        }
+                    } else {
+                        raw_value = Some(read_text_fast(reader)?);
+                    }
                 },
-                b"f" => {
-                    formula = Some(read_text_fast(reader)?);
+                "f" => {
+                    let si = shared_si(e)?;
+                    let text = read_text_fast(reader)?;
+                    // A shared group's master carries the text once, here.
+                    if let Some(si) = si {
+                        shared.add_master(si, reference.clone(), text.clone());
+                    }
+                    formula = Some(text);
                 },
-                b"is" => {
-                    raw_value = Some(parse_inline_string_fast(reader)?);
+                "is" => {
+                    let (text, runs) = parse_inline_string_fast(reader)?;
+                    raw_value = Some(text);
+                    inline_rich_runs = runs;
                 },
                 _ => {
                     reader.read_to_end(e.to_end().name())?;
                 },
             },
-            Event::Empty(ref e) if e.local_name().as_ref() == b"f" => {
-                formula = None;
+            Event::Empty(ref e) if e.local_name().as_ref() == "f" => {
+                // A bare `<f t="shared" si="N"/>` is a follower: no text of
+                // its own, but its formula is the group master's translated
+                // by the row/column offset. Discarding it made a formula
+                // cell indistinguishable from one with no formula.
+                formula = match shared_si(e)? {
+                    Some(si) => shared.follower(si, &reference),
+                    None => None,
+                };
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"c" => {
+            Event::End(ref e) if e.local_name().as_ref() == "c" => {
                 break;
             },
             Event::Eof => break,
@@ -632,12 +1035,13 @@ fn parse_cell_fast(
             Some(s) => CellValue::Error(s),
             None => CellValue::Error(String::new()),
         },
-        _ => match raw_value {
-            Some(s) => match fast_float2::parse::<f64, _>(&s) {
+        _ => match (number, raw_value) {
+            (Some(n), _) => CellValue::Number(n),
+            (None, Some(s)) => match fast_float2::parse::<f64, _>(&s) {
                 Ok(n) => CellValue::Number(n),
                 Err(_) => CellValue::String(s),
             },
-            None => CellValue::Empty,
+            (None, None) => CellValue::Empty,
         },
     };
 
@@ -646,6 +1050,8 @@ fn parse_cell_fast(
         value,
         style_index,
         formula,
+        vm,
+        rich_runs: inline_rich_runs,
     })
 }
 
@@ -655,19 +1061,53 @@ fn read_text_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<
 }
 
 /// Fast inline string parser: `<is><t>text</t></is>` or `<is><r>...<t>text</t>...</r></is>`.
-fn parse_inline_string_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<String> {
-    let mut text = String::new();
+///
+/// Runs with the sheet reader's text trimming turned off. The sheet reader
+/// trims — right for `<v>`, wrong here: quick-xml reports every entity
+/// reference as its own event, splitting the literal text around it into
+/// separate `Event::Text` fragments, and trimming each fragment
+/// independently eats the space that sat at the entity boundary, so
+/// `AT&amp;T &lt;tag&gt;` read back as `AT&T<tag>`. This matches the
+/// non-trimming reader `shared_strings.rs` already uses for the same
+/// content model.
+fn parse_inline_string_fast(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> crate::core::Result<(String, Option<Vec<crate::xlsx::shared_strings::RichTextRun>>)> {
+    let trim_start = reader.config().trim_text_start;
+    let trim_end = reader.config().trim_text_end;
+    reader.config_mut().trim_text(false);
+
+    let result = read_inline_string_body(reader);
+
+    reader.config_mut().trim_text_start = trim_start;
+    reader.config_mut().trim_text_end = trim_end;
+    result
+}
+
+fn read_inline_string_body(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> crate::core::Result<(String, Option<Vec<crate::xlsx::shared_strings::RichTextRun>>)> {
+    let mut plain_text = String::new();
+    let mut runs: Vec<crate::xlsx::shared_strings::RichTextRun> = Vec::new();
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"t" {
-                    text.push_str(&read_text_fast(reader)?);
-                } else {
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                "t" => plain_text.push_str(&read_text_fast(reader)?),
+                // A rich inline string wraps each run in `<r>`, exactly
+                // like a shared string's `<si>` — reuse the same parser
+                // so a run's `<rPr>` (bold/italic/size/font/color) isn't
+                // discarded here the way it used to be (the rich-text
+                // fix covered shared strings but missed this
+                // structurally identical inline-string path entirely).
+                "r" => {
+                    runs.push(crate::xlsx::shared_strings::parse_rich_text_run(reader)?);
+                },
+                _ => {
                     reader.read_to_end(e.to_end().name())?;
-                }
+                },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"is" => {
+            Event::End(ref e) if e.local_name().as_ref() == "is" => {
                 break;
             },
             Event::Eof => break,
@@ -675,7 +1115,12 @@ fn parse_inline_string_fast(reader: &mut quick_xml::Reader<&[u8]>) -> crate::cor
         }
     }
 
-    Ok(text)
+    if !runs.is_empty() {
+        let full_text = runs.iter().map(|r| r.text.as_str()).collect::<String>();
+        Ok((full_text, Some(runs)))
+    } else {
+        Ok((plain_text, None))
+    }
 }
 
 #[cfg(test)]
@@ -688,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_simple_worksheet() {
+    fn test_parse_simple_worksheet() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <dimension ref="A1:B2"/>
@@ -718,8 +1163,351 @@ mod tests {
         assert!(matches!(&ws.rows[1].cells[1].value, CellValue::Error(e) if e == "#DIV/0!"));
     }
 
+    /// A shared-formula group carries its text once, on the master;
+    /// every follower is a bare `<f t="shared" si="N"/>` that used to set
+    /// `formula = None`, indistinguishable from a cell with no formula.
     #[test]
-    fn parse_worksheet_with_formula() {
+    fn test_shared_formula_followers_reconstruct_their_formula() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="2"><c r="B2"><f t="shared" ref="B2:B4" si="0">A2</f><v>1</v></c></row>
+    <row r="3"><c r="B3"><f t="shared" si="0"/><v>2</v></c></row>
+    <row r="4"><c r="B4"><f t="shared" si="0"/><v>3</v></c></row>
+  </sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.rows[0].cells[0].formula.as_deref(), Some("A2"));
+        assert_eq!(ws.rows[1].cells[0].formula.as_deref(), Some("A3"));
+        assert_eq!(ws.rows[2].cells[0].formula.as_deref(), Some("A4"));
+    }
+
+    /// Same, with the master written after its followers — the record order
+    /// calamine's `..._reversed.xlsx` fixture uses.
+    #[test]
+    fn test_shared_formula_master_after_followers_still_resolves() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="3"><c r="B3"><f t="shared" si="0"/><v>2</v></c></row>
+    <row r="2"><c r="B2"><f t="shared" ref="B2:B3" si="0">A2*2</f><v>1</v></c></row>
+  </sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.rows[1].cells[0].formula.as_deref(), Some("A2*2"));
+        assert_eq!(ws.rows[0].cells[0].formula.as_deref(), Some("A3*2"));
+    }
+
+    /// A plain `<f/>` with no `t="shared"` still means "no formula text",
+    /// and a follower whose group never had a master stays `None` rather
+    /// than inventing one.
+    #[test]
+    fn test_bare_formula_element_without_shared_group_stays_none() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1"><f/><v>1</v></c>
+      <c r="B1"><f t="shared" si="9"/><v>2</v></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.rows[0].cells[0].formula, None);
+        assert_eq!(ws.rows[0].cells[1].formula, None);
+    }
+
+    /// The sheet reader trims text, and quick-xml emits every entity
+    /// reference as its own event, so the literal text around `&amp;`/`&lt;`
+    /// arrived as separate fragments that were each trimmed independently.
+    /// Every space touching an escaped character was deleted.
+    #[test]
+    fn test_inline_string_keeps_whitespace_around_escaped_characters() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is><t>AT&amp;T &lt;tag&gt; &quot;quoted&quot; &apos;apostrophe&apos; 5 &lt; 10 and 10 &gt; 5</t></is></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert!(
+            matches!(
+                &ws.rows[0].cells[0].value,
+                CellValue::String(s)
+                    if s == "AT&T <tag> \"quoted\" 'apostrophe' 5 < 10 and 10 > 5"
+            ),
+            "got {:?}",
+            ws.rows[0].cells[0].value
+        );
+    }
+
+    /// The same function skipped `<r>` wholesale, so a *rich* inline string
+    /// lost its text entirely rather than just its spacing.
+    #[test]
+    fn test_rich_inline_string_runs_are_not_skipped() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is>
+        <r><rPr><b/></rPr><t>Hello </t></r>
+        <r><t>world</t></r>
+      </is></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert!(
+            matches!(&ws.rows[0].cells[0].value, CellValue::String(s) if s == "Hello world"),
+            "got {:?}",
+            ws.rows[0].cells[0].value
+        );
+    }
+
+    /// An inline (`t="inlineStr"`) rich-text cell's run
+    /// formatting (bold/italic/color/font) used to be silently
+    /// discarded — the reader concatenated each run's text (see the
+    /// test above) but skipped `<rPr>` wholesale via the generic
+    /// unknown-element fallback. The rich-text fix closed this exact gap for shared
+    /// strings (`sst.xml`) but missed this structurally identical
+    /// inline-string path entirely, since it lives in a completely
+    /// different parser (`parse_cell_fast`/`parse_inline_string_fast`
+    /// here, vs `shared_strings.rs::parse_si`).
+    #[test]
+    fn test_rich_inline_string_run_formatting_reaches_the_cell() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is>
+        <r><rPr><b/><color rgb="FFFF0000"/></rPr><t>Hello </t></r>
+        <r><t>world</t></r>
+      </is></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        let cell = &ws.rows[0].cells[0];
+        let runs = cell
+            .rich_runs
+            .as_ref()
+            .expect("expected rich_runs to be populated");
+        assert_eq!(runs.len(), 2, "got {runs:?}");
+        assert_eq!(runs[0].text, "Hello ");
+        assert_eq!(runs[0].bold, Some(true), "bold must reach the run");
+        assert!(runs[0].color.is_some(), "color must reach the run");
+        assert_eq!(runs[1].text, "world");
+        assert!(runs[1].bold.is_none(), "the second run must not inherit the first run's bold");
+    }
+
+    /// A `cellIs`/`greaterThan` rule's sqref, type, operator,
+    /// and single comparison formula must all reach the IR.
+    #[test]
+    fn test_conditional_formatting_cell_is_rule_reaches_the_ir() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+  <conditionalFormatting sqref="A1:A10">
+    <cfRule type="cellIs" dxfId="0" priority="1" operator="greaterThan">
+      <formula>100</formula>
+    </cfRule>
+  </conditionalFormatting>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.conditional_formats.len(), 1);
+        let cf = &ws.conditional_formats[0];
+        assert_eq!(cf.range, "A1:A10");
+        assert_eq!(cf.rule_type, "cellIs");
+        assert_eq!(cf.operator.as_deref(), Some("greaterThan"));
+        assert_eq!(cf.formulas, vec!["100".to_string()]);
+    }
+
+    /// A `between` rule carries two `<formula>` children — both must be
+    /// captured as separate entries, not concatenated together.
+    #[test]
+    fn test_conditional_formatting_between_rule_keeps_both_formulas_separate() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+  <conditionalFormatting sqref="B1:B5">
+    <cfRule type="cellIs" operator="between" priority="1">
+      <formula>10</formula>
+      <formula>20</formula>
+    </cfRule>
+  </conditionalFormatting>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.conditional_formats[0].formulas, vec!["10".to_string(), "20".to_string()]);
+    }
+
+    /// A colour-scale rule has no `<formula>` children at all — must not
+    /// error or swallow the sheet, and correctly reports an empty
+    /// `formulas` list while still recording the rule's type and range.
+    #[test]
+    fn test_conditional_formatting_color_scale_has_no_formulas() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+  <conditionalFormatting sqref="C1:C20">
+    <cfRule type="colorScale" priority="1">
+      <colorScale>
+        <cfvo type="min"/>
+        <cfvo type="max"/>
+        <color rgb="FFFF0000"/>
+        <color rgb="FF00FF00"/>
+      </colorScale>
+    </cfRule>
+  </conditionalFormatting>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.conditional_formats.len(), 1);
+        assert_eq!(ws.conditional_formats[0].rule_type, "colorScale");
+        assert!(ws.conditional_formats[0].formulas.is_empty());
+        assert!(ws.conditional_formats[0].operator.is_none());
+    }
+
+    /// Multiple `<cfRule>`s under the same `<conditionalFormatting>` share
+    /// its `sqref` — each must still produce its own IR entry.
+    #[test]
+    fn test_conditional_formatting_multiple_rules_share_the_same_range() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+  <conditionalFormatting sqref="D1:D10">
+    <cfRule type="cellIs" operator="lessThan" priority="1"><formula>0</formula></cfRule>
+    <cfRule type="cellIs" operator="greaterThan" priority="2"><formula>100</formula></cfRule>
+  </conditionalFormatting>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.conditional_formats.len(), 2);
+        assert!(ws.conditional_formats.iter().all(|cf| cf.range == "D1:D10"));
+        assert_eq!(ws.conditional_formats[0].operator.as_deref(), Some("lessThan"));
+        assert_eq!(ws.conditional_formats[1].operator.as_deref(), Some("greaterThan"));
+    }
+
+    /// A sheet with no `<conditionalFormatting>` at all must produce an
+    /// empty list, not an error.
+    #[test]
+    fn test_no_conditional_formatting_is_an_empty_list() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert!(ws.conditional_formats.is_empty());
+    }
+
+    /// A `whole`/`between` rule's sqref, type, operator, both
+    /// comparison formulas, and `allowBlank` must all reach the IR.
+    #[test]
+    fn test_data_validation_whole_between_rule_reaches_the_ir() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+  <dataValidations count="1">
+    <dataValidation type="whole" operator="between" allowBlank="1" sqref="A1:A10">
+      <formula1>1</formula1>
+      <formula2>10</formula2>
+    </dataValidation>
+  </dataValidations>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.data_validations.len(), 1);
+        let dv = &ws.data_validations[0];
+        assert_eq!(dv.range, "A1:A10");
+        assert_eq!(dv.validation_type, "whole");
+        assert_eq!(dv.operator.as_deref(), Some("between"));
+        assert_eq!(dv.formula1.as_deref(), Some("1"));
+        assert_eq!(dv.formula2.as_deref(), Some("10"));
+        assert!(dv.allow_blank);
+    }
+
+    /// A `list` rule's explicit inline source (`"Yes,No,Maybe"`) must
+    /// reach `formula1` verbatim, and `list` carries no operator.
+    #[test]
+    fn test_data_validation_list_rule_has_no_operator() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="B1"><v>1</v></c></row></sheetData>
+  <dataValidations count="1">
+    <dataValidation type="list" allowBlank="0" sqref="B1:B5">
+      <formula1>"Yes,No,Maybe"</formula1>
+    </dataValidation>
+  </dataValidations>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.data_validations.len(), 1);
+        let dv = &ws.data_validations[0];
+        assert_eq!(dv.validation_type, "list");
+        assert!(dv.operator.is_none());
+        assert_eq!(dv.formula1.as_deref(), Some("\"Yes,No,Maybe\""));
+        assert!(!dv.allow_blank);
+    }
+
+    /// The childless Empty-tag form (`<dataValidation .../>`, no
+    /// `<formula1>`) must still parse its attributes correctly.
+    #[test]
+    fn test_data_validation_empty_tag_form_still_parses_attrs() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="C1"><v>1</v></c></row></sheetData>
+  <dataValidations count="1">
+    <dataValidation type="textLength" operator="lessThanOrEqual" sqref="C1:C5"/>
+  </dataValidations>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert_eq!(ws.data_validations.len(), 1);
+        let dv = &ws.data_validations[0];
+        assert_eq!(dv.validation_type, "textLength");
+        assert_eq!(dv.operator.as_deref(), Some("lessThanOrEqual"));
+        assert!(dv.formula1.is_none());
+    }
+
+    /// A sheet with no `<dataValidations>` at all must produce an empty
+    /// list, not an error.
+    #[test]
+    fn test_no_data_validations_is_an_empty_list() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert!(ws.data_validations.is_empty());
+    }
+
+    /// Turning trimming off for the inline-string body must not leak into
+    /// the rest of the sheet: `<v>` is still parsed with surrounding
+    /// whitespace ignored.
+    #[test]
+    fn test_inline_string_does_not_leave_the_sheet_reader_untrimmed() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is><t> padded </t></is></c>
+      <c r="B1"><v>
+        42
+      </v></c>
+    </row>
+  </sheetData>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        assert!(
+            matches!(&ws.rows[0].cells[0].value, CellValue::String(s) if s == " padded "),
+            "got {:?}",
+            ws.rows[0].cells[0].value
+        );
+        assert!(
+            matches!(ws.rows[0].cells[1].value, CellValue::Number(n) if n == 42.0),
+            "got {:?}",
+            ws.rows[0].cells[1].value
+        );
+    }
+
+    #[test]
+    fn test_parse_worksheet_with_formula() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <sheetData>
@@ -736,7 +1524,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_worksheet_page_setup() {
+    fn test_parse_worksheet_page_setup() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <sheetData/>
@@ -755,7 +1543,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_worksheet_page_setup_paper_enum() {
+    fn test_parse_worksheet_page_setup_paper_enum() {
         // paperSize=9 = A4 (11906x16838 twips portrait), rotated because
         // orientation="landscape" — `paperSize` names a portrait stock.
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -772,7 +1560,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_worksheet_merged_cells() {
+    fn test_parse_worksheet_merged_cells() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <sheetData>
@@ -791,28 +1579,28 @@ mod tests {
     // ── dim_to_twips ─────────────────────────────────────────────────────
 
     #[test]
-    fn dim_to_twips_inches() {
+    fn test_dim_to_twips_inches() {
         // 1 inch = 1440 twips.
         assert_eq!(dim_to_twips("1in"), Some(1440));
         assert_eq!(dim_to_twips("8.5in"), Some(12240));
     }
 
     #[test]
-    fn dim_to_twips_millimeters() {
+    fn test_dim_to_twips_millimeters() {
         // 210mm = 11906 twips (A4 width); allow ±1 for rounding.
         let twips = dim_to_twips("210mm").unwrap();
         assert!((twips as i32 - 11906).abs() <= 1, "got {twips}");
     }
 
     #[test]
-    fn dim_to_twips_centimeters() {
+    fn test_dim_to_twips_centimeters() {
         // 1cm = 1440/2.54 ≈ 567 twips.
         let twips = dim_to_twips("1cm").unwrap();
         assert!((twips as i32 - 567).abs() <= 1, "got {twips}");
     }
 
     #[test]
-    fn dim_to_twips_bare_number_assumed_mm() {
+    fn test_dim_to_twips_bare_number_assumed_mm() {
         // Bare numeric defaults to mm.
         let a = dim_to_twips("210mm").unwrap();
         let b = dim_to_twips("210").unwrap();
@@ -820,7 +1608,7 @@ mod tests {
     }
 
     #[test]
-    fn dim_to_twips_empty_and_zero() {
+    fn test_dim_to_twips_empty_and_zero() {
         assert_eq!(dim_to_twips(""), None);
         assert_eq!(dim_to_twips("   "), None);
         // Zero / negative dimensions are nonsensical: rejected.
@@ -829,7 +1617,7 @@ mod tests {
     }
 
     #[test]
-    fn dim_to_twips_invalid_string() {
+    fn test_dim_to_twips_invalid_string() {
         assert_eq!(dim_to_twips("garbage"), None);
         assert_eq!(dim_to_twips("abcmm"), None);
     }
@@ -837,34 +1625,34 @@ mod tests {
     // ── paper_size_enum_to_twips ────────────────────────────────────────
 
     #[test]
-    fn paper_size_letter() {
+    fn test_paper_size_letter() {
         assert_eq!(paper_size_enum_to_twips(1), (12240, 15840));
     }
 
     #[test]
-    fn paper_size_legal() {
+    fn test_paper_size_legal() {
         assert_eq!(paper_size_enum_to_twips(5), (12240, 20160));
     }
 
     #[test]
-    fn paper_size_a4() {
+    fn test_paper_size_a4() {
         assert_eq!(paper_size_enum_to_twips(9), (11906, 16838));
     }
 
     #[test]
-    fn paper_size_unknown_falls_back_to_a4() {
+    fn test_paper_size_unknown_falls_back_to_a4() {
         assert_eq!(paper_size_enum_to_twips(9999), (11906, 16838));
     }
 
     // ── build_page_setup ────────────────────────────────────────────────
 
     #[test]
-    fn build_page_setup_returns_none_when_both_missing() {
+    fn test_build_page_setup_returns_none_when_both_missing() {
         assert!(build_page_setup(None, None).is_none());
     }
 
     #[test]
-    fn build_page_setup_margins_only_zeroes_dimensions() {
+    fn test_build_page_setup_margins_only_zeroes_dimensions() {
         // <pageMargins> without <pageSetup> → dimensions left at 0 so
         // a downstream consumer falls back to its default page size.
         let margins = Some(PageMarginsIn {
@@ -885,7 +1673,7 @@ mod tests {
     }
 
     #[test]
-    fn build_page_setup_dimensions_only_uses_default_margins() {
+    fn test_build_page_setup_dimensions_only_uses_default_margins() {
         // <pageSetup> alone uses ECMA-376 default 0.7/0.7/0.75/0.75 inch margins.
         let raw = Some(PageSetupRaw {
             width_twips: 12240,
@@ -902,7 +1690,7 @@ mod tests {
     }
 
     #[test]
-    fn build_page_setup_combines_both() {
+    fn test_build_page_setup_combines_both() {
         let margins = Some(PageMarginsIn {
             left: 0.5,
             right: 0.5,
@@ -923,7 +1711,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_worksheet_landscape_with_paper_enum() {
+    fn test_parse_worksheet_landscape_with_paper_enum() {
         // Verifies that landscape attribute survives the parse_page_setup_attrs path.
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
@@ -939,7 +1727,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_worksheet_default_when_no_setup() {
+    fn test_parse_worksheet_default_when_no_setup() {
         // No <pageMargins> or <pageSetup> → no page_setup at all.
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
@@ -947,5 +1735,115 @@ mod tests {
 </worksheet>"#;
         let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
         assert!(ws.page_setup.is_none());
+    }
+
+    // ── Threaded comments ──
+
+    #[test]
+    fn test_parse_threaded_comments_reads_ref_person_and_text() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ThreadedComments xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments">
+  <threadedComment ref="C2" personId="{P1}" id="{ID1}">
+    <text xml:space="preserve">testing
+</text>
+  </threadedComment>
+</ThreadedComments>"#;
+        let out = parse_threaded_comments(xml).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].cell_ref, "C2");
+        assert_eq!(out[0].person_id.as_deref(), Some("{P1}"));
+        assert!(out[0].parent_id.is_none());
+        assert_eq!(out[0].text, "testing");
+    }
+
+    #[test]
+    fn test_parse_persons_maps_id_to_display_name() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<personList xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments">
+  <person displayName="Pankaj Chaudhary" id="{P1}" userId="S::x" providerId="AD"/>
+</personList>"#;
+        let out = parse_persons(xml).unwrap();
+        assert_eq!(out.get("{P1}").map(String::as_str), Some("Pankaj Chaudhary"));
+    }
+
+    /// A `ref` with a resolved threaded-comment thread must
+    /// use the clean thread text (author-resolved) instead of the
+    /// legacy ~290-char compatibility boilerplate for the same cell;
+    /// a `ref` with no threaded entry must keep its own legacy text
+    /// unchanged. Mirrors the real corpus file this was verified
+    /// against (poi_64759.xlsx: C2 threaded, B3 a genuine legacy Note).
+    #[test]
+    fn test_merge_prefers_threaded_text_and_keeps_untouched_legacy_notes() {
+        let legacy = vec![
+            SheetComment {
+                cell_ref: "C2".to_string(),
+                author: Some("tc={ID1}".to_string()),
+                text: "[Threaded comment]\n\nYour version of Excel allows you to read this \
+                       threaded comment... Comment:\n    testing"
+                    .to_string(),
+            },
+            SheetComment {
+                cell_ref: "B3".to_string(),
+                author: Some("Microsoft Office User".to_string()),
+                text: "Microsoft Office User:\nSample Notes".to_string(),
+            },
+        ];
+        let threaded = vec![RawThreadedComment {
+            cell_ref: "C2".to_string(),
+            parent_id: None,
+            person_id: Some("{P1}".to_string()),
+            text: "testing".to_string(),
+        }];
+        let mut persons = std::collections::HashMap::new();
+        persons.insert("{P1}".to_string(), "Pankaj Chaudhary".to_string());
+
+        let merged = merge_threaded_comments(legacy, threaded, &persons);
+        assert_eq!(merged.len(), 2);
+
+        let c2 = merged.iter().find(|c| c.cell_ref == "C2").unwrap();
+        assert_eq!(c2.author.as_deref(), Some("Pankaj Chaudhary"));
+        assert_eq!(c2.text, "Pankaj Chaudhary: testing");
+        assert!(!c2.text.contains("Threaded comment"), "boilerplate must not survive: {c2:?}");
+
+        let b3 = merged.iter().find(|c| c.cell_ref == "B3").unwrap();
+        assert_eq!(b3.text, "Microsoft Office User:\nSample Notes", "untouched legacy Note");
+    }
+
+    /// A reply chain (root + one reply sharing the same `ref`) must
+    /// produce a root-first, multi-line thread rather than dropping the
+    /// reply — the issue's own secondary, not-corpus-confirmed concern.
+    #[test]
+    fn test_merge_orders_reply_after_root_in_a_thread() {
+        let threaded = vec![
+            RawThreadedComment {
+                cell_ref: "A1".to_string(),
+                parent_id: Some("{ROOT}".to_string()),
+                person_id: None,
+                text: "a reply".to_string(),
+            },
+            RawThreadedComment {
+                cell_ref: "A1".to_string(),
+                parent_id: None,
+                person_id: None,
+                text: "the root message".to_string(),
+            },
+        ];
+        let merged =
+            merge_threaded_comments(Vec::new(), threaded, &std::collections::HashMap::new());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "the root message\na reply");
+    }
+
+    #[test]
+    fn test_no_threaded_comments_leaves_legacy_list_unchanged() {
+        let legacy = vec![SheetComment {
+            cell_ref: "A1".to_string(),
+            author: None,
+            text: "plain note".to_string(),
+        }];
+        let merged =
+            merge_threaded_comments(legacy.clone(), Vec::new(), &std::collections::HashMap::new());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "plain note");
     }
 }

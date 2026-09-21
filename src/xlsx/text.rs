@@ -3,23 +3,94 @@ use super::cell::{Cell, CellValue};
 use super::date;
 use super::numfmt;
 use super::worksheet::Row;
+use crate::limits::TextBudget;
+
+/// `B2 (Author)` — the same marker `to_ir()` puts on a comment's endnote.
+pub(crate) fn comment_marker(cell_ref: &str, author: Option<&str>) -> String {
+    match author {
+        Some(a) => format!("{cell_ref} ({a})"),
+        None => cell_ref.to_string(),
+    }
+}
 
 impl XlsxDocument {
-    /// Extract all text as a plain string (one sheet per section, tab-separated cells).
+    /// Extract all text as a plain string: each sheet's name on its own
+    /// line, then its rows with tab-separated cells.
+    ///
+    /// The sheet name is emitted for every sheet, as the `.xls` reader,
+    /// `to_markdown()` and every other spreadsheet reader (POI, openpyxl,
+    /// xlrd, calamine) do — the same workbook used to name its sheets in
+    /// one format and not the other.
     pub fn plain_text(&self) -> String {
         let mut parts = Vec::new();
-        for i in 0..self.worksheets.len() {
-            if let Some(text) = self.sheet_plain_text(i) {
+        // One text budget for the whole document: a shared string
+        // referenced from every cell is rendered once per cell, and
+        // nothing else bounds that product (see `crate::limits`).
+        let mut budget = TextBudget::new();
+        for (i, ws) in self.worksheets.iter().enumerate() {
+            let mut sheet = ws.name.clone();
+            if let Some(text) = self.sheet_plain_text_within(i, &mut budget) {
                 if !text.is_empty() {
-                    parts.push(text);
+                    sheet.push('\n');
+                    sheet.push_str(&text);
                 }
             }
+            if budget.exhausted() {
+                sheet.push('\n');
+                sheet.push_str(&budget.notice());
+                parts.push(sheet);
+                break;
+            }
+            // Cell comments are document content; `to_ir()` carries them
+            // as endnotes, and this direct renderer dropped them.
+            for c in &ws.comments {
+                sheet.push('\n');
+                sheet.push_str(&format!(
+                    "{}: {}",
+                    comment_marker(&c.cell_ref, c.author.as_deref()),
+                    c.text
+                ));
+            }
+            // Text boxes and WordArt drawn on the sheet reached `to_ir()`
+            // as text boxes and this renderer not at all — a sheet whose
+            // content is a drawn note came back as its name alone.
+            for ts in &ws.text_shapes {
+                if !ts.text.trim().is_empty() {
+                    sheet.push('\n');
+                    sheet.push_str(ts.text.trim());
+                }
+            }
+            parts.push(sheet);
+        }
+        // `to_markdown()` already surfaces chart text (axis titles, series
+        // names); `plain_text()` silently dropped it entirely.
+        for text in &self.chart_text {
+            if !text.trim().is_empty() {
+                parts.push(text.trim().to_string());
+            }
+        }
+        for (name, err) in &self.unreadable_sheets {
+            parts.push(unreadable_notice(name, err));
         }
         parts.join("\n\n")
     }
 
     /// Extract a single sheet as plain text.
     pub fn sheet_plain_text(&self, sheet_index: usize) -> Option<String> {
+        let mut budget = TextBudget::new();
+        let mut text = self.sheet_plain_text_within(sheet_index, &mut budget)?;
+        if budget.exhausted() {
+            text.push('\n');
+            text.push_str(&budget.notice());
+        }
+        Some(text)
+    }
+
+    fn sheet_plain_text_within(
+        &self,
+        sheet_index: usize,
+        budget: &mut TextBudget,
+    ) -> Option<String> {
         let ws = self.worksheets.get(sheet_index)?;
         let mut buf = String::with_capacity(ws.rows.len() * 64);
         for (row_idx, row) in ws.rows.iter().enumerate() {
@@ -30,7 +101,12 @@ impl XlsxDocument {
                 if col_idx > 0 {
                     buf.push('\t');
                 }
+                let before = buf.len();
                 self.write_cell_value(cell, &mut buf);
+                if !budget.charge(buf.len() - before) {
+                    buf.truncate(before);
+                    return Some(buf);
+                }
             }
         }
         Some(buf)
@@ -46,11 +122,17 @@ impl XlsxDocument {
         let ws = self.worksheets.get(sheet_index)?;
         let col_count = compute_column_count(&ws.rows);
         let mut lines = Vec::new();
+        let mut budget = TextBudget::new();
 
-        for row in &ws.rows {
+        'rows: for row in &ws.rows {
             let mut fields: Vec<String> = Vec::with_capacity(col_count);
             for cell in &row.cells {
-                fields.push(csv_escape(&self.format_cell_value(cell)));
+                let field = csv_escape(&self.format_cell_value(cell));
+                if !budget.charge(field.len()) {
+                    lines.push(budget.notice());
+                    break 'rows;
+                }
+                fields.push(field);
             }
             // Pad to column count
             while fields.len() < col_count {
@@ -65,10 +147,33 @@ impl XlsxDocument {
     /// Convert to markdown (pipe-delimited tables).
     pub fn to_markdown(&self) -> String {
         let mut parts = Vec::new();
-        for i in 0..self.worksheets.len() {
-            if let Some(md) = self.sheet_to_markdown(i) {
+        let mut budget = TextBudget::new();
+        for (i, ws) in self.worksheets.iter().enumerate() {
+            if let Some(md) = self.sheet_to_markdown_within(i, &mut budget) {
                 if !md.is_empty() {
                     parts.push(md);
+                } else if !ws.comments.is_empty()
+                    || ws.text_shapes.iter().any(|t| !t.text.trim().is_empty())
+                {
+                    // No cells, but comments or drawn text: they still
+                    // belong under the sheet's heading.
+                    parts.push(format!("## {}", ws.name));
+                }
+            }
+            if budget.exhausted() {
+                parts.push(budget.notice());
+                break;
+            }
+            for c in &ws.comments {
+                parts.push(format!(
+                    "> **{}:** {}",
+                    comment_marker(&c.cell_ref, c.author.as_deref()),
+                    c.text.trim()
+                ));
+            }
+            for ts in &ws.text_shapes {
+                if !ts.text.trim().is_empty() {
+                    parts.push(ts.text.trim().to_string());
                 }
             }
         }
@@ -80,15 +185,40 @@ impl XlsxDocument {
                 parts.push(format!("## Chart {}\n\n{}", i + 1, text));
             }
         }
+        for (name, err) in &self.unreadable_sheets {
+            parts.push(format!("## {name}\n\n{}", unreadable_notice(name, err)));
+        }
         parts.join("\n\n")
     }
 
     /// Convert specific sheet to markdown.
     pub fn sheet_to_markdown(&self, sheet_index: usize) -> Option<String> {
+        let mut budget = TextBudget::new();
+        let mut md = self.sheet_to_markdown_within(sheet_index, &mut budget)?;
+        if budget.exhausted() {
+            md.push_str("\n\n");
+            md.push_str(&budget.notice());
+        }
+        Some(md)
+    }
+
+    fn sheet_to_markdown_within(
+        &self,
+        sheet_index: usize,
+        budget: &mut TextBudget,
+    ) -> Option<String> {
         let ws = self.worksheets.get(sheet_index)?;
         if ws.rows.is_empty() {
             return Some(String::new());
         }
+        // Every cell text passes through here; a spent budget ends the
+        // sheet at the cell that spent it.
+        let mut cell_text = |cell: &Cell| -> Option<String> {
+            let text = self.format_cell_value(cell);
+            budget
+                .charge(text.len())
+                .then(|| crate::core::markdown::escape_cell(&text))
+        };
 
         let col_count = compute_column_count(&ws.rows);
         if col_count == 0 {
@@ -112,9 +242,11 @@ impl XlsxDocument {
             out.push_str(&format!("## {}\n\n", ws.name));
             for row in &ws.rows {
                 if let Some(cell) = row.cells.first() {
-                    let text = self.format_cell_value(cell);
+                    let Some(text) = cell_text(cell) else { break };
                     if !text.trim().is_empty() {
-                        out.push_str(text.trim());
+                        // `cell_text` escaped for a table cell; prose keeps
+                        // its line breaks as paragraphs.
+                        out.push_str(&text.replace("<br>", "\n"));
                         out.push_str("\n\n");
                     }
                 }
@@ -129,33 +261,42 @@ impl XlsxDocument {
         lines.push(String::new());
 
         // First row as header
-        let header_row = &ws.rows[0];
-        let header_cells: Vec<String> = (0..col_count)
-            .map(|i| {
-                header_row
-                    .cells
-                    .get(i)
-                    .map(|c| self.format_cell_value(c))
-                    .unwrap_or_default()
-            })
-            .collect();
-        lines.push(format!("| {} |", header_cells.join(" | ")));
+        // A row keeps the cells that fit the budget (the rest empty) and
+        // reports that the budget is spent, so the table ends after it.
+        let mut row_line = |row: &Row| -> (String, bool) {
+            let mut cells: Vec<String> = Vec::with_capacity(col_count);
+            let mut spent = false;
+            for i in 0..col_count {
+                let text = match row.cells.get(i) {
+                    Some(c) if !spent => match cell_text(c) {
+                        Some(t) => t,
+                        None => {
+                            spent = true;
+                            String::new()
+                        },
+                    },
+                    _ => String::new(),
+                };
+                cells.push(text);
+            }
+            (format!("| {} |", cells.join(" | ")), spent)
+        };
+        let (header, spent) = row_line(&ws.rows[0]);
+        lines.push(header);
 
         // Separator row
         let sep: Vec<&str> = vec!["---"; col_count];
         lines.push(format!("| {} |", sep.join(" | ")));
 
         // Data rows
-        for row in ws.rows.iter().skip(1) {
-            let cells: Vec<String> = (0..col_count)
-                .map(|i| {
-                    row.cells
-                        .get(i)
-                        .map(|c| self.format_cell_value(c))
-                        .unwrap_or_default()
-                })
-                .collect();
-            lines.push(format!("| {} |", cells.join(" | ")));
+        if !spent {
+            for row in ws.rows.iter().skip(1) {
+                let (line, spent) = row_line(row);
+                lines.push(line);
+                if spent {
+                    break;
+                }
+            }
         }
 
         Some(lines.join("\n"))
@@ -171,7 +312,16 @@ impl XlsxDocument {
     /// Write a cell value directly to a buffer (avoids allocation for shared strings).
     pub fn write_cell_value(&self, cell: &Cell, buf: &mut String) {
         match &cell.value {
-            CellValue::Empty => {},
+            // A formula cell with no cached `<v>` (the default output shape
+            // of closedxml and similar writers) rendered as a blank cell
+            // indistinguishable from a genuinely empty one, and the formula
+            // text never reached any consumer at all.
+            CellValue::Empty => {
+                if let Some(f) = &cell.formula {
+                    buf.push('=');
+                    buf.push_str(f);
+                }
+            },
             CellValue::Number(n) => {
                 if date::is_date_cell(cell.style_index, self.styles.as_ref()) {
                     if let Some(dt) = date::DateTimeValue::from_serial(*n, self.workbook.date1904) {
@@ -228,10 +378,15 @@ impl XlsxDocument {
                 let Some(fmt_id) = styles.number_format_id_for(idx) else {
                     return false;
                 };
+                // An explicit <numFmt> wins over the built-in meaning of its
+                // id — [ECMA-376] §18.8.30 lets a workbook redefine ids
+                // 0-163. Same precedence as `date::is_date_cell`; testing the
+                // id first made `0.00000E+0` declared under id 50 render as a
+                // 1900 date.
+                if let Some(fmt_str) = styles.number_format_override_for(idx) {
+                    return date::is_date_format_string(fmt_str);
+                }
                 date::is_date_format_id(fmt_id)
-                    || styles
-                        .number_format_override_for(idx)
-                        .is_some_and(date::is_date_format_string)
             })
             .collect()
     }
@@ -245,7 +400,13 @@ impl XlsxDocument {
         date_indices: &std::collections::HashSet<u32>,
     ) {
         match &cell.value {
-            CellValue::Empty => {},
+            // See `write_cell_value`'s identical arm.
+            CellValue::Empty => {
+                if let Some(f) = &cell.formula {
+                    buf.push('=');
+                    buf.push_str(f);
+                }
+            },
             CellValue::Number(n) => {
                 let is_date = cell.style_index.is_some_and(|i| date_indices.contains(&i));
                 if is_date {
@@ -318,27 +479,33 @@ fn csv_escape(field: &str) -> String {
     }
 }
 
+/// The line every renderer emits for a sheet that could not be read, so
+/// a workbook missing a sheet never passes for a complete one.
+pub(crate) fn unreadable_notice(name: &str, err: &str) -> String {
+    format!("[unreadable sheet {name:?}: {err}]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn csv_escape_plain() {
+    fn test_csv_escape_plain() {
         assert_eq!(csv_escape("hello"), "hello");
     }
 
     #[test]
-    fn csv_escape_with_comma() {
+    fn test_csv_escape_with_comma() {
         assert_eq!(csv_escape("a,b"), "\"a,b\"");
     }
 
     #[test]
-    fn csv_escape_with_quotes() {
+    fn test_csv_escape_with_quotes() {
         assert_eq!(csv_escape("say \"hi\""), "\"say \"\"hi\"\"\"");
     }
 
     #[test]
-    fn csv_escape_with_newline() {
+    fn test_csv_escape_with_newline() {
         assert_eq!(csv_escape("line1\nline2"), "\"line1\nline2\"");
     }
 
@@ -349,15 +516,205 @@ mod tests {
     }
 
     #[test]
-    fn format_number_integer() {
+    fn test_format_number_integer() {
         assert_eq!(fmt_num(42.0), "42");
         assert_eq!(fmt_num(0.0), "0");
         assert_eq!(fmt_num(-10.0), "-10");
     }
 
     #[test]
-    fn format_number_float() {
+    fn test_format_number_float() {
         assert_eq!(fmt_num(3.15), "3.15");
         assert_eq!(fmt_num(0.5), "0.5");
+    }
+
+    /// `date_style_indices` backs `to_ir()`'s cell renderer
+    /// and tested the built-in meaning of a `numFmtId` before the workbook's
+    /// own `<numFmt>` override of that id, so `0.00000E+0` declared under id
+    /// 50 was still treated as a date.
+    #[test]
+    fn test_date_style_indices_honours_numfmt_override_over_builtin_id() {
+        let styles = br#"<?xml version="1.0" encoding="UTF-8"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <numFmts count="2">
+    <numFmt numFmtId="50" formatCode="0.00000E+0"/>
+    <numFmt numFmtId="164" formatCode="yyyy-mm-dd"/>
+  </numFmts>
+  <cellXfs count="3">
+    <xf numFmtId="50" applyNumberFormat="1"/>
+    <xf numFmtId="164" applyNumberFormat="1"/>
+    <xf numFmtId="14" applyNumberFormat="1"/>
+  </cellXfs>
+</styleSheet>"#;
+        let ss = super::super::styles::StyleSheet::parse(styles).expect("styles parse");
+        let doc = XlsxDocument {
+            workbook: super::super::WorkbookInfo {
+                sheets: Vec::new(),
+                defined_names: Vec::new(),
+                date1904: false,
+            },
+            worksheets: Vec::new(),
+            shared_strings: super::super::SharedStringTable::empty(),
+            styles: Some(ss),
+            theme: None,
+            chart_text: Vec::new(),
+            embedded_fonts: Vec::new(),
+            core_properties: None,
+            app_properties: None,
+            has_macros: false,
+            unreadable_sheets: Vec::new(),
+            styles_data: None,
+            theme_data: None,
+        };
+        let idx = doc.date_style_indices();
+        assert!(!idx.contains(&0), "id 50 overridden to a numeric code is not a date");
+        assert!(idx.contains(&1), "a custom yyyy-mm-dd code is a date");
+        assert!(idx.contains(&2), "an un-overridden built-in date id is a date");
+    }
+
+    /// A text box or WordArt drawn on a sheet reached `to_ir()` as a text
+    /// box and the direct renderers not at all — a sheet whose only
+    /// content was a drawn note came back as its name alone, and the
+    /// markdown had no heading for it.
+    #[test]
+    fn test_drawn_text_shapes_reach_plain_text_and_markdown() {
+        let ws = super::super::worksheet::Worksheet {
+            name: "Notes".to_string(),
+            dimension: None,
+            rows: Vec::new(),
+            merged_cells: Vec::new(),
+            hyperlinks: Vec::new(),
+            page_setup: None,
+            images: Vec::new(),
+            comments: Vec::new(),
+            text_shapes: vec![super::super::worksheet::WorksheetTextShape {
+                text: "Lorem ipsum drawn in a text box".to_string(),
+                font_name: None,
+                font_size_pt: None,
+                bold: false,
+                italic: false,
+                color_hex: None,
+                x_emu: 0,
+                y_emu: 0,
+                cx_emu: 100,
+                cy_emu: 100,
+            }],
+            conditional_formats: Vec::new(),
+            data_validations: Vec::new(),
+        };
+        let doc = XlsxDocument {
+            workbook: super::super::WorkbookInfo {
+                sheets: Vec::new(),
+                defined_names: Vec::new(),
+                date1904: false,
+            },
+            worksheets: vec![ws],
+            shared_strings: super::super::SharedStringTable::empty(),
+            styles: None,
+            theme: None,
+            chart_text: Vec::new(),
+            embedded_fonts: Vec::new(),
+            core_properties: None,
+            app_properties: None,
+            has_macros: false,
+            unreadable_sheets: Vec::new(),
+            styles_data: None,
+            theme_data: None,
+        };
+        let text = doc.plain_text();
+        assert!(text.starts_with("Notes\nLorem ipsum drawn"), "{text:?}");
+        let md = doc.to_markdown();
+        assert!(md.starts_with("## Notes\n\nLorem ipsum drawn"), "{md:?}");
+        assert!(
+            crate::convert_xlsx::xlsx_to_ir(&doc)
+                .plain_text()
+                .contains("Lorem ipsum drawn")
+        );
+    }
+
+    /// `plain_text()` starts each sheet with its name, as `.xls`,
+    /// `to_markdown()` and every other spreadsheet reader do — the same
+    /// workbook used to name its sheets in one format and not the other.
+    #[test]
+    fn test_plain_text_names_each_sheet() {
+        let sheet = |name: &str, text: &str| super::super::worksheet::Worksheet {
+            name: name.to_string(),
+            dimension: None,
+            rows: vec![Row {
+                index: 1,
+                cells: vec![Cell {
+                    reference: super::super::CellRef { col: 0, row: 0 },
+                    value: CellValue::String(text.to_string()),
+                    style_index: None,
+                    formula: None,
+                    rich_runs: None,
+                    vm: None,
+                }],
+            }],
+            merged_cells: Vec::new(),
+            hyperlinks: Vec::new(),
+            page_setup: None,
+            images: Vec::new(),
+            comments: Vec::new(),
+            text_shapes: Vec::new(),
+            conditional_formats: Vec::new(),
+            data_validations: Vec::new(),
+        };
+        let doc = XlsxDocument {
+            workbook: super::super::WorkbookInfo {
+                sheets: Vec::new(),
+                defined_names: Vec::new(),
+                date1904: false,
+            },
+            worksheets: vec![sheet("Revenue", "north"), sheet("Costs", "south")],
+            shared_strings: super::super::SharedStringTable::empty(),
+            styles: None,
+            theme: None,
+            chart_text: Vec::new(),
+            embedded_fonts: Vec::new(),
+            core_properties: None,
+            app_properties: None,
+            has_macros: false,
+            unreadable_sheets: Vec::new(),
+            styles_data: None,
+            theme_data: None,
+        };
+        let text = doc.plain_text();
+        assert!(text.starts_with("Revenue\nnorth"), "{text:?}");
+        assert!(text.contains("\n\nCosts\nsouth"), "{text:?}");
+        // The two renderers agree on the names.
+        let md = doc.to_markdown();
+        assert!(md.contains("## Revenue") && md.contains("## Costs"), "{md:?}");
+    }
+
+    /// `to_markdown()` already surfaced chart text; `plain_text()`
+    /// silently dropped it, so the CLI's default `text` output (and anything
+    /// built on `plain_text()`, like PDF export) lost every chart's words.
+    #[test]
+    fn test_plain_text_includes_chart_text() {
+        let doc = XlsxDocument {
+            workbook: super::super::WorkbookInfo {
+                sheets: Vec::new(),
+                defined_names: Vec::new(),
+                date1904: false,
+            },
+            worksheets: Vec::new(),
+            shared_strings: super::super::SharedStringTable::empty(),
+            styles: None,
+            theme: None,
+            chart_text: vec!["Title: Rotated Title".to_string()],
+            embedded_fonts: Vec::new(),
+            core_properties: None,
+            app_properties: None,
+            has_macros: false,
+            unreadable_sheets: Vec::new(),
+            styles_data: None,
+            theme_data: None,
+        };
+        assert!(
+            doc.plain_text().contains("Rotated Title"),
+            "plain_text() must include chart text, same as to_markdown(): {:?}",
+            doc.plain_text()
+        );
     }
 }

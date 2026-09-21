@@ -34,6 +34,9 @@ pub struct RichTextRun {
     pub font_name: Option<String>,
     /// Text color.
     pub color: Option<ColorRef>,
+    /// Superscript/subscript alignment (`<vertAlign val="…"/>`), e.g. a
+    /// footnote-marker run within otherwise-plain body text.
+    pub vert_align: Option<crate::ir::VerticalAlign>,
 }
 
 impl SharedStringTable {
@@ -54,7 +57,7 @@ impl SharedStringTable {
 
         loop {
             match reader.read_event()? {
-                Event::Start(ref e) if e.local_name().as_ref() == b"si" => {
+                Event::Start(ref e) if e.local_name().as_ref() == "si" => {
                     strings.push(parse_si(&mut reader)?);
                 },
                 Event::Eof => break,
@@ -88,17 +91,17 @@ fn parse_si(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Shared
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"t" => {
+                "t" => {
                     plain_text = Some(xml::read_text_content_fast(reader)?);
                 },
-                b"r" => {
+                "r" => {
                     runs.push(parse_rich_text_run(reader)?);
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"si" => {
+            Event::End(ref e) if e.local_name().as_ref() == "si" => {
                 break;
             },
             Event::Eof => break,
@@ -121,26 +124,62 @@ fn parse_si(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Shared
     }
 }
 
-/// Parse a single `<r>` rich text run element.
-/// Optimized: skips `<rPr>` entirely — run properties are parsed lazily only when
-/// rich text metadata is actually needed (not for plain text extraction).
-fn parse_rich_text_run(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<RichTextRun> {
+/// Parse a single `<r>` rich text run element, including its `<rPr>`
+/// formatting (this used to be skipped entirely, discarding
+/// every run's bold/italic/size/font/color/superscript, permanently).
+pub(crate) fn parse_rich_text_run(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> crate::core::Result<RichTextRun> {
     let mut text = String::new();
+    let mut bold = None;
+    let mut italic = None;
+    let mut font_size = None;
+    let mut font_name = None;
+    let mut color = None;
+    let mut vert_align = None;
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                match e.local_name().as_ref() {
-                    b"t" => {
-                        text = xml::read_text_content_fast(reader)?;
+            Event::Start(ref e) if e.local_name().as_ref() == "t" => {
+                text = xml::read_text_content_fast(reader)?;
+            },
+            Event::Start(ref e) if e.local_name().as_ref() == "rPr" => loop {
+                match reader.read_event()? {
+                    Event::Start(ref p) | Event::Empty(ref p) => match p.local_name().as_ref() {
+                        "b" => bold = Some(xml::parse_toggle(p, "val")),
+                        "i" => italic = Some(xml::parse_toggle(p, "val")),
+                        "sz" => {
+                            font_size =
+                                xml::optional_attr_str(p, "val")?.and_then(|v| v.parse().ok());
+                        },
+                        // Run properties use `<rFont>`, not `<name>` (a
+                        // different schema from styles.xml's `<font><name>`).
+                        "rFont" => {
+                            font_name = xml::optional_attr_str(p, "val")?.map(|v| v.into_owned());
+                        },
+                        "color" => {
+                            color = parse_color_ref(p)?;
+                        },
+                        "vertAlign" => {
+                            vert_align =
+                                xml::optional_attr_str(p, "val")?.and_then(|v| match v.as_ref() {
+                                    "superscript" => Some(crate::ir::VerticalAlign::Superscript),
+                                    "subscript" => Some(crate::ir::VerticalAlign::Subscript),
+                                    "baseline" => Some(crate::ir::VerticalAlign::Baseline),
+                                    _ => None,
+                                });
+                        },
+                        _ => {},
                     },
-                    _ => {
-                        // Skip rPr and any other elements — only extract text
-                        xml::skip_element_fast(reader)?;
-                    },
+                    Event::End(ref p) if p.local_name().as_ref() == "rPr" => break,
+                    Event::Eof => break,
+                    _ => {},
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"r" => {
+            Event::Start(_) => {
+                xml::skip_element_fast(reader)?;
+            },
+            Event::End(ref e) if e.local_name().as_ref() == "r" => {
                 break;
             },
             Event::Eof => break,
@@ -150,11 +189,12 @@ fn parse_rich_text_run(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Re
 
     Ok(RichTextRun {
         text,
-        bold: None,
-        italic: None,
-        font_size: None,
-        font_name: None,
-        color: None,
+        bold,
+        italic,
+        font_size,
+        font_name,
+        color,
+        vert_align,
     })
 }
 
@@ -163,7 +203,7 @@ pub(crate) fn parse_color_ref(
     e: &quick_xml::events::BytesStart,
 ) -> crate::core::Result<Option<ColorRef>> {
     // Check for direct RGB color
-    if let Some(rgb_val) = xml::optional_attr_str(e, b"rgb")? {
+    if let Some(rgb_val) = xml::optional_attr_str(e, "rgb")? {
         let hex = rgb_val.as_ref();
         // ARGB format: "FF4472C4" — strip alpha prefix if 8 chars
         let hex = if hex.len() == 8 { &hex[2..] } else { hex };
@@ -173,7 +213,7 @@ pub(crate) fn parse_color_ref(
     }
 
     // Check for theme color
-    if let Some(theme_val) = xml::optional_attr_str(e, b"theme")? {
+    if let Some(theme_val) = xml::optional_attr_str(e, "theme")? {
         if let Ok(theme_idx) = theme_val.parse::<u32>() {
             let slot = match theme_idx {
                 0 => Some(ThemeColorSlot::Lt1),
@@ -191,7 +231,7 @@ pub(crate) fn parse_color_ref(
                 _ => None,
             };
             if let Some(slot) = slot {
-                let tint = xml::optional_attr_str(e, b"tint")?.and_then(|v| v.parse().ok());
+                let tint = xml::optional_attr_str(e, "tint")?.and_then(|v| v.parse().ok());
                 return Ok(Some(ColorRef::Theme {
                     slot,
                     tint,
@@ -203,7 +243,7 @@ pub(crate) fn parse_color_ref(
     }
 
     // Check for indexed color (simplified — just return None for now)
-    if xml::optional_attr_str(e, b"auto")?.is_some() {
+    if xml::optional_attr_str(e, "auto")?.is_some() {
         return Ok(Some(ColorRef::Auto));
     }
 
@@ -215,7 +255,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_plain_strings() {
+    fn test_parse_plain_strings() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="3" uniqueCount="3">
   <si><t>Hello</t></si>
@@ -231,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_rich_text_strings() {
+    fn test_parse_rich_text_strings() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1">
   <si>
@@ -254,8 +294,44 @@ mod tests {
         assert_eq!(rich[1].text, " normal");
     }
 
+    /// `<rPr>` was skipped entirely; every run's own
+    /// bold/size/font/superscript formatting must now survive parsing,
+    /// matching the exact real-file shape from the issue's own repro
+    /// (a plain run followed by a bold superscript footnote marker).
     #[test]
-    fn parse_empty_sst() {
+    fn test_parse_rich_text_run_properties() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1">
+  <si>
+    <r><t>Number of Hires</t></r>
+    <r>
+      <rPr><b/><vertAlign val="superscript"/><sz val="10"/><rFont val="Arial"/><color rgb="FFFF0000"/></rPr>
+      <t>(1)</t>
+    </r>
+  </si>
+</sst>"#;
+        let sst = SharedStringTable::parse(xml).unwrap();
+        let rich = sst.strings[0].rich_text.as_ref().unwrap();
+        assert_eq!(rich.len(), 2);
+
+        assert_eq!(rich[0].text, "Number of Hires");
+        assert!(rich[0].bold.is_none());
+        assert!(rich[0].vert_align.is_none());
+
+        let marker = &rich[1];
+        assert_eq!(marker.text, "(1)");
+        assert_eq!(marker.bold, Some(true));
+        assert_eq!(marker.vert_align, Some(crate::ir::VerticalAlign::Superscript));
+        assert_eq!(marker.font_size, Some(10.0));
+        assert_eq!(marker.font_name.as_deref(), Some("Arial"));
+        match marker.color.as_ref().unwrap() {
+            ColorRef::Rgb(rgb) => assert_eq!(rgb.0, [0xFF, 0x00, 0x00]),
+            other => panic!("expected an RGB color, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_empty_sst() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0">
 </sst>"#;
@@ -265,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn index_lookup() {
+    fn test_index_lookup() {
         let sst = SharedStringTable {
             strings: vec![
                 SharedString {

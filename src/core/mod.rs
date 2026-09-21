@@ -6,6 +6,12 @@
 //! DOCX, XLSX, and PPTX formats: ZIP archive handling, content types,
 //! relationships, core properties, and DrawingML shared types.
 
+/// Standard base64, shared by the IR JSON image codec and the renderers.
+pub(crate) mod base64;
+/// Text extraction from DrawingML chart parts (`c:chartSpace`), shared by
+/// the DOCX and PPTX readers for charts embedded via a drawing relationship.
+pub mod chart;
+pub(crate) mod codepage;
 /// `[Content_Types].xml` parsing and writing.
 pub mod content_types;
 /// Shared `docProps/core.xml` generator used by DOCX, PPTX, XLSX writers.
@@ -17,6 +23,8 @@ pub mod editable;
 pub mod embedded_fonts;
 /// Core error type and `Result` alias used throughout OOXML parsing.
 pub mod error;
+/// Markdown escaping shared by every renderer.
+pub mod markdown;
 /// OPC (Open Packaging Conventions) reader and writer for ZIP-based packages.
 pub mod opc;
 /// Parallel processing helpers (Rayon-based, feature-gated).

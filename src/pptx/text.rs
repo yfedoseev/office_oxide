@@ -1,6 +1,7 @@
 use super::PptxDocument;
 use super::shape::{
-    GraphicContent, HyperlinkTarget, Shape, ShapePosition, Table, TextBody, TextContent,
+    GraphicContent, HyperlinkTarget, Shape, ShapePosition, Table, TableCell, TableRow, TextBody,
+    TextContent,
 };
 
 impl PptxDocument {
@@ -37,10 +38,20 @@ impl PptxDocument {
         let mut result = parts.join("\n\n");
 
         if let Some(ref notes) = slide.notes {
-            if !notes.is_empty() {
+            let text = super::slide::extract_plain_text_from_body(notes);
+            if !text.is_empty() {
                 result.push_str("\n\n[Notes]\n");
-                result.push_str(notes);
+                result.push_str(&text);
             }
+        }
+        // Slide comments are review content; `to_ir()` carries them as
+        // endnotes, and this direct renderer dropped them — a slide whose
+        // only content was its comments came back empty.
+        for c in &slide.comments {
+            result.push_str("\n\n");
+            result.push_str(&comment_marker(c.author.as_deref()));
+            result.push_str(": ");
+            result.push_str(c.text.trim());
         }
 
         Some(result)
@@ -82,14 +93,25 @@ impl PptxDocument {
         }
 
         if let Some(ref notes) = slide.notes {
-            if !notes.is_empty() {
-                for line in notes.lines() {
+            // Same `markdown_from_body` ordinary slide body text already
+            // uses, so bold/italic/strikethrough/bullets in notes get
+            // rendered too, not flattened to plain lines.
+            let md = markdown_from_body(notes);
+            if !md.is_empty() {
+                for line in md.lines() {
                     result.push_str("> ");
                     result.push_str(line);
                     result.push('\n');
                 }
                 result.push('\n');
             }
+        }
+        for c in &slide.comments {
+            result.push_str(&format!(
+                "> **{}:** {}\n\n",
+                comment_marker(c.author.as_deref()),
+                c.text.trim()
+            ));
         }
 
         // Trim trailing whitespace
@@ -128,25 +150,49 @@ fn collect_text_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePositio
                 }
             },
             Shape::Picture(pic) => {
+                // A picture's description is a placeholder, bracketed as
+                // the IR's `plain_text()` renders it; unmarked, it read as
+                // slide text (no reference extractor shows it at all).
                 if let Some(ref alt) = pic.alt_text {
+                    let alt = alt.split_whitespace().collect::<Vec<_>>().join(" ");
                     if !alt.is_empty() {
-                        entries.push((pic.position.clone(), alt.clone()));
+                        entries.push((pic.position.clone(), format!("[{alt}]")));
                     }
                 }
             },
             Shape::Group(grp) => {
                 collect_text_entries(&grp.children, entries);
             },
-            Shape::GraphicFrame(gf) => {
-                if let GraphicContent::Table(ref tbl) = gf.content {
+            Shape::GraphicFrame(gf) => match &gf.content {
+                GraphicContent::Table(tbl) => {
                     let text = plain_text_from_table(tbl);
                     if !text.is_empty() {
                         entries.push((gf.position.clone(), text));
                     }
-                }
+                },
+                // SmartArt and embedded-chart text: `Document::plain_text()`
+                // dispatches here, a separate path from `to_ir()` (which
+                // already reads `GraphicContent::Text` correctly) — the
+                // same dual-renderer gap already hit for XLS dates
+                // and XLSX formulas, this time for chart text.
+                GraphicContent::Text(lines) => {
+                    let text = lines.join("\n");
+                    if !text.is_empty() {
+                        entries.push((gf.position.clone(), text));
+                    }
+                },
+                GraphicContent::Unknown => {},
             },
             Shape::Connector(_) => {},
         }
+    }
+}
+
+/// `Comment (Author)` — the label the IR's endnote carries as its marker.
+fn comment_marker(author: Option<&str>) -> String {
+    match author {
+        Some(a) => format!("Comment ({a})"),
+        None => "Comment".to_string(),
     }
 }
 
@@ -166,23 +212,83 @@ fn plain_text_from_body(body: &TextBody) -> String {
     parts.join("\n")
 }
 
-fn plain_text_from_table(table: &Table) -> String {
-    let mut rows = Vec::new();
-    for row in &table.rows {
-        let mut cells = Vec::new();
+/// Resolve `grid_span`/`row_span` into a proper 2-D grid, so a merged
+/// cell's neighbours land at their true column position instead of
+/// shifting left to fill the gap. Mirrors `ir_render.rs::table_grid`
+/// exactly — this crate hit the identical "flat cell list, not a grid"
+/// bug shape a third time here, on PPTX's own default text/markdown
+/// renderers, after DOCX's read side and the write path.
+fn pptx_table_grid(table: &Table) -> Vec<Vec<Option<&TableCell>>> {
+    // A raw PPTX row's `cells` includes h_merge/v_merge *continuation*
+    // placeholders alongside the real, span-owning cell — unlike the IR's
+    // `Table`, which never carries them at all (convert_pptx_table drops
+    // them before building `TableRow`). Summing every cell's grid_span,
+    // continuation placeholders included, double-counted the columns a
+    // merge already covers.
+    fn real_cells(r: &TableRow) -> impl Iterator<Item = &TableCell> {
+        r.cells.iter().filter(|c| !c.h_merge && !c.v_merge)
+    }
+    let cell_total: usize = table.rows.iter().map(|r| real_cells(r).count()).sum();
+    let width = table
+        .rows
+        .iter()
+        .map(|r| {
+            real_cells(r)
+                .map(|c| c.grid_span.max(1) as usize)
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0)
+        .min(cell_total.saturating_mul(1_000).max(1));
+    let mut grid: Vec<Vec<Option<&TableCell>>> = vec![vec![None; width]; table.rows.len()];
+    let mut covered: Vec<Vec<bool>> = vec![vec![false; width]; table.rows.len()];
+
+    for (r, row) in table.rows.iter().enumerate() {
+        let mut c = 0usize;
         for cell in &row.cells {
             if cell.h_merge || cell.v_merge {
                 continue;
             }
-            let text = cell
-                .text_body
-                .as_ref()
-                .map(plain_text_from_body)
-                .unwrap_or_default();
-            cells.push(text);
+            while c < width && covered[r][c] {
+                c += 1;
+            }
+            if c >= width {
+                break;
+            }
+            grid[r][c] = Some(cell);
+            let cs = cell.grid_span.max(1) as usize;
+            let rs = cell.row_span.max(1) as usize;
+            for dr in 0..rs {
+                for dc in 0..cs {
+                    if r + dr < covered.len() && c + dc < width {
+                        covered[r + dr][c + dc] = true;
+                    }
+                }
+            }
+            c += cs;
         }
-        rows.push(cells.join("\t"));
     }
+    grid
+}
+
+fn cell_plain_text(cell: &TableCell) -> String {
+    cell.text_body
+        .as_ref()
+        .map(plain_text_from_body)
+        .unwrap_or_default()
+}
+
+fn plain_text_from_table(table: &Table) -> String {
+    let grid = pptx_table_grid(table);
+    let rows: Vec<String> = grid
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|slot| slot.map(cell_plain_text).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\t")
+        })
+        .collect();
     rows.join("\n")
 }
 
@@ -212,20 +318,30 @@ fn collect_markdown_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePos
             Shape::Picture(pic) => {
                 if let Some(ref alt) = pic.alt_text {
                     if !alt.is_empty() {
-                        entries.push((pic.position.clone(), format!("![{alt}]()")));
+                        entries.push((
+                            pic.position.clone(),
+                            format!("![{}]()", crate::core::markdown::image_alt(alt)),
+                        ));
                     }
                 }
             },
             Shape::Group(grp) => {
                 collect_markdown_entries(&grp.children, entries);
             },
-            Shape::GraphicFrame(gf) => {
-                if let GraphicContent::Table(ref tbl) = gf.content {
+            Shape::GraphicFrame(gf) => match &gf.content {
+                GraphicContent::Table(tbl) => {
                     let md = markdown_table(tbl);
                     if !md.is_empty() {
                         entries.push((gf.position.clone(), md));
                     }
-                }
+                },
+                GraphicContent::Text(lines) => {
+                    let md = lines.join("\n");
+                    if !md.is_empty() {
+                        entries.push((gf.position.clone(), md));
+                    }
+                },
+                GraphicContent::Unknown => {},
             },
             Shape::Connector(_) => {},
         }
@@ -270,7 +386,8 @@ fn markdown_run(run: &super::shape::TextRun) -> String {
         return String::new();
     }
 
-    let mut text = run.text.clone();
+    // Document text must not read as markdown (`*not bold*`, `<tag>`).
+    let mut text = crate::core::markdown::escape_text(&run.text);
 
     // Apply inline formatting
     if run.strikethrough {
@@ -304,49 +421,35 @@ fn markdown_table(table: &Table) -> String {
         return String::new();
     }
 
-    let mut col_count = 0;
-    let mut md_rows: Vec<Vec<String>> = Vec::new();
-
-    for row in &table.rows {
-        let mut cells = Vec::new();
-        for cell in &row.cells {
-            if cell.h_merge || cell.v_merge {
-                continue;
-            }
-            let text = cell
-                .text_body
-                .as_ref()
-                .map(|tb| {
-                    // Flatten paragraphs for table cells — replace newlines with spaces
-                    plain_text_from_body(tb).replace('\n', " ")
-                })
-                .unwrap_or_default();
-            cells.push(text);
-        }
-        if cells.len() > col_count {
-            col_count = cells.len();
-        }
-        md_rows.push(cells);
-    }
-
+    let grid = pptx_table_grid(table);
+    let col_count = grid.first().map(Vec::len).unwrap_or(0);
     if col_count == 0 {
         return String::new();
     }
+    let md_rows: Vec<Vec<String>> = grid
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|slot| {
+                    slot.map(|cell| {
+                        cell.text_body
+                            .as_ref()
+                            .map(|tb| crate::core::markdown::escape_cell(&plain_text_from_body(tb)))
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default()
+                })
+                .collect()
+        })
+        .collect();
 
     let mut result = String::new();
 
     // Header row
     if let Some(header) = md_rows.first() {
         result.push('|');
-        for (i, cell) in header.iter().enumerate() {
+        for cell in header {
             result.push_str(&format!(" {cell} |"));
-            if i >= col_count - 1 {
-                break;
-            }
-        }
-        // Pad if fewer cells than col_count
-        for _ in header.len()..col_count {
-            result.push_str("  |");
         }
         result.push('\n');
 
@@ -361,14 +464,8 @@ fn markdown_table(table: &Table) -> String {
     // Data rows
     for row in md_rows.iter().skip(1) {
         result.push('|');
-        for (i, cell) in row.iter().enumerate() {
+        for cell in row {
             result.push_str(&format!(" {cell} |"));
-            if i >= col_count - 1 {
-                break;
-            }
-        }
-        for _ in row.len()..col_count {
-            result.push_str("  |");
         }
         result.push('\n');
     }
@@ -426,6 +523,8 @@ mod tests {
     fn make_doc(slides: Vec<Slide>) -> PptxDocument {
         PptxDocument {
             core_properties: None,
+            app_properties: None,
+            has_macros: false,
             presentation: PresentationInfo {
                 slides: Vec::new(),
                 slide_size: None,
@@ -433,6 +532,32 @@ mod tests {
             slides,
             theme: None,
             embedded_fonts: Vec::new(),
+        }
+    }
+
+    /// One `TextBody` paragraph per line — mirrors what a real notes
+    /// slide's body placeholder parses into.
+    fn notes_body(lines: &[&str]) -> TextBody {
+        TextBody {
+            paragraphs: lines
+                .iter()
+                .map(|line| TextParagraph {
+                    level: 0,
+                    alignment: None,
+                    space_before_hundredths_pt: None,
+                    content: vec![TextContent::Run(TextRun {
+                        text: line.to_string(),
+                        bold: None,
+                        italic: None,
+                        strikethrough: false,
+                        hyperlink: None,
+                        font_size_hundredths_pt: None,
+                        color_rgb: None,
+                        ..Default::default()
+                    })],
+                    ..Default::default()
+                })
+                .collect(),
         }
     }
 
@@ -466,6 +591,7 @@ mod tests {
                 }],
             }),
             placeholder: None,
+            hyperlink: None,
         })
     }
 
@@ -502,11 +628,12 @@ mod tests {
                 ph_type: Some("title".to_string()),
                 idx: Some(0),
             }),
+            hyperlink: None,
         })
     }
 
     #[test]
-    fn spatial_sort_order() {
+    fn test_spatial_sort_order() {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![
@@ -524,11 +651,11 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_with_notes() {
+    fn test_plain_text_with_notes() {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![text_shape("Text", "Hello", 0, 0)],
-            notes: Some("Speaker notes".to_string()),
+            notes: Some(notes_body(&["Speaker notes"])),
             background_rgb: None,
             ..Default::default()
         }]);
@@ -538,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_multi_slide() {
+    fn test_plain_text_multi_slide() {
         let doc = make_doc(vec![
             Slide {
                 name: String::new(),
@@ -561,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_with_title() {
+    fn test_markdown_with_title() {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![
@@ -581,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_formatting() {
+    fn test_markdown_formatting() {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![Shape::AutoShape(AutoShape {
@@ -635,6 +762,7 @@ mod tests {
                     }],
                 }),
                 placeholder: None,
+                hyperlink: None,
             })],
             notes: None,
             background_rgb: None,
@@ -646,11 +774,11 @@ mod tests {
     }
 
     #[test]
-    fn markdown_notes_blockquote() {
+    fn test_markdown_notes_blockquote() {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![text_shape("Text", "Content", 0, 0)],
-            notes: Some("Note line 1\nNote line 2".to_string()),
+            notes: Some(notes_body(&["Note line 1", "Note line 2"])),
             background_rgb: None,
             ..Default::default()
         }]);
@@ -659,8 +787,48 @@ mod tests {
         assert!(md.contains("> Note line 1\n> Note line 2"));
     }
 
+    /// Speaker notes used to be flattened to plain text
+    /// before ever reaching a renderer, so a bold run in notes rendered
+    /// as plain text even though the identical formatting survives for
+    /// ordinary slide body text via the same `TextRun`/`markdown_run`
+    /// path.
     #[test]
-    fn markdown_table() {
+    fn test_markdown_notes_preserve_bold_formatting() {
+        let notes = TextBody {
+            paragraphs: vec![TextParagraph {
+                level: 0,
+                alignment: None,
+                space_before_hundredths_pt: None,
+                content: vec![TextContent::Run(TextRun {
+                    text: "THIS LINE IS BOLD".to_string(),
+                    bold: Some(true),
+                    italic: None,
+                    strikethrough: false,
+                    hyperlink: None,
+                    font_size_hundredths_pt: None,
+                    color_rgb: None,
+                    ..Default::default()
+                })],
+                ..Default::default()
+            }],
+        };
+        let doc = make_doc(vec![Slide {
+            name: String::new(),
+            shapes: vec![text_shape("Text", "Content", 0, 0)],
+            notes: Some(notes),
+            background_rgb: None,
+            ..Default::default()
+        }]);
+
+        let md = doc.slide_to_markdown(0).unwrap();
+        assert!(
+            md.contains("> **THIS LINE IS BOLD**"),
+            "bold formatting must survive in notes markdown: {md:?}"
+        );
+    }
+
+    #[test]
+    fn test_markdown_table() {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![Shape::GraphicFrame(GraphicFrame {
@@ -794,8 +962,142 @@ mod tests {
         assert!(md.contains("| A | B |"));
     }
 
+    fn text_cell(
+        text: &str,
+        grid_span: u32,
+        row_span: u32,
+        h_merge: bool,
+        v_merge: bool,
+    ) -> TableCell {
+        let text_body = if h_merge || v_merge {
+            None
+        } else {
+            Some(TextBody {
+                paragraphs: vec![TextParagraph {
+                    level: 0,
+                    alignment: None,
+                    space_before_hundredths_pt: None,
+                    content: vec![TextContent::Run(TextRun {
+                        text: text.to_string(),
+                        bold: None,
+                        italic: None,
+                        strikethrough: false,
+                        hyperlink: None,
+                        font_size_hundredths_pt: None,
+                        color_rgb: None,
+                        ..Default::default()
+                    })],
+                    ..Default::default()
+                }],
+            })
+        };
+        TableCell {
+            text_body,
+            grid_span,
+            row_span,
+            h_merge,
+            v_merge,
+        }
+    }
+
+    /// merged-cell tables rendered with the wrong column
+    /// count and shifted/misaligned content: both plain_text_from_table
+    /// and markdown_table filtered out h_merge/v_merge continuation
+    /// cells and then just pushed the *remaining* cells into a flat
+    /// list (`col_count = cells.len()`), with no grid/covered-position
+    /// tracking — the same "flat cell list, not a grid" bug shape
+    /// already found and fixed for DOCX's read side and write
+    /// path. A 2x2 grid where row 0's first cell spans both
+    /// columns must still show row 1's two cells at their true
+    /// positions, with row 0's merged cell's content followed by one
+    /// blank slot, not shifted left.
     #[test]
-    fn markdown_hyperlink() {
+    fn test_markdown_and_plain_text_tables_handle_merged_cells() {
+        let table = Table {
+            first_row_header: false,
+            last_row_header: false,
+            rows: vec![
+                TableRow {
+                    cells: vec![
+                        text_cell("Merged", 2, 1, false, false),
+                        text_cell("", 1, 1, true, false),
+                    ],
+                },
+                TableRow {
+                    cells: vec![
+                        text_cell("A", 1, 1, false, false),
+                        text_cell("B", 1, 1, false, false),
+                    ],
+                },
+            ],
+        };
+        let doc = make_doc(vec![Slide {
+            name: String::new(),
+            shapes: vec![Shape::GraphicFrame(super::super::shape::GraphicFrame {
+                id: 1,
+                name: "Table".to_string(),
+                position: Some(ShapePosition {
+                    x: 0,
+                    y: 0,
+                    cx: 9000,
+                    cy: 3000,
+                }),
+                content: GraphicContent::Table(table),
+            })],
+            notes: None,
+            background_rgb: None,
+            ..Default::default()
+        }]);
+
+        let plain = doc.slide_plain_text(0).unwrap();
+        assert!(
+            plain.contains("A\tB"),
+            "row 1's cells must stay at their true columns: {plain:?}"
+        );
+
+        let md = doc.slide_to_markdown(0).unwrap();
+        assert!(md.contains("| Merged |  |"), "row 0 must show 2 columns: {md:?}");
+        assert!(md.contains("| A | B |"), "row 1 must not shift left: {md:?}");
+    }
+
+    /// `Document::plain_text()`/`to_markdown()` dispatch to this module, a
+    /// separate path from `to_ir()` (which already read
+    /// `GraphicContent::Text` correctly). `GraphicContent::Text` covers
+    /// both SmartArt and embedded-chart text — neither reached
+    /// plain_text/markdown before this fix.
+    #[test]
+    fn test_graphic_content_text_reaches_plain_text_and_markdown() {
+        let doc = make_doc(vec![Slide {
+            name: String::new(),
+            shapes: vec![Shape::GraphicFrame(super::super::shape::GraphicFrame {
+                id: 1,
+                name: "Chart".to_string(),
+                position: Some(ShapePosition {
+                    x: 0,
+                    y: 0,
+                    cx: 9000,
+                    cy: 3000,
+                }),
+                content: GraphicContent::Text(vec![
+                    "Title: Dollars per Group".to_string(),
+                    "Categories: Group 1, Group 2".to_string(),
+                ]),
+            })],
+            notes: None,
+            background_rgb: None,
+            ..Default::default()
+        }]);
+
+        let plain = doc.slide_plain_text(0).unwrap();
+        assert!(plain.contains("Dollars per Group"), "plain: {plain:?}");
+        assert!(plain.contains("Group 1, Group 2"), "plain: {plain:?}");
+
+        let md = doc.slide_to_markdown(0).unwrap();
+        assert!(md.contains("Dollars per Group"), "markdown: {md:?}");
+    }
+
+    #[test]
+    fn test_markdown_hyperlink() {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![Shape::AutoShape(AutoShape {
@@ -832,6 +1134,7 @@ mod tests {
                     }],
                 }),
                 placeholder: None,
+                hyperlink: None,
             })],
             notes: None,
             background_rgb: None,

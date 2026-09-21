@@ -18,7 +18,12 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         }
         prev = end;
     }
-    if prev < total || windows.is_empty() {
+    // The body-level `<w:sectPr>` describes a final section even when
+    // no element follows the last break: its headers and footers are
+    // still that section's. Skipping the empty window shifted every
+    // `doc.sections[idx]` lookup below and dropped the trailing
+    // section's headers outright.
+    if prev < total || windows.len() < doc.sections.len() || windows.is_empty() {
         windows.push((prev, total));
     }
 
@@ -71,17 +76,13 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         let mut elements = Vec::new();
         convert_block_elements(&doc.body.elements[start..end], &mut elements, doc);
 
+        // Must use the same extraction the write path's "is the title
+        // already present in the elements" check uses (`inline_to_text`),
+        // or a heading containing a `LineBreak` disagrees between the two
+        // and gets duplicated on every write.
         let title = elements.iter().find_map(|e| {
             if let Element::Heading(h) = e {
-                Some(
-                    h.content
-                        .iter()
-                        .filter_map(|c| match c {
-                            InlineContent::Text(span) => Some(span.text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<String>(),
-                )
+                Some(inline_to_text(&h.content))
             } else {
                 None
             }
@@ -154,37 +155,49 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
     // before this.
     if let Some(last) = ir_sections.last_mut() {
         for n in &doc.footnotes {
+            let (marker, rest) = extract_note_marker(&n.content, "FootnoteReference");
             let mut content = Vec::new();
-            convert_block_elements(&n.content, &mut content, doc);
+            convert_block_elements(rest, &mut content, doc);
             if !content.is_empty() {
                 last.elements.push(Element::Footnote(Note {
                     id: n.id,
                     content,
-                    marker: None,
+                    marker,
+                    author: None,
                 }));
             }
         }
         for n in &doc.endnotes {
+            let (marker, rest) = extract_note_marker(&n.content, "EndnoteReference");
             let mut content = Vec::new();
-            convert_block_elements(&n.content, &mut content, doc);
+            convert_block_elements(rest, &mut content, doc);
             if !content.is_empty() {
                 last.elements.push(Element::Endnote(Note {
                     id: n.id,
                     content,
-                    marker: None,
+                    marker,
+                    author: None,
                 }));
             }
         }
         // Comments are annotations rather than body text; carry them as
-        // endnotes with the author kept in the marker so nothing is lost.
+        // endnotes with the author kept in the marker so nothing is lost,
+        // and in the structured `author` field.
         for n in &doc.comments {
             let mut content = Vec::new();
             convert_block_elements(&n.content, &mut content, doc);
             if !content.is_empty() {
+                // The same label the spreadsheet and slide converters use,
+                // so every surface says "Comment (Author): …".
+                let marker = match n.author.as_deref() {
+                    Some(a) => format!("Comment ({a})"),
+                    None => "Comment".to_string(),
+                };
                 last.elements.push(Element::Endnote(Note {
                     id: n.id,
                     content,
-                    marker: n.author.clone(),
+                    marker: Some(marker),
+                    author: n.author.clone(),
                 }));
             }
         }
@@ -209,8 +222,11 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             created: cp.and_then(|c| c.created.clone()),
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
+            has_macros: doc.has_macros,
+            text_truncated: false,
         },
         sections: ir_sections,
+        defined_names: Vec::new(),
     }
 }
 
@@ -359,7 +375,101 @@ fn apply_paragraph_properties(pp: &crate::docx::ParagraphProperties, out: &mut P
     out.keep_together = pp.keep_lines.unwrap_or(false);
     out.page_break_before = pp.page_break_before.unwrap_or(false);
     out.outline_level = pp.outline_level;
-    out.border = pp.borders.as_ref().map(para_borders_to_ir);
+    out.border = pp.borders.as_deref().map(para_borders_to_ir);
+    out.background_color = pp
+        .shading
+        .as_ref()
+        .and_then(|sh| sh.fill.as_deref())
+        .and_then(hex_to_rgb);
+    out.tabs = pp
+        .tabs
+        .iter()
+        .map(|t| TabStop {
+            position_twips: t.position_twips,
+            alignment: match t.alignment.as_str() {
+                "center" => TabAlignment::Center,
+                "right" | "end" => TabAlignment::Right,
+                "decimal" => TabAlignment::Decimal,
+                "bar" => TabAlignment::Bar,
+                _ => TabAlignment::Left,
+            },
+            leader: match t.leader.as_deref() {
+                Some("dot") => TabLeader::Dot,
+                Some("hyphen") => TabLeader::Hyphen,
+                Some("underscore") => TabLeader::Underscore,
+                Some("heavy") => TabLeader::Heavy,
+                Some("middleDot") => TabLeader::MiddleDot,
+                _ => TabLeader::None,
+            },
+        })
+        .collect();
+}
+
+/// Split a custom footnote/endnote mark off the front of a note body, if
+/// present. The writer (`docx/write.rs::generate_notes_xml`) puts the mark
+/// in its own leading paragraph — a single run styled `style_name`
+/// ("FootnoteReference"/"EndnoteReference") with the literal glyph as its
+/// only content — so a real Word auto-number run (which carries the same
+/// style but no `w:t`, just an empty `<w:footnoteRef/>`) is never mistaken
+/// for a custom mark: `content` there stays empty, `Text` never appears.
+fn extract_note_marker<'a>(
+    content: &'a [crate::docx::BlockElement],
+    style_name: &str,
+) -> (Option<String>, &'a [crate::docx::BlockElement]) {
+    let Some(crate::docx::BlockElement::Paragraph(p)) = content.first() else {
+        return (None, content);
+    };
+    let [crate::docx::ParagraphContent::Run(run)] = p.content.as_slice() else {
+        return (None, content);
+    };
+    if run
+        .properties
+        .as_ref()
+        .and_then(|rp| rp.style_id.as_deref())
+        != Some(style_name)
+    {
+        return (None, content);
+    }
+    let [crate::docx::RunContent::Text(text)] = run.content.as_slice() else {
+        return (None, content);
+    };
+    if text.is_empty() {
+        return (None, content);
+    }
+    (Some(text.clone()), &content[1..])
+}
+
+/// Same property set as [`apply_paragraph_properties`], but for a promoted
+/// `Heading`. Outline-level promotion used to keep only the heading's level,
+/// content, frame position and alignment — indent, spacing, line spacing,
+/// keep-with-next/together, shading, borders and tabs all vanished in the
+/// same step, since `Heading` had no fields to receive them.
+fn apply_paragraph_properties_to_heading(pp: &crate::docx::ParagraphProperties, out: &mut Heading) {
+    if let Some(ind) = pp.indent.as_ref() {
+        out.indent_left_twips = ind.left.map(|t| t.0);
+        out.indent_right_twips = ind.right.map(|t| t.0);
+        out.first_line_indent_twips = match (ind.first_line, ind.hanging) {
+            (_, Some(h)) if h.0 != 0 => Some(h.0.saturating_neg()),
+            (Some(f), _) => Some(f.0),
+            _ => None,
+        };
+    }
+    if let Some(sp) = pp.spacing.as_ref() {
+        out.space_before_twips = sp.before.map(|t| t.0.max(0) as u32);
+        out.space_after_twips = sp.after.map(|t| t.0.max(0) as u32);
+        out.line_spacing = sp.line.as_ref().map(|l| {
+            let v = l.value.max(0) as u32;
+            match l.rule {
+                Some(crate::docx::LineSpacingRule::Exact) => LineSpacing::Exact(v),
+                Some(crate::docx::LineSpacingRule::AtLeast) => LineSpacing::AtLeast(v),
+                _ => LineSpacing::Auto(v),
+            }
+        });
+    }
+    out.keep_with_next = pp.keep_next.unwrap_or(false);
+    out.keep_together = pp.keep_lines.unwrap_or(false);
+    out.page_break_before = pp.page_break_before.unwrap_or(false);
+    out.border = pp.borders.as_deref().map(para_borders_to_ir);
     out.background_color = pp
         .shading
         .as_ref()
@@ -427,6 +537,13 @@ fn convert_block_elements(
     doc: &crate::docx::DocxDocument,
 ) {
     let mut i = 0;
+    // A numId resumed later in the same block sequence (after a non-list
+    // paragraph interrupts it) with no explicit override continues
+    // counting from where it left off, per OOXML/Word semantics — not a
+    // fresh 1. Tracks the next start number per numId across the several
+    // `convert_list_group` calls this loop makes.
+    let mut numbering_counts: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
     while i < blocks.len() {
         match &blocks[i] {
             crate::docx::BlockElement::Paragraph(p) => {
@@ -437,22 +554,32 @@ fn convert_block_elements(
                 let eff = effective_paragraph_props(p, doc);
                 let eff_ref = eff.as_ref();
 
+                // Heading level wins over list membership. Word's own
+                // multilevel-list "Heading" gallery attaches numPr/ilfo to
+                // the heading styles themselves, so a numbered heading
+                // ("1. Introduction", "2.3 Scope") is the normal shape of
+                // headings in real documents — checking list membership
+                // first turned every one of them into a ListItem, leaving
+                // the IR with no Headings, no Section.title, no guessed
+                // metadata.title.
+                let heading_level = resolve_heading_level(p, doc);
+
                 // Check if this is a list item — group consecutive list
                 // paragraphs. `<w:numId w:val="0"/>` is the ECMA-376 way of
                 // saying "this paragraph has no numbering" — usually a
                 // style-level list switched off for one paragraph. Treating
                 // it as a list turned an ordinary paragraph into a bullet.
-                if let Some(nr) = eff_ref
-                    .and_then(|pp| pp.numbering_ref.as_ref())
-                    .filter(|nr| nr.num_id != 0)
+                if heading_level.is_none()
+                    && let Some(nr) = eff_ref
+                        .and_then(|pp| pp.numbering_ref.as_ref())
+                        .filter(|nr| nr.num_id != 0)
                 {
-                    let list_element = convert_list_group(blocks, &mut i, nr.num_id, doc);
+                    let list_element =
+                        convert_list_group(blocks, &mut i, nr.num_id, doc, &mut numbering_counts);
                     elements.push(list_element);
                     continue;
                 }
 
-                // Check for heading
-                let heading_level = resolve_heading_level(p, doc);
                 let alignment = eff_ref.and_then(paragraph_alignment);
 
                 // Detect "horizontal rule" encoding: empty paragraph
@@ -468,45 +595,73 @@ fn convert_block_elements(
                 let has_bottom_border = eff_ref.is_some_and(|pp| pp.has_bottom_border);
                 if is_empty_para && has_bottom_border {
                     elements.push(Element::ThematicBreak);
+                    // The paragraph has no text, not no content: a heading
+                    // style with a bottom border that holds only a chart,
+                    // a picture or a text box used to `continue` past the
+                    // collectors below and lose the drawing entirely.
+                    collect_paragraph_floats(p, doc, elements);
+                    collect_paragraph_inline_images(p, doc, elements);
+                    collect_paragraph_text_boxes(p, doc, elements);
+                    collect_paragraph_chart_text(p, elements);
                     i += 1;
                     continue;
                 }
 
                 if let Some(level) = heading_level {
-                    elements.push(Element::Heading(Heading {
+                    let mut heading = Heading {
                         level: (level + 1).min(6),
-                        content: convert_paragraph_inline(p, doc),
+                        content: convert_heading_inline(p, doc),
                         frame_position: paragraph_frame_position(p),
                         alignment,
-                    }));
+                        ..Default::default()
+                    };
+                    if let Some(pp) = eff_ref {
+                        apply_paragraph_properties_to_heading(pp, &mut heading);
+                    }
+                    elements.push(Element::Heading(heading));
                 } else {
-                    // Check for page break in runs
-                    let (before_break, hard_break) = split_at_page_break(p, doc);
+                    // A hard break splits the paragraph: the runs before it,
+                    // the break, the runs after it. The runs after used to
+                    // be dropped — and Word writes a manual page break as
+                    // `<w:br w:type="page"/>` at the *start* of the next
+                    // paragraph, so that paragraph's whole text vanished
+                    // from every IR-backed surface while `plain_text()`
+                    // kept it (75 corpus files).
                     let frame_pos = paragraph_frame_position(p);
-                    if !before_break.is_empty() || hard_break.is_none() {
+                    let make_para = |content: Vec<InlineContent>| {
                         let mut para = Paragraph {
-                            content: if before_break.is_empty() && hard_break.is_none() {
-                                convert_paragraph_inline(p, doc)
-                            } else {
-                                before_break
-                            },
-                            frame_position: frame_pos,
-                            alignment,
+                            content,
+                            frame_position: frame_pos.clone(),
+                            alignment: alignment.clone(),
                             ..Default::default()
                         };
                         if let Some(pp) = eff_ref {
                             apply_paragraph_properties(pp, &mut para);
                         }
-                        elements.push(Element::Paragraph(para));
-                    }
-                    // A `<w:br w:type="page"/>` is a page break, not a
-                    // horizontal rule. Emitting `ThematicBreak` here used to
-                    // put a `---` in the markdown of every paginated document
-                    // and made `PageBreak`/`ColumnBreak` unreachable.
-                    match hard_break {
-                        Some(HardBreak::Page) => elements.push(Element::PageBreak),
-                        Some(HardBreak::Column) => elements.push(Element::ColumnBreak),
-                        None => {},
+                        Element::Paragraph(para)
+                    };
+                    let mut segments = split_at_hard_breaks(p, doc);
+                    if segments.len() == 1 && segments[0].1.is_none() {
+                        elements.push(make_para(convert_paragraph_inline(p, doc)));
+                    } else {
+                        // The paragraph's own slot is the first segment when
+                        // it holds text; later segments are paragraphs only
+                        // when they hold text, so a paragraph that is just
+                        // a page break stays just a page break.
+                        for (content, brk) in segments.drain(..) {
+                            if !content.is_empty() {
+                                elements.push(make_para(content));
+                            }
+                            // A `<w:br w:type="page"/>` is a page break, not
+                            // a horizontal rule. Emitting `ThematicBreak`
+                            // here used to put a `---` in the markdown of
+                            // every paginated document.
+                            match brk {
+                                Some(HardBreak::Page) => elements.push(Element::PageBreak),
+                                Some(HardBreak::Column) => elements.push(Element::ColumnBreak),
+                                None => {},
+                            }
+                        }
                     }
                 }
                 // Promote any floating drawings (anchored images, vector
@@ -526,14 +681,57 @@ fn convert_block_elements(
                 // frame. Leaving them unread silently dropped most of the
                 // prose in documents that lay text out with shapes.
                 collect_paragraph_text_boxes(p, doc, elements);
+                // Native charts keep every word they display in a separate
+                // part (`word/charts/chartN.xml`). The reader resolves it
+                // at open time; hoist the recovered lines to paragraph
+                // siblings so the chart's title, categories, series names
+                // and data values reach the IR.
+                collect_paragraph_chart_text(p, elements);
                 i += 1;
             },
             crate::docx::BlockElement::Table(t) => {
-                elements.push(convert_table(t, doc));
+                let table_elem = convert_table(t, doc);
+                // A table's accessibility caption (`w:tblCaption`) sits
+                // in `Table.caption`, but the writer also emits it as a
+                // visible "Caption"-styled paragraph immediately before
+                // `<w:tbl>` (nothing else ever renders `Table.caption`
+                // as visible text). Reading it back turned that
+                // paragraph into an ordinary sibling `Element::Paragraph`
+                // alongside the table's own `caption` field — the same
+                // text represented twice — and the next write emitted
+                // BOTH, growing by one duplicate paragraph every
+                // round trip. Absorbing the immediately-preceding
+                // matching paragraph here instead keeps the caption
+                // represented exactly once.
+                if let Element::Table(Table {
+                    caption: Some(cap), ..
+                }) = &table_elem
+                {
+                    let cap = cap.trim();
+                    let last_matches = matches!(
+                        elements.last(),
+                        Some(Element::Paragraph(p)) if paragraph_plain_text(p).trim() == cap
+                    );
+                    if last_matches {
+                        elements.pop();
+                    }
+                }
+                elements.push(table_elem);
                 i += 1;
             },
         }
     }
+}
+
+/// Plain-text content of a paragraph's inline runs, no formatting.
+fn paragraph_plain_text(p: &Paragraph) -> String {
+    let mut out = String::new();
+    for content in &p.content {
+        if let InlineContent::Text(span) = content {
+            out.push_str(&span.text);
+        }
+    }
+    out
 }
 
 /// Pull `<w:framePr>` data out of a paragraph's properties into the IR
@@ -590,6 +788,30 @@ fn collect_paragraph_inline_images(
                         display_width_emu: Some(d.width.0.max(0) as u64),
                         display_height_emu: Some(d.height.0.max(0) as u64),
                         positioning: ImagePositioning::Inline,
+                        ..Default::default()
+                    }));
+                }
+            }
+        }
+    }
+}
+
+/// Emit one IR paragraph per line of text recovered from a chart or
+/// SmartArt diagram part referenced by a drawing in this paragraph.
+fn collect_paragraph_chart_text(p: &crate::docx::Paragraph, out: &mut Vec<Element>) {
+    for pc in &p.content {
+        let runs: &[crate::docx::Run] = match pc {
+            crate::docx::ParagraphContent::Run(r) => std::slice::from_ref(r),
+            crate::docx::ParagraphContent::Hyperlink(hl) => &hl.runs,
+        };
+        for run in runs {
+            for rc in &run.content {
+                let crate::docx::RunContent::Drawing(d) = rc else {
+                    continue;
+                };
+                for line in d.chart_text.iter().chain(d.dgm_text.iter()) {
+                    out.push(Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan::plain(line.clone()))],
                         ..Default::default()
                     }));
                 }
@@ -834,7 +1056,27 @@ fn convert_paragraph_inline(
     p: &crate::docx::Paragraph,
     doc: &crate::docx::DocxDocument,
 ) -> Vec<InlineContent> {
-    let ctx = run_context(p, doc);
+    convert_inline_with(p, run_context(p, doc))
+}
+
+/// A heading's spans, without the formatting its own paragraph style
+/// supplies. `Heading 1`'s `<w:b/>`/`<w:sz>` *are* the heading — folding
+/// them into every span rendered `<h1><strong>…</strong></h1>` and
+/// `# **…**` on every styled heading, which is not what Word shows and
+/// not what pandoc or python-docx report. Direct formatting and character
+/// styles still apply.
+fn convert_heading_inline(
+    p: &crate::docx::Paragraph,
+    doc: &crate::docx::DocxDocument,
+) -> Vec<InlineContent> {
+    let ctx = RunContext {
+        paragraph_style_id: None,
+        ..run_context(p, doc)
+    };
+    convert_inline_with(p, ctx)
+}
+
+fn convert_inline_with(p: &crate::docx::Paragraph, ctx: RunContext<'_>) -> Vec<InlineContent> {
     let mut content = Vec::new();
     for pc in &p.content {
         match pc {
@@ -849,6 +1091,9 @@ fn convert_paragraph_inline(
             },
         }
     }
+    // Slack from `Vec`'s minimum capacity: an inline slot is ~100 bytes
+    // and most paragraphs hold one span.
+    content.shrink_to_fit();
     content
 }
 
@@ -873,6 +1118,15 @@ fn convert_run(
         },
         None => run.properties.as_ref(),
     };
+    // `<w:vanish/>` — Word never renders this run at all. Excluding it
+    // here (rather than carrying a `hidden` flag into the IR for every
+    // renderer to filter separately) keeps plain_text/to_markdown/to_html
+    // and the CLI's JSON projection automatically in agreement, instead
+    // of risking a 5th instance of this crate's "two renderers disagree"
+    // flaw.
+    if effective.and_then(|rp| rp.hidden).unwrap_or(false) {
+        return;
+    }
     let bold = effective.and_then(|rp| rp.bold).unwrap_or(false);
     let italic = effective.and_then(|rp| rp.italic).unwrap_or(false);
     let strike = effective
@@ -988,6 +1242,52 @@ fn convert_run(
                 // run *and* re-attached it to the image, so the document
                 // grew every time it was read and written back.
             },
+            // The citation point in body text — the note *body* is
+            // converted separately into `Element::Footnote`/`Endnote`.
+            // Carrying the reference mark here is the whole point:
+            // before this, to_ir() had the note body but no record of
+            // where it was cited.
+            crate::docx::RunContent::FootnoteRef(id, _) => {
+                content.push(InlineContent::FootnoteRef(FootnoteRef {
+                    note_id: *id,
+                    marker: None,
+                }));
+            },
+            crate::docx::RunContent::EndnoteRef(id, _) => {
+                content.push(InlineContent::EndnoteRef(FootnoteRef {
+                    note_id: *id,
+                    marker: None,
+                }));
+            },
+            // No IR-level representation for a comment's citation point
+            // today (only the comment body reaches the IR, via the
+            // existing Element::Endnote aliasing) — nothing to add here.
+            crate::docx::RunContent::CommentRef(_) => {},
+            crate::docx::RunContent::FormField(ff) => {
+                if let Some(text) = &ff.display_text {
+                    content.push(InlineContent::Text(TextSpan {
+                        text: text.clone(),
+                        bold,
+                        italic,
+                        strikethrough: strike,
+                        hyperlink: hyperlink_url.map(|s| s.to_string()),
+                        font_size_half_pt,
+                        font_name: font_name.clone(),
+                        color: text_color,
+                        underline: underline.clone(),
+                        highlight,
+                        vertical_align: vertical_align.clone(),
+                        all_caps,
+                        small_caps,
+                        char_spacing_half_pt,
+                    }));
+                }
+            },
+            // Resolved into a TextBox sibling during from_opc when the
+            // reference could be followed (SmartArt, embedded
+            // package); an unresolvable one is dropped, matching the
+            // type's documented intent.
+            crate::docx::RunContent::DeferredPart(_) => {},
         }
     }
 }
@@ -999,43 +1299,65 @@ enum HardBreak {
     Column,
 }
 
-fn split_at_page_break(
+/// The paragraph's inline content cut at every hard (page/column) break:
+/// `(content before the break, the break)`, with the final segment's
+/// break `None`. A paragraph without one is a single segment.
+fn split_at_hard_breaks(
     p: &crate::docx::Paragraph,
     doc: &crate::docx::DocxDocument,
-) -> (Vec<InlineContent>, Option<HardBreak>) {
+) -> Vec<(Vec<InlineContent>, Option<HardBreak>)> {
     let ctx = run_context(p, doc);
+    let mut segments: Vec<(Vec<InlineContent>, Option<HardBreak>)> = Vec::new();
     let mut content = Vec::new();
-    let mut has_break: Option<HardBreak> = None;
-
+    let convert_run_split =
+        |run: &crate::docx::Run,
+         url: Option<&str>,
+         content: &mut Vec<InlineContent>,
+         segments: &mut Vec<(Vec<InlineContent>, Option<HardBreak>)>| {
+            // A run holding a hard break is converted around it: the run's
+            // pieces before and after the break belong to different segments.
+            let mut piece = run.clone();
+            piece.content.clear();
+            for rc in &run.content {
+                let brk = match rc {
+                    crate::docx::RunContent::Break(crate::docx::BreakType::Page) => {
+                        Some(HardBreak::Page)
+                    },
+                    crate::docx::RunContent::Break(crate::docx::BreakType::Column) => {
+                        Some(HardBreak::Column)
+                    },
+                    _ => None,
+                };
+                match brk {
+                    Some(b) => {
+                        if !piece.content.is_empty() {
+                            convert_run(&piece, url, &ctx, content);
+                            piece.content.clear();
+                        }
+                        segments.push((std::mem::take(content), Some(b)));
+                    },
+                    None => piece.content.push(rc.clone()),
+                }
+            }
+            if !piece.content.is_empty() {
+                convert_run(&piece, url, &ctx, content);
+            }
+        };
     for pc in &p.content {
         match pc {
             crate::docx::ParagraphContent::Run(run) => {
-                for rc in &run.content {
-                    match rc {
-                        crate::docx::RunContent::Break(crate::docx::BreakType::Page) => {
-                            has_break.get_or_insert(HardBreak::Page);
-                        },
-                        crate::docx::RunContent::Break(crate::docx::BreakType::Column) => {
-                            has_break.get_or_insert(HardBreak::Column);
-                        },
-                        _ => {},
-                    }
-                }
-                if has_break.is_none() {
-                    convert_run(run, None, &ctx, &mut content);
-                }
+                convert_run_split(run, None, &mut content, &mut segments);
             },
             crate::docx::ParagraphContent::Hyperlink(hl) => {
-                if has_break.is_none() {
-                    let url = hyperlink_url(hl);
-                    for run in &hl.runs {
-                        convert_run(run, url.as_deref(), &ctx, &mut content);
-                    }
+                let url = hyperlink_url(hl);
+                for run in &hl.runs {
+                    convert_run_split(run, url.as_deref(), &mut content, &mut segments);
                 }
             },
         }
     }
-    (content, has_break)
+    segments.push((content, None));
+    segments
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,9 +1369,14 @@ fn convert_list_group(
     i: &mut usize,
     num_id: u32,
     doc: &crate::docx::DocxDocument,
+    numbering_counts: &mut std::collections::HashMap<u32, u32>,
 ) -> Element {
     let mut items = Vec::new();
     let mut is_ordered = false;
+    // How many items at the group's own (shallowest) level this group
+    // contributes — used to advance `numbering_counts` for
+    // interrupted-list continuation.
+    let mut top_level_item_count: u32 = 0;
     // The marker style and start value of the *shallowest* level in the
     // group describe the list the IR is about to build. Both used to be
     // resolved and then thrown away, so a list starting at 5 rendered as
@@ -1085,14 +1412,23 @@ fn convert_list_group(
                         if top_ilvl.is_none_or(|t| nr.ilvl < t) {
                             top_ilvl = Some(nr.ilvl);
                             style = number_format_to_list_style(&level.format);
-                            // `w:start` defaults to 1; only report an
-                            // explicit non-default so renderers that ignore
-                            // the field are not silently contradicted.
-                            start_number = (level.start != 1).then_some(level.start);
+                            // Honour this instance's own `<w:startOverride>`
+                            // when present, falling back to the
+                            // abstract level's own `<w:start>`. `w:start`
+                            // defaults to 1; only report an explicit
+                            // non-default so renderers that ignore the
+                            // field are not silently contradicted.
+                            let effective_start = numbering
+                                .resolve_start(nr.num_id, nr.ilvl)
+                                .unwrap_or(level.start);
+                            start_number = (effective_start != 1).then_some(effective_start);
                         }
                     }
                 }
 
+                if top_ilvl == Some(nr.ilvl) {
+                    top_level_item_count += 1;
+                }
                 items.push((nr.ilvl, convert_paragraph_inline(p, doc)));
                 *i += 1;
                 continue;
@@ -1108,6 +1444,17 @@ fn convert_list_group(
     if *i == start_index {
         *i += 1;
     }
+
+    // A numId seen earlier in this same block sequence, with no explicit
+    // `w:start`/`w:startOverride` this time, continues counting from where
+    // the previous group left off rather than restarting at 1.
+    if start_number.is_none() {
+        if let Some(&prev_count) = numbering_counts.get(&num_id) {
+            start_number = Some(prev_count + 1);
+        }
+    }
+    let resumed_from = start_number.unwrap_or(1);
+    numbering_counts.insert(num_id, resumed_from + top_level_item_count.saturating_sub(1));
 
     // Build nested list structure from flat (ilvl, content) pairs
     let mut list = crate::ir::build_nested_list(is_ordered, &items, 0);
@@ -1142,6 +1489,34 @@ const MAX_GRID_SPAN: u32 = 1_000;
 const MAX_TABLE_COLS: usize = 10_000;
 
 fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) -> Element {
+    // A table cell can hold another table (`convert_block_elements` ->
+    // `convert_table` -> `convert_block_elements` -> ...), so this
+    // recurses on whatever it's given — including a tree the XML parser
+    // already bounded to `MAX_NESTING_DEPTH`. That bound protects parsing
+    // (which runs on its own larger stack), but to_ir() runs on whatever
+    // stack the caller has, and re-walking a tree that deep overflowed it
+    // (the same defect class as an unguarded XML parse, one
+    // layer downstream of it).
+    let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+        return Element::Table(Table {
+            rows: vec![TableRow {
+                cells: vec![TableCell {
+                    content: vec![Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan::plain(format!(
+                            "[nested table deeper than {} levels not shown — \
+                             document truncated]",
+                            crate::core::xml::MAX_NESTING_DEPTH
+                        )))],
+                        ..Default::default()
+                    })],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+    };
+
     // First pass: compute row_span from vMerge patterns
     let num_rows = table.rows.len();
     // `w:gridSpan` is attacker-controlled and parsed as an unbounded u32.
@@ -1241,6 +1616,17 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
                 continue;
             }
 
+            // A cell deleted via tracked changes (`w:cellDel`) is excluded
+            // from the accepted view — same policy already applied to
+            // run-level `w:del` — but its grid position still needs to be
+            // accounted for, exactly like a vMerge-continue cell, so later
+            // real cells in the row don't shift into the wrong column.
+            let is_deleted = cell.properties.as_ref().is_some_and(|p| p.deleted);
+            if is_deleted {
+                grid_col += col_span as usize;
+                continue;
+            }
+
             let row_span = if grid_col < num_cols {
                 row_spans[row_idx][grid_col]
             } else {
@@ -1249,17 +1635,33 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
 
             let mut cell_elements = Vec::new();
             convert_block_elements(&cell.content, &mut cell_elements, doc);
+            // One paragraph per cell is the norm; an `Element` slot is
+            // ~270 bytes and a fresh `Vec` reserves four of them.
+            cell_elements.shrink_to_fit();
+
+            // The writer already emits `<w:jc>` inside a cell's paragraph
+            // from `TableCell::text_align` (`docx/write.rs`), but nothing
+            // read it back — take the first paragraph's alignment as the
+            // cell's own, the same convention the writer uses when it
+            // stamps every paragraph in the cell with this one value.
+            let text_align = cell_elements.iter().find_map(|e| match e {
+                Element::Paragraph(p) => p.alignment.clone(),
+                _ => None,
+            });
 
             let cp = cell.properties.as_ref();
             ir_cells.push(TableCell {
                 content: cell_elements,
                 col_span,
                 row_span,
+                text_align,
                 background_color: cp
                     .and_then(|p| p.shading.as_ref())
                     .and_then(|sh| sh.fill.as_deref())
                     .and_then(hex_to_rgb),
-                border: cp.and_then(|p| p.borders.as_ref()).map(table_borders_to_ir),
+                border: cp
+                    .and_then(|p| p.borders.as_deref())
+                    .map(table_borders_to_ir),
                 vertical_align: cp.and_then(|p| p.v_align).map(|va| match va {
                     crate::docx::CellVAlign::Top => CellVerticalAlign::Top,
                     crate::docx::CellVAlign::Center => CellVerticalAlign::Center,

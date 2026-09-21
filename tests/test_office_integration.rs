@@ -77,6 +77,181 @@ fn make_docx_with_numbering(document_xml: &[u8], numbering_xml: &[u8]) -> Vec<u8
     writer.finish().unwrap().into_inner()
 }
 
+fn make_docx_with_styles_and_numbering(
+    document_xml: &[u8],
+    styles_xml: &[u8],
+    numbering_xml: &[u8],
+) -> Vec<u8> {
+    let cursor = Cursor::new(Vec::new());
+    let mut writer = OpcWriter::new(cursor).unwrap();
+    let doc_part = PartName::new("/word/document.xml").unwrap();
+    writer
+        .add_part(
+            &doc_part,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+            document_xml,
+        )
+        .unwrap();
+    writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+    let styles_part = PartName::new("/word/styles.xml").unwrap();
+    writer
+        .add_part(
+            &styles_part,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml",
+            styles_xml,
+        )
+        .unwrap();
+    writer.add_part_rel(&doc_part, rel_types::STYLES, "styles.xml");
+    let num_part = PartName::new("/word/numbering.xml").unwrap();
+    writer
+        .add_part(
+            &num_part,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml",
+            numbering_xml,
+        )
+        .unwrap();
+    writer.add_part_rel(&doc_part, rel_types::NUMBERING, "numbering.xml");
+    writer.finish().unwrap().into_inner()
+}
+
+/// Bold and italic that live in a paragraph style's `w:rPr` or in a
+/// character style (`w:rStyle`, Word's "Strong"/"Emphasis") reached
+/// `to_ir()` through the style chain but not the direct `to_markdown()`
+/// renderer, which read the run's own `w:rPr` alone — so a template whose
+/// formatting is all in styles rendered as plain text on one surface and
+/// bold on the other.
+#[test]
+fn test_markdown_applies_run_formatting_inherited_from_styles() {
+    let document = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:p><w:pPr><w:pStyle w:val="Strongish"/></w:pPr><w:r><w:t>para-style bold</w:t></w:r></w:p>
+<w:p><w:r><w:rPr><w:rStyle w:val="Strong"/></w:rPr><w:t>char-style bold italic</w:t></w:r></w:p>
+<w:p><w:pPr><w:pStyle w:val="Strongish"/></w:pPr><w:r><w:rPr><w:b w:val="0"/></w:rPr><w:t>switched off</w:t></w:r></w:p>
+</w:body></w:document>"#;
+    let styles = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+<w:style w:type="paragraph" w:styleId="Strongish"><w:name w:val="Strongish"/><w:basedOn w:val="Normal"/><w:rPr><w:b/></w:rPr></w:style>
+<w:style w:type="character" w:styleId="Strong"><w:name w:val="Strong"/><w:rPr><w:b/><w:i/></w:rPr></w:style>
+</w:styles>"#;
+    let bytes = make_docx_with_styles(document, styles);
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+    let md = doc.to_markdown();
+    assert!(md.contains("**para-style bold**"), "{md}");
+    assert!(md.contains("***char-style bold italic***"), "{md}");
+    assert!(
+        md.contains("switched off") && !md.contains("**switched off**"),
+        "direct w:b=0 wins: {md}"
+    );
+    let html = doc.to_html();
+    assert_eq!(html.matches("<strong>").count(), 2, "{html}");
+}
+
+/// Table cells were rendered as plain text by the direct markdown
+/// renderer — every bold or italic span inside a table vanished on that
+/// surface while `to_html()` kept it (162 vs 2 on one corpus file).
+#[test]
+fn test_markdown_table_cells_keep_inline_formatting() {
+    let document = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:tbl><w:tr><w:tc><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Name</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:rPr><w:i/></w:rPr><w:t>Role</w:t></w:r></w:p></w:tc></w:tr>
+<w:tr><w:tc><w:p><w:r><w:t>Ada</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Engineer</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+</w:body></w:document>"#;
+    let bytes = make_minimal_docx(document);
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+    let md = doc.to_markdown();
+    assert!(md.contains("| **Name** | *Role* |"), "{md}");
+    assert!(md.contains("| Ada | Engineer |"), "{md}");
+}
+
+/// Word documents wrap whole forms in a one-cell table to draw a border
+/// around them. Markdown cannot nest tables, so both markdown renderers
+/// flattened the real table into that single cell — 1 row where the
+/// document has 77. The frame's content is rendered in its place.
+#[test]
+fn test_markdown_unwraps_a_one_cell_layout_frame_around_a_table() {
+    let document = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:tbl><w:tr><w:tc>
+  <w:p><w:r><w:t>Form title</w:t></w:r></w:p>
+  <w:tbl><w:tr><w:tc><w:p><w:r><w:t>Name</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Role</w:t></w:r></w:p></w:tc></w:tr>
+  <w:tr><w:tc><w:p><w:r><w:t>Ada</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Engineer</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+</w:tc></w:tr></w:tbl>
+</w:body></w:document>"#;
+    let bytes = make_minimal_docx(document);
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+    for (surface, md) in [
+        ("direct", doc.to_markdown()),
+        ("ir", doc.to_markdown_with(office_oxide::ir_render::MarkdownOptions::default())),
+    ] {
+        assert!(md.contains("Form title"), "{surface}: {md}");
+        assert!(md.contains("| Name | Role |"), "{surface}: {md}");
+        assert!(md.contains("| Ada | Engineer |"), "{surface}: {md}");
+        assert_eq!(md.lines().filter(|l| l.starts_with('|')).count(), 3, "{surface}: {md}");
+    }
+    // The HTML surface still nests, as HTML can.
+    assert_eq!(doc.to_html().matches("<table").count(), 2);
+}
+
+/// A heading style's `<w:b/>`/`<w:sz>` *are* the heading. Folding them
+/// into the spans rendered `<h1><strong>…</strong></h1>` and `# **…**` for
+/// every styled heading; direct formatting inside a heading still shows.
+#[test]
+fn test_heading_style_formatting_is_not_emphasis_but_direct_formatting_is() {
+    let document = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t xml:space="preserve">Plain </w:t></w:r><w:r><w:rPr><w:i/></w:rPr><w:t>italic</w:t></w:r></w:p>
+</w:body></w:document>"#;
+    let styles = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:pPr><w:outlineLvl w:val="0"/></w:pPr><w:rPr><w:b/><w:sz w:val="32"/></w:rPr></w:style>
+</w:styles>"#;
+    let bytes = make_docx_with_styles(document, styles);
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+    let md = doc.to_markdown();
+    assert!(md.starts_with("# Plain *italic*"), "{md}");
+    let html = doc.to_html();
+    assert!(html.starts_with("<h1>Plain <em>italic</em></h1>"), "{html}");
+}
+
+/// Word's own "List Bullet" / "List Number" styles carry the `w:numPr`
+/// in the *style*, not on each paragraph. `to_ir()` resolved that through
+/// the style chain; the direct `to_markdown()` renderer read the
+/// paragraph's own `w:pPr` and rendered every such list as plain lines —
+/// a business-plan template with 157 bullet items came out with none.
+#[test]
+fn test_markdown_lists_paragraphs_whose_numbering_comes_from_their_style() {
+    let document = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:p><w:pPr><w:pStyle w:val="ListBullet"/></w:pPr><w:r><w:t>styled item</w:t></w:r></w:p>
+<w:p><w:pPr><w:pStyle w:val="ListBullet"/><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr><w:r><w:t>switched off</w:t></w:r></w:p>
+<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr></w:pPr><w:r><w:t>direct item</w:t></w:r></w:p>
+</w:body></w:document>"#;
+    let styles = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+<w:style w:type="paragraph" w:styleId="ListBullet"><w:name w:val="List Bullet"/><w:basedOn w:val="Normal"/><w:pPr><w:numPr><w:numId w:val="7"/></w:numPr></w:pPr></w:style>
+</w:styles>"#;
+    let numbering = br#"<?xml version="1.0" encoding="UTF-8"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="&#8226;"/></w:lvl></w:abstractNum>
+<w:num w:numId="7"><w:abstractNumId w:val="0"/></w:num>
+</w:numbering>"#;
+    let bytes = make_docx_with_styles_and_numbering(document, styles, numbering);
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+    let md = doc.to_markdown();
+    assert!(md.contains("- styled item"), "style-level numPr: {md}");
+    assert!(md.contains("- direct item"), "direct numPr: {md}");
+    assert!(
+        !md.contains("- switched off") && md.contains("switched off"),
+        "numId 0 switches the style's list off: {md}"
+    );
+    // The IR-backed surface agrees, so the two renderers no longer diverge.
+    let html = doc.to_html();
+    assert_eq!(html.matches("<li>").count(), 2, "{html}");
+}
+
 struct XlsxBuilder {
     writer: OpcWriter<Cursor<Vec<u8>>>,
     workbook_part: PartName,
@@ -216,7 +391,7 @@ fn pres_xml(slide_ids: &[(u32, &str)]) -> Vec<u8> {
 // ===========================================================================
 
 #[test]
-fn docx_via_unified_api() {
+fn test_docx_via_unified_api() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -237,7 +412,7 @@ fn docx_via_unified_api() {
 // ===========================================================================
 
 #[test]
-fn xlsx_via_unified_api() {
+fn test_xlsx_via_unified_api() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -281,7 +456,7 @@ fn xlsx_via_unified_api() {
 // ===========================================================================
 
 #[test]
-fn pptx_via_unified_api() {
+fn test_pptx_via_unified_api() {
     let slide_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
        xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -341,7 +516,7 @@ fn pptx_via_unified_api() {
 // ===========================================================================
 
 #[test]
-fn format_detection() {
+fn test_format_detection() {
     assert_eq!(DocumentFormat::from_extension("docx"), Some(DocumentFormat::Docx));
     assert_eq!(DocumentFormat::from_extension("xlsx"), Some(DocumentFormat::Xlsx));
     assert_eq!(DocumentFormat::from_extension("pptx"), Some(DocumentFormat::Pptx));
@@ -354,7 +529,7 @@ fn format_detection() {
 // ===========================================================================
 
 #[test]
-fn from_reader_with_format() {
+fn test_from_reader_with_format() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -373,7 +548,7 @@ fn from_reader_with_format() {
 // This uses open() which requires a file path — we test the function exists
 // by calling from_reader and plain_text which is equivalent.
 #[test]
-fn extract_text_equivalent() {
+fn test_extract_text_equivalent() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -390,7 +565,7 @@ fn extract_text_equivalent() {
 // ===========================================================================
 
 #[test]
-fn docx_to_ir_headings_and_formatting() {
+fn test_docx_to_ir_headings_and_formatting() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -440,11 +615,11 @@ fn docx_to_ir_headings_and_formatting() {
     }
 }
 
-// Regression (issue #71): a horizontal-rule paragraph (empty paragraph with a
+// Regression: a horizontal-rule paragraph (empty paragraph with a
 // bottom-only pBdr) must (a) not truncate the document and (b) still convert
 // to Element::ThematicBreak via the unified to_ir() path.
 #[test]
-fn docx_to_ir_pbdr_hr_becomes_thematic_break() {
+fn test_docx_to_ir_pbdr_hr_becomes_thematic_break() {
     // Compact XML (no inter-tag whitespace), as real Word output — this is
     // what triggers the truncation bug the fix addresses.
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Above</w:t></w:r></w:p><w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr></w:pPr></w:p><w:p><w:r><w:t>Below</w:t></w:r></w:p></w:body></w:document>"#;
@@ -468,7 +643,7 @@ fn docx_to_ir_pbdr_hr_becomes_thematic_break() {
 // ===========================================================================
 
 #[test]
-fn xlsx_to_ir_sheets_as_sections() {
+fn test_xlsx_to_ir_sheets_as_sections() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -517,14 +692,14 @@ fn xlsx_to_ir_sheets_as_sections() {
 }
 
 // ===========================================================================
-// 8b. Regression: issue #72 — XLSX to_ir() cells carry semantic type + format
+// 8b. Regression: XLSX to_ir() cells carry semantic type + format
 // ===========================================================================
 
 // Before the fix, every IR TableCell was a plain text span with no way to
 // tell a number or date cell from text (WASM `toIr()` "always says text").
 // The grid path now populates data_type / raw_number / number_format(_id).
 #[test]
-fn xlsx_to_ir_cell_data_types_and_formats() {
+fn test_xlsx_to_ir_cell_data_types_and_formats() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -621,14 +796,14 @@ fn xlsx_to_ir_cell_data_types_and_formats() {
     assert_eq!(table.rows[2].cells[3].raw_number, Some(0.0));
 }
 
-// Mirrors the real-world layout from issue #72's attachment (a text/@ column,
+// Mirrors a real-world report layout (a text/@ column,
 // a number/#,##0.00 column, and a date-formatted column that actually holds
 // text) using synthetic values — NOT the reporter's data. Locks in two
 // behaviours: format metadata is surfaced on *text* cells (so a date-formatted
 // text column is identifiable), and built-in format IDs resolve to a code
 // string even though they never appear in <numFmts>.
 #[test]
-fn xlsx_to_ir_format_metadata_on_text_and_builtin_ids() {
+fn test_xlsx_to_ir_format_metadata_on_text_and_builtin_ids() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -711,7 +886,7 @@ fn xlsx_to_ir_format_metadata_on_text_and_builtin_ids() {
 // ===========================================================================
 
 #[test]
-fn pptx_to_ir_slides_as_sections() {
+fn test_pptx_to_ir_slides_as_sections() {
     let slide_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
        xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -785,7 +960,7 @@ fn pptx_to_ir_slides_as_sections() {
 // ===========================================================================
 
 #[test]
-fn ir_round_trip_plain_text() {
+fn test_ir_round_trip_plain_text() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -810,7 +985,7 @@ fn ir_round_trip_plain_text() {
 // ===========================================================================
 
 #[test]
-fn ir_markdown_with_formatting() {
+fn test_ir_markdown_with_formatting() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -842,7 +1017,7 @@ fn ir_markdown_with_formatting() {
 // ===========================================================================
 
 #[test]
-fn docx_lists_to_ir() {
+fn test_docx_lists_to_ir() {
     let numbering_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:abstractNum w:abstractNumId="0">
@@ -943,7 +1118,7 @@ fn docx_lists_to_ir() {
 // ===========================================================================
 
 #[test]
-fn docx_table_merges_to_ir() {
+fn test_docx_table_merges_to_ir() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -999,7 +1174,7 @@ fn docx_table_merges_to_ir() {
 // ===========================================================================
 
 #[test]
-fn format_specific_access() {
+fn test_format_specific_access() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -1020,7 +1195,7 @@ fn format_specific_access() {
 // ===========================================================================
 
 #[test]
-fn unsupported_format_error() {
+fn test_unsupported_format_error() {
     let result = Document::open("notes.txt");
     assert!(result.is_err());
     match result {
@@ -1034,7 +1209,7 @@ fn unsupported_format_error() {
 // ===========================================================================
 
 #[test]
-fn docx_heading_via_style() {
+fn test_docx_heading_via_style() {
     let styles_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:style w:type="paragraph" w:styleId="Heading1">
@@ -1066,7 +1241,7 @@ fn docx_heading_via_style() {
 // ===========================================================================
 
 #[test]
-fn docx_table_to_ir_plain_text() {
+fn test_docx_table_to_ir_plain_text() {
     let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -1097,7 +1272,7 @@ fn docx_table_to_ir_plain_text() {
 // ===========================================================================
 
 #[test]
-fn xlsx_to_ir_plain_text() {
+fn test_xlsx_to_ir_plain_text() {
     let wb_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -1140,7 +1315,7 @@ fn xlsx_to_ir_plain_text() {
 // ===========================================================================
 
 #[test]
-fn pptx_image_to_ir() {
+fn test_pptx_image_to_ir() {
     let slide_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
        xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -1193,7 +1368,7 @@ fn pptx_image_to_ir() {
 // ===========================================================================
 
 #[test]
-fn docx_strikethrough_and_hyperlink_in_ir() {
+fn test_docx_strikethrough_and_hyperlink_in_ir() {
     let cursor = Cursor::new(Vec::new());
     let mut writer = OpcWriter::new(cursor).unwrap();
     let doc_part = PartName::new("/word/document.xml").unwrap();

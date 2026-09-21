@@ -327,7 +327,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn heading_style_becomes_a_heading() {
+    fn test_heading_style_becomes_a_heading() {
         let bytes = build_minimal_docx(/* the one construct under test */);
         let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
         assert!(doc.plain_text().contains("Hello"));
@@ -335,8 +335,13 @@ mod tests {
 }
 ```
 
-Name the test after the **defect class** it guards (`heading_style_becomes_a_heading`),
-not after an issue or PR number.
+Name the test after the **defect class** it guards
+(`test_heading_style_becomes_a_heading`), not after an issue or PR number.
+Every test function starts with `test_` — a test is the one kind of function
+nothing ever calls by name, so the prefix is what marks it as one in a diff or
+a grep. CI enforces this, along with "no `allow(dead_code)`" and "no ticket
+numbers in code or comments", via `scripts/house-rules-check.sh`; run it
+locally before pushing.
 
 #### File naming
 

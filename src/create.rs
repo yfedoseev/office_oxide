@@ -93,8 +93,23 @@ pub fn create_from_ir_to_writer<W: Write + Seek>(
 
 /// Build a `DocxWriter` from `DocumentIR`, exposed so callers can embed
 /// extra parts (fonts, custom metadata) before serialization.
+///
+/// Content past `MAX_NESTING_DEPTH` is dropped rather than overflowing
+/// the writer's stack (`DocumentIR` is `Deserialize`, so it can arrive
+/// from anywhere, including untrusted input). Call
+/// [`crate::docx::write::DocxWriter::truncated_subtrees`] on the
+/// returned writer, after `write_to`/`save`, to learn whether that
+/// happened — it used to be a silent `Ok` with only a `log::warn!`.
 pub fn ir_to_docx(ir: &DocumentIR) -> crate::docx::write::DocxWriter {
     use crate::docx::write::{DocxWriter, IrParaProps, Run};
+
+    // The counter is thread-local (see core::xml::DepthGuard) and shared
+    // across every DocxWriter built on this thread; reset it here so a
+    // fresh ir_to_docx call's count doesn't inherit a previous one's.
+    // Building two DocxWriters concurrently, interleaved, on the same
+    // thread would confuse the two counts — not a pattern this crate (or
+    // realistically any caller) uses.
+    crate::core::xml::reset_truncated_subtrees();
 
     let mut writer = DocxWriter::new();
 
@@ -107,19 +122,23 @@ pub fn ir_to_docx(ir: &DocumentIR) -> crate::docx::write::DocxWriter {
 
     for section in &ir.sections {
         // Section title becomes H1 — but skip it when the title is already
-        // carried by the section's leading heading element. The DOCX parser
-        // derives `section.title` FROM the first heading (which it also keeps
-        // in `elements`), so re-emitting the title here would materialise a
-        // duplicate H1 on every write→parse cycle, breaking round-trip
-        // idempotence. Only emit a standalone title-H1 for a title that is
-        // NOT already represented as the leading heading.
-        let title_is_leading_heading = matches!(
-            section.elements.first(),
-            Some(Element::Heading(h))
-                if section.title.as_deref().is_some_and(|t| inline_to_text(&h.content) == t)
-        );
+        // carried by one of the section's own heading elements. The DOCX
+        // parser derives `section.title` FROM a heading (which it also
+        // keeps in `elements`), so re-emitting the title here would
+        // materialise a duplicate H1 on every write→parse cycle, breaking
+        // round-trip idempotence. This used to check only
+        // `section.elements.first()`, so a section whose heading wasn't
+        // its literal first element (e.g. a byline or date line before
+        // it) got the heading duplicated on every round trip —
+        // checking the whole element list instead of just the
+        // first entry fixes it without changing behavior for the common
+        // leading-heading case.
+        let title_already_present = section.elements.iter().any(|e| {
+            matches!(e, Element::Heading(h)
+                if section.title.as_deref().is_some_and(|t| inline_to_text(&h.content) == t))
+        });
         if let Some(ref title) = section.title {
-            if !title.is_empty() && !title_is_leading_heading {
+            if !title.is_empty() && !title_already_present {
                 let runs = [Run::new(title)];
                 let props = IrParaProps {
                     style: Some("Heading1".to_string()),
@@ -171,10 +190,20 @@ pub fn ir_to_docx(ir: &DocumentIR) -> crate::docx::write::DocxWriter {
             add_element_to_docx(&mut writer, elem);
         }
 
-        // Section page setup / columns
+        // Section page setup / columns. A section that owns headers or
+        // footers needs its own `sectPr` too — they are referenced from
+        // it, and without one the section merged into its neighbour and
+        // the neighbour's `sectPr` claimed them.
+        let has_hf = section.header.is_some()
+            || section.footer.is_some()
+            || section.first_page_header.is_some()
+            || section.first_page_footer.is_some()
+            || section.even_page_header.is_some()
+            || section.even_page_footer.is_some();
         if section.page_setup.is_some()
             || section.columns.is_some()
             || section.break_type != SectionBreakType::Continuous
+            || has_hf
         {
             writer.set_section_props(
                 section.page_setup.clone(),
@@ -197,6 +226,19 @@ fn add_element_to_docx(writer: &mut crate::docx::write::DocxWriter, elem: &Eleme
             let props = IrParaProps {
                 style: Some(format!("Heading{level}")),
                 alignment: h.alignment.clone(),
+                indent_left_twips: h.indent_left_twips,
+                indent_right_twips: h.indent_right_twips,
+                first_line_indent_twips: h.first_line_indent_twips,
+                space_before_twips: h.space_before_twips,
+                space_after_twips: h.space_after_twips,
+                line_spacing: h.line_spacing.clone(),
+                tabs: h.tabs.clone(),
+                frame_position: h.frame_position.clone(),
+                keep_with_next: h.keep_with_next,
+                keep_together: h.keep_together,
+                page_break_before: h.page_break_before,
+                background_color: h.background_color,
+                border: h.border.clone(),
                 ..Default::default()
             };
             writer.add_ir_paragraph(&runs, Some(props));
@@ -272,10 +314,10 @@ fn add_element_to_docx(writer: &mut crate::docx::write::DocxWriter, elem: &Eleme
             writer.add_text_box(tb);
         },
         Element::Footnote(n) => {
-            writer.add_footnote(n.id, &n.content);
+            writer.add_footnote(n.id, &n.content, n.marker.clone());
         },
         Element::Endnote(n) => {
-            writer.add_endnote(n.id, &n.content);
+            writer.add_endnote(n.id, &n.content, n.marker.clone());
         },
         Element::CodeBlock(cb) => {
             writer.add_code_block(&cb.content);
@@ -319,12 +361,14 @@ fn ir_inline_to_runs(content: &[InlineContent]) -> Vec<crate::docx::write::Run> 
             InlineContent::FootnoteRef(r) => {
                 runs.push(Run {
                     footnote_ref: Some(r.note_id),
+                    note_ref_marker: r.marker.clone(),
                     ..Default::default()
                 });
             },
             InlineContent::EndnoteRef(r) => {
                 runs.push(Run {
                     endnote_ref: Some(r.note_id),
+                    note_ref_marker: r.marker.clone(),
                     ..Default::default()
                 });
             },
@@ -497,9 +541,29 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                             sheet.set_column_width(ci, w.clamp(3.0, 80.0));
                         }
                     }
+                    // Columns currently claimed by a still-open vertical
+                    // merge anchored in an earlier row, mapped to how many
+                    // more rows (including the one about to be processed)
+                    // it still covers. Without this, `col` advanced purely
+                    // by summing `col_span` across each row's own cells —
+                    // but a row-covering merge means the covered rows have
+                    // that column excluded from their own `cells` entirely
+                    // (the sparse, span-driven model every reader already
+                    // uses), so every cell after the gap silently shifted
+                    // left, misplacing content and hyperlinks onto the
+                    // wrong column instead of skipping over the claimed
+                    // one.
+                    let mut active_spans: std::collections::BTreeMap<usize, usize> =
+                        std::collections::BTreeMap::new();
                     for row in &t.rows {
                         let mut col = 0usize;
                         for cell in &row.cells {
+                            while active_spans
+                                .get(&col)
+                                .is_some_and(|&remaining| remaining > 0)
+                            {
+                                col += 1;
+                            }
                             let text = cell_text(cell);
                             let data = ir_cell_to_cell_data(cell, &text);
                             if let Some(style) = xlsx_cell_style(
@@ -511,13 +575,28 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                             } else {
                                 sheet.set_cell(row_cursor, col, data);
                             }
+                            if let Some(url) = cell_hyperlink(cell) {
+                                sheet.set_cell_hyperlink(row_cursor, col, url);
+                            }
                             let cs = cell.col_span.max(1) as usize;
                             let rs = cell.row_span.max(1) as usize;
                             if cs > 1 || rs > 1 {
                                 sheet.merge_cells(row_cursor, col, rs, cs);
                             }
+                            if rs > 1 {
+                                for c in col..col + cs {
+                                    active_spans.insert(c, rs);
+                                }
+                            }
                             col += cs;
                         }
+                        // This row is now consumed: every still-open span
+                        // (including any minted just above) has one fewer
+                        // row left to cover.
+                        for v in active_spans.values_mut() {
+                            *v = v.saturating_sub(1);
+                        }
+                        active_spans.retain(|_, v| *v > 0);
                         row_cursor += 1;
                     }
                 },
@@ -537,13 +616,29 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                         if let Some(name) = first_inline_font_name(&p.content) {
                             style = style.font_name(name);
                         }
-                        for line in split_paragraph_for_xlsx(&text) {
+                        // The first hyperlink anywhere in the paragraph,
+                        // attached to the first resulting row — this
+                        // fallback (non-tabular content split across
+                        // cells) doesn't track which specific sub-line a
+                        // hyperlink's own span covers, matching the
+                        // simplification `cell_hyperlink` already makes
+                        // for a real table cell's content.
+                        let hyperlink = p.content.iter().find_map(|c| match c {
+                            InlineContent::Text(t) => t.hyperlink.clone(),
+                            _ => None,
+                        });
+                        for (i, line) in split_paragraph_for_xlsx(&text).into_iter().enumerate() {
                             sheet.set_cell_styled(
                                 row_cursor,
                                 0,
                                 CellData::String(line),
                                 style.clone(),
                             );
+                            if i == 0 {
+                                if let Some(ref url) = hyperlink {
+                                    sheet.set_cell_hyperlink(row_cursor, 0, url.clone());
+                                }
+                            }
                             row_cursor += 1;
                         }
                     }
@@ -559,7 +654,15 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                     if let (Some(data), Some(fmt)) = (&img.data, &img.format) {
                         let cx = img.display_width_emu.unwrap_or(3_000_000) as i64;
                         let cy = img.display_height_emu.unwrap_or(2_000_000) as i64;
-                        sheet.add_image(data.clone(), fmt.extension(), 0, 0, cx, cy);
+                        sheet.add_image_with_alt(
+                            data.clone(),
+                            fmt.extension(),
+                            0,
+                            0,
+                            cx,
+                            cy,
+                            img.alt_text.clone(),
+                        );
                     }
                 },
                 Element::TextBox(tb) => {
@@ -584,7 +687,15 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                                 } else {
                                     img.display_height_emu.unwrap_or(2_000_000) as i64
                                 };
-                                sheet.add_image(data.clone(), fmt.extension(), x, y, icx, icy);
+                                sheet.add_image_with_alt(
+                                    data.clone(),
+                                    fmt.extension(),
+                                    x,
+                                    y,
+                                    icx,
+                                    icy,
+                                    img.alt_text.clone(),
+                                );
                             }
                         }
                     }
@@ -621,6 +732,51 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                 | Element::PageBreak
                 | Element::ColumnBreak
                 | Element::Shape(_) => {},
+                // An XLSX-sourced cell comment round-trips as
+                // Element::Endnote (convert_xlsx.rs appends one per
+                // comment, marker = "{cell_ref}" or "{cell_ref}
+                // ({author})"). Written back as a real cell comment
+                // instead of falling into the generic wildcard below,
+                // which dumped every comment's text as a spurious extra
+                // row with no cell reference at all.
+                Element::Endnote(n) => {
+                    let placed = parse_xlsx_comment_marker(n.marker.as_deref())
+                        .and_then(|(cell_ref, author)| {
+                            crate::xlsx::CellRef::parse(&cell_ref).map(|r| (r, author))
+                        })
+                        .map(|(r, author)| {
+                            let mut rows = Vec::new();
+                            for inner in &n.content {
+                                xlsx_text_rows(inner, &mut rows);
+                            }
+                            let text = rows.join("\n");
+                            if !text.is_empty() {
+                                sheet.set_cell_comment(
+                                    r.row as usize,
+                                    r.col as usize,
+                                    author,
+                                    text,
+                                );
+                            }
+                        })
+                        .is_some();
+                    // A marker that doesn't match the XLSX "{cell_ref}
+                    // ({author})" shape (an endnote from a non-XLSX
+                    // source converted to a spreadsheet, say) still has
+                    // real text — fall back to the generic row dump
+                    // rather than silently dropping it.
+                    if !placed {
+                        let mut rows = Vec::new();
+                        for inner in &n.content {
+                            xlsx_text_rows(inner, &mut rows);
+                        }
+                        for line in rows {
+                            body_paragraphs_seen = true;
+                            sheet.set_cell(row_cursor, 0, CellData::String(line));
+                            row_cursor += 1;
+                        }
+                    }
+                },
                 // Everything else has no native spreadsheet shape but does
                 // have text, and dropping it silently is how a PPTX → XLSX
                 // conversion lost 96% of its words.
@@ -799,10 +955,14 @@ pub fn ir_to_pptx(ir: &DocumentIR) -> crate::pptx::write::PptxWriter {
 fn emit_pptx_slide_from_section(writer: &mut crate::pptx::write::PptxWriter, section: &Section) {
     let slide = writer.add_slide();
 
-    // Speaker notes round-trip into ppt/notesSlides/, never onto the slide.
+    // Speaker notes round-trip into ppt/notesSlides/, never onto the
+    // slide. Structured (bold/italic/bullets/numbering), not flattened
+    // to a plain string — matches the fidelity ordinary slide body text
+    // already gets.
     if let Some(ref notes) = section.speaker_notes {
-        if !notes.is_empty() {
-            slide.set_notes(notes);
+        let items = pptx_notes_body_items(notes);
+        if !items.is_empty() {
+            slide.set_notes_structured(items);
         }
     }
 
@@ -813,19 +973,25 @@ fn emit_pptx_slide_from_section(writer: &mut crate::pptx::write::PptxWriter, sec
     }
 
     // The PPTX parser surfaces the slide-title placeholder as BOTH
-    // `section.title` and a leading Heading element. The title placeholder is
-    // already set above, so re-emitting that heading as body text would both
-    // pollute the body and cause the real body content to be dropped on a
-    // write→parse cycle (breaking round-trip idempotence). Skip the leading
-    // heading when it merely duplicates the section title.
-    let skip_leading_title_heading = matches!(
-        section.elements.first(),
-        Some(Element::Heading(h))
-            if section.title.as_deref().is_some_and(|t| inline_to_text(&h.content) == t)
-    );
+    // `section.title` and a Heading element somewhere in `elements`. The
+    // title placeholder is already set above, so re-emitting that
+    // heading as body text would both pollute the body and duplicate it
+    // on a write→parse cycle (breaking round-trip idempotence). This
+    // used to only check `section.elements.first()` — the same bug
+    // shape as the DOCX title duplication — so a slide whose title heading
+    // wasn't its literal first shape (a decorative or subtitle shape
+    // ahead of it in z-order) got the title duplicated into the body on
+    // every round trip. Find the matching heading wherever it is and
+    // skip only that one occurrence, not every element after it.
+    let title_heading_idx = section.title.as_deref().and_then(|t| {
+        section
+            .elements
+            .iter()
+            .position(|e| matches!(e, Element::Heading(h) if inline_to_text(&h.content) == t))
+    });
 
     for (i, elem) in section.elements.iter().enumerate() {
-        if i == 0 && skip_leading_title_heading {
+        if Some(i) == title_heading_idx {
             continue;
         }
         emit_pptx_element(slide, elem);
@@ -844,6 +1010,57 @@ fn emit_pptx_slide_from_section(writer: &mut crate::pptx::write::PptxWriter, sec
 /// visible horizontal-rule glyph string and treats it as a
 /// separator.
 pub(crate) const PPTX_THEMATIC_BREAK_MARKER: &str = "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}";
+
+/// Convert `Section::speaker_notes` (`Element::Paragraph`/`List`, the
+/// same shape `convert_text_body` produces for ordinary slide body
+/// text) into `pptx::write::BodyItem`s for `set_notes_structured`, so
+/// bold/italic/bullets/numbering in notes reach the written file
+/// instead of being flattened to plain lines.
+fn pptx_notes_body_items(notes: &[Element]) -> Vec<crate::pptx::write::BodyItem> {
+    use crate::pptx::write::BodyItem;
+
+    fn flatten_list(
+        list: &crate::ir::List,
+        level: u8,
+        out: &mut Vec<(u8, Vec<crate::pptx::write::Run>)>,
+    ) {
+        for item in &list.items {
+            let runs: Vec<crate::pptx::write::Run> = item
+                .content
+                .iter()
+                .flat_map(|e| match e {
+                    Element::Paragraph(p) => inline_to_pptx_runs(&p.content),
+                    _ => Vec::new(),
+                })
+                .collect();
+            if !runs.is_empty() {
+                out.push((level, runs));
+            }
+            if let Some(ref nested) = item.nested {
+                flatten_list(nested, level.saturating_add(1), out);
+            }
+        }
+    }
+
+    let mut items = Vec::new();
+    for elem in notes {
+        match elem {
+            Element::Paragraph(p) => {
+                let runs = inline_to_pptx_runs(&p.content);
+                items.push(BodyItem::RichText(runs, crate::pptx::write::ParaProps::default()));
+            },
+            Element::List(l) => {
+                let mut bullets = Vec::new();
+                flatten_list(l, l.level, &mut bullets);
+                if !bullets.is_empty() {
+                    items.push(BodyItem::BulletList(bullets));
+                }
+            },
+            _ => {},
+        }
+    }
+    items
+}
 
 fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) {
     match elem {
@@ -885,43 +1102,50 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
         Element::List(l) => {
             // Flatten the whole tree: `ListItem::nested` was read by no
             // writer, so every item below level 0 was silently dropped.
-            fn flatten(list: &crate::ir::List, level: u8, out: &mut Vec<(u8, String)>) {
+            // Each item's runs (not just its plain text) now carry
+            // through, so a hyperlink or bold/italic/color on a list
+            // item's text survives the write.
+            fn flatten(
+                list: &crate::ir::List,
+                level: u8,
+                out: &mut Vec<(u8, Vec<crate::pptx::write::Run>)>,
+            ) {
                 for item in &list.items {
-                    let text = item
+                    let runs: Vec<crate::pptx::write::Run> = item
                         .content
                         .iter()
-                        .map(|e| match e {
-                            Element::Paragraph(p) => inline_to_text(&p.content),
-                            _ => String::new(),
+                        .flat_map(|e| match e {
+                            Element::Paragraph(p) => inline_to_pptx_runs(&p.content),
+                            _ => Vec::new(),
                         })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if !text.is_empty() {
-                        out.push((level, text));
+                        .collect();
+                    if !runs.is_empty() {
+                        out.push((level, runs));
                     }
                     if let Some(ref nested) = item.nested {
                         flatten(nested, level.saturating_add(1), out);
                     }
                 }
             }
-            let mut items: Vec<(u8, String)> = Vec::new();
+            let mut items: Vec<(u8, Vec<crate::pptx::write::Run>)> = Vec::new();
             flatten(l, l.level, &mut items);
-            slide.add_nested_bullet_list(&items);
+            slide.add_nested_bullet_list(items);
         },
         Element::Table(t) => {
             // A real a:tbl, not tab-joined text: the previous form lost the
-            // grid, every cell boundary and all per-cell formatting.
-            let rows: Vec<Vec<String>> = t
+            // grid, every cell boundary, and (until table cells carried runs) all
+            // per-cell run formatting including hyperlinks.
+            let rows: Vec<Vec<Vec<crate::pptx::write::Run>>> = t
                 .rows
                 .iter()
-                .map(|row| row.cells.iter().map(cell_text).collect())
+                .map(|row| row.cells.iter().map(cell_runs).collect())
                 .collect();
             slide.add_table(rows);
         },
         Element::Image(img) => {
+            let cx = img.display_width_emu.unwrap_or(3_000_000);
+            let cy = img.display_height_emu.unwrap_or(2_000_000);
             if let (Some(data), Some(fmt)) = (&img.data, &img.format) {
-                let cx = img.display_width_emu.unwrap_or(3_000_000);
-                let cy = img.display_height_emu.unwrap_or(2_000_000);
                 slide.add_image_with_alt(
                     data.clone(),
                     fmt.clone(),
@@ -931,6 +1155,8 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
                     cy,
                     img.alt_text.clone(),
                 );
+            } else if let Some(alt) = img.alt_text.as_deref() {
+                slide.add_placeholder_shape(alt, 0, 0, cx, cy);
             }
         },
         Element::CodeBlock(cb) => {
@@ -938,12 +1164,77 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
             slide.add_rich_text(&[run]);
         },
         Element::TextBox(tb) => {
-            // The PPTX parser wraps a slide's body placeholder content in a
-            // TextBox. Emit its inner block content back into the slide body;
-            // without this arm the body (bullets, paragraphs) was silently
-            // dropped on a write→parse cycle.
+            // A `TextBox` in the IR only ever exists because the reader
+            // saw a real `<a:xfrm>` on the source shape (see
+            // `push_positional_textbox` in convert_pptx.rs — content
+            // without one flows as plain elements and is never wrapped
+            // at all). This includes a body PLACEHOLDER that happens to
+            // inherit a real position, which is why a `List`/`Table` can
+            // show up as a TextBox's content too, not just a genuine
+            // free-floating text box.
+            //
+            // Flattening everything into the generic slide-body stream
+            // (the old behavior) threw the box's own position away and
+            // merged multiple independent text boxes' content into one
+            // undifferentiated stream — or conjured a spurious empty box
+            // out of unrelated body content once that flattening was
+            // "fixed" to stop dropping text. Paragraph/
+            // Heading content — the common "this really is just a text
+            // box" case — is now emitted as its own positioned shape,
+            // the same way `Element::Image` already does. A nested
+            // `List`/`Table`/`TextBox` — which has no positioned
+            // representation of its own here — still flattens into the
+            // body stream as before, preserving its own structure rather
+            // than losing it to plain text (and keeping write→parse
+            // idempotent: a body placeholder wrapping a bulleted list
+            // reads back into the same TextBox{List} shape either way).
+            let mut paragraphs = Vec::new();
             for inner in &tb.content {
-                emit_pptx_element(slide, inner);
+                match inner {
+                    Element::Paragraph(_) | Element::Heading(_) => {
+                        let single = std::slice::from_ref(inner);
+                        paragraphs.extend(textbox_content_to_pptx_paragraphs(single));
+                    },
+                    // `Element::Image`'s own arm always anchors at (0, 0)
+                    // — routing it through `emit_pptx_element` like the
+                    // other fallback cases would silently move it there,
+                    // discarding the *wrapping* text box's real position
+                    // (confirmed on real corpus files: a
+                    // positioned image inside a TextBox lost its position
+                    // and stopped counting as a positioned shape at all).
+                    Element::Image(img) => {
+                        let cx = img
+                            .display_width_emu
+                            .unwrap_or(tb.width_emu.unwrap_or(3_000_000));
+                        let cy = img
+                            .display_height_emu
+                            .unwrap_or(tb.height_emu.unwrap_or(2_000_000));
+                        let (x, y) = (tb.x_emu.unwrap_or(0), tb.y_emu.unwrap_or(0));
+                        if let (Some(data), Some(fmt)) = (&img.data, &img.format) {
+                            slide.add_image_with_alt(
+                                data.clone(),
+                                fmt.clone(),
+                                x,
+                                y,
+                                cx,
+                                cy,
+                                img.alt_text.clone(),
+                            );
+                        } else if let Some(alt) = img.alt_text.as_deref() {
+                            // As at body level: a description without
+                            // bytes is kept as a description-only shape.
+                            slide.add_placeholder_shape(alt, x, y, cx, cy);
+                        }
+                    },
+                    _ => emit_pptx_element(slide, inner),
+                }
+            }
+            if !paragraphs.is_empty() {
+                let x = tb.x_emu.unwrap_or(0);
+                let y = tb.y_emu.unwrap_or(0);
+                let cx = tb.width_emu.map(|w| w as i64).unwrap_or(3_000_000);
+                let cy = tb.height_emu.map(|h| h as i64).unwrap_or(500_000);
+                slide.add_multi_paragraph_text_box(paragraphs, x, y, cx, cy);
             }
         },
         // Footnote and endnote bodies have no slide equivalent, but their
@@ -1144,18 +1435,6 @@ fn emit_pptx_slides_compacted(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn inline_to_text(content: &[InlineContent]) -> String {
-    let mut out = String::new();
-    for item in content {
-        match item {
-            InlineContent::Text(span) => out.push_str(&span.text),
-            InlineContent::LineBreak => out.push('\n'),
-            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
-        }
-    }
-    out
-}
-
 fn rgb_to_hex(rgb: [u8; 3]) -> String {
     format!("{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
 }
@@ -1171,6 +1450,33 @@ fn cell_text(cell: &TableCell) -> String {
         .join(" ")
 }
 
+/// A PPTX table cell's content as styled `Run`s instead of `cell_text`'s
+/// plain string — needed so a cell's hyperlink/bold/italic/color reaches
+/// the PPTX writer at all.
+fn cell_runs(cell: &TableCell) -> Vec<crate::pptx::write::Run> {
+    cell.content
+        .iter()
+        .flat_map(|e| match e {
+            Element::Paragraph(p) => inline_to_pptx_runs(&p.content),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+/// The first hyperlink URL found anywhere in a cell's content, if any
+/// (xlsx::write had no hyperlink concept at all, so a
+/// cell's `TextSpan.hyperlink` — the same field DOCX/PPTX runs already
+/// use — was silently dropped on every write).
+fn cell_hyperlink(cell: &TableCell) -> Option<String> {
+    cell.content.iter().find_map(|e| match e {
+        Element::Paragraph(p) => p.content.iter().find_map(|c| match c {
+            InlineContent::Text(t) => t.hyperlink.clone(),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
 /// Convert an IR cell to writer data, honouring the type the parser recorded.
 ///
 /// Re-parsing the *rendered* string threw away `data_type`, `raw_number` and
@@ -1179,6 +1485,28 @@ fn cell_text(cell: &TableCell) -> String {
 /// cell. The typed fields are only populated by the XLSX reader; prose formats
 /// leave them `None` and still fall back to sniffing the text.
 fn ir_cell_to_cell_data(cell: &TableCell, text: &str) -> crate::xlsx::write::CellData {
+    use crate::xlsx::write::CellData;
+
+    // A cell that carries a formula keeps it, with whatever value it
+    // showed as the cached result. Writing only the value silently turned
+    // every formula into a constant; writing only the formula blanked the
+    // cell for every reader that does not evaluate.
+    if let Some(f) = cell.formula.as_deref().filter(|f| !f.trim().is_empty()) {
+        // A cell with no cached value shows `=formula` (as `plain_text()`
+        // renders it); that is not a result to cache.
+        if text.is_empty() || text.strip_prefix('=').is_some_and(|t| t == f) {
+            return CellData::Formula(f.to_string());
+        }
+        return CellData::FormulaWithValue {
+            formula: f.to_string(),
+            cached: Box::new(ir_cell_value_data(cell, text)),
+        };
+    }
+    ir_cell_value_data(cell, text)
+}
+
+/// The cell's value alone, formula disregarded.
+fn ir_cell_value_data(cell: &TableCell, text: &str) -> crate::xlsx::write::CellData {
     use crate::ir::CellDataType;
     use crate::xlsx::write::CellData;
 
@@ -1200,26 +1528,91 @@ fn ir_cell_to_cell_data(cell: &TableCell, text: &str) -> crate::xlsx::write::Cel
         // Text and Error cells keep their rendered form verbatim; sniffing
         // would re-introduce the "007" and "inf" corruption.
         Some(CellDataType::Text) | Some(CellDataType::Error) => {
-            return if text.is_empty() {
-                CellData::Empty
-            } else {
-                CellData::String(text.to_string())
-            };
+            return text_cell_data(cell, text);
         },
         None => {},
     }
-    text_to_cell_data(text)
+    if !text.is_empty() {
+        if let Ok(n) = text.parse::<f64>() {
+            return CellData::Number(n);
+        }
+    }
+    text_cell_data(cell, text)
 }
 
-fn text_to_cell_data(text: &str) -> crate::xlsx::write::CellData {
+/// Build a plain or rich-run `CellData` for text-bearing cell content —
+/// rich only when at least one run carries real character formatting
+/// (bold/italic/underline/color/font), keeping the common (plain) case's
+/// written XML exactly as before. Closes the write side of the
+/// read-only gap the rich-text reader left: a cell's own
+/// bold/italic/color/font (single- or multi-run) used to be silently
+/// discarded on write regardless of how it reached the IR.
+fn text_cell_data(cell: &TableCell, text: &str) -> crate::xlsx::write::CellData {
     use crate::xlsx::write::CellData;
     if text.is_empty() {
-        CellData::Empty
-    } else if let Ok(n) = text.parse::<f64>() {
-        CellData::Number(n)
+        return CellData::Empty;
+    }
+    let runs = ir_cell_rich_runs(cell);
+    let has_formatting = runs.iter().any(|r| {
+        r.bold
+            || r.italic
+            || r.underline
+            || r.font_color.is_some()
+            || r.font_size_pt.is_some()
+            || r.font_name.is_some()
+    });
+    if has_formatting && !runs.is_empty() {
+        CellData::RichString(runs)
     } else {
         CellData::String(text.to_string())
     }
+}
+
+/// A table cell's paragraphs/spans as `xlsx::write::RichRun`s — the
+/// per-run mirror of `cell_text`'s flattening, with the same
+/// paragraph-join-by-space behavior.
+fn ir_cell_rich_runs(cell: &TableCell) -> Vec<crate::xlsx::write::RichRun> {
+    use crate::xlsx::write::RichRun;
+    let mut runs: Vec<RichRun> = Vec::new();
+    let mut first_paragraph = true;
+    for elem in &cell.content {
+        let Element::Paragraph(p) = elem else {
+            continue;
+        };
+        if !first_paragraph {
+            runs.push(RichRun {
+                text: " ".to_string(),
+                ..Default::default()
+            });
+        }
+        first_paragraph = false;
+        for inc in &p.content {
+            match inc {
+                InlineContent::Text(span) => {
+                    if span.text.is_empty() {
+                        continue;
+                    }
+                    runs.push(RichRun {
+                        text: span.text.clone(),
+                        bold: span.bold,
+                        italic: span.italic,
+                        underline: span.underline.is_some(),
+                        font_color: span.color.map(rgb_to_hex),
+                        font_size_pt: span.font_size_half_pt.map(|hp| hp as f32 / 2.0),
+                        font_name: span.font_name.clone(),
+                    });
+                },
+                InlineContent::LineBreak => {
+                    runs.push(RichRun {
+                        text: "\n".to_string(),
+                        ..Default::default()
+                    });
+                },
+                _ => {},
+            }
+        }
+    }
+    runs
 }
 
 /// Pluck the first `Element::Heading`'s plain text from a section's
@@ -1264,6 +1657,23 @@ fn first_inline_font_name(content: &[InlineContent]) -> Option<String> {
 /// `CodeBlock`, `Footnote`, `Endnote` and everything inside a `TextBox` that
 /// was not an image. Converting a presentation to a spreadsheet lost almost
 /// all of its text that way.
+/// Parse an XLSX-sourced comment's `Note::marker` — `"{cell_ref}"` or
+/// `"{cell_ref} ({author})"`, exactly the shape `convert_xlsx.rs`
+/// generates for every `Element::Endnote` it builds from a real cell
+/// comment — back into `(cell_ref, author)`. Returns `None` for any
+/// other shape (no marker, or one that doesn't parse this way), so the
+/// caller can fall back to treating it as ordinary endnote content.
+fn parse_xlsx_comment_marker(marker: Option<&str>) -> Option<(String, Option<String>)> {
+    let marker = marker?;
+    match marker.split_once(" (") {
+        Some((cell_ref, rest)) => {
+            let author = rest.strip_suffix(')')?;
+            Some((cell_ref.to_string(), Some(author.to_string())))
+        },
+        None => Some((marker.to_string(), None)),
+    }
+}
+
 fn xlsx_text_rows(elem: &Element, out: &mut Vec<String>) {
     match elem {
         Element::Paragraph(p) => {
@@ -1351,6 +1761,57 @@ fn xlsx_cell_style(
     }
 }
 
+/// Convert a `TextBox`'s block content into the `(runs, ParaProps)`
+/// pairs `SlideData::add_multi_paragraph_text_box` needs.
+///
+/// Handles `Paragraph`/`Heading` (the common case — a real text box's
+/// content is ordinary flowed paragraphs) as real paragraphs, each with
+/// its own alignment/spacing carried through the same way
+/// `emit_pptx_element`'s own `Element::Paragraph` arm does. Anything
+/// else (a table, list, or nested text box inside a text box — rare)
+/// falls back to one plain-text paragraph via `inline_to_text`-style
+/// flattening, so it isn't silently dropped, at the cost of its own
+/// rich formatting.
+/// Convert `Paragraph`/`Heading` elements into the `(runs, ParaProps)`
+/// pairs `SlideData::add_multi_paragraph_text_box` needs.
+/// Callers only pass paragraph-like content here — a nested `List`/
+/// `Table`/`TextBox` inside a `TextBox` is emitted separately (see
+/// `emit_pptx_element`'s own `Element::TextBox` arm), since it has no
+/// positioned representation of its own and collapsing it to plain text
+/// would both lose its structure and break write→parse idempotence for
+/// the common "body placeholder wrapped in a TextBox" case.
+fn textbox_content_to_pptx_paragraphs(
+    content: &[Element],
+) -> Vec<(Vec<crate::pptx::write::Run>, crate::pptx::write::ParaProps)> {
+    let mut out = Vec::new();
+    for elem in content {
+        match elem {
+            Element::Paragraph(p) => {
+                let runs = inline_to_pptx_runs(&p.content);
+                if !runs.is_empty() {
+                    let props = crate::pptx::write::ParaProps {
+                        alignment: p.alignment.clone(),
+                        space_before_hundredths_pt: p.space_before_twips.map(|t| t * 5),
+                    };
+                    out.push((runs, props));
+                }
+            },
+            Element::Heading(h) => {
+                let runs = inline_to_pptx_runs(&h.content);
+                if !runs.is_empty() {
+                    let props = crate::pptx::write::ParaProps {
+                        alignment: h.alignment.clone(),
+                        ..Default::default()
+                    };
+                    out.push((runs, props));
+                }
+            },
+            _ => {},
+        }
+    }
+    out
+}
+
 fn inline_to_pptx_runs(content: &[InlineContent]) -> Vec<crate::pptx::write::Run> {
     use crate::pptx::write::Run;
     content
@@ -1389,10 +1850,442 @@ fn inline_to_pptx_runs(content: &[InlineContent]) -> Vec<crate::pptx::write::Run
                 if let Some(ref name) = span.font_name {
                     run = run.font(name.clone());
                 }
+                if let Some(ref url) = span.hyperlink {
+                    run = run.hyperlink(url.clone());
+                }
                 Some(run)
             } else {
                 None
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod xlsx_table_write_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// A row-spanning merge (`row_span > 1`) claims its
+    /// column for every row it covers. The covered rows' own `cells`
+    /// correctly exclude that column (the sparse, span-driven model
+    /// every reader uses), but the writer used to compute each cell's
+    /// output column by summing `col_span` in encounter order within
+    /// that row's own (already-filtered) cell list — with no way to
+    /// know a column was skipped, every cell after the gap silently
+    /// shifted left, misplacing its content and hyperlink onto the
+    /// wrong column instead of the one actually claimed by the merge.
+    #[test]
+    fn test_a_cell_after_a_row_spanning_merge_keeps_its_own_column_and_hyperlink() {
+        let cell = |text: &str, url: &str, row_span: u32| TableCell {
+            content: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    text: text.to_string(),
+                    hyperlink: Some(url.to_string()),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            })],
+            col_span: 1,
+            row_span,
+            ..Default::default()
+        };
+
+        let table = Table {
+            rows: vec![
+                TableRow {
+                    cells: vec![
+                        cell("Anchor", "https://example.com/anchor", 3),
+                        cell("B0", "https://example.com/b0", 1),
+                    ],
+                    ..Default::default()
+                },
+                // Column 0 is covered by the anchor's row_span=3 merge, so
+                // this row's own `cells` correctly holds only column 1 —
+                // the writer must place it at column 1, not column 0.
+                TableRow {
+                    cells: vec![cell("B1", "https://example.com/b1", 1)],
+                    ..Default::default()
+                },
+                TableRow {
+                    cells: vec![cell("B2", "https://example.com/b2", 1)],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let ir = DocumentIR {
+            metadata: Metadata {
+                format: DocumentFormat::Xlsx,
+                ..Default::default()
+            },
+            sections: vec![Section {
+                elements: vec![Element::Table(table)],
+                ..Default::default()
+            }],
+            defined_names: Vec::new(),
+        };
+
+        let mut buf = Cursor::new(Vec::new());
+        create_from_ir_to_writer(&ir, DocumentFormat::Xlsx, &mut buf).unwrap();
+        buf.set_position(0);
+        let doc = crate::Document::from_reader(buf, DocumentFormat::Xlsx).unwrap();
+        let ir2 = doc.to_ir();
+
+        let mut found: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let Element::Table(t) = &ir2.sections[0].elements[0] else {
+            panic!("expected a table");
+        };
+        for row in &t.rows {
+            for cell in &row.cells {
+                for c in &cell.content {
+                    if let Element::Paragraph(p) = c {
+                        for inc in &p.content {
+                            if let InlineContent::Text(span) = inc {
+                                if let Some(url) = &span.hyperlink {
+                                    found.insert(span.text.clone(), url.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(found.get("Anchor").map(String::as_str), Some("https://example.com/anchor"));
+        assert_eq!(found.get("B0").map(String::as_str), Some("https://example.com/b0"));
+        assert_eq!(
+            found.get("B1").map(String::as_str),
+            Some("https://example.com/b1"),
+            "B1's hyperlink must survive at its own column, not be lost to a left-shift: {found:?}"
+        );
+        assert_eq!(
+            found.get("B2").map(String::as_str),
+            Some("https://example.com/b2"),
+            "B2's hyperlink must survive at its own column, not be lost to a left-shift: {found:?}"
+        );
+    }
+
+    /// The XLSX reader turns every real cell comment into an
+    /// `Element::Endnote` whose marker is `"{cell_ref}"` or
+    /// `"{cell_ref} ({author})"` (see `convert_xlsx.rs`). The writer used
+    /// to have nowhere to put endnote content in a spreadsheet and fell
+    /// back to dumping each one's text as a spurious extra row with no
+    /// cell reference at all, silently turning every commented cell into
+    /// bogus sheet data instead of round-tripping the comment. It must
+    /// now write a real `xl/comments*.xml` + `vmlDrawing*.vml` pair and
+    /// leave the sheet's own grid untouched.
+    #[test]
+    fn test_a_cell_comment_round_trips_as_a_real_comment_not_an_extra_row() {
+        let cell = |text: &str| TableCell {
+            content: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    text: text.to_string(),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            })],
+            col_span: 1,
+            row_span: 1,
+            ..Default::default()
+        };
+
+        let table = Table {
+            rows: vec![TableRow {
+                cells: vec![cell("A1"), cell("B1")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let comment = Element::Endnote(Note {
+            id: 1,
+            marker: Some("B1 (Jane Doe)".to_string()),
+            author: None,
+            content: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan {
+                    text: "This needs review".to_string(),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            })],
+        });
+
+        let ir = DocumentIR {
+            metadata: Metadata {
+                format: DocumentFormat::Xlsx,
+                ..Default::default()
+            },
+            sections: vec![Section {
+                elements: vec![Element::Table(table), comment],
+                ..Default::default()
+            }],
+            defined_names: Vec::new(),
+        };
+
+        let mut buf = Cursor::new(Vec::new());
+        create_from_ir_to_writer(&ir, DocumentFormat::Xlsx, &mut buf).unwrap();
+        buf.set_position(0);
+
+        // The written package must contain a real comments part and its
+        // companion VML drawing, not just plain sheet data.
+        let mut zip = zip::ZipArchive::new(buf.clone()).unwrap();
+        let names: Vec<String> = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with("xl/comments") && n.ends_with(".xml")),
+            "expected a comments part, got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("vmlDrawing")),
+            "expected a companion VML drawing part, got: {names:?}"
+        );
+
+        buf.set_position(0);
+        let doc = crate::Document::from_reader(buf, DocumentFormat::Xlsx).unwrap();
+        let ir2 = doc.to_ir();
+
+        let Element::Table(t) = &ir2.sections[0].elements[0] else {
+            panic!("expected a table as the first element");
+        };
+        assert_eq!(t.rows.len(), 1, "the comment must not appear as an extra sheet row");
+
+        let has_comment_endnote = ir2.sections[0].elements.iter().any(
+            |e| matches!(e, Element::Endnote(n) if n.marker.as_deref() == Some("B1 (Jane Doe)")),
+        );
+        assert!(
+            has_comment_endnote,
+            "the comment must round-trip back onto cell B1: {:?}",
+            ir2.sections[0].elements
+        );
+    }
+
+    /// A table cell's own character formatting (bold/
+    /// italic/color) was silently discarded on write no matter how it
+    /// reached the IR: `ir_cell_to_cell_data` built a `CellData` from
+    /// the cell's flattened text and a style derived only from
+    /// `is_header`/`background_color`/`number_format`, never the
+    /// cell's own `TextSpan`s. Both a single formatted run and a
+    /// multi-run cell (the exact shape the rich-text fix taught the reader to
+    /// parse, with no write-side counterpart until now) must survive a
+    /// write->reread round trip with per-run fidelity.
+    #[test]
+    fn test_cell_character_formatting_round_trips_including_multi_run() {
+        let span = |text: &str, bold: bool, color: Option<[u8; 3]>| {
+            InlineContent::Text(TextSpan {
+                text: text.to_string(),
+                bold,
+                color,
+                ..Default::default()
+            })
+        };
+        let cell = |spans: Vec<InlineContent>| TableCell {
+            content: vec![Element::Paragraph(Paragraph {
+                content: spans,
+                ..Default::default()
+            })],
+            col_span: 1,
+            row_span: 1,
+            ..Default::default()
+        };
+
+        let table = Table {
+            rows: vec![TableRow {
+                cells: vec![
+                    cell(vec![span("Bold Red", true, Some([255, 0, 0]))]),
+                    cell(vec![span("Plain", false, None)]),
+                    cell(vec![span("Bold ", true, None), span("Plain", false, None)]),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let ir = DocumentIR {
+            metadata: Metadata {
+                format: DocumentFormat::Xlsx,
+                ..Default::default()
+            },
+            sections: vec![Section {
+                elements: vec![Element::Table(table)],
+                ..Default::default()
+            }],
+            defined_names: Vec::new(),
+        };
+
+        let mut buf = Cursor::new(Vec::new());
+        create_from_ir_to_writer(&ir, DocumentFormat::Xlsx, &mut buf).unwrap();
+        buf.set_position(0);
+        let doc = crate::Document::from_reader(buf, DocumentFormat::Xlsx).unwrap();
+        let ir2 = doc.to_ir();
+
+        let Element::Table(t) = &ir2.sections[0].elements[0] else {
+            panic!("expected a table as the first element");
+        };
+        fn spans_of(cell: &TableCell) -> Vec<&TextSpan> {
+            cell.content
+                .iter()
+                .flat_map(|e| match e {
+                    Element::Paragraph(p) => p
+                        .content
+                        .iter()
+                        .filter_map(|c| {
+                            if let InlineContent::Text(t) = c {
+                                Some(t)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                })
+                .collect()
+        }
+
+        let s0 = spans_of(&t.rows[0].cells[0]);
+        assert_eq!(s0.len(), 1);
+        assert_eq!(s0[0].text, "Bold Red");
+        assert!(s0[0].bold, "bold must survive a single-run cell round trip");
+        assert_eq!(
+            s0[0].color,
+            Some([255, 0, 0]),
+            "color must survive a single-run cell round trip"
+        );
+
+        let s1 = spans_of(&t.rows[0].cells[1]);
+        assert_eq!(s1.len(), 1);
+        assert!(!s1[0].bold, "a plain cell must not gain formatting");
+
+        let s2 = spans_of(&t.rows[0].cells[2]);
+        assert_eq!(s2.len(), 2, "both runs of a multi-run cell must survive separately: {s2:?}");
+        assert_eq!(s2[0].text, "Bold ");
+        assert!(s2[0].bold, "the first run's bold must survive");
+        assert_eq!(s2[1].text, "Plain");
+        assert!(!s2[1].bold, "the second run must not inherit the first run's bold");
+    }
+}
+
+#[cfg(test)]
+mod docx_section_title_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// `convert_docx.rs` derives `section.title` from a
+    /// heading using a narrower text extraction (only `InlineContent::
+    /// Text`, silently dropping `LineBreak`) than `ir_to_docx`'s "is the
+    /// title already present in the elements" check (`inline_to_text`,
+    /// which turns `LineBreak` into `\n`). A heading containing a line
+    /// break therefore never string-matched its own derived title, so
+    /// the title-suppression check always failed and a second, spurious
+    /// copy of the heading got written on every round trip. Both sides
+    /// must now agree by construction — they share `ir::inline_to_text`.
+    #[test]
+    fn test_a_heading_with_a_line_break_is_not_duplicated_as_a_second_title() {
+        let heading = Element::Heading(Heading {
+            level: 1,
+            content: vec![
+                InlineContent::LineBreak,
+                InlineContent::Text(TextSpan::plain("Individual Elements")),
+            ],
+            ..Default::default()
+        });
+        let body = Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan::plain("Body text."))],
+            ..Default::default()
+        });
+
+        let ir = DocumentIR {
+            metadata: Metadata {
+                format: DocumentFormat::Docx,
+                ..Default::default()
+            },
+            sections: vec![Section {
+                title: Some(inline_to_text(&[
+                    InlineContent::LineBreak,
+                    InlineContent::Text(TextSpan::plain("Individual Elements")),
+                ])),
+                elements: vec![heading, body],
+                ..Default::default()
+            }],
+            defined_names: Vec::new(),
+        };
+
+        let mut buf = Cursor::new(Vec::new());
+        create_from_ir_to_writer(&ir, DocumentFormat::Docx, &mut buf).unwrap();
+        buf.set_position(0);
+        let doc = crate::Document::from_reader(buf, DocumentFormat::Docx).unwrap();
+        let ir2 = doc.to_ir();
+
+        let heading_count = ir2.sections[0]
+            .elements
+            .iter()
+            .filter(|e| matches!(e, Element::Heading(h) if inline_to_text(&h.content).contains("Individual Elements")))
+            .count();
+        assert_eq!(
+            heading_count, 1,
+            "the heading must not be duplicated as a second title on write: {:?}",
+            ir2.sections[0].elements
+        );
+    }
+}
+
+#[cfg(test)]
+mod pptx_notes_write_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// A bold run in `Section::speaker_notes` must survive
+    /// a full write→reread round trip, not just reach the writer's own
+    /// intermediate representation.
+    #[test]
+    fn test_bold_speaker_notes_round_trip() {
+        let notes = vec![Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan {
+                text: "THIS LINE IS BOLD".to_string(),
+                bold: true,
+                ..Default::default()
+            })],
+            ..Default::default()
+        })];
+
+        let ir = DocumentIR {
+            metadata: Metadata {
+                format: DocumentFormat::Pptx,
+                ..Default::default()
+            },
+            sections: vec![Section {
+                elements: vec![Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain("Visible body"))],
+                    ..Default::default()
+                })],
+                speaker_notes: Some(notes),
+                ..Default::default()
+            }],
+            defined_names: Vec::new(),
+        };
+
+        let mut buf = Cursor::new(Vec::new());
+        create_from_ir_to_writer(&ir, DocumentFormat::Pptx, &mut buf).unwrap();
+        buf.set_position(0);
+        let doc = crate::Document::from_reader(buf, DocumentFormat::Pptx).unwrap();
+        let ir2 = doc.to_ir();
+
+        let notes2 = ir2.sections[0]
+            .speaker_notes
+            .as_ref()
+            .expect("notes must survive the round trip");
+        let bold_survived = notes2.iter().any(|e| {
+            matches!(e, Element::Paragraph(p) if p.content.iter().any(|c| {
+                matches!(c, InlineContent::Text(t) if t.text == "THIS LINE IS BOLD" && t.bold)
+            }))
+        });
+        assert!(
+            bold_survived,
+            "bold formatting on speaker notes must survive a write->reread round trip: {notes2:?}"
+        );
+    }
 }

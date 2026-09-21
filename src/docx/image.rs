@@ -25,6 +25,28 @@ pub struct DrawingInfo {
     /// Vector shape data when the drawing is a `<wps:wsp>` rather
     /// than an embedded picture.
     pub shape: Option<ShapeInfo>,
+    /// Relationship id from `<c:chart r:id="…"/>` when the drawing is a
+    /// native DrawingML chart (`word/charts/chartN.xml`) rather than a
+    /// picture or a vector shape.
+    pub chart_rel_id: Option<String>,
+    /// Readable text of the referenced chart part — chart and axis titles,
+    /// category labels, series names and cached data values — one line each.
+    ///
+    /// The chart part lives outside the document part, so this is filled in
+    /// by `DocxDocument::from_opc` after the body has been parsed; a
+    /// standalone `<w:drawing>` parse leaves it empty.
+    pub chart_text: Vec<String>,
+    /// Relationship id from `<dgm:relIds r:dm="…"/>` when the graphic is a
+    /// SmartArt diagram, pointing at its data part
+    /// (`word/diagrams/dataN.xml`) rather than a picture or a shape.
+    pub dgm_data_rel_id: Option<String>,
+    /// Readable text of the referenced SmartArt data part — every `<a:t>`
+    /// text node in reading order, one per line.
+    ///
+    /// Like `chart_text`, the diagram data part lives outside the document
+    /// part, so this is filled in by `DocxDocument::from_opc` after the
+    /// body has been parsed.
+    pub dgm_text: Vec<String>,
 }
 
 /// Absolute coordinates extracted from a `<wp:anchor>` wrapper.

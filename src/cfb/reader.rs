@@ -23,9 +23,16 @@ pub struct CfbReader<R> {
 impl<R: Read + Seek> CfbReader<R> {
     /// Open and parse a CFB file.
     pub fn new(mut reader: R) -> Result<Self> {
-        // Read header.
+        // Read header. A file shorter than the header is not a compound
+        // file at all (a text file under a `.doc`/`.dot` name, say); say
+        // so rather than "failed to fill whole buffer".
         let mut header_buf = [0u8; 512];
-        reader.read_exact(&mut header_buf)?;
+        let got = read_fully(&mut reader, &mut header_buf)?;
+        if got < header_buf.len() {
+            return Err(CfbError::InvalidHeader(format!(
+                "not a compound file: {got} bytes, shorter than the 512-byte header"
+            )));
+        }
         let header = CfbHeader::parse(&header_buf)?;
 
         // Build the FAT.
@@ -75,12 +82,39 @@ impl<R: Read + Seek> CfbReader<R> {
         &self.header
     }
 
-    /// Find a stream entry by name (case-insensitive).
+    /// Find a stream entry by name (case-insensitive), among the **root
+    /// storage's direct children only**.
+    ///
+    /// This used to flat-scan `self.entries` — the directory stream's
+    /// on-disk array order, not the logical storage tree — so a document
+    /// that OLE-embeds another document of the same kind (two directory
+    /// entries both named e.g. `WordDocument`/`1Table`, one at the root
+    /// and one nested under `ObjectPool/_<id>/`) could silently return
+    /// the *embedded* object's stream instead of the top-level document's
+    /// own, whenever the embedded copy happened to sit at a lower array
+    /// index. Confirmed on real, non-fuzzed files: 15 failed with a
+    /// confusing "piece table outside the stream" error (the wrong,
+    /// smaller stream was returned), 2 silently extracted the embedded
+    /// object's content as if it were the document's own, both with
+    /// `Ok`/no signal anything was substituted.
     pub fn find_entry(&self, name: &str) -> Option<usize> {
-        let lower = name.to_ascii_lowercase();
-        self.entries
-            .iter()
-            .position(|e| e.entry_type == EntryType::Stream && e.name.to_ascii_lowercase() == lower)
+        if self.entries.is_empty() || self.entries[0].entry_type != EntryType::RootStorage {
+            return None;
+        }
+        let idx = self.find_in_tree(self.entries[0].child, name)?;
+        (self.entries[idx].entry_type == EntryType::Stream).then_some(idx)
+    }
+
+    /// `true` when the root storage has a direct child (stream *or*
+    /// storage) with this name — e.g. a `_VBA_PROJECT` storage, which
+    /// [`find_entry`](Self::find_entry) alone can never see, since it
+    /// only matches streams. Same root-scoped tree walk as `find_entry`,
+    /// without the type filter.
+    pub fn has_root_entry(&self, name: &str) -> bool {
+        if self.entries.is_empty() || self.entries[0].entry_type != EntryType::RootStorage {
+            return false;
+        }
+        self.find_in_tree(self.entries[0].child, name).is_some()
     }
 
     /// Find an entry by path (e.g., "Storage1/StreamName"), case-insensitive.
@@ -119,20 +153,29 @@ impl<R: Read + Seek> CfbReader<R> {
 
     /// Search the red-black tree rooted at `node_id` for an entry matching `name`.
     fn find_in_tree(&self, node_id: u32, name: &str) -> Option<usize> {
-        if node_id == NO_ENTRY || node_id as usize >= self.entries.len() {
-            return None;
-        }
-
-        let entry = &self.entries[node_id as usize];
+        // An explicit stack and a visited set, not recursion: a malformed
+        // directory whose sibling pointers form a cycle recursed without
+        // bound and overflowed the stack — an abort no caller can catch,
+        // reachable from `open_stream` on every legacy format. Each entry
+        // is visited at most once, so the walk is bounded by the directory.
         let lower = name.to_ascii_lowercase();
-
-        if entry.name.to_ascii_lowercase() == lower {
-            return Some(node_id as usize);
+        let mut visited = vec![false; self.entries.len()];
+        let mut stack = vec![node_id];
+        while let Some(id) = stack.pop() {
+            if id == NO_ENTRY || id as usize >= self.entries.len() || visited[id as usize] {
+                continue;
+            }
+            visited[id as usize] = true;
+            let entry = &self.entries[id as usize];
+            if entry.name.to_ascii_lowercase() == lower {
+                return Some(id as usize);
+            }
+            // Search both subtrees (the tree may not be well-ordered in
+            // malformed files); left first, so it is popped first.
+            stack.push(entry.right_sibling);
+            stack.push(entry.left_sibling);
         }
-
-        // Search both subtrees (the tree may not be well-ordered in malformed files).
-        self.find_in_tree(entry.left_sibling, name)
-            .or_else(|| self.find_in_tree(entry.right_sibling, name))
+        None
     }
 
     /// Read a stream by directory entry index.
@@ -157,8 +200,9 @@ impl<R: Read + Seek> CfbReader<R> {
         {
             self.read_mini_stream(start, size)
         } else {
-            let data = Self::read_chain(&mut self.reader, &self.header, &self.fat, start)?;
-            Ok(data[..size.min(data.len())].to_vec())
+            let mut data = Self::read_chain(&mut self.reader, &self.header, &self.fat, start)?;
+            data.truncate(size);
+            Ok(data)
         }
     }
 
@@ -196,9 +240,23 @@ impl<R: Read + Seek> CfbReader<R> {
             .collect();
 
         // Follow the DIFAT chain for large files.
+        //
+        // Bounded like every other chain walk in this file. A chain cannot
+        // visit more distinct sectors than the file holds, so walking past
+        // that many is a cycle (a sector whose "next" pointer refers back to
+        // one already visited — trivially, to itself). Without the bound this
+        // loop had no exit condition a cycle could satisfy, and a 1.5 KB file
+        // hung `Document::open` forever.
+        let file_len = reader.seek(SeekFrom::End(0))?;
+        let sectors_in_file = (file_len / header.sector_size as u64).saturating_add(1);
         let mut difat_sector = header.first_difat_sector;
         let entries_per_difat = header.sector_size / 4 - 1; // last u32 is next DIFAT sector
+        let mut visited_difat = 0u64;
         while difat_sector <= MAX_REG_SECT {
+            if visited_difat >= sectors_in_file {
+                return Err(CfbError::CorruptedStream("DIFAT chain cycle detected".into()));
+            }
+            visited_difat += 1;
             let mut sector_buf = vec![0u8; header.sector_size];
             reader.seek(SeekFrom::Start(header.sector_offset(difat_sector)))?;
             let n = read_fully(reader, &mut sector_buf)?;
@@ -256,34 +314,67 @@ impl<R: Read + Seek> CfbReader<R> {
     }
 
     /// Read a chain of sectors starting at `start` and return the concatenated data.
+    ///
+    /// The chain is walked in the in-memory FAT first, so the destination
+    /// is reserved once and consecutive sectors — which is how Office
+    /// writes every stream — are fetched with one `seek` and one `read`
+    /// per run rather than one of each (plus a 512-byte buffer) per
+    /// sector. On a 14 MB `.doc` that was ~28,000 syscalls and half the
+    /// open time.
     fn read_chain(reader: &mut R, header: &CfbHeader, fat: &[u32], start: u32) -> Result<Vec<u8>> {
-        let mut data = Vec::new();
+        let file_len = reader.seek(SeekFrom::End(0))?;
+        let max_sectors = fat.len() + 1; // safety limit
+        let mut chain: Vec<u32> = Vec::new();
         let mut sector = start;
-        let mut visited = 0u32;
-        let max_sectors = fat.len() as u32 + 1; // safety limit
-
         while sector <= MAX_REG_SECT {
-            if visited > max_sectors {
+            // Tolerate truncated files: a sector past the end of the file
+            // ends the stream, as the read that came back empty did when
+            // the chain was followed one read at a time — and before a
+            // cycle further along it could be reported.
+            if header.sector_offset(sector) >= file_len {
+                break;
+            }
+            if chain.len() > max_sectors {
                 return Err(CfbError::CorruptedStream("FAT chain cycle detected".into()));
             }
+            chain.push(sector);
+            match fat.get(sector as usize) {
+                Some(&next) => sector = next,
+                None => break,
+            }
+        }
 
-            let offset = header.sector_offset(sector);
-            let mut buf = vec![0u8; header.sector_size];
-            reader.seek(SeekFrom::Start(offset))?;
+        // A FAT can name far more sectors than the file holds; never
+        // reserve past the end of the file for it.
+        let sector_size = header.sector_size;
+        let wanted = (chain.len() * sector_size) as u64;
+        let mut data = Vec::with_capacity(wanted.min(file_len) as usize);
+
+        let mut i = 0;
+        while i < chain.len() {
+            let run_start = chain[i];
+            let mut run_len = 1usize;
+            while i + run_len < chain.len()
+                && chain[i + run_len] == run_start.wrapping_add(run_len as u32)
+            {
+                run_len += 1;
+            }
+            let offset = header.sector_offset(run_start);
             // Tolerate truncated files: read as much as available.
-            let n = read_fully(reader, &mut buf)?;
-            if n == 0 {
+            let available = file_len.saturating_sub(offset);
+            let want = ((run_len * sector_size) as u64).min(available) as usize;
+            if want == 0 {
                 break;
             }
-            data.extend_from_slice(&buf[..n]);
-
-            // Follow chain.
-            if (sector as usize) < fat.len() {
-                sector = fat[sector as usize];
-            } else {
+            let old_len = data.len();
+            data.resize(old_len + want, 0);
+            reader.seek(SeekFrom::Start(offset))?;
+            let n = read_fully(reader, &mut data[old_len..])?;
+            data.truncate(old_len + n);
+            if n < run_len * sector_size {
                 break;
             }
-            visited += 1;
+            i += run_len;
         }
 
         Ok(data)
@@ -478,8 +569,169 @@ mod tests {
         file[off..off + 4].copy_from_slice(&value.to_le_bytes());
     }
 
+    /// A v3 file whose one stream occupies `n` consecutive sectors (a
+    /// header, a directory sector, a FAT sector, then the data), filled
+    /// with a byte pattern so the read-back can be checked.
+    fn build_cfb_with_contiguous_stream(n: usize) -> (Vec<u8>, Vec<u8>) {
+        assert!(n + 2 <= 128, "one FAT sector covers 128 entries");
+        let sector_size = 512usize;
+        let mut file = vec![0u8; 512 + (2 + n) * sector_size];
+        let mut hdr = build_minimal_cfb();
+        hdr.truncate(512);
+        file[..512].copy_from_slice(&hdr);
+        let dir_offset = 512;
+        let stream_len = n * sector_size - 7; // not sector-aligned on purpose
+        write_dir_entry(
+            &mut file[dir_offset..dir_offset + 128],
+            "Root Entry",
+            5,
+            1,
+            END_OF_CHAIN,
+            0,
+        );
+        write_dir_entry(
+            &mut file[dir_offset + 128..dir_offset + 256],
+            "BigStream",
+            2,
+            NO_ENTRY,
+            2,
+            stream_len as u32,
+        );
+        file[dir_offset + 256 + 0x42] = 0;
+        file[dir_offset + 384 + 0x42] = 0;
+        let fat_offset = 512 + sector_size;
+        write_fat_entry(&mut file, fat_offset, 0, END_OF_CHAIN);
+        write_fat_entry(&mut file, fat_offset, 1, FAT_SECT);
+        for i in 0..n {
+            let next = if i + 1 == n {
+                END_OF_CHAIN
+            } else {
+                (3 + i) as u32
+            };
+            write_fat_entry(&mut file, fat_offset, 2 + i, next);
+        }
+        for i in (2 + n)..128 {
+            write_fat_entry(&mut file, fat_offset, i, FREE_SECT);
+        }
+        let data_offset = 512 + 2 * sector_size;
+        let payload: Vec<u8> = (0..stream_len).map(|i| (i % 251) as u8).collect();
+        file[data_offset..data_offset + stream_len].copy_from_slice(&payload);
+        (file, payload)
+    }
+
+    /// Counts the I/O calls the CFB reader makes against its source.
+    struct CountingReader {
+        inner: Cursor<Vec<u8>>,
+        reads: usize,
+    }
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            self.inner.read(buf)
+        }
+    }
+    impl Seek for CountingReader {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// A 464-byte JSON file under a `.doc` name failed with the I/O
+    /// layer's "failed to fill whole buffer"; it is simply not a compound
+    /// file, and the error says so.
     #[test]
-    fn open_minimal_cfb() {
+    fn test_a_file_shorter_than_the_header_is_named_not_a_compound_file() {
+        let err = CfbReader::new(Cursor::new(vec![b'['; 464]))
+            .err()
+            .expect("refused");
+        let msg = err.to_string();
+        assert!(msg.contains("not a compound file") && msg.contains("464"), "{msg}");
+    }
+
+    /// A fuzzed deck's stream chain continued past the end of the file
+    /// and then looped. Reading sector by sector, the first empty read
+    /// ended the stream with the bytes so far; walking the whole chain up
+    /// front reported the cycle instead and a file that used to open
+    /// stopped opening. Truncation still ends the stream first.
+    #[test]
+    fn test_a_chain_that_leaves_the_file_before_it_cycles_is_truncated_not_an_error() {
+        let (mut file, payload) = build_cfb_with_contiguous_stream(1);
+        let fat_offset = 512 + 512;
+        write_fat_entry(&mut file, fat_offset, 2, 50); // past the 3-sector file
+        write_fat_entry(&mut file, fat_offset, 50, 2); // ...and back: a cycle
+        let mut cfb = CfbReader::new(Cursor::new(file)).unwrap();
+        let data = cfb.open_stream("BigStream").unwrap();
+        assert_eq!(data, payload);
+    }
+
+    /// A stream was read one sector at a time — a 512-byte buffer, a
+    /// `seek` and a `read` per sector — then copied whole a second time
+    /// on the way out. A 64-sector stream now costs a handful of reads
+    /// (the header, the directory and FAT chains, one run of data), not
+    /// 64 of them, and the bytes come back exactly.
+    #[test]
+    fn test_contiguous_stream_is_read_in_one_run() {
+        let (file, payload) = build_cfb_with_contiguous_stream(64);
+        let mut cfb = CfbReader::new(CountingReader {
+            inner: Cursor::new(file),
+            reads: 0,
+        })
+        .unwrap();
+        let before = cfb.reader.reads;
+        let data = cfb.open_stream("BigStream").unwrap();
+        let reads = cfb.reader.reads - before;
+        assert_eq!(data, payload);
+        assert!(reads <= 2, "64 contiguous sectors took {reads} read calls");
+    }
+
+    /// Regression: a DIFAT chain whose last sector's "next" pointer refers
+    /// back to a sector already visited (here: to itself) had no exit
+    /// condition — `Document::open` on a 1.5 KB file never returned. The
+    /// walk is now bounded by the sectors the file holds and reports a
+    /// cycle.
+    #[test]
+    fn test_cyclic_difat_chain_is_an_error_not_a_hang() {
+        let mut file = build_minimal_cfb();
+        // Add a sector 3 that is a DIFAT sector: every FAT pointer free,
+        // and its trailing "next DIFAT" entry pointing at itself.
+        file.extend(std::iter::repeat_n(0xFFu8, 512));
+        let s3 = 512 + 3 * 512;
+        file[s3 + 508..s3 + 512].copy_from_slice(&3u32.to_le_bytes());
+        // Header: first DIFAT sector = 3, one DIFAT sector.
+        file[0x44..0x48].copy_from_slice(&3u32.to_le_bytes());
+        file[0x48..0x4C].copy_from_slice(&1u32.to_le_bytes());
+
+        let err = match CfbReader::new(Cursor::new(file)) {
+            Err(e) => e,
+            Ok(_) => panic!("a cyclic DIFAT chain must fail"),
+        };
+        assert!(
+            matches!(err, CfbError::CorruptedStream(ref m) if m.contains("DIFAT chain cycle")),
+            "got {err:?}"
+        );
+    }
+
+    /// Regression: a directory entry whose sibling pointer refers to
+    /// itself (or an ancestor) made the recursive tree search overflow the
+    /// stack — an abort no caller can catch, reachable from `open_stream`
+    /// on every legacy format. The search visits each entry once now.
+    #[test]
+    fn test_cyclic_directory_siblings_do_not_recurse_forever() {
+        let mut file = build_minimal_cfb();
+        // Entry 1 ("TestStream"): left sibling -> itself, right -> root.
+        let e1 = 512 + 128;
+        file[e1 + 0x44..e1 + 0x48].copy_from_slice(&1u32.to_le_bytes());
+        file[e1 + 0x48..e1 + 0x4C].copy_from_slice(&0u32.to_le_bytes());
+        let mut reader = CfbReader::new(Cursor::new(file)).unwrap();
+        // The stream is still found through the cycle...
+        assert_eq!(reader.open_stream("TestStream").unwrap(), b"Hello, CFB!");
+        // ...and a name that is not there terminates instead of recursing.
+        assert!(reader.open_stream("Missing").is_err());
+        assert!(!reader.has_root_entry("Missing"));
+    }
+
+    #[test]
+    fn test_open_minimal_cfb() {
         let data = build_minimal_cfb();
         let cursor = Cursor::new(data);
         let reader = CfbReader::new(cursor).unwrap();
@@ -490,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn read_stream_by_name() {
+    fn test_read_stream_by_name() {
         let data = build_minimal_cfb();
         let cursor = Cursor::new(data);
         let mut reader = CfbReader::new(cursor).unwrap();
@@ -498,8 +750,126 @@ mod tests {
         assert_eq!(&stream, b"Hello, CFB!");
     }
 
+    /// Build a CFB whose root storage has one direct child, "ObjectPool"
+    /// (a storage), which itself holds a stream named "TestStream" — at a
+    /// *lower* directory-array index than a second, unrelated "TestStream"
+    /// that lives directly under the root. Mirrors the real shape found in
+    /// 53379.doc (Apache POI test-data): an embedded OLE sub-document's
+    /// stream sits earlier in the flat array than the top-level document's
+    /// own same-named stream.
+    fn build_cfb_with_embedded_same_name_stream() -> Vec<u8> {
+        let sector_size = 512usize;
+        let mut file = vec![0u8; 512 + 4 * sector_size];
+
+        file[0..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        file[0x18..0x1A].copy_from_slice(&0x003Eu16.to_le_bytes());
+        file[0x1A..0x1C].copy_from_slice(&3u16.to_le_bytes());
+        file[0x1C..0x1E].copy_from_slice(&0xFFFEu16.to_le_bytes());
+        file[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
+        file[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
+        file[0x2C..0x30].copy_from_slice(&1u32.to_le_bytes());
+        file[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());
+        file[0x38..0x3C].copy_from_slice(&4096u32.to_le_bytes());
+        file[0x3C..0x40].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+        file[0x40..0x44].copy_from_slice(&0u32.to_le_bytes());
+        file[0x44..0x48].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+        file[0x48..0x4C].copy_from_slice(&0u32.to_le_bytes());
+        file[0x4C..0x50].copy_from_slice(&1u32.to_le_bytes());
+        for i in 1..109 {
+            let off = 0x4C + i * 4;
+            file[off..off + 4].copy_from_slice(&FREE_SECT.to_le_bytes());
+        }
+
+        let dir_offset = 512;
+        // Entry 0: Root Entry, child = 2 ("ObjectPool")
+        write_dir_entry(
+            &mut file[dir_offset..dir_offset + 128],
+            "Root Entry",
+            5,
+            2,
+            END_OF_CHAIN,
+            0,
+        );
+        // Entry 1: "TestStream" NESTED under ObjectPool — the embedded
+        // object's copy, lower array index, wrong content.
+        write_dir_entry(
+            &mut file[dir_offset + 128..dir_offset + 256],
+            "TestStream",
+            2,
+            NO_ENTRY,
+            2,
+            6,
+        );
+        // Entry 2: "ObjectPool" storage — child = 1 (the nested stream),
+        // right_sibling = 3 (links to the real root-level stream so both
+        // are reachable from Root's tree).
+        write_dir_entry(
+            &mut file[dir_offset + 256..dir_offset + 384],
+            "ObjectPool",
+            1,
+            1,
+            END_OF_CHAIN,
+            0,
+        );
+        file[dir_offset + 256 + 0x48..dir_offset + 256 + 0x4C].copy_from_slice(&3u32.to_le_bytes());
+        // Entry 3: "TestStream" at ROOT level — the real, wanted stream,
+        // higher array index than the embedded one.
+        write_dir_entry(
+            &mut file[dir_offset + 384..dir_offset + 512],
+            "TestStream",
+            2,
+            NO_ENTRY,
+            3,
+            11,
+        );
+
+        let fat_offset = 512 + sector_size;
+        write_fat_entry(&mut file, fat_offset, 0, END_OF_CHAIN);
+        write_fat_entry(&mut file, fat_offset, 1, FAT_SECT);
+        write_fat_entry(&mut file, fat_offset, 2, END_OF_CHAIN);
+        write_fat_entry(&mut file, fat_offset, 3, END_OF_CHAIN);
+        for i in 4..128 {
+            write_fat_entry(&mut file, fat_offset, i, FREE_SECT);
+        }
+
+        let wrong_offset = 512 + 2 * sector_size;
+        file[wrong_offset..wrong_offset + 6].copy_from_slice(b"Wrong!");
+        let real_offset = 512 + 3 * sector_size;
+        file[real_offset..real_offset + 11].copy_from_slice(b"Hello, CFB!");
+
+        file
+    }
+
+    /// find_entry/open_stream used to flat-scan the
+    /// directory array in on-disk order, so an embedded sub-document's
+    /// same-named stream at a lower array index silently won over the
+    /// top-level document's own stream of the same name.
     #[test]
-    fn read_stream_case_insensitive() {
+    fn test_find_entry_resolves_only_root_level_children_not_embedded_objects() {
+        let data = build_cfb_with_embedded_same_name_stream();
+        let mut reader = CfbReader::new(Cursor::new(data)).unwrap();
+        let stream = reader.open_stream("TestStream").unwrap();
+        assert_eq!(
+            &stream, b"Hello, CFB!",
+            "must return the root-level stream, not the embedded object's"
+        );
+    }
+
+    /// A `_VBA_PROJECT` (or here, "ObjectPool") root-level
+    /// entry is a STORAGE, not a stream; `find_entry`/`has_stream` alone
+    /// can never see it, since they only match streams. `has_root_entry`
+    /// must find it regardless of type, and must not match a nested
+    /// entry (the embedded "TestStream" one level down).
+    #[test]
+    fn test_has_root_entry_finds_a_storage_not_just_streams() {
+        let data = build_cfb_with_embedded_same_name_stream();
+        let reader = CfbReader::new(Cursor::new(data)).unwrap();
+        assert!(reader.has_root_entry("ObjectPool"), "must find the root-level storage");
+        assert!(!reader.has_root_entry("NoSuchEntry"));
+    }
+
+    #[test]
+    fn test_read_stream_case_insensitive() {
         let data = build_minimal_cfb();
         let cursor = Cursor::new(data);
         let mut reader = CfbReader::new(cursor).unwrap();
@@ -508,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_not_found() {
+    fn test_stream_not_found() {
         let data = build_minimal_cfb();
         let cursor = Cursor::new(data);
         let mut reader = CfbReader::new(cursor).unwrap();
@@ -516,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn has_stream() {
+    fn test_has_stream() {
         let data = build_minimal_cfb();
         let cursor = Cursor::new(data);
         let reader = CfbReader::new(cursor).unwrap();
@@ -613,7 +983,7 @@ mod tests {
     }
 
     #[test]
-    fn read_mini_stream() {
+    fn test_read_mini_stream() {
         let data = build_cfb_with_mini_stream();
         let cursor = Cursor::new(data);
         let mut reader = CfbReader::new(cursor).unwrap();
@@ -622,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn find_entry_by_path_simple() {
+    fn test_find_entry_by_path_simple() {
         let data = build_minimal_cfb();
         let cursor = Cursor::new(data);
         let reader = CfbReader::new(cursor).unwrap();

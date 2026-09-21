@@ -81,6 +81,13 @@ html_exports/
 # Internal feature request documents (not for public distribution)
 docs/requests/
 
+# Internal release/security material (not for public distribution —
+# SECURITY.md requires private disclosure, never public GitHub issues)
+docs/releases/
+
+# Fetched external regression corpus (see scripts/regression-sweep/README.md)
+scripts/regression-sweep/corpus/
+
 # Large test files
 tests/fixtures/large/
 tests/fixtures/real/
@@ -94,3 +101,6 @@ sbom.json
 
 # Fetched by scripts/ooxml-validate/fetch_schemas.py, not committed.
 scripts/ooxml-validate/xsd/
+
+# Local review/research notes — kept out of the tree.
+.research/

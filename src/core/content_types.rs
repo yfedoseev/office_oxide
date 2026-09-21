@@ -32,14 +32,14 @@ impl ContentTypes {
                     let local_bytes = local.as_ref();
 
                     match local_bytes {
-                        b"Default" => {
-                            let ext = xml::required_attr_str(e, b"Extension")?;
-                            let ct = xml::required_attr_str(e, b"ContentType")?;
+                        "Default" => {
+                            let ext = xml::required_attr_str(e, "Extension")?;
+                            let ct = xml::required_attr_str(e, "ContentType")?;
                             defaults.insert(ext.to_ascii_lowercase(), ct.into_owned());
                         },
-                        b"Override" => {
-                            let pn = xml::required_attr_str(e, b"PartName")?;
-                            let ct = xml::required_attr_str(e, b"ContentType")?;
+                        "Override" => {
+                            let pn = xml::required_attr_str(e, "PartName")?;
+                            let ct = xml::required_attr_str(e, "ContentType")?;
                             let part_name = PartName::new(&pn)?;
                             overrides.insert(part_name, ct.into_owned());
                         },
@@ -196,14 +196,14 @@ mod tests {
 </Types>"#;
 
     #[test]
-    fn parse_content_types() {
+    fn test_parse_content_types() {
         let ct = ContentTypes::parse(SAMPLE_CT_XML).unwrap();
         assert_eq!(ct.defaults().len(), 3);
         assert_eq!(ct.overrides().len(), 2);
     }
 
     #[test]
-    fn resolve_override() {
+    fn test_resolve_override() {
         let ct = ContentTypes::parse(SAMPLE_CT_XML).unwrap();
         let pn = PartName::new("/word/document.xml").unwrap();
         assert_eq!(
@@ -215,21 +215,21 @@ mod tests {
     }
 
     #[test]
-    fn resolve_default_by_extension() {
+    fn test_resolve_default_by_extension() {
         let ct = ContentTypes::parse(SAMPLE_CT_XML).unwrap();
         let pn = PartName::new("/word/media/image1.png").unwrap();
         assert_eq!(ct.resolve(&pn), Some("image/png"));
     }
 
     #[test]
-    fn resolve_unknown_returns_none() {
+    fn test_resolve_unknown_returns_none() {
         let ct = ContentTypes::parse(SAMPLE_CT_XML).unwrap();
         let pn = PartName::new("/word/unknown.bin").unwrap();
         assert_eq!(ct.resolve(&pn), None);
     }
 
     #[test]
-    fn builder_round_trip() {
+    fn test_builder_round_trip() {
         let mut builder = ContentTypesBuilder::new();
         builder.add_default("png", "image/png");
         builder.add_override(

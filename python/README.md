@@ -1,6 +1,6 @@
 # office-oxide for Python — The Fastest Office Document Library for Python
 
-The fastest Python library for text extraction, Markdown conversion, and editing across all six Microsoft Office formats. Powered by a Rust core via PyO3. Up to 100× faster than python-docx, openpyxl, and python-pptx. 100% pass rate on valid Office files — zero failures on legitimate Word/Excel/PowerPoint documents. MIT / Apache-2.0 licensed.
+The fastest Python library for text extraction and Markdown conversion across all six Microsoft Office formats (DOCX, XLSX, PPTX, DOC, XLS, PPT), plus writing and editing for DOCX, XLSX, and PPTX (the legacy binary formats are read-only, and convertible to OOXML via `save_as`). Powered by a Rust core via PyO3. Up to 100× faster than python-docx, openpyxl, and python-pptx. 100% pass rate on valid Office files — zero failures on legitimate Word/Excel/PowerPoint documents. MIT / Apache-2.0 licensed.
 
 [![PyPI](https://img.shields.io/pypi/v/office-oxide.svg)](https://pypi.org/project/office-oxide/)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](https://opensource.org/licenses)
@@ -94,6 +94,8 @@ with open("file.docx", "rb") as f:
 ```
 
 ### Editing
+
+Only DOCX, XLSX, and PPTX are editable; DOC, XLS, and PPT are read-only.
 
 ```python
 with EditableDocument.open("template.docx") as ed:

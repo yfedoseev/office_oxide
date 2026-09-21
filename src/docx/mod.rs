@@ -56,7 +56,9 @@ pub use headers::{
 pub use hyperlink::{Hyperlink, HyperlinkTarget};
 pub use image::{AnchorFrame, AnchorPosition, DrawingInfo, ShapeInfo, ShapeKind};
 pub use numbering::{NumberFormat, NumberingDefinitions};
-pub use paragraph::{BreakType, Paragraph, ParagraphContent, Run, RunContent};
+pub use paragraph::{
+    BreakType, FormField, FormFieldKind, Paragraph, ParagraphContent, Run, RunContent,
+};
 pub use styles::{Style, StyleSheet, StyleType};
 pub use table::{
     CellMargins, CellVAlign, RowHeightRule, Table, TableCell, TableProperties, TableRow,
@@ -121,6 +123,15 @@ pub struct DocxDocument {
     /// Parsed `docProps/core.xml`. `None` when the package carries no
     /// core-properties part.
     pub core_properties: Option<crate::core::properties::CoreProperties>,
+    /// Parsed `docProps/app.xml` (company, producing application, template,
+    /// page/word/character/paragraph counts). `None` when the package
+    /// carries no extended-properties part. The parser already existed;
+    /// nothing on the read side called it until now.
+    pub app_properties: Option<crate::core::properties::AppProperties>,
+    /// `true` when the document part's own relationships include a
+    /// `vbaProject` entry — a cheap macro-presence signal, no VBA
+    /// interpretation.
+    pub has_macros: bool,
     /// Footnote bodies from `word/footnotes.xml`, in document order.
     /// Separator/continuation pseudo-notes are filtered out.
     pub footnotes: Vec<NoteBody>,
@@ -156,7 +167,20 @@ impl DocxDocument {
     }
 
     /// Open a DOCX document from any `Read + Seek` source.
-    pub fn from_reader<R: Read + Seek>(reader: R) -> Result<Self> {
+    pub fn from_reader<R: Read + Seek>(mut reader: R) -> Result<Self> {
+        // A password-protected DOCX is a CFB container, not a zip at all.
+        // Without this check, opening one here (rather than through the
+        // unified `Document::from_reader`, which already has it) failed
+        // with a confusing low-level "Could not find EOCD" zip error
+        // instead of naming the real cause.
+        if crate::cfb::is_cfb_container(&mut reader).map_err(crate::core::Error::from)? {
+            return Err(crate::core::Error::Unsupported(
+                "the file is a password-protected (encrypted) OOXML package; \
+                 decryption is not supported"
+                    .into(),
+            )
+            .into());
+        }
         let opc = OpcReader::new(reader)?;
         Self::from_opc(opc)
     }
@@ -176,8 +200,10 @@ impl DocxDocument {
             "a WordprocessingML document",
         )?;
         let core_properties = crate::core::properties::read_core_properties(&mut opc);
+        let app_properties = crate::core::properties::read_app_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let doc_rels = opc.read_rels_for(&main_part)?;
+        let has_macros = doc_rels.has_vba_project();
 
         // Parse theme
         // A theme is decoration: it supplies colour-scheme lookups and
@@ -260,11 +286,73 @@ impl DocxDocument {
             }
         }
 
+        // Resolve every native DrawingML chart the body references. A
+        // `<w:drawing>` holding a chart carries only `<c:chart r:id="…"/>`;
+        // the chart's title, axis titles, category labels, series names and
+        // cached data values all live in the separate part that id resolves
+        // to (`word/charts/chartN.xml`), which was never opened, so none of
+        // that text reached any consumer.
+        let mut chart_text_by_rid: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for rel in doc_rels.all() {
+            if rel.rel_type != rel_types::CHART || rel.target_mode != TargetMode::Internal {
+                continue;
+            }
+            let Ok(part) = main_part.resolve_relative(&rel.target) else {
+                continue;
+            };
+            if !opc.has_part(&part) {
+                continue;
+            }
+            let Ok(data) = opc.read_part(&part) else {
+                continue;
+            };
+            let lines = crate::core::chart::chart_text_lines(&data);
+            if !lines.is_empty() {
+                chart_text_by_rid.insert(rel.id.clone(), lines);
+            }
+        }
+        // Resolve every SmartArt diagram the body references, the same
+        // way charts are resolved just above.
+        let mut dgm_text_by_rid: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for rel in doc_rels.all() {
+            if rel.rel_type != rel_types::DIAGRAM_DATA || rel.target_mode != TargetMode::Internal {
+                continue;
+            }
+            let Ok(part) = main_part.resolve_relative(&rel.target) else {
+                continue;
+            };
+            if !opc.has_part(&part) {
+                continue;
+            }
+            let Ok(data) = opc.read_part(&part) else {
+                continue;
+            };
+            let lines = diagram_text_lines(&data);
+            if !lines.is_empty() {
+                dgm_text_by_rid.insert(rel.id.clone(), lines);
+            }
+        }
+        if !chart_text_by_rid.is_empty() || !dgm_text_by_rid.is_empty() {
+            attach_chart_text(&mut body.elements, &chart_text_by_rid, &dgm_text_by_rid);
+        }
+
+        // Resolve every embedded native OOXML package object
+        // (`<o:OLEObject Type="Embed">`) by opening its bytes
+        // with the appropriate format reader and folding in its text.
+        resolve_deferred_parts(&mut body.elements, &mut opc, &main_part, &doc_rels);
+
         // Parse headers and footers. Walk header refs and footer refs
         // separately so each parsed `HeaderFooter` can record its own
         // role; without that distinction, downstream consumers had to
         // back-derive headers-vs-footers from cumulative ref counts,
         // which silently misclassifies entries in multi-section docs.
+        // Images referenced from a part other than the main document
+        // (a header's logo, a picture in a footnote), keyed as
+        // `<part>:<rId>` — see `qualify_part_images`.
+        let mut part_images: std::collections::HashMap<String, (Vec<u8>, Option<String>)> =
+            std::collections::HashMap::new();
         let mut headers_footers = Vec::new();
         let mut parse_hf = |hf_ref: &HeaderFooterRef, is_header: bool| -> CoreResult<()> {
             if let Some(rel) = doc_rels.get_by_id(&hf_ref.relationship_id) {
@@ -272,7 +360,27 @@ impl DocxDocument {
                     let part_name = main_part.resolve_relative(&rel.target)?;
                     if opc.has_part(&part_name) {
                         let data = opc.read_part(&part_name)?;
-                        let content = parse_body_elements(&data)?;
+                        // A header or footer part that does not parse (a
+                        // damaged archive with an intact body) is not the
+                        // document: skip it with a warning rather than fail
+                        // the file, as Tika/POI do.
+                        let mut content = match parse_body_elements(&data) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                log::warn!("docx: skipping unreadable {part_name}: {e}");
+                                return Ok(());
+                            },
+                        };
+                        if let Ok(hf_rels) = opc.read_rels_for(&part_name) {
+                            resolve_hyperlinks(&mut content, &hf_rels);
+                            qualify_part_images(
+                                &mut content,
+                                &part_name,
+                                &hf_rels,
+                                &mut opc,
+                                &mut part_images,
+                            );
+                        }
                         headers_footers.push(HeaderFooter {
                             hf_type: hf_ref.hf_type,
                             content,
@@ -295,7 +403,7 @@ impl DocxDocument {
         // Footnotes, endnotes and comments are separate parts referenced
         // from the document relationships. They were never read, which made
         // `ir::Element::Footnote` unreachable and dropped every note body.
-        let mut read_notes = |rel_type: &str, end: &[u8]| -> Vec<NoteBody> {
+        let mut read_notes = |rel_type: &str, end: &str| -> Vec<NoteBody> {
             let Some(rel) = doc_rels.first_by_type(rel_type) else {
                 return Vec::new();
             };
@@ -305,14 +413,32 @@ impl DocxDocument {
             if !opc.has_part(&part) {
                 return Vec::new();
             }
-            match opc.read_part(&part) {
-                Ok(data) => parse_notes_part(&data, end).unwrap_or_default(),
-                Err(_) => Vec::new(),
+            let Ok(data) = opc.read_part(&part) else {
+                return Vec::new();
+            };
+            let mut notes = parse_notes_part(&data, end).unwrap_or_default();
+            // `r:id` is scoped per OPC part: a hyperlink inside a
+            // footnote/endnote/comment resolves against *that* part's
+            // `_rels`, not `document.xml.rels`. Resolving against the
+            // document's relationships left the raw `rIdN` string as the
+            // "URL" for every note hyperlink.
+            if let Ok(note_rels) = opc.read_rels_for(&part) {
+                for n in &mut notes {
+                    resolve_hyperlinks(&mut n.content, &note_rels);
+                    qualify_part_images(
+                        &mut n.content,
+                        &part,
+                        &note_rels,
+                        &mut opc,
+                        &mut part_images,
+                    );
+                }
             }
+            notes
         };
-        let footnotes = read_notes(rel_types::FOOTNOTES, b"footnote");
-        let endnotes = read_notes(rel_types::ENDNOTES, b"endnote");
-        let comments = read_notes(rel_types::COMMENTS, b"comment");
+        let footnotes = read_notes(rel_types::FOOTNOTES, "footnote");
+        let endnotes = read_notes(rel_types::ENDNOTES, "endnote");
+        let comments = read_notes(rel_types::COMMENTS, "comment");
 
         // Scan `word/fonts/` for embedded font programs. Files there are
         // typically `font_<n>_<name>.ttf` (written by our own `DocxWriter`)
@@ -376,6 +502,7 @@ impl DocxDocument {
                 .map(|s| s.to_lowercase());
             images.insert(rel.id.clone(), (data, ext));
         }
+        images.extend(part_images);
 
         debug!(
             "DocxDocument: {} block elements, {} sections, {} embedded fonts, {} images",
@@ -394,6 +521,8 @@ impl DocxDocument {
             embedded_fonts,
             images,
             core_properties,
+            app_properties,
+            has_macros,
             footnotes,
             endnotes,
             comments,
@@ -409,11 +538,11 @@ fn parse_body_elements(xml_data: &[u8]) -> CoreResult<Vec<BlockElement>> {
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"p" => {
+                "p" => {
                     elements.push(BlockElement::Paragraph(parse_paragraph(&mut reader)?));
                 },
-                b"tbl" => {
-                    elements.push(BlockElement::Table(parse_table(&mut reader)?));
+                "tbl" => {
+                    elements.push(BlockElement::Table(Box::new(parse_table(&mut reader)?)));
                 },
                 _ => {},
             },
@@ -524,18 +653,18 @@ fn strip_html_tags(html: &str) -> String {
 /// `comment`). Word emits two pseudo-notes at ids 0 and -1 (the separator
 /// and continuation marks) with `w:type` set; those are not document
 /// content and are filtered out.
-fn parse_notes_part(xml_data: &[u8], end: &[u8]) -> CoreResult<Vec<NoteBody>> {
+fn parse_notes_part(xml_data: &[u8], end: &str) -> CoreResult<Vec<NoteBody>> {
     let mut reader = make_content_reader(xml_data);
     let mut notes = Vec::new();
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) if e.local_name().as_ref() == end => {
-                let note_type = xml::optional_attr_str(e, b"w:type")?;
-                let id: i64 = xml::optional_attr_str(e, b"w:id")?
+                let note_type = xml::optional_attr_str(e, "w:type")?;
+                let id: i64 = xml::optional_attr_str(e, "w:id")?
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
-                let author = xml::optional_attr_str(e, b"w:author")?.map(|v| v.into_owned());
+                let author = xml::optional_attr_str(e, "w:author")?.map(|v| v.into_owned());
                 let content = parse_block_elements_until(&mut reader, end)?;
                 let is_pseudo = note_type.as_deref().is_some_and(|t| t != "normal") || id < 0;
                 if !is_pseudo {
@@ -558,14 +687,19 @@ fn parse_notes_part(xml_data: &[u8], end: &[u8]) -> CoreResult<Vec<NoteBody>> {
 /// document content inside a shape.
 fn parse_block_elements_until(
     reader: &mut quick_xml::Reader<&[u8]>,
-    end_local: &[u8],
+    end_local: &str,
 ) -> CoreResult<Vec<BlockElement>> {
     let mut elements = Vec::new();
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"p" => elements.push(BlockElement::Paragraph(parse_paragraph(reader)?)),
-                b"tbl" => elements.push(BlockElement::Table(parse_table(reader)?)),
+                "p" => elements.push(BlockElement::Paragraph(parse_paragraph(reader)?)),
+                "tbl" => elements.push(BlockElement::Table(Box::new(parse_table(reader)?))),
+                // A content control is a transparent wrapper around its
+                // `w:sdtContent` blocks, here exactly as in the body. Word's
+                // own "quote" text-box templates wrap the whole box in one;
+                // skipping it dropped every such text box entirely.
+                "sdt" | "sdtContent" => {},
                 _ => xml::skip_element_fast(reader)?,
             },
             Event::End(ref e) if e.local_name().as_ref() == end_local => break,
@@ -576,23 +710,129 @@ fn parse_block_elements_until(
     Ok(elements)
 }
 
-/// Collect every `<w:txbxContent>` body inside a VML `<w:pict>` / `<w:object>`
-/// subtree, reading through the matching closing tag.
-fn parse_text_boxes_in(
+/// Everything a legacy VML `<w:pict>` / `<w:object>` subtree can carry.
+///
+/// Only `<w:txbxContent>` used to be read, so a `w:pict` wrapping an
+/// image, WordArt or an embedded package contributed
+/// nothing at all to the document.
+#[derive(Default)]
+struct VmlContent {
+    /// `<w:txbxContent>` bodies (text boxes).
+    boxes: Vec<Vec<BlockElement>>,
+    /// `<v:imagedata>` relationship ids with the enclosing shape's size.
+    images: Vec<(String, Emu, Emu)>,
+    /// `<v:textpath string="…">` values (WordArt).
+    wordart: Vec<String>,
+    /// `<o:OLEObject Type="Embed">` relationship ids.
+    ole_rids: Vec<String>,
+}
+
+impl VmlContent {
+    fn is_empty(&self) -> bool {
+        self.boxes.is_empty()
+            && self.images.is_empty()
+            && self.wordart.is_empty()
+            && self.ole_rids.is_empty()
+    }
+
+    fn merge(&mut self, other: VmlContent) {
+        self.boxes.extend(other.boxes);
+        self.images.extend(other.images);
+        self.wordart.extend(other.wordart);
+        self.ole_rids.extend(other.ole_rids);
+    }
+
+    /// Append this payload to a run's content in a stable order: WordArt
+    /// text, then images, then text boxes, then deferred packages.
+    fn push_into(self, out: &mut Vec<RunContent>) {
+        for s in self.wordart {
+            out.push(RunContent::Text(s));
+        }
+        for (rid, w, h) in self.images {
+            out.push(RunContent::Drawing(Box::new(DrawingInfo {
+                relationship_id: rid,
+                description: None,
+                width: w,
+                height: h,
+                inline: true,
+                anchor_position: None,
+                shape: None,
+                chart_rel_id: None,
+                chart_text: Vec::new(),
+                dgm_data_rel_id: None,
+                dgm_text: Vec::new(),
+            })));
+        }
+        for b in self.boxes {
+            out.push(RunContent::TextBox(b));
+        }
+        for rid in self.ole_rids {
+            out.push(RunContent::DeferredPart(rid));
+        }
+    }
+}
+
+/// Read a VML `<v:shape style="width:191pt;height:88pt">` size. VML uses
+/// CSS-ish lengths, so the unit has to be honoured.
+fn vml_style_size(e: &quick_xml::events::BytesStart) -> Option<(Emu, Emu)> {
+    let style = xml::optional_attr_str(e, "style").ok()??;
+    fn dim(style: &str, key: &str) -> Option<i64> {
+        // Match `width:` but not `mso-wrap-width:`; a leading `;` or the
+        // string start must precede it.
+        let mut rest = style;
+        loop {
+            let at = rest.find(key)?;
+            let ok = at == 0
+                || rest[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c == ';' || c.is_whitespace());
+            if ok {
+                let v = rest[at + key.len()..].trim();
+                let end = v
+                    .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+                    .unwrap_or(v.len());
+                let num: f64 = v[..end].parse().ok()?;
+                let unit = v[end..].trim();
+                // 1 pt = 12700 EMU; the rest convert through points.
+                let emu_per = match unit.trim_end_matches(|c: char| c == ';' || c.is_whitespace()) {
+                    "in" => 914_400.0,
+                    "cm" => 360_000.0,
+                    "mm" => 36_000.0,
+                    "px" => 9525.0,
+                    "pc" => 152_400.0,
+                    _ => 12_700.0,
+                };
+                return Some((num * emu_per) as i64);
+            }
+            rest = &rest[at + key.len()..];
+        }
+    }
+    let w = dim(&style, "width:").unwrap_or(0);
+    let h = dim(&style, "height:").unwrap_or(0);
+    if w == 0 && h == 0 {
+        None
+    } else {
+        Some((Emu(w), Emu(h)))
+    }
+}
+
+/// Collect the contents of a VML `<w:pict>` / `<w:object>` subtree,
+/// reading through the matching closing tag.
+fn parse_vml_content_in(
     reader: &mut quick_xml::Reader<&[u8]>,
-    end_local: &[u8],
-) -> CoreResult<Vec<Vec<BlockElement>>> {
-    let mut boxes = Vec::new();
+    end_local: &str,
+) -> CoreResult<VmlContent> {
+    let mut out = VmlContent::default();
     let mut depth = 1i32;
+    // `<v:imagedata>` is a child of `<v:shape>`, which is where the
+    // display size lives.
+    let mut shape_size = (Emu(0), Emu(0));
+
     loop {
-        match reader.read_event()? {
-            Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"txbxContent" {
-                    boxes.push(parse_block_elements_until(reader, b"txbxContent")?);
-                } else {
-                    depth += 1;
-                }
-            },
+        let (e, is_start) = match reader.read_event()? {
+            Event::Start(e) => (e, true),
+            Event::Empty(e) => (e, false),
             Event::End(ref e) => {
                 if e.local_name().as_ref() == end_local && depth <= 1 {
                     break;
@@ -601,12 +841,57 @@ fn parse_text_boxes_in(
                 if depth <= 0 {
                     break;
                 }
+                continue;
             },
             Event::Eof => break,
+            _ => continue,
+        };
+        match e.local_name().as_ref() {
+            "txbxContent" if is_start => {
+                out.boxes
+                    .push(parse_block_elements_until(reader, "txbxContent")?);
+                // The subtree is fully consumed, so depth is unchanged.
+                continue;
+            },
+            "shape" | "rect" | "roundrect" | "oval" | "line" | "polyline" => {
+                if let Some(sz) = vml_style_size(&e) {
+                    shape_size = sz;
+                }
+            },
+            "imagedata" => {
+                // Word writes `r:id`; some producers write `o:relid`.
+                let rid = xml::optional_attr_str(&e, "r:id")?
+                    .or(xml::optional_attr_str(&e, "o:relid")?)
+                    .map(|v| v.into_owned());
+                if let Some(rid) = rid.filter(|r| !r.is_empty()) {
+                    out.images.push((rid, shape_size.0, shape_size.1));
+                }
+            },
+            // WordArt keeps its text in an *attribute*, so neither the
+            // text-box nor the run path ever reached it.
+            "textpath" => {
+                if let Some(s) = xml::optional_attr_str(&e, "string")? {
+                    let s = s.into_owned();
+                    if !s.trim().is_empty() {
+                        out.wordart.push(s);
+                    }
+                }
+            },
+            "OLEObject" => {
+                let embedded = xml::optional_attr_str(&e, "Type")?
+                    .is_none_or(|t| t.eq_ignore_ascii_case("Embed"));
+                let rid = xml::optional_attr_str(&e, "r:id")?.map(|v| v.into_owned());
+                if let Some(rid) = rid.filter(|_| embedded) {
+                    out.ole_rids.push(rid);
+                }
+            },
             _ => {},
         }
+        if is_start {
+            depth += 1;
+        }
     }
-    Ok(boxes)
+    Ok(out)
 }
 
 /// Parse `<mc:AlternateContent>`, taking the `<mc:Choice>` branch and
@@ -616,19 +901,17 @@ fn parse_text_boxes_in(
 /// Extracting both duplicated every text box's contents; extracting
 /// neither dropped them. `<mc:Fallback>` is used only when no `<mc:Choice>`
 /// yielded content.
-fn parse_alternate_content(
-    reader: &mut quick_xml::Reader<&[u8]>,
-) -> CoreResult<Vec<Vec<BlockElement>>> {
-    let mut chosen: Vec<Vec<BlockElement>> = Vec::new();
-    let mut fallback: Vec<Vec<BlockElement>> = Vec::new();
+fn parse_alternate_content(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<VmlContent> {
+    let mut chosen = VmlContent::default();
+    let mut fallback = VmlContent::default();
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"Choice" => chosen.extend(parse_text_boxes_in(reader, b"Choice")?),
-                b"Fallback" => fallback.extend(parse_text_boxes_in(reader, b"Fallback")?),
+                "Choice" => chosen.merge(parse_vml_content_in(reader, "Choice")?),
+                "Fallback" => fallback.merge(parse_vml_content_in(reader, "Fallback")?),
                 _ => xml::skip_element_fast(reader)?,
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"AlternateContent" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "AlternateContent" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -643,7 +926,7 @@ fn parse_alternate_content(
 /// bullet-ish equivalent rather than emitting an unrenderable PUA code
 /// point, and pass everything else through unchanged.
 fn parse_sym_char(e: &quick_xml::events::BytesStart) -> Option<char> {
-    let raw = xml::optional_attr_str(e, b"w:char").ok().flatten()?;
+    let raw = xml::optional_attr_str(e, "w:char").ok().flatten()?;
     let code = u32::from_str_radix(raw.trim(), 16).ok()?;
     let mapped = match code {
         0xF0B7 | 0xF0A7 => 0x2022, // Wingdings/Symbol bullet
@@ -696,20 +979,20 @@ fn parse_document(
                     continue;
                 }
                 match e.local_name().as_ref() {
-                    b"body" => {
+                    "body" => {
                         in_body = true;
                     },
-                    b"p" if in_body => {
+                    "p" if in_body => {
                         elements.push(BlockElement::Paragraph(parse_paragraph(&mut reader)?));
                     },
-                    b"tbl" if in_body => {
-                        elements.push(BlockElement::Table(parse_table(&mut reader)?));
+                    "tbl" if in_body => {
+                        elements.push(BlockElement::Table(Box::new(parse_table(&mut reader)?)));
                     },
-                    b"sectPr" if in_body => {
+                    "sectPr" if in_body => {
                         sections.push(parse_section_properties(&mut reader, e)?);
                     },
-                    b"altChunk" if in_body => {
-                        if let Ok(Some(rid)) = xml::optional_attr_str(e, b"r:id") {
+                    "altChunk" if in_body => {
+                        if let Ok(Some(rid)) = xml::optional_attr_str(e, "r:id") {
                             alt_chunk_rids.push(rid.into_owned());
                             // Record the insertion point so the chunk's
                             // content lands where the document puts it.
@@ -719,15 +1002,15 @@ fn parse_document(
                     _ => {},
                 }
             },
-            Event::Empty(ref e) if in_body && e.local_name().as_ref() == b"altChunk" => {
+            Event::Empty(ref e) if in_body && e.local_name().as_ref() == "altChunk" => {
                 if guard.accepts(e) {
-                    if let Ok(Some(rid)) = xml::optional_attr_str(e, b"r:id") {
+                    if let Ok(Some(rid)) = xml::optional_attr_str(e, "r:id") {
                         alt_chunk_rids.push(rid.into_owned());
                         alt_chunk_positions.push(elements.len());
                     }
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"body" => {
+            Event::End(ref e) if e.local_name().as_ref() == "body" => {
                 in_body = false;
             },
             Event::Eof => break,
@@ -750,7 +1033,7 @@ fn parse_document(
             if let Some(props) = &p.properties {
                 if let Some(sp) = &props.section_properties {
                     section_breaks.push(idx + 1);
-                    break_sections.push(sp.clone());
+                    break_sections.push(sp.as_ref().clone());
                 }
             }
         }
@@ -776,16 +1059,46 @@ fn resolve_hyperlinks(
         match elem {
             BlockElement::Paragraph(p) => {
                 for content in &mut p.content {
-                    if let ParagraphContent::Hyperlink(hl) = content {
-                        if let HyperlinkTarget::External(ref r_id) = hl.target {
-                            if let Some(rel) = rels.get_by_id(r_id) {
-                                if rel.target_mode == TargetMode::External {
-                                    hl.target = HyperlinkTarget::External(rel.target.clone());
-                                } else {
-                                    hl.target = HyperlinkTarget::Internal(rel.target.clone());
+                    match content {
+                        ParagraphContent::Hyperlink(hl) => {
+                            if let HyperlinkTarget::External(ref r_id) = hl.target {
+                                match rels.get_by_id(r_id) {
+                                    Some(rel) => {
+                                        // A `w:anchor` alongside `r:id` is a URI
+                                        // fragment of the resolved target.
+                                        let mut t = rel.target.clone();
+                                        if let Some(frag) =
+                                            hl.fragment.as_deref().filter(|f| !f.is_empty())
+                                        {
+                                            t.push('#');
+                                            t.push_str(frag);
+                                        }
+                                        hl.target = if rel.target_mode == TargetMode::External {
+                                            HyperlinkTarget::External(t)
+                                        } else {
+                                            HyperlinkTarget::Internal(t)
+                                        };
+                                    },
+                                    // Unresolvable relationship: a bare
+                                    // relationship id is not a URL. Fall back
+                                    // to the anchor when the element carried
+                                    // one rather than reporting `rIdN`.
+                                    None => {
+                                        if let Some(frag) =
+                                            hl.fragment.as_deref().filter(|f| !f.is_empty())
+                                        {
+                                            hl.target = HyperlinkTarget::Internal(frag.to_string());
+                                        }
+                                    },
                                 }
                             }
-                        }
+                            for run in &mut hl.runs {
+                                resolve_hyperlinks_in_run(run, rels);
+                            }
+                        },
+                        ParagraphContent::Run(run) => {
+                            resolve_hyperlinks_in_run(run, rels);
+                        },
                     }
                 }
             },
@@ -796,6 +1109,16 @@ fn resolve_hyperlinks(
                     }
                 }
             },
+        }
+    }
+}
+
+/// Resolve hyperlinks nested inside a run's text-box bodies. Text-box
+/// prose is ordinary content and carries ordinary links.
+fn resolve_hyperlinks_in_run(run: &mut Run, rels: &crate::core::relationships::Relationships) {
+    for rc in &mut run.content {
+        if let RunContent::TextBox(blocks) = rc {
+            resolve_hyperlinks(blocks, rels);
         }
     }
 }
@@ -814,21 +1137,21 @@ fn resolve_hyperlinks(
 ///
 /// `w:del` is deliberately absent: its `w:delText` children are *deleted*
 /// text and are not part of the document.
-fn is_transparent_paragraph_wrapper(local: &[u8]) -> bool {
+fn is_transparent_paragraph_wrapper(local: &str) -> bool {
     matches!(
         local,
-        b"ins"
-            | b"moveTo"
-            | b"fldSimple"
-            | b"smartTag"
-            | b"sdt"
-            | b"sdtContent"
-            | b"ruby"
-            | b"rt"
-            | b"rubyBase"
-            | b"bdo"
-            | b"dir"
-            | b"customXml"
+        "ins"
+            | "moveTo"
+            | "fldSimple"
+            | "smartTag"
+            | "sdt"
+            | "sdtContent"
+            | "ruby"
+            | "rt"
+            | "rubyBase"
+            | "bdo"
+            | "dir"
+            | "customXml"
     )
 }
 
@@ -837,24 +1160,69 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
     // Depth of transparent wrappers we have descended into, so their
     // closing tags are consumed without ending the paragraph.
     let mut wrapper_depth = 0usize;
+    // Open complex fields (`{ HYPERLINK … }`). A field spans several runs,
+    // so it is stitched together here rather than inside `parse_run`.
+    let mut fields: Vec<OpenField> = Vec::new();
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"pPr" => {
+                "pPr" => {
                     paragraph.properties = Some(parse_paragraph_properties_fast(reader)?);
                 },
-                b"r" => {
-                    paragraph
-                        .content
-                        .push(ParagraphContent::Run(parse_run(reader)?));
+                "r" => {
+                    let mut parts = Vec::new();
+                    let run = parse_run(reader, &mut parts)?;
+                    apply_field_parts(&parts, &mut paragraph.content, &mut fields);
+                    if !run.content.is_empty() || run.properties.is_some() {
+                        paragraph.content.push(ParagraphContent::Run(run));
+                    }
                 },
-                b"hyperlink" => {
+                "hyperlink" => {
                     paragraph
                         .content
                         .push(ParagraphContent::Hyperlink(parse_hyperlink(reader, e)?));
                 },
-                b"del" | b"moveFrom" => {
+                // `w:fldSimple` is the one-element form of the same field
+                // mechanism; its `w:instr` attribute holds the URL of a
+                // HYPERLINK field. Other field types keep the
+                // existing transparent-wrapper behaviour.
+                "fldSimple" => {
+                    let target = xml::optional_attr_str(e, "w:instr")?
+                        .as_deref()
+                        .and_then(hyperlink_target_from_instr);
+                    match target {
+                        Some(target) => {
+                            let runs = collect_runs_until(reader, "fldSimple")?;
+                            paragraph
+                                .content
+                                .push(ParagraphContent::Hyperlink(Hyperlink {
+                                    target,
+                                    fragment: None,
+                                    tooltip: None,
+                                    runs,
+                                }));
+                        },
+                        None => wrapper_depth += 1,
+                    }
+                },
+                // OMML equations: no structural model, but every `<m:t>`
+                // inside one is real, visible text.
+                "oMath" | "oMathPara" => {
+                    let end: &str = if e.local_name().as_ref() == "oMathPara" {
+                        "oMathPara"
+                    } else {
+                        "oMath"
+                    };
+                    let text = collect_omml_text(reader, end)?;
+                    if !text.is_empty() {
+                        paragraph.content.push(ParagraphContent::Run(Run {
+                            properties: None,
+                            content: vec![RunContent::Text(text)],
+                        }));
+                    }
+                },
+                "del" | "moveFrom" => {
                     // Tracked deletions are not document content.
                     xml::skip_element_fast(reader)?;
                 },
@@ -867,12 +1235,12 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
             },
             Event::End(ref e) => {
                 let local = e.local_name();
-                if local.as_ref() == b"p" && wrapper_depth == 0 {
+                if local.as_ref() == "p" && wrapper_depth == 0 {
                     break;
                 }
                 if is_transparent_paragraph_wrapper(local.as_ref()) {
                     wrapper_depth = wrapper_depth.saturating_sub(1);
-                } else if local.as_ref() == b"p" {
+                } else if local.as_ref() == "p" {
                     // A malformed file closed the paragraph while a wrapper
                     // was still open; stop rather than swallow the rest.
                     break;
@@ -882,26 +1250,162 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
             _ => {},
         }
     }
+    // `Vec::push` on an empty vector reserves four slots, and a paragraph
+    // slot is ~200 bytes; most paragraphs hold one run. Release the slack
+    // now, once, rather than carry it for the life of the document —
+    // it was most of the 4 KB a plain table cell cost.
+    paragraph.content.shrink_to_fit();
     Ok(paragraph)
 }
 
-fn parse_run(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Run> {
+/// One part of a complex field (`{ HYPERLINK "…" }`), reported out of
+/// `parse_run` so the enclosing paragraph can stitch the sequence back
+/// together: the instruction and the display runs live in *different*
+/// runs, so neither alone can resolve the field.
+#[derive(Debug, Clone)]
+enum FieldPart {
+    /// `<w:fldChar w:fldCharType="begin"/>`.
+    Begin,
+    /// `<w:fldChar w:fldCharType="separate"/>` — the field result starts.
+    Separate,
+    /// `<w:fldChar w:fldCharType="end"/>`.
+    End,
+    /// `<w:instrText>` content (a field's instruction is often split
+    /// across several runs, so these accumulate).
+    Instr(String),
+}
+
+/// An in-progress complex field, tracked across the several runs that make
+/// up `begin … instrText … separate … <display runs> … end`.
+struct OpenField {
+    /// Accumulated `<w:instrText>` content across every run seen so far.
+    instr: String,
+    /// Index into the paragraph's `content` vec where the field's display
+    /// runs start — set when `separate` is seen, since everything from
+    /// that point until `end` is the field's rendered result.
+    content_start: usize,
+    /// Whether `separate` has been seen yet. A field with no `separate`
+    /// (some writers omit it, e.g. a display-only field) has no distinct
+    /// result span to splice out.
+    separated: bool,
+}
+
+/// Fold one run's field-code events into the paragraph's open-field stack,
+/// resolving a completed field into a `ParagraphContent::Hyperlink` when it
+/// turns out to be a `HYPERLINK` field.
+///
+/// Fields nest in principle (a field's instruction can itself contain
+/// another field), so `fields` is a stack — but only the outermost
+/// completed `HYPERLINK` field is ever turned into a hyperlink; an inner
+/// field's own `instr`/`content_start` are simply discarded when it ends,
+/// since nested field results already sit in `content` as ordinary runs.
+fn apply_field_parts(
+    parts: &[FieldPart],
+    content: &mut Vec<ParagraphContent>,
+    fields: &mut Vec<OpenField>,
+) {
+    for part in parts {
+        match part {
+            FieldPart::Begin => {
+                fields.push(OpenField {
+                    instr: String::new(),
+                    content_start: content.len(),
+                    separated: false,
+                });
+            },
+            FieldPart::Instr(s) => {
+                if let Some(f) = fields.last_mut() {
+                    f.instr.push_str(s);
+                }
+            },
+            FieldPart::Separate => {
+                if let Some(f) = fields.last_mut() {
+                    f.separated = true;
+                    f.content_start = content.len();
+                }
+            },
+            FieldPart::End => {
+                let Some(f) = fields.pop() else { continue };
+                if !f.separated {
+                    continue;
+                }
+                let Some(target) = hyperlink_target_from_instr(&f.instr) else {
+                    continue;
+                };
+                let start = f.content_start.min(content.len());
+                let runs: Vec<Run> = content
+                    .drain(start..)
+                    .map(|c| match c {
+                        ParagraphContent::Run(r) => r,
+                        ParagraphContent::Hyperlink(h) => Run {
+                            properties: None,
+                            content: h.runs.into_iter().flat_map(|r| r.content).collect(),
+                        },
+                    })
+                    .collect();
+                content.push(ParagraphContent::Hyperlink(Hyperlink {
+                    target,
+                    fragment: None,
+                    tooltip: None,
+                    runs,
+                }));
+            },
+        }
+    }
+}
+
+/// Collect every `<m:t>` text run inside an OMML equation (`<m:oMath>` or
+/// `<m:oMathPara>`), concatenated with no separators. This is not a
+/// structural math model — just enough to stop 100% content loss on a
+/// document whose only content is a formula.
+fn collect_omml_text(reader: &mut quick_xml::Reader<&[u8]>, end_local: &str) -> CoreResult<String> {
+    let mut text = String::new();
+    let mut depth = 1i32;
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => {
+                if e.local_name().as_ref() == "t" {
+                    text.push_str(&xml::read_text_content_fast(reader)?);
+                } else {
+                    depth += 1;
+                }
+            },
+            Event::End(ref e) => {
+                if e.local_name().as_ref() == end_local && depth <= 1 {
+                    break;
+                }
+                depth -= 1;
+                if depth <= 0 {
+                    break;
+                }
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(text)
+}
+
+fn parse_run(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    fields: &mut Vec<FieldPart>,
+) -> CoreResult<Run> {
     let mut run = Run::default();
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"rPr" => {
+                "rPr" => {
                     run.properties = Some(parse_run_properties_fast(reader)?);
                 },
-                b"t" => {
+                "t" => {
                     let text = xml::read_text_content_fast(reader)?;
                     if !text.is_empty() {
                         run.content.push(RunContent::Text(text));
                     }
                 },
-                b"br" => {
-                    let break_type = match xml::optional_attr_str(e, b"w:type")? {
+                "br" => {
+                    let break_type = match xml::optional_attr_str(e, "w:type")? {
                         Some(ref t) => match t.as_ref() {
                             "page" => BreakType::Page,
                             "column" => BreakType::Column,
@@ -912,12 +1416,12 @@ fn parse_run(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Run> {
                     run.content.push(RunContent::Break(break_type));
                     xml::skip_element_fast(reader)?;
                 },
-                b"drawing" => {
+                "drawing" => {
                     // A `<w:drawing>` may wrap a picture *or* a shape whose
                     // `<wps:txbx>` holds real prose. Collect both.
                     let (drawing, boxes) = parse_drawing_and_text_boxes(reader)?;
                     if let Some(drawing) = drawing {
-                        run.content.push(RunContent::Drawing(drawing));
+                        run.content.push(RunContent::Drawing(Box::new(drawing)));
                     }
                     for b in boxes {
                         run.content.push(RunContent::TextBox(b));
@@ -925,34 +1429,58 @@ fn parse_run(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Run> {
                 },
                 // VML shapes (`<w:pict>`) and the compatibility wrapper
                 // (`<mc:AlternateContent>`) are the other two places a text
-                // box hides. `parse_text_boxes_in` also resolves
+                // box hides. `parse_vml_content_in` also resolves
                 // AlternateContent to its `<mc:Choice>` branch so shape text
-                // is not extracted twice (once per branch).
-                b"pict" | b"object" => {
-                    for b in parse_text_boxes_in(reader, b"pict")? {
-                        run.content.push(RunContent::TextBox(b));
+                // is not extracted twice (once per branch), and picks up the
+                // *other* payloads a VML shape can carry: legacy images
+                //, WordArt and embedded packages.
+                "pict" | "object" => {
+                    let end: &str = if e.local_name().as_ref() == "object" {
+                        "object"
+                    } else {
+                        "pict"
+                    };
+                    parse_vml_content_in(reader, end)?.push_into(&mut run.content);
+                },
+                "AlternateContent" => {
+                    parse_alternate_content(reader)?.push_into(&mut run.content);
+                },
+                // A note's reference mark. The mark *is* content: it is
+                // where the note is cited.
+                "footnoteReference" | "endnoteReference" | "commentReference" => {
+                    push_note_reference(e, &mut run.content)?;
+                    xml::skip_element_fast(reader)?;
+                },
+                // Complex field codes. The `begin` char also carries
+                // `<w:ffData>` for legacy form fields, whose state exists
+                // nowhere else in the document.
+                "fldChar" => {
+                    fields.push(fld_char_part(e)?);
+                    if let Some(mut ff) = parse_fld_char_body(reader)? {
+                        ff.display_text = ff.value_text();
+                        run.content.push(RunContent::FormField(ff));
                     }
                 },
-                b"AlternateContent" => {
-                    for b in parse_alternate_content(reader)? {
-                        run.content.push(RunContent::TextBox(b));
-                    }
+                // The field instruction — for a HYPERLINK field this holds
+                // the URL, which was previously unreachable.
+                "instrText" => {
+                    fields.push(FieldPart::Instr(xml::read_text_content_fast(reader)?));
                 },
                 // `<w:sym>` carries its character in the `w:char` attribute
                 // as a hex code point, usually in the Wingdings private-use
                 // range. Dropping it silently deleted bullet glyphs and
                 // maths symbols from the text.
-                b"sym" => {
+                "sym" => {
                     if let Some(c) = parse_sym_char(e) {
                         run.content.push(RunContent::Text(c.to_string()));
                     }
                     xml::skip_element_fast(reader)?;
                 },
-                b"cr" => {
+                "cr" => {
                     run.content.push(RunContent::Break(BreakType::Line));
                     xml::skip_element_fast(reader)?;
                 },
-                b"noBreakHyphen" => {
+                "noBreakHyphen" => {
                     run.content.push(RunContent::Text("\u{2011}".to_string()));
                     xml::skip_element_fast(reader)?;
                 },
@@ -965,10 +1493,10 @@ fn parse_run(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Run> {
                 // what every mainstream extractor does. `w:noBreakHyphen`
                 // above is the opposite case: a hyphen the document actually
                 // draws, so it is kept.
-                b"softHyphen" => {
+                "softHyphen" => {
                     xml::skip_element_fast(reader)?;
                 },
-                b"delText" => {
+                "delText" => {
                     // Deleted revision text is not document content.
                     xml::skip_element_fast(reader)?;
                 },
@@ -977,8 +1505,8 @@ fn parse_run(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Run> {
                 },
             },
             Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"br" => {
-                    let break_type = match xml::optional_attr_str(e, b"w:type")? {
+                "br" => {
+                    let break_type = match xml::optional_attr_str(e, "w:type")? {
                         Some(ref t) => match t.as_ref() {
                             "page" => BreakType::Page,
                             "column" => BreakType::Column,
@@ -988,32 +1516,248 @@ fn parse_run(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Run> {
                     };
                     run.content.push(RunContent::Break(break_type));
                 },
-                b"tab" => {
+                "tab" => {
                     run.content.push(RunContent::Tab);
                 },
-                b"cr" => {
+                "cr" => {
                     run.content.push(RunContent::Break(BreakType::Line));
                 },
-                b"noBreakHyphen" => {
+                "noBreakHyphen" => {
                     run.content.push(RunContent::Text("\u{2011}".to_string()));
                 },
                 // See the Start arm: a discretionary hyphen is not content.
-                b"softHyphen" => {},
-                b"sym" => {
+                "softHyphen" => {},
+                "sym" => {
                     if let Some(c) = parse_sym_char(e) {
                         run.content.push(RunContent::Text(c.to_string()));
                     }
                 },
+                "footnoteReference" | "endnoteReference" | "commentReference" => {
+                    push_note_reference(e, &mut run.content)?;
+                },
+                "fldChar" => {
+                    fields.push(fld_char_part(e)?);
+                },
                 _ => {},
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"r" => {
+            Event::End(ref e) if e.local_name().as_ref() == "r" => {
                 break;
             },
             Event::Eof => break,
             _ => {},
         }
     }
+    run.content.shrink_to_fit();
     Ok(run)
+}
+
+/// Push the `RunContent` for a `w:footnoteReference` /
+/// `w:endnoteReference` / `w:commentReference` mark.
+fn push_note_reference(
+    e: &quick_xml::events::BytesStart,
+    out: &mut Vec<RunContent>,
+) -> CoreResult<()> {
+    let id: u32 = xml::optional_attr_str(e, "w:id")?
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .map(|v| v.max(0) as u32)
+        .unwrap_or(0);
+    // `w:customMarkFollows="1"` tells Word the note body supplies its own
+    // mark glyph instead of the auto-number; without threading this back,
+    // a custom footnote mark ("*", "†") has nowhere in the IR to land, and
+    // downstream conversion has no way to distinguish it from an ordinary
+    // leading run of note-body text.
+    let custom_mark = xml::optional_attr_str(e, "w:customMarkFollows")?
+        .is_some_and(|v| matches!(v.as_ref(), "1" | "true" | "on"));
+    out.push(match e.local_name().as_ref() {
+        "footnoteReference" => RunContent::FootnoteRef(id, custom_mark),
+        "endnoteReference" => RunContent::EndnoteRef(id, custom_mark),
+        _ => RunContent::CommentRef(id),
+    });
+    Ok(())
+}
+
+/// Map a `<w:fldChar w:fldCharType="…">` onto its field part. An absent or
+/// unrecognised type is treated as `begin`, which is what Word writes when
+/// the attribute is omitted.
+fn fld_char_part(e: &quick_xml::events::BytesStart) -> CoreResult<FieldPart> {
+    Ok(match xml::optional_attr_str(e, "w:fldCharType")?.as_deref() {
+        Some("separate") => FieldPart::Separate,
+        Some("end") => FieldPart::End,
+        _ => FieldPart::Begin,
+    })
+}
+
+/// Read the children of a non-empty `<w:fldChar>`, returning the
+/// `<w:ffData>` form-field state when it carries one.
+fn parse_fld_char_body(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<FormField>> {
+    let mut form = None;
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => {
+                if e.local_name().as_ref() == "ffData" {
+                    form = Some(parse_ff_data(reader)?);
+                } else {
+                    xml::skip_element_fast(reader)?;
+                }
+            },
+            Event::End(ref e) if e.local_name().as_ref() == "fldChar" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(form)
+}
+
+/// Parse `<w:ffData>`: the checkbox state, the dropdown option list and
+/// selection, or the text field's default value. Reads through
+/// `</w:ffData>`.
+fn parse_ff_data(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<FormField> {
+    // Which `w:ffData` child we are inside: `w:default` means a different
+    // thing in each (a checkbox's initial state, a dropdown's index, a text
+    // field's value).
+    #[derive(PartialEq)]
+    enum Kind {
+        None,
+        CheckBox,
+        DdList,
+        TextInput,
+    }
+
+    let mut name = None;
+    let mut kind = Kind::None;
+    let mut checked: Option<bool> = None;
+    let mut cb_default = false;
+    let mut entries: Vec<String> = Vec::new();
+    let mut selected = 0usize;
+    let mut text_default: Option<String> = None;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) | Event::Empty(ref e) => {
+                let val = xml::optional_attr_str(e, "w:val")?.map(|v| v.into_owned());
+                match e.local_name().as_ref() {
+                    "name" => name = val,
+                    "checkBox" => kind = Kind::CheckBox,
+                    "ddList" => kind = Kind::DdList,
+                    "textInput" => kind = Kind::TextInput,
+                    "checked" => checked = Some(xml::parse_toggle(e, "w:val")),
+                    "listEntry" => entries.push(val.unwrap_or_default()),
+                    "result" => {
+                        if let Some(v) = val.as_deref().and_then(|v| v.trim().parse::<usize>().ok())
+                        {
+                            selected = v;
+                        }
+                    },
+                    "default" => match kind {
+                        Kind::CheckBox => cb_default = xml::parse_toggle(e, "w:val"),
+                        Kind::DdList => {
+                            if let Some(v) =
+                                val.as_deref().and_then(|v| v.trim().parse::<usize>().ok())
+                            {
+                                selected = v;
+                            }
+                        },
+                        Kind::TextInput => text_default = val,
+                        Kind::None => {},
+                    },
+                    _ => {},
+                }
+            },
+            Event::End(ref e) if e.local_name().as_ref() == "ffData" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+
+    Ok(FormField {
+        name,
+        kind: match kind {
+            Kind::CheckBox => FormFieldKind::CheckBox {
+                checked: checked.unwrap_or(cb_default),
+            },
+            Kind::DdList => FormFieldKind::DropDown { entries, selected },
+            Kind::TextInput => FormFieldKind::TextInput {
+                default: text_default,
+            },
+            Kind::None => FormFieldKind::Unknown,
+        },
+        display_text: None,
+    })
+}
+
+/// Split a field instruction into quote-aware tokens:
+/// `HYPERLINK "http://x" \l "frag"` → `[HYPERLINK, http://x, \l, frag]`.
+fn field_instr_tokens(instr: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    for c in instr.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                if !quoted {
+                    out.push(std::mem::take(&mut cur));
+                }
+            },
+            c if c.is_whitespace() && !quoted => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            },
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Resolve a `HYPERLINK` field instruction into a hyperlink target.
+///
+/// `HYPERLINK "https://x" \l "frag"` → external `https://x#frag`;
+/// `HYPERLINK \l "bookmark"` → internal `bookmark`. Returns `None` for
+/// every other field type (PAGE, TOC, REF, …), whose display text already
+/// survives as an ordinary run.
+fn hyperlink_target_from_instr(instr: &str) -> Option<HyperlinkTarget> {
+    let tokens = field_instr_tokens(instr);
+    let (first, rest) = tokens.split_first()?;
+    if !first.eq_ignore_ascii_case("HYPERLINK") {
+        return None;
+    }
+    let mut url: Option<String> = None;
+    let mut anchor: Option<String> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        let tok = &rest[i];
+        if let Some(switch) = tok.strip_prefix('\\') {
+            // `\l` takes the sub-address; `\o`/`\t` take an argument we
+            // do not model; `\n`/`\h`/`\m` take none.
+            let takes_arg = matches!(switch, "l" | "o" | "t" | "L" | "O" | "T");
+            if takes_arg {
+                if let Some(arg) = rest.get(i + 1) {
+                    if switch.eq_ignore_ascii_case("l") {
+                        anchor = Some(arg.clone());
+                    }
+                    i += 1;
+                }
+            }
+        } else if url.is_none() {
+            url = Some(tok.clone());
+        }
+        i += 1;
+    }
+    match (url, anchor) {
+        (Some(mut u), anchor) => {
+            if let Some(a) = anchor.filter(|a| !a.is_empty()) {
+                u.push('#');
+                u.push_str(&a);
+            }
+            Some(HyperlinkTarget::External(u))
+        },
+        (None, Some(a)) => Some(HyperlinkTarget::Internal(a)),
+        (None, None) => None,
+    }
 }
 
 fn parse_hyperlink(
@@ -1021,42 +1765,313 @@ fn parse_hyperlink(
     start: &quick_xml::events::BytesStart,
 ) -> CoreResult<Hyperlink> {
     // Determine target: r:id for external, w:anchor for internal
-    let r_id = xml::optional_attr_str(start, b"r:id")?.map(|v| v.into_owned());
-    let anchor = xml::optional_attr_str(start, b"w:anchor")?.map(|v| v.into_owned());
-    let tooltip = xml::optional_attr_str(start, b"w:tooltip")?.map(|v| v.into_owned());
+    let r_id = xml::optional_attr_str(start, "r:id")?.map(|v| v.into_owned());
+    let anchor = xml::optional_attr_str(start, "w:anchor")?.map(|v| v.into_owned());
+    let tooltip = xml::optional_attr_str(start, "w:tooltip")?.map(|v| v.into_owned());
 
-    let target = if let Some(anchor) = anchor {
-        HyperlinkTarget::Internal(anchor)
-    } else if let Some(r_id) = r_id {
-        // Will be resolved to actual URL after parsing via resolve_hyperlinks()
-        HyperlinkTarget::External(r_id)
-    } else {
-        HyperlinkTarget::Internal(String::new())
+    // `r:id` wins when both attributes are present: ECMA-376 makes
+    // `w:anchor` a *fragment* of the relationship's target in that case
+    // (`externalURL#fragment`). Taking the anchor branch unconditionally
+    // discarded the real URL and left a dead same-document reference
+    // behind — the single most prevalent hyperlink defect in the corpus
+    //. The anchor is kept in `fragment` and appended
+    // by `resolve_hyperlinks` once the relationship is known.
+    let (target, fragment) = match (r_id, anchor) {
+        // Will be resolved to the actual URL after parsing via
+        // `resolve_hyperlinks()`.
+        (Some(r_id), anchor) => (HyperlinkTarget::External(r_id), anchor),
+        (None, Some(anchor)) => (HyperlinkTarget::Internal(anchor), None),
+        (None, None) => (HyperlinkTarget::Internal(String::new()), None),
     };
 
+    let runs = collect_runs_until(reader, "hyperlink")?;
+
+    Ok(Hyperlink {
+        target,
+        fragment,
+        tooltip,
+        runs,
+    })
+}
+
+/// Collect the `<w:r>` children of an inline container, reading through
+/// the matching `</end_local>`. Shared by `w:hyperlink` and the
+/// `w:fldSimple` HYPERLINK path.
+fn collect_runs_until(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    end_local: &str,
+) -> CoreResult<Vec<Run>> {
     let mut runs = Vec::new();
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"r" {
-                    runs.push(parse_run(reader)?);
+                if e.local_name().as_ref() == "r" {
+                    // A field cannot legally nest inside w:fldSimple's own
+                    // display runs, so field-part tracking is a fresh,
+                    // throwaway vec here.
+                    runs.push(parse_run(reader, &mut Vec::new())?);
                 } else {
                     xml::skip_element_fast(reader)?;
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"hyperlink" => {
+            Event::End(ref e) if e.local_name().as_ref() == end_local => {
                 break;
             },
             Event::Eof => break,
             _ => {},
         }
     }
+    Ok(runs)
+}
 
-    Ok(Hyperlink {
-        target,
-        tooltip,
-        runs,
-    })
+// ---------------------------------------------------------------------------
+// Embedded chart text
+// ---------------------------------------------------------------------------
+
+/// Walk a parsed body and copy each chart part's extracted text onto the
+/// drawing that references it, keyed by relationship id.
+///
+/// Charts nest wherever drawings do — inside table cells and inside text
+/// boxes — so the walk recurses through both rather than only scanning
+/// top-level paragraphs.
+/// Load the images a header, footer or note part references and re-key
+/// the part's drawings to `<part>:<rId>` so they resolve against
+/// `DocxDocument::images` alongside the main document's own `rId`s.
+/// `r:id` is scoped per OPC part — a header's `rId3` and the body's
+/// `rId3` are unrelated — and the map used to hold the body's only, so
+/// every picture outside the body was dropped on read and a colliding id
+/// could have shown the wrong one.
+fn qualify_part_images<R: Read + Seek>(
+    elements: &mut [BlockElement],
+    part: &crate::core::opc::PartName,
+    rels: &crate::core::relationships::Relationships,
+    opc: &mut OpcReader<R>,
+    images: &mut std::collections::HashMap<String, (Vec<u8>, Option<String>)>,
+) {
+    let prefix = format!("{}:", part.as_str().rsplit('/').next().unwrap_or(""));
+    let mut any = false;
+    for rel in rels.get_by_type(rel_types::IMAGE) {
+        if rel.target_mode != TargetMode::Internal {
+            continue;
+        }
+        let Ok(image_part) = part.resolve_relative(&rel.target) else {
+            continue;
+        };
+        if !opc.has_part(&image_part) {
+            continue;
+        }
+        let Ok(data) = opc.read_part(&image_part) else {
+            continue;
+        };
+        let ext = image_part
+            .as_str()
+            .rsplit('.')
+            .next()
+            .map(|s| s.to_lowercase());
+        images.insert(format!("{prefix}{}", rel.id), (data, ext));
+        any = true;
+    }
+    if any {
+        prefix_drawing_rids(elements, &prefix);
+    }
+}
+
+fn prefix_drawing_rids(elements: &mut [BlockElement], prefix: &str) {
+    for elem in elements {
+        match elem {
+            BlockElement::Paragraph(p) => {
+                for pc in &mut p.content {
+                    let runs: &mut [Run] = match pc {
+                        ParagraphContent::Run(r) => std::slice::from_mut(r),
+                        ParagraphContent::Hyperlink(hl) => &mut hl.runs,
+                    };
+                    for run in runs {
+                        for rc in &mut run.content {
+                            match rc {
+                                RunContent::Drawing(d) => {
+                                    if !d.relationship_id.is_empty() {
+                                        d.relationship_id =
+                                            format!("{prefix}{}", d.relationship_id);
+                                    }
+                                },
+                                RunContent::TextBox(blocks) => prefix_drawing_rids(blocks, prefix),
+                                _ => {},
+                            }
+                        }
+                    }
+                }
+            },
+            BlockElement::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        prefix_drawing_rids(&mut cell.content, prefix);
+                    }
+                }
+            },
+        }
+    }
+}
+
+fn attach_chart_text(
+    elements: &mut [BlockElement],
+    chart_text_by_rid: &std::collections::HashMap<String, Vec<String>>,
+    dgm_text_by_rid: &std::collections::HashMap<String, Vec<String>>,
+) {
+    for elem in elements {
+        match elem {
+            BlockElement::Paragraph(p) => {
+                for pc in &mut p.content {
+                    let runs: &mut [Run] = match pc {
+                        ParagraphContent::Run(r) => std::slice::from_mut(r),
+                        ParagraphContent::Hyperlink(hl) => &mut hl.runs,
+                    };
+                    for run in runs {
+                        for rc in &mut run.content {
+                            match rc {
+                                RunContent::Drawing(d) => {
+                                    if let Some(rid) = d.chart_rel_id.as_deref() {
+                                        if let Some(lines) = chart_text_by_rid.get(rid) {
+                                            d.chart_text = lines.clone();
+                                        }
+                                    }
+                                    if let Some(rid) = d.dgm_data_rel_id.as_deref() {
+                                        if let Some(lines) = dgm_text_by_rid.get(rid) {
+                                            d.dgm_text = lines.clone();
+                                        }
+                                    }
+                                },
+                                RunContent::TextBox(blocks) => {
+                                    attach_chart_text(blocks, chart_text_by_rid, dgm_text_by_rid);
+                                },
+                                _ => {},
+                            }
+                        }
+                    }
+                }
+            },
+            BlockElement::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        attach_chart_text(&mut cell.content, chart_text_by_rid, dgm_text_by_rid);
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// Replace every `RunContent::DeferredPart(rid)` in the tree with the
+/// extracted plain text of the OOXML package it refers to
+/// (`<o:OLEObject Type="Embed">`), wrapped as a `TextBox` so
+/// it flows as ordinary block content. A reference that can't be resolved
+/// (unknown relationship, unreadable part, unrecognised extension, or the
+/// nested document fails to open) is left as `DeferredPart` and every
+/// renderer's catch-all already drops those silently — matching the
+/// pre-existing "unresolvable is dropped" behaviour.
+fn resolve_deferred_parts<R: Read + Seek>(
+    elements: &mut [BlockElement],
+    opc: &mut OpcReader<R>,
+    main_part: &crate::core::opc::PartName,
+    doc_rels: &crate::core::relationships::Relationships,
+) {
+    for elem in elements {
+        match elem {
+            BlockElement::Paragraph(p) => {
+                for pc in &mut p.content {
+                    let runs: &mut [Run] = match pc {
+                        ParagraphContent::Run(r) => std::slice::from_mut(r),
+                        ParagraphContent::Hyperlink(hl) => &mut hl.runs,
+                    };
+                    for run in runs {
+                        for rc in &mut run.content {
+                            match rc {
+                                RunContent::TextBox(blocks) => {
+                                    resolve_deferred_parts(blocks, opc, main_part, doc_rels);
+                                },
+                                RunContent::DeferredPart(rid) => {
+                                    if let Some(blocks) =
+                                        resolve_one_deferred_part(rid, opc, main_part, doc_rels)
+                                    {
+                                        *rc = RunContent::TextBox(blocks);
+                                    }
+                                },
+                                _ => {},
+                            }
+                        }
+                    }
+                }
+            },
+            BlockElement::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        resolve_deferred_parts(&mut cell.content, opc, main_part, doc_rels);
+                    }
+                }
+            },
+        }
+    }
+}
+
+fn resolve_one_deferred_part<R: Read + Seek>(
+    rid: &str,
+    opc: &mut OpcReader<R>,
+    main_part: &crate::core::opc::PartName,
+    doc_rels: &crate::core::relationships::Relationships,
+) -> Option<Vec<BlockElement>> {
+    let rel = doc_rels.get_by_id(rid)?;
+    if rel.target_mode != TargetMode::Internal {
+        return None;
+    }
+    let part = main_part.resolve_relative(&rel.target).ok()?;
+    if !opc.has_part(&part) {
+        return None;
+    }
+    let ext = part.as_str().rsplit('.').next()?;
+    let format = crate::format::DocumentFormat::from_extension(ext)?;
+    let data = opc.read_part(&part).ok()?;
+    let text = crate::Document::from_reader(std::io::Cursor::new(data), format)
+        .ok()?
+        .plain_text();
+    let paragraphs: Vec<BlockElement> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            BlockElement::Paragraph(Paragraph {
+                properties: None,
+                content: vec![ParagraphContent::Run(Run {
+                    properties: None,
+                    content: vec![RunContent::Text(line.to_string())],
+                })],
+            })
+        })
+        .collect();
+    if paragraphs.is_empty() {
+        None
+    } else {
+        Some(paragraphs)
+    }
+}
+
+/// Collect every `<a:t>` text node inside a SmartArt data part
+/// (`word/diagrams/dataN.xml`), in document order, one per line.
+fn diagram_text_lines(xml: &[u8]) -> Vec<String> {
+    let mut reader = xml::make_fast_reader(xml);
+    let mut lines = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) if e.local_name().as_ref() == "t" => {
+                if let Ok(text) = xml::read_text_content_fast(&mut reader) {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        lines.push(text.to_string());
+                    }
+                }
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {},
+        }
+    }
+    lines
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,21 +2099,21 @@ fn parse_drawing_and_text_boxes(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"inline" => {
+                "inline" => {
                     info = parse_inline_or_anchor_body(
-                        reader, /*inline=*/ true, b"inline", &mut boxes,
+                        reader, /*inline=*/ true, "inline", &mut boxes,
                     )?;
                 },
-                b"anchor" => {
+                "anchor" => {
                     info = parse_inline_or_anchor_body(
-                        reader, /*inline=*/ false, b"anchor", &mut boxes,
+                        reader, /*inline=*/ false, "anchor", &mut boxes,
                     )?;
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"drawing" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "drawing" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -1113,7 +2128,7 @@ fn parse_drawing_and_text_boxes(
 fn parse_inline_or_anchor_body(
     reader: &mut quick_xml::Reader<&[u8]>,
     inline: bool,
-    end_local: &[u8],
+    end_local: &str,
     text_boxes: &mut Vec<Vec<BlockElement>>,
 ) -> CoreResult<Option<DrawingInfo>> {
     use crate::docx::image::{AnchorFrame, AnchorPosition};
@@ -1123,6 +2138,8 @@ fn parse_inline_or_anchor_body(
     let mut description: Option<String> = None;
     let mut relationship_id: Option<String> = None;
     let mut shape: Option<crate::docx::image::ShapeInfo> = None;
+    let mut chart_rel_id: Option<String> = None;
+    let mut dgm_data_rel_id: Option<String> = None;
 
     let mut anchor_x: Option<i64> = None;
     let mut anchor_y: Option<i64> = None;
@@ -1132,29 +2149,29 @@ fn parse_inline_or_anchor_body(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"extent" => {
+                "extent" => {
                     parse_extent_attrs(e, &mut width, &mut height);
                     xml::skip_element_fast(reader)?;
                 },
-                b"docPr" => {
-                    if let Some(desc) = xml::optional_attr_str(e, b"descr")? {
+                "docPr" => {
+                    if let Some(desc) = xml::optional_attr_str(e, "descr")? {
                         description = Some(desc.into_owned());
                     }
                     xml::skip_element_fast(reader)?;
                 },
-                b"positionH" => {
-                    if let Some(rf) = xml::optional_attr_str(e, b"relativeFrom")? {
+                "positionH" => {
+                    if let Some(rf) = xml::optional_attr_str(e, "relativeFrom")? {
                         h_frame = parse_anchor_frame(&rf);
                     }
-                    anchor_x = parse_position_offset(reader, b"positionH")?;
+                    anchor_x = parse_position_offset(reader, "positionH")?;
                 },
-                b"positionV" => {
-                    if let Some(rf) = xml::optional_attr_str(e, b"relativeFrom")? {
+                "positionV" => {
+                    if let Some(rf) = xml::optional_attr_str(e, "relativeFrom")? {
                         v_frame = parse_anchor_frame(&rf);
                     }
-                    anchor_y = parse_position_offset(reader, b"positionV")?;
+                    anchor_y = parse_position_offset(reader, "positionV")?;
                 },
-                b"graphic" => {
+                "graphic" => {
                     let g = parse_graphic(reader, text_boxes)?;
                     if let Some(rid) = g.relationship_id {
                         relationship_id = Some(rid);
@@ -1162,15 +2179,21 @@ fn parse_inline_or_anchor_body(
                     if let Some(s) = g.shape {
                         shape = Some(s);
                     }
+                    if let Some(rid) = g.chart_rel_id {
+                        chart_rel_id = Some(rid);
+                    }
+                    if let Some(rid) = g.dgm_data_rel_id {
+                        dgm_data_rel_id = Some(rid);
+                    }
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
             Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"extent" => parse_extent_attrs(e, &mut width, &mut height),
-                b"docPr" => {
-                    if let Some(desc) = xml::optional_attr_str(e, b"descr")? {
+                "extent" => parse_extent_attrs(e, &mut width, &mut height),
+                "docPr" => {
+                    if let Some(desc) = xml::optional_attr_str(e, "descr")? {
                         description = Some(desc.into_owned());
                     }
                 },
@@ -1193,7 +2216,14 @@ fn parse_inline_or_anchor_body(
         None
     };
 
-    if relationship_id.is_some() || shape.is_some() {
+    // A chart-only or diagram-only graphic has neither a blip nor a
+    // `prstGeom`, so without these two conditions the whole drawing was
+    // discarded and the chart/diagram part was never reachable.
+    if relationship_id.is_some()
+        || shape.is_some()
+        || chart_rel_id.is_some()
+        || dgm_data_rel_id.is_some()
+    {
         Ok(Some(DrawingInfo {
             relationship_id: relationship_id.unwrap_or_default(),
             description,
@@ -1202,6 +2232,10 @@ fn parse_inline_or_anchor_body(
             inline,
             anchor_position,
             shape,
+            chart_rel_id,
+            chart_text: Vec::new(),
+            dgm_data_rel_id,
+            dgm_text: Vec::new(),
         }))
     } else {
         Ok(None)
@@ -1213,13 +2247,13 @@ fn parse_inline_or_anchor_body(
 /// closing tag (`end_local`).
 fn parse_position_offset(
     reader: &mut quick_xml::Reader<&[u8]>,
-    end_local: &[u8],
+    end_local: &str,
 ) -> CoreResult<Option<i64>> {
     let mut offset: Option<i64> = None;
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) if e.local_name().as_ref() == b"posOffset" => {
+            Event::Start(ref e) if e.local_name().as_ref() == "posOffset" => {
                 let text = xml::read_text_content_fast(reader)?;
                 if let Ok(v) = text.trim().parse::<i64>() {
                     offset = Some(v);
@@ -1242,6 +2276,11 @@ fn parse_position_offset(
 struct GraphicPayload {
     relationship_id: Option<String>,
     shape: Option<crate::docx::image::ShapeInfo>,
+    /// `r:id` of a `<c:chart>` reference, when the graphic is a chart.
+    chart_rel_id: Option<String>,
+    /// `r:dm` of a `<dgm:relIds>` reference, when the graphic is a
+    /// SmartArt diagram.
+    dgm_data_rel_id: Option<String>,
 }
 
 /// Parse `<a:graphic>` and any contained `<pic:pic>` (image) or
@@ -1252,30 +2291,61 @@ fn parse_graphic(
 ) -> CoreResult<GraphicPayload> {
     let mut relationship_id: Option<String> = None;
     let mut shape: Option<crate::docx::image::ShapeInfo> = None;
+    let mut chart_rel_id: Option<String> = None;
+    let mut dgm_data_rel_id: Option<String> = None;
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"pic" => {
+                "pic" => {
                     if let Some(rid) = parse_pic(reader)? {
                         relationship_id = Some(rid);
                     }
                 },
-                b"wsp" => {
+                "wsp" => {
                     if let Some(s) = parse_wsp(reader, text_boxes)? {
                         shape = Some(s);
                     }
                 },
+                // A native chart: the graphic carries only a relationship
+                // pointing at `word/charts/chartN.xml`, where all of its
+                // text actually lives. Usually the empty form, but the
+                // element is allowed children (`<c:extLst>`).
+                "chart" => {
+                    if let Some(rid) = xml::optional_prefixed_attr_str(e, "id")? {
+                        chart_rel_id = Some(rid.into_owned());
+                    }
+                    xml::skip_element_fast(reader)?;
+                },
+                // A SmartArt diagram: `<dgm:relIds r:dm="…" r:lo="…" .../>`
+                // — `r:dm` points at the data part (`word/diagrams/dataN.xml`)
+                // where the diagram's actual text lives.
+                "relIds" => {
+                    if let Some(rid) = xml::optional_prefixed_attr_str(e, "dm")? {
+                        dgm_data_rel_id = Some(rid.into_owned());
+                    }
+                    xml::skip_element_fast(reader)?;
+                },
                 // A group shape nests further `<wps:wsp>` children; descend
                 // so text boxes inside groups are not lost.
-                b"grpSp" | b"wgp" => continue,
+                "grpSp" | "wgp" => continue,
                 // <a:graphicData> is just a wrapper; descend into it.
-                b"graphicData" => continue,
+                "graphicData" => continue,
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"graphic" => break,
+            Event::Empty(ref e) if e.local_name().as_ref() == "chart" => {
+                if let Some(rid) = xml::optional_prefixed_attr_str(e, "id")? {
+                    chart_rel_id = Some(rid.into_owned());
+                }
+            },
+            Event::Empty(ref e) if e.local_name().as_ref() == "relIds" => {
+                if let Some(rid) = xml::optional_prefixed_attr_str(e, "dm")? {
+                    dgm_data_rel_id = Some(rid.into_owned());
+                }
+            },
+            Event::End(ref e) if e.local_name().as_ref() == "graphic" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -1284,6 +2354,8 @@ fn parse_graphic(
     Ok(GraphicPayload {
         relationship_id,
         shape,
+        chart_rel_id,
+        dgm_data_rel_id,
     })
 }
 
@@ -1301,8 +2373,8 @@ fn parse_pic(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<String>
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"blip" {
-                    if let Some(embed) = xml::optional_attr_str(e, b"r:embed")? {
+                if e.local_name().as_ref() == "blip" {
+                    if let Some(embed) = xml::optional_attr_str(e, "r:embed")? {
                         rid = Some(embed.into_owned());
                     }
                     // Skip over blip's own children (e.g. <a:extLst>).
@@ -1311,8 +2383,8 @@ fn parse_pic(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<String>
                     depth += 1;
                 }
             },
-            Event::Empty(ref e) if e.local_name().as_ref() == b"blip" => {
-                if let Some(embed) = xml::optional_attr_str(e, b"r:embed")? {
+            Event::Empty(ref e) if e.local_name().as_ref() == "blip" => {
+                if let Some(embed) = xml::optional_attr_str(e, "r:embed")? {
                     rid = Some(embed.into_owned());
                 }
             },
@@ -1343,11 +2415,18 @@ fn parse_wsp(
     let mut stroke_rgb: Option<(u8, u8, u8)> = None;
     let mut fill_rgb: Option<(u8, u8, u8)> = None;
     let mut stroke_w_emu: Option<i64> = None;
+    // A `<wps:wsp>` with both `<a:prstGeom>` (shape geometry, schema-
+    // required) AND `<wps:txbx><w:txbxContent>` (real text) is the
+    // standard way Word encodes a text box — not a shape that happens to
+    // also carry a text box. Emitting both `Element::Shape` and
+    // `Element::TextBox` for the one drawing doubled it into a
+    // content-free phantom shape plus the real text box.
+    let mut has_text_box = false;
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"spPr" => {
+                "spPr" => {
                     parse_sp_pr(
                         reader,
                         &mut kind,
@@ -1358,18 +2437,23 @@ fn parse_wsp(
                 },
                 // `<wps:txbx>` is a wrapper; `<w:txbxContent>` inside it is
                 // ordinary block content.
-                b"txbx" => continue,
-                b"txbxContent" => {
-                    text_boxes.push(parse_block_elements_until(reader, b"txbxContent")?);
+                "txbx" => continue,
+                "txbxContent" => {
+                    text_boxes.push(parse_block_elements_until(reader, "txbxContent")?);
+                    has_text_box = true;
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"wsp" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "wsp" => break,
             Event::Eof => break,
             _ => {},
         }
+    }
+
+    if has_text_box {
+        return Ok(None);
     }
 
     Ok(kind.map(|k| ShapeInfo {
@@ -1395,8 +2479,8 @@ fn parse_sp_pr(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"prstGeom" => {
-                    if let Some(prst) = xml::optional_attr_str(e, b"prst")? {
+                "prstGeom" => {
+                    if let Some(prst) = xml::optional_attr_str(e, "prst")? {
                         *kind = match prst.as_ref() {
                             "line" | "straightConnector1" => Some(ShapeKind::Line),
                             "rect" => Some(ShapeKind::Rect),
@@ -1405,13 +2489,13 @@ fn parse_sp_pr(
                     }
                     xml::skip_element_fast(reader)?;
                 },
-                b"ln" => {
-                    if let Some(w) = xml::optional_attr_str(e, b"w")? {
+                "ln" => {
+                    if let Some(w) = xml::optional_attr_str(e, "w")? {
                         *stroke_w_emu = w.parse().ok();
                     }
                     *stroke_rgb = parse_line_color(reader)?.or(*stroke_rgb);
                 },
-                b"solidFill" => {
+                "solidFill" => {
                     *fill_rgb = parse_solid_fill_color(reader)?.or(*fill_rgb);
                 },
                 _ => {
@@ -1419,8 +2503,8 @@ fn parse_sp_pr(
                 },
             },
             Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"prstGeom" => {
-                    if let Some(prst) = xml::optional_attr_str(e, b"prst")? {
+                "prstGeom" => {
+                    if let Some(prst) = xml::optional_attr_str(e, "prst")? {
                         *kind = match prst.as_ref() {
                             "line" | "straightConnector1" => Some(ShapeKind::Line),
                             "rect" => Some(ShapeKind::Rect),
@@ -1428,14 +2512,14 @@ fn parse_sp_pr(
                         };
                     }
                 },
-                b"ln" => {
-                    if let Some(w) = xml::optional_attr_str(e, b"w")? {
+                "ln" => {
+                    if let Some(w) = xml::optional_attr_str(e, "w")? {
                         *stroke_w_emu = w.parse().ok();
                     }
                 },
                 _ => {},
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"spPr" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "spPr" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -1452,7 +2536,7 @@ fn parse_line_color(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"solidFill" => {
+                "solidFill" => {
                     if let Some(c) = parse_solid_fill_color(reader)? {
                         rgb = Some(c);
                     }
@@ -1461,7 +2545,7 @@ fn parse_line_color(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"ln" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "ln" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -1480,8 +2564,8 @@ fn parse_solid_fill_color(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"srgbClr" {
-                    if let Some(val) = xml::optional_attr_str(e, b"val")? {
+                if e.local_name().as_ref() == "srgbClr" {
+                    if let Some(val) = xml::optional_attr_str(e, "val")? {
                         if let Some(parsed) = parse_hex_rgb(&val) {
                             rgb = Some(parsed);
                         }
@@ -1489,14 +2573,14 @@ fn parse_solid_fill_color(
                 }
                 xml::skip_element_fast(reader)?;
             },
-            Event::Empty(ref e) if e.local_name().as_ref() == b"srgbClr" => {
-                if let Some(val) = xml::optional_attr_str(e, b"val")? {
+            Event::Empty(ref e) if e.local_name().as_ref() == "srgbClr" => {
+                if let Some(val) = xml::optional_attr_str(e, "val")? {
                     if let Some(parsed) = parse_hex_rgb(&val) {
                         rgb = Some(parsed);
                     }
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"solidFill" => break,
+            Event::End(ref e) if e.local_name().as_ref() == "solidFill" => break,
             Event::Eof => break,
             _ => {},
         }
@@ -1540,10 +2624,10 @@ fn parse_hex_rgb(s: &str) -> Option<(u8, u8, u8)> {
 }
 
 fn parse_extent_attrs(e: &quick_xml::events::BytesStart, width: &mut Emu, height: &mut Emu) {
-    if let Ok(Some(cx)) = xml::optional_attr_str(e, b"cx") {
+    if let Ok(Some(cx)) = xml::optional_attr_str(e, "cx") {
         *width = Emu(cx.parse().unwrap_or(0));
     }
-    if let Ok(Some(cy)) = xml::optional_attr_str(e, b"cy") {
+    if let Ok(Some(cy)) = xml::optional_attr_str(e, "cy") {
         *height = Emu(cy.parse().unwrap_or(0));
     }
 }
@@ -1589,25 +2673,40 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Table> {
     let mut properties = None;
     let mut grid = Vec::new();
     let mut rows = Vec::new();
+    // A whole row can be wrapped the same way a cell can
+    // (`<w:tbl><w:sdt><w:sdtContent><w:tr>`) — same transparent-wrapper
+    // treatment as `parse_table_row` gives `<w:tc>`.
+    let mut wrapper_depth = 0usize;
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"tblPr" => {
+                "tblPr" => {
                     properties = Some(parse_table_properties(reader)?);
                 },
-                b"tblGrid" => {
+                "tblGrid" => {
                     grid = parse_table_grid(reader)?;
                 },
-                b"tr" => {
+                "tr" => {
                     rows.push(parse_table_row(reader)?);
+                },
+                "sdt" | "sdtContent" => {
+                    wrapper_depth += 1;
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"tbl" => {
-                break;
+            Event::End(ref e) => {
+                let local = e.local_name();
+                if local.as_ref() == "tbl" && wrapper_depth == 0 {
+                    break;
+                }
+                if matches!(local.as_ref(), "sdt" | "sdtContent") {
+                    wrapper_depth = wrapper_depth.saturating_sub(1);
+                } else if local.as_ref() == "tbl" {
+                    break;
+                }
             },
             Event::Eof => break,
             _ => {},
@@ -1627,36 +2726,36 @@ fn parse_table_properties(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<T
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"tblW" => {
+                "tblW" => {
                     props.width = parse_table_width(e)?;
                     xml::skip_element_fast(reader)?;
                 },
-                b"jc" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "jc" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.justification =
                             Some(self::formatting::parse_justification_value(&val));
                     }
                     xml::skip_element_fast(reader)?;
                 },
-                b"tblStyle" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "tblStyle" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.style_id = Some(val.into_owned());
                     }
                     xml::skip_element_fast(reader)?;
                 },
-                b"tblBorders" => {
+                "tblBorders" => {
                     props.borders =
-                        Some(self::formatting::parse_table_borders_fast(reader, b"tblBorders")?);
+                        Some(self::formatting::parse_table_borders_fast(reader, "tblBorders")?);
                 },
-                b"tblCellMar" => {
-                    props.cell_margins = Some(parse_cell_margins(reader, b"tblCellMar")?);
+                "tblCellMar" => {
+                    props.cell_margins = Some(parse_cell_margins(reader, "tblCellMar")?);
                 },
-                b"tblInd" => {
+                "tblInd" => {
                     props.indent = parse_measure_w(e);
                     xml::skip_element_fast(reader)?;
                 },
-                b"tblCaption" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "tblCaption" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.caption = Some(val.into_owned());
                     }
                     xml::skip_element_fast(reader)?;
@@ -1666,31 +2765,31 @@ fn parse_table_properties(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<T
                 },
             },
             Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"tblInd" => {
+                "tblInd" => {
                     props.indent = parse_measure_w(e);
                 },
-                b"tblCaption" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "tblCaption" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.caption = Some(val.into_owned());
                     }
                 },
-                b"tblW" => {
+                "tblW" => {
                     props.width = parse_table_width(e)?;
                 },
-                b"jc" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "jc" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.justification =
                             Some(self::formatting::parse_justification_value(&val));
                     }
                 },
-                b"tblStyle" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "tblStyle" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.style_id = Some(val.into_owned());
                     }
                 },
                 _ => {},
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"tblPr" => {
+            Event::End(ref e) if e.local_name().as_ref() == "tblPr" => {
                 break;
             },
             Event::Eof => break,
@@ -1707,13 +2806,13 @@ fn parse_table_grid(
 
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == b"gridCol" => {
-                if let Ok(Some(w)) = xml::optional_attr_str(e, b"w:w") {
+            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == "gridCol" => {
+                if let Ok(Some(w)) = xml::optional_attr_str(e, "w:w") {
                     let val: i32 = w.parse().unwrap_or(0);
                     cols.push(crate::core::units::Twip(val));
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"tblGrid" => {
+            Event::End(ref e) if e.local_name().as_ref() == "tblGrid" => {
                 break;
             },
             Event::Eof => break,
@@ -1726,28 +2825,46 @@ fn parse_table_grid(
 fn parse_table_row(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableRow> {
     let mut properties = None;
     let mut cells = Vec::new();
+    // A cell can be wrapped in a content control (`<w:tr><w:sdt><w:sdtContent>
+    // <w:tc>`). Treating `sdt`/`sdtContent` as opaque dropped the whole cell,
+    // shifting every subsequent cell in the row into the wrong column
+    // — descend into them instead, matching how
+    // `parse_paragraph` already treats them as transparent wrappers.
+    let mut wrapper_depth = 0usize;
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"trPr" => {
+                "trPr" => {
                     properties = Some(parse_table_row_properties(reader)?);
                 },
-                b"tc" => {
+                "tc" => {
                     cells.push(parse_table_cell(reader)?);
+                },
+                "sdt" | "sdtContent" => {
+                    wrapper_depth += 1;
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"tr" => {
-                break;
+            Event::End(ref e) => {
+                let local = e.local_name();
+                if local.as_ref() == "tr" && wrapper_depth == 0 {
+                    break;
+                }
+                if matches!(local.as_ref(), "sdt" | "sdtContent") {
+                    wrapper_depth = wrapper_depth.saturating_sub(1);
+                } else if local.as_ref() == "tr" {
+                    break;
+                }
             },
             Event::Eof => break,
             _ => {},
         }
     }
 
+    cells.shrink_to_fit();
     Ok(TableRow { properties, cells })
 }
 
@@ -1759,19 +2876,19 @@ fn parse_table_row_properties(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) | Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"tblHeader" => {
-                    props.is_header = xml::parse_toggle(e, b"w:val");
+                "tblHeader" => {
+                    props.is_header = xml::parse_toggle(e, "w:val");
                 },
-                b"cantSplit" => {
-                    props.cant_split = xml::parse_toggle(e, b"w:val");
+                "cantSplit" => {
+                    props.cant_split = xml::parse_toggle(e, "w:val");
                 },
-                b"trHeight" => {
-                    props.height = xml::optional_attr_str(e, b"w:val")
+                "trHeight" => {
+                    props.height = xml::optional_attr_str(e, "w:val")
                         .ok()
                         .flatten()
                         .and_then(|v| v.parse().ok());
                     props.height_rule =
-                        xml::optional_attr_str(e, b"w:hRule")
+                        xml::optional_attr_str(e, "w:hRule")
                             .ok()
                             .flatten()
                             .map(|v| match v.as_ref() {
@@ -1782,7 +2899,7 @@ fn parse_table_row_properties(
                 },
                 _ => {},
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"trPr" => {
+            Event::End(ref e) if e.local_name().as_ref() == "trPr" => {
                 break;
             },
             Event::Eof => break,
@@ -1799,20 +2916,25 @@ fn parse_table_cell(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableCe
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"tcPr" => {
+                "tcPr" => {
                     properties = Some(parse_table_cell_properties(reader)?);
                 },
-                b"p" => {
+                "p" => {
                     content.push(BlockElement::Paragraph(parse_paragraph(reader)?));
                 },
-                b"tbl" => {
-                    content.push(BlockElement::Table(parse_table(reader)?));
+                "tbl" => {
+                    content.push(BlockElement::Table(Box::new(parse_table(reader)?)));
                 },
+                // A content control inside the cell (`w:tc > w:sdt >
+                // w:sdtContent > w:p`) — how a data-bound form lays out
+                // its fields — is a transparent wrapper, as in the body;
+                // skipping it emptied every such cell.
+                "sdt" | "sdtContent" => {},
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"tc" => {
+            Event::End(ref e) if e.local_name().as_ref() == "tc" => {
                 break;
             },
             Event::Eof => break,
@@ -1820,6 +2942,7 @@ fn parse_table_cell(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableCe
         }
     }
 
+    content.shrink_to_fit();
     Ok(TableCell {
         properties,
         content,
@@ -1834,47 +2957,55 @@ fn parse_table_cell_properties(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
-                b"tcW" => {
+                "tcW" => {
                     props.width = parse_table_width(e)?;
                     xml::skip_element_fast(reader)?;
                 },
-                b"vMerge" => {
-                    let val = xml::optional_attr_str(e, b"w:val")?;
+                "vMerge" => {
+                    let val = xml::optional_attr_str(e, "w:val")?;
                     props.vertical_merge = Some(match val.as_deref() {
                         Some("restart") => MergeType::Restart,
                         _ => MergeType::Continue,
                     });
                     xml::skip_element_fast(reader)?;
                 },
-                b"gridSpan" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "gridSpan" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.grid_span = val.parse().ok();
                     }
                     xml::skip_element_fast(reader)?;
                 },
-                b"shd" => {
-                    props.shading = Some(Shading {
-                        fill: xml::optional_attr_str(e, b"w:fill")?.map(|v| v.into_owned()),
-                        color: xml::optional_attr_str(e, b"w:color")?.map(|v| v.into_owned()),
-                        pattern: xml::optional_attr_str(e, b"w:val")?.map(|v| v.into_owned()),
-                    });
+                "shd" => {
+                    props.shading = Some(Box::new(Shading {
+                        fill: xml::optional_attr_str(e, "w:fill")?.map(|v| v.into_owned()),
+                        color: xml::optional_attr_str(e, "w:color")?.map(|v| v.into_owned()),
+                        pattern: xml::optional_attr_str(e, "w:val")?.map(|v| v.into_owned()),
+                    }));
                     xml::skip_element_fast(reader)?;
                 },
-                b"tcBorders" => {
-                    props.borders =
-                        Some(self::formatting::parse_table_borders_fast(reader, b"tcBorders")?);
+                "tcBorders" => {
+                    props.borders = Some(Box::new(self::formatting::parse_table_borders_fast(
+                        reader,
+                        "tcBorders",
+                    )?));
                 },
-                b"tcMar" => {
-                    props.margins = Some(parse_cell_margins(reader, b"tcMar")?);
+                "tcMar" => {
+                    props.margins = Some(parse_cell_margins(reader, "tcMar")?);
                 },
-                b"vAlign" => {
+                "vAlign" => {
                     props.v_align = parse_cell_v_align(e);
                     xml::skip_element_fast(reader)?;
                 },
-                b"textDirection" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "textDirection" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.text_direction = Some(val.into_owned());
                     }
+                    xml::skip_element_fast(reader)?;
+                },
+                // `<w:cellDel>` marks the whole cell deleted via tracked
+                // changes, pending acceptance.
+                "cellDel" => {
+                    props.deleted = true;
                     xml::skip_element_fast(reader)?;
                 },
                 _ => {
@@ -1882,39 +3013,42 @@ fn parse_table_cell_properties(
                 },
             },
             Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"tcW" => {
+                "tcW" => {
                     props.width = parse_table_width(e)?;
                 },
-                b"vMerge" => {
-                    let val = xml::optional_attr_str(e, b"w:val")?;
+                "cellDel" => {
+                    props.deleted = true;
+                },
+                "vMerge" => {
+                    let val = xml::optional_attr_str(e, "w:val")?;
                     props.vertical_merge = Some(match val.as_deref() {
                         Some("restart") => MergeType::Restart,
                         _ => MergeType::Continue,
                     });
                 },
-                b"gridSpan" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "gridSpan" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.grid_span = val.parse().ok();
                     }
                 },
-                b"shd" => {
-                    props.shading = Some(Shading {
-                        fill: xml::optional_attr_str(e, b"w:fill")?.map(|v| v.into_owned()),
-                        color: xml::optional_attr_str(e, b"w:color")?.map(|v| v.into_owned()),
-                        pattern: xml::optional_attr_str(e, b"w:val")?.map(|v| v.into_owned()),
-                    });
+                "shd" => {
+                    props.shading = Some(Box::new(Shading {
+                        fill: xml::optional_attr_str(e, "w:fill")?.map(|v| v.into_owned()),
+                        color: xml::optional_attr_str(e, "w:color")?.map(|v| v.into_owned()),
+                        pattern: xml::optional_attr_str(e, "w:val")?.map(|v| v.into_owned()),
+                    }));
                 },
-                b"vAlign" => {
+                "vAlign" => {
                     props.v_align = parse_cell_v_align(e);
                 },
-                b"textDirection" => {
-                    if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                "textDirection" => {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                         props.text_direction = Some(val.into_owned());
                     }
                 },
                 _ => {},
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"tcPr" => {
+            Event::End(ref e) if e.local_name().as_ref() == "tcPr" => {
                 break;
             },
             Event::Eof => break,
@@ -1927,7 +3061,7 @@ fn parse_table_cell_properties(
 /// Read a `w:w` twip measure off an element (`w:tblInd`, `w:top` in
 /// `w:tblCellMar`, …).
 fn parse_measure_w(e: &quick_xml::events::BytesStart) -> Option<crate::core::units::Twip> {
-    xml::optional_attr_str(e, b"w:w")
+    xml::optional_attr_str(e, "w:w")
         .ok()
         .flatten()
         .and_then(|v| v.parse().ok())
@@ -1935,7 +3069,7 @@ fn parse_measure_w(e: &quick_xml::events::BytesStart) -> Option<crate::core::uni
 }
 
 fn parse_cell_v_align(e: &quick_xml::events::BytesStart) -> Option<CellVAlign> {
-    xml::optional_attr_str(e, b"w:val")
+    xml::optional_attr_str(e, "w:val")
         .ok()
         .flatten()
         .map(|v| match v.as_ref() {
@@ -1947,20 +3081,17 @@ fn parse_cell_v_align(e: &quick_xml::events::BytesStart) -> Option<CellVAlign> {
 
 /// Parse the children of `w:tblCellMar` / `w:tcMar`. The caller has consumed
 /// the start tag; `end` names the closing element to stop at.
-fn parse_cell_margins(
-    reader: &mut quick_xml::Reader<&[u8]>,
-    end: &[u8],
-) -> CoreResult<CellMargins> {
+fn parse_cell_margins(reader: &mut quick_xml::Reader<&[u8]>, end: &str) -> CoreResult<CellMargins> {
     let mut m = CellMargins::default();
     loop {
         match reader.read_event()? {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 let v = parse_measure_w(e).map(|t| t.0);
                 match e.local_name().as_ref() {
-                    b"top" => m.top = v,
-                    b"bottom" => m.bottom = v,
-                    b"left" | b"start" => m.left = v,
-                    b"right" | b"end" => m.right = v,
+                    "top" => m.top = v,
+                    "bottom" => m.bottom = v,
+                    "left" | "start" => m.left = v,
+                    "right" | "end" => m.right = v,
                     _ => {},
                 }
             },
@@ -1973,8 +3104,8 @@ fn parse_cell_margins(
 }
 
 fn parse_table_width(e: &quick_xml::events::BytesStart) -> CoreResult<Option<TableWidth>> {
-    let w = xml::optional_attr_str(e, b"w:w")?;
-    let t = xml::optional_attr_str(e, b"w:type")?;
+    let w = xml::optional_attr_str(e, "w:w")?;
+    let t = xml::optional_attr_str(e, "w:type")?;
 
     if let Some(ref w_val) = w {
         let value: i32 = w_val.parse().unwrap_or(0);
@@ -2004,87 +3135,86 @@ pub(crate) fn parse_section_properties(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) | Event::Empty(ref e) => match e.local_name().as_ref() {
-                b"pgSz" => {
-                    let w: i32 = xml::optional_attr_str(e, b"w:w")?
+                "pgSz" => {
+                    let w: i32 = xml::optional_attr_str(e, "w:w")?
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(12240);
-                    let h: i32 = xml::optional_attr_str(e, b"w:h")?
+                    let h: i32 = xml::optional_attr_str(e, "w:h")?
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(15840);
-                    let orient =
-                        xml::optional_attr_str(e, b"w:orient")?.map(|v| match v.as_ref() {
-                            "landscape" => PageOrientation::Landscape,
-                            _ => PageOrientation::Portrait,
-                        });
+                    let orient = xml::optional_attr_str(e, "w:orient")?.map(|v| match v.as_ref() {
+                        "landscape" => PageOrientation::Landscape,
+                        _ => PageOrientation::Portrait,
+                    });
                     props.page_size = Some(PageSize {
                         width: crate::core::units::Twip(w),
                         height: crate::core::units::Twip(h),
                         orient,
                     });
                 },
-                b"pgMar" => {
+                "pgMar" => {
                     props.margins = Some(PageMargins {
                         top: crate::core::units::Twip(
-                            xml::optional_attr_str(e, b"w:top")?
+                            xml::optional_attr_str(e, "w:top")?
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(1440),
                         ),
                         bottom: crate::core::units::Twip(
-                            xml::optional_attr_str(e, b"w:bottom")?
+                            xml::optional_attr_str(e, "w:bottom")?
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(1440),
                         ),
                         left: crate::core::units::Twip(
-                            xml::optional_attr_str(e, b"w:left")?
+                            xml::optional_attr_str(e, "w:left")?
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(1440),
                         ),
                         right: crate::core::units::Twip(
-                            xml::optional_attr_str(e, b"w:right")?
+                            xml::optional_attr_str(e, "w:right")?
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(1440),
                         ),
-                        header: xml::optional_attr_str(e, b"w:header")?
+                        header: xml::optional_attr_str(e, "w:header")?
                             .and_then(|v| v.parse().ok())
                             .map(crate::core::units::Twip),
-                        footer: xml::optional_attr_str(e, b"w:footer")?
+                        footer: xml::optional_attr_str(e, "w:footer")?
                             .and_then(|v| v.parse().ok())
                             .map(crate::core::units::Twip),
-                        gutter: xml::optional_attr_str(e, b"w:gutter")?
+                        gutter: xml::optional_attr_str(e, "w:gutter")?
                             .and_then(|v| v.parse().ok())
                             .map(crate::core::units::Twip),
                     });
                 },
-                b"headerReference" => {
+                "headerReference" => {
                     let hf_type = parse_hf_type(e)?;
-                    if let Ok(Some(rid)) = xml::optional_attr_str(e, b"r:id") {
+                    if let Ok(Some(rid)) = xml::optional_attr_str(e, "r:id") {
                         props.header_refs.push(HeaderFooterRef {
                             hf_type,
                             relationship_id: rid.into_owned(),
                         });
                     }
                 },
-                b"footerReference" => {
+                "footerReference" => {
                     let hf_type = parse_hf_type(e)?;
-                    if let Ok(Some(rid)) = xml::optional_attr_str(e, b"r:id") {
+                    if let Ok(Some(rid)) = xml::optional_attr_str(e, "r:id") {
                         props.footer_refs.push(HeaderFooterRef {
                             hf_type,
                             relationship_id: rid.into_owned(),
                         });
                     }
                 },
-                b"cols" => {
-                    if let Ok(Some(num)) = xml::optional_attr_str(e, b"w:num") {
+                "cols" => {
+                    if let Ok(Some(num)) = xml::optional_attr_str(e, "w:num") {
                         props.columns = num.parse().ok();
                     }
                     props.column_layout = Some(ColumnDefs {
-                        space: xml::optional_attr_str(e, b"w:space")
+                        space: xml::optional_attr_str(e, "w:space")
                             .ok()
                             .flatten()
                             .and_then(|v| v.parse().ok()),
                         // Absent `w:sep` means no separator; present-with-no-val
                         // means true, which is what `parse_toggle` gives us.
-                        separator: xml::optional_attr_str(e, b"w:sep")
+                        separator: xml::optional_attr_str(e, "w:sep")
                             .ok()
                             .flatten()
                             .is_some_and(|v| matches!(v.as_ref(), "1" | "true" | "on")),
@@ -2094,18 +3224,18 @@ pub(crate) fn parse_section_properties(
                 // `<w:col>` children of a non-self-closing `<w:cols>` arrive
                 // through this same loop; `</w:cols>` is ignored and only
                 // `</w:sectPr>` ends it.
-                b"col" => {
+                "col" => {
                     if let Some(layout) = props.column_layout.as_mut() {
-                        if let Ok(Some(w)) = xml::optional_attr_str(e, b"w:w") {
+                        if let Ok(Some(w)) = xml::optional_attr_str(e, "w:w") {
                             if let Ok(v) = w.parse::<u32>() {
                                 layout.widths.push(v);
                             }
                         }
                     }
                 },
-                b"type" => {
+                "type" => {
                     props.break_type =
-                        xml::optional_attr_str(e, b"w:val")?.map(|v| match v.as_ref() {
+                        xml::optional_attr_str(e, "w:val")?.map(|v| match v.as_ref() {
                             "continuous" => SectionBreakKind::Continuous,
                             "evenPage" => SectionBreakKind::EvenPage,
                             "oddPage" => SectionBreakKind::OddPage,
@@ -2113,12 +3243,12 @@ pub(crate) fn parse_section_properties(
                             _ => SectionBreakKind::NextPage,
                         });
                 },
-                b"titlePg" => {
-                    props.title_page = xml::parse_toggle(e, b"w:val");
+                "titlePg" => {
+                    props.title_page = xml::parse_toggle(e, "w:val");
                 },
                 _ => {},
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"sectPr" => {
+            Event::End(ref e) if e.local_name().as_ref() == "sectPr" => {
                 break;
             },
             Event::Eof => break,
@@ -2159,7 +3289,7 @@ pub(crate) fn strip_embedded_font_filename(basename: &str) -> String {
 }
 
 fn parse_hf_type(e: &quick_xml::events::BytesStart) -> CoreResult<HeaderFooterType> {
-    Ok(match xml::optional_attr_str(e, b"w:type")? {
+    Ok(match xml::optional_attr_str(e, "w:type")? {
         Some(ref val) => match val.as_ref() {
             "first" => HeaderFooterType::First,
             "even" => HeaderFooterType::Even,
@@ -2186,6 +3316,47 @@ impl crate::core::OfficeDocument for DocxDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plain one-run paragraph in a one-paragraph cell cost ~4 KB even
+    /// after the property structs were boxed: `BlockElement` was 536
+    /// bytes (an unboxed `Table`), `RunContent`
+    /// 224 (an unboxed `DrawingInfo`), and each one-element content `Vec`
+    /// kept the four slots `push` reserves. 128,000 such cells were 524 MB
+    /// at `open()`. The sizes are budgeted with headroom; the capacities
+    /// are exact.
+    #[test]
+    fn test_one_run_cells_carry_no_variant_or_capacity_slack() {
+        assert!(
+            std::mem::size_of::<BlockElement>() <= 250,
+            "BlockElement is {} bytes — is `Table` still boxed?",
+            std::mem::size_of::<BlockElement>()
+        );
+        assert!(
+            std::mem::size_of::<RunContent>() <= 100,
+            "RunContent is {} bytes — is `DrawingInfo` still boxed?",
+            std::mem::size_of::<RunContent>()
+        );
+        let xml = br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
+<w:tbl><w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+<w:p><w:r><w:t>para</w:t></w:r></w:p>
+</w:body></w:document>"#;
+        let rels = crate::core::relationships::Relationships::empty();
+        let parsed = parse_document(xml, &rels).unwrap();
+        let BlockElement::Table(table) = &parsed.0.elements[0] else {
+            panic!("first element is the table")
+        };
+        let cell = &table.rows[0].cells[0];
+        assert_eq!(cell.content.capacity(), 1, "cell content over-reserved");
+        assert_eq!(table.rows[0].cells.capacity(), 1, "row cells over-reserved");
+        let BlockElement::Paragraph(p) = &cell.content[0] else {
+            panic!("cell holds a paragraph")
+        };
+        assert_eq!(p.content.capacity(), 1, "paragraph content over-reserved");
+        let ParagraphContent::Run(run) = &p.content[0] else {
+            panic!("paragraph holds a run")
+        };
+        assert_eq!(run.content.capacity(), 1, "run content over-reserved");
+    }
     use std::io::Cursor;
 
     use crate::core::opc::{OpcWriter, PartName};
@@ -2209,8 +3380,207 @@ mod tests {
         result.into_inner()
     }
 
+    /// Like `make_minimal_docx`, but also writes a SmartArt diagram data
+    /// part and the `document.xml -> diagrams/data1.xml` relationship
+    /// (`rId7`, matching what real Word/pandoc output uses) so a
+    /// `<dgm:relIds r:dm="rId7">` reference in `document_xml` resolves.
+    fn make_docx_with_diagram(document_xml: &[u8], diagram_data_xml: &[u8]) -> Vec<u8> {
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+
+        let dgm_part = PartName::new("/word/diagrams/data1.xml").unwrap();
+        writer
+            .add_part(
+                &dgm_part,
+                "application/vnd.openxmlformats-officedocument.drawingml.diagramData+xml",
+                diagram_data_xml,
+            )
+            .unwrap();
+        let rid = writer.add_part_rel(&doc_part, rel_types::DIAGRAM_DATA, "diagrams/data1.xml");
+        assert_eq!(rid, "rId1", "test fixture assumes the first relationship id");
+
+        let result = writer.finish().unwrap();
+        result.into_inner()
+    }
+
     #[test]
-    fn parse_empty_document() {
+    fn test_embedded_package_object_text_is_extracted() {
+        // An embedded native OOXML package
+        // (<o:OLEObject Type="Embed">) was never opened at all.
+        let mut xlsx_writer = crate::xlsx::write::XlsxWriter::new();
+        {
+            let mut sheet = xlsx_writer.add_sheet("Sheet1");
+            sheet.set_cell(
+                0,
+                0,
+                crate::xlsx::write::CellData::String("EmbeddedCellText".to_string()),
+            );
+        }
+        let mut embedded_xlsx = Vec::new();
+        xlsx_writer
+            .write_to(Cursor::new(&mut embedded_xlsx))
+            .unwrap();
+
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+             xmlns:o="urn:schemas-microsoft-com:office:office"
+             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>
+    <w:p><w:r><w:pict>
+      <o:OLEObject Type="Embed" ProgID="Excel.Sheet.12" r:id="rId1"/>
+    </w:pict></w:r></w:p>
+  </w:body>
+</w:document>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let embed_part = PartName::new("/word/embeddings/Microsoft_Excel_Worksheet1.xlsx").unwrap();
+        writer
+            .add_part(
+                &embed_part,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                &embedded_xlsx,
+            )
+            .unwrap();
+        let rid = writer.add_part_rel(
+            &doc_part,
+            rel_types::PACKAGE,
+            "embeddings/Microsoft_Excel_Worksheet1.xlsx",
+        );
+        assert_eq!(rid, "rId1", "test fixture assumes the first relationship id");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let text = doc.plain_text();
+        assert!(text.contains("EmbeddedCellText"), "expected embedded workbook text in {text:?}");
+    }
+
+    #[test]
+    fn test_numbered_list_resumed_after_interruption_continues_counting() {
+        // A numbered list interrupted by a plain paragraph
+        // then resumed later with the same numId (no explicit override)
+        // restarted at 1 instead of continuing where it left off.
+        let numbering_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="0">
+    <w:lvl w:ilvl="0">
+      <w:start w:val="1"/>
+      <w:numFmt w:val="decimal"/>
+      <w:lvlText w:val="%1."/>
+    </w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="1">
+    <w:abstractNumId w:val="0"/>
+  </w:num>
+</w:numbering>"#;
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>one</w:t></w:r></w:p>
+    <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>two</w:t></w:r></w:p>
+    <w:p><w:r><w:t>an interrupting paragraph, not a list item</w:t></w:r></w:p>
+    <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>three</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let numbering_part = PartName::new("/word/numbering.xml").unwrap();
+        writer
+            .add_part(
+                &numbering_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml",
+                numbering_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::NUMBERING, "numbering.xml");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let ir = crate::convert_docx::docx_to_ir(&doc);
+        let lists: Vec<&crate::ir::List> = ir.sections[0]
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                crate::ir::Element::List(l) => Some(l),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lists.len(), 2, "expected two separate list groups (interrupted once)");
+        assert_eq!(lists[0].start_number, None, "first group: no explicit start, defaults to 1");
+        assert_eq!(
+            lists[1].start_number,
+            Some(3),
+            "second group (numId=1 resumed, no override) must continue from item 3, not restart at 1"
+        );
+    }
+
+    #[test]
+    fn test_smartart_diagram_text_is_extracted() {
+        // word/diagrams/dataN.xml was never opened, so
+        // SmartArt text was completely invisible.
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+             xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+             xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+             xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram"
+             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>
+    <w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram">
+      <dgm:relIds r:dm="rId1" r:lo="rId1" r:qs="rId1" r:cs="rId1"/>
+    </a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let diagram_data_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram"
+               xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <dgm:ptLst>
+    <dgm:pt><dgm:t><a:p><a:r><a:t>top</a:t></a:r></a:p></dgm:t></dgm:pt>
+    <dgm:pt><dgm:t><a:p><a:r><a:t>middle</a:t></a:r></a:p></dgm:t></dgm:pt>
+    <dgm:pt><dgm:t><a:p><a:r><a:t>bottom</a:t></a:r></a:p></dgm:t></dgm:pt>
+  </dgm:ptLst>
+</dgm:dataModel>"#;
+        let data = make_docx_with_diagram(document_xml, diagram_data_xml);
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let text = doc.plain_text();
+        assert!(text.contains("top"), "expected 'top' in {text:?}");
+        assert!(text.contains("middle"), "expected 'middle' in {text:?}");
+        assert!(text.contains("bottom"), "expected 'bottom' in {text:?}");
+    }
+
+    #[test]
+    fn test_parse_empty_document() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body/>
@@ -2222,7 +3592,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_single_paragraph() {
+    fn test_parse_single_paragraph() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -2240,7 +3610,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_multiple_paragraphs() {
+    fn test_parse_multiple_paragraphs() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -2259,7 +3629,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_multiple_runs() {
+    fn test_parse_multiple_runs() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -2275,7 +3645,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_break_and_tab() {
+    fn test_parse_break_and_tab() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -2294,7 +3664,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_table_basic() {
+    fn test_parse_table_basic() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -2323,7 +3693,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_paragraph_with_formatting() {
+    fn test_parse_paragraph_with_formatting() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -2363,7 +3733,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_bold_italic() {
+    fn test_markdown_bold_italic() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -2388,7 +3758,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_table() {
+    fn test_markdown_table() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -2413,7 +3783,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_drawing_anchor_position() {
+    fn test_parse_drawing_anchor_position() {
         let xml =
             br#"<w:drawing xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
                 xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
@@ -2436,7 +3806,7 @@ mod tests {
         // depth=1 already accounting for that wrapper).
         loop {
             match reader.read_event().unwrap() {
-                quick_xml::events::Event::Start(ref e) if e.local_name().as_ref() == b"drawing" => {
+                quick_xml::events::Event::Start(ref e) if e.local_name().as_ref() == "drawing" => {
                     break;
                 },
                 quick_xml::events::Event::Eof => panic!("no drawing"),
@@ -2456,7 +3826,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_drawing_wsp_line_shape() {
+    fn test_parse_drawing_wsp_line_shape() {
         let xml =
             br#"<w:drawing xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
                 xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
@@ -2481,7 +3851,7 @@ mod tests {
         let mut reader = make_content_reader(xml);
         loop {
             match reader.read_event().unwrap() {
-                quick_xml::events::Event::Start(ref e) if e.local_name().as_ref() == b"drawing" => {
+                quick_xml::events::Event::Start(ref e) if e.local_name().as_ref() == "drawing" => {
                     break;
                 },
                 quick_xml::events::Event::Eof => panic!("no drawing"),
@@ -2499,7 +3869,7 @@ mod tests {
     }
 
     #[test]
-    fn section_properties() {
+    fn test_section_properties() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -2524,7 +3894,7 @@ mod tests {
     // ── strip_embedded_font_filename ────────────────────────────────────
 
     #[test]
-    fn strip_embedded_font_writer_convention() {
+    fn test_strip_embedded_font_writer_convention() {
         // Writer convention: font_<n>_<face>.<ext>
         assert_eq!(
             strip_embedded_font_filename("font_4_TeXGyreTermesX-Regular.ttf"),
@@ -2535,27 +3905,27 @@ mod tests {
     }
 
     #[test]
-    fn strip_embedded_font_no_prefix_keeps_stem() {
+    fn test_strip_embedded_font_no_prefix_keeps_stem() {
         // No `font_<n>_` prefix → return the stem unchanged.
         assert_eq!(strip_embedded_font_filename("Arial.ttf"), "Arial");
         assert_eq!(strip_embedded_font_filename("MyFont.otf"), "MyFont");
     }
 
     #[test]
-    fn strip_embedded_font_no_extension() {
+    fn test_strip_embedded_font_no_extension() {
         // No extension → use the whole input.
         assert_eq!(strip_embedded_font_filename("font_1_Calibri"), "Calibri");
         assert_eq!(strip_embedded_font_filename("Calibri"), "Calibri");
     }
 
     #[test]
-    fn strip_embedded_font_non_digit_prefix_keeps_stem() {
+    fn test_strip_embedded_font_non_digit_prefix_keeps_stem() {
         // `font_xxx_<face>` where xxx isn't digits → don't strip.
         assert_eq!(strip_embedded_font_filename("font_abc_Foo.ttf"), "font_abc_Foo");
     }
 
     #[test]
-    fn strip_embedded_font_alphabetic_face_preserved() {
+    fn test_strip_embedded_font_alphabetic_face_preserved() {
         // Regression: greedy trim_end_matches(alphabetic) used to eat
         // the face name. Verify a face with trailing alphabetic chars
         // survives intact.
@@ -2566,14 +3936,1360 @@ mod tests {
     }
 
     #[test]
-    fn strip_embedded_font_empty() {
+    fn test_strip_embedded_font_empty() {
         assert_eq!(strip_embedded_font_filename(""), "");
     }
 
     #[test]
-    fn strip_embedded_font_no_face_after_prefix() {
+    fn test_strip_embedded_font_no_face_after_prefix() {
         // `font_<n>_` with nothing after the underscore → empty face.
         // Caller of this helper falls back to the full basename.
         assert_eq!(strip_embedded_font_filename("font_5_.ttf"), "");
+    }
+
+    /// Parse a `<w:p>…</w:p>` fragment directly through `parse_paragraph`,
+    /// the way the body-element dispatcher does: consume the `<w:p>` start
+    /// event first, then hand the reader (now positioned just inside) to
+    /// the function under test.
+    fn parse_paragraph_fragment(xml: &[u8]) -> Paragraph {
+        let mut reader = quick_xml::Reader::from_reader(xml);
+        reader.config_mut().trim_text(false);
+        match reader.read_event().unwrap() {
+            Event::Start(_) => {},
+            other => panic!("expected <w:p> start, got {other:?}"),
+        }
+        parse_paragraph(&mut reader).unwrap()
+    }
+
+    fn run_texts(p: &Paragraph) -> Vec<String> {
+        p.content
+            .iter()
+            .filter_map(|c| match c {
+                ParagraphContent::Run(r) => Some(
+                    r.content
+                        .iter()
+                        .filter_map(|rc| match rc {
+                            RunContent::Text(t) => Some(t.clone()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_ffdata_checkbox_state_is_captured() {
+        // A FORMCHECKBOX's checked state exists nowhere else
+        // in the document; skipping w:ffData lost it unrecoverably.
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:r><w:fldChar w:fldCharType="begin"><w:ffData>
+  <w:name w:val="Check1"/>
+  <w:checkBox><w:default w:val="0"/><w:checked w:val="1"/></w:checkBox>
+</w:ffData></w:fldChar></w:r>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let ff = p.content.iter().find_map(|c| match c {
+            ParagraphContent::Run(r) => r.content.iter().find_map(|rc| match rc {
+                RunContent::FormField(ff) => Some(ff.clone()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        let ff = ff.expect("FormField was not captured");
+        assert_eq!(ff.name.as_deref(), Some("Check1"));
+        assert_eq!(ff.kind, FormFieldKind::CheckBox { checked: true });
+        assert_eq!(ff.value_text().as_deref(), Some("\u{2612}"));
+    }
+
+    /// A `FORMTEXT` field's `w:default` is the value the form shows until
+    /// the user types — the third of the three form-field kinds, and the
+    /// one whose state is the text itself.
+    #[test]
+    fn test_ffdata_text_input_default_value_is_captured() {
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:r><w:fldChar w:fldCharType="begin"><w:ffData>
+  <w:name w:val="Text1"/>
+  <w:textInput><w:default w:val="Enter your name"/></w:textInput>
+</w:ffData></w:fldChar></w:r>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let ff = p
+            .content
+            .iter()
+            .find_map(|c| match c {
+                ParagraphContent::Run(r) => r.content.iter().find_map(|rc| match rc {
+                    RunContent::FormField(ff) => Some(ff.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("FormField was not captured");
+        assert_eq!(ff.name.as_deref(), Some("Text1"));
+        assert_eq!(
+            ff.kind,
+            FormFieldKind::TextInput {
+                default: Some("Enter your name".to_string())
+            }
+        );
+        assert_eq!(ff.value_text().as_deref(), Some("Enter your name"));
+    }
+
+    #[test]
+    fn test_ffdata_dropdown_full_option_list_is_captured() {
+        // The full option list, not just the selected value,
+        // must survive even when the field also has a cached display run.
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:r><w:fldChar w:fldCharType="begin"><w:ffData>
+  <w:ddList>
+    <w:listEntry w:val="Red"/>
+    <w:listEntry w:val="Green"/>
+    <w:listEntry w:val="Blue"/>
+    <w:result w:val="1"/>
+  </w:ddList>
+</w:ffData></w:fldChar></w:r>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let ff = p.content.iter().find_map(|c| match c {
+            ParagraphContent::Run(r) => r.content.iter().find_map(|rc| match rc {
+                RunContent::FormField(ff) => Some(ff.clone()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        let ff = ff.expect("FormField was not captured");
+        assert_eq!(ff.value_text().as_deref(), Some("Green"));
+        match ff.kind {
+            FormFieldKind::DropDown { entries, selected } => {
+                assert_eq!(entries, vec!["Red", "Green", "Blue"]);
+                assert_eq!(selected, 1);
+            },
+            other => panic!("expected DropDown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_omml_math_text_is_not_dropped() {
+        // Every <m:t> inside an m:oMath is real, visible text.
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+  <m:d><m:e><m:r><m:t>x</m:t></m:r></m:e><m:e><m:r><m:t>y</m:t></m:r></m:e></m:d>
+</m:oMath>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let texts = run_texts(&p).join("");
+        assert!(texts.contains('x'), "expected 'x' in {texts:?}");
+        assert!(texts.contains('y'), "expected 'y' in {texts:?}");
+    }
+
+    #[test]
+    fn test_vml_imagedata_is_extracted_as_an_image() {
+        // v:imagedata's r:id was only ever read for text
+        // boxes; a v:shape wrapping an image, not a text box, vanished.
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:r><w:pict xmlns:v="urn:schemas-microsoft-com:vml" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <v:shape style="width:100pt;height:50pt">
+    <v:imagedata r:id="rId9"/>
+  </v:shape>
+</w:pict></w:r>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let rid = p.content.iter().find_map(|c| match c {
+            ParagraphContent::Run(r) => r.content.iter().find_map(|rc| match rc {
+                RunContent::Drawing(d) => Some(d.relationship_id.clone()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        assert_eq!(rid.as_deref(), Some("rId9"));
+    }
+
+    #[test]
+    fn test_wordart_textpath_string_is_extracted_as_text() {
+        // WordArt's visible text lives in an XML attribute,
+        // not element content, so it was never read at all.
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:r><w:pict xmlns:v="urn:schemas-microsoft-com:vml">
+  <v:shape><v:textpath string="WORD-ART"/></v:shape>
+</w:pict></w:r>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let texts = run_texts(&p).join("");
+        assert!(texts.contains("WORD-ART"), "expected WordArt text in {texts:?}");
+    }
+
+    #[test]
+    fn test_hyperlink_with_both_rid_and_anchor_keeps_the_external_target() {
+        // The anchor branch was checked first and
+        // unconditionally taken, discarding a real external r:id whenever
+        // a w:anchor fragment was also present.
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<w:hyperlink r:id="rId7" w:anchor="section1"><w:r><w:t>link</w:t></w:r></w:hyperlink>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let hl = p.content.iter().find_map(|c| match c {
+            ParagraphContent::Hyperlink(h) => Some(h.clone()),
+            _ => None,
+        });
+        let hl = hl.expect("hyperlink was not captured");
+        match &hl.target {
+            HyperlinkTarget::External(rid) => assert_eq!(rid, "rId7"),
+            other => panic!("expected an External target carrying r:id, got {other:?}"),
+        }
+        assert_eq!(hl.fragment.as_deref(), Some("section1"));
+    }
+
+    #[test]
+    fn test_hyperlink_field_code_instrtext_url_is_captured() {
+        // A HYPERLINK expressed via fldChar/instrText (common
+        // pandoc/older-tool output) had its URL completely unreachable.
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:r><w:fldChar w:fldCharType="begin"/></w:r>
+<w:r><w:instrText xml:space="preserve"> HYPERLINK "https://example.com/page" </w:instrText></w:r>
+<w:r><w:fldChar w:fldCharType="separate"/></w:r>
+<w:r><w:t>Click here</w:t></w:r>
+<w:r><w:fldChar w:fldCharType="end"/></w:r>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let hl = p.content.iter().find_map(|c| match c {
+            ParagraphContent::Hyperlink(h) => Some(h.clone()),
+            _ => None,
+        });
+        let hl = hl.expect("field-code hyperlink was not resolved");
+        match &hl.target {
+            HyperlinkTarget::External(url) => assert_eq!(url, "https://example.com/page"),
+            other => panic!("expected an External URL target, got {other:?}"),
+        }
+        let text: String = hl
+            .runs
+            .iter()
+            .flat_map(|r| &r.content)
+            .filter_map(|rc| match rc {
+                RunContent::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Click here");
+    }
+
+    /// A content control *inside* a cell (`w:tc > w:sdt > w:sdtContent >
+    /// w:p`), how a data-bound form lays out its fields. The wrapper was
+    /// skipped whole, so every such cell came back empty: a corpus form
+    /// lost its company, address, city, state and country.
+    #[test]
+    fn test_content_control_inside_a_cell_keeps_the_cells_text() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>Company</w:t></w:r></w:p></w:tc>
+        <w:tc><w:sdt><w:sdtPr><w:alias w:val="Company"/></w:sdtPr><w:sdtContent>
+          <w:p><w:r><w:t>Microsoft Corporation</w:t></w:r></w:p>
+        </w:sdtContent></w:sdt></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let data = make_minimal_docx(xml);
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let text = doc.plain_text();
+        assert!(text.contains("Microsoft Corporation"), "{text:?}");
+        let html = crate::convert_docx::docx_to_ir(&doc).to_html();
+        assert!(html.contains("Microsoft Corporation"), "{html}");
+    }
+
+    #[test]
+    fn test_sdt_wrapped_table_cell_is_not_dropped() {
+        // A cell wrapped in a content control
+        // (<w:tr><w:sdt><w:sdtContent><w:tc>) was entirely dropped by the
+        // catch-all, shifting every subsequent cell in the row into the
+        // wrong column.
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tr>
+        <w:sdt><w:sdtContent><w:tc><w:p><w:r><w:t>SdtCell</w:t></w:r></w:p></w:tc></w:sdtContent></w:sdt>
+        <w:tc><w:p><w:r><w:t>SecondCell</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let data = make_minimal_docx(xml);
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let md = doc.to_markdown();
+        assert!(
+            md.contains("SdtCell") && md.contains("SecondCell"),
+            "both cells must survive: {md:?}"
+        );
+        // Not just present anywhere — in the right columns, not merged/shifted.
+        assert!(
+            md.contains("| SdtCell | SecondCell |"),
+            "cells must stay in their original columns: {md:?}"
+        );
+    }
+
+    #[test]
+    fn test_tracked_change_deleted_cell_is_excluded_from_accepted_view() {
+        // A cell marked <w:cellDel> (deleted via tracked
+        // changes, pending acceptance) still appeared in the accepted
+        // output, same bug w:del was already fixed for at the run level.
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tr>
+        <w:tc>
+          <w:tcPr><w:cellDel w:id="1" w:author="A" w:date="2020-01-01T00:00:00Z"/></w:tcPr>
+          <w:p><w:r><w:t>REMOVED CELL</w:t></w:r></w:p>
+        </w:tc>
+        <w:tc><w:p><w:r><w:t>Kept Cell</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let data = make_minimal_docx(xml);
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let text = doc.plain_text();
+        assert!(
+            !text.contains("REMOVED CELL"),
+            "deleted cell content must not appear in the accepted view: {text:?}"
+        );
+        assert!(text.contains("Kept Cell"), "the surviving cell must still be present: {text:?}");
+    }
+
+    #[test]
+    fn test_text_box_with_prstgeom_is_not_double_extracted_as_a_phantom_shape() {
+        // A <wps:wsp> carrying both <a:prstGeom> (required by
+        // schema) and real <wps:txbx> text content produced a content-free
+        // phantom Shape(Rect) in addition to the real TextBox.
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+             xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+             xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+             xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+<w:r><w:drawing><wp:inline><a:graphic><a:graphicData>
+  <wps:wsp>
+    <wps:spPr><a:prstGeom prst="rect"/></wps:spPr>
+    <wps:txbx><w:txbxContent><w:p><w:r><w:t>7</w:t></w:r></w:p></w:txbxContent></wps:txbx>
+  </wps:wsp>
+</a:graphicData></a:graphic></wp:inline></w:drawing></w:r>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let shape_count = p
+            .content
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    ParagraphContent::Run(r)
+                        if r.content.iter().any(|rc| matches!(rc, RunContent::Drawing(d) if d.shape.is_some()))
+                )
+            })
+            .count();
+        assert_eq!(shape_count, 0, "no phantom Shape should be produced");
+        let texts = run_texts(&p);
+        let text_box_found = p.content.iter().any(|c| match c {
+            ParagraphContent::Run(r) => r
+                .content
+                .iter()
+                .any(|rc| matches!(rc, RunContent::TextBox(_))),
+            _ => false,
+        });
+        assert!(text_box_found, "the real text box must still be present: {texts:?}");
+    }
+
+    #[test]
+    fn test_table_cell_jc_is_mapped_back_to_text_align() {
+        // gap: the writer emits <w:jc> inside a cell's paragraph
+        // from TableCell::text_align, but nothing read it back on open.
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tr>
+        <w:tc>
+          <w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>centered</w:t></w:r></w:p>
+        </w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let data = make_minimal_docx(document_xml);
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let ir = crate::convert_docx::docx_to_ir(&doc);
+        let table = ir.sections[0]
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                crate::ir::Element::Table(t) => Some(t),
+                _ => None,
+            })
+            .expect("expected a table element");
+        assert_eq!(table.rows[0].cells[0].text_align, Some(crate::ir::ParagraphAlignment::Center));
+    }
+
+    #[test]
+    fn test_outline_level_promotion_keeps_the_rest_of_the_paragraph_properties() {
+        // gap: promoting a paragraph to a Heading via
+        // <w:outlineLvl> used to keep only level/content/frame_position/
+        // alignment, discarding indent, spacing, keep-with-next and every
+        // other property in the same step.
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:pPr>
+        <w:outlineLvl w:val="0"/>
+        <w:ind w:left="720"/>
+        <w:spacing w:before="240" w:after="120"/>
+        <w:keepNext/>
+      </w:pPr>
+      <w:r><w:t>Rich Heading</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let data = make_minimal_docx(document_xml);
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let ir = crate::convert_docx::docx_to_ir(&doc);
+        let heading = ir.sections[0]
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                crate::ir::Element::Heading(h) => Some(h),
+                _ => None,
+            })
+            .expect("expected a heading element");
+        assert_eq!(heading.indent_left_twips, Some(720));
+        assert_eq!(heading.space_before_twips, Some(240));
+        assert_eq!(heading.space_after_twips, Some(120));
+        assert!(heading.keep_with_next);
+    }
+
+    #[test]
+    fn test_table_caption_does_not_duplicate_across_round_trips() {
+        // A table's caption is written both as w:tblCaption
+        // (accessibility metadata) and as a visible "Caption"-styled
+        // paragraph immediately before <w:tbl>. Reading it back turned
+        // that paragraph into an ordinary sibling, so the next write
+        // emitted BOTH — growing by one duplicate paragraph per round
+        // trip with no convergence. 4 consecutive round trips must not
+        // grow the element count past the first stable read.
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:pStyle w:val="Caption"/></w:pPr><w:r><w:t>Table 1: Results</w:t></w:r></w:p>
+    <w:tbl>
+      <w:tblPr><w:tblCaption w:val="Table 1: Results"/></w:tblPr>
+      <w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let data = make_minimal_docx(document_xml);
+        let mut ir = DocxDocument::from_reader(Cursor::new(data))
+            .map(|doc| crate::convert_docx::docx_to_ir(&doc))
+            .unwrap();
+
+        let element_count = |ir: &crate::ir::DocumentIR| -> usize {
+            ir.sections.iter().map(|s| s.elements.len()).sum()
+        };
+        let first_count = element_count(&ir);
+
+        for round in 0..4 {
+            let writer = crate::create::ir_to_docx(&ir);
+            let mut buf = Cursor::new(Vec::new());
+            writer.write_to(&mut buf).unwrap();
+            let doc = DocxDocument::from_reader(Cursor::new(buf.into_inner())).unwrap();
+            ir = crate::convert_docx::docx_to_ir(&doc);
+            assert_eq!(
+                element_count(&ir),
+                first_count,
+                "round {round}: element count grew from {first_count} — caption is duplicating"
+            );
+        }
+    }
+
+    #[test]
+    fn test_numbered_heading_wins_over_list_membership() {
+        // Word's multilevel-list "Heading" gallery attaches
+        // numPr to the heading styles themselves, so a numbered heading
+        // ("1. Introduction") is the normal shape of a heading in real
+        // documents. Checking list membership before outlineLvl turned
+        // every one of them into a ListItem, leaving no Headings at all.
+        let numbering_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="0">
+    <w:lvl w:ilvl="0">
+      <w:start w:val="1"/>
+      <w:numFmt w:val="decimal"/>
+      <w:lvlText w:val="%1."/>
+    </w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="1">
+    <w:abstractNumId w:val="0"/>
+  </w:num>
+</w:numbering>"#;
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:pPr>
+        <w:outlineLvl w:val="0"/>
+        <w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>
+      </w:pPr>
+      <w:r><w:t>Introduction</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let numbering_part = PartName::new("/word/numbering.xml").unwrap();
+        writer
+            .add_part(
+                &numbering_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml",
+                numbering_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::NUMBERING, "numbering.xml");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let ir = crate::convert_docx::docx_to_ir(&doc);
+        assert!(
+            ir.sections[0]
+                .elements
+                .iter()
+                .any(|e| matches!(e, crate::ir::Element::Heading(h) if h.level == 1)),
+            "expected a Heading 1, got {:#?}",
+            ir.sections[0].elements
+        );
+        assert!(
+            !ir.sections[0]
+                .elements
+                .iter()
+                .any(|e| matches!(e, crate::ir::Element::List(_))),
+            "list membership must be dropped once the paragraph is a heading, got {:#?}",
+            ir.sections[0].elements
+        );
+    }
+
+    #[test]
+    fn test_num_start_override_is_read_back() {
+        // The writer emits <w:num><w:lvlOverride><w:startOverride>
+        // (confirmed present in real numbering.xml output) but nothing read
+        // it back; List.start_number always came back None.
+        let numbering_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="0">
+    <w:lvl w:ilvl="0">
+      <w:start w:val="1"/>
+      <w:numFmt w:val="decimal"/>
+      <w:lvlText w:val="%1."/>
+    </w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="1">
+    <w:abstractNumId w:val="0"/>
+    <w:lvlOverride w:ilvl="0">
+      <w:startOverride w:val="7"/>
+    </w:lvlOverride>
+  </w:num>
+</w:numbering>"#;
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>seven</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let numbering_part = PartName::new("/word/numbering.xml").unwrap();
+        writer
+            .add_part(
+                &numbering_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml",
+                numbering_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::NUMBERING, "numbering.xml");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let ir = crate::convert_docx::docx_to_ir(&doc);
+        let list = ir.sections[0]
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                crate::ir::Element::List(l) => Some(l),
+                _ => None,
+            })
+            .expect("expected a list element");
+        assert_eq!(list.start_number, Some(7), "startOverride=7 must be read back, not None");
+    }
+
+    #[test]
+    fn test_encrypted_docx_gives_a_friendly_error_via_the_format_specific_reader() {
+        // Opening an encrypted OOXML file directly through
+        // DocxDocument::from_reader (bypassing the unified Document
+        // entry point, which already had this check) gave a confusing
+        // "Could not find EOCD" zip error instead of naming the real
+        // cause.
+        let mut cfb = vec![0u8; 512];
+        cfb[0..8].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        let err = DocxDocument::from_reader(Cursor::new(cfb)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("password-protected"),
+            "expected a friendly password-protected message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_vba_project_relationship_sets_metadata_has_macros() {
+        // No API surface reported whether a document
+        // contains macros. A vbaProject relationship on the document
+        // part must set Metadata::has_macros.
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>hello</w:t></w:r></w:p></w:body>
+</w:document>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.ms-word.document.macroEnabled.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let vba_part = PartName::new("/word/vbaProject.bin").unwrap();
+        writer
+            .add_part(&vba_part, "application/vnd.ms-office.vbaProject", b"fake vba bytes")
+            .unwrap();
+        // The relationship type Office writes — the crate's own constant
+        // is the OOXML-namespace form no real file carries.
+        writer.add_part_rel(&doc_part, rel_types::VBA_PROJECT_MS, "vbaProject.bin");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        assert!(doc.has_macros, "DocxDocument::has_macros must be true");
+        let ir = crate::convert_docx::docx_to_ir(&doc);
+        assert!(ir.metadata.has_macros, "Metadata::has_macros must be true");
+    }
+
+    /// Regression: `<w:vanish/>` inherited from a character style (a
+    /// glossary popup styled `acicollapsed1`, say) was honoured by the IR
+    /// path but not by the direct `plain_text()`/`to_markdown()` renderers,
+    /// which only read the run's own `w:rPr` — so `to_html()` hid the text
+    /// and `plain_text()` showed it.
+    /// `w:vanish` in a *paragraph* style's `w:rPr` hides every run of the
+    /// paragraph — the other half of style-inherited hidden text, and the
+    /// shape that reached `to_html()` but not `plain_text()`/`to_markdown()`.
+    #[test]
+    fn test_vanish_inherited_from_a_paragraph_style_is_excluded_everywhere() {
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>Visible before.</w:t></w:r></w:p>
+    <w:p><w:pPr><w:pStyle w:val="Draft"/></w:pPr><w:r><w:t>Hidden by the paragraph style.</w:t></w:r></w:p>
+    <w:p><w:pPr><w:pStyle w:val="Draft"/></w:pPr><w:r><w:rPr><w:vanish w:val="0"/></w:rPr><w:t>Shown again by a direct override.</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Visible after.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let styles_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+  <w:style w:type="paragraph" w:styleId="Draft"><w:name w:val="Draft"/><w:basedOn w:val="Normal"/><w:rPr><w:vanish/></w:rPr></w:style>
+</w:styles>"#;
+        let mut writer = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let styles_part = PartName::new("/word/styles.xml").unwrap();
+        writer
+            .add_part(
+                &styles_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml",
+                styles_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::STYLES, "styles.xml");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let ir = crate::convert_docx::docx_to_ir(&doc);
+        for (surface, out) in [
+            ("plain_text", doc.plain_text()),
+            ("to_markdown", doc.to_markdown()),
+            ("to_ir", ir.plain_text()),
+            ("to_html", ir.to_html()),
+        ] {
+            assert!(!out.contains("Hidden by the paragraph style"), "{surface}: {out:?}");
+            assert!(out.contains("Shown again by a direct override"), "{surface}: {out:?}");
+            assert!(
+                out.contains("Visible before.") && out.contains("Visible after."),
+                "{surface}: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_vanish_inherited_from_a_character_style_is_excluded_everywhere() {
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:r><w:t xml:space="preserve">Visible before. </w:t></w:r>
+      <w:r><w:rPr><w:rStyle w:val="collapsed"/></w:rPr><w:t xml:space="preserve">Hidden </w:t></w:r>
+      <w:r><w:t xml:space="preserve">Visible after.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let styles_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="character" w:styleId="collapsed">
+    <w:name w:val="collapsed"/>
+    <w:rPr><w:vanish/></w:rPr>
+  </w:style>
+</w:styles>"#;
+        let mut writer = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let styles_part = PartName::new("/word/styles.xml").unwrap();
+        writer
+            .add_part(
+                &styles_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml",
+                styles_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::STYLES, "styles.xml");
+        let data = writer.finish().unwrap().into_inner();
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        assert!(doc.styles.is_some(), "fixture must load its stylesheet");
+
+        let plain = doc.plain_text();
+        assert!(
+            !plain.contains("Hidden"),
+            "plain_text() must exclude style-hidden text: {plain:?}"
+        );
+        assert!(plain.contains("Visible before.") && plain.contains("Visible after."));
+        let md = doc.to_markdown();
+        assert!(!md.contains("Hidden"), "to_markdown() must exclude style-hidden text: {md:?}");
+        let ir_text = crate::convert_docx::docx_to_ir(&doc).plain_text();
+        assert!(!ir_text.contains("Hidden"), "{ir_text:?}");
+    }
+
+    /// Regression: a text box whose paragraphs sit inside a content
+    /// control (`w:txbxContent > w:sdt > w:sdtContent > w:p`) — the shape
+    /// of every "quote" text box Word inserts from its gallery — was
+    /// dropped whole, because the text-box block parser skipped anything
+    /// that was not directly a `w:p`/`w:tbl`. Three corpus files lost
+    /// their only text this way.
+    #[test]
+    fn test_text_box_content_inside_a_content_control_is_extracted() {
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+            xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+            xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+  <w:body>
+    <w:p><w:r><w:t>Body text.</w:t></w:r></w:p>
+    <w:p><w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing>
+      <wp:anchor><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+        <wps:wsp><wps:txbx><w:txbxContent>
+          <w:sdt><w:sdtPr><w:id w:val="1"/></w:sdtPr><w:sdtContent>
+            <w:p><w:r><w:t>Grab your reader's attention with a great quote.</w:t></w:r></w:p>
+          </w:sdtContent></w:sdt>
+        </w:txbxContent></wps:txbx></wps:wsp>
+      </a:graphicData></a:graphic></wp:anchor>
+    </w:drawing></mc:Choice><mc:Fallback/></mc:AlternateContent></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let data = make_minimal_docx(document_xml);
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let plain = doc.plain_text();
+        assert!(plain.contains("Body text."), "{plain:?}");
+        assert!(
+            plain.contains("Grab your reader's attention"),
+            "text box content wrapped in a content control must be extracted: {plain:?}"
+        );
+        let ir_text = crate::convert_docx::docx_to_ir(&doc).plain_text();
+        assert!(ir_text.contains("Grab your reader's attention"), "{ir_text:?}");
+    }
+
+    #[test]
+    fn test_vanish_run_is_excluded_from_extraction() {
+        // <w:vanish/> (Word never renders this run at all)
+        // was never read anywhere; hidden text leaked into every
+        // extraction surface as if it were ordinary visible content.
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:r><w:t xml:space="preserve">Visible before. </w:t></w:r>
+      <w:r><w:rPr><w:vanish/></w:rPr><w:t xml:space="preserve">Hidden </w:t></w:r>
+      <w:r><w:t xml:space="preserve">Visible after.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let data = make_minimal_docx(document_xml);
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+
+        let plain = doc.plain_text();
+        assert!(!plain.contains("Hidden"), "plain_text() must exclude vanish text: {plain:?}");
+        assert!(plain.contains("Visible before."));
+        assert!(plain.contains("Visible after."));
+
+        let md = doc.to_markdown();
+        assert!(!md.contains("Hidden"), "to_markdown() must exclude vanish text: {md:?}");
+
+        let ir = crate::convert_docx::docx_to_ir(&doc);
+        let text_in_ir: String = ir.plain_text();
+        assert!(
+            !text_in_ir.contains("Hidden"),
+            "the IR itself must not carry vanish text: {text_in_ir:?}"
+        );
+    }
+
+    #[test]
+    fn test_markdown_ordered_list_increments_instead_of_repeating_the_start_value() {
+        // docx/text.rs's markdown_blocks printed the same
+        // literal <w:start> value for every item in an ordered list,
+        // instead of incrementing. 4th instance of the "two renderers
+        // disagree" flaw (ir_render.rs already increments correctly).
+        let numbering_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="0">
+    <w:lvl w:ilvl="0">
+      <w:start w:val="3"/>
+      <w:numFmt w:val="decimal"/>
+      <w:lvlText w:val="%1."/>
+    </w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="1">
+    <w:abstractNumId w:val="0"/>
+  </w:num>
+</w:numbering>"#;
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>first</w:t></w:r></w:p>
+    <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>second</w:t></w:r></w:p>
+    <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>third</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let numbering_part = PartName::new("/word/numbering.xml").unwrap();
+        writer
+            .add_part(
+                &numbering_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml",
+                numbering_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::NUMBERING, "numbering.xml");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let md = doc.to_markdown();
+        assert!(md.contains("3. first"), "expected '3. first', got: {md:?}");
+        assert!(md.contains("4. second"), "expected '4. second', got: {md:?}");
+        assert!(md.contains("5. third"), "expected '5. third', got: {md:?}");
+    }
+
+    #[test]
+    fn test_app_properties_are_read_on_open() {
+        // AppProperties::parse existed, fully tested, but
+        // nothing on the read side ever called it; company name and every
+        // word/page/paragraph count were unreachable through any public
+        // API.
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>hello</w:t></w:r></w:p></w:body>
+</w:document>"#;
+        let app_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">
+  <Company>Acme Corp</Company>
+  <Words>1250</Words>
+  <Pages>3</Pages>
+</Properties>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let app_part = PartName::new("/docProps/app.xml").unwrap();
+        writer
+            .add_part(
+                &app_part,
+                "application/vnd.openxmlformats-officedocument.extended-properties+xml",
+                app_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::EXTENDED_PROPERTIES, "docProps/app.xml");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let app = doc
+            .app_properties
+            .expect("app_properties must be populated");
+        assert_eq!(app.company.as_deref(), Some("Acme Corp"));
+        assert_eq!(app.words, Some(1250));
+        assert_eq!(app.pages, Some(3));
+    }
+
+    #[test]
+    fn test_docx_chart_text_is_extracted() {
+        // A native DrawingML chart embedded in a DOCX had its
+        // title/category/series text never extracted at all: the chart
+        // part (word/charts/chartN.xml) was never opened. The extraction
+        // engine itself (core::chart::chart_text_lines) was already
+        // tested; this is the missing end-to-end DOCX wiring test.
+        let chart_xml = br#"<?xml version="1.0"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+              xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <c:chart>
+    <c:title><c:tx><c:rich><a:p><a:r><a:t>Dollars per Group</a:t></a:r></a:p></c:rich></c:tx></c:title>
+    <c:plotArea>
+      <c:barChart>
+        <c:ser>
+          <c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>Revenue</c:v></c:pt></c:strCache></c:strRef></c:tx>
+          <c:cat><c:strRef><c:strCache>
+            <c:pt idx="0"><c:v>Group 1</c:v></c:pt>
+            <c:pt idx="1"><c:v>Group 2</c:v></c:pt>
+          </c:strCache></c:strRef></c:cat>
+          <c:val><c:numRef><c:numCache>
+            <c:pt idx="0"><c:v>15.53</c:v></c:pt>
+            <c:pt idx="1"><c:v>27.32</c:v></c:pt>
+          </c:numCache></c:numRef></c:val>
+        </c:ser>
+      </c:barChart>
+    </c:plotArea>
+  </c:chart>
+</c:chartSpace>"#;
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+            xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+            xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>
+    <w:p><w:r><w:t>Pie:</w:t></w:r></w:p>
+    <w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="auto"/></w:pBdr></w:pPr><w:r><w:drawing>
+      <wp:inline>
+        <wp:extent cx="2000000" cy="1500000"/>
+        <wp:docPr id="1" name="Chart 1"/>
+        <a:graphic><a:graphicData uri="">
+          <c:chart r:id="rId1"/>
+        </a:graphicData></a:graphic>
+      </wp:inline>
+    </w:drawing></w:r></w:p>
+  </w:body>
+</w:document>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let chart_part = PartName::new("/word/charts/chart1.xml").unwrap();
+        writer
+            .add_part(
+                &chart_part,
+                "application/vnd.openxmlformats-officedocument.drawingml.chart+xml",
+                chart_xml,
+            )
+            .unwrap();
+        let rid = writer.add_part_rel(&doc_part, rel_types::CHART, "charts/chart1.xml");
+        assert_eq!(rid, "rId1", "test fixture assumes the first relationship id");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        // The chart's paragraph carries a bottom border and no text — the
+        // shape of a bordered heading style holding only a drawing. The
+        // IR path turned that into a ThematicBreak and skipped the
+        // drawing collectors, so the chart reached plain_text() and not
+        // to_ir()/to_html().
+        let ir = crate::convert_docx::docx_to_ir(&doc);
+        for (surface, text) in [
+            ("plain_text", doc.plain_text()),
+            ("to_ir", ir.plain_text()),
+            ("to_html", ir.to_html()),
+        ] {
+            for expected in [
+                "Dollars per Group",
+                "Revenue",
+                "Group 1",
+                "Group 2",
+                "15.53",
+                "27.32",
+            ] {
+                assert!(
+                    text.contains(expected),
+                    "chart text {expected:?} missing from {surface}: {text:?}"
+                );
+            }
+        }
+    }
+
+    /// The same gap covered endnotes and comments, each in its own part;
+    /// the footnote test alone would let either regress.
+    #[test]
+    fn test_plain_text_and_markdown_include_endnote_and_comment_bodies() {
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>Body</w:t></w:r><w:r><w:endnoteReference w:id="1"/></w:r>
+      <w:commentRangeStart w:id="0"/><w:r><w:t> text</w:t></w:r><w:commentRangeEnd w:id="0"/>
+      <w:r><w:commentReference w:id="0"/></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let endnotes_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:endnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:endnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:endnote>
+  <w:endnote w:id="1"><w:p><w:r><w:t>The endnote body sentence.</w:t></w:r></w:p></w:endnote>
+</w:endnotes>"#;
+        let comments_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:comment w:id="0" w:author="Reviewer"><w:p><w:r><w:t>The comment body sentence.</w:t></w:r></w:p></w:comment>
+</w:comments>"#;
+        let mut writer = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let endnotes_part = PartName::new("/word/endnotes.xml").unwrap();
+        writer
+            .add_part(
+                &endnotes_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml",
+                endnotes_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::ENDNOTES, "endnotes.xml");
+        let comments_part = PartName::new("/word/comments.xml").unwrap();
+        writer
+            .add_part(
+                &comments_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml",
+                comments_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::COMMENTS, "comments.xml");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        for (surface, out) in [
+            ("plain_text", doc.plain_text()),
+            ("to_markdown", doc.to_markdown()),
+        ] {
+            assert!(
+                out.contains("The endnote body sentence."),
+                "{surface} lacks the endnote: {out:?}"
+            );
+            assert!(
+                out.contains("The comment body sentence."),
+                "{surface} lacks the comment: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_plain_text_and_markdown_include_footnote_body_content() {
+        // plain_text()/to_markdown() only walked body.elements
+        // and headers/footers, never self.footnotes/endnotes/comments. A
+        // footnote-only document returned "" from both even though to_ir()
+        // (via docx_to_ir) already carried the note body correctly.
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>Ouch</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r><w:r><w:t>.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let footnotes_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote>
+  <w:footnote w:type="continuationSeparator" w:id="0"><w:p><w:r><w:continuationSeparator/></w:r></w:p></w:footnote>
+  <w:footnote w:id="1"><w:p><w:r><w:t>A tachyon walks into a bar.</w:t></w:r></w:p></w:footnote>
+</w:footnotes>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let footnotes_part = PartName::new("/word/footnotes.xml").unwrap();
+        writer
+            .add_part(
+                &footnotes_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml",
+                footnotes_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::FOOTNOTES, "footnotes.xml");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        assert!(
+            doc.plain_text().contains("A tachyon walks into a bar."),
+            "plain_text() must include the footnote body, got: {:?}",
+            doc.plain_text()
+        );
+        assert!(
+            doc.to_markdown().contains("A tachyon walks into a bar."),
+            "to_markdown() must include the footnote body, got: {:?}",
+            doc.to_markdown()
+        );
+    }
+
+    /// A hyperlink's `r:id` inside a footnote is scoped to
+    /// `word/_rels/footnotes.xml.rels`, not `word/_rels/document.xml.rels` —
+    /// resolving it against the document's own relationships left the raw
+    /// `rIdN` string as the "URL" for every note hyperlink.
+    #[test]
+    fn test_footnote_hyperlink_resolves_against_the_footnotes_parts_own_rels() {
+        let document_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>See</w:t></w:r><w:r><w:footnoteReference w:id="1"/></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let footnotes_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:footnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:footnote w:id="1"><w:p><w:hyperlink r:id="rId1"><w:r><w:t>source</w:t></w:r></w:hyperlink></w:p></w:footnote>
+</w:footnotes>"#;
+
+        let buf = Vec::new();
+        let cursor = Cursor::new(buf);
+        let mut writer = OpcWriter::new(cursor).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let footnotes_part = PartName::new("/word/footnotes.xml").unwrap();
+        writer
+            .add_part(
+                &footnotes_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml",
+                footnotes_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::FOOTNOTES, "footnotes.xml");
+        // The hyperlink's rId is only ever declared in the footnotes
+        // part's own rels, not the document's — this is the crux of the bug.
+        writer.add_part_rel_with_mode(
+            &footnotes_part,
+            rel_types::HYPERLINK,
+            "https://example.com/source",
+            TargetMode::External,
+        );
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let hl = doc.footnotes[0].content.iter().find_map(|b| match b {
+            BlockElement::Paragraph(p) => p.content.iter().find_map(|c| match c {
+                ParagraphContent::Hyperlink(h) => Some(h.clone()),
+                _ => None,
+            }),
+            _ => None,
+        });
+        let hl = hl.expect("hyperlink was not captured in the footnote body");
+        assert_eq!(
+            hl.target,
+            HyperlinkTarget::External("https://example.com/source".to_string()),
+            "the footnote hyperlink must resolve against footnotes.xml's own rels, not the \
+             document's — got {:?}",
+            hl.target
+        );
+    }
+
+    #[test]
+    fn test_footnote_custom_mark_round_trips() {
+        // A custom mark ("*") became an auto-number on
+        // write (nothing carried it into word/footnotes.xml), and nothing
+        // read it back even where it was written correctly by other tools.
+        let ir = crate::ir::DocumentIR {
+            sections: vec![crate::ir::Section {
+                elements: vec![
+                    crate::ir::Element::Paragraph(crate::ir::Paragraph {
+                        content: vec![
+                            crate::ir::InlineContent::Text(crate::ir::TextSpan::plain("see")),
+                            crate::ir::InlineContent::FootnoteRef(crate::ir::FootnoteRef {
+                                note_id: 1,
+                                marker: Some("*".to_string()),
+                            }),
+                        ],
+                        ..Default::default()
+                    }),
+                    crate::ir::Element::Footnote(crate::ir::Note {
+                        id: 1,
+                        marker: Some("*".to_string()),
+                        author: None,
+                        content: vec![crate::ir::Element::Paragraph(crate::ir::Paragraph {
+                            content: vec![crate::ir::InlineContent::Text(
+                                crate::ir::TextSpan::plain("custom marked note"),
+                            )],
+                            ..Default::default()
+                        })],
+                    }),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let writer = crate::create::ir_to_docx(&ir);
+        let mut buf = Cursor::new(Vec::new());
+        writer.write_to(&mut buf).unwrap();
+        let bytes = buf.into_inner();
+
+        // The reference itself must carry customMarkFollows so Word shows
+        // "*" instead of an auto-number in the body citation.
+        let doc_xml = {
+            let mut reader = OpcReader::new(Cursor::new(bytes.clone())).expect("valid opc package");
+            let part = PartName::new("/word/document.xml").unwrap();
+            String::from_utf8(reader.read_part(&part).unwrap()).unwrap()
+        };
+        assert!(
+            doc_xml.contains("customMarkFollows"),
+            "reference run must carry customMarkFollows: {doc_xml}"
+        );
+
+        let doc = DocxDocument::from_reader(Cursor::new(bytes)).unwrap();
+        let out_ir = crate::convert_docx::docx_to_ir(&doc);
+        let note = out_ir.sections[0]
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                crate::ir::Element::Footnote(n) => Some(n),
+                _ => None,
+            })
+            .expect("expected a footnote element");
+        assert_eq!(note.marker.as_deref(), Some("*"));
+        // The custom mark must not leak into the note's actual text.
+        let note_text = note
+            .content
+            .iter()
+            .find_map(|e| match e {
+                crate::ir::Element::Paragraph(p) => Some(
+                    p.content
+                        .iter()
+                        .filter_map(|c| match c {
+                            crate::ir::InlineContent::Text(s) => Some(s.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(note_text, "custom marked note");
+    }
+
+    #[test]
+    fn test_footnote_reference_mark_reaches_run_content() {
+        // to_ir() carried the note body but lost where in
+        // the text it was actually cited.
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:r><w:t>see</w:t></w:r>
+<w:r><w:footnoteReference w:id="3"/></w:r>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let found = p.content.iter().any(|c| match c {
+            ParagraphContent::Run(r) => r
+                .content
+                .iter()
+                .any(|rc| matches!(rc, RunContent::FootnoteRef(3, _))),
+            _ => false,
+        });
+        assert!(found, "expected a FootnoteRef(3) in the paragraph content");
     }
 }

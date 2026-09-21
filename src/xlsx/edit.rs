@@ -345,7 +345,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn set_existing_cell() {
+    fn test_set_existing_cell() {
         let xml = r#"<sheetData><row r="1"><c r="A1"><v>42</v></c></row></sheetData>"#;
         let result = set_cell_in_xml(xml, "A1", &CellValue::Number(99.0));
         assert!(result.contains(r#"<c r="A1"><v>99</v></c>"#));
@@ -353,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn set_new_cell_existing_row() {
+    fn test_set_new_cell_existing_row() {
         let xml = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#;
         let result = set_cell_in_xml(xml, "B1", &CellValue::String("hello".into()));
         assert!(result.contains(r#"<c r="B1" t="inlineStr"><is><t>hello</t></is></c>"#));
@@ -361,21 +361,21 @@ mod tests {
     }
 
     #[test]
-    fn set_cell_new_row() {
+    fn test_set_cell_new_row() {
         let xml = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#;
         let result = set_cell_in_xml(xml, "A2", &CellValue::Number(2.0));
         assert!(result.contains(r#"<row r="2"><c r="A2"><v>2</v></c></row>"#));
     }
 
     #[test]
-    fn set_boolean_cell() {
+    fn test_set_boolean_cell() {
         let xml = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#;
         let result = set_cell_in_xml(xml, "A1", &CellValue::Boolean(true));
         assert!(result.contains(r#"<c r="A1" t="b"><v>1</v></c>"#));
     }
 
     #[test]
-    fn set_existing_cell_preserves_style_index() {
+    fn test_set_existing_cell_preserves_style_index() {
         // `s="5"` is the cell's style: its number format, fill and font. Rebuilding the
         // <c> element from scratch dropped it, and the written cell came back unstyled.
         let xml = r#"<sheetData><row r="1"><c r="A1" s="5" t="n"><v>42</v></c></row></sheetData>"#;
@@ -384,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn set_existing_string_cell_preserves_style_index() {
+    fn test_set_existing_string_cell_preserves_style_index() {
         let xml = r#"<sheetData><row r="1"><c r="A1" s="3" t="inlineStr"><is><t>old</t></is></c></row></sheetData>"#;
         let result = set_cell_in_xml(xml, "A1", &CellValue::String("new".into()));
         assert!(
@@ -394,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn set_existing_cell_preserves_unrelated_attributes() {
+    fn test_set_existing_cell_preserves_unrelated_attributes() {
         let xml =
             r#"<sheetData><row r="1"><c r="A1" s="2" cm="1" vm="4"><v>1</v></c></row></sheetData>"#;
         let result = set_cell_in_xml(xml, "A1", &CellValue::Number(2.0));
@@ -404,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn set_self_closing_cell_does_not_swallow_the_next_cell() {
+    fn test_set_self_closing_cell_does_not_swallow_the_next_cell() {
         // An empty but STYLED cell is self-closing: `<c r="A1" s="5"/>` — no `</c>`.
         // Searching for `</c>` first found B1's closing tag instead, and the
         // replacement deleted B1 along the way. A pre-formatted template row is made
@@ -420,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn set_self_closing_cell_to_empty_stays_self_closing() {
+    fn test_set_self_closing_cell_to_empty_stays_self_closing() {
         let xml =
             r#"<sheetData><row r="1"><c r="A1" s="5"/><c r="B1"><v>7</v></c></row></sheetData>"#;
         let result = set_cell_in_xml(xml, "A1", &CellValue::Empty);
@@ -429,14 +429,14 @@ mod tests {
     }
 
     #[test]
-    fn set_new_cell_carries_no_borrowed_attributes() {
+    fn test_set_new_cell_carries_no_borrowed_attributes() {
         let xml = r#"<sheetData><row r="1"><c r="A1" s="9"><v>1</v></c></row></sheetData>"#;
         let result = set_cell_in_xml(xml, "B1", &CellValue::Number(2.0));
         assert!(result.contains(r#"<c r="B1"><v>2</v></c>"#), "result: {result}");
     }
 
     #[test]
-    fn parse_cell_ref_valid() {
+    fn test_parse_cell_ref_valid() {
         assert_eq!(parse_cell_ref("A1"), Some((1, "A")));
         assert_eq!(parse_cell_ref("ZZ100"), Some((100, "ZZ")));
     }
@@ -451,7 +451,7 @@ mod ordering_tests {
     /// runs past such a row and lands on the NEXT row's closing tag, so the
     /// inserted cell ends up inside the wrong row entirely.
     #[test]
-    fn self_closing_row_does_not_swallow_the_cell_into_the_next_row() {
+    fn test_self_closing_row_does_not_swallow_the_cell_into_the_next_row() {
         let xml = concat!(
             r#"<sheetData>"#,
             r#"<row r="1" ht="30" customHeight="1"/>"#,
@@ -470,7 +470,7 @@ mod ordering_tests {
 
     /// [ECMA-376] §18.3.1.73: cells ascend by column within a row.
     #[test]
-    fn new_cell_is_inserted_in_ascending_column_order() {
+    fn test_new_cell_is_inserted_in_ascending_column_order() {
         let xml = concat!(
             r#"<sheetData><row r="2">"#,
             r#"<c r="B2"><v>2</v></c><c r="D2"><v>4</v></c>"#,
@@ -490,7 +490,7 @@ mod ordering_tests {
 
     /// Rows ascend by index within `sheetData`.
     #[test]
-    fn new_row_is_inserted_in_ascending_row_order() {
+    fn test_new_row_is_inserted_in_ascending_row_order() {
         let xml = r#"<sheetData><row r="2"><c r="A2"><v>2</v></c></row></sheetData>"#;
         let out = set_cell_in_xml(xml, "A1", &CellValue::Number(1.0));
         let r1 = out.find(r#"<row r="1""#).expect("row 1 written");
@@ -501,7 +501,7 @@ mod ordering_tests {
     /// Control characters make the part unparseable; the writer already
     /// guards this and the editor must agree.
     #[test]
-    fn control_characters_are_stripped_from_cell_text() {
+    fn test_control_characters_are_stripped_from_cell_text() {
         let xml = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#;
         let out = set_cell_in_xml(xml, "B1", &CellValue::String("ctl\u{1}here".into()));
         assert!(!out.contains('\u{1}'), "control char reached the XML:\n{out}");
@@ -510,7 +510,7 @@ mod ordering_tests {
 
     /// `NaN`/`inf` have no `xsd:double` lexical form.
     #[test]
-    fn non_finite_numbers_become_error_cells() {
+    fn test_non_finite_numbers_become_error_cells() {
         let xml = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#;
         for v in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let out = set_cell_in_xml(xml, "B1", &CellValue::Number(v));

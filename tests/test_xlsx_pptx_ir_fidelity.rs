@@ -76,6 +76,10 @@ impl<'a> Xlsx<'a> {
     }
 
     fn ir(self) -> DocumentIR {
+        self.doc().to_ir()
+    }
+
+    fn doc(self) -> Document {
         let mut w = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
         let wb = PartName::new("/xl/workbook.xml").unwrap();
         w.add_package_rel(rel_types::OFFICE_DOCUMENT, "xl/workbook.xml");
@@ -149,9 +153,7 @@ impl<'a> Xlsx<'a> {
         }
 
         let bytes = w.finish().unwrap().into_inner();
-        Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx)
-            .expect("parse xlsx")
-            .to_ir()
+        Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx).expect("parse xlsx")
     }
 }
 
@@ -191,11 +193,11 @@ fn cell_text(cell: &TableCell) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// #146 — cells keep their column
+// Cells keep their column
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_row_that_skips_a_column_keeps_every_value_under_its_own_header() {
+fn test_a_row_that_skips_a_column_keeps_every_value_under_its_own_header() {
     // XLSX stores only non-empty cells, so a sparse row is perfectly legal.
     // Emitting cells in encounter order put "9" under the "Name" header.
     let ir = Xlsx::new(vec![Sheet::new(
@@ -219,12 +221,121 @@ fn a_row_that_skips_a_column_keeps_every_value_under_its_own_header() {
     assert_eq!(cell_text(&t.rows[2].cells[2]), "4");
 }
 
+/// A merge over sheet rows a sheet does not store (`A1:E5` in a sheet
+/// whose next stored row is 6, the shape this crate's own writer saves)
+/// spans the stored rows it covers, not five IR rows: `row_span = 5` hid
+/// the four rows that followed from every IR renderer.
+#[test]
+fn test_a_merge_over_unstored_rows_does_not_hide_the_rows_that_follow() {
+    let cell = |r: &str, t: &str| format!(r#"<c r="{r}" t="inlineStr"><is><t>{t}</t></is></c>"#);
+    let body = format!(
+        "<row r=\"1\">{}{}</row><row r=\"6\">{}{}</row><row r=\"7\">{}{}</row>",
+        cell("A1", "Title"),
+        cell("B1", "Side"),
+        cell("A6", "first data"),
+        cell("B6", "x"),
+        cell("A7", "second data"),
+        cell("B7", "y"),
+    );
+    let mut sheet = Sheet::new("S", &body);
+    sheet.extra = r#"<mergeCells count="1"><mergeCell ref="A1:A5"/></mergeCells>"#;
+    let ir = Xlsx::new(vec![sheet]).ir();
+    let t = only_table(&ir, 0);
+    assert_eq!(t.rows[0].cells[0].row_span, 1, "{:?}", t.rows[0]);
+    for (name, text) in [("plain", ir.plain_text()), ("html", ir.to_html())] {
+        assert!(text.contains("first data") && text.contains("second data"), "{name}: {text}");
+    }
+}
+
+/// A formula whose cached result is the empty string (`t="str"` with an
+/// empty `<v>`, the shape a lookup-heavy workbook saves) shows nothing,
+/// as in Excel and `plain_text()`; the IR path rendered `=formula` for
+/// it, so `to_html()` of one corpus workbook had 10,000 words its own
+/// `plain_text()` did not. A formula with no cached value at all keeps
+/// showing `=formula` on every surface.
+#[test]
+fn test_a_formula_with_an_empty_cached_string_shows_nothing_on_every_surface() {
+    let body = r#"<row r="1">
+        <c r="A1" t="inlineStr"><is><t>Name</t></is></c>
+        <c r="B1" t="inlineStr"><is><t>Value</t></is></c>
+      </row>
+      <row r="2">
+        <c r="A2" t="str"><f>IF(ISNA(VLOOKUP(1,Q!A:B,2,FALSE))," ",1)</f><v></v></c>
+        <c r="B2"><f>NOW()</f></c>
+      </row>"#;
+    let doc = Xlsx::new(vec![Sheet::new("S", body)]).doc();
+    let ir = doc.to_ir();
+    for (name, text) in [
+        ("plain_text", doc.plain_text()),
+        ("ir plain", ir.plain_text()),
+        ("html", ir.to_html()),
+    ] {
+        assert!(!text.contains("VLOOKUP"), "{name} shows the empty-result formula: {text}");
+        assert!(text.contains("=NOW()"), "{name} lost the value-less formula: {text}");
+    }
+    let t = only_table(&ir, 0);
+    assert_eq!(
+        t.rows[1].cells[0].formula.as_deref(),
+        Some(r#"IF(ISNA(VLOOKUP(1,Q!A:B,2,FALSE))," ",1)"#)
+    );
+}
+
+/// A prose-shaped sheet (most rows one cell) may still have rows with
+/// several cells; prose mode kept only the first cell of such a row, so
+/// the rest vanished from every IR surface while `plain_text()` had it.
+#[test]
+fn test_prose_mode_keeps_every_cell_of_a_multi_cell_row() {
+    let cell = |r: &str, t: &str| format!(r#"<c r="{r}" t="inlineStr"><is><t>{t}</t></is></c>"#);
+    let body = format!(
+        "<row r=\"1\">{}</row><row r=\"2\">{}</row><row r=\"3\">{}</row><row r=\"4\">{}{}</row><row r=\"5\">{}</row>",
+        cell("A1", "Line one"),
+        cell("A2", "Line two"),
+        cell("A3", "Line three"),
+        cell("A4", "Left"),
+        cell("F4", "Right"),
+        cell("A5", "Line five"),
+    );
+    let ir = Xlsx::new(vec![Sheet::new("S", &body)]).ir();
+    let text = ir.plain_text();
+    for w in ["Line one", "Left", "Right", "Line five"] {
+        assert!(text.contains(w), "{w} missing: {text:?}");
+    }
+    assert!(
+        text.contains("Left\tRight"),
+        "the two cells of one row stay on one line, tab-separated: {text:?}"
+    );
+}
+
+/// A sheet whose part is not well-formed (a damaged archive) is skipped
+/// and named, and the intact sheets are returned; the whole workbook
+/// used to fail. The loss is on record: a section holding the notice,
+/// and `Metadata::text_truncated`.
+#[test]
+fn test_an_unreadable_sheet_is_reported_and_the_others_are_kept() {
+    let ir = Xlsx::new(vec![
+        Sheet::new("Good", r#"<row r="1"><c r="A1" t="inlineStr"><is><t>kept</t></is></c></row>"#),
+        Sheet::new("Bad", r#"<row r="1"><c r="A1" t="x><v>1</v></c></row>"#),
+    ])
+    .ir();
+    let text = ir.plain_text();
+    assert!(text.contains("kept"), "{text}");
+    assert!(text.contains("[unreadable sheet \"Bad\""), "{text}");
+    assert!(ir.metadata.text_truncated);
+    assert_eq!(
+        ir.sections
+            .iter()
+            .filter(|s| s.title.as_deref() == Some("Bad"))
+            .count(),
+        1
+    );
+}
+
 // ---------------------------------------------------------------------------
-// #184 — cell fonts in table mode
+// Cell fonts in table mode
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cell_font_formatting_reaches_the_ir_in_table_mode() {
+fn test_cell_font_formatting_reaches_the_ir_in_table_mode() {
     let ir = Xlsx::new(vec![Sheet::new(
         "S",
         r#"<row r="1">
@@ -255,11 +366,11 @@ fn cell_font_formatting_reaches_the_ir_in_table_mode() {
 }
 
 // ---------------------------------------------------------------------------
-// #164 — cell hyperlinks
+// Cell hyperlinks
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cell_hyperlinks_reach_the_ir() {
+fn test_cell_hyperlinks_reach_the_ir() {
     let ir = Xlsx::new(vec![Sheet {
         name: "S",
         state: None,
@@ -292,11 +403,11 @@ fn cell_hyperlinks_reach_the_ir() {
 }
 
 // ---------------------------------------------------------------------------
-// #193 — hidden sheets are flagged
+// Hidden sheets are flagged
 // ---------------------------------------------------------------------------
 
 #[test]
-fn hidden_and_very_hidden_sheets_are_flagged() {
+fn test_hidden_and_very_hidden_sheets_are_flagged() {
     let body = r#"<row r="1"><c r="A1" t="inlineStr"><is><t>x</t></is></c></row>"#;
     let ir = Xlsx::new(vec![
         Sheet::new("Visible", body),
@@ -323,11 +434,11 @@ fn hidden_and_very_hidden_sheets_are_flagged() {
 }
 
 // ---------------------------------------------------------------------------
-// #174 — workbook metadata is not the first sheet's name
+// Workbook metadata is not the first sheet's name
 // ---------------------------------------------------------------------------
 
 #[test]
-fn workbook_metadata_comes_from_core_properties() {
+fn test_workbook_metadata_comes_from_core_properties() {
     let ir = Xlsx::new(vec![Sheet::new(
         "Sheet1",
         r#"<row r="1"><c r="A1" t="inlineStr"><is><t>x</t></is></c></row>"#,
@@ -339,7 +450,7 @@ fn workbook_metadata_comes_from_core_properties() {
 }
 
 #[test]
-fn workbook_title_falls_back_to_the_first_sheet_name() {
+fn test_workbook_title_falls_back_to_the_first_sheet_name() {
     let ir = Xlsx::new(vec![Sheet::new(
         "Sheet1",
         r#"<row r="1"><c r="A1" t="inlineStr"><is><t>x</t></is></c></row>"#,
@@ -349,11 +460,11 @@ fn workbook_title_falls_back_to_the_first_sheet_name() {
 }
 
 // ---------------------------------------------------------------------------
-// #147 — number formats
+// Number formats
 // ---------------------------------------------------------------------------
 
 #[test]
-fn quoted_literals_in_a_number_format_are_not_date_tokens() {
+fn test_quoted_literals_in_a_number_format_are_not_date_tokens() {
     // The `M` in `" M"` and the `y`/`d` in `"yes"`/`" days"` are literal
     // text. Reading them as month/year/day tokens rendered 12,500,000 as
     // the date 36123-11-01.
@@ -391,7 +502,7 @@ fn quoted_literals_in_a_number_format_are_not_date_tokens() {
 }
 
 #[test]
-fn a_real_date_format_is_still_a_date() {
+fn test_a_real_date_format_is_still_a_date() {
     let ir = Xlsx::new(vec![Sheet::new(
         "S",
         r#"<row r="1"><c r="A1" s="1"><v>45000</v></c><c r="B1"><v>1</v></c></row>
@@ -413,11 +524,11 @@ fn a_real_date_format_is_still_a_date() {
 }
 
 // ---------------------------------------------------------------------------
-// #165 — cell comments
+// Cell comments
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cell_comments_reach_the_ir() {
+fn test_cell_comments_reach_the_ir() {
     let ir = Xlsx::new(vec![Sheet::new(
         "S",
         r#"<row r="1"><c r="A1" t="inlineStr"><is><t>x</t></is></c></row>"#,
@@ -442,11 +553,46 @@ fn cell_comments_reach_the_ir() {
 }
 
 // ---------------------------------------------------------------------------
-// #160 / #173 — writer validation
+// Conditional formatting
 // ---------------------------------------------------------------------------
 
 #[test]
-fn non_finite_numbers_are_written_as_an_error_cell_not_as_inf() {
+fn test_conditional_formatting_reaches_the_ir() {
+    let ir = Xlsx::new(vec![Sheet {
+        name: "S",
+        state: None,
+        body: r#"<row r="1"><c r="A1"><v>1</v></c></row>"#,
+        extra: r#"<conditionalFormatting sqref="A1:A10">
+                    <cfRule type="cellIs" operator="greaterThan" priority="1">
+                      <formula>100</formula>
+                    </cfRule>
+                  </conditionalFormatting>"#,
+    }])
+    .ir();
+    let cf = &ir.sections[0].conditional_formats;
+    assert_eq!(cf.len(), 1, "the rule must reach Section::conditional_formats");
+    assert_eq!(cf[0].range, "A1:A10");
+    assert_eq!(cf[0].rule_type, "cellIs");
+    assert_eq!(cf[0].operator.as_deref(), Some("greaterThan"));
+    assert_eq!(cf[0].formulas, vec!["100".to_string()]);
+}
+
+#[test]
+fn test_a_sheet_with_no_conditional_formatting_has_an_empty_list() {
+    let ir = Xlsx::new(vec![Sheet::new(
+        "S",
+        r#"<row r="1"><c r="A1"><v>1</v></c></row>"#,
+    )])
+    .ir();
+    assert!(ir.sections[0].conditional_formats.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Writer validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_non_finite_numbers_are_written_as_an_error_cell_not_as_inf() {
     use office_oxide::xlsx::write::{CellData, XlsxWriter};
     let mut wb = XlsxWriter::new();
     {
@@ -466,7 +612,7 @@ fn non_finite_numbers_are_written_as_an_error_cell_not_as_inf() {
 }
 
 #[test]
-fn illegal_sheet_names_are_normalised() {
+fn test_illegal_sheet_names_are_normalised() {
     use office_oxide::xlsx::write::XlsxWriter;
     let mut wb = XlsxWriter::new();
     let long = "N".repeat(40);
@@ -495,7 +641,7 @@ fn illegal_sheet_names_are_normalised() {
 }
 
 #[test]
-fn writing_to_a_nonexistent_sheet_reports_failure() {
+fn test_writing_to_a_nonexistent_sheet_reports_failure() {
     use office_oxide::xlsx::write::{CellData, XlsxWriter};
     let mut wb = XlsxWriter::new();
     let idx = wb.add_sheet_get_index("Only");
@@ -511,7 +657,7 @@ fn writing_to_a_nonexistent_sheet_reports_failure() {
 }
 
 #[test]
-fn cells_outside_excels_grid_are_refused() {
+fn test_cells_outside_excels_grid_are_refused() {
     use office_oxide::xlsx::write::{CellData, XlsxWriter};
     let mut wb = XlsxWriter::new();
     let idx = wb.add_sheet_get_index("S");
@@ -522,11 +668,11 @@ fn cells_outside_excels_grid_are_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// #179 — landscape page size
+// Landscape page size
 // ---------------------------------------------------------------------------
 
 #[test]
-fn landscape_orientation_rotates_the_paper_size() {
+fn test_landscape_orientation_rotates_the_paper_size() {
     let ir = Xlsx::new(vec![Sheet {
         name: "S",
         state: None,
@@ -547,11 +693,11 @@ fn landscape_orientation_rotates_the_paper_size() {
 }
 
 // ---------------------------------------------------------------------------
-// #148 — spanned cells do not shift their neighbours
+// Spanned cells do not shift their neighbours
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_row_spanning_cell_leaves_the_covered_position_empty() {
+fn test_a_row_spanning_cell_leaves_the_covered_position_empty() {
     // Markdown has no rowspan syntax, so the covered position must render
     // empty. Indexing cells positionally shifted every cell to its right
     // one column left in the row below the span.
@@ -586,6 +732,7 @@ fn a_row_spanning_cell_leaves_the_covered_position_empty() {
             })],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
     let md = ir.to_markdown();
     let second_row = md.lines().nth(2).expect("a second body row");
@@ -624,6 +771,10 @@ impl<'a> Slide<'a> {
 }
 
 fn pptx_ir(slides: Vec<Slide<'_>>) -> DocumentIR {
+    pptx_doc(slides).to_ir()
+}
+
+fn pptx_doc(slides: Vec<Slide<'_>>) -> Document {
     let mut w = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
     let pres = PartName::new("/ppt/presentation.xml").unwrap();
     w.add_package_rel(rel_types::OFFICE_DOCUMENT, "ppt/presentation.xml");
@@ -688,9 +839,7 @@ fn pptx_ir(slides: Vec<Slide<'_>>) -> DocumentIR {
     w.add_part(&pres, CT_PRES, pres_xml.as_bytes()).unwrap();
 
     let bytes = w.finish().unwrap().into_inner();
-    Document::from_reader(Cursor::new(bytes), DocumentFormat::Pptx)
-        .expect("parse pptx")
-        .to_ir()
+    Document::from_reader(Cursor::new(bytes), DocumentFormat::Pptx).expect("parse pptx")
 }
 
 /// A body placeholder carrying the given `<a:p>` paragraphs.
@@ -739,11 +888,11 @@ fn first_pptx_span(ir: &DocumentIR) -> &TextSpan {
 }
 
 // ---------------------------------------------------------------------------
-// #183 — PPTX run properties
+// PPTX run properties
 // ---------------------------------------------------------------------------
 
 #[test]
-fn pptx_run_underline_font_baseline_caps_and_spacing_reach_the_ir() {
+fn test_pptx_run_underline_font_baseline_caps_and_spacing_reach_the_ir() {
     let tree = body_sp(
         r#"<a:p><a:pPr><a:buNone/></a:pPr>
              <a:r>
@@ -765,11 +914,11 @@ fn pptx_run_underline_font_baseline_caps_and_spacing_reach_the_ir() {
 }
 
 // ---------------------------------------------------------------------------
-// #150 — bullets
+// Bullets
 // ---------------------------------------------------------------------------
 
 #[test]
-fn level_zero_bullets_still_form_a_list() {
+fn test_level_zero_bullets_still_form_a_list() {
     // Every bullet at lvl=0 is the ordinary single-level list. Keying off
     // `level > 0` alone rendered it as plain paragraphs with no markers.
     let tree = body_sp(
@@ -786,7 +935,7 @@ fn level_zero_bullets_still_form_a_list() {
 }
 
 #[test]
-fn auto_numbered_bullets_produce_an_ordered_list() {
+fn test_auto_numbered_bullets_produce_an_ordered_list() {
     let tree = body_sp(
         r#"<a:p><a:pPr><a:buAutoNum type="alphaLcParenR" startAt="3"/></a:pPr>
              <a:r><a:t>one</a:t></a:r></a:p>
@@ -801,7 +950,7 @@ fn auto_numbered_bullets_produce_an_ordered_list() {
 }
 
 #[test]
-fn bu_none_paragraphs_are_not_a_list() {
+fn test_bu_none_paragraphs_are_not_a_list() {
     let tree = body_sp(r#"<a:p><a:pPr><a:buNone/></a:pPr><a:r><a:t>prose</a:t></a:r></a:p>"#);
     let ir = pptx_ir(vec![Slide::new(&tree)]);
     fn has_list(elements: &[Element]) -> bool {
@@ -815,7 +964,7 @@ fn bu_none_paragraphs_are_not_a_list() {
 }
 
 // ---------------------------------------------------------------------------
-// #192 — table header rows
+// Table header rows
 // ---------------------------------------------------------------------------
 
 fn table_frame(tbl_pr: &str) -> String {
@@ -850,7 +999,7 @@ fn find_table(ir: &DocumentIR) -> &Table {
 }
 
 #[test]
-fn a_table_declaring_no_header_row_does_not_get_one() {
+fn test_a_table_declaring_no_header_row_does_not_get_one() {
     let tree = table_frame("");
     let ir = pptx_ir(vec![Slide::new(&tree)]);
     let t = find_table(&ir);
@@ -858,7 +1007,7 @@ fn a_table_declaring_no_header_row_does_not_get_one() {
 }
 
 #[test]
-fn a_table_declaring_first_row_gets_a_header() {
+fn test_a_table_declaring_first_row_gets_a_header() {
     let tree = table_frame(r#"<a:tblPr firstRow="1"/>"#);
     let ir = pptx_ir(vec![Slide::new(&tree)]);
     let t = find_table(&ir);
@@ -867,11 +1016,11 @@ fn a_table_declaring_first_row_gets_a_header() {
 }
 
 // ---------------------------------------------------------------------------
-// #193 — hidden slides
+// Hidden slides
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_hidden_slide_is_flagged_but_still_extracted() {
+fn test_a_hidden_slide_is_flagged_but_still_extracted() {
     let tree = body_sp(r#"<a:p><a:r><a:t>SECRET</a:t></a:r></a:p>"#);
     let ir = pptx_ir(vec![
         Slide::new(&tree),
@@ -889,11 +1038,11 @@ fn a_hidden_slide_is_flagged_but_still_extracted() {
 }
 
 // ---------------------------------------------------------------------------
-// #143 — speaker notes
+// Speaker notes
 // ---------------------------------------------------------------------------
 
 #[test]
-fn speaker_notes_reach_the_ir() {
+fn test_speaker_notes_reach_the_ir() {
     let tree = body_sp(r#"<a:p><a:r><a:t>BODY</a:t></a:r></a:p>"#);
     let ir = pptx_ir(vec![Slide {
         attrs: "",
@@ -909,11 +1058,11 @@ fn speaker_notes_reach_the_ir() {
 }
 
 // ---------------------------------------------------------------------------
-// #165 — slide comments
+// Slide comments
 // ---------------------------------------------------------------------------
 
 #[test]
-fn slide_comments_reach_the_ir() {
+fn test_slide_comments_reach_the_ir() {
     let tree = body_sp(r#"<a:p><a:r><a:t>BODY</a:t></a:r></a:p>"#);
     let ir = pptx_ir(vec![Slide {
         attrs: "",
@@ -931,12 +1080,36 @@ fn slide_comments_reach_the_ir() {
     );
 }
 
+/// The direct `plain_text()`/`to_markdown()` renderers dropped slide
+/// comments that `to_ir()` carried — a slide whose only content was its
+/// review comments came back empty on the CLI's default surfaces.
+#[test]
+fn test_slide_comments_reach_plain_text_and_markdown() {
+    let tree = body_sp(r#"<a:p><a:r><a:t>BODY</a:t></a:r></a:p>"#);
+    let doc = pptx_doc(vec![Slide {
+        attrs: "",
+        tree: &tree,
+        notes: None,
+        comments: Some(
+            r#"<p:cm authorId="1" idx="1"><p:pos x="100" y="100"/>
+                 <p:text>Fix the axis label</p:text></p:cm>"#,
+        ),
+    }]);
+    for (surface, out) in [
+        ("plain_text", doc.plain_text()),
+        ("to_markdown", doc.to_markdown()),
+    ] {
+        assert!(out.contains("Fix the axis label"), "{surface}: {out:?}");
+        assert!(out.contains("Comment"), "{surface} labels the comment: {out:?}");
+    }
+}
+
 // ---------------------------------------------------------------------------
-// #149 — SmartArt / chart text
+// SmartArt / chart text
 // ---------------------------------------------------------------------------
 
 #[test]
-fn smartart_and_chart_text_is_extracted() {
+fn test_smartart_and_chart_text_is_extracted() {
     // A graphicFrame whose uri is not the table one used to be skipped
     // wholesale, so a deck built out of SmartArt extracted as empty.
     let tree = r#"<p:graphicFrame>
@@ -956,11 +1129,11 @@ fn smartart_and_chart_text_is_extracted() {
 }
 
 // ---------------------------------------------------------------------------
-// #174 — deck metadata
+// Deck metadata
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_deck_title_is_not_the_first_slides_title_when_core_properties_exist() {
+fn test_a_deck_title_is_not_the_first_slides_title_when_core_properties_exist() {
     // Without core properties the slide title is a reasonable fallback,
     // which is what this asserts; the DOCX/XLSX tests cover the positive
     // core-properties case and the code path is shared.
@@ -974,7 +1147,7 @@ fn a_deck_title_is_not_the_first_slides_title_when_core_properties_exist() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cells_without_a_reference_take_the_next_column() {
+fn test_cells_without_a_reference_take_the_next_column() {
     // `r` is optional on both <row> and <c>; several writers omit it for the
     // whole sheet. Defaulting the missing reference to column 0 put every
     // cell of a row in the same slot, so laying the row out on the grid kept
@@ -1002,7 +1175,7 @@ fn cells_without_a_reference_take_the_next_column() {
 }
 
 #[test]
-fn an_explicit_reference_resets_the_implied_column() {
+fn test_an_explicit_reference_resets_the_implied_column() {
     // A sheet may mix the two forms: the cell after an explicit `r` continues
     // from that column, not from wherever the implicit run had reached.
     let ir = Xlsx::new(vec![Sheet::new(
@@ -1020,7 +1193,7 @@ fn an_explicit_reference_resets_the_implied_column() {
 }
 
 #[test]
-fn rows_without_a_reference_are_numbered_in_document_order() {
+fn test_rows_without_a_reference_are_numbered_in_document_order() {
     // Every row defaulting to index 1 collapsed the sheet's addressing; the
     // grid still has to report one row per <row> element, in order.
     let ir = Xlsx::new(vec![Sheet::new(
@@ -1039,7 +1212,7 @@ fn rows_without_a_reference_are_numbered_in_document_order() {
 }
 
 #[test]
-fn cells_out_of_column_order_are_all_kept() {
+fn test_cells_out_of_column_order_are_all_kept() {
     // A malformed sheet can list columns unordered. Bailing out of the row on
     // the first backwards reference discarded every cell after it; the values
     // belong in their own columns instead.
@@ -1061,7 +1234,7 @@ fn cells_out_of_column_order_are_all_kept() {
 }
 
 #[test]
-fn a_duplicate_reference_keeps_the_first_value() {
+fn test_a_duplicate_reference_keeps_the_first_value() {
     // Two cells claiming one column is corruption either way; the first wins,
     // and — the part that regressed — the rest of the row survives.
     let ir = Xlsx::new(vec![Sheet::new(

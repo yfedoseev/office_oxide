@@ -46,6 +46,12 @@ pub struct NumberingInstance {
     pub abstract_num_id: u32,
     /// Level overrides within this instance.
     pub overrides: HashMap<u8, NumberingLevel>,
+    /// `<w:lvlOverride w:ilvl="N"><w:startOverride w:val="…"/></w:lvlOverride>`
+    /// — the common, partial-override form that changes only where this
+    /// specific numbering instance starts counting, leaving the abstract
+    /// level's format/text/justification untouched. The writer already
+    /// emits this; nothing read it back.
+    pub start_overrides: HashMap<u8, u32>,
 }
 
 /// Number format type.
@@ -78,12 +84,12 @@ impl NumberingDefinitions {
         loop {
             match reader.read_event()? {
                 Event::Start(ref e) => match e.local_name().as_ref() {
-                    b"abstractNum" => {
+                    "abstractNum" => {
                         if let Some(an) = parse_abstract_num(&mut reader, e)? {
                             defs.abstract_nums.insert(an.abstract_num_id, an);
                         }
                     },
-                    b"num" => {
+                    "num" => {
                         if let Some(inst) = parse_num_instance(&mut reader, e)? {
                             defs.instances.insert(inst.num_id, inst);
                         }
@@ -106,13 +112,25 @@ impl NumberingDefinitions {
         let abstract_num = self.abstract_nums.get(&instance.abstract_num_id)?;
         abstract_num.levels.get(&ilvl)
     }
+
+    /// Resolve the *effective* starting value for a numId + ilvl, honouring
+    /// this instance's own `<w:startOverride>` when present and falling
+    /// back to the abstract level's `<w:start>` otherwise.
+    pub fn resolve_start(&self, num_id: u32, ilvl: u8) -> Option<u32> {
+        if let Some(instance) = self.instances.get(&num_id) {
+            if let Some(&start) = instance.start_overrides.get(&ilvl) {
+                return Some(start);
+            }
+        }
+        self.resolve_level(num_id, ilvl).map(|l| l.start)
+    }
 }
 
 fn parse_abstract_num(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
 ) -> crate::core::Result<Option<AbstractNum>> {
-    let abstract_num_id = match xml::optional_attr_str(start, b"w:abstractNumId")? {
+    let abstract_num_id = match xml::optional_attr_str(start, "w:abstractNumId")? {
         Some(id) => id.parse().unwrap_or(0),
         None => return Ok(None),
     };
@@ -121,8 +139,8 @@ fn parse_abstract_num(
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == b"lvl" {
-                    let ilvl = xml::optional_attr_str(e, b"w:ilvl")?
+                if e.local_name().as_ref() == "lvl" {
+                    let ilvl = xml::optional_attr_str(e, "w:ilvl")?
                         .and_then(|v| v.parse::<u8>().ok())
                         .unwrap_or(0);
                     let level = parse_numbering_level(reader)?;
@@ -131,7 +149,7 @@ fn parse_abstract_num(
                     xml::skip_element_fast(reader)?;
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"abstractNum" => {
+            Event::End(ref e) if e.local_name().as_ref() == "abstractNum" => {
                 break;
             },
             Event::Eof => break,
@@ -157,34 +175,34 @@ fn parse_numbering_level(
         match reader.read_event()? {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 match e.local_name().as_ref() {
-                    b"start" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "start" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             start_val = val.parse().unwrap_or(1);
                         }
                     },
-                    b"numFmt" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "numFmt" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             format = parse_number_format(&val);
                         }
                     },
-                    b"lvlText" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "lvlText" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             level_text = val.into_owned();
                         }
                     },
-                    b"lvlJc" => {
-                        if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                    "lvlJc" => {
+                        if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                             justification =
                                 Some(super::formatting::parse_justification_value(&val));
                         }
                     },
-                    b"pPr" | b"rPr" => {
+                    "pPr" | "rPr" => {
                         // Skip sub-properties for now (they apply to the numbering marker)
                     },
                     _ => {},
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"lvl" => {
+            Event::End(ref e) if e.local_name().as_ref() == "lvl" => {
                 break;
             },
             Event::Eof => break,
@@ -217,23 +235,43 @@ fn parse_num_instance(
     reader: &mut quick_xml::Reader<&[u8]>,
     start: &quick_xml::events::BytesStart,
 ) -> crate::core::Result<Option<NumberingInstance>> {
-    let num_id = match xml::optional_attr_str(start, b"w:numId")? {
+    let num_id = match xml::optional_attr_str(start, "w:numId")? {
         Some(id) => id.parse().unwrap_or(0),
         None => return Ok(None),
     };
     let mut abstract_num_id = 0u32;
     let overrides = HashMap::new();
+    let mut start_overrides = HashMap::new();
+    let mut in_lvl_override: Option<u8> = None;
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) | Event::Empty(ref e)
-                if e.local_name().as_ref() == b"abstractNumId" =>
+                if e.local_name().as_ref() == "abstractNumId" =>
             {
-                if let Ok(Some(val)) = xml::optional_attr_str(e, b"w:val") {
+                if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
                     abstract_num_id = val.parse().unwrap_or(0);
                 }
             },
-            Event::End(ref e) if e.local_name().as_ref() == b"num" => {
+            Event::Start(ref e) if e.local_name().as_ref() == "lvlOverride" => {
+                in_lvl_override =
+                    xml::optional_attr_str(e, "w:ilvl")?.and_then(|v| v.parse::<u8>().ok());
+            },
+            Event::End(ref e) if e.local_name().as_ref() == "lvlOverride" => {
+                in_lvl_override = None;
+            },
+            Event::Start(ref e) | Event::Empty(ref e)
+                if e.local_name().as_ref() == "startOverride" =>
+            {
+                if let Some(ilvl) = in_lvl_override {
+                    if let Ok(Some(val)) = xml::optional_attr_str(e, "w:val") {
+                        if let Ok(start) = val.parse::<u32>() {
+                            start_overrides.insert(ilvl, start);
+                        }
+                    }
+                }
+            },
+            Event::End(ref e) if e.local_name().as_ref() == "num" => {
                 break;
             },
             Event::Eof => break,
@@ -245,6 +283,7 @@ fn parse_num_instance(
         num_id,
         abstract_num_id,
         overrides,
+        start_overrides,
     }))
 }
 
@@ -272,7 +311,7 @@ mod tests {
 </w:numbering>"#;
 
     #[test]
-    fn parse_numbering_defs() {
+    fn test_parse_numbering_defs() {
         let defs = NumberingDefinitions::parse(SAMPLE_NUMBERING).unwrap();
         assert_eq!(defs.abstract_nums.len(), 1);
         assert_eq!(defs.instances.len(), 1);
@@ -285,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_numbering_level() {
+    fn test_resolve_numbering_level() {
         let defs = NumberingDefinitions::parse(SAMPLE_NUMBERING).unwrap();
         let level = defs.resolve_level(1, 0).unwrap();
         assert_eq!(level.format, NumberFormat::Bullet);

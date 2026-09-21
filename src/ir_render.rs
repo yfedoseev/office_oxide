@@ -1,23 +1,33 @@
 use crate::ir::*;
 
-/// How `to_markdown_with` should represent embedded images.
+/// How `to_markdown_with` / `to_html_with` should represent embedded images.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ImageEmbed {
     /// Render the image's description, or nothing when it has none.
-    /// This is what plain `to_markdown` does.
+    /// This is what plain `to_markdown` and `to_html` do.
     #[default]
     None,
-    /// Emit `[image-base64:<data>]` at the image's position in the flow.
+    /// Emit the image bytes inline at the image's position in the flow:
+    /// `[image-base64:<data>]` in markdown, `<img src="data:…;base64,…">`
+    /// in HTML.
     ///
     /// Keeps both the position and the content in one self-contained
     /// string, which is what a vision-capable model consuming the markdown
-    /// needs — images were otherwise dropped entirely.
+    /// — or a browser opening the HTML with no sidecar files — needs;
+    /// images were otherwise dropped entirely.
     Base64,
 }
 
 /// Options for [`DocumentIR::to_markdown_with`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MarkdownOptions {
+    /// How to represent embedded images.
+    pub image_embed: ImageEmbed,
+}
+
+/// Options for [`DocumentIR::to_html_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HtmlOptions {
     /// How to represent embedded images.
     pub image_embed: ImageEmbed,
 }
@@ -32,33 +42,34 @@ thread_local! {
         const { std::cell::Cell::new(MarkdownOptions {
             image_embed: ImageEmbed::None,
         }) };
+
+    /// Rendering options for the current `to_html_with` call; same
+    /// reasoning as `MARKDOWN_OPTIONS`.
+    static HTML_OPTIONS: std::cell::Cell<HtmlOptions> =
+        const { std::cell::Cell::new(HtmlOptions {
+            image_embed: ImageEmbed::None,
+        }) };
 }
 
-/// Standard base64 (RFC 4648) with padding, no line breaks.
-fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[n as usize & 63] as char
-        } else {
-            '='
-        });
+/// The media type to put in an image's `data:` URI.
+///
+/// `Image::format` is authoritative when the converter set it; otherwise the
+/// bytes are sniffed, because a data URI with the wrong (or a generic) type
+/// does not render. `None` means "do not emit a data URI for this image" —
+/// the caller falls back to describing it.
+fn image_mime(img: &Image) -> Option<&'static str> {
+    if let Some(ref fmt) = img.format {
+        return Some(fmt.content_type());
     }
-    out
+    let data = img.data.as_deref()?;
+    Some(match data {
+        [0x89, b'P', b'N', b'G', ..] => "image/png",
+        [0xFF, 0xD8, 0xFF, ..] => "image/jpeg",
+        [b'G', b'I', b'F', b'8', ..] => "image/gif",
+        [b'B', b'M', ..] => "image/bmp",
+        [0x49, 0x49, 0x2A, 0x00, ..] | [0x4D, 0x4D, 0x00, 0x2A, ..] => "image/tiff",
+        _ => return None,
+    })
 }
 
 /// Plain-text marker for a page, slide or thematic boundary.
@@ -98,12 +109,18 @@ mod block_default {
                 .map(super::render_element_plain)
                 .collect::<Vec<_>>()
                 .join("\n\n"),
-            Element::Footnote(n) | Element::Endnote(n) => n
-                .content
-                .iter()
-                .map(super::render_element_plain)
-                .collect::<Vec<_>>()
-                .join("\n\n"),
+            Element::Footnote(n) | Element::Endnote(n) => {
+                let body = n
+                    .content
+                    .iter()
+                    .map(super::render_element_plain)
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                match super::authored_marker(n) {
+                    Some(m) => format!("{m}: {body}"),
+                    None => body,
+                }
+            },
             // A page or column break is a real boundary in the source, so
             // it gets the same form-feed marker a thematic break does.
             Element::PageBreak | Element::ColumnBreak => PLAIN_BREAK.to_string(),
@@ -135,19 +152,25 @@ mod block_default {
                 .map(super::render_element_markdown)
                 .collect::<Vec<_>>()
                 .join("\n\n"),
-            Element::Footnote(n) | Element::Endnote(n) => n
-                .content
-                .iter()
-                .map(super::render_element_markdown)
-                .collect::<Vec<_>>()
-                .join("\n\n"),
+            Element::Footnote(n) | Element::Endnote(n) => {
+                let body = n
+                    .content
+                    .iter()
+                    .map(super::render_element_markdown)
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                match super::authored_marker(n) {
+                    Some(m) => format!("**{}:** {body}", super::escape_markdown(&m)),
+                    None => body,
+                }
+            },
             Element::PageBreak | Element::ColumnBreak | Element::Shape(_) => String::new(),
             Element::Image(img) => {
                 // With `ImageEmbed::Base64` the bytes go inline at the
                 // image's position in the flow.
                 if super::MARKDOWN_OPTIONS.with(|o| o.get().image_embed) == ImageEmbed::Base64 {
                     if let Some(ref data) = img.data {
-                        return format!("[image-base64:{}]", super::base64_encode(data));
+                        return format!("[image-base64:{}]", crate::core::base64::encode(data));
                     }
                 }
                 // An `![alt]()` with an empty target renders as a broken
@@ -172,33 +195,49 @@ mod block_default {
     pub fn default_html(element: &Element) -> String {
         match element {
             Element::ThematicBreak => "<hr />".to_string(),
-            Element::TextBox(tb) => tb
-                .content
-                .iter()
-                .map(super::render_element_html)
-                .collect::<Vec<_>>()
-                .join("\n"),
-            Element::Footnote(n) | Element::Endnote(n) => n
-                .content
-                .iter()
-                .map(super::render_element_html)
-                .collect::<Vec<_>>()
-                .join("\n"),
+            Element::TextBox(tb) => super::render_elements_html(&tb.content).join("\n"),
+            Element::Footnote(n) | Element::Endnote(n) => {
+                let body = super::render_elements_html(&n.content).join("\n");
+                match super::authored_marker(n) {
+                    Some(m) => {
+                        format!("<p><strong>{}:</strong></p>\n{body}", super::escape_html(&m))
+                    },
+                    None => body,
+                }
+            },
             Element::PageBreak | Element::ColumnBreak | Element::Shape(_) => String::new(),
-            // `src` is required on `<img>`; an element without one is
-            // invalid HTML. With no addressable source in the IR, describe
-            // the image with its alt text instead.
-            Element::Image(img) => match img.alt_text.as_deref() {
-                Some(alt) if !alt.is_empty() => {
-                    let mut out = String::new();
-                    let _ = write!(
-                        out,
-                        "<figure><figcaption>{}</figcaption></figure>",
-                        super::escape_html(alt)
-                    );
-                    out
-                },
-                _ => String::new(),
+            Element::Image(img) => {
+                // With `ImageEmbed::Base64` the bytes go inline as a data
+                // URI, so the HTML is self-contained — `to_html` otherwise
+                // has no way at all to show an image.
+                if super::HTML_OPTIONS.with(|o| o.get().image_embed) == ImageEmbed::Base64 {
+                    if let (Some(data), Some(mime)) = (img.data.as_ref(), super::image_mime(img)) {
+                        let alt = img.alt_text.as_deref().unwrap_or("");
+                        let mut out = String::new();
+                        let _ = write!(
+                            out,
+                            "<img src=\"data:{mime};base64,{}\" alt=\"{}\" />",
+                            crate::core::base64::encode(data),
+                            super::escape_html(alt)
+                        );
+                        return out;
+                    }
+                }
+                // `src` is required on `<img>`; an element without one is
+                // invalid HTML. With no addressable source in the IR,
+                // describe the image with its alt text instead.
+                match img.alt_text.as_deref() {
+                    Some(alt) if !alt.is_empty() => {
+                        let mut out = String::new();
+                        let _ = write!(
+                            out,
+                            "<figure><figcaption>{}</figcaption></figure>",
+                            super::escape_html(alt)
+                        );
+                        out
+                    },
+                    _ => String::new(),
+                }
             },
             Element::Heading(_)
             | Element::Paragraph(_)
@@ -227,12 +266,24 @@ impl DocumentIR {
 
     /// Render the IR as an HTML fragment (no `<html>`/`<body>` wrapper).
     pub fn to_html(&self) -> String {
+        self.to_html_with(HtmlOptions::default())
+    }
+
+    /// Render the IR as an HTML fragment with explicit options.
+    ///
+    /// With [`ImageEmbed::Base64`] each image whose bytes the IR carries is
+    /// emitted as an `<img src="data:…;base64,…">`, giving a genuinely
+    /// self-contained preview — the mirror of `to_markdown_with`'s existing
+    /// image-embedding option.
+    pub fn to_html_with(&self, options: HtmlOptions) -> String {
+        HTML_OPTIONS.with(|o| o.set(options));
         let section_texts: Vec<String> = self
             .sections
             .iter()
             .map(render_section_html)
             .filter(|s| !s.is_empty())
             .collect();
+        HTML_OPTIONS.with(|o| o.set(HtmlOptions::default()));
         section_texts.join("\n<hr />\n")
     }
 
@@ -279,10 +330,32 @@ fn section_title_is_redundant(section: &Section) -> bool {
     let Some(title) = section.title.as_deref().filter(|t| !t.is_empty()) else {
         return false;
     };
-    match section.elements.first() {
-        Some(Element::Heading(h)) => render_inline_plain(&h.content).trim() == title.trim(),
-        _ => false,
-    }
+    // The converters lift the title from the section's first *heading*,
+    // which need not be its first element — a blank paragraph or a byline
+    // often precedes it. Checking only `elements.first()` printed the title
+    // twice for exactly those documents (and made the rendered text change
+    // across a write/reread that drops the leading blank paragraph).
+    // A declared title (the file's own metadata) that is also the
+    // section's opening line is the same text; the `.doc` line-shape
+    // heuristic may keep that line a paragraph rather than a heading.
+    let first_para = section.elements.iter().find_map(|e| match e {
+        Element::Paragraph(p) if !p.content.is_empty() => Some(render_inline_plain(&p.content)),
+        _ => None,
+    });
+    first_para.is_some_and(|t| t.trim().trim_end_matches('.') == title.trim().trim_end_matches('.'))
+        || section.elements.iter().any(|e| match e {
+            Element::Heading(h) => render_inline_plain(&h.content).trim() == title.trim(),
+            _ => false,
+        })
+}
+
+/// The marker of a note that records who wrote it — a spreadsheet or
+/// document comment (`C8 (Jane Doe)`). The direct renderers print it in
+/// front of the comment; the IR surfaces printed the body alone, so the
+/// cell and the author were lost on `to_ir()`/`to_html()`.
+fn authored_marker(n: &Note) -> Option<String> {
+    let marker = n.marker.as_deref().filter(|m| !m.is_empty())?;
+    (n.author.is_some() || marker.starts_with("Comment")).then(|| marker.to_string())
 }
 
 fn section_headers(section: &Section) -> impl Iterator<Item = &HeaderFooter> {
@@ -332,8 +405,14 @@ fn render_section_plain(section: &Section) -> String {
     // Speaker notes are not part of the visible surface; label them so a
     // consumer can tell them apart from slide body text.
     if let Some(ref notes) = section.speaker_notes {
-        if !notes.is_empty() {
-            parts.push(format!("[Notes]\n{notes}"));
+        let text = notes
+            .iter()
+            .map(render_element_plain)
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            parts.push(format!("[Notes]\n{text}"));
         }
     }
     for hf in section_footers(section) {
@@ -445,8 +524,22 @@ fn render_section_markdown(section: &Section) -> String {
         }
     }
     if let Some(ref notes) = section.speaker_notes {
-        if !notes.is_empty() {
-            parts.push(format!("> **Notes:** {notes}"));
+        let body = notes
+            .iter()
+            .map(render_element_markdown)
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if !body.is_empty() {
+            // Every line must start with `>` to stay inside the
+            // blockquote — a bare newline (e.g. between list items)
+            // would otherwise end it partway through the notes.
+            let quoted = body
+                .lines()
+                .map(|l| format!("> {l}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            parts.push(format!("> **Notes:**\n{quoted}"));
         }
     }
     for hf in section_footers(section) {
@@ -644,9 +737,34 @@ fn table_grid(table: &Table) -> Vec<Vec<Option<&TableCell>>> {
     grid
 }
 
+/// A table with one row and one cell whose content holds a table is a
+/// layout frame — Word documents wrap whole forms in one to draw a
+/// border around them. Markdown cannot nest tables, so rendering the
+/// frame flattened the real table into a single cell; the frame's
+/// content is rendered in its place.
+fn layout_frame_content(table: &Table) -> Option<&[Element]> {
+    let [row] = table.rows.as_slice() else {
+        return None;
+    };
+    let [cell] = row.cells.as_slice() else {
+        return None;
+    };
+    cell.content
+        .iter()
+        .any(|e| matches!(e, Element::Table(_)))
+        .then_some(cell.content.as_slice())
+}
+
 fn render_table_markdown(table: &Table) -> String {
     if table.rows.is_empty() {
         return String::new();
+    }
+    if let Some(content) = layout_frame_content(table) {
+        return content
+            .iter()
+            .map(render_element_markdown)
+            .collect::<Vec<_>>()
+            .join("\n\n");
     }
 
     let grid = table_grid(table);
@@ -689,18 +807,35 @@ fn render_table_markdown(table: &Table) -> String {
 }
 
 fn render_cell_markdown(cell: &TableCell) -> String {
-    cell.content
+    let text = cell
+        .content
         .iter()
         .map(|e| match e {
             Element::Paragraph(p) => render_inline_markdown(&p.content),
             other => render_element_markdown(other),
         })
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    // A line break inside a cell (a `LineBreak` renders as a newline, a
+    // nested block as a paragraph) ends a GFM table row; `<br>` is the
+    // form GitHub and pandoc understand.
+    text.split(['\r', '\n'])
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("<br>")
 }
 
 fn render_list_markdown(list: &List, indent: usize) -> String {
     let prefix_str = "  ".repeat(indent);
+    // A numbered list that starts at 3 in the source must start at 3 here:
+    // `start_number` was parsed and then ignored, so every ordered list
+    // rendered as 1, 2, 3 regardless of what the document said.
+    let start = if list.ordered {
+        list.start_number.unwrap_or(1)
+    } else {
+        1
+    };
     let mut lines = Vec::new();
     for (i, item) in list.items.iter().enumerate() {
         let text = item
@@ -710,7 +845,7 @@ fn render_list_markdown(list: &List, indent: usize) -> String {
             .collect::<Vec<_>>()
             .join(" ");
         let marker = if list.ordered {
-            format!("{}. ", i + 1)
+            format!("{}. ", start.saturating_add(u32::try_from(i).unwrap_or(u32::MAX)))
         } else {
             "- ".to_string()
         };
@@ -761,17 +896,7 @@ fn safe_url(url: &str) -> Option<String> {
 /// text inject structure into the rendered output — a cell containing
 /// `|` splitting a table row, or a literal `[x](y)` becoming a link.
 fn escape_markdown(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        // `_` is deliberately absent: CommonMark does not treat intra-word
-        // `_` as emphasis, and escaping it turns ordinary identifiers like
-        // `HEADER_TEXT` into unreadable `HEADER\_TEXT`.
-        if matches!(c, '\\' | '`' | '*' | '[' | ']' | '<' | '>' | '|' | '~') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
+    crate::core::markdown::escape_text(s)
 }
 
 /// Escape the characters that would terminate a markdown link target early.
@@ -805,8 +930,7 @@ fn render_section_html(section: &Section) -> String {
             parts.push(format!("<h2>{}</h2>", escape_html(title)));
         }
     }
-    for elem in &section.elements {
-        let html = render_element_html(elem);
+    for html in render_elements_html(&section.elements) {
         if !html.is_empty() {
             parts.push(html);
         }
@@ -814,8 +938,13 @@ fn render_section_html(section: &Section) -> String {
     // Speaker notes are not slide-surface content, but dropping them from
     // HTML loses text the plain and markdown renderers both keep.
     if let Some(ref notes) = section.speaker_notes {
-        if !notes.is_empty() {
-            parts.push(format!("<aside class=\"speaker-notes\">{}</aside>", escape_html(notes)));
+        let body = render_elements_html(notes)
+            .into_iter()
+            .filter(|h| !h.is_empty())
+            .collect::<Vec<_>>()
+            .join("");
+        if !body.is_empty() {
+            parts.push(format!("<aside class=\"speaker-notes\">{body}</aside>"));
         }
     }
     for hf in section_footers(section) {
@@ -852,6 +981,79 @@ fn render_element_html(element: &Element) -> String {
     }
 }
 
+/// A CSS colour literal for an IR RGB triple.
+fn css_rgb(rgb: [u8; 3]) -> String {
+    format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
+}
+
+/// A font family name reduced to what is safe inside a quoted CSS value.
+///
+/// A font name comes from an untrusted document, so anything that could
+/// terminate the quoted value or the declaration — quotes, `;`, `(`, `)` —
+/// is dropped rather than escaped. Letters (including non-ASCII, for CJK
+/// family names), digits, spaces and the few punctuation marks real font
+/// names use survive.
+fn css_font_family(name: &str) -> Option<String> {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.'))
+        .collect();
+    let cleaned = cleaned.trim();
+    (!cleaned.is_empty()).then(|| format!("font-family:'{cleaned}'"))
+}
+
+/// `text-decoration-style` for the underline variants a plain `<u>` cannot
+/// distinguish. `<u>` already supplies `text-decoration-line: underline`.
+fn underline_decoration_style(style: &UnderlineStyle) -> Option<&'static str> {
+    match style {
+        UnderlineStyle::Double => Some("double"),
+        UnderlineStyle::Dotted => Some("dotted"),
+        UnderlineStyle::Dash | UnderlineStyle::DotDash | UnderlineStyle::DotDotDash => {
+            Some("dashed")
+        },
+        UnderlineStyle::Wave => Some("wavy"),
+        UnderlineStyle::Single
+        | UnderlineStyle::Thick
+        | UnderlineStyle::Words
+        | UnderlineStyle::None => None,
+    }
+}
+
+/// The CSS declarations for the span formatting that has no dedicated HTML
+/// element: colour, highlight, font and the caps variants.
+///
+/// Returns `None` when the span carries none of them, so an unformatted
+/// span still renders as bare text with no wrapper.
+fn span_style_css(span: &TextSpan) -> Option<String> {
+    let mut decls: Vec<String> = Vec::new();
+    if let Some(rgb) = span.color {
+        decls.push(format!("color:{}", css_rgb(rgb)));
+    }
+    if let Some(rgb) = span.highlight {
+        decls.push(format!("background-color:{}", css_rgb(rgb)));
+    }
+    if let Some(ref name) = span.font_name {
+        if let Some(decl) = css_font_family(name) {
+            decls.push(decl);
+        }
+    }
+    if let Some(half_pt) = span.font_size_half_pt {
+        if half_pt % 2 == 0 {
+            decls.push(format!("font-size:{}pt", half_pt / 2));
+        } else {
+            decls.push(format!("font-size:{}.5pt", half_pt / 2));
+        }
+    }
+    // `all_caps` wins over `small_caps` when a document sets both, which is
+    // what Word renders.
+    if span.all_caps {
+        decls.push("text-transform:uppercase".to_string());
+    } else if span.small_caps {
+        decls.push("font-variant:small-caps".to_string());
+    }
+    (!decls.is_empty()).then(|| decls.join(";"))
+}
+
 fn render_inline_html(content: &[InlineContent]) -> String {
     let mut out = String::new();
     for item in content {
@@ -859,6 +1061,13 @@ fn render_inline_html(content: &[InlineContent]) -> String {
             InlineContent::Text(span) => {
                 let mut text = escape_html(&span.text);
 
+                // Super/subscript sit innermost so the raised text still
+                // picks up the emphasis and colour wrapped around it.
+                match span.vertical_align {
+                    Some(VerticalAlign::Superscript) => text = format!("<sup>{text}</sup>"),
+                    Some(VerticalAlign::Subscript) => text = format!("<sub>{text}</sub>"),
+                    Some(VerticalAlign::Baseline) | None => {},
+                }
                 if span.bold {
                     text = format!("<strong>{text}</strong>");
                 }
@@ -867,6 +1076,21 @@ fn render_inline_html(content: &[InlineContent]) -> String {
                 }
                 if span.strikethrough {
                     text = format!("<del>{text}</del>");
+                }
+                // `UnderlineStyle::None` is an explicit "not underlined" in
+                // the source, so it must not produce a `<u>`.
+                if let Some(ref u) = span.underline {
+                    if *u != UnderlineStyle::None {
+                        text = match underline_decoration_style(u) {
+                            Some(kind) => {
+                                format!("<u style=\"text-decoration-style:{kind}\">{text}</u>")
+                            },
+                            None => format!("<u>{text}</u>"),
+                        };
+                    }
+                }
+                if let Some(css) = span_style_css(span) {
+                    text = format!("<span style=\"{}\">{text}</span>", escape_html(&css));
                 }
                 if let Some(url) = span.hyperlink.as_deref().and_then(safe_url) {
                     text = format!("<a href=\"{}\">{text}</a>", escape_html(&url));
@@ -895,8 +1119,8 @@ fn render_table_html(table: &Table) -> String {
             if cell.row_span > 1 {
                 attrs.push_str(&format!(" rowspan=\"{}\"", cell.row_span));
             }
-            let content: Vec<String> = cell.content.iter().map(render_element_html).collect();
-            html.push_str(&format!("<{tag}{attrs}>{}</{tag}>", content.join("")));
+            let content = render_elements_html(&cell.content).join("");
+            html.push_str(&format!("<{tag}{attrs}>{content}</{tag}>"));
         }
         html.push_str("</tr>\n");
     }
@@ -906,24 +1130,106 @@ fn render_table_html(table: &Table) -> String {
 }
 
 fn render_list_html(list: &List) -> String {
-    let tag = if list.ordered { "ol" } else { "ul" };
-    let mut html = format!("<{tag}>\n");
-    for item in &list.items {
-        let content = item
-            .content
-            .iter()
-            .map(render_element_html)
-            .collect::<Vec<_>>()
-            .join("");
-        html.push_str(&format!("<li>{content}"));
-        if let Some(ref nested) = item.nested {
-            html.push('\n');
-            html.push_str(&render_list_html(nested));
+    render_list_group_html(&[list])
+}
+
+/// Render one or more `List`s as a single `<ul>`/`<ol>` block.
+///
+/// Real DOCX generators hand visually-continuous bullets a fresh `w:numId`
+/// per paragraph, which the converter faithfully turns into one
+/// `Element::List` per fragment. Emitting a separate list block for each
+/// produced a run of one-item `<ul>`s — extra margins in a browser and
+/// "list, 1 item" announced repeatedly by a screen reader — where markdown's
+/// line-based output incidentally showed one continuous list. Adjacent
+/// fragments that agree on shape are re-joined here; see
+/// [`merge_adjacent_lists`] for what counts as adjacent.
+fn render_list_group_html(lists: &[&List]) -> String {
+    let Some(first) = lists.first() else {
+        return String::new();
+    };
+    let tag = if first.ordered { "ol" } else { "ul" };
+    // `start` only exists on `<ol>`; a browser ignores it on `<ul>`. Omitted
+    // for 1, which is the attribute's own default, so ordinary lists keep a
+    // bare `<ol>`.
+    let start_attr = match first.start_number {
+        Some(n) if first.ordered && n != 1 => format!(" start=\"{n}\""),
+        _ => String::new(),
+    };
+    let mut html = format!("<{tag}{start_attr}>\n");
+    for list in lists {
+        for item in &list.items {
+            let content = render_elements_html(&item.content).join("");
+            html.push_str(&format!("<li>{content}"));
+            if let Some(ref nested) = item.nested {
+                html.push('\n');
+                html.push_str(&render_list_html(nested));
+            }
+            html.push_str("</li>\n");
         }
-        html.push_str("</li>\n");
     }
     html.push_str(&format!("</{tag}>"));
     html
+}
+
+/// Whether `next` is a continuation of `prev` rather than a new list.
+///
+/// Conservative on purpose: the two must agree on ordered-ness, marker
+/// style and nesting level, and an ordered list that carries its own
+/// explicit `start_number` is a deliberate restart and stays separate.
+fn lists_are_continuous(prev: &List, next: &List) -> bool {
+    prev.ordered == next.ordered
+        && prev.style == next.style
+        && prev.level == next.level
+        && !(next.ordered && next.start_number.is_some())
+}
+
+/// Group a block-element slice into runs, coalescing adjacent continuous
+/// `Element::List` siblings so each run renders as one list block.
+///
+/// Borrows throughout — nothing is cloned, so this costs nothing on the
+/// large documents where element counts matter.
+fn merge_adjacent_lists(elements: &[Element]) -> Vec<Vec<&Element>> {
+    let mut groups: Vec<Vec<&Element>> = Vec::with_capacity(elements.len());
+    for element in elements {
+        let continues = match (element, groups.last().and_then(|g| g.last())) {
+            (Element::List(next), Some(Element::List(prev))) => lists_are_continuous(prev, next),
+            _ => false,
+        };
+        if continues {
+            // `continues` is only true when a last group exists.
+            if let Some(group) = groups.last_mut() {
+                group.push(element);
+            }
+        } else {
+            groups.push(vec![element]);
+        }
+    }
+    groups
+}
+
+/// Render a block-element slice to one HTML string per emitted block,
+/// with adjacent continuous lists merged into single list blocks.
+///
+/// Every place that walks a `Vec<Element>` for HTML goes through this so
+/// the merge applies uniformly — section bodies, table cells, text boxes
+/// and note bodies alike.
+fn render_elements_html(elements: &[Element]) -> Vec<String> {
+    merge_adjacent_lists(elements)
+        .into_iter()
+        .map(|group| match group.as_slice() {
+            [single] => render_element_html(single),
+            many => {
+                let lists: Vec<&List> = many
+                    .iter()
+                    .filter_map(|e| match e {
+                        Element::List(l) => Some(l),
+                        _ => None,
+                    })
+                    .collect();
+                render_list_group_html(&lists)
+            },
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -943,6 +1249,7 @@ mod tests {
                 elements,
                 ..Default::default()
             }],
+            defined_names: Vec::new(),
         }
     }
 
@@ -957,14 +1264,101 @@ mod tests {
         InlineContent::Text(TextSpan::plain(text))
     }
 
+    /// A field added as a sibling of `Section::elements`
+    /// (not inside it, like `speaker_notes`) is invisible to any renderer
+    /// that was never explicitly taught about it, and nothing enforces
+    /// that every renderer was. Adding `speaker_notes` broke two
+    /// of four consumers (render_section_html and the CLI's `ir` JSON
+    /// projection) silently — a corpus sweep found them, not the unit
+    /// suite. This test populates every text-bearing sibling field at
+    /// once and asserts each one reaches all three IR-level rendering
+    /// surfaces, so a future field with the same shape fails a fast unit
+    /// test instead of needing a multi-thousand-file corpus diff.
     #[test]
-    fn plain_text_paragraph() {
+    fn test_maximal_section_reaches_every_rendering_surface() {
+        let hf = |marker: &str| {
+            Some(HeaderFooter {
+                content: vec![para(marker)],
+            })
+        };
+        let section = Section {
+            title: Some("SECTION_TITLE_MARKER".to_string()),
+            elements: vec![para("BODY_MARKER")],
+            header: hf("HEADER_MARKER"),
+            footer: hf("FOOTER_MARKER"),
+            first_page_header: hf("FIRST_HEADER_MARKER"),
+            first_page_footer: hf("FIRST_FOOTER_MARKER"),
+            even_page_header: hf("EVEN_HEADER_MARKER"),
+            even_page_footer: hf("EVEN_FOOTER_MARKER"),
+            speaker_notes: Some(vec![para("SPEAKER_NOTES_MARKER")]),
+            ..Default::default()
+        };
+        let ir = DocumentIR {
+            metadata: Metadata {
+                format: DocumentFormat::Pptx,
+                title: None,
+                ..Default::default()
+            },
+            sections: vec![section],
+            defined_names: Vec::new(),
+        };
+
+        let markers = [
+            "BODY_MARKER",
+            "HEADER_MARKER",
+            "FOOTER_MARKER",
+            "FIRST_HEADER_MARKER",
+            "FIRST_FOOTER_MARKER",
+            "EVEN_HEADER_MARKER",
+            "EVEN_FOOTER_MARKER",
+            "SPEAKER_NOTES_MARKER",
+        ];
+        let plain = ir.plain_text();
+        let markdown = ir.to_markdown();
+        let html = ir.to_html();
+        for marker in markers {
+            assert!(plain.contains(marker), "plain_text() is missing {marker}: {plain:?}");
+            assert!(markdown.contains(marker), "to_markdown() is missing {marker}: {markdown:?}");
+            assert!(html.contains(marker), "to_html() is missing {marker}: {html:?}");
+        }
+    }
+
+    #[test]
+    fn test_plain_text_paragraph() {
         let ir = simple_ir(vec![para("Hello world")]);
         assert_eq!(ir.plain_text(), "Hello world");
     }
 
+    /// A section title lifted from a heading that is not the section's
+    /// first element (a blank paragraph precedes it, as Word documents
+    /// often start) is still that heading, not a second line of content.
     #[test]
-    fn markdown_heading() {
+    fn test_title_lifted_from_a_later_heading_is_not_rendered_twice() {
+        let mut ir = simple_ir(vec![
+            Element::Paragraph(Paragraph::default()),
+            Element::Heading(Heading {
+                level: 1,
+                content: vec![span("Annual Report")],
+                ..Default::default()
+            }),
+            para("Body"),
+        ]);
+        ir.sections[0].title = Some("Annual Report".into());
+        for (name, text) in [
+            ("plain_text", ir.plain_text()),
+            ("markdown", ir.to_markdown()),
+            ("html", ir.to_html()),
+        ] {
+            assert_eq!(
+                text.matches("Annual Report").count(),
+                1,
+                "{name} rendered the title and the heading it came from:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_markdown_heading() {
         let ir = simple_ir(vec![Element::Heading(Heading {
             level: 2,
             content: vec![span("Title")],
@@ -974,7 +1368,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_formatting() {
+    fn test_markdown_formatting() {
         let ir = simple_ir(vec![Element::Paragraph(Paragraph {
             content: vec![
                 InlineContent::Text(TextSpan {
@@ -1007,7 +1401,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_table() {
+    fn test_markdown_table() {
         let ir = simple_ir(vec![Element::Table(Table {
             rows: vec![
                 TableRow {
@@ -1030,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_list() {
+    fn test_markdown_list() {
         let ir = simple_ir(vec![Element::List(List {
             ordered: false,
             items: vec![
@@ -1049,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_hyperlink() {
+    fn test_markdown_hyperlink() {
         let ir = simple_ir(vec![Element::Paragraph(Paragraph {
             content: vec![InlineContent::Text(TextSpan {
                 text: "click".to_string(),
@@ -1062,7 +1456,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_section_separator() {
+    fn test_multi_section_separator() {
         let ir = DocumentIR {
             metadata: Metadata {
                 format: DocumentFormat::Xlsx,
@@ -1081,6 +1475,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            defined_names: Vec::new(),
         };
         let plain = ir.plain_text();
         assert!(plain.contains("Sheet1"));
@@ -1092,13 +1487,13 @@ mod tests {
     }
 
     #[test]
-    fn html_paragraph() {
+    fn test_html_paragraph() {
         let ir = simple_ir(vec![para("Hello world")]);
         assert_eq!(ir.to_html(), "<p>Hello world</p>");
     }
 
     #[test]
-    fn html_formatting() {
+    fn test_html_formatting() {
         let ir = simple_ir(vec![Element::Paragraph(Paragraph {
             content: vec![
                 InlineContent::Text(TextSpan {
@@ -1122,14 +1517,14 @@ mod tests {
     }
 
     #[test]
-    fn html_escaping() {
+    fn test_html_escaping() {
         let ir = simple_ir(vec![para("<script>alert('xss')</script>")]);
         assert!(ir.to_html().contains("&lt;script&gt;"));
         assert!(!ir.to_html().contains("<script>"));
     }
 
     #[test]
-    fn html_table() {
+    fn test_html_table() {
         let ir = simple_ir(vec![Element::Table(Table {
             rows: vec![TableRow {
                 cells: vec![cell("A")],
@@ -1145,7 +1540,7 @@ mod tests {
     }
 
     #[test]
-    fn html_list() {
+    fn test_html_list() {
         let ir = simple_ir(vec![Element::List(List {
             ordered: true,
             items: vec![
@@ -1166,22 +1561,292 @@ mod tests {
         assert!(html.contains("<li><p>Second</p></li>"));
     }
 
+    /// `to_html()` had no image-embedding option at all, so an image
+    /// never reached the HTML surface — only a `<figcaption>` when it
+    /// happened to carry alt text.
+    #[test]
+    fn test_html_image_base64_embedding() {
+        // A one-pixel PNG's magic bytes are enough: the renderer only needs
+        // a media type and the bytes.
+        let png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x01, 0x02];
+        let ir = simple_ir(vec![Element::Image(Image {
+            alt_text: Some("A <chart>".into()),
+            data: Some(png.clone()),
+            ..Default::default()
+        })]);
+
+        // Default behaviour is unchanged: a caption, no image data.
+        let plain = ir.to_html();
+        assert!(plain.contains("<figcaption>"), "{plain}");
+        assert!(!plain.contains("<img"), "{plain}");
+
+        let embedded = ir.to_html_with(HtmlOptions {
+            image_embed: ImageEmbed::Base64,
+        });
+        assert!(embedded.contains("<img src=\"data:image/png;base64,"), "{embedded}");
+        assert!(embedded.contains(&crate::core::base64::encode(&png)), "{embedded}");
+        // Alt text is escaped, not injected.
+        assert!(embedded.contains("alt=\"A &lt;chart&gt;\""), "{embedded}");
+
+        // `format` is authoritative when the converter set it.
+        let jpeg = simple_ir(vec![Element::Image(Image {
+            data: Some(vec![0x00, 0x01, 0x02]),
+            format: Some(ImageFormat::Jpeg),
+            ..Default::default()
+        })]);
+        assert!(
+            jpeg.to_html_with(HtmlOptions {
+                image_embed: ImageEmbed::Base64,
+            })
+            .contains("data:image/jpeg;base64,"),
+        );
+
+        // Unknown bytes with no declared format fall back rather than
+        // emitting a data URI a browser cannot render.
+        let unknown = simple_ir(vec![Element::Image(Image {
+            alt_text: Some("mystery".into()),
+            data: Some(vec![0x00, 0x01, 0x02, 0x03]),
+            ..Default::default()
+        })]);
+        let html = unknown.to_html_with(HtmlOptions {
+            image_embed: ImageEmbed::Base64,
+        });
+        assert!(!html.contains("<img"), "{html}");
+        assert!(html.contains("mystery"), "{html}");
+
+        // The option does not leak into a later default render.
+        assert!(!ir.to_html().contains("<img"));
+    }
+
+    /// numId fragmentation splits visually-continuous bullets into one
+    /// `Element::List` each; HTML emitted a separate one-item `<ul>` per
+    /// fragment where markdown showed one continuous list.
+    #[test]
+    fn test_adjacent_same_style_lists_merge_in_html() {
+        let bullet = |text: &str| {
+            Element::List(List {
+                ordered: false,
+                style: Some(ListStyle::Bullet),
+                items: vec![ListItem {
+                    content: vec![para(text)],
+                    nested: None,
+                }],
+                ..Default::default()
+            })
+        };
+
+        let ir = simple_ir(vec![bullet("one"), bullet("two"), bullet("three")]);
+        let html = ir.to_html();
+        assert_eq!(html.matches("<ul>").count(), 1, "html: {html}");
+        assert_eq!(html.matches("</ul>").count(), 1, "html: {html}");
+        assert_eq!(html.matches("<li>").count(), 3, "html: {html}");
+        // Order is preserved.
+        let pos = |needle: &str| html.find(needle).expect(needle);
+        assert!(pos("one") < pos("two") && pos("two") < pos("three"), "html: {html}");
+
+        // Intervening non-list content keeps the lists apart.
+        let split = simple_ir(vec![bullet("one"), para("interruption"), bullet("two")]);
+        assert_eq!(split.to_html().matches("<ul>").count(), 2, "{}", split.to_html());
+
+        // A different marker style is a different list.
+        let other_style = Element::List(List {
+            ordered: false,
+            style: Some(ListStyle::Square),
+            items: vec![ListItem {
+                content: vec![para("sq")],
+                nested: None,
+            }],
+            ..Default::default()
+        });
+        let mixed = simple_ir(vec![bullet("one"), other_style]);
+        assert_eq!(mixed.to_html().matches("<ul>").count(), 2, "{}", mixed.to_html());
+
+        // Ordered vs unordered never merge.
+        let numbered = Element::List(List {
+            ordered: true,
+            items: vec![ListItem {
+                content: vec![para("n")],
+                nested: None,
+            }],
+            ..Default::default()
+        });
+        let mixed = simple_ir(vec![bullet("one"), numbered]);
+        let html = mixed.to_html();
+        assert_eq!(html.matches("<ul>").count(), 1, "{html}");
+        assert_eq!(html.matches("<ol>").count(), 1, "{html}");
+
+        // An ordered list with its own explicit start is a deliberate
+        // restart and keeps its own block (and its `start` attribute).
+        let restart = |n: u32| {
+            Element::List(List {
+                ordered: true,
+                start_number: Some(n),
+                items: vec![ListItem {
+                    content: vec![para("i")],
+                    nested: None,
+                }],
+                ..Default::default()
+            })
+        };
+        let restarted = simple_ir(vec![restart(1), restart(5)]);
+        let html = restarted.to_html();
+        assert_eq!(html.matches("<ol").count(), 2, "{html}");
+        assert!(html.contains("<ol start=\"5\">"), "{html}");
+    }
+
+    /// `render_inline_html` read only bold/italic/strikethrough/
+    /// hyperlink, so underline, super/subscript, highlight, colour, font and
+    /// the caps variants vanished from `to_html()` while the IR carried them.
+    #[test]
+    fn test_html_span_formatting_is_not_dropped() {
+        let styled = |f: fn(&mut TextSpan)| {
+            let mut s = TextSpan::plain("X");
+            f(&mut s);
+            simple_ir(vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(s)],
+                ..Default::default()
+            })])
+            .to_html()
+        };
+
+        // Underline: `<u>`, and a distinguishable style for the variants a
+        // bare `<u>` cannot express.
+        let html = styled(|s| s.underline = Some(UnderlineStyle::Single));
+        assert_eq!(html, "<p><u>X</u></p>");
+        let html = styled(|s| s.underline = Some(UnderlineStyle::Double));
+        assert!(html.contains("text-decoration-style:double"), "{html}");
+        // An explicit "no underline" must not produce one.
+        let html = styled(|s| s.underline = Some(UnderlineStyle::None));
+        assert_eq!(html, "<p>X</p>");
+
+        // Super/subscript, mirroring what the markdown renderer already did.
+        let html = styled(|s| s.vertical_align = Some(VerticalAlign::Superscript));
+        assert_eq!(html, "<p><sup>X</sup></p>");
+        let html = styled(|s| s.vertical_align = Some(VerticalAlign::Subscript));
+        assert_eq!(html, "<p><sub>X</sub></p>");
+        let html = styled(|s| s.vertical_align = Some(VerticalAlign::Baseline));
+        assert_eq!(html, "<p>X</p>");
+
+        // Highlight, colour, font and caps all land in one style span.
+        let html = styled(|s| s.highlight = Some([255, 255, 0]));
+        assert!(html.contains("background-color:#FFFF00"), "{html}");
+        let html = styled(|s| s.color = Some([17, 34, 51]));
+        assert!(html.contains("color:#112233"), "{html}");
+        let html = styled(|s| s.font_name = Some("Times New Roman".into()));
+        assert!(html.contains("font-family:'Times New Roman'"), "{html}");
+        let html = styled(|s| s.font_size_half_pt = Some(24));
+        assert!(html.contains("font-size:12pt"), "{html}");
+        let html = styled(|s| s.font_size_half_pt = Some(25));
+        assert!(html.contains("font-size:12.5pt"), "{html}");
+        let html = styled(|s| s.all_caps = true);
+        assert!(html.contains("text-transform:uppercase"), "{html}");
+        let html = styled(|s| s.small_caps = true);
+        assert!(html.contains("font-variant:small-caps"), "{html}");
+
+        // A plain span still renders bare — no empty wrapper.
+        assert_eq!(styled(|_| {}), "<p>X</p>");
+    }
+
+    /// The new attribute values must not be able to break out of the
+    /// `style="…"` they sit in, and text content stays escaped.
+    #[test]
+    fn test_html_span_style_values_are_escaped() {
+        let ir = simple_ir(vec![Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan {
+                text: "<b>&hi</b>".into(),
+                font_name: Some("Evil'; color:red; x:'".into()),
+                underline: Some(UnderlineStyle::Single),
+                ..Default::default()
+            })],
+            ..Default::default()
+        })]);
+        let html = ir.to_html();
+        // Text content is still escaped.
+        assert!(html.contains("&lt;b&gt;&amp;hi&lt;/b&gt;"), "{html}");
+        assert!(!html.contains("<b>"), "{html}");
+        // Nothing that could close the quoted value or start another
+        // declaration survives into the attribute.
+        let open = html.find("style=\"").expect("a style attribute") + "style=\"".len();
+        let close = open + html[open..].find('"').expect("a closing quote");
+        assert_eq!(&html[open..close], "font-family:'Evil colorred x'");
+    }
+
+    /// `List.start_number` was parsed and then ignored by both
+    /// renderers, so a list the document starts at 3 rendered as 1, 2, 3.
+    #[test]
+    fn test_list_start_number_is_honoured() {
+        let list = List {
+            ordered: true,
+            start_number: Some(3),
+            items: vec![
+                ListItem {
+                    content: vec![para("A")],
+                    nested: None,
+                },
+                ListItem {
+                    content: vec![para("B")],
+                    nested: None,
+                },
+                ListItem {
+                    content: vec![para("C")],
+                    nested: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let ir = simple_ir(vec![Element::List(list)]);
+
+        let html = ir.to_html();
+        assert!(html.contains("<ol start=\"3\">"), "html: {html}");
+
+        let md = ir.to_markdown();
+        assert!(md.contains("3. A"), "md: {md}");
+        assert!(md.contains("4. B"), "md: {md}");
+        assert!(md.contains("5. C"), "md: {md}");
+        assert!(!md.contains("1. A"), "md still starts at 1: {md}");
+
+        // An unordered list never gets a `start`, and a list starting at the
+        // attribute's own default keeps a bare `<ol>`.
+        let plain_ol = simple_ir(vec![Element::List(List {
+            ordered: true,
+            start_number: Some(1),
+            items: vec![ListItem {
+                content: vec![para("A")],
+                nested: None,
+            }],
+            ..Default::default()
+        })]);
+        assert!(plain_ol.to_html().contains("<ol>"), "{}", plain_ol.to_html());
+
+        let bullets = simple_ir(vec![Element::List(List {
+            ordered: false,
+            start_number: Some(7),
+            items: vec![ListItem {
+                content: vec![para("A")],
+                nested: None,
+            }],
+            ..Default::default()
+        })]);
+        assert!(!bullets.to_html().contains("start="), "{}", bullets.to_html());
+        assert!(bullets.to_markdown().contains("- A"), "{}", bullets.to_markdown());
+    }
+
     // ── Defaults centralized in `block_default` ──────────────────────
 
     #[test]
-    fn thematic_break_renders_as_a_form_feed_in_plain() {
+    fn test_thematic_break_renders_as_a_form_feed_in_plain() {
         let ir = simple_ir(vec![Element::ThematicBreak]);
         assert_eq!(ir.plain_text(), PLAIN_BREAK);
     }
 
     #[test]
-    fn thematic_break_renders_in_markdown() {
+    fn test_thematic_break_renders_in_markdown() {
         let ir = simple_ir(vec![Element::ThematicBreak]);
         assert!(ir.to_markdown().contains("---"));
     }
 
     #[test]
-    fn page_break_invisible_in_plain() {
+    fn test_page_break_invisible_in_plain() {
         // PageBreak/ColumnBreak/Shape/Image have no plain-text counterpart
         // — they collapse to empty so plain_text shows only the surrounding
         // content.
@@ -1192,7 +1857,7 @@ mod tests {
     }
 
     #[test]
-    fn shape_invisible_in_plain() {
+    fn test_shape_invisible_in_plain() {
         let ir = simple_ir(vec![
             para("before"),
             Element::Shape(Shape::default()),
@@ -1204,7 +1869,7 @@ mod tests {
     }
 
     #[test]
-    fn text_box_recursively_renders_children() {
+    fn test_text_box_recursively_renders_children() {
         let ir = simple_ir(vec![Element::TextBox(TextBox {
             content: vec![para("inside")],
             ..Default::default()
@@ -1214,7 +1879,7 @@ mod tests {
     }
 
     #[test]
-    fn html_thematic_break() {
+    fn test_html_thematic_break() {
         let ir = simple_ir(vec![Element::ThematicBreak]);
         let html = ir.to_html();
         assert!(html.contains("<hr"), "html: {html}");
@@ -1229,7 +1894,7 @@ mod speaker_notes_render_tests {
     /// `elements` fixed the leak on the write side but dropped them from
     /// HTML, which a corpus sweep against v0.1.10 caught.
     #[test]
-    fn every_renderer_surfaces_speaker_notes() {
+    fn test_every_renderer_surfaces_speaker_notes() {
         let ir = DocumentIR {
             sections: vec![Section {
                 elements: vec![Element::Paragraph(Paragraph {
@@ -1239,7 +1904,13 @@ mod speaker_notes_render_tests {
                     })],
                     ..Default::default()
                 })],
-                speaker_notes: Some("NoteText".into()),
+                speaker_notes: Some(vec![Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan {
+                        text: "NoteText".into(),
+                        ..Default::default()
+                    })],
+                    ..Default::default()
+                })]),
                 ..Default::default()
             }],
             ..Default::default()

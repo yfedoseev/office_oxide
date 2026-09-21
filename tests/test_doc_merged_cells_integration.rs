@@ -158,7 +158,7 @@ fn synthetic_merged_doc() -> Vec<u8> {
 }
 
 #[test]
-fn doc_merged_cells_have_four_rows() {
+fn test_doc_merged_cells_have_four_rows() {
     let bytes = synthetic_merged_doc();
     let doc = open_doc(&bytes);
     let ir = doc.to_ir();
@@ -168,7 +168,7 @@ fn doc_merged_cells_have_four_rows() {
 }
 
 #[test]
-fn doc_horizontal_merges_set_col_span() {
+fn test_doc_horizontal_merges_set_col_span() {
     let bytes = synthetic_merged_doc();
     let doc = open_doc(&bytes);
     let ir = doc.to_ir();
@@ -205,7 +205,7 @@ fn doc_horizontal_merges_set_col_span() {
 }
 
 #[test]
-fn doc_vertical_merge_sets_row_span() {
+fn test_doc_vertical_merge_sets_row_span() {
     let bytes = synthetic_merged_doc();
     let doc = open_doc(&bytes);
     let ir = doc.to_ir();

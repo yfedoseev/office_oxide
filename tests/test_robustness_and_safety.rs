@@ -56,11 +56,11 @@ fn expect_err(r: office_oxide::Result<Document>, why: &str) -> office_oxide::Off
 }
 
 // ---------------------------------------------------------------------------
-// #145 — truncated XML
+// Truncated XML
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_truncated_document_part_is_an_error_not_a_short_document() {
+fn test_a_truncated_document_part_is_an_error_not_a_short_document() {
     // A file cut short by a failed download used to parse to whatever came
     // before the cut and report success, so a partial document looked
     // complete.
@@ -79,17 +79,17 @@ fn a_truncated_document_part_is_an_error_not_a_short_document() {
 }
 
 #[test]
-fn a_complete_document_still_parses() {
+fn test_a_complete_document_still_parses() {
     let doc = open_docx(docx_with(r#"<w:p><w:r><w:t>OK</w:t></w:r></w:p>"#)).expect("parse");
     assert_eq!(doc.plain_text(), "OK");
 }
 
 // ---------------------------------------------------------------------------
-// #145 — format mismatch
+// Format mismatch
 // ---------------------------------------------------------------------------
 
 #[test]
-fn opening_a_workbook_as_a_document_names_what_it_found() {
+fn test_opening_a_workbook_as_a_document_names_what_it_found() {
     let mut w = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
     let part = PartName::new("/xl/workbook.xml").unwrap();
     w.add_package_rel(rel_types::OFFICE_DOCUMENT, "xl/workbook.xml");
@@ -112,11 +112,11 @@ fn opening_a_workbook_as_a_document_names_what_it_found() {
 }
 
 // ---------------------------------------------------------------------------
-// #145 — duplicate part names
+// Duplicate part names
 // ---------------------------------------------------------------------------
 
 #[test]
-fn duplicate_part_names_are_refused() {
+fn test_duplicate_part_names_are_refused() {
     // Two entries with the same name mean two readers can see two different
     // documents from the same bytes. Whichever copy we picked would be
     // accidental, so the package is refused.
@@ -175,12 +175,117 @@ fn duplicate_part_names_are_refused() {
     assert!(err.to_string().contains("duplicate part"), "got {err}");
 }
 
+/// The XLSX reader opens its archive directly for speed, bypassing
+/// `OpcReader` — and, until this test, bypassing the duplicate-entry
+/// refusal with it: a workbook with two `xl/worksheets/sheet1.xml` entries
+/// opened cleanly and silently showed whichever copy the zip crate resolved
+/// to (the second). DOCX and PPTX refused the same construction. Same
+/// CVE-2025-31672 shape, same answer for all three.
+#[test]
+fn test_duplicate_part_names_are_refused_by_the_xlsx_fast_path() {
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    zip.start_file("xl/workbook.xml", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0"?><workbook
+             xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+           <sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+    )
+    .unwrap();
+    zip.start_file("xl/_rels/workbook.xml.rels", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0"?><Relationships
+             xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+           <Relationship Id="rId1"
+             Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+             Target="worksheets/sheet1.xml"/></Relationships>"#,
+    )
+    .unwrap();
+    for (name, text) in [
+        ("xl/worksheets/sheet1.xml", "SAFE_FIRST_COPY"),
+        ("xl/worksheets/sheet2.xml", "EVIL_SECOND_COPY"),
+    ] {
+        zip.start_file(name, opts).unwrap();
+        zip.write_all(
+            format!(
+                r#"<?xml version="1.0"?><worksheet
+                     xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+                   <sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>{text}</t></is></c></row>
+                   </sheetData></worksheet>"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    }
+    let mut bytes = zip.finish().unwrap().into_inner();
+    rename_entry(&mut bytes, b"xl/worksheets/sheet2.xml", b"xl/worksheets/sheet1.xml");
+
+    let err = expect_err(
+        Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx),
+        "an XLSX with duplicate parts must be refused, not silently resolved to one copy",
+    );
+    assert!(err.to_string().contains("duplicate part"), "got {err}");
+}
+
+/// A cell reference past the grid (`ZZZZZZ1` is column 321,272,405)
+/// reached the IR converter, which sized every table row to the widest
+/// column seen: a 95 GB allocation and an abort from a 2 KB package,
+/// through `to_ir()` on every binding. The reader refuses the reference
+/// (the cell takes the implied column) and the converter is capped at
+/// the grid's width regardless.
+#[test]
+fn test_a_cell_reference_past_the_grid_does_not_size_the_table_to_it() {
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    zip.start_file("xl/workbook.xml", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0"?><workbook
+             xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+           <sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+    )
+    .unwrap();
+    zip.start_file("xl/_rels/workbook.xml.rels", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0"?><Relationships
+             xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+           <Relationship Id="rId1"
+             Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+             Target="worksheets/sheet1.xml"/></Relationships>"#,
+    )
+    .unwrap();
+    zip.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+    zip.write_all(
+        br#"<?xml version="1.0"?><worksheet
+             xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+           <sheetData><row r="1"><c r="A1"><v>1</v></c><c r="ZZZZZZ1"><v>2</v></c></row>
+           <row r="2"><c r="A2"><v>3</v></c></row></sheetData></worksheet>"#,
+    )
+    .unwrap();
+    let bytes = zip.finish().unwrap().into_inner();
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx).unwrap();
+    let ir = doc.to_ir();
+    let text = doc.plain_text();
+    assert!(text.contains('1') && text.contains('2') && text.contains('3'), "{text}");
+    let widest = ir.sections[0]
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            office_oxide::ir::Element::Table(t) => t.rows.iter().map(|r| r.cells.len()).max(),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    assert!(widest <= 2, "table sized to the bogus column: {widest} cells wide");
+}
+
 // ---------------------------------------------------------------------------
-// #151 — unbounded recursion
+// Unbounded recursion
 // ---------------------------------------------------------------------------
 
 #[test]
-fn deeply_nested_tables_do_not_abort_the_process() {
+fn test_deeply_nested_tables_do_not_abort_the_process() {
     // Nested `<w:tbl>` elements used to drive the recursive-descent parser
     // into a stack overflow, which aborts the process — an uncatchable
     // crash no caller in any binding can defend against.
@@ -204,7 +309,7 @@ fn deeply_nested_tables_do_not_abort_the_process() {
 }
 
 #[test]
-fn a_document_nested_past_the_cap_says_so_rather_than_truncating_silently() {
+fn test_a_document_nested_past_the_cap_says_so_rather_than_truncating_silently() {
     use office_oxide::ir::Element;
 
     let depth = office_oxide::core::xml::MAX_NESTING_DEPTH + 50;
@@ -228,7 +333,7 @@ fn a_document_nested_past_the_cap_says_so_rather_than_truncating_silently() {
 }
 
 #[test]
-fn deeply_nested_tables_stay_within_the_depth_limit() {
+fn test_deeply_nested_tables_stay_within_the_depth_limit() {
     // Below `MAX_NESTING_DEPTH`, so the document parses in full.
     let depth = 200;
     let mut body = String::new();
@@ -245,11 +350,11 @@ fn deeply_nested_tables_stay_within_the_depth_limit() {
 }
 
 // ---------------------------------------------------------------------------
-// #138 — malformed CFB header
+// Malformed CFB header
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_cfb_header_with_an_absurd_sector_shift_is_rejected_cleanly() {
+fn test_a_cfb_header_with_an_absurd_sector_shift_is_rejected_cleanly() {
     // `1usize << shift` overflows for any shift a malformed file cares to
     // write. The spec permits only 9 and 12.
     let mut data = vec![0u8; 1536];
@@ -274,11 +379,11 @@ fn a_cfb_header_with_an_absurd_sector_shift_is_rejected_cleanly() {
 }
 
 // ---------------------------------------------------------------------------
-// #158 — writers must not emit XML-illegal characters
+// Writers must not emit XML-illegal characters
 // ---------------------------------------------------------------------------
 
 #[test]
-fn control_characters_do_not_reach_the_generated_xml() {
+fn test_control_characters_do_not_reach_the_generated_xml() {
     use office_oxide::create;
     use office_oxide::ir::*;
 
@@ -299,6 +404,7 @@ fn control_characters_do_not_reach_the_generated_xml() {
             })],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     for fmt in [
@@ -326,11 +432,11 @@ fn control_characters_do_not_reach_the_generated_xml() {
 }
 
 // ---------------------------------------------------------------------------
-// #159 — replace_text must not corrupt the document
+// replace_text must not corrupt the document
 // ---------------------------------------------------------------------------
 
 #[test]
-fn replace_text_matches_and_writes_escaped_characters_correctly() {
+fn test_replace_text_matches_and_writes_escaped_characters_correctly() {
     use office_oxide::edit::EditableDocument;
 
     // The stored XML holds `AT&amp;T`, so matching the raw bytes never
@@ -352,7 +458,7 @@ fn replace_text_matches_and_writes_escaped_characters_correctly() {
 }
 
 #[test]
-fn replace_text_does_not_rewrite_table_elements() {
+fn test_replace_text_does_not_rewrite_table_elements() {
     use office_oxide::edit::EditableDocument;
 
     // `<w:t` is a prefix of `<w:tbl>`, `<w:tc>`, `<w:tr>` and `<w:tab/>`.
@@ -375,11 +481,11 @@ fn replace_text_does_not_rewrite_table_elements() {
 }
 
 // ---------------------------------------------------------------------------
-// #176 — a malformed theme must not make the document unreadable
+// A malformed theme must not make the document unreadable
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_malformed_theme_part_does_not_fail_the_open() {
+fn test_a_malformed_theme_part_does_not_fail_the_open() {
     // A *missing* theme was always fine; a malformed one failed the whole
     // open, which is the inconsistency that gave the bug away.
     let mut w = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
@@ -408,11 +514,11 @@ fn a_malformed_theme_part_does_not_fail_the_open() {
 }
 
 // ---------------------------------------------------------------------------
-// #135 / #136 — heading level normalisation
+// Heading level normalisation
 // ---------------------------------------------------------------------------
 
 #[test]
-fn outline_level_nine_is_body_text_not_a_heading() {
+fn test_outline_level_nine_is_body_text_not_a_heading() {
     use office_oxide::ir::Element;
 
     // ECMA-376 §17.3.1.20: 9 means "no outline level applied", and is the
@@ -435,7 +541,7 @@ fn outline_level_nine_is_body_text_not_a_heading() {
 }
 
 #[test]
-fn every_renderer_agrees_on_an_out_of_range_heading_level() {
+fn test_every_renderer_agrees_on_an_out_of_range_heading_level() {
     use office_oxide::ir::*;
 
     // `Heading` derives Default and serde accepts an explicit 0, so level 0
@@ -454,17 +560,18 @@ fn every_renderer_agrees_on_an_out_of_range_heading_level() {
             })],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
     assert!(ir.to_markdown().starts_with("# Zero"), "markdown: {:?}", ir.to_markdown());
     assert!(ir.to_html().contains("<h1>Zero</h1>"), "html: {}", ir.to_html());
 }
 
 // ---------------------------------------------------------------------------
-// #137 — the section title must not be rendered twice
+// The section title must not be rendered twice
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_sections_first_heading_is_not_rendered_twice() {
+fn test_a_sections_first_heading_is_not_rendered_twice() {
     let doc = open_docx(docx_with(
         r#"<w:p><w:pPr><w:outlineLvl w:val="0"/></w:pPr>
              <w:r><w:t>Introduction</w:t></w:r></w:p>
@@ -481,11 +588,11 @@ fn a_sections_first_heading_is_not_rendered_twice() {
 }
 
 // ---------------------------------------------------------------------------
-// #162 — namespace-aware dispatch
+// namespace-aware dispatch
 // ---------------------------------------------------------------------------
 
 #[test]
-fn text_from_a_foreign_namespace_is_not_document_content() {
+fn test_text_from_a_foreign_namespace_is_not_document_content() {
     // Element dispatch matches on local name, so a `<evil:p>` inside the
     // body used to be parsed as a WordprocessingML paragraph and its text
     // extracted as content Word never renders.
@@ -514,7 +621,7 @@ fn text_from_a_foreign_namespace_is_not_document_content() {
 }
 
 #[test]
-fn a_rebound_prefix_means_the_package_is_not_what_it_claims() {
+fn test_a_rebound_prefix_means_the_package_is_not_what_it_claims() {
     // Binding `w` to something that is not WordprocessingML must not leave
     // the document parsing exactly as before.
     let mut w = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
@@ -538,7 +645,7 @@ fn a_rebound_prefix_means_the_package_is_not_what_it_claims() {
 }
 
 #[test]
-fn a_document_with_no_namespace_declaration_still_parses() {
+fn test_a_document_with_no_namespace_declaration_still_parses() {
     // Minimal, hand-written parts declare nothing; filtering them out would
     // reject far more than it protects.
     let mut w = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
@@ -557,11 +664,11 @@ fn a_document_with_no_namespace_declaration_still_parses() {
 }
 
 // ---------------------------------------------------------------------------
-// #153 — markdown emphasis
+// Markdown emphasis
 // ---------------------------------------------------------------------------
 
 #[test]
-fn adjacent_runs_with_the_same_formatting_are_merged() {
+fn test_adjacent_runs_with_the_same_formatting_are_merged() {
     use office_oxide::ir::*;
 
     // Word splits one visually-bold phrase into several runs routinely.
@@ -586,6 +693,7 @@ fn adjacent_runs_with_the_same_formatting_are_merged() {
             })],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
     let md = ir.to_markdown();
     assert_eq!(md, "**BOLD_ABOLD_B**", "got {md}");
@@ -593,7 +701,7 @@ fn adjacent_runs_with_the_same_formatting_are_merged() {
 }
 
 #[test]
-fn superscript_survives_the_markdown_renderer() {
+fn test_superscript_survives_the_markdown_renderer() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {
@@ -615,12 +723,13 @@ fn superscript_survives_the_markdown_renderer() {
             })],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
     assert_eq!(ir.to_markdown(), "E=mc<sup>2</sup>");
 }
 
 #[test]
-fn emphasis_delimiters_do_not_wrap_leading_or_trailing_spaces() {
+fn test_emphasis_delimiters_do_not_wrap_leading_or_trailing_spaces() {
     use office_oxide::ir::*;
 
     // CommonMark does not open emphasis on `** text**`.
@@ -640,16 +749,17 @@ fn emphasis_delimiters_do_not_wrap_leading_or_trailing_spaces() {
             })],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
     assert_eq!(ir.to_markdown(), " **padded** ");
 }
 
 // ---------------------------------------------------------------------------
-// #100 — base64 image embedding
+// base64 image embedding
 // ---------------------------------------------------------------------------
 
 #[test]
-fn images_can_be_embedded_as_base64_at_their_position_in_the_flow() {
+fn test_images_can_be_embedded_as_base64_at_their_position_in_the_flow() {
     use office_oxide::ir::*;
     use office_oxide::ir_render::{ImageEmbed, MarkdownOptions};
 
@@ -675,6 +785,7 @@ fn images_can_be_embedded_as_base64_at_their_position_in_the_flow() {
             ],
             ..Default::default()
         }],
+        defined_names: Vec::new(),
     };
 
     // Without the option, images stay out of the markdown entirely.
@@ -691,7 +802,7 @@ fn images_can_be_embedded_as_base64_at_their_position_in_the_flow() {
 }
 
 #[test]
-fn base64_padding_is_correct_for_every_input_length() {
+fn test_base64_padding_is_correct_for_every_input_length() {
     use office_oxide::ir::*;
     use office_oxide::ir_render::{ImageEmbed, MarkdownOptions};
 
@@ -712,6 +823,7 @@ fn base64_padding_is_correct_for_every_input_length() {
                 })],
                 ..Default::default()
             }],
+            defined_names: Vec::new(),
         };
         let md = ir.to_markdown_with(MarkdownOptions {
             image_embed: ImageEmbed::Base64,
@@ -721,11 +833,11 @@ fn base64_padding_is_correct_for_every_input_length() {
 }
 
 // ---------------------------------------------------------------------------
-// #119 — password-protected OOXML
+// password-protected OOXML
 // ---------------------------------------------------------------------------
 
 #[test]
-fn an_encrypted_ooxml_package_says_so_rather_than_failing_as_a_bad_zip() {
+fn test_an_encrypted_ooxml_package_says_so_rather_than_failing_as_a_bad_zip() {
     // Office wraps a password-protected package in a CFB container, so
     // opening one as a zip failed with an archive error that said nothing
     // about the real reason.
@@ -764,7 +876,7 @@ fn an_encrypted_ooxml_package_says_so_rather_than_failing_as_a_bad_zip() {
 /// backs `save_as`, `to_markdown`, the MCP extract tool and every binding.
 /// An abort is not catchable, so no caller could defend against it.
 #[test]
-fn a_huge_grid_span_does_not_become_a_huge_allocation() {
+fn test_a_huge_grid_span_does_not_become_a_huge_allocation() {
     let doc_xml = format!(
         concat!(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
@@ -840,7 +952,7 @@ fn build_minimal_docx(document_xml: &[u8]) -> Vec<u8> {
 /// nothing. No allocation, so nothing ever stopped it: `save_as` simply never
 /// returned.
 #[test]
-fn huge_table_spans_do_not_hang_the_writer() {
+fn test_huge_table_spans_do_not_hang_the_writer() {
     use office_oxide::ir::*;
 
     let cell = |span: u32| TableCell {
@@ -896,7 +1008,7 @@ fn huge_table_spans_do_not_hang_the_writer() {
 /// that any consumer deserialising such an IR would hit. Sizing the stack here
 /// keeps this test about the thing it is named for.
 #[test]
-fn deeply_nested_ir_does_not_overflow_the_writer_stack() {
+fn test_deeply_nested_ir_does_not_overflow_the_writer_stack() {
     let handle = std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(|| {
@@ -944,7 +1056,7 @@ fn deeply_nested_ir_does_not_overflow_the_writer_stack() {
 /// problem on `w:hanging="-2147483648"`. `w:hanging` is `ST_TwipsMeasure`
 /// (unsigned), so the magnitude is what the attribute wants anyway.
 #[test]
-fn an_extreme_hanging_indent_does_not_overflow() {
+fn test_an_extreme_hanging_indent_does_not_overflow() {
     use office_oxide::ir::*;
 
     let ir = DocumentIR {

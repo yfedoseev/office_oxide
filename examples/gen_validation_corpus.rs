@@ -11,7 +11,7 @@ use office_oxide::create::{create_from_ir, create_from_markdown};
 use office_oxide::docx::write::{DocxWriter, HfType, Run as DRun};
 use office_oxide::format::DocumentFormat;
 use office_oxide::ir::*;
-use office_oxide::pptx::write::PptxWriter;
+use office_oxide::pptx::write::{PptxWriter, Run as PRun};
 use office_oxide::xlsx::write::{CellData, CellStyle, XlsxWriter};
 
 const PNG: &[u8] = &[
@@ -184,6 +184,9 @@ fn maximal_properties_corpus(out: &str) {
             width_twips: 3000,
             height_twips: 400,
         }),
+        // Not exercised here: no writer currently emits `<p:ph type="...">`
+        // from this field (placeholder roles are read-only: PPTX/PPT -> IR).
+        placeholder_role: None,
     };
 
     let ir = DocumentIR {
@@ -192,7 +195,10 @@ fn maximal_properties_corpus(out: &str) {
             elements: vec![Element::Paragraph(para), Element::Table(table)],
             page_setup: Some(PageSetup::default()),
             background_rgb: Some([0x11, 0x22, 0x33]),
-            speaker_notes: Some("notes".into()),
+            speaker_notes: Some(vec![Element::Paragraph(Paragraph {
+                content: vec![span("notes")],
+                ..Default::default()
+            })]),
             ..Default::default()
         }],
         ..Default::default()
@@ -278,8 +284,8 @@ fn docx_builder_corpus(out: &str) {
         ..Default::default()
     });
     w.add_text_box(&TextBox::default());
-    w.add_footnote(1, &[Element::Paragraph(Default::default())]);
-    w.add_endnote(1, &[Element::Paragraph(Default::default())]);
+    w.add_footnote(1, &[Element::Paragraph(Default::default())], None);
+    w.add_endnote(1, &[Element::Paragraph(Default::default())], None);
     for t in [
         HfType::DefaultHeader,
         HfType::DefaultFooter,
@@ -303,7 +309,10 @@ fn pptx_builder_corpus(out: &str) {
         s.add_text_box("boxed", 100_000, 100_000, 2_000_000, 500_000);
         s.add_image(PNG.to_vec(), ImageFormat::Png, 0, 900_000, 500_000, 500_000);
         s.set_notes("presenter only");
-        s.add_table(vec![vec!["A".into(), "B".into()], vec!["1".into(), "2".into()]]);
+        s.add_table(vec![
+            vec![vec![PRun::new("A")], vec![PRun::new("B")]],
+            vec![vec![PRun::new("1")], vec![PRun::new("2")]],
+        ]);
     }
     p.add_slide();
     p.save(format!("{out}/builder.pptx")).unwrap();

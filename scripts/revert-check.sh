@@ -42,6 +42,18 @@ if [ -z "$CHANGED" ]; then
   exit 0
 fi
 
+# The gate measures whether the tests a branch *adds* reach the production
+# code it adds. A branch that adds no test — a refactor, a rename, a comment
+# sweep — has nothing for it to measure: reverting the production change
+# leaves a suite that passed before and passes after, which is the expected
+# outcome, not a finding. Say so instead of reporting a failure.
+ADDED_TESTS=$(git diff "$MERGE_BASE"..HEAD -- 'src/' 'tests/' 'crates/' \
+                | grep -cE '^\+[[:space:]]*#\[(tokio::)?test' || true)
+if [ "$ADDED_TESTS" -eq 0 ]; then
+  echo "revert-check: the branch adds no tests — nothing to check"
+  exit 0
+fi
+
 CHANGED_SRC=$(echo "$CHANGED" | cut -f2-)
 
 echo "revert-check: reverting production changes against $MERGE_BASE:"
