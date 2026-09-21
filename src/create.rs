@@ -1203,22 +1203,27 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
                     // positioned image inside a TextBox lost its position
                     // and stopped counting as a positioned shape at all).
                     Element::Image(img) => {
+                        let cx = img
+                            .display_width_emu
+                            .unwrap_or(tb.width_emu.unwrap_or(3_000_000));
+                        let cy = img
+                            .display_height_emu
+                            .unwrap_or(tb.height_emu.unwrap_or(2_000_000));
+                        let (x, y) = (tb.x_emu.unwrap_or(0), tb.y_emu.unwrap_or(0));
                         if let (Some(data), Some(fmt)) = (&img.data, &img.format) {
-                            let cx = img
-                                .display_width_emu
-                                .unwrap_or(tb.width_emu.unwrap_or(3_000_000));
-                            let cy = img
-                                .display_height_emu
-                                .unwrap_or(tb.height_emu.unwrap_or(2_000_000));
                             slide.add_image_with_alt(
                                 data.clone(),
                                 fmt.clone(),
-                                tb.x_emu.unwrap_or(0),
-                                tb.y_emu.unwrap_or(0),
+                                x,
+                                y,
                                 cx,
                                 cy,
                                 img.alt_text.clone(),
                             );
+                        } else if let Some(alt) = img.alt_text.as_deref() {
+                            // As at body level: a description without
+                            // bytes is kept as a description-only shape.
+                            slide.add_placeholder_shape(alt, x, y, cx, cy);
                         }
                     },
                     _ => emit_pptx_element(slide, inner),

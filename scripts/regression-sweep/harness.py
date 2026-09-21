@@ -237,6 +237,12 @@ def sh(cmd, **kw):
     subprocess.run(cmd, check=True, **kw)
 
 def cmd_run(a):
+    # Every path is used from more than one working directory (the round
+    # trip runs inside the corpus); a relative one broke there.
+    for name in ("prev_bin", "next_bin", "corpus", "work", "panel", "tika", "validator"):
+        v = getattr(a, name, None)
+        if v:
+            setattr(a, name, os.path.abspath(v))
     os.makedirs(a.work, exist_ok=True)
     jobs = str(a.jobs)
     for arm, binary in (("prev", a.prev_bin), ("next", a.next_bin)):
@@ -247,15 +253,28 @@ def cmd_run(a):
         sh([sys.executable, os.path.join(HERE, "sweep_tree.py"), binary, a.corpus, d, "--jobs", jobs])
     if a.validator:
         rt = os.path.join(a.work, "rt.jsonl")
-        if not (a.reuse and os.path.exists(rt)):
-            lst = os.path.join(a.work, "ooxml.list")
-            with open(lst, "w") as f:
-                for root, _, files in os.walk(a.corpus):
-                    for fn in files:
-                        if fn.rsplit(".", 1)[-1].lower() in ("docx", "xlsx", "pptx", "docm", "xlsm", "pptm"):
-                            f.write(os.path.relpath(os.path.join(root, fn), a.corpus) + "\n")
+        # An empty file is a run that did not happen (a crash before the
+        # first record), not a result to reuse.
+        if not (a.reuse and os.path.exists(rt) and os.path.getsize(rt) > 0):
+            paths = []
+            for root, _, files in os.walk(a.corpus):
+                for fn in files:
+                    if fn.rsplit(".", 1)[-1].lower() in ("docx", "xlsx", "pptx", "docm", "xlsm", "pptm"):
+                        paths.append(os.path.relpath(os.path.join(root, fn), a.corpus))
+            paths.sort()
+            # Batches of 100 with a timeout each: a crash or hang loses
+            # one batch's tail, not the run.
             with open(rt, "w") as out:
-                subprocess.run([a.validator, "--list", lst], cwd=a.corpus, stdout=out, stderr=subprocess.DEVNULL)
+                for i in range(0, len(paths), 100):
+                    lst = os.path.join(a.work, "rt_batch.list")
+                    with open(lst, "w") as f:
+                        f.write("\n".join(paths[i:i + 100]) + "\n")
+                    try:
+                        subprocess.run([a.validator, "--list", lst], cwd=a.corpus, stdout=out,
+                                       stderr=subprocess.DEVNULL, timeout=900)
+                    except subprocess.TimeoutExpired:
+                        print(f"round trip: batch at {i} timed out", flush=True)
+                    print(f"  rt {min(i + 100, len(paths))}/{len(paths)}", flush=True)
     render = os.path.join(a.work, "render", "render.jsonl")
     if not (a.reuse and os.path.exists(render)):
         os.makedirs(os.path.dirname(render), exist_ok=True)

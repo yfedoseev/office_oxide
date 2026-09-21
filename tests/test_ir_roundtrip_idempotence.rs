@@ -342,21 +342,36 @@ fn test_pptx_roundtrip_keeps_the_description_of_an_image_without_bytes() {
                     alt_text: Some("Small circle".into()),
                     ..Default::default()
                 }),
+                // The same picture inside a positioned box, how the
+                // reader wraps a picture with an anchor.
+                Element::TextBox(TextBox {
+                    content: vec![Element::Image(Image {
+                        alt_text: Some("Project logo".into()),
+                        ..Default::default()
+                    })],
+                    x_emu: Some(914_400),
+                    y_emu: Some(914_400),
+                    ..Default::default()
+                }),
             ],
             ..Default::default()
         }],
         ..Default::default()
     };
     let (back, _) = write_parse(&ir, DocumentFormat::Pptx);
-    let alts: Vec<String> = back.sections[0]
-        .elements
-        .iter()
-        .filter_map(|e| match e {
-            Element::Image(img) => img.alt_text.clone(),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(alts, vec!["Small circle".to_string()], "{back:#?}");
+    fn alts(elements: &[Element], out: &mut Vec<String>) {
+        for e in elements {
+            match e {
+                Element::Image(img) => out.extend(img.alt_text.clone()),
+                Element::TextBox(tb) => alts(&tb.content, out),
+                _ => {},
+            }
+        }
+    }
+    let mut found = Vec::new();
+    alts(&back.sections[0].elements, &mut found);
+    found.sort();
+    assert_eq!(found, vec!["Project logo".to_string(), "Small circle".to_string()], "{back:#?}");
     let (again, _) = write_parse(&back, DocumentFormat::Pptx);
     assert_eq!(back, again, "second cycle drifted");
 }
