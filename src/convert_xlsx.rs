@@ -373,7 +373,19 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                     for (col, cell) in tcells.iter_mut().enumerate() {
                         if let Some(&(row_span, col_span)) = merge_span.get(&(true_row, col as u32))
                         {
-                            cell.row_span = row_span;
+                            // The IR table holds only the rows the sheet
+                            // stores; a merge over sheet rows 1-5 in a
+                            // sheet whose next stored row is 6 spans one
+                            // IR row, not five — five hid the four rows
+                            // that followed. Count the stored rows the
+                            // merge covers.
+                            let last = true_row + row_span - 1;
+                            let covered = row_numbers[row_idx..]
+                                .iter()
+                                .take_while(|&&r| r <= last)
+                                .count()
+                                .max(1) as u32;
+                            cell.row_span = covered;
                             cell.col_span = col_span;
                         }
                     }

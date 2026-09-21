@@ -221,6 +221,32 @@ fn test_a_row_that_skips_a_column_keeps_every_value_under_its_own_header() {
     assert_eq!(cell_text(&t.rows[2].cells[2]), "4");
 }
 
+/// A merge over sheet rows a sheet does not store (`A1:E5` in a sheet
+/// whose next stored row is 6, the shape this crate's own writer saves)
+/// spans the stored rows it covers, not five IR rows: `row_span = 5` hid
+/// the four rows that followed from every IR renderer.
+#[test]
+fn test_a_merge_over_unstored_rows_does_not_hide_the_rows_that_follow() {
+    let cell = |r: &str, t: &str| format!(r#"<c r="{r}" t="inlineStr"><is><t>{t}</t></is></c>"#);
+    let body = format!(
+        "<row r=\"1\">{}{}</row><row r=\"6\">{}{}</row><row r=\"7\">{}{}</row>",
+        cell("A1", "Title"),
+        cell("B1", "Side"),
+        cell("A6", "first data"),
+        cell("B6", "x"),
+        cell("A7", "second data"),
+        cell("B7", "y"),
+    );
+    let mut sheet = Sheet::new("S", &body);
+    sheet.extra = r#"<mergeCells count="1"><mergeCell ref="A1:A5"/></mergeCells>"#;
+    let ir = Xlsx::new(vec![sheet]).ir();
+    let t = only_table(&ir, 0);
+    assert_eq!(t.rows[0].cells[0].row_span, 1, "{:?}", t.rows[0]);
+    for (name, text) in [("plain", ir.plain_text()), ("html", ir.to_html())] {
+        assert!(text.contains("first data") && text.contains("second data"), "{name}: {text}");
+    }
+}
+
 /// A formula whose cached result is the empty string (`t="str"` with an
 /// empty `<v>`, the shape a lookup-heavy workbook saves) shows nothing,
 /// as in Excel and `plain_text()`; the IR path rendered `=formula` for

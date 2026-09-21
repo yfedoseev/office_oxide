@@ -321,3 +321,42 @@ fn test_docx_roundtrip_keeps_headers_on_their_own_sections() {
     let (again, _) = write_parse(&back, DocumentFormat::Docx);
     assert_eq!(back, again, "second cycle drifted");
 }
+
+/// A picture the IR carries without bytes (a linked picture, a vector
+/// shape read for its description) keeps its description on a PPTX
+/// round trip: it is written as a text-less shape with `descr`, which
+/// reads back as the same alt-only image. It used to be dropped.
+#[test]
+fn test_pptx_roundtrip_keeps_the_description_of_an_image_without_bytes() {
+    use office_oxide::ir::*;
+    let ir = DocumentIR {
+        sections: vec![Section {
+            title: Some("Slide".into()),
+            elements: vec![
+                Element::Heading(Heading {
+                    level: 1,
+                    content: vec![InlineContent::Text(TextSpan::plain("Slide"))],
+                    ..Default::default()
+                }),
+                Element::Image(Image {
+                    alt_text: Some("Small circle".into()),
+                    ..Default::default()
+                }),
+            ],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let (back, _) = write_parse(&ir, DocumentFormat::Pptx);
+    let alts: Vec<String> = back.sections[0]
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            Element::Image(img) => img.alt_text.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(alts, vec!["Small circle".to_string()], "{back:#?}");
+    let (again, _) = write_parse(&back, DocumentFormat::Pptx);
+    assert_eq!(back, again, "second cycle drifted");
+}

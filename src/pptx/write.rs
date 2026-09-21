@@ -226,6 +226,13 @@ pub(crate) enum BodyItem {
     TextBox(Vec<(Vec<Run>, ParaProps)>, i64, i64, i64, i64),
     /// Embedded image: (data, format, x_emu, y_emu, cx_emu, cy_emu)
     Image(Vec<u8>, crate::ir::ImageFormat, i64, i64, u64, u64, Option<String>),
+    /// A shape that is nothing but its description — an image the IR
+    /// carries without bytes (a linked picture, a vector shape read for
+    /// its alt text): (alt text, x_emu, y_emu, cx_emu, cy_emu). Written
+    /// as a text-less AutoShape with `descr`, which reads back as the
+    /// same alt-only image; dropping it lost every such description on a
+    /// round trip.
+    Placeholder(String, i64, i64, u64, u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +444,24 @@ impl SlideData {
         self
     }
 
+    /// Add a shape carrying only a description (`descr`), for an image
+    /// with alt text but no bytes.
+    pub fn add_placeholder_shape(
+        &mut self,
+        alt: impl Into<String>,
+        x: i64,
+        y: i64,
+        cx: u64,
+        cy: u64,
+    ) -> &mut Self {
+        let alt = alt.into();
+        if !alt.trim().is_empty() {
+            self.body_items
+                .push(BodyItem::Placeholder(alt, x, y, cx, cy));
+        }
+        self
+    }
+
     /// Attach an image to this slide at an absolute position, in EMU.
     pub fn add_image(
         &mut self,
@@ -453,9 +478,9 @@ impl SlideData {
     }
 
     fn has_placeholder_body(&self) -> bool {
-        self.body_items
-            .iter()
-            .any(|i| !matches!(i, BodyItem::TextBox(..) | BodyItem::Image(..)))
+        self.body_items.iter().any(|i| {
+            !matches!(i, BodyItem::TextBox(..) | BodyItem::Image(..) | BodyItem::Placeholder(..))
+        })
     }
 }
 
@@ -1139,7 +1164,10 @@ fn generate_notes_slide_xml(
             },
             // Notes are a single placeholder body — tables/text boxes/
             // images have nowhere positional to go inside it.
-            BodyItem::Table(..) | BodyItem::TextBox(..) | BodyItem::Image(..) => {},
+            BodyItem::Table(..)
+            | BodyItem::TextBox(..)
+            | BodyItem::Image(..)
+            | BodyItem::Placeholder(..) => {},
         }
     }
     if !wrote_paragraph {
@@ -1501,6 +1529,14 @@ fn generate_slide_xml(
         next_id += 1;
     }
 
+    // Description-only shapes
+    for item in &slide.body_items {
+        if let BodyItem::Placeholder(alt, x, y, cx, cy) = item {
+            write_placeholder_shape(&mut w, next_id, alt, *x, *y, *cx, *cy);
+            next_id += 1;
+        }
+    }
+
     w.write_event(Event::End(BytesEnd::new("p:spTree")))
         .expect("write");
     w.write_event(Event::End(BytesEnd::new("p:cSld")))
@@ -1686,7 +1722,10 @@ fn write_body_shape(
                 }
             },
             // Tables, text boxes and images are separate shapes, not body text.
-            BodyItem::Table(..) | BodyItem::TextBox(..) | BodyItem::Image(..) => {},
+            BodyItem::Table(..)
+            | BodyItem::TextBox(..)
+            | BodyItem::Image(..)
+            | BodyItem::Placeholder(..) => {},
         }
     }
     // CT_TextBody requires at least one a:p. A placeholder whose only items
@@ -1810,6 +1849,58 @@ fn write_table_frame(
     w.write_event(Event::End(BytesEnd::new("a:graphic")))
         .expect("write");
     w.write_event(Event::End(BytesEnd::new("p:graphicFrame")))
+        .expect("write");
+}
+
+/// A text-less AutoShape whose `descr` is `alt` — the form in which an
+/// image without bytes keeps its description.
+fn write_placeholder_shape(
+    w: &mut Writer<Vec<u8>>,
+    id: u32,
+    alt: &str,
+    x: i64,
+    y: i64,
+    cx: u64,
+    cy: u64,
+) {
+    let id_str = id.to_string();
+    let name = format!("Shape {id}");
+    w.write_event(Event::Start(BytesStart::new("p:sp")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:nvSpPr")))
+        .expect("write");
+    let mut cnv_pr = BytesStart::new("p:cNvPr");
+    cnv_pr.push_attribute(("id", id_str.as_str()));
+    cnv_pr.push_attribute(("name", name.as_str()));
+    cnv_pr.push_attribute(("descr", alt));
+    w.write_event(Event::Empty(cnv_pr)).expect("write");
+    write_empty(w, "p:cNvSpPr");
+    write_empty(w, "p:nvPr");
+    w.write_event(Event::End(BytesEnd::new("p:nvSpPr")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("p:spPr")))
+        .expect("write");
+    w.write_event(Event::Start(BytesStart::new("a:xfrm")))
+        .expect("write");
+    let mut off = BytesStart::new("a:off");
+    off.push_attribute(("x", x.to_string().as_str()));
+    off.push_attribute(("y", y.to_string().as_str()));
+    w.write_event(Event::Empty(off)).expect("write");
+    let mut ext = BytesStart::new("a:ext");
+    ext.push_attribute(("cx", clamp_extent(cx as i64).to_string().as_str()));
+    ext.push_attribute(("cy", clamp_extent(cy as i64).to_string().as_str()));
+    w.write_event(Event::Empty(ext)).expect("write");
+    w.write_event(Event::End(BytesEnd::new("a:xfrm")))
+        .expect("write");
+    let mut geom = BytesStart::new("a:prstGeom");
+    geom.push_attribute(("prst", "rect"));
+    w.write_event(Event::Start(geom)).expect("write");
+    write_empty(w, "a:avLst");
+    w.write_event(Event::End(BytesEnd::new("a:prstGeom")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:spPr")))
+        .expect("write");
+    w.write_event(Event::End(BytesEnd::new("p:sp")))
         .expect("write");
 }
 

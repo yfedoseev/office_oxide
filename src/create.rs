@@ -1143,9 +1143,9 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
             slide.add_table(rows);
         },
         Element::Image(img) => {
+            let cx = img.display_width_emu.unwrap_or(3_000_000);
+            let cy = img.display_height_emu.unwrap_or(2_000_000);
             if let (Some(data), Some(fmt)) = (&img.data, &img.format) {
-                let cx = img.display_width_emu.unwrap_or(3_000_000);
-                let cy = img.display_height_emu.unwrap_or(2_000_000);
                 slide.add_image_with_alt(
                     data.clone(),
                     fmt.clone(),
@@ -1155,6 +1155,8 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
                     cy,
                     img.alt_text.clone(),
                 );
+            } else if let Some(alt) = img.alt_text.as_deref() {
+                slide.add_placeholder_shape(alt, 0, 0, cx, cy);
             }
         },
         Element::CodeBlock(cb) => {
