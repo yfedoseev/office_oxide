@@ -338,7 +338,13 @@ impl TableBuilder {
         if !self.in_table {
             return;
         }
-        // A row left without an explicit terminator — keep it, without a TAP.
+        // A cell or row left without its terminator (the text ends inside
+        // the table) — keep it, without a TAP. The open cell's paragraphs
+        // were dropped here with the cell, so a document whose last
+        // paragraph sat in a table lost it from the structured view.
+        if !self.cell.is_empty() {
+            self.row_cells.push(std::mem::take(&mut self.cell));
+        }
         if !self.row_cells.is_empty() {
             let cells = std::mem::take(&mut self.row_cells);
             self.rows.push(PendingRow {
@@ -1560,6 +1566,40 @@ mod tests {
             els.iter().any(|e| matches!(e, Element::Table(_))),
             "f_in_table cell paragraph must be emitted inside a table"
         );
+    }
+
+    /// A document that ends inside a table cell — the last paragraph is
+    /// `fInTable` with a `\r` terminator and no cell or row mark follows
+    /// it. The open cell used to be dropped at the end-of-document flush.
+    #[test]
+    fn test_a_document_ending_inside_a_table_cell_keeps_that_cell() {
+        let in_table = |text: &str, terminator: char| DocParagraph {
+            text: text.into(),
+            terminator,
+            props: PapProps {
+                f_in_table: true,
+                itap: 1,
+                ..PapProps::default()
+            },
+            hyperlinks: Vec::new(),
+            chp_runs: Vec::new(),
+        };
+        let paragraphs = [
+            in_table("first cell", '\u{7}'),
+            in_table("last paragraph", '\r'),
+        ];
+        let mut els = Vec::new();
+        walk_paragraphs(&paragraphs, false, &mut els, &ListFormatting::default());
+        let ir = DocumentIR {
+            sections: vec![Section {
+                elements: els,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let text = ir.plain_text();
+        assert!(text.contains("first cell"), "{text}");
+        assert!(text.contains("last paragraph"), "{text}");
     }
 
     /// Build a single-column `PendingRow` whose cell carries the given `rgf`

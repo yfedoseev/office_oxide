@@ -299,10 +299,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 // than one cell, and taking only the first cell of such a
                 // row dropped the rest.
                 let mut content: Vec<InlineContent> = Vec::new();
-                for cd in cells
-                    .iter()
-                    .filter(|cd| !cd.text.is_empty() || cd.formula.is_some())
-                {
+                for cd in cells.iter().filter(|cd| !cd.text.is_empty()) {
                     if !content.is_empty() {
                         content.push(InlineContent::Text(TextSpan::plain("\t")));
                     }
@@ -326,7 +323,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 // stays under the `B` header even when `A2` is absent.
                 let mut tcells: Vec<TableCell> = Vec::with_capacity(grid_width);
                 for cd in cells {
-                    let content = if cd.text.is_empty() && cd.formula.is_none() {
+                    let content = if cd.text.is_empty() {
                         Vec::new()
                     } else {
                         // Cell font formatting reached the IR in prose mode
@@ -539,6 +536,21 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         });
     }
 
+    // A sheet that could not be read is a section holding the notice, so
+    // the loss is visible in every projection of the IR.
+    for (name, err) in &doc.unreadable_sheets {
+        sections.push(Section {
+            title: Some(name.clone()),
+            elements: vec![Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(
+                    crate::xlsx::text::unreadable_notice(name, err),
+                ))],
+                ..Default::default()
+            })],
+            ..Default::default()
+        });
+    }
+
     // The first sheet's *name* is not the workbook's title. Read the real
     // one from `docProps/core.xml` and fall back to the sheet name only
     // when the package carries no core properties.
@@ -562,7 +574,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
-            text_truncated: false,
+            text_truncated: !doc.unreadable_sheets.is_empty(),
         },
         sections,
         defined_names: doc
@@ -602,7 +614,7 @@ fn empty_cell() -> TableCell {
 /// weight from the workbook stylesheet, and the sheet's hyperlink target if
 /// the cell has one.
 fn cell_span(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> TextSpan {
-    let mut span = TextSpan::plain(display_text(cd).into_owned());
+    let mut span = TextSpan::plain(display_text(cd).to_string());
     span.hyperlink = cd.hyperlink.clone();
     let Some(font) = cd.style_index.and_then(|idx| font_for(doc, idx)) else {
         return span;
@@ -689,14 +701,13 @@ struct CellData {
 /// output shape from closedxml and similar writers that never cache
 /// values) used to render as a blank cell indistinguishable from a
 /// genuinely empty one.
-fn display_text(cd: &CellData) -> std::borrow::Cow<'_, str> {
-    if !cd.text.is_empty() {
-        std::borrow::Cow::Borrowed(&cd.text)
-    } else if let Some(f) = &cd.formula {
-        std::borrow::Cow::Owned(format!("={f}"))
-    } else {
-        std::borrow::Cow::Borrowed("")
-    }
+/// What the cell shows: the same text `plain_text()` renders (a formula
+/// with no cached value is already `=formula` there). A formula whose
+/// cached value is the empty string shows nothing, as in Excel, Tika and
+/// calamine; rendering `=formula` for it here made `to_html()` of a
+/// lookup-heavy workbook 10,000 words longer than its own `plain_text()`.
+fn display_text(cd: &CellData) -> &str {
+    &cd.text
 }
 
 /// Derive a cell's semantic type, raw numeric value, and number-format

@@ -131,7 +131,10 @@ def surface_text(raw, surface):
     elif surface == "markdown":
         s = MD_NOISE.sub(" ", raw)
     else:
-        s = raw
+        # A bracketed line is a placeholder for a picture or object
+        # (`[Company logo]`), the text surface's form of markdown's
+        # `![alt]()` and html's `<figcaption>`.
+        s = re.sub(r"^\[[^\]\n]*\]\s*$", " ", raw, flags=re.M)
     return URL.sub(" ", s)
 
 def docx_hidden_words(corpus, rel):
@@ -369,8 +372,11 @@ def analyse_one(rel):
                 if exp is not None and (recall(nw, exp) or 0) >= max(0.95, (recall(pw, exp) or 0)):
                     add("PEER_SPLIT", 5, f"{n_gone} words prev had and next lost, but next matches the consensus {sorted(members)} ({recall(nw, exp):.2f}) at least as well as prev did ({recall(pw, exp):.2f})" + (f"; {why}" if why else ""),
                         [w for w, _ in lost_c.most_common(12)])
-                elif "next" in sides.values() and "prev" in sides.values():
-                    add("PEER_SPLIT", 5, f"{n_gone} words differ; next sides with {[k for k, v in sides.items() if v == 'next']}, prev with {[k for k, v in sides.items() if v == 'prev']}" + (f"; {why}" if why else ""),
+                elif "next" in sides.values():
+                    # The new arm reproduces a reference's output; what it
+                    # lost relative to the old arm, that reference does not
+                    # show either (field instructions, tracked deletions).
+                    add("PEER_SPLIT", 5, f"{n_gone} words differ; next matches {[k for k, v in sides.items() if v == 'next']} (>= 0.97 both ways)" + (f", prev matches {[k for k, v in sides.items() if v == 'prev']}" if "prev" in sides.values() else "") + (f"; {why}" if why else ""),
                         [w for w, _ in lost_c.most_common(12)])
                 elif why:
                     add("PEER_SPLIT", 5, f"{n_gone} words prev had and next lost: {why}", [w for w, _ in lost_c.most_common(12)])

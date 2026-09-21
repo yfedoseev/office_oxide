@@ -335,10 +335,18 @@ fn section_title_is_redundant(section: &Section) -> bool {
     // often precedes it. Checking only `elements.first()` printed the title
     // twice for exactly those documents (and made the rendered text change
     // across a write/reread that drops the leading blank paragraph).
-    section.elements.iter().any(|e| match e {
-        Element::Heading(h) => render_inline_plain(&h.content).trim() == title.trim(),
-        _ => false,
-    })
+    // A declared title (the file's own metadata) that is also the
+    // section's opening line is the same text; the `.doc` line-shape
+    // heuristic may keep that line a paragraph rather than a heading.
+    let first_para = section.elements.iter().find_map(|e| match e {
+        Element::Paragraph(p) if !p.content.is_empty() => Some(render_inline_plain(&p.content)),
+        _ => None,
+    });
+    first_para.is_some_and(|t| t.trim().trim_end_matches('.') == title.trim().trim_end_matches('.'))
+        || section.elements.iter().any(|e| match e {
+            Element::Heading(h) => render_inline_plain(&h.content).trim() == title.trim(),
+            _ => false,
+        })
 }
 
 /// The marker of a note that records who wrote it — a spreadsheet or
@@ -346,8 +354,8 @@ fn section_title_is_redundant(section: &Section) -> bool {
 /// front of the comment; the IR surfaces printed the body alone, so the
 /// cell and the author were lost on `to_ir()`/`to_html()`.
 fn authored_marker(n: &Note) -> Option<String> {
-    n.author.as_ref()?;
-    n.marker.clone().filter(|m| !m.is_empty())
+    let marker = n.marker.as_deref().filter(|m| !m.is_empty())?;
+    (n.author.is_some() || marker.starts_with("Comment")).then(|| marker.to_string())
 }
 
 fn section_headers(section: &Section) -> impl Iterator<Item = &HeaderFooter> {

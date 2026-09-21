@@ -69,6 +69,9 @@ impl XlsxDocument {
                 parts.push(text.trim().to_string());
             }
         }
+        for (name, err) in &self.unreadable_sheets {
+            parts.push(unreadable_notice(name, err));
+        }
         parts.join("\n\n")
     }
 
@@ -181,6 +184,9 @@ impl XlsxDocument {
             if !text.trim().is_empty() {
                 parts.push(format!("## Chart {}\n\n{}", i + 1, text));
             }
+        }
+        for (name, err) in &self.unreadable_sheets {
+            parts.push(format!("## {name}\n\n{}", unreadable_notice(name, err)));
         }
         parts.join("\n\n")
     }
@@ -473,6 +479,12 @@ fn csv_escape(field: &str) -> String {
     }
 }
 
+/// The line every renderer emits for a sheet that could not be read, so
+/// a workbook missing a sheet never passes for a complete one.
+pub(crate) fn unreadable_notice(name: &str, err: &str) -> String {
+    format!("[unreadable sheet {name:?}: {err}]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +562,7 @@ mod tests {
             core_properties: None,
             app_properties: None,
             has_macros: false,
+            unreadable_sheets: Vec::new(),
             styles_data: None,
             theme_data: None,
         };
@@ -604,6 +617,7 @@ mod tests {
             core_properties: None,
             app_properties: None,
             has_macros: false,
+            unreadable_sheets: Vec::new(),
             styles_data: None,
             theme_data: None,
         };
@@ -661,6 +675,7 @@ mod tests {
             core_properties: None,
             app_properties: None,
             has_macros: false,
+            unreadable_sheets: Vec::new(),
             styles_data: None,
             theme_data: None,
         };
@@ -692,6 +707,7 @@ mod tests {
             core_properties: None,
             app_properties: None,
             has_macros: false,
+            unreadable_sheets: Vec::new(),
             styles_data: None,
             theme_data: None,
         };

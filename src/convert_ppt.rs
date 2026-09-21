@@ -273,53 +273,47 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
 
             match run.text_type {
                 TextType::Title | TextType::CenterTitle => {
-                    // A heading is rendered as one block; use the first
-                    // non-empty paragraph's real formatting when direct
-                    // formatting was read, falling back to the old
-                    // synthetic "always bold" only when no
-                    // `StyleTextPropAtom` was present at all (e.g. the
-                    // many hand-built test fixtures that never set
-                    // `char_formats`).
-                    let mut content = Vec::new();
+                    // The first non-empty paragraph is the heading. A title
+                    // placeholder that holds the whole slide's text — one
+                    // paragraph per line, which real decks do — used to be
+                    // joined into a single heading with its paragraphs
+                    // fused at the seams (`ИнструментиАнализи`); the rest
+                    // are body paragraphs. A heading is not also bold: the
+                    // synthetic bold forced on every span rendered
+                    // `# **Title**`.
+                    let mut heading_done = false;
                     for &(start, end) in &paragraphs {
-                        content.extend(spans_for_range(
+                        let content = spans_for_range(
                             &text_chars,
                             start,
                             end,
                             &run.char_formats,
                             run.hyperlink.as_deref(),
-                        ));
-                    }
-                    if content.is_empty() {
-                        continue;
-                    }
-                    if run.char_formats.is_empty() {
-                        for c in &mut content {
-                            if let InlineContent::Text(t) = c {
-                                t.bold = true;
-                            }
+                        );
+                        if content.is_empty() {
+                            continue;
                         }
+                        let alignment = alignment_at(&run.para_formats, start);
+                        if heading_done {
+                            elements.push(Element::Paragraph(Paragraph {
+                                content,
+                                alignment,
+                                placeholder_role: run.placeholder_role.clone(),
+                                ..Default::default()
+                            }));
+                            continue;
+                        }
+                        heading_done = true;
+                        if slide_title.is_none() {
+                            slide_title = Some(inline_to_text(&content));
+                        }
+                        elements.push(Element::Heading(Heading {
+                            level: 1,
+                            content,
+                            alignment,
+                            ..Default::default()
+                        }));
                     }
-                    if slide_title.is_none() {
-                        let joined: String = content
-                            .iter()
-                            .filter_map(|c| match c {
-                                InlineContent::Text(t) => Some(t.text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("");
-                        slide_title = Some(joined);
-                    }
-                    elements.push(Element::Heading(Heading {
-                        level: 1,
-                        content,
-                        alignment: alignment_at(
-                            &run.para_formats,
-                            paragraphs.first().map_or(0, |p| p.0),
-                        ),
-                        ..Default::default()
-                    }));
                 },
                 TextType::Body | TextType::HalfBody | TextType::QuarterBody => {
                     for &(start, end) in &paragraphs {
@@ -343,27 +337,27 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                 TextType::Notes => {
                     notes_lines.push(run.text.trim());
                 },
+                // Every other text type (`Other`, subtitles, footers …):
+                // one paragraph per paragraph, as for a body — joining
+                // them into one block fused the last word of each with the
+                // first of the next (`LOASPChap`).
                 _ => {
-                    let mut content = Vec::new();
                     for &(start, end) in &paragraphs {
-                        content.extend(spans_for_range(
+                        let content = spans_for_range(
                             &text_chars,
                             start,
                             end,
                             &run.char_formats,
                             run.hyperlink.as_deref(),
-                        ));
-                    }
-                    if !content.is_empty() {
-                        elements.push(Element::Paragraph(Paragraph {
-                            content,
-                            alignment: alignment_at(
-                                &run.para_formats,
-                                paragraphs.first().map_or(0, |p| p.0),
-                            ),
-                            placeholder_role: run.placeholder_role.clone(),
-                            ..Default::default()
-                        }));
+                        );
+                        if !content.is_empty() {
+                            elements.push(Element::Paragraph(Paragraph {
+                                content,
+                                alignment: alignment_at(&run.para_formats, start),
+                                placeholder_role: run.placeholder_role.clone(),
+                                ..Default::default()
+                            }));
+                        }
                     }
                 },
             }

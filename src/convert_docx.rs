@@ -187,10 +187,16 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             let mut content = Vec::new();
             convert_block_elements(&n.content, &mut content, doc);
             if !content.is_empty() {
+                // The same label the spreadsheet and slide converters use,
+                // so every surface says "Comment (Author): …".
+                let marker = match n.author.as_deref() {
+                    Some(a) => format!("Comment ({a})"),
+                    None => "Comment".to_string(),
+                };
                 last.elements.push(Element::Endnote(Note {
                     id: n.id,
                     content,
-                    marker: n.author.clone(),
+                    marker: Some(marker),
                     author: n.author.clone(),
                 }));
             }

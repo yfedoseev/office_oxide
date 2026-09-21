@@ -99,6 +99,12 @@ pub struct XlsxDocument {
     /// `vbaProject` entry — a cheap macro-presence signal, no VBA
     /// interpretation.
     pub has_macros: bool,
+    /// Sheets whose part could not be parsed — `(sheet name, error)`. A
+    /// damaged archive (a bad CRC turning one part to garbage) used to
+    /// fail the whole workbook where Tika/POI return the sheets that are
+    /// intact; those are returned now, and the loss is on record here,
+    /// in every renderer's output and in `Metadata::text_truncated`.
+    pub unreadable_sheets: Vec<(String, String)>,
     // Raw bytes for lazy parsing (None after parsing or if not present)
     styles_data: Option<Vec<u8>>,
     theme_data: Option<Vec<u8>>,
@@ -324,15 +330,41 @@ impl XlsxDocument {
             });
         }
 
-        // Phase 2: parse worksheets (parallel when feature enabled)
-        let mut worksheets =
-            crate::core::parallel::map_collect(bundles, |b| -> Result<Worksheet> {
-                let mut ws = Worksheet::parse(&b.data, b.name, &b.rels)?;
-                ws.images = b.images;
-                ws.text_shapes = b.text_shapes;
-                ws.comments = b.comments;
-                Ok(ws)
-            })?;
+        // Phase 2: parse worksheets (parallel when feature enabled). A
+        // sheet whose part does not parse is recorded, not fatal.
+        let parsed = crate::core::parallel::map_collect(
+            bundles,
+            |b| -> Result<std::result::Result<Worksheet, (String, String)>> {
+                let name = b.name.clone();
+                match Worksheet::parse(&b.data, b.name, &b.rels) {
+                    Ok(mut ws) => {
+                        ws.images = b.images;
+                        ws.text_shapes = b.text_shapes;
+                        ws.comments = b.comments;
+                        Ok(Ok(ws))
+                    },
+                    Err(e) => {
+                        log::warn!("xlsx: sheet {name:?} is unreadable and skipped: {e}");
+                        Ok(Err((name, e.to_string())))
+                    },
+                }
+            },
+        )?;
+        let mut worksheets = Vec::with_capacity(parsed.len());
+        let mut unreadable_sheets = Vec::new();
+        for p in parsed {
+            match p {
+                Ok(ws) => worksheets.push(ws),
+                Err(u) => unreadable_sheets.push(u),
+            }
+        }
+        if !unreadable_sheets.is_empty() && worksheets.is_empty() {
+            let (name, err) = &unreadable_sheets[0];
+            return Err(crate::core::Error::MalformedXml(format!(
+                "no readable sheet: {name:?}: {err}"
+            ))
+            .into());
+        }
 
         // Resolve any in-cell rich-value images: a `vm`-
         // tagged `t="e"` cell whose `vm` maps through the workbook's
@@ -416,6 +448,7 @@ impl XlsxDocument {
             core_properties,
             app_properties,
             has_macros,
+            unreadable_sheets,
             styles_data: None,
             theme_data,
         })

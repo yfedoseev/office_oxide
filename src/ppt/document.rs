@@ -628,6 +628,58 @@ mod tests {
         assert!(!md.contains('\r'));
     }
 
+    /// A title placeholder holding several paragraphs: the first is the
+    /// heading, the rest are body paragraphs, and none are fused.
+    #[test]
+    fn test_ir_title_run_with_several_paragraphs_is_a_heading_and_paragraphs() {
+        use crate::ir::Element;
+        let doc = PptDocument {
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
+            has_macros: false,
+            summary_properties: None,
+            slides: vec![make_slide(vec![(
+                TextType::CenterTitle,
+                "Methods & Tools\rAnalyses – national studies\rEvaluation – criteria",
+            )])],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        let kinds: Vec<&str> = ir.sections[0]
+            .elements
+            .iter()
+            .map(|e| match e {
+                Element::Heading(_) => "heading",
+                Element::Paragraph(_) => "paragraph",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["heading", "paragraph", "paragraph"]);
+        assert_eq!(ir.sections[0].title.as_deref(), Some("Methods & Tools"));
+        let md = ir.to_markdown();
+        assert!(md.contains("# Methods & Tools"), "{md}");
+        assert!(!md.contains("**"), "a heading is not also bold: {md}");
+        assert!(!ir.plain_text().contains("ToolsAnalyses"));
+    }
+
+    /// A free text box (`TextType::Other`) with several paragraphs is
+    /// several paragraphs, not one block with its lines fused.
+    #[test]
+    fn test_ir_other_text_paragraphs_are_not_fused() {
+        let doc = PptDocument {
+            pictures_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
+            has_macros: false,
+            summary_properties: None,
+            slides: vec![make_slide(vec![(
+                TextType::Other,
+                "LOASP\rChap. 14: information",
+            )])],
+        };
+        let ir = crate::convert_ppt::ppt_to_ir(&doc);
+        assert_eq!(ir.sections[0].elements.len(), 2, "{:?}", ir.sections[0].elements);
+        assert!(!ir.to_html().contains("LOASPChap"));
+    }
+
     #[test]
     fn test_ir_title_becomes_heading_and_section_title() {
         use crate::ir::Element;

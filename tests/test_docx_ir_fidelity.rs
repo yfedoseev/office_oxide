@@ -104,6 +104,18 @@ impl Docx {
         self
     }
 
+    /// Add a header part with the given raw bytes — for a part that is
+    /// not well-formed XML.
+    fn header_raw(mut self, placeholder: &str, xml: &[u8]) -> Self {
+        let part = PartName::new("/word/header1.xml").unwrap();
+        self.w.add_part(&part, CT_HF, xml).unwrap();
+        let rid = self
+            .w
+            .add_part_rel(&self.doc_part, rel_types::HEADER, "header1.xml");
+        self.body = self.body.replace(placeholder, &rid);
+        self
+    }
+
     /// Add a header part carrying a picture: the image part and its
     /// relationship live on the *header*, under an id assigned by the
     /// header's own rels file.
@@ -1155,7 +1167,10 @@ fn test_comment_bodies_reach_the_ir_with_their_author() {
             _ => None,
         })
         .expect("comment reached the IR");
-    assert_eq!(note.marker.as_deref(), Some("Reviewer"));
+    assert_eq!(note.author.as_deref(), Some("Reviewer"));
+    // The label every surface and format uses for a comment.
+    assert_eq!(note.marker.as_deref(), Some("Comment (Reviewer)"));
+    assert!(ir.plain_text().contains("Comment (Reviewer): "), "{}", ir.plain_text());
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,6 +1241,21 @@ fn test_a_picture_in_a_header_is_read_through_the_header_parts_rels() {
         Some(PNG),
         "the bytes must come from the header's own image relationship"
     );
+}
+
+/// A header part that is not well-formed (a damaged archive with an
+/// intact body) is skipped with a warning; the document is still read,
+/// as Tika/POI read it. It used to fail the whole file.
+#[test]
+fn test_an_unreadable_header_part_does_not_fail_the_document() {
+    let ir = Docx::new(
+        r#"<w:p><w:r><w:t>BODY TEXT</w:t></w:r></w:p>
+           <w:sectPr><w:headerReference w:type="default" r:id="RID_H"/></w:sectPr>"#,
+    )
+    .header_raw("RID_H", b"<w:hdr xmlns:w=\"x\"><w:p><w:r w:a=\"unterminated")
+    .ir();
+    assert!(ir.plain_text().contains("BODY TEXT"));
+    assert!(ir.sections[0].header.is_none(), "{:?}", ir.sections[0].header);
 }
 
 // ---------------------------------------------------------------------------

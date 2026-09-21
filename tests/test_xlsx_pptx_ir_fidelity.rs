@@ -76,6 +76,10 @@ impl<'a> Xlsx<'a> {
     }
 
     fn ir(self) -> DocumentIR {
+        self.doc().to_ir()
+    }
+
+    fn doc(self) -> Document {
         let mut w = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
         let wb = PartName::new("/xl/workbook.xml").unwrap();
         w.add_package_rel(rel_types::OFFICE_DOCUMENT, "xl/workbook.xml");
@@ -149,9 +153,7 @@ impl<'a> Xlsx<'a> {
         }
 
         let bytes = w.finish().unwrap().into_inner();
-        Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx)
-            .expect("parse xlsx")
-            .to_ir()
+        Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx).expect("parse xlsx")
     }
 }
 
@@ -219,6 +221,39 @@ fn test_a_row_that_skips_a_column_keeps_every_value_under_its_own_header() {
     assert_eq!(cell_text(&t.rows[2].cells[2]), "4");
 }
 
+/// A formula whose cached result is the empty string (`t="str"` with an
+/// empty `<v>`, the shape a lookup-heavy workbook saves) shows nothing,
+/// as in Excel and `plain_text()`; the IR path rendered `=formula` for
+/// it, so `to_html()` of one corpus workbook had 10,000 words its own
+/// `plain_text()` did not. A formula with no cached value at all keeps
+/// showing `=formula` on every surface.
+#[test]
+fn test_a_formula_with_an_empty_cached_string_shows_nothing_on_every_surface() {
+    let body = r#"<row r="1">
+        <c r="A1" t="inlineStr"><is><t>Name</t></is></c>
+        <c r="B1" t="inlineStr"><is><t>Value</t></is></c>
+      </row>
+      <row r="2">
+        <c r="A2" t="str"><f>IF(ISNA(VLOOKUP(1,Q!A:B,2,FALSE))," ",1)</f><v></v></c>
+        <c r="B2"><f>NOW()</f></c>
+      </row>"#;
+    let doc = Xlsx::new(vec![Sheet::new("S", body)]).doc();
+    let ir = doc.to_ir();
+    for (name, text) in [
+        ("plain_text", doc.plain_text()),
+        ("ir plain", ir.plain_text()),
+        ("html", ir.to_html()),
+    ] {
+        assert!(!text.contains("VLOOKUP"), "{name} shows the empty-result formula: {text}");
+        assert!(text.contains("=NOW()"), "{name} lost the value-less formula: {text}");
+    }
+    let t = only_table(&ir, 0);
+    assert_eq!(
+        t.rows[1].cells[0].formula.as_deref(),
+        Some(r#"IF(ISNA(VLOOKUP(1,Q!A:B,2,FALSE))," ",1)"#)
+    );
+}
+
 /// A prose-shaped sheet (most rows one cell) may still have rows with
 /// several cells; prose mode kept only the first cell of such a row, so
 /// the rest vanished from every IR surface while `plain_text()` had it.
@@ -242,6 +277,30 @@ fn test_prose_mode_keeps_every_cell_of_a_multi_cell_row() {
     assert!(
         text.contains("Left\tRight"),
         "the two cells of one row stay on one line, tab-separated: {text:?}"
+    );
+}
+
+/// A sheet whose part is not well-formed (a damaged archive) is skipped
+/// and named, and the intact sheets are returned; the whole workbook
+/// used to fail. The loss is on record: a section holding the notice,
+/// and `Metadata::text_truncated`.
+#[test]
+fn test_an_unreadable_sheet_is_reported_and_the_others_are_kept() {
+    let ir = Xlsx::new(vec![
+        Sheet::new("Good", r#"<row r="1"><c r="A1" t="inlineStr"><is><t>kept</t></is></c></row>"#),
+        Sheet::new("Bad", r#"<row r="1"><c r="A1" t="x><v>1</v></c></row>"#),
+    ])
+    .ir();
+    let text = ir.plain_text();
+    assert!(text.contains("kept"), "{text}");
+    assert!(text.contains("[unreadable sheet \"Bad\""), "{text}");
+    assert!(ir.metadata.text_truncated);
+    assert_eq!(
+        ir.sections
+            .iter()
+            .filter(|s| s.title.as_deref() == Some("Bad"))
+            .count(),
+        1
     );
 }
 

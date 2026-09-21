@@ -118,6 +118,7 @@ pub(super) fn from_zip<R: Read + Seek>(
         core_properties,
         app_properties,
         has_macros,
+        unreadable_sheets: Vec::new(),
         styles_data: None,
         theme_data: None,
     })

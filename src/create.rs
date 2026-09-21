@@ -1485,10 +1485,9 @@ fn ir_cell_to_cell_data(cell: &TableCell, text: &str) -> crate::xlsx::write::Cel
     // every formula into a constant; writing only the formula blanked the
     // cell for every reader that does not evaluate.
     if let Some(f) = cell.formula.as_deref().filter(|f| !f.trim().is_empty()) {
-        // The converter shows `=formula` as the content of a cell with no
-        // cached value; that is not a result to cache.
-        let shown_formula = text.strip_prefix('=').is_some_and(|t| t == f);
-        if shown_formula {
+        // A cell with no cached value shows `=formula` (as `plain_text()`
+        // renders it); that is not a result to cache.
+        if text.is_empty() || text.strip_prefix('=').is_some_and(|t| t == f) {
             return CellData::Formula(f.to_string());
         }
         return CellData::FormulaWithValue {

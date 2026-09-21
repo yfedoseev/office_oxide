@@ -360,7 +360,17 @@ impl DocxDocument {
                     let part_name = main_part.resolve_relative(&rel.target)?;
                     if opc.has_part(&part_name) {
                         let data = opc.read_part(&part_name)?;
-                        let mut content = parse_body_elements(&data)?;
+                        // A header or footer part that does not parse (a
+                        // damaged archive with an intact body) is not the
+                        // document: skip it with a warning rather than fail
+                        // the file, as Tika/POI do.
+                        let mut content = match parse_body_elements(&data) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                log::warn!("docx: skipping unreadable {part_name}: {e}");
+                                return Ok(());
+                            },
+                        };
                         if let Ok(hf_rels) = opc.read_rels_for(&part_name) {
                             resolve_hyperlinks(&mut content, &hf_rels);
                             qualify_part_images(
@@ -2915,6 +2925,11 @@ fn parse_table_cell(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableCe
                 "tbl" => {
                     content.push(BlockElement::Table(Box::new(parse_table(reader)?)));
                 },
+                // A content control inside the cell (`w:tc > w:sdt >
+                // w:sdtContent > w:p`) — how a data-bound form lays out
+                // its fields — is a transparent wrapper, as in the body;
+                // skipping it emptied every such cell.
+                "sdt" | "sdtContent" => {},
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
@@ -4157,6 +4172,33 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "Click here");
+    }
+
+    /// A content control *inside* a cell (`w:tc > w:sdt > w:sdtContent >
+    /// w:p`), how a data-bound form lays out its fields. The wrapper was
+    /// skipped whole, so every such cell came back empty: a corpus form
+    /// lost its company, address, city, state and country.
+    #[test]
+    fn test_content_control_inside_a_cell_keeps_the_cells_text() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>Company</w:t></w:r></w:p></w:tc>
+        <w:tc><w:sdt><w:sdtPr><w:alias w:val="Company"/></w:sdtPr><w:sdtContent>
+          <w:p><w:r><w:t>Microsoft Corporation</w:t></w:r></w:p>
+        </w:sdtContent></w:sdt></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let data = make_minimal_docx(xml);
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let text = doc.plain_text();
+        assert!(text.contains("Microsoft Corporation"), "{text:?}");
+        let html = crate::convert_docx::docx_to_ir(&doc).to_html();
+        assert!(html.contains("Microsoft Corporation"), "{html}");
     }
 
     #[test]

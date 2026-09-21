@@ -554,6 +554,18 @@ impl DocDocument {
             out.push_str(text);
             out.push('\n');
         }
+        // Embedded objects are named here as they are on the IR surfaces
+        // (`[Embedded Equation Editor/MathType Object]`), so a document
+        // whose content is its equations does not read as empty on this
+        // surface alone.
+        for obj in &self.ole_objects {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('[');
+            out.push_str(&obj.description);
+            out.push_str("]\n");
+        }
         out
     }
 
@@ -887,6 +899,36 @@ mod tests {
         assert!(!md.contains("\n\n\n"), "{md:?}");
         assert!(md.contains("Second paragraph\n\n"));
         assert!(md.trim_end().ends_with("After gap"));
+    }
+
+    /// An embedded object is named on the direct surfaces as on the IR
+    /// ones; `plain_text()` alone said nothing about it.
+    #[test]
+    fn test_plain_text_names_embedded_objects() {
+        let doc = DocDocument {
+            subdocuments: Vec::new(),
+            has_macros: false,
+            text_complete: true,
+            summary_properties: None,
+            list_formatting: crate::doc::list_format::ListFormatting::default(),
+            comment_authors: Vec::new(),
+            comments: Vec::new(),
+            ole_objects: vec![crate::doc::ole_objects::EmbeddedOleObject {
+                description: "Embedded Equation Editor/MathType Object".into(),
+            }],
+            header_footer: HeaderFooterStories::default(),
+            data_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
+            text: "Body".into(),
+            paragraphs: Vec::new(),
+        };
+        let text = doc.plain_text();
+        assert_eq!(text, "Body\n[Embedded Equation Editor/MathType Object]\n");
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        assert!(
+            ir.plain_text()
+                .contains("[Embedded Equation Editor/MathType Object]")
+        );
     }
 
     #[test]

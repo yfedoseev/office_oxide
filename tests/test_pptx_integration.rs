@@ -647,7 +647,9 @@ fn test_picture_alt_text() {
         .build();
 
     let doc = parse(&data);
-    assert_eq!(doc.plain_text(), "A cute cat");
+    // A placeholder, bracketed as the IR's `plain_text()` renders it —
+    // not slide text.
+    assert_eq!(doc.plain_text(), "[A cute cat]");
     let md = doc.to_markdown();
     assert!(md.contains("![A cute cat]()"));
 }

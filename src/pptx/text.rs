@@ -150,9 +150,13 @@ fn collect_text_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePositio
                 }
             },
             Shape::Picture(pic) => {
+                // A picture's description is a placeholder, bracketed as
+                // the IR's `plain_text()` renders it; unmarked, it read as
+                // slide text (no reference extractor shows it at all).
                 if let Some(ref alt) = pic.alt_text {
+                    let alt = alt.split_whitespace().collect::<Vec<_>>().join(" ");
                     if !alt.is_empty() {
-                        entries.push((pic.position.clone(), alt.clone()));
+                        entries.push((pic.position.clone(), format!("[{alt}]")));
                     }
                 }
             },

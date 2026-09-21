@@ -33,13 +33,23 @@ impl DocxDocument {
         // though it visibly has text, and a document's word count changed
         // depending on which of plain_text()/to_markdown()/to_ir() a caller
         // used.
-        for n in self
-            .footnotes
-            .iter()
-            .chain(self.endnotes.iter())
-            .chain(self.comments.iter())
-        {
+        for n in self.footnotes.iter().chain(self.endnotes.iter()) {
             plain_text_blocks(&n.content, styles, &mut out);
+        }
+        // A comment names its author, as on every other surface and format.
+        for n in &self.comments {
+            let mut body = String::new();
+            plain_text_blocks(&n.content, styles, &mut body);
+            let body = body.trim();
+            if !body.is_empty() {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(&comment_marker(n.author.as_deref()));
+                out.push_str(": ");
+                out.push_str(body);
+                out.push('\n');
+            }
         }
         // Trim trailing newlines
         while out.ends_with('\n') {
@@ -73,11 +83,12 @@ impl DocxDocument {
         // endnote and comment bodies are real content that to_ir() already
         // carries, and dropping them here made this renderer disagree with
         // that one.
-        for n in self
+        for (n, is_comment) in self
             .footnotes
             .iter()
             .chain(self.endnotes.iter())
-            .chain(self.comments.iter())
+            .map(|n| (n, false))
+            .chain(self.comments.iter().map(|n| (n, true)))
         {
             let mut note_buf = String::new();
             markdown_blocks(&n.content, &ctx, &mut note_buf, 0);
@@ -85,6 +96,9 @@ impl DocxDocument {
             if !note_text.is_empty() {
                 if !out.ends_with("\n\n") && !out.is_empty() {
                     out.push_str("\n\n");
+                }
+                if is_comment {
+                    out.push_str(&format!("**{}:** ", comment_marker(n.author.as_deref())));
                 }
                 out.push_str(note_text);
                 out.push('\n');
@@ -181,6 +195,14 @@ fn plain_text_blocks(elements: &[BlockElement], styles: Option<&StyleSheet>, out
                 plain_text_table(table, styles, out);
             },
         }
+    }
+}
+
+/// The label a comment carries on every surface and format.
+fn comment_marker(author: Option<&str>) -> String {
+    match author {
+        Some(a) => format!("Comment ({a})"),
+        None => "Comment".to_string(),
     }
 }
 
