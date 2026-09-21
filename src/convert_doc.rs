@@ -32,11 +32,11 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
         line_heuristic(doc.plain_text_ref(), &mut elements);
     }
 
+    // The whole heading, not its first span: a heading with a formatting
+    // change mid-way gave a title that matched no heading, so the
+    // renderers printed it twice.
     let heading_title = elements.iter().find_map(|e| match e {
-        Element::Heading(h) => h.content.first().and_then(|c| match c {
-            InlineContent::Text(t) => Some(t.text.clone()),
-            _ => None,
-        }),
+        Element::Heading(h) => Some(inline_to_text(&h.content)),
         _ => None,
     });
     // The file's own declared title (from `\x05SummaryInformation`) beats
@@ -47,10 +47,14 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     let title = summary
         .and_then(|s| s.title.clone())
         .filter(|t| !t.is_empty())
-        .or(heading_title);
+        .or_else(|| heading_title.clone());
 
+    // The section's title is the heading the section itself carries, as
+    // in every other converter. Giving it the file's declared title
+    // (metadata, not content) made the IR renderers print a line the
+    // document's text does not have.
     let mut sections = vec![Section {
-        title: title.clone(),
+        title: heading_title,
         elements,
         ..Default::default()
     }];

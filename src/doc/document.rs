@@ -931,6 +931,35 @@ mod tests {
         );
     }
 
+    /// The file's declared title is metadata: it reaches
+    /// `Metadata::title`, not the section, so no renderer prints a line
+    /// the document's text does not have.
+    #[test]
+    fn test_declared_title_is_metadata_not_section_content() {
+        let doc = DocDocument {
+            subdocuments: Vec::new(),
+            has_macros: false,
+            text_complete: true,
+            summary_properties: Some(crate::cfb::oleps::SummaryProperties {
+                title: Some("Wines of Moldova for you".into()),
+                ..Default::default()
+            }),
+            list_formatting: crate::doc::list_format::ListFormatting::default(),
+            comment_authors: Vec::new(),
+            comments: Vec::new(),
+            ole_objects: Vec::new(),
+            header_footer: HeaderFooterStories::default(),
+            data_stream: Vec::new(),
+            images: std::sync::OnceLock::new(),
+            text: "Price list follows.".into(),
+            paragraphs: Vec::new(),
+        };
+        let ir = crate::convert_doc::doc_to_ir(&doc);
+        assert_eq!(ir.metadata.title.as_deref(), Some("Wines of Moldova for you"));
+        assert!(!ir.to_markdown().contains("Moldova"), "{}", ir.to_markdown());
+        assert!(!ir.to_html().contains("Moldova"));
+    }
+
     #[test]
     fn test_plain_text_access() {
         let doc = DocDocument {

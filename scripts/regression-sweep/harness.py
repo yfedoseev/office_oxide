@@ -416,11 +416,15 @@ def analyse_one(rel):
             mt = read_gz(os.path.join(W, "next"), rel, "markdown")
             ht = read_gz(os.path.join(W, "next"), rel, "html")
             if mt is not None and ht is not None:
+                # The text surface goes through the same filter (URLs, bracketed
+                # placeholders) as the other two, or a hyperlink's target counts
+                # as words markdown lost.
+                wt = words(surface_text(nt, "text"))
                 wm, wh = words(surface_text(mt, "markdown")), words(surface_text(ht, "html"))
-                base = max(sum(nw.values()), sum(wm.values()), sum(wh.values()), 1)
+                base = max(sum(wt.values()), sum(wm.values()), sum(wh.values()), 1)
                 if base >= 20:
-                    pairs = {"text_not_md": nw - wm, "md_not_text": wm - nw, "text_not_html": nw - wh,
-                             "html_not_text": wh - nw, "md_not_html": wm - wh, "html_not_md": wh - wm}
+                    pairs = {"text_not_md": wt - wm, "md_not_text": wm - wt, "text_not_html": wt - wh,
+                             "html_not_text": wh - wt, "md_not_html": wm - wh, "html_not_md": wh - wm}
                     bad = {k: v for k, v in pairs.items() if sum(v.values()) >= 5 and sum(v.values()) / base >= 0.02}
                     if bad:
                         k = max(bad, key=lambda k: sum(bad[k].values()))
