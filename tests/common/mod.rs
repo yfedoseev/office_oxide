@@ -22,6 +22,11 @@ use std::io::Cursor;
 /// Sentinel directory id: no sibling / child.
 const NO_ENTRY: u32 = 0xFFFF_FFFF;
 
+/// 512-byte pages reserved for the FIB at the start of `WordDocument`: its
+/// `FibRgFcLcb97` runs past the first page (e.g. `fcPlcftxbxTxt` at
+/// 0x25A), so the FKP pages and text start after two.
+const FIB_PAGES: usize = 2;
+
 /// A single main-text paragraph to encode.
 pub struct Para {
     /// Paragraph text (assumed BMP / ASCII — encoded as UTF-16LE).
@@ -177,9 +182,9 @@ pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> V
     }
     let text_bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
     let total_chars = units.len() as u32;
-
+    // Text lives after the FIB pages (0..FIB_PAGES) and the N FKP pages.
     // Text lives after the FIB page (page 0) and the N FKP pages (pages 1..N).
-    let text_offset = ((n as u32) + 1) * 512;
+    let text_offset = ((n + FIB_PAGES) as u32) * 512;
 
     // ── 0Table stream: CLX (piece table) followed by PlcfBtePapx. ──
     let mut table = build_clx(text_offset, total_chars);
@@ -252,7 +257,7 @@ pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> V
         }
         let fc1 = text_offset + cp1 * 2;
         let page = build_fkp_page(fc0, fc1, &p.grpprl);
-        let off = (i + 1) * 512;
+        let off = (i + FIB_PAGES) * 512;
         word_doc[off..off + 512].copy_from_slice(&page);
     }
     word_doc[text_offset as usize..text_offset as usize + text_bytes.len()]
@@ -326,7 +331,7 @@ fn build_plcf_bte_papx(n: usize, cp_starts: &[u32], text_len: u32) -> Vec<u8> {
         v.extend_from_slice(&cp.to_le_bytes());
     }
     for i in 0..n {
-        v.extend_from_slice(&((i as u32) + 1).to_le_bytes()); // page number
+        v.extend_from_slice(&((i as u32) + FIB_PAGES as u32).to_le_bytes()); // page number
     }
     v
 }

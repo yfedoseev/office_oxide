@@ -198,3 +198,36 @@ fn test_every_section_gets_its_own_headers_and_ir_section() {
     assert!(body(1).contains("Sec two.") && !body(1).contains("Sec three."), "{}", body(1));
     assert!(body(2).contains("Sec three."), "{}", body(2));
 }
+
+/// `PlcftxbxTxt` ([MS-DOC] `PlcftxbxTxt`) delimits each text box's
+/// story within the text-box subdocument. It was never read, so every
+/// box's text came out as one merged blob; each box is its own element now.
+#[test]
+fn test_text_box_stories_are_split_per_box() {
+    let subdocs = Subdocs {
+        textboxes: "Box one\rBox two",
+        ..Default::default()
+    };
+    // "Box one\r" [0,8), "Box two\r" [8,16), then the trailing dummy story.
+    let tweaks = FibTweaks {
+        plcf_txbx_txt: vec![0, 8, 16, 16],
+        ..Default::default()
+    };
+    let doc = open_doc(&build_doc_full(&[para("Body.")], &subdocs, tweaks));
+    let ir = doc.to_ir();
+    let boxes: Vec<String> = ir.sections[0]
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            Element::TextBox(tb) => Some(all_text(&office_oxide::ir::DocumentIR {
+                sections: vec![office_oxide::ir::Section {
+                    elements: tb.content.clone(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(boxes, ["Box one\n", "Box two\n"]);
+}

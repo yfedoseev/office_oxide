@@ -88,17 +88,18 @@ pub struct SubDocument {
     pub kind: SubDocumentKind,
     /// Sanitised text of the subdocument.
     pub text: String,
-    /// Footnote/endnote subdocuments: each note's sanitised body. Every
-    /// note body opens with the auto-numbered reference mark (0x02) in the
-    /// raw story; the split is taken there, before sanitising drops the
-    /// mark. Empty for other kinds, or when the story has no such marks.
-    pub(crate) notes: Vec<String>,
+    /// The subdocument's individual stories, each sanitised: one per
+    /// footnote/endnote (split on the auto-numbered reference mark, 0x02,
+    /// that opens each note body in the raw story, before sanitising drops
+    /// it), or one per text box (split at `PlcftxbxTxt`/`PlcfHdrtxbxTxt`
+    /// boundaries). Empty when the subdocument has no such structure.
+    pub(crate) parts: Vec<String>,
 }
 
 impl SubDocument {
     /// Build a subdocument from its raw (unsanitised) story text.
     pub(crate) fn from_raw(kind: SubDocumentKind, raw: &str) -> Self {
-        let notes = if matches!(kind, SubDocumentKind::Footnotes | SubDocumentKind::Endnotes)
+        let parts = if matches!(kind, SubDocumentKind::Footnotes | SubDocumentKind::Endnotes)
             && raw.contains('\u{2}')
         {
             raw.split('\u{2}')
@@ -111,8 +112,29 @@ impl SubDocument {
         Self {
             kind,
             text: sanitize_text(raw),
-            notes,
+            parts,
         }
+    }
+
+    /// As [`from_raw`](Self::from_raw), with the stories split at the
+    /// given CP boundaries (story `i` is `bounds[i]..bounds[i + 1]`,
+    /// relative to the subdocument's first character).
+    pub(crate) fn from_raw_stories(kind: SubDocumentKind, raw: &str, bounds: &[u32]) -> Self {
+        let mut sub = Self::from_raw(kind, raw);
+        let chars: Vec<char> = raw.chars().collect();
+        sub.parts = bounds
+            .windows(2)
+            .filter_map(|w| {
+                let (lo, hi) = (w[0] as usize, (w[1] as usize).min(chars.len()));
+                if hi <= lo {
+                    return None;
+                }
+                let story: String = chars[lo..hi].iter().collect();
+                let text = sanitize_text(&story).trim().to_string();
+                (!text.is_empty()).then_some(text)
+            })
+            .collect();
+        sub
     }
 }
 
@@ -328,8 +350,21 @@ impl DocDocument {
                     &comment_authors,
                 );
             }
+            // Text boxes: each box's story is delimited by its PLC.
+            let txbx_plc = match kind {
+                SubDocumentKind::TextBoxes => Some((fib.fc_plcftxbx_txt, fib.lcb_plcftxbx_txt)),
+                SubDocumentKind::HeaderTextBoxes => {
+                    Some((fib.fc_plcf_hdrtxbx_txt, fib.lcb_plcf_hdrtxbx_txt))
+                },
+                _ => None,
+            };
+            let story_bounds = txbx_plc
+                .map(|(fc, lcb)| parse_plcf_txbx_bounds(&table_stream, fc, lcb))
+                .unwrap_or_default();
             let sub = if text_start > 0 {
                 SubDocument::from_raw(kind, &raw.chars().skip(text_start).collect::<String>())
+            } else if story_bounds.len() >= 2 {
+                SubDocument::from_raw_stories(kind, &raw, &story_bounds)
             } else {
                 SubDocument::from_raw(kind, &raw)
             };
@@ -483,7 +518,7 @@ impl DocDocument {
                 };
                 let mut sub = SubDocument::from_raw(kind, &text);
                 sub.text = crlf(sub.text);
-                sub.notes = sub.notes.into_iter().map(crlf).collect();
+                sub.parts = sub.parts.into_iter().map(crlf).collect();
                 Some(sub)
             })
             .collect();
@@ -780,6 +815,43 @@ fn parse_plcf_hdd_stories(
         prev = merged;
     }
     out
+}
+
+/// The story boundary CPs (`aCP`) of `PlcftxbxTxt`/`PlcfHdrtxbxTxt`
+/// ([MS-DOC] `PlcftxbxTxt`: a PLC of 22-byte `FTXBXS`; text box `i`'s
+/// story is `aCP[i]..aCP[i + 1]` within the text-box subdocument). The
+/// final story is a placeholder with no text box and comes out empty.
+/// Empty when absent or malformed.
+fn parse_plcf_txbx_bounds(table_stream: &[u8], fc: u32, lcb: u32) -> Vec<u32> {
+    const FTXBXS_SIZE: usize = 22;
+    let start = fc as usize;
+    let Some(end) = start.checked_add(lcb as usize) else {
+        return Vec::new();
+    };
+    if lcb < 4 || end > table_stream.len() {
+        return Vec::new();
+    }
+    let cb = end - start;
+    if (cb - 4) % (4 + FTXBXS_SIZE) != 0 {
+        return Vec::new();
+    }
+    let n = (cb - 4) / (4 + FTXBXS_SIZE);
+    let cps: Vec<u32> = (0..=n)
+        .map(|i| {
+            let at = start + i * 4;
+            u32::from_le_bytes([
+                table_stream[at],
+                table_stream[at + 1],
+                table_stream[at + 2],
+                table_stream[at + 3],
+            ])
+        })
+        .collect();
+    // A PLC's CPs are non-decreasing; anything else is not a boundary list.
+    if cps.windows(2).any(|w| w[1] < w[0]) {
+        return Vec::new();
+    }
+    cps
 }
 
 /// The end CP of every section, from `PlcfSed` ([MS-DOC] §2.8.26 — a PLC
