@@ -382,7 +382,9 @@ impl<R: Read + Seek> CfbReader<R> {
 
     /// Read from the mini-stream using mini-FAT chain.
     fn read_mini_stream(&self, start: u32, size: usize) -> Result<Vec<u8>> {
-        let mut data = Vec::with_capacity(size);
+        // The declared size comes from the file; the mini stream is what
+        // actually backs it, so never reserve past that.
+        let mut data = Vec::with_capacity(size.min(self.mini_stream.len()));
         let mut sector = start;
         let mut remaining = size;
         let mini_sector_size = self.header.mini_sector_size;
@@ -989,6 +991,41 @@ mod tests {
         let mut reader = CfbReader::new(cursor).unwrap();
         let stream = reader.open_stream("SmallStream").unwrap();
         assert_eq!(&stream, b"Small");
+    }
+
+    /// [MS-CFB] §2.2 fixes the mini stream cutoff at 4096 bytes. A header
+    /// declaring a huge cutoff sent a stream claiming ~4 GB down the
+    /// mini-stream path, which reserved the whole claimed size up front.
+    /// The cutoff is the spec constant, and no read reserves more than the
+    /// bytes that back it.
+    #[test]
+    fn test_header_mini_stream_cutoff_does_not_size_an_allocation() {
+        let mut data = build_cfb_with_mini_stream();
+        data[0x38..0x3C].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let e1 = 512 + 128;
+        data[e1 + 0x78..e1 + 0x7C].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+        let file_len = data.len();
+        let mut reader = CfbReader::new(Cursor::new(data)).unwrap();
+        assert_eq!(reader.header().mini_stream_cutoff, 4096);
+        let stream = reader.open_stream("SmallStream").unwrap();
+        assert!(
+            stream.capacity() <= file_len,
+            "reserved {} bytes for a {file_len}-byte file",
+            stream.capacity()
+        );
+    }
+
+    /// A stream under the cutoff whose declared size exceeds the whole
+    /// mini stream reserves no more than the mini stream holds.
+    #[test]
+    fn test_mini_stream_read_reserves_at_most_the_mini_stream() {
+        let mut data = build_cfb_with_mini_stream();
+        let e1 = 512 + 128;
+        data[e1 + 0x78..e1 + 0x7C].copy_from_slice(&4000u32.to_le_bytes());
+        let mut reader = CfbReader::new(Cursor::new(data)).unwrap();
+        let stream = reader.open_stream("SmallStream").unwrap();
+        assert!(stream.capacity() <= 512, "reserved {}", stream.capacity());
+        assert!(stream.starts_with(b"Small"));
     }
 
     #[test]
