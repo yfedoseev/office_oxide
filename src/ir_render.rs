@@ -1192,7 +1192,15 @@ fn render_list_group_html(lists: &[&List]) -> String {
         Some(n) if first.ordered && n != 1 => format!(" start=\"{n}\""),
         _ => String::new(),
     };
-    let mut html = format!("<{tag}{start_attr}>\n");
+    // Letter and roman markers: HTML's `<ol type>`. Decimal is its default.
+    let type_attr = match first.style {
+        Some(ListStyle::LowerAlpha) if first.ordered => " type=\"a\"",
+        Some(ListStyle::UpperAlpha) if first.ordered => " type=\"A\"",
+        Some(ListStyle::LowerRoman) if first.ordered => " type=\"i\"",
+        Some(ListStyle::UpperRoman) if first.ordered => " type=\"I\"",
+        _ => "",
+    };
+    let mut html = format!("<{tag}{type_attr}{start_attr}>\n");
     for list in lists {
         for item in &list.items {
             let content = render_elements_html(&item.content).join("");
@@ -1866,6 +1874,34 @@ mod tests {
         })]);
         assert!(!bullets.to_html().contains("start="), "{}", bullets.to_html());
         assert!(bullets.to_markdown().contains("- A"), "{}", bullets.to_markdown());
+    }
+
+    /// Letter and roman markers are carried in `List::style` but HTML
+    /// rendered every ordered list as decimal; `<ol type>` is the HTML
+    /// attribute for exactly these four. (Markdown has no such syntax —
+    /// CommonMark ordered-list markers are decimal only — so it keeps
+    /// digits.)
+    #[test]
+    fn test_letter_and_roman_list_styles_reach_the_html_type_attribute() {
+        for (style, attr) in [
+            (ListStyle::LowerAlpha, " type=\"a\""),
+            (ListStyle::UpperAlpha, " type=\"A\""),
+            (ListStyle::LowerRoman, " type=\"i\""),
+            (ListStyle::UpperRoman, " type=\"I\""),
+            (ListStyle::Decimal, ""),
+        ] {
+            let ir = simple_ir(vec![Element::List(List {
+                ordered: true,
+                style: Some(style.clone()),
+                items: vec![ListItem {
+                    content: vec![para("A")],
+                    nested: None,
+                }],
+                ..Default::default()
+            })]);
+            let html = ir.to_html();
+            assert!(html.contains(&format!("<ol{attr}>")), "{style:?}: {html}");
+        }
     }
 
     // ── Defaults centralized in `block_default` ──────────────────────
