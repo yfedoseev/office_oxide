@@ -26,6 +26,8 @@ pub mod edit;
 pub mod error;
 /// Number format rendering: apply Excel format strings to numeric values.
 pub mod numfmt;
+/// Row-sweep lookup of rectangular ranges (merges, range hyperlinks).
+pub(crate) mod range_sweep;
 /// Shared-formula (`<f t="shared">`) group expansion.
 pub mod shared_formula;
 /// Shared string table (SST) parsing and lookup.
