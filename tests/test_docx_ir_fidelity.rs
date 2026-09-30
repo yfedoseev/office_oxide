@@ -818,6 +818,78 @@ fn test_table_style_borders_and_conditional_shading_reach_the_ir() {
     assert!(tables[1].border.is_some());
 }
 
+/// A table style's `w:tblStylePr` run and paragraph formatting — the bold
+/// header row of nearly every built-in table style, banded italics, a
+/// centred header — was not read: only its cell shading was. It now
+/// applies through `w:tblLook` in the §17.7.6 region order, beneath the
+/// paragraph style and direct formatting (§17.7.2), identically in
+/// `to_ir()`, the direct markdown and plain-text renderers, and HTML.
+#[test]
+fn test_table_style_conditional_run_and_paragraph_formatting_applies_everywhere() {
+    let cell = |t: &str| format!("<w:tc><w:p><w:r><w:t>{t}</w:t></w:r></w:p></w:tc>");
+    let row = |cells: &[&str]| {
+        format!("<w:tr>{}</w:tr>", cells.iter().map(|t| cell(t)).collect::<String>())
+    };
+    let body = format!(
+        r#"<w:tbl><w:tblPr><w:tblStyle w:val="Report"/>
+             <w:tblLook w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="1"/></w:tblPr>
+           <w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/></w:tblGrid>
+           {}{}{}{}{}
+           <w:tr><w:tc><w:p><w:pPr><w:pStyle w:val="Plain"/></w:pPr><w:r><w:t>styledoff</w:t></w:r></w:p></w:tc>
+             <w:tc><w:p><w:r><w:rPr><w:i w:val="0"/></w:rPr><w:t>directoff</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+        row(&["Name", "Qty"]),
+        row(&["apple", "3"]),
+        row(&["pear", "5"]),
+        row(&["plum", "7"]),
+        row(&["fig", "9"]),
+    );
+    let styles = r#"
+        <w:style w:type="paragraph" w:styleId="Plain"><w:name w:val="Plain"/><w:rPr><w:i w:val="0"/></w:rPr></w:style>
+        <w:style w:type="table" w:styleId="Base"><w:name w:val="Base"/>
+          <w:tblStylePr w:type="firstRow"><w:pPr><w:jc w:val="center"/></w:pPr><w:rPr><w:b/></w:rPr></w:tblStylePr>
+        </w:style>
+        <w:style w:type="table" w:styleId="Report"><w:name w:val="Report"/><w:basedOn w:val="Base"/>
+          <w:rPr><w:color w:val="112233"/></w:rPr>
+          <w:tblStylePr w:type="band1Horz"><w:rPr><w:i/></w:rPr></w:tblStylePr>
+        </w:style>"#;
+    let bytes = Docx::new(&body).styles(styles).bytes();
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+    let ir = doc.to_ir();
+    let t = table(&ir);
+    let span = |r: usize, c: usize| -> TextSpan {
+        match &t.rows[r].cells[c].content[0] {
+            Element::Paragraph(p) => first_span(p).clone(),
+            other => panic!("not a paragraph: {other:?}"),
+        }
+    };
+    // Header row: bold (inherited from the base style) and centred.
+    assert!(span(0, 0).bold && span(0, 1).bold);
+    assert_eq!(t.rows[0].cells[0].text_align, Some(ParagraphAlignment::Center));
+    // Banded rows: band1 is every other data row, starting with the first.
+    let italics: Vec<bool> = (1..5).map(|r| span(r, 0).italic).collect();
+    assert_eq!(italics, [true, false, true, false]);
+    assert!(!span(1, 0).bold, "data rows are not header rows");
+    // The style's own run formatting reaches every cell.
+    assert_eq!(span(2, 1).color, Some([0x11, 0x22, 0x33]));
+    // A paragraph style and direct formatting both win over the table style.
+    assert!(!span(5, 0).italic && !span(5, 1).italic, "a band1 row, switched off");
+    assert_eq!(span(5, 0).text, "styledoff");
+
+    // Every surface draws the same emphasis.
+    let direct = doc.to_markdown();
+    let via_ir = ir.to_markdown();
+    assert_eq!(direct.trim_end(), via_ir.trim_end());
+    assert!(direct.contains("| **Name** | **Qty** |"), "{direct}");
+    assert!(direct.contains("| *apple* | *3* |"), "{direct}");
+    assert!(direct.contains("| pear | 5 |"), "{direct}");
+    let html = doc.to_html();
+    assert!(
+        html.contains("<strong>Name</strong>") && html.contains("<em>apple</em>"),
+        "{html}"
+    );
+    assert_eq!(doc.plain_text().trim_end(), ir.plain_text().trim_end());
+}
+
 /// `w:trHeight/@w:hRule` (ECMA-376 §17.18) was parsed and read by
 /// nothing, and the writer omitted it — the default is `atLeast`, so an
 /// exact-height row (forms, labels) came back as a minimum height.

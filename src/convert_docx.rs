@@ -1,7 +1,67 @@
+use crate::docx::styles::CellStyleLayer;
+use crate::docx::{DocxDocument, ParagraphProperties, RunProperties};
 use crate::format::DocumentFormat;
 use crate::ir::*;
 
+/// Everything the `docx_to_ir` helpers share: the document (which it
+/// dereferences to) and the table-style layer of the cell being converted.
+struct Cx<'a, 'd> {
+    doc: &'d DocxDocument,
+    /// The enclosing table cell's style layer.
+    table: Option<&'a CellStyleLayer>,
+}
+
+impl std::ops::Deref for Cx<'_, '_> {
+    type Target = DocxDocument;
+    fn deref(&self) -> &DocxDocument {
+        self.doc
+    }
+}
+
+impl<'a, 'd> Cx<'a, 'd> {
+    /// The same context inside a table cell whose style layer is `layer`.
+    fn in_cell<'b>(&'b self, layer: Option<&'b CellStyleLayer>) -> Cx<'b, 'd> {
+        Cx {
+            doc: self.doc,
+            table: layer,
+        }
+    }
+
+    /// Effective run properties: document defaults, this cell's table
+    /// layer, the paragraph style chain, the character style chain, then
+    /// the run's own `w:rPr`.
+    fn run_properties(
+        &self,
+        paragraph_style_id: Option<&str>,
+        direct: Option<&RunProperties>,
+    ) -> Option<RunProperties> {
+        let Some(sheet) = self.doc.styles.as_ref() else {
+            return direct.cloned();
+        };
+        Some(sheet.effective_run_properties_in(
+            self.table.map(|l| &l.run),
+            paragraph_style_id,
+            direct,
+        ))
+    }
+
+    /// Effective paragraph properties: document defaults, this cell's
+    /// table layer, the paragraph style chain, then the paragraph's own
+    /// `w:pPr`.
+    fn paragraph_properties(
+        &self,
+        direct: Option<&ParagraphProperties>,
+    ) -> Option<ParagraphProperties> {
+        let Some(sheet) = self.doc.styles.as_ref() else {
+            return direct.cloned();
+        };
+        Some(sheet.effective_paragraph_properties_in(self.table.map(|l| &l.paragraph), direct))
+    }
+}
+
 pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
+    let cx = Cx { doc, table: None };
+    let doc = &cx;
     // Build per-section block-element windows from `body.section_breaks`.
     // Each break index is the exclusive end of one section. Trailing
     // elements after the last break go into a final section described
@@ -599,7 +659,7 @@ fn section_props_to_page_setup(sp: &crate::docx::SectionProperties) -> Option<Pa
 fn convert_block_elements(
     blocks: &[crate::docx::BlockElement],
     elements: &mut Vec<Element>,
-    doc: &crate::docx::DocxDocument,
+    doc: &Cx<'_, '_>,
 ) {
     let mut i = 0;
     // A numId resumed later in the same block sequence (after a non-list
@@ -895,9 +955,12 @@ fn collect_paragraph_chart_text(p: &crate::docx::Paragraph, out: &mut Vec<Elemen
 
 fn collect_paragraph_text_boxes(
     p: &crate::docx::Paragraph,
-    doc: &crate::docx::DocxDocument,
+    doc: &Cx<'_, '_>,
     out: &mut Vec<Element>,
 ) {
+    // A text box anchored in a table cell is not formatted by the table's
+    // style.
+    let doc = &doc.in_cell(None);
     for pc in &p.content {
         let runs: &[crate::docx::Run] = match pc {
             crate::docx::ParagraphContent::Run(r) => std::slice::from_ref(r),
@@ -1061,12 +1124,9 @@ fn paragraph_frame_position(p: &crate::docx::Paragraph) -> Option<FramePosition>
 /// has no stylesheet.
 fn effective_paragraph_props(
     p: &crate::docx::Paragraph,
-    doc: &crate::docx::DocxDocument,
+    doc: &Cx<'_, '_>,
 ) -> Option<crate::docx::ParagraphProperties> {
-    let mut eff = match doc.styles.as_ref() {
-        Some(sheet) => Some(sheet.effective_paragraph_properties(p.properties.as_ref())),
-        None => p.properties.clone(),
-    };
+    let mut eff = doc.paragraph_properties(p.properties.as_ref());
     // A numbered paragraph's indentation comes from its numbering level's
     // `w:pPr/w:ind` (ECMA-376 §17.9) unless the paragraph sets its own;
     // Word applies it over the paragraph style's.
@@ -1124,9 +1184,9 @@ fn resolve_heading_level(
 
 /// Everything `convert_run` needs from the enclosing document to resolve a
 /// run's effective formatting.
-struct RunContext<'a> {
+struct RunContext<'a, 'd> {
     theme: Option<&'a crate::core::theme::Theme>,
-    styles: Option<&'a crate::docx::StyleSheet>,
+    cx: &'a Cx<'a, 'd>,
     paragraph_style_id: Option<&'a str>,
 }
 
@@ -1144,21 +1204,15 @@ fn hyperlink_url(hl: &crate::docx::Hyperlink) -> Option<String> {
     }
 }
 
-fn run_context<'a>(
-    p: &'a crate::docx::Paragraph,
-    doc: &'a crate::docx::DocxDocument,
-) -> RunContext<'a> {
+fn run_context<'a, 'd>(p: &'a crate::docx::Paragraph, doc: &'a Cx<'a, 'd>) -> RunContext<'a, 'd> {
     RunContext {
         theme: doc.theme.as_ref(),
-        styles: doc.styles.as_ref(),
+        cx: doc,
         paragraph_style_id: p.properties.as_ref().and_then(|pp| pp.style_id.as_deref()),
     }
 }
 
-fn convert_paragraph_inline(
-    p: &crate::docx::Paragraph,
-    doc: &crate::docx::DocxDocument,
-) -> Vec<InlineContent> {
+fn convert_paragraph_inline(p: &crate::docx::Paragraph, doc: &Cx<'_, '_>) -> Vec<InlineContent> {
     convert_inline_with(p, run_context(p, doc))
 }
 
@@ -1168,10 +1222,7 @@ fn convert_paragraph_inline(
 /// `# **…**` on every styled heading, which is not what Word shows and
 /// not what pandoc or python-docx report. Direct formatting and character
 /// styles still apply.
-fn convert_heading_inline(
-    p: &crate::docx::Paragraph,
-    doc: &crate::docx::DocxDocument,
-) -> Vec<InlineContent> {
+fn convert_heading_inline(p: &crate::docx::Paragraph, doc: &Cx<'_, '_>) -> Vec<InlineContent> {
     let ctx = RunContext {
         paragraph_style_id: None,
         ..run_context(p, doc)
@@ -1179,7 +1230,7 @@ fn convert_heading_inline(
     convert_inline_with(p, ctx)
 }
 
-fn convert_inline_with(p: &crate::docx::Paragraph, ctx: RunContext<'_>) -> Vec<InlineContent> {
+fn convert_inline_with(p: &crate::docx::Paragraph, ctx: RunContext<'_, '_>) -> Vec<InlineContent> {
     let mut content = Vec::new();
     for pc in &p.content {
         match pc {
@@ -1205,7 +1256,7 @@ fn convert_run(
     run: &crate::docx::Run,
     // The enclosing hyperlink's URL and hover text.
     link: Option<(&str, Option<&str>)>,
-    ctx: &RunContext<'_>,
+    ctx: &RunContext<'_, '_>,
     content: &mut Vec<InlineContent>,
 ) {
     convert_run_content(run.properties.as_ref(), &run.content, link, ctx, content);
@@ -1218,7 +1269,7 @@ fn convert_run_content(
     run_content: &[crate::docx::RunContent],
     // The enclosing hyperlink's URL and hover text.
     link: Option<(&str, Option<&str>)>,
-    ctx: &RunContext<'_>,
+    ctx: &RunContext<'_, '_>,
     content: &mut Vec<InlineContent>,
 ) {
     let theme = ctx.theme;
@@ -1227,14 +1278,10 @@ fn convert_run_content(
     // Reading `run.properties` alone meant a document that keeps its
     // formatting in styles — every Word template does — came back with
     // none of it.
-    let resolved;
-    let effective: Option<&crate::docx::RunProperties> = match ctx.styles {
-        Some(sheet) => {
-            resolved = sheet.effective_run_properties(ctx.paragraph_style_id, run_properties);
-            Some(&resolved)
-        },
-        None => run_properties,
-    };
+    let resolved = ctx
+        .cx
+        .run_properties(ctx.paragraph_style_id, run_properties);
+    let effective: Option<&crate::docx::RunProperties> = resolved.as_ref();
     // `<w:vanish/>` — Word never renders this run at all. Excluding it
     // here (rather than carrying a `hidden` flag into the IR for every
     // renderer to filter separately) keeps plain_text/to_markdown/to_html
@@ -1428,7 +1475,7 @@ enum HardBreak {
 /// break `None`. A paragraph without one is a single segment.
 fn split_at_hard_breaks(
     p: &crate::docx::Paragraph,
-    doc: &crate::docx::DocxDocument,
+    doc: &Cx<'_, '_>,
 ) -> Vec<(Vec<InlineContent>, Option<HardBreak>)> {
     let ctx = run_context(p, doc);
     let mut segments: Vec<(Vec<InlineContent>, Option<HardBreak>)> = Vec::new();
@@ -1500,7 +1547,7 @@ fn convert_list_group(
     blocks: &[crate::docx::BlockElement],
     i: &mut usize,
     num_id: u32,
-    doc: &crate::docx::DocxDocument,
+    doc: &Cx<'_, '_>,
     numbering_counts: &mut std::collections::HashMap<u32, u32>,
     // The first paragraph's effective properties, which the caller already
     // resolved to decide this is a list.
@@ -1717,20 +1764,12 @@ fn number_format_to_list_style(f: &crate::docx::NumberFormat) -> Option<ListStyl
 // Table conversion
 // ---------------------------------------------------------------------------
 
-/// Upper bound for a single `w:gridSpan`. Word's own table limit is 63
-/// columns; this leaves generous headroom while keeping the value bounded.
-const MAX_GRID_SPAN: u32 = 1_000;
-
-/// A cell's `w:gridSpan`, clamped to `1..=MAX_GRID_SPAN`.
+/// A cell's `w:gridSpan`, clamped (see `TableCell::grid_span`).
 fn cell_grid_span(cell: &crate::docx::TableCell) -> u32 {
-    cell.properties
-        .as_ref()
-        .and_then(|p| p.grid_span)
-        .unwrap_or(1)
-        .clamp(1, MAX_GRID_SPAN)
+    cell.grid_span()
 }
 
-fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) -> Element {
+fn convert_table(table: &crate::docx::Table, doc: &Cx<'_, '_>) -> Element {
     // A table cell can hold another table (`convert_block_elements` ->
     // `convert_table` -> `convert_block_elements` -> ...), so this
     // recurses on whatever it's given — including a tree the XML parser
@@ -1769,21 +1808,7 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
     let num_rows = table.rows.len();
     // Starting grid column of every cell, row by row (ascending, so a
     // lookup by column is a binary search).
-    let starts: Vec<Vec<usize>> = table
-        .rows
-        .iter()
-        .map(|r| {
-            let mut col = 0usize;
-            r.cells
-                .iter()
-                .map(|c| {
-                    let start = col;
-                    col = col.saturating_add(cell_grid_span(c) as usize);
-                    start
-                })
-                .collect()
-        })
-        .collect();
+    let starts: Vec<Vec<usize>> = table.grid_starts();
     let vmerge_at = |row: usize, col: usize| {
         let i = starts[row].binary_search(&col).ok()?;
         table.rows[row].cells[i]
@@ -1822,28 +1847,15 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
         .zip(doc.styles.as_ref())
         .map(|(id, sheet)| sheet.resolve_table_style(id))
         .unwrap_or_default();
-    let grid_width = starts
-        .iter()
-        .zip(&table.rows)
-        .map(|(s, r)| match (s.last(), r.cells.last()) {
-            (Some(&start), Some(cell)) => start.saturating_add(cell_grid_span(cell) as usize),
-            _ => 0,
-        })
-        .max()
-        .unwrap_or(0);
-    let layout = TableStyleLayout {
-        look: tp.and_then(|p| p.look),
-        num_rows,
-        grid_width,
-        row_band: tp
-            .and_then(|p| p.row_band_size)
-            .or(style.row_band_size)
-            .unwrap_or(1) as usize,
-        col_band: tp
-            .and_then(|p| p.col_band_size)
-            .or(style.col_band_size)
-            .unwrap_or(1) as usize,
-    };
+    let layout = crate::docx::table::TableStyleLayout::new(
+        table,
+        &starts,
+        style.row_band_size,
+        style.col_band_size,
+    );
+    // The run and paragraph formatting the style gives each distinct set of
+    // regions (a bold header row, banded rows, ...), built once per set.
+    let mut layers: Vec<(Vec<&'static str>, Option<CellStyleLayer>)> = Vec::new();
 
     let mut ir_rows = Vec::new();
     for (row_idx, row) in table.rows.iter().enumerate() {
@@ -1878,9 +1890,25 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
             }
 
             let row_span = row_spans[row_idx][cell_idx];
+            let regions = {
+                let start = starts[row_idx][cell_idx];
+                layout.regions(row_idx, start, start.saturating_add(col_span as usize))
+            };
+            let slot = match layers.iter().position(|(r, _)| *r == regions) {
+                Some(i) => i,
+                None => {
+                    let layer = style.cell_layer(&regions);
+                    layers.push((regions.clone(), layer));
+                    layers.len() - 1
+                },
+            };
 
             let mut cell_elements = Vec::new();
-            convert_block_elements(&cell.content, &mut cell_elements, doc);
+            convert_block_elements(
+                &cell.content,
+                &mut cell_elements,
+                &doc.in_cell(layers[slot].1.as_ref()),
+            );
             // One paragraph per cell is the norm; an `Element` slot is
             // ~270 bytes and a fresh `Vec` reserves four of them.
             cell_elements.shrink_to_fit();
@@ -1905,23 +1933,15 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
                 // `w:shd`, even `nil`, is the cell's own choice.
                 background_color: match cp.and_then(|p| p.shading.as_deref()) {
                     Some(sh) => shading_rgb(sh),
-                    None => {
-                        let start = starts[row_idx][cell_idx];
-                        let end = start.saturating_add(col_span as usize);
-                        layout
-                            .regions(row_idx, start, end)
+                    None => regions.iter().rev().find_map(|kind| {
+                        style
+                            .conditionals
                             .iter()
-                            .rev()
-                            .find_map(|kind| {
-                                style
-                                    .conditionals
-                                    .iter()
-                                    .find(|c| c.kind == *kind)
-                                    .and_then(|c| c.cell_properties.as_ref())
-                                    .and_then(|p| p.shading.as_deref())
-                                    .and_then(shading_rgb)
-                            })
-                    },
+                            .find(|c| c.kind == *kind)
+                            .and_then(|c| c.cell_properties.as_ref())
+                            .and_then(|p| p.shading.as_deref())
+                            .and_then(shading_rgb)
+                    }),
                 },
                 border: cp
                     .and_then(|p| p.borders.as_deref())
@@ -1986,70 +2006,6 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
         width_twips: tp.and_then(|p| p.width.as_ref()).and_then(dxa_width),
         indent_left_twips: tp.and_then(|p| p.indent).map(|t| t.0),
     })
-}
-
-/// Where a cell sits relative to the regions a table style formats.
-struct TableStyleLayout {
-    /// `None` when the table has no `w:tblLook`: only whole-table
-    /// formatting applies, rather than guessing which regions are on.
-    look: Option<crate::docx::table::TableLook>,
-    num_rows: usize,
-    grid_width: usize,
-    row_band: usize,
-    col_band: usize,
-}
-
-impl TableStyleLayout {
-    /// The `w:tblStylePr` regions covering the cell at `row` spanning grid
-    /// columns `start..end`, in increasing precedence (ECMA-376 §17.7.6:
-    /// whole table, banded columns, banded rows, first/last column,
-    /// first/last row, corner cells).
-    fn regions(&self, row: usize, start: usize, end: usize) -> Vec<&'static str> {
-        let mut out = vec!["wholeTable"];
-        let Some(look) = self.look else {
-            return out;
-        };
-        let first_row = look.first_row && row == 0;
-        let last_row = look.last_row && row + 1 == self.num_rows;
-        let first_col = look.first_column && start == 0;
-        let last_col = look.last_column && end >= self.grid_width;
-        if !look.no_v_band && !first_col && !last_col {
-            let data_col = start.saturating_sub(usize::from(look.first_column));
-            out.push(if (data_col / self.col_band.max(1)).is_multiple_of(2) {
-                "band1Vert"
-            } else {
-                "band2Vert"
-            });
-        }
-        if !look.no_h_band && !first_row && !last_row {
-            let data_row = row.saturating_sub(usize::from(look.first_row));
-            out.push(if (data_row / self.row_band.max(1)).is_multiple_of(2) {
-                "band1Horz"
-            } else {
-                "band2Horz"
-            });
-        }
-        if first_col {
-            out.push("firstCol");
-        }
-        if last_col {
-            out.push("lastCol");
-        }
-        if first_row {
-            out.push("firstRow");
-        }
-        if last_row {
-            out.push("lastRow");
-        }
-        match (first_row, last_row, first_col, last_col) {
-            (true, _, true, _) => out.push("nwCell"),
-            (true, _, _, true) => out.push("neCell"),
-            (_, true, true, _) => out.push("swCell"),
-            (_, true, _, true) => out.push("seCell"),
-            _ => {},
-        }
-        out
-    }
 }
 
 /// Read a `w:tblW` / `w:tcW` preferred width, but only when it is an
