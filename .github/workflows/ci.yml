@@ -503,7 +503,9 @@ jobs:
 
       - name: Run Node tests
         working-directory: js
-        run: node --test test/basic.test.mjs
+        # Auto-discovers every test/*.test.mjs (a shell glob would not expand
+        # under the Windows runner's default shell).
+        run: node --test
         env:
           OFFICE_OXIDE_LIB: ${{ steps.lib.outputs.path }}
 

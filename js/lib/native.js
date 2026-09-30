@@ -62,7 +62,15 @@ const freeBytesRaw = lib.func('void office_oxide_free_bytes(void* ptr, size_t le
 
 // Register a disposable `HeapStr` type. koffi keeps the type table global,
 // so the type name (registered here) is usable by name in function prototypes.
-koffi.disposable('HeapStr', 'char*', freeStringRaw);
+// koffi's type table is process-global, so a second copy of this binding
+// in the same process (the ESM and CommonJS entry points both loaded, or
+// two installed copies) must reuse the registration instead of throwing
+// "Duplicate type name".
+try {
+  koffi.disposable('HeapStr', 'char*', freeStringRaw);
+} catch (e) {
+  if (!String(e && e.message).includes('Duplicate type name')) throw e;
+}
 
 export const native = {
   version: lib.func('const char* office_oxide_version()'),
@@ -76,15 +84,18 @@ export const native = {
   documentFormat: lib.func('const char* office_document_format(void* handle)'),
   documentPlainText: lib.func('HeapStr office_document_plain_text(void* handle, _Out_ int* error_code)'),
   documentToMarkdown: lib.func('HeapStr office_document_to_markdown(void* handle, _Out_ int* error_code)'),
+  documentToMarkdownWithImages: lib.func('HeapStr office_document_to_markdown_with_images(void* handle, _Out_ int* error_code)'),
   documentToHtml: lib.func('HeapStr office_document_to_html(void* handle, _Out_ int* error_code)'),
   documentToIrJson: lib.func('HeapStr office_document_to_ir_json(void* handle, _Out_ int* error_code)'),
   documentSaveAs: lib.func('int32_t office_document_save_as(void* handle, const char* path, _Out_ int* error_code)'),
 
   editableOpen: lib.func('void* office_editable_open(const char* path, _Out_ int* error_code)'),
+  editableOpenFromBytes: lib.func('void* office_editable_open_from_bytes(const uint8_t* data, size_t len, const char* format, _Out_ int* error_code)'),
   editableFree: lib.func('void office_editable_free(void* handle)'),
   editableReplaceText: lib.func('int64_t office_editable_replace_text(void* handle, const char* find, const char* replace, _Out_ int* error_code)'),
   editableSetCell: lib.func('int32_t office_editable_set_cell(void* handle, uint32_t sheet_index, const char* cell_ref, int32_t value_type, const char* value_str, double value_num, _Out_ int* error_code)'),
   editableSave: lib.func('int32_t office_editable_save(void* handle, const char* path, _Out_ int* error_code)'),
+  editableSaveToBytes: lib.func('uint8_t* office_editable_save_to_bytes(void* handle, _Out_ size_t* out_len, _Out_ int* error_code)'),
 
   extractText: lib.func('HeapStr office_extract_text(const char* path, _Out_ int* error_code)'),
   toMarkdown: lib.func('HeapStr office_to_markdown(const char* path, _Out_ int* error_code)'),
@@ -109,7 +120,7 @@ export const native = {
   pptxWriterAddSlide: lib.func('uint32_t office_pptx_writer_add_slide(void* handle)'),
   pptxSlideSetTitle: lib.func('int32_t office_pptx_slide_set_title(void* handle, uint32_t slide, const char* title)'),
   pptxSlideAddText: lib.func('int32_t office_pptx_slide_add_text(void* handle, uint32_t slide, const char* text)'),
-  pptxSlideAddImage: lib.func('void office_pptx_slide_add_image(void* handle, uint32_t slide, const uint8_t* data, size_t len, const char* format, int64_t x, int64_t y, uint64_t cx, uint64_t cy)'),
+  pptxSlideAddImage: lib.func('int32_t office_pptx_slide_add_image(void* handle, uint32_t slide, const uint8_t* data, size_t len, const char* format, int64_t x, int64_t y, uint64_t cx, uint64_t cy)'),
   pptxWriterSave: lib.func('int32_t office_pptx_writer_save(void* handle, const char* path, _Out_ int* error_code)'),
   pptxWriterToBytes: lib.func('uint8_t* office_pptx_writer_to_bytes(void* handle, _Out_ size_t* out_len, _Out_ int* error_code)'),
 };
