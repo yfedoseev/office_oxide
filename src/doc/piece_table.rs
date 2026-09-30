@@ -2,7 +2,10 @@
 //!
 //! The piece table maps character positions to byte ranges in the WordDocument stream.
 //! Each piece can be either:
-//! - Compressed (CP1252): 1 byte per character, fc has bit 30 set, actual offset = (fc & ~0x40000000) / 2
+//! - Compressed (8-bit): 1 byte per character, fc has bit 30 set, actual
+//!   offset = (fc & ~0x40000000) / 2. Decoded in the code page the FIB's
+//!   `lid` implies (`codepage::decode_byte`) — Windows-1252, the mapping
+//!   [MS-DOC] §2.4.1 tabulates, for English and every unrecognised `lid`.
 //! - Unicode (UTF-16LE): 2 bytes per character, fc is used directly
 
 use super::error::{DocError, Result};
@@ -16,7 +19,7 @@ pub struct Piece {
     pub cp_end: u32,
     /// File offset in the WordDocument stream.
     pub fc: u32,
-    /// Whether this piece uses compressed (CP1252) encoding.
+    /// Whether this piece uses compressed (8-bit, `lid` code page) encoding.
     pub is_compressed: bool,
 }
 
@@ -195,7 +198,7 @@ pub fn extract_text_range(
         let char_count = piece.cp_end.min(max_chars) - piece.cp_start - skip;
 
         if piece.is_compressed {
-            // Compressed: 1 byte per character, CP1252.
+            // Compressed: 1 byte per character, in the `lid` code page.
             // Actual byte offset = (fc & ~0x40000000) / 2
             let byte_offset = ((piece.fc & !0x40000000) / 2) as usize + skip as usize;
             let byte_count = char_count as usize;
@@ -301,7 +304,7 @@ pub(crate) fn piece_backed_cp_end(piece: &Piece, word_doc_len: usize) -> u32 {
 /// Unlike [`extract_text_range`] this is *per range*: callers slice by CP without
 /// first collapsing the whole document into a flat `String`, so a surrogate
 /// pair (2 UTF-16 code units) in a Unicode piece is decoded into one `char`
-/// exactly where it belongs, and compressed (CP1252) pieces are decoded by
+/// exactly where it belongs, and compressed (8-bit) pieces are decoded by
 /// their own stride. A truncated/out-of-range segment is skipped per-CP
 /// rather than dropping the entire piece, which keeps later ranges aligned.
 pub(crate) fn decode_cp_range(
