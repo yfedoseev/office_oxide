@@ -5,6 +5,28 @@ use super::numfmt;
 use super::worksheet::Row;
 use crate::limits::TextBudget;
 
+/// The heading every renderer gives a pivot's cached source data.
+pub(crate) fn pivot_cache_title(pivot_name: &str) -> String {
+    format!("{pivot_name} (cached pivot source data)")
+}
+
+/// The line every renderer appends when a pivot cache stopped
+/// materialising at its record, field or text bound.
+pub(crate) const PIVOT_CACHE_TRUNCATED_NOTICE: &str = "[pivot cache truncated: a record, field or text limit was reached — later records are missing]";
+
+impl XlsxDocument {
+    /// Every pivot whose cached source data was materialised (its source
+    /// is not in the workbook), as `(pivot name, data)`, in sheet order.
+    pub(crate) fn pivot_caches(
+        &self,
+    ) -> impl Iterator<Item = (&str, &super::worksheet::PivotCacheData)> {
+        self.worksheets
+            .iter()
+            .flat_map(|ws| &ws.pivot_tables)
+            .filter_map(|p| Some((p.name.as_str(), p.cache_data.as_ref()?)))
+    }
+}
+
 /// `B2 (Author)` — the same marker `to_ir()` puts on a comment's endnote.
 pub(crate) fn comment_marker(cell_ref: &str, author: Option<&str>) -> String {
     match author {
@@ -131,6 +153,18 @@ impl XlsxDocument {
             if !text.trim().is_empty() {
                 parts.push(text.trim().to_string());
             }
+        }
+        for (name, data) in self.pivot_caches() {
+            let mut block = pivot_cache_title(name);
+            for row in std::iter::once(&data.fields).chain(&data.records) {
+                block.push('\n');
+                block.push_str(&row.join("\t"));
+            }
+            if data.truncated {
+                block.push('\n');
+                block.push_str(PIVOT_CACHE_TRUNCATED_NOTICE);
+            }
+            parts.push(block);
         }
         for (name, err) in &self.unreadable_sheets {
             parts.push(unreadable_notice(name, err));
@@ -276,6 +310,33 @@ impl XlsxDocument {
             if !text.trim().is_empty() {
                 parts.push(format!("## Chart {}\n\n{}", i + 1, text));
             }
+        }
+        for (name, data) in self.pivot_caches() {
+            let cols = data.fields.len().max(1);
+            let md_row = |row: &[String]| {
+                let mut line = String::from("|");
+                for i in 0..cols {
+                    let v = row.get(i).map(String::as_str).unwrap_or("");
+                    line.push(' ');
+                    line.push_str(&crate::core::markdown::escape_cell(v));
+                    line.push_str(" |");
+                }
+                line
+            };
+            let mut block = format!("## {}\n\n", pivot_cache_title(name));
+            block.push_str(&md_row(&data.fields));
+            block.push('\n');
+            block.push('|');
+            block.push_str(&" --- |".repeat(cols));
+            for rec in &data.records {
+                block.push('\n');
+                block.push_str(&md_row(rec));
+            }
+            if data.truncated {
+                block.push_str("\n\n");
+                block.push_str(PIVOT_CACHE_TRUNCATED_NOTICE);
+            }
+            parts.push(block);
         }
         for (name, err) in &self.unreadable_sheets {
             parts.push(format!("## {name}\n\n{}", unreadable_notice(name, err)));
