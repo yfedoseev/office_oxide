@@ -450,57 +450,66 @@ impl ZipEntryIndex {
     }
 }
 
-/// Read a ZIP entry by name, returning its bytes.
-/// Falls back to case-insensitive and backslash-normalized lookup if exact match fails.
-/// Read the "total number of entries in the central directory" field from a
-/// ZIP's End of Central Directory record.
+/// Count the records physically present in the central directory that
+/// starts at `start`, walking them by their own length fields until the
+/// next structure is not a central-directory file header (PKWARE APPNOTE
+/// §4.3.12, which ECMA-376 Part 2 Annex C adopts: a 46-byte fixed header
+/// followed by the name, extra field and comment).
 ///
-/// Returns `None` when the record cannot be located or the archive uses the
-/// ZIP64 sentinel, in which case the caller simply skips the duplicate check
-/// rather than guessing. The field is the only way to see duplicates at all:
-/// the zip crate keys its entries by name, so two records with the same name
-/// collapse into one before any caller can notice.
-fn central_directory_entry_count<R: Read + Seek>(reader: &mut R) -> Result<Option<usize>> {
-    const EOCD_SIG: [u8; 4] = [b'P', b'K', 5, 6];
-    // The EOCD is at most 22 bytes plus a 64 KiB comment.
-    const MAX_SCAN: u64 = 22 + 0xFFFF;
+/// This is the count a reader that walks the directory by size sees,
+/// independent of the record count the end-of-central-directory declares.
+fn count_central_directory_records<R: Read + Seek>(reader: &mut R, start: u64) -> Result<usize> {
+    /// Central directory file header signature (APPNOTE §4.3.12).
+    const CD_SIG: u32 = 0x0201_4b50;
+    /// Fixed part of a central directory file header (APPNOTE §4.3.12).
+    const CD_FIXED_LEN: usize = 46;
 
-    let len = reader.seek(std::io::SeekFrom::End(0))?;
-    if len < 22 {
-        return Ok(None);
+    reader.seek(std::io::SeekFrom::Start(start))?;
+    let mut r = std::io::BufReader::new(reader);
+    let mut header = [0u8; CD_FIXED_LEN];
+    let mut count = 0usize;
+    loop {
+        match r.read_exact(&mut header[..4]) {
+            Ok(()) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+        if u32::from_le_bytes([header[0], header[1], header[2], header[3]]) != CD_SIG {
+            break;
+        }
+        r.read_exact(&mut header[4..])?;
+        let name_len = u16::from_le_bytes([header[28], header[29]]) as i64;
+        let extra_len = u16::from_le_bytes([header[30], header[31]]) as i64;
+        let comment_len = u16::from_le_bytes([header[32], header[33]]) as i64;
+        r.seek_relative(name_len + extra_len + comment_len)?;
+        count += 1;
     }
-    let scan = MAX_SCAN.min(len);
-    reader.seek(std::io::SeekFrom::End(-(scan as i64)))?;
-    let mut buf = vec![0u8; scan as usize];
-    reader.read_exact(&mut buf)?;
-
-    // Scan backwards for the signature; the last match is the real EOCD.
-    let Some(pos) = buf
-        .windows(4)
-        .rposition(|w| w == EOCD_SIG)
-        .filter(|&p| p + 12 <= buf.len())
-    else {
-        return Ok(None);
-    };
-    let total = u16::from_le_bytes([buf[pos + 10], buf[pos + 11]]);
-    // 0xFFFF is the ZIP64 sentinel: the real count lives elsewhere.
-    if total == u16::MAX {
-        return Ok(None);
-    }
-    Ok(Some(total as usize))
+    Ok(count)
 }
 
-/// Open a ZIP archive, refusing one that holds two entries with the same
-/// name.
+/// Open a ZIP archive, refusing one whose entries two readers could
+/// resolve differently.
 ///
 /// Which of two same-named entries a reader returns is unspecified, so two
 /// implementations reading the same bytes can see two different
 /// documents. That is the shape of CVE-2025-31672 and of every "scanner
 /// reads one copy, renderer reads the other" bypass. Whichever copy we
-/// picked would be accidental, so the package is refused. The
-/// central-directory record count is read *before* the zip crate sees the
-/// reader, because the crate keys entries by name and collapses duplicates
-/// before any caller can notice.
+/// picked would be accidental, so the package is refused. Three shapes are
+/// checked:
+///
+/// * **Exact duplicates.** The zip crate keys entries by name and collapses
+///   two records with the same name into one, so they are detected by
+///   walking the central directory and comparing its record count with the
+///   number of entries the crate kept. This holds for ZIP64 archives too:
+///   the walk starts wherever the crate located the directory.
+/// * **Hidden records.** An end-of-central-directory record (classic or
+///   ZIP64) that understates the record count makes the crate stop early,
+///   while a reader that walks the directory by size sees every record.
+///   The same walk catches this.
+/// * **Case / separator duplicates.** OPC part names are compared
+///   ASCII-case-insensitively (ECMA-376 Part 2 §9.1.1.1), and
+///   Windows-written archives use `\`: `word/Document.xml` and
+///   `word\document.xml` name the same part as `word/document.xml`.
 ///
 /// Every OOXML reader must open its archive through this — `OpcReader`
 /// does, and so does the XLSX fast path, which bypasses `OpcReader` for
@@ -508,14 +517,27 @@ fn central_directory_entry_count<R: Read + Seek>(reader: &mut R) -> Result<Optio
 pub(crate) fn open_zip_rejecting_duplicates<R: Read + Seek>(
     mut reader: R,
 ) -> Result<ZipArchive<R>> {
-    let declared_entries = central_directory_entry_count(&mut reader)?;
+    // A first pass lets the crate locate the central directory its own way
+    // (EOCD, ZIP64 EOCD, prepended-data offset), so the walk below counts
+    // exactly the directory the crate reads.
+    let (dir_start, kept) = {
+        let archive = ZipArchive::new(&mut reader)?;
+        (archive.central_directory_start(), archive.len())
+    };
+    let present = count_central_directory_records(&mut reader, dir_start)?;
+    if present != kept {
+        return Err(Error::DuplicatePart(format!(
+            "the central directory holds {present} records but resolves to {kept} distinct entries"
+        )));
+    }
     reader.seek(std::io::SeekFrom::Start(0))?;
     let archive = ZipArchive::new(reader)?;
-    if let Some(declared) = declared_entries {
-        if declared > archive.len() {
+
+    let mut seen = std::collections::HashSet::with_capacity(archive.len());
+    for name in archive.file_names() {
+        if !seen.insert(ZipEntryIndex::normalize(name)) {
             return Err(Error::DuplicatePart(format!(
-                "{declared} central-directory entries collapse to {} unique names",
-                archive.len()
+                "'{name}' names the same part as another entry (part names are case-insensitive)"
             )));
         }
     }
@@ -771,6 +793,220 @@ mod tests {
             archive.index_for_name("xl/Worksheets/Sheet1.xml")
         );
         assert_eq!(index.lookup("xl/worksheets/sheet2.xml"), None);
+    }
+
+    /// Bitwise CRC-32 (IEEE), enough to hand-assemble stored zip entries.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in data {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    /// How the end-of-central-directory of a hand-assembled zip is written.
+    #[derive(Clone, Copy)]
+    enum Eocd {
+        /// A plain EOCD whose record count is the given value.
+        Count(u16),
+        /// A ZIP64 EOCD record + locator carrying the true count, with the
+        /// classic EOCD holding the 0xFFFF / 0xFFFFFFFF sentinels.
+        Zip64,
+    }
+
+    /// Hand-assemble a stored (uncompressed) zip. The zip crate's writer
+    /// refuses duplicate names and never forges counts, so the shapes the
+    /// reader must reject are built byte by byte. `bad_crc` names entries
+    /// whose recorded CRC-32 is deliberately wrong.
+    fn raw_zip(entries: &[(&str, &[u8])], eocd: Eocd, bad_crc: &[&str]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (name, data) in entries {
+            let mut crc = crc32(data);
+            if bad_crc.contains(name) {
+                crc ^= 0xDEAD_BEEF;
+            }
+            let offset = out.len() as u32;
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+            out.extend_from_slice(&0u32.to_le_bytes()); // time + date
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes()); // made by
+            central.extend_from_slice(&20u16.to_le_bytes()); // needed
+            central.extend_from_slice(&0u16.to_le_bytes()); // flags
+            central.extend_from_slice(&0u16.to_le_bytes()); // method
+            central.extend_from_slice(&0u32.to_le_bytes()); // time + date
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes()); // extra
+            central.extend_from_slice(&0u16.to_le_bytes()); // comment
+            central.extend_from_slice(&0u16.to_le_bytes()); // disk
+            central.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+            central.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let cd_offset = out.len() as u64;
+        let cd_size = central.len() as u64;
+        out.extend_from_slice(&central);
+        let n = entries.len() as u64;
+        let (count16, size32, offset32) = match eocd {
+            Eocd::Count(c) => (c, cd_size as u32, cd_offset as u32),
+            Eocd::Zip64 => {
+                let eocd64_offset = out.len() as u64;
+                out.extend_from_slice(&0x0606_4b50u32.to_le_bytes());
+                out.extend_from_slice(&44u64.to_le_bytes()); // record size
+                out.extend_from_slice(&45u16.to_le_bytes()); // made by
+                out.extend_from_slice(&45u16.to_le_bytes()); // needed
+                out.extend_from_slice(&0u32.to_le_bytes()); // this disk
+                out.extend_from_slice(&0u32.to_le_bytes()); // cd disk
+                out.extend_from_slice(&n.to_le_bytes()); // entries on disk
+                out.extend_from_slice(&n.to_le_bytes()); // entries total
+                out.extend_from_slice(&cd_size.to_le_bytes());
+                out.extend_from_slice(&cd_offset.to_le_bytes());
+                // ZIP64 end-of-central-directory locator.
+                out.extend_from_slice(&0x0706_4b50u32.to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+                out.extend_from_slice(&eocd64_offset.to_le_bytes());
+                out.extend_from_slice(&1u32.to_le_bytes());
+                (u16::MAX, u32::MAX, u32::MAX)
+            },
+        };
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // this disk
+        out.extend_from_slice(&0u16.to_le_bytes()); // cd disk
+        out.extend_from_slice(&count16.to_le_bytes());
+        out.extend_from_slice(&count16.to_le_bytes());
+        out.extend_from_slice(&size32.to_le_bytes());
+        out.extend_from_slice(&offset32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        out
+    }
+
+    const MINIMAL_CT: &[u8] = br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>"#;
+
+    fn open(bytes: Vec<u8>) -> Result<OpcReader<std::io::Cursor<Vec<u8>>>> {
+        OpcReader::new(std::io::Cursor::new(bytes))
+    }
+
+    #[test]
+    fn test_hand_assembled_zip_opens() {
+        let bytes = raw_zip(
+            &[("[Content_Types].xml", MINIMAL_CT), ("word/a.xml", b"<a/>")],
+            Eocd::Count(2),
+            &[],
+        );
+        let mut r = open(bytes).expect("a well-formed hand-assembled zip opens");
+        let a = r.read_part(&PartName::new("/word/a.xml").unwrap()).unwrap();
+        assert_eq!(a, b"<a/>");
+        let bytes = raw_zip(
+            &[("[Content_Types].xml", MINIMAL_CT), ("word/a.xml", b"<a/>")],
+            Eocd::Zip64,
+            &[],
+        );
+        open(bytes).expect("a well-formed ZIP64 zip opens");
+    }
+
+    #[test]
+    fn test_zip64_archive_with_duplicate_entries_is_rejected() {
+        let bytes = raw_zip(
+            &[
+                ("[Content_Types].xml", MINIMAL_CT),
+                ("word/a.xml", b"<first/>"),
+                ("word/a.xml", b"<second/>"),
+            ],
+            Eocd::Zip64,
+            &[],
+        );
+        assert!(matches!(open(bytes), Err(Error::DuplicatePart(_))));
+    }
+
+    /// An end-of-central-directory that declares fewer records than the
+    /// directory holds makes this reader stop early while a reader that
+    /// walks the directory by size sees every record. Either way the two
+    /// disagree about the package, so it is refused.
+    #[test]
+    fn test_understated_central_directory_count_is_rejected() {
+        // The duplicate sits past the declared count.
+        let bytes = raw_zip(
+            &[
+                ("[Content_Types].xml", MINIMAL_CT),
+                ("word/a.xml", b"<first/>"),
+                ("word/a.xml", b"<second/>"),
+            ],
+            Eocd::Count(2),
+            &[],
+        );
+        assert!(open(bytes).is_err());
+        // Declared count covers both duplicates but not a trailing record.
+        let bytes = raw_zip(
+            &[
+                ("[Content_Types].xml", MINIMAL_CT),
+                ("word/a.xml", b"<first/>"),
+                ("word/a.xml", b"<second/>"),
+                ("word/b.xml", b"<b/>"),
+            ],
+            Eocd::Count(3),
+            &[],
+        );
+        assert!(open(bytes).is_err());
+        // A hidden trailing record with a distinct name.
+        let bytes = raw_zip(
+            &[
+                ("[Content_Types].xml", MINIMAL_CT),
+                ("word/a.xml", b"<a/>"),
+                ("word/hidden.xml", b"<h/>"),
+            ],
+            Eocd::Count(2),
+            &[],
+        );
+        assert!(open(bytes).is_err());
+    }
+
+    /// Part names are compared case-insensitively (ECMA-376 Part 2 §9.1.1.1),
+    /// so two entries differing only in case name the same part.
+    #[test]
+    fn test_case_only_duplicate_part_names_are_rejected() {
+        let bytes = raw_zip(
+            &[
+                ("[Content_Types].xml", MINIMAL_CT),
+                ("word/Document.xml", b"<first/>"),
+                ("word/document.xml", b"<second/>"),
+            ],
+            Eocd::Count(3),
+            &[],
+        );
+        assert!(matches!(open(bytes), Err(Error::DuplicatePart(_))));
+        // `\` and `/` separators name the same part too.
+        let bytes = raw_zip(
+            &[
+                ("[Content_Types].xml", MINIMAL_CT),
+                ("word/a.xml", b"<first/>"),
+                ("word\\a.xml", b"<second/>"),
+            ],
+            Eocd::Count(3),
+            &[],
+        );
+        assert!(matches!(open(bytes), Err(Error::DuplicatePart(_))));
     }
 
     #[test]
