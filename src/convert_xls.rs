@@ -24,66 +24,64 @@ const MAX_CELLS_PER_SHEET: usize = 1_000_000;
 #[cfg(test)]
 const MAX_CELLS_PER_SHEET: usize = 5_000;
 
-/// Reduce `Sheet::merged_cells` ((row_first, row_last, col_first,
-/// col_last) tuples from the MERGEDCELLS record) to an anchor
-/// (row, col) -> (row_span, col_span) map plus the set of positions
-/// each range covers — the same split `convert_xlsx.rs` uses, so both
-/// formats feed the sparse, span-driven TableRow model
-/// ir_render.rs's table_grid expects (XLS half).
-/// Reduce `Sheet::hyperlinks` (one entry per `HLINK` record, which can
-/// cover a whole range, not just a single cell) to a per-cell lookup —
-/// the same shape `convert_xlsx.rs` already builds from its own
-/// `Worksheet::hyperlinks`.
-fn hyperlink_lookup(
-    hyperlinks: &[crate::xls::XlsHyperlink],
-) -> std::collections::HashMap<(u16, u16), String> {
-    let mut map = std::collections::HashMap::new();
-    for hl in hyperlinks {
-        let (row_lo, row_hi) = (hl.row_first.min(hl.row_last), hl.row_first.max(hl.row_last));
-        let (col_lo, col_hi) = (hl.col_first.min(hl.col_last), hl.col_first.max(hl.col_last));
-        for r in row_lo..=row_hi {
-            for c in col_lo..=col_hi {
-                map.insert((r, c), hl.target.clone());
-            }
-        }
-    }
-    map
+use crate::xlsx::range_sweep::{CellRange, RangeSweep};
+
+/// `Sheet::merged_cells` ((row_first, row_last, col_first, col_last)
+/// tuples from MERGEDCELLS) as a row sweep. Each range is kept whole and
+/// consulted per materialised row — the anchor gets its span, covered
+/// positions are dropped — the same sparse, span-driven TableRow model
+/// `ir_render`'s `table_grid` expects. Expanding each range into the set of
+/// positions it covers cost its declared area: one whole-grid entry was
+/// billions of inserts.
+fn merge_sweep(merged_cells: &[(u16, u16, u16, u16)]) -> RangeSweep<()> {
+    RangeSweep::new(
+        merged_cells
+            .iter()
+            .map(|&(r0, r1, c0, c1)| {
+                CellRange::from_corners(r0.into(), c0.into(), r1.into(), c1.into())
+            })
+            .filter(|r| r.row_span() > 1 || r.col_span() > 1)
+            .map(|r| (r, ()))
+            .collect(),
+    )
 }
 
-fn merge_lookup(
-    merged_cells: &[(u16, u16, u16, u16)],
-) -> (
-    std::collections::HashMap<(u16, u16), (u16, u16)>,
-    std::collections::HashSet<(u16, u16)>,
-) {
-    let mut span = std::collections::HashMap::new();
-    let mut covered = std::collections::HashSet::new();
-    for &(row_first, row_last, col_first, col_last) in merged_cells {
-        let (row_lo, row_hi) = (row_first.min(row_last), row_first.max(row_last));
-        let (col_lo, col_hi) = (col_first.min(col_last), col_first.max(col_last));
-        let row_span = row_hi - row_lo + 1;
-        let col_span = col_hi - col_lo + 1;
-        if row_span <= 1 && col_span <= 1 {
-            continue;
-        }
-        span.insert((row_lo, col_lo), (row_span, col_span));
-        for r in row_lo..=row_hi {
-            for c in col_lo..=col_hi {
-                if (r, c) != (row_lo, col_lo) {
-                    covered.insert((r, c));
-                }
-            }
-        }
+/// `Sheet::hyperlinks` (one entry per `HLINK` record, which can cover a
+/// range, not just a single cell) as a row sweep; a later record wins
+/// where ranges overlap.
+fn hyperlink_sweep(hyperlinks: &[crate::xls::XlsHyperlink]) -> RangeSweep<&str> {
+    RangeSweep::new(
+        hyperlinks
+            .iter()
+            .map(|hl| {
+                let range = CellRange::from_corners(
+                    hl.row_first.into(),
+                    hl.col_first.into(),
+                    hl.row_last.into(),
+                    hl.col_last.into(),
+                );
+                (range, hl.target.as_str())
+            })
+            .collect(),
+    )
+}
+
+/// Clip `range`'s columns to a row of `width` cells: `None` when it lies
+/// wholly past the row's last cell.
+fn clip_cols(range: &CellRange, width: usize) -> Option<(usize, usize)> {
+    let lo = range.col_lo as usize;
+    if lo >= width {
+        return None;
     }
-    (span, covered)
+    Some((lo, (range.col_hi as usize).min(width - 1)))
 }
 
 pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
     let mut sections = Vec::new();
 
     for sheet in &doc.sheets {
-        let (merge_span, merge_covered) = merge_lookup(&sheet.merged_cells);
-        let links = hyperlink_lookup(&sheet.hyperlinks);
+        let mut merges = merge_sweep(&sheet.merged_cells);
+        let mut links = hyperlink_sweep(&sheet.hyperlinks);
         let mut rows = Vec::new();
         // Rows past the last one carrying data are padding; measuring the
         // sheet against them would report a truncation that dropped nothing.
@@ -98,6 +96,14 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
                     .any(|cell_value| !matches!(cell_value, crate::xls::CellValue::Empty))
             })
             .map_or(0, |i| i + 1);
+        // Widest row, for clipping a merge's column span to the table.
+        let max_width = sheet
+            .rows
+            .iter()
+            .take(total_rows)
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0);
         let mut budget = MAX_CELLS_PER_SHEET;
         // Rows reached before the budget ran out, counted separately from
         // `rows` so that trimming an all-empty tail is not reported as
@@ -118,6 +124,7 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
                 .iter()
                 .rposition(|cell_value| !matches!(cell_value, crate::xls::CellValue::Empty))
                 .map_or(0, |i| i + 1);
+            let row_links = row_hyperlinks(&mut links, row_idx as u32, width);
             let mut cells = Vec::with_capacity(width);
             for col_idx in 0..width {
                 // Number-format-aware rendering: a date cell is an ISO
@@ -126,7 +133,10 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
                     .display_text(row_idx, col_idx)
                     .map(std::borrow::Cow::into_owned)
                     .unwrap_or_default();
-                let hyperlink = links.get(&(row_idx as u16, col_idx as u16)).cloned();
+                let hyperlink = row_links
+                    .as_ref()
+                    .and_then(|l| l[col_idx])
+                    .map(str::to_string);
                 cells.push(TableCell {
                     content: vec![Element::Paragraph(Paragraph {
                         content: if text.is_empty() {
@@ -145,28 +155,11 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
             }
 
             // Apply merges: the anchor gets its real span, and every
-            // position it covers is dropped from the row entirely —
-            // `sheet.rows[row_idx]` is already a dense, fully-padded
-            // grid (`row.iter().enumerate()` gives every column 0..N),
-            // so `row_idx`/`col_idx` are already the true absolute
-            // positions `merged_cells` uses, no gap-adjustment needed.
-            if !merge_span.is_empty() {
-                for (col_idx, cell) in cells.iter_mut().enumerate() {
-                    if let Some(&(row_span, col_span)) =
-                        merge_span.get(&(row_idx as u16, col_idx as u16))
-                    {
-                        cell.row_span = row_span as u32;
-                        cell.col_span = col_span as u32;
-                    }
-                }
-            }
-            if !merge_covered.is_empty() {
-                let mut col_idx = 0u16;
-                cells.retain(|_| {
-                    let keep = !merge_covered.contains(&(row_idx as u16, col_idx));
-                    col_idx += 1;
-                    keep
-                });
+            // position a range covers is dropped from the row entirely.
+            // `sheet.rows` is dense, so `row_idx`/`col_idx` are already the
+            // absolute positions `merged_cells` uses.
+            if !merges.is_empty() {
+                apply_merges(&mut merges, &mut cells, row_idx, total_rows, max_width);
             }
 
             // Drop trailing empty cells. A BIFF sheet reports the whole
@@ -213,12 +206,28 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
             }));
         }
 
+        // Range lookups whose work budget ran out (only a file declaring
+        // vast numbers of overlapping ranges gets there) say so.
+        for (sweep_exhausted, what) in [
+            (merges.exhausted(), "merged cell ranges"),
+            (links.exhausted(), "hyperlink ranges"),
+        ] {
+            if sweep_exhausted {
+                elements.push(Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(format!(
+                        "[some {what} not applied — too many overlapping ranges]"
+                    )))],
+                    ..Default::default()
+                }));
+            }
+        }
+
         // Cell comments are document content, and were never surfaced at
         // all before — appended as endnotes so every
         // renderer sees them, the same convention convert_xlsx.rs uses
         // for its own comments.
         for (i, c) in sheet.comments.iter().enumerate() {
-            let cell_ref = crate::xls::condfmt::col_name(c.col) + &(c.row + 1).to_string();
+            let cell_ref = crate::xls::condfmt::cell_ref(c.row, c.col);
             let marker = match c.author.as_deref() {
                 Some(a) => format!("{cell_ref} ({a})"),
                 None => cell_ref,
@@ -279,6 +288,27 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
         });
     }
 
+    // Whatever made the workbook incomplete is stated in the content, as
+    // the direct renderers state it, not only flagged in the metadata.
+    // The title is read before this, so a notice-only section never
+    // becomes the document's title.
+    let first_title = sections.first().and_then(|s| s.title.clone());
+    if !doc.notices().is_empty() {
+        let notices = doc.notices().iter().map(|n| {
+            Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(n.clone()))],
+                ..Default::default()
+            })
+        });
+        match sections.last_mut() {
+            Some(last) => last.elements.extend(notices),
+            None => sections.push(Section {
+                elements: notices.collect(),
+                ..Default::default()
+            }),
+        }
+    }
+
     // The workbook's own declared title (from `\x05SummaryInformation`)
     // beats the first sheet's name — a sheet name is not a document
     // title, it's just the only thing that was ever there to fall back
@@ -287,7 +317,7 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
     let title = summary
         .and_then(|s| s.title.clone())
         .filter(|t| !t.is_empty())
-        .or_else(|| sections.first().and_then(|s| s.title.clone()));
+        .or(first_title);
 
     DocumentIR {
         metadata: Metadata {
@@ -357,6 +387,77 @@ fn cell_is_empty(cell: &TableCell) -> bool {
         }),
         _ => false,
     })
+}
+
+/// The hyperlink target for each of a row's `width` cells, or `None` when
+/// no hyperlink range touches the row.
+fn row_hyperlinks<'a>(
+    links: &mut RangeSweep<&'a str>,
+    row: u32,
+    width: usize,
+) -> Option<Vec<Option<&'a str>>> {
+    if links.is_empty() || width == 0 {
+        return None;
+    }
+    let mut out: Vec<Option<&'a str>> = Vec::new();
+    let mut cost = 0u64;
+    // Declaration order, so a later record overwrites an earlier one.
+    for (range, target) in links.row(row) {
+        let Some((lo, hi)) = clip_cols(range, width) else {
+            continue;
+        };
+        if out.is_empty() {
+            out = vec![None; width];
+        }
+        for slot in &mut out[lo..=hi] {
+            *slot = Some(*target);
+        }
+        cost += (hi - lo + 1) as u64;
+    }
+    links.charge(cost);
+    (!out.is_empty()).then_some(out)
+}
+
+/// Give each merge anchor in `cells` its span (clipped to the table's
+/// `total_rows` x `max_width` extent) and drop every covered position.
+fn apply_merges(
+    merges: &mut RangeSweep<()>,
+    cells: &mut Vec<TableCell>,
+    row_idx: usize,
+    total_rows: usize,
+    max_width: usize,
+) {
+    let width = cells.len();
+    if width == 0 {
+        // Still advance the sweep so its row order stays monotonic.
+        let _ = merges.row(row_idx as u32).count();
+        return;
+    }
+    let mut covered = vec![false; width];
+    let mut cost = 0u64;
+    for (range, ()) in merges.row(row_idx as u32) {
+        let Some((lo, hi)) = clip_cols(range, width) else {
+            continue;
+        };
+        if range.row_lo as usize == row_idx {
+            let anchor = &mut cells[lo];
+            let rows_left = (total_rows - row_idx) as u64;
+            let cols_left = (max_width - lo) as u64;
+            anchor.row_span = range.row_span().min(rows_left) as u32;
+            anchor.col_span = range.col_span().min(cols_left) as u32;
+            covered[lo + 1..=hi].fill(true);
+        } else {
+            covered[lo..=hi].fill(true);
+        }
+        cost += (hi - lo + 1) as u64;
+    }
+    merges.charge(cost);
+    let mut col = 0usize;
+    cells.retain(|_| {
+        let keep = !covered[col];
+        col += 1;
+        keep
+    });
 }
 
 #[cfg(test)]
@@ -640,6 +741,133 @@ mod tests {
         assert!(
             ir.to_html()
                 .contains("<strong>A1 (Gilsinei Hansen):</strong>")
+        );
+    }
+
+    /// Run `xls_to_ir` on another thread and fail if it does not finish in
+    /// `secs` — a conversion whose cost follows a range's declared area
+    /// rather than the cells present never returns.
+    fn ir_within(doc: XlsDocument, secs: u64) -> DocumentIR {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(xls_to_ir(&doc));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(secs))
+            .expect("xls_to_ir must finish in time proportional to the cells present")
+    }
+
+    fn two_by_two() -> Vec<Vec<CellValue>> {
+        vec![
+            vec![CellValue::String("a".into()), CellValue::String("b".into())],
+            vec![CellValue::String("c".into()), CellValue::String("d".into())],
+        ]
+    }
+
+    /// A `MERGEDCELLS` entry may legally name the whole BIFF8 grid
+    /// (rows 0..=65535, and the raw u16 column fields go past 255).
+    /// Expanding it position by position was billions of set inserts, and
+    /// the 1-based span overflowed u16.
+    #[test]
+    fn test_a_full_grid_merge_range_converts_in_bounded_time() {
+        let sheet = Sheet {
+            name: "S".into(),
+            rows: two_by_two(),
+            merged_cells: vec![(0, 0xFFFF, 0, 0xFFFF)],
+            ..Default::default()
+        };
+        let ir = ir_within(XlsDocument::from_sheets(vec![sheet]), 20);
+        let Element::Table(t) = &ir.sections[0].elements[0] else {
+            panic!("expected a table");
+        };
+        assert_eq!(t.rows[0].cells.len(), 1, "only the anchor survives: {:?}", t.rows[0]);
+        assert_eq!(cell_texts(&ir), ["a"]);
+        let anchor = &t.rows[0].cells[0];
+        assert_eq!(anchor.row_span, 2, "the span is clipped to the rows the table has");
+        assert_eq!(anchor.col_span, 2, "the span is clipped to the columns the table has");
+    }
+
+    /// An `HLINK` record's range is four raw u16s; a whole-grid one was
+    /// expanded into a map entry per position.
+    #[test]
+    fn test_a_full_grid_hyperlink_range_converts_in_bounded_time() {
+        let sheet = Sheet {
+            name: "S".into(),
+            rows: two_by_two(),
+            hyperlinks: vec![crate::xls::XlsHyperlink {
+                row_first: 0xFFFF,
+                row_last: 0,
+                col_first: 0xFFFF,
+                col_last: 0,
+                target: "http://example.com".to_string(),
+            }],
+            ..Default::default()
+        };
+        let ir = ir_within(XlsDocument::from_sheets(vec![sheet]), 20);
+        let Element::Table(t) = &ir.sections[0].elements[0] else {
+            panic!("expected a table");
+        };
+        for cell in t.rows.iter().flat_map(|r| &r.cells) {
+            let Element::Paragraph(p) = &cell.content[0] else {
+                panic!("expected a paragraph");
+            };
+            let InlineContent::Text(span) = &p.content[0] else {
+                panic!("expected a text span");
+            };
+            assert_eq!(span.hyperlink.as_deref(), Some("http://example.com"));
+        }
+    }
+
+    /// Overlapping hyperlink ranges: the later record wins, as the map
+    /// insert order made it before.
+    #[test]
+    fn test_overlapping_hyperlink_ranges_resolve_to_the_last_declared() {
+        let link = |c0, c1, t: &str| crate::xls::XlsHyperlink {
+            row_first: 0,
+            row_last: 1,
+            col_first: c0,
+            col_last: c1,
+            target: t.to_string(),
+        };
+        let sheet = Sheet {
+            name: "S".into(),
+            rows: two_by_two(),
+            hyperlinks: vec![link(0, 1, "first"), link(1, 1, "second")],
+            ..Default::default()
+        };
+        let ir = xls_to_ir(&XlsDocument::from_sheets(vec![sheet]));
+        let Element::Table(t) = &ir.sections[0].elements[0] else {
+            panic!("expected a table");
+        };
+        let link_of = |cell: &TableCell| match &cell.content[0] {
+            Element::Paragraph(p) => match &p.content[0] {
+                InlineContent::Text(s) => s.hyperlink.clone(),
+                _ => None,
+            },
+            _ => None,
+        };
+        assert_eq!(link_of(&t.rows[1].cells[0]).as_deref(), Some("first"));
+        assert_eq!(link_of(&t.rows[1].cells[1]).as_deref(), Some("second"));
+    }
+
+    /// Vast numbers of overlapping merge ranges over the same rows: the
+    /// work is bounded, and the omission is stated rather than silent.
+    #[test]
+    fn test_overlapping_merge_ranges_past_the_work_budget_are_reported() {
+        let rows: Vec<Vec<CellValue>> = (0..2_000)
+            .map(|_| vec![CellValue::String("v".into())])
+            .collect();
+        let sheet = Sheet {
+            name: "S".into(),
+            rows,
+            merged_cells: vec![(0, 0xFFFF, 0, 1); 40_000],
+            ..Default::default()
+        };
+        let ir = ir_within(XlsDocument::from_sheets(vec![sheet]), 60);
+        let texts = cell_texts(&ir);
+        assert!(
+            texts.iter().any(|t| t.contains("merged")),
+            "a notice must record the ignored ranges: {:?}",
+            texts.last()
         );
     }
 }

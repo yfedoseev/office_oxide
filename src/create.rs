@@ -482,6 +482,9 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
 
     let mut writer = crate::xlsx::write::XlsxWriter::new();
     writer.set_metadata(&ir.metadata);
+    for name in &ir.defined_names {
+        writer.add_defined_name(name.clone());
+    }
 
     // Sheet names must be unique within a workbook (ECMA-376) and Excel
     // additionally rejects names > 31 chars, names containing `:\\/?*[]`,
@@ -503,6 +506,7 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
         let name = unique_sheet_name(raw, idx + 1, &used_names);
         used_names.insert(name.clone());
         let mut sheet = writer.add_sheet(&name);
+        sheet.set_hidden(section.hidden);
 
         // Propagate per-section page geometry so a PDF→XLSX→PDF round
         // trip preserves the source MediaBox. Without this each
@@ -566,11 +570,30 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                             }
                             let text = cell_text(cell);
                             let data = ir_cell_to_cell_data(cell, &text);
-                            if let Some(style) = xlsx_cell_style(
+                            let style = xlsx_cell_style(
                                 row.is_header,
                                 cell.background_color,
                                 cell.number_format.as_deref(),
-                            ) {
+                            );
+                            // A cell's horizontal alignment round-trips.
+                            let halign = match cell.text_align {
+                                Some(crate::ir::ParagraphAlignment::Left) => {
+                                    Some(crate::xlsx::write::HAlign::Left)
+                                },
+                                Some(crate::ir::ParagraphAlignment::Center) => {
+                                    Some(crate::xlsx::write::HAlign::Center)
+                                },
+                                Some(crate::ir::ParagraphAlignment::Right) => {
+                                    Some(crate::xlsx::write::HAlign::Right)
+                                },
+                                _ => None,
+                            };
+                            let style = match (style, halign) {
+                                (Some(s), Some(a)) => Some(s.align(a)),
+                                (None, Some(a)) => Some(CellStyle::new().align(a)),
+                                (s, None) => s,
+                            };
+                            if let Some(style) = style {
                                 sheet.set_cell_styled(row_cursor, col, data, style);
                             } else {
                                 sheet.set_cell(row_cursor, col, data);

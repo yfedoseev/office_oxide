@@ -12,7 +12,9 @@ use super::error::{Result, XlsError};
 use super::hyperlink::parse_hlink;
 use super::images::{XlsImage, extract_images};
 use super::records::*;
-use super::sst::{parse_sst, read_short_unicode_string, read_unicode_string};
+use super::sst::{
+    parse_sst, read_short_unicode_string, read_unicode_string, read_unicode_string_across,
+};
 
 /// A parsed legacy XLS document.
 #[derive(Debug)]
@@ -37,6 +39,10 @@ pub struct XlsDocument {
     /// missing from `sheets` with no other signal a caller could use to
     /// tell that apart from a file that genuinely ended there.
     truncated: bool,
+    /// One line per way the workbook came back incomplete (record limit,
+    /// text budget, cells whose shared string is missing), appended by
+    /// every renderer so a partial result never passes for a whole one.
+    notices: Vec<String>,
     /// Title/author/subject/keywords/comments/dates from the
     /// `\x05SummaryInformation` OLE property-set stream every real `.xls`
     /// carries by default — parsed and then never read anywhere in the
@@ -78,6 +84,7 @@ impl XlsDocument {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             truncated: false,
+            notices: Vec::new(),
             summary_properties: None,
             chart_text: Vec::new(),
         }
@@ -148,6 +155,18 @@ pub struct Sheet {
 struct SheetInfo {
     name: String,
     hidden: bool,
+    /// `lbPlyPos`: stream offset of the sheet's own `BOF` record.
+    ply_pos: u32,
+}
+
+/// `BOF.dt` of a worksheet or dialog-sheet substream ([MS-XLS] §2.4.21).
+/// The other substream kinds a sheet can be — chart (0x0020), Excel 4
+/// macro sheet (0x0040), VBA module (0x0006) — hold no worksheet cells.
+const BOF_DT_WORKSHEET: u16 = 0x0010;
+
+/// The substream type of a `BOF` record (`dt` at offset 2), when present.
+fn bof_dt(data: &[u8]) -> Option<u16> {
+    Some(u16::from_le_bytes([*data.get(2)?, *data.get(3)?]))
 }
 
 impl XlsDocument {
@@ -252,7 +271,17 @@ impl XlsDocument {
         let mut supbook_internal: Vec<bool> = Vec::new();
         let mut externsheet: Vec<(u16, i16, i16)> = Vec::new();
         let mut sheet_idx = 0usize;
-        let mut pending_formula_string: Option<(u16, u16)> = None;
+        // The BOUNDSHEET entry of the substream being read.
+        let mut current_info: Option<usize> = None;
+        // Set while walking a chart/macro/module sheet substream: its
+        // records are skipped like a nested chart's, and it yields no sheet.
+        let mut skipping_substream = false;
+        // `SST` bookkeeping: strings read vs declared, and how many cells
+        // referenced a string the table does not have.
+        let mut sst_declared = 0usize;
+        let mut sst_malformed = false;
+        let mut missing_sst_refs = 0usize;
+        let mut pending_formula_string: Option<(u16, u16, u16)> = None;
         // An embedded chart (or other embedded object) is its own nested
         // BOF..EOF substream *inside* the parent worksheet's own substream
         // ([MS-XLS] §2.1.7.20.1, dt=0x0020 for a chart sheet). Without
@@ -310,18 +339,28 @@ impl XlsDocument {
                         return Err(XlsError::Encrypted);
                     },
                     RT_BOUNDSHEET => {
-                        if let Ok(info) = parse_boundsheet(&rec.data) {
+                        if let Ok(info) = parse_boundsheet(&rec.data, biff8, codepage) {
                             sheet_infos.push(info);
                         }
                     },
-                    RT_SST => {
-                        sst = parse_sst(&rec.data, &rec.continue_at)?;
+                    // A malformed SST no longer fails the workbook: sheets
+                    // that do not use it are intact, and the cells that do
+                    // are counted and reported below.
+                    RT_SST => match parse_sst(&rec.data, &rec.continue_at) {
+                        Ok((strings, declared)) => {
+                            sst = strings;
+                            sst_declared = declared;
+                        },
+                        Err(_) => {
+                            sst.clear();
+                            sst_malformed = true;
+                        },
                     },
                     // `FORMAT` maps a format id to its code string; `XF`
                     // maps a cell's `ixfe` to a format id. Both are needed
                     // to tell a date from any other number.
                     RT_FORMAT => {
-                        if let Some((id, code)) = parse_format_record(&rec.data) {
+                        if let Some((id, code)) = parse_format_record(&rec.data, biff8, codepage) {
                             formats.insert(id, code);
                         }
                     },
@@ -386,6 +425,15 @@ impl XlsDocument {
                 },
                 Phase::BetweenSheets => {
                     if rec.record_type == RT_BOF {
+                        // Pair the substream with its BOUNDSHEET by stream
+                        // offset (`lbPlyPos`), falling back to sequence for
+                        // a file whose offsets do not match any BOF.
+                        current_info = sheet_infos
+                            .iter()
+                            .position(|i| i.ply_pos != 0 && i.ply_pos as usize == rec.offset)
+                            .or_else(|| (sheet_idx < sheet_infos.len()).then_some(sheet_idx));
+                        skipping_substream =
+                            bof_dt(&rec.data).is_some_and(|dt| dt != BOF_DT_WORKSHEET);
                         phase = Phase::InSheet;
                         cells.clear();
                         merged_cells.clear();
@@ -397,7 +445,10 @@ impl XlsDocument {
                         obj_text.clear();
                         pending_notes.clear();
                         pending_formula_string = None;
-                        nested_bof_depth = 0;
+                        // A non-worksheet substream is walked as if nested,
+                        // so its cached chart values never become cells and
+                        // its SeriesText still reaches `chart_text`.
+                        nested_bof_depth = u32::from(skipping_substream);
                     }
                 },
                 Phase::InSheet => match rec.record_type {
@@ -409,6 +460,11 @@ impl XlsDocument {
                     },
                     RT_EOF if nested_bof_depth > 0 => {
                         nested_bof_depth -= 1;
+                        if nested_bof_depth == 0 && skipping_substream {
+                            skipping_substream = false;
+                            sheet_idx += 1;
+                            phase = Phase::BetweenSheets;
+                        }
                     },
                     RT_SERIESTEXT if nested_bof_depth > 0 => {
                         // [MS-XLS] §2.4.254: 2 bytes reserved, then a
@@ -432,7 +488,7 @@ impl XlsDocument {
                     // copy of whatever the chart plotted.
                     _ if nested_bof_depth > 0 => {},
                     RT_EOF => {
-                        let (name, hidden) = match sheet_infos.get(sheet_idx) {
+                        let (name, hidden) = match current_info.and_then(|i| sheet_infos.get(i)) {
                             Some(info) => (info.name.clone(), info.hidden),
                             None => (format!("Sheet{}", sheet_idx + 1), false),
                         };
@@ -480,16 +536,25 @@ impl XlsDocument {
                         phase = Phase::BetweenSheets;
                     },
                     RT_STRING => {
-                        if let Some((row, col)) = pending_formula_string.take() {
-                            if rec.data.len() >= 3 {
-                                if let Ok((s, _)) = read_unicode_string(&rec.data, 0) {
-                                    cells.push(Cell {
-                                        row,
-                                        col,
-                                        xf_index: 0,
-                                        value: CellValue::String(s),
-                                    });
-                                }
+                        if let Some((row, col, xf_index)) = pending_formula_string.take() {
+                            // [MS-XLS] §2.4.268: BIFF8 carries an
+                            // XLUnicodeString, which a CONTINUE splits with
+                            // a fresh flags byte; BIFF5 a 16-bit count and
+                            // raw codepage bytes, with no flags byte at all.
+                            let text = if biff8 {
+                                read_unicode_string_across(&rec.data, 0, &rec.continue_at)
+                                    .ok()
+                                    .map(|(s, _)| s)
+                            } else {
+                                biff5_string(&rec.data, codepage)
+                            };
+                            if let Some(s) = text {
+                                cells.push(Cell {
+                                    row,
+                                    col,
+                                    xf_index,
+                                    value: CellValue::String(s),
+                                });
                             }
                         }
                     },
@@ -564,7 +629,8 @@ impl XlsDocument {
                             if val_bytes[6] == 0xFF && val_bytes[7] == 0xFF && val_bytes[0] == 0 {
                                 let row = u16::from_le_bytes([rec.data[0], rec.data[1]]);
                                 let col = u16::from_le_bytes([rec.data[2], rec.data[3]]);
-                                pending_formula_string = Some((row, col));
+                                let xf = u16::from_le_bytes([rec.data[4], rec.data[5]]);
+                                pending_formula_string = Some((row, col, xf));
                                 continue;
                             }
                         }
@@ -597,6 +663,18 @@ impl XlsDocument {
                                 });
                             }
                         } else {
+                            if rec.record_type == RT_LABELSST
+                                && rec.data.len() >= 10
+                                && u32::from_le_bytes([
+                                    rec.data[6],
+                                    rec.data[7],
+                                    rec.data[8],
+                                    rec.data[9],
+                                ]) as usize
+                                    >= sst.len()
+                            {
+                                missing_sst_refs += 1;
+                            }
                             let _ = parse_cell_record(
                                 &rec,
                                 &sst,
@@ -613,6 +691,29 @@ impl XlsDocument {
         let defined_names =
             resolve_defined_names(&raw_names, &externsheet, &supbook_internal, &sheet_infos);
 
+        let mut notices = Vec::new();
+        if record_budget_exhausted {
+            notices.push(
+                "[workbook truncated: the record limit was reached before the end of the \
+                 Workbook stream — later sheets or cells are missing]"
+                    .to_string(),
+            );
+        }
+        if text_budget.exhausted() {
+            notices.push(text_budget.notice());
+        }
+        if missing_sst_refs > 0 {
+            let table = if sst_malformed {
+                "the shared string table is malformed".to_string()
+            } else {
+                format!("{} of {} shared strings could be read", sst.len(), sst_declared)
+            };
+            notices.push(format!(
+                "[{missing_sst_refs} cells reference a shared string missing from the table \
+                 ({table}) — those cells are shown empty]"
+            ));
+        }
+
         Ok(Self {
             sheets,
             defined_names,
@@ -621,7 +722,8 @@ impl XlsDocument {
             // Set by the caller (from_reader), which has the CfbReader
             // this function doesn't.
             has_macros: false,
-            truncated: record_budget_exhausted || text_budget.exhausted(),
+            truncated: !notices.is_empty(),
+            notices,
             summary_properties: None,
             chart_text,
         })
@@ -639,11 +741,17 @@ impl XlsDocument {
         self.has_macros
     }
 
-    /// `true` when the record-parsing safety cap cut the Workbook stream
-    /// short — trailing sheets, or the whole workbook, are missing from
-    /// `sheets`.
+    /// `true` when the workbook came back incomplete: the record-parsing
+    /// safety cap cut the Workbook stream short, the text budget ran out,
+    /// or cells referenced shared strings the table does not have.
     pub fn truncated(&self) -> bool {
         self.truncated
+    }
+
+    /// One human-readable line per way the workbook is incomplete; every
+    /// renderer appends these.
+    pub fn notices(&self) -> &[String] {
+        &self.notices
     }
 
     /// Title/author/subject/keywords/comments/dates from the file's
@@ -701,6 +809,11 @@ impl XlsDocument {
                 out.push_str(text);
                 out.push('\n');
             }
+        }
+        for notice in &self.notices {
+            out.push('\n');
+            out.push_str(notice);
+            out.push('\n');
         }
         out
     }
@@ -775,6 +888,11 @@ impl XlsDocument {
                 out.push_str(&format!("## Chart {}\n\n{}\n\n", i + 1, text));
             }
         }
+        for notice in &self.notices {
+            out.push('\n');
+            out.push_str(notice);
+            out.push('\n');
+        }
         out
     }
 }
@@ -831,20 +949,40 @@ fn fill<R: Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(filled)
 }
 
-fn parse_boundsheet(data: &[u8]) -> Result<SheetInfo> {
-    if data.len() < 8 {
+/// Parse a `BOUNDSHEET` record ([MS-XLS] §2.4.28): `lbPlyPos` (u32),
+/// `hsState` (low 2 bits: 0 visible, 1 hidden, 2 very hidden), `dt` (sheet
+/// type — the substream's own `BOF.dt` is what the reader acts on), then the
+/// name. BIFF8 stores the name as a ShortXLUnicodeString (count, flags
+/// byte, characters); BIFF5/7 as a 1-byte count and raw codepage bytes
+/// with no flags byte (as xlrd reads it).
+fn parse_boundsheet(data: &[u8], biff8: bool, codepage: Option<u16>) -> Result<SheetInfo> {
+    if data.len() < 7 {
         return Err(XlsError::InvalidRecord("BOUNDSHEET too short".into()));
     }
-    // Bytes 0..4 are the sheet's stream offset; the reader walks the
-    // record stream sequentially and never seeks to it.
-    let visibility = data[4]; // 0=visible, 1=hidden, 2=very hidden
-    let _sheet_type = data[5]; // 0=worksheet, 2=chart, 6=VBA
-    let (name, _) = read_short_unicode_string(data, 6)?;
+    let ply_pos = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let visibility = data[4] & 0x03;
+    let name = if biff8 {
+        read_short_unicode_string(data, 6)?.0
+    } else {
+        let cch = data[6] as usize;
+        let bytes = data
+            .get(7..7 + cch)
+            .ok_or_else(|| XlsError::InvalidRecord("BOUNDSHEET name truncated".into()))?;
+        super::codepage::decode_biff5_text(bytes, codepage)
+    };
 
     Ok(SheetInfo {
         name,
         hidden: visibility != 0,
+        ply_pos,
     })
+}
+
+/// A BIFF5/7 `STRING` record body: a 16-bit count and raw codepage bytes.
+fn biff5_string(data: &[u8], codepage: Option<u16>) -> Option<String> {
+    let n = u16::from_le_bytes([*data.first()?, *data.get(1)?]) as usize;
+    let end = (2 + n).min(data.len());
+    Some(super::codepage::decode_biff5_text(&data[2..end], codepage))
 }
 
 /// A `NAME` record ([MS-XLS] §2.4.174) before its `rgce` formula has been
@@ -954,7 +1092,7 @@ fn builtin_name(id: u8) -> Option<&'static str> {
 /// "Z", 26 -> "AA").
 /// `B2 (Author)` — the same marker `convert_xls` puts on a comment's endnote.
 fn comment_marker(c: &XlsComment) -> String {
-    let cell_ref = super::condfmt::col_name(c.col) + &(c.row + 1).to_string();
+    let cell_ref = super::condfmt::cell_ref(c.row, c.col);
     match c.author.as_deref() {
         Some(a) => format!("{cell_ref} ({a})"),
         None => cell_ref,
@@ -1009,8 +1147,10 @@ fn resolve_defined_names(
         }
     };
 
+    // Widen before the 1-based adjustment: row 0xFFFF is the last legal
+    // BIFF8 row, and `$A$65536` does not fit a u16.
     let cell_ref = |row: u16, col_raw: u16| -> String {
-        format!("${}${}", col_letters((col_raw & 0x3FFF) as u32), row + 1)
+        format!("${}${}", col_letters((col_raw & 0x3FFF) as u32), u32::from(row) + 1)
     };
 
     raw_names
@@ -1082,14 +1222,20 @@ fn decompile_single_ref(
 /// Build a 2D grid from sparse cells.
 ///
 /// Takes ownership of cell values via `std::mem::take` to avoid cloning.
-/// Parse a `FORMAT` record: `ifmt` (u16) then the format code as a
-/// BIFF8 unicode string.
-fn parse_format_record(data: &[u8]) -> Option<(u16, String)> {
-    if data.len() < 4 {
+/// Parse a `FORMAT` record ([MS-XLS] §2.4.126): `ifmt` (u16) then the
+/// format code — a BIFF8 XLUnicodeString, or in BIFF5/7 a 1-byte count
+/// and raw codepage bytes (as xlrd reads it).
+fn parse_format_record(data: &[u8], biff8: bool, codepage: Option<u16>) -> Option<(u16, String)> {
+    if data.len() < 3 {
         return None;
     }
     let id = u16::from_le_bytes([data[0], data[1]]);
-    let (code, _) = read_unicode_string(data, 2).ok()?;
+    let code = if biff8 {
+        read_unicode_string(data, 2).ok()?.0
+    } else {
+        let cch = data[2] as usize;
+        super::codepage::decode_biff5_text(data.get(3..3 + cch)?, codepage)
+    };
     Some((id, code))
 }
 
@@ -1829,7 +1975,7 @@ mod tests {
         data.push(6); // char count
         data.push(0); // compressed
         data.extend_from_slice(b"Sheet1");
-        let info = parse_boundsheet(&data).unwrap();
+        let info = parse_boundsheet(&data, true, None).unwrap();
         assert_eq!(info.name, "Sheet1");
         assert!(!info.hidden);
     }
@@ -1842,6 +1988,7 @@ mod tests {
             has_macros: false,
             defined_names: Vec::new(),
             truncated: false,
+            notices: Vec::new(),
             summary_properties: None,
             chart_text: Vec::new(),
             sheets: vec![Sheet {
@@ -1870,6 +2017,7 @@ mod tests {
             has_macros: false,
             defined_names: Vec::new(),
             truncated: false,
+            notices: Vec::new(),
             summary_properties: None,
             chart_text: Vec::new(),
             sheets: vec![Sheet {
@@ -1932,6 +2080,7 @@ mod tests {
             has_macros: false,
             defined_names: Vec::new(),
             truncated: false,
+            notices: Vec::new(),
             summary_properties: None,
             chart_text: Vec::new(),
             sheets,
@@ -2454,5 +2603,389 @@ mod tests {
         assert_eq!(doc.defined_names.len(), 1);
         assert_eq!(doc.defined_names[0].name, "_xlnm.Print_Area");
         assert_eq!(doc.defined_names[0].value, "Sheet1!$A$1:$E$10");
+    }
+
+    /// Row index 0xFFFF is the last BIFF8 row (`$A$65536`), a legal target
+    /// for a defined name. Its 1-based row number does not fit a u16.
+    #[test]
+    fn test_defined_name_on_the_last_biff8_row_does_not_overflow() {
+        let globals = vec![
+            supbook_internal_record(1),
+            externsheet_record(&[(0, 0, 0)]),
+            name_record("LastCell", 0, false, &ptg_ref3d(0, 0xFFFF, 0)),
+            name_record("WholeCol", 0, false, &ptg_area3d(0, 0, 0xFFFF, 1, 1)),
+        ];
+        let stream = workbook_stream_with_globals(&globals, &[("Sheet1", 0, label(0, 0, "x"))]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+        assert_eq!(doc.defined_names[0].value, "Sheet1!$A$65536");
+        assert_eq!(doc.defined_names[1].value, "Sheet1!$B$1:$B$65536");
+    }
+
+    /// A comment on the last BIFF8 row renders as `A65536`, in both direct
+    /// renderers and the IR endnote marker.
+    #[test]
+    fn test_comment_on_the_last_biff8_row_does_not_overflow() {
+        let sheet = Sheet {
+            name: "S".into(),
+            comments: vec![XlsComment {
+                row: 0xFFFF,
+                col: 0,
+                author: None,
+                text: "bottom".to_string(),
+            }],
+            ..Default::default()
+        };
+        let doc = XlsDocument::from_sheets(vec![sheet]);
+        assert!(doc.plain_text().contains("A65536: bottom"), "{}", doc.plain_text());
+        assert!(doc.to_markdown().contains("A65536"), "{}", doc.to_markdown());
+        let ir = crate::convert_xls::xls_to_ir(&doc);
+        let markers: Vec<_> = ir.sections[0]
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                crate::ir::Element::Endnote(n) => n.marker.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers, ["A65536"]);
+    }
+
+    // ── BIFF5 globals, sheet kinds, STRING records ────────────────────
+
+    /// A BIFF5/7 `BOF` (`vers` = 0x0500) opening a substream of type `dt`.
+    fn bof5(dt: u16) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&0x0500u16.to_le_bytes());
+        d.extend_from_slice(&dt.to_le_bytes());
+        d.extend_from_slice(&[0u8; 4]);
+        biff_rec(RT_BOF, &d)
+    }
+
+    /// A BIFF5/7 `BOUNDSHEET`: lbPlyPos, hsState, dt, then a byte-counted
+    /// codepage string with no option-flags byte ([MS-XLS] §2.4.28).
+    fn boundsheet5(name: &[u8], visibility: u8, dt: u8) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.push(visibility);
+        d.push(dt);
+        d.push(name.len() as u8);
+        d.extend_from_slice(name);
+        biff_rec(RT_BOUNDSHEET, &d)
+    }
+
+    /// A BIFF8 `BOUNDSHEET` with an explicit sheet type and stream offset.
+    fn boundsheet8(name: &str, visibility: u8, dt: u8, ply_pos: u32) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&ply_pos.to_le_bytes());
+        d.push(visibility);
+        d.push(dt);
+        d.push(name.len() as u8);
+        d.push(0);
+        d.extend_from_slice(name.as_bytes());
+        biff_rec(RT_BOUNDSHEET, &d)
+    }
+
+    /// A `FORMULA` cell whose cached result is a string, delivered by the
+    /// `STRING` record that follows ([MS-XLS] §2.5.133 FormulaValue).
+    fn string_formula(row: u16, col: u16, xf: u16) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&row.to_le_bytes());
+        d.extend_from_slice(&col.to_le_bytes());
+        d.extend_from_slice(&xf.to_le_bytes());
+        d.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0xFF, 0xFF]); // string result
+        d.extend_from_slice(&[0u8; 6]); // grbit, chn
+        d.extend_from_slice(&0u16.to_le_bytes()); // cce
+        biff_rec(RT_FORMULA, &d)
+    }
+
+    /// BIFF5 names a sheet with a 1-byte count and raw codepage bytes; the
+    /// BIFF8 reader consumed the first character as a flags byte, failed
+    /// on every record, and the sheets came back as `Sheet1..N` with their
+    /// hidden flags lost.
+    #[test]
+    fn test_biff5_boundsheet_name_has_no_flags_byte() {
+        let mut s = bof5(0x0005);
+        s.extend(biff_rec(RT_CODEPAGE, &1252u16.to_le_bytes()));
+        s.extend(boundsheet5(b"Data", 0, 0));
+        s.extend(boundsheet5(b"Caf\xe9", 1, 0));
+        s.extend(eof());
+        for _ in 0..2 {
+            s.extend(bof5(0x0010));
+            s.extend(number(0, 0, 0, 1.0));
+            s.extend(eof());
+        }
+        let doc = XlsDocument::parse_workbook_stream(&s).expect("parses");
+        let names: Vec<_> = doc.sheets.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Data", "Café"]);
+        assert_eq!(doc.sheets.iter().map(|s| s.hidden).collect::<Vec<_>>(), [false, true]);
+    }
+
+    /// A chart sheet, an Excel 4 macro sheet and a VBA module are
+    /// substreams of their own kind (`BOF.dt`, [MS-XLS] §2.4.21). Parsed as
+    /// worksheets, the chart's cached series values became phantom cells
+    /// under the chart sheet's real name.
+    #[test]
+    fn test_chart_macro_and_module_sheets_are_not_worksheets() {
+        let mut s = bof(0x0005);
+        s.extend(boundsheet8("Sheet1", 0, 0, 0));
+        s.extend(boundsheet8("Chart1", 0, 2, 0));
+        s.extend(boundsheet8("Macro1", 0, 1, 0));
+        s.extend(boundsheet8("Module1", 0, 6, 0));
+        s.extend(boundsheet8("Sheet2", 0, 0, 0));
+        s.extend(eof());
+        s.extend(bof(0x0010));
+        s.extend(label(0, 0, "real data"));
+        s.extend(eof());
+        s.extend(bof(0x0020)); // chart sheet
+        s.extend(number(0, 0, 0, 3.67));
+        s.extend(series_text("Revenue"));
+        s.extend(eof());
+        s.extend(bof(0x0040)); // macro sheet
+        s.extend(label(0, 0, "=HALT()"));
+        s.extend(eof());
+        s.extend(bof(0x0006)); // VBA module
+        s.extend(eof());
+        s.extend(bof(0x0010));
+        s.extend(label(0, 0, "second sheet"));
+        s.extend(eof());
+        let doc = XlsDocument::parse_workbook_stream(&s).expect("parses");
+        let names: Vec<_> = doc.sheets.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Sheet1", "Sheet2"], "only worksheets are sheets");
+        assert_eq!(doc.chart_text(), ["Revenue".to_string()]);
+        let text = doc.plain_text();
+        assert!(text.contains("second sheet"), "{text}");
+        assert!(!text.contains("3.67") && !text.contains("HALT"), "{text}");
+    }
+
+    /// BIFF5 `FORMAT` carries a byte-counted codepage string; read as a
+    /// BIFF8 XLUnicodeString the count was inflated and the record dropped,
+    /// so a custom date format rendered its raw serial.
+    #[test]
+    fn test_biff5_format_record_is_a_byte_string() {
+        let mut fmt = 164u16.to_le_bytes().to_vec();
+        fmt.push(10);
+        fmt.extend_from_slice(b"yyyy-mm-dd");
+        let mut xf = vec![0u8; 16];
+        xf[2..4].copy_from_slice(&164u16.to_le_bytes());
+        let mut s = bof5(0x0005);
+        s.extend(biff_rec(RT_FORMAT, &fmt));
+        s.extend(biff_rec(RT_XF, &xf));
+        s.extend(boundsheet5(b"S", 0, 0));
+        s.extend(eof());
+        s.extend(bof5(0x0010));
+        s.extend(number(0, 0, 0, 38971.0));
+        s.extend(eof());
+        let doc = XlsDocument::parse_workbook_stream(&s).expect("parses");
+        let shown = doc.sheets[0].display_text(0, 0).unwrap().into_owned();
+        assert!(shown.starts_with("2006-09-11"), "{shown}");
+    }
+
+    /// A BIFF5 `STRING` record is `cch` + raw codepage bytes with no flags
+    /// byte; the BIFF8 layout ate the first character.
+    #[test]
+    fn test_biff5_formula_string_result_has_no_flags_byte() {
+        let mut st = 5u16.to_le_bytes().to_vec();
+        st.extend_from_slice(b"total");
+        let mut s = bof5(0x0005);
+        s.extend(boundsheet5(b"S", 0, 0));
+        s.extend(eof());
+        s.extend(bof5(0x0010));
+        s.extend(string_formula(0, 0, 0));
+        s.extend(biff_rec(RT_STRING, &st));
+        s.extend(eof());
+        let doc = XlsDocument::parse_workbook_stream(&s).expect("parses");
+        assert_eq!(doc.sheets[0].display_text(0, 0).as_deref(), Some("total"));
+    }
+
+    /// A BIFF8 `STRING` cut by a `CONTINUE` resumes with its own
+    /// option-flags byte ([MS-XLS] §2.5.293); read flat, that byte landed
+    /// in the text.
+    #[test]
+    fn test_biff8_formula_string_across_continue_drops_the_flags_byte() {
+        let mut first = 6u16.to_le_bytes().to_vec();
+        first.push(0); // 8-bit characters
+        first.extend_from_slice(b"abc");
+        let mut cont = vec![0x01u8]; // continues as 16-bit characters
+        for ch in "déf".encode_utf16() {
+            cont.extend_from_slice(&ch.to_le_bytes());
+        }
+        let mut body = string_formula(0, 0, 0);
+        body.extend(biff_rec(RT_STRING, &first));
+        body.extend(biff_rec(RT_CONTINUE, &cont));
+        let doc = XlsDocument::parse_workbook_stream(&workbook_stream(&[("S", 0, body)]))
+            .expect("parses");
+        assert_eq!(doc.sheets[0].display_text(0, 0).as_deref(), Some("abcdéf"));
+    }
+
+    /// The formula's own XF applies to its string result.
+    #[test]
+    fn test_formula_string_result_keeps_the_formula_cells_xf() {
+        let mut st = 2u16.to_le_bytes().to_vec();
+        st.push(0);
+        st.extend_from_slice(b"ok");
+        let mut body = string_formula(0, 0, 7);
+        body.extend(biff_rec(RT_STRING, &st));
+        let doc = XlsDocument::parse_workbook_stream(&workbook_stream(&[("S", 0, body)]))
+            .expect("parses");
+        assert_eq!(doc.sheets[0].xf[0][0], 7);
+    }
+
+    /// A `LABELSST` cell in column A referencing shared string `idx`.
+    fn labelsst(row: u16, idx: u32) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&row.to_le_bytes());
+        d.extend_from_slice(&0u16.to_le_bytes());
+        d.extend_from_slice(&0u16.to_le_bytes());
+        d.extend_from_slice(&idx.to_le_bytes());
+        biff_rec(RT_LABELSST, &d)
+    }
+
+    /// An SST that ends before its declared string count leaves the cells
+    /// that referenced the lost strings empty — the workbook says so.
+    #[test]
+    fn test_truncated_sst_flags_the_workbook_and_the_renderers_say_so() {
+        let mut sst = Vec::new();
+        sst.extend_from_slice(&3u32.to_le_bytes());
+        sst.extend_from_slice(&3u32.to_le_bytes()); // three declared
+        sst.extend_from_slice(&3u16.to_le_bytes());
+        sst.push(0);
+        sst.extend_from_slice(b"one"); // only one present
+        let mut body = labelsst(0, 0);
+        body.extend(labelsst(1, 2));
+        let stream = workbook_stream_with_globals(&[biff_rec(RT_SST, &sst)], &[("S", 0, body)]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+        assert_eq!(doc.sheets[0].display_text(0, 0).as_deref(), Some("one"));
+        assert!(doc.truncated(), "lost strings must be flagged");
+        for out in [doc.plain_text(), doc.to_markdown()] {
+            assert!(out.contains("shared string"), "{out}");
+        }
+        let ir = crate::convert_xls::xls_to_ir(&doc);
+        assert!(ir.metadata.text_truncated);
+        assert!(ir.plain_text().contains("shared string"), "{}", ir.plain_text());
+    }
+
+    /// An SST record too short to hold its own header used to fail the
+    /// whole workbook even when every sheet was intact. The sheets are kept;
+    /// the cell that needed a string from it is reported, not left blank.
+    #[test]
+    fn test_a_malformed_sst_header_does_not_fail_the_workbook() {
+        let mut body = number(0, 0, 0, 5.0);
+        body.extend(labelsst(1, 0));
+        let stream =
+            workbook_stream_with_globals(&[biff_rec(RT_SST, &[1, 0, 0])], &[("S", 0, body)]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("sheets are intact");
+        assert_eq!(doc.sheets[0].display_text(0, 0).as_deref(), Some("5"));
+        assert!(doc.truncated());
+        assert!(doc.plain_text().contains("shared string"), "{}", doc.plain_text());
+    }
+
+    /// A shorter-than-declared SST loses nothing when no cell references
+    /// the missing strings, and is not reported.
+    #[test]
+    fn test_a_short_sst_nobody_references_past_is_not_reported() {
+        let mut sst = Vec::new();
+        sst.extend_from_slice(&1u32.to_le_bytes());
+        sst.extend_from_slice(&5u32.to_le_bytes());
+        sst.extend_from_slice(&1u16.to_le_bytes());
+        sst.push(0);
+        sst.push(b'x');
+        let stream =
+            workbook_stream_with_globals(&[biff_rec(RT_SST, &sst)], &[("S", 0, labelsst(0, 0))]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+        assert!(!doc.truncated());
+    }
+
+    /// When the record budget runs out, the direct renderers state it, as
+    /// `to_ir()`'s metadata already did.
+    #[test]
+    fn test_direct_renderers_surface_record_budget_truncation() {
+        let stream = workbook_stream(&[
+            ("Sheet1", 0, label(0, 0, "Sheet1A1")),
+            ("Sheet2", 0, label(0, 0, "Sheet2A1")),
+        ]);
+        let doc = XlsDocument::parse_workbook_stream_with_budget(&stream, 7).expect("parses");
+        for out in [doc.plain_text(), doc.to_markdown()] {
+            assert!(out.contains("truncated"), "{out}");
+        }
+    }
+
+    /// `BOUNDSHEET.lbPlyPos` is the stream offset of the sheet's own `BOF`
+    /// ([MS-XLS] §2.4.28). A file whose BOUNDSHEET order differs from its
+    /// substream order was misnamed by pairing them in sequence.
+    #[test]
+    fn test_boundsheet_stream_offset_pairs_each_name_with_its_substream() {
+        let sheet_a = {
+            let mut v = bof(0x0010);
+            v.extend(label(0, 0, "in A"));
+            v.extend(eof());
+            v
+        };
+        let sheet_b = {
+            let mut v = bof(0x0010);
+            v.extend(label(0, 0, "in B"));
+            v.extend(eof());
+            v
+        };
+        // Globals: BOF + 2 BOUNDSHEETs + EOF; the substreams follow, B
+        // first in the stream but listed second.
+        let globals_len = bof(0x0005).len()
+            + boundsheet8("A", 0, 0, 0).len()
+            + boundsheet8("B", 0, 0, 0).len()
+            + eof().len();
+        let b_at = globals_len as u32;
+        let a_at = b_at + sheet_b.len() as u32;
+        let mut s = bof(0x0005);
+        s.extend(boundsheet8("A", 0, 0, a_at));
+        s.extend(boundsheet8("B", 1, 0, b_at));
+        s.extend(eof());
+        s.extend(sheet_b);
+        s.extend(sheet_a);
+        let doc = XlsDocument::parse_workbook_stream(&s).expect("parses");
+        let got: Vec<_> = doc
+            .sheets
+            .iter()
+            .map(|s| (s.name.clone(), s.display_text(0, 0).unwrap().into_owned(), s.hidden))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("B".to_string(), "in B".to_string(), true),
+                ("A".to_string(), "in A".to_string(), false)
+            ]
+        );
+    }
+
+    /// A BIFF8 `FORMAT` record ([MS-XLS] §2.4.126) defines a custom code by
+    /// id; an `XF` pointing at it makes a `NUMBER` render through it.
+    #[test]
+    fn test_biff8_custom_format_record_applies_to_its_cells() {
+        let mut fmt = 165u16.to_le_bytes().to_vec();
+        let code = "0.0\" kg\"";
+        fmt.extend_from_slice(&(code.len() as u16).to_le_bytes());
+        fmt.push(0); // 8-bit characters
+        fmt.extend_from_slice(code.as_bytes());
+        let mut date_fmt = 166u16.to_le_bytes().to_vec();
+        date_fmt.extend_from_slice(&10u16.to_le_bytes());
+        date_fmt.push(0);
+        date_fmt.extend_from_slice(b"dd/mm/yyyy");
+        let xf = |ifmt: u16| {
+            let mut d = vec![0u8; 20];
+            d[2..4].copy_from_slice(&ifmt.to_le_bytes());
+            biff_rec(RT_XF, &d)
+        };
+        let globals = vec![
+            biff_rec(RT_FORMAT, &fmt),
+            biff_rec(RT_FORMAT, &date_fmt),
+            xf(0),
+            xf(165),
+            xf(166),
+        ];
+        let mut body = number(0, 0, 1, 12.34);
+        body.extend(number(0, 1, 2, 38971.0));
+        let stream = workbook_stream_with_globals(&globals, &[("S", 0, body)]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+        assert_eq!(doc.sheets[0].display_text(0, 0).as_deref(), Some("12.3 kg"));
+        let date = doc.sheets[0].display_text(0, 1).unwrap().into_owned();
+        assert!(date.starts_with("2006-09-11"), "{date}");
     }
 }

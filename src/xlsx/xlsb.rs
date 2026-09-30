@@ -27,7 +27,7 @@ use super::workbook::{SheetInfo, SheetState, WorkbookInfo};
 use super::worksheet::{Row, Worksheet};
 use super::{Result, XlsxDocument};
 use crate::core::opc::{self, ZipEntryIndex};
-use crate::core::relationships::Relationships;
+use crate::core::relationships::{Relationships, rel_types};
 
 // Record ids ([MS-XLSB] §2.3, decimal as the specification lists them).
 const BRT_ROW_HDR: u32 = 0;
@@ -86,15 +86,23 @@ pub(super) fn from_zip<R: Read + Seek>(
         .ok()
         .map(|d| parse_styles(&d));
     let mut worksheets = Vec::with_capacity(sheets.len());
+    let mut unreadable_sheets = Vec::new();
     for (i, info) in sheets.iter().enumerate() {
-        let path = rels
-            .get_by_id(&info.rel_id)
+        let rel = rels.get_by_id(&info.rel_id);
+        // A chartsheet (or macro/dialog sheet) has no cells to read.
+        if rel.is_some_and(|r| r.rel_type != rel_types::WORKSHEET) {
+            continue;
+        }
+        let path = rel
             .map(|r| super::resolve_relative_zip_path("xl/workbook.bin", &r.target))
             .unwrap_or_else(|| format!("xl/worksheets/sheet{}.bin", i + 1));
         let Ok(data) = opc::read_zip_entry(archive, entries, &path) else {
+            unreadable_sheets.push((info.name.clone(), format!("worksheet part {path} not found")));
             continue;
         };
-        worksheets.push(parse_sheet(&data, info.name.clone()));
+        let mut ws = parse_sheet(&data, info.name.clone());
+        ws.state = info.state;
+        worksheets.push(ws);
     }
     let crate::core::properties::PackageMetadata {
         core: core_properties,
@@ -118,7 +126,7 @@ pub(super) fn from_zip<R: Read + Seek>(
         app_properties,
         package_properties,
         has_macros,
-        unreadable_sheets: Vec::new(),
+        unreadable_sheets,
         styles_data: None,
         theme_data: None,
     })
@@ -299,6 +307,7 @@ fn parse_styles(data: &[u8]) -> StyleSheet {
                         border_index: Some(u16::from_le_bytes([b[8], b[9]]) as u32),
                         apply_number_format: true,
                         xf_id: Some(u16::from_le_bytes([b[0], b[1]]) as u32),
+                        alignment: None,
                     });
                 }
             },
@@ -452,6 +461,10 @@ fn parse_sheet(data: &[u8], name: String) -> Worksheet {
         rows.push(r);
     }
     Worksheet {
+        state: SheetState::Visible,
+        header_footer: Default::default(),
+        tables: Vec::new(),
+        pivot_tables: Vec::new(),
         name,
         dimension: None,
         rows,

@@ -183,6 +183,11 @@ fn parse_mulrk(data: &[u8], cells: &mut Vec<Cell>) -> Result<()> {
 
     cells.reserve(count);
     for i in 0..count {
+        // A column past the last u16 does not exist; a crafted `first_col`
+        // near 0xFFFF would otherwise wrap onto column 0.
+        let Some(col) = u16::try_from(i).ok().and_then(|i| first_col.checked_add(i)) else {
+            break;
+        };
         let off = i * 6;
         // Each MULRK entry carries its own `ixfe`.
         let xf_index = u16::from_le_bytes([rk_data[off], rk_data[off + 1]]);
@@ -195,7 +200,7 @@ fn parse_mulrk(data: &[u8], cells: &mut Vec<Cell>) -> Result<()> {
         cells.push(Cell {
             xf_index,
             row,
-            col: first_col + i as u16,
+            col,
             value: CellValue::Number(decode_rk(rk_val)),
         });
     }
@@ -257,19 +262,22 @@ fn parse_mulblank(data: &[u8], cells: &mut Vec<Cell>) -> Result<()> {
     }
     let row = u16::from_le_bytes([data[0], data[1]]);
     let first_col = u16::from_le_bytes([data[2], data[3]]);
+    // [MS-XLS] §2.4.175: one `ixfe` per column from `colFirst` to
+    // `colLast`, then `colLast` itself. The entries present bound the count:
+    // `colLast` alone let a 10-byte record claim 65,536 cells (and its
+    // span overflowed u16).
     let last_col = u16::from_le_bytes([data[data.len() - 2], data[data.len() - 1]]);
-    let count = (last_col.saturating_sub(first_col) + 1) as usize;
-    let ixfe = &data[4..data.len().saturating_sub(2)];
-    cells.extend((0..count).map(|i| {
-        Cell {
-            xf_index: ixfe
-                .get(i * 2..i * 2 + 2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                .unwrap_or(0),
+    let declared = usize::from(last_col.saturating_sub(first_col)) + 1;
+    let ixfe = &data[4..data.len() - 2];
+    let count = declared.min(ixfe.len() / 2);
+    cells.extend((0..count).map_while(|i| {
+        let col = first_col.checked_add(u16::try_from(i).ok()?)?;
+        Some(Cell {
+            xf_index: u16::from_le_bytes([ixfe[i * 2], ixfe[i * 2 + 1]]),
             row,
-            col: first_col + i as u16,
+            col,
             value: CellValue::Empty,
-        }
+        })
     }));
     Ok(())
 }
@@ -412,6 +420,7 @@ mod tests {
         data.extend_from_slice(&0u16.to_le_bytes()); // XF index
         data.extend_from_slice(&1u32.to_le_bytes()); // SST index 1
         let rec = BiffRecord {
+            offset: 0,
             record_type: RT_LABELSST,
             data: data.into(),
             continue_at: Vec::new(),
@@ -433,6 +442,7 @@ mod tests {
         data.extend_from_slice(&0u16.to_le_bytes()); // XF
         data.extend_from_slice(&42.5f64.to_le_bytes());
         let rec = BiffRecord {
+            offset: 0,
             record_type: RT_NUMBER,
             data: data.into(),
             continue_at: Vec::new(),
@@ -452,6 +462,7 @@ mod tests {
         data.push(1); // true
         data.push(0); // is_error = false (it's a bool)
         let rec = BiffRecord {
+            offset: 0,
             record_type: RT_BOOLERR,
             data: data.into(),
             continue_at: Vec::new(),
@@ -471,6 +482,7 @@ mod tests {
         data.push(0x07); // #DIV/0!
         data.push(1); // is_error = true
         let rec = BiffRecord {
+            offset: 0,
             record_type: RT_BOOLERR,
             data: data.into(),
             continue_at: Vec::new(),
@@ -498,6 +510,7 @@ mod tests {
         data.extend_from_slice(&1u16.to_le_bytes());
 
         let rec = BiffRecord {
+            offset: 0,
             record_type: RT_MULRK,
             data: data.into(),
             continue_at: Vec::new(),
@@ -510,5 +523,117 @@ mod tests {
         assert_eq!(cells[0].value, CellValue::Number(10.0));
         assert_eq!(cells[1].col, 1);
         assert_eq!(cells[1].value, CellValue::Number(20.0));
+    }
+
+    /// Parse one record of type `rt` into cells.
+    fn cells_of(rt: u16, data: Vec<u8>) -> Vec<Cell> {
+        let rec = BiffRecord {
+            offset: 0,
+            record_type: rt,
+            data: data.into(),
+            continue_at: Vec::new(),
+        };
+        let mut cells = Vec::new();
+        parse_cell_record(&rec, &[], None, &mut cells, &mut crate::limits::TextBudget::new())
+            .unwrap();
+        cells
+    }
+
+    /// A `MULRK` whose first column is the last u16 column: the columns
+    /// of the entries after it do not exist, and computing them overflowed.
+    #[test]
+    fn test_mulrk_columns_past_the_last_u16_column_are_dropped_not_wrapped() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0xFFFFu16.to_le_bytes()); // first_col
+        for v in [1u32, 2, 3] {
+            data.extend_from_slice(&0u16.to_le_bytes());
+            data.extend_from_slice(&((v << 2) | 0x02).to_le_bytes());
+        }
+        data.extend_from_slice(&0xFFFFu16.to_le_bytes()); // last_col
+        let cells = cells_of(RT_MULRK, data);
+        assert_eq!(cells.len(), 1, "{cells:?}");
+        assert_eq!(cells[0].col, 0xFFFF);
+        assert_eq!(cells[0].value, CellValue::Number(1.0));
+    }
+
+    /// A `MULBLANK` carries one `ixfe` per column ([MS-XLS] §2.4.175); its
+    /// `colLast` field alone drove the count, so a 10-byte record claiming
+    /// columns 0..=65535 overflowed the span and produced 65,536 cells.
+    #[test]
+    fn test_mulblank_cell_count_follows_the_ixfe_entries_present() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&3u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes()); // first_col
+        data.extend_from_slice(&7u16.to_le_bytes());
+        data.extend_from_slice(&8u16.to_le_bytes());
+        data.extend_from_slice(&0xFFFFu16.to_le_bytes()); // last_col
+        let cells = cells_of(RT_MULBLANK, data);
+        assert_eq!(cells.len(), 2, "{cells:?}");
+        assert_eq!((cells[1].row, cells[1].col, cells[1].xf_index), (3, 1, 8));
+        assert!(cells.iter().all(|c| c.value == CellValue::Empty));
+    }
+
+    /// A `FORMULA` record ([MS-XLS] §2.4.127) carrying `result` as its
+    /// 8-byte cached value.
+    fn formula_cells(result: [u8; 8]) -> Vec<Cell> {
+        let mut data = vec![2, 0, 3, 0, 9, 0]; // row 2, col 3, xf 9
+        data.extend_from_slice(&result);
+        data.extend_from_slice(&[0u8; 8]); // grbit, chn, cce
+        cells_of(RT_FORMULA, data)
+    }
+
+    /// Every `FormulaValue` arm ([MS-XLS] §2.5.133): a number, and the
+    /// `fExprO = 0xFFFF` forms — string (text follows in `STRING`),
+    /// boolean, error and blank.
+    #[test]
+    fn test_formula_cached_results_decode_by_type() {
+        let num = formula_cells(12.5f64.to_le_bytes());
+        assert_eq!((num[0].row, num[0].col, num[0].xf_index), (2, 3, 9));
+        assert_eq!(num[0].value, CellValue::Number(12.5));
+        let special = |kind: u8, val: u8| [kind, 0, val, 0, 0, 0, 0xFF, 0xFF];
+        assert_eq!(formula_cells(special(0, 0))[0].value, CellValue::String(String::new()));
+        assert_eq!(formula_cells(special(1, 1))[0].value, CellValue::Bool(true));
+        assert_eq!(formula_cells(special(1, 0))[0].value, CellValue::Bool(false));
+        assert_eq!(formula_cells(special(2, 0x07))[0].value, CellValue::Error(0x07));
+        assert_eq!(formula_cells(special(3, 0))[0].value, CellValue::Empty);
+        assert_eq!(formula_cells(special(9, 0))[0].value, CellValue::Empty);
+        // Too short to hold a cached value: an error, not a panic.
+        let rec = BiffRecord {
+            offset: 0,
+            record_type: RT_FORMULA,
+            data: vec![0u8; 13].into(),
+            continue_at: Vec::new(),
+        };
+        let mut out = Vec::new();
+        assert!(
+            parse_cell_record(&rec, &[], None, &mut out, &mut crate::limits::TextBudget::new())
+                .is_err()
+        );
+    }
+
+    /// `RK` ([MS-XLS] §2.4.220): an RkNumber in all four encodings.
+    #[test]
+    fn test_rk_record_decodes_all_four_rk_encodings() {
+        let rk = |v: u32| {
+            let mut d = vec![1, 0, 1, 0, 4, 0];
+            d.extend_from_slice(&v.to_le_bytes());
+            cells_of(RT_RK, d)
+        };
+        let int = rk((7u32 << 2) | 0x02);
+        assert_eq!((int[0].row, int[0].col, int[0].xf_index), (1, 1, 4));
+        assert_eq!(int[0].value, CellValue::Number(7.0));
+        assert_eq!(rk((1234u32 << 2) | 0x03)[0].value, CellValue::Number(12.34));
+        let float_bits = (1.5f64.to_bits() >> 32) as u32;
+        assert_eq!(rk(float_bits)[0].value, CellValue::Number(1.5));
+        assert_eq!(rk(float_bits | 0x01)[0].value, CellValue::Number(0.015));
+    }
+
+    /// `BLANK` ([MS-XLS] §2.4.20) is a formatted empty cell.
+    #[test]
+    fn test_blank_record_is_an_empty_formatted_cell() {
+        let cells = cells_of(RT_BLANK, vec![5, 0, 6, 0, 3, 0]);
+        assert_eq!((cells[0].row, cells[0].col, cells[0].xf_index), (5, 6, 3));
+        assert_eq!(cells[0].value, CellValue::Empty);
     }
 }

@@ -43,6 +43,9 @@ const RK: u16 = 0x027E;
 /// `CODEPAGE` ([MS-XLS] §2.4.52): the 8-bit character set of every string.
 const CODEPAGE: u16 = 0x0042;
 const EOF: u16 = 0x000A;
+/// `FILEPASS` ([MS-XLS] §2.4.117; the same id since BIFF2): every record
+/// after it is encrypted.
+const FILEPASS: u16 = 0x002F;
 
 /// Parse a raw BIFF2/3/4 stream into a one-sheet workbook.
 pub(super) fn parse(data: &[u8], biff: u8) -> Result<XlsDocument> {
@@ -64,6 +67,9 @@ pub(super) fn parse(data: &[u8], biff: u8) -> Result<XlsDocument> {
                 codepage = Some(u16::from_le_bytes([d[0], d[1]]));
             },
             (_, EOF) => break,
+            // What follows is ciphertext: reading it as cells yields
+            // garbage or an empty sheet reported as success.
+            (_, FILEPASS) => return Err(XlsError::Encrypted),
             // ---- BIFF2: rw, col, 3-byte cell attributes, then the value.
             (2, BIFF2_BLANK) => {},
             (2, BIFF2_INTEGER) if d.len() >= 9 => {
@@ -318,5 +324,56 @@ mod tests {
         s.extend(rec(STRING, &[9, 0, b'x']));
         let doc = parse(&s, 3).unwrap();
         assert!(doc.sheets[0].rows.is_empty());
+    }
+
+    /// An encrypted Excel 2-4 file is refused, as a BIFF8 one is, rather
+    /// than read as an empty (or garbage) sheet with `Ok`.
+    #[test]
+    fn test_biff2_4_filepass_is_reported_as_encrypted() {
+        for (bof_id, biff) in [(0x0009u16, 2u8), (0x0209, 3), (0x0409, 4)] {
+            let mut s = rec(bof_id, &[0, 0, 0x10, 0]);
+            s.extend(rec(FILEPASS, &[0x12, 0x34, 0x56, 0x78]));
+            s.extend(rec(NUMBER, &[0xAA; 14]));
+            s.extend(rec(EOF, &[]));
+            assert!(
+                matches!(parse(&s, biff), Err(XlsError::Encrypted)),
+                "BIFF{biff} FILEPASS must be an encryption error"
+            );
+        }
+    }
+
+    /// The BIFF2 `BOOLERR`, `FORMULA` (every cached-result form) and
+    /// `STRING` arms, and a `LABEL` whose count overruns the record.
+    #[test]
+    fn test_biff2_boolerr_formula_and_string_records_are_read() {
+        let mut s = rec(0x0009, &[0, 0, 0x10, 0]);
+        // BOOLERR: rw, col, 3 attribute bytes, value, fError.
+        s.extend(rec(BIFF2_BOOLERR, &[0, 0, 0, 0, 0, 0, 0, 1, 0]));
+        s.extend(rec(BIFF2_BOOLERR, &[0, 0, 1, 0, 0, 0, 0, 0x2A, 1]));
+        // FORMULA: rw, col, attrs, 8-byte cached result, then the formula.
+        let formula = |col: u8, result: [u8; 8]| {
+            let mut f = vec![1, 0, col, 0, 0, 0, 0];
+            f.extend_from_slice(&result);
+            f.extend_from_slice(&[0, 0, 0]);
+            rec(BIFF2_FORMULA, &f)
+        };
+        s.extend(formula(0, 2.25f64.to_le_bytes()));
+        s.extend(formula(1, [1, 0, 1, 0, 0, 0, 0xFF, 0xFF])); // TRUE
+        s.extend(formula(2, [2, 0, 0x07, 0, 0, 0, 0xFF, 0xFF])); // #DIV/0!
+        s.extend(formula(3, [0, 0, 0, 0, 0, 0, 0xFF, 0xFF])); // string follows
+        s.extend(rec(BIFF2_STRING, &[4, b'd', b'o', b'n', b'e']));
+        // LABEL claiming 9 characters with 2 present: what is there is kept.
+        s.extend(rec(BIFF2_LABEL, &[2, 0, 0, 0, 0, 0, 0, 9, b'o', b'k']));
+        s.extend(rec(EOF, &[]));
+        let doc = parse(&s, 2).unwrap();
+        let sheet = &doc.sheets[0];
+        let at = |r, c| sheet.display_text(r, c).map(|t| t.into_owned());
+        assert_eq!(at(0, 0).as_deref(), Some("TRUE"));
+        assert_eq!(at(0, 1).as_deref(), Some("#N/A"));
+        assert_eq!(at(1, 0).as_deref(), Some("2.25"));
+        assert_eq!(at(1, 1).as_deref(), Some("TRUE"));
+        assert_eq!(at(1, 2).as_deref(), Some("#DIV/0!"));
+        assert_eq!(at(1, 3).as_deref(), Some("done"));
+        assert_eq!(at(2, 0).as_deref(), Some("ok"));
     }
 }

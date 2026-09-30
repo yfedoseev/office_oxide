@@ -97,6 +97,10 @@ pub mod rel_types {
     /// Relationship type for worksheet parts.
     pub const WORKSHEET: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet";
+    /// Relationship type for chartsheet parts ([ECMA-376] §12.3.2) — a
+    /// sheet that is one chart, with no cells.
+    pub const CHARTSHEET: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet";
     /// Relationship type for the shared string table.
     pub const SHARED_STRINGS: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings";
