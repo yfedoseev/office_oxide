@@ -214,7 +214,7 @@ fn write_atomically(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) ->
 
     // `create_new` refuses to reuse a name, so a stale temporary file from a
     // killed process (or a concurrent save) is never clobbered or adopted.
-    let (tmp_path, mut file) = loop {
+    let (tmp_path, file) = loop {
         let mut name = std::ffi::OsString::from(".");
         name.push(file_name);
         name.push(format!(
@@ -234,12 +234,13 @@ fn write_atomically(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) ->
         }
     };
 
-    let result = write(&mut file)
-        .and_then(|()| file.sync_all().map_err(Into::into))
-        .and_then(|()| {
-            drop(file);
-            std::fs::rename(&tmp_path, path).map_err(Into::into)
-        });
+    // The handle is closed at the end of this block, before the rename or
+    // the clean-up: Windows can neither rename nor delete an open file.
+    let written = {
+        let mut file = file;
+        write(&mut file).and_then(|()| file.sync_all().map_err(Into::into))
+    };
+    let result = written.and_then(|()| std::fs::rename(&tmp_path, path).map_err(Into::into));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp_path);
     }
