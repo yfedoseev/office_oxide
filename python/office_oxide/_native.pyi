@@ -6,9 +6,9 @@ Every `path` argument accepts ``str`` or any ``os.PathLike[str]``.
 
 from os import PathLike
 from types import TracebackType
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias
 
-from typing_extensions import Self, TypeAlias
+from typing_extensions import Self
 
 __version__: str
 

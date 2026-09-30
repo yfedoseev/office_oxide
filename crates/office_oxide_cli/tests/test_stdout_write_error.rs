@@ -1,4 +1,9 @@
 //! The binary's behaviour when stdout cannot be written.
+//!
+//! `/dev/full` exists only on Linux, so the whole file is Linux-only (a
+//! function-level `cfg` left its imports unused elsewhere, which `-D
+//! warnings` turns into a build failure).
+#![cfg(target_os = "linux")]
 
 use std::process::{Command, Stdio};
 
@@ -7,7 +12,6 @@ use std::process::{Command, Stdio};
 /// error other than a closed pipe is an ordinary failure: `error: …` on
 /// stderr and exit status 1, like every other failure this CLI reports.
 #[test]
-#[cfg(target_os = "linux")]
 fn test_a_stdout_write_error_is_reported_not_panicked() {
     let dir = std::env::temp_dir().join(format!("office_oxide_devfull_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

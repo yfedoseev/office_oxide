@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 """Behavioural tests for the Python binding's writer and editing surface."""
 
-import pytest
-
 import office_oxide
+import pytest
 from office_oxide import Document, EditableDocument, XlsxWriter
 
 
@@ -73,9 +72,8 @@ def test_empty_find_is_rejected():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "a.docx")
         office_oxide.create_from_markdown(md, "docx", path)
-        with EditableDocument.open(path) as ed:
-            with pytest.raises(ValueError):
-                ed.replace_text("", "X")
+        with EditableDocument.open(path) as ed, pytest.raises(ValueError):
+            ed.replace_text("", "X")
 
 
 def test_markdown_with_images_is_typed_and_callable():
