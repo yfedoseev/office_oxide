@@ -1862,6 +1862,60 @@ mod tests {
         assert_eq!(ico_to_rgb(0x11), None);
     }
 
+    /// Every `Ico` index ([MS-DOC] §2.9.119) decodes to its own colour
+    /// through both SPRMs that carry one — text colour (`sprmCIco`) and
+    /// highlight (`sprmCHighlight`) — so a dropped or swapped table entry
+    /// fails here rather than colouring runs wrongly.
+    #[test]
+    fn test_every_ico_index_decodes_to_its_spec_colour() {
+        let table: [(u8, [u8; 3]); 16] = [
+            (0x01, [0x00, 0x00, 0x00]),
+            (0x02, [0x00, 0x00, 0xFF]),
+            (0x03, [0x00, 0xFF, 0xFF]),
+            (0x04, [0x00, 0xFF, 0x00]),
+            (0x05, [0xFF, 0x00, 0xFF]),
+            (0x06, [0xFF, 0x00, 0x00]),
+            (0x07, [0xFF, 0xFF, 0x00]),
+            (0x08, [0xFF, 0xFF, 0xFF]),
+            (0x09, [0x00, 0x00, 0x80]),
+            (0x0A, [0x00, 0x80, 0x80]),
+            (0x0B, [0x00, 0x80, 0x00]),
+            (0x0C, [0x80, 0x00, 0x80]),
+            (0x0D, [0x80, 0x00, 0x00]),
+            (0x0E, [0x80, 0x80, 0x00]),
+            (0x0F, [0x80, 0x80, 0x80]),
+            (0x10, [0xC0, 0xC0, 0xC0]),
+        ];
+        for (ico, rgb) in table {
+            assert_eq!(extract_chp_props(&[0x42, 0x2A, ico]).color, Some(rgb), "sprmCIco {ico}");
+            assert_eq!(
+                extract_chp_props(&[0x0C, 0x2A, ico]).highlight,
+                Some(rgb),
+                "sprmCHighlight {ico}"
+            );
+        }
+        for ico in [0x00, 0x11, 0xFF] {
+            assert_eq!(extract_chp_props(&[0x42, 0x2A, ico]).color, None, "ico {ico}");
+        }
+    }
+
+    /// A zero baseline offset is neither raised nor lowered: only a
+    /// strictly positive `hps_pos` is superscript and only a strictly
+    /// negative one subscript.
+    #[test]
+    fn test_zero_baseline_offset_has_no_vertical_align() {
+        let at = |p: i16| {
+            ChpProps {
+                hps_pos: Some(p),
+                ..Default::default()
+            }
+            .vertical_align()
+        };
+        assert_eq!(at(0), None);
+        assert_eq!(at(1), Some(VerticalAlign::Superscript));
+        assert_eq!(at(-1), Some(VerticalAlign::Subscript));
+    }
+
     // ── Operand framing and tab-stop decoding, behaviourally ──
 
     /// `spra` 7 ([MS-DOC] §2.2.5.1) is a 3-byte operand: the walker must
