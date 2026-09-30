@@ -203,6 +203,19 @@ pub struct ParaProps {
     pub space_before_hundredths_pt: Option<u32>,
 }
 
+/// How a list paragraph is marked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListMarker {
+    /// `<a:buChar char="•"/>`.
+    Bullet,
+    /// `<a:buAutoNum type="…" startAt="…"/>` (ECMA-376 Part 1 §21.1.2.4.1;
+    /// `type` is an `ST_TextAutonumberScheme`, §20.1.10.61).
+    AutoNum {
+        scheme: &'static str,
+        start_at: Option<u32>,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum BodyItem {
     Text(String),
@@ -211,7 +224,7 @@ pub(crate) enum BodyItem {
     /// Each item is a paragraph's worth of styled `Run`s:
     /// this used to be a bare `String`, so a hyperlink or any character
     /// formatting on a list item's text was silently dropped on write.
-    BulletList(Vec<(u8, Vec<Run>)>),
+    BulletList(Vec<(u8, Vec<Run>, ListMarker)>),
     /// A real table: rows of cells, each cell a paragraph's worth of
     /// styled `Run`s. Flattening a table into tab-joined plain text lost
     /// the grid entirely; flattening each cell to a bare `String`
@@ -345,7 +358,10 @@ impl SlideData {
 
     /// Add a bullet list to the body area.
     pub fn add_bullet_list(&mut self, items: &[&str]) -> &mut Self {
-        let owned: Vec<(u8, Vec<Run>)> = items.iter().map(|s| (0, vec![Run::new(*s)])).collect();
+        let owned: Vec<(u8, Vec<Run>, ListMarker)> = items
+            .iter()
+            .map(|s| (0, vec![Run::new(*s)], ListMarker::Bullet))
+            .collect();
         self.body_items.push(BodyItem::BulletList(owned));
         self
     }
@@ -358,6 +374,17 @@ impl SlideData {
     /// — and every item used to be a bare `String`, so run formatting was
     /// lost too.
     pub fn add_nested_bullet_list(&mut self, items: Vec<(u8, Vec<Run>)>) -> &mut Self {
+        let items = items
+            .into_iter()
+            .map(|(level, runs)| (level, runs, ListMarker::Bullet))
+            .collect();
+        self.body_items.push(BodyItem::BulletList(items));
+        self
+    }
+
+    /// Add a list whose items each carry their own marker — bullets or
+    /// automatic numbering — so an ordered list is written as one.
+    pub(crate) fn add_marked_list(&mut self, items: Vec<(u8, Vec<Run>, ListMarker)>) -> &mut Self {
         self.body_items.push(BodyItem::BulletList(items));
         self
     }
@@ -1173,7 +1200,7 @@ fn generate_notes_slide_xml(
             },
             BodyItem::BulletList(bullets) => {
                 for bullet in bullets {
-                    write_bullet_paragraph(&mut w, bullet.0, &bullet.1, hyperlink_rids);
+                    write_bullet_paragraph(&mut w, bullet.0, &bullet.1, bullet.2, hyperlink_rids);
                     wrote_paragraph = true;
                 }
             },
@@ -1464,7 +1491,9 @@ fn collect_slide_hyperlinks(items: &[BodyItem]) -> Vec<String> {
                 .iter()
                 .flat_map(|(runs, _)| runs.iter())
                 .collect(),
-            BodyItem::BulletList(items) => items.iter().flat_map(|(_, runs)| runs.iter()).collect(),
+            BodyItem::BulletList(items) => {
+                items.iter().flat_map(|(_, runs, _)| runs.iter()).collect()
+            },
             BodyItem::Table(rows) => rows.iter().flatten().flatten().collect(),
             _ => continue,
         };
@@ -1732,7 +1761,7 @@ fn write_body_shape(
             },
             BodyItem::BulletList(bullets) => {
                 for bullet in bullets {
-                    write_bullet_paragraph(w, bullet.0, &bullet.1, hyperlink_rids);
+                    write_bullet_paragraph(w, bullet.0, &bullet.1, bullet.2, hyperlink_rids);
                     wrote_paragraph = true;
                 }
             },
@@ -2136,6 +2165,7 @@ fn write_bullet_paragraph(
     w: &mut Writer<Vec<u8>>,
     level: u8,
     runs: &[Run],
+    marker: ListMarker,
     hyperlink_rids: &HashMap<String, String>,
 ) {
     w.write_event(Event::Start(BytesStart::new("a:p")))
@@ -2151,8 +2181,22 @@ fn write_bullet_paragraph(
     p_pr.push_attribute(("marL", mar_l.to_string().as_str()));
     p_pr.push_attribute(("indent", format!("-{BULLET_INDENT_EMU}").as_str()));
     w.write_event(Event::Start(p_pr)).expect("write");
-    let mut bu = BytesStart::new("a:buChar");
-    bu.push_attribute(("char", "\u{2022}"));
+    let bu = match marker {
+        ListMarker::Bullet => {
+            let mut bu = BytesStart::new("a:buChar");
+            bu.push_attribute(("char", "\u{2022}"));
+            bu
+        },
+        ListMarker::AutoNum { scheme, start_at } => {
+            let mut bu = BytesStart::new("a:buAutoNum");
+            bu.push_attribute(("type", scheme));
+            // ST_TextBulletStartAtNum: 1..=32767; 1 is the default.
+            if let Some(n) = start_at.filter(|&n| n != 1) {
+                bu.push_attribute(("startAt", n.clamp(1, 32_767).to_string().as_str()));
+            }
+            bu
+        },
+    };
     w.write_event(Event::Empty(bu)).expect("write");
     w.write_event(Event::End(BytesEnd::new("a:pPr")))
         .expect("write");
@@ -2525,7 +2569,7 @@ mod tests {
             let slide = writer.add_slide();
             slide.set_notes_structured(vec![
                 BodyItem::RichText(vec![Run::new("bold note").bold()], ParaProps::default()),
-                BodyItem::BulletList(vec![(0, vec![Run::new("bullet one")])]),
+                BodyItem::BulletList(vec![(0, vec![Run::new("bullet one")], ListMarker::Bullet)]),
             ]);
         }
         let notes_xml = part_xml(writer, "ppt/notesSlides/notesSlide1.xml");

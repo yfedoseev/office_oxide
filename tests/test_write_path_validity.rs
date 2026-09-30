@@ -144,3 +144,61 @@ fn test_pptx_notes_hyperlinks_resolve_in_the_notes_part() {
     let notes = format!("{:?}", back.sections[0].speaker_notes);
     assert!(notes.contains("https://example.com/notes-only"), "{notes}");
 }
+
+// ---------------------------------------------------------------------------
+// PPTX ordered lists
+// ---------------------------------------------------------------------------
+
+fn find_list(elements: &[Element]) -> Option<&List> {
+    elements.iter().find_map(|e| match e {
+        Element::List(l) => Some(l),
+        Element::TextBox(tb) => find_list(&tb.content),
+        _ => None,
+    })
+}
+
+/// Every IR list — ordered or not — was written with
+/// `<a:buChar char="•"/>`: a numbered list came out of PPTX as bullets.
+#[test]
+fn test_pptx_ordered_list_is_written_with_auto_numbering() {
+    let item = |t: &str, nested: Option<List>| ListItem {
+        content: vec![para(vec![InlineContent::Text(TextSpan::plain(t))])],
+        nested,
+    };
+    let list = List {
+        ordered: true,
+        start_number: Some(3),
+        style: Some(ListStyle::LowerAlpha),
+        items: vec![
+            item(
+                "third",
+                Some(List {
+                    items: vec![item("a bullet", None)],
+                    ..Default::default()
+                }),
+            ),
+            item("fourth", None),
+        ],
+        ..Default::default()
+    };
+    let mut ir = one_section(vec![Element::List(list.clone())], DocumentFormat::Pptx);
+    ir.sections[0].speaker_notes = Some(vec![Element::List(list)]);
+    let bytes = write_ir(&ir, DocumentFormat::Pptx);
+    for name in ["ppt/slides/slide1.xml", "ppt/notesSlides/notesSlide1.xml"] {
+        let xml = part(&bytes, name).unwrap();
+        assert_eq!(
+            xml.matches(r#"<a:buAutoNum type="alphaLcPeriod" startAt="3"/>"#)
+                .count(),
+            2,
+            "{name}: {xml}"
+        );
+        assert_eq!(xml.matches("<a:buChar").count(), 1, "the nested list stays bulleted: {xml}");
+    }
+    let doc =
+        office_oxide::Document::from_reader(Cursor::new(bytes), DocumentFormat::Pptx).unwrap();
+    let back = doc.to_ir();
+    let l = find_list(&back.sections[0].elements).expect("a list");
+    assert!(l.ordered);
+    assert_eq!(l.start_number, Some(3));
+    assert_eq!(l.style, Some(ListStyle::LowerAlpha));
+}
