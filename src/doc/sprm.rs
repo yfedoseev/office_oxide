@@ -650,6 +650,19 @@ pub fn extract_pap_props(grpprl: &[u8]) -> PapProps {
     props
 }
 
+/// Decode a ToggleOperand ([MS-DOC] §2.9.339) against the value in force:
+/// `0x00` off, `0x01` on, `0x80` the value in force (the style's), `0x81`
+/// its negation — POI's `getFlag`. Reading every non-zero operand as *on*
+/// turned `0x80` ("same as the style") runs bold, italic or hidden.
+fn toggle(operand: u8, current: bool) -> bool {
+    match operand {
+        0x00 => false,
+        0x80 => current,
+        0x81 => !current,
+        _ => true,
+    }
+}
+
 /// Character-property flags distilled from a CHP grpprl (`sgc` == 2).
 ///
 /// Revision-mark flags and
@@ -791,7 +804,7 @@ chp_sprm_dispatch! {
     /// text.
     "sprmCFRMarkDel" @ "2.6.1" => [0x0800] (props, operand) {
         if let Some(&b) = operand.first() {
-            props.f_rmark_del = b != 0;
+            props.f_rmark_del = toggle(b, props.f_rmark_del);
         }
     }
 
@@ -799,21 +812,21 @@ chp_sprm_dispatch! {
     /// revision-mark text.
     "sprmCFRMarkIns" @ "2.6.1" => [0x0801] (props, operand) {
         if let Some(&b) = operand.first() {
-            props.f_rmark_ins = b != 0;
+            props.f_rmark_ins = toggle(b, props.f_rmark_ins);
         }
     }
 
     /// ToggleOperand (1 byte, spra 0): whether the text is bold.
     "sprmCFBold" @ "2.6.1" => [0x0835] (props, operand) {
         if let Some(&b) = operand.first() {
-            props.bold = b != 0;
+            props.bold = toggle(b, props.bold);
         }
     }
 
     /// ToggleOperand (1 byte, spra 0): whether the text is italicized.
     "sprmCFItalic" @ "2.6.1" => [0x0836] (props, operand) {
         if let Some(&b) = operand.first() {
-            props.italic = b != 0;
+            props.italic = toggle(b, props.italic);
         }
     }
 
@@ -865,7 +878,7 @@ chp_sprm_dispatch! {
     /// ToggleOperand (1 byte, spra 0): single strikethrough.
     "sprmCFStrike" @ "2.6.1" => [0x0837] (props, operand) {
         if let Some(&b) = operand.first() {
-            props.strike = b != 0;
+            props.strike = toggle(b, props.strike);
         }
     }
 
@@ -874,28 +887,35 @@ chp_sprm_dispatch! {
     /// `w:dstrike`.
     "sprmCFDStrike" @ "2.6.1" => [0x2A53] (props, operand) {
         if let Some(&b) = operand.first() {
-            props.strike = b != 0;
+            props.strike = toggle(b, props.strike);
         }
     }
 
     /// ToggleOperand (1 byte, spra 0): hidden text.
     "sprmCFVanish" @ "2.6.1" => [0x083C] (props, operand) {
         if let Some(&b) = operand.first() {
-            props.vanish = b != 0;
+            // Hiding deletes content, so it takes certainty: `0x80`/`0x81`
+            // are relative to the style's value, which is not resolved
+            // here, and leave the value in force (see the test).
+            props.vanish = match b {
+                0x00 => false,
+                0x80 | 0x81 => props.vanish,
+                _ => true,
+            };
         }
     }
 
     /// ToggleOperand (1 byte, spra 0): small capitals.
     "sprmCFSmallCaps" @ "2.6.1" => [0x083A] (props, operand) {
         if let Some(&b) = operand.first() {
-            props.small_caps = b != 0;
+            props.small_caps = toggle(b, props.small_caps);
         }
     }
 
     /// ToggleOperand (1 byte, spra 0): all capitals.
     "sprmCFCaps" @ "2.6.1" => [0x083B] (props, operand) {
         if let Some(&b) = operand.first() {
-            props.all_caps = b != 0;
+            props.all_caps = toggle(b, props.all_caps);
         }
     }
 
@@ -1792,6 +1812,53 @@ mod tests {
         // 0 is below the spec's minimum of 2 — ignored, not stored.
         let props = extract_chp_props(&[0x43, 0x4A, 0, 0]);
         assert_eq!(props.font_size_half_pt, None);
+    }
+
+    /// A ToggleOperand ([MS-DOC] §2.9.339) is `0x00` off, `0x01` on, `0x80`
+    /// "the style's value" and `0x81` "the opposite of the style's value".
+    /// Decoding every non-zero operand as *on* read `0x80` as on: visible
+    /// text Word shows (its style is not hidden) was treated as hidden and
+    /// dropped, and `0x80` bold/italic runs came out bold/italic. As in
+    /// POI's `getFlag`, `0x80` keeps the value in force and `0x81` negates
+    /// it (with no style value applied here, that value is "off").
+    #[test]
+    fn test_toggle_operands_0x80_and_0x81_are_relative_to_the_style() {
+        for opcode in [
+            [0x35, 0x08], // sprmCFBold
+            [0x36, 0x08], // sprmCFItalic
+            [0x37, 0x08], // sprmCFStrike
+            [0x53, 0x2A], // sprmCFDStrike
+            [0x3B, 0x08], // sprmCFCaps
+            [0x3A, 0x08], // sprmCFSmallCaps
+            [0x00, 0x08], // sprmCFRMarkDel
+        ] {
+            let with = |operand: u8| extract_chp_props(&[opcode[0], opcode[1], operand]);
+            let on = |p: ChpProps| {
+                p.bold || p.italic || p.strike || p.all_caps || p.small_caps || p.f_rmark_del
+            };
+            assert!(!on(with(0x80)), "{opcode:02X?}: 0x80 over an off style is off");
+            assert!(on(with(0x81)), "{opcode:02X?}: 0x81 over an off style is on");
+            // 0x81 after an explicit on turns it back off; 0x80 keeps it.
+            let on_then = |second: u8| {
+                extract_chp_props(&[opcode[0], opcode[1], 0x01, opcode[0], opcode[1], second])
+            };
+            assert!(!on(on_then(0x81)), "{opcode:02X?}: 0x81 negates the value in force");
+            assert!(on(on_then(0x80)), "{opcode:02X?}: 0x80 keeps the value in force");
+        }
+    }
+
+    /// `sprmCFVanish` hides text, so a wrong *on* deletes content. Without
+    /// the style sheet the value a `0x80`/`0x81` operand is relative to is
+    /// unknown, and real documents carry `0x81` on ordinary visible form
+    /// text (which 0.1.12 showed and Word displays). Only an explicit
+    /// `0x01` hides; `0x80`/`0x81` leave the value in force unchanged.
+    #[test]
+    fn test_vanish_hides_only_on_an_explicit_operand() {
+        assert!(extract_chp_props(&[0x3C, 0x08, 0x01]).vanish);
+        assert!(!extract_chp_props(&[0x3C, 0x08, 0x81]).vanish);
+        assert!(!extract_chp_props(&[0x3C, 0x08, 0x80]).vanish);
+        assert!(extract_chp_props(&[0x3C, 0x08, 0x01, 0x3C, 0x08, 0x80]).vanish);
+        assert!(!extract_chp_props(&[0x3C, 0x08, 0x01, 0x3C, 0x08, 0x00]).vanish);
     }
 
     /// Hidden text, strikethrough, super/subscript, highlight and the
