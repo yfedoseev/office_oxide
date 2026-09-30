@@ -19,8 +19,15 @@ use office_oxide::cfb::{CFB_SIGNATURE, END_OF_CHAIN, FAT_SECT, FREE_SECT};
 use office_oxide::{Document, DocumentFormat};
 use std::io::Cursor;
 
+pub mod ppt;
+
 /// Sentinel directory id: no sibling / child.
 const NO_ENTRY: u32 = 0xFFFF_FFFF;
+
+/// 512-byte pages reserved for the FIB at the start of `WordDocument`: its
+/// `FibRgFcLcb97` runs past the first page (e.g. `fcPlcftxbxTxt` at
+/// 0x25A), so the FKP pages and text start after two.
+const FIB_PAGES: usize = 2;
 
 /// A single main-text paragraph to encode.
 pub struct Para {
@@ -127,11 +134,39 @@ pub struct FibTweaks {
     /// text (Word leaves the first `rgfc` at the start of the text area,
     /// not at `fcMin`).
     pub first_fkp_fc_before_text: u32,
+    /// `PlcfSed` section boundary CPs (`aCP`, one more than the section
+    /// count; each `Sed` is written as zeros). Empty: no `PlcfSed`.
+    pub plcf_sed: Vec<u32>,
+    /// `PlcfHdd` header-story CPs (`aCP`, stories + 2 entries). Empty: no
+    /// `PlcfHdd`.
+    pub plcf_hdd: Vec<u32>,
+    /// `PlcftxbxTxt` text-box story CPs (`aCP`, one more than the story
+    /// count; each `FTXBXS` is written as zeros). Empty: no `PlcftxbxTxt`.
+    pub plcf_txbx_txt: Vec<u32>,
+    /// `FTXBXS.lid` of each `PlcftxbxTxt` story, in order (the shape id the
+    /// box's text begins in). Stories past this list keep `lid` 0; the
+    /// last `FTXBXS` is always written with `fReusable` = 1.
+    pub txbx_lids: Vec<u32>,
+    /// `PlcSpaMom` shape anchors as `(anchor CP, Spa.lid)`, followed by a
+    /// final CP of `text_len`. Empty: no `PlcSpaMom`.
+    pub plcf_spa: Vec<(u32, u32)>,
 }
 
 /// Build a synthetic `.doc`, optionally with subdocuments and FIB tweaks.
 #[allow(dead_code)]
 pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> Vec<u8> {
+    let (word_doc, table) = build_doc_streams(paras, subdocs, tweaks);
+    build_cfb(&word_doc, &table)
+}
+
+/// The `WordDocument` and `0Table` stream bytes of
+/// [`build_doc_full`], for a test that assembles its own container.
+#[allow(dead_code)]
+pub fn build_doc_streams(
+    paras: &[Para],
+    subdocs: &Subdocs,
+    tweaks: FibTweaks,
+) -> (Vec<u8>, Vec<u8>) {
     let n = paras.len();
 
     // Build the main text (UTF-16LE) and the CP range of each paragraph.
@@ -168,15 +203,58 @@ pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> V
     }
     let text_bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
     let total_chars = units.len() as u32;
-
+    // Text lives after the FIB pages (0..FIB_PAGES) and the N FKP pages.
     // Text lives after the FIB page (page 0) and the N FKP pages (pages 1..N).
-    let text_offset = ((n as u32) + 1) * 512;
+    let text_offset = ((n + FIB_PAGES) as u32) * 512;
 
     // ── 0Table stream: CLX (piece table) followed by PlcfBtePapx. ──
     let mut table = build_clx(text_offset, total_chars);
     let fc_plcf = table.len() as u32;
     table.extend_from_slice(&build_plcf_bte_papx(n, &cp_starts, text_len));
     let lcb_plcf = (table.len() as u32) - fc_plcf;
+    // Optional PLCs, each placed after what is already in the table stream:
+    // (FIB fc offset, aCP, data-element size).
+    let mut plcs: Vec<(usize, u32, u32)> = Vec::new();
+    let spa_cps: Vec<u32> = if tweaks.plcf_spa.is_empty() {
+        Vec::new()
+    } else {
+        let mut v: Vec<u32> = tweaks.plcf_spa.iter().map(|&(cp, _)| cp).collect();
+        v.push(text_len);
+        v
+    };
+    for (fib_off, cps, cb) in [
+        (0x00CA, &tweaks.plcf_sed, 12usize), // fcPlcfSed: Sed = 12 bytes
+        (0x00F2, &tweaks.plcf_hdd, 0),       // fcPlcfHdd: no data elements
+        (0x025A, &tweaks.plcf_txbx_txt, 22), // fcPlcftxbxTxt: FTXBXS = 22 bytes
+        (0x01DA, &spa_cps, 26),              // fcPlcSpaMom: Spa = 26 bytes
+    ] {
+        if cps.is_empty() {
+            continue;
+        }
+        let fc = table.len() as u32;
+        for cp in cps.iter() {
+            table.extend_from_slice(&cp.to_le_bytes());
+        }
+        let elems = if cb == 0 { 0 } else { cps.len() - 1 };
+        for i in 0..elems {
+            let mut elem = vec![0u8; cb];
+            match fib_off {
+                0x025A => {
+                    // FTXBXS: fReusable at 8, lid at 14.
+                    if i + 1 == elems {
+                        elem[8..10].copy_from_slice(&1u16.to_le_bytes());
+                    } else if let Some(lid) = tweaks.txbx_lids.get(i) {
+                        elem[14..18].copy_from_slice(&lid.to_le_bytes());
+                    }
+                },
+                // Spa: lid first.
+                0x01DA => elem[0..4].copy_from_slice(&tweaks.plcf_spa[i].1.to_le_bytes()),
+                _ => {},
+            }
+            table.extend_from_slice(&elem);
+        }
+        plcs.push((fib_off, fc, table.len() as u32 - fc));
+    }
 
     // ── WordDocument stream: FIB + N FKP pages + text. ──
     let wd_len = text_offset as usize + text_bytes.len();
@@ -207,6 +285,10 @@ pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> V
     if let Some(off) = tweaks.clx_offset {
         word_doc[0x01A2..0x01A6].copy_from_slice(&off.to_le_bytes());
     }
+    for (fib_off, fc, lcb) in plcs {
+        word_doc[fib_off..fib_off + 4].copy_from_slice(&fc.to_le_bytes());
+        word_doc[fib_off + 4..fib_off + 8].copy_from_slice(&lcb.to_le_bytes());
+    }
     for (i, p) in paras.iter().enumerate() {
         let cp0 = cp_starts[i];
         let cp1 = if i + 1 < n {
@@ -220,13 +302,13 @@ pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> V
         }
         let fc1 = text_offset + cp1 * 2;
         let page = build_fkp_page(fc0, fc1, &p.grpprl);
-        let off = (i + 1) * 512;
+        let off = (i + FIB_PAGES) * 512;
         word_doc[off..off + 512].copy_from_slice(&page);
     }
     word_doc[text_offset as usize..text_offset as usize + text_bytes.len()]
         .copy_from_slice(&text_bytes);
 
-    build_cfb(&word_doc, &table)
+    (word_doc, table)
 }
 
 /// Open a synthetic `.doc` byte buffer through the public API.
@@ -242,6 +324,14 @@ pub fn open_doc(bytes: &[u8]) -> Document {
 /// story sequence.
 #[allow(dead_code)]
 pub fn build_word6_doc(wident: u16, text: &[u8]) -> Vec<u8> {
+    build_word6_doc_with_tail(wident, text, &[])
+}
+
+/// As [`build_word6_doc`], with `tail` stored in the `WordDocument` stream
+/// after the text (outside every story) — where Word 6.0/95 keeps
+/// pictures.
+#[allow(dead_code)]
+pub fn build_word6_doc_with_tail(wident: u16, text: &[u8], tail: &[u8]) -> Vec<u8> {
     let fc_min = 0x300u32;
     let mut wd = vec![0u8; fc_min as usize];
     wd[0..2].copy_from_slice(&wident.to_le_bytes());
@@ -251,6 +341,7 @@ pub fn build_word6_doc(wident: u16, text: &[u8]) -> Vec<u8> {
     wd[0x1C..0x20].copy_from_slice(&(fc_min + text.len() as u32).to_le_bytes());
     wd[0x34..0x38].copy_from_slice(&(text.len() as u32).to_le_bytes());
     wd.extend_from_slice(text);
+    wd.extend_from_slice(tail);
     let pad = (512 - wd.len() % 512) % 512;
     wd.extend(std::iter::repeat_n(0u8, pad));
     build_cfb(&wd, &[0u8; 512])
@@ -294,7 +385,7 @@ fn build_plcf_bte_papx(n: usize, cp_starts: &[u32], text_len: u32) -> Vec<u8> {
         v.extend_from_slice(&cp.to_le_bytes());
     }
     for i in 0..n {
-        v.extend_from_slice(&((i as u32) + 1).to_le_bytes()); // page number
+        v.extend_from_slice(&((i as u32) + FIB_PAGES as u32).to_le_bytes()); // page number
     }
     v
 }
@@ -559,5 +650,127 @@ pub fn cfb_with_stream(name: &str, data: &[u8]) -> Vec<u8> {
     }
     let data_off = 512 + first_data as usize * 512;
     file[data_off..data_off + data.len()].copy_from_slice(data);
+    file
+}
+
+/// A minimal CFB v3 container holding the given streams, each in its own
+/// run of consecutive sectors (no mini stream, so streams of any size are
+/// read through the FAT). A name with `/` places the stream in storages
+/// created along its path (`"Macros/VBA/dir"`). Each storage's children
+/// form a chain of right siblings.
+#[allow(dead_code)]
+pub fn cfb_with_streams(streams: &[(&str, &[u8])]) -> Vec<u8> {
+    // Directory entries: (name, type, parent index, data index).
+    let mut entries: Vec<(String, u8, usize, Option<usize>)> =
+        vec![("Root Entry".to_string(), 5, usize::MAX, None)];
+    for (si, (path, _)) in streams.iter().enumerate() {
+        let parts: Vec<&str> = path.split('/').collect();
+        let mut parent = 0usize;
+        for (k, part) in parts.iter().enumerate() {
+            let is_stream = k + 1 == parts.len();
+            let found = entries
+                .iter()
+                .position(|e| e.2 == parent && e.0 == *part && e.1 == 1);
+            parent = match (found, is_stream) {
+                (Some(i), false) => i,
+                _ => {
+                    let kind = if is_stream { 2 } else { 1 };
+                    entries.push((part.to_string(), kind, parent, is_stream.then_some(si)));
+                    entries.len() - 1
+                },
+            };
+        }
+    }
+    let sectors: Vec<usize> = streams
+        .iter()
+        .map(|(_, d)| d.len().div_ceil(512).max(1))
+        .collect();
+    let dir_sectors = entries.len().div_ceil(4);
+    let data_sectors: usize = sectors.iter().sum();
+    let mut fat_sectors = 1;
+    while fat_sectors * 128 < dir_sectors + fat_sectors + data_sectors {
+        fat_sectors += 1;
+    }
+    assert!(fat_sectors <= 109, "header DIFAT only");
+    let total = dir_sectors + fat_sectors + data_sectors;
+    let mut file = vec![0u8; 512 * (1 + total)];
+    file[0..8].copy_from_slice(&CFB_SIGNATURE);
+    file[0x18..0x1A].copy_from_slice(&0x003Eu16.to_le_bytes());
+    file[0x1A..0x1C].copy_from_slice(&3u16.to_le_bytes());
+    file[0x1C..0x1E].copy_from_slice(&0xFFFEu16.to_le_bytes());
+    file[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
+    file[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
+    file[0x2C..0x30].copy_from_slice(&(fat_sectors as u32).to_le_bytes());
+    file[0x30..0x34].copy_from_slice(&0u32.to_le_bytes()); // directory at sector 0
+    file[0x38..0x3C].copy_from_slice(&4096u32.to_le_bytes());
+    file[0x3C..0x40].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+    file[0x44..0x48].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+    for i in 0..109 {
+        let v = if i < fat_sectors {
+            (dir_sectors + i) as u32
+        } else {
+            FREE_SECT
+        };
+        file[0x4C + i * 4..0x50 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let mut fat = vec![FREE_SECT; fat_sectors * 128];
+    for i in 0..dir_sectors {
+        fat[i] = if i + 1 == dir_sectors {
+            END_OF_CHAIN
+        } else {
+            (i + 1) as u32
+        };
+    }
+    for i in 0..fat_sectors {
+        fat[dir_sectors + i] = FAT_SECT;
+    }
+    // Stream data, in stream order.
+    let mut starts = Vec::with_capacity(streams.len());
+    let mut next = dir_sectors + fat_sectors;
+    for ((_, data), &n) in streams.iter().zip(&sectors) {
+        starts.push(next);
+        for k in 0..n {
+            fat[next + k] = if k + 1 == n {
+                END_OF_CHAIN
+            } else {
+                (next + k + 1) as u32
+            };
+        }
+        let data_off = 512 + next * 512;
+        file[data_off..data_off + data.len()].copy_from_slice(data);
+        next += n;
+    }
+    // Directory entries: each storage's first child, siblings chained.
+    for (i, (name, kind, parent, data)) in entries.iter().enumerate() {
+        let child = entries
+            .iter()
+            .position(|e| e.2 == i)
+            .map_or(NO_ENTRY, |c| c as u32);
+        let right = entries
+            .iter()
+            .enumerate()
+            .skip(i + 1)
+            .find(|(_, e)| e.2 == *parent)
+            .map_or(NO_ENTRY, |(j, _)| j as u32);
+        let right = if i == 0 { NO_ENTRY } else { right };
+        let (start, size) = match data {
+            Some(si) => (starts[*si] as u32, streams[*si].1.len() as u32),
+            None => (END_OF_CHAIN, 0),
+        };
+        let off = 512 + i * 128;
+        write_dir_entry_with_sibling(
+            &mut file[off..off + 128],
+            name,
+            *kind,
+            child,
+            right,
+            start,
+            size,
+        );
+    }
+    for (i, v) in fat.iter().enumerate() {
+        let off = 512 + dir_sectors * 512 + i * 4;
+        file[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
     file
 }

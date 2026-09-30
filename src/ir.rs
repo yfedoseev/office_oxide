@@ -333,6 +333,22 @@ pub struct PageSetup {
     pub header_distance_twips: u32,
     /// Distance from bottom edge to footer in twips (default 720 = 0.5").
     pub footer_distance_twips: u32,
+    /// Extra binding margin in twips (DOCX `w:pgMar/@w:gutter`), added to
+    /// the inside edge for binding. `0` when there is none.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub gutter_twips: u32,
+    /// The number of the section's first page, when it restarts numbering
+    /// (DOCX `w:pgNumType/@w:start`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_number_start: Option<u32>,
+    /// The page-number format (DOCX `w:pgNumType/@w:fmt`: `decimal`,
+    /// `lowerRoman`, `upperLetter`, ...), when not decimal by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_number_format: Option<String>,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 impl Default for PageSetup {
@@ -347,6 +363,9 @@ impl Default for PageSetup {
             landscape: false,
             header_distance_twips: 720,
             footer_distance_twips: 720,
+            gutter_twips: 0,
+            page_number_start: None,
+            page_number_format: None,
         }
     }
 }
@@ -570,8 +589,9 @@ pub struct Metadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// `true` when the source document carries a macro/VBA project — an
-    /// OOXML part reached via a `vbaProject` relationship, or a legacy
-    /// CFB file's top-level `_VBA_PROJECT` storage. A cheap presence-only
+    /// OOXML part reached via a `vbaProject` relationship, or a
+    /// legacy file's VBA project (a `.doc`'s `Macros/VBA` storage, a
+    /// `.ppt`'s `VBAInfoAtom`, an `.xls`'s project storage). A cheap presence-only
     /// signal for content-safety use cases; office_oxide never
     /// interprets or executes the macro content itself.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -586,6 +606,99 @@ pub struct Metadata {
     /// self-check, or the check passed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub text_truncated: bool,
+    /// The user who last saved the document (`cp:lastModifiedBy`; the
+    /// legacy SummaryInformation `PIDSI_LASTAUTHOR`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_modified_by: Option<String>,
+    /// The revision number (`cp:revision`; legacy `PIDSI_REVNUMBER`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    /// The document category (`cp:category`; legacy
+    /// DocumentSummaryInformation `PIDDSI_CATEGORY`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// The content status, e.g. "Draft" or "Final" (`cp:contentStatus`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_status: Option<String>,
+    /// The document's language (`dc:language`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// The company (`docProps/app.xml` `<Company>`; legacy
+    /// DocumentSummaryInformation `PIDDSI_COMPANY`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub company: Option<String>,
+    /// The author's manager (`<Manager>`; legacy `PIDDSI_MANAGER`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager: Option<String>,
+    /// User-defined document properties (`docProps/custom.xml`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_properties: Vec<CustomProperty>,
+    /// `true` when the source package carries a digital signature — an
+    /// OOXML digital-signature origin part, or a legacy compound file's
+    /// `_signatures` / `_xmlsignatures` storage. Presence only: the
+    /// signature is not validated, and a converted or re-written document
+    /// no longer carries it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_digital_signature: bool,
+    /// The package thumbnail (the image the file browser shows), when the
+    /// source carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<Image>,
+    /// Structural problems the reader worked around rather than failing
+    /// on, one human-readable line each — e.g. a legacy container whose
+    /// header counts disagree with its chains, or a structure the IR could
+    /// only represent approximately. Reported here instead of being written
+    /// into the document's text. Empty when there were none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+impl Metadata {
+    /// The document properties that are set, as `(label, value)` pairs in
+    /// a fixed order — what a summary view (`office-oxide info`, the MCP
+    /// `info` tool) lists. Flags and custom properties are not included;
+    /// read their fields directly.
+    pub fn properties(&self) -> Vec<(&'static str, String)> {
+        let keywords = (!self.keywords.is_empty()).then(|| self.keywords.join(", "));
+        [
+            ("Title", &self.title),
+            ("Author", &self.author),
+            ("Subject", &self.subject),
+            ("Keywords", &keywords),
+            ("Description", &self.description),
+            ("Category", &self.category),
+            ("Company", &self.company),
+            ("Manager", &self.manager),
+            ("Created", &self.created),
+            ("Modified", &self.modified),
+            ("Last modified by", &self.last_modified_by),
+            ("Revision", &self.revision),
+            ("Content status", &self.content_status),
+            ("Language", &self.language),
+        ]
+        .into_iter()
+        .filter_map(|(label, value)| {
+            value
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .map(|v| (label, v.to_string()))
+        })
+        .collect()
+    }
+}
+
+/// One user-defined document property (ECMA-376 Part 1 §22.3.2.2
+/// `property`). The value is kept as its text form together with the
+/// variant type that holds it, so it can be written back unchanged.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct CustomProperty {
+    /// The property name.
+    pub name: String,
+    /// The value, as the text of its variant element.
+    pub value: String,
+    /// The variant type's local name (ECMA-376 Part 1 §22.4, e.g.
+    /// `lpwstr`, `i4`, `r8`, `bool`, `filetime`).
+    pub value_type: String,
 }
 
 /// A conditional formatting rule from a worksheet (XLSX `<cfRule>` inside
@@ -737,6 +850,61 @@ pub struct Section {
     /// none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data_validations: Vec<DataValidation>,
+    /// How this section numbers and places its footnotes (DOCX
+    /// `w:sectPr/w:footnotePr`, ECMA-376 §17.11.11). `None` when the section
+    /// states nothing, which means the document-wide settings apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footnote_settings: Option<NoteSettings>,
+    /// How this section numbers and places its endnotes (DOCX
+    /// `w:sectPr/w:endnotePr`, ECMA-376 §17.11.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endnote_settings: Option<NoteSettings>,
+    /// What kind of spreadsheet sheet this section is (XLSX/XLSB/XLS
+    /// only; `None` for every other format). A chart sheet or dialog sheet
+    /// is a named tab with no cells, and an Excel 4.0 macro sheet holds
+    /// cells that are macro code rather than data — a consumer can tell
+    /// them from worksheets by this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sheet_kind: Option<SheetKind>,
+}
+
+/// The kind of a spreadsheet sheet.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SheetKind {
+    /// An ordinary worksheet: a grid of cells.
+    #[default]
+    Worksheet,
+    /// An Excel 4.0 (XLM) macro sheet: the worksheet cell model, whose
+    /// cells hold macro formulas, labels and their cached values.
+    Macro,
+    /// A chart sheet: one chart occupying the whole tab, no cells.
+    Chart,
+    /// A dialog sheet: an Excel 5.0 dialog, no cells.
+    Dialog,
+}
+
+/// Footnote or endnote numbering and placement for one section. Values are
+/// kept as the source's ST_* tokens, like [`PageSetup::page_number_format`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NoteSettings {
+    /// Where the notes are placed (`w:pos`: `pageBottom`, `beneathText`,
+    /// `sectEnd`, `docEnd`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<String>,
+    /// The reference-mark number format (`w:numFmt`: `decimal`,
+    /// `lowerRoman`, `chicago`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number_format: Option<String>,
+    /// The first note number (`w:numStart`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<u32>,
+    /// When numbering restarts (`w:numRestart`: `continuous`, `eachSect`,
+    /// `eachPage`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<String>,
 }
 
 /// A block-level content element.
@@ -1119,6 +1287,20 @@ pub enum InlineContent {
     FootnoteRef(FootnoteRef),
     /// An inline endnote reference mark.
     EndnoteRef(FootnoteRef),
+    /// Where a comment's anchored range begins. The comment itself is the
+    /// `Element::Endnote` labelled `"Comment"`/`"Comment (author)"` with
+    /// the same id.
+    CommentStart(CommentAnchor),
+    /// A comment's citation point, which also ends its anchored range.
+    CommentRef(CommentAnchor),
+}
+
+/// Identifies the comment an inline [`InlineContent::CommentStart`] or
+/// [`InlineContent::CommentRef`] marker belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct CommentAnchor {
+    /// The comment's id — the `id` of its `Element::Endnote`.
+    pub comment_id: u32,
 }
 
 /// Concatenate a heading/paragraph's inline content into plain text —
@@ -1137,7 +1319,10 @@ pub fn inline_to_text(content: &[InlineContent]) -> String {
         match item {
             InlineContent::Text(span) => out.push_str(&span.text),
             InlineContent::LineBreak => out.push('\n'),
-            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
+            InlineContent::FootnoteRef(_)
+            | InlineContent::EndnoteRef(_)
+            | InlineContent::CommentStart(_)
+            | InlineContent::CommentRef(_) => {},
         }
     }
     out
@@ -1180,6 +1365,10 @@ pub struct TextSpan {
     /// Optional hyperlink URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hyperlink: Option<String>,
+    /// The hyperlink's hover text (DOCX `w:hyperlink/@w:tooltip`, XLSX
+    /// `hyperlink/@tooltip`, PPTX `a:hlinkClick/@tooltip`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperlink_tooltip: Option<String>,
     /// Font size in half-points (e.g. 24 = 12 pt).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_size_half_pt: Option<u32>,
@@ -1258,6 +1447,10 @@ pub struct TableRow {
     /// Row height in twips, if set explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height_twips: Option<u32>,
+    /// How `height_twips` constrains the row. `None` is the OOXML default,
+    /// a minimum height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height_rule: Option<RowHeightRule>,
     /// Whether the row may break across pages.
     #[serde(default = "default_true", skip_serializing_if = "Clone::clone")]
     pub allow_break: bool,
@@ -1266,12 +1459,26 @@ pub struct TableRow {
     pub repeat_as_header: bool,
 }
 
+/// How a table row's height is applied (DOCX `w:trHeight/@w:hRule`,
+/// ECMA-376 §17.18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowHeightRule {
+    /// The height is a minimum; the row grows to fit its content.
+    AtLeast,
+    /// The row is exactly this tall; content beyond it is clipped.
+    Exact,
+    /// The height is ignored and the row fits its content.
+    Auto,
+}
+
 impl Default for TableRow {
     fn default() -> Self {
         Self {
             cells: Vec::new(),
             is_header: false,
             height_twips: None,
+            height_rule: None,
             allow_break: true,
             repeat_as_header: false,
         }
@@ -1355,6 +1562,10 @@ pub struct TableCell {
     /// produced it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub formula: Option<String>,
+    /// Text wraps onto multiple lines within the cell (XLSX `wrapText`,
+    /// ECMA-376 §18.8.1 `alignment`). `false` for prose formats.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wrap_text: bool,
 }
 
 /// An ordered or unordered list.
@@ -1374,6 +1585,38 @@ pub struct List {
     /// Nesting depth (0 = top-level).
     #[serde(default)]
     pub level: u8,
+    /// How an ordered list's marker is drawn around its number, as a
+    /// DOCX `w:lvlText` pattern (ECMA-376 Part 1 §17.9, numbering): `%N` is the
+    /// level-`N` counter (1-based), so `"%1)"` is `1)`, `"(%1)"` is `(1)`
+    /// and `"%1.%2."` is `1.2.`. `None` for bullets and when the source
+    /// uses the plain `"%N."` form or has no such notion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker_pattern: Option<String>,
+    /// How the marker is aligned in its number area (DOCX `w:lvlJc`,
+    /// ECMA-376 Part 1 §17.9). `None` when unstated (left).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker_alignment: Option<ParagraphAlignment>,
+}
+
+impl List {
+    /// The CommonMark delimiter for this list's ordered markers: `)` when
+    /// the marker pattern is the bare counter followed by `)` (`%N)`),
+    /// otherwise `.` — CommonMark has no form for `(1)` or `1.2.`.
+    pub fn ordered_delimiter(&self) -> char {
+        match self.marker_pattern.as_deref() {
+            Some(p) if is_paren_pattern(p) => ')',
+            _ => '.',
+        }
+    }
+}
+
+/// `true` for a `w:lvlText` of the form `%N)` (one counter, closing paren).
+pub(crate) fn is_paren_pattern(pattern: &str) -> bool {
+    pattern
+        .trim()
+        .strip_prefix('%')
+        .and_then(|rest| rest.strip_suffix(')'))
+        .is_some_and(|n| n.len() == 1 && n.as_bytes()[0].is_ascii_digit())
 }
 
 /// A single item within a list.
@@ -1567,6 +1810,11 @@ pub struct Image {
     /// navigate" shapes carry their entire purpose here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hyperlink: Option<String>,
+    /// Where a *linked* image's bytes live — the external target of a
+    /// picture that references its image instead of embedding it
+    /// (DrawingML `<a:blip r:link>`). Usually a URL; `data` is then `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
 }
 
 #[cfg(test)]

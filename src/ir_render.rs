@@ -51,6 +51,37 @@ thread_local! {
         }) };
 }
 
+/// Enter one level of the recursive element walk.
+///
+/// `DocumentIR` is `Deserialize`, so a caller can hand a renderer a tree
+/// nested far deeper than any bounded reader produces, and the renderers
+/// run on the caller's own stack. Past `MAX_NESTING_DEPTH` the subtree is
+/// skipped; the skip is counted in `core::xml::truncated_subtrees` (reset
+/// it before rendering to read a per-call count) as well as logged.
+///
+/// The budget is larger than the readers' [`MAX_NESTING_DEPTH`]: a walk
+/// spends a level on the element that holds a table *and* one on the table
+/// itself, and with the readers' budget a table the converter kept in full
+/// lost its innermost levels here. Two levels per reader level, plus
+/// headroom for the section/cell wrappers, keeps everything a reader
+/// produced visible while still bounding a crafted, deserialized tree.
+///
+/// [`MAX_NESTING_DEPTH`]: crate::core::xml::MAX_NESTING_DEPTH
+fn enter_render_level() -> Option<crate::core::xml::DepthGuard> {
+    let guard = crate::core::xml::DepthGuard::enter_within(RENDER_NESTING_DEPTH);
+    if guard.is_none() {
+        log::warn!("render: element nesting exceeds the depth limit; subtree skipped");
+    }
+    guard
+}
+
+/// See [`enter_render_level`].
+const RENDER_NESTING_DEPTH: usize = 2 * crate::core::xml::MAX_NESTING_DEPTH + 16;
+
+/// What a renderer writes in place of a subtree it skipped at the depth
+/// bound, so the output says content is missing instead of silently ending.
+const SKIPPED_SUBTREE_NOTICE: &str = "[content nested too deeply not shown — document truncated]";
+
 /// The media type to put in an image's `data:` URI.
 ///
 /// `Image::format` is authoritative when the converter set it; otherwise the
@@ -173,6 +204,14 @@ mod block_default {
                         return format!("[image-base64:{}]", crate::core::base64::encode(data));
                     }
                 }
+                // A linked image has a real, addressable source.
+                if let Some(src) = img.source_url.as_deref().and_then(super::safe_url) {
+                    return format!(
+                        "![{}]({})",
+                        crate::core::markdown::image_alt(img.alt_text.as_deref().unwrap_or("")),
+                        super::escape_markdown_url(&src)
+                    );
+                }
                 // An `![alt]()` with an empty target renders as a broken
                 // image. With no addressable source, emit the description
                 // as ordinary italic text, and nothing when there is none.
@@ -222,6 +261,14 @@ mod block_default {
                         );
                         return out;
                     }
+                }
+                if let Some(src) = img.source_url.as_deref().and_then(super::safe_url) {
+                    let alt = img.alt_text.as_deref().unwrap_or("");
+                    return format!(
+                        "<img src=\"{}\" alt=\"{}\" />",
+                        super::escape_html(&src),
+                        super::escape_html(alt)
+                    );
                 }
                 // `src` is required on `<img>`; an element without one is
                 // invalid HTML. With no addressable source in the IR,
@@ -427,6 +474,9 @@ fn render_section_plain(section: &Section) -> String {
 }
 
 fn render_element_plain(element: &Element) -> String {
+    let Some(_depth) = enter_render_level() else {
+        return format!("{SKIPPED_SUBTREE_NOTICE}\n");
+    };
     match element {
         Element::Heading(h) => render_inline_plain(&h.content),
         Element::Paragraph(p) => render_inline_plain(&p.content),
@@ -450,7 +500,10 @@ fn render_inline_plain(content: &[InlineContent]) -> String {
         match item {
             InlineContent::Text(span) => out.push_str(&span.text),
             InlineContent::LineBreak => out.push('\n'),
-            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
+            InlineContent::FootnoteRef(_)
+            | InlineContent::EndnoteRef(_)
+            | InlineContent::CommentStart(_)
+            | InlineContent::CommentRef(_) => {},
         }
     }
     out
@@ -479,6 +532,9 @@ fn render_table_plain(table: &Table) -> String {
 }
 
 fn render_list_plain(list: &List, indent: usize) -> String {
+    let Some(_depth) = enter_render_level() else {
+        return format!("{SKIPPED_SUBTREE_NOTICE}\n");
+    };
     let prefix_str = " ".repeat(indent * 2);
     let mut lines = Vec::new();
     for item in &list.items {
@@ -553,7 +609,22 @@ fn render_section_markdown(section: &Section) -> String {
     parts.join("\n\n")
 }
 
+/// Render a run of block elements the way a section body renders them:
+/// each non-empty block separated by a blank line. For a format's direct
+/// renderer that must lay blocks out exactly as the IR path does.
+pub(crate) fn render_blocks_markdown(elements: &[Element]) -> String {
+    elements
+        .iter()
+        .map(render_element_markdown)
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 fn render_element_markdown(element: &Element) -> String {
+    let Some(_depth) = enter_render_level() else {
+        return format!("*{}*\n\n", escape_markdown(SKIPPED_SUBTREE_NOTICE));
+    };
     match element {
         Element::Heading(h) => {
             let hashes = "#".repeat(h.clamped_level() as usize);
@@ -674,7 +745,10 @@ fn render_inline_markdown(content: &[InlineContent]) -> String {
                 flush(&mut pending, &mut out);
                 out.push_str("  \n");
             },
-            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
+            InlineContent::FootnoteRef(_)
+            | InlineContent::EndnoteRef(_)
+            | InlineContent::CommentStart(_)
+            | InlineContent::CommentRef(_) => {},
         }
     }
     flush(&mut pending, &mut out);
@@ -702,15 +776,38 @@ fn table_grid(table: &Table) -> Vec<Vec<Option<&TableCell>>> {
         .map(|r| {
             r.cells
                 .iter()
-                .map(|c| c.col_span.max(1) as usize)
-                .sum::<usize>()
+                .fold(0usize, |w, c| w.saturating_add(c.col_span.max(1) as usize))
         })
         .max()
         .unwrap_or(0)
         .min(cell_total.saturating_mul(1_000).max(1));
-    let mut grid: Vec<Vec<Option<&TableCell>>> = vec![vec![None; width]; table.rows.len()];
+    let rows = table.rows.len();
+    // The grid is `rows x width`, so one wide row made every other row cost
+    // its width: a table with one row of wide spans over many narrow rows
+    // was quadratic in the input. A real table's positions stay within a
+    // small multiple of its cells (Word's grid is at most 63 columns wide);
+    // past that, lay each row out on its own, which keeps every cell and
+    // its order but not the column alignment spans would have given it.
+    let ragged = || -> Vec<Vec<Option<&TableCell>>> {
+        table
+            .rows
+            .iter()
+            .map(|r| r.cells.iter().map(Some).collect())
+            .collect()
+    };
+    let max_positions = cell_total
+        .saturating_mul(MAX_GRID_POSITIONS_PER_CELL)
+        .max(MIN_GRID_POSITIONS);
+    if rows.saturating_mul(width) > max_positions {
+        log::warn!(
+            "table grid of {rows} x {width} positions for {cell_total} cells exceeds the layout \
+             bound; rendering rows without span alignment"
+        );
+        return ragged();
+    }
+    let mut grid: Vec<Vec<Option<&TableCell>>> = vec![vec![None; width]; rows];
     // Positions already claimed by a cell spanning down from an earlier row.
-    let mut covered: Vec<Vec<bool>> = vec![vec![false; width]; table.rows.len()];
+    let mut covered: Vec<Vec<bool>> = vec![vec![false; width]; rows];
 
     for (r, row) in table.rows.iter().enumerate() {
         let mut c = 0usize;
@@ -719,23 +816,35 @@ fn table_grid(table: &Table) -> Vec<Vec<Option<&TableCell>>> {
                 c += 1;
             }
             if c >= width {
-                break;
+                // Spans that claim more of the grid than exists (only an
+                // inconsistent or clamped IR has these) left no room for
+                // this cell; dropping it lost its text. Keep every cell.
+                log::warn!(
+                    "table spans leave no grid position for a cell; rendering rows without span alignment"
+                );
+                return ragged();
             }
             grid[r][c] = Some(cell);
-            let cs = cell.col_span.max(1) as usize;
-            let rs = cell.row_span.max(1) as usize;
-            for dr in 0..rs {
-                for dc in 0..cs {
-                    if r + dr < covered.len() && c + dc < width {
-                        covered[r + dr][c + dc] = true;
-                    }
-                }
+            // Clip to the grid before looping: the spans are untrusted and
+            // their product is not otherwise bounded.
+            let cs = (cell.col_span.max(1) as usize).min(width - c);
+            let rs = (cell.row_span.max(1) as usize).min(rows - r);
+            for covered_row in &mut covered[r..r + rs] {
+                covered_row[c..c + cs].fill(true);
             }
             c += cs;
         }
     }
     grid
 }
+
+/// See [`table_grid`]: how many grid positions a table may lay out per cell
+/// it actually holds (one more than Word's 63-column grid limit).
+const MAX_GRID_POSITIONS_PER_CELL: usize = 64;
+
+/// Floor for the grid-position bound, so small tables with legitimately
+/// large merged areas always keep their alignment.
+const MIN_GRID_POSITIONS: usize = 1 << 20;
 
 /// A table with one row and one cell whose content holds a table is a
 /// layout frame — Word documents wrap whole forms in one to draw a
@@ -768,7 +877,9 @@ fn render_table_markdown(table: &Table) -> String {
     }
 
     let grid = table_grid(table);
-    let col_count = grid.first().map(|r| r.len()).unwrap_or(0);
+    // Every row of a laid-out grid is the same width; a table past the
+    // layout bound comes back ragged, and its widest row sets the header.
+    let col_count = grid.iter().map(Vec::len).max().unwrap_or(0);
     if col_count == 0 {
         return String::new();
     }
@@ -827,6 +938,9 @@ fn render_cell_markdown(cell: &TableCell) -> String {
 }
 
 fn render_list_markdown(list: &List, indent: usize) -> String {
+    let Some(_depth) = enter_render_level() else {
+        return format!("*{}*\n", escape_markdown(SKIPPED_SUBTREE_NOTICE));
+    };
     let prefix_str = "  ".repeat(indent);
     // A numbered list that starts at 3 in the source must start at 3 here:
     // `start_number` was parsed and then ignored, so every ordered list
@@ -845,7 +959,11 @@ fn render_list_markdown(list: &List, indent: usize) -> String {
             .collect::<Vec<_>>()
             .join(" ");
         let marker = if list.ordered {
-            format!("{}. ", start.saturating_add(u32::try_from(i).unwrap_or(u32::MAX)))
+            format!(
+                "{}{} ",
+                start.saturating_add(u32::try_from(i).unwrap_or(u32::MAX)),
+                list.ordered_delimiter()
+            )
         } else {
             "- ".to_string()
         };
@@ -868,7 +986,7 @@ fn render_list_markdown(list: &List, indent: usize) -> String {
 /// XSS vector in whatever viewer displays it. Relative URLs, fragments and
 /// the ordinary network schemes pass through; anything with an unknown
 /// scheme is dropped so the link text still renders as plain text.
-fn safe_url(url: &str) -> Option<String> {
+pub(crate) fn safe_url(url: &str) -> Option<String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return None;
@@ -900,7 +1018,7 @@ fn escape_markdown(s: &str) -> String {
 }
 
 /// Escape the characters that would terminate a markdown link target early.
-fn escape_markdown_url(s: &str) -> String {
+pub(crate) fn escape_markdown_url(s: &str) -> String {
     s.replace('(', "%28")
         .replace(')', "%29")
         .replace(' ', "%20")
@@ -959,6 +1077,9 @@ fn render_section_html(section: &Section) -> String {
 }
 
 fn render_element_html(element: &Element) -> String {
+    let Some(_depth) = enter_render_level() else {
+        return format!("<p>{}</p>\n", escape_html(SKIPPED_SUBTREE_NOTICE));
+    };
     match element {
         Element::Heading(h) => {
             let level = h.clamped_level();
@@ -1093,13 +1214,22 @@ fn render_inline_html(content: &[InlineContent]) -> String {
                     text = format!("<span style=\"{}\">{text}</span>", escape_html(&css));
                 }
                 if let Some(url) = span.hyperlink.as_deref().and_then(safe_url) {
-                    text = format!("<a href=\"{}\">{text}</a>", escape_html(&url));
+                    // The source's hover text is HTML's `title`.
+                    let title = span
+                        .hyperlink_tooltip
+                        .as_deref()
+                        .map(|t| format!(" title=\"{}\"", escape_html(t)))
+                        .unwrap_or_default();
+                    text = format!("<a href=\"{}\"{title}>{text}</a>", escape_html(&url));
                 }
 
                 out.push_str(&text);
             },
             InlineContent::LineBreak => out.push_str("<br />"),
-            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
+            InlineContent::FootnoteRef(_)
+            | InlineContent::EndnoteRef(_)
+            | InlineContent::CommentStart(_)
+            | InlineContent::CommentRef(_) => {},
         }
     }
     out
@@ -1144,6 +1274,9 @@ fn render_list_html(list: &List) -> String {
 /// fragments that agree on shape are re-joined here; see
 /// [`merge_adjacent_lists`] for what counts as adjacent.
 fn render_list_group_html(lists: &[&List]) -> String {
+    let Some(_depth) = enter_render_level() else {
+        return format!("<p>{}</p>\n", escape_html(SKIPPED_SUBTREE_NOTICE));
+    };
     let Some(first) = lists.first() else {
         return String::new();
     };
@@ -1155,7 +1288,15 @@ fn render_list_group_html(lists: &[&List]) -> String {
         Some(n) if first.ordered && n != 1 => format!(" start=\"{n}\""),
         _ => String::new(),
     };
-    let mut html = format!("<{tag}{start_attr}>\n");
+    // Letter and roman markers: HTML's `<ol type>`. Decimal is its default.
+    let type_attr = match first.style {
+        Some(ListStyle::LowerAlpha) if first.ordered => " type=\"a\"",
+        Some(ListStyle::UpperAlpha) if first.ordered => " type=\"A\"",
+        Some(ListStyle::LowerRoman) if first.ordered => " type=\"i\"",
+        Some(ListStyle::UpperRoman) if first.ordered => " type=\"I\"",
+        _ => "",
+    };
+    let mut html = format!("<{tag}{type_attr}{start_attr}>\n");
     for list in lists {
         for item in &list.items {
             let content = render_elements_html(&item.content).join("");
@@ -1829,6 +1970,34 @@ mod tests {
         })]);
         assert!(!bullets.to_html().contains("start="), "{}", bullets.to_html());
         assert!(bullets.to_markdown().contains("- A"), "{}", bullets.to_markdown());
+    }
+
+    /// Letter and roman markers are carried in `List::style` but HTML
+    /// rendered every ordered list as decimal; `<ol type>` is the HTML
+    /// attribute for exactly these four. (Markdown has no such syntax —
+    /// CommonMark ordered-list markers are decimal only — so it keeps
+    /// digits.)
+    #[test]
+    fn test_letter_and_roman_list_styles_reach_the_html_type_attribute() {
+        for (style, attr) in [
+            (ListStyle::LowerAlpha, " type=\"a\""),
+            (ListStyle::UpperAlpha, " type=\"A\""),
+            (ListStyle::LowerRoman, " type=\"i\""),
+            (ListStyle::UpperRoman, " type=\"I\""),
+            (ListStyle::Decimal, ""),
+        ] {
+            let ir = simple_ir(vec![Element::List(List {
+                ordered: true,
+                style: Some(style.clone()),
+                items: vec![ListItem {
+                    content: vec![para("A")],
+                    nested: None,
+                }],
+                ..Default::default()
+            })]);
+            let html = ir.to_html();
+            assert!(html.contains(&format!("<ol{attr}>")), "{style:?}: {html}");
+        }
     }
 
     // ── Defaults centralized in `block_default` ──────────────────────

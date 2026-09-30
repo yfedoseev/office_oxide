@@ -29,6 +29,9 @@ pub const RT_MERGEDCELLS: u16 = 0x00E5;
 pub const RT_NAME: u16 = 0x0018;
 pub const RT_EXTERNSHEET: u16 = 0x0017;
 pub const RT_SUPBOOK: u16 = 0x01AE;
+/// Sheet-level flags ([MS-XLS] §2.4.351 `WsBool`); bit 4 of the first
+/// byte, `fDialog`, marks a dialog sheet in a worksheet substream.
+pub const RT_WSBOOL: u16 = 0x0081;
 /// Chart series/trendline/axis/chart title text ([MS-XLS] §2.4.254), found
 /// inside a chart's nested `BOF..EOF` substream.
 pub const RT_SERIESTEXT: u16 = 0x100D;
@@ -78,6 +81,9 @@ pub const RT_MSODRAWING: u16 = 0x00EC;
 #[derive(Debug, Clone)]
 pub struct BiffRecord<'a> {
     pub record_type: u16,
+    /// Offset of the record's 4-byte header in the stream — what
+    /// `BOUNDSHEET.lbPlyPos` ([MS-XLS] §2.4.28) names for a sheet's `BOF`.
+    pub offset: usize,
     pub data: std::borrow::Cow<'a, [u8]>,
     /// Offsets into `data` at which each merged `CONTINUE` record began,
     /// ascending. Almost every record has none; the ones that do (`SST`
@@ -92,16 +98,11 @@ pub struct BiffRecord<'a> {
 pub struct RecordIter<'a> {
     data: &'a [u8],
     pos: usize,
-    last_type: u16,
 }
 
 impl<'a> RecordIter<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            pos: 0,
-            last_type: 0,
-        }
+        Self { data, pos: 0 }
     }
 
     /// Read the next raw record (without merging CONTINUE).
@@ -131,13 +132,12 @@ impl<'a> Iterator for RecordIter<'a> {
     type Item = Result<BiffRecord<'a>>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let offset = self.pos;
         let (rt, first) = match self.read_raw()? {
             Ok(v) => v,
             Err(e) => return Some(Err(e)),
         };
         let mut data = std::borrow::Cow::Borrowed(first);
-
-        self.last_type = rt;
 
         // Merge subsequent CONTINUE records into this record's data,
         // remembering where each one began.
@@ -163,6 +163,7 @@ impl<'a> Iterator for RecordIter<'a> {
 
         Some(Ok(BiffRecord {
             record_type: rt,
+            offset,
             data,
             continue_at,
         }))
@@ -202,6 +203,7 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].record_type, RT_BOF);
         assert_eq!(records[1].record_type, RT_EOF);
+        assert_eq!((records[0].offset, records[1].offset), (0, 6));
     }
 
     #[test]

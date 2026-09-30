@@ -1,10 +1,11 @@
 use super::DocxDocument;
 use super::document::BlockElement;
+use super::formatting::RunProperties;
 use super::hyperlink::HyperlinkTarget;
 use super::image::DrawingInfo;
 use super::numbering::NumberingDefinitions;
 use super::paragraph::{BreakType, ParagraphContent, Run, RunContent};
-use super::styles::StyleSheet;
+use super::styles::{CellStyleLayer, StyleSheet};
 use super::table::Table;
 
 // ---------------------------------------------------------------------------
@@ -20,12 +21,20 @@ impl DocxDocument {
     pub fn plain_text(&self) -> String {
         let mut out = String::new();
         let styles = self.styles.as_ref();
-        for hf in self.headers_footers.iter().filter(|h| h.is_header) {
-            plain_text_blocks(&hf.content, styles, &mut out);
+        for hf in self
+            .headers_footers
+            .iter()
+            .filter(|h| h.active && h.is_header)
+        {
+            plain_text_blocks(&hf.content, styles, None, &mut out);
         }
-        plain_text_blocks(&self.body.elements, styles, &mut out);
-        for hf in self.headers_footers.iter().filter(|h| !h.is_header) {
-            plain_text_blocks(&hf.content, styles, &mut out);
+        plain_text_blocks(&self.body.elements, styles, None, &mut out);
+        for hf in self
+            .headers_footers
+            .iter()
+            .filter(|h| h.active && !h.is_header)
+        {
+            plain_text_blocks(&hf.content, styles, None, &mut out);
         }
         // Footnote/endnote/comment bodies are real document content that
         // to_ir() already carries (as Element::Footnote/Endnote) — without
@@ -34,12 +43,12 @@ impl DocxDocument {
         // depending on which of plain_text()/to_markdown()/to_ir() a caller
         // used.
         for n in self.footnotes.iter().chain(self.endnotes.iter()) {
-            plain_text_blocks(&n.content, styles, &mut out);
+            plain_text_blocks(&n.content, styles, None, &mut out);
         }
         // A comment names its author, as on every other surface and format.
         for n in &self.comments {
             let mut body = String::new();
-            plain_text_blocks(&n.content, styles, &mut body);
+            plain_text_blocks(&n.content, styles, None, &mut body);
             let body = body.trim();
             if !body.is_empty() {
                 if !out.is_empty() && !out.ends_with('\n') {
@@ -69,6 +78,7 @@ impl DocxDocument {
         let ctx = MarkdownCtx {
             styles: self.styles.as_ref(),
             numbering: self.numbering.as_ref(),
+            table: None,
         };
 
         let (header_texts, footer_texts) = split_headers_footers(self, &ctx);
@@ -131,7 +141,7 @@ fn split_headers_footers(doc: &DocxDocument, ctx: &MarkdownCtx) -> (Vec<String>,
     let mut header_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut footer_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for hf in &doc.headers_footers {
+    for hf in doc.headers_footers.iter().filter(|h| h.active) {
         let mut buf = String::new();
         markdown_blocks(&hf.content, ctx, &mut buf, 0);
         let t = buf.trim().to_string();
@@ -156,12 +166,18 @@ fn split_headers_footers(doc: &DocxDocument, ctx: &MarkdownCtx) -> (Vec<String>,
 struct HiddenCtx<'a> {
     styles: Option<&'a StyleSheet>,
     paragraph_style_id: Option<&'a str>,
+    /// The run formatting the enclosing table cell's style gives it.
+    table: Option<&'a RunProperties>,
 }
 
 impl HiddenCtx<'_> {
     fn is_hidden(&self, run: &Run) -> bool {
         match self.styles {
-            Some(sheet) => sheet.effective_hidden(self.paragraph_style_id, run.properties.as_ref()),
+            Some(sheet) => sheet.effective_hidden_in(
+                self.table,
+                self.paragraph_style_id,
+                run.properties.as_ref(),
+            ),
             None => run
                 .properties
                 .as_ref()
@@ -171,13 +187,20 @@ impl HiddenCtx<'_> {
     }
 }
 
-fn plain_text_blocks(elements: &[BlockElement], styles: Option<&StyleSheet>, out: &mut String) {
+fn plain_text_blocks(
+    elements: &[BlockElement],
+    styles: Option<&StyleSheet>,
+    // The enclosing table cell's style layer, if any.
+    table: Option<&RunProperties>,
+    out: &mut String,
+) {
     for elem in elements {
         match elem {
             BlockElement::Paragraph(p) => {
                 let ctx = HiddenCtx {
                     styles,
                     paragraph_style_id: p.properties.as_ref().and_then(|pp| pp.style_id.as_deref()),
+                    table,
                 };
                 for content in &p.content {
                     match content {
@@ -244,7 +267,8 @@ fn plain_text_run(run: &Run, ctx: HiddenCtx<'_>, out: &mut String) {
             // it (`Linz` + `ANTRAG` -> `LinzANTRAG`).
             RunContent::TextBox(blocks) => {
                 let mut inner = String::new();
-                plain_text_blocks(blocks, ctx.styles, &mut inner);
+                // A text box is not formatted by the table it sits in.
+                plain_text_blocks(blocks, ctx.styles, None, &mut inner);
                 let inner = inner.trim();
                 if !inner.is_empty() {
                     if !out.is_empty() && !out.ends_with(['\n', ' ', '\t']) {
@@ -259,7 +283,8 @@ fn plain_text_run(run: &Run, ctx: HiddenCtx<'_>, out: &mut String) {
             // the citation point, nothing to render here.
             RunContent::FootnoteRef(..)
             | RunContent::EndnoteRef(..)
-            | RunContent::CommentRef(_) => {},
+            | RunContent::CommentRef(_)
+            | RunContent::CommentRangeStart(_) => {},
             RunContent::FormField(ff) => {
                 if let Some(text) = &ff.display_text {
                     out.push_str(text);
@@ -290,21 +315,24 @@ fn plain_text_table(table: &Table, styles: Option<&StyleSheet>, out: &mut String
         ));
         return;
     };
-    for row in &table.rows {
+    let layers = cell_style_layers(table, styles);
+    for (row_idx, row) in table.rows.iter().enumerate() {
         // A cell deleted via tracked changes is excluded from the
         // accepted view, same policy already applied to run-level
         // `w:del`.
         let cells: Vec<_> = row
             .cells
             .iter()
-            .filter(|c| !c.properties.as_ref().is_some_and(|p| p.deleted))
+            .enumerate()
+            .filter(|(_, c)| !c.properties.as_ref().is_some_and(|p| p.deleted))
             .collect();
-        for (i, cell) in cells.iter().enumerate() {
+        for (i, (cell_idx, cell)) in cells.iter().enumerate() {
             if i > 0 {
                 out.push('\t');
             }
             let mut cell_text = String::new();
-            plain_text_blocks(&cell.content, styles, &mut cell_text);
+            let layer = layers.get(row_idx, *cell_idx).map(|l| &l.run);
+            plain_text_blocks(&cell.content, styles, layer, &mut cell_text);
             // Replace internal newlines with spaces for table cell text
             out.push_str(&cell_text.trim_end_matches('\n').replace('\n', " "));
         }
@@ -319,6 +347,67 @@ fn plain_text_table(table: &Table, styles: Option<&StyleSheet>, out: &mut String
 struct MarkdownCtx<'a> {
     styles: Option<&'a StyleSheet>,
     numbering: Option<&'a NumberingDefinitions>,
+    /// The enclosing table cell's style layer (a bold header row, ...).
+    table: Option<&'a CellStyleLayer>,
+}
+
+/// The table style's run/paragraph layer of every cell of `table`, by row
+/// and cell index — the same regions and precedence `to_ir()` applies
+/// (`TableStyleLayout`, `ResolvedTableStyle::cell_layer`), each distinct
+/// layer built once.
+struct CellLayers {
+    by_cell: Vec<Vec<Option<std::rc::Rc<CellStyleLayer>>>>,
+}
+
+impl CellLayers {
+    fn get(&self, row: usize, cell: usize) -> Option<&CellStyleLayer> {
+        self.by_cell.get(row)?.get(cell)?.as_deref()
+    }
+}
+
+fn cell_style_layers(table: &Table, styles: Option<&StyleSheet>) -> CellLayers {
+    let Some(style) = table
+        .properties
+        .as_ref()
+        .and_then(|p| p.style_id.as_deref())
+        .zip(styles)
+        .map(|(id, sheet)| sheet.resolve_table_style(id))
+    else {
+        return CellLayers {
+            by_cell: Vec::new(),
+        };
+    };
+    let starts = table.grid_starts();
+    let layout = super::table::TableStyleLayout::new(
+        table,
+        &starts,
+        style.row_band_size,
+        style.col_band_size,
+    );
+    let mut built: Vec<(Vec<&'static str>, Option<std::rc::Rc<CellStyleLayer>>)> = Vec::new();
+    let by_cell = table
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(r, row)| {
+            row.cells
+                .iter()
+                .enumerate()
+                .map(|(c, cell)| {
+                    let start = starts[r][c];
+                    let regions =
+                        layout.regions(r, start, start.saturating_add(cell.grid_span() as usize));
+                    if let Some((_, l)) = built.iter().find(|(k, _)| *k == regions) {
+                        return l.clone();
+                    }
+                    let l = style.cell_layer(&regions).map(std::rc::Rc::new);
+                    built.push((regions, l.clone()));
+                    l
+                })
+                .collect()
+        })
+        .collect();
+    CellLayers { by_cell }
 }
 
 fn markdown_blocks(elements: &[BlockElement], ctx: &MarkdownCtx, out: &mut String, _depth: usize) {
@@ -342,9 +431,28 @@ fn markdown_blocks_inner(
     _depth: usize,
     numbering_counts: &mut std::collections::HashMap<(u32, u8), u32>,
 ) {
+    // Blocks are separated by a blank line, except consecutive items of one
+    // list (one `numId`), which stay tight — the layout the IR renderer
+    // produces. Ending every block with a single newline let a table, a
+    // code line or a following paragraph run on as a lazy continuation of
+    // the block before it.
+    let mut prev_list: Option<u32> = None;
+    let separate = |out: &mut String, list: Option<u32>, prev: Option<u32>| {
+        if out.is_empty() {
+            return;
+        }
+        while out.ends_with('\n') {
+            out.pop();
+        }
+        let tight = list.is_some() && list == prev;
+        out.push_str(if tight { "\n" } else { "\n\n" });
+    };
     for elem in elements {
         match elem {
             BlockElement::Paragraph(p) => {
+                let block_out: &mut String = out;
+                let mut para_buf = String::new();
+                let out = &mut para_buf;
                 // Determine heading level from outline_level or style
                 let heading_level = p
                     .properties
@@ -367,8 +475,17 @@ fn markdown_blocks_inner(
                 // the converter.
                 let effective = ctx
                     .styles
-                    .map(|sheet| sheet.effective_paragraph_properties(p.properties.as_ref()))
+                    .map(|sheet| {
+                        sheet.effective_paragraph_properties_in(
+                            ctx.table.map(|l| &l.paragraph),
+                            p.properties.as_ref(),
+                        )
+                    })
                     .or_else(|| p.properties.clone());
+                let list_num = effective
+                    .as_ref()
+                    .and_then(|pp| pp.numbering_ref.as_ref())
+                    .map(|nr| nr.num_id);
                 let list_prefix = effective.as_ref().and_then(|pp| {
                     let nr = pp.numbering_ref.as_ref().filter(|nr| nr.num_id != 0)?;
                     let numbering = ctx.numbering?;
@@ -391,13 +508,21 @@ fn markdown_blocks_inner(
                         numbering_counts.insert(key, next);
                         next
                     };
+                    // `w:lvlText` "%1)" is CommonMark's `1)` marker; every
+                    // other pattern has no CommonMark form and keeps `.`
+                    // (as `List::ordered_delimiter` on the IR path).
+                    let delim = if crate::ir::is_paren_pattern(&level.level_text) {
+                        ')'
+                    } else {
+                        '.'
+                    };
                     let marker = match &level.format {
                         NumberFormat::Bullet => "- ".to_string(),
-                        NumberFormat::Decimal => format!("{}. ", next_ordinal()),
-                        NumberFormat::LowerLetter => format!("{}. ", next_ordinal()),
-                        NumberFormat::UpperLetter => format!("{}. ", next_ordinal()),
-                        NumberFormat::LowerRoman => format!("{}. ", next_ordinal()),
-                        NumberFormat::UpperRoman => format!("{}. ", next_ordinal()),
+                        NumberFormat::Decimal
+                        | NumberFormat::LowerLetter
+                        | NumberFormat::UpperLetter
+                        | NumberFormat::LowerRoman
+                        | NumberFormat::UpperRoman => format!("{}{delim} ", next_ordinal()),
                         NumberFormat::None => String::new(),
                         NumberFormat::Other(_) => "- ".to_string(),
                     };
@@ -425,14 +550,15 @@ fn markdown_blocks_inner(
                 let hidden = HiddenCtx {
                     styles: ctx.styles,
                     paragraph_style_id: p.properties.as_ref().and_then(|pp| pp.style_id.as_deref()),
+                    table: ctx.table.map(|l| &l.run),
                 };
                 // A heading's own style supplies its look; only direct and
                 // character-style formatting become delimiters inside it
                 // (see `convert_heading_inline`).
                 let format_ctx = if heading_level.is_some() {
                     HiddenCtx {
-                        styles: ctx.styles,
                         paragraph_style_id: None,
+                        ..hidden
                     }
                 } else {
                     hidden
@@ -477,15 +603,25 @@ fn markdown_blocks_inner(
                     }
                 }
                 flush_run(&mut pending, out);
-                out.push('\n');
 
-                // Add extra newline after headings for readability
-                if heading_level.is_some() {
-                    out.push('\n');
+                // A list item is a list item even when empty; any other
+                // empty paragraph is not a block (as on the IR path).
+                let list = list_prefix
+                    .as_ref()
+                    .and(list_num)
+                    .filter(|_| heading_level.is_none());
+                if list.is_none() && para_buf.trim().is_empty() {
+                    prev_list = None;
+                    continue;
                 }
+                separate(block_out, list, prev_list);
+                block_out.push_str(&para_buf);
+                prev_list = list;
             },
             BlockElement::Table(table) => {
+                separate(out, None, prev_list);
                 markdown_table(table, ctx, out);
+                prev_list = None;
             },
         }
     }
@@ -511,14 +647,29 @@ impl RunStyle {
         let effective;
         let rp = match hidden.styles {
             Some(sheet) => {
-                effective = sheet.effective_run_properties(hidden.paragraph_style_id, direct);
+                effective = sheet.effective_run_properties_in(
+                    hidden.table,
+                    hidden.paragraph_style_id,
+                    direct,
+                );
                 Some(&effective)
             },
             None => direct,
         };
+        // Complex-script text takes bold/italic from `w:bCs`/`w:iCs`, by
+        // the same run-level rule as `to_ir()` (`RunProperties::face_for`).
+        let (bold, italic) = rp.map_or((false, false), |rp| {
+            let face =
+                rp.face_for(rp.run_script_class(run.content.iter().filter_map(|rc| match rc {
+                    RunContent::Text(t) => Some(t.as_str()),
+                    RunContent::FormField(ff) => ff.display_text.as_deref(),
+                    _ => None,
+                })));
+            (face.bold, face.italic)
+        });
         Self {
-            bold: rp.and_then(|rp| rp.bold).unwrap_or(false),
-            italic: rp.and_then(|rp| rp.italic).unwrap_or(false),
+            bold,
+            italic,
             strike: rp.and_then(|rp| rp.strike.or(rp.dstrike)).unwrap_or(false),
             vertical_align: rp.and_then(|rp| rp.vertical_align),
         }
@@ -600,7 +751,12 @@ fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, hidden: HiddenCtx<'_>, text: 
             // fuses with the run that follows it.
             RunContent::TextBox(blocks) => {
                 let mut inner = String::new();
-                markdown_blocks(blocks, ctx, &mut inner, 0);
+                // A text box is not formatted by the table it sits in.
+                let ctx = MarkdownCtx {
+                    table: None,
+                    ..*ctx
+                };
+                markdown_blocks(blocks, &ctx, &mut inner, 0);
                 let inner = inner.trim();
                 if !inner.is_empty() {
                     if !text.is_empty() && !text.ends_with(['\n', ' ', '\t']) {
@@ -612,7 +768,8 @@ fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, hidden: HiddenCtx<'_>, text: 
             },
             RunContent::FootnoteRef(..)
             | RunContent::EndnoteRef(..)
-            | RunContent::CommentRef(_) => {},
+            | RunContent::CommentRef(_)
+            | RunContent::CommentRangeStart(_) => {},
             RunContent::FormField(ff) => {
                 if let Some(t) = &ff.display_text {
                     text.push_str(t);
@@ -641,19 +798,42 @@ fn markdown_drawing(drawing: &DrawingInfo, out: &mut String) {
         out.push('\n');
         return;
     }
-    out.push_str("![");
-    if let Some(ref desc) = drawing.description {
-        out.push_str(&crate::core::markdown::image_alt(desc));
+    // A linked picture has a real target to point at, as in the IR
+    // renderer.
+    if let Some(url) = drawing
+        .linked_image
+        .as_deref()
+        .and_then(crate::ir_render::safe_url)
+    {
+        out.push_str("![");
+        out.push_str(&crate::core::markdown::image_alt(
+            drawing.description.as_deref().unwrap_or(""),
+        ));
+        out.push_str("](");
+        out.push_str(&crate::ir_render::escape_markdown_url(&url));
+        out.push(')');
+        return;
     }
-    out.push_str("](");
-    out.push_str(&drawing.relationship_id);
-    out.push(')');
+    // The relationship id is not a target a markdown reader can resolve,
+    // and this renderer has no other address for the picture. Describe it
+    // with its alt text as the IR renderer does (italic, nothing when
+    // there is none) rather than emit `![alt](rId7)`.
+    if let Some(desc) = drawing.description.as_deref().filter(|d| !d.is_empty()) {
+        out.push('*');
+        out.push_str(&crate::core::markdown::escape_text(desc));
+        out.push('*');
+    }
 }
 
 fn markdown_table(table: &Table, ctx: &MarkdownCtx, out: &mut String) {
     if table.rows.is_empty() {
         return;
     }
+    let layers = cell_style_layers(table, ctx.styles);
+    let in_cell = |row: usize, cell: usize| MarkdownCtx {
+        table: layers.get(row, cell),
+        ..*ctx
+    };
     // A one-cell table holding a table is a layout frame; render what is
     // inside it (see `ir_render::layout_frame_content`).
     if let [row] = table.rows.as_slice()
@@ -663,7 +843,7 @@ fn markdown_table(table: &Table, ctx: &MarkdownCtx, out: &mut String) {
             .iter()
             .any(|e| matches!(e, BlockElement::Table(_)))
     {
-        markdown_blocks(&cell.content, ctx, out, 1);
+        markdown_blocks(&cell.content, &in_cell(0, 0), out, 1);
         return;
     }
 
@@ -671,19 +851,20 @@ fn markdown_table(table: &Table, ctx: &MarkdownCtx, out: &mut String) {
     let mut row_texts: Vec<Vec<String>> = Vec::new();
     let mut max_cols = 0usize;
 
-    for row in &table.rows {
+    for (row_idx, row) in table.rows.iter().enumerate() {
         let mut cells: Vec<String> = Vec::new();
         // Same tracked-changes policy as plain_text_table.
-        for cell in row
+        for (cell_idx, cell) in row
             .cells
             .iter()
-            .filter(|c| !c.properties.as_ref().is_some_and(|p| p.deleted))
+            .enumerate()
+            .filter(|(_, c)| !c.properties.as_ref().is_some_and(|p| p.deleted))
         {
             // Cells keep their inline formatting, as the IR renderer's
             // cells do; rendering them as plain text dropped every bold
             // and italic span inside a table on this surface alone.
             let mut cell_text = String::new();
-            markdown_blocks(&cell.content, ctx, &mut cell_text, 1);
+            markdown_blocks(&cell.content, &in_cell(row_idx, cell_idx), &mut cell_text, 1);
             // The cell is already markdown (its own emphasis and
             // escapes); only the line breaks still need taming, since a
             // raw newline ends a GFM table row.

@@ -35,6 +35,8 @@ pub struct NumberingLevel {
     pub level_text: String,
     /// Justification of the numbering marker.
     pub justification: Option<Justification>,
+    /// The list paragraph's indentation from the level's `w:pPr/w:ind`.
+    pub indent: Option<super::formatting::ParagraphIndent>,
 }
 
 /// A concrete numbering instance referencing an abstract definition.
@@ -44,7 +46,8 @@ pub struct NumberingInstance {
     pub num_id: u32,
     /// ID of the abstract numbering this instance references.
     pub abstract_num_id: u32,
-    /// Level overrides within this instance.
+    /// Complete replacement levels from `<w:lvlOverride><w:lvl>`, keyed by
+    /// the level they replace.
     pub overrides: HashMap<u8, NumberingLevel>,
     /// `<w:lvlOverride w:ilvl="N"><w:startOverride w:val="…"/></w:lvlOverride>`
     /// — the common, partial-override form that changes only where this
@@ -170,6 +173,7 @@ fn parse_numbering_level(
     let mut format = NumberFormat::Decimal;
     let mut level_text = String::new();
     let mut justification: Option<Justification> = None;
+    let mut indent = None;
 
     loop {
         match reader.read_event()? {
@@ -196,9 +200,9 @@ fn parse_numbering_level(
                                 Some(super::formatting::parse_justification_value(&val));
                         }
                     },
-                    "pPr" | "rPr" => {
-                        // Skip sub-properties for now (they apply to the numbering marker)
-                    },
+                    // The list paragraph's indentation (ECMA-376 §17.9:
+                    // the level's `w:pPr`, here its `w:ind`, §17.3.1).
+                    "ind" => indent = Some(super::formatting::parse_indent(e)?),
                     _ => {},
                 }
             },
@@ -215,6 +219,7 @@ fn parse_numbering_level(
         format,
         level_text,
         justification,
+        indent,
     })
 }
 
@@ -240,7 +245,7 @@ fn parse_num_instance(
         None => return Ok(None),
     };
     let mut abstract_num_id = 0u32;
-    let overrides = HashMap::new();
+    let mut overrides = HashMap::new();
     let mut start_overrides = HashMap::new();
     let mut in_lvl_override: Option<u8> = None;
 
@@ -269,6 +274,15 @@ fn parse_num_instance(
                             start_overrides.insert(ilvl, start);
                         }
                     }
+                }
+            },
+            // A complete replacement level for this instance (ECMA-376
+            // §17.9). Keyed by the enclosing override's `w:ilvl`, which
+            // is the level it replaces.
+            Event::Start(ref e) if e.local_name().as_ref() == "lvl" => {
+                let level = parse_numbering_level(reader)?;
+                if let Some(ilvl) = in_lvl_override {
+                    overrides.insert(ilvl, level);
                 }
             },
             Event::End(ref e) if e.local_name().as_ref() == "num" => {
@@ -321,6 +335,61 @@ mod tests {
 
         let inst = defs.instances.get(&1).unwrap();
         assert_eq!(inst.abstract_num_id, 0);
+    }
+
+    /// `w:lvlOverride` (ECMA-376 §17.9) may carry a complete `w:lvl`
+    /// that replaces the abstract level for this instance only, with or
+    /// without a `w:startOverride` (§17.9), which wins over the
+    /// override level's own `w:start`.
+    #[test]
+    fn test_lvl_override_with_a_full_level_replaces_the_abstract_level() {
+        let xml = br#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="0">
+    <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+    <w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%2."/></w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+  <w:num w:numId="2"><w:abstractNumId w:val="0"/>
+    <w:lvlOverride w:ilvl="0">
+      <w:lvl w:ilvl="0"><w:start w:val="3"/><w:numFmt w:val="upperRoman"/><w:lvlText w:val="%1)"/>
+        <w:lvlJc w:val="right"/></w:lvl>
+    </w:lvlOverride>
+    <w:lvlOverride w:ilvl="1"><w:startOverride w:val="7"/>
+      <w:lvl w:ilvl="1"><w:start w:val="2"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="(%2)"/></w:lvl>
+    </w:lvlOverride>
+  </w:num>
+</w:numbering>"#;
+        let defs = NumberingDefinitions::parse(xml).unwrap();
+        // The instance without an override still sees the abstract level.
+        assert_eq!(defs.resolve_level(1, 0).unwrap().format, NumberFormat::Decimal);
+        let l0 = defs.resolve_level(2, 0).unwrap();
+        assert_eq!(l0.format, NumberFormat::UpperRoman);
+        assert_eq!(l0.level_text, "%1)");
+        assert_eq!(l0.justification, Some(Justification::Right));
+        assert_eq!(defs.resolve_start(2, 0), Some(3));
+        assert_eq!(defs.resolve_level(2, 1).unwrap().format, NumberFormat::LowerLetter);
+        assert_eq!(defs.resolve_start(2, 1), Some(7), "startOverride wins");
+    }
+
+    /// A level's `w:pPr/w:ind` (§17.9, §17.3.1) is the list
+    /// paragraph's indentation; its `w:rPr` children must not leak into
+    /// the level's own fields.
+    #[test]
+    fn test_numbering_level_indentation_is_read() {
+        let xml = br#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="0">
+    <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="o"/>
+      <w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>
+      <w:rPr><w:rFonts w:ascii="Courier New"/></w:rPr></w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+</w:numbering>"#;
+        let defs = NumberingDefinitions::parse(xml).unwrap();
+        let level = defs.resolve_level(1, 0).unwrap();
+        let ind = level.indent.as_ref().expect("indent");
+        assert_eq!(ind.left.map(|t| t.0), Some(720));
+        assert_eq!(ind.hanging.map(|t| t.0), Some(360));
+        assert_eq!(level.level_text, "o");
     }
 
     #[test]

@@ -1,7 +1,6 @@
 use super::PptxDocument;
 use super::shape::{
-    GraphicContent, HyperlinkTarget, Shape, ShapePosition, Table, TableCell, TableRow, TextBody,
-    TextContent,
+    GraphicContent, Shape, ShapePosition, Table, TableCell, TableRow, TextBody, TextContent,
 };
 
 impl PptxDocument {
@@ -9,6 +8,11 @@ impl PptxDocument {
     ///
     /// Shapes are spatially sorted (top-to-bottom, left-to-right) per slide.
     /// Slides are separated by `\n\n---\n\n`.
+    ///
+    /// Text placed directly on a slide layout or master (outside
+    /// placeholders) follows the slides once, in a section titled
+    /// [`super::layout::MASTER_TEXT_SECTION_TITLE`]; see the
+    /// [`super::layout`] module.
     pub fn plain_text(&self) -> String {
         let mut parts = Vec::new();
         for (i, _) in self.slides.iter().enumerate() {
@@ -18,12 +22,28 @@ impl PptxDocument {
                 }
             }
         }
+        let master: Vec<String> = self
+            .master_static_bodies()
+            .into_iter()
+            .map(|(body, _)| plain_text_from_body(body))
+            .filter(|t| !t.is_empty())
+            .collect();
+        if !master.is_empty() {
+            parts.push(format!(
+                "{}\n\n{}",
+                super::layout::MASTER_TEXT_SECTION_TITLE,
+                master.join("\n\n")
+            ));
+        }
         parts.join("\n\n---\n\n")
     }
 
     /// Extract plain text from a single slide by index.
     pub fn slide_plain_text(&self, index: usize) -> Option<String> {
         let slide = self.slides.get(index)?;
+        if let Some(ref err) = slide.parse_error {
+            return Some(unreadable_slide_notice(&slide.name, err));
+        }
         let mut entries = Vec::new();
         collect_text_entries(&slide.shapes, &mut entries);
         entries.sort_by(|a, b| spatial_cmp(&a.0, &b.0));
@@ -58,6 +78,9 @@ impl PptxDocument {
     }
 
     /// Convert the entire presentation to markdown.
+    ///
+    /// Layout and master static text follows the slides once, as for
+    /// [`Self::plain_text`].
     pub fn to_markdown(&self) -> String {
         let mut parts = Vec::new();
         for (i, _) in self.slides.iter().enumerate() {
@@ -65,12 +88,37 @@ impl PptxDocument {
                 parts.push(md);
             }
         }
-        parts.join("\n\n")
+        let mut out = parts.join("\n\n");
+        let master: Vec<String> = self
+            .master_static_bodies()
+            .into_iter()
+            .map(|(body, _)| markdown_from_body(body))
+            .filter(|md| !md.is_empty())
+            .collect();
+        if !master.is_empty() {
+            // Set off from the slides by a rule, as the IR renderer
+            // separates sections.
+            if !out.is_empty() {
+                out.push_str("\n\n---\n\n");
+            }
+            out.push_str("## ");
+            out.push_str(super::layout::MASTER_TEXT_SECTION_TITLE);
+            out.push_str("\n\n");
+            out.push_str(&master.join("\n\n"));
+        }
+        out
     }
 
     /// Convert a single slide to markdown by index.
     pub fn slide_to_markdown(&self, index: usize) -> Option<String> {
         let slide = self.slides.get(index)?;
+        if let Some(ref err) = slide.parse_error {
+            return Some(format!(
+                "## Slide {}\n\n{}",
+                index + 1,
+                unreadable_slide_notice(&slide.name, err)
+            ));
+        }
         let mut result = String::new();
 
         // Slide heading: use title placeholder text or "Slide N"
@@ -96,8 +144,10 @@ impl PptxDocument {
             // Same `markdown_from_body` ordinary slide body text already
             // uses, so bold/italic/strikethrough/bullets in notes get
             // rendered too, not flattened to plain lines.
+            // Labelled and quoted exactly as the IR renderer does.
             let md = markdown_from_body(notes);
             if !md.is_empty() {
+                result.push_str("> **Notes:**\n");
                 for line in md.lines() {
                     result.push_str("> ");
                     result.push_str(line);
@@ -181,11 +231,18 @@ fn collect_text_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePositio
                         entries.push((gf.position.clone(), text));
                     }
                 },
-                GraphicContent::Unknown => {},
+                // An OLE object has no text; its preview is a picture.
+                GraphicContent::OleObject(_) | GraphicContent::Unknown => {},
             },
             Shape::Connector(_) => {},
         }
     }
+}
+
+/// The text standing in for a slide whose part could not be read — the
+/// same notice on every rendering surface.
+pub(crate) fn unreadable_slide_notice(part: &str, err: &str) -> String {
+    format!("[unreadable slide {part:?}: {err}]")
 }
 
 /// `Comment (Author)` — the label the IR's endnote carries as its marker.
@@ -316,13 +373,19 @@ fn collect_markdown_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePos
                 }
             },
             Shape::Picture(pic) => {
-                if let Some(ref alt) = pic.alt_text {
-                    if !alt.is_empty() {
-                        entries.push((
-                            pic.position.clone(),
-                            format!("![{}]()", crate::core::markdown::image_alt(alt)),
-                        ));
-                    }
+                let alt = pic.alt_text.as_deref().unwrap_or("");
+                // A linked picture has a real, addressable source.
+                let src = pic
+                    .link_target
+                    .as_deref()
+                    .and_then(crate::ir_render::safe_url)
+                    .map(|u| crate::ir_render::escape_markdown_url(&u))
+                    .unwrap_or_default();
+                if !alt.is_empty() || !src.is_empty() {
+                    entries.push((
+                        pic.position.clone(),
+                        format!("![{}]({src})", crate::core::markdown::image_alt(alt)),
+                    ));
                 }
             },
             Shape::Group(grp) => {
@@ -341,79 +404,24 @@ fn collect_markdown_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePos
                         entries.push((gf.position.clone(), md));
                     }
                 },
-                GraphicContent::Unknown => {},
+                // An OLE object has no text; its preview is a picture.
+                GraphicContent::OleObject(_) | GraphicContent::Unknown => {},
             },
             Shape::Connector(_) => {},
         }
     }
 }
 
+/// A text body as markdown, through the same block conversion and
+/// renderer `to_ir()` uses: which paragraphs are list items, how runs of
+/// them nest and number, and how blocks are separated are decided in one
+/// place. This renderer used to mark only indented paragraphs as bullets,
+/// so a level-0 bulleted list rendered as plain lines, numbered items lost
+/// their numbers, and the result disagreed with the IR markdown.
 fn markdown_from_body(body: &TextBody) -> String {
-    let mut parts = Vec::new();
-    for para in &body.paragraphs {
-        let text = markdown_paragraph(para);
-        parts.push(text);
-    }
-    parts.join("\n")
-}
-
-fn markdown_paragraph(para: &super::shape::TextParagraph) -> String {
-    let mut text = String::new();
-    for content in &para.content {
-        match content {
-            TextContent::Run(run) => {
-                text.push_str(&markdown_run(run));
-            },
-            TextContent::LineBreak => {
-                text.push_str("  \n");
-            },
-            TextContent::Field(field) => {
-                text.push_str(&field.text);
-            },
-        }
-    }
-    // Add bullet indent for outline levels > 0
-    if para.level > 0 {
-        let indent = "  ".repeat(para.level as usize);
-        format!("{indent}- {text}")
-    } else {
-        text
-    }
-}
-
-fn markdown_run(run: &super::shape::TextRun) -> String {
-    if run.text.is_empty() {
-        return String::new();
-    }
-
-    // Document text must not read as markdown (`*not bold*`, `<tag>`).
-    let mut text = crate::core::markdown::escape_text(&run.text);
-
-    // Apply inline formatting
-    if run.strikethrough {
-        text = format!("~~{text}~~");
-    }
-    if run.bold == Some(true) && run.italic == Some(true) {
-        text = format!("***{text}***");
-    } else if run.bold == Some(true) {
-        text = format!("**{text}**");
-    } else if run.italic == Some(true) {
-        text = format!("*{text}*");
-    }
-
-    // Apply hyperlink
-    if let Some(ref link) = run.hyperlink {
-        match &link.target {
-            HyperlinkTarget::External(url) => {
-                text = format!("[{text}]({url})");
-            },
-            HyperlinkTarget::Internal(_) => {
-                // Internal links — just keep the text
-            },
-        }
-    }
-
-    text
+    let mut elements = Vec::new();
+    crate::convert_pptx::convert_text_body(body, &mut elements);
+    crate::ir_render::render_blocks_markdown(&elements)
 }
 
 fn markdown_table(table: &Table) -> String {
@@ -524,6 +532,7 @@ mod tests {
         PptxDocument {
             core_properties: None,
             app_properties: None,
+            package_properties: Default::default(),
             has_macros: false,
             presentation: PresentationInfo {
                 slides: Vec::new(),
@@ -532,6 +541,9 @@ mod tests {
             slides,
             theme: None,
             embedded_fonts: Vec::new(),
+            unreadable_parts: Vec::new(),
+            layouts: Vec::new(),
+            masters: Vec::new(),
         }
     }
 
@@ -784,7 +796,11 @@ mod tests {
         }]);
 
         let md = doc.slide_to_markdown(0).unwrap();
-        assert!(md.contains("> Note line 1\n> Note line 2"));
+        // Two note paragraphs: two blocks inside one labelled quote, laid
+        // out as the IR renderer lays them out.
+        assert!(md.contains("> **Notes:**\n> Note line 1\n> \n> Note line 2"), "{md}");
+        let ir = crate::convert_pptx::pptx_to_ir(&doc).to_markdown();
+        assert!(ir.contains("> **Notes:**\n> Note line 1\n> \n> Note line 2"), "{ir}");
     }
 
     /// Speaker notes used to be flattened to plain text

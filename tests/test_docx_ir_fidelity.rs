@@ -173,6 +173,44 @@ impl Docx {
         self
     }
 
+    /// Add an external relationship from the document part and substitute
+    /// its id into the body's `placeholder` token.
+    fn external_rel(mut self, placeholder: &str, rel_type: &str, target: &str) -> Self {
+        let rid = self.w.add_part_rel_with_mode(
+            &self.doc_part,
+            rel_type,
+            target,
+            office_oxide::core::relationships::TargetMode::External,
+        );
+        self.body = self.body.replace(placeholder, &rid);
+        self
+    }
+
+    /// A theme part whose font scheme has `major` / `minor` Latin faces
+    /// and a `minor` East Asian face `minor_ea`.
+    fn theme_fonts(mut self, major: &str, minor: &str, minor_ea: &str) -> Self {
+        let part = PartName::new("/word/theme/theme1.xml").unwrap();
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="T"><a:themeElements>
+<a:clrScheme name="C"><a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1></a:clrScheme>
+<a:fontScheme name="F">
+<a:majorFont><a:latin typeface="{major}"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont>
+<a:minorFont><a:latin typeface="{minor}"/><a:ea typeface="{minor_ea}"/><a:cs typeface=""/></a:minorFont>
+</a:fontScheme></a:themeElements></a:theme>"#
+        );
+        self.w
+            .add_part(
+                &part,
+                "application/vnd.openxmlformats-officedocument.theme+xml",
+                xml.as_bytes(),
+            )
+            .unwrap();
+        self.w
+            .add_part_rel(&self.doc_part, rel_types::THEME, "theme/theme1.xml");
+        self
+    }
+
     fn core_props(mut self, inner: &str) -> Self {
         let part = PartName::new("/docProps/core.xml").unwrap();
         let xml = format!(
@@ -188,7 +226,13 @@ impl Docx {
         self
     }
 
-    fn ir(mut self) -> DocumentIR {
+    fn ir(self) -> DocumentIR {
+        Document::from_reader(Cursor::new(self.bytes()), DocumentFormat::Docx)
+            .expect("parse")
+            .to_ir()
+    }
+
+    fn bytes(mut self) -> Vec<u8> {
         let xml = format!(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -200,10 +244,7 @@ impl Docx {
         self.w
             .add_part(&self.doc_part, CT_DOC, xml.as_bytes())
             .unwrap();
-        let bytes = self.w.finish().unwrap().into_inner();
-        Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
-            .expect("parse")
-            .to_ir()
+        self.w.finish().unwrap().into_inner()
     }
 }
 
@@ -242,6 +283,167 @@ fn test_run_underline_reaches_the_ir() {
     let ir =
         Docx::new(r#"<w:p><w:r><w:rPr><w:u w:val="double"/></w:rPr><w:t>x</w:t></w:r></w:p>"#).ir();
     assert_eq!(first_span(para(&ir, 0)).underline, Some(UnderlineStyle::Double));
+}
+
+/// Write `ir` back out as a `.docx`.
+fn docx_bytes(ir: &DocumentIR) -> Vec<u8> {
+    let mut out = Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(ir, DocumentFormat::Docx, &mut out)
+        .expect("write");
+    out.into_inner()
+}
+
+/// `w:hyperlink/@w:tooltip` (ECMA-376 §17.16) and a `HYPERLINK`
+/// field's `\o` switch (§17.16.5) are the link's hover text. Both were
+/// parsed (or skipped) and never reached the IR, any renderer or the
+/// writer.
+#[test]
+fn test_hyperlink_tooltips_reach_the_ir_html_and_the_writer() {
+    let ir = Docx::new(
+        r#"<w:p><w:hyperlink w:anchor="intro" w:tooltip="Jump to the intro"><w:r><w:t>Intro</w:t></w:r></w:hyperlink></w:p>
+           <w:p><w:fldSimple w:instr=" HYPERLINK \l &quot;end&quot; \o &quot;Go to the end&quot; "><w:r><w:t>End</w:t></w:r></w:fldSimple></w:p>"#,
+    )
+    .ir();
+    let tip = |ir: &DocumentIR, i: usize| first_span(para(ir, i)).hyperlink_tooltip.clone();
+    assert_eq!(tip(&ir, 0).as_deref(), Some("Jump to the intro"));
+    assert_eq!(tip(&ir, 1).as_deref(), Some("Go to the end"));
+    let html = ir.to_html();
+    assert!(html.contains(r##"<a href="#intro" title="Jump to the intro">"##), "{html}");
+
+    let again = Document::from_reader(Cursor::new(docx_bytes(&ir)), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(tip(&again, 0).as_deref(), Some("Jump to the intro"));
+    assert_eq!(tip(&again, 1).as_deref(), Some("Go to the end"));
+}
+
+fn spans(p: &Paragraph) -> Vec<&TextSpan> {
+    p.content
+        .iter()
+        .filter_map(|c| match c {
+            InlineContent::Text(s) => Some(s),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `w:rFonts` names four faces (ECMA-376 §17.3.2.26) and Word picks one
+/// per character: `w:ascii` for Basic Latin, `w:eastAsia` for CJK,
+/// `w:cs` for complex scripts (and for every character of a `w:rtl` or
+/// `w:cs` run), `w:hAnsi` for the rest. Complex-script text also takes
+/// its size from `w:szCs` (§17.3.2) and bold/italic from `w:bCs`/`w:iCs`
+/// (§17.3.2). Only `w:ascii`/`w:sz`/`w:b` were read, so
+/// CJK and Arabic runs reported the Latin face and size.
+#[test]
+fn test_run_fonts_and_sizes_follow_the_script_of_the_text() {
+    let rpr = r#"<w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Cambria" w:eastAsia="MS Mincho" w:cs="Arial"/>
+                 <w:b/><w:sz w:val="22"/><w:szCs w:val="28"/></w:rPr>"#;
+    let ir = Docx::new(&format!(
+        r#"<w:p><w:r>{rpr}<w:t>Tokyo</w:t></w:r></w:p>
+           <w:p><w:r>{rpr}<w:t>東京</w:t></w:r></w:p>
+           <w:p><w:r>{rpr}<w:t>مرحبا</w:t></w:r></w:p>
+           <w:p><w:r>{rpr}<w:t>café</w:t></w:r></w:p>
+           <w:p><w:r><w:rPr><w:rFonts w:ascii="Calibri" w:cs="Arial"/><w:bCs/><w:rtl/>
+               <w:sz w:val="22"/><w:szCs w:val="28"/></w:rPr><w:t>abc</w:t></w:r></w:p>
+           <w:p><w:r>{rpr}<w:t>東京 2024</w:t></w:r></w:p>"#
+    ))
+    .ir();
+    let latin = first_span(para(&ir, 0));
+    assert_eq!(latin.font_name.as_deref(), Some("Calibri"));
+    assert_eq!(latin.font_size_half_pt, Some(22));
+    assert!(latin.bold);
+
+    let cjk = first_span(para(&ir, 1));
+    assert_eq!(cjk.font_name.as_deref(), Some("MS Mincho"));
+    assert_eq!(cjk.font_size_half_pt, Some(22));
+    assert!(cjk.bold, "w:b applies to East Asian text");
+
+    let arabic = first_span(para(&ir, 2));
+    assert_eq!(arabic.font_name.as_deref(), Some("Arial"));
+    assert_eq!(arabic.font_size_half_pt, Some(28), "complex script takes w:szCs");
+    assert!(!arabic.bold, "w:b does not apply to complex script; w:bCs is absent");
+
+    let accented = spans(para(&ir, 3));
+    let faces: Vec<_> = accented
+        .iter()
+        .map(|s| (s.text.as_str(), s.font_name.as_deref()))
+        .collect();
+    assert_eq!(faces, [("caf", Some("Calibri")), ("é", Some("Cambria"))], "é is hAnsi");
+
+    let rtl = first_span(para(&ir, 4));
+    assert_eq!(rtl.font_name.as_deref(), Some("Arial"), "a w:rtl run is complex script");
+    assert_eq!(rtl.font_size_half_pt, Some(28));
+    assert!(rtl.bold, "w:bCs");
+
+    // A mixed run splits where the face changes, and loses no text.
+    let mixed = spans(para(&ir, 5));
+    let text: String = mixed.iter().map(|s| s.text.as_str()).collect();
+    assert_eq!(text, "東京 2024");
+    assert_eq!(mixed[0].font_name.as_deref(), Some("MS Mincho"));
+    assert_eq!(mixed.last().unwrap().font_name.as_deref(), Some("Calibri"));
+}
+
+#[test]
+fn test_complex_script_bold_and_size_survive_a_docx_round_trip() {
+    let ir = Docx::new(
+        r#"<w:p><w:r><w:rPr><w:b/><w:bCs/><w:i/><w:iCs/><w:sz w:val="30"/><w:szCs w:val="30"/></w:rPr>
+             <w:t>مرحبا</w:t></w:r></w:p>"#,
+    )
+    .ir();
+    let before = first_span(para(&ir, 0)).clone();
+    assert!(before.bold && before.italic);
+    let bytes = docx_bytes(&ir);
+    let again = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
+        .expect("reread")
+        .to_ir();
+    let after = first_span(para(&again, 0));
+    assert_eq!((after.bold, after.italic), (true, true));
+    assert_eq!(after.font_size_half_pt, Some(30));
+}
+
+/// `w:asciiTheme` names a font of the theme's font scheme and supersedes
+/// the literal `w:ascii` face (ECMA-376 Part 1 §17.3.2.26); it is how
+/// every Office template assigns fonts, and it was never parsed.
+#[test]
+fn test_theme_font_references_resolve_to_the_font_scheme_faces() {
+    let ir = Docx::new(
+        r#"<w:p><w:r><w:rPr><w:rFonts w:asciiTheme="majorHAnsi" w:ascii="Ignored"/></w:rPr><w:t>heading</w:t></w:r></w:p>
+           <w:p><w:r><w:rPr><w:rFonts w:hAnsiTheme="minorHAnsi"/></w:rPr><w:t>body</w:t></w:r></w:p>
+           <w:p><w:r><w:rPr><w:rFonts w:asciiTheme="minorEastAsia"/></w:rPr><w:t>ea</w:t></w:r></w:p>
+           <w:p><w:r><w:rPr><w:rFonts w:asciiTheme="majorBidi" w:ascii="Literal"/></w:rPr><w:t>cs</w:t></w:r></w:p>
+           <w:p><w:r><w:rPr><w:rFonts w:ascii="Direct Face"/></w:rPr><w:t>direct</w:t></w:r></w:p>"#,
+    )
+    .theme_fonts("Heading Face", "Body Face", "EA Face")
+    .ir();
+    let font = |i: usize| first_span(para(&ir, i)).font_name.clone();
+    assert_eq!(font(0).as_deref(), Some("Heading Face"));
+    assert_eq!(font(1).as_deref(), Some("Body Face"));
+    assert_eq!(font(2).as_deref(), Some("EA Face"));
+    // An empty scheme slot falls back to the literal face.
+    assert_eq!(font(3).as_deref(), Some("Literal"));
+    assert_eq!(font(4).as_deref(), Some("Direct Face"));
+}
+
+/// A theme reference inherited from a style is replaced, not kept, by a
+/// face named directly on the run; a theme reference on the run replaces
+/// a style's direct face.
+#[test]
+fn test_theme_font_and_direct_face_override_each_other_as_a_unit() {
+    let ir = Docx::new(
+        r#"<w:p><w:r><w:rPr><w:rStyle w:val="Themed"/><w:rFonts w:ascii="Run Face"/></w:rPr><w:t>a</w:t></w:r></w:p>
+           <w:p><w:r><w:rPr><w:rStyle w:val="Plain"/><w:rFonts w:asciiTheme="minorAscii"/></w:rPr><w:t>b</w:t></w:r></w:p>
+           <w:p><w:r><w:rPr><w:rStyle w:val="Themed"/></w:rPr><w:t>c</w:t></w:r></w:p>"#,
+    )
+    .styles(
+        r#"<w:style w:type="character" w:styleId="Themed"><w:rPr><w:rFonts w:asciiTheme="majorAscii"/></w:rPr></w:style>
+           <w:style w:type="character" w:styleId="Plain"><w:rPr><w:rFonts w:ascii="Style Face"/></w:rPr></w:style>"#,
+    )
+    .theme_fonts("Heading Face", "Body Face", "")
+    .ir();
+    let font = |i: usize| first_span(para(&ir, i)).font_name.clone();
+    assert_eq!(font(0).as_deref(), Some("Run Face"));
+    assert_eq!(font(1).as_deref(), Some("Body Face"));
+    assert_eq!(font(2).as_deref(), Some("Heading Face"));
 }
 
 #[test]
@@ -417,6 +619,309 @@ fn test_empty_paragraph_with_only_a_bottom_border_is_still_a_thematic_break() {
 // Table geometry and borders
 // ---------------------------------------------------------------------------
 
+/// A linked picture (`a:blip/@r:link`, an external image relationship)
+/// has no bytes in the package, only a target. The reader looked at
+/// `r:embed` only, so such a picture vanished without trace.
+#[test]
+fn test_a_linked_picture_reaches_the_ir_renderers_and_the_writer() {
+    let bytes = Docx::new(
+        r#"<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+             <wp:extent cx="100" cy="100"/><wp:docPr id="1" name="P" descr="Linked logo"/>
+             <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData>
+               <pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
+                 <pic:blipFill><a:blip r:link="LINK"/></pic:blipFill></pic:pic>
+             </a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#,
+    )
+    .external_rel("LINK", rel_types::IMAGE, "https://example.com/logo.png")
+    .bytes();
+    let image = |ir: &DocumentIR| -> Image {
+        ir.sections[0]
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                Element::Image(i) => Some(i.clone()),
+                _ => None,
+            })
+            .expect("the linked picture reached the IR")
+    };
+    let ir = Document::from_reader(Cursor::new(bytes.clone()), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    let img = image(&ir);
+    assert_eq!(img.source_url.as_deref(), Some("https://example.com/logo.png"));
+    assert!(img.data.is_none());
+    assert_eq!(img.alt_text.as_deref(), Some("Linked logo"));
+    let want = "![Linked logo](https://example.com/logo.png)";
+    assert!(ir.to_markdown().contains(want), "{}", ir.to_markdown());
+    assert!(
+        ir.to_html()
+            .contains(r#"<img src="https://example.com/logo.png""#)
+    );
+    let direct = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes))
+        .unwrap()
+        .to_markdown();
+    assert!(direct.contains(want), "{direct}");
+
+    let again = Document::from_reader(Cursor::new(docx_bytes(&ir)), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(image(&again).source_url, img.source_url);
+}
+
+/// The direct markdown renderer wrote a picture as `![alt](rId7)`: the
+/// relationship id is not a target any markdown reader can resolve. The
+/// IR renderer, with no addressable source, writes the description as
+/// italic text; both must agree.
+#[test]
+fn test_direct_markdown_does_not_use_a_relationship_id_as_an_image_target() {
+    const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let image = |alt: Option<&str>| {
+        Element::Image(Image {
+            data: Some(PNG.to_vec()),
+            format: Some(ImageFormat::Png),
+            display_width_emu: Some(100),
+            display_height_emu: Some(100),
+            alt_text: alt.map(str::to_string),
+            ..Default::default()
+        })
+    };
+    let ir = DocumentIR {
+        metadata: Metadata {
+            format: DocumentFormat::Docx,
+            ..Default::default()
+        },
+        sections: vec![Section {
+            elements: vec![image(Some("A *cat*")), image(None)],
+            ..Default::default()
+        }],
+        defined_names: Vec::new(),
+    };
+    let bytes = docx_bytes(&ir);
+    let direct = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes.clone()))
+        .unwrap()
+        .to_markdown();
+    let via_ir = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir()
+        .to_markdown();
+    assert!(!direct.contains("rId") && !direct.contains("]("), "{direct:?}");
+    assert_eq!(direct.trim(), via_ir.trim());
+    assert!(direct.contains(r"*A \*cat\**"), "{direct:?}");
+}
+
+/// `w:shd` (ECMA-376 §17.3.5) paints its pattern (`w:val`) in `w:color`
+/// over `w:fill`. Only `w:fill` was read, so `solid` shading — the whole
+/// area in `w:color` — and percentage patterns came out as the fill alone
+/// (often `auto`, i.e. nothing).
+#[test]
+fn test_cell_and_paragraph_shading_honour_the_pattern_and_its_colour() {
+    let cell = |shd: &str| {
+        format!("<w:tc><w:tcPr>{shd}</w:tcPr><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc>")
+    };
+    let body = format!(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="1000"/></w:tblGrid><w:tr>{}{}{}{}{}</w:tr></w:tbl>
+           <w:p><w:pPr><w:shd w:val="solid" w:color="0000FF" w:fill="auto"/></w:pPr><w:r><w:t>p</w:t></w:r></w:p>"#,
+        cell(r#"<w:shd w:val="solid" w:color="FF0000" w:fill="auto"/>"#),
+        cell(r#"<w:shd w:val="pct50" w:color="000000" w:fill="FFFFFF"/>"#),
+        cell(r#"<w:shd w:val="clear" w:color="auto" w:fill="00FF00"/>"#),
+        cell(r#"<w:shd w:val="nil" w:fill="00FF00"/>"#),
+        cell(r#"<w:shd w:val="pct25" w:color="auto" w:fill="auto"/>"#),
+    );
+    let ir = Docx::new(&body).ir();
+    let fills: Vec<_> = table(&ir).rows[0]
+        .cells
+        .iter()
+        .map(|c| c.background_color)
+        .collect();
+    assert_eq!(
+        fills,
+        [
+            Some([0xFF, 0, 0]),
+            Some([0x80, 0x80, 0x80]),
+            Some([0, 0xFF, 0]),
+            None,
+            // Automatic pattern colour is black, automatic fill white.
+            Some([0xBF, 0xBF, 0xBF]),
+        ]
+    );
+    assert_eq!(para(&ir, 1).background_color, Some([0, 0, 0xFF]));
+}
+
+/// A table whose look lives in its table style: `w:style/w:tblPr` (borders)
+/// and `w:tblStylePr` conditional formatting (header-row and banded-row
+/// shading), switched on per table by `w:tblLook`. `Style.table_properties`
+/// was hardcoded `None` and `w:tblStylePr`/`w:tblLook` were never read, so
+/// such tables converted borderless and unshaded.
+#[test]
+fn test_table_style_borders_and_conditional_shading_reach_the_ir() {
+    let row = |t: &str| format!("<w:tr><w:tc><w:p><w:r><w:t>{t}</w:t></w:r></w:p></w:tc></w:tr>");
+    let body = format!(
+        r#"<w:tbl><w:tblPr><w:tblStyle w:val="Banded"/>
+             <w:tblLook w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="1"/></w:tblPr>
+           <w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid>{}{}{}{}
+           <w:tr><w:tc><w:tcPr><w:shd w:val="clear" w:fill="FF0000"/></w:tcPr><w:p><w:r><w:t>own</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+           <w:p/>
+           <w:tbl><w:tblPr><w:tblStyle w:val="Banded"/><w:tblLook w:val="0600"/></w:tblPr>
+           <w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid>{}{}</w:tbl>"#,
+        row("head"),
+        row("one"),
+        row("two"),
+        row("three"),
+        row("plain head"),
+        row("plain one"),
+    );
+    let ir = Docx::new(&body)
+        .styles(
+            r#"<w:style w:type="table" w:styleId="Base"><w:name w:val="Base"/>
+                 <w:tblPr><w:tblBorders><w:top w:val="single" w:sz="4" w:color="000000"/>
+                   <w:insideH w:val="single" w:sz="4" w:color="000000"/></w:tblBorders></w:tblPr></w:style>
+               <w:style w:type="table" w:styleId="Banded"><w:name w:val="Banded"/><w:basedOn w:val="Base"/>
+                 <w:tblStylePr w:type="firstRow"><w:rPr><w:b/></w:rPr>
+                   <w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="4472C4"/></w:tcPr></w:tblStylePr>
+                 <w:tblStylePr w:type="band1Horz"><w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="D9E2F3"/></w:tcPr></w:tblStylePr>
+               </w:style>"#,
+        )
+        .ir();
+    let tables: Vec<&Table> = ir.sections[0]
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            Element::Table(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    let fills = |t: &Table| -> Vec<Option<[u8; 3]>> {
+        t.rows.iter().map(|r| r.cells[0].background_color).collect()
+    };
+    assert!(
+        tables[0]
+            .border
+            .as_ref()
+            .is_some_and(|b| b.top.is_some() && b.inside_h.is_some()),
+        "the style's borders (through basedOn) apply: {:?}",
+        tables[0].border
+    );
+    assert_eq!(
+        fills(tables[0]),
+        [
+            Some([0x44, 0x72, 0xC4]),
+            Some([0xD9, 0xE2, 0xF3]),
+            None,
+            Some([0xD9, 0xE2, 0xF3]),
+            Some([0xFF, 0x00, 0x00]),
+        ],
+        "header row, banded rows, and a cell's own shading winning"
+    );
+    // The older bitmask form: 0x0600 is noHBand + noVBand with no
+    // header/total/column flags, so every conditional is off.
+    assert_eq!(fills(tables[1]), [None, None]);
+    assert!(tables[1].border.is_some());
+}
+
+/// A table style's `w:tblStylePr` run and paragraph formatting — the bold
+/// header row of nearly every built-in table style, banded italics, a
+/// centred header — was not read: only its cell shading was. It now
+/// applies through `w:tblLook` in the §17.7.6 region order, beneath the
+/// paragraph style and direct formatting (§17.7.2), identically in
+/// `to_ir()`, the direct markdown and plain-text renderers, and HTML.
+#[test]
+fn test_table_style_conditional_run_and_paragraph_formatting_applies_everywhere() {
+    let cell = |t: &str| format!("<w:tc><w:p><w:r><w:t>{t}</w:t></w:r></w:p></w:tc>");
+    let row = |cells: &[&str]| {
+        format!("<w:tr>{}</w:tr>", cells.iter().map(|t| cell(t)).collect::<String>())
+    };
+    let body = format!(
+        r#"<w:tbl><w:tblPr><w:tblStyle w:val="Report"/>
+             <w:tblLook w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="1"/></w:tblPr>
+           <w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/></w:tblGrid>
+           {}{}{}{}{}
+           <w:tr><w:tc><w:p><w:pPr><w:pStyle w:val="Plain"/></w:pPr><w:r><w:t>styledoff</w:t></w:r></w:p></w:tc>
+             <w:tc><w:p><w:r><w:rPr><w:i w:val="0"/></w:rPr><w:t>directoff</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+        row(&["Name", "Qty"]),
+        row(&["apple", "3"]),
+        row(&["pear", "5"]),
+        row(&["plum", "7"]),
+        row(&["fig", "9"]),
+    );
+    let styles = r#"
+        <w:style w:type="paragraph" w:styleId="Plain"><w:name w:val="Plain"/><w:rPr><w:i w:val="0"/></w:rPr></w:style>
+        <w:style w:type="table" w:styleId="Base"><w:name w:val="Base"/>
+          <w:tblStylePr w:type="firstRow"><w:pPr><w:jc w:val="center"/></w:pPr><w:rPr><w:b/></w:rPr></w:tblStylePr>
+        </w:style>
+        <w:style w:type="table" w:styleId="Report"><w:name w:val="Report"/><w:basedOn w:val="Base"/>
+          <w:rPr><w:color w:val="112233"/></w:rPr>
+          <w:tblStylePr w:type="band1Horz"><w:rPr><w:i/></w:rPr></w:tblStylePr>
+        </w:style>"#;
+    let bytes = Docx::new(&body).styles(styles).bytes();
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+    let ir = doc.to_ir();
+    let t = table(&ir);
+    let span = |r: usize, c: usize| -> TextSpan {
+        match &t.rows[r].cells[c].content[0] {
+            Element::Paragraph(p) => first_span(p).clone(),
+            other => panic!("not a paragraph: {other:?}"),
+        }
+    };
+    // Header row: bold (inherited from the base style) and centred.
+    assert!(span(0, 0).bold && span(0, 1).bold);
+    assert_eq!(t.rows[0].cells[0].text_align, Some(ParagraphAlignment::Center));
+    // Banded rows: band1 is every other data row, starting with the first.
+    let italics: Vec<bool> = (1..5).map(|r| span(r, 0).italic).collect();
+    assert_eq!(italics, [true, false, true, false]);
+    assert!(!span(1, 0).bold, "data rows are not header rows");
+    // The style's own run formatting reaches every cell.
+    assert_eq!(span(2, 1).color, Some([0x11, 0x22, 0x33]));
+    // A paragraph style and direct formatting both win over the table style.
+    assert!(!span(5, 0).italic && !span(5, 1).italic, "a band1 row, switched off");
+    assert_eq!(span(5, 0).text, "styledoff");
+
+    // Every surface draws the same emphasis.
+    let direct = doc.to_markdown();
+    let via_ir = ir.to_markdown();
+    assert_eq!(direct.trim_end(), via_ir.trim_end());
+    assert!(direct.contains("| **Name** | **Qty** |"), "{direct}");
+    assert!(direct.contains("| *apple* | *3* |"), "{direct}");
+    assert!(direct.contains("| pear | 5 |"), "{direct}");
+    let html = doc.to_html();
+    assert!(
+        html.contains("<strong>Name</strong>") && html.contains("<em>apple</em>"),
+        "{html}"
+    );
+    assert_eq!(doc.plain_text().trim_end(), ir.plain_text().trim_end());
+}
+
+/// `w:trHeight/@w:hRule` (ECMA-376 §17.18) was parsed and read by
+/// nothing, and the writer omitted it — the default is `atLeast`, so an
+/// exact-height row (forms, labels) came back as a minimum height.
+#[test]
+fn test_row_height_rule_survives_a_round_trip() {
+    let ir = Docx::new(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid>
+             <w:tr><w:trPr><w:trHeight w:val="400" w:hRule="exact"/></w:trPr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc></w:tr>
+             <w:tr><w:trPr><w:trHeight w:val="500" w:hRule="auto"/></w:trPr><w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc></w:tr>
+             <w:tr><w:trPr><w:trHeight w:val="600"/></w:trPr><w:tc><w:p><w:r><w:t>C</w:t></w:r></w:p></w:tc></w:tr>
+           </w:tbl>"#,
+    )
+    .ir();
+    let rules = |ir: &DocumentIR| -> Vec<_> {
+        table(ir)
+            .rows
+            .iter()
+            .map(|r| (r.height_twips, r.height_rule))
+            .collect()
+    };
+    let want = vec![
+        (Some(400), Some(RowHeightRule::Exact)),
+        (Some(500), Some(RowHeightRule::Auto)),
+        (Some(600), None),
+    ];
+    assert_eq!(rules(&ir), want);
+    let again = Document::from_reader(Cursor::new(docx_bytes(&ir)), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(rules(&again), want);
+}
+
 #[test]
 fn test_table_geometry_reaches_the_ir() {
     let ir = Docx::new(
@@ -563,6 +1068,117 @@ fn test_column_layout_keeps_space_separator_and_widths() {
     assert_eq!(c.column_widths_twips, vec![4320, 4320]);
 }
 
+/// A section's `w:pgNumType`, `w:footnotePr` and `w:endnotePr` were never
+/// parsed. Page numbering now reaches the IR and the writer; the note
+/// settings are read onto the section's properties.
+#[test]
+fn test_section_page_and_note_numbering_are_read() {
+    let body = r#"<w:p><w:r><w:t>body</w:t></w:r></w:p>
+        <w:sectPr>
+          <w:footnotePr><w:pos w:val="beneathText"/><w:numFmt w:val="lowerRoman"/>
+            <w:numStart w:val="3"/><w:numRestart w:val="eachPage"/></w:footnotePr>
+          <w:endnotePr><w:numFmt w:val="upperLetter"/></w:endnotePr>
+          <w:pgSz w:w="12240" w:h="15840"/>
+          <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/>
+          <w:pgNumType w:fmt="lowerRoman" w:start="5"/>
+        </w:sectPr>"#;
+    let bytes = Docx::new(body).bytes();
+    let docx = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes.clone())).unwrap();
+    let sp = &docx.sections[0];
+    let foot = sp.footnote_properties.as_ref().expect("footnotePr");
+    assert_eq!(foot.position.as_deref(), Some("beneathText"));
+    assert_eq!(foot.number_format.as_deref(), Some("lowerRoman"));
+    assert_eq!(foot.start, Some(3));
+    assert_eq!(foot.restart.as_deref(), Some("eachPage"));
+    let end = sp.endnote_properties.as_ref().expect("endnotePr");
+    assert_eq!(end.number_format.as_deref(), Some("upperLetter"));
+    assert_eq!(end.position, None);
+
+    let ir = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    let numbering = |ir: &DocumentIR| {
+        let ps = ir.sections[0].page_setup.as_ref().expect("page setup");
+        (ps.page_number_start, ps.page_number_format.clone())
+    };
+    assert_eq!(numbering(&ir), (Some(5), Some("lowerRoman".to_string())));
+    let again = Document::from_reader(Cursor::new(docx_bytes(&ir)), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(numbering(&again), numbering(&ir));
+}
+
+/// The section's `w:footnotePr` / `w:endnotePr` were read onto the
+/// parser's section properties and then dropped: the IR had nowhere to
+/// hold them and the writer emitted an empty `<w:footnotePr/>`, so a
+/// round trip reset roman, restarting footnotes to plain decimal.
+#[test]
+fn test_section_note_settings_reach_the_ir_and_survive_a_round_trip() {
+    let body = r#"<w:p><w:r><w:t>body</w:t></w:r></w:p>
+        <w:sectPr>
+          <w:footnotePr><w:pos w:val="beneathText"/><w:numFmt w:val="lowerRoman"/>
+            <w:numStart w:val="3"/><w:numRestart w:val="eachPage"/></w:footnotePr>
+          <w:endnotePr><w:numFmt w:val="upperLetter"/></w:endnotePr>
+          <w:pgSz w:w="12240" w:h="15840"/>
+        </w:sectPr>"#;
+    let ir = Docx::new(body).ir();
+    let foot = NoteSettings {
+        position: Some("beneathText".into()),
+        number_format: Some("lowerRoman".into()),
+        start: Some(3),
+        restart: Some("eachPage".into()),
+    };
+    let end = NoteSettings {
+        number_format: Some("upperLetter".into()),
+        ..Default::default()
+    };
+    let notes = |ir: &DocumentIR| {
+        let s = &ir.sections[0];
+        (s.footnote_settings.clone(), s.endnote_settings.clone())
+    };
+    assert_eq!(notes(&ir), (Some(foot.clone()), Some(end.clone())));
+
+    let bytes = docx_bytes(&ir);
+    let again = Document::from_reader(Cursor::new(bytes.clone()), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(notes(&again), notes(&ir));
+
+    // Also through an inline (non-final) section break.
+    let mut two = ir.clone();
+    two.sections.push(Section {
+        elements: vec![Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan::plain("second"))],
+            ..Default::default()
+        })],
+        ..Default::default()
+    });
+    let again = Document::from_reader(Cursor::new(docx_bytes(&two)), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(notes(&again), (Some(foot), Some(end)));
+}
+
+/// `w:pgMar/@w:gutter` was parsed and never read, and the writer
+/// hardcoded `w:gutter="0"`, so a bound document's binding margin was
+/// zeroed on every round-trip.
+#[test]
+fn test_gutter_margin_survives_a_round_trip() {
+    let ir = Docx::new(
+        r#"<w:p><w:r><w:t>body</w:t></w:r></w:p>
+           <w:sectPr><w:pgSz w:w="12240" w:h="15840"/>
+             <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"
+                      w:header="720" w:footer="720" w:gutter="567"/></w:sectPr>"#,
+    )
+    .ir();
+    let gutter = |ir: &DocumentIR| ir.sections[0].page_setup.as_ref().map(|p| p.gutter_twips);
+    assert_eq!(gutter(&ir), Some(567));
+    let again = Document::from_reader(Cursor::new(docx_bytes(&ir)), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(gutter(&again), Some(567));
+}
+
 #[test]
 fn test_a_sect_pr_with_no_page_size_reports_no_page_setup() {
     // Synthesising a Letter page for a section that states none would hand
@@ -586,6 +1202,7 @@ fn test_first_default_and_even_headers_land_in_distinct_slots() {
              <w:headerReference w:type="default" r:id="rIdH1"/>
              <w:headerReference w:type="first" r:id="rIdH2"/>
              <w:footerReference w:type="default" r:id="rIdF1"/>
+             <w:titlePg/>
            </w:sectPr>"#,
     )
     .hf("header1.xml", "rIdH1", "DEFAULT HEADER")
@@ -594,32 +1211,102 @@ fn test_first_default_and_even_headers_land_in_distinct_slots() {
     .ir();
 
     let s = &ir.sections[0];
-    let text = |hf: &Option<HeaderFooter>| -> String {
-        hf.as_ref()
-            .map(|h| {
-                h.content
-                    .iter()
-                    .map(|e| match e {
-                        Element::Paragraph(p) => p
-                            .content
-                            .iter()
-                            .filter_map(|c| match c {
-                                InlineContent::Text(t) => Some(t.text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<String>(),
-                        _ => String::new(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    assert_eq!(text(&s.header), "DEFAULT HEADER");
-    assert_eq!(text(&s.first_page_header), "FIRST HEADER");
-    assert_eq!(text(&s.footer), "DEFAULT FOOTER");
+    assert_eq!(hf_text(&s.header), "DEFAULT HEADER");
+    assert_eq!(hf_text(&s.first_page_header), "FIRST HEADER");
+    assert_eq!(hf_text(&s.footer), "DEFAULT FOOTER");
     // The footer must not have leaked into the header slot, which is what
     // the old cumulative-index split did as soon as the counts were unequal.
-    assert!(!text(&s.header).contains("FOOTER"));
+    assert!(!hf_text(&s.header).contains("FOOTER"));
+}
+
+/// A `w:type="first"` header or footer is shown only in a section with
+/// `w:titlePg` (ECMA-376 §17.10). `title_page` was parsed and never
+/// read: the inactive part reached every surface, and the writer, which
+/// emits `w:titlePg` whenever a first-page part exists, made it visible
+/// in Word after a round-trip.
+#[test]
+fn test_an_inactive_first_page_header_is_not_content() {
+    let bytes = Docx::new(
+        r#"<w:p><w:r><w:t>body</w:t></w:r></w:p>
+           <w:sectPr>
+             <w:headerReference w:type="default" r:id="rIdH1"/>
+             <w:headerReference w:type="first" r:id="rIdH2"/>
+             <w:footerReference w:type="first" r:id="rIdF2"/>
+           </w:sectPr>"#,
+    )
+    .hf("header1.xml", "rIdH1", "DEFAULT HEADER")
+    .hf("header2.xml", "rIdH2", "FIRST HEADER")
+    .hf("footer2.xml", "rIdF2", "FIRST FOOTER")
+    .bytes();
+    let doc = Document::from_reader(Cursor::new(bytes.clone()), DocumentFormat::Docx).unwrap();
+    let ir = doc.to_ir();
+    assert_eq!(hf_text(&ir.sections[0].header), "DEFAULT HEADER");
+    assert!(ir.sections[0].first_page_header.is_none());
+    assert!(ir.sections[0].first_page_footer.is_none());
+    let docx = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes)).unwrap();
+    for (surface, out) in [
+        ("ir plain_text", ir.plain_text()),
+        ("ir markdown", ir.to_markdown()),
+        ("plain_text", docx.plain_text()),
+        ("to_markdown", docx.to_markdown()),
+    ] {
+        assert!(out.contains("DEFAULT HEADER"), "{surface}: {out:?}");
+        assert!(!out.contains("FIRST"), "{surface} shows an inactive part: {out:?}");
+    }
+    // Written back, the section stays without a distinct first page.
+    let written = docx_bytes(&ir);
+    let again = office_oxide::docx::DocxDocument::from_reader(Cursor::new(written)).unwrap();
+    assert!(!again.sections.iter().any(|s| s.title_page));
+}
+
+/// A section that declares no header/footer reference of a type inherits
+/// the previous section's (ECMA-376 §17.10.5), and `w:titlePg` is the
+/// inheriting section's own: a first-page header declared in section one
+/// (no `titlePg`) is shown on the first page of a later section that has
+/// `titlePg`. Judging activity only by the declaring section hid a header
+/// Word shows.
+#[test]
+fn test_an_inherited_first_page_header_is_shown_by_a_later_title_page_section() {
+    let bytes = Docx::new(
+        r#"<w:p><w:pPr><w:sectPr>
+             <w:headerReference w:type="default" r:id="rIdH1"/>
+             <w:headerReference w:type="first" r:id="rIdH2"/>
+             <w:footerReference w:type="first" r:id="rIdF2"/>
+           </w:sectPr></w:pPr><w:r><w:t>first section</w:t></w:r></w:p>
+           <w:p><w:r><w:t>second section</w:t></w:r></w:p>
+           <w:sectPr><w:titlePg/></w:sectPr>"#,
+    )
+    .hf("header1.xml", "rIdH1", "DEFAULT HEADER")
+    .hf("header2.xml", "rIdH2", "FIRST HEADER")
+    .hf("footer2.xml", "rIdF2", "FIRST FOOTER")
+    .bytes();
+    let doc = Document::from_reader(Cursor::new(bytes.clone()), DocumentFormat::Docx).unwrap();
+    let ir = doc.to_ir();
+    let docx = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes)).unwrap();
+    for (surface, out) in [
+        ("ir plain_text", ir.plain_text()),
+        ("ir markdown", ir.to_markdown()),
+        ("plain_text", docx.plain_text()),
+        ("to_markdown", docx.to_markdown()),
+    ] {
+        for text in ["DEFAULT HEADER", "FIRST HEADER", "FIRST FOOTER"] {
+            assert!(out.contains(text), "{surface} lost {text}: {out:?}");
+        }
+    }
+}
+
+fn hf_text(hf: &Option<HeaderFooter>) -> String {
+    hf.as_ref()
+        .map(|h| {
+            h.content
+                .iter()
+                .map(|e| match e {
+                    Element::Paragraph(p) => inline_to_text(&p.content),
+                    _ => String::new(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -686,6 +1373,136 @@ fn test_list_start_number_and_style_reach_the_ir() {
     assert!(list.ordered);
     assert_eq!(list.start_number, Some(5));
     assert_eq!(list.style, Some(ListStyle::LowerAlpha));
+}
+
+/// A bullet level's `w:lvlText` is the glyph Word draws; the writer maps
+/// `ListStyle::Square`/`Circle`/`Dash` to ▪/○/– and the reader turned every
+/// glyph back into a plain bullet, so the marker changed on a round-trip.
+#[test]
+fn test_bullet_glyph_selects_the_list_style() {
+    let level = |id: u32, glyph: &str| {
+        format!(
+            r#"<w:abstractNum w:abstractNumId="{id}"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/>
+                 <w:lvlText w:val="{glyph}"/></w:lvl></w:abstractNum>
+               <w:num w:numId="{id}"><w:abstractNumId w:val="{id}"/></w:num>"#
+        )
+    };
+    let glyphs = [
+        ("\u{25AA}", ListStyle::Square),
+        ("\u{25CB}", ListStyle::Circle),
+        ("o", ListStyle::Circle),
+        ("\u{2013}", ListStyle::Dash),
+        ("\u{2022}", ListStyle::Bullet),
+        ("\u{F0A7}", ListStyle::Square),
+    ];
+    let mut numbering = String::new();
+    let mut body = String::new();
+    for (i, (glyph, _)) in glyphs.iter().enumerate() {
+        let id = i as u32 + 1;
+        numbering.push_str(&level(id, glyph));
+        body.push_str(&format!(
+            r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="{id}"/></w:numPr></w:pPr>
+                 <w:r><w:t>item {id}</w:t></w:r></w:p><w:p><w:r><w:t>gap</w:t></w:r></w:p>"#
+        ));
+    }
+    let ir = Docx::new(&body).numbering(&numbering).ir();
+    let styles: Vec<_> = ir.sections[0]
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            Element::List(l) => Some(l.style.clone()),
+            _ => None,
+        })
+        .collect();
+    let want: Vec<_> = glyphs.iter().map(|(_, s)| Some(s.clone())).collect();
+    assert_eq!(styles, want);
+}
+
+/// A numbered heading is not turned into a list item, so its level's
+/// `w:pPr/w:ind` is the only place its indentation comes from; direct
+/// `w:ind` still wins.
+#[test]
+fn test_numbering_level_indent_applies_to_a_numbered_heading() {
+    let ir = Docx::new(
+        r#"<w:p><w:pPr><w:outlineLvl w:val="0"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>One</w:t></w:r></w:p>
+           <w:p><w:pPr><w:outlineLvl w:val="0"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr><w:ind w:left="100"/></w:pPr><w:r><w:t>Two</w:t></w:r></w:p>"#,
+    )
+    .numbering(
+        r#"<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/>
+             <w:pPr><w:ind w:left="432" w:hanging="432"/></w:pPr></w:lvl></w:abstractNum>
+           <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#,
+    )
+    .ir();
+    let heading = |i: usize| match &ir.sections[0].elements[i] {
+        Element::Heading(h) => h,
+        other => panic!("not a heading: {other:?}"),
+    };
+    assert_eq!(heading(0).indent_left_twips, Some(432));
+    assert_eq!(heading(0).first_line_indent_twips, Some(-432));
+    assert_eq!(heading(1).indent_left_twips, Some(100));
+}
+
+/// `w:lvlText` (the marker pattern around the counter) and `w:lvlJc` were
+/// parsed and never read: `a)`, `(1)` and `1.1.` all became `1.`, a
+/// sub-list took the ordered flag of whichever item came last, and the
+/// writer always wrote `%N.` with no `w:lvlJc`.
+#[test]
+fn test_numbering_marker_pattern_and_alignment_reach_the_ir_renderers_and_writer() {
+    let numbering = r#"
+      <w:abstractNum w:abstractNumId="0">
+        <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/>
+          <w:lvlText w:val="%1)"/><w:lvlJc w:val="right"/></w:lvl>
+        <w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/>
+          <w:lvlText w:val="%1.%2."/><w:lvlJc w:val="left"/></w:lvl>
+        <w:lvl w:ilvl="2"><w:start w:val="1"/><w:numFmt w:val="bullet"/>
+          <w:lvlText w:val="&#9642;"/></w:lvl>
+      </w:abstractNum>
+      <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#;
+    let para = |ilvl: u8, text: &str| {
+        format!(
+            r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+        )
+    };
+    let body = [
+        para(0, "one"),
+        para(1, "one-a"),
+        para(2, "dot"),
+        para(0, "two"),
+    ]
+    .concat();
+    let bytes = Docx::new(&body).numbering(numbering).bytes();
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+
+    let check = |ir: &DocumentIR| {
+        let top = match first(ir) {
+            Element::List(l) => l,
+            other => panic!("not a list: {other:?}"),
+        };
+        assert!(top.ordered);
+        assert_eq!(top.marker_pattern.as_deref(), Some("%1)"));
+        assert_eq!(top.marker_alignment, Some(ParagraphAlignment::Right));
+        let sub = top.items[0].nested.as_ref().expect("level 1");
+        assert!(sub.ordered);
+        assert_eq!(sub.marker_pattern.as_deref(), Some("%1.%2."));
+        assert_eq!(sub.marker_alignment, None);
+        let dots = sub.items[0].nested.as_ref().expect("level 2");
+        assert!(!dots.ordered, "a bullet level under a numbered one is a bullet list");
+        assert_eq!(dots.style, Some(ListStyle::Square));
+        assert_eq!(dots.marker_pattern, None);
+    };
+    let ir = doc.to_ir();
+    check(&ir);
+
+    // CommonMark has `1)`; both markdown pipelines use it, and agree.
+    let direct = doc.to_markdown();
+    assert!(direct.contains("1) one") && direct.contains("2) two"), "{direct}");
+    assert_eq!(ir.to_markdown().trim_end(), direct.trim_end());
+
+    // The writer keeps the pattern and the alignment.
+    let again = Document::from_reader(Cursor::new(docx_bytes(&ir)), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    check(&again);
 }
 
 #[test]
@@ -1173,6 +1990,108 @@ fn test_comment_bodies_reach_the_ir_with_their_author() {
     assert!(ir.plain_text().contains("Comment (Reviewer): "), "{}", ir.plain_text());
 }
 
+/// Where a comment's anchored range starts, and its citation point, as a
+/// sequence of markers around the paragraph's text.
+fn comment_shape(p: &Paragraph) -> Vec<String> {
+    p.content
+        .iter()
+        .map(|c| match c {
+            InlineContent::Text(s) => s.text.trim().to_string(),
+            InlineContent::CommentStart(a) => format!("<{}", a.comment_id),
+            InlineContent::CommentRef(a) => format!("{}>", a.comment_id),
+            other => format!("{other:?}"),
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+const COMMENTED_BODY: &str = r#"<w:p><w:r><w:t xml:space="preserve">Before </w:t></w:r>
+  <w:commentRangeStart w:id="4"/><w:r><w:t>commented</w:t></w:r><w:commentRangeEnd w:id="4"/>
+  <w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="4"/></w:r>
+  <w:r><w:t xml:space="preserve"> after</w:t></w:r></w:p>"#;
+const COMMENTS: &str = r#"<w:comment w:id="4" w:author="Reviewer"><w:p><w:r><w:t>Please check</w:t></w:r></w:p></w:comment>"#;
+
+/// `w:commentRangeStart` (ECMA-376 §17.13.4) and `w:commentReference`
+/// (§17.13.4) were never read into the IR, so a comment's body survived
+/// with no record of what it was about.
+#[test]
+fn test_comment_anchor_reaches_the_ir() {
+    let ir = Docx::new(COMMENTED_BODY)
+        .notes("comments.xml", rel_types::COMMENTS, CT_COMMENTS, COMMENTS)
+        .ir();
+    assert_eq!(comment_shape(para(&ir, 0)), ["Before", "<4", "commented", "4>", "after"]);
+}
+
+/// A DOCX comment read into the IR (an `Endnote` labelled "Comment (…)")
+/// was written back as an endnote: the writer had no comments part at
+/// all, so read→write turned every comment into an endnote detached from
+/// its anchor.
+#[test]
+fn test_a_comment_round_trips_as_an_anchored_comment() {
+    let ir = Docx::new(COMMENTED_BODY)
+        .notes("comments.xml", rel_types::COMMENTS, CT_COMMENTS, COMMENTS)
+        .ir();
+    let bytes = docx_bytes(&ir);
+    let doc = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes.clone())).unwrap();
+    assert_eq!(doc.comments.len(), 1, "written as a comment");
+    assert!(doc.endnotes.is_empty(), "not as an endnote");
+    assert_eq!(doc.comments[0].author.as_deref(), Some("Reviewer"));
+    let again = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(comment_shape(para(&again, 0)), ["Before", "<4", "commented", "4>", "after"]);
+    assert!(
+        again
+            .plain_text()
+            .contains("Comment (Reviewer): Please check")
+    );
+}
+
+/// A comment with no anchor in the IR (one from a slide or built by hand)
+/// is still a comment on write, cited at the end of the body.
+#[test]
+fn test_an_unanchored_comment_is_written_as_a_comment() {
+    let ir = DocumentIR {
+        metadata: Metadata {
+            format: DocumentFormat::Docx,
+            ..Default::default()
+        },
+        sections: vec![Section {
+            elements: vec![
+                Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain("Body"))],
+                    ..Default::default()
+                }),
+                Element::Endnote(Note {
+                    id: 9,
+                    content: vec![Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan::plain("Loose remark"))],
+                        ..Default::default()
+                    })],
+                    marker: Some("Comment (Ann)".to_string()),
+                    author: Some("Ann".to_string()),
+                }),
+            ],
+            ..Default::default()
+        }],
+        defined_names: Vec::new(),
+    };
+    let bytes = docx_bytes(&ir);
+    let doc = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes.clone())).unwrap();
+    assert_eq!(doc.comments.len(), 1);
+    assert!(doc.endnotes.is_empty());
+    let again = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert!(
+        comment_shape(para(&again, 0))
+            .iter()
+            .any(|s| s.ends_with('>')),
+        "the comment is cited in the body: {:?}",
+        para(&again, 0)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Image alt text must not also become body text
 // ---------------------------------------------------------------------------
@@ -1422,4 +2341,83 @@ fn test_text_box_content_does_not_fuse_with_the_following_run() {
             "{name} fused the text box to the next run: {out:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Nested lists
+// ---------------------------------------------------------------------------
+
+const NESTED_WORDS: [&str; 6] = ["one", "one-a", "one-b", "two", "two-a", "three"];
+
+/// Positions of each of `NESTED_WORDS` as a whole line/item in `s`.
+fn nested_word_positions(s: &str) -> Vec<usize> {
+    let s = format!("{s}\n");
+    NESTED_WORDS
+        .iter()
+        .map(|w| {
+            [format!(" {w}\n"), format!("\n{w}\n"), format!(">{w}<")]
+                .iter()
+                .find_map(|pat| s.find(pat.as_str()))
+                .unwrap_or_else(|| panic!("{w} missing from {s}"))
+        })
+        .collect()
+}
+
+fn assert_nested_order(doc: &Document) {
+    let ir = doc.to_ir();
+    let list = match first(&ir) {
+        Element::List(l) => l,
+        other => panic!("not a list: {other:?}"),
+    };
+    assert_eq!(list.items.len(), 3, "top level: {list:?}");
+    let kids = |i: usize| list.items[i].nested.as_ref().map_or(0, |l| l.items.len());
+    assert_eq!((kids(0), kids(1), kids(2)), (2, 1, 0), "children moved: {list:?}");
+    for s in [
+        doc.to_markdown(),
+        ir.to_markdown(),
+        doc.to_html(),
+        doc.plain_text(),
+    ] {
+        let pos = nested_word_positions(&format!("\n{s}"));
+        assert!(pos.windows(2).all(|w| w[0] < w[1]), "out of order: {s}");
+    }
+}
+
+/// A sub-list written by the DOCX writer belongs under the item it hangs
+/// off. The writer emitted every item of a level first and the sub-lists
+/// after them, so on the way back in both markdown pipelines (and HTML)
+/// showed "one / two / three / one-a …": each child under the wrong parent.
+#[test]
+fn test_written_nested_list_keeps_children_under_their_parent() {
+    let md = "- one\n  - one-a\n  - one-b\n- two\n  - two-a\n- three\n";
+    let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
+    let doc = Document::from_reader(Cursor::new(docx_bytes(&ir)), DocumentFormat::Docx).unwrap();
+    assert_nested_order(&doc);
+
+    // The same list read from Word-shaped paragraphs.
+    let para = |ilvl: u8, text: &str| {
+        format!(
+            r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+        )
+    };
+    let body = [
+        (0, "one"),
+        (1, "one-a"),
+        (1, "one-b"),
+        (0, "two"),
+        (1, "two-a"),
+        (0, "three"),
+    ]
+    .iter()
+    .map(|(l, t)| para(*l, t))
+    .collect::<String>();
+    let bytes = Docx::new(&body)
+        .numbering(
+            r#"<w:abstractNum w:abstractNumId="0">
+                 <w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="&#8226;"/></w:lvl>
+                 <w:lvl w:ilvl="1"><w:numFmt w:val="bullet"/><w:lvlText w:val="&#8226;"/></w:lvl>
+               </w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#,
+        )
+        .bytes();
+    assert_nested_order(&Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap());
 }

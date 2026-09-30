@@ -95,6 +95,8 @@ pub struct Run {
     /// had no hyperlink concept at all, so a run's URL was silently
     /// dropped, unconditionally, on every write).
     pub hyperlink: Option<String>,
+    /// The hyperlink's hover text, written as `a:hlinkClick/@tooltip`.
+    pub hyperlink_tooltip: Option<String>,
 }
 
 impl Run {
@@ -203,6 +205,19 @@ pub struct ParaProps {
     pub space_before_hundredths_pt: Option<u32>,
 }
 
+/// How a list paragraph is marked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListMarker {
+    /// `<a:buChar char="•"/>`.
+    Bullet,
+    /// `<a:buAutoNum type="…" startAt="…"/>` (ECMA-376 Part 1 §21.1.2.4.1;
+    /// `type` is an `ST_TextAutonumberScheme`, §20.1.10.61).
+    AutoNum {
+        scheme: &'static str,
+        start_at: Option<u32>,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum BodyItem {
     Text(String),
@@ -211,7 +226,7 @@ pub(crate) enum BodyItem {
     /// Each item is a paragraph's worth of styled `Run`s:
     /// this used to be a bare `String`, so a hyperlink or any character
     /// formatting on a list item's text was silently dropped on write.
-    BulletList(Vec<(u8, Vec<Run>)>),
+    BulletList(Vec<(u8, Vec<Run>, ListMarker)>),
     /// A real table: rows of cells, each cell a paragraph's worth of
     /// styled `Run`s. Flattening a table into tab-joined plain text lost
     /// the grid entirely; flattening each cell to a bare `String`
@@ -345,7 +360,10 @@ impl SlideData {
 
     /// Add a bullet list to the body area.
     pub fn add_bullet_list(&mut self, items: &[&str]) -> &mut Self {
-        let owned: Vec<(u8, Vec<Run>)> = items.iter().map(|s| (0, vec![Run::new(*s)])).collect();
+        let owned: Vec<(u8, Vec<Run>, ListMarker)> = items
+            .iter()
+            .map(|s| (0, vec![Run::new(*s)], ListMarker::Bullet))
+            .collect();
         self.body_items.push(BodyItem::BulletList(owned));
         self
     }
@@ -358,6 +376,17 @@ impl SlideData {
     /// — and every item used to be a bare `String`, so run formatting was
     /// lost too.
     pub fn add_nested_bullet_list(&mut self, items: Vec<(u8, Vec<Run>)>) -> &mut Self {
+        let items = items
+            .into_iter()
+            .map(|(level, runs)| (level, runs, ListMarker::Bullet))
+            .collect();
+        self.body_items.push(BodyItem::BulletList(items));
+        self
+    }
+
+    /// Add a list whose items each carry their own marker — bullets or
+    /// automatic numbering — so an ordered list is written as one.
+    pub(crate) fn add_marked_list(&mut self, items: Vec<(u8, Vec<Run>, ListMarker)>) -> &mut Self {
         self.body_items.push(BodyItem::BulletList(items));
         self
     }
@@ -639,16 +668,10 @@ impl PptxWriter {
         opc.add_package_rel(rel_types::OFFICE_DOCUMENT, "ppt/presentation.xml");
         opc.add_part_rel(&pres_part, rel_types::SLIDE_MASTER, "slideMasters/slideMaster1.xml");
 
-        // Core properties (docProps/core.xml). Written only when the
-        // caller supplied metadata so files generated through the
-        // existing `add_slide` API stay byte-identical when no
-        // metadata was set.
-        if let Some(ref meta) = self.metadata {
-            let core_part = PartName::new("/docProps/core.xml")?;
-            opc.add_package_rel(rel_types::CORE_PROPERTIES, "docProps/core.xml");
-            let core_xml = crate::core::core_properties::generate_xml(meta);
-            opc.add_part(&core_part, crate::core::core_properties::CONTENT_TYPE, &core_xml)?;
-        }
+        // Package properties: core.xml only when the caller supplied
+        // metadata, app.xml (the producer) always, custom.xml when the
+        // metadata carries custom properties.
+        crate::core::core_properties::add_property_parts(&mut opc, self.metadata.as_ref())?;
 
         let mut slide_parts = Vec::with_capacity(self.slides.len());
         for i in 0..self.slides.len() {
@@ -671,9 +694,14 @@ impl PptxWriter {
             .slides
             .iter()
             .any(|s| s.notes.as_ref().is_some_and(|n| !n.is_empty()));
+        let mut notes_master_rid = None;
         if has_notes {
             let nm_part = PartName::new("/ppt/notesMasters/notesMaster1.xml")?;
-            opc.add_part_rel(&pres_part, rel_types::NOTES_MASTER, "notesMasters/notesMaster1.xml");
+            notes_master_rid = Some(opc.add_part_rel(
+                &pres_part,
+                rel_types::NOTES_MASTER,
+                "notesMasters/notesMaster1.xml",
+            ));
             opc.add_part_rel(&nm_part, rel_types::THEME, "../theme/theme1.xml");
             opc.add_part(&nm_part, CT_NOTES_MASTER, &generate_notes_master_xml())?;
         }
@@ -683,7 +711,12 @@ impl PptxWriter {
         let pres_props_part = PartName::new("/ppt/presProps.xml")?;
         opc.add_part(&pres_props_part, CT_PRES_PROPS, &generate_pres_props_xml())?;
 
-        let pres_xml = generate_presentation_xml(self.slides.len(), self.cx, self.cy);
+        let pres_xml = generate_presentation_xml(
+            self.slides.len(),
+            self.cx,
+            self.cy,
+            notes_master_rid.as_deref(),
+        );
         opc.add_part(&pres_part, CT_PRESENTATION, &pres_xml)?;
 
         let master_xml = generate_slide_master_xml();
@@ -760,10 +793,25 @@ impl PptxWriter {
                     rel_types::NOTES_MASTER,
                     "../notesMasters/notesMaster1.xml",
                 );
+                // Relationship ids are scoped to their source part: the
+                // notes part needs its own hyperlink relationships. Handing
+                // it the slide's map dropped note-only URLs and wrote shared
+                // ones as ids the notes part's `.rels` did not define (or
+                // defined as something else).
+                let mut notes_rids: HashMap<String, String> = HashMap::new();
+                for url in collect_slide_hyperlinks(notes) {
+                    let rid = opc.add_part_rel_with_mode(
+                        &notes_part,
+                        rel_types::HYPERLINK,
+                        &url,
+                        crate::core::relationships::TargetMode::External,
+                    );
+                    notes_rids.insert(url, rid);
+                }
                 opc.add_part(
                     &notes_part,
                     CT_NOTES_SLIDE,
-                    &generate_notes_slide_xml(notes, &hyperlink_rids),
+                    &generate_notes_slide_xml(notes, &notes_rids),
                 )?;
             }
 
@@ -894,6 +942,13 @@ fn write_dml_run(w: &mut Writer<Vec<u8>>, run: &Run, hyperlink_rids: &HashMap<St
             if let Some(rid) = rid {
                 let mut hlink = BytesStart::new("a:hlinkClick");
                 hlink.push_attribute(("r:id", rid.as_str()));
+                // CT_Hyperlink `tooltip` (ECMA-376 §21.1.2.3).
+                if let Some(tip) = run.hyperlink_tooltip.as_deref() {
+                    hlink.push_attribute((
+                        "tooltip",
+                        crate::core::xml::sanitize_xml_text(tip).as_ref(),
+                    ));
+                }
                 w.write_event(Event::Empty(hlink))
                     .expect("write hlinkClick");
             }
@@ -914,7 +969,12 @@ fn write_dml_run(w: &mut Writer<Vec<u8>>, run: &Run, hyperlink_rids: &HashMap<St
 // presentation.xml
 // ---------------------------------------------------------------------------
 
-fn generate_presentation_xml(slide_count: usize, cx: u64, cy: u64) -> Vec<u8> {
+fn generate_presentation_xml(
+    slide_count: usize,
+    cx: u64,
+    cy: u64,
+    notes_master_rid: Option<&str>,
+) -> Vec<u8> {
     let mut w = Writer::new(Vec::new());
     write_decl(&mut w);
 
@@ -929,6 +989,20 @@ fn generate_presentation_xml(slide_count: usize, cx: u64, cy: u64) -> Vec<u8> {
     w.write_event(Event::Empty(master_id)).expect("write");
     w.write_event(Event::End(BytesEnd::new("p:sldMasterIdLst")))
         .expect("write");
+
+    // CT_Presentation (ECMA-376 Part 1 §19.2.1.26) lists the notes master
+    // after the slide masters. Optional in the schema, but every
+    // PowerPoint-authored deck with notes declares the notesMaster it
+    // relates to here.
+    if let Some(rid) = notes_master_rid {
+        w.write_event(Event::Start(BytesStart::new("p:notesMasterIdLst")))
+            .expect("write");
+        let mut nm_id = BytesStart::new("p:notesMasterId");
+        nm_id.push_attribute(("r:id", rid));
+        w.write_event(Event::Empty(nm_id)).expect("write");
+        w.write_event(Event::End(BytesEnd::new("p:notesMasterIdLst")))
+            .expect("write");
+    }
 
     w.write_event(Event::Start(BytesStart::new("p:sldIdLst")))
         .expect("write");
@@ -1158,7 +1232,7 @@ fn generate_notes_slide_xml(
             },
             BodyItem::BulletList(bullets) => {
                 for bullet in bullets {
-                    write_bullet_paragraph(&mut w, bullet.0, &bullet.1, hyperlink_rids);
+                    write_bullet_paragraph(&mut w, bullet.0, &bullet.1, bullet.2, hyperlink_rids);
                     wrote_paragraph = true;
                 }
             },
@@ -1449,7 +1523,9 @@ fn collect_slide_hyperlinks(items: &[BodyItem]) -> Vec<String> {
                 .iter()
                 .flat_map(|(runs, _)| runs.iter())
                 .collect(),
-            BodyItem::BulletList(items) => items.iter().flat_map(|(_, runs)| runs.iter()).collect(),
+            BodyItem::BulletList(items) => {
+                items.iter().flat_map(|(_, runs, _)| runs.iter()).collect()
+            },
             BodyItem::Table(rows) => rows.iter().flatten().flatten().collect(),
             _ => continue,
         };
@@ -1717,7 +1793,7 @@ fn write_body_shape(
             },
             BodyItem::BulletList(bullets) => {
                 for bullet in bullets {
-                    write_bullet_paragraph(w, bullet.0, &bullet.1, hyperlink_rids);
+                    write_bullet_paragraph(w, bullet.0, &bullet.1, bullet.2, hyperlink_rids);
                     wrote_paragraph = true;
                 }
             },
@@ -2121,6 +2197,7 @@ fn write_bullet_paragraph(
     w: &mut Writer<Vec<u8>>,
     level: u8,
     runs: &[Run],
+    marker: ListMarker,
     hyperlink_rids: &HashMap<String, String>,
 ) {
     w.write_event(Event::Start(BytesStart::new("a:p")))
@@ -2136,8 +2213,22 @@ fn write_bullet_paragraph(
     p_pr.push_attribute(("marL", mar_l.to_string().as_str()));
     p_pr.push_attribute(("indent", format!("-{BULLET_INDENT_EMU}").as_str()));
     w.write_event(Event::Start(p_pr)).expect("write");
-    let mut bu = BytesStart::new("a:buChar");
-    bu.push_attribute(("char", "\u{2022}"));
+    let bu = match marker {
+        ListMarker::Bullet => {
+            let mut bu = BytesStart::new("a:buChar");
+            bu.push_attribute(("char", "\u{2022}"));
+            bu
+        },
+        ListMarker::AutoNum { scheme, start_at } => {
+            let mut bu = BytesStart::new("a:buAutoNum");
+            bu.push_attribute(("type", scheme));
+            // ST_TextBulletStartAtNum: 1..=32767; 1 is the default.
+            if let Some(n) = start_at.filter(|&n| n != 1) {
+                bu.push_attribute(("startAt", n.clamp(1, 32_767).to_string().as_str()));
+            }
+            bu
+        },
+    };
     w.write_event(Event::Empty(bu)).expect("write");
     w.write_event(Event::End(BytesEnd::new("a:pPr")))
         .expect("write");
@@ -2510,7 +2601,7 @@ mod tests {
             let slide = writer.add_slide();
             slide.set_notes_structured(vec![
                 BodyItem::RichText(vec![Run::new("bold note").bold()], ParaProps::default()),
-                BodyItem::BulletList(vec![(0, vec![Run::new("bullet one")])]),
+                BodyItem::BulletList(vec![(0, vec![Run::new("bullet one")], ListMarker::Bullet)]),
             ]);
         }
         let notes_xml = part_xml(writer, "ppt/notesSlides/notesSlide1.xml");

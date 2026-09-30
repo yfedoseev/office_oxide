@@ -83,6 +83,21 @@ pub struct TextRun {
     /// it — `None` when the shape has no `OEPlaceholderAtom`, or its
     /// `placeholderId` has no OOXML-equivalent role.
     pub placeholder_role: Option<String>,
+    /// Hyperlinks covering part of the text (a `TextInteractiveInfoAtom`
+    /// range), in `char` indices. The run stays one piece of text — a link
+    /// inside a sentence does not break the sentence.
+    pub link_ranges: Vec<LinkRange>,
+}
+
+/// A hyperlink over `[start, end)` (`char` indices) of a run's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkRange {
+    /// Start character offset (inclusive).
+    pub start: usize,
+    /// End character offset (exclusive).
+    pub end: usize,
+    /// The link target.
+    pub url: String,
 }
 
 /// Extract per-slide text from a "PowerPoint Document" stream.
@@ -97,24 +112,63 @@ pub struct TextRun {
 /// that directory — see the `persist` module — falling back to weaker
 /// heuristics only when a usable directory can't be built at all (e.g. a
 /// minimal hand-built stream that never went through a real save cycle).
+#[cfg(test)]
 pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<SlideText> {
+    extract_deck_text(stream, current_user).slides
+}
+
+/// What a "PowerPoint Document" stream yields: per-slide text, and the
+/// static text of the masters those slides show.
+#[derive(Debug, Clone, Default)]
+pub struct DeckText {
+    /// One entry per slide, in presentation order.
+    pub slides: Vec<SlideText>,
+    /// The static (non-placeholder) text of every master at least one
+    /// slide shows, each distinct text once; see [`master_static_text`].
+    pub master_text: Vec<TextRun>,
+}
+
+/// Extract the deck's slide text (resolved as described on
+/// `extract_slides_text`) and its masters' static text.
+pub fn extract_deck_text(stream: &[u8], current_user: Option<&[u8]>) -> DeckText {
+    let mut resolved = DeckText::default();
+    if let Some(dir) = persist::build(stream, current_user) {
+        if let Some(deck) = extract_slides_via_persist(stream, &dir) {
+            // A resolved-but-entirely-textless result is ambiguous: it's the
+            // correct answer for a genuinely text-free deck (image-only
+            // slides, or slides whose only text is on their master), but
+            // it's also what a corrupted persist chain that resolved to the
+            // wrong offsets looks like. Fall through to the weaker
+            // heuristics below rather than committing to it — if they also
+            // come up empty, this was the right answer all along, and the
+            // resolved slides are kept.
+            if !deck.slides.is_empty() && deck.slides.iter().any(|s| !s.text_runs.is_empty()) {
+                return deck;
+            }
+            resolved = deck;
+        }
+    }
+    let slides = extract_slides_without_persist(stream);
+    DeckText {
+        slides: if slides.is_empty() {
+            resolved.slides
+        } else {
+            slides
+        },
+        // Which masters the slides show is known only through the persist
+        // directory; the weaker paths cannot tell, so they add none.
+        master_text: resolved.master_text,
+    }
+}
+
+/// The slide-text heuristics used when the persist directory yields no
+/// text: the slide list's inline text cache, then every `Slide` container
+/// in the stream, then every text atom outside the masters and notes.
+fn extract_slides_without_persist(stream: &[u8]) -> Vec<SlideText> {
     // A best-effort fallback scope for the weaker paths below, which have
     // no persist-resolved DocumentContainer to search within at all.
     let stream_wide_hyperlinks = parse_ex_hyperlinks(stream);
     let stream_wide_ole_objects = parse_ex_ole_objects(stream);
-    if let Some(dir) = persist::build(stream, current_user) {
-        if let Some(slides) = extract_slides_via_persist(stream, &dir) {
-            // A resolved-but-entirely-textless result is ambiguous: it's the
-            // correct answer for a genuinely text-free deck (image-only
-            // slides), but it's also what a corrupted persist chain that
-            // resolved to the wrong offsets looks like. Fall through to the
-            // weaker heuristics below rather than committing to it — if they
-            // also come up empty, this was the right answer all along.
-            if !slides.is_empty() && slides.iter().any(|s| !s.text_runs.is_empty()) {
-                return slides;
-            }
-        }
-    }
 
     if let Some(slide_list) = find_descendant(stream, RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES, 0) {
         let slides = extract_slides_from_slide_list_cache(&slide_list);
@@ -125,10 +179,10 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
 
     // Weaker fallback: walk only `Slide` containers found anywhere in the
     // stream. A whole-stream scan also picks up `MainMaster` containers,
-    // whose placeholder prompts ("Click to edit Master title style", the
-    // `*` bullet placeholders) are PowerPoint's own UI strings and never
-    // render on a slide — in two POI corpus files they were 116 of the 137
-    // and 121 extracted characters respectively.
+    // whose placeholder prompts ("Click to edit Master title style", in
+    // whatever language PowerPoint was running) are its own UI strings and
+    // never render on a slide — in two POI corpus files they were 116 of
+    // the 137 and 121 extracted characters respectively.
     let mut slides = Vec::new();
     collect_slide_containers(
         stream,
@@ -142,13 +196,27 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
     }
 
     // Last resort: no resolvable structure at all — dump whatever text atoms
-    // exist anywhere in the stream, minus the master boilerplate.
+    // exist anywhere in the stream, except inside the masters (slide, title,
+    // notes and handout masters), whose text is prompt boilerplate. That is
+    // decided by structure, not by matching the English prompt strings: a
+    // localized master's prompts leaked, and a slide's own text that
+    // happened to start with "Click to add title" was deleted. Notes pages
+    // are skipped too — speaker notes are not slide text.
+    let mut content = Vec::new();
+    for rec in RecordIter::new(stream) {
+        let Ok(rec) = rec else { break };
+        if matches!(rec.header.rec_type, RT_MAIN_MASTER | RT_NOTES | RT_HANDOUT) {
+            continue;
+        }
+        let end = rec.offset + 8 + rec.data.len();
+        content.extend_from_slice(&stream[rec.offset..end]);
+    }
     let mut runs = Vec::new();
     let mut tables = Vec::new();
     let mut image_refs = Vec::new();
     let mut ole_object_refs = Vec::new();
     extract_shape_text(
-        stream,
+        &content,
         0,
         &[],
         &stream_wide_hyperlinks,
@@ -160,7 +228,7 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
         &mut image_refs,
         &mut ole_object_refs,
     );
-    runs.retain(|r| !is_master_placeholder_prompt(&r.text));
+    runs.retain(|r| !is_field_placeholder_only(&r.text));
     if runs.is_empty() && tables.is_empty() && image_refs.is_empty() {
         Vec::new()
     } else {
@@ -205,7 +273,7 @@ fn collect_slide_containers(
                 &mut image_refs,
                 &mut ole_object_refs,
             );
-            runs.retain(|r| !is_master_placeholder_prompt(&r.text));
+            runs.retain(|r| !is_field_placeholder_only(&r.text));
             let hidden = slide_is_hidden(&rec.data);
             out.push(SlideText {
                 text_runs: runs,
@@ -222,26 +290,12 @@ fn collect_slide_containers(
     }
 }
 
-/// Whether a text run is a slide-master placeholder prompt rather than
-/// document content.
-///
-/// PowerPoint stores the master's prompt strings as ordinary text atoms.
-/// They are shown in master view and never rendered on a slide, so a
-/// consumer that receives them gets a document whose "content" is the
-/// application's own UI strings.
-fn is_master_placeholder_prompt(text: &str) -> bool {
+/// Whether a text run is nothing but `*` — the stand-in character
+/// PowerPoint stores for a date, slide-number or footer field placeholder,
+/// not text anyone typed. Language-independent, unlike a prompt string.
+fn is_field_placeholder_only(text: &str) -> bool {
     let t = text.trim();
-    if t.is_empty() {
-        return false;
-    }
-    // The English prompts PowerPoint 97–2003 writes, plus the bare bullet
-    // placeholders that accompany them.
-    t.starts_with("Click to edit Master")
-        || t.starts_with("Click to edit the outline text format")
-        || t.starts_with("Click to add title")
-        || t.starts_with("Click to add text")
-        || t.starts_with("Click to add notes")
-        || t.chars().all(|c| c == '*' || c.is_whitespace())
+    !t.is_empty() && t.chars().all(|c| c == '*' || c.is_whitespace())
 }
 
 /// Resolve the current "Slides" list through the persist directory and
@@ -258,7 +312,7 @@ fn is_master_placeholder_prompt(text: &str) -> bool {
 /// Returns `None` if the `DocumentContainer` or its slide list can't be
 /// resolved at all (directory present but unusable); returns `Some(vec![])`
 /// if the slide list resolves but is empty.
-fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<Vec<SlideText>> {
+fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<DeckText> {
     let doc_offset = dir.resolve(dir.doc_persist_id)?;
     let doc_children = bounded_container_children(stream, doc_offset, RT_DOCUMENT)?;
     let slide_list = find_child(&doc_children, RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES)?;
@@ -268,35 +322,459 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
     // directory itself exists to route around for slides).
     let hyperlinks = parse_ex_hyperlinks(&doc_children);
     let ole_objects = parse_ex_ole_objects(&doc_children);
-    // The deck's header/footer/user-date text, applied uniformly to every
-    // slide ("Apply to All" in PowerPoint's own Header and Footer dialog)
-    // rather than stored per-slide — confirmed by direct inspection of a
-    // real corpus file's DocumentContainer.
-    let headers_footers = parse_headers_footers(&doc_children);
+    // The deck's slide header/footer settings ("Apply to All" in
+    // PowerPoint's Header and Footer dialog): the DocumentContainer's
+    // `SlideHeadersFootersContainer`, which a slide's own container
+    // overrides.
+    let deck_headers_footers = find_child(&doc_children, RT_HEADER_FOOTER, HF_INSTANCE_SLIDES)
+        .map(|hf| shown_slide_header_footer_texts(&hf))
+        .unwrap_or_default();
+
+    let fonts = font_collection(&doc_children);
 
     let mut slides = Vec::new();
-    let mut current_persist_id: Option<u32> = None;
-    let mut outline_texts: Vec<TextRun> = Vec::new();
+    // Per slide: its `SlideId` and `SlideAtom.notesIdRef`, to attach notes.
+    let mut slide_links: Vec<(u32, Option<u32>)> = Vec::new();
+    // Per slide: its `(masterIdRef, fMasterObjects)`.
+    let mut master_refs: Vec<(u32, bool)> = Vec::new();
+    let master_persist_ids = master_persist_ids(&doc_children);
+    for entry in slide_list_entries(&slide_list) {
+        let (mut slide, links) = resolve_slide(
+            stream,
+            dir,
+            &master_persist_ids,
+            entry.persist_id_ref,
+            &entry.outline_texts,
+            &hyperlinks,
+            &ole_objects,
+        );
+        let hf_texts = links
+            .headers_footers
+            .as_deref()
+            .unwrap_or(&deck_headers_footers);
+        for text in hf_texts {
+            slide.text_runs.push(TextRun {
+                text_type: TextType::Other,
+                text: text.clone(),
+                hyperlink: None,
+                ..Default::default()
+            });
+        }
+        slides.push(slide);
+        slide_links.push((entry.slide_id, links.notes_id_ref));
+        master_refs.extend(links.master);
+    }
+
+    // Speaker notes: the `NotesListWithTextContainer` lists every notes
+    // page; a slide names its own through `SlideAtom.notesIdRef` (matching
+    // the notes entry's `SlidePersistAtom.slideId`, [MS-PPT]
+    // `NotesIdRef`), and each notes page names its slide through
+    // `NotesAtom.slideIdRef` — used when the slide's reference is absent.
+    if let Some(notes_list) = find_child(&doc_children, RT_SLIDE_LIST_WITH_TEXT, SLWT_NOTES) {
+        let mut by_notes_id: HashMap<u32, Vec<TextRun>> = HashMap::new();
+        let mut by_slide_id: HashMap<u32, Vec<TextRun>> = HashMap::new();
+        for entry in slide_list_entries(&notes_list) {
+            let Some((runs, slide_id_ref)) = resolve_notes(
+                stream,
+                dir,
+                entry.persist_id_ref,
+                &entry.outline_texts,
+                &hyperlinks,
+                &ole_objects,
+            ) else {
+                continue;
+            };
+            if let Some(sid) = slide_id_ref {
+                by_slide_id.entry(sid).or_insert_with(|| runs.clone());
+            }
+            by_notes_id.entry(entry.slide_id).or_insert(runs);
+        }
+        for (slide, &(slide_id, notes_id_ref)) in slides.iter_mut().zip(&slide_links) {
+            let notes = notes_id_ref
+                .filter(|&id| id != 0)
+                .and_then(|id| by_notes_id.get(&id))
+                .or_else(|| by_slide_id.get(&slide_id));
+            if let Some(runs) = notes {
+                slide.text_runs.extend(runs.iter().cloned());
+            }
+        }
+    }
+
+    let mut master_text = master_static_text(
+        stream,
+        dir,
+        &master_persist_ids,
+        master_refs.iter().copied(),
+        &hyperlinks,
+        &ole_objects,
+    );
+    // The notes/handout header and footer print on every notes page and
+    // handout through the Notes and Handout Masters when shown. They are
+    // never slide text; they belong with the other master-level text, once.
+    if let Some(hf) = find_child(&doc_children, RT_HEADER_FOOTER, HF_INSTANCE_NOTES) {
+        for text in shown_header_footer_texts(&hf, true) {
+            if !master_text.iter().any(|r| r.text == text) {
+                master_text.push(TextRun {
+                    text_type: TextType::Other,
+                    text,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    // Every run's `fontRef` names a font in the deck's collection.
+    if !fonts.is_empty() {
+        for run in slides
+            .iter_mut()
+            .flat_map(|s| s.text_runs.iter_mut())
+            .chain(master_text.iter_mut())
+        {
+            for span in &mut run.char_formats {
+                span.format.typeface = span
+                    .format
+                    .font_ref
+                    .and_then(|r| fonts.get(r as usize))
+                    .cloned();
+            }
+        }
+    }
+
+    Some(DeckText {
+        slides,
+        master_text,
+    })
+}
+
+/// `masterId` → `persistIdRef` for every entry of the
+/// `MasterListWithTextContainer` ([MS-PPT] `MasterListWithTextContainer`,
+/// a `SlideListWithText` record with `recInstance` 1; each child is a
+/// `MasterPersistAtom`, whose `masterId` sits at body offset 12). A
+/// `SlideAtom.masterIdRef` names a master by this `masterId` ([MS-PPT]
+/// `MasterIdRef`), not by its persist id.
+fn master_persist_ids(doc_children: &[u8]) -> HashMap<u32, u32> {
+    let Some(list) = find_child(doc_children, RT_SLIDE_LIST_WITH_TEXT, SLWT_MASTERS) else {
+        return HashMap::new();
+    };
+    slide_list_entries(&list)
+        .into_iter()
+        .map(|e| (e.slide_id, e.persist_id_ref))
+        .collect()
+}
+
+/// A master resolved from its `masterId`.
+enum MasterContainer {
+    /// A `MainMasterContainer`'s children.
+    Main(Vec<u8>),
+    /// A title master — a `SlideContainer` listed in the master list —
+    /// whose own `SlideAtom` names its main master.
+    Title(Vec<u8>),
+}
+
+/// Resolve a `SlideAtom.masterIdRef` to its master: the `masterId` maps to
+/// a persist id through the `MasterListWithTextContainer`
+/// ([`master_persist_ids`]), and that persist id to a `MainMaster` or a
+/// title-master `Slide` container. The one resolver for both master
+/// formatting inheritance and master static text. `None` when any link is
+/// missing — never a guess from the id's low bits.
+fn resolve_master(
+    stream: &[u8],
+    dir: &PersistDirectory,
+    master_persist_ids: &HashMap<u32, u32>,
+    master_id: u32,
+) -> Option<MasterContainer> {
+    let offset = dir.resolve(*master_persist_ids.get(&master_id)?)?;
+    if let Some(c) = bounded_container_children(stream, offset, RT_MAIN_MASTER) {
+        return Some(MasterContainer::Main(c));
+    }
+    bounded_container_children(stream, offset, RT_SLIDE).map(MasterContainer::Title)
+}
+
+/// Bound on master → master references followed (a title master names
+/// its main master); real decks need one hop.
+const MAX_MASTER_CHAIN: usize = 8;
+
+/// The static text of every master a slide shows, in first-use order,
+/// each distinct text once.
+///
+/// `slide_masters` yields each slide's `(SlideAtom.masterIdRef,
+/// fMasterObjects)`. A slide shows its master's shapes only when
+/// `fMasterObjects` is set ([MS-PPT] `SlideAtom.slideFlags`, bit 0: "the
+/// slide follows the master objects"); a master none of the slides shows
+/// contributes nothing. A title master is itself a `SlideContainer` with a
+/// `SlideAtom` naming its main master, followed the same way.
+///
+/// Only shapes that are not placeholders count — see
+/// [`collect_master_static_runs`]. Placeholder text on a master is
+/// PowerPoint's prompt ("Click to edit Master title style", in the
+/// language PowerPoint ran in), which never appears on a slide.
+fn master_static_text(
+    stream: &[u8],
+    dir: &PersistDirectory,
+    master_persist_ids: &HashMap<u32, u32>,
+    slide_masters: impl Iterator<Item = (u32, bool)>,
+    hyperlinks: &HashMap<u32, String>,
+    ole_objects: &HashMap<u32, OleObjectInfo>,
+) -> Vec<TextRun> {
+    let mut visited = std::collections::HashSet::new();
+    let mut runs = Vec::new();
+    for (first, follows) in slide_masters {
+        let mut next = follows.then_some(first);
+        for _ in 0..MAX_MASTER_CHAIN {
+            let Some(master_id) = next.take() else { break };
+            if master_id == 0 || !visited.insert(master_id) {
+                break;
+            }
+            let children = match resolve_master(stream, dir, master_persist_ids, master_id) {
+                Some(MasterContainer::Main(c)) => c,
+                Some(MasterContainer::Title(c)) => {
+                    // A title master: its own shapes, then its main master's
+                    // when it follows that master's objects.
+                    next = slide_master_ref(&c).and_then(|(id, follows)| follows.then_some(id));
+                    c
+                },
+                None => break,
+            };
+            collect_master_static_runs(&children, 0, hyperlinks, ole_objects, &mut runs);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    runs.retain(|r| seen.insert(r.text.trim().to_string()));
+    runs
+}
+
+/// A `Slide`/title-master container's `SlideAtom` `(masterIdRef,
+/// fMasterObjects)` ([MS-PPT] `SlideAtom`: `masterIdRef` at body offset
+/// 12, `slideFlags` at 20, `fMasterObjects` its bit 0).
+fn slide_master_ref(children: &[u8]) -> Option<(u32, bool)> {
+    let atom = RecordIter::new(children)
+        .filter_map(Result::ok)
+        .find(|r| r.header.rec_type == RT_SLIDE_ATOM)?;
+    let id = atom.data.get(12..16)?;
+    let flags = atom.data.get(20..22)?;
+    Some((
+        u32::from_le_bytes([id[0], id[1], id[2], id[3]]),
+        u16::from_le_bytes([flags[0], flags[1]]) & SLIDE_FLAG_MASTER_OBJECTS != 0,
+    ))
+}
+
+/// Collect the text of a master's non-placeholder shapes. A shape is a
+/// placeholder when its `OfficeArtClientData` carries an
+/// `OEPlaceholderAtom` or a `RoundTripHFPlaceholder12Atom`; as a second
+/// line of defence only `Tx_TYPE_OTHER` text is kept, since every other
+/// text type (title, body, notes and their variants) is placeholder text
+/// by definition ([MS-PPT] `TextTypeEnum`). Field stand-ins (`*`) and
+/// blank text are dropped too.
+fn collect_master_static_runs(
+    data: &[u8],
+    depth: usize,
+    hyperlinks: &HashMap<u32, String>,
+    ole_objects: &HashMap<u32, OleObjectInfo>,
+    out: &mut Vec<TextRun>,
+) {
+    if depth > MAX_SHAPE_DEPTH {
+        return;
+    }
+    for rec in RecordIter::new(data) {
+        let Ok(rec) = rec else { break };
+        if rec.header.rec_type == RT_SHAPE {
+            if shape_is_placeholder(&rec.data) {
+                continue;
+            }
+            let hyperlink = resolve_shape_hyperlink(&rec.data, hyperlinks);
+            let mut runs = Vec::new();
+            let mut tables = Vec::new();
+            extract_shape_text(
+                &rec.data,
+                depth + 1,
+                &[],
+                hyperlinks,
+                ole_objects,
+                hyperlink.as_deref(),
+                None,
+                &mut runs,
+                &mut tables,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            );
+            let table_runs = tables.into_iter().flat_map(|t| t.rows).flatten().flatten();
+            out.extend(runs.into_iter().chain(table_runs).filter(|r| {
+                r.text_type == TextType::Other
+                    && !r.text.trim().is_empty()
+                    && !is_field_placeholder_only(&r.text)
+            }));
+        } else if rec.header.is_container() {
+            collect_master_static_runs(&rec.data, depth + 1, hyperlinks, ole_objects, out);
+        }
+    }
+}
+
+/// Whether a shape is a placeholder: its `OfficeArtClientData` holds an
+/// `OEPlaceholderAtom` or a `RoundTripHFPlaceholder12Atom`, whatever the
+/// role ([MS-PPT] `OfficeArtClientData`).
+fn shape_is_placeholder(shape_data: &[u8]) -> bool {
+    let Some(client_data) = find_descendant(shape_data, RT_CLIENT_DATA, 0, 0) else {
+        return false;
+    };
+    find_descendant(&client_data, RT_OE_PLACEHOLDER_ATOM, 0, 0).is_some()
+        || find_descendant(&client_data, RT_ROUND_TRIP_HF_PLACEHOLDER12_ATOM, 0, 0).is_some()
+}
+
+/// The deck's typeface names, in `FontCollectionContainer` order — the
+/// index a `TextCFException.fontRef` uses ([MS-PPT] `FontEntityAtom`:
+/// `lfFaceName` is 32 UTF-16 units, NUL-terminated or padded).
+fn font_collection(doc_children: &[u8]) -> Vec<String> {
+    let Some(env) = find_child(doc_children, RT_ENVIRONMENT, 0) else {
+        return Vec::new();
+    };
+    let Some(collection) = find_child(&env, RT_FONT_COLLECTION, 0) else {
+        return Vec::new();
+    };
+    RecordIter::new(&collection)
+        .filter_map(Result::ok)
+        .filter(|r| r.header.rec_type == RT_FONT_ENTITY_ATOM)
+        .map(|r| {
+            let name = r.data.get(..64).unwrap_or(&r.data);
+            let name = decode_utf16le(name);
+            name.split('\0').next().unwrap_or_default().to_string()
+        })
+        .collect()
+}
+
+/// Whether the deck carries a VBA project: a `VBAInfoAtom` with
+/// `fHasMacros` set and a non-zero `persistIdRef` in the current
+/// `DocumentContainer` ([MS-PPT] `VBAInfoAtom`). A `.ppt` keeps its project
+/// as a compressed storage inside the "PowerPoint Document" stream, not as
+/// a CFB root storage the way `.xls` (`_VBA_PROJECT_CUR`) and `.doc`
+/// (`Macros`) do.
+pub fn has_vba_project(stream: &[u8], current_user: Option<&[u8]>) -> bool {
+    let doc_children = persist::build(stream, current_user)
+        .and_then(|dir| dir.resolve(dir.doc_persist_id))
+        .and_then(|offset| bounded_container_children(stream, offset, RT_DOCUMENT));
+    let scope = doc_children.as_deref().unwrap_or(stream);
+    find_record_any_instance(scope, RT_VBA_INFO_ATOM, 0).is_some_and(|atom| {
+        atom.len() >= 8
+            && u32::from_le_bytes([atom[0], atom[1], atom[2], atom[3]]) != 0
+            && u32::from_le_bytes([atom[4], atom[5], atom[6], atom[7]]) == 1
+    })
+}
+
+/// Bounded recursive search for the first record of `rec_type`, whatever
+/// its instance, returning its body.
+fn find_record_any_instance(data: &[u8], rec_type: u16, depth: usize) -> Option<Vec<u8>> {
+    if depth > MAX_SHAPE_DEPTH {
+        return None;
+    }
+    for rec in RecordIter::new(data) {
+        let Ok(rec) = rec else { break };
+        if rec.header.rec_type == rec_type {
+            return Some(rec.data);
+        }
+        if rec.header.is_container() {
+            if let Some(found) = find_record_any_instance(&rec.data, rec_type, depth + 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// The header/footer text a slides' `HeadersFootersContainer` actually
+/// shows: the footer when `fHasFooter` is set, the user date when both
+/// `fHasDate` and `fHasUserDate` are ([MS-PPT] `HeadersFootersAtom`).
+/// The header string is the notes/handout page's and is never shown on a
+/// slide; an automatic date has no stored text.
+fn shown_slide_header_footer_texts(hf_children: &[u8]) -> Vec<String> {
+    shown_header_footer_texts(hf_children, false)
+}
+
+/// The shown header/footer text of a `HeadersFootersContainer`: the header
+/// (only when `with_header` — a notes/handout container) under
+/// `fHasHeader`, the footer under `fHasFooter`, the user date under
+/// `fHasDate` + `fHasUserDate` ([MS-PPT] `HeadersFootersAtom`).
+fn shown_header_footer_texts(hf_children: &[u8], with_header: bool) -> Vec<String> {
+    let mut flags = 0u16;
+    let mut user_date = None;
+    let mut header = None;
+    let mut footer = None;
+    for rec in RecordIter::new(hf_children) {
+        let Ok(rec) = rec else { break };
+        match rec.header.rec_type {
+            RT_HEADER_FOOTER_ATOM if rec.data.len() >= 4 => {
+                flags = u16::from_le_bytes([rec.data[2], rec.data[3]]);
+            },
+            RT_CSTRING => {
+                let text = decode_utf16le(&rec.data).trim().to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                match rec.header.rec_instance {
+                    HF_CSTRING_USER_DATE => user_date = Some(text),
+                    HF_CSTRING_HEADER => header = Some(text),
+                    HF_CSTRING_FOOTER => footer = Some(text),
+                    _ => {},
+                }
+            },
+            _ => {},
+        }
+    }
+    let mut texts = Vec::new();
+    if with_header && flags & HF_HAS_HEADER != 0 {
+        texts.extend(header);
+    }
+    if flags & HF_HAS_FOOTER != 0 {
+        texts.extend(footer);
+    }
+    if flags & HF_HAS_DATE != 0 && flags & HF_HAS_USER_DATE != 0 {
+        texts.extend(user_date);
+    }
+    texts
+}
+
+/// What resolving a slide found besides its text: its
+/// `SlideAtom.notesIdRef`, and its own slide header/footer settings when it
+/// overrides the deck's.
+struct SlideLinks {
+    notes_id_ref: Option<u32>,
+    headers_footers: Option<Vec<String>>,
+    /// `SlideAtom` `(masterIdRef, fMasterObjects)`.
+    master: Option<(u32, bool)>,
+}
+
+/// One `SlidePersistAtom` entry of a `SlideListWithText`-family container
+/// and the outline-text sequence that follows it ([MS-PPT] 2.4.14.3).
+struct SlideListEntry {
+    persist_id_ref: u32,
+    /// `SlidePersistAtom.slideId` (body offset 12): the slide's `SlideId`,
+    /// or for a notes list the notes page's `NotesId`.
+    slide_id: u32,
+    outline_texts: Vec<TextRun>,
+}
+
+/// Walk a `SlideListWithText`/`NotesListWithText` container's records into
+/// one entry per `SlidePersistAtom`, each with its outline texts — the
+/// `TextHeaderAtom`/`TextCharsAtom`/`TextBytesAtom` runs that directly
+/// follow it, which an `OutlineTextRefAtom` indexes into.
+fn slide_list_entries(list: &[u8]) -> Vec<SlideListEntry> {
+    let mut entries: Vec<SlideListEntry> = Vec::new();
     let mut current_type = TextType::Other;
     let mut last_outline_idx: Option<usize> = None;
-
-    for rec in RecordIter::new(&slide_list) {
+    for rec in RecordIter::new(list) {
         let Ok(rec) = rec else { break };
         match rec.header.rec_type {
             RT_SLIDE_PERSIST_ATOM if rec.data.len() >= 4 => {
-                if let Some(persist_id_ref) = current_persist_id.take() {
-                    slides.push(resolve_slide(
-                        stream,
-                        dir,
-                        persist_id_ref,
-                        &outline_texts,
-                        &hyperlinks,
-                        &ole_objects,
-                    ));
-                }
-                current_persist_id =
-                    Some(u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]));
-                outline_texts.clear();
+                let persist_id_ref =
+                    u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]);
+                let slide_id = rec
+                    .data
+                    .get(12..16)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .unwrap_or(0);
+                entries.push(SlideListEntry {
+                    persist_id_ref,
+                    slide_id,
+                    outline_texts: Vec::new(),
+                });
                 current_type = TextType::Other;
                 last_outline_idx = None;
             },
@@ -305,92 +783,82 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
                 current_type = TextType::from_u32(t);
                 last_outline_idx = None;
             },
-            RT_TEXT_CHARS => {
+            RT_TEXT_CHARS | RT_TEXT_BYTES => {
+                let Some(entry) = entries.last_mut() else {
+                    continue;
+                };
+                let text = if rec.header.rec_type == RT_TEXT_CHARS {
+                    decode_utf16le(&rec.data)
+                } else {
+                    decode_text_bytes(&rec.data)
+                };
                 // Positional index into this list is meaningful (it's what
                 // OutlineTextRefAtom references) — an empty run still
                 // occupies a slot and must not be skipped here.
-                outline_texts.push(TextRun {
+                entry.outline_texts.push(TextRun {
                     text_type: current_type,
-                    text: decode_utf16le(&rec.data),
+                    text,
                     hyperlink: None,
                     ..Default::default()
                 });
-                last_outline_idx = Some(outline_texts.len() - 1);
-            },
-            RT_TEXT_BYTES => {
-                outline_texts.push(TextRun {
-                    text_type: current_type,
-                    text: rec.data.iter().map(|&b| b as char).collect(),
-                    hyperlink: None,
-                    ..Default::default()
-                });
-                last_outline_idx = Some(outline_texts.len() - 1);
+                last_outline_idx = Some(entry.outline_texts.len() - 1);
             },
             RT_STYLE_TEXT_PROP => {
-                if let Some(idx) = last_outline_idx {
-                    apply_style_text_prop(&mut outline_texts[idx], &rec.data);
+                if let (Some(entry), Some(idx)) = (entries.last_mut(), last_outline_idx) {
+                    apply_style_text_prop(&mut entry.outline_texts[idx], &rec.data);
                 }
             },
             _ => {},
         }
     }
-    if let Some(persist_id_ref) = current_persist_id.take() {
-        slides.push(resolve_slide(
-            stream,
-            dir,
-            persist_id_ref,
-            &outline_texts,
-            &hyperlinks,
-            &ole_objects,
-        ));
-    }
-
-    if !headers_footers.is_empty() {
-        for slide in &mut slides {
-            for text in &headers_footers {
-                slide.text_runs.push(TextRun {
-                    text_type: TextType::Other,
-                    text: text.clone(),
-                    hyperlink: None,
-                    ..Default::default()
-                });
-            }
-        }
-    }
-
-    Some(slides)
+    entries
 }
 
-/// Extract the header/footer/user-date `CString` text from every
-/// `HeadersFootersContainer` (0x0FD9) directly under `doc_children`. A
-/// `DocumentContainer` commonly carries two — one for slides, one for
-/// notes/handouts — collected together (deduplicated) since a deck's
-/// slide-facing header/footer is what's relevant here.
-fn parse_headers_footers(doc_children: &[u8]) -> Vec<String> {
-    let mut texts = Vec::new();
-    for rec in RecordIter::new(doc_children) {
-        let Ok(rec) = rec else { break };
-        if rec.header.rec_type != RT_HEADER_FOOTER {
-            continue;
-        }
-        for child in RecordIter::new(&rec.data) {
-            let Ok(child) = child else { break };
-            if child.header.rec_type != RT_CSTRING {
-                continue;
-            }
-            let text = decode_utf16le(&child.data);
-            let text = text.trim();
-            if !text.is_empty() && !texts.iter().any(|t: &String| t == text) {
-                texts.push(text.to_string());
-            }
-        }
-    }
-    texts
+/// Resolve one notes page: its `Notes` container's `Tx_TYPE_NOTES` text
+/// (the notes body — not the page's slide image or date/number
+/// placeholders), and the `NotesAtom.slideIdRef` of the slide it belongs
+/// to. `None` when the container does not resolve.
+fn resolve_notes(
+    stream: &[u8],
+    dir: &PersistDirectory,
+    persist_id_ref: u32,
+    outline_texts: &[TextRun],
+    hyperlinks: &HashMap<u32, String>,
+    ole_objects: &HashMap<u32, OleObjectInfo>,
+) -> Option<(Vec<TextRun>, Option<u32>)> {
+    let offset = dir.resolve(persist_id_ref)?;
+    let children = bounded_container_children(stream, offset, RT_NOTES)?;
+    let slide_id_ref = RecordIter::new(&children)
+        .filter_map(Result::ok)
+        .find(|r| r.header.rec_type == RT_NOTES_ATOM)
+        .and_then(|r| {
+            r.data
+                .get(0..4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        });
+    let mut runs = Vec::new();
+    extract_shape_text(
+        &children,
+        0,
+        outline_texts,
+        hyperlinks,
+        ole_objects,
+        None,
+        None,
+        &mut runs,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+    runs.retain(|r| r.text_type == TextType::Notes && !r.text.trim().is_empty());
+    Some((runs, slide_id_ref))
 }
 
 /// Resolve one slide's shape text: locate its `Slide` container via the
 /// persist directory and walk its shape tree, resolving any
-/// `OutlineTextRefAtom` references against `outline_texts`.
+/// `OutlineTextRefAtom` references against `outline_texts`. Also returns
+/// the slide's `SlideAtom.notesIdRef` (body offset 16) and its own
+/// header/footer override, when present.
 ///
 /// Every persist-directory-resolved slide is kept regardless of whether text
 /// was found — an image-only slide is still a slide, and the presentation's
@@ -398,18 +866,33 @@ fn parse_headers_footers(doc_children: &[u8]) -> Vec<String> {
 fn resolve_slide(
     stream: &[u8],
     dir: &PersistDirectory,
+    master_persist_ids: &HashMap<u32, u32>,
     persist_id_ref: u32,
     outline_texts: &[TextRun],
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
-) -> SlideText {
+) -> (SlideText, SlideLinks) {
     let mut text_runs = Vec::new();
     let mut tables = Vec::new();
     let mut image_refs = Vec::new();
     let mut ole_object_refs = Vec::new();
     let mut hidden = false;
+    let mut notes_id_ref = None;
+    let mut headers_footers = None;
+    let mut master = None;
     if let Some(offset) = dir.resolve(persist_id_ref) {
         if let Some(children) = bounded_container_children(stream, offset, RT_SLIDE) {
+            master = slide_master_ref(&children);
+            headers_footers = find_child(&children, RT_HEADER_FOOTER, HF_INSTANCE_SLIDES)
+                .map(|hf| shown_slide_header_footer_texts(&hf));
+            notes_id_ref = RecordIter::new(&children)
+                .filter_map(Result::ok)
+                .find(|r| r.header.rec_type == RT_SLIDE_ATOM)
+                .and_then(|r| {
+                    r.data
+                        .get(16..20)
+                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                });
             extract_shape_text(
                 &children,
                 0,
@@ -430,126 +913,204 @@ fn resolve_slide(
             // main master. Best-effort: any missing piece
             // of this chain (no SlideAtom, no master, no matching
             // TxMasterStyleAtom) just leaves direct formatting as-is.
-            if let Some(master_id) = find_master_id(&children) {
-                if let Some(styles) = resolve_master_styles(stream, dir, master_id) {
+            if let Some((master_id, _)) = master {
+                if let Some(styles) =
+                    resolve_master_styles(stream, dir, master_persist_ids, master_id)
+                {
                     apply_master_inheritance(&mut text_runs, &styles);
                 }
             }
         }
     }
-    SlideText {
-        text_runs,
-        tables,
-        image_refs,
-        ole_object_refs,
-        hidden,
-    }
+    (
+        SlideText {
+            text_runs,
+            tables,
+            image_refs,
+            ole_object_refs,
+            hidden,
+        },
+        SlideLinks {
+            notes_id_ref,
+            headers_footers,
+            master,
+        },
+    )
 }
 
-/// The level-0 (no indentation) master style for the two placeholder
-/// text types this crate resolves inheritance for — matches the
-/// issue's own "title vs body" scope. Levels 1-4 (nested outline
-/// bullets) are a follow-up, not attempted here.
+/// A main master's text styles: for each `TextTypeEnum` value (the
+/// `TxMasterStyleAtom` `recInstance`, 0-8), its indent levels 0-4, each
+/// level already carrying whatever it leaves unset from the level above
+/// it ([MS-PPT] `TextMasterStyleAtom`: a level's exceptions override the
+/// previous level's).
 #[derive(Debug, Clone, Default)]
 struct MasterStyles {
-    title: Option<(super::style::ParaFormat, super::style::CharFormat)>,
-    body: Option<(super::style::ParaFormat, super::style::CharFormat)>,
+    levels: [Vec<(super::style::ParaFormat, super::style::CharFormat)>; 9],
 }
 
-/// Find a `Slide` container's own `SlideAtom` and return its
-/// `masterIdRef` — the persist ID of the main master this slide
-/// inherits from. Layout ([MS-PPT] 2.4.2, cross-checked against Apache
-/// POI's `SlideAtom`): after the embedded 12-byte `SSlideLayoutAtom`,
-/// `masterIdRef: i32` immediately follows (body-relative offset 12).
-fn find_master_id(slide_children: &[u8]) -> Option<u32> {
-    // `USES_MASTER_SLIDE_ID` (0x80000000, per Apache POI's `SlideAtom`) is
-    // OR'd into `masterID`'s high bit as a "this references a real master"
-    // flag, not part of the persist ID itself — every real corpus file
-    // sets it, and masking it out is required for `dir.resolve()` to ever
-    // find the master (without this, every lookup silently misses).
-    const USES_MASTER_SLIDE_ID: u32 = 0x8000_0000;
-    for rec in RecordIter::new(slide_children) {
-        let Ok(rec) = rec else { break };
-        if rec.header.rec_type == RT_SLIDE_ATOM {
-            let b = rec.data.get(12..16)?;
-            let master_id = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-            return Some(master_id & !USES_MASTER_SLIDE_ID);
-        }
+impl MasterStyles {
+    /// The levels a run of `text_type` inherits from. The placeholder
+    /// variants fall back to their base style when the master has none of
+    /// their own — `CenterTitle` to `Title`, `CenterBody`/`HalfBody`/
+    /// `QuarterBody` to `Body` — as PowerPoint derives them.
+    fn for_type(
+        &self,
+        text_type: TextType,
+    ) -> Option<&[(super::style::ParaFormat, super::style::CharFormat)]> {
+        let (own, base) = match text_type {
+            TextType::Title => (0, None),
+            TextType::Body => (1, None),
+            TextType::Notes => (2, None),
+            TextType::Other => (4, None),
+            TextType::CenterBody => (5, Some(1)),
+            TextType::CenterTitle => (6, Some(0)),
+            TextType::HalfBody => (7, Some(1)),
+            TextType::QuarterBody => (8, Some(1)),
+        };
+        [Some(own), base]
+            .into_iter()
+            .flatten()
+            .map(|i| self.levels[i].as_slice())
+            .find(|l| !l.is_empty())
     }
-    None
 }
 
-/// Resolve `master_id` through the persist directory to its
-/// `MainMaster` container, then parse its `TxMasterStyleAtom` children
-/// for the Title/Body text types' level-0 style.
+/// Resolve `master_id` (a `SlideAtom.masterIdRef`) to its main master via
+/// [`resolve_master`] — through a title master to the main master it
+/// names, since only main masters carry text styles — then parse every
+/// `TxMasterStyleAtom` child: one per text type, up to five indent levels
+/// each.
 fn resolve_master_styles(
     stream: &[u8],
     dir: &PersistDirectory,
+    master_persist_ids: &HashMap<u32, u32>,
     master_id: u32,
 ) -> Option<MasterStyles> {
-    let offset = dir.resolve(master_id)?;
-    let children = bounded_container_children(stream, offset, RT_MAIN_MASTER)?;
+    let mut master_id = master_id;
+    let mut children = None;
+    for _ in 0..MAX_MASTER_CHAIN {
+        match resolve_master(stream, dir, master_persist_ids, master_id)? {
+            MasterContainer::Main(c) => {
+                children = Some(c);
+                break;
+            },
+            MasterContainer::Title(c) => master_id = slide_master_ref(&c)?.0,
+        }
+    }
+    let children = children?;
     let mut styles = MasterStyles::default();
     for rec in RecordIter::new(&children) {
         let Ok(rec) = rec else { break };
         if rec.header.rec_type != RT_TX_MASTER_STYLE_ATOM {
             continue;
         }
-        let text_type = TextType::from_u32(rec.header.rec_instance as u32);
-        let target = match text_type {
-            TextType::Title => &mut styles.title,
-            TextType::Body => &mut styles.body,
-            _ => continue,
+        let Some(slot) = styles.levels.get_mut(rec.header.rec_instance as usize) else {
+            continue;
         };
-        if target.is_none() {
-            let levels = style::parse_tx_master_style_atom(&rec.data, rec.header.rec_instance);
-            *target = levels.into_iter().next();
+        if slot.is_empty() {
+            *slot = cascade_levels(style::parse_tx_master_style_atom(
+                &rec.data,
+                rec.header.rec_instance,
+            ));
         }
     }
-    if styles.title.is_none() && styles.body.is_none() {
+    if styles.levels.iter().all(Vec::is_empty) {
         return None;
     }
     Some(styles)
 }
 
-/// Fill any unset `CharFormat`/`ParaFormat` field on every Title/Body
-/// `TextRun` from the resolved master style — a run with no direct
-/// formatting spans at all gets one synthetic whole-text span carrying
-/// pure master formatting, matching what PowerPoint itself renders.
+/// Make each master level carry what it leaves unset from the level above
+/// it, so a paragraph at level `n` needs only level `n`.
+fn cascade_levels(
+    levels: Vec<(super::style::ParaFormat, super::style::CharFormat)>,
+) -> Vec<(super::style::ParaFormat, super::style::CharFormat)> {
+    let mut out: Vec<(super::style::ParaFormat, super::style::CharFormat)> =
+        Vec::with_capacity(levels.len());
+    for (pf, cf) in levels {
+        let resolved = match out.last() {
+            Some((ppf, pcf)) => (pf.inherit_from(ppf), cf.inherit_from(pcf)),
+            None => (pf, cf),
+        };
+        out.push(resolved);
+    }
+    out
+}
+
+/// Fill any unset `CharFormat`/`ParaFormat` field on every `TextRun` from
+/// the master style of its text type, at each paragraph's own indent
+/// level (`TextPFRun.indentLevel`; level 0 where the run has no paragraph
+/// formatting). A run with no direct formatting spans at all gets one
+/// synthetic whole-text span carrying pure level-0 master formatting,
+/// matching what PowerPoint itself renders.
 fn apply_master_inheritance(text_runs: &mut [TextRun], styles: &MasterStyles) {
     for run in text_runs {
-        let Some((master_pf, master_cf)) = (match run.text_type {
-            TextType::Title => styles.title.as_ref(),
-            TextType::Body => styles.body.as_ref(),
-            _ => None,
-        }) else {
+        let Some(levels) = styles.for_type(run.text_type) else {
             continue;
         };
+        let level_at = |level: Option<u16>| {
+            let i = (level.unwrap_or(0) as usize).min(levels.len() - 1);
+            &levels[i]
+        };
         let text_char_len = run.text.chars().count();
+        // Character spans first, while the paragraph spans still carry
+        // only the file's own indent levels: split each at the paragraph
+        // boundaries it crosses, so each piece inherits from its own
+        // paragraph's level.
         if run.char_formats.is_empty() {
             if text_char_len > 0 {
                 run.char_formats.push(CharFormatSpan {
                     start: 0,
                     end: text_char_len,
-                    format: master_cf.clone(),
+                    format: level_at(None).1.clone(),
                 });
             }
         } else {
-            for span in &mut run.char_formats {
-                span.format = span.format.inherit_from(master_cf);
+            let mut split = Vec::with_capacity(run.char_formats.len());
+            for span in &run.char_formats {
+                let mut cursor = span.start;
+                for p in run
+                    .para_formats
+                    .iter()
+                    .filter(|p| p.end > span.start && p.start < span.end)
+                {
+                    let (a, b) = (p.start.max(span.start), p.end.min(span.end));
+                    if a > cursor {
+                        split.push(CharFormatSpan {
+                            start: cursor,
+                            end: a,
+                            format: span.format.inherit_from(&level_at(None).1),
+                        });
+                    }
+                    split.push(CharFormatSpan {
+                        start: a,
+                        end: b,
+                        format: span.format.inherit_from(&level_at(p.format.indent_level).1),
+                    });
+                    cursor = b;
+                }
+                if cursor < span.end {
+                    split.push(CharFormatSpan {
+                        start: cursor,
+                        end: span.end,
+                        format: span.format.inherit_from(&level_at(None).1),
+                    });
+                }
             }
+            run.char_formats = split;
         }
         if run.para_formats.is_empty() {
             if text_char_len > 0 {
                 run.para_formats.push(ParaFormatSpan {
                     start: 0,
                     end: text_char_len,
-                    format: master_pf.clone(),
+                    format: level_at(None).0.clone(),
                 });
             }
         } else {
             for span in &mut run.para_formats {
-                span.format = span.format.inherit_from(master_pf);
+                let master = &level_at(span.format.indent_level).0;
+                span.format = span.format.inherit_from(master);
             }
         }
     }
@@ -620,7 +1181,7 @@ fn extract_shape_text(
                 }
             },
             RT_TEXT_BYTES => {
-                let text: String = rec.data.iter().map(|&b| b as char).collect();
+                let text = decode_text_bytes(&rec.data);
                 if !text.is_empty() {
                     out.push(TextRun {
                         text_type: current_type,
@@ -689,7 +1250,7 @@ fn extract_shape_text(
                                 rec.data[7],
                             ])
                             .max(0) as usize;
-                            split_run_with_hyperlink(out, idx, begin, end, url);
+                            add_link_range(out, idx, begin, end, url);
                         }
                     }
                 }
@@ -907,7 +1468,7 @@ fn extract_slides_from_slide_list_cache(slide_list: &[u8]) -> Vec<SlideText> {
             },
             RT_TEXT_BYTES => {
                 if let Some(slide) = current.as_mut() {
-                    let text: String = rec.data.iter().map(|&b| b as char).collect();
+                    let text = decode_text_bytes(&rec.data);
                     if !text.is_empty() {
                         slide.text_runs.push(TextRun {
                             text_type: current_type,
@@ -1013,37 +1574,79 @@ fn collect_ex_hyperlinks(data: &[u8], depth: usize, out: &mut HashMap<u32, Strin
 }
 
 /// Parse one `ExHyperlinkContainer`'s own children: its `ExHyperlinkAtom`
-/// (`exHyperlinkId`) and its `TargetAtom` (the URL/path).
+/// (`exHyperlinkId`), its `TargetAtom` (the URL/path) and its
+/// `LocationAtom`. A hyperlink with only a location jumps inside this
+/// deck; see [`internal_location_target`].
 fn parse_one_ex_hyperlink(data: &[u8]) -> Option<(u32, String)> {
     let mut id = None;
     let mut target = None;
+    let mut location = None;
     for rec in RecordIter::new(data) {
         let Ok(rec) = rec else { break };
         match rec.header.rec_type {
             RT_EXTERNAL_HYPERLINK_ATOM if rec.data.len() >= 4 => {
                 id = Some(u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]));
             },
-            RT_CSTRING if rec.header.rec_instance == CSTRING_INSTANCE_TARGET => {
+            RT_CSTRING => {
                 let s = decode_utf16le(&rec.data);
-                if !s.is_empty() {
-                    target = Some(s);
+                let s = s.trim_end_matches('\0');
+                if s.is_empty() {
+                    continue;
+                }
+                match rec.header.rec_instance {
+                    CSTRING_INSTANCE_TARGET => target = Some(s.to_string()),
+                    CSTRING_INSTANCE_LOCATION => location = Some(s.to_string()),
+                    _ => {},
                 }
             },
             _ => {},
         }
     }
-    Some((id?, target?))
+    let url = match (target, location) {
+        (Some(t), _) => t,
+        (None, Some(loc)) => internal_location_target(&loc),
+        (None, None) => return None,
+    };
+    Some((id?, url))
 }
 
-/// One embedded/linked/ActiveX OLE object's identity, resolved from its
-/// `ExOleObjAtom`.
+/// The IR hyperlink for a deck-internal `LocationAtom`. A slide jump is
+/// written `"<slideId>,<slide number>,<title>"` (as Apache POI reads it);
+/// it becomes `#slide<N>.xml`, the same target the PPTX converter gives a
+/// slide jump. Any other location is kept as a `#` fragment.
+fn internal_location_target(location: &str) -> String {
+    let mut parts = location.splitn(3, ',');
+    if let (Some(id), Some(number)) = (parts.next(), parts.next()) {
+        if id.trim().parse::<u32>().is_ok() {
+            if let Ok(n) = number.trim().parse::<u32>() {
+                return format!("#slide{n}.xml");
+            }
+        }
+    }
+    format!("#{location}")
+}
+
+/// One external object's identity: an embedded/linked/ActiveX OLE object
+/// resolved from its `ExOleObjAtom`, or a video/sound object resolved from
+/// its `ExMediaAtom` (both share the `ExObjListContainer`'s `exObjId`
+/// space, which a shape's `ExObjRefAtom` names).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OleObjectInfo {
     /// `ExOleObjAtom.subType` — 0-15; see `describe_ole_subtype` in
-    /// `convert_ppt.rs` for the enum meaning.
+    /// `convert_ppt.rs` for the enum meaning. 0 for media.
     pub subtype: u32,
-    /// `ExOleObjAtom.type` — 0 = embedded, 1 = linked, 2 = ActiveX control.
+    /// `ExOleObjAtom.type` — 0 = embedded, 1 = linked, 2 = ActiveX control
+    /// — or [`KIND_MEDIA_VIDEO`](Self::KIND_MEDIA_VIDEO) /
+    /// [`KIND_MEDIA_AUDIO`](Self::KIND_MEDIA_AUDIO) for a media object,
+    /// which has no `ExOleObjAtom`.
     pub kind: u32,
+}
+
+impl OleObjectInfo {
+    /// `kind` of a video object (`ExAviMovieContainer`/`ExMCIMovieContainer`).
+    pub const KIND_MEDIA_VIDEO: u32 = 0x100;
+    /// `kind` of a sound object (MIDI, CD audio, embedded or linked WAV).
+    pub const KIND_MEDIA_AUDIO: u32 = 0x101;
 }
 
 /// Build the document-wide `objID -> OleObjectInfo` table from the
@@ -1070,6 +1673,27 @@ fn collect_ex_ole_objects(data: &[u8], depth: usize, out: &mut HashMap<u32, OleO
                 out.insert(id, info);
             }
             continue; // an ExOleObjAtom's own siblings are never other ExOleObjAtoms
+        }
+        // A video or sound object: identified by the `exObjId` of the
+        // `ExMediaAtom` inside it, and — unlike OLE objects — it left no
+        // trace at all before, so a slide's movie or sound vanished.
+        let media_kind = match rec.header.rec_type {
+            RT_EX_AVI_MOVIE | RT_EX_MCI_MOVIE => Some(OleObjectInfo::KIND_MEDIA_VIDEO),
+            RT_EX_MIDI_AUDIO | RT_EX_CD_AUDIO | RT_EX_WAV_AUDIO_EMBEDDED | RT_EX_WAV_AUDIO_LINK => {
+                Some(OleObjectInfo::KIND_MEDIA_AUDIO)
+            },
+            _ => None,
+        };
+        if let Some(kind) = media_kind {
+            let id =
+                find_record_any_instance(&rec.data, RT_EX_MEDIA_ATOM, depth + 1).and_then(|b| {
+                    b.get(0..4)
+                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                });
+            if let Some(id) = id {
+                out.entry(id).or_insert(OleObjectInfo { subtype: 0, kind });
+            }
+            continue;
         }
         if rec.header.is_container() {
             collect_ex_ole_objects(&rec.data, depth + 1, out);
@@ -1228,130 +1852,70 @@ fn resolve_shape_pib(shape_data: &[u8]) -> Option<usize> {
     None
 }
 
-/// Split `out[idx]` into up to 3 runs at the character offsets `begin..end`
-/// (`TextRange`, [MS-PPT] 2.6.12): the unlinked prefix (if any), the
-/// hyperlinked `[begin, end)` slice, and the unlinked suffix (if any) — the
-/// text-run-level hyperlink mechanism, where a hyperlink covers only part
-/// of a run's text (e.g. a URL appearing mid-sentence) rather than the
-/// whole shape.
+/// Record a text-range hyperlink ([MS-PPT] `TextInteractiveInfoAtom`) on
+/// `out[idx]`. `begin`/`end` are `TextPosition` offsets, which count UTF-16
+/// code units (the text is stored as UTF-16); they are converted to `char`
+/// indices, so an astral-plane character (a surrogate pair) before the
+/// range does not shift it.
 ///
-/// `begin`/`end` are [MS-PPT]'s `TextPosition` character offsets, which
-/// this slices via `char` count rather than UTF-16 code units — an exact
-/// match for the common case, off by one per astral-plane character
-/// (surrogate pair) in the rare case one appears before the hyperlinked
-/// range, which is judged not worth the extra bookkeeping here.
-fn split_run_with_hyperlink(
-    out: &mut Vec<TextRun>,
-    idx: usize,
-    begin: usize,
-    end: usize,
-    url: &str,
-) {
-    let Some(run) = out.get(idx) else { return };
-    let chars: Vec<char> = run.text.chars().collect();
-    let begin = begin.min(chars.len());
-    let end = end.clamp(begin, chars.len());
+/// The run is not split: splitting it into prefix/link/suffix runs made
+/// each piece its own paragraph downstream, breaking the sentence around
+/// the link into three lines and dropping the spaces at the joins.
+fn add_link_range(out: &mut [TextRun], idx: usize, begin: usize, end: usize, url: &str) {
+    let Some(run) = out.get_mut(idx) else { return };
+    let len = run.text.chars().count();
+    let begin = utf16_to_char_index(&run.text, begin).min(len);
+    let end = utf16_to_char_index(&run.text, end).clamp(begin, len);
     if begin >= end {
         return; // empty or invalid range — leave the run untouched
     }
-
-    let text_type = run.text_type;
-    let surrounding_hyperlink = run.hyperlink.clone();
-    let placeholder_role = run.placeholder_role.clone();
-    let prefix: String = chars[..begin].iter().collect();
-    let linked: String = chars[begin..end].iter().collect();
-    let suffix: String = chars[end..].iter().collect();
-    // Splitting a run must not silently drop its own direct formatting —
-    // slice each formatting span onto whichever piece(s) it overlaps,
-    // re-based to that piece's own character indices.
-    let prefix_char_fmt = slice_char_formats(&run.char_formats, 0..begin);
-    let linked_char_fmt = slice_char_formats(&run.char_formats, begin..end);
-    let suffix_char_fmt = slice_char_formats(&run.char_formats, end..chars.len());
-    let prefix_para_fmt = slice_para_formats(&run.para_formats, 0..begin);
-    let linked_para_fmt = slice_para_formats(&run.para_formats, begin..end);
-    let suffix_para_fmt = slice_para_formats(&run.para_formats, end..chars.len());
-
-    let mut replacement = Vec::with_capacity(3);
-    if !prefix.is_empty() {
-        replacement.push(TextRun {
-            text_type,
-            text: prefix,
-            hyperlink: surrounding_hyperlink.clone(),
-            char_formats: prefix_char_fmt,
-            para_formats: prefix_para_fmt,
-            placeholder_role: placeholder_role.clone(),
-        });
+    if begin == 0 && end == len {
+        run.hyperlink = Some(url.to_string()); // the whole run is the link
+        return;
     }
-    replacement.push(TextRun {
-        text_type,
-        text: linked,
-        hyperlink: Some(url.to_string()),
-        char_formats: linked_char_fmt,
-        para_formats: linked_para_fmt,
-        placeholder_role: placeholder_role.clone(),
+    run.link_ranges.push(LinkRange {
+        start: begin,
+        end,
+        url: url.to_string(),
     });
-    if !suffix.is_empty() {
-        replacement.push(TextRun {
-            text_type,
-            text: suffix,
-            hyperlink: surrounding_hyperlink,
-            char_formats: suffix_char_fmt,
-            para_formats: suffix_para_fmt,
-            placeholder_role,
-        });
-    }
-
-    out.splice(idx..=idx, replacement);
-}
-
-/// Slice/clip a set of character-formatting spans onto `range`, re-based
-/// so the returned spans are relative to `range.start` (i.e. valid over
-/// the substring `text[range]` on its own).
-fn slice_char_formats(
-    spans: &[CharFormatSpan],
-    range: std::ops::Range<usize>,
-) -> Vec<CharFormatSpan> {
-    spans
-        .iter()
-        .filter_map(|s| {
-            let start = s.start.max(range.start);
-            let end = s.end.min(range.end);
-            (start < end).then(|| CharFormatSpan {
-                start: start - range.start,
-                end: end - range.start,
-                format: s.format.clone(),
-            })
-        })
-        .collect()
-}
-
-/// Same as [`slice_char_formats`] for paragraph-formatting spans.
-fn slice_para_formats(
-    spans: &[ParaFormatSpan],
-    range: std::ops::Range<usize>,
-) -> Vec<ParaFormatSpan> {
-    spans
-        .iter()
-        .filter_map(|s| {
-            let start = s.start.max(range.start);
-            let end = s.end.min(range.end);
-            (start < end).then(|| ParaFormatSpan {
-                start: start - range.start,
-                end: end - range.start,
-                format: s.format.clone(),
-            })
-        })
-        .collect()
 }
 
 /// Parse `data` as a `StyleTextPropAtom` body and attach the resulting
 /// character-/paragraph-formatting spans to `run`, clamped against
-/// `run.text`'s own character count.
+/// `run.text`'s own length.
+///
+/// The runs' `count`s are in UTF-16 code units, the unit the text is
+/// stored in; the spans are parsed in those units and then converted to
+/// `char` indices, which is what every consumer slices by.
 fn apply_style_text_prop(run: &mut TextRun, data: &[u8]) {
-    let text_char_len = run.text.chars().count();
-    let (para_spans, char_spans) = style::parse_style_text_prop(data, text_char_len);
+    let text_utf16_len = run.text.encode_utf16().count();
+    let (mut para_spans, mut char_spans) = style::parse_style_text_prop(data, text_utf16_len);
+    if text_utf16_len != run.text.chars().count() {
+        for s in &mut para_spans {
+            s.start = utf16_to_char_index(&run.text, s.start);
+            s.end = utf16_to_char_index(&run.text, s.end);
+        }
+        for s in &mut char_spans {
+            s.start = utf16_to_char_index(&run.text, s.start);
+            s.end = utf16_to_char_index(&run.text, s.end);
+        }
+    }
     run.para_formats = para_spans;
     run.char_formats = char_spans;
+}
+
+/// The `char` index of UTF-16 code unit offset `units` in `text` (an offset
+/// inside a surrogate pair rounds up to the next character; past the end
+/// clamps to the length).
+fn utf16_to_char_index(text: &str, units: usize) -> usize {
+    let mut seen = 0usize;
+    for (i, c) in text.chars().enumerate() {
+        if seen >= units {
+            return i;
+        }
+        seen += c.len_utf16();
+    }
+    text.chars().count()
 }
 
 /// Text content of a single slide.
@@ -1405,6 +1969,14 @@ fn slide_is_hidden(children: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// Decode a `TextBytesAtom` body ([MS-PPT] `TextBytesAtom`): "each byte is the low
+/// byte of a UTF-16 character whose high byte is 0x00" — i.e. Latin-1,
+/// whatever the deck's language; PowerPoint writes a `TextCharsAtom`
+/// whenever a character needs more.
+fn decode_text_bytes(data: &[u8]) -> String {
+    data.iter().map(|&b| b as char).collect()
 }
 
 fn decode_utf16le(data: &[u8]) -> String {
@@ -1512,6 +2084,84 @@ mod tests {
 
     /// Build one `ExHyperlinkContainer`: `ExHyperlinkAtom` (id) +
     /// `TargetAtom` (a `RT_CSTRING` at `CSTRING_INSTANCE_TARGET`, UTF-16LE).
+    /// Slide-jump hyperlinks carry their target in a `LocationAtom`
+    /// (`CString` instance 3) with no `TargetAtom`; only the `TargetAtom`
+    /// was read, so every internal jump resolved to nothing.
+    #[test]
+    fn test_location_atom_hyperlink_resolves_to_an_internal_target() {
+        let mut children = make_atom(RT_EXTERNAL_HYPERLINK_ATOM, 0, &7u32.to_le_bytes());
+        let loc: Vec<u8> = "258,3,Results"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        children.extend(make_atom(RT_CSTRING, CSTRING_INSTANCE_LOCATION, &loc));
+        assert_eq!(parse_one_ex_hyperlink(&children), Some((7, "#slide3.xml".to_string())));
+        assert_eq!(internal_location_target("Bookmark1"), "#Bookmark1");
+        // A target wins over a location (the location is inside it).
+        let with_target = {
+            let mut c = children.clone();
+            let t: Vec<u8> = "http://example.com/"
+                .encode_utf16()
+                .flat_map(|u| u.to_le_bytes())
+                .collect();
+            c.extend(make_atom(RT_CSTRING, CSTRING_INSTANCE_TARGET, &t));
+            c
+        };
+        assert_eq!(
+            parse_one_ex_hyperlink(&with_target).map(|(_, u)| u),
+            Some("http://example.com/".to_string())
+        );
+    }
+
+    /// Text-range hyperlink offsets count UTF-16 code units; slicing them
+    /// as `char` indices put the link one character late for every emoji
+    /// (surrogate pair) before it.
+    #[test]
+    fn test_hyperlink_range_is_measured_in_utf16_units() {
+        let text = "\u{1F600} link here";
+        let mut out = vec![TextRun {
+            text: text.to_string(),
+            ..Default::default()
+        }];
+        // Emoji = 2 units, space = 1: "link" is units 3..7, chars 2..6.
+        add_link_range(&mut out, 0, 3, 7, "http://example.com/");
+        assert_eq!((out[0].link_ranges[0].start, out[0].link_ranges[0].end), (2, 6));
+        assert_eq!(utf16_to_char_index(text, 2), 1);
+        assert_eq!(utf16_to_char_index(text, 1), 1, "inside the pair rounds up");
+        assert_eq!(utf16_to_char_index(text, 99), text.chars().count());
+    }
+
+    /// `StyleTextPropAtom` run counts are UTF-16 units too: formatting on
+    /// the word after an emoji must cover exactly that word.
+    #[test]
+    fn test_style_runs_are_measured_in_utf16_units() {
+        let text = "\u{1F600} bold";
+        let mut run = TextRun {
+            text: text.to_string(),
+            ..Default::default()
+        };
+        // One paragraph run over all 8 units (+1 mark), then character runs:
+        // 3 units plain, 4 units bold (CF_BOLD, fontStyle bold), 1 plain.
+        let mut data = Vec::new();
+        data.extend_from_slice(&8u32.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        for (count, bold) in [(3u32, false), (4, true), (2, false)] {
+            data.extend_from_slice(&count.to_le_bytes());
+            data.extend_from_slice(&1u32.to_le_bytes()); // CFMasks: bold
+            data.extend_from_slice(&(bold as u16).to_le_bytes()); // fontStyle
+        }
+        apply_style_text_prop(&mut run, &data);
+        let bold: Vec<(usize, usize)> = run
+            .char_formats
+            .iter()
+            .filter(|s| s.format.bold == Some(true))
+            .map(|s| (s.start, s.end))
+            .collect();
+        // chars: emoji(0) space(1) b(2) o(3) l(4) d(5)
+        assert_eq!(bold, [(2, 6)]);
+    }
+
     fn make_ex_hyperlink(id: u32, url: &str) -> Vec<u8> {
         let mut children = make_atom(RT_EXTERNAL_HYPERLINK_ATOM, 0, &id.to_le_bytes());
         let utf16: Vec<u8> = url.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
@@ -1717,6 +2367,26 @@ mod tests {
         );
     }
 
+    /// Video and sound objects ([MS-PPT] `ExAviMovieContainer`,
+    /// `ExWAVAudioEmbeddedContainer`, …) are named by their `ExMediaAtom`'s
+    /// `exObjId`; a shape's `ExObjRefAtom` referencing one resolved to
+    /// nothing, so a slide's movie or sound left no trace.
+    #[test]
+    fn test_media_objects_resolve_like_ole_objects() {
+        let media =
+            |id: u32| make_atom(RT_EX_MEDIA_ATOM, 0, &[&id.to_le_bytes()[..], &[0u8; 4]].concat());
+        let video = make_container(
+            RT_EX_AVI_MOVIE,
+            0,
+            &make_container(0x1005, 0, &media(4)), // ExVideoContainer
+        );
+        let sound = make_container(RT_EX_WAV_AUDIO_EMBEDDED, 0, &media(5));
+        let ex_obj_list = make_container(RT_EXTERNAL_OBJECT_LIST, 0, &[video, sound].concat());
+        let map = parse_ex_ole_objects(&ex_obj_list);
+        assert_eq!(map.get(&4).map(|i| i.kind), Some(OleObjectInfo::KIND_MEDIA_VIDEO));
+        assert_eq!(map.get(&5).map(|i| i.kind), Some(OleObjectInfo::KIND_MEDIA_AUDIO));
+    }
+
     /// A shape with no `ExObjRefAtom` at all must not resolve anything,
     /// even when the document has real OLE objects elsewhere.
     #[test]
@@ -1872,10 +2542,11 @@ mod tests {
     /// covering only PART of a text run's characters, via a sibling
     /// `MouseClickInteractiveInfoContainer` + `MouseClickTextInteractiveInfoAtom`
     /// pair in the `ClientTextbox` (not nested in `RT_CLIENT_DATA` at all —
-    /// confirmed against real corpus bytes, not just the spec). The run
-    /// must split into unlinked-prefix / linked / unlinked-suffix pieces.
+    /// confirmed against real corpus bytes, not just the spec). The link
+    /// is recorded on the run over exactly its characters; the run itself
+    /// stays whole.
     #[test]
-    fn test_text_range_hyperlink_splits_the_run() {
+    fn test_text_range_hyperlink_is_recorded_on_the_run() {
         let mut hyperlinks = HashMap::new();
         hyperlinks.insert(7u32, "http://example.com/".to_string());
 
@@ -1910,13 +2581,17 @@ mod tests {
             &mut Vec::new(),
         );
 
-        assert_eq!(runs.len(), 3, "must split into prefix/linked/suffix: {runs:?}");
-        assert_eq!(runs[0].text, "See ");
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].text, "See http://example.com/ here");
         assert_eq!(runs[0].hyperlink, None);
-        assert_eq!(runs[1].text, "http://example.com/");
-        assert_eq!(runs[1].hyperlink.as_deref(), Some("http://example.com/"));
-        assert_eq!(runs[2].text, " here");
-        assert_eq!(runs[2].hyperlink, None);
+        assert_eq!(
+            runs[0].link_ranges,
+            [LinkRange {
+                start: 4,
+                end: 23,
+                url: "http://example.com/".to_string()
+            }]
+        );
     }
 
     /// The hyperlinked range can cover the WHOLE run (no unlinked prefix
@@ -1973,7 +2648,8 @@ mod tests {
     }
 
     fn make_table_cell_shape(left: i32, top: i32, text: &[u8]) -> Vec<u8> {
-        let mut children = make_child_anchor(left, top, left + 100, top + 50);
+        let mut children =
+            make_child_anchor(left, top, left.saturating_add(100), top.saturating_add(50));
         // Tx_TYPE_OTHER
         let mut textbox_children = make_atom(RT_TEXT_HEADER, 0, &4u32.to_le_bytes());
         textbox_children.extend(make_atom(RT_TEXT_BYTES, 0, text));
@@ -2018,6 +2694,36 @@ mod tests {
         assert_eq!(t.rows[0][1][0].text, "B1");
         assert_eq!(t.rows[1][0][0].text, "A2");
         assert_eq!(t.rows[1][1][0].text, "B2");
+    }
+
+    /// Child anchors at the `i32` extremes reach the table heuristic
+    /// straight from the file; they must neither overflow nor lose text.
+    #[test]
+    fn test_spgr_container_with_extreme_child_anchors_does_not_overflow() {
+        let mut spgr_children = make_container(RT_SHAPE, 0, &[]);
+        spgr_children.extend(make_table_cell_shape(i32::MIN, i32::MIN, b"A1"));
+        spgr_children.extend(make_table_cell_shape(i32::MAX, i32::MIN, b"B1"));
+        spgr_children.extend(make_table_cell_shape(i32::MIN, i32::MAX, b"A2"));
+        spgr_children.extend(make_table_cell_shape(i32::MAX, i32::MAX, b"B2"));
+        let spgr = make_container(RT_SPGR_CONTAINER, 0, &spgr_children);
+
+        let mut runs = Vec::new();
+        let mut tables = Vec::new();
+        extract_shape_text(
+            &spgr,
+            0,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            None,
+            &mut runs,
+            &mut tables,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].rows[1][1][0].text, "B2");
     }
 
     /// A group that ISN'T a clean grid (here: only 3
@@ -2378,12 +3084,114 @@ mod tests {
         make_atom(RT_SLIDE_PERSIST_ATOM, 0, &body)
     }
 
+    fn level(
+        bold: Option<bool>,
+        italic: Option<bool>,
+    ) -> (super::style::ParaFormat, super::style::CharFormat) {
+        (
+            super::style::ParaFormat::default(),
+            super::style::CharFormat {
+                bold,
+                italic,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Master inheritance covered only Title and Body at indent level 0: a
+    /// nested bullet (level 1+) and every other text type (notes, other,
+    /// the centred/half/quarter placeholder variants) got nothing from the
+    /// master. Each paragraph now inherits from its own level, a level
+    /// carries what it leaves unset from the level above it, and the
+    /// placeholder variants fall back to their base style.
+    #[test]
+    fn test_master_inheritance_follows_indent_level_and_every_text_type() {
+        let mut styles = MasterStyles::default();
+        styles.levels[1] = cascade_levels(vec![level(Some(true), None), level(None, Some(true))]);
+        styles.levels[0] = cascade_levels(vec![level(None, Some(true))]);
+        assert_eq!(styles.levels[1][1].1.bold, Some(true), "level 1 cascades from level 0");
+
+        let para = |start, end, indent| ParaFormatSpan {
+            start,
+            end,
+            format: super::style::ParaFormat {
+                indent_level: Some(indent),
+                ..Default::default()
+            },
+        };
+        let mut runs = vec![
+            TextRun {
+                text_type: TextType::Body,
+                text: "Top\rNested".into(),
+                para_formats: vec![para(0, 4, 0), para(4, 10, 1)],
+                char_formats: vec![CharFormatSpan {
+                    start: 0,
+                    end: 10,
+                    format: Default::default(),
+                }],
+                ..Default::default()
+            },
+            TextRun {
+                text_type: TextType::CenterTitle,
+                text: "Centred".into(),
+                ..Default::default()
+            },
+            TextRun {
+                text_type: TextType::HalfBody,
+                text: "Half".into(),
+                ..Default::default()
+            },
+        ];
+        apply_master_inheritance(&mut runs, &styles);
+
+        let body = &runs[0].char_formats;
+        let at = |i: usize| body.iter().find(|s| s.start <= i && i < s.end).unwrap();
+        assert_eq!((at(0).format.bold, at(0).format.italic), (Some(true), None));
+        assert_eq!((at(5).format.bold, at(5).format.italic), (Some(true), Some(true)));
+        // CenterTitle has no master style of its own: Title's applies.
+        assert_eq!(runs[1].char_formats[0].format.italic, Some(true));
+        // HalfBody falls back to Body level 0.
+        assert_eq!(runs[2].char_formats[0].format.bold, Some(true));
+    }
+
     fn slide_container_bytes(title: &str) -> Vec<u8> {
         let header = make_atom(RT_TEXT_HEADER, 0, &0u32.to_le_bytes());
         let mut textbox_children = header;
         textbox_children.extend(make_atom(RT_TEXT_BYTES, 0, title.as_bytes()));
         let textbox = make_container(0xF00D, 0, &textbox_children); // ClientTextbox
         make_container(RT_SLIDE, 0, &textbox)
+    }
+
+    /// A slide's own text that starts like an English master prompt was
+    /// deleted on the degraded (no persist directory) paths; the masters
+    /// are excluded by structure now, so slide text is never string-matched.
+    #[test]
+    fn test_slide_text_that_reads_like_a_prompt_is_kept() {
+        let stream = slide_container_bytes("Click to add title: our roadmap");
+        let slides = extract_slides_text(&stream, None);
+        assert_eq!(slides[0].text_runs[0].text, "Click to add title: our roadmap");
+    }
+
+    /// The last-resort whole-stream dump skipped only *English* master
+    /// prompts; a localized master's prompts leaked as content. Master
+    /// containers are skipped whatever language their prompts are in.
+    #[test]
+    fn test_last_resort_dump_skips_master_containers_in_any_language() {
+        let prompt = "Klicken Sie, um das Titelformat zu bearbeiten";
+        let mut master_tb = make_atom(RT_TEXT_HEADER, 0, &0u32.to_le_bytes());
+        master_tb.extend(make_atom(RT_TEXT_BYTES, 0, prompt.as_bytes()));
+        let mut stream = make_container(RT_MAIN_MASTER, 0, &make_container(0xF00D, 0, &master_tb));
+        // Loose text outside any slide container (the degraded shape).
+        let mut loose = make_atom(RT_TEXT_HEADER, 0, &4u32.to_le_bytes());
+        loose.extend(make_atom(RT_TEXT_BYTES, 0, b"Loose text"));
+        stream.extend(make_container(0xF00D, 0, &loose));
+        let slides = extract_slides_text(&stream, None);
+        let all: Vec<&str> = slides
+            .iter()
+            .flat_map(|s| &s.text_runs)
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(all, ["Loose text"]);
     }
 
     /// Same shape as `slide_container_bytes`, plus a
@@ -2529,7 +3337,11 @@ mod tests {
     /// a `HeadersFootersAtom` (0x0FDA) plus `CString` (0x0FBA) children
     /// for the user date (instance 0) and footer (instance 2) text.
     fn header_footer_container_bytes(date: &str, footer: &str) -> Vec<u8> {
-        let mut children = make_atom(RT_HEADER_FOOTER_ATOM, 0, &[0u8; 4]);
+        // formatId 0; flags fHasDate | fHasUserDate | fHasFooter.
+        let flags = HF_HAS_DATE | HF_HAS_USER_DATE | HF_HAS_FOOTER;
+        let mut atom = 0u16.to_le_bytes().to_vec();
+        atom.extend_from_slice(&flags.to_le_bytes());
+        let mut children = make_atom(RT_HEADER_FOOTER_ATOM, 0, &atom);
         let date_bytes: Vec<u8> = date.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
         children.extend(make_atom(RT_CSTRING, 0, &date_bytes));
         let footer_bytes: Vec<u8> = footer
@@ -2696,25 +3508,38 @@ mod tests {
     fn test_placeholder_formatting_inherits_from_master_when_direct_formatting_is_absent() {
         // A Title placeholder with no StyleTextPropAtom of its own at
         // all (no direct formatting) whose slide's SlideAtom.masterIdRef
-        // points — with the USES_MASTER_SLIDE_ID flag bit (0x80000000)
-        // set, exactly as every real corpus file does — at a MainMaster
-        // carrying a Title TxMasterStyleAtom. The run must end up with
-        // the master's alignment/font_size.
+        // names a MainMaster carrying a Title TxMasterStyleAtom. The run
+        // must end up with the master's alignment/font_size.
+        //
+        // The reference is a `masterId` (0x8000000C here, as in a real
+        // Apache Tika sample), mapped to the master's persist id (3)
+        // through the MasterListWithTextContainer — not a persist id with
+        // its high bit masked, which this test used to encode and which
+        // resolves to nothing on real decks.
         let mut stream = Vec::new();
 
         let doc_offset = stream.len() as u32;
         let mut slide_list_children = slide_persist_atom_bytes(2, 256);
         slide_list_children.extend(make_atom(RT_TEXT_HEADER, 0, &0u32.to_le_bytes())); // type=Title
         slide_list_children.extend(make_atom(RT_TEXT_BYTES, 0, b"Title Text"));
-        let slide_list = make_container(RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES, &slide_list_children);
-        stream.extend(make_container(RT_DOCUMENT, 0, &slide_list));
+        let mut doc_children = make_container(
+            RT_SLIDE_LIST_WITH_TEXT,
+            SLWT_MASTERS,
+            &slide_persist_atom_bytes(3, 0x8000_000C),
+        );
+        doc_children.extend(make_container(
+            RT_SLIDE_LIST_WITH_TEXT,
+            SLWT_SLIDES,
+            &slide_list_children,
+        ));
+        stream.extend(make_container(RT_DOCUMENT, 0, &doc_children));
 
         let slide_offset = stream.len() as u32;
         let index_bytes = 0i32.to_le_bytes();
         let outline_ref = make_atom(RT_OUTLINE_TEXT_REF_ATOM, 0, &index_bytes);
         let textbox = make_container(0xF00D, 0, &outline_ref);
         let shape = make_container(0xF004, 0, &textbox);
-        let mut slide_children = slide_atom_bytes(3 | 0x8000_0000);
+        let mut slide_children = slide_atom_bytes(0x8000_000C);
         slide_children.extend(shape);
         stream.extend(make_container(RT_SLIDE, 0, &slide_children));
 
@@ -2817,5 +3642,152 @@ mod tests {
         let slides = extract_slides_text(&stream, Some(&current_user));
         assert_eq!(slides.len(), 1);
         assert_eq!(slides[0].text_runs[0].text, "FALLBACK CACHE TEXT");
+    }
+
+    /// A `SlideAtom` naming `master_id` with `fMasterObjects` as given.
+    fn slide_atom_following(master_id: u32, follows: bool) -> Vec<u8> {
+        let mut body = vec![0u8; 24];
+        body[12..16].copy_from_slice(&master_id.to_le_bytes());
+        if follows {
+            body[20..22].copy_from_slice(&SLIDE_FLAG_MASTER_OBJECTS.to_le_bytes());
+        }
+        make_atom(RT_SLIDE_ATOM, 2, &body)
+    }
+
+    /// A shape holding one `Tx_TYPE_OTHER` text, with `client_data`
+    /// children (a placeholder atom) when given.
+    fn other_text_shape(text: &str, client_data: Option<Vec<u8>>) -> Vec<u8> {
+        let mut children = Vec::new();
+        if let Some(cd) = client_data {
+            children.extend(make_container(RT_CLIENT_DATA, 0, &cd));
+        }
+        let mut tb = make_atom(RT_TEXT_HEADER, 0, &4u32.to_le_bytes());
+        tb.extend(make_atom(RT_TEXT_BYTES, 0, text.as_bytes()));
+        children.extend(make_container(0xF00D, 0, &tb));
+        make_container(RT_SHAPE, 0, &children)
+    }
+
+    /// A title slide names a title master (a `SlideContainer` in the
+    /// master list), which names its main master: both masters' static
+    /// text is shown and extracted, each once, while header/footer
+    /// placeholders (`RoundTripHFPlaceholder12Atom`) are not static text.
+    /// `masterIdRef` values are `masterId`s from the
+    /// `MasterListWithTextContainer`, not persist ids.
+    #[test]
+    fn test_title_master_chain_yields_static_text_of_both_masters() {
+        const TITLE_MASTER: u32 = 0x8000_0010;
+        const MAIN_MASTER: u32 = 0x8000_0020;
+        let mut stream = Vec::new();
+
+        let doc_offset = stream.len() as u32;
+        let mut doc = make_container(
+            RT_SLIDE_LIST_WITH_TEXT,
+            SLWT_MASTERS,
+            &[
+                slide_persist_atom_bytes(3, TITLE_MASTER),
+                slide_persist_atom_bytes(4, MAIN_MASTER),
+            ]
+            .concat(),
+        );
+        doc.extend(make_container(
+            RT_SLIDE_LIST_WITH_TEXT,
+            SLWT_SLIDES,
+            &[
+                slide_persist_atom_bytes(2, 256),
+                slide_persist_atom_bytes(5, 257),
+            ]
+            .concat(),
+        ));
+        stream.extend(make_container(RT_DOCUMENT, 0, &doc));
+
+        let slide_offset = stream.len() as u32;
+        let mut slide = slide_atom_following(TITLE_MASTER, true);
+        slide.extend(other_text_shape("SLIDE TEXT", None));
+        stream.extend(make_container(RT_SLIDE, 0, &slide));
+
+        let title_master_offset = stream.len() as u32;
+        let mut title_master = slide_atom_following(MAIN_MASTER, true);
+        title_master.extend(other_text_shape("TITLE MASTER TEXT", None));
+        title_master.extend(other_text_shape("SHARED TEXT", None));
+        stream.extend(make_container(RT_SLIDE, 0, &title_master));
+
+        let main_master_offset = stream.len() as u32;
+        let mut main_master = slide_atom_following(0, false);
+        // Tx_TYPE_OTHER style: right-aligned, 30pt.
+        main_master.extend(master_style_bytes(4, 2, 30));
+        main_master.extend(other_text_shape("MAIN MASTER TEXT", None));
+        main_master.extend(other_text_shape("SHARED TEXT", None));
+        main_master.extend(other_text_shape(
+            "FOOTER PROMPT",
+            Some(make_atom(RT_ROUND_TRIP_HF_PLACEHOLDER12_ATOM, 0, &[9])),
+        ));
+        stream.extend(make_container(RT_MAIN_MASTER, 0, &main_master));
+
+        // A second slide on the main master, hiding its objects.
+        let hidden_offset = stream.len() as u32;
+        let mut hidden = slide_atom_following(MAIN_MASTER, false);
+        hidden.extend(other_text_shape("SECOND SLIDE", None));
+        stream.extend(make_container(RT_SLIDE, 0, &hidden));
+
+        let pd_offset = stream.len() as u32;
+        stream.extend(persist_directory_bytes(&[
+            (1, doc_offset),
+            (2, slide_offset),
+            (3, title_master_offset),
+            (4, main_master_offset),
+            (5, hidden_offset),
+        ]));
+        let edit_offset = stream.len() as u32;
+        stream.extend(user_edit_atom_bytes(0, pd_offset, 1));
+        let current_user = current_user_bytes(edit_offset);
+
+        let deck = extract_deck_text(&stream, Some(&current_user));
+        assert_eq!(deck.slides.len(), 2);
+        let master: Vec<&str> = deck.master_text.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(master, ["TITLE MASTER TEXT", "SHARED TEXT", "MAIN MASTER TEXT"]);
+        // Text styles come from the main master behind the title master.
+        let slide_run = &deck.slides[0].text_runs[0];
+        assert_eq!(slide_run.text, "SLIDE TEXT");
+        assert_eq!(slide_run.char_formats[0].format.font_size, Some(30));
+        assert_eq!(slide_run.para_formats[0].format.alignment, Some(2));
+    }
+
+    /// A master reference cycle (title master naming itself through a
+    /// second title master) terminates.
+    #[test]
+    fn test_master_reference_cycle_terminates() {
+        const A: u32 = 0x8000_0001;
+        const B: u32 = 0x8000_0002;
+        let mut stream = Vec::new();
+        let doc_offset = stream.len() as u32;
+        let mut doc = make_container(
+            RT_SLIDE_LIST_WITH_TEXT,
+            SLWT_MASTERS,
+            &[
+                slide_persist_atom_bytes(3, A),
+                slide_persist_atom_bytes(4, B),
+            ]
+            .concat(),
+        );
+        doc.extend(make_container(
+            RT_SLIDE_LIST_WITH_TEXT,
+            SLWT_SLIDES,
+            &slide_persist_atom_bytes(2, 256),
+        ));
+        stream.extend(make_container(RT_DOCUMENT, 0, &doc));
+        let mut offsets = vec![(1, doc_offset)];
+        for (pid, next, text) in [(2, A, "SLIDE"), (3, B, "A TEXT"), (4, A, "B TEXT")] {
+            offsets.push((pid, stream.len() as u32));
+            let mut c = slide_atom_following(next, true);
+            c.extend(other_text_shape(text, None));
+            stream.extend(make_container(RT_SLIDE, 0, &c));
+        }
+        let pd_offset = stream.len() as u32;
+        stream.extend(persist_directory_bytes(&offsets));
+        let edit_offset = stream.len() as u32;
+        stream.extend(user_edit_atom_bytes(0, pd_offset, 1));
+        let deck = extract_deck_text(&stream, Some(&current_user_bytes(edit_offset)));
+        let master: Vec<&str> = deck.master_text.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(master, ["A TEXT", "B TEXT"]);
     }
 }

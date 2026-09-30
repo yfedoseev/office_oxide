@@ -32,14 +32,20 @@ pub(crate) fn col_name(col: u16) -> String {
     String::from_utf8(result).unwrap()
 }
 
-/// Format a 0-based `(row, col)` pair as `"A1"`-style, and a range as
-/// `"A1:B2"` (or just `"A1"` when the range is a single cell).
+/// Format a 0-based `(row, col)` pair as `"A1"`-style. The row is widened
+/// before the 1-based adjustment: 0xFFFF is the last legal BIFF8 row
+/// ([MS-XLS] §2.5.198 `Rw`), and its A1 number 65536 does not fit a u16.
+pub(crate) fn cell_ref(row: u16, col: u16) -> String {
+    format!("{}{}", col_name(col), u32::from(row) + 1)
+}
+
+/// Format a range as `"A1:B2"` (or just `"A1"` when it is a single cell).
 pub(crate) fn range_ref(row_first: u16, row_last: u16, col_first: u16, col_last: u16) -> String {
-    let first = format!("{}{}", col_name(col_first), row_first + 1);
+    let first = cell_ref(row_first, col_first);
     if row_first == row_last && col_first == col_last {
         first
     } else {
-        format!("{first}:{}{}", col_name(col_last), row_last + 1)
+        format!("{first}:{}", cell_ref(row_last, col_last))
     }
 }
 
@@ -184,5 +190,13 @@ mod tests {
         assert_eq!(col_name(0), "A");
         assert_eq!(col_name(25), "Z");
         assert_eq!(col_name(26), "AA");
+    }
+
+    /// Row index 0xFFFF is the last legal BIFF8 row; its 1-based A1 number
+    /// is 65536, which does not fit the u16 the row is stored in.
+    #[test]
+    fn test_range_ref_on_the_last_biff8_row_does_not_overflow() {
+        assert_eq!(range_ref(0, 0xFFFF, 0, 0), "A1:A65536");
+        assert_eq!(range_ref(0xFFFF, 0xFFFF, 0xFF, 0xFF), "IV65536");
     }
 }

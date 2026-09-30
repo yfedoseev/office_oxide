@@ -3,18 +3,36 @@ use crate::ir::*;
 
 pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
     // Slide size sits at presentation level — every slide in the
-    // deck shares it. EMU → twips is /635 (914400 EMU per inch,
-    // 1440 twips per inch → 914400/1440 = 635).
-    let page_setup = doc.presentation.slide_size.as_ref().map(|sz| PageSetup {
-        width_twips: (sz.cx.max(0) / 635) as u32,
-        height_twips: (sz.cy.max(0) / 635) as u32,
-        landscape: sz.cx > sz.cy,
-        ..Default::default()
-    });
+    // deck shares it.
+    let page_setup = doc
+        .presentation
+        .slide_size
+        .as_ref()
+        .and_then(slide_page_setup);
 
     let mut sections = Vec::new();
 
     for slide in doc.slides.iter() {
+        if let Some(ref err) = slide.parse_error {
+            // An unreadable slide keeps its place as a notice, so the loss
+            // is visible in every projection of the IR.
+            sections.push(Section {
+                elements: vec![Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(
+                        crate::pptx::text::unreadable_slide_notice(&slide.name, err),
+                    ))],
+                    ..Default::default()
+                })],
+                break_type: if sections.is_empty() {
+                    SectionBreakType::Continuous
+                } else {
+                    SectionBreakType::NextPage
+                },
+                page_setup: page_setup.clone(),
+                ..Default::default()
+            });
+            continue;
+        }
         let title_with_algn = find_title(&slide.shapes);
         let title = title_with_algn.as_ref().map(|(t, _)| t.clone());
         let title_alignment = title_with_algn.as_ref().and_then(|(_, a)| a.clone());
@@ -114,6 +132,27 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         .filter(|t| !t.is_empty())
         .or_else(|| sections.first().and_then(|s| s.title.clone()));
 
+    // Layout and master static text, once per deck, after the slides (see
+    // `pptx::layout`) — through the same conversion as slide text, so the
+    // direct markdown renderer and this one agree.
+    let mut master_elements = Vec::new();
+    for (body, _) in doc.master_static_bodies() {
+        convert_text_body(body, &mut master_elements);
+    }
+    if !master_elements.is_empty() {
+        sections.push(Section {
+            title: Some(crate::pptx::layout::MASTER_TEXT_SECTION_TITLE.to_string()),
+            elements: master_elements,
+            break_type: if sections.is_empty() {
+                SectionBreakType::Continuous
+            } else {
+                SectionBreakType::NextPage
+            },
+            page_setup: page_setup.clone(),
+            ..Default::default()
+        });
+    }
+
     DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Pptx,
@@ -128,11 +167,47 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
-            text_truncated: false,
+            text_truncated: !doc.unreadable_parts.is_empty(),
+            ..crate::core::core_properties::ooxml_metadata_extras(
+                cp,
+                doc.app_properties.as_ref(),
+                Some(&doc.package_properties),
+            )
         },
         sections,
         defined_names: Vec::new(),
     }
+}
+
+/// Smallest and largest legal `p:sldSz` extent, in EMU
+/// (`ST_SlideSizeCoordinate`, ECMA-376 Part 1 §19.7.18: 1 inch to 56 inches).
+const MIN_SLIDE_EXTENT_EMU: i64 = 914_400;
+const MAX_SLIDE_EXTENT_EMU: i64 = 51_206_400;
+
+/// The IR page geometry for a deck's slide size. EMU → twips is /635
+/// (914400 EMU per inch, 1440 twips per inch).
+///
+/// A size outside the schema's range is not a page size anything can
+/// honour; converting it used to truncate through `as u32` into an
+/// arbitrary, plausible-looking page. It now yields no page setup (with a
+/// warning), so consumers fall back to their own default.
+fn slide_page_setup(sz: &crate::pptx::SlideSize) -> Option<PageSetup> {
+    let legal = MIN_SLIDE_EXTENT_EMU..=MAX_SLIDE_EXTENT_EMU;
+    if !legal.contains(&sz.cx) || !legal.contains(&sz.cy) {
+        log::warn!(
+            "pptx: slide size {}x{} EMU is outside the legal range; page size not set",
+            sz.cx,
+            sz.cy
+        );
+        return None;
+    }
+    // In range, both quotients are well below u32::MAX.
+    Some(PageSetup {
+        width_twips: u32::try_from(sz.cx / 635).ok()?,
+        height_twips: u32::try_from(sz.cy / 635).ok()?,
+        landscape: sz.cx > sz.cy,
+        ..Default::default()
+    })
 }
 
 fn collect_shape_entries<'a>(
@@ -330,6 +405,7 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
                 display_width_emu: display_w,
                 display_height_emu: display_h,
                 hyperlink: pic.hyperlink.as_ref().and_then(hyperlink_info_url),
+                source_url: pic.link_target.clone(),
                 ..Default::default()
             });
             push_positional_textbox(elements, vec![img_el], pic.position.as_ref());
@@ -359,6 +435,34 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
                     .collect();
                 if !paras.is_empty() {
                     push_positional_textbox(elements, paras, gf.position.as_ref());
+                }
+            },
+            // An OLE object is shown as its preview picture. It used to fall
+            // through as an unknown graphic, losing the preview.
+            crate::pptx::GraphicContent::OleObject(ref ole) => {
+                if let Some(ref data) = ole.preview_data {
+                    let (display_w, display_h) = gf
+                        .position
+                        .as_ref()
+                        .map(|p| (Some(p.cx.max(0) as u64), Some(p.cy.max(0) as u64)))
+                        .unwrap_or((None, None));
+                    let img = Element::Image(Image {
+                        data: Some(data.clone()),
+                        format: ole
+                            .preview_format
+                            .as_deref()
+                            .and_then(image_format_from_ext),
+                        display_width_emu: display_w,
+                        display_height_emu: display_h,
+                        ..Default::default()
+                    });
+                    push_positional_textbox(elements, vec![img], gf.position.as_ref());
+                } else {
+                    log::debug!(
+                        "pptx: OLE object {:?} ({:?}) has no preview picture",
+                        ole.name,
+                        ole.prog_id
+                    );
                 }
             },
             crate::pptx::GraphicContent::Unknown => {},
@@ -424,75 +528,192 @@ fn push_positional_textbox(
     }
 }
 
-fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) {
+/// Whether `para` is a list item: it declares a bullet (`buChar`,
+/// `buAutoNum`, `buBlip`), or it is indented and does not switch bullets
+/// off (`buNone`).
+fn is_list_paragraph(para: &crate::pptx::TextParagraph) -> bool {
     use crate::pptx::BulletStyle;
+    match para.bullet {
+        Some(BulletStyle::Char(_) | BulletStyle::AutoNum { .. } | BulletStyle::Picture { .. }) => {
+            true
+        },
+        Some(BulletStyle::None) => false,
+        None => para.level > 0,
+    }
+}
 
-    // A paragraph is a list item when it is indented *or* when it declares
-    // a bullet. Keying only off `level > 0` meant a body placeholder whose
-    // bullets all sit at level 0 — the ordinary single-level bullet list —
-    // came out as plain paragraphs with no markers, and `<a:buAutoNum>`
-    // numbering was lost entirely.
-    let declares_bullet = body
-        .paragraphs
-        .iter()
-        .any(|p| matches!(p.bullet, Some(BulletStyle::Char(_) | BulletStyle::AutoNum { .. })));
-    let has_levels = body.paragraphs.iter().any(|p| p.level > 0) || declares_bullet;
+/// `Some(true)` for a numbered paragraph, `Some(false)` for a bulleted one,
+/// `None` when it declares neither (an inherited bullet).
+fn paragraph_is_ordered(para: &crate::pptx::TextParagraph) -> Option<bool> {
+    use crate::pptx::BulletStyle;
+    match para.bullet {
+        Some(BulletStyle::AutoNum { .. }) => Some(true),
+        Some(BulletStyle::Char(_) | BulletStyle::Picture { .. }) => Some(false),
+        _ => None,
+    }
+}
 
-    if has_levels {
-        // The shallowest bulleted paragraph decides the list's marker
-        // style and start value.
-        let mut items = Vec::new();
-        let mut top_level: Option<u32> = None;
-        let mut ordered = false;
-        let mut style: Option<ListStyle> = None;
-        let mut start_number: Option<u32> = None;
-        for para in &body.paragraphs {
-            if top_level.is_none_or(|t| para.level < t) {
-                if let Some(b) = para.bullet.as_ref() {
-                    top_level = Some(para.level);
-                    match b {
-                        BulletStyle::AutoNum { scheme, start_at } => {
-                            ordered = true;
-                            style = Some(auto_num_style(scheme));
-                            start_number = start_at.filter(|&n| n != 1);
-                        },
-                        BulletStyle::Char(_) => {
-                            ordered = false;
-                            style = Some(ListStyle::Bullet);
-                        },
-                        BulletStyle::None => {},
-                    }
+/// Convert a text body into block elements: each run of consecutive list
+/// paragraphs becomes one `List`, every other paragraph a `Paragraph`.
+///
+/// Shared by `to_ir()` and the direct markdown renderer, so the two cannot
+/// lay a slide out differently. The whole body used to become one list as
+/// soon as any paragraph was bulleted, so plain paragraphs rendered as
+/// bullets and a numbered run after a bulleted one lost its numbers.
+pub(crate) fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) {
+    let paras = &body.paragraphs;
+    let mut i = 0;
+    while i < paras.len() {
+        if !is_list_paragraph(&paras[i]) {
+            convert_plain_text_paragraph(&paras[i], elements);
+            i += 1;
+            continue;
+        }
+        // One list: consecutive list paragraphs, until a paragraph at the
+        // list's top level switches between numbered and bulleted.
+        let start = i;
+        let mut top_level = paras[i].level;
+        let mut top_ordered = paragraph_is_ordered(&paras[i]);
+        i += 1;
+        while i < paras.len() && is_list_paragraph(&paras[i]) {
+            let p = &paras[i];
+            if p.level <= top_level {
+                let kind = paragraph_is_ordered(p);
+                if kind.is_some() && top_ordered.is_some() && kind != top_ordered {
+                    break;
+                }
+                top_level = p.level;
+                top_ordered = top_ordered.or(kind);
+            }
+            i += 1;
+        }
+        elements.push(Element::List(convert_list_run(&paras[start..i])));
+    }
+}
+
+/// One run of list paragraphs as a nested `List`. The shallowest bulleted
+/// paragraph decides the list's marker style and start value.
+fn convert_list_run(paras: &[crate::pptx::TextParagraph]) -> List {
+    use crate::pptx::BulletStyle;
+    let mut items = Vec::new();
+    let mut top_level: Option<u32> = None;
+    let mut ordered = false;
+    let mut style: Option<ListStyle> = None;
+    let mut start_number: Option<u32> = None;
+    for para in paras {
+        if top_level.is_none_or(|t| para.level < t) {
+            if let Some(b) = para.bullet.as_ref() {
+                top_level = Some(para.level);
+                match b {
+                    BulletStyle::AutoNum { scheme, start_at } => {
+                        ordered = true;
+                        style = Some(auto_num_style(scheme));
+                        start_number = start_at.filter(|&n| n != 1);
+                    },
+                    // A picture bullet is an unordered marker drawn
+                    // as an image.
+                    BulletStyle::Char(_) | BulletStyle::Picture { .. } => {
+                        ordered = false;
+                        style = Some(ListStyle::Bullet);
+                    },
+                    BulletStyle::None => {},
                 }
             }
-            items.push((para.level as u8, convert_text_paragraph_inline(para)));
         }
-        let mut list = crate::ir::build_nested_list(ordered, &items, 0);
-        list.style = style;
-        list.start_number = start_number;
-        elements.push(Element::List(list));
-    } else {
-        for para in &body.paragraphs {
-            let content = convert_text_paragraph_inline(para);
-            // Honour space_before from PPTX so spacer paragraphs
-            // emitted by pdf_to_ir round-trip with their full vertical
-            // gap. Convert hundredths-of-pt → twips: 1pt = 20 twips,
-            // so pt*100 → twips = (pt*100)/5. Plain division keeps the
-            // round-trip exact for values that are multiples of 5;
-            // div_ceil would inflate every non-multiple by 1 twip.
-            let space_before_twips = para.space_before_hundredths_pt.map(|h| h / 5);
-            // Empty paragraphs serve as vertical spacers — keep them
-            // in the IR even when content is empty so the renderer
-            // can advance the cursor by the requested amount.
-            if !content.is_empty() || space_before_twips.is_some() {
-                elements.push(Element::Paragraph(Paragraph {
-                    content,
-                    alignment: para.alignment.clone(),
-                    space_before_twips,
-                    ..Default::default()
-                }));
-            }
-        }
+        items.push((para.level as u8, convert_text_paragraph_inline(para)));
     }
+    let mut list = crate::ir::build_nested_list(ordered, &items, 0);
+    list.style = style;
+    list.start_number = start_number;
+    list
+}
+
+fn convert_plain_text_paragraph(para: &crate::pptx::TextParagraph, elements: &mut Vec<Element>) {
+    let content = convert_text_paragraph_inline(para);
+    // Honour space_before from PPTX so spacer paragraphs
+    // emitted by pdf_to_ir round-trip with their full vertical
+    // gap. Convert hundredths-of-pt → twips: 1pt = 20 twips,
+    // so pt*100 → twips = (pt*100)/5. Plain division keeps the
+    // round-trip exact for values that are multiples of 5;
+    // div_ceil would inflate every non-multiple by 1 twip.
+    let space_before_twips = para
+        .space_before_hundredths_pt
+        .map(|h| h / 5)
+        .or_else(|| percent_spacing_twips(para, para.space_before));
+    // Empty paragraphs serve as vertical spacers — keep them
+    // in the IR even when content is empty so the renderer
+    // can advance the cursor by the requested amount.
+    if !content.is_empty() || space_before_twips.is_some() {
+        elements.push(Element::Paragraph(Paragraph {
+            content,
+            alignment: para.alignment.clone(),
+            space_before_twips,
+            space_after_twips: match para.space_after {
+                Some(crate::pptx::TextSpacing::Points(h)) => Some(h / 5),
+                pct => percent_spacing_twips(para, pct),
+            },
+            line_spacing: para.line_spacing.map(|s| match s {
+                // Same unit as DOCX `w:line` with lineRule=auto:
+                // 240ths of a line (100000 = single = 240).
+                crate::pptx::TextSpacing::Percent(p) => LineSpacing::Auto(
+                    u32::try_from(u64::from(p) * 240 / 100_000).unwrap_or(u32::MAX),
+                ),
+                crate::pptx::TextSpacing::Points(h) => LineSpacing::Exact(h / 5),
+            }),
+            indent_left_twips: para.margin_left_emu.map(emu_to_twips),
+            indent_right_twips: para.margin_right_emu.map(emu_to_twips),
+            first_line_indent_twips: para.indent_emu.map(emu_to_twips),
+            tabs: para
+                .tab_stops
+                .iter()
+                .map(|t| TabStop {
+                    position_twips: emu_to_twips(t.position_emu),
+                    alignment: match t.alignment.as_deref() {
+                        Some("ctr") => TabAlignment::Center,
+                        Some("r") => TabAlignment::Right,
+                        Some("dec") => TabAlignment::Decimal,
+                        _ => TabAlignment::Left,
+                    },
+                    leader: TabLeader::None,
+                })
+                .collect(),
+            ..Default::default()
+        }));
+    }
+}
+
+/// Text size a percent spacing is measured against when no run in the
+/// paragraph resolves one through the inheritance chain: 18 pt, the size
+/// PowerPoint and LibreOffice's OOXML import both fall back to.
+const DEFAULT_TEXT_SIZE_HUNDREDTHS_PT: u32 = 1800;
+
+/// A percent-form space before/after (`<a:spcPct>` inside `<a:spcBef>` /
+/// `<a:spcAft>`, ECMA-376 Part 1 §21.1.2.2.11: "a percentage of the text
+/// size") as twips, measured against the first run's resolved font size
+/// (its own `sz`, or the size the list-style / placeholder / master chain
+/// filled in). `None` for any other spacing form.
+fn percent_spacing_twips(
+    para: &crate::pptx::TextParagraph,
+    spacing: Option<crate::pptx::TextSpacing>,
+) -> Option<u32> {
+    let crate::pptx::TextSpacing::Percent(pct) = spacing? else {
+        return None;
+    };
+    let size = para
+        .content
+        .iter()
+        .find_map(|c| match c {
+            crate::pptx::TextContent::Run(r) => r.font_size_hundredths_pt,
+            _ => None,
+        })
+        .unwrap_or(DEFAULT_TEXT_SIZE_HUNDREDTHS_PT);
+    // hundredths-pt × (pct / 100000) × 20 twips/pt ÷ 100.
+    u32::try_from(u64::from(size) * u64::from(pct) / 500_000).ok()
+}
+
+/// EMU → twips (635 EMU per twip), saturating at the `i32` range.
+fn emu_to_twips(emu: i64) -> i32 {
+    i32::try_from(emu / 635).unwrap_or(if emu < 0 { i32::MIN } else { i32::MAX })
 }
 
 /// Resolve a parsed `HyperlinkInfo` (run-level `a:rPr/a:hlinkClick` or
@@ -559,6 +780,7 @@ fn convert_text_paragraph_inline(para: &crate::pptx::TextParagraph) -> Vec<Inlin
                         // field uses the twentieths-of-a-point units the
                         // DOCX writer emits, so scale by 1/5.
                         char_spacing_half_pt: run.char_spacing_hundredths_pt.map(|s| s / 5),
+                        hyperlink_tooltip: run.hyperlink.as_ref().and_then(|h| h.tooltip.clone()),
                         ..Default::default()
                     }));
                 }
@@ -690,6 +912,31 @@ mod tests {
                 out
             })
             .collect()
+    }
+
+    /// An absurd `p:sldSz` truncated through `as u32` into an arbitrary
+    /// page size; an out-of-range size must yield no page size at all.
+    #[test]
+    fn test_out_of_range_slide_size_does_not_become_a_page_size() {
+        use crate::pptx::SlideSize;
+        let ok = slide_page_setup(&SlideSize {
+            cx: 12_192_000,
+            cy: 6_858_000,
+        })
+        .expect("a 16:9 slide is legal");
+        assert_eq!((ok.width_twips, ok.height_twips, ok.landscape), (19_200, 10_800, true));
+        for (cx, cy) in [
+            (i64::MAX, 6_858_000),
+            (4_294_967_296 * 635, 6_858_000),
+            (0, 6_858_000),
+            (-5, 6_858_000),
+            (12_192_000, 51_206_401),
+        ] {
+            assert!(
+                slide_page_setup(&SlideSize { cx, cy }).is_none(),
+                "{cx}x{cy} must not produce a page size"
+            );
+        }
     }
 
     /// A non-text AutoShape (decorative icon, action

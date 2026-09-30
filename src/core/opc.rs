@@ -199,6 +199,53 @@ fn normalize_path(path: &str) -> String {
     segments.join("/")
 }
 
+/// Content types of a package's main part (ECMA-376 Part 1 §11.3.10,
+/// §12.3.23, §13.3.6 and the macro-enabled / template variants Office
+/// registers), used when `_rels/.rels` does not name the main part.
+const MAIN_PART_CONTENT_TYPES: &[&str] = &[
+    // WordprocessingML: .docx, .dotx, .docm, .dotm
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml",
+    "application/vnd.ms-word.document.macroEnabled.main+xml",
+    "application/vnd.ms-word.template.macroEnabledTemplate.main+xml",
+    // SpreadsheetML: .xlsx, .xltx, .xlsm, .xltm, .xlam, .xlsb
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
+    "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+    "application/vnd.ms-excel.template.macroEnabled.main+xml",
+    "application/vnd.ms-excel.addin.macroEnabled.main+xml",
+    "application/vnd.ms-excel.sheet.binary.macroEnabled.main",
+    // PresentationML: .pptx, .ppsx, .potx, .pptm, .ppsm, .potm
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
+    "application/vnd.openxmlformats-officedocument.presentationml.slideshow.main+xml",
+    "application/vnd.openxmlformats-officedocument.presentationml.template.main+xml",
+    "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml",
+    "application/vnd.ms-powerpoint.slideshow.macroEnabled.main+xml",
+    "application/vnd.ms-powerpoint.template.macroEnabled.main+xml",
+];
+
+/// Whether a zip entry name (`/`-separated, no leading `/`) is a
+/// relationships part: a `*.rels` file directly inside a `_rels` folder
+/// (ECMA-376 Part 2 §9.3.3). Both are compared ASCII-case-insensitively,
+/// as part names are; a `_rels` substring elsewhere (`word/a_rels/x.xml`)
+/// is an ordinary part.
+fn is_relationships_part_name(name: &str) -> bool {
+    let (dir, file) = name.rsplit_once('/').unwrap_or(("", name));
+    let folder = dir.rsplit('/').next().unwrap_or("");
+    folder.eq_ignore_ascii_case("_rels") && ends_with_ignore_ascii_case(file, ".rels")
+}
+
+/// Whether a part name carries an XML payload by extension (`.xml` or
+/// `.rels`, any case) and so goes through encoding normalisation.
+pub(crate) fn is_xml_part_name(name: &str) -> bool {
+    ends_with_ignore_ascii_case(name, ".xml") || ends_with_ignore_ascii_case(name, ".rels")
+}
+
+fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
+    s.len() >= suffix.len()
+        && s.as_bytes()[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+}
+
 // ---------------------------------------------------------------------------
 // OpcReader
 // ---------------------------------------------------------------------------
@@ -291,6 +338,14 @@ impl<R: Read + Seek> OpcReader<R> {
         })
     }
 
+    /// Parts read so far whose bytes failed their recorded CRC-32. They
+    /// were read as stored; a reader reports them through
+    /// `Metadata::warnings` so possibly damaged content is not presented
+    /// as sound.
+    pub fn crc_mismatched_parts(&self) -> Vec<String> {
+        self.entries.crc_mismatched_parts()
+    }
+
     /// Return the package-level relationships from `_rels/.rels`.
     pub fn package_rels(&self) -> &Relationships {
         &self.package_rels
@@ -304,7 +359,7 @@ impl<R: Read + Seek> OpcReader<R> {
         trace!("read_part '{}' ({} bytes)", name, data.len());
 
         // Transcode non-UTF-8 XML to UTF-8 (handles ISO-8859-1, Windows-1252, etc.)
-        if name.as_str().ends_with(".xml") || name.as_str().ends_with(".rels") {
+        if is_xml_part_name(name.as_str()) {
             if let Some(utf8_data) = super::xml::ensure_utf8(&data) {
                 trace!("read_part '{}': transcoded to UTF-8", name);
                 return Ok(utf8_data);
@@ -348,14 +403,14 @@ impl<R: Read + Seek> OpcReader<R> {
             return PartName::new(&target);
         }
 
-        // Fallback: scan [Content_Types].xml overrides for a main document content type
-        const MAIN_CONTENT_TYPES: &[&str] = &[
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
-        ];
+        // Fallback: scan [Content_Types].xml overrides for a main document
+        // content type — every variant the format readers accept, macro-
+        // enabled and template packages included.
         for (part_name, ct) in self.content_types.overrides() {
-            if MAIN_CONTENT_TYPES.iter().any(|&expected| ct == expected) {
+            if MAIN_PART_CONTENT_TYPES
+                .iter()
+                .any(|&expected| ct == expected)
+            {
                 debug!(
                     "main_document_part: fallback to Content_Types override '{}' ({})",
                     part_name, ct
@@ -382,8 +437,9 @@ impl<R: Read + Seek> OpcReader<R> {
                 if name.eq_ignore_ascii_case("[Content_Types].xml") {
                     return None;
                 }
-                // Skip .rels files in _rels directories
-                if name.contains("_rels/") {
+                // Skip relationships parts; they are read per source part
+                // through `read_rels_for` and regenerated on save.
+                if is_relationships_part_name(&name) {
                     return None;
                 }
                 let part_name = format!("/{name}");
@@ -410,12 +466,46 @@ impl<R: Read + Seek> OpcReader<R> {
 /// relationship, and the XLSX loader *probes* for optional parts per sheet,
 /// so package open was quadratic in the number of parts: 8,000 one-cell
 /// sheets took 56 s. This index makes the miss as cheap as the hit.
+///
+/// It also keeps the package-wide decompression account: every distinct
+/// entry read through [`read_zip_entry`] is charged once against
+/// [`crate::limits::max_package_bytes`], so a package of many parts each
+/// just under [`MAX_PART_SIZE`] — or many entries pointing at the same
+/// compressed data — cannot add up to an unbounded allocation.
 pub(crate) struct ZipEntryIndex {
     by_normalized: HashMap<String, usize>,
+    /// Entries already charged against the byte budget, by index.
+    charged: Vec<std::cell::Cell<bool>>,
+    /// Decompressed bytes charged so far.
+    consumed: std::cell::Cell<u64>,
+    /// The package-wide byte budget, fixed when the index is built.
+    byte_limit: u64,
+    /// Entries whose bytes failed their recorded CRC-32, in read order.
+    crc_mismatched: std::cell::RefCell<Vec<String>>,
 }
 
 impl ZipEntryIndex {
+    /// Record that `name` failed its CRC-32 check (once per entry).
+    fn record_crc_mismatch(&self, name: &str) {
+        let mut seen = self.crc_mismatched.borrow_mut();
+        if !seen.iter().any(|n| n == name) {
+            seen.push(name.to_string());
+        }
+    }
+
+    /// Entries read so far whose bytes failed their recorded CRC-32.
+    pub(crate) fn crc_mismatched_parts(&self) -> Vec<String> {
+        self.crc_mismatched.borrow().clone()
+    }
+
     pub(crate) fn new<R: Read + Seek>(archive: &ZipArchive<R>) -> Self {
+        Self::with_byte_limit(archive, crate::limits::max_package_bytes())
+    }
+
+    pub(crate) fn with_byte_limit<R: Read + Seek>(
+        archive: &ZipArchive<R>,
+        byte_limit: u64,
+    ) -> Self {
         let mut by_normalized = HashMap::with_capacity(archive.len());
         for name in archive.file_names() {
             let Some(index) = archive.index_for_name(name) else {
@@ -428,7 +518,41 @@ impl ZipEntryIndex {
                 .and_modify(|existing: &mut usize| *existing = (*existing).min(index))
                 .or_insert(index);
         }
-        Self { by_normalized }
+        Self {
+            by_normalized,
+            charged: (0..archive.len())
+                .map(|_| std::cell::Cell::new(false))
+                .collect(),
+            consumed: std::cell::Cell::new(0),
+            byte_limit,
+            crc_mismatched: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Charge `bytes` decompressed from entry `index` against the package
+    /// budget. An entry already charged is free: re-reading a shared image
+    /// allocates nothing that outlives the previous read.
+    fn charge(&self, index: usize, bytes: u64, name: &str) -> Result<()> {
+        if self.charged.get(index).is_some_and(|c| c.get()) {
+            return Ok(());
+        }
+        let total = self.consumed.get().saturating_add(bytes);
+        if total > self.byte_limit {
+            return Err(Error::PackageLimit(format!(
+                "reading '{name}' brings the package's decompressed size past {} bytes",
+                self.byte_limit
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record that entry `index` was read in full, `bytes` long.
+    fn commit(&self, index: usize, bytes: u64) {
+        if let Some(c) = self.charged.get(index) {
+            if !c.replace(true) {
+                self.consumed.set(self.consumed.get().saturating_add(bytes));
+            }
+        }
     }
 
     /// Index of the entry matching `name` case-insensitively, with `\` and
@@ -450,20 +574,20 @@ impl ZipEntryIndex {
     }
 }
 
-/// Read a ZIP entry by name, returning its bytes.
-/// Falls back to case-insensitive and backslash-normalized lookup if exact match fails.
-/// Read the "total number of entries in the central directory" field from a
-/// ZIP's End of Central Directory record.
-///
-/// Returns `None` when the record cannot be located or the archive uses the
-/// ZIP64 sentinel, in which case the caller simply skips the duplicate check
-/// rather than guessing. The field is the only way to see duplicates at all:
-/// the zip crate keys its entries by name, so two records with the same name
-/// collapse into one before any caller can notice.
-fn central_directory_entry_count<R: Read + Seek>(reader: &mut R) -> Result<Option<usize>> {
+/// The total entry count an archive's end-of-central-directory declares —
+/// the ZIP64 record's 8-byte count when the classic record holds the
+/// 0xFFFF sentinel (APPNOTE §4.3.14–§4.3.16). `None` when neither record
+/// can be found; the zip crate then reports the archive as malformed.
+fn declared_entry_count<R: Read + Seek>(reader: &mut R) -> Result<Option<u64>> {
+    /// End of central directory record signature (APPNOTE §4.3.16).
     const EOCD_SIG: [u8; 4] = [b'P', b'K', 5, 6];
-    // The EOCD is at most 22 bytes plus a 64 KiB comment.
-    const MAX_SCAN: u64 = 22 + 0xFFFF;
+    /// ZIP64 end of central directory locator signature (APPNOTE §4.3.15).
+    const EOCD64_LOCATOR_SIG: [u8; 4] = [b'P', b'K', 6, 7];
+    /// ZIP64 end of central directory record signature (APPNOTE §4.3.14).
+    const EOCD64_SIG: [u8; 4] = [b'P', b'K', 6, 6];
+    /// The EOCD is 22 bytes plus a comment of at most 64 KiB, preceded by
+    /// the 20-byte ZIP64 locator when present.
+    const MAX_SCAN: u64 = 20 + 22 + 0xFFFF;
 
     let len = reader.seek(std::io::SeekFrom::End(0))?;
     if len < 22 {
@@ -478,44 +602,146 @@ fn central_directory_entry_count<R: Read + Seek>(reader: &mut R) -> Result<Optio
     let Some(pos) = buf
         .windows(4)
         .rposition(|w| w == EOCD_SIG)
-        .filter(|&p| p + 12 <= buf.len())
+        .filter(|&p| p + 22 <= buf.len())
     else {
         return Ok(None);
     };
     let total = u16::from_le_bytes([buf[pos + 10], buf[pos + 11]]);
-    // 0xFFFF is the ZIP64 sentinel: the real count lives elsewhere.
-    if total == u16::MAX {
+    if total != u16::MAX {
+        return Ok(Some(total as u64));
+    }
+    // ZIP64: the locator sits immediately before the EOCD and gives the
+    // absolute offset of the ZIP64 record, whose total count is at +32.
+    let Some(loc) = pos
+        .checked_sub(20)
+        .filter(|&l| buf[l..l + 4] == EOCD64_LOCATOR_SIG)
+    else {
+        return Ok(None);
+    };
+    let mut off = [0u8; 8];
+    off.copy_from_slice(&buf[loc + 8..loc + 16]);
+    let eocd64_offset = u64::from_le_bytes(off);
+    if eocd64_offset.checked_add(56).is_none_or(|end| end > len) {
         return Ok(None);
     }
-    Ok(Some(total as usize))
+    let mut record = [0u8; 56];
+    reader.seek(std::io::SeekFrom::Start(eocd64_offset))?;
+    reader.read_exact(&mut record)?;
+    if record[..4] != EOCD64_SIG {
+        return Ok(None);
+    }
+    let mut count = [0u8; 8];
+    count.copy_from_slice(&record[32..40]);
+    Ok(Some(u64::from_le_bytes(count)))
 }
 
-/// Open a ZIP archive, refusing one that holds two entries with the same
-/// name.
+/// Count the records physically present in the central directory that
+/// starts at `start`, walking them by their own length fields until the
+/// next structure is not a central-directory file header (PKWARE APPNOTE
+/// §4.3.12, which ECMA-376 Part 2 Annex C adopts: a 46-byte fixed header
+/// followed by the name, extra field and comment).
+///
+/// This is the count a reader that walks the directory by size sees,
+/// independent of the record count the end-of-central-directory declares.
+fn count_central_directory_records<R: Read + Seek>(reader: &mut R, start: u64) -> Result<usize> {
+    /// Central directory file header signature (APPNOTE §4.3.12).
+    const CD_SIG: u32 = 0x0201_4b50;
+    /// Fixed part of a central directory file header (APPNOTE §4.3.12).
+    const CD_FIXED_LEN: usize = 46;
+
+    reader.seek(std::io::SeekFrom::Start(start))?;
+    let mut r = std::io::BufReader::new(reader);
+    let mut header = [0u8; CD_FIXED_LEN];
+    let mut count = 0usize;
+    loop {
+        match r.read_exact(&mut header[..4]) {
+            Ok(()) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+        if u32::from_le_bytes([header[0], header[1], header[2], header[3]]) != CD_SIG {
+            break;
+        }
+        r.read_exact(&mut header[4..])?;
+        let name_len = u16::from_le_bytes([header[28], header[29]]) as i64;
+        let extra_len = u16::from_le_bytes([header[30], header[31]]) as i64;
+        let comment_len = u16::from_le_bytes([header[32], header[33]]) as i64;
+        r.seek_relative(name_len + extra_len + comment_len)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Open a ZIP archive, refusing one whose entries two readers could
+/// resolve differently.
 ///
 /// Which of two same-named entries a reader returns is unspecified, so two
 /// implementations reading the same bytes can see two different
 /// documents. That is the shape of CVE-2025-31672 and of every "scanner
 /// reads one copy, renderer reads the other" bypass. Whichever copy we
-/// picked would be accidental, so the package is refused. The
-/// central-directory record count is read *before* the zip crate sees the
-/// reader, because the crate keys entries by name and collapses duplicates
-/// before any caller can notice.
+/// picked would be accidental, so the package is refused. Three shapes are
+/// checked:
+///
+/// * **Exact duplicates.** The zip crate keys entries by name and collapses
+///   two records with the same name into one, so they are detected by
+///   walking the central directory and comparing its record count with the
+///   number of entries the crate kept. This holds for ZIP64 archives too:
+///   the walk starts wherever the crate located the directory.
+/// * **Hidden records.** An end-of-central-directory record (classic or
+///   ZIP64) that understates the record count makes the crate stop early,
+///   while a reader that walks the directory by size sees every record.
+///   The same walk catches this.
+/// * **Case / separator duplicates.** OPC part names are compared
+///   ASCII-case-insensitively (ECMA-376 Part 2 §9.1.1.1), and
+///   Windows-written archives use `\`: `word/Document.xml` and
+///   `word\document.xml` name the same part as `word/document.xml`.
 ///
 /// Every OOXML reader must open its archive through this — `OpcReader`
 /// does, and so does the XLSX fast path, which bypasses `OpcReader` for
 /// speed and for a while bypassed this check with it.
-pub(crate) fn open_zip_rejecting_duplicates<R: Read + Seek>(
-    mut reader: R,
-) -> Result<ZipArchive<R>> {
-    let declared_entries = central_directory_entry_count(&mut reader)?;
+///
+/// The package's entry count is bounded by
+/// [`crate::limits::max_package_entries`]: the declared count is checked
+/// before the zip crate sizes its entry table from it, and the walked count
+/// after.
+pub(crate) fn open_zip_rejecting_duplicates<R: Read + Seek>(reader: R) -> Result<ZipArchive<R>> {
+    open_zip_checked(reader, crate::limits::max_package_entries())
+}
+
+fn open_zip_checked<R: Read + Seek>(mut reader: R, max_entries: usize) -> Result<ZipArchive<R>> {
+    let too_many = |n: u64| {
+        Error::PackageLimit(format!("the package declares {n} entries; the limit is {max_entries}"))
+    };
+    if let Some(declared) = declared_entry_count(&mut reader)? {
+        if declared > max_entries as u64 {
+            return Err(too_many(declared));
+        }
+    }
+    // A first pass lets the crate locate the central directory its own way
+    // (EOCD, ZIP64 EOCD, prepended-data offset), so the walk below counts
+    // exactly the directory the crate reads.
+    reader.seek(std::io::SeekFrom::Start(0))?;
+    let (dir_start, kept) = {
+        let archive = ZipArchive::new(&mut reader)?;
+        (archive.central_directory_start(), archive.len())
+    };
+    let present = count_central_directory_records(&mut reader, dir_start)?;
+    if present > max_entries {
+        return Err(too_many(present as u64));
+    }
+    if present != kept {
+        return Err(Error::DuplicatePart(format!(
+            "the central directory holds {present} records but resolves to {kept} distinct entries"
+        )));
+    }
     reader.seek(std::io::SeekFrom::Start(0))?;
     let archive = ZipArchive::new(reader)?;
-    if let Some(declared) = declared_entries {
-        if declared > archive.len() {
+
+    let mut seen = std::collections::HashSet::with_capacity(archive.len());
+    for name in archive.file_names() {
+        if !seen.insert(ZipEntryIndex::normalize(name)) {
             return Err(Error::DuplicatePart(format!(
-                "{declared} central-directory entries collapse to {} unique names",
-                archive.len()
+                "'{name}' names the same part as another entry (part names are case-insensitive)"
             )));
         }
     }
@@ -560,19 +786,27 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
             limit: MAX_PART_SIZE,
         });
     }
+    // The package-wide account, checked against the declared size before
+    // reading and against the actual size after.
+    entries.charge(index, file.size(), name)?;
     let mut buf = Vec::with_capacity((file.size() as usize).min(1 << 20));
     let mut capped = (&mut file).take(MAX_PART_SIZE + 1);
     match capped.read_to_end(&mut buf) {
         Ok(_) => {},
+        // A CRC-32 mismatch means the bytes may not be the ones the
+        // producer wrote. Refusing the part cost real documents their
+        // content (a sheet whose only fault was its checksum vanished), so
+        // the bytes are kept — as 7-Zip does when it extracts with a CRC
+        // warning — provided all of them arrived, and the mismatch is
+        // recorded so every reader reports it (`Metadata::warnings`)
+        // rather than presenting possibly damaged text as sound.
         Err(e)
             if e.kind() == std::io::ErrorKind::InvalidData
                 && e.to_string().contains("checksum")
-                && !buf.is_empty() =>
+                && buf.len() as u64 == file.size() =>
         {
-            // CRC32 mismatch — the data was fully decompressed but the checksum
-            // doesn't match. Accept the data anyway for tolerance of real-world
-            // files with minor corruption (e.g., re-saved without recomputing CRC).
-            trace!("read_zip_entry '{}': ignoring CRC mismatch", name);
+            log::warn!("opc: part '{name}' failed its CRC-32 check; read as stored");
+            entries.record_crc_mismatch(name);
         },
         Err(e) => return Err(e.into()),
     }
@@ -582,6 +816,9 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
             limit: MAX_PART_SIZE,
         });
     }
+    // A lying declared size is caught here, before the bytes are kept.
+    entries.charge(index, buf.len() as u64, name)?;
+    entries.commit(index, buf.len() as u64);
     Ok(buf)
 }
 
@@ -771,6 +1008,443 @@ mod tests {
             archive.index_for_name("xl/Worksheets/Sheet1.xml")
         );
         assert_eq!(index.lookup("xl/worksheets/sheet2.xml"), None);
+    }
+
+    /// Bitwise CRC-32 (IEEE), enough to hand-assemble stored zip entries.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in data {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    /// How the end-of-central-directory of a hand-assembled zip is written.
+    #[derive(Clone, Copy)]
+    enum Eocd {
+        /// A plain EOCD whose record count is the given value.
+        Count(u16),
+        /// A ZIP64 EOCD record + locator carrying the true count, with the
+        /// classic EOCD holding the 0xFFFF / 0xFFFFFFFF sentinels.
+        Zip64,
+    }
+
+    /// Hand-assemble a stored (uncompressed) zip. The zip crate's writer
+    /// refuses duplicate names and never forges counts, so the shapes the
+    /// reader must reject are built byte by byte. `bad_crc` names entries
+    /// whose recorded CRC-32 is deliberately wrong.
+    fn raw_zip(entries: &[(&str, &[u8])], eocd: Eocd, bad_crc: &[&str]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (name, data) in entries {
+            let mut crc = crc32(data);
+            if bad_crc.contains(name) {
+                crc ^= 0xDEAD_BEEF;
+            }
+            let offset = out.len() as u32;
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+            out.extend_from_slice(&0u32.to_le_bytes()); // time + date
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes()); // made by
+            central.extend_from_slice(&20u16.to_le_bytes()); // needed
+            central.extend_from_slice(&0u16.to_le_bytes()); // flags
+            central.extend_from_slice(&0u16.to_le_bytes()); // method
+            central.extend_from_slice(&0u32.to_le_bytes()); // time + date
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes()); // extra
+            central.extend_from_slice(&0u16.to_le_bytes()); // comment
+            central.extend_from_slice(&0u16.to_le_bytes()); // disk
+            central.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+            central.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let cd_offset = out.len() as u64;
+        let cd_size = central.len() as u64;
+        out.extend_from_slice(&central);
+        let n = entries.len() as u64;
+        let (count16, size32, offset32) = match eocd {
+            Eocd::Count(c) => (c, cd_size as u32, cd_offset as u32),
+            Eocd::Zip64 => {
+                let eocd64_offset = out.len() as u64;
+                out.extend_from_slice(&0x0606_4b50u32.to_le_bytes());
+                out.extend_from_slice(&44u64.to_le_bytes()); // record size
+                out.extend_from_slice(&45u16.to_le_bytes()); // made by
+                out.extend_from_slice(&45u16.to_le_bytes()); // needed
+                out.extend_from_slice(&0u32.to_le_bytes()); // this disk
+                out.extend_from_slice(&0u32.to_le_bytes()); // cd disk
+                out.extend_from_slice(&n.to_le_bytes()); // entries on disk
+                out.extend_from_slice(&n.to_le_bytes()); // entries total
+                out.extend_from_slice(&cd_size.to_le_bytes());
+                out.extend_from_slice(&cd_offset.to_le_bytes());
+                // ZIP64 end-of-central-directory locator.
+                out.extend_from_slice(&0x0706_4b50u32.to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+                out.extend_from_slice(&eocd64_offset.to_le_bytes());
+                out.extend_from_slice(&1u32.to_le_bytes());
+                (u16::MAX, u32::MAX, u32::MAX)
+            },
+        };
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // this disk
+        out.extend_from_slice(&0u16.to_le_bytes()); // cd disk
+        out.extend_from_slice(&count16.to_le_bytes());
+        out.extend_from_slice(&count16.to_le_bytes());
+        out.extend_from_slice(&size32.to_le_bytes());
+        out.extend_from_slice(&offset32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        out
+    }
+
+    const MINIMAL_CT: &[u8] = br#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>"#;
+
+    fn open(bytes: Vec<u8>) -> Result<OpcReader<std::io::Cursor<Vec<u8>>>> {
+        OpcReader::new(std::io::Cursor::new(bytes))
+    }
+
+    #[test]
+    fn test_hand_assembled_zip_opens() {
+        let bytes = raw_zip(
+            &[("[Content_Types].xml", MINIMAL_CT), ("word/a.xml", b"<a/>")],
+            Eocd::Count(2),
+            &[],
+        );
+        let mut r = open(bytes).expect("a well-formed hand-assembled zip opens");
+        let a = r.read_part(&PartName::new("/word/a.xml").unwrap()).unwrap();
+        assert_eq!(a, b"<a/>");
+        let bytes = raw_zip(
+            &[("[Content_Types].xml", MINIMAL_CT), ("word/a.xml", b"<a/>")],
+            Eocd::Zip64,
+            &[],
+        );
+        open(bytes).expect("a well-formed ZIP64 zip opens");
+    }
+
+    #[test]
+    fn test_zip64_archive_with_duplicate_entries_is_rejected() {
+        let bytes = raw_zip(
+            &[
+                ("[Content_Types].xml", MINIMAL_CT),
+                ("word/a.xml", b"<first/>"),
+                ("word/a.xml", b"<second/>"),
+            ],
+            Eocd::Zip64,
+            &[],
+        );
+        assert!(matches!(open(bytes), Err(Error::DuplicatePart(_))));
+    }
+
+    /// An end-of-central-directory that declares fewer records than the
+    /// directory holds makes this reader stop early while a reader that
+    /// walks the directory by size sees every record. Either way the two
+    /// disagree about the package, so it is refused.
+    #[test]
+    fn test_understated_central_directory_count_is_rejected() {
+        // The duplicate sits past the declared count.
+        let bytes = raw_zip(
+            &[
+                ("[Content_Types].xml", MINIMAL_CT),
+                ("word/a.xml", b"<first/>"),
+                ("word/a.xml", b"<second/>"),
+            ],
+            Eocd::Count(2),
+            &[],
+        );
+        assert!(open(bytes).is_err());
+        // Declared count covers both duplicates but not a trailing record.
+        let bytes = raw_zip(
+            &[
+                ("[Content_Types].xml", MINIMAL_CT),
+                ("word/a.xml", b"<first/>"),
+                ("word/a.xml", b"<second/>"),
+                ("word/b.xml", b"<b/>"),
+            ],
+            Eocd::Count(3),
+            &[],
+        );
+        assert!(open(bytes).is_err());
+        // A hidden trailing record with a distinct name.
+        let bytes = raw_zip(
+            &[
+                ("[Content_Types].xml", MINIMAL_CT),
+                ("word/a.xml", b"<a/>"),
+                ("word/hidden.xml", b"<h/>"),
+            ],
+            Eocd::Count(2),
+            &[],
+        );
+        assert!(open(bytes).is_err());
+    }
+
+    /// Part names are compared case-insensitively (ECMA-376 Part 2 §9.1.1.1),
+    /// so two entries differing only in case name the same part.
+    #[test]
+    fn test_case_only_duplicate_part_names_are_rejected() {
+        let bytes = raw_zip(
+            &[
+                ("[Content_Types].xml", MINIMAL_CT),
+                ("word/Document.xml", b"<first/>"),
+                ("word/document.xml", b"<second/>"),
+            ],
+            Eocd::Count(3),
+            &[],
+        );
+        assert!(matches!(open(bytes), Err(Error::DuplicatePart(_))));
+        // `\` and `/` separators name the same part too.
+        let bytes = raw_zip(
+            &[
+                ("[Content_Types].xml", MINIMAL_CT),
+                ("word/a.xml", b"<first/>"),
+                ("word\\a.xml", b"<second/>"),
+            ],
+            Eocd::Count(3),
+            &[],
+        );
+        assert!(matches!(open(bytes), Err(Error::DuplicatePart(_))));
+    }
+
+    /// Overwrite the uncompressed size `name`'s local and central headers
+    /// declare, leaving the data untouched.
+    fn forge_uncompressed_size(bytes: &mut [u8], name: &str, size: u32) {
+        let mut at = 0;
+        while at + 4 <= bytes.len() {
+            let sig = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let (name_at, size_at) = match sig {
+                0x0403_4b50 => (at + 30, at + 22),
+                0x0201_4b50 => (at + 46, at + 24),
+                _ => {
+                    at += 1;
+                    continue;
+                },
+            };
+            if bytes[name_at..].starts_with(name.as_bytes()) {
+                bytes[size_at..size_at + 4].copy_from_slice(&size.to_le_bytes());
+            }
+            at += 1;
+        }
+    }
+
+    /// The per-part guard refuses an entry whose declared size exceeds
+    /// `MAX_PART_SIZE` before allocating anything for it.
+    #[test]
+    fn test_part_declaring_more_than_the_part_cap_is_refused() {
+        let mut bytes = raw_zip(
+            &[("[Content_Types].xml", MINIMAL_CT), ("word/a.xml", b"<a/>")],
+            Eocd::Count(2),
+            &[],
+        );
+        forge_uncompressed_size(&mut bytes, "word/a.xml", (MAX_PART_SIZE + 1) as u32);
+        let mut r = open(bytes).expect("the directory itself is well formed");
+        let err = r
+            .read_part(&PartName::new("/word/a.xml").unwrap())
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::DecompressionLimit { ref part, limit }
+                if part == "word/a.xml" && limit == MAX_PART_SIZE),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn test_entry_count_over_the_limit_is_refused() {
+        let entries: &[(&str, &[u8])] = &[
+            ("[Content_Types].xml", MINIMAL_CT),
+            ("a.xml", b"<a/>"),
+            ("b.xml", b"<b/>"),
+        ];
+        for eocd in [Eocd::Count(3), Eocd::Zip64] {
+            let bytes = raw_zip(entries, eocd, &[]);
+            assert!(open_zip_checked(std::io::Cursor::new(bytes.clone()), 3).is_ok());
+            let err = open_zip_checked(std::io::Cursor::new(bytes), 2).unwrap_err();
+            assert!(matches!(err, Error::PackageLimit(_)), "{err:?}");
+        }
+        // A declared count that hides records does not hide them from
+        // the limit: the walked count is checked too.
+        let bytes = raw_zip(entries, Eocd::Count(1), &[]);
+        let err = open_zip_checked(std::io::Cursor::new(bytes), 2).unwrap_err();
+        assert!(matches!(err, Error::PackageLimit(_)), "{err:?}");
+    }
+
+    /// Distinct parts are charged against one package-wide budget; a part
+    /// read twice is charged once.
+    #[test]
+    fn test_package_byte_budget_spans_parts_and_charges_each_once() {
+        let bytes = raw_zip(
+            &[
+                ("a.bin", &[1u8; 8]),
+                ("b.bin", &[2u8; 8]),
+                ("c.bin", &[3u8; 8]),
+            ],
+            Eocd::Count(3),
+            &[],
+        );
+        let mut archive = ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let entries = ZipEntryIndex::with_byte_limit(&archive, 16);
+        assert_eq!(
+            read_zip_entry(&mut archive, &entries, "a.bin")
+                .unwrap()
+                .len(),
+            8
+        );
+        assert_eq!(
+            read_zip_entry(&mut archive, &entries, "a.bin")
+                .unwrap()
+                .len(),
+            8
+        );
+        assert_eq!(
+            read_zip_entry(&mut archive, &entries, "b.bin")
+                .unwrap()
+                .len(),
+            8
+        );
+        let err = read_zip_entry(&mut archive, &entries, "c.bin").unwrap_err();
+        assert!(matches!(err, Error::PackageLimit(_)), "{err:?}");
+        // Already-charged parts stay readable.
+        assert!(read_zip_entry(&mut archive, &entries, "b.bin").is_ok());
+    }
+
+    /// A declared size that understates the data does not dodge the
+    /// package budget: the actual length is charged after the read.
+    #[test]
+    fn test_package_byte_budget_charges_actual_not_declared_size() {
+        let mut bytes = raw_zip(&[("a.bin", &[7u8; 32])], Eocd::Count(1), &[]);
+        forge_uncompressed_size(&mut bytes, "a.bin", 1);
+        let mut archive = ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let entries = ZipEntryIndex::with_byte_limit(&archive, 16);
+        let err = read_zip_entry(&mut archive, &entries, "a.bin").unwrap_err();
+        assert!(matches!(err, Error::PackageLimit(_)), "{err:?}");
+    }
+
+    /// Only `*.rels` files directly in a `_rels` folder are relationships
+    /// parts, in any case; `a_rels/` is an ordinary folder whose parts must
+    /// survive an edit round trip.
+    #[test]
+    fn test_part_names_skip_exactly_the_relationships_parts() {
+        let bytes = raw_zip(
+            &[
+                ("[Content_Types].xml", MINIMAL_CT),
+                ("_rels/.rels", b"<Relationships/>"),
+                ("word/document.xml", b"<d/>"),
+                ("word/_rels/document.xml.rels", b"<Relationships/>"),
+                ("word/_RELS/other.xml.RELS", b"<Relationships/>"),
+                ("word/a_rels/data.xml", b"<keep/>"),
+                ("word/_rels/notes.xml", b"<keep/>"),
+            ],
+            Eocd::Count(7),
+            &[],
+        );
+        let r = open(bytes.clone()).unwrap();
+        let mut names: Vec<String> = r.part_names().iter().map(|p| p.to_string()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "/word/_rels/notes.xml",
+                "/word/a_rels/data.xml",
+                "/word/document.xml"
+            ]
+        );
+
+        let pkg = super::super::editable::EditablePackage::from_reader(std::io::Cursor::new(bytes))
+            .unwrap();
+        let kept = pkg.get_part(&PartName::new("/word/a_rels/data.xml").unwrap());
+        assert_eq!(kept, Some(&b"<keep/>"[..]));
+    }
+
+    /// With no `_rels/.rels`, the main part is found from the content-type
+    /// overrides — for macro-enabled and template packages too.
+    #[test]
+    fn test_main_part_fallback_accepts_macro_and_template_content_types() {
+        for ct in [
+            "application/vnd.ms-word.document.macroEnabled.main+xml",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml",
+            "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
+            "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml",
+            "application/vnd.openxmlformats-officedocument.presentationml.template.main+xml",
+        ] {
+            let types = format!(
+                r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/main/part.xml" ContentType="{ct}"/></Types>"#
+            );
+            let bytes = raw_zip(
+                &[
+                    ("[Content_Types].xml", types.as_bytes()),
+                    ("main/part.xml", b"<m/>"),
+                ],
+                Eocd::Count(2),
+                &[],
+            );
+            let r = open(bytes).unwrap();
+            assert_eq!(r.main_document_part().unwrap().as_str(), "/main/part.xml", "{ct}");
+        }
+    }
+
+    /// Entry lookup is case-insensitive, so the XML-ness test that gates
+    /// encoding normalisation must be too.
+    #[test]
+    fn test_upper_case_xml_part_is_transcoded_to_utf8() {
+        let latin1 = b"<?xml version=\"1.0\" encoding=\"windows-1252\"?><a>caf\xE9</a>";
+        let bytes = raw_zip(
+            &[
+                ("[Content_Types].xml", MINIMAL_CT),
+                ("WORD/DOCUMENT.XML", latin1),
+            ],
+            Eocd::Count(2),
+            &[],
+        );
+        let mut r = open(bytes).unwrap();
+        let data = r
+            .read_part(&PartName::new("/WORD/DOCUMENT.XML").unwrap())
+            .unwrap();
+        let text = String::from_utf8(data).expect("transcoded to UTF-8");
+        assert!(text.contains("caf\u{e9}"), "{text}");
+    }
+
+    /// A part whose bytes do not match its recorded CRC-32 may be damaged.
+    /// Failing the read cost real documents their content (a workbook
+    /// whose sheets all carried a bad CRC went from full text to nothing),
+    /// so the bytes are kept — as 7-Zip does when it extracts with a CRC
+    /// warning — and the mismatch is recorded where a caller can see it.
+    #[test]
+    fn test_crc_mismatch_is_read_and_recorded() {
+        let bytes = raw_zip(
+            &[
+                ("[Content_Types].xml", MINIMAL_CT),
+                ("word/a.xml", b"<a>text</a>"),
+            ],
+            Eocd::Count(2),
+            &["word/a.xml"],
+        );
+        let mut r = open(bytes).expect("the directory is well formed");
+        assert!(r.crc_mismatched_parts().is_empty());
+        let data = r.read_part(&PartName::new("/word/a.xml").unwrap()).unwrap();
+        assert_eq!(data, b"<a>text</a>");
+        assert_eq!(r.crc_mismatched_parts(), vec!["word/a.xml".to_string()]);
+        // Reading it again does not record it twice.
+        r.read_part(&PartName::new("/word/a.xml").unwrap()).unwrap();
+        assert_eq!(r.crc_mismatched_parts().len(), 1);
     }
 
     #[test]

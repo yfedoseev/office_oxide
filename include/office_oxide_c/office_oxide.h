@@ -11,11 +11,22 @@
  *     2 = IO error
  *     3 = parse error
  *     4 = extraction failed
- *     5 = internal error
+ *     5 = internal error (including a library panic caught at the boundary)
  *     6 = unsupported format / feature
+ *   The code reflects the kind of failure, e.g. a file that cannot be read or
+ *   created is OFFICE_ERR_IO, whatever the operation.
+ *
+ * Panic containment:
+ *   No function lets a Rust panic unwind into the caller. A panic (always a
+ *   library bug) is reported as OFFICE_ERR_INTERNAL with the function's
+ *   failure return (NULL, -1 or a status). The handle stays safe to use and
+ *   free, though an edit that panicked may be half-applied.
  *
  * Memory Convention:
  *   - Strings returned as `char*` must be freed with office_oxide_free_string().
+ *     Returned text is UTF-8. A C string cannot contain a NUL byte, so any
+ *     U+0000 in the document text is replaced by U+FFFD (the replacement
+ *     character) rather than silently truncating the string there.
  *   - Byte buffers returned as `uint8_t*` (with an `out_len`) must be freed with
  *     office_oxide_free_bytes(ptr, len).
  *   - Opaque handles must be freed with their corresponding *_free() function.
@@ -59,6 +70,9 @@ extern "C" {
 #define OFFICE_CELL_STRING          1
 #define OFFICE_CELL_NUMBER          2
 #define OFFICE_CELL_BOOLEAN         3
+/* Writer only (office_xlsx_sheet_set_cell*): value_str holds the formula,
+ * with or without a leading '='. */
+#define OFFICE_CELL_FORMULA         4
 
 /* ─── Opaque handle types ─────────────────────────────────────────────────── */
 
@@ -110,10 +124,22 @@ char* office_document_plain_text(const OfficeDocumentHandle* handle, int* error_
 /** Convert to Markdown. Free result with office_oxide_free_string. */
 char* office_document_to_markdown(const OfficeDocumentHandle* handle, int* error_code);
 
+/**
+ * Convert to Markdown with every image embedded inline as
+ * `[image-base64:<data>]` at its position in the flow (plain
+ * office_document_to_markdown drops images). Free with office_oxide_free_string.
+ */
+char* office_document_to_markdown_with_images(
+    const OfficeDocumentHandle* handle,
+    int* error_code);
+
 /** Convert to HTML fragment. Free result with office_oxide_free_string. */
 char* office_document_to_html(const OfficeDocumentHandle* handle, int* error_code);
 
-/** Convert to the document IR as JSON. Free result with office_oxide_free_string. */
+/**
+ * Convert to the document IR as JSON. Free result with office_oxide_free_string.
+ * OFFICE_ERR_EXTRACTION if the IR cannot be serialised.
+ */
 char* office_document_to_ir_json(const OfficeDocumentHandle* handle, int* error_code);
 
 /**
@@ -142,7 +168,9 @@ void office_editable_free(OfficeEditableHandle* handle);
 
 /**
  * Replace every occurrence of `find` with `replace` in text content.
- * Returns the number of replacements, or -1 on error.
+ * Returns the number of replacements, or -1 on error: OFFICE_ERR_INVALID_ARG
+ * for an empty `find` (it would match between every character),
+ * OFFICE_ERR_UNSUPPORTED for XLSX (use office_editable_set_cell).
  */
 int64_t office_editable_replace_text(
     OfficeEditableHandle* handle,
@@ -166,7 +194,11 @@ int32_t office_editable_set_cell(
     double value_num,
     int* error_code);
 
-/** Save the edited document to a file. */
+/**
+ * Save the edited document to a file. The file is written to a temporary
+ * sibling and renamed into place, so a failed save leaves any existing file
+ * at `path` untouched.
+ */
 int32_t office_editable_save(
     const OfficeEditableHandle* handle,
     const char* path,
@@ -195,7 +227,7 @@ char* office_to_html(const char* path, int* error_code);
 /**
  * Convert a Markdown string to an Office document file.
  * format must be "docx", "xlsx", or "pptx" (case-insensitive).
- * Returns OFFICE_OK (0) on success, a negative error code on failure.
+ * Returns OFFICE_OK (0) on success, otherwise a positive error code.
  */
 int32_t office_create_from_markdown(
     const char* markdown,
@@ -221,8 +253,13 @@ uint32_t office_xlsx_writer_add_sheet(OfficeXlsxWriterHandle* handle, const char
 
 /**
  * Set a cell value.
- * value_type: OFFICE_CELL_EMPTY=0, OFFICE_CELL_STRING=1, OFFICE_CELL_NUMBER=2.
- * value_str used when value_type==1; value_num used when value_type==2.
+ * value_type: OFFICE_CELL_EMPTY=0, OFFICE_CELL_STRING=1, OFFICE_CELL_NUMBER=2,
+ * OFFICE_CELL_BOOLEAN=3, OFFICE_CELL_FORMULA=4.
+ * value_str is used for STRING and FORMULA; value_num for NUMBER and BOOLEAN
+ * (nonzero = true).
+ * Returns OFFICE_OK; OFFICE_ERR_INVALID_ARG for a null handle, unknown
+ * value_type or missing value_str; OFFICE_ERR_UNSUPPORTED when the sheet
+ * does not exist or the cell is outside Excel's grid (nothing was written).
  */
 int32_t office_xlsx_sheet_set_cell(
     OfficeXlsxWriterHandle* handle,
@@ -233,6 +270,7 @@ int32_t office_xlsx_sheet_set_cell(
  * Set a cell with styling.
  * bold: apply bold weight.
  * bg_color: 6-char hex string ("D3D3D3") or NULL for no fill.
+ * value_type and return statuses as office_xlsx_sheet_set_cell.
  */
 int32_t office_xlsx_sheet_set_cell_styled(
     OfficeXlsxWriterHandle* handle,
@@ -251,7 +289,10 @@ void office_xlsx_sheet_set_column_width(
     OfficeXlsxWriterHandle* handle,
     uint32_t sheet, uint32_t col, double width);
 
-/** Save the workbook to a file. Returns OFFICE_OK on success. */
+/**
+ * Save the workbook to a file. Returns OFFICE_OK on success, otherwise the
+ * error code (also written to *error_code), e.g. OFFICE_ERR_IO.
+ */
 int32_t office_xlsx_writer_save(
     const OfficeXlsxWriterHandle* handle,
     const char* path, int* error_code);
@@ -288,12 +329,15 @@ void office_pptx_writer_set_presentation_size(
  */
 uint32_t office_pptx_writer_add_slide(OfficePptxWriterHandle* handle);
 
-/** Set the slide title. */
+/**
+ * Set the slide title. Returns OFFICE_OK, OFFICE_ERR_INVALID_ARG, or
+ * OFFICE_ERR_UNSUPPORTED when the slide does not exist (nothing was written).
+ */
 int32_t office_pptx_slide_set_title(
     OfficePptxWriterHandle* handle,
     uint32_t slide, const char* title);
 
-/** Add a plain text paragraph to the slide body. */
+/** Add a plain text paragraph to the slide body. Statuses as office_pptx_slide_set_title. */
 int32_t office_pptx_slide_add_text(
     OfficePptxWriterHandle* handle,
     uint32_t slide, const char* text);
@@ -303,8 +347,10 @@ int32_t office_pptx_slide_add_text(
  * data/len: raw PNG, JPEG, or GIF bytes.
  * format: "png", "jpeg"/"jpg", or "gif".
  * x, y, cx, cy: position and size in EMU (914400 = 1 inch).
+ * Returns OFFICE_OK; OFFICE_ERR_INVALID_ARG for a null handle, empty data or
+ * unknown format; OFFICE_ERR_UNSUPPORTED when the slide does not exist.
  */
-void office_pptx_slide_add_image(
+int32_t office_pptx_slide_add_image(
     OfficePptxWriterHandle* handle,
     uint32_t slide,
     const uint8_t* data, size_t len,
@@ -312,7 +358,10 @@ void office_pptx_slide_add_image(
     int64_t x, int64_t y,
     uint64_t cx, uint64_t cy);
 
-/** Save the presentation to a file. Returns OFFICE_OK on success. */
+/**
+ * Save the presentation to a file. Returns OFFICE_OK on success, otherwise
+ * the error code (also written to *error_code), e.g. OFFICE_ERR_IO.
+ */
 int32_t office_pptx_writer_save(
     const OfficePptxWriterHandle* handle,
     const char* path, int* error_code);

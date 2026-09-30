@@ -67,7 +67,7 @@ LD_LIBRARY_PATH=/usr/local/lib ./quickstart
 ### Library info
 
 ```c
-const char *version = office_oxide_version();           // "0.1.12" — don't free
+const char *version = office_oxide_version();           // "0.1.13" — don't free
 const char *fmt     = office_oxide_detect_format("f"); // "docx"/... or NULL
 ```
 
@@ -243,7 +243,9 @@ Pair with RAII wrappers (e.g. `std::unique_ptr<OfficeDocumentHandle, decltype(&o
 | Runtime: `error while loading shared libraries: liboffice_oxide.so` | Add the library directory to `LD_LIBRARY_PATH` (Linux), `DYLD_LIBRARY_PATH` (macOS), or next to the exe (Windows). |
 | `OFFICE_ERR_INVALID_ARG` on `open_from_bytes` | `format` must be exactly `"docx"|"xlsx"|"pptx"|"doc"|"xls"|"ppt"`, lowercase. |
 | Double-free or heap corruption | Check that each `char*` was freed with `office_oxide_free_string`, and each byte buffer with `office_oxide_free_bytes(ptr, len)` using the original `out_len`. |
-| `office_editable_replace_text` returns 0 on XLSX | Expected — use `office_editable_set_cell` for spreadsheet edits. |
+| `office_editable_replace_text` returns -1 with `OFFICE_ERR_UNSUPPORTED` on XLSX | Expected — use `office_editable_set_cell` for spreadsheet edits. |
+| `office_editable_replace_text` returns -1 with `OFFICE_ERR_INVALID_ARG` | `find` is empty (it would match between every character). |
+| A writer call (`office_xlsx_sheet_set_cell`, `office_pptx_slide_set_title`, …) returns `OFFICE_ERR_UNSUPPORTED` | The sheet/slide does not exist or the cell is outside Excel's grid; nothing was written. |
 
 ## Links
 

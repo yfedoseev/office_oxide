@@ -26,6 +26,72 @@ fn require_written(ok: bool, what: &str) -> PyResult<()> {
 
 pyo3::create_exception!(office_oxide, OfficeOxideError, pyo3::exceptions::PyException);
 
+/// The largest magnitude up to which every integer is exactly an `f64`.
+const MAX_EXACT_INT: i64 = 1 << 53;
+
+/// Convert a Python `int` to the `f64` an Excel number is stored as,
+/// refusing one that would silently change value.
+///
+/// Excel stores every number as an IEEE-754 double. An `int` beyond 2**53
+/// (or beyond `i64`) cannot be held exactly: `2**53 + 1` was written as
+/// `2**53`, so an account or order number came back different. Raising
+/// tells the caller to store it as text instead.
+fn exact_int(value: &Bound<'_, PyAny>) -> PyResult<f64> {
+    let too_big = || {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "integer {} cannot be stored exactly as an Excel number (a double is exact only \
+             up to 2**53); write it as a string instead",
+            value.str().map(|s| s.to_string()).unwrap_or_default()
+        ))
+    };
+    let i: i64 = value.extract().map_err(|_| too_big())?;
+    if i.unsigned_abs() > MAX_EXACT_INT as u64 {
+        return Err(too_big());
+    }
+    Ok(i as f64)
+}
+
+/// The value kinds every `set_cell` accepts, decoded once.
+enum PyCell {
+    Empty,
+    Bool(bool),
+    Str(String),
+    Number(f64),
+}
+
+/// Decode a Python cell value. `bool` is tested first: it is a subclass of
+/// `int`, and pyo3's float extraction accepts it through `__index__`, so
+/// `True` checked after the number arms became the number 1.
+fn py_cell(value: &Bound<'_, PyAny>) -> PyResult<Option<PyCell>> {
+    use pyo3::types::{PyBool, PyFloat, PyInt, PyString};
+    Ok(Some(if value.is_none() {
+        PyCell::Empty
+    } else if value.is_instance_of::<PyBool>() {
+        PyCell::Bool(value.extract()?)
+    } else if value.is_instance_of::<PyString>() {
+        PyCell::Str(value.extract()?)
+    } else if value.is_instance_of::<PyInt>() {
+        PyCell::Number(exact_int(value)?)
+    } else if value.is_instance_of::<PyFloat>() {
+        PyCell::Number(value.extract()?)
+    } else {
+        return Ok(None);
+    }))
+}
+
+/// Decode a writer cell value; anything that is not None/bool/str/int/float
+/// is written as its `str()`.
+fn writer_cell_data(value: &Bound<'_, PyAny>) -> PyResult<crate::xlsx::write::CellData> {
+    use crate::xlsx::write::CellData;
+    Ok(match py_cell(value)? {
+        Some(PyCell::Empty) => CellData::Empty,
+        Some(PyCell::Bool(b)) => CellData::Boolean(b),
+        Some(PyCell::Str(s)) => CellData::String(s),
+        Some(PyCell::Number(n)) => CellData::Number(n),
+        None => CellData::String(value.str()?.to_string()),
+    })
+}
+
 impl From<OfficeError> for PyErr {
     fn from(e: OfficeError) -> PyErr {
         OfficeOxideError::new_err(e.to_string())
@@ -224,6 +290,17 @@ impl PyEditable {
         Ok(PyEditable { inner: Some(inner) })
     }
 
+    /// Open a document for editing from raw bytes with an explicit format
+    /// ("docx", "xlsx" or "pptx"), without a temporary file.
+    #[staticmethod]
+    #[pyo3(signature = (data, format, /))]
+    fn from_bytes(data: &[u8], format: &str) -> PyResult<Self> {
+        let fmt = DocumentFormat::from_extension(format)
+            .ok_or_else(|| OfficeOxideError::new_err(format!("unsupported format: {format}")))?;
+        let inner = EditableDocument::from_reader(Cursor::new(data.to_vec()), fmt)?;
+        Ok(PyEditable { inner: Some(inner) })
+    }
+
     /// Replace every occurrence of `find` with `replace` in text content.
     /// Returns the number of replacements.
     #[pyo3(signature = (find, replace, /))]
@@ -244,18 +321,16 @@ impl PyEditable {
         value: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         use crate::xlsx::edit::CellValue;
-        let cv = if value.is_none() {
-            CellValue::Empty
-        } else if let Ok(b) = value.extract::<bool>() {
-            CellValue::Boolean(b)
-        } else if let Ok(s) = value.extract::<String>() {
-            CellValue::String(s)
-        } else if let Ok(f) = value.extract::<f64>() {
-            CellValue::Number(f)
-        } else {
-            return Err(pyo3::exceptions::PyTypeError::new_err(
-                "value must be None, str, bool, int, or float",
-            ));
+        let cv = match py_cell(value)? {
+            Some(PyCell::Empty) => CellValue::Empty,
+            Some(PyCell::Bool(b)) => CellValue::Boolean(b),
+            Some(PyCell::Str(s)) => CellValue::String(s),
+            Some(PyCell::Number(n)) => CellValue::Number(n),
+            None => {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "value must be None, str, bool, int, or float",
+                ));
+            },
         };
         self.get_mut()?.set_cell(sheet_index, cell_ref, cv)?;
         Ok(())
@@ -266,6 +341,13 @@ impl PyEditable {
     fn save(&self, path: PathBuf) -> PyResult<()> {
         self.get()?.save(&path)?;
         Ok(())
+    }
+
+    /// Serialize the edited document to bytes.
+    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+        let mut cursor = Cursor::new(Vec::new());
+        self.get()?.write_to(&mut cursor)?;
+        Ok(pyo3::types::PyBytes::new(py, &cursor.into_inner()))
     }
 
     fn close(&mut self) {
@@ -352,6 +434,10 @@ impl PyXlsxWriter {
     }
 
     /// Set a cell value (str, float, int, bool, or None).
+    ///
+    /// A `str` is always text, even one starting with `=`; use
+    /// `set_formula` for a formula. An `int` beyond 2**53 raises
+    /// `ValueError`: Excel stores numbers as doubles and would change it.
     fn set_cell(
         &mut self,
         sheet: usize,
@@ -359,24 +445,20 @@ impl PyXlsxWriter {
         col: usize,
         value: &pyo3::Bound<'_, pyo3::PyAny>,
     ) -> PyResult<()> {
-        use crate::xlsx::write::CellData;
-        let data = if value.is_none() {
-            CellData::Empty
-        } else if let Ok(s) = value.extract::<String>() {
-            CellData::String(s)
-        } else if let Ok(f) = value.extract::<f64>() {
-            CellData::Number(f)
-        } else if let Ok(i) = value.extract::<i64>() {
-            CellData::Number(i as f64)
-        } else if let Ok(b) = value.extract::<bool>() {
-            CellData::Boolean(b)
-        } else {
-            CellData::String(value.str()?.to_string())
-        };
+        let data = writer_cell_data(value)?;
         require_written(self.writer.sheet_set_cell(sheet, row, col, data), "set_cell")
     }
 
-    /// Set a cell with styling. bg_color is a 6-char hex string or None.
+    /// Set a formula cell, e.g. `set_formula(0, 3, 1, "SUM(B1:B3)")`. A
+    /// leading `=` is accepted and dropped.
+    fn set_formula(&mut self, sheet: usize, row: usize, col: usize, formula: &str) -> PyResult<()> {
+        let data = crate::xlsx::write::CellData::Formula(formula.to_string());
+        require_written(self.writer.sheet_set_cell(sheet, row, col, data), "set_formula")
+    }
+
+    /// Set a cell with styling. bg_color is a 6-char hex string or None
+    /// (the default, as the type stub always said).
+    #[pyo3(signature = (sheet, row, col, value, bold, bg_color=None))]
     fn set_cell_styled(
         &mut self,
         sheet: usize,
@@ -386,18 +468,9 @@ impl PyXlsxWriter {
         bold: bool,
         bg_color: Option<&str>,
     ) -> PyResult<()> {
-        use crate::xlsx::write::{CellData, CellStyle};
-        let data = if value.is_none() {
-            CellData::Empty
-        } else if let Ok(s) = value.extract::<String>() {
-            CellData::String(s)
-        } else if let Ok(f) = value.extract::<f64>() {
-            CellData::Number(f)
-        } else if let Ok(i) = value.extract::<i64>() {
-            CellData::Number(i as f64)
-        } else {
-            CellData::String(value.str()?.to_string())
-        };
+        use crate::xlsx::write::CellStyle;
+        // Booleans had no arm here at all: `True` became the number 1.
+        let data = writer_cell_data(value)?;
         let mut style = CellStyle::new();
         if bold {
             style = style.bold();

@@ -16,6 +16,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Warnings-as-errors, as in ci.yml: maturin and the feature-gated cargo
+  # test below would otherwise let warnings through.
+  RUSTFLAGS: "-D warnings"
 
 # Least-privilege default token (OpenSSF Scorecard Token-Permissions). Jobs
 # opt into wider scopes only where they actually need them.
@@ -31,7 +34,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13', '3.14']
+        # 3.8 (EOL Oct 2024) and 3.9 (EOL Oct 2025) dropped, as in ci.yml.
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,7 +68,7 @@ jobs:
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - name: Create virtual environment with uv
         run: uv venv
@@ -89,6 +93,9 @@ jobs:
       - name: Test Python import
         run: uv run python -c "import office_oxide; print('office_oxide imported successfully')"
 
+      - name: Run Python binding tests
+        run: uv run pytest -q python/tests
+
   # Lint job - check code quality
   lint:
     name: Lint and Format Check
@@ -109,7 +116,7 @@ jobs:
         run: cargo clippy --features python --all-targets -- -D warnings
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - name: Pin Python version
         run: uv python pin 3.11

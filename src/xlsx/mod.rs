@@ -26,6 +26,8 @@ pub mod edit;
 pub mod error;
 /// Number format rendering: apply Excel format strings to numeric values.
 pub mod numfmt;
+/// Row-sweep lookup of rectangular ranges (merges, range hyperlinks).
+pub(crate) mod range_sweep;
 /// Shared-formula (`<f t="shared">`) group expansion.
 pub mod shared_formula;
 /// Shared string table (SST) parsing and lookup.
@@ -95,6 +97,9 @@ pub struct XlsxDocument {
     /// page/word/character/paragraph counts). `None` when the package
     /// carries no extended-properties part.
     pub app_properties: Option<crate::core::properties::AppProperties>,
+    /// Package-level properties beyond core/app: custom properties
+    /// (`docProps/custom.xml`), digital-signature presence and thumbnail.
+    pub package_properties: crate::core::properties::PackageProperties,
     /// `true` when the workbook part's own relationships include a
     /// `vbaProject` entry — a cheap macro-presence signal, no VBA
     /// interpretation.
@@ -119,6 +124,19 @@ impl XlsxDocument {
             }
         }
         self.styles.as_ref()
+    }
+
+    /// The theme for colour resolution without mutating the document: the
+    /// cached one if `ensure_theme` ran, otherwise parsed from the raw part.
+    pub(crate) fn theme_for_render(&self) -> Option<std::borrow::Cow<'_, Theme>> {
+        match &self.theme {
+            Some(t) => Some(std::borrow::Cow::Borrowed(t)),
+            None => self
+                .theme_data
+                .as_ref()
+                .and_then(|d| Theme::parse(d).ok())
+                .map(std::borrow::Cow::Owned),
+        }
     }
 
     /// Parse and cache theme on demand. Returns the theme if available.
@@ -173,12 +191,26 @@ impl XlsxDocument {
         name: &str,
     ) -> std::result::Result<Vec<u8>, crate::core::Error> {
         let data = opc::read_zip_entry(archive, entries, name)?;
-        if name.ends_with(".xml") || name.ends_with(".rels") {
+        if opc::is_xml_part_name(name) {
             if let Some(utf8_data) = crate::core::xml::ensure_utf8(&data) {
                 return Ok(utf8_data);
             }
         }
         Ok(data)
+    }
+
+    /// Every package-level property part, located through `_rels/.rels`.
+    pub(super) fn read_package_metadata<R: Read + Seek>(
+        archive: &mut ZipArchive<R>,
+        entries: &opc::ZipEntryIndex,
+    ) -> crate::core::properties::PackageMetadata {
+        let rels = Self::read_xml_entry(archive, entries, "_rels/.rels")
+            .ok()
+            .and_then(|d| Relationships::parse(&d).ok())
+            .unwrap_or_else(Relationships::empty);
+        crate::core::properties::read_package_metadata(&rels, |path| {
+            Self::read_xml_entry(archive, entries, path).ok()
+        })
     }
 
     /// Fast path: open ZIP directly and read XLSX parts by known paths,
@@ -192,15 +224,13 @@ impl XlsxDocument {
             return xlsb::from_zip(&mut archive, &entries);
         }
 
-        // Document metadata lives at the conventional path in every package
-        // Excel writes; the fast path doesn't consult package relationships,
-        // so read it by name here.
-        let core_properties = Self::read_xml_entry(&mut archive, &entries, "docProps/core.xml")
-            .ok()
-            .and_then(|d| crate::core::properties::CoreProperties::parse(&d).ok());
-        let app_properties = Self::read_xml_entry(&mut archive, &entries, "docProps/app.xml")
-            .ok()
-            .and_then(|d| crate::core::properties::AppProperties::parse(&d).ok());
+        // Document metadata is found through the package relationships
+        // like every other reader does, not at a hard-coded path.
+        let crate::core::properties::PackageMetadata {
+            core: core_properties,
+            app: app_properties,
+            package: mut package_properties,
+        } = Self::read_package_metadata(&mut archive, &entries);
 
         // Read workbook relationships to resolve sheet targets
         let wb_rels =
@@ -243,6 +273,11 @@ impl XlsxDocument {
         // Phase 1: gather raw data sequentially (requires &mut archive)
         struct SheetBundle {
             name: String,
+            state: SheetState,
+            kind: crate::ir::SheetKind,
+            chart_text: Vec<String>,
+            tables: Vec<worksheet::SheetTable>,
+            pivot_tables: Vec<worksheet::SheetPivotTable>,
             data: Vec<u8>,
             rels: Relationships,
             images: Vec<crate::xlsx::worksheet::WorksheetPicture>,
@@ -250,11 +285,28 @@ impl XlsxDocument {
             comments: Vec<crate::xlsx::worksheet::SheetComment>,
         }
         let mut bundles = Vec::with_capacity(workbook.sheets.len());
+        // Pivot cache records materialised for sources outside the
+        // workbook share one text budget, like every other cell text.
+        let mut pivot_budget = crate::limits::TextBudget::new();
+        let mut pivot_ctx = PivotContext::new(&mut archive, &entries);
+        let mut unreadable_sheets: Vec<(String, String)> = Vec::new();
+        // Chart parts a chartsheet displays: their text is that sheet's
+        // content, not repeated among the embedded charts'.
+        let mut chartsheet_charts: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for sheet in &workbook.sheets {
             // Skip sheets with empty r:id (virtual sheets, VBA modules, etc.)
             if sheet.rel_id.is_empty() {
                 continue;
             }
+
+            // What the sheet is comes from its relationship type. A
+            // macro sheet has a worksheet's cell content; a chartsheet or
+            // dialog sheet ([ECMA-376] §12.3.2, §12.3.7) is a named tab with
+            // no cells. Anything else is not a sheet.
+            let Some(kind) = sheet_kind_of(wb_rels.get_by_id(&sheet.rel_id)) else {
+                continue;
+            };
 
             // Resolve sheet path from relationships, or fall back to convention
             let sheet_path = if let Some(rel) = wb_rels.get_by_id(&sheet.rel_id) {
@@ -272,16 +324,72 @@ impl XlsxDocument {
                 format!("xl/worksheets/sheet{}.xml", idx)
             };
 
-            let ws_data = match Self::read_xml_entry(&mut archive, &entries, &sheet_path) {
-                Ok(data) => data,
-                Err(_) => {
-                    // Try alternate index-based name
-                    let idx = bundles.len() + 1;
-                    let alt = format!("xl/worksheets/sheet{}.xml", idx);
-                    match Self::read_xml_entry(&mut archive, &entries, &alt) {
-                        Ok(data) => data,
-                        Err(_) => continue,
+            if matches!(kind, crate::ir::SheetKind::Chart | crate::ir::SheetKind::Dialog) {
+                // No cells to read. A chartsheet's content is the text of
+                // the chart its drawing references.
+                let chart_text = if kind == crate::ir::SheetKind::Chart {
+                    let paths = chartsheet_chart_parts(&mut archive, &entries, &sheet_path);
+                    let mut texts = Vec::new();
+                    for path in paths {
+                        if let Ok(data) = Self::read_xml_entry(&mut archive, &entries, &path) {
+                            let text = extract_chart_text(&data);
+                            if !text.is_empty() {
+                                texts.push(text);
+                            }
+                        }
+                        chartsheet_charts.insert(path);
                     }
+                    texts
+                } else {
+                    Vec::new()
+                };
+                bundles.push(SheetBundle {
+                    name: sheet.name.clone(),
+                    state: sheet.state,
+                    kind,
+                    chart_text,
+                    tables: Vec::new(),
+                    pivot_tables: Vec::new(),
+                    data: Vec::new(),
+                    rels: Relationships::empty(),
+                    images: Vec::new(),
+                    text_shapes: Vec::new(),
+                    comments: Vec::new(),
+                });
+                continue;
+            }
+
+            // The index-based name is a fallback for a part that is *missing*
+            // (a relationship pointing nowhere); a part that exists but
+            // cannot be read is that sheet's error, never a cue to read a
+            // different sheet's cells under this sheet's name. Only a
+            // worksheet has a conventional name to fall back to.
+            let read = match Self::read_xml_entry(&mut archive, &entries, &sheet_path) {
+                Err(crate::core::Error::MissingPart(_))
+                    if kind == crate::ir::SheetKind::Worksheet =>
+                {
+                    let idx = bundles
+                        .iter()
+                        .filter(|b| b.kind == crate::ir::SheetKind::Worksheet)
+                        .count()
+                        + 1;
+                    let alt = format!("xl/worksheets/sheet{}.xml", idx);
+                    Self::read_xml_entry(&mut archive, &entries, &alt)
+                        .map_err(|_| format!("worksheet part {sheet_path} not found"))
+                },
+                Err(crate::core::Error::MissingPart(_)) => {
+                    Err(format!("sheet part {sheet_path} not found"))
+                },
+                other => other.map_err(|e| format!("worksheet part {sheet_path}: {e}")),
+            };
+            let ws_data = match read {
+                Ok(data) => data,
+                // Recorded, not dropped: a workbook missing a sheet must
+                // not pass for a complete one.
+                Err(reason) => {
+                    log::warn!("xlsx: sheet {:?}: {reason}", sheet.name);
+                    unreadable_sheets.push((sheet.name.clone(), reason));
+                    continue;
                 },
             };
 
@@ -320,8 +428,23 @@ impl XlsxDocument {
             let comments =
                 worksheet::merge_threaded_comments(comments, threaded_comments, &persons);
 
+            let (tables, pivot_tables) = read_tables_and_pivots(
+                &mut archive,
+                &entries,
+                &sheet_path,
+                &ws_rels,
+                &workbook,
+                &mut pivot_ctx,
+                &mut pivot_budget,
+            );
+
             bundles.push(SheetBundle {
                 name: sheet.name.clone(),
+                state: sheet.state,
+                kind,
+                chart_text: Vec::new(),
+                tables,
+                pivot_tables,
                 data: ws_data,
                 rels: ws_rels,
                 images,
@@ -336,8 +459,18 @@ impl XlsxDocument {
             bundles,
             |b| -> Result<std::result::Result<Worksheet, (String, String)>> {
                 let name = b.name.clone();
+                if matches!(b.kind, crate::ir::SheetKind::Chart | crate::ir::SheetKind::Dialog) {
+                    let mut ws = Worksheet::without_cells(b.name, b.kind);
+                    ws.state = b.state;
+                    ws.chart_text = b.chart_text;
+                    return Ok(Ok(ws));
+                }
                 match Worksheet::parse(&b.data, b.name, &b.rels) {
                     Ok(mut ws) => {
+                        ws.kind = b.kind;
+                        ws.state = b.state;
+                        ws.tables = b.tables;
+                        ws.pivot_tables = b.pivot_tables;
                         ws.images = b.images;
                         ws.text_shapes = b.text_shapes;
                         ws.comments = b.comments;
@@ -351,13 +484,13 @@ impl XlsxDocument {
             },
         )?;
         let mut worksheets = Vec::with_capacity(parsed.len());
-        let mut unreadable_sheets = Vec::new();
         for p in parsed {
             match p {
                 Ok(ws) => worksheets.push(ws),
                 Err(u) => unreadable_sheets.push(u),
             }
         }
+        drop_pivot_caches_backed_by_tables(&mut worksheets);
         if !unreadable_sheets.is_empty() && worksheets.is_empty() {
             let (name, err) = &unreadable_sheets[0];
             return Err(crate::core::Error::MalformedXml(format!(
@@ -377,7 +510,9 @@ impl XlsxDocument {
                 for row in &mut ws.rows {
                     for cell in &mut row.cells {
                         let Some(vm) = cell.vm else { continue };
-                        if !matches!(cell.value, CellValue::Error(_)) {
+                        // Excel writes an image cell as `t="e"` with
+                        // `#VALUE!`; a self-closing `vm` cell is empty.
+                        if !matches!(cell.value, CellValue::Error(_) | CellValue::Empty) {
                             continue;
                         }
                         if let Some(pic) = rich_value_images.get(&vm) {
@@ -398,6 +533,7 @@ impl XlsxDocument {
         let chart_names: Vec<String> = (0..archive.len())
             .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
             .filter(|n| n.starts_with("xl/charts/chart") && n.ends_with(".xml"))
+            .filter(|n| !chartsheet_charts.contains(n))
             .collect();
         for name in chart_names {
             if let Ok(data) = Self::read_xml_entry(&mut archive, &entries, &name) {
@@ -437,6 +573,7 @@ impl XlsxDocument {
             chart_text.len(),
             embedded_fonts.len()
         );
+        package_properties.crc_mismatched_parts = entries.crc_mismatched_parts();
         Ok(XlsxDocument {
             workbook,
             worksheets,
@@ -447,6 +584,7 @@ impl XlsxDocument {
             embedded_fonts,
             core_properties,
             app_properties,
+            package_properties,
             has_macros,
             unreadable_sheets,
             styles_data: None,
@@ -645,6 +783,287 @@ struct ChartSeries {
 
 /// Compute the .rels path for a worksheet ZIP entry.
 /// e.g. "xl/worksheets/sheet1.xml" → "xl/worksheets/_rels/sheet1.xml.rels"
+/// Worksheet-to-table relationship ([ECMA-376] §12.3.21).
+const TABLE_REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/table";
+/// Worksheet-to-pivot-table relationship ([ECMA-376] §12.3.16).
+const PIVOT_TABLE_REL: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable";
+/// Pivot-table-to-cache-definition relationship ([ECMA-376] §12.3.14).
+const PIVOT_CACHE_DEFINITION_REL: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition";
+
+/// The table parts and pivot tables a worksheet's relationships name. A
+/// part that is missing or does not parse is logged and skipped; the cells
+/// it describes are in the sheet either way.
+/// What the pivot readers share across every sheet of one workbook.
+///
+/// A pivot cache is shared by every pivot built on it, and a workbook table
+/// as its source means the source cells are already in the workbook: the
+/// records were parsed once per pivot and then thrown away once the table
+/// turned up, which made a workbook of 17 pivots over 5 table-backed caches
+/// open 4.7x slower than before pivot caches were read, for no output.
+struct PivotContext {
+    /// Every table name and display name in the package, lower-cased, read
+    /// from the table parts before any sheet so a table-backed source is
+    /// recognised before its records are touched.
+    table_names: std::collections::HashSet<String>,
+    /// Materialised cache data by cache-definition part, so a cache shared
+    /// by several pivots is parsed once.
+    parsed: std::collections::HashMap<String, Option<worksheet::PivotCacheData>>,
+}
+
+impl PivotContext {
+    fn new<R: Read + Seek>(archive: &mut ZipArchive<R>, entries: &opc::ZipEntryIndex) -> Self {
+        let mut ctx = PivotContext {
+            table_names: std::collections::HashSet::new(),
+            parsed: std::collections::HashMap::new(),
+        };
+        // Only a package with a pivot cache needs its table names.
+        if !archive
+            .file_names()
+            .any(|n| n.to_ascii_lowercase().contains("pivotcachedefinition"))
+        {
+            return ctx;
+        }
+        let table_parts: Vec<String> = archive
+            .file_names()
+            .filter(|n| {
+                let lower = n.to_ascii_lowercase();
+                lower.starts_with("xl/tables/") && lower.ends_with(".xml")
+            })
+            .map(str::to_string)
+            .collect();
+        for part in table_parts {
+            if let Ok(t) = XlsxDocument::read_xml_entry(archive, entries, &part)
+                .map_err(|e| e.to_string())
+                .and_then(|d| worksheet::parse_table_part(&d).map_err(|e| e.to_string()))
+            {
+                for name in [t.name, t.display_name] {
+                    if !name.is_empty() {
+                        ctx.table_names.insert(name.to_lowercase());
+                    }
+                }
+            }
+        }
+        ctx
+    }
+}
+
+fn read_tables_and_pivots<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
+    sheet_path: &str,
+    ws_rels: &Relationships,
+    workbook: &WorkbookInfo,
+    pivot_ctx: &mut PivotContext,
+    budget: &mut crate::limits::TextBudget,
+) -> (Vec<worksheet::SheetTable>, Vec<worksheet::SheetPivotTable>) {
+    let mut tables = Vec::new();
+    for rel in ws_rels.get_by_type(TABLE_REL) {
+        let path = resolve_relative_zip_path(sheet_path, &rel.target);
+        match XlsxDocument::read_xml_entry(archive, entries, &path)
+            .map_err(|e| e.to_string())
+            .and_then(|d| worksheet::parse_table_part(&d).map_err(|e| e.to_string()))
+        {
+            Ok(t) => tables.push(t),
+            Err(e) => log::warn!("xlsx: table part {path} skipped: {e}"),
+        }
+    }
+    let mut pivots = Vec::new();
+    for rel in ws_rels.get_by_type(PIVOT_TABLE_REL) {
+        let path = resolve_relative_zip_path(sheet_path, &rel.target);
+        let mut pivot = match XlsxDocument::read_xml_entry(archive, entries, &path)
+            .map_err(|e| e.to_string())
+            .and_then(|d| worksheet::parse_pivot_table_part(&d).map_err(|e| e.to_string()))
+        {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("xlsx: pivot table part {path} skipped: {e}");
+                continue;
+            },
+        };
+        let pivot_rels = XlsxDocument::read_xml_entry(archive, entries, &sheet_rels_path(&path))
+            .ok()
+            .and_then(|d| Relationships::parse(&d).ok());
+        if let Some(cache) = pivot_rels
+            .as_ref()
+            .and_then(|r| r.first_by_type(PIVOT_CACHE_DEFINITION_REL))
+        {
+            let cache_path = resolve_relative_zip_path(&path, &cache.target);
+            if let Ok(def) = XlsxDocument::read_xml_entry(archive, entries, &cache_path) {
+                let src = worksheet::parse_pivot_cache_definition(&def).unwrap_or_default();
+                pivot.source = src.display();
+                if !pivot_source_in_workbook(&src, workbook, &pivot_ctx.table_names) {
+                    pivot.cache_data = match pivot_ctx.parsed.get(&cache_path) {
+                        Some(data) => data.clone(),
+                        None => {
+                            let data = read_pivot_cache_data(
+                                archive,
+                                entries,
+                                &cache_path,
+                                &def,
+                                &src,
+                                budget,
+                            );
+                            pivot_ctx.parsed.insert(cache_path.clone(), data.clone());
+                            data
+                        },
+                    };
+                }
+            }
+        }
+        pivots.push(pivot);
+    }
+    (tables, pivots)
+}
+
+/// Whether a pivot cache's source cells are in this workbook: a
+/// `worksheetSource` naming a sheet the workbook has, a bare range, or a
+/// defined name or table. An external/consolidation source, a missing sheet
+/// or an unknown name is not.
+fn pivot_source_in_workbook(
+    src: &worksheet::PivotCacheSource,
+    workbook: &WorkbookInfo,
+    table_names: &std::collections::HashSet<String>,
+) -> bool {
+    if !src.is_worksheet {
+        return false;
+    }
+    match (&src.sheet, &src.range, &src.name) {
+        (Some(sheet), Some(_), _) => workbook
+            .sheets
+            .iter()
+            .any(|s| s.name.eq_ignore_ascii_case(sheet)),
+        (None, Some(_), _) => true,
+        (_, None, Some(name)) => {
+            table_names.contains(&name.to_lowercase())
+                || workbook
+                    .defined_names
+                    .iter()
+                    .any(|d| d.name.eq_ignore_ascii_case(name))
+        },
+        _ => false,
+    }
+}
+
+/// A pivot cache records part ([ECMA-376] §12.3.15), from its cache
+/// definition.
+const PIVOT_CACHE_RECORDS_REL: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheRecords";
+
+/// Materialise a pivot cache's records against its fields. `None` when
+/// the definition names no readable records part.
+fn read_pivot_cache_data<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
+    cache_path: &str,
+    definition: &[u8],
+    src: &worksheet::PivotCacheSource,
+    budget: &mut crate::limits::TextBudget,
+) -> Option<worksheet::PivotCacheData> {
+    let rels = XlsxDocument::read_xml_entry(archive, entries, &sheet_rels_path(cache_path))
+        .ok()
+        .and_then(|d| Relationships::parse(&d).ok())?;
+    let rel = src
+        .records_rel_id
+        .as_deref()
+        .and_then(|id| rels.get_by_id(id))
+        .or_else(|| rels.first_by_type(PIVOT_CACHE_RECORDS_REL))?;
+    let records_path = resolve_relative_zip_path(cache_path, &rel.target);
+    let records = match XlsxDocument::read_xml_entry(archive, entries, &records_path) {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("xlsx: pivot cache records {records_path} skipped: {e}");
+            return None;
+        },
+    };
+    let (fields, fields_truncated) = match worksheet::parse_pivot_cache_fields(definition, budget) {
+        Ok(f) => f,
+        Err(e) => {
+            log::warn!("xlsx: pivot cache definition {cache_path} fields unreadable: {e}");
+            return None;
+        },
+    };
+    match worksheet::parse_pivot_cache_records(&records, &fields, budget) {
+        Ok(mut data) => {
+            data.truncated |= fields_truncated;
+            Some(data)
+        },
+        Err(e) => {
+            log::warn!("xlsx: pivot cache records {records_path} unreadable: {e}");
+            None
+        },
+    }
+}
+
+/// A pivot whose source is a table name has its source cells in the
+/// workbook after all: drop the cached copy.
+fn drop_pivot_caches_backed_by_tables(worksheets: &mut [Worksheet]) {
+    let tables: Vec<String> = worksheets
+        .iter()
+        .flat_map(|ws| &ws.tables)
+        .flat_map(|t| [t.name.clone(), t.display_name.clone()])
+        .filter(|n| !n.is_empty())
+        .collect();
+    for pivot in worksheets.iter_mut().flat_map(|ws| &mut ws.pivot_tables) {
+        if pivot
+            .source
+            .as_deref()
+            .is_some_and(|s| tables.iter().any(|t| t.eq_ignore_ascii_case(s)))
+        {
+            pivot.cache_data = None;
+        }
+    }
+}
+
+/// The kind of sheet a workbook `<sheet>`'s relationship names, or `None`
+/// for one that is not a sheet. A sheet with no relationship at all is
+/// read as a worksheet at its conventional path.
+pub(super) fn sheet_kind_of(
+    rel: Option<&crate::core::relationships::Relationship>,
+) -> Option<crate::ir::SheetKind> {
+    use crate::ir::SheetKind;
+    match rel.map(|r| r.rel_type.as_str()) {
+        None | Some(rel_types::WORKSHEET) => Some(SheetKind::Worksheet),
+        Some(rel_types::MACROSHEET | rel_types::INTL_MACROSHEET) => Some(SheetKind::Macro),
+        Some(rel_types::CHARTSHEET) => Some(SheetKind::Chart),
+        Some(rel_types::DIALOGSHEET) => Some(SheetKind::Dialog),
+        Some(_) => None,
+    }
+}
+
+/// The chart parts a chartsheet displays: its drawing's chart
+/// relationships ([ECMA-376] §12.3.2 — a chartsheet shows one chart
+/// through a drawing part). A part that is missing or unrelated yields
+/// nothing; the sheet is then its name alone.
+pub(super) fn chartsheet_chart_parts<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
+    sheet_path: &str,
+) -> Vec<String> {
+    let read_rels = |archive: &mut ZipArchive<R>, part: &str| {
+        XlsxDocument::read_xml_entry(archive, entries, &sheet_rels_path(part))
+            .ok()
+            .and_then(|d| Relationships::parse(&d).ok())
+    };
+    let Some(sheet_rels) = read_rels(archive, sheet_path) else {
+        return Vec::new();
+    };
+    let mut charts = Vec::new();
+    for drawing in sheet_rels.get_by_type(rel_types::DRAWING) {
+        let drawing_path = resolve_relative_zip_path(sheet_path, &drawing.target);
+        if let Some(drawing_rels) = read_rels(archive, &drawing_path) {
+            for chart in drawing_rels.get_by_type(rel_types::CHART) {
+                let path = resolve_relative_zip_path(&drawing_path, &chart.target);
+                if !charts.contains(&path) {
+                    charts.push(path);
+                }
+            }
+        }
+    }
+    charts
+}
+
 fn sheet_rels_path(sheet_path: &str) -> String {
     if let Some(pos) = sheet_path.rfind('/') {
         let dir = &sheet_path[..pos];
@@ -2067,32 +2486,18 @@ mod tests {
         assert!(parsed.text_shapes.is_empty());
     }
 
-    /// Build a minimal SpreadsheetML package whose main part carries
-    /// `content_type`.
-    /// A `vm`-tagged `t="e"` cell whose fallback `<v>` is
-    /// the literal `"#VALUE!"` is Excel 365's in-cell rich-value image
-    /// (`=IMAGE(...)`/"Place in Cell"), not a real formula error. The
-    /// real image is reachable by resolving `vm` through `xl/
-    /// metadata.xml` -> `xl/richData/{rdrichvalue,
-    /// rdrichvaluestructure,richValueRel}.xml` -> `xl/media/*`. This
-    /// fixture mirrors the exact shape of the real-corpus reproducer
-    /// (`phpspreadsheet_drawing_in_cell.xlsx`) byte for byte.
-    #[test]
-    fn test_a_rich_value_image_cell_resolves_to_a_real_image_not_a_value_error() {
-        const PNG: &[u8] = &[
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
-            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
-            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
-            0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
-
-        let sheet_xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+    /// A single-sheet package whose row 2 holds `cell`, with the rich-value
+    /// chain (metadata -> rich value -> structure -> rel -> media) that
+    /// makes `vm="1"` a local image of `RICH_VALUE_PNG`.
+    fn rich_value_image_package(cell: &str) -> Vec<u8> {
+        let sheet_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <sheetData>
-    <row r="2"><c r="B2" t="e" vm="1"><v>#VALUE!</v></c></row>
+    <row r="2">{cell}</row>
   </sheetData>
-</worksheet>"#;
+</worksheet>"#
+        );
 
         let metadata_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:xlrd="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata"><metadataTypes count="1"><metadataType name="XLRICHVALUE" minSupportedVersion="120000"/></metadataTypes><futureMetadata name="XLRICHVALUE" count="1"><bk><extLst><ext uri="{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}"><xlrd:rvb i="0"/></ext></extLst></bk></futureMetadata><valueMetadata count="1"><bk><rc t="1" v="0"/></bk></valueMetadata></metadata>"#;
@@ -2109,22 +2514,56 @@ mod tests {
         let richvaluerel_rels = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/></Relationships>"#;
 
-        let bytes = single_sheet_xlsx(
-            std::str::from_utf8(sheet_xml).unwrap(),
+        single_sheet_xlsx(
+            &sheet_xml,
             &[
                 ("xl/metadata.xml", metadata_xml.as_slice()),
                 ("xl/richData/rdrichvalue.xml", rdrichvalue_xml.as_slice()),
                 ("xl/richData/rdrichvaluestructure.xml", rdrichvaluestructure_xml.as_slice()),
                 ("xl/richData/richValueRel.xml", richvaluerel_xml.as_slice()),
                 ("xl/richData/_rels/richValueRel.xml.rels", richvaluerel_rels.as_slice()),
-                ("xl/media/image1.png", PNG),
+                ("xl/media/image1.png", RICH_VALUE_PNG),
             ],
-        );
-        let doc = open_bytes(bytes);
+        )
+    }
+
+    const RICH_VALUE_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    /// A self-closing `<c r="B2" vm="1"/>` still names value metadata; the
+    /// empty-cell path parsed and then dropped the `vm`, so such a cell's
+    /// rich-value image was lost.
+    #[test]
+    fn test_a_self_closing_vm_cell_keeps_its_value_metadata_link() {
+        let doc = open_bytes(rich_value_image_package(r#"<c r="B2" vm="1"/>"#));
+        let ws = &doc.worksheets[0];
+        assert_eq!(ws.images.len(), 1, "the rich-value image must reach ws.images");
+        assert_eq!(ws.images[0].data, RICH_VALUE_PNG);
+    }
+
+    /// Build a minimal SpreadsheetML package whose main part carries
+    /// `content_type`.
+    /// A `vm`-tagged `t="e"` cell whose fallback `<v>` is
+    /// the literal `"#VALUE!"` is Excel 365's in-cell rich-value image
+    /// (`=IMAGE(...)`/"Place in Cell"), not a real formula error. The
+    /// real image is reachable by resolving `vm` through `xl/
+    /// metadata.xml` -> `xl/richData/{rdrichvalue,
+    /// rdrichvaluestructure,richValueRel}.xml` -> `xl/media/*`. This
+    /// fixture mirrors the exact shape of the real-corpus reproducer
+    /// (`phpspreadsheet_drawing_in_cell.xlsx`) byte for byte.
+    #[test]
+    fn test_a_rich_value_image_cell_resolves_to_a_real_image_not_a_value_error() {
+        let doc =
+            open_bytes(rich_value_image_package(r#"<c r="B2" t="e" vm="1"><v>#VALUE!</v></c>"#));
         let ws = &doc.worksheets[0];
 
         assert_eq!(ws.images.len(), 1, "the rich-value image must reach ws.images");
-        assert_eq!(ws.images[0].data, PNG);
+        assert_eq!(ws.images[0].data, RICH_VALUE_PNG);
         assert_eq!(ws.images[0].format, "png");
 
         let cell = &ws.rows[0].cells[0];
@@ -2133,5 +2572,577 @@ mod tests {
             "the fabricated #VALUE! error must be cleared: {:?}",
             cell.value
         );
+    }
+
+    /// A workbook listing `(name, rel type, target, state, part body)`
+    /// sheets; a `None` body leaves the target part out of the package.
+    fn workbook_of(sheets: &[(&str, &str, &str, Option<&str>, Option<&str>)]) -> Vec<u8> {
+        workbook_of_with(sheets, &[])
+    }
+
+    /// As `workbook_of`, plus `extra` parts (relationships, drawings,
+    /// charts) at their full package paths.
+    fn workbook_of_with(
+        sheets: &[(&str, &str, &str, Option<&str>, Option<&str>)],
+        extra: &[(&str, &[u8])],
+    ) -> Vec<u8> {
+        let mut rels = String::from(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        );
+        let mut tags = String::new();
+        let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
+        for (i, (name, rel_type, target, state, body)) in sheets.iter().enumerate() {
+            let n = i + 1;
+            rels.push_str(&format!(
+                r#"<Relationship Id="rId{n}" Type="{rel_type}" Target="{target}"/>"#
+            ));
+            let state = state
+                .map(|s| format!(r#" state="{s}""#))
+                .unwrap_or_default();
+            tags.push_str(&format!(r#"<sheet name="{name}" sheetId="{n}" r:id="rId{n}"{state}/>"#));
+            if let Some(body) = body {
+                parts.push((format!("xl/{target}"), body.as_bytes().to_vec()));
+            }
+        }
+        rels.push_str("</Relationships>");
+        let wb = format!(
+            r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{tags}</sheets></workbook>"#
+        );
+        let mut all: Vec<(&str, &[u8])> = vec![
+            ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+            ("xl/workbook.xml", wb.as_bytes()),
+        ];
+        all.extend(parts.iter().map(|(n, d)| (n.as_str(), d.as_slice())));
+        all.extend_from_slice(extra);
+        zip_parts(&all)
+    }
+
+    fn one_cell_sheet(text: &str) -> String {
+        format!(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>{text}</t></is></c></row></sheetData></worksheet>"#
+        )
+    }
+
+    const WS: &str = rel_types::WORKSHEET;
+
+    /// A sheet whose part is absent from the package used to vanish with no
+    /// record, and the positional hidden-state lookup then pinned every
+    /// later sheet's `hidden` flag on the wrong sheet.
+    #[test]
+    fn test_a_sheet_with_a_missing_part_is_reported_and_hidden_flags_stay_aligned() {
+        let visible = one_cell_sheet("visible data");
+        let bytes = workbook_of(&[
+            ("Gone", WS, "worksheets/gone.xml", Some("hidden"), None),
+            ("Shown", WS, "worksheets/shown.xml", None, Some(&visible)),
+        ]);
+        let doc = open_bytes(bytes);
+        assert_eq!(doc.worksheets.len(), 1);
+        assert_eq!(doc.worksheets[0].name, "Shown");
+        assert!(
+            doc.unreadable_sheets.iter().any(|(n, _)| n == "Gone"),
+            "{:?}",
+            doc.unreadable_sheets
+        );
+        assert!(doc.plain_text().contains("unreadable sheet \"Gone\""), "{}", doc.plain_text());
+        let ir = crate::convert_xlsx::xlsx_to_ir(&doc);
+        let shown = ir
+            .sections
+            .iter()
+            .find(|s| s.title.as_deref() == Some("Shown"))
+            .expect("Shown section");
+        assert!(!shown.hidden, "Shown is visible; the missing sheet's state must not shift");
+        assert!(ir.metadata.text_truncated);
+    }
+
+    /// A chartsheet's relationship is not a worksheet one; parsed as a
+    /// worksheet it became an empty sheet under the chart's name. It is a
+    /// sheet of its own kind — the tab, with no cells — and each sheet
+    /// keeps its own state.
+    #[test]
+    fn test_chartsheets_are_not_parsed_as_worksheets() {
+        let data = one_cell_sheet("numbers");
+        let chart = r#"<chartsheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetPr/></chartsheet>"#;
+        let bytes = workbook_of(&[
+            ("Chart1", rel_types::CHARTSHEET, "chartsheets/sheet1.xml", None, Some(chart)),
+            ("Data", WS, "worksheets/sheet1.xml", Some("hidden"), Some(&data)),
+        ]);
+        let doc = open_bytes(bytes);
+        let names: Vec<_> = doc
+            .worksheets
+            .iter()
+            .map(|w| (w.name.as_str(), w.kind))
+            .collect();
+        use crate::ir::SheetKind as K;
+        assert_eq!(names, [("Chart1", K::Chart), ("Data", K::Worksheet)]);
+        assert!(doc.worksheets[0].rows.is_empty());
+        assert!(doc.unreadable_sheets.is_empty());
+        let ir = crate::convert_xlsx::xlsx_to_ir(&doc);
+        assert_eq!(ir.sections.len(), 2);
+        assert!(!ir.sections[0].hidden, "the chartsheet is visible");
+        assert!(ir.sections[1].hidden, "Data's own state, not the chartsheet's");
+    }
+
+    const CHART_NS: &str = r#"xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main""#;
+
+    /// A chart part titled `title`, with one cached value `value`.
+    fn titled_chart(title: &str, value: &str) -> String {
+        format!(
+            r#"<c:chartSpace {CHART_NS}><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>{title}</a:t></a:r></a:p></c:rich></c:tx></c:title><c:plotArea><c:barChart><c:ser><c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>{value}</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#
+        )
+    }
+
+    fn rels_xml(rels: &[(&str, &str)]) -> String {
+        let mut x = String::from(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        );
+        for (i, (ty, target)) in rels.iter().enumerate() {
+            x.push_str(&format!(
+                r#"<Relationship Id="rId{}" Type="{ty}" Target="{target}"/>"#,
+                i + 1
+            ));
+        }
+        x.push_str("</Relationships>");
+        x
+    }
+
+    /// Text of one IR section, rendered on its own.
+    fn section_text(s: &crate::ir::Section) -> String {
+        crate::ir::DocumentIR {
+            sections: vec![s.clone()],
+            ..Default::default()
+        }
+        .plain_text()
+    }
+
+    /// An Excel 4.0 macro sheet (`xl/macrosheets/`, root `xne:macrosheet`,
+    /// a `CT_Worksheet`) holds real cells — labels, formulas and cached
+    /// values — and a chartsheet or dialog sheet is a named tab. All three
+    /// were dropped whole. They are sheets of their own kind now, in
+    /// workbook order with their own state; the chartsheet's content is
+    /// the text of the chart its drawing references, which is no longer
+    /// repeated among the embedded charts.
+    #[test]
+    fn test_macro_chart_and_dialog_sheets_surface_with_their_kind() {
+        let data = one_cell_sheet("data cell");
+        let tail = one_cell_sheet("tail cell");
+        let macro_sheet = r#"<xne:macrosheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:xne="http://schemas.microsoft.com/office/excel/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Auto_Open</t></is></c></row><row r="2"><c r="A2" t="b"><f>ISNUMBER(1)</f><v>1</v></c></row></sheetData></xne:macrosheet>"#;
+        let chartsheet = r#"<chartsheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><drawing r:id="rId1"/></chartsheet>"#;
+        let dialog =
+            r#"<dialogsheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>"#;
+        let drawing = r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>"#;
+        let cs_rels = rels_xml(&[(rel_types::DRAWING, "../drawings/drawing1.xml")]);
+        let dr_rels = rels_xml(&[(rel_types::CHART, "../charts/chart1.xml")]);
+        let own_chart = titled_chart("Profile Title", "3.67");
+        let embedded = titled_chart("Embedded Title", "5");
+        let bytes = workbook_of_with(
+            &[
+                ("Data", WS, "worksheets/sheet1.xml", None, Some(&data)),
+                (
+                    "Macro1",
+                    rel_types::MACROSHEET,
+                    "macrosheets/sheet1.xml",
+                    Some("veryHidden"),
+                    Some(macro_sheet),
+                ),
+                (
+                    "Profile",
+                    rel_types::CHARTSHEET,
+                    "chartsheets/sheet1.xml",
+                    Some("hidden"),
+                    Some(chartsheet),
+                ),
+                ("Dialog1", rel_types::DIALOGSHEET, "dialogsheets/sheet1.xml", None, Some(dialog)),
+                ("Tail", WS, "worksheets/sheet2.xml", None, Some(&tail)),
+            ],
+            &[
+                ("xl/chartsheets/_rels/sheet1.xml.rels", cs_rels.as_bytes()),
+                ("xl/drawings/drawing1.xml", drawing.as_bytes()),
+                ("xl/drawings/_rels/drawing1.xml.rels", dr_rels.as_bytes()),
+                ("xl/charts/chart1.xml", own_chart.as_bytes()),
+                ("xl/charts/chart2.xml", embedded.as_bytes()),
+            ],
+        );
+        let doc = open_bytes(bytes);
+        use crate::ir::SheetKind as K;
+        let got: Vec<_> = doc
+            .worksheets
+            .iter()
+            .map(|w| (w.name.as_str(), w.kind, w.state))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("Data", K::Worksheet, SheetState::Visible),
+                ("Macro1", K::Macro, SheetState::VeryHidden),
+                ("Profile", K::Chart, SheetState::Hidden),
+                ("Dialog1", K::Dialog, SheetState::Visible),
+                ("Tail", K::Worksheet, SheetState::Visible),
+            ]
+        );
+        assert!(doc.unreadable_sheets.is_empty(), "{:?}", doc.unreadable_sheets);
+        let profile = &doc.worksheets[2];
+        assert!(profile.rows.is_empty());
+        assert_eq!(profile.chart_text.len(), 1);
+        assert!(profile.chart_text[0].contains("Profile Title"), "{:?}", profile.chart_text);
+        assert_eq!(doc.chart_text.len(), 1, "only the embedded chart: {:?}", doc.chart_text);
+        assert!(doc.chart_text[0].contains("Embedded Title"));
+
+        let text = doc.plain_text();
+        let md = doc.to_markdown();
+        let ir = crate::convert_xlsx::xlsx_to_ir(&doc);
+        let ir_text = ir.plain_text();
+        let ir_md = ir.to_markdown();
+        let html = ir.to_html();
+        for (what, out) in [
+            ("plain_text", &text),
+            ("to_markdown", &md),
+            ("ir text", &ir_text),
+            ("ir md", &ir_md),
+        ] {
+            for want in [
+                "Data",
+                "data cell",
+                "Macro1",
+                "Auto_Open",
+                "TRUE",
+                "Profile",
+                "Profile Title",
+                "Dialog1",
+                "tail cell",
+                "Embedded Title",
+            ] {
+                assert!(out.contains(want), "{what} lost {want:?}: {out}");
+            }
+            assert_eq!(out.matches("Profile Title").count(), 1, "{what}: {out}");
+        }
+        assert!(
+            md.contains("## Profile\n") && ir_md.contains("## Profile\n"),
+            "{md}\n--\n{ir_md}"
+        );
+        assert!(md.contains("## Dialog1") && ir_md.contains("## Dialog1"), "{md}\n--\n{ir_md}");
+        for want in [
+            "<h2>Profile</h2>",
+            "Profile Title",
+            "Auto_Open",
+            "<h2>Dialog1</h2>",
+        ] {
+            assert!(html.contains(want), "to_html lost {want:?}: {html}");
+        }
+
+        let sections: Vec<_> = ir
+            .sections
+            .iter()
+            .filter(|s| s.sheet_kind.is_some())
+            .map(|s| (s.title.as_deref().unwrap_or(""), s.sheet_kind, s.hidden))
+            .collect();
+        assert_eq!(
+            sections,
+            [
+                ("Data", Some(K::Worksheet), false),
+                ("Macro1", Some(K::Macro), true),
+                ("Profile", Some(K::Chart), true),
+                ("Dialog1", Some(K::Dialog), false),
+                ("Tail", Some(K::Worksheet), false),
+            ]
+        );
+        let chart_section = &ir.sections[2];
+        assert!(
+            !chart_section
+                .elements
+                .iter()
+                .any(|e| matches!(e, crate::ir::Element::Table(_))),
+            "no cells in a chart sheet's section"
+        );
+        assert!(section_text(chart_section).contains("Profile Title"));
+    }
+
+    /// A single-sheet package with one pivot table whose cache definition
+    /// is `cache_def` and whose records part is `records`.
+    fn pivot_package(cache_def: &str, records: &str) -> Vec<u8> {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Pivot</t></is></c></row></sheetData></worksheet>"#;
+        let sheet_rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/></Relationships>"#;
+        let pivot = br#"<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="Sales Pivot" cacheId="1"><location ref="A3:B6" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/></pivotTableDefinition>"#;
+        let pivot_rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="../pivotCache/pivotCacheDefinition1.xml"/></Relationships>"#;
+        let cache_rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheRecords" Target="pivotCacheRecords1.xml"/></Relationships>"#;
+        single_sheet_xlsx(
+            sheet,
+            &[
+                ("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels),
+                ("xl/pivotTables/pivotTable1.xml", pivot),
+                ("xl/pivotTables/_rels/pivotTable1.xml.rels", pivot_rels),
+                ("xl/pivotCache/pivotCacheDefinition1.xml", cache_def.as_bytes()),
+                ("xl/pivotCache/_rels/pivotCacheDefinition1.xml.rels", cache_rels),
+                ("xl/pivotCache/pivotCacheRecords1.xml", records.as_bytes()),
+            ],
+        )
+    }
+
+    const PIVOT_FIELDS: &str = r#"<cacheFields count="4"><cacheField name="Region"><sharedItems count="2"><s v="North"/><s v="South"/></sharedItems></cacheField><cacheField name="Qty"><sharedItems containsNumber="1"/></cacheField><cacheField name="Paid"><sharedItems/></cacheField><cacheField name="Note"><sharedItems/></cacheField></cacheFields>"#;
+    const PIVOT_RECORDS: &str = r#"<pivotCacheRecords xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="2"><r><x v="1"/><n v="12.5"/><b v="1"/><m/></r><r><x v="0"/><n v="3"/><b v="0"/><s v="late"/></r></pivotCacheRecords>"#;
+
+    /// A pivot over an external source keeps its only copy of the source
+    /// data in `pivotCacheRecords`, which was never read: the data behind
+    /// the pivot was lost. It now reaches the model, `to_ir()`,
+    /// `plain_text()` and `to_markdown()`.
+    #[test]
+    fn test_pivot_cache_records_surface_for_an_external_source() {
+        let def = format!(
+            r#"<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"><cacheSource type="external" connectionId="1"/>{PIVOT_FIELDS}</pivotCacheDefinition>"#
+        );
+        let doc = open_bytes(pivot_package(&def, PIVOT_RECORDS));
+        let pivot = &doc.worksheets[0].pivot_tables[0];
+        assert_eq!(pivot.source, None);
+        let data = pivot.cache_data.as_ref().expect("cached source data");
+        assert_eq!(data.fields, ["Region", "Qty", "Paid", "Note"]);
+        assert_eq!(
+            data.records,
+            [
+                vec!["South", "12.5", "TRUE", ""],
+                vec!["North", "3", "FALSE", "late"],
+            ]
+        );
+        assert!(!data.truncated);
+
+        let ir = crate::convert_xlsx::xlsx_to_ir(&doc);
+        let table = ir
+            .sections
+            .iter()
+            .flat_map(|s| &s.elements)
+            .find_map(|e| match e {
+                crate::ir::Element::Table(t) if t.rows.len() == 3 => Some(t),
+                _ => None,
+            })
+            .expect("a table of the cached records");
+        assert!(table.rows[0].is_header);
+        let md = doc.to_markdown();
+        assert!(md.contains("Sales Pivot"), "{md}");
+        assert!(md.contains("| South | 12.5 | TRUE |"), "{md}");
+        let text = doc.plain_text();
+        assert!(text.contains("North\t3\tFALSE\tlate"), "{text}");
+    }
+
+    /// A worksheet source naming a sheet the workbook does not have is not
+    /// in the workbook either; one naming a sheet it has is, and its cells
+    /// already carry the data, so nothing is duplicated.
+    #[test]
+    fn test_pivot_cache_records_only_when_the_source_is_missing() {
+        let def = |sheet: &str| {
+            format!(
+                r#"<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"><cacheSource type="worksheet"><worksheetSource ref="A1:D3" sheet="{sheet}"/></cacheSource>{PIVOT_FIELDS}</pivotCacheDefinition>"#
+            )
+        };
+        let missing = open_bytes(pivot_package(&def("Deleted"), PIVOT_RECORDS));
+        let p = &missing.worksheets[0].pivot_tables[0];
+        assert_eq!(p.source.as_deref(), Some("Deleted!A1:D3"));
+        assert_eq!(p.cache_data.as_ref().map(|d| d.records.len()), Some(2));
+
+        let present = open_bytes(pivot_package(&def("sheet1"), PIVOT_RECORDS));
+        assert_eq!(present.worksheets[0].pivot_tables[0].cache_data, None);
+    }
+
+    /// A pivot cache is shared by every pivot built on it, and a workbook
+    /// table as the source means the source cells are already in the
+    /// workbook. The reader parsed the records once per pivot and only then
+    /// found the table and threw the data away: a workbook with 17 pivots
+    /// over 5 table-backed caches spent 80% of its open time there (4.7x
+    /// slower than 0.1.12) for no output. A table-backed cache is now never
+    /// parsed, and a cache that is needed is parsed once.
+    #[test]
+    fn test_pivot_caches_are_parsed_once_and_never_for_a_table_source() {
+        let package = |cache_source: &str| {
+            let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Pivot</t></is></c></row></sheetData></worksheet>"#;
+            let sheet_rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable2.xml"/>
+  <Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable3.xml"/>
+</Relationships>"#;
+            let table = br#"<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Sales" displayName="SalesTbl" ref="A1:B5"><tableColumns count="2"><tableColumn id="1" name="Region"/><tableColumn id="2" name="Qty"/></tableColumns></table>"#;
+            let pivot = br#"<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="P" cacheId="1"><location ref="D1:E4" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/></pivotTableDefinition>"#;
+            let pivot_rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="../pivotCache/pivotCacheDefinition1.xml"/></Relationships>"#;
+            let cache_rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheRecords" Target="pivotCacheRecords1.xml"/></Relationships>"#;
+            let def = format!(
+                r#"<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1">{cache_source}{PIVOT_FIELDS}</pivotCacheDefinition>"#
+            );
+            let bytes = single_sheet_xlsx(
+                sheet,
+                &[
+                    ("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels),
+                    ("xl/tables/table1.xml", table),
+                    ("xl/pivotTables/pivotTable1.xml", pivot),
+                    ("xl/pivotTables/pivotTable2.xml", pivot),
+                    ("xl/pivotTables/pivotTable3.xml", pivot),
+                    ("xl/pivotTables/_rels/pivotTable1.xml.rels", pivot_rels),
+                    ("xl/pivotTables/_rels/pivotTable2.xml.rels", pivot_rels),
+                    ("xl/pivotTables/_rels/pivotTable3.xml.rels", pivot_rels),
+                    ("xl/pivotCache/pivotCacheDefinition1.xml", def.as_bytes()),
+                    ("xl/pivotCache/_rels/pivotCacheDefinition1.xml.rels", cache_rels),
+                    ("xl/pivotCache/pivotCacheRecords1.xml", PIVOT_RECORDS.as_bytes()),
+                ],
+            );
+            worksheet::PIVOT_RECORD_PARSES.with(|n| n.set(0));
+            let doc = open_bytes(bytes);
+            (doc, worksheet::PIVOT_RECORD_PARSES.with(std::cell::Cell::get))
+        };
+
+        for source in ["SalesTbl", "Sales"] {
+            let (doc, parses) = package(&format!(
+                r#"<cacheSource type="worksheet"><worksheetSource name="{source}"/></cacheSource>"#
+            ));
+            assert_eq!(parses, 0, "{source}: a table-backed cache was parsed");
+            assert!(
+                doc.worksheets[0]
+                    .pivot_tables
+                    .iter()
+                    .all(|p| p.cache_data.is_none())
+            );
+        }
+
+        let (doc, parses) = package(r#"<cacheSource type="external" connectionId="1"/>"#);
+        assert_eq!(parses, 1, "a cache shared by three pivots was parsed {parses} times");
+        let pivots = &doc.worksheets[0].pivot_tables;
+        assert_eq!(pivots.len(), 3);
+        for p in pivots {
+            assert_eq!(p.cache_data.as_ref().map(|d| d.records.len()), Some(2));
+        }
+    }
+
+    /// Materialising records is bounded by the text budget: an `x` index
+    /// repeats one shared item per record, so a small part can expand to
+    /// far more text than it holds.
+    #[test]
+    fn test_pivot_cache_records_stop_at_the_text_budget() {
+        let fields = vec![("F".to_string(), vec!["x".repeat(100)])];
+        let records =
+            format!("<pivotCacheRecords>{}</pivotCacheRecords>", r#"<r><x v="0"/></r>"#.repeat(50));
+        let mut budget = crate::limits::TextBudget::with_limit(1_000);
+        let data =
+            worksheet::parse_pivot_cache_records(records.as_bytes(), &fields, &mut budget).unwrap();
+        assert!(data.truncated);
+        assert_eq!(data.records.len(), 10);
+        assert!(budget.exhausted());
+    }
+
+    /// Table parts (`xl/tables/`) and pivot tables were never read: their
+    /// definitions — the table's name, range and columns, the pivot's
+    /// location and source range — dropped without a trace.
+    #[test]
+    fn test_table_parts_and_pivot_tables_are_read() {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Region</t></is></c><c r="B1" t="inlineStr"><is><t>Qty</t></is></c></row></sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts></worksheet>"#;
+        let sheet_rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/>
+</Relationships>"#;
+        let table = br#"<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Sales" displayName="SalesTbl" ref="A1:B5" totalsRowCount="1"><autoFilter ref="A1:B4"/><tableColumns count="2"><tableColumn id="1" name="Region"/><tableColumn id="2" name="Qty"/></tableColumns></table>"#;
+        let pivot = br#"<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="PivotTable1" cacheId="3"><location ref="D1:E4" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/></pivotTableDefinition>"#;
+        let pivot_rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="../pivotCache/pivotCacheDefinition1.xml"/></Relationships>"#;
+        let cache = br#"<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cacheSource type="worksheet"><worksheetSource ref="A1:B4" sheet="Sheet1"/></cacheSource></pivotCacheDefinition>"#;
+        let bytes = single_sheet_xlsx(
+            sheet,
+            &[
+                ("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels),
+                ("xl/tables/table1.xml", table),
+                ("xl/pivotTables/pivotTable1.xml", pivot),
+                ("xl/pivotTables/_rels/pivotTable1.xml.rels", pivot_rels),
+                ("xl/pivotCache/pivotCacheDefinition1.xml", cache),
+            ],
+        );
+        let doc = open_bytes(bytes);
+        let ws = &doc.worksheets[0];
+        assert_eq!(
+            ws.tables,
+            [worksheet::SheetTable {
+                name: "Sales".into(),
+                display_name: "SalesTbl".into(),
+                range: "A1:B5".into(),
+                columns: vec!["Region".into(), "Qty".into()],
+                header_row_count: 1,
+                totals_row_count: 1,
+            }]
+        );
+        assert_eq!(
+            ws.pivot_tables,
+            [worksheet::SheetPivotTable {
+                name: "PivotTable1".into(),
+                location: "D1:E4".into(),
+                source: Some("Sheet1!A1:B4".into()),
+                cache_data: None,
+            }]
+        );
+    }
+
+    /// The lazy public accessors: `ensure_theme` parses the theme part on
+    /// first use and caches it; `ensure_styles` returns the stylesheet the
+    /// reader already parsed.
+    #[test]
+    fn test_ensure_theme_and_ensure_styles_accessors() {
+        let theme = br#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="T"><a:themeElements><a:clrScheme name="C">
+<a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1>
+<a:dk2><a:srgbClr val="111111"/></a:dk2><a:lt2><a:srgbClr val="EEEEEE"/></a:lt2>
+<a:accent1><a:srgbClr val="4472C4"/></a:accent1><a:accent2><a:srgbClr val="ED7D31"/></a:accent2>
+<a:accent3><a:srgbClr val="A5A5A5"/></a:accent3><a:accent4><a:srgbClr val="FFC000"/></a:accent4>
+<a:accent5><a:srgbClr val="5B9BD5"/></a:accent5><a:accent6><a:srgbClr val="70AD47"/></a:accent6>
+<a:hlink><a:srgbClr val="0563C1"/></a:hlink><a:folHlink><a:srgbClr val="954F72"/></a:folHlink>
+</a:clrScheme><a:fontScheme name="F"><a:majorFont><a:latin typeface="Cambria"/></a:majorFont><a:minorFont><a:latin typeface="Calibri"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#;
+        let styles = br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="0"/></cellXfs></styleSheet>"#;
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/></worksheet>"#;
+        let mut doc = open_bytes(single_sheet_xlsx(
+            sheet,
+            &[("xl/theme/theme1.xml", theme), ("xl/styles.xml", styles)],
+        ));
+        assert!(doc.theme.is_none(), "the theme is parsed lazily");
+        let accent1 = doc
+            .ensure_theme()
+            .and_then(|t| {
+                t.resolve_color(crate::core::theme::ThemeColorSlot::Accent1)
+                    .cloned()
+            })
+            .expect("theme parses");
+        assert_eq!(accent1.0, [0x44, 0x72, 0xC4]);
+        assert!(doc.theme.is_some(), "and cached");
+        assert!(doc.ensure_theme().is_some());
+        assert_eq!(doc.ensure_styles().map(|s| s.cell_formats.len()), Some(1));
+    }
+
+    /// The per-sheet public wrappers render one sheet, and name no sheet
+    /// past the last.
+    #[test]
+    fn test_per_sheet_text_and_markdown_wrappers() {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>h</t></is></c><c r="B1"><v>2</v></c></row></sheetData></worksheet>"#;
+        let doc = open_bytes(single_sheet_xlsx(sheet, &[]));
+        assert_eq!(doc.sheet_plain_text(0).as_deref(), Some("h\t2"));
+        assert_eq!(
+            doc.sheet_to_markdown(0).as_deref(),
+            Some("## Sheet1\n\n| h | 2 |\n| --- | --- |")
+        );
+        assert_eq!(doc.sheet_to_csv(0).as_deref(), Some("h,2"));
+        assert!(doc.sheet_plain_text(1).is_none());
+        assert!(doc.sheet_to_markdown(1).is_none());
+    }
+
+    /// A fill naming a theme slot resolves through the workbook's theme
+    /// part in `to_ir()`, which cannot mutate the document to cache it.
+    #[test]
+    fn test_theme_coloured_fill_resolves_through_the_theme_part() {
+        let theme = br#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="T"><a:themeElements><a:clrScheme name="C">
+<a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1>
+<a:dk2><a:srgbClr val="111111"/></a:dk2><a:lt2><a:srgbClr val="EEEEEE"/></a:lt2>
+<a:accent1><a:srgbClr val="4472C4"/></a:accent1><a:accent2><a:srgbClr val="ED7D31"/></a:accent2>
+<a:accent3><a:srgbClr val="A5A5A5"/></a:accent3><a:accent4><a:srgbClr val="FFC000"/></a:accent4>
+<a:accent5><a:srgbClr val="5B9BD5"/></a:accent5><a:accent6><a:srgbClr val="70AD47"/></a:accent6>
+<a:hlink><a:srgbClr val="0563C1"/></a:hlink><a:folHlink><a:srgbClr val="954F72"/></a:folHlink>
+</a:clrScheme><a:fontScheme name="F"><a:majorFont><a:latin typeface="Cambria"/></a:majorFont><a:minorFont><a:latin typeface="Calibri"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#;
+        let styles = br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="solid"><fgColor theme="4"/></patternFill></fill></fills><cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="0" fillId="1" applyFill="1"/></cellXfs></styleSheet>"#;
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" s="1"><v>1</v></c><c r="B1"><v>2</v></c></row></sheetData></worksheet>"#;
+        let doc = open_bytes(single_sheet_xlsx(
+            sheet,
+            &[("xl/theme/theme1.xml", theme), ("xl/styles.xml", styles)],
+        ));
+        let ir = crate::convert_xlsx::xlsx_to_ir(&doc);
+        let crate::ir::Element::Table(t) = &ir.sections[0].elements[0] else {
+            panic!("expected a table");
+        };
+        assert_eq!(t.rows[0].cells[0].background_color, Some([0x44, 0x72, 0xC4]));
+        assert_eq!(t.rows[0].cells[1].background_color, None);
     }
 }

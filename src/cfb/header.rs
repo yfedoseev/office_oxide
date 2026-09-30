@@ -14,6 +14,9 @@ pub const FAT_SECT: u32 = 0xFFFFFFFD;
 pub const DIFAT_SECT: u32 = 0xFFFFFFFC;
 /// Maximum valid regular sector index.
 pub const MAX_REG_SECT: u32 = 0xFFFFFFFA;
+/// Mini Stream Cutoff Size, [MS-CFB] §2.2: "This integer field MUST be
+/// set to 0x00001000." Streams smaller than this live in the mini stream.
+pub const MINI_STREAM_CUTOFF: u32 = 0x0000_1000;
 
 /// Parsed CFB header (first 512 bytes).
 #[derive(Debug, Clone)]
@@ -30,7 +33,9 @@ pub struct CfbHeader {
     pub fat_sector_count: u32,
     /// First directory sector.
     pub first_dir_sector: u32,
-    /// Mini-stream cutoff size (typically 4096).
+    /// Mini-stream cutoff size. [MS-CFB] §2.2 fixes it at 4096
+    /// (`MINI_STREAM_CUTOFF`); a header declaring any other value is
+    /// normalized to that constant, so this is always 4096.
     pub mini_stream_cutoff: u32,
     /// First mini-FAT sector.
     pub first_mini_fat_sector: u32,
@@ -117,7 +122,17 @@ impl CfbHeader {
 
         let fat_sector_count = u32::from_le_bytes([buf[0x2C], buf[0x2D], buf[0x2E], buf[0x2F]]);
         let first_dir_sector = u32::from_le_bytes([buf[0x30], buf[0x31], buf[0x32], buf[0x33]]);
-        let mini_stream_cutoff = u32::from_le_bytes([buf[0x38], buf[0x39], buf[0x3A], buf[0x3B]]);
+        // The cutoff decides which streams are read from the mini stream.
+        // The spec fixes it, so the header's own value is only checked:
+        // honouring a larger one routed multi-gigabyte size claims down
+        // the mini-stream path. Apache POI likewise ignores the field.
+        let declared_cutoff = u32::from_le_bytes([buf[0x38], buf[0x39], buf[0x3A], buf[0x3B]]);
+        if declared_cutoff != MINI_STREAM_CUTOFF {
+            log::warn!(
+                "cfb: header declares mini stream cutoff {declared_cutoff}; using the fixed {MINI_STREAM_CUTOFF}"
+            );
+        }
+        let mini_stream_cutoff = MINI_STREAM_CUTOFF;
         let first_mini_fat_sector =
             u32::from_le_bytes([buf[0x3C], buf[0x3D], buf[0x3E], buf[0x3F]]);
         let mini_fat_sector_count =

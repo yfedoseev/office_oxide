@@ -203,12 +203,18 @@ pub fn ir_to_docx(ir: &DocumentIR) -> crate::docx::write::DocxWriter {
         if section.page_setup.is_some()
             || section.columns.is_some()
             || section.break_type != SectionBreakType::Continuous
+            || section.footnote_settings.is_some()
+            || section.endnote_settings.is_some()
             || has_hf
         {
             writer.set_section_props(
                 section.page_setup.clone(),
                 section.columns.clone(),
                 section.break_type.clone(),
+            );
+            writer.set_section_note_settings(
+                section.footnote_settings.clone(),
+                section.endnote_settings.clone(),
             );
         }
     }
@@ -316,6 +322,13 @@ fn add_element_to_docx(writer: &mut crate::docx::write::DocxWriter, elem: &Eleme
         Element::Footnote(n) => {
             writer.add_footnote(n.id, &n.content, n.marker.clone());
         },
+        // A comment travels through the IR as an endnote labelled
+        // "Comment"/"Comment (author)" (every reader uses that label).
+        // Writing it as an endnote turned each comment into a numbered
+        // note detached from the text it was about.
+        Element::Endnote(n) if comment_author(n).is_some() => {
+            writer.add_comment(n.id, comment_author(n).flatten(), &n.content);
+        },
         Element::Endnote(n) => {
             writer.add_endnote(n.id, &n.content, n.marker.clone());
         },
@@ -330,6 +343,23 @@ fn add_element_to_docx(writer: &mut crate::docx::write::DocxWriter, elem: &Eleme
     }
 }
 
+/// `Some(author)` when `n` is a comment — an endnote labelled `"Comment"`
+/// or `"Comment (author)"` — and `None` for an ordinary endnote. The
+/// structured `author` field wins over the label.
+fn comment_author(n: &crate::ir::Note) -> Option<Option<String>> {
+    let marker = n.marker.as_deref()?;
+    let from_label = match marker {
+        "Comment" => None,
+        _ => Some(
+            marker
+                .strip_prefix("Comment (")?
+                .strip_suffix(')')?
+                .to_string(),
+        ),
+    };
+    Some(n.author.clone().or(from_label))
+}
+
 fn ir_inline_to_runs(content: &[InlineContent]) -> Vec<crate::docx::write::Run> {
     use crate::docx::write::Run;
     let mut runs: Vec<Run> = Vec::new();
@@ -342,6 +372,7 @@ fn ir_inline_to_runs(content: &[InlineContent]) -> Vec<crate::docx::write::Run> 
                 run.strikethrough = span.strikethrough;
                 run.font_name = span.font_name.clone();
                 run.hyperlink = span.hyperlink.clone();
+                run.hyperlink_tooltip = span.hyperlink_tooltip.clone();
                 run.font_size_half_pt = span.font_size_half_pt;
                 run.color_rgb = span.color;
                 run.underline_style = span.underline.clone();
@@ -372,6 +403,14 @@ fn ir_inline_to_runs(content: &[InlineContent]) -> Vec<crate::docx::write::Run> 
                     ..Default::default()
                 });
             },
+            InlineContent::CommentStart(a) => runs.push(Run {
+                comment_start: Some(a.comment_id),
+                ..Default::default()
+            }),
+            InlineContent::CommentRef(a) => runs.push(Run {
+                comment_ref: Some(a.comment_id),
+                ..Default::default()
+            }),
         }
     }
     coalesce_runs(runs)
@@ -390,15 +429,18 @@ fn ir_inline_to_runs(content: &[InlineContent]) -> Vec<crate::docx::write::Run> 
 fn coalesce_runs(runs: Vec<crate::docx::write::Run>) -> Vec<crate::docx::write::Run> {
     use crate::docx::write::Run;
     let mut out: Vec<Run> = Vec::with_capacity(runs.len());
+    // Note references, comment anchors and line breaks are markers, not text.
+    let is_marker = |r: &Run| {
+        r.footnote_ref.is_some()
+            || r.endnote_ref.is_some()
+            || r.comment_start.is_some()
+            || r.comment_ref.is_some()
+            || r.text == "\n"
+    };
     for r in runs {
-        let mergeable = r.footnote_ref.is_none() && r.endnote_ref.is_none() && r.text != "\n";
-        if mergeable {
+        if !is_marker(&r) {
             if let Some(last) = out.last_mut() {
-                if last.footnote_ref.is_none()
-                    && last.endnote_ref.is_none()
-                    && last.text != "\n"
-                    && run_props_equal(last, &r)
-                {
+                if !is_marker(last) && run_props_equal(last, &r) {
                     last.text.push_str(&r.text);
                     continue;
                 }
@@ -415,6 +457,7 @@ fn run_props_equal(a: &crate::docx::write::Run, b: &crate::docx::write::Run) -> 
     // hyperlink is part of a run's identity: merging a linked run with an
     // unlinked one silently swallows the link.
     a.hyperlink == b.hyperlink
+        && a.hyperlink_tooltip == b.hyperlink_tooltip
         && a.bold == b.bold
         && a.italic == b.italic
         && a.underline == b.underline
@@ -482,6 +525,9 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
 
     let mut writer = crate::xlsx::write::XlsxWriter::new();
     writer.set_metadata(&ir.metadata);
+    for name in &ir.defined_names {
+        writer.add_defined_name(name.clone());
+    }
 
     // Sheet names must be unique within a workbook (ECMA-376) and Excel
     // additionally rejects names > 31 chars, names containing `:\\/?*[]`,
@@ -503,6 +549,7 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
         let name = unique_sheet_name(raw, idx + 1, &used_names);
         used_names.insert(name.clone());
         let mut sheet = writer.add_sheet(&name);
+        sheet.set_hidden(section.hidden);
 
         // Propagate per-section page geometry so a PDF→XLSX→PDF round
         // trip preserves the source MediaBox. Without this each
@@ -566,17 +613,45 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                             }
                             let text = cell_text(cell);
                             let data = ir_cell_to_cell_data(cell, &text);
-                            if let Some(style) = xlsx_cell_style(
+                            let style = xlsx_cell_style(
                                 row.is_header,
                                 cell.background_color,
                                 cell.number_format.as_deref(),
-                            ) {
+                            );
+                            // A cell's horizontal alignment round-trips.
+                            let halign = match cell.text_align {
+                                Some(crate::ir::ParagraphAlignment::Left) => {
+                                    Some(crate::xlsx::write::HAlign::Left)
+                                },
+                                Some(crate::ir::ParagraphAlignment::Center) => {
+                                    Some(crate::xlsx::write::HAlign::Center)
+                                },
+                                Some(crate::ir::ParagraphAlignment::Right) => {
+                                    Some(crate::xlsx::write::HAlign::Right)
+                                },
+                                _ => None,
+                            };
+                            let style = match (style, halign) {
+                                (Some(s), Some(a)) => Some(s.align(a)),
+                                (None, Some(a)) => Some(CellStyle::new().align(a)),
+                                (s, None) => s,
+                            };
+                            // So does text wrapping (§18.8.1 `wrapText`).
+                            let style = match (style, cell.wrap_text) {
+                                (Some(s), true) => Some(s.wrap()),
+                                (None, true) => Some(CellStyle::new().wrap()),
+                                (s, false) => s,
+                            };
+                            if let Some(style) = style {
                                 sheet.set_cell_styled(row_cursor, col, data, style);
                             } else {
                                 sheet.set_cell(row_cursor, col, data);
                             }
-                            if let Some(url) = cell_hyperlink(cell) {
+                            if let Some((url, tooltip)) = cell_hyperlink(cell) {
                                 sheet.set_cell_hyperlink(row_cursor, col, url);
+                                if let Some(tip) = tooltip {
+                                    sheet.set_cell_hyperlink_tooltip(row_cursor, col, tip);
+                                }
                             }
                             let cs = cell.col_span.max(1) as usize;
                             let rs = cell.row_span.max(1) as usize;
@@ -1019,29 +1094,6 @@ pub(crate) const PPTX_THEMATIC_BREAK_MARKER: &str = "\u{2500}\u{2500}\u{2500}\u{
 fn pptx_notes_body_items(notes: &[Element]) -> Vec<crate::pptx::write::BodyItem> {
     use crate::pptx::write::BodyItem;
 
-    fn flatten_list(
-        list: &crate::ir::List,
-        level: u8,
-        out: &mut Vec<(u8, Vec<crate::pptx::write::Run>)>,
-    ) {
-        for item in &list.items {
-            let runs: Vec<crate::pptx::write::Run> = item
-                .content
-                .iter()
-                .flat_map(|e| match e {
-                    Element::Paragraph(p) => inline_to_pptx_runs(&p.content),
-                    _ => Vec::new(),
-                })
-                .collect();
-            if !runs.is_empty() {
-                out.push((level, runs));
-            }
-            if let Some(ref nested) = item.nested {
-                flatten_list(nested, level.saturating_add(1), out);
-            }
-        }
-    }
-
     let mut items = Vec::new();
     for elem in notes {
         match elem {
@@ -1051,7 +1103,7 @@ fn pptx_notes_body_items(notes: &[Element]) -> Vec<crate::pptx::write::BodyItem>
             },
             Element::List(l) => {
                 let mut bullets = Vec::new();
-                flatten_list(l, l.level, &mut bullets);
+                flatten_ir_list_for_pptx(l, l.level, &mut bullets);
                 if !bullets.is_empty() {
                     items.push(BodyItem::BulletList(bullets));
                 }
@@ -1062,7 +1114,58 @@ fn pptx_notes_body_items(notes: &[Element]) -> Vec<crate::pptx::write::BodyItem>
     items
 }
 
+/// Flatten an IR list tree into PPTX list paragraphs: `(level, runs,
+/// marker)`, where each nested list keeps its own marker — an ordered list
+/// is written with `<a:buAutoNum>` in the scheme of its `ListStyle`, not
+/// as bullets.
+fn flatten_ir_list_for_pptx(
+    list: &crate::ir::List,
+    level: u8,
+    out: &mut Vec<(u8, Vec<crate::pptx::write::Run>, crate::pptx::write::ListMarker)>,
+) {
+    use crate::pptx::write::ListMarker;
+    let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+        log::warn!("create: element nesting exceeds the depth limit; subtree skipped");
+        return;
+    };
+    let marker = if list.ordered {
+        ListMarker::AutoNum {
+            // ST_TextAutonumberScheme (ECMA-376 Part 1 §20.1.10.61).
+            scheme: match list.style {
+                Some(ListStyle::LowerAlpha) => "alphaLcPeriod",
+                Some(ListStyle::UpperAlpha) => "alphaUcPeriod",
+                Some(ListStyle::LowerRoman) => "romanLcPeriod",
+                Some(ListStyle::UpperRoman) => "romanUcPeriod",
+                _ => "arabicPeriod",
+            },
+            start_at: list.start_number,
+        }
+    } else {
+        ListMarker::Bullet
+    };
+    for item in &list.items {
+        let runs: Vec<crate::pptx::write::Run> = item
+            .content
+            .iter()
+            .flat_map(|e| match e {
+                Element::Paragraph(p) => inline_to_pptx_runs(&p.content),
+                _ => Vec::new(),
+            })
+            .collect();
+        if !runs.is_empty() {
+            out.push((level, runs, marker));
+        }
+        if let Some(ref nested) = item.nested {
+            flatten_ir_list_for_pptx(nested, level.saturating_add(1), out);
+        }
+    }
+}
+
 fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) {
+    let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+        log::warn!("create: element nesting exceeds the depth limit; subtree skipped");
+        return;
+    };
     match elem {
         Element::ThematicBreak => {
             // Encode via the marker text + center alignment. The
@@ -1105,31 +1208,9 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
             // Each item's runs (not just its plain text) now carry
             // through, so a hyperlink or bold/italic/color on a list
             // item's text survives the write.
-            fn flatten(
-                list: &crate::ir::List,
-                level: u8,
-                out: &mut Vec<(u8, Vec<crate::pptx::write::Run>)>,
-            ) {
-                for item in &list.items {
-                    let runs: Vec<crate::pptx::write::Run> = item
-                        .content
-                        .iter()
-                        .flat_map(|e| match e {
-                            Element::Paragraph(p) => inline_to_pptx_runs(&p.content),
-                            _ => Vec::new(),
-                        })
-                        .collect();
-                    if !runs.is_empty() {
-                        out.push((level, runs));
-                    }
-                    if let Some(ref nested) = item.nested {
-                        flatten(nested, level.saturating_add(1), out);
-                    }
-                }
-            }
-            let mut items: Vec<(u8, Vec<crate::pptx::write::Run>)> = Vec::new();
-            flatten(l, l.level, &mut items);
-            slide.add_nested_bullet_list(items);
+            let mut items = Vec::new();
+            flatten_ir_list_for_pptx(l, l.level, &mut items);
+            slide.add_marked_list(items);
         },
         Element::Table(t) => {
             // A real a:tbl, not tab-joined text: the previous form lost the
@@ -1467,10 +1548,14 @@ fn cell_runs(cell: &TableCell) -> Vec<crate::pptx::write::Run> {
 /// (xlsx::write had no hyperlink concept at all, so a
 /// cell's `TextSpan.hyperlink` — the same field DOCX/PPTX runs already
 /// use — was silently dropped on every write).
-fn cell_hyperlink(cell: &TableCell) -> Option<String> {
+/// The first hyperlink in a cell's content, with its hover text.
+fn cell_hyperlink(cell: &TableCell) -> Option<(String, Option<String>)> {
     cell.content.iter().find_map(|e| match e {
         Element::Paragraph(p) => p.content.iter().find_map(|c| match c {
-            InlineContent::Text(t) => t.hyperlink.clone(),
+            InlineContent::Text(t) => t
+                .hyperlink
+                .clone()
+                .map(|url| (url, t.hyperlink_tooltip.clone())),
             _ => None,
         }),
         _ => None,
@@ -1675,6 +1760,10 @@ fn parse_xlsx_comment_marker(marker: Option<&str>) -> Option<(String, Option<Str
 }
 
 fn xlsx_text_rows(elem: &Element, out: &mut Vec<String>) {
+    let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+        log::warn!("create: element nesting exceeds the depth limit; subtree skipped");
+        return;
+    };
     match elem {
         Element::Paragraph(p) => {
             let t = inline_to_text(&p.content);
@@ -1690,6 +1779,10 @@ fn xlsx_text_rows(elem: &Element, out: &mut Vec<String>) {
         },
         Element::List(l) => {
             fn walk(list: &crate::ir::List, out: &mut Vec<String>) {
+                let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+                    log::warn!("create: element nesting exceeds the depth limit; subtree skipped");
+                    return;
+                };
                 for item in &list.items {
                     for e in &item.content {
                         xlsx_text_rows(e, out);
@@ -1852,6 +1945,7 @@ fn inline_to_pptx_runs(content: &[InlineContent]) -> Vec<crate::pptx::write::Run
                 }
                 if let Some(ref url) = span.hyperlink {
                     run = run.hyperlink(url.clone());
+                    run.hyperlink_tooltip = span.hyperlink_tooltip.clone();
                 }
                 Some(run)
             } else {

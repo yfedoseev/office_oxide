@@ -54,6 +54,11 @@ pub struct DocParagraph {
     /// span with `ChpProps::default()` (see `resolve_chp_segments`), so
     /// callers never need a separate "no formatting info" case.
     pub chp_runs: Vec<(std::ops::Range<usize>, ChpProps)>,
+    /// Main-text CP just past this paragraph's terminator — the paragraph
+    /// holds every CP below this and at or above the previous paragraph's
+    /// `cp_end`. Lets shape anchors (`PlcSpaMom`) be placed after the
+    /// paragraph that holds them.
+    pub cp_end: u32,
 }
 
 /// Parse every PAPX FKP page referenced by the PlcfBtePapx.
@@ -195,7 +200,8 @@ fn extract_grpprl(page: &[u8], word_off: usize) -> Vec<u8> {
     page[grpprl_start..grpprl_end].to_vec()
 }
 
-/// The CP ranges an FC run `[fc_start, fc_end)` covers, in CP order.
+/// The pieces ordered by the file bytes they occupy, for mapping FC runs
+/// (CHPX/PAPX FKP runs) to CP ranges.
 ///
 /// In a fast-saved (complex) file the text of one FC run is not one CP
 /// range: the piece table scatters edits, so consecutive file bytes can
@@ -204,40 +210,74 @@ fn extract_grpprl(page: &[u8], word_off: usize) -> Vec<u8> {
 /// whatever CPs lay *between* those two points — a paragraph gained the
 /// text of its neighbours, a formatting run covered characters it did
 /// not format, a start below every piece mapped to nothing. Each piece is
-/// intersected with the run instead.
-pub fn fc_run_to_cp_ranges(fc_start: u32, fc_end: u32, pieces: &[Piece]) -> Vec<(u32, u32)> {
-    let norm = |fc: u32| {
-        if fc & 0x4000_0000 != 0 {
-            (fc & !0x4000_0000) / 2
-        } else {
-            fc
+/// intersected with the run instead — but only the pieces whose bytes can
+/// overlap it, found by binary search, rather than every piece for every
+/// run (runs × pieces on a fast-saved file with thousands of each).
+pub struct PieceFcIndex<'a> {
+    /// `(byte start, byte end, piece)`, sorted by byte start.
+    spans: Vec<(u64, u64, &'a Piece)>,
+    /// `max_end[i]` = the largest byte end among `spans[..=i]`: monotonic
+    /// even when pieces overlap, so it can be binary-searched.
+    max_end: Vec<u64>,
+}
+
+impl<'a> PieceFcIndex<'a> {
+    /// Index `pieces` by their byte ranges.
+    pub fn new(pieces: &'a [Piece]) -> Self {
+        let mut spans: Vec<(u64, u64, &Piece)> = pieces
+            .iter()
+            .filter(|p| p.cp_end > p.cp_start)
+            .map(|p| {
+                let (base, stride) = piece_byte_base(p);
+                let (base, stride) = (base as u64, stride as u64);
+                (base, base.saturating_add((p.cp_end - p.cp_start) as u64 * stride), p)
+            })
+            .collect();
+        spans.sort_unstable_by_key(|&(start, _, _)| start);
+        let mut max_end = Vec::with_capacity(spans.len());
+        let mut m = 0u64;
+        for &(_, end, _) in &spans {
+            m = m.max(end);
+            max_end.push(m);
         }
-    };
-    let (run_start, run_end) = (norm(fc_start) as u64, norm(fc_end) as u64);
-    let mut out = Vec::new();
-    if run_end <= run_start {
-        return out;
+        Self { spans, max_end }
     }
-    for p in pieces {
-        if p.cp_end <= p.cp_start {
-            continue;
+
+    /// The CP ranges an FC run `[fc_start, fc_end)` covers, in CP order.
+    pub fn cp_ranges(&self, fc_start: u32, fc_end: u32) -> Vec<(u32, u32)> {
+        let norm = |fc: u32| {
+            if fc & 0x4000_0000 != 0 {
+                (fc & !0x4000_0000) / 2
+            } else {
+                fc
+            }
+        };
+        let (run_start, run_end) = (norm(fc_start) as u64, norm(fc_end) as u64);
+        let mut out = Vec::new();
+        if run_end <= run_start {
+            return out;
         }
-        let (base, stride) = piece_byte_base(p);
-        let (base, stride) = (base as u64, stride as u64);
-        let piece_end = base.saturating_add((p.cp_end - p.cp_start) as u64 * stride);
-        let lo = run_start.max(base);
-        let hi = run_end.min(piece_end);
-        if hi <= lo {
-            continue;
+        // Every span before `first` ends at or before the run starts.
+        let first = self.max_end.partition_point(|&e| e <= run_start);
+        for &(base, piece_end, p) in &self.spans[first..] {
+            if base >= run_end {
+                break; // sorted by start: every later piece starts later
+            }
+            let stride = if p.is_compressed { 1 } else { 2 };
+            let lo = run_start.max(base);
+            let hi = run_end.min(piece_end);
+            if hi <= lo {
+                continue;
+            }
+            let cp_lo = p.cp_start as u64 + (lo - base) / stride;
+            let cp_hi = p.cp_start as u64 + (hi - base).div_ceil(stride);
+            if cp_hi > cp_lo {
+                out.push((cp_lo.min(u32::MAX as u64) as u32, cp_hi.min(u32::MAX as u64) as u32));
+            }
         }
-        let cp_lo = p.cp_start as u64 + (lo - base) / stride;
-        let cp_hi = p.cp_start as u64 + (hi - base).div_ceil(stride);
-        if cp_hi > cp_lo {
-            out.push((cp_lo.min(u32::MAX as u64) as u32, cp_hi.min(u32::MAX as u64) as u32));
-        }
+        out.sort_unstable();
+        out
     }
-    out.sort_unstable();
-    out
 }
 
 /// Real byte offset and stride (bytes per character) of a piece's start.
@@ -262,6 +302,13 @@ fn piece_byte_base(p: &Piece) -> (u32, u32) {
 /// appears. The inner text is run through [`sanitize_text`] (which strips
 /// field codes `0x13/0x14/0x15` and maps control chars); the trailing
 /// character is kept raw as the `terminator` that drives cell/row grouping.
+///
+/// `section_ends` are the section end CPs (`PlcfSed`, sorted): the last
+/// character of every section but the last is its section mark (0x0C),
+/// which also ends that section's last paragraph, so it terminates a
+/// paragraph here (terminator `0x0C`)
+/// rather than merging it with the next section's first. A 0x0C anywhere
+/// else is a page break inside a paragraph.
 pub fn build_paragraphs(
     word_doc: &[u8],
     pieces: &[Piece],
@@ -269,6 +316,7 @@ pub fn build_paragraphs(
     text_len: u32,
     lid: u16,
     chp_runs: &[FkpRun],
+    section_ends: &[u32],
 ) -> Vec<DocParagraph> {
     // PAPX runs in CP space: every FKP run intersected with every piece.
     // A paragraph is then the text up to and including the next paragraph
@@ -276,10 +324,12 @@ pub fn build_paragraphs(
     // §2.4.6.1 — the PAPX applies to the paragraph whose mark it covers).
     // Taking each FKP run as one paragraph instead, with its two FC end
     // points mapped to CPs, was right only for a never-fast-saved file.
+    let fc_index = PieceFcIndex::new(pieces);
     let mut pap: Vec<(u32, u32, &FkpParagraph)> = fkp
         .iter()
         .flat_map(|fp| {
-            fc_run_to_cp_ranges(fp.fc_start, fp.fc_end, pieces)
+            fc_index
+                .cp_ranges(fp.fc_start, fp.fc_end)
                 .into_iter()
                 .map(move |(a, b)| (a.min(text_len), b.min(text_len), fp))
         })
@@ -320,21 +370,30 @@ pub fn build_paragraphs(
             let segments = resolve_chp_segments(&sorted_chp_runs, seg_a, seg_b);
             for (seg_start, seg_end, props) in &segments {
                 let chunk = decode_cp_range(word_doc, pieces, *seg_start, *seg_end, lid);
+                let mut cp = *seg_start;
                 for ch in chunk.chars() {
-                    let is_mark = matches!(ch, '\r' | '\u{7}');
+                    let this_cp = cp;
+                    cp = cp.saturating_add(ch.len_utf16() as u32);
+                    let is_mark = matches!(ch, '\r' | '\u{7}')
+                        || (ch == '\u{C}'
+                            && section_ends
+                                .binary_search(&this_cp.saturating_add(1))
+                                .is_ok());
                     // Deleted revision-mark text (`sprmCFRMarkDel`) is
                     // not part of the accepted view: the flat text already
                     // excludes it, and keeping it here made
                     // `to_ir()`/`to_html()` show sentences `plain_text()`
                     // did not. The paragraph mark itself stays, so a
                     // wholly deleted paragraph still terminates.
-                    if props.f_rmark_del && !is_mark {
+                    // Hidden (`sprmCFVanish`) text likewise: Word does
+                    // not display it.
+                    if props.is_excluded() && !is_mark {
                         continue;
                     }
                     buf.push(ch);
                     buf_props.push(props.clone());
                     if is_mark {
-                        emit_paragraph(&mut buf, &mut buf_props, run, &mut out);
+                        emit_paragraph(&mut buf, &mut buf_props, run, cp, &mut out);
                     }
                 }
             }
@@ -346,7 +405,7 @@ pub fn build_paragraphs(
         buf.push('\r');
         buf_props.push(buf_props.last().cloned().unwrap_or_default());
         let last = pap.last().map(|&(_, _, fp)| fp).unwrap_or(&empty);
-        emit_paragraph(&mut buf, &mut buf_props, last, &mut out);
+        emit_paragraph(&mut buf, &mut buf_props, last, cursor, &mut out);
     }
     out
 }
@@ -357,6 +416,7 @@ fn emit_paragraph(
     buf: &mut Vec<char>,
     buf_props: &mut Vec<ChpProps>,
     run: &FkpParagraph,
+    cp_end: u32,
     out: &mut Vec<DocParagraph>,
 ) {
     let terminator = buf[buf.len() - 1];
@@ -371,6 +431,7 @@ fn emit_paragraph(
         props,
         hyperlinks,
         chp_runs: chp_spans,
+        cp_end,
     });
     buf.clear();
     buf_props.clear();
@@ -388,6 +449,59 @@ mod tests {
             cp_end,
             fc,
             is_compressed: false,
+            prm_grpprl: Vec::new(),
+        }
+    }
+
+    /// A fast-saved layout: many pieces whose bytes are out of CP order,
+    /// some compressed, one overlapping another's bytes. The indexed
+    /// lookup must give exactly what intersecting every piece gives, for
+    /// every run — it only skips pieces that cannot overlap.
+    #[test]
+    fn test_fc_index_matches_intersecting_every_piece() {
+        let mut pieces = Vec::new();
+        let mut cp = 0u32;
+        for i in 0..40u32 {
+            let len = 3 + (i % 5);
+            // Bytes laid out in reverse CP order, every 7th compressed,
+            // every 11th reusing the previous piece's bytes.
+            let byte = 0x10000 - (i + 1) * 0x40 + if i % 11 == 10 { 0x40 } else { 0 };
+            let compressed = i % 7 == 3;
+            pieces.push(Piece {
+                cp_start: cp,
+                cp_end: cp + len,
+                fc: if compressed {
+                    0x4000_0000 | (byte * 2)
+                } else {
+                    byte
+                },
+                is_compressed: compressed,
+                prm_grpprl: Vec::new(),
+            });
+            cp += len;
+        }
+        let brute = |a: u32, b: u32| {
+            let mut out = Vec::new();
+            for p in &pieces {
+                let (base, stride) = piece_byte_base(p);
+                let (base, stride) = (base as u64, stride as u64);
+                let end = base + (p.cp_end - p.cp_start) as u64 * stride;
+                let (lo, hi) = ((a as u64).max(base), (b as u64).min(end));
+                if hi > lo {
+                    out.push((
+                        (p.cp_start as u64 + (lo - base) / stride) as u32,
+                        (p.cp_start as u64 + (hi - base).div_ceil(stride)) as u32,
+                    ));
+                }
+            }
+            out.sort_unstable();
+            out
+        };
+        let index = PieceFcIndex::new(&pieces);
+        for a in (0xF000..0x10040u32).step_by(13) {
+            for len in [1u32, 5, 64, 300, 4000] {
+                assert_eq!(index.cp_ranges(a, a + len), brute(a, a + len), "run {a:#x}+{len}");
+            }
         }
     }
 
@@ -396,10 +510,14 @@ mod tests {
         // table.doc: one Unicode piece, fc = 0x800, text_len = 23.
         let pieces = [unicode_piece(0x800, 23)];
         // bytes 0x802..0x806 = cps 1..3.
-        assert_eq!(fc_run_to_cp_ranges(0x802, 0x806, &pieces), vec![(1, 3)]);
+        assert_eq!(PieceFcIndex::new(&pieces).cp_ranges(0x802, 0x806), vec![(1, 3)]);
         // A run reaching below and beyond the piece is clipped to it.
-        assert_eq!(fc_run_to_cp_ranges(0x700, 0x900, &pieces), vec![(0, 23)]);
-        assert!(fc_run_to_cp_ranges(0x900, 0x910, &pieces).is_empty());
+        assert_eq!(PieceFcIndex::new(&pieces).cp_ranges(0x700, 0x900), vec![(0, 23)]);
+        assert!(
+            PieceFcIndex::new(&pieces)
+                .cp_ranges(0x900, 0x910)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -410,10 +528,11 @@ mod tests {
             cp_end: 5,
             fc: 0x4000_0010, // compressed, real offset = 0x10/2 = 8
             is_compressed: true,
+            prm_grpprl: Vec::new(),
         }];
-        assert_eq!(fc_run_to_cp_ranges(0x4000_0010, 0x4000_0014, &pieces), vec![(0, 2)]);
+        assert_eq!(PieceFcIndex::new(&pieces).cp_ranges(0x4000_0010, 0x4000_0014), vec![(0, 2)]);
         // fc 9 (real byte, no bit) → cp 1.
-        assert_eq!(fc_run_to_cp_ranges(9, 11, &pieces), vec![(1, 3)]);
+        assert_eq!(PieceFcIndex::new(&pieces).cp_ranges(9, 11), vec![(1, 3)]);
     }
 
     /// A fast-saved file scatters one paragraph's characters over the
@@ -429,18 +548,20 @@ mod tests {
                 cp_end: 10,
                 fc: 0x4000_0000 | (0x800 * 2),
                 is_compressed: true,
+                prm_grpprl: Vec::new(),
             },
             Piece {
                 cp_start: 10,
                 cp_end: 20,
                 fc: 0x4000_0000 | (0x100 * 2),
                 is_compressed: true,
+                prm_grpprl: Vec::new(),
             },
         ];
         // One FC run covering bytes 0x100..0x900: both pieces, in CP order.
-        assert_eq!(fc_run_to_cp_ranges(0x100, 0x900, &pieces), vec![(0, 10), (10, 20)]);
+        assert_eq!(PieceFcIndex::new(&pieces).cp_ranges(0x100, 0x900), vec![(0, 10), (10, 20)]);
         // A run over the later-stored piece only.
-        assert_eq!(fc_run_to_cp_ranges(0x105, 0x108, &pieces), vec![(15, 18)]);
+        assert_eq!(PieceFcIndex::new(&pieces).cp_ranges(0x105, 0x108), vec![(15, 18)]);
     }
 
     #[test]
@@ -509,7 +630,7 @@ mod tests {
             mk(5, 6, &rowmark), // "\u{7}" row mark
         ];
 
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 6, 0, &[]);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 6, 0, &[], &[]);
         assert_eq!(paras.len(), 4);
         // leading mark
         assert_eq!(paras[0].text, "");
@@ -556,8 +677,19 @@ mod tests {
             grpprl: Vec::new(),
         };
         let runs = vec![plain(0, 10), del, plain(23, n)];
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, n, 0, &runs);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, n, 0, &runs, &[]);
         assert_eq!(paras.len(), 1);
+        assert_eq!(paras[0].text, "Keep this here.");
+
+        // Hidden text (`sprmCFVanish`) is not displayed by Word either; it
+        // surfaced as visible text.
+        let hidden = FkpRun {
+            fc_start: 0x800 + 10 * 2,
+            fc_end: 0x800 + 23 * 2,
+            grpprl: vec![0x3C, 0x08, 0x01],
+        };
+        let runs = vec![plain(0, 10), hidden, plain(23, n)];
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, n, 0, &runs, &[]);
         assert_eq!(paras[0].text, "Keep this here.");
     }
 
@@ -582,7 +714,7 @@ mod tests {
         };
         let fkp = vec![mk(0, 6), mk(6, 12)];
 
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 12, 0, &[]);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 12, 0, &[], &[]);
         assert_eq!(paras.len(), 2);
         assert_eq!(paras[0].text, "Hi 😀", "emoji must not desync the range");
         assert_eq!(paras[0].terminator, '\r');
@@ -614,7 +746,8 @@ mod tests {
             grpprl: Vec::new(),
         };
         let fkp = vec![mk(0, raw.chars().count() as u32)];
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, 0, &[]);
+        let paras =
+            build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, 0, &[], &[]);
         assert_eq!(paras.len(), 1);
         assert_eq!(paras[0].terminator, '\r');
         let t = &paras[0].text;
@@ -681,9 +814,10 @@ mod tests {
             cp_end: u32::MAX,
             fc: 0,
             is_compressed: false,
+            prm_grpprl: Vec::new(),
         }];
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            fc_run_to_cp_ranges(0, u32::MAX, &pieces)
+            PieceFcIndex::new(&pieces).cp_ranges(0, u32::MAX)
         }));
         assert!(result.is_ok(), "the FC walk must not overflow on a huge declared CP range");
     }

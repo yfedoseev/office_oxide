@@ -34,8 +34,8 @@ use crate::core::opc::{OpcWriter, PartName};
 use crate::core::relationships::rel_types;
 use crate::ir::{
     BorderLine, BorderStyle, CellVerticalAlign, ColumnLayout, ImageFormat, ImagePositioning,
-    LineSpacing, ListStyle, PageSetup, ParagraphAlignment, SectionBreakType, TableAlignment,
-    UnderlineStyle, VerticalAlign,
+    LineSpacing, ListStyle, NoteSettings, PageSetup, ParagraphAlignment, SectionBreakType,
+    TableAlignment, UnderlineStyle, VerticalAlign,
 };
 
 use super::Result;
@@ -59,6 +59,8 @@ const CT_FOOTNOTES: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml";
 const CT_ENDNOTES: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml";
+const CT_COMMENTS: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml";
 
 use crate::core::xml::ns::{R_STR as R_NS, WML_STR as WML_NS};
 
@@ -142,6 +144,8 @@ pub struct Run {
     /// Hyperlink target URL. Emitted as a `w:hyperlink` wrapper with an
     /// external relationship; previously read and thrown away.
     pub hyperlink: Option<String>,
+    /// The hyperlink's hover text, written as `w:hyperlink/@w:tooltip`.
+    pub hyperlink_tooltip: Option<String>,
     /// Small-caps text transform.
     pub small_caps: bool,
     /// Character spacing in half-points (positive = expand, negative = condense).
@@ -155,6 +159,14 @@ pub struct Run {
     /// carries `w:customMarkFollows="1"` and the note body gets the glyph
     /// as its own leading run instead of an auto-number.
     pub note_ref_marker: Option<String>,
+    /// Comment range start (special run that emits only
+    /// `<w:commentRangeStart w:id>`). Written only for a comment added
+    /// with [`DocxWriter::add_comment`].
+    pub comment_start: Option<u32>,
+    /// Comment citation point (special run that emits
+    /// `<w:commentRangeEnd>` followed by a `<w:commentReference>` run).
+    /// Written only for a comment added with [`DocxWriter::add_comment`].
+    pub comment_ref: Option<u32>,
 }
 
 impl Run {
@@ -310,6 +322,7 @@ struct DocxTable {
     rows: Vec<Vec<String>>,
 }
 
+#[derive(Clone)]
 struct DocxRichParagraph {
     runs: Vec<Run>,
     props: IrParaProps,
@@ -328,6 +341,7 @@ struct DocxRichTable {
 
 struct DocxRichRow {
     height_twips: Option<u32>,
+    height_rule: Option<crate::ir::RowHeightRule>,
     allow_break: bool,
     repeat_as_header: bool,
     cells: Vec<DocxRichCell>,
@@ -348,7 +362,11 @@ struct DocxRichCell {
 }
 
 struct DocxImage {
+    /// Embedded bytes; empty for a linked picture.
     data: Vec<u8>,
+    /// A linked picture's target (`a:blip/@r:link`), written as an
+    /// external relationship instead of a media part.
+    linked: Option<String>,
     format: ImageFormat,
     display_width_emu: u64,
     display_height_emu: u64,
@@ -361,6 +379,9 @@ struct DocxSectPr {
     page_setup: Option<PageSetup>,
     columns: Option<ColumnLayout>,
     break_type: SectionBreakType,
+    /// `w:footnotePr` / `w:endnotePr` for this section.
+    footnote_settings: Option<NoteSettings>,
+    endnote_settings: Option<NoteSettings>,
     /// The headers/footers (indices into `DocxWriter::headers_footers`)
     /// that belong to this section: those added since the previous
     /// section's `sectPr`. Every section used to share one flat list
@@ -399,11 +420,21 @@ struct DocxNote {
     marker: Option<String>,
 }
 
+struct DocxComment {
+    id: u32,
+    author: Option<String>,
+    elements: Vec<DocxElement>,
+}
+
 struct DocxRichList {
     ordered: bool,
     items: Vec<Vec<DocxElement>>,
     start_number: Option<u32>,
     style: Option<ListStyle>,
+    /// `w:lvlText` for an ordered level whose marker is not plain `%N.`.
+    marker_pattern: Option<String>,
+    /// `w:lvlJc`.
+    marker_alignment: Option<ParagraphAlignment>,
     level: u8,
     num_id: u32,
 }
@@ -431,16 +462,6 @@ enum DocxElement {
     RichList(DocxRichList),
     CodeBlock(String),
     TextBox(DocxTextBox),
-}
-
-struct CoreProps {
-    title: Option<String>,
-    author: Option<String>,
-    subject: Option<String>,
-    keywords: Option<String>,
-    description: Option<String>,
-    created: Option<String>,
-    modified: Option<String>,
 }
 
 /// Resolved `r:id` for each hyperlink URL used anywhere in the package.
@@ -536,8 +557,18 @@ fn register_part_image_rids<W: Write + Seek>(
         else {
             continue;
         };
-        let target = format!("media/image{}.{}", idx + 1, img.format.extension());
-        let rid = opc.add_part_rel(part, rel_types::IMAGE, &target);
+        let rid = match img.linked {
+            Some(ref url) => opc.add_part_rel_with_mode(
+                part,
+                rel_types::IMAGE,
+                url,
+                crate::core::relationships::TargetMode::External,
+            ),
+            None => {
+                let target = format!("media/image{}.{}", idx + 1, img.format.extension());
+                opc.add_part_rel(part, rel_types::IMAGE, &target)
+            },
+        };
         out.push(ImageInfo {
             rid,
             ..info.clone()
@@ -608,6 +639,8 @@ fn collect_hyperlinks(elements: &[DocxElement], out: &mut Vec<String>) {
 struct ImageInfo {
     idx: usize,
     rid: String,
+    /// `rid` names an external (linked) picture: `r:link`, not `r:embed`.
+    linked: bool,
     width_emu: u64,
     height_emu: u64,
     alt_text: Option<String>,
@@ -631,7 +664,9 @@ pub struct DocxWriter {
     hf_section_start: usize,
     footnotes: Vec<DocxNote>,
     endnotes: Vec<DocxNote>,
-    core_props: Option<CoreProps>,
+    comments: Vec<DocxComment>,
+    /// Document metadata for the package-property parts.
+    metadata: Option<crate::ir::Metadata>,
     next_num_id: u32,
     /// Embedded font programs to ship inside the package under `word/fonts/`.
     /// Each entry is `(font_name, ttf_or_otf_bytes)`. The reader recognizes
@@ -651,7 +686,8 @@ impl DocxWriter {
             hf_section_start: 0,
             footnotes: Vec::new(),
             endnotes: Vec::new(),
-            core_props: None,
+            comments: Vec::new(),
+            metadata: None,
             next_num_id: 3,
             embedded_fonts: Vec::new(),
         }
@@ -808,9 +844,33 @@ impl DocxWriter {
             page_setup,
             columns,
             break_type,
+            footnote_settings: None,
+            endnote_settings: None,
             hf_range,
         }));
         self
+    }
+
+    /// Set the footnote and endnote numbering/placement of the section most
+    /// recently closed by [`Self::set_section_props`], written as its
+    /// `w:footnotePr` / `w:endnotePr`. Returns `false` (and changes nothing)
+    /// when no section has been closed yet.
+    pub fn set_section_note_settings(
+        &mut self,
+        footnote: Option<NoteSettings>,
+        endnote: Option<NoteSettings>,
+    ) -> bool {
+        let Some(DocxElement::SectPr(sp)) = self
+            .elements
+            .iter_mut()
+            .rev()
+            .find(|e| matches!(e, DocxElement::SectPr(_)))
+        else {
+            return false;
+        };
+        sp.footnote_settings = footnote;
+        sp.endnote_settings = endnote;
+        true
     }
 
     /// Add an IR list with rich style information.
@@ -823,54 +883,15 @@ impl DocxWriter {
 
     /// Emit `list` and, recursively, every sub-list hanging off its items.
     ///
-    /// `ListItem::nested` was read by no writer at all, so everything below
-    /// level 0 vanished from the output while the API reported success.
-    ///
-    /// `num_id` is shared across every recursive call for one logical list
-    /// (only `add_ir_list` mints a fresh one) — a nested sub-list used to
-    /// get its own brand-new `numId` per level, which the reader (correctly,
-    /// per spec: one logical list keeps one `numId` across all its levels)
-    /// re-parsed as an unrelated *sibling* top-level list instead of a
-    /// child of the parent item, losing the parent/child relationship (and
-    /// sometimes the `ordered` flag) on every round trip.
+    /// `num_id` is shared across every level of one logical list (only
+    /// `add_ir_list` mints a fresh one): per spec one logical list keeps
+    /// one `numId` across all its levels, and a sub-list with its own
+    /// `numId` re-reads as an unrelated sibling list.
     fn add_ir_list_at(&mut self, list: &crate::ir::List, level: u8, num_id: u32) {
-        let start_number = list.start_number.unwrap_or(1);
-        let style = list.style.clone();
-
-        let items: Vec<Vec<DocxElement>> = list
-            .items
-            .iter()
-            .map(|item| {
-                let mut elems: Vec<DocxElement> = Vec::new();
-                for content_elem in &item.content {
-                    convert_ir_element_to_docx_elements(
-                        content_elem,
-                        &mut elems,
-                        &mut self.next_num_id,
-                        &mut self.images,
-                    );
-                }
-                elems
-            })
-            .collect();
-
-        self.elements.push(DocxElement::RichList(DocxRichList {
-            ordered: list.ordered,
-            items,
-            start_number: if start_number != 1 {
-                Some(start_number)
-            } else {
-                None
-            },
-            style,
-            level,
-            num_id,
-        }));
-
-        for item in &list.items {
-            if let Some(ref nested) = item.nested {
-                self.add_ir_list_at(nested, level.saturating_add(1).min(8), num_id);
-            }
+        if let Some(rl) =
+            convert_ir_list_at(list, level, num_id, &mut self.next_num_id, &mut self.images)
+        {
+            self.elements.push(DocxElement::RichList(rl));
         }
     }
 
@@ -955,22 +976,51 @@ impl DocxWriter {
         self
     }
 
-    /// Set document metadata (written to `docProps/core.xml`).
-    pub fn set_metadata(&mut self, meta: &crate::ir::Metadata) -> &mut Self {
-        let keywords = if meta.keywords.is_empty() {
-            None
+    /// Add a comment (written to `word/comments.xml`). Its anchor in the
+    /// text is a pair of runs with [`Run::comment_start`] and
+    /// [`Run::comment_ref`] set to `id`; a comment with no
+    /// `comment_ref` anywhere in the body is cited at the end of the last
+    /// body paragraph, so Word still shows it. A comment whose id was
+    /// already added gets a fresh id instead (and so is cited at the end:
+    /// the anchors name the first).
+    pub fn add_comment(
+        &mut self,
+        id: u32,
+        author: Option<String>,
+        content: &[crate::ir::Element],
+    ) -> &mut Self {
+        let id = if self.comments.iter().any(|c| c.id == id) {
+            let used: std::collections::HashSet<u32> = self.comments.iter().map(|c| c.id).collect();
+            let fresh = (0..=u32::MAX)
+                .find(|i| !used.contains(i))
+                .unwrap_or(u32::MAX);
+            log::warn!("docx writer: duplicate comment id {id} renumbered to {fresh}");
+            fresh
         } else {
-            Some(meta.keywords.join(", "))
+            id
         };
-        self.core_props = Some(CoreProps {
-            title: meta.title.clone(),
-            author: meta.author.clone(),
-            subject: meta.subject.clone(),
-            keywords,
-            description: meta.description.clone(),
-            created: meta.created.clone(),
-            modified: meta.modified.clone(),
+        let mut elems: Vec<DocxElement> = Vec::new();
+        for elem in content {
+            convert_ir_element_to_docx_elements(
+                elem,
+                &mut elems,
+                &mut self.next_num_id,
+                &mut self.images,
+            );
+        }
+        self.comments.push(DocxComment {
+            id,
+            author,
+            elements: elems,
         });
+        self
+    }
+
+    /// Set document metadata (written to `docProps/core.xml`, with the
+    /// company/manager in `docProps/app.xml` and custom properties in
+    /// `docProps/custom.xml`).
+    pub fn set_metadata(&mut self, meta: &crate::ir::Metadata) -> &mut Self {
+        self.metadata = Some(meta.clone());
         self
     }
 
@@ -1016,6 +1066,17 @@ impl DocxWriter {
     /// Write the document to an arbitrary `Write + Seek` destination.
     pub fn write_to<W: Write + Seek>(&self, writer: W) -> Result<()> {
         let opc = OpcWriter::new(writer)?;
+        // Comment anchors are written only for comments this package
+        // defines (see `write_run`); the set is scoped to this call.
+        struct Reset(Vec<u32>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                let previous = std::mem::take(&mut self.0);
+                WRITTEN_COMMENT_IDS.with(|ids| *ids.borrow_mut() = previous);
+            }
+        }
+        let ids: Vec<u32> = self.comments.iter().map(|c| c.id).collect();
+        let _reset = Reset(WRITTEN_COMMENT_IDS.with(|cur| cur.replace(ids)));
         self.write_package(opc)?;
         Ok(())
     }
@@ -1034,6 +1095,25 @@ impl DocxWriter {
         // --- Register images ---
         let mut image_rids: Vec<ImageInfo> = Vec::new();
         for (idx, img) in self.images.iter().enumerate() {
+            if let Some(ref url) = img.linked {
+                let rid = opc.add_part_rel_with_mode(
+                    &doc_part,
+                    rel_types::IMAGE,
+                    url,
+                    crate::core::relationships::TargetMode::External,
+                );
+                image_rids.push(ImageInfo {
+                    idx,
+                    rid,
+                    linked: true,
+                    width_emu: img.display_width_emu,
+                    height_emu: img.display_height_emu,
+                    alt_text: img.alt_text.clone(),
+                    decorative: img.decorative,
+                    positioning: img.positioning.clone(),
+                });
+                continue;
+            }
             let n = idx + 1;
             let ext = img.format.extension();
             let target = format!("media/image{n}.{ext}");
@@ -1052,6 +1132,7 @@ impl DocxWriter {
             image_rids.push(ImageInfo {
                 idx,
                 rid,
+                linked: false,
                 width_emu: img.display_width_emu,
                 height_emu: img.display_height_emu,
                 alt_text: img.alt_text.clone(),
@@ -1197,17 +1278,37 @@ impl DocxWriter {
             None
         };
 
-        // --- Core properties ---
-        if let Some(ref props) = self.core_props {
-            let core_part = PartName::new("/docProps/core.xml")?;
-            opc.add_package_rel(rel_types::CORE_PROPERTIES, "docProps/core.xml");
-            let xml = generate_core_props_xml(props);
-            opc.add_part(
-                &core_part,
-                "application/vnd.openxmlformats-package.core-properties+xml",
-                &xml,
-            )?;
+        // --- Comments ---
+        if !self.comments.is_empty() {
+            let part = PartName::new("/word/comments.xml")?;
+            opc.add_part_rel(&doc_part, rel_types::COMMENTS, "comments.xml");
+            let mut urls = Vec::new();
+            for c in &self.comments {
+                collect_hyperlinks(&c.elements, &mut urls);
+            }
+            let mut links = HyperlinkRids::new();
+            for url in urls {
+                let rid = opc.add_part_rel_with_mode(
+                    &part,
+                    rel_types::HYPERLINK,
+                    &url,
+                    crate::core::relationships::TargetMode::External,
+                );
+                links.insert(url, rid);
+            }
+            let elems: Vec<&[DocxElement]> = self
+                .comments
+                .iter()
+                .map(|c| c.elements.as_slice())
+                .collect();
+            let comment_image_rids =
+                register_part_image_rids(&mut opc, &part, &elems, &image_rids, &self.images);
+            let xml = generate_comments_xml(&self.comments, &comment_image_rids, &links);
+            opc.add_part(&part, CT_COMMENTS, &xml)?;
         }
+
+        // --- Package properties (core.xml, app.xml, custom.xml) ---
+        crate::core::core_properties::add_property_parts(&mut opc, self.metadata.as_ref())?;
 
         // --- Gather sectPr info ---
         let mut sectpr_info: Option<SectPrInfo> = None;
@@ -1223,6 +1324,8 @@ impl DocxWriter {
                     break_type: sp.break_type.clone(),
                     hf_rids: own,
                     has_footnotes: footnote_rid.is_some(),
+                    footnote_settings: sp.footnote_settings.clone(),
+                    endnote_settings: sp.endnote_settings.clone(),
                 });
             }
         }
@@ -1235,6 +1338,8 @@ impl DocxWriter {
                 break_type: SectionBreakType::Continuous,
                 hf_rids: hf_rids.clone(),
                 has_footnotes: footnote_rid.is_some(),
+                footnote_settings: None,
+                endnote_settings: None,
             });
         }
 
@@ -1263,24 +1368,77 @@ impl DocxWriter {
             opc.add_part(&numbering_part, CT_NUMBERING, &numbering_xml)?;
         }
 
-        // settings.xml carries two switches other parts depend on:
+        // settings.xml carries three switches other parts depend on:
         // w:evenAndOddHeaders, without which a w:type="even" header is never
-        // shown, and w:embedTrueTypeFonts, without which fontTable.xml's
-        // embedded font references are inert.
+        // shown; w:embedTrueTypeFonts, without which fontTable.xml's
+        // embedded font references are inert; and w:displayBackgroundShape,
+        // without which Word does not draw w:background.
         let has_even_hf = self
             .headers_footers
             .iter()
             .any(|hf| matches!(hf.hf_type, HfType::EvenPageHeader | HfType::EvenPageFooter));
         let has_fonts = !self.embedded_fonts.is_empty();
-        if has_even_hf || has_fonts {
+        let has_background = self.background_rgb.is_some();
+        if has_even_hf || has_fonts || has_background {
             let settings_part = PartName::new("/word/settings.xml")?;
             opc.add_part_rel(&doc_part, rel_types::SETTINGS, "settings.xml");
-            let xml = generate_settings_xml(has_even_hf, has_fonts);
+            let xml = generate_settings_xml(SettingsSwitches {
+                display_background_shape: has_background,
+                embed_fonts: has_fonts,
+                even_and_odd_headers: has_even_hf,
+            });
             opc.add_part(&settings_part, CT_SETTINGS, &xml)?;
         }
 
         opc.finish()?;
         Ok(())
+    }
+
+    /// Ids of added comments that no `Run::comment_ref` anywhere in the
+    /// package cites.
+    fn unanchored_comment_ids(&self) -> Vec<u32> {
+        if self.comments.is_empty() {
+            return Vec::new();
+        }
+        fn walk(elements: &[DocxElement], out: &mut Vec<u32>) {
+            let runs = |runs: &[Run], out: &mut Vec<u32>| {
+                out.extend(runs.iter().filter_map(|r| r.comment_ref));
+            };
+            for e in elements {
+                match e {
+                    DocxElement::Paragraph(p) => runs(&p.runs, out),
+                    DocxElement::RichParagraph(p) => runs(&p.runs, out),
+                    DocxElement::RichList(l) => {
+                        for item in &l.items {
+                            walk(item, out);
+                        }
+                    },
+                    DocxElement::RichTable(t) => {
+                        for row in &t.rows {
+                            for c in &row.cells {
+                                walk(&c.content, out);
+                            }
+                        }
+                    },
+                    DocxElement::TextBox(tb) => walk(&tb.content, out),
+                    _ => {},
+                }
+            }
+        }
+        let mut cited = Vec::new();
+        walk(&self.elements, &mut cited);
+        for hf in &self.headers_footers {
+            walk(&hf.elements, &mut cited);
+        }
+        for n in self.footnotes.iter().chain(&self.endnotes) {
+            walk(&n.elements, &mut cited);
+        }
+        let cited: std::collections::HashSet<u32> = cited.into_iter().collect();
+        self.comments
+            .iter()
+            .map(|c| c.id)
+            .filter(|id| !cited.contains(id))
+            .collect()
     }
 
     fn has_text_boxes(&self) -> bool {
@@ -1391,6 +1549,22 @@ impl DocxWriter {
             .iter()
             .rposition(|e| matches!(e, DocxElement::SectPr(_)));
 
+        // A comment cited nowhere would never be shown; cite each such
+        // comment at the end of the last body paragraph (or in a
+        // paragraph of its own when the body ends in something else).
+        let unanchored = self.unanchored_comment_ids();
+        let last_para_idx = self
+            .elements
+            .iter()
+            .rposition(|e| !matches!(e, DocxElement::SectPr(_)))
+            .filter(|&i| matches!(self.elements[i], DocxElement::RichParagraph(_)));
+        let citations = || {
+            unanchored.iter().map(|&id| Run {
+                comment_ref: Some(id),
+                ..Default::default()
+            })
+        };
+
         let mut image_counter = 0u32;
         for (idx, element) in self.elements.iter().enumerate() {
             if let DocxElement::SectPr(sp) = element {
@@ -1402,7 +1576,22 @@ impl DocxWriter {
                 write_inline_section_break_paragraph(&mut w, sp, &hf_rids[sp.hf_range.clone()]);
                 continue;
             }
+            if Some(idx) == last_para_idx && !unanchored.is_empty() {
+                if let DocxElement::RichParagraph(p) = element {
+                    let mut cited = p.clone();
+                    cited.runs.extend(citations());
+                    write_rich_paragraph(&mut w, &cited, links);
+                    continue;
+                }
+            }
             write_docx_element(&mut w, element, image_rids, &mut image_counter, links);
+        }
+        if last_para_idx.is_none() && !unanchored.is_empty() {
+            let p = DocxRichParagraph {
+                runs: citations().collect(),
+                props: Default::default(),
+            };
+            write_rich_paragraph(&mut w, &p, links);
         }
 
         if let Some(sp) = sect_pr {
@@ -1478,8 +1667,8 @@ impl DocxWriter {
         // CT_Numbering is `numPicBullet*, abstractNum*, num*`: every abstract
         // definition must precede every instance, so these run as two passes
         // rather than one pair per list.
-        write_abstract_num(&mut w, 0, &[(0, "bullet", "\u{2022}".to_string())]);
-        write_abstract_num(&mut w, 1, &[(0, "decimal", "%1.".to_string())]);
+        write_abstract_num(&mut w, 0, &[(0, "bullet", "\u{2022}".to_string(), None)]);
+        write_abstract_num(&mut w, 1, &[(0, "decimal", "%1.".to_string(), None)]);
 
         // One logical list's recursive nesting levels now share a single
         // `numId`, so group by `num_id` here rather than
@@ -1497,12 +1686,24 @@ impl DocxWriter {
 
         for &num_id in &num_ids {
             let abstract_id = num_id - 3 + 2;
-            let mut levels: Vec<(u8, &str, String)> = Vec::new();
+            let mut levels: Vec<AbstractLevel> = Vec::new();
             for rl in &rich_lists {
                 if rl.num_id == num_id && !levels.iter().any(|(l, ..)| *l == rl.level) {
-                    let (fmt, lvl_text) =
+                    let (fmt, mut lvl_text) =
                         list_style_to_fmt(rl.style.as_ref(), rl.ordered, rl.level);
-                    levels.push((rl.level, fmt, lvl_text));
+                    if let Some(pattern) = rl
+                        .marker_pattern
+                        .as_deref()
+                        .filter(|p| rl.ordered && pattern_fits_level(p, rl.level))
+                    {
+                        lvl_text = pattern.to_string();
+                    }
+                    let jc = rl.marker_alignment.as_ref().map(|a| match a {
+                        ParagraphAlignment::Center => "center",
+                        ParagraphAlignment::Right => "right",
+                        _ => "left",
+                    });
+                    levels.push((rl.level, fmt, lvl_text, jc));
                 }
             }
             write_abstract_num(&mut w, abstract_id, &levels);
@@ -1692,6 +1893,7 @@ fn convert_ir_table(
 
         rich_rows.push(DocxRichRow {
             height_twips: row.height_twips,
+            height_rule: row.height_rule,
             allow_break: row.allow_break,
             repeat_as_header: row.repeat_as_header,
             cells: rich_cells,
@@ -1713,7 +1915,13 @@ fn convert_ir_table(
 /// Store an IR image in the writer's media list and return its index,
 /// or `None` when the IR carries no bytes for it.
 fn register_ir_image(image: &crate::ir::Image, images: &mut Vec<DocxImage>) -> Option<usize> {
-    let data = image.data.clone()?;
+    // Embedded bytes win; a picture with none but a `source_url` is a
+    // linked picture, written as one rather than dropped.
+    let (data, linked) = match (&image.data, &image.source_url) {
+        (Some(data), _) => (data.clone(), None),
+        (None, Some(url)) => (Vec::new(), Some(url.clone())),
+        (None, None) => return None,
+    };
     let format = image.format.clone().unwrap_or(ImageFormat::Png);
 
     let (w_emu, h_emu) =
@@ -1728,6 +1936,7 @@ fn register_ir_image(image: &crate::ir::Image, images: &mut Vec<DocxImage>) -> O
     let idx = images.len();
     images.push(DocxImage {
         data,
+        linked,
         format,
         display_width_emu: w_emu,
         display_height_emu: h_emu,
@@ -1788,7 +1997,9 @@ fn convert_ir_element_to_docx_elements(
             // analogous top-level-list bug).
             let num_id = *next_num_id;
             *next_num_id += 1;
-            convert_ir_list_at(l, l.level, num_id, out, next_num_id, images);
+            if let Some(rl) = convert_ir_list_at(l, l.level, num_id, next_num_id, images) {
+                out.push(DocxElement::RichList(rl));
+            }
         },
         E::Image(img) => {
             // Every nested image used to be skipped here ("needs the outer
@@ -1827,25 +2038,29 @@ fn convert_ir_element_to_docx_elements(
     }
 }
 
-/// Emit `list` and, recursively, every sub-list hanging off its items, into
-/// `out` — the free-function counterpart of `DocxWriter::add_ir_list_at`
-/// for content nested inside a table cell, text box, header/footer, or
-/// footnote/endnote, which has no `self.elements` to push sibling
-/// `RichList` entries into. `num_id` is shared across every recursive call
-/// for one logical list (only the `E::List` match arm that calls this
-/// mints a fresh one), matching `add_ir_list_at`'s contract that one
-/// logical list keeps one `numId` across all its nesting levels.
+/// Build the `RichList` for `list` at `level`, with every sub-list placed
+/// inside the item it hangs off — after that item's own content and before
+/// the next sibling, which is where Word expects the level-`n+1` paragraphs.
+/// Emitting all of a level's items first and the sub-lists after them moved
+/// every child under the wrong parent on the way back in.
+///
+/// `num_id` is shared across every recursive call for one logical list: per
+/// spec one logical list keeps one `numId` across all its nesting levels.
+/// Returns `None` only when the nesting exceeds the depth limit.
 fn convert_ir_list_at(
     list: &crate::ir::List,
     level: u8,
     num_id: u32,
-    out: &mut Vec<DocxElement>,
     next_num_id: &mut u32,
     images: &mut Vec<DocxImage>,
-) {
+) -> Option<DocxRichList> {
+    // Nested sub-lists recurse here, outside the element walk's own guard,
+    // so the list chain needs its own bound.
+    let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+        log::warn!("docx: list nesting exceeds the depth limit; sub-list skipped");
+        return None;
+    };
     let start_number = list.start_number.unwrap_or(1);
-    let style = list.style.clone();
-
     let items: Vec<Vec<DocxElement>> = list
         .items
         .iter()
@@ -1854,35 +2069,28 @@ fn convert_ir_list_at(
             for content_elem in &item.content {
                 convert_ir_element_to_docx_elements(content_elem, &mut elems, next_num_id, images);
             }
+            if let Some(ref nested) = item.nested {
+                let child_level = level.saturating_add(1).min(8);
+                if let Some(rl) =
+                    convert_ir_list_at(nested, child_level, num_id, next_num_id, images)
+                {
+                    elems.push(DocxElement::RichList(rl));
+                }
+            }
             elems
         })
         .collect();
 
-    out.push(DocxElement::RichList(DocxRichList {
+    Some(DocxRichList {
         ordered: list.ordered,
         items,
-        start_number: if start_number != 1 {
-            Some(start_number)
-        } else {
-            None
-        },
-        style,
+        start_number: (start_number != 1).then_some(start_number),
+        style: list.style.clone(),
+        marker_pattern: list.marker_pattern.clone(),
+        marker_alignment: list.marker_alignment.clone(),
         level,
         num_id,
-    }));
-
-    for item in &list.items {
-        if let Some(ref nested) = item.nested {
-            convert_ir_list_at(
-                nested,
-                level.saturating_add(1).min(8),
-                num_id,
-                out,
-                next_num_id,
-                images,
-            );
-        }
-    }
+    })
 }
 
 fn ir_paragraph_to_runs(p: &crate::ir::Paragraph) -> Vec<Run> {
@@ -1909,6 +2117,7 @@ fn ir_inline_to_runs(content: &[crate::ir::InlineContent]) -> Vec<Run> {
                 run.small_caps = span.small_caps;
                 run.char_spacing_half_pt = span.char_spacing_half_pt;
                 run.hyperlink = span.hyperlink.clone();
+                run.hyperlink_tooltip = span.hyperlink_tooltip.clone();
                 runs.push(run);
             },
             InlineContent::LineBreak => {
@@ -1933,6 +2142,14 @@ fn ir_inline_to_runs(content: &[crate::ir::InlineContent]) -> Vec<Run> {
                 };
                 runs.push(run);
             },
+            InlineContent::CommentStart(a) => runs.push(Run {
+                comment_start: Some(a.comment_id),
+                ..Default::default()
+            }),
+            InlineContent::CommentRef(a) => runs.push(Run {
+                comment_ref: Some(a.comment_id),
+                ..Default::default()
+            }),
         }
     }
     runs
@@ -1971,6 +2188,8 @@ struct SectPrInfo {
     hf_rids: Vec<(HfType, String)>,
     /// Presence only: sectPr's `<w:footnotePr/>` carries no relationship id.
     has_footnotes: bool,
+    footnote_settings: Option<NoteSettings>,
+    endnote_settings: Option<NoteSettings>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2000,7 +2219,7 @@ fn write_docx_element(
                     ImagePositioning::Inline => {
                         write_inline_image_run(
                             w,
-                            &info.rid,
+                            (&info.rid, info.linked),
                             info.width_emu,
                             info.height_emu,
                             info.alt_text.as_deref(),
@@ -2011,7 +2230,7 @@ fn write_docx_element(
                     ImagePositioning::Floating(fi) => {
                         write_floating_image_run(
                             w,
-                            &info.rid,
+                            (&info.rid, info.linked),
                             fi,
                             info.alt_text.as_deref(),
                             info.decorative,
@@ -2247,7 +2466,10 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph, links: &
 
         if let Some(level) = props.outline_level {
             let mut lvl = BytesStart::new("w:outlineLvl");
-            lvl.push_attribute(("w:val", level.to_string().as_str()));
+            // Word's outline levels are 0-8, with 9 meaning body text
+            // (ECMA-376 Part 1 §17.3.1.20); anything above reads as body
+            // text there, so write that rather than an out-of-range value.
+            lvl.push_attribute(("w:val", level.min(9).to_string().as_str()));
             w.write_event(Event::Empty(lvl)).expect("write outlineLvl");
         }
         w.write_event(Event::End(BytesEnd::new("w:pPr")))
@@ -2260,6 +2482,7 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph, links: &
     let mut i = 0usize;
     while i < p.runs.len() {
         let url = p.runs[i].hyperlink.as_deref().filter(|u| !u.is_empty());
+        let tooltip = p.runs[i].hyperlink_tooltip.as_deref();
         // A pure `#anchor` URL (empty base) is a same-document link with
         // no relationship at all — `w:anchor` alone. Anything else with a
         // fragment (`https://…#section`) keeps the relationship on the
@@ -2282,9 +2505,17 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph, links: &
                 if let Some(frag) = frag {
                     link.push_attribute(("w:anchor", frag));
                 }
+                // CT_Hyperlink: `w:tooltip` (ECMA-376 §17.16).
+                if let Some(tip) = tooltip {
+                    link.push_attribute((
+                        "w:tooltip",
+                        crate::core::xml::sanitize_xml_text(tip).as_ref(),
+                    ));
+                }
                 w.write_event(Event::Start(link)).expect("write hyperlink");
                 while i < p.runs.len()
                     && p.runs[i].hyperlink.as_deref().filter(|u| !u.is_empty()) == url
+                    && p.runs[i].hyperlink_tooltip.as_deref() == tooltip
                 {
                     write_run(w, &p.runs[i]);
                     i += 1;
@@ -2334,13 +2565,22 @@ fn write_rpr_content(w: &mut Writer<Vec<u8>>, run: &Run) {
         elem.push_attribute(("w:eastAsia", name.as_str()));
         w.write_event(Event::Empty(elem)).expect("write rFonts");
     }
+    // `w:b`/`w:i` apply to non-complex-script characters only (ECMA-376
+    // §17.3.2); `w:bCs`/`w:iCs` (§17.3.2)
+    // carry the same toggle for complex-script text, as `w:szCs` already
+    // mirrors `w:sz` below. Without them bold Arabic or Hebrew text
+    // written here rendered regular in Word.
     if run.bold {
         w.write_event(Event::Empty(BytesStart::new("w:b")))
             .expect("write bold");
+        w.write_event(Event::Empty(BytesStart::new("w:bCs")))
+            .expect("write complex-script bold");
     }
     if run.italic {
         w.write_event(Event::Empty(BytesStart::new("w:i")))
             .expect("write italic");
+        w.write_event(Event::Empty(BytesStart::new("w:iCs")))
+            .expect("write complex-script italic");
     }
     if let Some(ref us) = run.underline_style {
         let val = underline_style_val(us);
@@ -2458,7 +2698,53 @@ fn write_field_run(w: &mut Writer<Vec<u8>>, run: &Run, instr: &str) {
         .expect("write r end");
 }
 
+thread_local! {
+    /// Ids of the comments the package being written defines, set for the
+    /// duration of [`DocxWriter::write_to`]. An anchor for any other id
+    /// would dangle — a `w:commentReference` whose comment does not exist.
+    static WRITTEN_COMMENT_IDS: std::cell::RefCell<Vec<u32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn comment_is_written(id: u32) -> bool {
+    WRITTEN_COMMENT_IDS.with(|ids| ids.borrow().contains(&id))
+}
+
+/// `<w:commentRangeEnd>` then the `<w:commentReference>` run, the shape
+/// Word writes at a comment's citation point (ECMA-376 §17.13.4,
+/// §17.13.4).
+fn write_comment_reference(w: &mut Writer<Vec<u8>>, id: u32) {
+    let id = id.to_string();
+    let mut end = BytesStart::new("w:commentRangeEnd");
+    end.push_attribute(("w:id", id.as_str()));
+    w.write_event(Event::Empty(end))
+        .expect("write commentRangeEnd");
+    w.write_event(Event::Start(BytesStart::new("w:r")))
+        .expect("write r start");
+    let mut reference = BytesStart::new("w:commentReference");
+    reference.push_attribute(("w:id", id.as_str()));
+    w.write_event(Event::Empty(reference))
+        .expect("write commentReference");
+    w.write_event(Event::End(BytesEnd::new("w:r")))
+        .expect("write r end");
+}
+
 fn write_run(w: &mut Writer<Vec<u8>>, run: &Run) {
+    if let Some(id) = run.comment_start {
+        if comment_is_written(id) {
+            let mut start = BytesStart::new("w:commentRangeStart");
+            start.push_attribute(("w:id", id.to_string().as_str()));
+            w.write_event(Event::Empty(start))
+                .expect("write commentRangeStart");
+        }
+        return;
+    }
+    if let Some(id) = run.comment_ref {
+        if comment_is_written(id) {
+            write_comment_reference(w, id);
+        }
+        return;
+    }
     if let Some(note_id) = run.footnote_ref {
         write_footnote_ref_run(w, note_id, false, run.note_ref_marker.as_deref());
         return;
@@ -2735,6 +3021,17 @@ fn write_rich_table(
             if let Some(h) = row.height_twips {
                 let mut trh = BytesStart::new("w:trHeight");
                 trh.push_attribute(("w:val", h.to_string().as_str()));
+                // `w:hRule` (ECMA-376 §17.18) defaults to `atLeast`, so
+                // an exact-height row written without it grew to fit.
+                match row.height_rule {
+                    Some(crate::ir::RowHeightRule::Exact) => {
+                        trh.push_attribute(("w:hRule", "exact"));
+                    },
+                    Some(crate::ir::RowHeightRule::Auto) => {
+                        trh.push_attribute(("w:hRule", "auto"));
+                    },
+                    Some(crate::ir::RowHeightRule::AtLeast) | None => {},
+                }
                 w.write_event(Event::Empty(trh)).expect("write trHeight");
             }
             if row.repeat_as_header {
@@ -3139,8 +3436,14 @@ fn write_text_box(
     w.write_event(Event::Start(BytesStart::new("w:txbxContent")))
         .expect("write txbxContent start");
     let mut txb_ic = 0u32;
+    let before = w.get_ref().len();
     for elem in &tb.content {
         write_docx_element(w, elem, image_rids, &mut txb_ic, links);
+    }
+    // CT_TxbxContent (wml.xsd) requires at least one block-level element.
+    if w.get_ref().len() == before {
+        w.write_event(Event::Empty(BytesStart::new("w:p")))
+            .expect("write empty p");
     }
     w.write_event(Event::End(BytesEnd::new("w:txbxContent")))
         .expect("write txbxContent end");
@@ -3165,13 +3468,61 @@ fn write_text_box(
         .expect("write p end");
 }
 
+/// Office's "mark as decorative" extension ([MS-ODRAWXML], the
+/// `adec:decorative` element in a `wp:docPr` extension list).
+const DECORATIVE_EXT_URI: &str = "{C183D7F6-B498-43B3-948B-1728B52AA6E4}";
+const DECORATIVE_NS: &str = "http://schemas.microsoft.com/office/drawing/2017/decorative";
+
+/// `wp:docPr` for a picture, with the decorative flag when set.
+fn write_picture_doc_pr(
+    w: &mut Writer<Vec<u8>>,
+    pic_id: u32,
+    alt_text: Option<&str>,
+    decorative: bool,
+) {
+    let mut doc_pr = BytesStart::new("wp:docPr");
+    doc_pr.push_attribute(("id", pic_id.to_string().as_str()));
+    doc_pr.push_attribute(("name", format!("Image{pic_id}").as_str()));
+    if let Some(alt) = alt_text {
+        doc_pr.push_attribute(("descr", alt));
+    }
+    if !decorative {
+        w.write_event(Event::Empty(doc_pr)).expect("write docPr");
+        return;
+    }
+    w.write_event(Event::Start(doc_pr)).expect("write docPr");
+    w.write_event(Event::Start(BytesStart::new("a:extLst")))
+        .expect("write extLst");
+    let mut ext = BytesStart::new("a:ext");
+    ext.push_attribute(("uri", DECORATIVE_EXT_URI));
+    w.write_event(Event::Start(ext)).expect("write ext");
+    let mut dec = BytesStart::new("adec:decorative");
+    dec.push_attribute(("xmlns:adec", DECORATIVE_NS));
+    dec.push_attribute(("val", "1"));
+    w.write_event(Event::Empty(dec)).expect("write decorative");
+    w.write_event(Event::End(BytesEnd::new("a:ext")))
+        .expect("write ext end");
+    w.write_event(Event::End(BytesEnd::new("a:extLst")))
+        .expect("write extLst end");
+    w.write_event(Event::End(BytesEnd::new("wp:docPr")))
+        .expect("write docPr end");
+}
+
+/// `a:blip` pointing at a picture: `(relationship id, linked)`, `r:link`
+/// for a linked picture and `r:embed` otherwise.
+fn write_blip(w: &mut Writer<Vec<u8>>, (rid, linked): (&str, bool)) {
+    let mut blip = BytesStart::new("a:blip");
+    blip.push_attribute((if linked { "r:link" } else { "r:embed" }, rid));
+    w.write_event(Event::Empty(blip)).expect("write blip");
+}
+
 fn write_inline_image_run(
     w: &mut Writer<Vec<u8>>,
-    rid: &str,
+    rid: (&str, bool),
     width_emu: u64,
     height_emu: u64,
     alt_text: Option<&str>,
-    _decorative: bool,
+    decorative: bool,
     pic_id: u32,
 ) {
     w.write_event(Event::Start(BytesStart::new("w:p")))
@@ -3192,13 +3543,7 @@ fn write_inline_image_run(
     w.write_event(Event::Empty(extent)).expect("write extent");
 
     // wp:docPr
-    let mut doc_pr = BytesStart::new("wp:docPr");
-    doc_pr.push_attribute(("id", pic_id.to_string().as_str()));
-    doc_pr.push_attribute(("name", format!("Image{pic_id}").as_str()));
-    if let Some(alt) = alt_text {
-        doc_pr.push_attribute(("descr", alt));
-    }
-    w.write_event(Event::Empty(doc_pr)).expect("write docPr");
+    write_picture_doc_pr(w, pic_id, alt_text, decorative);
 
     // a:graphic
     w.write_event(Event::Start(BytesStart::new("a:graphic")))
@@ -3228,9 +3573,7 @@ fn write_inline_image_run(
     // pic:blipFill
     w.write_event(Event::Start(BytesStart::new("pic:blipFill")))
         .expect("write blipFill start");
-    let mut blip = BytesStart::new("a:blip");
-    blip.push_attribute(("r:embed", rid));
-    w.write_event(Event::Empty(blip)).expect("write blip");
+    write_blip(w, rid);
     w.write_event(Event::Start(BytesStart::new("a:stretch")))
         .expect("write stretch start");
     w.write_event(Event::Empty(BytesStart::new("a:fillRect")))
@@ -3284,10 +3627,10 @@ fn write_inline_image_run(
 
 fn write_floating_image_run(
     w: &mut Writer<Vec<u8>>,
-    rid: &str,
+    rid: (&str, bool),
     fi: &crate::ir::FloatingImage,
     alt_text: Option<&str>,
-    _decorative: bool,
+    decorative: bool,
     pic_id: u32,
 ) {
     let float_anchor_val = |a: &crate::ir::FloatAnchor| match a {
@@ -3398,13 +3741,7 @@ fn write_floating_image_run(
 
     // CT_Anchor orders EG_WrapType before docPr; emitting docPr first
     // produces a schema-invalid drawing.
-    let mut doc_pr = BytesStart::new("wp:docPr");
-    doc_pr.push_attribute(("id", pic_id.to_string().as_str()));
-    doc_pr.push_attribute(("name", format!("Image{pic_id}").as_str()));
-    if let Some(alt) = alt_text {
-        doc_pr.push_attribute(("descr", alt));
-    }
-    w.write_event(Event::Empty(doc_pr)).expect("write docPr");
+    write_picture_doc_pr(w, pic_id, alt_text, decorative);
 
     // a:graphic (same pic:pic structure as inline)
     w.write_event(Event::Start(BytesStart::new("a:graphic")))
@@ -3429,9 +3766,7 @@ fn write_floating_image_run(
 
     w.write_event(Event::Start(BytesStart::new("pic:blipFill")))
         .expect("write blipFill start");
-    let mut blip = BytesStart::new("a:blip");
-    blip.push_attribute(("r:embed", rid));
-    w.write_event(Event::Empty(blip)).expect("write blip");
+    write_blip(w, rid);
     w.write_event(Event::Start(BytesStart::new("a:stretch")))
         .expect("write stretch start");
     w.write_event(Event::Empty(BytesStart::new("a:fillRect")))
@@ -3497,7 +3832,7 @@ fn write_inline_section_break_paragraph(
         .expect("write inline-section p start");
     w.write_event(Event::Start(BytesStart::new("w:pPr")))
         .expect("write inline-section pPr start");
-    write_section_pr_body(w, sp.page_setup.as_ref(), sp.columns.as_ref(), &sp.break_type, hf_rids);
+    write_section_pr_body(w, sp, hf_rids);
     w.write_event(Event::End(BytesEnd::new("w:pPr")))
         .expect("write inline-section pPr end");
     w.write_event(Event::End(BytesEnd::new("w:p")))
@@ -3534,21 +3869,62 @@ fn write_hf_references(w: &mut Writer<Vec<u8>>, hf_rids: &[(HfType, String)]) ->
     has_first_page
 }
 
+/// A section's `w:footnotePr` / `w:endnotePr` (CT_FtnProps / CT_EdnProps,
+/// ECMA-376 §17.11.11 / §17.11.5): children in schema order `pos`,
+/// `numFmt`, `numStart`, `numRestart`. Nothing is written for `None`.
+fn write_note_pr(w: &mut Writer<Vec<u8>>, tag: &str, settings: Option<&NoteSettings>) {
+    let Some(ns) = settings else {
+        return;
+    };
+    w.write_event(Event::Start(BytesStart::new(tag)))
+        .expect("write note pr start");
+    let children = [
+        ("w:pos", ns.position.clone()),
+        ("w:numFmt", ns.number_format.clone()),
+        ("w:numStart", ns.start.map(|n| n.to_string())),
+        ("w:numRestart", ns.restart.clone()),
+    ];
+    for (child, value) in children {
+        if let Some(v) = value {
+            let mut e = BytesStart::new(child);
+            e.push_attribute(("w:val", crate::core::xml::sanitize_xml_text(&v).as_ref()));
+            w.write_event(Event::Empty(e)).expect("write note pr child");
+        }
+    }
+    w.write_event(Event::End(BytesEnd::new(tag)))
+        .expect("write note pr end");
+}
+
+/// `w:pgNumType` (CT_SectPr puts it after `w:pgMar` and before
+/// `w:cols`), when the section numbers its pages other than by default.
+fn write_pg_num_type(w: &mut Writer<Vec<u8>>, ps: &PageSetup) {
+    if ps.page_number_start.is_none() && ps.page_number_format.is_none() {
+        return;
+    }
+    let mut pn = BytesStart::new("w:pgNumType");
+    if let Some(ref fmt) = ps.page_number_format {
+        pn.push_attribute(("w:fmt", crate::core::xml::sanitize_xml_text(fmt).as_ref()));
+    }
+    if let Some(start) = ps.page_number_start {
+        pn.push_attribute(("w:start", start.to_string().as_str()));
+    }
+    w.write_event(Event::Empty(pn)).expect("write pgNumType");
+}
+
 /// Shared `<w:sectPr>...</w:sectPr>` body writer — used by both the
 /// body-level final sectPr and inline (per-paragraph) section breaks.
 /// Caller writes the surrounding `<w:sectPr>`/`</w:sectPr>` tags.
-fn write_section_pr_body(
-    w: &mut Writer<Vec<u8>>,
-    page_setup: Option<&PageSetup>,
-    columns: Option<&ColumnLayout>,
-    break_type: &SectionBreakType,
-    hf_rids: &[(HfType, String)],
-) {
+fn write_section_pr_body(w: &mut Writer<Vec<u8>>, sp: &DocxSectPr, hf_rids: &[(HfType, String)]) {
+    let (page_setup, columns, break_type) =
+        (sp.page_setup.as_ref(), sp.columns.as_ref(), &sp.break_type);
     w.write_event(Event::Start(BytesStart::new("w:sectPr")))
         .expect("write sectPr start");
 
-    // CT_SectPr orders the header/footer references first.
+    // CT_SectPr orders the header/footer references first, then
+    // `footnotePr` and `endnotePr`.
     let has_first_page = write_hf_references(w, hf_rids);
+    write_note_pr(w, "w:footnotePr", sp.footnote_settings.as_ref());
+    write_note_pr(w, "w:endnotePr", sp.endnote_settings.as_ref());
 
     match break_type {
         SectionBreakType::Continuous => {
@@ -3592,8 +3968,9 @@ fn write_section_pr_body(
         pg_mar.push_attribute(("w:header", ps.header_distance_twips.to_string().as_str()));
         pg_mar.push_attribute(("w:footer", ps.footer_distance_twips.to_string().as_str()));
         // CT_PageMar declares all seven attributes as use="required".
-        pg_mar.push_attribute(("w:gutter", "0"));
+        pg_mar.push_attribute(("w:gutter", ps.gutter_twips.to_string().as_str()));
         w.write_event(Event::Empty(pg_mar)).expect("write pgMar");
+        write_pg_num_type(w, ps);
     }
 
     if let Some(cols) = columns {
@@ -3641,10 +4018,13 @@ fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
 
     let has_first_page = write_hf_references(w, &sp.hf_rids);
 
-    if sp.has_footnotes {
+    if sp.footnote_settings.is_some() {
+        write_note_pr(w, "w:footnotePr", sp.footnote_settings.as_ref());
+    } else if sp.has_footnotes {
         w.write_event(Event::Empty(BytesStart::new("w:footnotePr")))
             .expect("write footnotePr");
     }
+    write_note_pr(w, "w:endnotePr", sp.endnote_settings.as_ref());
 
     match sp.break_type {
         SectionBreakType::Continuous => {},
@@ -3682,8 +4062,9 @@ fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
         pg_mar.push_attribute(("w:header", ps.header_distance_twips.to_string().as_str()));
         pg_mar.push_attribute(("w:footer", ps.footer_distance_twips.to_string().as_str()));
         // CT_PageMar declares all seven attributes as use="required".
-        pg_mar.push_attribute(("w:gutter", "0"));
+        pg_mar.push_attribute(("w:gutter", ps.gutter_twips.to_string().as_str()));
         w.write_event(Event::Empty(pg_mar)).expect("write pgMar");
+        write_pg_num_type(w, ps);
     }
 
     if let Some(ref cols) = sp.columns {
@@ -3793,15 +4174,74 @@ fn generate_endnotes_xml(
     generate_notes_xml(notes, image_rids, true, links)
 }
 
+/// `word/comments.xml` (ECMA-376 §17.13.4).
+fn generate_comments_xml(
+    comments: &[DocxComment],
+    image_rids: &[ImageInfo],
+    links: &HyperlinkRids,
+) -> Vec<u8> {
+    let mut w = Writer::new(Vec::new());
+    w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
+        .expect("write decl");
+    let mut root = BytesStart::new("w:comments");
+    root.push_attribute(("xmlns:w", WML_NS));
+    root.push_attribute(("xmlns:r", R_NS));
+    root.push_attribute(("xmlns:wp", DRAWING_NS));
+    root.push_attribute(("xmlns:a", DML_NS));
+    root.push_attribute(("xmlns:pic", PIC_NS));
+    root.push_attribute(("xmlns:wps", WPS_NS));
+    w.write_event(Event::Start(root))
+        .expect("write comments root");
+    for c in comments {
+        let mut elem = BytesStart::new("w:comment");
+        elem.push_attribute(("w:id", c.id.to_string().as_str()));
+        // `w:author` is required by CT_Comment's base type.
+        let author = crate::core::xml::sanitize_xml_text(c.author.as_deref().unwrap_or(""));
+        elem.push_attribute(("w:author", author.as_ref()));
+        w.write_event(Event::Start(elem)).expect("write comment");
+        let mut ic = 0u32;
+        for e in &c.elements {
+            write_docx_element(&mut w, e, image_rids, &mut ic, links);
+        }
+        if c.elements.is_empty() {
+            w.write_event(Event::Empty(BytesStart::new("w:p")))
+                .expect("write p");
+        }
+        w.write_event(Event::End(BytesEnd::new("w:comment")))
+            .expect("write comment end");
+    }
+    w.write_event(Event::End(BytesEnd::new("w:comments")))
+        .expect("write comments end");
+    w.into_inner()
+}
+
+/// The `word/settings.xml` switches a written document depends on.
+struct SettingsSwitches {
+    display_background_shape: bool,
+    embed_fonts: bool,
+    even_and_odd_headers: bool,
+}
+
 /// `word/settings.xml`, written only when a part depends on it.
-fn generate_settings_xml(even_and_odd_headers: bool, embed_fonts: bool) -> Vec<u8> {
+fn generate_settings_xml(switches: SettingsSwitches) -> Vec<u8> {
+    let SettingsSwitches {
+        display_background_shape,
+        embed_fonts,
+        even_and_odd_headers,
+    } = switches;
     let mut w = Writer::new(Vec::new());
     w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
         .expect("write decl");
     let mut root = BytesStart::new("w:settings");
     root.push_attribute(("xmlns:w", WML_NS));
     w.write_event(Event::Start(root)).expect("write settings");
-    // CT_Settings is a sequence; embedTrueTypeFonts precedes evenAndOddHeaders.
+    // CT_Settings (ECMA-376 Part 1 §17.15.1.78) is a sequence:
+    // displayBackgroundShape, then embedTrueTypeFonts, then
+    // evenAndOddHeaders.
+    if display_background_shape {
+        w.write_event(Event::Empty(BytesStart::new("w:displayBackgroundShape")))
+            .expect("write displayBackgroundShape");
+    }
     if embed_fonts {
         w.write_event(Event::Empty(BytesStart::new("w:embedTrueTypeFonts")))
             .expect("write embedTrueTypeFonts");
@@ -3938,91 +4378,6 @@ fn generate_notes_xml(
 
     w.write_event(Event::End(BytesEnd::new(root_tag)))
         .expect("write notes end");
-    w.into_inner()
-}
-
-// ---------------------------------------------------------------------------
-// Core properties XML
-// ---------------------------------------------------------------------------
-
-fn generate_core_props_xml(props: &CoreProps) -> Vec<u8> {
-    let mut w = Writer::new(Vec::new());
-    w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
-        .expect("write decl");
-
-    let mut root = BytesStart::new("cp:coreProperties");
-    root.push_attribute((
-        "xmlns:cp",
-        "http://schemas.openxmlformats.org/package/2006/metadata/core-properties",
-    ));
-    root.push_attribute(("xmlns:dc", "http://purl.org/dc/elements/1.1/"));
-    root.push_attribute(("xmlns:dcterms", "http://purl.org/dc/terms/"));
-    root.push_attribute(("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance"));
-    w.write_event(Event::Start(root)).expect("write core root");
-
-    if let Some(ref v) = props.title {
-        w.write_event(Event::Start(BytesStart::new("dc:title")))
-            .expect("write title start");
-        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
-            .expect("write title text");
-        w.write_event(Event::End(BytesEnd::new("dc:title")))
-            .expect("write title end");
-    }
-    if let Some(ref v) = props.subject {
-        w.write_event(Event::Start(BytesStart::new("dc:subject")))
-            .expect("write subject start");
-        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
-            .expect("write subject text");
-        w.write_event(Event::End(BytesEnd::new("dc:subject")))
-            .expect("write subject end");
-    }
-    if let Some(ref v) = props.author {
-        w.write_event(Event::Start(BytesStart::new("dc:creator")))
-            .expect("write creator start");
-        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
-            .expect("write creator text");
-        w.write_event(Event::End(BytesEnd::new("dc:creator")))
-            .expect("write creator end");
-    }
-    if let Some(ref v) = props.description {
-        w.write_event(Event::Start(BytesStart::new("dc:description")))
-            .expect("write desc start");
-        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
-            .expect("write desc text");
-        w.write_event(Event::End(BytesEnd::new("dc:description")))
-            .expect("write desc end");
-    }
-    if let Some(ref v) = props.keywords {
-        w.write_event(Event::Start(BytesStart::new("cp:keywords")))
-            .expect("write kw start");
-        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
-            .expect("write kw text");
-        w.write_event(Event::End(BytesEnd::new("cp:keywords")))
-            .expect("write kw end");
-    }
-    if let Some(ref v) = props.created {
-        let mut elem = BytesStart::new("dcterms:created");
-        elem.push_attribute(("xsi:type", "dcterms:W3CDTF"));
-        w.write_event(Event::Start(elem))
-            .expect("write created start");
-        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
-            .expect("write created text");
-        w.write_event(Event::End(BytesEnd::new("dcterms:created")))
-            .expect("write created end");
-    }
-    if let Some(ref v) = props.modified {
-        let mut elem = BytesStart::new("dcterms:modified");
-        elem.push_attribute(("xsi:type", "dcterms:W3CDTF"));
-        w.write_event(Event::Start(elem))
-            .expect("write modified start");
-        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
-            .expect("write modified text");
-        w.write_event(Event::End(BytesEnd::new("dcterms:modified")))
-            .expect("write modified end");
-    }
-
-    w.write_event(Event::End(BytesEnd::new("cp:coreProperties")))
-        .expect("write core end");
     w.into_inner()
 }
 
@@ -4253,17 +4608,30 @@ fn write_character_style(w: &mut Writer<Vec<u8>>, style_id: &str, name: &str) {
 /// paragraph referencing an `ilvl` this abstractNum never defines falls
 /// back to Word's own default numbering behavior instead of the level's
 /// real ordered/bullet style.
-fn write_abstract_num(
-    w: &mut Writer<Vec<u8>>,
-    abstract_num_id: u32,
-    levels: &[(u8, &str, String)],
-) {
+/// One `w:lvl`: `(ilvl, numFmt, lvlText, lvlJc)`.
+type AbstractLevel = (u8, &'static str, String, Option<&'static str>);
+
+/// Whether every `%N` placeholder in a `w:lvlText` pattern names a level at
+/// or above `ilvl` (0-based) — a counter that exists when the pattern is
+/// drawn. A sub-list written at a different depth than it was read at could
+/// otherwise point at a level the list never uses.
+fn pattern_fits_level(pattern: &str, ilvl: u8) -> bool {
+    let bytes = pattern.as_bytes();
+    bytes.iter().enumerate().all(|(i, &b)| {
+        b != b'%'
+            || bytes
+                .get(i + 1)
+                .is_some_and(|d| d.is_ascii_digit() && (1..=ilvl + 1).contains(&(d - b'0')))
+    })
+}
+
+fn write_abstract_num(w: &mut Writer<Vec<u8>>, abstract_num_id: u32, levels: &[AbstractLevel]) {
     let mut elem = BytesStart::new("w:abstractNum");
     elem.push_attribute(("w:abstractNumId", abstract_num_id.to_string().as_str()));
     w.write_event(Event::Start(elem))
         .expect("write abstractNum start");
 
-    for (ilvl, num_fmt, lvl_text) in levels {
+    for (ilvl, num_fmt, lvl_text, lvl_jc) in levels {
         let mut lvl = BytesStart::new("w:lvl");
         lvl.push_attribute(("w:ilvl", ilvl.to_string().as_str()));
         w.write_event(Event::Start(lvl)).expect("write lvl start");
@@ -4273,8 +4641,15 @@ fn write_abstract_num(
         w.write_event(Event::Empty(fmt)).expect("write numFmt");
 
         let mut text = BytesStart::new("w:lvlText");
-        text.push_attribute(("w:val", lvl_text.as_str()));
+        text.push_attribute(("w:val", crate::core::xml::sanitize_xml_text(lvl_text).as_ref()));
         w.write_event(Event::Empty(text)).expect("write lvlText");
+
+        // CT_Lvl puts `lvlJc` right after `lvlText`.
+        if let Some(jc) = lvl_jc {
+            let mut e = BytesStart::new("w:lvlJc");
+            e.push_attribute(("w:val", *jc));
+            w.write_event(Event::Empty(e)).expect("write lvlJc");
+        }
 
         w.write_event(Event::End(BytesEnd::new("w:lvl")))
             .expect("write lvl end");
@@ -5331,6 +5706,55 @@ mod tests {
         assert!(
             settings.contains("<w:evenAndOddHeaders/>"),
             "settings.xml must enable even/odd headers: {settings}"
+        );
+    }
+
+    /// `CT_TxbxContent` requires at least one block-level element; an empty
+    /// text box wrote `<w:txbxContent></w:txbxContent>`.
+    #[test]
+    fn test_empty_text_box_content_holds_a_paragraph() {
+        for content in [
+            vec![],
+            // Content that writes nothing of its own.
+            vec![crate::ir::Element::Shape(Default::default())],
+        ] {
+            let mut doc = DocxWriter::new();
+            doc.add_text_box(&crate::ir::TextBox {
+                content,
+                ..Default::default()
+            });
+            let xml = &all_parts(doc)["word/document.xml"];
+            let start = xml.find("<w:txbxContent>").expect(xml);
+            let end = xml.find("</w:txbxContent>").expect(xml);
+            let inner = &xml[start + "<w:txbxContent>".len()..end];
+            assert!(inner.starts_with("<w:p"), "empty txbxContent: {xml}");
+        }
+    }
+
+    /// Word draws `w:background` only when settings.xml carries
+    /// `w:displayBackgroundShape`; settings.xml was not even written for a
+    /// document with a page colour, so the colour was invisible in Word.
+    #[test]
+    fn test_page_background_is_enabled_in_settings() {
+        let mut doc = DocxWriter::new();
+        doc.add_paragraph("x");
+        doc.set_background_rgb([0x11, 0x22, 0x33]);
+        doc.embed_font("Face", vec![0, 1, 0, 0]);
+        let parts = all_parts(doc);
+        assert!(parts["word/document.xml"].contains("<w:background"));
+        let settings = parts
+            .get("word/settings.xml")
+            .expect("a page background needs settings.xml");
+        // CT_Settings is a sequence: displayBackgroundShape precedes
+        // embedTrueTypeFonts.
+        let bg = settings
+            .find("<w:displayBackgroundShape/>")
+            .expect(settings);
+        let fonts = settings.find("<w:embedTrueTypeFonts/>").expect(settings);
+        assert!(bg < fonts, "{settings}");
+        assert!(
+            parts["word/_rels/document.xml.rels"].contains("settings.xml"),
+            "settings.xml must be related from the document"
         );
     }
 

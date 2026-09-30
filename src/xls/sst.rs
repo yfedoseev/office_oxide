@@ -18,7 +18,12 @@ use super::error::{Result, XlsError};
 /// the text, and the first string past the first boundary was misread —
 /// so an SST of 20,000 strings yielded ~470, and every cell referencing
 /// the rest came back empty.
-pub fn parse_sst(data: &[u8], continue_at: &[usize]) -> Result<Vec<String>> {
+///
+/// Returns the strings read and the count the record declared: a table
+/// cut short (truncated file, malformed string) yields fewer, and the
+/// caller reports the loss instead of rendering the affected cells as
+/// silently empty.
+pub fn parse_sst(data: &[u8], continue_at: &[usize]) -> Result<(Vec<String>, usize)> {
     if data.len() < 8 {
         return Err(XlsError::Corrupted("SST too short".into()));
     }
@@ -39,11 +44,12 @@ pub fn parse_sst(data: &[u8], continue_at: &[usize]) -> Result<Vec<String>> {
                 strings.push(s);
                 pos = new_pos;
             },
-            Err(_) => break, // Tolerate truncated SST
+            // Keep what was read; the shortfall is reported by the caller.
+            Err(_) => break,
         }
     }
 
-    Ok(strings)
+    Ok((strings, unique_count))
 }
 
 /// As [`read_unicode_string`], for a string that may be cut by the
@@ -307,7 +313,7 @@ mod tests {
         data.push(b'C');
         data.push(b'D');
 
-        let strings = parse_sst(&data, &[]).unwrap();
+        let strings = parse_sst(&data, &[]).unwrap().0;
         assert_eq!(strings, vec!["AB", "CD"]);
     }
 
@@ -324,7 +330,7 @@ mod tests {
         data.extend_from_slice(&b'i'.to_le_bytes());
         data.push(0x00);
 
-        let strings = parse_sst(&data, &[]).unwrap();
+        let strings = parse_sst(&data, &[]).unwrap().0;
         assert_eq!(strings, vec!["Hi"]);
     }
 
@@ -342,7 +348,7 @@ mod tests {
         // Rich text run (4 bytes, we skip it)
         data.extend_from_slice(&[0x00, 0x00, 0x01, 0x00]);
 
-        let strings = parse_sst(&data, &[]).unwrap();
+        let strings = parse_sst(&data, &[]).unwrap().0;
         assert_eq!(strings, vec!["AB"]);
     }
 
@@ -403,7 +409,7 @@ mod continue_tests {
         data.extend_from_slice(b"an town");
         data.extend(compressed("third"));
 
-        let strings = parse_sst(&data, &[boundary]).unwrap();
+        let strings = parse_sst(&data, &[boundary]).unwrap().0;
         assert_eq!(strings, ["first", "West Logan town", "third"]);
     }
 
@@ -420,7 +426,7 @@ mod continue_tests {
         data.extend("\u{e9}s!".encode_utf16().flat_map(|u| u.to_le_bytes()));
         data.extend(compressed("next"));
 
-        let strings = parse_sst(&data, &[boundary]).unwrap();
+        let strings = parse_sst(&data, &[boundary]).unwrap().0;
         assert_eq!(strings, ["caf\u{e9}s!", "next"]);
     }
 
@@ -432,7 +438,7 @@ mod continue_tests {
         data.extend(compressed("alpha"));
         let boundary = data.len();
         data.extend(compressed("beta"));
-        let strings = parse_sst(&data, &[boundary]).unwrap();
+        let strings = parse_sst(&data, &[boundary]).unwrap().0;
         assert_eq!(strings, ["alpha", "beta"]);
     }
 
@@ -449,7 +455,7 @@ mod continue_tests {
         let boundary = data.len();
         data.extend_from_slice(&[2, 0, 6, 0]); // run 2, after the cut
         data.extend(compressed("plain"));
-        let strings = parse_sst(&data, &[boundary]).unwrap();
+        let strings = parse_sst(&data, &[boundary]).unwrap().0;
         assert_eq!(strings, ["rich", "plain"]);
     }
 
@@ -467,7 +473,7 @@ mod continue_tests {
         let boundary = data.len();
         data.push(0x01); // the CONTINUE's own flags byte: still wide
         data.extend("696".encode_utf16().flat_map(|u| u.to_le_bytes()));
-        let strings = parse_sst(&data, &[boundary]).unwrap();
+        let strings = parse_sst(&data, &[boundary]).unwrap().0;
         assert_eq!(strings, ["before", "696"]);
     }
 
@@ -484,7 +490,7 @@ mod continue_tests {
         let b2 = data.len();
         data.push(0x00);
         data.extend_from_slice(b"ghi");
-        let strings = parse_sst(&data, &[b1, b2]).unwrap();
+        let strings = parse_sst(&data, &[b1, b2]).unwrap().0;
         assert_eq!(strings, ["abcdefghi"]);
     }
 

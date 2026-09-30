@@ -1,6 +1,6 @@
 # office-oxide MCP Server
 
-An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that gives Claude, Cursor, and other AI assistants the ability to read Office documents locally.
+An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that gives Claude, Cursor, and other AI assistants the ability to read — and edit the text of — Office documents locally.
 
 ## Supported Formats
 
@@ -53,16 +53,38 @@ Add to your `.claude/settings.json`:
 
 ### `extract`
 
-Extract content from an Office document.
+Extract content from an Office document (DOCX, XLSX, PPTX, DOC, XLS, PPT).
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `file_path` | string | Path to the document |
-| `format` | string | Output format: `text` (default), `markdown`, or `ir` |
+| `format` | string | Output format: `text` (default), `markdown`, `markdown-with-images`, `html`, or `ir` |
+
+`markdown-with-images` embeds each image inline as `[image-base64:...]` at its
+position in the flow; `ir` is the document IR as JSON. A result larger than
+32 MiB is refused with an error rather than truncated — use a more compact
+format, or the `office-oxide` CLI, which streams its output.
+
+### `replace_text`
+
+Replace text in a DOCX or PPTX document, preserving every other part of the
+file.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `file_path` | string | Path to the document |
+| `find` | string | Text to search for (must not be empty) |
+| `replace` | string | Replacement text |
+| `output_path` | string | Where to write the result (default: overwrite `file_path`) |
+
+The result is written to a temporary file and renamed into place, so a failed
+save never leaves a truncated document behind.
 
 ### `info`
 
-Get document metadata (format, file size).
+Get document metadata: format, file size, title, the full document properties
+(author, subject, keywords, dates, …), a `warnings` list (e.g. when text
+extraction is known to be incomplete), and the section list.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|

@@ -4,10 +4,11 @@ use quick_xml::events::Event;
 
 use crate::core::xml;
 
+use super::formatting::TableBorders;
 use super::formatting::{
     ParagraphProperties, RunProperties, parse_paragraph_properties_fast, parse_run_properties_fast,
 };
-use super::table::TableProperties;
+use super::table::{TableCellProperties, TableProperties};
 
 /// Parsed stylesheet from `word/styles.xml`.
 #[derive(Debug, Clone, Default)]
@@ -42,8 +43,28 @@ pub struct Style {
     pub run_properties: Option<RunProperties>,
     /// Paragraph-level overrides for this style.
     pub paragraph_properties: Option<ParagraphProperties>,
-    /// Table-level overrides for this style.
+    /// Table-level overrides for this style (`w:tblPr`).
     pub table_properties: Option<TableProperties>,
+    /// Conditional formats of a table style (`w:tblStylePr`), applied to
+    /// the parts of a table its `w:tblLook` switches on.
+    pub table_conditionals: Vec<TableStyleConditional>,
+}
+
+/// One `w:tblStylePr` (ECMA-376 §17.7.6): formatting a table style applies
+/// to one region of the table.
+#[derive(Debug, Clone)]
+pub struct TableStyleConditional {
+    /// The region (`w:type`): `wholeTable`, `firstRow`, `lastRow`,
+    /// `firstCol`, `lastCol`, `band1Horz`, `band2Horz`, `band1Vert`,
+    /// `band2Vert`, `nwCell`, `neCell`, `swCell` or `seCell`.
+    pub kind: String,
+    /// Cell formatting for the region (`w:tcPr`).
+    pub cell_properties: Option<TableCellProperties>,
+    /// Run formatting for the region's text (`w:rPr`), e.g. a bold header
+    /// row.
+    pub run_properties: Option<RunProperties>,
+    /// Paragraph formatting for the region's paragraphs (`w:pPr`).
+    pub paragraph_properties: Option<ParagraphProperties>,
 }
 
 /// The kind of style.
@@ -89,18 +110,23 @@ impl StyleSheet {
     /// so callers can overlay each style in turn and have the most specific
     /// one win. Cycles and pathological `w:basedOn` chains are cut off at 20
     /// links.
-    fn chain(&self, style_id: &str) -> Vec<&Style> {
-        let mut out = Vec::new();
+    ///
+    /// Collected on the stack: this runs for every run and paragraph of a
+    /// document, and a `Vec` per call was a heap allocation each time.
+    fn chain(&self, style_id: &str) -> impl DoubleEndedIterator<Item = &Style> {
+        const MAX_CHAIN: usize = 20;
+        let mut buf: [Option<&Style>; MAX_CHAIN] = [None; MAX_CHAIN];
+        let mut len = 0;
         let mut current = self.styles.get(style_id);
         while let Some(style) = current {
-            if out.len() >= 20 {
+            if len >= MAX_CHAIN {
                 break;
             }
-            out.push(style);
+            buf[len] = Some(style);
+            len += 1;
             current = style.based_on.as_deref().and_then(|id| self.styles.get(id));
         }
-        out.reverse();
-        out
+        buf.into_iter().take(len).rev().flatten()
     }
 
     /// Fold the effective run formatting for a run: document defaults, then
@@ -115,11 +141,47 @@ impl StyleSheet {
         paragraph_style_id: Option<&str>,
         direct: Option<&RunProperties>,
     ) -> RunProperties {
+        self.effective_run_properties_in(None, paragraph_style_id, direct)
+    }
+
+    /// [`Self::effective_run_properties`] for a run inside a table cell:
+    /// the table style's layer for the cell (`table`) sits between the
+    /// document defaults and the paragraph style.
+    pub(crate) fn effective_run_properties_in(
+        &self,
+        table: Option<&RunProperties>,
+        paragraph_style_id: Option<&str>,
+        direct: Option<&RunProperties>,
+    ) -> RunProperties {
+        let mut out = self.run_style_base(
+            table,
+            paragraph_style_id,
+            direct.and_then(|d| d.style_id.as_deref()),
+        );
+        if let Some(d) = direct {
+            out.overlay(d);
+        }
+        out
+    }
+
+    /// Everything a run inherits before its own `w:rPr`: document
+    /// defaults, the table layer, the paragraph style chain, then the
+    /// character style chain. Depends only on its three inputs, so a
+    /// converter can fold it once per distinct combination.
+    pub(crate) fn run_style_base(
+        &self,
+        table: Option<&RunProperties>,
+        paragraph_style_id: Option<&str>,
+        character_style_id: Option<&str>,
+    ) -> RunProperties {
         let mut out = self
             .doc_defaults
             .as_ref()
             .and_then(|d| d.run_properties.clone())
             .unwrap_or_default();
+        if let Some(t) = table {
+            out.overlay(t);
+        }
         if let Some(pid) = paragraph_style_id {
             for style in self.chain(pid) {
                 if let Some(rp) = style.run_properties.as_ref() {
@@ -129,15 +191,12 @@ impl StyleSheet {
         }
         // `w:rStyle` on the run names a character style, which sits above
         // the paragraph style but below the run's own direct formatting.
-        if let Some(cid) = direct.and_then(|d| d.style_id.as_deref()) {
+        if let Some(cid) = character_style_id {
             for style in self.chain(cid) {
                 if let Some(rp) = style.run_properties.as_ref() {
                     out.overlay(rp);
                 }
             }
-        }
-        if let Some(d) = direct {
-            out.overlay(d);
         }
         out
     }
@@ -152,14 +211,27 @@ impl StyleSheet {
         paragraph_style_id: Option<&str>,
         direct: Option<&RunProperties>,
     ) -> bool {
+        self.effective_hidden_in(None, paragraph_style_id, direct)
+    }
+
+    /// [`Self::effective_hidden`] inside a table cell whose table style
+    /// layer is `table`.
+    pub(crate) fn effective_hidden_in(
+        &self,
+        table: Option<&RunProperties>,
+        paragraph_style_id: Option<&str>,
+        direct: Option<&RunProperties>,
+    ) -> bool {
         let mut hidden = self
             .doc_defaults
             .as_ref()
             .and_then(|d| d.run_properties.as_ref())
             .and_then(|rp| rp.hidden);
+        if let Some(h) = table.and_then(|t| t.hidden) {
+            hidden = Some(h);
+        }
         let chain_hidden = |sid: &str| {
             self.chain(sid)
-                .into_iter()
                 .rev()
                 .find_map(|style| style.run_properties.as_ref().and_then(|rp| rp.hidden))
         };
@@ -184,20 +256,45 @@ impl StyleSheet {
         &self,
         direct: Option<&ParagraphProperties>,
     ) -> ParagraphProperties {
+        self.effective_paragraph_properties_in(None, direct)
+    }
+
+    /// [`Self::effective_paragraph_properties`] inside a table cell: the
+    /// table style's layer sits between the document defaults and the
+    /// paragraph style.
+    pub(crate) fn effective_paragraph_properties_in(
+        &self,
+        table: Option<&ParagraphProperties>,
+        direct: Option<&ParagraphProperties>,
+    ) -> ParagraphProperties {
+        let mut out = self.paragraph_style_base(table, direct.and_then(|d| d.style_id.as_deref()));
+        if let Some(d) = direct {
+            out.overlay(d);
+        }
+        out
+    }
+
+    /// Everything a paragraph inherits before its own `w:pPr`: document
+    /// defaults, the table layer, then the paragraph style chain.
+    pub(crate) fn paragraph_style_base(
+        &self,
+        table: Option<&ParagraphProperties>,
+        paragraph_style_id: Option<&str>,
+    ) -> ParagraphProperties {
         let mut out = self
             .doc_defaults
             .as_ref()
             .and_then(|d| d.paragraph_properties.clone())
             .unwrap_or_default();
-        if let Some(pid) = direct.and_then(|d| d.style_id.as_deref()) {
+        if let Some(t) = table {
+            out.overlay(t);
+        }
+        if let Some(pid) = paragraph_style_id {
             for style in self.chain(pid) {
                 if let Some(pp) = style.paragraph_properties.as_ref() {
                     out.overlay(pp);
                 }
             }
-        }
-        if let Some(d) = direct {
-            out.overlay(d);
         }
         out
     }
@@ -324,6 +421,8 @@ fn parse_style(
     let mut based_on = None;
     let mut run_properties = None;
     let mut paragraph_properties = None;
+    let mut table_properties = None;
+    let mut table_conditionals = Vec::new();
 
     loop {
         match reader.read_event()? {
@@ -345,6 +444,15 @@ fn parse_style(
                 },
                 "pPr" => {
                     paragraph_properties = Some(parse_paragraph_properties_fast(reader)?);
+                },
+                "tblPr" => {
+                    table_properties = Some(super::parse_table_properties(reader)?);
+                },
+                "tblStylePr" => {
+                    let kind = xml::optional_attr_str(e, "w:type")?
+                        .map(|v| v.into_owned())
+                        .unwrap_or_default();
+                    table_conditionals.push(parse_table_style_conditional(reader, kind)?);
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
@@ -378,8 +486,123 @@ fn parse_style(
         based_on,
         run_properties,
         paragraph_properties,
-        table_properties: None,
+        table_properties,
+        table_conditionals,
     }))
+}
+
+/// The body of one `w:tblStylePr` (its start already consumed).
+fn parse_table_style_conditional(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    kind: String,
+) -> crate::core::Result<TableStyleConditional> {
+    let mut cond = TableStyleConditional {
+        kind,
+        cell_properties: None,
+        run_properties: None,
+        paragraph_properties: None,
+    };
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                "tcPr" => cond.cell_properties = Some(super::parse_table_cell_properties(reader)?),
+                "rPr" => cond.run_properties = Some(parse_run_properties_fast(reader)?),
+                "pPr" => cond.paragraph_properties = Some(parse_paragraph_properties_fast(reader)?),
+                _ => xml::skip_element_fast(reader)?,
+            },
+            Event::End(ref e) if e.local_name().as_ref() == "tblStylePr" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(cond)
+}
+
+/// A table style resolved through its `w:basedOn` chain.
+#[derive(Debug, Default)]
+pub(crate) struct ResolvedTableStyle<'a> {
+    /// Borders from the nearest style in the chain that sets them.
+    pub borders: Option<&'a TableBorders>,
+    /// Rows / columns per band.
+    pub row_band_size: Option<u32>,
+    pub col_band_size: Option<u32>,
+    /// Conditional formats by region; a derived style's entry replaces
+    /// its base style's for the same region.
+    pub conditionals: Vec<&'a TableStyleConditional>,
+    /// The chain's own `w:rPr` / `w:pPr` (formatting for the whole table),
+    /// root ancestor first.
+    pub run_properties: Vec<&'a RunProperties>,
+    pub paragraph_properties: Vec<&'a ParagraphProperties>,
+}
+
+/// The run and paragraph formatting a table style gives the content of one
+/// cell: its own `w:rPr`/`w:pPr`, then each region's `w:tblStylePr` that
+/// covers the cell, in increasing precedence. It sits between the document
+/// defaults and the paragraph style (ECMA-376 Part 1 §17.7.2: defaults,
+/// table style, numbering, paragraph style, run style, direct formatting).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CellStyleLayer {
+    pub run: RunProperties,
+    pub paragraph: ParagraphProperties,
+}
+
+impl ResolvedTableStyle<'_> {
+    /// The layer for a cell covered by `regions` (from
+    /// `TableStyleLayout::regions`, lowest precedence first), or `None`
+    /// when the style formats no text at all there.
+    pub(crate) fn cell_layer(&self, regions: &[&str]) -> Option<CellStyleLayer> {
+        let conds = regions
+            .iter()
+            .filter_map(|kind| self.conditionals.iter().find(|c| c.kind == *kind));
+        let any = !self.run_properties.is_empty()
+            || !self.paragraph_properties.is_empty()
+            || conds
+                .clone()
+                .any(|c| c.run_properties.is_some() || c.paragraph_properties.is_some());
+        if !any {
+            return None;
+        }
+        let mut layer = CellStyleLayer::default();
+        for rp in &self.run_properties {
+            layer.run.overlay(rp);
+        }
+        for pp in &self.paragraph_properties {
+            layer.paragraph.overlay(pp);
+        }
+        for c in conds {
+            if let Some(rp) = c.run_properties.as_ref() {
+                layer.run.overlay(rp);
+            }
+            if let Some(pp) = c.paragraph_properties.as_ref() {
+                layer.paragraph.overlay(pp);
+            }
+        }
+        Some(layer)
+    }
+}
+
+impl StyleSheet {
+    /// Resolve table style `style_id` through its inheritance chain.
+    pub(crate) fn resolve_table_style(&self, style_id: &str) -> ResolvedTableStyle<'_> {
+        let mut out = ResolvedTableStyle::default();
+        for style in self.chain(style_id) {
+            if let Some(tp) = style.table_properties.as_ref() {
+                if tp.borders.is_some() {
+                    out.borders = tp.borders.as_ref();
+                }
+                out.row_band_size = tp.row_band_size.or(out.row_band_size);
+                out.col_band_size = tp.col_band_size.or(out.col_band_size);
+            }
+            for c in &style.table_conditionals {
+                out.conditionals.retain(|prev| prev.kind != c.kind);
+                out.conditionals.push(c);
+            }
+            out.run_properties.extend(style.run_properties.as_ref());
+            out.paragraph_properties
+                .extend(style.paragraph_properties.as_ref());
+        }
+        out
+    }
 }
 
 #[cfg(test)]

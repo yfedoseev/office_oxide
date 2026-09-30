@@ -24,6 +24,10 @@ pub const RT_SLIDE_ATOM: u16 = 0x03EF;
 /// character/paragraph formatting a placeholder shape falls back to for
 /// any property its own direct `StyleTextPropAtom` didn't set.
 pub const RT_MAIN_MASTER: u16 = 0x03F8;
+/// `HandoutContainer` ([MS-PPT] `HandoutContainer`, record type 4041):
+/// the handout master, whose text is prompt/placeholder text like a
+/// slide master's.
+pub const RT_HANDOUT: u16 = 0x0FC9;
 /// TxMasterStyleAtom ([MS-PPT] 2.9.5, record type 4003). `recInstance`
 /// is itself the `TextTypeEnum` value this atom's styles apply to — "the
 /// atom instance value is the text type", per Apache POI's own doc
@@ -56,11 +60,30 @@ pub const RT_CURRENT_USER_ATOM: u16 = 0x0FF6;
 /// child.
 pub const RT_HEADER_FOOTER: u16 = 0x0FD9;
 /// `HeadersFootersAtom`: the flags atom nested inside a
-/// `HeadersFootersContainer` ([MS-PPT] 2.4.17, record type 4058 =
-/// 0x0FDA). Not decoded — this fix only surfaces the container's
-/// `CString` text children, not the show/hide flag bits.
-#[cfg(test)]
+/// `HeadersFootersContainer` ([MS-PPT] `HeadersFootersAtom`, record type
+/// 4058 = 0x0FDA): `formatId` (2 bytes), then the show flags (2 bytes).
 pub const RT_HEADER_FOOTER_ATOM: u16 = 0x0FDA;
+/// `HeadersFootersContainer.recInstance` of the slides' header/footer
+/// settings ([MS-PPT] `SlideHeadersFootersContainer`: MUST be 0x003); the
+/// notes/handouts one is 0x004 and never applies to slides.
+pub const HF_INSTANCE_SLIDES: u16 = 0x003;
+/// `HeadersFootersContainer.recInstance` of the notes pages' and handouts'
+/// header/footer settings ([MS-PPT] `NotesHeadersFootersContainer`: MUST be
+/// 0x004), shown through the Notes and Handout Masters.
+pub const HF_INSTANCE_NOTES: u16 = 0x004;
+/// `HeadersFootersAtom` flag bits ([MS-PPT] `HeadersFootersAtom`):
+/// `fHasDate` (bit 0), `fHasUserDate` (bit 2), `fHasHeader` (bit 4),
+/// `fHasFooter` (bit 5).
+pub const HF_HAS_DATE: u16 = 0x0001;
+pub const HF_HAS_USER_DATE: u16 = 0x0004;
+pub const HF_HAS_FOOTER: u16 = 0x0020;
+/// `fHasHeader` (bit 4) — only meaningful for notes pages and handouts.
+pub const HF_HAS_HEADER: u16 = 0x0010;
+/// `CString` instances inside a `HeadersFootersContainer`
+/// ([MS-PPT] `HeadersFootersContainer`): user date 0, header 1, footer 2.
+pub const HF_CSTRING_USER_DATE: u16 = 0;
+pub const HF_CSTRING_HEADER: u16 = 1;
+pub const HF_CSTRING_FOOTER: u16 = 2;
 pub const RT_STYLE_TEXT_PROP: u16 = 0x0FA1;
 pub const RT_CSTRING: u16 = 0x0FBA;
 /// `TargetAtom`'s own `rh.recInstance` value ([MS-PPT] 2.10.19) — the
@@ -68,6 +91,11 @@ pub const RT_CSTRING: u16 = 0x0FBA;
 /// hyperlink's actual target URL/path, as opposed to `FriendlyNameAtom`
 /// or `LocationAtom` (other `RT_CSTRING` children at different instances).
 pub const CSTRING_INSTANCE_TARGET: u16 = 0x001;
+/// `LocationAtom`'s `rh.recInstance` ([MS-PPT] `ExHyperlinkContainer`):
+/// the `RT_CSTRING` naming a location inside the target, or — with no
+/// `TargetAtom` — inside this deck (a slide jump, written as
+/// `"<slideId>,<slide number>,<title>"`).
+pub const CSTRING_INSTANCE_LOCATION: u16 = 0x003;
 
 /// [MS-ODRAW] §2.2.16 `OfficeArtSpgrContainer` — a group of shapes. Its
 /// first child `RT_SHAPE` is the group's own placeholder shape (no
@@ -135,10 +163,58 @@ pub const RT_EXTERNAL_OBJECT_REF_ATOM: u16 = 0x0BC1;
 /// (1 byte) + `placeholderSize` (1 byte) + `unusedShort` (2 bytes) = 8
 /// bytes, confirmed against Apache POI's `OEPlaceholderAtom.java`.
 pub const RT_OE_PLACEHOLDER_ATOM: u16 = 0x0BC3;
+/// [MS-PPT] `RoundTripHFPlaceholder12Atom` (record type 0x0420) — the
+/// placeholder role of a header/footer placeholder shape, found directly
+/// inside its `RT_CLIENT_DATA` in place of an `OEPlaceholderAtom`.
+pub const RT_ROUND_TRIP_HF_PLACEHOLDER12_ATOM: u16 = 0x0420;
+/// [MS-PPT] `SlideAtom.slideFlags` bit 0, `fMasterObjects`: the slide
+/// shows the shapes of its master (unset = "Hide background graphics").
+pub const SLIDE_FLAG_MASTER_OBJECTS: u16 = 0x0001;
 
 // ── SlideListWithText `rh.recInstance` discriminants ([MS-PPT] 2.4.14) ──
 /// `rh.recInstance` value identifying a `SlideListWithTextContainer` (real slides).
 pub const SLWT_SLIDES: u16 = 0;
+/// `MasterListWithTextContainer` is a `SlideListWithText` record with
+/// `recInstance` 1 ([MS-PPT] `MasterListWithTextContainer`): one
+/// `MasterPersistAtom` per main master and title master.
+pub const SLWT_MASTERS: u16 = 1;
+/// `NotesListWithTextContainer` is a `SlideListWithText` record with
+/// `recInstance` 2 ([MS-PPT] `NotesListWithTextContainer`; the master list is 1).
+pub const SLWT_NOTES: u16 = 2;
+/// `NotesContainer` ([MS-PPT] `NotesContainer`, record type 1008): one notes page.
+pub const RT_NOTES: u16 = 0x03F0;
+/// `NotesAtom` ([MS-PPT] `NotesAtom`, record type 1009): `slideIdRef`, the
+/// `SlideId` of the slide these notes belong to, at body offset 0.
+pub const RT_NOTES_ATOM: u16 = 0x03F1;
+/// `VBAInfoAtom` ([MS-PPT] `VBAInfoAtom`, record type 1024), inside the
+/// `DocInfoListContainer`'s `VBAInfoContainer`: `persistIdRef` of the
+/// compressed VBA project storage, then `fHasMacros` (1 when it holds a
+/// project), then `version`.
+pub const RT_VBA_INFO_ATOM: u16 = 0x0400;
+/// `ExMediaAtom` ([MS-PPT] `ExMediaAtom`, record type 4100): `exObjId` at
+/// body offset 0 — the id a shape's `ExObjRefAtom` names.
+pub const RT_EX_MEDIA_ATOM: u16 = 0x1004;
+/// Media containers in the `ExObjListContainer` ([MS-PPT]
+/// `ExAviMovieContainer` 4102, `ExMCIMovieContainer` 4103 — video;
+/// `ExMIDIAudioContainer` 4109, `ExCDAudioContainer` 4110,
+/// `ExWAVAudioEmbeddedContainer` 4111, `ExWAVAudioLinkContainer` 4112 —
+/// audio).
+pub const RT_EX_AVI_MOVIE: u16 = 0x1006;
+pub const RT_EX_MCI_MOVIE: u16 = 0x1007;
+pub const RT_EX_MIDI_AUDIO: u16 = 0x100D;
+pub const RT_EX_CD_AUDIO: u16 = 0x100E;
+pub const RT_EX_WAV_AUDIO_EMBEDDED: u16 = 0x100F;
+pub const RT_EX_WAV_AUDIO_LINK: u16 = 0x1010;
+/// `EnvironmentContainer` ([MS-PPT] `EnvironmentContainer`, record type
+/// 1010), a `DocumentContainer` child holding the font collection.
+pub const RT_ENVIRONMENT: u16 = 0x03F2;
+/// `FontCollectionContainer` ([MS-PPT] `FontCollectionContainer`, record
+/// type 2005).
+pub const RT_FONT_COLLECTION: u16 = 0x07D5;
+/// `FontEntityAtom` ([MS-PPT] `FontEntityAtom`, record type 4023): the
+/// face name as 32 UTF-16 units (NUL-terminated/padded), then charset and
+/// pitch/family bytes. A run's `fontRef` indexes these in order.
+pub const RT_FONT_ENTITY_ATOM: u16 = 0x0FB7;
 
 /// A parsed PPT record header.
 #[derive(Debug, Clone, Copy)]

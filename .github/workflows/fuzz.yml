@@ -1,0 +1,82 @@
+name: Fuzz
+
+# The fuzz crate is excluded from the workspace (it needs nightly and
+# sanitizer flags), so no other job compiles it: the target could bit-rot
+# unseen. Every change to the library or the target builds it and runs it
+# briefly; a daily run fuzzes for longer.
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'src/**'
+      - 'fuzz/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/fuzz.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'src/**'
+      - 'fuzz/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/fuzz.yml'
+  schedule:
+    - cron: "0 5 * * *" # daily at 05:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Build and run fuzz_parse
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: nightly
+
+      - name: Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+
+      # The committed fuzz/Cargo.lock is what the advisory gate audits; fail
+      # if it no longer matches the manifests instead of silently resolving
+      # a different tree here.
+      - name: Check the fuzz lockfile is current
+        run: cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 > /dev/null
+
+      - name: Build the fuzz target
+        run: cargo fuzz build fuzz_parse
+
+      # 60 s on every change, 10 min on the daily run. Any crash fails the job.
+      - name: Fuzz
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          secs=60
+          if [ "$EVENT_NAME" = "schedule" ]; then secs=600; fi
+          cargo fuzz run fuzz_parse -- -max_total_time="$secs" -rss_limit_mb=4096
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

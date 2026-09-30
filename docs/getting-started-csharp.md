@@ -5,7 +5,7 @@
 ## Installation
 
 ```bash
-dotnet add package OfficeOxide --version 0.1.12
+dotnet add package OfficeOxide --version 0.1.13
 ```
 
 Requires .NET 8 or .NET 10. The NuGet package ships prebuilt native libraries for `win-x64`, `linux-x64`, `linux-arm64`, `osx-x64`, `osx-arm64` under `runtimes/<rid>/native/`. `dotnet publish` places the right one next to your binary automatically.
@@ -65,7 +65,7 @@ string md   = OfficeOxide.ToMarkdown("file.pptx");
 string html = OfficeOxide.ToHtml("file.xlsx");
 
 string? fmt = Document.DetectFormat("mystery.bin"); // null if unsupported
-Console.WriteLine(Document.Version);                // "0.1.12"
+Console.WriteLine(Document.Version);                // "0.1.13"
 ```
 
 ### `EditableDocument`
@@ -81,7 +81,7 @@ Console.WriteLine($"{n} replacements");
 ed.Save("out.docx");
 ```
 
-`ReplaceText` returns the replacement count (0 on XLSX — use `SetCell` instead).
+`ReplaceText` returns the replacement count. It throws for XLSX (`Unsupported` — use `SetCell` instead) and for an empty search string (`InvalidArg`).
 
 ## Editing Examples
 

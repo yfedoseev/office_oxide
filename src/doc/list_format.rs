@@ -123,13 +123,18 @@ impl ListFormatting {
     }
 
     /// Resolve a paragraph's declared list level, given its `ilfo`
-    /// (`sprmPIlfo`, 1-based; `0`/negative/out-of-range means "not in a
-    /// list", per [MS-DOC] §2.4.6.3) and `ilvl` (0-based nesting depth).
+    /// (`sprmPIlfo` read as a signed `i16`) and `ilvl` (0-based nesting
+    /// depth). Per [MS-DOC] §2.6.2 `sprmPIlfo`: `0x0001`–`0x07FE` is a
+    /// 1-based index into `PlfLfo.rgLfo`, `0xF802`–`0xFFFF` is the negation
+    /// of one (resolved to the same LFO), and `0x0000`/`0xF801`/anything
+    /// else is "not in a list".
     pub fn level_for(&self, ilfo: i16, ilvl: u8) -> Option<ListLevel> {
-        if ilfo <= 0 {
-            return None;
-        }
-        let lfo = self.lfos.get((ilfo - 1) as usize)?;
+        let index = match ilfo {
+            1..=0x07FE => ilfo,
+            -0x07FE..=-1 => -ilfo,
+            _ => return None,
+        };
+        let lfo = self.lfos.get((index - 1) as usize)?;
         let def = self.list_defs.iter().find(|d| d.lsid == lfo.lsid)?;
         // A level deeper than the list defines (malformed input, or a
         // simple/1-level list referenced at ilvl > 0) falls back to the
@@ -461,11 +466,14 @@ mod tests {
     }
 
     #[test]
-    fn test_ilfo_zero_or_negative_is_not_in_a_list() {
+    fn test_ilfo_zero_and_f801_are_not_in_a_list_but_negated_indices_are() {
         let table = spec_example_table_stream();
         let fmt = ListFormatting::parse(&table, 0x0536, 0x001E, 0x07E1, 0x0018);
         assert!(fmt.level_for(0, 0).is_none());
-        assert!(fmt.level_for(-1, 0).is_none());
+        assert!(fmt.level_for(-2047, 0).is_none()); // 0xF801
+        // 0xFFFF is the negation of index 1: the same list as ilfo = 1.
+        assert_eq!(fmt.level_for(-1, 0), fmt.level_for(1, 0));
+        assert!(fmt.level_for(-1, 0).is_some());
     }
 
     #[test]

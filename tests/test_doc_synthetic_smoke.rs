@@ -95,3 +95,24 @@ fn test_synthetic_table_and_prose_coexist() {
         .count();
     assert_eq!(tables, 1, "exactly one table must be emitted");
 }
+
+/// A `WordDocument` stream whose sector chain ends before its declared
+/// size was read short with no signal: the document converted as if
+/// complete. The short read now marks the IR as truncated.
+#[test]
+fn test_truncated_container_stream_marks_doc_text_truncated() {
+    let paras = [Para {
+        text: "Short stream.",
+        terminator: '\r',
+        grpprl: prose_grpprl(),
+    }];
+    let mut bytes = build_doc(&paras);
+    assert!(!open_doc(&bytes).to_ir().metadata.text_truncated);
+    // Directory entry 1 is `WordDocument`; claim two more sectors than
+    // its chain holds.
+    let size_at = 512 + 128 + 0x78;
+    let size = u32::from_le_bytes(bytes[size_at..size_at + 4].try_into().unwrap());
+    bytes[size_at..size_at + 4].copy_from_slice(&(size + 1024).to_le_bytes());
+    let ir = open_doc(&bytes).to_ir();
+    assert!(ir.metadata.text_truncated);
+}

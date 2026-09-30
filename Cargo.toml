@@ -20,7 +20,7 @@ match_like_matches_macro = "allow"
 manual_find = "allow"
 
 [workspace.package]
-version = "0.1.12"
+version = "0.1.13"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yfedoseev/office_oxide"
@@ -76,21 +76,24 @@ log = "0.4"
 encoding_rs = "0.8"
 atoi_simd = "0.18"
 fast-float2 = "0.2"
+# zlib inflate for compressed OfficeArt metafile BLIPs ([MS-ODRAW]); the
+# same flate2/zlib-rs build `zip`'s deflate feature already pulls in.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 
 # Optional
 memmap2 = { version = "0.9", optional = true }
 rayon = { version = "1.12", optional = true }
 
 # Python bindings.
-# `abi3-py38` builds a single stable-ABI wheel (cp38-abi3) that works on
-# CPython 3.8+ and — crucially — cross-compiles without a target-arch Python
+# `abi3-py310` builds a single stable-ABI wheel (cp310-abi3) that works on
+# CPython 3.10+ (the floor `requires-python` declares and CI tests) and — crucially — cross-compiles without a target-arch Python
 # interpreter, which the aarch64 manylinux cross container does not provide
 # (maturin otherwise fails with "Couldn't find any python interpreters").
 # `generate-import-lib` synthesises the `python3.lib` import library for abi3
 # on Windows so the wheel links without a matching local Python install.
 pyo3 = { version = "0.29", features = [
     "extension-module",
-    "abi3-py38",
+    "abi3-py310",
     "generate-import-lib",
 ], optional = true }
 

@@ -1,4 +1,5 @@
 //! The binary's behaviour when its reader goes away.
+#![cfg(unix)]
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -22,7 +23,6 @@ fn big_docx() -> Vec<u8> {
 /// `SIGPIPE` ignored. A closed pipe now ends the process the way it ends
 /// `cat`: quietly, by the signal.
 #[test]
-#[cfg(unix)]
 fn test_closed_stdout_pipe_ends_quietly_without_a_panic() {
     let dir = std::env::temp_dir().join(format!("office_oxide_pipe_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

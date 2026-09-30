@@ -27,7 +27,10 @@ pub use error::{CfbError, Result};
 pub use header::{
     CFB_SIGNATURE, CfbHeader, DIFAT_SECT, END_OF_CHAIN, FAT_SECT, FREE_SECT, MAX_REG_SECT,
 };
-pub use oleps::{SummaryProperties, parse_summary_information};
+pub use oleps::{
+    SummaryProperties, parse_document_summary_information, parse_summary_information,
+    read_document_properties,
+};
 pub use reader::CfbReader;
 
 /// `true` when `reader` begins with the CFB/OLE2 magic signature — the
