@@ -47,6 +47,128 @@ pub struct Worksheet {
     /// worksheet (chartsheets, sheets whose part is missing), so looking
     /// the state up by position pinned it on the wrong sheet.
     pub state: super::SheetState,
+    /// Page header/footer text from `<headerFooter>`, as written (with its
+    /// formatting codes); [`SheetHeaderFooter::text`] decodes one.
+    pub header_footer: SheetHeaderFooter,
+}
+
+/// A sheet's `<headerFooter>` ([ECMA-376] §18.3.1.46): the raw code strings
+/// of each header/footer and the flags that decide which ones are in use.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SheetHeaderFooter {
+    /// `<oddHeader>` — every page's header unless the flags say otherwise.
+    pub odd_header: Option<String>,
+    /// `<oddFooter>`.
+    pub odd_footer: Option<String>,
+    /// `<evenHeader>`, in use only when `different_odd_even` is set.
+    pub even_header: Option<String>,
+    /// `<evenFooter>`, in use only when `different_odd_even` is set.
+    pub even_footer: Option<String>,
+    /// `<firstHeader>`, in use only when `different_first` is set.
+    pub first_header: Option<String>,
+    /// `<firstFooter>`, in use only when `different_first` is set.
+    pub first_footer: Option<String>,
+    /// `differentOddEven`.
+    pub different_odd_even: bool,
+    /// `differentFirst`.
+    pub different_first: bool,
+}
+
+impl SheetHeaderFooter {
+    /// Whether no header or footer text is present at all.
+    pub fn is_empty(&self) -> bool {
+        [
+            &self.odd_header,
+            &self.odd_footer,
+            &self.even_header,
+            &self.even_footer,
+            &self.first_header,
+            &self.first_footer,
+        ]
+        .iter()
+        .all(|h| h.as_deref().is_none_or(|t| t.trim().is_empty()))
+    }
+
+    /// The header/footer text actually in use, decoded, as
+    /// `(first, odd, even)` header triples then footers — inactive even or
+    /// first-page variants (their flag unset) are `None`.
+    pub fn active(&self, sheet_name: &str) -> [Option<String>; 6] {
+        let decode = |h: &Option<String>, on: bool| {
+            h.as_deref()
+                .filter(|_| on)
+                .map(|c| Self::text(c, sheet_name))
+                .filter(|t| !t.trim().is_empty())
+        };
+        [
+            decode(&self.first_header, self.different_first),
+            decode(&self.odd_header, true),
+            decode(&self.even_header, self.different_odd_even),
+            decode(&self.first_footer, self.different_first),
+            decode(&self.odd_footer, true),
+            decode(&self.even_footer, self.different_odd_even),
+        ]
+    }
+
+    /// Decode a header/footer code string ([ECMA-376] §18.3.1.36) to the
+    /// text it shows. `&L`/`&C`/`&R` start the left/centre/right parts
+    /// (text before any marker is centred), which are joined with tabs;
+    /// `&&` is a literal ampersand; font (`&"name,style"`, `&nn`), colour
+    /// (`&K` + 6 characters) and style toggles (`&B`, `&I`, `&U`, ...) are
+    /// dropped; `&A` is the sheet's name; the other fields, whose value
+    /// exists only when printing, show as Excel's header editor shows them
+    /// (`&[Page]`, `&[Pages]`, `&[Date]`, `&[Time]`, `&[File]`, `&[Path]`,
+    /// `&[Picture]`).
+    pub fn text(code: &str, sheet_name: &str) -> String {
+        let mut parts: [String; 3] = Default::default();
+        let mut cur = 1usize;
+        let mut chars = code.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '&' {
+                parts[cur].push(c);
+                continue;
+            }
+            let Some(code) = chars.next() else { break };
+            match code {
+                '&' => parts[cur].push('&'),
+                'L' => cur = 0,
+                'C' => cur = 1,
+                'R' => cur = 2,
+                'P' => parts[cur].push_str("&[Page]"),
+                'N' => parts[cur].push_str("&[Pages]"),
+                'D' => parts[cur].push_str("&[Date]"),
+                'T' => parts[cur].push_str("&[Time]"),
+                'F' => parts[cur].push_str("&[File]"),
+                'Z' => parts[cur].push_str("&[Path]"),
+                'G' => parts[cur].push_str("&[Picture]"),
+                'A' => parts[cur].push_str(sheet_name),
+                '"' => {
+                    for ch in chars.by_ref() {
+                        if ch == '"' {
+                            break;
+                        }
+                    }
+                },
+                'K' => {
+                    for _ in 0..6 {
+                        chars.next();
+                    }
+                },
+                d if d.is_ascii_digit() => {
+                    while chars.peek().is_some_and(char::is_ascii_digit) {
+                        chars.next();
+                    }
+                },
+                // B I U E S X Y O H: style toggles, no text.
+                _ => {},
+            }
+        }
+        parts
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join("\t")
+    }
 }
 
 /// One cell comment from `xl/comments*.xml`.
@@ -362,6 +484,7 @@ impl Worksheet {
         let mut shared = SharedFormulas::default();
         let mut conditional_formats = Vec::new();
         let mut data_validations = Vec::new();
+        let mut header_footer = SheetHeaderFooter::default();
 
         loop {
             match reader.read_event()? {
@@ -402,6 +525,9 @@ impl Worksheet {
                     },
                     "dataValidations" => {
                         data_validations.extend(parse_data_validations(&mut reader)?);
+                    },
+                    "headerFooter" => {
+                        header_footer = parse_header_footer(&mut reader, e)?;
                     },
                     _ => {},
                 },
@@ -451,6 +577,7 @@ impl Worksheet {
 
         Ok(Worksheet {
             state: super::SheetState::Visible,
+            header_footer,
             comments: Vec::new(),
             name,
             dimension,
@@ -464,6 +591,51 @@ impl Worksheet {
             data_validations,
         })
     }
+}
+
+/// Parse `<headerFooter>` and its six optional code-string children.
+fn parse_header_footer(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    start: &quick_xml::events::BytesStart,
+) -> crate::core::Result<SheetHeaderFooter> {
+    let flag =
+        |name: &str| -> crate::core::Result<bool> {
+            Ok(xml::optional_attr_str(start, name)?
+                .is_some_and(|v| matches!(v.as_ref(), "1" | "true")))
+        };
+    let mut hf = SheetHeaderFooter {
+        different_odd_even: flag("differentOddEven")?,
+        different_first: flag("differentFirst")?,
+        ..Default::default()
+    };
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => {
+                let slot = match e.local_name().as_ref() {
+                    "oddHeader" => &mut hf.odd_header,
+                    "oddFooter" => &mut hf.odd_footer,
+                    "evenHeader" => &mut hf.even_header,
+                    "evenFooter" => &mut hf.even_footer,
+                    "firstHeader" => &mut hf.first_header,
+                    "firstFooter" => &mut hf.first_footer,
+                    _ => {
+                        xml::skip_element_fast(reader)?;
+                        continue;
+                    },
+                };
+                // The raw content, unescaped here: the fast reader trims
+                // each text event, which dropped the spaces next to an
+                // entity (`Page &amp;P` came back as `Page&P`).
+                let raw = reader.read_text(e.to_end().name())?;
+                let text = quick_xml::escape::unescape(&raw).map_err(quick_xml::Error::from)?;
+                *slot = Some(text.into_owned());
+            },
+            Event::End(ref e) if e.local_name().as_ref() == "headerFooter" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(hf)
 }
 
 /// Parse one `<conditionalFormatting sqref="...">` block: its `sqref`

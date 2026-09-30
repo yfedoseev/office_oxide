@@ -478,11 +478,27 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             }));
         }
 
+        // Page headers/footers in use ([ECMA-376] §18.3.1.46).
+        let hf = |text: Option<String>| {
+            text.map(|t| HeaderFooter {
+                content: vec![Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(t))],
+                    ..Default::default()
+                })],
+            })
+        };
+        let [fh, oh, eh, ff, of, ef] = ws.header_footer.active(&ws.name);
         sections.push(Section {
             title: Some(ws.name.clone()),
             elements: combined,
             page_setup,
             break_type,
+            header: hf(oh),
+            footer: hf(of),
+            first_page_header: hf(fh),
+            first_page_footer: hf(ff),
+            even_page_header: hf(eh),
+            even_page_footer: hf(ef),
             hidden: ws.state != crate::xlsx::SheetState::Visible,
             conditional_formats: ws.conditional_formats.clone(),
             data_validations: ws.data_validations.clone(),

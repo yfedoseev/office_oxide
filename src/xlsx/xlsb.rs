@@ -461,6 +461,7 @@ fn parse_sheet(data: &[u8], name: String) -> Worksheet {
     }
     Worksheet {
         state: SheetState::Visible,
+        header_footer: Default::default(),
         name,
         dimension: None,
         rows,

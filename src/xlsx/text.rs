@@ -81,11 +81,22 @@ impl XlsxDocument {
         let mut budget = TextBudget::new();
         for (i, ws) in self.worksheets.iter().enumerate() {
             let mut sheet = ws.name.clone();
+            // Page headers above the cells and footers below, as the IR
+            // renderers place a section's headers and footers.
+            let [fh, oh, eh, ff, of, ef] = ws.header_footer.active(&ws.name);
+            for h in [fh, oh, eh].into_iter().flatten() {
+                sheet.push('\n');
+                sheet.push_str(&h);
+            }
             if let Some(text) = self.sheet_plain_text_within(i, &mut budget) {
                 if !text.is_empty() {
                     sheet.push('\n');
                     sheet.push_str(&text);
                 }
+            }
+            for f in [ff, of, ef].into_iter().flatten() {
+                sheet.push('\n');
+                sheet.push_str(&f);
             }
             if budget.exhausted() {
                 sheet.push('\n');
@@ -225,16 +236,21 @@ impl XlsxDocument {
         let mut parts = Vec::new();
         let mut budget = TextBudget::new();
         for (i, ws) in self.worksheets.iter().enumerate() {
+            let [fh, oh, eh, ff, of, ef] = ws.header_footer.active(&ws.name);
             if let Some(md) = self.sheet_to_markdown_within(i, &mut budget) {
                 if !md.is_empty() {
                     parts.push(md);
                 } else if !ws.comments.is_empty()
                     || ws.text_shapes.iter().any(|t| !t.text.trim().is_empty())
+                    || !ws.header_footer.is_empty()
                 {
-                    // No cells, but comments or drawn text: they still
-                    // belong under the sheet's heading.
+                    // No cells, but comments, drawn text or page
+                    // headers: they still belong under the sheet's heading.
                     parts.push(format!("## {}", ws.name));
                 }
+            }
+            for hf in [fh, oh, eh, ff, of, ef].into_iter().flatten() {
+                parts.push(crate::core::markdown::escape_text(&hf));
             }
             if budget.exhausted() {
                 parts.push(budget.notice());
@@ -674,6 +690,7 @@ mod tests {
             conditional_formats: Vec::new(),
             data_validations: Vec::new(),
             state: super::super::SheetState::Visible,
+            header_footer: Default::default(),
         };
         let doc = XlsxDocument {
             workbook: super::super::WorkbookInfo {
@@ -733,6 +750,7 @@ mod tests {
             conditional_formats: Vec::new(),
             data_validations: Vec::new(),
             state: super::super::SheetState::Visible,
+            header_footer: Default::default(),
         };
         let doc = XlsxDocument {
             workbook: super::super::WorkbookInfo {

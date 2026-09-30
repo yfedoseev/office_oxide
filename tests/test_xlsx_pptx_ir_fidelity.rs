@@ -1402,3 +1402,52 @@ fn test_cell_borders_reach_the_table_cell() {
     assert_eq!(b.top.as_ref().unwrap().style, BorderStyle::Thick);
     assert_eq!(b.bottom.as_ref().unwrap().style, BorderStyle::Dashed);
 }
+
+/// `<headerFooter>` (§18.3.1.46) carries user-visible text that was never
+/// read. It now reaches the IR's section headers/footers and both direct
+/// renderers, with its formatting codes (§18.3.1.36) decoded: section
+/// markers split the parts, fields show as Excel's editor shows them, and
+/// an inactive even-page header (no `differentOddEven`) stays out.
+#[test]
+fn test_sheet_header_and_footer_text_is_extracted() {
+    let mut sheet = Sheet::new("S", r#"<row r="1"><c r="A1"><v>1</v></c></row>"#);
+    sheet.extra = r#"<headerFooter differentFirst="1">
+        <oddHeader>&amp;L&amp;"Arial,Bold"&amp;14Quarterly Report&amp;RPage &amp;P of &amp;N</oddHeader>
+        <oddFooter>&amp;CConfidential &amp;&amp; internal &amp;KFF0000&amp;A</oddFooter>
+        <evenHeader>&amp;CEven only</evenHeader>
+        <firstHeader>&amp;CCover</firstHeader>
+      </headerFooter>"#;
+    let doc = Xlsx::new(vec![sheet]).doc();
+    let ir = doc.to_ir();
+    let hf_text = |hf: &Option<HeaderFooter>| {
+        hf.as_ref().map(|h| {
+            h.content
+                .iter()
+                .map(|e| match e {
+                    Element::Paragraph(p) => p
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            InlineContent::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                    _ => String::new(),
+                })
+                .collect::<String>()
+        })
+    };
+    let s = &ir.sections[0];
+    assert_eq!(
+        hf_text(&s.header).as_deref(),
+        Some("Quarterly Report\tPage &[Page] of &[Pages]")
+    );
+    assert_eq!(hf_text(&s.footer).as_deref(), Some("Confidential & internal S"));
+    assert_eq!(hf_text(&s.first_page_header).as_deref(), Some("Cover"));
+    assert_eq!(hf_text(&s.even_page_header), None, "differentOddEven is off");
+    for out in [doc.plain_text(), doc.to_markdown()] {
+        assert!(out.contains("Quarterly Report"), "{out}");
+        assert!(out.contains("Confidential & internal"), "{out}");
+        assert!(!out.contains("Even only"), "{out}");
+    }
+}
