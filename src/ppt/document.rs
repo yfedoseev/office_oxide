@@ -1174,7 +1174,10 @@ mod tests {
                     para_formats: vec![ParaFormatSpan {
                         start: 0,
                         end: 8,
-                        format: ParaFormat { alignment: Some(1) }, // Tx_ALIGNCenter
+                        format: ParaFormat {
+                            alignment: Some(1),
+                            ..Default::default()
+                        }, // Tx_ALIGNCenter
                     }],
                     placeholder_role: None,
                 }],

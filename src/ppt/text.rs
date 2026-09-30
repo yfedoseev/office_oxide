@@ -654,14 +654,41 @@ fn resolve_slide(
     )
 }
 
-/// The level-0 (no indentation) master style for the two placeholder
-/// text types this crate resolves inheritance for — matches the
-/// issue's own "title vs body" scope. Levels 1-4 (nested outline
-/// bullets) are a follow-up, not attempted here.
+/// A main master's text styles: for each `TextTypeEnum` value (the
+/// `TxMasterStyleAtom` `recInstance`, 0-8), its indent levels 0-4, each
+/// level already carrying whatever it leaves unset from the level above
+/// it ([MS-PPT] `TextMasterStyleAtom`: a level's exceptions override the
+/// previous level's).
 #[derive(Debug, Clone, Default)]
 struct MasterStyles {
-    title: Option<(super::style::ParaFormat, super::style::CharFormat)>,
-    body: Option<(super::style::ParaFormat, super::style::CharFormat)>,
+    levels: [Vec<(super::style::ParaFormat, super::style::CharFormat)>; 9],
+}
+
+impl MasterStyles {
+    /// The levels a run of `text_type` inherits from. The placeholder
+    /// variants fall back to their base style when the master has none of
+    /// their own — `CenterTitle` to `Title`, `CenterBody`/`HalfBody`/
+    /// `QuarterBody` to `Body` — as PowerPoint derives them.
+    fn for_type(
+        &self,
+        text_type: TextType,
+    ) -> Option<&[(super::style::ParaFormat, super::style::CharFormat)]> {
+        let (own, base) = match text_type {
+            TextType::Title => (0, None),
+            TextType::Body => (1, None),
+            TextType::Notes => (2, None),
+            TextType::Other => (4, None),
+            TextType::CenterBody => (5, Some(1)),
+            TextType::CenterTitle => (6, Some(0)),
+            TextType::HalfBody => (7, Some(1)),
+            TextType::QuarterBody => (8, Some(1)),
+        };
+        [Some(own), base]
+            .into_iter()
+            .flatten()
+            .map(|i| self.levels[i].as_slice())
+            .find(|l| !l.is_empty())
+    }
 }
 
 /// Find a `Slide` container's own `SlideAtom` and return its
@@ -688,8 +715,8 @@ fn find_master_id(slide_children: &[u8]) -> Option<u32> {
 }
 
 /// Resolve `master_id` through the persist directory to its
-/// `MainMaster` container, then parse its `TxMasterStyleAtom` children
-/// for the Title/Body text types' level-0 style.
+/// `MainMaster` container, then parse every `TxMasterStyleAtom` child —
+/// one per text type, up to five indent levels each.
 fn resolve_master_styles(
     stream: &[u8],
     dir: &PersistDirectory,
@@ -703,61 +730,113 @@ fn resolve_master_styles(
         if rec.header.rec_type != RT_TX_MASTER_STYLE_ATOM {
             continue;
         }
-        let text_type = TextType::from_u32(rec.header.rec_instance as u32);
-        let target = match text_type {
-            TextType::Title => &mut styles.title,
-            TextType::Body => &mut styles.body,
-            _ => continue,
+        let Some(slot) = styles.levels.get_mut(rec.header.rec_instance as usize) else {
+            continue;
         };
-        if target.is_none() {
-            let levels = style::parse_tx_master_style_atom(&rec.data, rec.header.rec_instance);
-            *target = levels.into_iter().next();
+        if slot.is_empty() {
+            *slot = cascade_levels(style::parse_tx_master_style_atom(
+                &rec.data,
+                rec.header.rec_instance,
+            ));
         }
     }
-    if styles.title.is_none() && styles.body.is_none() {
+    if styles.levels.iter().all(Vec::is_empty) {
         return None;
     }
     Some(styles)
 }
 
-/// Fill any unset `CharFormat`/`ParaFormat` field on every Title/Body
-/// `TextRun` from the resolved master style — a run with no direct
-/// formatting spans at all gets one synthetic whole-text span carrying
-/// pure master formatting, matching what PowerPoint itself renders.
+/// Make each master level carry what it leaves unset from the level above
+/// it, so a paragraph at level `n` needs only level `n`.
+fn cascade_levels(
+    levels: Vec<(super::style::ParaFormat, super::style::CharFormat)>,
+) -> Vec<(super::style::ParaFormat, super::style::CharFormat)> {
+    let mut out: Vec<(super::style::ParaFormat, super::style::CharFormat)> =
+        Vec::with_capacity(levels.len());
+    for (pf, cf) in levels {
+        let resolved = match out.last() {
+            Some((ppf, pcf)) => (pf.inherit_from(ppf), cf.inherit_from(pcf)),
+            None => (pf, cf),
+        };
+        out.push(resolved);
+    }
+    out
+}
+
+/// Fill any unset `CharFormat`/`ParaFormat` field on every `TextRun` from
+/// the master style of its text type, at each paragraph's own indent
+/// level (`TextPFRun.indentLevel`; level 0 where the run has no paragraph
+/// formatting). A run with no direct formatting spans at all gets one
+/// synthetic whole-text span carrying pure level-0 master formatting,
+/// matching what PowerPoint itself renders.
 fn apply_master_inheritance(text_runs: &mut [TextRun], styles: &MasterStyles) {
     for run in text_runs {
-        let Some((master_pf, master_cf)) = (match run.text_type {
-            TextType::Title => styles.title.as_ref(),
-            TextType::Body => styles.body.as_ref(),
-            _ => None,
-        }) else {
+        let Some(levels) = styles.for_type(run.text_type) else {
             continue;
         };
+        let level_at = |level: Option<u16>| {
+            let i = (level.unwrap_or(0) as usize).min(levels.len() - 1);
+            &levels[i]
+        };
         let text_char_len = run.text.chars().count();
+        // Character spans first, while the paragraph spans still carry
+        // only the file's own indent levels: split each at the paragraph
+        // boundaries it crosses, so each piece inherits from its own
+        // paragraph's level.
         if run.char_formats.is_empty() {
             if text_char_len > 0 {
                 run.char_formats.push(CharFormatSpan {
                     start: 0,
                     end: text_char_len,
-                    format: master_cf.clone(),
+                    format: level_at(None).1.clone(),
                 });
             }
         } else {
-            for span in &mut run.char_formats {
-                span.format = span.format.inherit_from(master_cf);
+            let mut split = Vec::with_capacity(run.char_formats.len());
+            for span in &run.char_formats {
+                let mut cursor = span.start;
+                for p in run
+                    .para_formats
+                    .iter()
+                    .filter(|p| p.end > span.start && p.start < span.end)
+                {
+                    let (a, b) = (p.start.max(span.start), p.end.min(span.end));
+                    if a > cursor {
+                        split.push(CharFormatSpan {
+                            start: cursor,
+                            end: a,
+                            format: span.format.inherit_from(&level_at(None).1),
+                        });
+                    }
+                    split.push(CharFormatSpan {
+                        start: a,
+                        end: b,
+                        format: span.format.inherit_from(&level_at(p.format.indent_level).1),
+                    });
+                    cursor = b;
+                }
+                if cursor < span.end {
+                    split.push(CharFormatSpan {
+                        start: cursor,
+                        end: span.end,
+                        format: span.format.inherit_from(&level_at(None).1),
+                    });
+                }
             }
+            run.char_formats = split;
         }
         if run.para_formats.is_empty() {
             if text_char_len > 0 {
                 run.para_formats.push(ParaFormatSpan {
                     start: 0,
                     end: text_char_len,
-                    format: master_pf.clone(),
+                    format: level_at(None).0.clone(),
                 });
             }
         } else {
             for span in &mut run.para_formats {
-                span.format = span.format.inherit_from(master_pf);
+                let master = &level_at(span.format.indent_level).0;
+                span.format = span.format.inherit_from(master);
             }
         }
     }
@@ -2818,6 +2897,76 @@ mod tests {
         body.extend_from_slice(&slide_id.to_le_bytes());
         body.extend_from_slice(&0u32.to_le_bytes()); // reserved3
         make_atom(RT_SLIDE_PERSIST_ATOM, 0, &body)
+    }
+
+    fn level(
+        bold: Option<bool>,
+        italic: Option<bool>,
+    ) -> (super::style::ParaFormat, super::style::CharFormat) {
+        (
+            super::style::ParaFormat::default(),
+            super::style::CharFormat {
+                bold,
+                italic,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Master inheritance covered only Title and Body at indent level 0: a
+    /// nested bullet (level 1+) and every other text type (notes, other,
+    /// the centred/half/quarter placeholder variants) got nothing from the
+    /// master. Each paragraph now inherits from its own level, a level
+    /// carries what it leaves unset from the level above it, and the
+    /// placeholder variants fall back to their base style.
+    #[test]
+    fn test_master_inheritance_follows_indent_level_and_every_text_type() {
+        let mut styles = MasterStyles::default();
+        styles.levels[1] = cascade_levels(vec![level(Some(true), None), level(None, Some(true))]);
+        styles.levels[0] = cascade_levels(vec![level(None, Some(true))]);
+        assert_eq!(styles.levels[1][1].1.bold, Some(true), "level 1 cascades from level 0");
+
+        let para = |start, end, indent| ParaFormatSpan {
+            start,
+            end,
+            format: super::style::ParaFormat {
+                indent_level: Some(indent),
+                ..Default::default()
+            },
+        };
+        let mut runs = vec![
+            TextRun {
+                text_type: TextType::Body,
+                text: "Top\rNested".into(),
+                para_formats: vec![para(0, 4, 0), para(4, 10, 1)],
+                char_formats: vec![CharFormatSpan {
+                    start: 0,
+                    end: 10,
+                    format: Default::default(),
+                }],
+                ..Default::default()
+            },
+            TextRun {
+                text_type: TextType::CenterTitle,
+                text: "Centred".into(),
+                ..Default::default()
+            },
+            TextRun {
+                text_type: TextType::HalfBody,
+                text: "Half".into(),
+                ..Default::default()
+            },
+        ];
+        apply_master_inheritance(&mut runs, &styles);
+
+        let body = &runs[0].char_formats;
+        let at = |i: usize| body.iter().find(|s| s.start <= i && i < s.end).unwrap();
+        assert_eq!((at(0).format.bold, at(0).format.italic), (Some(true), None));
+        assert_eq!((at(5).format.bold, at(5).format.italic), (Some(true), Some(true)));
+        // CenterTitle has no master style of its own: Title's applies.
+        assert_eq!(runs[1].char_formats[0].format.italic, Some(true));
+        // HalfBody falls back to Body level 0.
+        assert_eq!(runs[2].char_formats[0].format.bold, Some(true));
     }
 
     fn slide_container_bytes(title: &str) -> Vec<u8> {

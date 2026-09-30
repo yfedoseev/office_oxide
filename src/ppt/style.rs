@@ -26,9 +26,10 @@
 //!   aligned) — their values aren't surfaced; the IR has no field for
 //!   per-tab-stop layout.
 //! - Master-slide style inheritance (formatting a placeholder doesn't
-//!   directly override, but should visually inherit from
-//!   `TextMasterStyleAtom`) is a separate, larger gap, filed as its own
-//!   issue rather than folded into this one.
+//!   directly override, but visually inherits from `TextMasterStyleAtom`)
+//!   is applied by the caller, `text::apply_master_inheritance`, using the
+//!   levels [`parse_tx_master_style_atom`] returns and each paragraph's
+//!   `indent_level`.
 
 /// Character-level formatting resolved from a single `TextCFRun`. Each
 /// field is `None` when the corresponding `CFMasks` bit was unset, i.e.
@@ -62,6 +63,10 @@ pub struct ParaFormat {
     /// Raw `TextAlignmentEnum` value (0=left, 1=center, 2=right,
     /// 3=justify, 4=distributed, 5=Thai distributed, 6=justify-low).
     pub alignment: Option<u16>,
+    /// `TextPFRun.indentLevel` (0-4): which master style level the
+    /// paragraph takes its defaults from. `None` for a master style level
+    /// itself.
+    pub indent_level: Option<u16>,
 }
 
 /// A formatting run resolved to a clamped `[start, end)` character range
@@ -180,9 +185,11 @@ const PF_TEXT_DIRECTION: u32 = 1 << 21;
 /// the mask bits select, in the exact order [MS-PPT] lays them out).
 fn parse_pf_run(c: &mut Cursor) -> Option<(usize, ParaFormat)> {
     let count = c.u32()? as usize;
-    c.skip(2)?; // indentLevel
+    let indent_level = c.u16()?;
     let masks = c.u32()?;
-    Some((count, parse_pf_body(c, masks)?))
+    let mut pf = parse_pf_body(c, masks)?;
+    pf.indent_level = Some(indent_level);
+    Some((count, pf))
 }
 
 /// The `TextPFException` body shared by `TextPFRun` and each
@@ -241,7 +248,10 @@ fn parse_pf_body(c: &mut Cursor, masks: u32) -> Option<ParaFormat> {
         c.skip(2)?;
     }
 
-    Some(ParaFormat { alignment })
+    Some(ParaFormat {
+        alignment,
+        indent_level: None,
+    })
 }
 
 // CFMasks bit positions ([MS-PPT] 2.9.13).
@@ -394,6 +404,7 @@ impl ParaFormat {
     pub fn inherit_from(&self, master: &ParaFormat) -> ParaFormat {
         ParaFormat {
             alignment: self.alignment.or(master.alignment),
+            indent_level: self.indent_level.or(master.indent_level),
         }
     }
 }
@@ -688,10 +699,19 @@ mod tests {
 
     #[test]
     fn test_para_format_inherit_from_fills_only_unset_fields() {
-        let direct = ParaFormat { alignment: Some(0) };
-        let master = ParaFormat { alignment: Some(2) };
+        let direct = ParaFormat {
+            alignment: Some(0),
+            ..Default::default()
+        };
+        let master = ParaFormat {
+            alignment: Some(2),
+            ..Default::default()
+        };
         assert_eq!(direct.inherit_from(&master).alignment, Some(0));
-        let unset = ParaFormat { alignment: None };
+        let unset = ParaFormat {
+            alignment: None,
+            ..Default::default()
+        };
         assert_eq!(unset.inherit_from(&master).alignment, Some(2));
     }
 }
