@@ -2259,7 +2259,10 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph, links: &
 
         if let Some(level) = props.outline_level {
             let mut lvl = BytesStart::new("w:outlineLvl");
-            lvl.push_attribute(("w:val", level.to_string().as_str()));
+            // Word's outline levels are 0-8, with 9 meaning body text
+            // (ECMA-376 Part 1 §17.3.1.20); anything above reads as body
+            // text there, so write that rather than an out-of-range value.
+            lvl.push_attribute(("w:val", level.min(9).to_string().as_str()));
             w.write_event(Event::Empty(lvl)).expect("write outlineLvl");
         }
         w.write_event(Event::End(BytesEnd::new("w:pPr")))

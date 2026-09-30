@@ -327,3 +327,25 @@ fn test_pptx_with_notes_declares_its_notes_master() {
     let pres = part(&buf.into_inner(), "ppt/presentation.xml").unwrap();
     assert!(!pres.contains("notesMaster"), "{pres}");
 }
+
+// ---------------------------------------------------------------------------
+// DOCX outline level range
+// ---------------------------------------------------------------------------
+
+/// `Paragraph::outline_level` is an unbounded `u8` in an IR that can come
+/// from anywhere; `w:outlineLvl` was written unclamped, outside Word's
+/// 0–9 range (9 = body text).
+#[test]
+fn test_docx_outline_level_is_written_within_range() {
+    let ir = one_section(
+        vec![Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan::plain("x"))],
+            outline_level: Some(200),
+            ..Default::default()
+        })],
+        DocumentFormat::Docx,
+    );
+    let xml = part(&write_ir(&ir, DocumentFormat::Docx), "word/document.xml").unwrap();
+    assert!(xml.contains(r#"<w:outlineLvl w:val="9"/>"#), "{xml}");
+    assert!(!xml.contains(r#"w:val="200""#), "{xml}");
+}
