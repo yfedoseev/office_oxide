@@ -97,16 +97,23 @@ impl XlsxDocument {
             if row_idx > 0 {
                 buf.push('\n');
             }
-            for (col_idx, cell) in row.cells.iter().enumerate() {
-                if col_idx > 0 {
-                    buf.push('\t');
-                }
+            // A cell sits in its own column: XLSX stores only non-empty
+            // cells (§18.3.1.4), so the columns a row skips are tabs, not
+            // nothing. A cell out of order or repeating a column follows the
+            // previous one rather than being dropped.
+            let mut next_col = 0u32;
+            for (i, cell) in row.cells.iter().enumerate() {
+                let col = cell.reference.col;
+                let gap = col.saturating_sub(next_col) as usize;
+                let tabs = if i == 0 { gap } else { gap + 1 };
                 let before = buf.len();
+                buf.extend(std::iter::repeat_n('\t', tabs));
                 self.write_cell_value(cell, &mut buf);
                 if !budget.charge(buf.len() - before) {
                     buf.truncate(before);
                     return Some(buf);
                 }
+                next_col = next_col.max(col.saturating_add(1));
             }
         }
         Some(buf)
@@ -124,19 +131,34 @@ impl XlsxDocument {
         let mut lines = Vec::new();
         let mut budget = TextBudget::new();
 
+        // Rows the sheet does not store are empty lines, so every value
+        // keeps its row number (§18.3.1.73 `r`); the padding is charged to
+        // the budget like text, which bounds a sheet whose two cells sit
+        // at A1 and XFD1048576.
+        let empty_line = ",".repeat(col_count.saturating_sub(1));
+        let mut next_row = 1u32;
         'rows: for row in &ws.rows {
-            let mut fields: Vec<String> = Vec::with_capacity(col_count);
+            while next_row < row.index {
+                if !budget.charge(empty_line.len() + 2) {
+                    lines.push(budget.notice());
+                    break 'rows;
+                }
+                lines.push(empty_line.clone());
+                next_row += 1;
+            }
+            next_row = next_row.max(row.index.saturating_add(1));
+            let mut fields: Vec<String> = vec![String::new(); col_count];
+            if !budget.charge(col_count) {
+                lines.push(budget.notice());
+                break 'rows;
+            }
             for cell in &row.cells {
                 let field = csv_escape(&self.format_cell_value(cell));
                 if !budget.charge(field.len()) {
                     lines.push(budget.notice());
                     break 'rows;
                 }
-                fields.push(field);
-            }
-            // Pad to column count
-            while fields.len() < col_count {
-                fields.push(String::new());
+                place(&mut fields, cell.reference.col, field);
             }
             lines.push(fields.join(","));
         }
@@ -263,21 +285,18 @@ impl XlsxDocument {
         // First row as header
         // A row keeps the cells that fit the budget (the rest empty) and
         // reports that the budget is spent, so the table ends after it.
+        // Each cell goes under its own column's header (§18.3.1.4 `r`).
         let mut row_line = |row: &Row| -> (String, bool) {
-            let mut cells: Vec<String> = Vec::with_capacity(col_count);
+            let mut cells: Vec<String> = vec![String::new(); col_count];
             let mut spent = false;
-            for i in 0..col_count {
-                let text = match row.cells.get(i) {
-                    Some(c) if !spent => match cell_text(c) {
-                        Some(t) => t,
-                        None => {
-                            spent = true;
-                            String::new()
-                        },
+            for c in &row.cells {
+                match cell_text(c) {
+                    Some(t) => place(&mut cells, c.reference.col, t),
+                    None => {
+                        spent = true;
+                        break;
                     },
-                    _ => String::new(),
-                };
-                cells.push(text);
+                }
             }
             (format!("| {} |", cells.join(" | ")), spent)
         };
@@ -464,9 +483,25 @@ fn write_number(n: f64, buf: &mut String) {
     }
 }
 
-/// Compute the maximum number of columns across all rows.
+/// The sheet's width: one past the rightmost column any cell references
+/// (not the longest row's cell count — a sparse row is short but wide).
 fn compute_column_count(rows: &[Row]) -> usize {
-    rows.iter().map(|r| r.cells.len()).max().unwrap_or(0)
+    rows.iter()
+        .flat_map(|r| &r.cells)
+        .map(|c| c.reference.col as usize + 1)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Put `value` in column `col` of a row laid out `fields.len()` wide. A
+/// column already filled (two cells claiming one reference) keeps its first
+/// value, as the IR path does.
+fn place(fields: &mut [String], col: u32, value: String) {
+    if let Some(slot) = fields.get_mut(col as usize) {
+        if slot.is_empty() {
+            *slot = value;
+        }
+    }
 }
 
 /// Escape a field for CSV (RFC 4180).

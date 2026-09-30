@@ -1300,3 +1300,44 @@ fn test_overlapping_merge_cells_past_the_work_budget_are_reported() {
     let ir = ir_within(sheet, 120);
     assert!(ir.plain_text().contains("merged cell ranges"), "{}", ir.plain_text());
 }
+
+// ---------------------------------------------------------------------------
+// Direct renderers keep sparse cells in their own row and column
+// ---------------------------------------------------------------------------
+
+const SPARSE: &str = r#"<row r="1">
+     <c r="A1" t="inlineStr"><is><t>Name</t></is></c>
+     <c r="B1" t="inlineStr"><is><t>Qty</t></is></c>
+     <c r="C1" t="inlineStr"><is><t>Price</t></is></c>
+   </row>
+   <row r="2"><c r="C2"><v>9</v></c></row>
+   <row r="4"><c r="A4" t="inlineStr"><is><t>Pear</t></is></c><c r="C4"><v>4</v></c></row>"#;
+
+/// XLSX stores only non-empty cells, positioned by `r=` (§18.3.1.4,
+/// §18.3.1.73). `to_csv()` emitted cells in encounter order, so `9` landed
+/// under `Name`, and dropped the omitted row 3, shifting row 4 up.
+#[test]
+fn test_csv_places_sparse_cells_by_reference() {
+    let doc = Xlsx::new(vec![Sheet::new("S", SPARSE)]).doc();
+    let csv = doc.as_xlsx().unwrap().to_csv();
+    assert_eq!(csv, "Name,Qty,Price\r\n,,9\r\n,,\r\nPear,,4");
+}
+
+/// `plain_text()` keeps each value in its own tab-separated column.
+#[test]
+fn test_plain_text_places_sparse_cells_by_column() {
+    let doc = Xlsx::new(vec![Sheet::new("S", SPARSE)]).doc();
+    let text = doc.plain_text();
+    assert!(text.contains("Name\tQty\tPrice\n\t\t9\nPear\t\t4"), "{text:?}");
+}
+
+/// `to_markdown()` (the README path, which does not go through the IR)
+/// put `9` under the `Name` header.
+#[test]
+fn test_markdown_places_sparse_cells_by_column() {
+    let doc = Xlsx::new(vec![Sheet::new("S", SPARSE)]).doc();
+    let md = doc.to_markdown();
+    assert!(md.contains("| Name | Qty | Price |"), "{md}");
+    assert!(md.contains("|  |  | 9 |"), "{md}");
+    assert!(md.contains("| Pear |  | 4 |"), "{md}");
+}
