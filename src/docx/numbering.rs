@@ -200,8 +200,8 @@ fn parse_numbering_level(
                                 Some(super::formatting::parse_justification_value(&val));
                         }
                     },
-                    // The list paragraph's indentation (ECMA-376 §17.9.6:
-                    // the level's `w:pPr`, here its `w:ind`, §17.3.1.12).
+                    // The list paragraph's indentation (ECMA-376 §17.9:
+                    // the level's `w:pPr`, here its `w:ind`, §17.3.1).
                     "ind" => indent = Some(super::formatting::parse_indent(e)?),
                     _ => {},
                 }
@@ -277,7 +277,7 @@ fn parse_num_instance(
                 }
             },
             // A complete replacement level for this instance (ECMA-376
-            // §17.9.8). Keyed by the enclosing override's `w:ilvl`, which
+            // §17.9). Keyed by the enclosing override's `w:ilvl`, which
             // is the level it replaces.
             Event::Start(ref e) if e.local_name().as_ref() == "lvl" => {
                 let level = parse_numbering_level(reader)?;
@@ -337,9 +337,9 @@ mod tests {
         assert_eq!(inst.abstract_num_id, 0);
     }
 
-    /// `w:lvlOverride` (ECMA-376 §17.9.8) may carry a complete `w:lvl`
+    /// `w:lvlOverride` (ECMA-376 §17.9) may carry a complete `w:lvl`
     /// that replaces the abstract level for this instance only, with or
-    /// without a `w:startOverride` (§17.9.26), which wins over the
+    /// without a `w:startOverride` (§17.9), which wins over the
     /// override level's own `w:start`.
     #[test]
     fn test_lvl_override_with_a_full_level_replaces_the_abstract_level() {
@@ -371,7 +371,7 @@ mod tests {
         assert_eq!(defs.resolve_start(2, 1), Some(7), "startOverride wins");
     }
 
-    /// A level's `w:pPr/w:ind` (§17.9.6 lvl, §17.3.1.12 ind) is the list
+    /// A level's `w:pPr/w:ind` (§17.9, §17.3.1) is the list
     /// paragraph's indentation; its `w:rPr` children must not leak into
     /// the level's own fields.
     #[test]

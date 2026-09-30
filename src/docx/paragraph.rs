@@ -60,7 +60,7 @@ pub enum RunContent {
     EndnoteRef(u32, bool),
     /// A `w:commentReference` mark. See [`RunContent::FootnoteRef`].
     CommentRef(u32),
-    /// A `w:commentRangeStart` (ECMA-376 §17.13.4.4): where the text a
+    /// A `w:commentRangeStart` (ECMA-376 §17.13.4): where the text a
     /// comment is about begins. It sits between runs, so the reader wraps
     /// it in a run of its own. The range ends at the comment's
     /// [`RunContent::CommentRef`].

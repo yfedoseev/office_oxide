@@ -428,8 +428,8 @@ fn find_tooltip(elements: &[Element]) -> Option<String> {
     })
 }
 
-/// XLSX `hyperlink/@tooltip` (ECMA-376 §18.3.1.47) and PPTX
-/// `a:hlinkClick/@tooltip` (§21.1.2.3.5) were parsed and never reached
+/// XLSX `hyperlink/@tooltip` (ECMA-376 §18.3.1) and PPTX
+/// `a:hlinkClick/@tooltip` (§21.1.2.3) were parsed and never reached
 /// the IR, and neither writer emitted them.
 #[test]
 fn test_hyperlink_tooltips_round_trip_through_xlsx_and_pptx() {

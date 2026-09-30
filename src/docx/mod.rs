@@ -781,7 +781,7 @@ fn parse_block_elements_until(
                 // `w:sdtContent` blocks, here exactly as in the body. Word's
                 // own "quote" text-box templates wrap the whole box in one;
                 // skipping it dropped every such text box entirely.
-                // Block-level custom XML (§17.5.1.6) is the same shape.
+                // Block-level custom XML (§17.5.1) is the same shape.
                 "sdt" | "sdtContent" | "customXml" => {},
                 _ => xml::skip_element_fast(reader)?,
             },
@@ -1221,7 +1221,7 @@ fn resolve_hyperlinks_in_run(run: &mut Run, rels: &crate::core::relationships::R
 ///
 /// `w:del` is deliberately absent: its `w:delText` children are *deleted*
 /// text and are not part of the document. So is `w:rt` (ECMA-376
-/// §17.3.3.26), a ruby's phonetic guide: Word draws it above the
+/// §17.3.3), a ruby's phonetic guide: Word draws it above the
 /// `w:rubyBase` text, not in the line, and inlining it doubled every
 /// annotated word (東京 read as とうきょう東京).
 fn is_transparent_paragraph_wrapper(local: &str) -> bool {
@@ -1241,7 +1241,7 @@ fn is_transparent_paragraph_wrapper(local: &str) -> bool {
     )
 }
 
-/// Record a `w:commentRangeStart` (ECMA-376 §17.13.4.4) in paragraph
+/// Record a `w:commentRangeStart` (ECMA-376 §17.13.4) in paragraph
 /// order. It is range markup between runs, so it gets a run of its own.
 fn push_comment_range_start(
     e: &quick_xml::events::BytesStart,
@@ -1827,7 +1827,7 @@ fn field_instr_tokens(instr: &str) -> Vec<String> {
 /// `HYPERLINK \l "bookmark"` → internal `bookmark`. Returns `None` for
 /// every other field type (PAGE, TOC, REF, …), whose display text already
 /// survives as an ordinary run.
-/// The target of a `HYPERLINK` field (ECMA-376 §17.16.5.25) and its `\o`
+/// The target of a `HYPERLINK` field (ECMA-376 §17.16.5) and its `\o`
 /// ScreenTip text.
 fn hyperlink_target_from_instr(instr: &str) -> Option<(HyperlinkTarget, Option<String>)> {
     let tokens = field_instr_tokens(instr);
@@ -2795,7 +2795,7 @@ fn parse_extent_attrs(e: &quick_xml::events::BytesStart, width: &mut Emu, height
 /// Wrappers whose `w:tr` (inside `w:tbl`) or `w:tc` (inside `w:tr`)
 /// children are ordinary rows/cells: content controls (`w:sdt`,
 /// ECMA-376 §17.5.2), custom XML (`w:customXml`, CT_CustomXmlRow /
-/// CT_CustomXmlCell, §17.5.1.5 / §17.5.1.4), and the tracked-insertion
+/// CT_CustomXmlCell, §17.5.1), and the tracked-insertion
 /// and move-destination markers (`w:ins`, `w:moveTo`) that producers
 /// also wrap whole rows in. `w:del`/`w:moveFrom` are deliberately absent:
 /// what they hold is not part of the accepted document, as at run level.
@@ -3096,7 +3096,7 @@ fn parse_table_cell(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableCe
                 // w:sdtContent > w:p`) — how a data-bound form lays out
                 // its fields — is a transparent wrapper, as in the body;
                 // skipping it emptied every such cell. Block-level custom
-                // XML (CT_CustomXmlBlock, ECMA-376 §17.5.1.6) likewise.
+                // XML (CT_CustomXmlBlock, ECMA-376 §17.5.1) likewise.
                 "sdt" | "sdtContent" | "customXml" => {},
                 _ => {
                     xml::skip_element_fast(reader)?;
@@ -4239,8 +4239,8 @@ mod tests {
 
     #[test]
     fn test_ruby_annotation_text_is_not_inlined_into_the_base_text() {
-        // `w:rt` (ECMA-376 §17.3.3.26) is the phonetic guide Word draws
-        // above `w:rubyBase` (§17.3.3.27); it is not part of the line.
+        // `w:rt` (ECMA-376 §17.3.3) is the phonetic guide Word draws
+        // above `w:rubyBase` (§17.3.3); it is not part of the line.
         let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:ruby><w:rubyPr><w:rubyAlign w:val="distributeSpace"/></w:rubyPr>
 <w:rt><w:r><w:t>とうきょう</w:t></w:r></w:rt>
@@ -4417,7 +4417,7 @@ mod tests {
     #[test]
     fn test_wrapped_table_rows_and_cells_are_not_dropped() {
         // `w:customXml` is a legal wrapper of both `w:tr` (CT_CustomXmlRow,
-        // ECMA-376 §17.5.1.5) and `w:tc` (CT_CustomXmlCell, §17.5.1.4).
+        // ECMA-376 §17.5.1) and `w:tc` (CT_CustomXmlCell, §17.5.1).
         // Producers also wrap inserted/moved rows in `w:ins`/`w:moveTo`.
         // Each was skipped whole, deleting the row's text; a deleted or
         // moved-away row stays out of the accepted view.

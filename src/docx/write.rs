@@ -2473,7 +2473,7 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph, links: &
                 if let Some(frag) = frag {
                     link.push_attribute(("w:anchor", frag));
                 }
-                // CT_Hyperlink: `w:tooltip` (ECMA-376 §17.16.22).
+                // CT_Hyperlink: `w:tooltip` (ECMA-376 §17.16).
                 if let Some(tip) = tooltip {
                     link.push_attribute((
                         "w:tooltip",
@@ -2534,7 +2534,7 @@ fn write_rpr_content(w: &mut Writer<Vec<u8>>, run: &Run) {
         w.write_event(Event::Empty(elem)).expect("write rFonts");
     }
     // `w:b`/`w:i` apply to non-complex-script characters only (ECMA-376
-    // §17.3.2.1 / §17.3.2.16); `w:bCs`/`w:iCs` (§17.3.2.2 / §17.3.2.17)
+    // §17.3.2); `w:bCs`/`w:iCs` (§17.3.2)
     // carry the same toggle for complex-script text, as `w:szCs` already
     // mirrors `w:sz` below. Without them bold Arabic or Hebrew text
     // written here rendered regular in Word.
@@ -2679,8 +2679,8 @@ fn comment_is_written(id: u32) -> bool {
 }
 
 /// `<w:commentRangeEnd>` then the `<w:commentReference>` run, the shape
-/// Word writes at a comment's citation point (ECMA-376 §17.13.4.3,
-/// §17.13.4.5).
+/// Word writes at a comment's citation point (ECMA-376 §17.13.4,
+/// §17.13.4).
 fn write_comment_reference(w: &mut Writer<Vec<u8>>, id: u32) {
     let id = id.to_string();
     let mut end = BytesStart::new("w:commentRangeEnd");
@@ -2989,7 +2989,7 @@ fn write_rich_table(
             if let Some(h) = row.height_twips {
                 let mut trh = BytesStart::new("w:trHeight");
                 trh.push_attribute(("w:val", h.to_string().as_str()));
-                // `w:hRule` (ECMA-376 §17.18.37) defaults to `atLeast`, so
+                // `w:hRule` (ECMA-376 §17.18) defaults to `atLeast`, so
                 // an exact-height row written without it grew to fit.
                 match row.height_rule {
                     Some(crate::ir::RowHeightRule::Exact) => {
@@ -4086,7 +4086,7 @@ fn generate_endnotes_xml(
     generate_notes_xml(notes, image_rids, true, links)
 }
 
-/// `word/comments.xml` (ECMA-376 §17.13.4.2).
+/// `word/comments.xml` (ECMA-376 §17.13.4).
 fn generate_comments_xml(
     comments: &[DocxComment],
     image_rids: &[ImageInfo],

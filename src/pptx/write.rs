@@ -896,7 +896,7 @@ fn write_dml_run(w: &mut Writer<Vec<u8>>, run: &Run, hyperlink_rids: &HashMap<St
             if let Some(rid) = rid {
                 let mut hlink = BytesStart::new("a:hlinkClick");
                 hlink.push_attribute(("r:id", rid.as_str()));
-                // CT_Hyperlink `tooltip` (ECMA-376 §21.1.2.3.5).
+                // CT_Hyperlink `tooltip` (ECMA-376 §21.1.2.3).
                 if let Some(tip) = run.hyperlink_tooltip.as_deref() {
                     hlink.push_attribute((
                         "tooltip",

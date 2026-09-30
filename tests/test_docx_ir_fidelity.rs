@@ -255,8 +255,8 @@ fn docx_bytes(ir: &DocumentIR) -> Vec<u8> {
     out.into_inner()
 }
 
-/// `w:hyperlink/@w:tooltip` (ECMA-376 §17.16.22) and a `HYPERLINK`
-/// field's `\o` switch (§17.16.5.25) are the link's hover text. Both were
+/// `w:hyperlink/@w:tooltip` (ECMA-376 §17.16) and a `HYPERLINK`
+/// field's `\o` switch (§17.16.5) are the link's hover text. Both were
 /// parsed (or skipped) and never reached the IR, any renderer or the
 /// writer.
 #[test]
@@ -293,8 +293,8 @@ fn spans(p: &Paragraph) -> Vec<&TextSpan> {
 /// per character: `w:ascii` for Basic Latin, `w:eastAsia` for CJK,
 /// `w:cs` for complex scripts (and for every character of a `w:rtl` or
 /// `w:cs` run), `w:hAnsi` for the rest. Complex-script text also takes
-/// its size from `w:szCs` (§17.3.2.39) and bold/italic from `w:bCs`/`w:iCs`
-/// (§17.3.2.2 / §17.3.2.17). Only `w:ascii`/`w:sz`/`w:b` were read, so
+/// its size from `w:szCs` (§17.3.2) and bold/italic from `w:bCs`/`w:iCs`
+/// (§17.3.2). Only `w:ascii`/`w:sz`/`w:b` were read, so
 /// CJK and Arabic runs reported the Latin face and size.
 #[test]
 fn test_run_fonts_and_sizes_follow_the_script_of_the_text() {
@@ -536,7 +536,7 @@ fn test_empty_paragraph_with_only_a_bottom_border_is_still_a_thematic_break() {
 // Table geometry and borders
 // ---------------------------------------------------------------------------
 
-/// `w:trHeight/@w:hRule` (ECMA-376 §17.18.37) was parsed and read by
+/// `w:trHeight/@w:hRule` (ECMA-376 §17.18) was parsed and read by
 /// nothing, and the writer omitted it — the default is `atLeast`, so an
 /// exact-height row (forms, labels) came back as a minimum height.
 #[test]
@@ -775,7 +775,7 @@ fn test_first_default_and_even_headers_land_in_distinct_slots() {
 }
 
 /// A `w:type="first"` header or footer is shown only in a section with
-/// `w:titlePg` (ECMA-376 §17.10.6). `title_page` was parsed and never
+/// `w:titlePg` (ECMA-376 §17.10). `title_page` was parsed and never
 /// read: the inactive part reached every surface, and the writer, which
 /// emits `w:titlePg` whenever a first-page part exists, made it visible
 /// in Word after a round-trip.
@@ -1467,8 +1467,8 @@ const COMMENTED_BODY: &str = r#"<w:p><w:r><w:t xml:space="preserve">Before </w:t
   <w:r><w:t xml:space="preserve"> after</w:t></w:r></w:p>"#;
 const COMMENTS: &str = r#"<w:comment w:id="4" w:author="Reviewer"><w:p><w:r><w:t>Please check</w:t></w:r></w:p></w:comment>"#;
 
-/// `w:commentRangeStart` (ECMA-376 §17.13.4.4) and `w:commentReference`
-/// (§17.13.4.5) were never read into the IR, so a comment's body survived
+/// `w:commentRangeStart` (ECMA-376 §17.13.4) and `w:commentReference`
+/// (§17.13.4) were never read into the IR, so a comment's body survived
 /// with no record of what it was about.
 #[test]
 fn test_comment_anchor_reaches_the_ir() {

@@ -992,7 +992,7 @@ fn effective_paragraph_props(
         None => p.properties.clone(),
     };
     // A numbered paragraph's indentation comes from its numbering level's
-    // `w:pPr/w:ind` (ECMA-376 §17.9.6) unless the paragraph sets its own;
+    // `w:pPr/w:ind` (ECMA-376 §17.9) unless the paragraph sets its own;
     // Word applies it over the paragraph style's.
     if let Some(pp) = eff.as_mut()
         && p.properties.as_ref().is_none_or(|d| d.indent.is_none())

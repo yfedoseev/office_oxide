@@ -65,15 +65,15 @@ pub struct ScriptRunProperties {
     /// `w:rFonts/@w:hint` = `eastAsia`: characters shared between the
     /// Latin and East Asian ranges use the East Asian face.
     pub east_asia_hint: Option<bool>,
-    /// `w:szCs` (§17.3.2.39) — complex-script font size.
+    /// `w:szCs` (§17.3.2) — complex-script font size.
     pub font_size_cs: Option<HalfPoint>,
-    /// `w:bCs` (§17.3.2.2) — complex-script bold.
+    /// `w:bCs` (§17.3.2) — complex-script bold.
     pub bold_cs: Option<bool>,
-    /// `w:iCs` (§17.3.2.17) — complex-script italic.
+    /// `w:iCs` (§17.3.2) — complex-script italic.
     pub italic_cs: Option<bool>,
-    /// `w:cs` (§17.3.2.7) — treat every character as complex script.
+    /// `w:cs` (§17.3.2) — treat every character as complex script.
     pub complex_script: Option<bool>,
-    /// `w:rtl` (§17.3.2.30) — right-to-left run, also complex script.
+    /// `w:rtl` (§17.3.2) — right-to-left run, also complex script.
     pub rtl: Option<bool>,
 }
 
@@ -273,7 +273,7 @@ impl RunProperties {
     /// Face, size and weight for text of `class`. A face the run does not
     /// name falls back to `w:ascii`, as it did before the other three were
     /// read; complex-script bold/italic come only from `w:bCs`/`w:iCs`
-    /// (`w:b`/`w:i` apply to non-complex-script characters, §17.3.2.1).
+    /// (`w:b`/`w:i` apply to non-complex-script characters, §17.3.2).
     pub(crate) fn face_for(&self, class: ScriptClass) -> ScriptFace<'_> {
         let s = self.script.as_deref();
         let ascii = self.font_name.as_deref();

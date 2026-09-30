@@ -743,7 +743,7 @@ impl<'a> SheetData<'a> {
     }
 
     /// Set the hover text of a cell's hyperlink, written as
-    /// `hyperlink/@tooltip` (ECMA-376 §18.3.1.47). Has no effect on a
+    /// `hyperlink/@tooltip` (ECMA-376 §18.3.1). Has no effect on a
     /// cell without a hyperlink.
     pub fn set_cell_hyperlink_tooltip(
         &mut self,
