@@ -85,6 +85,32 @@ pub struct SubDocument {
     pub kind: SubDocumentKind,
     /// Sanitised text of the subdocument.
     pub text: String,
+    /// Footnote/endnote subdocuments: each note's sanitised body. Every
+    /// note body opens with the auto-numbered reference mark (0x02) in the
+    /// raw story; the split is taken there, before sanitising drops the
+    /// mark. Empty for other kinds, or when the story has no such marks.
+    pub(crate) notes: Vec<String>,
+}
+
+impl SubDocument {
+    /// Build a subdocument from its raw (unsanitised) story text.
+    pub(crate) fn from_raw(kind: SubDocumentKind, raw: &str) -> Self {
+        let notes = if matches!(kind, SubDocumentKind::Footnotes | SubDocumentKind::Endnotes)
+            && raw.contains('\u{2}')
+        {
+            raw.split('\u{2}')
+                .map(|body| sanitize_text(body).trim().to_string())
+                .filter(|body| !body.is_empty())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            kind,
+            text: sanitize_text(raw),
+            notes,
+        }
+    }
 }
 
 /// One comment, split out of the merged Comments substory by `PlcfandTxt`
@@ -299,12 +325,12 @@ impl DocDocument {
                 );
             }
             let sub = if text_start > 0 {
-                sanitize_text(&raw.chars().skip(text_start).collect::<String>())
+                SubDocument::from_raw(kind, &raw.chars().skip(text_start).collect::<String>())
             } else {
-                sanitize_text(&raw)
+                SubDocument::from_raw(kind, &raw)
             };
-            if !sub.trim().is_empty() {
-                subdocuments.push(SubDocument { kind, text: sub });
+            if !sub.text.trim().is_empty() {
+                subdocuments.push(sub);
             }
             cp = end;
         }
@@ -387,7 +413,7 @@ impl DocDocument {
                     // Story 3 is the macro text (`ccpMcr`), not document content.
                     _ => return None,
                 };
-                Some(SubDocument { kind, text })
+                Some(SubDocument::from_raw(kind, &text))
             })
             .collect();
         let has_macros = cfb.has_root_entry("_VBA_PROJECT") || fib.ccp[3] != 0;
@@ -440,10 +466,10 @@ impl DocDocument {
                     4 => SubDocumentKind::Comments,
                     _ => return None,
                 };
-                Some(SubDocument {
-                    kind,
-                    text: crlf(text),
-                })
+                let mut sub = SubDocument::from_raw(kind, &text);
+                sub.text = crlf(sub.text);
+                sub.notes = sub.notes.into_iter().map(crlf).collect();
+                Some(sub)
             })
             .collect();
         Ok(Self {
@@ -993,18 +1019,9 @@ mod tests {
     fn test_plain_text_and_markdown_include_subdocument_bodies() {
         let doc = DocDocument {
             subdocuments: vec![
-                SubDocument {
-                    kind: SubDocumentKind::Footnotes,
-                    text: "FOOTNOTE ONE".into(),
-                },
-                SubDocument {
-                    kind: SubDocumentKind::Comments,
-                    text: "REVIEW NOTE".into(),
-                },
-                SubDocument {
-                    kind: SubDocumentKind::HeaderTextBoxes,
-                    text: "SIDEBAR".into(),
-                },
+                SubDocument::from_raw(SubDocumentKind::Footnotes, "FOOTNOTE ONE"),
+                SubDocument::from_raw(SubDocumentKind::Comments, "REVIEW NOTE"),
+                SubDocument::from_raw(SubDocumentKind::HeaderTextBoxes, "SIDEBAR"),
             ],
             has_macros: false,
             text_complete: true,
@@ -1034,10 +1051,7 @@ mod tests {
     #[test]
     fn test_empty_subdocuments_are_skipped_in_both_renderers() {
         let doc = DocDocument {
-            subdocuments: vec![SubDocument {
-                kind: SubDocumentKind::Comments,
-                text: "  \n ".into(),
-            }],
+            subdocuments: vec![SubDocument::from_raw(SubDocumentKind::Comments, "  \n ")],
             has_macros: false,
             text_complete: true,
             summary_properties: None,
@@ -1338,10 +1352,7 @@ mod tests {
     fn test_a_single_comment_author_reaches_the_comments_note() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument {
-            kind: SubDocumentKind::Comments,
-            text: "Here is a comment".into(),
-        }];
+        doc.subdocuments = vec![SubDocument::from_raw(SubDocumentKind::Comments, "Here is a comment")];
         doc.comment_authors = vec!["Michael McCandless".to_string()];
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
@@ -1366,10 +1377,7 @@ mod tests {
     fn test_multiple_comment_authors_leave_the_note_author_unset() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument {
-            kind: SubDocumentKind::Comments,
-            text: "Inner\nOuter".into(),
-        }];
+        doc.subdocuments = vec![SubDocument::from_raw(SubDocumentKind::Comments, "Inner\nOuter")];
         doc.comment_authors = vec!["vmiklos".to_string(), "Miklos Vajna".to_string()];
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
@@ -1399,10 +1407,7 @@ mod tests {
     fn test_footnotes_split_into_one_element_per_reference_mark() {
         use crate::ir::{Element, InlineContent, Note};
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument {
-            kind: SubDocumentKind::Footnotes,
-            text: "\u{2} First footnote.\n\u{2} Second footnote.\n\u{2} Third footnote.\n".into(),
-        }];
+        doc.subdocuments = vec![SubDocument::from_raw(SubDocumentKind::Footnotes, "\u{2} First footnote.\n\u{2} Second footnote.\n\u{2} Third footnote.\n")];
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
         let footnotes: Vec<&Note> = ir.sections[0]
@@ -1447,10 +1452,7 @@ mod tests {
     fn test_comments_stay_merged_into_a_single_note() {
         use crate::ir::{Element, Note};
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument {
-            kind: SubDocumentKind::Comments,
-            text: "First comment.\nSecond comment.\n".into(),
-        }];
+        doc.subdocuments = vec![SubDocument::from_raw(SubDocumentKind::Comments, "First comment.\nSecond comment.\n")];
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
         let comments: Vec<&Note> = ir.sections[0]
@@ -1535,10 +1537,7 @@ mod tests {
     fn test_header_footer_stories_reach_the_section_fields() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument {
-            kind: SubDocumentKind::HeadersFooters,
-            text: "irrelevant merged blob".into(),
-        }];
+        doc.subdocuments = vec![SubDocument::from_raw(SubDocumentKind::HeadersFooters, "irrelevant merged blob")];
         doc.header_footer = HeaderFooterStories {
             odd_header: Some("The Odd Header".to_string()),
             first_footer: Some("The First Footer".to_string()),
@@ -1567,10 +1566,7 @@ mod tests {
     fn test_header_footer_falls_back_to_a_textbox_when_plcf_hdd_is_absent() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument {
-            kind: SubDocumentKind::HeadersFooters,
-            text: "OLD MERGED HEADER BLOB".into(),
-        }];
+        doc.subdocuments = vec![SubDocument::from_raw(SubDocumentKind::HeadersFooters, "OLD MERGED HEADER BLOB")];
         // doc.header_footer left at its default (empty) — no PlcfHdd data.
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
@@ -1682,10 +1678,7 @@ mod tests {
     fn test_split_comments_reach_the_ir_as_separate_notes() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument {
-            kind: SubDocumentKind::Comments,
-            text: "Inner\nOuter\nAs in non-range.".into(),
-        }];
+        doc.subdocuments = vec![SubDocument::from_raw(SubDocumentKind::Comments, "Inner\nOuter\nAs in non-range.")];
         doc.comments = vec![
             ParsedComment {
                 text: "Inner".into(),

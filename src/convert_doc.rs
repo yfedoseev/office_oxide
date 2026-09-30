@@ -129,19 +129,10 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             // fallback path for a Comments substory whose `doc.comments()`
             // came back empty (PLC absent/malformed/mismatched) — it stays
             // merged into one Note, same as before endnote/comment splitting existed.
-            let splittable = matches!(
-                sub.kind,
-                crate::doc::SubDocumentKind::Footnotes | crate::doc::SubDocumentKind::Endnotes
-            ) && sub.text.contains('\u{2}');
-
-            let bodies: Vec<&str> = if splittable {
-                sub.text
-                    .split('\u{2}')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            } else {
+            let bodies: Vec<&str> = if sub.notes.is_empty() {
                 vec![sub.text.as_str()]
+            } else {
+                sub.notes.iter().map(String::as_str).collect()
             };
 
             for body in bodies {

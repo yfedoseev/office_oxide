@@ -524,7 +524,11 @@ fn strip_fields(
                     }
                 }
             },
-            '\x01' | '\x08' => {}, // Picture placeholder, historic field-mark — always skip
+            // Picture placeholder, historic field-mark; and the reference
+            // marks [MS-DOC] §2.4.1 puts in a story where a footnote/endnote
+            // (0x02, auto-numbered reference) or comment (0x05, annotation
+            // reference) is anchored — anchors, not text. Always skipped.
+            '\x01' | '\x08' | '\x02' | '\x05' => {},
             _ => {
                 if visible(&stack) {
                     track_chp_run(char_props, idx, &out, &mut chp_spans, &mut open_run);
@@ -556,6 +560,14 @@ fn push_mapped(ch: char, out: &mut String) {
         '\x07' => out.push('\t'), // Cell/row mark → tab
         '\x0C' => out.push('\n'), // Page break / section break
         '\x0B' => out.push('\n'), // Vertical tab → newline
+        // [MS-DOC] §2.4.1: 0x1E is a non-breaking hyphen — a hyphen Word
+        // draws, so it is kept, as U+2011 (the DOCX reader's
+        // `w:noBreakHyphen`).
+        '\x1E' => out.push('\u{2011}'),
+        // 0x1F is an optional hyphen — drawn only where a line happens to
+        // break. Dropped, as the DOCX reader drops `w:softHyphen`: emitting
+        // it splits the word for every consumer doing word-level work.
+        '\x1F' => {},
         _ => out.push(ch),
     }
 }
