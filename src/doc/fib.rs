@@ -6,7 +6,7 @@
 use super::error::{DocError, Result};
 
 /// Parsed FIB fields needed for text extraction.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Fib {
     /// FibBase `lid`: the document's default language ID (Windows LCID),
     /// e.g. `0x0419` = Russian. Determines which codepage compressed
@@ -83,6 +83,15 @@ pub struct Fib {
     pub fc_plcf_bte_chpx: u32,
     /// Byte length of the PlcBteChpx in the Table stream (0x00FE).
     pub lcb_plcf_bte_chpx: u32,
+    /// Offset of the style sheet (`stshf`, an `STSH`) in the Table stream
+    /// (absolute 0x00A2). This is an **offset, not a presence flag**: the
+    /// style sheet is normally the first thing written to the Table stream, so
+    /// `0` is its usual value on real files. Test [`lcb_stshf`] for absence.
+    pub fc_stshf: u32,
+    /// Byte length of the style sheet in the Table stream (0x00A6). The only
+    /// valid absence test: [MS-DOC] `FibRgFcLcb97` requires this to be
+    /// non-zero, and `STSH` states every FIB contains a style sheet.
+    pub lcb_stshf: u32,
 }
 
 impl Fib {
@@ -246,6 +255,15 @@ impl Fib {
             (0, 0)
         };
 
+        // fcStshf / lcbStshf — style sheet (STSH) in the Table stream
+        // (absolute 0x00A2 / 0x00A6). `fcStshf` is an offset whose usual value
+        // is 0; only `lcbStshf` says whether a style sheet is present.
+        let (fc_stshf, lcb_stshf) = if data.len() > 0x00A9 {
+            (read_u32(data, 0x00A2), read_u32(data, 0x00A6))
+        } else {
+            (0, 0)
+        };
+
         Ok(Self {
             lid,
             use_table1,
@@ -274,6 +292,8 @@ impl Fib {
             lcb_plcf_and_txt,
             fc_plcf_bte_chpx,
             lcb_plcf_bte_chpx,
+            fc_stshf,
+            lcb_stshf,
         })
     }
 }

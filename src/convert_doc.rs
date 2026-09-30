@@ -1,6 +1,6 @@
 use crate::doc::{
-    ChpProps, DocDocument, DocParagraph, HyperlinkSpan, ListFormatting, PapProps, TapCellInfo,
-    TapInfo,
+    ChpProps, DocDocument, DocParagraph, HyperlinkSpan, LevelSource, ListFormatting, OutlineLevel,
+    PapProps, TapCellInfo, TapInfo,
 };
 use crate::format::DocumentFormat;
 use crate::ir::*;
@@ -17,15 +17,27 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     let paragraphs = doc.paragraphs();
     // One whole-document decision, taken before the walk, gated on the
     // *outcome*: run the line-shape heading guess only when no paragraph
-    // resolved a real outline level.
+    // states its own level via `sprmPOutLvl`.
     //
-    // Gating on "the document has a stylesheet" instead would be wrong —
-    // a parsed style sheet is not evidence a document uses headings, and
-    // letters, memos and forms with a valid STSH containing no heading
-    // styles would silently lose their headings, and with them
-    // `metadata.title` and `Section.title`, both of which are derived from
-    // the first `Element::Heading` below.
-    let has_structured_headings = paragraphs.iter().any(|p| p.props.outline_level.is_some());
+    // Keyed on a level the paragraph states itself, not on one we resolved
+    // from its style: a document may style a few paragraphs (e.g. a body
+    // heading) while leaving its section heads as unstyled ALL-CAPS lines, and
+    // switching the guess off on a style-resolved level would silence those
+    // heads. Style-derived levels are still used — the walk below emits them as
+    // headings — they just do not, by themselves, disable the heuristic.
+    //
+    // Retiring the line-shape guess entirely is a separate, data-driven piece
+    // of work: the guesses are genuinely mixed, and tying the new style-sheet
+    // path to that decision would be a side effect, not a choice.
+    let has_structured_headings = paragraphs.iter().any(|p| {
+        matches!(
+            p.props.outline_level,
+            Some(OutlineLevel::Heading {
+                source: LevelSource::Sprm,
+                ..
+            })
+        )
+    });
     if !paragraphs.is_empty() {
         walk_paragraphs(paragraphs, has_structured_headings, &mut elements, doc.list_formatting());
     } else {
@@ -605,7 +617,7 @@ fn walk_paragraphs(
         } else if p.props.f_in_table {
             flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
             table.add_cell_paragraph(p);
-        } else if let Some(lvl) = p.props.outline_level {
+        } else if let Some(OutlineLevel::Heading { level, .. }) = p.props.outline_level {
             // Outline level wins over list membership, exactly like the
             // DOCX converter: Word's multilevel-list "Heading" gallery
             // attaches an ilfo to the heading styles themselves, so a
@@ -615,7 +627,7 @@ fn walk_paragraphs(
             // the IR at all.
             table.flush(elements);
             flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
-            emit_heading(&p.text, lvl + 1, elements, &p.hyperlinks, &p.chp_runs);
+            emit_heading(&p.text, level + 1, elements, &p.hyperlinks, &p.chp_runs);
         } else if is_doc_list_item(p.props.ilfo) {
             // List membership is keyed on `ilfo` (sprmPIlfo, `0x460B`), not on
             // `ilvl`: per [MS-DOC] §2.4.6.3 a paragraph is a list item only when
@@ -629,7 +641,15 @@ fn walk_paragraphs(
         } else {
             table.flush(elements);
             flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
-            if has_structured_headings {
+            // The walk above already routed every `Heading` (SPRM or style) to
+            // `emit_heading`, so `outline_level` here is only `BodyText` or
+            // `None`. A paragraph that explicitly says it is body text (even
+            // when its style is a heading) and one that only resolved a level
+            // from a style both take the paragraph branch: `has_structured_headings`
+            // keeps the line-shape guess switched off without inventing a heading.
+            if matches!(p.props.outline_level, Some(OutlineLevel::BodyText))
+                || (p.props.outline_level.is_none() && has_structured_headings)
+            {
                 elements.push(Element::Paragraph(Paragraph {
                     content: inline_content_for(&p.text, &p.hyperlinks, &p.chp_runs),
                     tabs: p.props.tabs.clone(),
@@ -869,7 +889,7 @@ fn emit_heading(
     // formatting inside the heading is kept.
     let content = inline_content_for(trimmed, &hyperlinks, &chp_runs);
     elements.push(Element::Heading(Heading {
-        level: level.clamp(1, 6),
+        level: level.clamp(1, MAX_HEADING_DEPTH),
         content,
         ..Default::default()
     }));
@@ -1355,8 +1375,11 @@ mod tests {
     fn test_numbered_heading_wins_over_list_membership() {
         let props = PapProps {
             ilvl: Some(0),
-            ilfo: Some(1),          // valid 1-based list index
-            outline_level: Some(0), // Heading 1
+            ilfo: Some(1), // valid 1-based list index
+            outline_level: Some(OutlineLevel::Heading {
+                level: 0,
+                source: LevelSource::Sprm,
+            }), // Heading 1
             ..PapProps::default()
         };
         let p = para("1. Introduction", props);
@@ -1604,6 +1627,115 @@ mod tests {
         let text = ir.plain_text();
         assert!(text.contains("first cell"), "{text}");
         assert!(text.contains("last paragraph"), "{text}");
+    }
+    /// A paragraph inside a table whose style resolves to a heading must stay a
+    /// table cell. `walk_paragraphs` routes table paragraphs before `emit_prose`,
+    /// so a styled heading can neither leak into the table structure nor escape
+    /// it as a top-level `Heading`.
+    ///
+    /// Note this guards the *routing* (pre-existing) as well as the styled
+    /// heading branch: without the final contrast below it would pass even with
+    /// the branch deleted, which is how it was first (wrongly) revert-checked.
+    #[test]
+    fn test_styled_heading_inside_table_stays_a_cell() {
+        let mark = DocParagraph {
+            text: String::new(),
+            terminator: '\r',
+            props: PapProps {
+                is_table_trailing_mark: true,
+                itap: 1,
+                outline_level: Some(OutlineLevel::Heading {
+                    level: 2,
+                    source: LevelSource::Style,
+                }),
+                ..PapProps::default()
+            },
+            hyperlinks: Vec::new(),
+            chp_runs: Vec::new(),
+        };
+        let cell = DocParagraph {
+            text: "cell text".into(),
+            terminator: '\u{7}', // closes the cell
+            props: PapProps {
+                f_in_table: true,
+                outline_level: Some(OutlineLevel::Heading {
+                    level: 2,
+                    source: LevelSource::Style,
+                }),
+                ..PapProps::default()
+            },
+            hyperlinks: Vec::new(),
+            chp_runs: Vec::new(),
+        };
+        let paragraphs = [mark.clone(), cell.clone(), mark];
+        let mut els = Vec::new();
+        walk_paragraphs(&paragraphs, true, &mut els, &ListFormatting::default());
+        assert!(
+            els.iter().any(|e| matches!(e, Element::Table(_))),
+            "the cell must still be emitted inside a table"
+        );
+        assert!(
+            !els.iter().any(|e| matches!(e, Element::Heading(_))),
+            "a styled heading inside a table must not become a Heading"
+        );
+
+        // Contrast, so the assertions above cannot pass merely because the
+        // level is ignored: the same paragraph outside a table must produce a
+        // Heading. It carries `outline_level`, so `emit_heading` handles it
+        // whatever the text looks like — what the contrast pins is the table
+        // routing above, not the line-shape guess.
+        let mut prose = cell;
+        prose.props.f_in_table = false;
+        prose.terminator = '\r';
+        prose.text = "cell text.".into();
+        let mut els = Vec::new();
+        walk_paragraphs(&[prose], true, &mut els, &ListFormatting::default());
+        assert!(
+            els.iter().any(|e| matches!(e, Element::Heading(_))),
+            "outside a table the same styled paragraph must emit a Heading"
+        );
+    }
+
+    /// A row-terminator paragraph that also carries a heading style must end the
+    /// row, not emit a `Heading` into the element stream.
+    #[test]
+    fn test_styled_heading_on_row_terminator_is_not_a_heading() {
+        let row = DocParagraph {
+            // A row terminator can carry the trailing cell's text; keeping it
+            // non-empty is what makes this test meaningful — an empty text
+            // would be dropped by `emit_prose` whether or not the routing is
+            // correct, so the test could not tell the two apart.
+            text: "row text.".into(),
+            terminator: '\r',
+            props: PapProps {
+                is_table_trailing_mark: true,
+                itap: 1,
+                outline_level: Some(OutlineLevel::Heading {
+                    level: 1,
+                    source: LevelSource::Style,
+                }),
+                ..PapProps::default()
+            },
+            hyperlinks: Vec::new(),
+            chp_runs: Vec::new(),
+        };
+        let mut els = Vec::new();
+        walk_paragraphs(std::slice::from_ref(&row), true, &mut els, &ListFormatting::default());
+        assert!(
+            !els.iter().any(|e| matches!(e, Element::Heading(_))),
+            "a row-terminator paragraph must end a row, not emit a Heading"
+        );
+        // Contrast: the same paragraph as ordinary prose must emit a Heading.
+        // It carries `outline_level`, so this pins that being a row terminator
+        // — not the text shape — is what suppressed the heading above.
+        let mut prose = row;
+        prose.props.is_table_trailing_mark = false;
+        let mut els = Vec::new();
+        walk_paragraphs(&[prose], true, &mut els, &ListFormatting::default());
+        assert!(
+            els.iter().any(|e| matches!(e, Element::Heading(_))),
+            "as ordinary prose the same paragraph must emit a Heading"
+        );
     }
 
     /// Build a single-column `PendingRow` whose cell carries the given `rgf`

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`.doc` heading levels come from the style sheet ([#132](https://github.com/yfedoseev/office_oxide/issues/132)).** A paragraph whose style is a built-in `Heading 1`–`Heading 9`, or a user-defined `Heading N`, now renders at that level. Previously the level came from a line-shape guess that could only ever produce 1 or 2, and a heading that was not ALL-CAPS was missed entirely. On a 351-file corpus this resolves a real level for **163 headings across 35 files** that no earlier release could level; no document loses a heading. The guess is unchanged for paragraphs with no styled or explicit level.
+
 ## [0.1.12] - 2026-09-21
 
 > Read-path fidelity across all six formats, and the first real fidelity work on the legacy binaries. 141 issues closed, every dependency at its latest release, and a corpus verification that compares against independent readers, not just the previous version.
