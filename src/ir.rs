@@ -1653,6 +1653,11 @@ pub struct Image {
     /// navigate" shapes carry their entire purpose here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hyperlink: Option<String>,
+    /// Where a *linked* image's bytes live — the external target of a
+    /// picture that references its image instead of embedding it
+    /// (DrawingML `<a:blip r:link>`). Usually a URL; `data` is then `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
 }
 
 #[cfg(test)]

@@ -1735,8 +1735,14 @@ impl XlsxWriter {
 /// `Writer` handles this automatically for `Event::Text`/attribute
 /// values via its own API, but the VML builder below writes some
 /// content as raw string interpolation, so text needs escaping by hand.
+///
+/// Characters XML 1.0 cannot represent at all (C0 controls other than tab,
+/// LF, CR) are dropped first, as everywhere else in the writers
+/// (`sanitize_xml_text`); left in, they made the part non-well-formed
+/// while `save()` returned Ok.
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
+    crate::core::xml::sanitize_xml_text(s)
+        .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }

@@ -422,7 +422,7 @@ impl RelationshipsBuilder {
             let mut elem = BytesStart::new("Relationship");
             elem.push_attribute(("Id", rel.id.as_str()));
             elem.push_attribute(("Type", rel.rel_type.as_str()));
-            elem.push_attribute(("Target", rel.target.as_str()));
+            elem.push_attribute(("Target", encode_target_controls(&rel.target).as_ref()));
             if rel.target_mode == TargetMode::External {
                 elem.push_attribute(("TargetMode", "External"));
             }
@@ -435,6 +435,27 @@ impl RelationshipsBuilder {
 
         writer.into_inner()
     }
+}
+
+/// Percent-encode the characters a relationship `Target` cannot hold as
+/// XML: C0 controls (other than tab, LF, CR) have no representation in
+/// XML 1.0, and a URI must percent-encode controls anyway (RFC 3986 §2.1),
+/// so encoding them keeps the target meaningful where deleting them would
+/// silently change it.
+fn encode_target_controls(target: &str) -> std::borrow::Cow<'_, str> {
+    let illegal = |c: char| (c as u32) < 0x20 && !matches!(c, '\t' | '\n' | '\r');
+    if !target.chars().any(illegal) {
+        return std::borrow::Cow::Borrowed(target);
+    }
+    let mut out = String::with_capacity(target.len() + 8);
+    for c in target.chars() {
+        if illegal(c) {
+            out.push_str(&format!("%{:02X}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 impl Default for RelationshipsBuilder {

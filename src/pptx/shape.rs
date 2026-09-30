@@ -55,6 +55,56 @@ pub struct PictureShape {
     pub format: Option<String>,
     /// Click-action hyperlink from `p:cNvPr > a:hlinkClick`.
     pub hyperlink: Option<HyperlinkInfo>,
+    /// Target of a *linked* picture — `<a:blip r:link="rIdN"/>`, whose
+    /// relationship points outside the package (usually a URL). The image
+    /// bytes are not in the file; this is where they live.
+    pub link_target: Option<String>,
+    /// The audio or video clip this picture stands for, when the picture is
+    /// the poster frame of a media shape.
+    pub media: Option<MediaReference>,
+}
+
+/// An audio or video clip referenced from a picture shape's `<p:nvPr>`
+/// (`a:videoFile`/`a:audioFile`/… ECMA-376 Part 1 §20.1.3, or the embedded
+/// `p14:media` extension).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaReference {
+    /// Audio or video.
+    pub kind: MediaKind,
+    /// The clip's location: a URL when `external`, otherwise the resolved
+    /// part name inside the package (e.g. `/ppt/media/media1.mp4`).
+    pub target: String,
+    /// Whether the clip lives outside the package.
+    pub external: bool,
+}
+
+/// Kind of a [`MediaReference`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    /// `a:audioFile`, `a:wavAudioFile`, `a:audioCd`.
+    Audio,
+    /// `a:videoFile`, `a:quickTimeFile`.
+    Video,
+    /// `p14:media` without a declared audio/video element.
+    Unknown,
+}
+
+/// An embedded or linked OLE object (`<p:oleObj>`, ECMA-376 Part 1
+/// §19.3.2.4) — a spreadsheet, document or other object PowerPoint shows
+/// as a preview picture.
+#[derive(Debug, Clone)]
+pub struct OleObject {
+    /// The object's ProgID, e.g. `Excel.Sheet.12`.
+    pub prog_id: Option<String>,
+    /// The object's display name (`name` attribute).
+    pub name: Option<String>,
+    /// Relationship id of the embedded object part (or link).
+    pub rel_id: Option<String>,
+    /// Bytes of the preview picture PowerPoint draws in place of the
+    /// object, when the file carries one.
+    pub preview_data: Option<Vec<u8>>,
+    /// Format of `preview_data` (e.g. `"png"`, `"emf"`).
+    pub preview_format: Option<String>,
 }
 
 /// A group of child shapes (`<p:grpSp>`).
@@ -88,11 +138,15 @@ pub struct GraphicFrame {
 pub enum GraphicContent {
     /// A DrawingML table.
     Table(Table),
-    /// Flattened text from a graphic whose structure we do not model —
-    /// a SmartArt diagram or an embedded chart. The graphic is not drawn,
-    /// but its words are real document content and used to be dropped
-    /// entirely: a deck built out of SmartArt extracted as empty.
+    /// Flattened text from a graphic whose structure we do not model: a
+    /// SmartArt diagram (one line per node paragraph, read from its
+    /// `ppt/diagrams/dataN.xml` data part), an embedded chart (read from
+    /// its `ppt/charts/chartN.xml` part), or the inline `<a:t>` text of an
+    /// unrecognised graphic. The graphic is not drawn, but its words are
+    /// real document content.
     Text(Vec<String>),
+    /// An embedded or linked OLE object and its preview picture.
+    OleObject(OleObject),
     /// Unsupported or unrecognised graphic type.
     Unknown,
 }
@@ -154,10 +208,46 @@ pub struct TextParagraph {
     /// attribute is absent (renderer-default left alignment).
     pub alignment: Option<crate::ir::ParagraphAlignment>,
     /// Space before the paragraph, in 100ths of a point — read from
-    /// `<a:pPr><a:spcBef><a:spcPts val="…"/></a:spcBef></a:pPr>`.
+    /// `<a:pPr><a:spcBef><a:spcPts val="…"/></a:spcBef></a:pPr>`. The
+    /// percent form is in [`Self::space_before`].
     pub space_before_hundredths_pt: Option<u32>,
+    /// Space before the paragraph in either form (`<a:spcBef>`).
+    pub space_before: Option<TextSpacing>,
+    /// Space after the paragraph (`<a:spcAft>`).
+    pub space_after: Option<TextSpacing>,
+    /// Line spacing (`<a:lnSpc>`).
+    pub line_spacing: Option<TextSpacing>,
+    /// Left margin in EMU (`<a:pPr marL>`).
+    pub margin_left_emu: Option<i64>,
+    /// Right margin in EMU (`<a:pPr marR>`).
+    pub margin_right_emu: Option<i64>,
+    /// First-line indent in EMU, negative for a hanging indent
+    /// (`<a:pPr indent>`).
+    pub indent_emu: Option<i64>,
+    /// Custom tab stops (`<a:tabLst>`).
+    pub tab_stops: Vec<TabStop>,
     /// Inline content items in this paragraph.
     pub content: Vec<TextContent>,
+}
+
+/// A DrawingML spacing value (`CT_TextSpacing`, ECMA-376 Part 1
+/// §21.1.2.2.10/.11/.12/.18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextSpacing {
+    /// `<a:spcPts val>` — hundredths of a point.
+    Points(u32),
+    /// `<a:spcPct val>` — thousandths of a percent of the line
+    /// (`100000` = single spacing).
+    Percent(u32),
+}
+
+/// A custom tab stop (`<a:tab pos algn>`, ECMA-376 Part 1 §21.1.2.2.13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabStop {
+    /// Position in EMU from the text box's left edge.
+    pub position_emu: i64,
+    /// `l`, `ctr`, `r` or `dec` (`None` = left).
+    pub alignment: Option<String>,
 }
 
 /// How a paragraph's bullet marker is produced.
@@ -173,6 +263,12 @@ pub enum BulletStyle {
         scheme: String,
         /// `startAt`, when the numbering does not begin at 1.
         start_at: Option<u32>,
+    },
+    /// `<a:buBlip><a:blip r:embed="rIdN"/></a:buBlip>` — an unordered
+    /// marker drawn as a picture (ECMA-376 Part 1 §21.1.2.4.2).
+    Picture {
+        /// Relationship id of the marker image.
+        rel_id: Option<String>,
     },
 }
 

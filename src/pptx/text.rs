@@ -9,6 +9,10 @@ impl PptxDocument {
     ///
     /// Shapes are spatially sorted (top-to-bottom, left-to-right) per slide.
     /// Slides are separated by `\n\n---\n\n`.
+    ///
+    /// Only each slide's own shapes are included. Text placed directly on
+    /// a slide layout or master (outside placeholders) is not — the same
+    /// default as python-pptx; see [`Self::static_text_for_slide`].
     pub fn plain_text(&self) -> String {
         let mut parts = Vec::new();
         for (i, _) in self.slides.iter().enumerate() {
@@ -24,6 +28,9 @@ impl PptxDocument {
     /// Extract plain text from a single slide by index.
     pub fn slide_plain_text(&self, index: usize) -> Option<String> {
         let slide = self.slides.get(index)?;
+        if let Some(ref err) = slide.parse_error {
+            return Some(unreadable_slide_notice(&slide.name, err));
+        }
         let mut entries = Vec::new();
         collect_text_entries(&slide.shapes, &mut entries);
         entries.sort_by(|a, b| spatial_cmp(&a.0, &b.0));
@@ -71,6 +78,13 @@ impl PptxDocument {
     /// Convert a single slide to markdown by index.
     pub fn slide_to_markdown(&self, index: usize) -> Option<String> {
         let slide = self.slides.get(index)?;
+        if let Some(ref err) = slide.parse_error {
+            return Some(format!(
+                "## Slide {}\n\n{}",
+                index + 1,
+                unreadable_slide_notice(&slide.name, err)
+            ));
+        }
         let mut result = String::new();
 
         // Slide heading: use title placeholder text or "Slide N"
@@ -181,11 +195,18 @@ fn collect_text_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePositio
                         entries.push((gf.position.clone(), text));
                     }
                 },
-                GraphicContent::Unknown => {},
+                // An OLE object has no text; its preview is a picture.
+                GraphicContent::OleObject(_) | GraphicContent::Unknown => {},
             },
             Shape::Connector(_) => {},
         }
     }
+}
+
+/// The text standing in for a slide whose part could not be read — the
+/// same notice on every rendering surface.
+pub(crate) fn unreadable_slide_notice(part: &str, err: &str) -> String {
+    format!("[unreadable slide {part:?}: {err}]")
 }
 
 /// `Comment (Author)` — the label the IR's endnote carries as its marker.
@@ -316,13 +337,19 @@ fn collect_markdown_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePos
                 }
             },
             Shape::Picture(pic) => {
-                if let Some(ref alt) = pic.alt_text {
-                    if !alt.is_empty() {
-                        entries.push((
-                            pic.position.clone(),
-                            format!("![{}]()", crate::core::markdown::image_alt(alt)),
-                        ));
-                    }
+                let alt = pic.alt_text.as_deref().unwrap_or("");
+                // A linked picture has a real, addressable source.
+                let src = pic
+                    .link_target
+                    .as_deref()
+                    .and_then(crate::ir_render::safe_url)
+                    .map(|u| crate::ir_render::escape_markdown_url(&u))
+                    .unwrap_or_default();
+                if !alt.is_empty() || !src.is_empty() {
+                    entries.push((
+                        pic.position.clone(),
+                        format!("![{}]({src})", crate::core::markdown::image_alt(alt)),
+                    ));
                 }
             },
             Shape::Group(grp) => {
@@ -341,7 +368,8 @@ fn collect_markdown_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePos
                         entries.push((gf.position.clone(), md));
                     }
                 },
-                GraphicContent::Unknown => {},
+                // An OLE object has no text; its preview is a picture.
+                GraphicContent::OleObject(_) | GraphicContent::Unknown => {},
             },
             Shape::Connector(_) => {},
         }
@@ -533,6 +561,9 @@ mod tests {
             slides,
             theme: None,
             embedded_fonts: Vec::new(),
+            unreadable_parts: Vec::new(),
+            layouts: Vec::new(),
+            masters: Vec::new(),
         }
     }
 

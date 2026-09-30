@@ -1042,29 +1042,6 @@ pub(crate) const PPTX_THEMATIC_BREAK_MARKER: &str = "\u{2500}\u{2500}\u{2500}\u{
 fn pptx_notes_body_items(notes: &[Element]) -> Vec<crate::pptx::write::BodyItem> {
     use crate::pptx::write::BodyItem;
 
-    fn flatten_list(
-        list: &crate::ir::List,
-        level: u8,
-        out: &mut Vec<(u8, Vec<crate::pptx::write::Run>)>,
-    ) {
-        for item in &list.items {
-            let runs: Vec<crate::pptx::write::Run> = item
-                .content
-                .iter()
-                .flat_map(|e| match e {
-                    Element::Paragraph(p) => inline_to_pptx_runs(&p.content),
-                    _ => Vec::new(),
-                })
-                .collect();
-            if !runs.is_empty() {
-                out.push((level, runs));
-            }
-            if let Some(ref nested) = item.nested {
-                flatten_list(nested, level.saturating_add(1), out);
-            }
-        }
-    }
-
     let mut items = Vec::new();
     for elem in notes {
         match elem {
@@ -1074,7 +1051,7 @@ fn pptx_notes_body_items(notes: &[Element]) -> Vec<crate::pptx::write::BodyItem>
             },
             Element::List(l) => {
                 let mut bullets = Vec::new();
-                flatten_list(l, l.level, &mut bullets);
+                flatten_ir_list_for_pptx(l, l.level, &mut bullets);
                 if !bullets.is_empty() {
                     items.push(BodyItem::BulletList(bullets));
                 }
@@ -1085,7 +1062,58 @@ fn pptx_notes_body_items(notes: &[Element]) -> Vec<crate::pptx::write::BodyItem>
     items
 }
 
+/// Flatten an IR list tree into PPTX list paragraphs: `(level, runs,
+/// marker)`, where each nested list keeps its own marker — an ordered list
+/// is written with `<a:buAutoNum>` in the scheme of its `ListStyle`, not
+/// as bullets.
+fn flatten_ir_list_for_pptx(
+    list: &crate::ir::List,
+    level: u8,
+    out: &mut Vec<(u8, Vec<crate::pptx::write::Run>, crate::pptx::write::ListMarker)>,
+) {
+    use crate::pptx::write::ListMarker;
+    let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+        log::warn!("create: element nesting exceeds the depth limit; subtree skipped");
+        return;
+    };
+    let marker = if list.ordered {
+        ListMarker::AutoNum {
+            // ST_TextAutonumberScheme (ECMA-376 Part 1 §20.1.10.61).
+            scheme: match list.style {
+                Some(ListStyle::LowerAlpha) => "alphaLcPeriod",
+                Some(ListStyle::UpperAlpha) => "alphaUcPeriod",
+                Some(ListStyle::LowerRoman) => "romanLcPeriod",
+                Some(ListStyle::UpperRoman) => "romanUcPeriod",
+                _ => "arabicPeriod",
+            },
+            start_at: list.start_number,
+        }
+    } else {
+        ListMarker::Bullet
+    };
+    for item in &list.items {
+        let runs: Vec<crate::pptx::write::Run> = item
+            .content
+            .iter()
+            .flat_map(|e| match e {
+                Element::Paragraph(p) => inline_to_pptx_runs(&p.content),
+                _ => Vec::new(),
+            })
+            .collect();
+        if !runs.is_empty() {
+            out.push((level, runs, marker));
+        }
+        if let Some(ref nested) = item.nested {
+            flatten_ir_list_for_pptx(nested, level.saturating_add(1), out);
+        }
+    }
+}
+
 fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) {
+    let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+        log::warn!("create: element nesting exceeds the depth limit; subtree skipped");
+        return;
+    };
     match elem {
         Element::ThematicBreak => {
             // Encode via the marker text + center alignment. The
@@ -1128,31 +1156,9 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
             // Each item's runs (not just its plain text) now carry
             // through, so a hyperlink or bold/italic/color on a list
             // item's text survives the write.
-            fn flatten(
-                list: &crate::ir::List,
-                level: u8,
-                out: &mut Vec<(u8, Vec<crate::pptx::write::Run>)>,
-            ) {
-                for item in &list.items {
-                    let runs: Vec<crate::pptx::write::Run> = item
-                        .content
-                        .iter()
-                        .flat_map(|e| match e {
-                            Element::Paragraph(p) => inline_to_pptx_runs(&p.content),
-                            _ => Vec::new(),
-                        })
-                        .collect();
-                    if !runs.is_empty() {
-                        out.push((level, runs));
-                    }
-                    if let Some(ref nested) = item.nested {
-                        flatten(nested, level.saturating_add(1), out);
-                    }
-                }
-            }
-            let mut items: Vec<(u8, Vec<crate::pptx::write::Run>)> = Vec::new();
-            flatten(l, l.level, &mut items);
-            slide.add_nested_bullet_list(items);
+            let mut items = Vec::new();
+            flatten_ir_list_for_pptx(l, l.level, &mut items);
+            slide.add_marked_list(items);
         },
         Element::Table(t) => {
             // A real a:tbl, not tab-joined text: the previous form lost the
@@ -1698,6 +1704,10 @@ fn parse_xlsx_comment_marker(marker: Option<&str>) -> Option<(String, Option<Str
 }
 
 fn xlsx_text_rows(elem: &Element, out: &mut Vec<String>) {
+    let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+        log::warn!("create: element nesting exceeds the depth limit; subtree skipped");
+        return;
+    };
     match elem {
         Element::Paragraph(p) => {
             let t = inline_to_text(&p.content);
@@ -1713,6 +1723,10 @@ fn xlsx_text_rows(elem: &Element, out: &mut Vec<String>) {
         },
         Element::List(l) => {
             fn walk(list: &crate::ir::List, out: &mut Vec<String>) {
+                let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+                    log::warn!("create: element nesting exceeds the depth limit; subtree skipped");
+                    return;
+                };
                 for item in &list.items {
                     for e in &item.content {
                         xlsx_text_rows(e, out);

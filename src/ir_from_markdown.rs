@@ -299,6 +299,7 @@ impl<'a> MarkdownParser<'a> {
     /// nested-list handling in the writers.
     fn parse_list_at(&mut self, ordered: bool, base_indent: usize) -> List {
         let mut items: Vec<ListItem> = Vec::new();
+        let mut start_number = None;
         while let Some(line) = self.peek() {
             let is_marker = if ordered {
                 is_ordered_list_marker(line)
@@ -324,6 +325,11 @@ impl<'a> MarkdownParser<'a> {
                 break;
             }
             self.advance();
+            // CommonMark §5.2: an ordered list starts at its first item's
+            // number.
+            if ordered && items.is_empty() {
+                start_number = ordered_marker_number(line).filter(|&n| n != 1);
+            }
             let content_str = strip_list_marker(line);
             items.push(ListItem {
                 content: vec![Element::Paragraph(Paragraph {
@@ -336,9 +342,17 @@ impl<'a> MarkdownParser<'a> {
         List {
             ordered,
             items,
+            start_number,
             ..Default::default()
         }
     }
+}
+
+/// The number of an ordered-list marker line (`3. a` → 3).
+fn ordered_marker_number(line: &str) -> Option<u32> {
+    let t = line.trim_start();
+    let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+    t[..digits].parse().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -471,8 +485,19 @@ fn parse_atx_heading(line: &str) -> Option<(u8, String)> {
     }
     let rest = &trimmed[hashes..];
     if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t') {
-        let text = rest.trim().trim_end_matches('#').trim().to_string();
-        Some((hashes as u8, text))
+        // CommonMark §4.2: an optional closing run of `#` counts only when
+        // it is the whole content or a space precedes it — the `#` of
+        // `C#` is text.
+        let content = rest.trim();
+        let open = content.trim_end_matches('#');
+        let text = if open.is_empty() {
+            ""
+        } else if open.ends_with([' ', '\t']) {
+            open.trim_end()
+        } else {
+            content
+        };
+        Some((hashes as u8, text.to_string()))
     } else {
         None
     }
@@ -683,6 +708,49 @@ mod tests {
             .expect("first item should have a nested sub-list");
         assert_eq!(nested.items.len(), 2);
         assert!(list.items[1].nested.is_none());
+    }
+
+    /// CommonMark §4.2: a closing `#` sequence is stripped only when a
+    /// space precedes it. `trim_end_matches('#')` also ate the `#` of
+    /// `C#`.
+    #[test]
+    fn test_atx_heading_keeps_a_trailing_hash_that_is_part_of_the_text() {
+        for (line, want) in [
+            ("# Learn C#", "Learn C#"),
+            ("## F# and C#", "F# and C#"),
+            ("# Title ##", "Title"),
+            ("# Title #   ", "Title"),
+            ("### ###", ""),
+            ("#", ""),
+            ("# #hashtag", "#hashtag"),
+        ] {
+            assert_eq!(parse_atx_heading(line).map(|(_, t)| t).as_deref(), Some(want), "{line:?}");
+        }
+    }
+
+    /// An ordered list's first number is its start (CommonMark §5.2);
+    /// `3. a` was written as a list starting at 1.
+    #[test]
+    fn test_ordered_list_start_number_is_kept() {
+        let ir =
+            DocumentIR::from_markdown("3. a\n4. b\n\n- x\n  7) nested\n", DocumentFormat::Docx);
+        let lists: Vec<&List> = ir.sections[0]
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                Element::List(l) => Some(l),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lists[0].start_number, Some(3));
+        let nested = lists[1].items[0].nested.as_ref().expect("nested list");
+        assert_eq!(nested.start_number, Some(7));
+        // A list starting at 1 keeps the default.
+        let ir = DocumentIR::from_markdown("1. a\n", DocumentFormat::Docx);
+        let Element::List(ref l) = ir.sections[0].elements[0] else {
+            panic!()
+        };
+        assert_eq!(l.start_number, None);
     }
 
     #[test]
