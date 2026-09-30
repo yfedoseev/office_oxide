@@ -1348,15 +1348,14 @@ fn parse_hlink_click(
     let tooltip = xml::optional_attr_str(e, "tooltip")?.map(|v| v.into_owned());
     let action = xml::optional_attr_str(e, "action")?;
 
-    let target = if let Some(ref r_id) = r_id {
-        if let Some(rel) = rels.get_by_id(r_id) {
-            if rel.target_mode == TargetMode::External {
-                HyperlinkTarget::External(rel.target.clone())
-            } else {
-                HyperlinkTarget::Internal(rel.target.clone())
-            }
+    // A non-empty id that names no relationship (dangling after an edit)
+    // falls through to `action` as well, when there is one.
+    let resolved = r_id.as_deref().and_then(|id| rels.get_by_id(id));
+    let target = if let Some(rel) = resolved {
+        if rel.target_mode == TargetMode::External {
+            HyperlinkTarget::External(rel.target.clone())
         } else {
-            return Ok(None);
+            HyperlinkTarget::Internal(rel.target.clone())
         }
     } else if let Some(ref action) = action {
         // Internal action like ppaction://hlinksldjump
@@ -1940,6 +1939,39 @@ mod tests {
             HyperlinkTarget::Internal(action) => assert_eq!(action, "ppaction://noaction"),
             other => panic!("expected an Internal action target, got {other:?}"),
         }
+    }
+
+    /// A non-empty `r:id` that names no relationship (a dangling id left by
+    /// an editor) discarded the click action outright, even when the
+    /// element's own `action` attribute says what the click does.
+    #[test]
+    fn test_unresolvable_hlink_r_id_falls_back_to_action() {
+        let slide = parse_with_rels(
+            r#"<p:sp><p:nvSpPr>
+                 <p:cNvPr id="7" name="Button"><a:hlinkClick r:id="rId99" action="ppaction://hlinkshowjump?jump=nextslide"/></p:cNvPr>
+                 <p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr/></p:sp>"#,
+            None,
+        );
+        let Shape::AutoShape(ref auto) = slide.shapes[0] else {
+            panic!("expected auto shape");
+        };
+        match auto.hyperlink.as_ref().map(|h| &h.target) {
+            Some(HyperlinkTarget::Internal(a)) => {
+                assert_eq!(a, "ppaction://hlinkshowjump?jump=nextslide")
+            },
+            other => panic!("expected the action fallback, got {other:?}"),
+        }
+        // Without an action there is nothing to fall back to.
+        let slide = parse_with_rels(
+            r#"<p:sp><p:nvSpPr>
+                 <p:cNvPr id="7" name="Button"><a:hlinkClick r:id="rId99"/></p:cNvPr>
+                 <p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr/></p:sp>"#,
+            None,
+        );
+        let Shape::AutoShape(ref auto) = slide.shapes[0] else {
+            panic!("expected auto shape");
+        };
+        assert!(auto.hyperlink.is_none());
     }
 
     /// The slide XML only ever holds `<c:chart r:id="…"/>` — a reference,
