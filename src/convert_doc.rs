@@ -576,10 +576,8 @@ fn count_grid_edges(centers: &[i16], col: usize, grid: &[i32]) -> u32 {
 fn is_doc_list_item(ilfo: Option<i16>) -> bool {
     match ilfo {
         None | Some(0) | Some(-2047) => false, // 0x0000 / 0xF801: not in a list
-        // TODO(ilfo-negated): 0xF802..=0xFFFF (i16 -2046..=-1) are list items
-        // whose `ilfo` is the negation of a 1-based index; resolve to the
-        // positive index when list-id grouping is implemented. Until then they
-        // must still be emitted as list items, not dropped to prose.
+        // 0xF802..=0xFFFF (i16 -2046..=-1): the negation of a 1-based index,
+        // still a list item; `ListFormatting::level_for` resolves it.
         Some(v) if (1..=0x07FE).contains(&v) => true, // 0x0001..0x07FE normal
         Some(v) if (-0x07FE..=-1).contains(&v) => true, // 0xF802..0xFFFF negated
         _ => false,                                   // 0x07FF and other non-spec
@@ -1403,7 +1401,7 @@ mod tests {
     }
 
     /// `0xF802`–`0xFFFF` is the negation of a 1-based index and is still a list
-    /// item (see TODO(ilfo-negated)); it must not be dropped to prose.
+    /// item; it must not be dropped to prose.
     #[test]
     fn test_ilfo_negated_band_is_list() {
         let props = PapProps {
@@ -1418,6 +1416,39 @@ mod tests {
             els.iter().any(|e| matches!(e, Element::List(_))),
             "0xF802 (negated index) must still be a list item"
         );
+    }
+
+    /// A negated `ilfo` ([MS-DOC] §2.6.2 `sprmPIlfo`: `0xF802`–`0xFFFF` is
+    /// the negation of a 1-based `PlfLfo` index) resolves to the same list
+    /// as its positive form. It was passed on negative and resolved to
+    /// nothing: a bullet with no start number even when the LFO said
+    /// otherwise.
+    #[test]
+    fn test_negated_ilfo_resolves_through_list_formatting() {
+        let list_formatting = crate::doc::ListFormatting::from_parts(
+            vec![(
+                7,
+                vec![crate::doc::ListLevel {
+                    start_at: 3,
+                    nfc: 0x00,
+                }],
+            )],
+            vec![7],
+        );
+        let props = PapProps {
+            ilvl: Some(0),
+            ilfo: Some(-1), // 0xFFFF: negated index 1
+            ..PapProps::default()
+        };
+        let mut els = Vec::new();
+        walk_paragraphs(&[para("Item", props)], false, &mut els, &list_formatting);
+        let Element::List(list) = &els[0] else {
+            panic!("expected a List element, got {els:#?}");
+        };
+        assert!(list.ordered);
+        assert_eq!(list.start_number, Some(3));
+        // 0xF801 is still "not in a list".
+        assert!(list_formatting.level_for(-2047, 0).is_none());
     }
 
     /// A list run's `ilfo` must resolve through `PlfLfo`'s

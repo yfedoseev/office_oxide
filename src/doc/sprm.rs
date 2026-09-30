@@ -206,7 +206,7 @@ pub struct PapProps {
     /// *signed* `i16` [MS-DOC] specifies. `None` when the SPRM is absent
     /// (defaults to "not in a list"). Bands: `0`/`0xF801` = not in a list;
     /// `0x0001`–`0x07FE` = 1-based index; `0xF802`–`0xFFFF` = negated index
-    /// (still a list item — see TODO(ilfo-negated) in `convert_doc.rs`).
+    /// (still a list item, resolved by `ListFormatting::level_for`).
     pub ilfo: Option<i16>,
     /// Parsed row definition (`sprmTDefTable` operand) for row-terminator
     /// paragraphs. `None` when the paragraph is not a row mark or the TAP
