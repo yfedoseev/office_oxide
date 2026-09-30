@@ -225,3 +225,48 @@ fn test_xlsb_package_reads_through_the_unified_api() {
     assert_eq!(ir.sections.len(), 1);
     assert_eq!(ir.sections[0].title.as_deref(), Some("Binary"));
 }
+
+/// A Workbook stream whose sector chain ends before its declared size was
+/// read short with nothing in the IR to say so; `.doc` and `.ppt` already
+/// flag it. The workbook now reports the text as truncated and names the
+/// stream in `Metadata::warnings`.
+#[test]
+fn test_truncated_workbook_stream_marks_xls_text_truncated() {
+    let mut bytes = build_xls("Short");
+    let doc = Document::from_reader(Cursor::new(bytes.clone()), DocumentFormat::Xls).unwrap();
+    let ir = doc.to_ir();
+    assert!(!ir.metadata.text_truncated);
+    assert!(ir.metadata.warnings.is_empty(), "{:?}", ir.metadata.warnings);
+    // Directory entry 1 is "Workbook"; declare it 4 KiB longer than its chain.
+    let size_at = 512 + 128 + 0x78;
+    let size = u32::from_le_bytes(bytes[size_at..size_at + 4].try_into().unwrap());
+    bytes[size_at..size_at + 4].copy_from_slice(&(size + 4096).to_le_bytes());
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Xls).unwrap();
+    assert!(doc.plain_text().contains("Short"), "short data stays readable");
+    let ir = doc.to_ir();
+    assert!(ir.metadata.text_truncated);
+    assert!(
+        ir.metadata.warnings.iter().any(|w| w.contains("Workbook")),
+        "{:?}",
+        ir.metadata.warnings
+    );
+}
+
+/// The container's own structural warnings (header sector counts that
+/// disagree with the chains present) reach `Metadata::warnings` for
+/// `.xls` as they do for `.doc`/`.ppt`, without marking the text truncated.
+#[test]
+fn test_xls_container_warnings_reach_metadata() {
+    let mut bytes = build_xls("Cell");
+    // [MS-CFB] §2.2 header `Number of DIFAT Sectors` (offset 0x48): claim
+    // one although the DIFAT chain (0x44) is empty.
+    bytes[0x48..0x4C].copy_from_slice(&1u32.to_le_bytes());
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Xls).unwrap();
+    let ir = doc.to_ir();
+    assert!(!ir.metadata.text_truncated);
+    assert!(
+        ir.metadata.warnings.iter().any(|w| w.contains("DIFAT")),
+        "{:?}",
+        ir.metadata.warnings
+    );
+}
