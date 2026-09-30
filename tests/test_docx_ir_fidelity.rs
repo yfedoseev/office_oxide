@@ -244,6 +244,98 @@ fn test_run_underline_reaches_the_ir() {
     assert_eq!(first_span(para(&ir, 0)).underline, Some(UnderlineStyle::Double));
 }
 
+/// Write `ir` back out as a `.docx`.
+fn docx_bytes(ir: &DocumentIR) -> Vec<u8> {
+    let mut out = Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(ir, DocumentFormat::Docx, &mut out)
+        .expect("write");
+    out.into_inner()
+}
+
+fn spans(p: &Paragraph) -> Vec<&TextSpan> {
+    p.content
+        .iter()
+        .filter_map(|c| match c {
+            InlineContent::Text(s) => Some(s),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `w:rFonts` names four faces (ECMA-376 §17.3.2.26) and Word picks one
+/// per character: `w:ascii` for Basic Latin, `w:eastAsia` for CJK,
+/// `w:cs` for complex scripts (and for every character of a `w:rtl` or
+/// `w:cs` run), `w:hAnsi` for the rest. Complex-script text also takes
+/// its size from `w:szCs` (§17.3.2.39) and bold/italic from `w:bCs`/`w:iCs`
+/// (§17.3.2.2 / §17.3.2.17). Only `w:ascii`/`w:sz`/`w:b` were read, so
+/// CJK and Arabic runs reported the Latin face and size.
+#[test]
+fn test_run_fonts_and_sizes_follow_the_script_of_the_text() {
+    let rpr = r#"<w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Cambria" w:eastAsia="MS Mincho" w:cs="Arial"/>
+                 <w:b/><w:sz w:val="22"/><w:szCs w:val="28"/></w:rPr>"#;
+    let ir = Docx::new(&format!(
+        r#"<w:p><w:r>{rpr}<w:t>Tokyo</w:t></w:r></w:p>
+           <w:p><w:r>{rpr}<w:t>東京</w:t></w:r></w:p>
+           <w:p><w:r>{rpr}<w:t>مرحبا</w:t></w:r></w:p>
+           <w:p><w:r>{rpr}<w:t>café</w:t></w:r></w:p>
+           <w:p><w:r><w:rPr><w:rFonts w:ascii="Calibri" w:cs="Arial"/><w:bCs/><w:rtl/>
+               <w:sz w:val="22"/><w:szCs w:val="28"/></w:rPr><w:t>abc</w:t></w:r></w:p>
+           <w:p><w:r>{rpr}<w:t>東京 2024</w:t></w:r></w:p>"#
+    ))
+    .ir();
+    let latin = first_span(para(&ir, 0));
+    assert_eq!(latin.font_name.as_deref(), Some("Calibri"));
+    assert_eq!(latin.font_size_half_pt, Some(22));
+    assert!(latin.bold);
+
+    let cjk = first_span(para(&ir, 1));
+    assert_eq!(cjk.font_name.as_deref(), Some("MS Mincho"));
+    assert_eq!(cjk.font_size_half_pt, Some(22));
+    assert!(cjk.bold, "w:b applies to East Asian text");
+
+    let arabic = first_span(para(&ir, 2));
+    assert_eq!(arabic.font_name.as_deref(), Some("Arial"));
+    assert_eq!(arabic.font_size_half_pt, Some(28), "complex script takes w:szCs");
+    assert!(!arabic.bold, "w:b does not apply to complex script; w:bCs is absent");
+
+    let accented = spans(para(&ir, 3));
+    let faces: Vec<_> = accented
+        .iter()
+        .map(|s| (s.text.as_str(), s.font_name.as_deref()))
+        .collect();
+    assert_eq!(faces, [("caf", Some("Calibri")), ("é", Some("Cambria"))], "é is hAnsi");
+
+    let rtl = first_span(para(&ir, 4));
+    assert_eq!(rtl.font_name.as_deref(), Some("Arial"), "a w:rtl run is complex script");
+    assert_eq!(rtl.font_size_half_pt, Some(28));
+    assert!(rtl.bold, "w:bCs");
+
+    // A mixed run splits where the face changes, and loses no text.
+    let mixed = spans(para(&ir, 5));
+    let text: String = mixed.iter().map(|s| s.text.as_str()).collect();
+    assert_eq!(text, "東京 2024");
+    assert_eq!(mixed[0].font_name.as_deref(), Some("MS Mincho"));
+    assert_eq!(mixed.last().unwrap().font_name.as_deref(), Some("Calibri"));
+}
+
+#[test]
+fn test_complex_script_bold_and_size_survive_a_docx_round_trip() {
+    let ir = Docx::new(
+        r#"<w:p><w:r><w:rPr><w:b/><w:bCs/><w:i/><w:iCs/><w:sz w:val="30"/><w:szCs w:val="30"/></w:rPr>
+             <w:t>مرحبا</w:t></w:r></w:p>"#,
+    )
+    .ir();
+    let before = first_span(para(&ir, 0)).clone();
+    assert!(before.bold && before.italic);
+    let bytes = docx_bytes(&ir);
+    let again = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
+        .expect("reread")
+        .to_ir();
+    let after = first_span(para(&again, 0));
+    assert_eq!((after.bold, after.italic), (true, true));
+    assert_eq!(after.font_size_half_pt, Some(30));
+}
+
 #[test]
 fn test_run_caps_smallcaps_and_spacing_reach_the_ir() {
     let ir = Docx::new(

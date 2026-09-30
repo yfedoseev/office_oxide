@@ -516,9 +516,20 @@ impl RunStyle {
             },
             None => direct,
         };
+        // Complex-script text takes bold/italic from `w:bCs`/`w:iCs`, by
+        // the same run-level rule as `to_ir()` (`RunProperties::face_for`).
+        let (bold, italic) = rp.map_or((false, false), |rp| {
+            let face =
+                rp.face_for(rp.run_script_class(run.content.iter().filter_map(|rc| match rc {
+                    RunContent::Text(t) => Some(t.as_str()),
+                    RunContent::FormField(ff) => ff.display_text.as_deref(),
+                    _ => None,
+                })));
+            (face.bold, face.italic)
+        });
         Self {
-            bold: rp.and_then(|rp| rp.bold).unwrap_or(false),
-            italic: rp.and_then(|rp| rp.italic).unwrap_or(false),
+            bold,
+            italic,
             strike: rp.and_then(|rp| rp.strike.or(rp.dstrike)).unwrap_or(false),
             vertical_align: rp.and_then(|rp| rp.vertical_align),
         }

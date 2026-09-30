@@ -2334,13 +2334,22 @@ fn write_rpr_content(w: &mut Writer<Vec<u8>>, run: &Run) {
         elem.push_attribute(("w:eastAsia", name.as_str()));
         w.write_event(Event::Empty(elem)).expect("write rFonts");
     }
+    // `w:b`/`w:i` apply to non-complex-script characters only (ECMA-376
+    // §17.3.2.1 / §17.3.2.16); `w:bCs`/`w:iCs` (§17.3.2.2 / §17.3.2.17)
+    // carry the same toggle for complex-script text, as `w:szCs` already
+    // mirrors `w:sz` below. Without them bold Arabic or Hebrew text
+    // written here rendered regular in Word.
     if run.bold {
         w.write_event(Event::Empty(BytesStart::new("w:b")))
             .expect("write bold");
+        w.write_event(Event::Empty(BytesStart::new("w:bCs")))
+            .expect("write complex-script bold");
     }
     if run.italic {
         w.write_event(Event::Empty(BytesStart::new("w:i")))
             .expect("write italic");
+        w.write_event(Event::Empty(BytesStart::new("w:iCs")))
+            .expect("write complex-script italic");
     }
     if let Some(ref us) = run.underline_style {
         let val = underline_style_val(us);

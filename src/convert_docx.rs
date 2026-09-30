@@ -1127,46 +1127,44 @@ fn convert_run(
     if effective.and_then(|rp| rp.hidden).unwrap_or(false) {
         return;
     }
-    let bold = effective.and_then(|rp| rp.bold).unwrap_or(false);
-    let italic = effective.and_then(|rp| rp.italic).unwrap_or(false);
-    let strike = effective
-        .and_then(|rp| rp.strike.or(rp.dstrike))
-        .unwrap_or(false);
-    // `<w:sz w:val="N"/>` is already in half-points; IR uses the
-    // same encoding. See `crate::core::units::HalfPoint::from_word_sz`
-    // for the cross-format invariant (also: PPTX hundredths-pt,
-    // XLSX points-as-f32 must convert here).
-    let font_size_half_pt = effective.and_then(|rp| {
-        rp.font_size
-            .map(|hp| crate::core::units::HalfPoint::from_word_sz(hp.0).0)
-    });
-    // `<w:rFonts w:ascii="...">` carries the run's face name. Without
-    // forwarding it onto `TextSpan.font_name`, the IR→PDF renderer
-    // falls back to the page builder's default font (Helvetica) and
-    // every PDF→DOCX→PDF round-trip loses every typeface — even when
-    // the DOCX writer correctly embedded the source-PDF font program
-    // under `word/fonts/`.
-    let font_name = effective.and_then(|rp| rp.font_name.clone());
+    let no_properties;
+    let eff: &crate::docx::RunProperties = match effective {
+        Some(rp) => rp,
+        None => {
+            no_properties = crate::docx::RunProperties::default();
+            &no_properties
+        },
+    };
+    // `w:rFonts` names a face per script and complex-script text has its
+    // own size and weight (`w:szCs`, `w:bCs`, `w:iCs`); see
+    // `RunProperties::face_for`. Bold and italic are per run, taken from
+    // the script of its text; face and size may change inside a run, so
+    // each text item is split where they do.
+    let run_face =
+        eff.face_for(eff.run_script_class(run.content.iter().filter_map(|rc| match rc {
+            crate::docx::RunContent::Text(t) => Some(t.as_str()),
+            crate::docx::RunContent::FormField(ff) => ff.display_text.as_deref(),
+            _ => None,
+        })));
+    let bold = run_face.bold;
+    let italic = run_face.italic;
+    let strike = eff.strike.or(eff.dstrike).unwrap_or(false);
     // Propagate `<w:color w:val="RRGGBB"/>` so PDF→DOCX→PDF round-trips
-    // preserve coloured text (red "0" in `pdfs_pdfium/text_color.pdf`
-    // and the like). Theme / system / auto colours fall through to
-    // the renderer default for now — resolving them properly needs the
-    // document's `theme.xml`, which the current convert path doesn't
-    // thread in.
-    // Resolve `<w:color>` through the document theme. Matching only
-    // `ColorRef::Rgb` silently dropped every theme-coloured run — and the
-    // `w:val` fallback OOXML writes next to `w:themeColor` was discarded at
-    // parse time, so even a document with no theme part came out colourless.
-    let text_color = effective
-        .and_then(|rp| rp.color.as_ref())
+    // preserve coloured text. Resolve it through the document theme:
+    // matching only `ColorRef::Rgb` silently dropped every theme-coloured
+    // run — and the `w:val` fallback OOXML writes next to `w:themeColor`
+    // was discarded at parse time, so even a document with no theme part
+    // came out colourless.
+    let text_color = eff
+        .color
+        .as_ref()
         .and_then(|c| c.resolve_opt(theme))
         .map(|rgb| rgb.0);
     // Remaining `w:rPr` toggles. Half of `TextSpan`'s fields used to be
     // permanently empty for DOCX because these were parsed and then never
     // read; underline in particular is the single most common piece of
     // direct formatting after bold/italic.
-    let rp = effective;
-    let underline = rp.and_then(|rp| rp.underline.as_ref()).map(|u| match u {
+    let underline = eff.underline.as_ref().map(|u| match u {
         crate::docx::UnderlineType::Single => UnderlineStyle::Single,
         crate::docx::UnderlineType::Double => UnderlineStyle::Double,
         crate::docx::UnderlineType::Thick => UnderlineStyle::Thick,
@@ -1182,42 +1180,51 @@ fn convert_run(
     // The DOCX writer encodes `TextSpan::highlight` as `<w:shd w:fill>`
     // inside `w:rPr`, so read that first and fall back to Word's named
     // `<w:highlight>` palette for documents authored elsewhere.
-    let highlight = rp
-        .and_then(|rp| rp.shading_fill.as_deref())
+    let highlight = eff
+        .shading_fill
+        .as_deref()
         .and_then(hex_to_rgb)
-        .or_else(|| {
-            rp.and_then(|rp| rp.highlight.as_deref())
-                .and_then(highlight_name_to_rgb)
-        });
-    let vertical_align = rp.and_then(|rp| rp.vertical_align).map(|va| match va {
+        .or_else(|| eff.highlight.as_deref().and_then(highlight_name_to_rgb));
+    let vertical_align = eff.vertical_align.map(|va| match va {
         crate::docx::VerticalAlign::Superscript => VerticalAlign::Superscript,
         crate::docx::VerticalAlign::Subscript => VerticalAlign::Subscript,
         crate::docx::VerticalAlign::Baseline => VerticalAlign::Baseline,
     });
-    let all_caps = rp.and_then(|rp| rp.caps).unwrap_or(false);
-    let small_caps = rp.and_then(|rp| rp.small_caps).unwrap_or(false);
-    let char_spacing_half_pt = rp.and_then(|rp| rp.char_spacing);
+    let all_caps = eff.caps.unwrap_or(false);
+    let small_caps = eff.small_caps.unwrap_or(false);
+    let char_spacing_half_pt = eff.char_spacing;
+
+    // One span per piece of `text` whose face and size stay the same.
+    // The face name reaches `TextSpan.font_name` so the IR→PDF renderer
+    // does not fall back to its default font; `<w:sz>` is already in
+    // half-points, the IR's own encoding (see
+    // `crate::core::units::HalfPoint::from_word_sz`).
+    let push_text = |text: &str, content: &mut Vec<InlineContent>| {
+        eff.for_each_script_segment(text, |piece, face| {
+            content.push(InlineContent::Text(TextSpan {
+                text: piece.to_string(),
+                bold,
+                italic,
+                strikethrough: strike,
+                hyperlink: hyperlink_url.map(|s| s.to_string()),
+                font_size_half_pt: face
+                    .font_size
+                    .map(|hp| crate::core::units::HalfPoint::from_word_sz(hp.0).0),
+                font_name: face.font_name.map(str::to_string),
+                color: text_color,
+                underline: underline.clone(),
+                highlight,
+                vertical_align: vertical_align.clone(),
+                all_caps,
+                small_caps,
+                char_spacing_half_pt,
+            }));
+        });
+    };
 
     for rc in &run.content {
         match rc {
-            crate::docx::RunContent::Text(text) => {
-                content.push(InlineContent::Text(TextSpan {
-                    text: text.clone(),
-                    bold,
-                    italic,
-                    strikethrough: strike,
-                    hyperlink: hyperlink_url.map(|s| s.to_string()),
-                    font_size_half_pt,
-                    font_name: font_name.clone(),
-                    color: text_color,
-                    underline: underline.clone(),
-                    highlight,
-                    vertical_align: vertical_align.clone(),
-                    all_caps,
-                    small_caps,
-                    char_spacing_half_pt,
-                }));
-            },
+            crate::docx::RunContent::Text(text) => push_text(text, content),
             crate::docx::RunContent::Break(crate::docx::BreakType::Line) => {
                 content.push(InlineContent::LineBreak);
             },
@@ -1265,22 +1272,7 @@ fn convert_run(
             crate::docx::RunContent::CommentRef(_) => {},
             crate::docx::RunContent::FormField(ff) => {
                 if let Some(text) = &ff.display_text {
-                    content.push(InlineContent::Text(TextSpan {
-                        text: text.clone(),
-                        bold,
-                        italic,
-                        strikethrough: strike,
-                        hyperlink: hyperlink_url.map(|s| s.to_string()),
-                        font_size_half_pt,
-                        font_name: font_name.clone(),
-                        color: text_color,
-                        underline: underline.clone(),
-                        highlight,
-                        vertical_align: vertical_align.clone(),
-                        all_caps,
-                        small_caps,
-                        char_spacing_half_pt,
-                    }));
+                    push_text(text, content);
                 }
             },
             // Resolved into a TextBox sibling during from_opc when the

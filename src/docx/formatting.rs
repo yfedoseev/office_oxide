@@ -43,6 +43,269 @@ pub struct RunProperties {
     /// internals). Converters use this to exclude the run from every
     /// extraction surface, the same way a run-level `w:del` already is.
     pub hidden: Option<bool>,
+    /// The non-Latin halves of the run's formatting: the other three
+    /// `w:rFonts` faces and the complex-script size/bold/italic. Boxed:
+    /// absent from most runs, and a run is the most numerous struct in a
+    /// document.
+    pub script: Option<Box<ScriptRunProperties>>,
+}
+
+/// Run formatting that applies to text by script (ECMA-376 §17.3.2.26):
+/// `font_name` on [`RunProperties`] is `w:rFonts/@w:ascii`; these are the
+/// faces and sizes Word uses for every other character class.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScriptRunProperties {
+    /// `w:rFonts/@w:hAnsi` — characters outside Basic Latin that are
+    /// neither East Asian nor complex script.
+    pub font_h_ansi: Option<String>,
+    /// `w:rFonts/@w:eastAsia` — East Asian characters.
+    pub font_east_asia: Option<String>,
+    /// `w:rFonts/@w:cs` — complex-script characters.
+    pub font_cs: Option<String>,
+    /// `w:rFonts/@w:hint` = `eastAsia`: characters shared between the
+    /// Latin and East Asian ranges use the East Asian face.
+    pub east_asia_hint: Option<bool>,
+    /// `w:szCs` (§17.3.2.39) — complex-script font size.
+    pub font_size_cs: Option<HalfPoint>,
+    /// `w:bCs` (§17.3.2.2) — complex-script bold.
+    pub bold_cs: Option<bool>,
+    /// `w:iCs` (§17.3.2.17) — complex-script italic.
+    pub italic_cs: Option<bool>,
+    /// `w:cs` (§17.3.2.7) — treat every character as complex script.
+    pub complex_script: Option<bool>,
+    /// `w:rtl` (§17.3.2.30) — right-to-left run, also complex script.
+    pub rtl: Option<bool>,
+}
+
+impl ScriptRunProperties {
+    fn overlay(&mut self, src: &ScriptRunProperties) {
+        macro_rules! take {
+            ($($f:ident),* $(,)?) => {$(
+                if src.$f.is_some() { self.$f = src.$f.clone(); }
+            )*};
+        }
+        take!(
+            font_h_ansi,
+            font_east_asia,
+            font_cs,
+            east_asia_hint,
+            font_size_cs,
+            bold_cs,
+            italic_cs,
+            complex_script,
+            rtl,
+        );
+    }
+}
+
+/// Which `w:rFonts` face Word uses for a character (ECMA-376 §17.3.2.26,
+/// with Word's script itemisation for complex scripts, which is what
+/// LibreOffice's importer matches too).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScriptClass {
+    /// Basic Latin (U+0000–U+007F): `w:ascii`.
+    Ascii,
+    /// Every other character not below: `w:hAnsi`.
+    HAnsi,
+    /// CJK, kana, Hangul, Yi and full-width forms: `w:eastAsia`.
+    EastAsia,
+    /// Right-to-left and South/South-East Asian scripts: `w:cs`.
+    Complex,
+}
+
+/// Classify one character. See [`ScriptClass`].
+pub(crate) fn char_script_class(c: char) -> ScriptClass {
+    match c as u32 {
+        0x0000..=0x007F => ScriptClass::Ascii,
+        // Hebrew, Arabic, Syriac, Arabic Supplement, Thaana, NKo,
+        // Samaritan, Mandaic, Arabic Extended; Indic scripts through
+        // Sinhala; Thai, Lao, Tibetan, Myanmar; Khmer; Hebrew and Arabic
+        // presentation forms.
+        0x0590..=0x08FF
+        | 0x0900..=0x0DFF
+        | 0x0E00..=0x0FFF
+        | 0x1000..=0x109F
+        | 0x1780..=0x17FF
+        | 0xFB1D..=0xFDFF
+        | 0xFE70..=0xFEFF => ScriptClass::Complex,
+        // Hangul Jamo; CJK radicals through CJK Unified Ideographs
+        // (including kana, Bopomofo, compatibility Jamo); Yi; Hangul
+        // syllables; CJK compatibility ideographs and forms; half- and
+        // full-width forms; the supplementary ideographic planes.
+        0x1100..=0x11FF
+        | 0x2E80..=0x9FFF
+        | 0xA000..=0xA4CF
+        | 0xA960..=0xA97F
+        | 0xAC00..=0xD7FF
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFFEF
+        | 0x20000..=0x3FFFF => ScriptClass::EastAsia,
+        _ => ScriptClass::HAnsi,
+    }
+}
+
+/// Apply one script-dependent `w:rPr` child (`w:rFonts`, `w:szCs`,
+/// `w:bCs`, `w:iCs`, `w:cs`, `w:rtl`) to `props`. Returns `false` for any
+/// other element.
+fn apply_script_property(
+    local: &str,
+    e: &BytesStart,
+    props: &mut RunProperties,
+) -> crate::core::Result<bool> {
+    fn script(props: &mut RunProperties) -> &mut ScriptRunProperties {
+        props.script.get_or_insert_with(Default::default)
+    }
+    match local {
+        "rFonts" => {
+            for attr in xml::attrs(e) {
+                let Ok((key, value)) = attr else { break };
+                match key {
+                    "w:ascii" => props.font_name = Some(value.into_owned()),
+                    "w:hAnsi" => script(props).font_h_ansi = Some(value.into_owned()),
+                    "w:eastAsia" => script(props).font_east_asia = Some(value.into_owned()),
+                    "w:cs" => script(props).font_cs = Some(value.into_owned()),
+                    "w:hint" => script(props).east_asia_hint = Some(value == "eastAsia"),
+                    _ => {},
+                }
+            }
+        },
+        "szCs" => {
+            if let Some(val) = parse_half_point_val(e)? {
+                script(props).font_size_cs = Some(val);
+            }
+        },
+        "bCs" => script(props).bold_cs = Some(parse_toggle(e)),
+        "iCs" => script(props).italic_cs = Some(parse_toggle(e)),
+        "cs" => script(props).complex_script = Some(parse_toggle(e)),
+        "rtl" => script(props).rtl = Some(parse_toggle(e)),
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// The face, size, bold and italic Word applies to text of one
+/// [`ScriptClass`] in a run with these (effective) properties.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScriptFace<'a> {
+    pub font_name: Option<&'a str>,
+    pub font_size: Option<HalfPoint>,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+impl RunProperties {
+    /// Whether every character of the run is complex script regardless of
+    /// its code point (`w:cs` or `w:rtl`).
+    pub(crate) fn forces_complex_script(&self) -> bool {
+        self.script
+            .as_deref()
+            .is_some_and(|s| s.complex_script == Some(true) || s.rtl == Some(true))
+    }
+
+    /// The class of a run's text for the properties that apply to the run
+    /// as a whole (bold and italic): the class of its first non-whitespace
+    /// character. Per-character bold is not representable in a single
+    /// span, and a run that mixes complex-script and other text with
+    /// different `w:b`/`w:bCs` values is vanishingly rare.
+    pub(crate) fn run_script_class<'t>(
+        &self,
+        text: impl IntoIterator<Item = &'t str>,
+    ) -> ScriptClass {
+        if self.forces_complex_script() {
+            return ScriptClass::Complex;
+        }
+        text.into_iter()
+            .flat_map(str::chars)
+            .find(|c| !c.is_whitespace())
+            .map_or(ScriptClass::Ascii, |c| self.script_class_of(c))
+    }
+
+    /// The class Word formats `c` with in this run.
+    pub(crate) fn script_class_of(&self, c: char) -> ScriptClass {
+        if self.forces_complex_script() {
+            return ScriptClass::Complex;
+        }
+        match char_script_class(c) {
+            ScriptClass::HAnsi
+                if self
+                    .script
+                    .as_deref()
+                    .is_some_and(|s| s.east_asia_hint == Some(true)) =>
+            {
+                ScriptClass::EastAsia
+            },
+            class => class,
+        }
+    }
+
+    /// Split `text` where the face or size Word uses for it changes,
+    /// calling `emit` with each piece and its face. Whitespace joins the
+    /// piece before it (or after it, at the start) rather than splitting
+    /// a phrase into alternating faces. One piece in the common case.
+    pub(crate) fn for_each_script_segment<'s>(
+        &'s self,
+        text: &str,
+        mut emit: impl FnMut(&str, &ScriptFace<'s>),
+    ) {
+        let key = |f: &ScriptFace<'s>| (f.font_name, f.font_size);
+        let mut start = 0;
+        let mut current: Option<ScriptFace<'s>> = None;
+        for (i, c) in text.char_indices() {
+            if c.is_whitespace() {
+                continue;
+            }
+            let face = self.face_for(self.script_class_of(c));
+            match &current {
+                Some(cur) if key(cur) == key(&face) => {},
+                Some(cur) => {
+                    emit(&text[start..i], cur);
+                    start = i;
+                    current = Some(face);
+                },
+                None => current = Some(face),
+            }
+        }
+        let face = current.unwrap_or_else(|| self.face_for(ScriptClass::Ascii));
+        emit(&text[start..], &face);
+    }
+
+    /// Face, size and weight for text of `class`. A face the run does not
+    /// name falls back to `w:ascii`, as it did before the other three were
+    /// read; complex-script bold/italic come only from `w:bCs`/`w:iCs`
+    /// (`w:b`/`w:i` apply to non-complex-script characters, §17.3.2.1).
+    pub(crate) fn face_for(&self, class: ScriptClass) -> ScriptFace<'_> {
+        let s = self.script.as_deref();
+        let ascii = self.font_name.as_deref();
+        let bold = self.bold.unwrap_or(false);
+        let italic = self.italic.unwrap_or(false);
+        match class {
+            ScriptClass::Ascii => ScriptFace {
+                font_name: ascii,
+                font_size: self.font_size,
+                bold,
+                italic,
+            },
+            ScriptClass::HAnsi => ScriptFace {
+                font_name: s.and_then(|s| s.font_h_ansi.as_deref()).or(ascii),
+                font_size: self.font_size,
+                bold,
+                italic,
+            },
+            ScriptClass::EastAsia => ScriptFace {
+                font_name: s.and_then(|s| s.font_east_asia.as_deref()).or(ascii),
+                font_size: self.font_size,
+                bold,
+                italic,
+            },
+            ScriptClass::Complex => ScriptFace {
+                font_name: s.and_then(|s| s.font_cs.as_deref()).or(ascii),
+                font_size: s.and_then(|s| s.font_size_cs).or(self.font_size),
+                bold: s.and_then(|s| s.bold_cs).unwrap_or(false),
+                italic: s.and_then(|s| s.italic_cs).unwrap_or(false),
+            },
+        }
+    }
 }
 
 /// Paragraph-level formatting properties (`w:pPr`).
@@ -205,6 +468,11 @@ impl RunProperties {
             shading_fill,
             hidden,
         );
+        if let Some(src) = src.script.as_deref() {
+            self.script
+                .get_or_insert_with(Default::default)
+                .overlay(src);
+        }
     }
 }
 
@@ -429,10 +697,7 @@ pub(crate) fn parse_run_properties(
                             }
                             xml::skip_element(reader)?;
                         },
-                        "rFonts" => {
-                            if let Ok(Some(ascii)) = xml::optional_attr_str(e, "w:ascii") {
-                                props.font_name = Some(ascii.into_owned());
-                            }
+                        name if apply_script_property(name, e, &mut props)? => {
                             xml::skip_element(reader)?;
                         },
                         "color" => {
@@ -486,11 +751,7 @@ pub(crate) fn parse_run_properties(
                             props.font_size = Some(val);
                         }
                     },
-                    "rFonts" => {
-                        if let Ok(Some(ascii)) = xml::optional_attr_str(e, "w:ascii") {
-                            props.font_name = Some(ascii.into_owned());
-                        }
-                    },
+                    name if apply_script_property(name, e, &mut props)? => {},
                     "color" => {
                         props.color = parse_color_ref(e)?;
                     },
@@ -666,10 +927,7 @@ pub(crate) fn parse_run_properties_fast(
                         }
                         xml::skip_element_fast(reader)?;
                     },
-                    "rFonts" => {
-                        if let Ok(Some(ascii)) = xml::optional_attr_str(e, "w:ascii") {
-                            props.font_name = Some(ascii.into_owned());
-                        }
+                    name if apply_script_property(name, e, &mut props)? => {
                         xml::skip_element_fast(reader)?;
                     },
                     "color" => {
@@ -749,11 +1007,7 @@ pub(crate) fn parse_run_properties_fast(
                             props.font_size = Some(val);
                         }
                     },
-                    "rFonts" => {
-                        if let Ok(Some(ascii)) = xml::optional_attr_str(e, "w:ascii") {
-                            props.font_name = Some(ascii.into_owned());
-                        }
-                    },
+                    name if apply_script_property(name, e, &mut props)? => {},
                     "color" => {
                         props.color = parse_color_ref(e)?;
                     },
