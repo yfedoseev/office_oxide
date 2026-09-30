@@ -1,5 +1,6 @@
 use crate::format::DocumentFormat;
 use crate::ir::*;
+use crate::xlsx::range_sweep::{CellRange, RangeSweep};
 
 /// Maximum worksheet rows materialised into the IR per sheet. A worksheet is
 /// converted eagerly into an in-memory `Table` (or one `Paragraph` per row),
@@ -23,8 +24,12 @@ fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
 }
 
 pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
-    // Pre-compute date style indices once — avoids re-scanning format strings per cell.
-    let date_indices = doc.date_style_indices();
+    // Date styles found once and custom number formats compiled once, not
+    // re-scanned and re-parsed per cell.
+    let mut formatter = crate::xlsx::text::CellFormatter::new(doc);
+    let date_indices = formatter.date_indices().clone();
+    // Theme colours resolve cell fills; parsed once per document.
+    let theme = doc.theme_for_render();
 
     // Single String buffer reused across all cells — clear() keeps the heap
     // allocation; std::mem::take() moves it into TextSpan for non-empty cells.
@@ -67,45 +72,26 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             })
             .collect();
 
-        // `merged_cells` ("A1:C1") was parsed and then never read on this
-        // path: every TableCell got col_span/row_span hardcoded to 1, so
-        // a merged header or label flattened to an ordinary unspanned
-        // grid. Reduce each range to the anchor's span plus
-        // the set of positions it covers, so the anchor carries the real
-        // span and covered positions are excluded from the row entirely
-        // — the same sparse, span-driven model every other format's
-        // TableRow already uses (matches ir_render.rs's table_grid,
-        // which resolves col_span/row_span by walking row.cells and
-        // skipping ahead over covered columns).
-        let mut merge_span: std::collections::HashMap<(u32, u32), (u32, u32)> =
-            std::collections::HashMap::new();
-        let mut merge_covered: std::collections::HashSet<(u32, u32)> =
-            std::collections::HashSet::new();
-        for range in &ws.merged_cells {
-            let Some((start, end)) = range.split_once(':') else {
-                continue;
-            };
-            let (Some(s), Some(e)) =
-                (crate::xlsx::CellRef::parse(start), crate::xlsx::CellRef::parse(end))
-            else {
-                continue;
-            };
-            let (row_lo, row_hi) = (s.row.min(e.row), s.row.max(e.row));
-            let (col_lo, col_hi) = (s.col.min(e.col), s.col.max(e.col));
-            let row_span = row_hi - row_lo + 1;
-            let col_span = col_hi - col_lo + 1;
-            if row_span <= 1 && col_span <= 1 {
-                continue;
-            }
-            merge_span.insert((row_lo, col_lo), (row_span, col_span));
-            for r in row_lo..=row_hi {
-                for c in col_lo..=col_hi {
-                    if (r, c) != (row_lo, col_lo) {
-                        merge_covered.insert((r, c));
-                    }
-                }
-            }
-        }
+        // `merged_cells` ("A1:C1"): the anchor carries the real span and
+        // covered positions are excluded from the row entirely — the same
+        // sparse, span-driven model every other format's TableRow uses
+        // (matches ir_render.rs's table_grid, which resolves spans by
+        // walking row.cells and skipping ahead over covered columns).
+        // Each range is kept whole and consulted per stored row: expanding
+        // it into the set of positions it covers cost its declared area,
+        // and one legal `A1:XFD1048576` was ~17 billion inserts.
+        let mut merges = RangeSweep::new(
+            ws.merged_cells
+                .iter()
+                .filter_map(|range| {
+                    let (start, end) = range.split_once(':')?;
+                    let s = crate::xlsx::CellRef::parse(start)?;
+                    let e = crate::xlsx::CellRef::parse(end)?;
+                    let r = CellRange::from_corners(s.row, s.col, e.row, e.col);
+                    (r.row_span() > 1 || r.col_span() > 1).then_some((r, ()))
+                })
+                .collect(),
+        );
 
         let total_rows = ws.rows.len();
         let mut parsed_rows: Vec<Vec<CellData>> =
@@ -126,7 +112,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             let mut cells: Vec<CellData> = Vec::with_capacity(row.cells.len());
             for cell in &row.cells {
                 buf.clear();
-                doc.write_cell_value_fast(cell, &mut buf, &date_indices);
+                formatter.write(cell, &mut buf);
                 // A row keeps the cells that fit the budget; the sheet
                 // ends after it.
                 if !budget.charge(buf.len()) {
@@ -344,6 +330,10 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                         number_format: cd.number_format.clone(),
                         number_format_id: cd.number_format_id,
                         formula: cd.formula.clone(),
+                        background_color: cell_background(doc, cd, theme.as_deref()),
+                        border: cell_border(doc, cd, theme.as_deref()),
+                        text_align: cell_h_align(doc, cd),
+                        vertical_align: cell_v_align(doc, cd),
                         ..Default::default()
                     };
                     while tcells.len() < cd.col as usize {
@@ -370,36 +360,10 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 // (dense-grid -> sparse, span-driven row) rather than
                 // rebuilding the placement loop above around them.
                 let true_row = row_numbers.get(row_idx).copied().unwrap_or(row_idx as u32);
-                if !merge_span.is_empty() {
-                    for (col, cell) in tcells.iter_mut().enumerate() {
-                        if let Some(&(row_span, col_span)) = merge_span.get(&(true_row, col as u32))
-                        {
-                            // The IR table holds only the rows the sheet
-                            // stores; a merge over sheet rows 1-5 in a
-                            // sheet whose next stored row is 6 spans one
-                            // IR row, not five — five hid the four rows
-                            // that followed. Count the stored rows the
-                            // merge covers.
-                            let last = true_row + row_span - 1;
-                            let covered = row_numbers[row_idx..]
-                                .iter()
-                                .take_while(|&&r| r <= last)
-                                .count()
-                                .max(1) as u32;
-                            cell.row_span = covered;
-                            cell.col_span = col_span;
-                        }
-                    }
-                }
-                let tcells: Vec<TableCell> = if merge_covered.is_empty() {
+                let tcells = if merges.is_empty() {
                     tcells
                 } else {
-                    tcells
-                        .into_iter()
-                        .enumerate()
-                        .filter(|(col, _)| !merge_covered.contains(&(true_row, *col as u32)))
-                        .map(|(_, cell)| cell)
-                        .collect()
+                    apply_merges(&mut merges, tcells, true_row, &row_numbers[row_idx..])
                 };
                 rows.push(TableRow {
                     cells: tcells,
@@ -500,6 +464,17 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 ..Default::default()
             }));
         }
+        // Only a file declaring vast numbers of overlapping merge ranges
+        // spends the sweep's work budget; the ranges past it are not
+        // applied, and that is stated.
+        if merges.exhausted() {
+            combined.push(Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(
+                    "[some merged cell ranges not applied — too many overlapping ranges]",
+                ))],
+                ..Default::default()
+            }));
+        }
         if budget.exhausted() {
             combined.push(Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain(budget.notice()))],
@@ -507,16 +482,28 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             }));
         }
 
+        // Page headers/footers in use ([ECMA-376] §18.3.1.46).
+        let hf = |text: Option<String>| {
+            text.map(|t| HeaderFooter {
+                content: vec![Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(t))],
+                    ..Default::default()
+                })],
+            })
+        };
+        let [fh, oh, eh, ff, of, ef] = ws.header_footer.active(&ws.name);
         sections.push(Section {
             title: Some(ws.name.clone()),
             elements: combined,
             page_setup,
             break_type,
-            hidden: doc
-                .workbook
-                .sheets
-                .get(ws_idx)
-                .is_some_and(|s| s.state != crate::xlsx::SheetState::Visible),
+            header: hf(oh),
+            footer: hf(of),
+            first_page_header: hf(fh),
+            first_page_footer: hf(ff),
+            even_page_header: hf(eh),
+            even_page_footer: hf(ef),
+            hidden: ws.state != crate::xlsx::SheetState::Visible,
             conditional_formats: ws.conditional_formats.clone(),
             data_validations: ws.data_validations.clone(),
             ..Default::default()
@@ -589,6 +576,11 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
             text_truncated: !doc.unreadable_sheets.is_empty(),
+            ..crate::core::core_properties::ooxml_metadata_extras(
+                cp,
+                doc.app_properties.as_ref(),
+                Some(&doc.package_properties),
+            )
         },
         sections,
         defined_names: doc
@@ -603,6 +595,56 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             })
             .collect(),
     }
+}
+
+/// Give each merge anchor in `tcells` (one per grid column of sheet row
+/// `true_row`) its span and drop every covered position. `rows_from_here`
+/// is the absolute row number of this and every later stored row: the IR
+/// table holds only the rows the sheet stores, so a merge over sheet rows
+/// 1-5 in a sheet whose next stored row is 6 spans one IR row, not five.
+fn apply_merges(
+    merges: &mut RangeSweep<()>,
+    mut tcells: Vec<TableCell>,
+    true_row: u32,
+    rows_from_here: &[u32],
+) -> Vec<TableCell> {
+    let width = tcells.len();
+    let mut covered = vec![false; width];
+    let mut cost = 0u64;
+    for (range, ()) in merges.row(true_row) {
+        let lo = range.col_lo as usize;
+        if lo >= width {
+            continue;
+        }
+        let hi = (range.col_hi as usize).min(width - 1);
+        if range.row_lo == true_row {
+            let last = range.row_hi;
+            let rows = rows_from_here
+                .iter()
+                .take_while(|&&r| r <= last)
+                .count()
+                .max(1);
+            cost += rows as u64;
+            let anchor = &mut tcells[lo];
+            anchor.row_span = rows as u32;
+            // Clipped to the table's width, like the row span to its rows.
+            anchor.col_span = range.col_span().min((width - lo) as u64) as u32;
+            covered[lo + 1..=hi].fill(true);
+        } else {
+            covered[lo..=hi].fill(true);
+        }
+        cost += (hi - lo + 1) as u64;
+    }
+    merges.charge(cost);
+    if !covered.contains(&true) {
+        return tcells;
+    }
+    tcells
+        .into_iter()
+        .zip(covered)
+        .filter(|(_, c)| !c)
+        .map(|(cell, _)| cell)
+        .collect()
 }
 
 /// A grid position with no cell in the source.
@@ -790,6 +832,101 @@ fn cell_semantics(
 /// `to_ir` runs after the document has been fully read; if styles weren't
 /// parsed yet they remain `None` and we silently skip per-cell font
 /// recovery rather than mutate the document during a `&self` traversal.
+/// A cell's solid fill colour ([ECMA-376] §18.8.20 fill), resolved
+/// through the theme when it names a theme slot.
+fn cell_background(
+    doc: &crate::xlsx::XlsxDocument,
+    cd: &CellData,
+    theme: Option<&crate::core::theme::Theme>,
+) -> Option<[u8; 3]> {
+    let fill = doc.styles.as_ref()?.fill_for(cd.style_index?)?;
+    fill.solid_color()?.resolve_opt(theme).map(|rgb| rgb.0)
+}
+
+/// A cell's border ([ECMA-376] §18.8.4), one IR line per styled side.
+fn cell_border(
+    doc: &crate::xlsx::XlsxDocument,
+    cd: &CellData,
+    theme: Option<&crate::core::theme::Theme>,
+) -> Option<TableBorder> {
+    let b = doc.styles.as_ref()?.border_for(cd.style_index?)?;
+    let line = |side: &Option<crate::xlsx::styles::BorderSide>| {
+        let side = side.as_ref()?;
+        let (style, size) = border_line_style(&side.style)?;
+        Some(BorderLine {
+            style,
+            color: side
+                .color
+                .as_ref()
+                .and_then(|c| c.resolve_opt(theme))
+                .map(|rgb| rgb.0),
+            size: Some(size),
+            space: None,
+        })
+    };
+    let border = TableBorder {
+        top: line(&b.top),
+        bottom: line(&b.bottom),
+        left: line(&b.left),
+        right: line(&b.right),
+        inside_h: None,
+        inside_v: None,
+    };
+    [&border.top, &border.bottom, &border.left, &border.right]
+        .iter()
+        .any(|l| l.is_some())
+        .then_some(border)
+}
+
+/// An `ST_BorderStyle` ([ECMA-376] §18.18.3) as an IR line style and a
+/// width in eighths of a point (thin 1/2 pt, medium 1 pt, thick 1 1/2 pt;
+/// hair is thinner still). `none` is no line.
+fn border_line_style(style: &str) -> Option<(BorderStyle, u32)> {
+    Some(match style {
+        "thin" => (BorderStyle::Single, 4),
+        "medium" => (BorderStyle::Single, 8),
+        "thick" => (BorderStyle::Thick, 12),
+        "double" => (BorderStyle::Double, 4),
+        "hair" => (BorderStyle::Dotted, 2),
+        "dotted" => (BorderStyle::Dotted, 4),
+        "dashed" | "dashDot" | "dashDotDot" => (BorderStyle::Dashed, 4),
+        "mediumDashed" | "mediumDashDot" | "mediumDashDotDot" | "slantDashDot" => {
+            (BorderStyle::Dashed, 8)
+        },
+        _ => return None,
+    })
+}
+
+fn cell_alignment<'d>(
+    doc: &'d crate::xlsx::XlsxDocument,
+    cd: &CellData,
+) -> Option<&'d crate::xlsx::styles::CellAlignment> {
+    doc.styles.as_ref()?.alignment_for(cd.style_index?)
+}
+
+/// `horizontal` (§18.18.40) as IR paragraph alignment; `general`, `fill`
+/// and `centerContinuous` have no IR equivalent and stay unset.
+fn cell_h_align(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> Option<ParagraphAlignment> {
+    Some(match cell_alignment(doc, cd)?.horizontal.as_deref()? {
+        "left" => ParagraphAlignment::Left,
+        "center" => ParagraphAlignment::Center,
+        "right" => ParagraphAlignment::Right,
+        "justify" => ParagraphAlignment::Justify,
+        "distributed" => ParagraphAlignment::Distribute,
+        _ => return None,
+    })
+}
+
+/// `vertical` (§18.18.88) as IR cell vertical alignment.
+fn cell_v_align(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> Option<CellVerticalAlign> {
+    Some(match cell_alignment(doc, cd)?.vertical.as_deref()? {
+        "top" => CellVerticalAlign::Top,
+        "center" => CellVerticalAlign::Center,
+        "bottom" => CellVerticalAlign::Bottom,
+        _ => return None,
+    })
+}
+
 fn font_for(
     doc: &crate::xlsx::XlsxDocument,
     style_index: u32,

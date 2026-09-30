@@ -296,6 +296,8 @@ pub struct XlsxWriter {
     /// Document metadata for `docProps/core.xml`. `None` means no
     /// core-properties part is written.
     metadata: Option<crate::ir::Metadata>,
+    /// Workbook `<definedNames>` ([ECMA-376] §18.2.5).
+    defined_names: Vec<crate::ir::DefinedName>,
 }
 
 /// Per-worksheet page geometry.
@@ -426,6 +428,8 @@ struct SheetDataInner {
     /// (these used to have nowhere to go and fell through
     /// to being dumped as plain extra rows below the table).
     pub comments: Vec<SheetCommentOut>,
+    /// Written as `<sheet state="hidden">`.
+    pub hidden: bool,
 }
 
 impl SheetDataInner {
@@ -442,6 +446,7 @@ impl SheetDataInner {
             hyperlinks: HashMap::new(),
             hyperlink_tooltips: HashMap::new(),
             comments: Vec::new(),
+            hidden: false,
         }
     }
 
@@ -797,6 +802,13 @@ impl<'a> SheetData<'a> {
         self
     }
 
+    /// Mark this sheet hidden (`<sheet state="hidden">`, [ECMA-376]
+    /// §18.2.19).
+    pub fn set_hidden(&mut self, hidden: bool) -> &mut Self {
+        self.0.hidden = hidden;
+        self
+    }
+
     /// Anchor a styled text run on this worksheet at absolute EMU
     /// coordinates. Used by the PDF→XLSX layout-preserving path: each
     /// PDF text span becomes one `<xdr:sp>` shape with a single run.
@@ -877,6 +889,17 @@ impl<'a> SheetData<'a> {
 // XlsxWriter impl
 // ---------------------------------------------------------------------------
 
+/// A `<t>` start tag, with `xml:space="preserve"` (XML 1.0 §2.10) when the
+/// text has leading or trailing whitespace a normalising consumer would
+/// otherwise strip — when Excel and openpyxl write it.
+fn t_start(text: &str) -> BytesStart<'static> {
+    let mut t = BytesStart::new("t");
+    if text.trim() != text {
+        t.push_attribute(("xml:space", "preserve"));
+    }
+    t
+}
+
 impl Default for XlsxWriter {
     fn default() -> Self {
         Self::new()
@@ -890,6 +913,27 @@ impl XlsxWriter {
             sheets: Vec::new(),
             embedded_fonts: Vec::new(),
             metadata: None,
+            defined_names: Vec::new(),
+        }
+    }
+
+    /// Add a workbook-level defined name ([ECMA-376] §18.2.5): `value` is
+    /// its formula text (`Sheet1!$A$1:$B$10`), `local_sheet_id` the 0-based
+    /// index of the sheet it is scoped to, if any.
+    pub fn add_defined_name(&mut self, name: crate::ir::DefinedName) -> &mut Self {
+        self.defined_names.push(name);
+        self
+    }
+
+    /// Mark a sheet hidden (`<sheet state="hidden">`) by index. Returns
+    /// `false` when `sheet` names no sheet.
+    pub fn sheet_set_hidden(&mut self, sheet: usize, hidden: bool) -> bool {
+        match self.sheets.get_mut(sheet) {
+            Some(s) => {
+                s.hidden = hidden;
+                true
+            },
+            None => false,
         }
     }
 
@@ -1051,16 +1095,11 @@ impl XlsxWriter {
 
         opc.add_package_rel(rel_types::OFFICE_DOCUMENT, "xl/workbook.xml");
 
-        // Core properties (docProps/core.xml). Optional; written only
-        // when caller supplied metadata via `set_metadata`. Surfaces
-        // PDF /Title /Author etc. in Excel's "Properties" dialog after
-        // a PDF→XLSX→Excel round trip.
-        if let Some(ref meta) = self.metadata {
-            let core_part = PartName::new("/docProps/core.xml")?;
-            opc.add_package_rel(rel_types::CORE_PROPERTIES, "docProps/core.xml");
-            let core_xml = crate::core::core_properties::generate_xml(meta);
-            opc.add_part(&core_part, crate::core::core_properties::CONTENT_TYPE, &core_xml)?;
-        }
+        // Package properties: core.xml only when the caller supplied
+        // metadata via `set_metadata` (it surfaces /Title /Author etc. in
+        // Excel's "Properties" dialog), app.xml (the producer) always,
+        // custom.xml when the metadata carries custom properties.
+        crate::core::core_properties::add_property_parts(opc, self.metadata.as_ref())?;
 
         let mut sheet_rids = Vec::with_capacity(sheets.len());
         for (i, _) in sheets.iter().enumerate() {
@@ -1070,7 +1109,7 @@ impl XlsxWriter {
         }
         opc.add_part_rel(&wb_part, rel_types::STYLES, "styles.xml");
 
-        let wb_xml = Self::build_workbook_xml(sheets, &sheet_rids)?;
+        let wb_xml = Self::build_workbook_xml(sheets, &sheet_rids, &self.defined_names)?;
         opc.add_part(&wb_part, CT_WORKBOOK, &wb_xml)?;
 
         // Collect all unique styles across all sheets, assign indices.
@@ -1148,6 +1187,7 @@ impl XlsxWriter {
     fn build_workbook_xml(
         sheets: &[SheetDataInner],
         sheet_rids: &[String],
+        defined_names: &[crate::ir::DefinedName],
     ) -> crate::core::Result<Vec<u8>> {
         let mut w = Writer::new(Vec::new());
 
@@ -1162,6 +1202,12 @@ impl XlsxWriter {
         // and Excel will not open the workbook.
         w.write_event(Event::Start(BytesStart::new("sheets")))?;
 
+        // Excel refuses a workbook with no visible sheet; if every sheet is
+        // marked hidden the first stays visible, and that is logged.
+        let all_hidden = sheets.iter().all(|s| s.hidden);
+        if all_hidden {
+            log::warn!("xlsx: every sheet is hidden; the first is written visible");
+        }
         for (i, sheet) in sheets.iter().enumerate() {
             let mut elem = BytesStart::new("sheet");
             // sanitize_xml_text is applied to element text everywhere but was
@@ -1172,10 +1218,49 @@ impl XlsxWriter {
             let sheet_id = (i + 1).to_string();
             elem.push_attribute(("sheetId", sheet_id.as_str()));
             elem.push_attribute(("r:id", sheet_rids[i].as_str()));
+            if sheet.hidden && !(all_hidden && i == 0) {
+                elem.push_attribute(("state", "hidden"));
+            }
             w.write_event(Event::Empty(elem))?;
         }
 
         w.write_event(Event::End(BytesEnd::new("sheets")))?;
+
+        // [ECMA-376] §18.2.5/§18.2.6. A name scoped to a sheet this
+        // workbook does not have would make the file invalid; it is
+        // dropped with a warning.
+        let names: Vec<&crate::ir::DefinedName> = defined_names
+            .iter()
+            .filter(|n| {
+                let ok = !n.name.is_empty()
+                    && n.local_sheet_id
+                        .is_none_or(|id| (id as usize) < sheets.len());
+                if !ok {
+                    log::warn!("xlsx: defined name {:?} not written: no such sheet", n.name);
+                }
+                ok
+            })
+            .collect();
+        if !names.is_empty() {
+            w.write_event(Event::Start(BytesStart::new("definedNames")))?;
+            for n in names {
+                let mut elem = BytesStart::new("definedName");
+                let safe_name = crate::core::xml::sanitize_xml_text(&n.name);
+                elem.push_attribute(("name", safe_name.as_ref()));
+                let local = n.local_sheet_id.map(|id| id.to_string());
+                if let Some(id) = local.as_deref() {
+                    elem.push_attribute(("localSheetId", id));
+                }
+                if n.hidden {
+                    elem.push_attribute(("hidden", "1"));
+                }
+                w.write_event(Event::Start(elem))?;
+                let value = crate::core::xml::sanitize_xml_text(&n.value);
+                w.write_event(Event::Text(BytesText::new(&value)))?;
+                w.write_event(Event::End(BytesEnd::new("definedName")))?;
+            }
+            w.write_event(Event::End(BytesEnd::new("definedNames")))?;
+        }
         w.write_event(Event::End(BytesEnd::new("workbook")))?;
 
         Ok(w.into_inner())
@@ -1504,10 +1589,9 @@ impl XlsxWriter {
                 }
                 w.write_event(Event::Start(c))?;
                 w.write_event(Event::Start(BytesStart::new("is")))?;
-                w.write_event(Event::Start(BytesStart::new("t")))?;
-                w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(
-                    s,
-                ))))?;
+                let text = crate::core::xml::sanitize_xml_text(s);
+                w.write_event(Event::Start(t_start(&text)))?;
+                w.write_event(Event::Text(BytesText::new(&text)))?;
                 w.write_event(Event::End(BytesEnd::new("t")))?;
                 w.write_event(Event::End(BytesEnd::new("is")))?;
                 w.write_event(Event::End(BytesEnd::new("c")))?;
@@ -1562,10 +1646,9 @@ impl XlsxWriter {
                         }
                         w.write_event(Event::End(BytesEnd::new("rPr")))?;
                     }
-                    w.write_event(Event::Start(BytesStart::new("t")))?;
-                    w.write_event(Event::Text(BytesText::new(
-                        &crate::core::xml::sanitize_xml_text(&run.text),
-                    )))?;
+                    let text = crate::core::xml::sanitize_xml_text(&run.text);
+                    w.write_event(Event::Start(t_start(&text)))?;
+                    w.write_event(Event::Text(BytesText::new(&text)))?;
                     w.write_event(Event::End(BytesEnd::new("t")))?;
                     w.write_event(Event::End(BytesEnd::new("r")))?;
                 }
@@ -1688,8 +1771,14 @@ impl XlsxWriter {
 /// `Writer` handles this automatically for `Event::Text`/attribute
 /// values via its own API, but the VML builder below writes some
 /// content as raw string interpolation, so text needs escaping by hand.
+///
+/// Characters XML 1.0 cannot represent at all (C0 controls other than tab,
+/// LF, CR) are dropped first, as everywhere else in the writers
+/// (`sanitize_xml_text`); left in, they made the part non-well-formed
+/// while `save()` returned Ok.
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
+    crate::core::xml::sanitize_xml_text(s)
+        .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
@@ -2968,5 +3057,30 @@ mod validity_tests {
         // "History" is reserved by Excel.
         let cleaned = sanitize_sheet_name("History", &[]);
         assert_ne!(cleaned, "History", "Excel reserves this name");
+    }
+
+    /// Text with leading/trailing whitespace is written with
+    /// `xml:space="preserve"` (XML 1.0 §2.10), as Excel and openpyxl
+    /// write it; without it a normalising consumer may strip the spaces.
+    #[test]
+    fn test_padded_cell_text_is_written_with_xml_space_preserve() {
+        let mut wb = XlsxWriter::new();
+        {
+            let mut sheet = wb.add_sheet("S");
+            sheet.set_cell(0, 0, CellData::String("  padded ".into()));
+            sheet.set_cell(0, 1, CellData::String("tight".into()));
+            sheet.set_cell(
+                0,
+                2,
+                CellData::RichString(vec![RichRun {
+                    text: " run".into(),
+                    ..Default::default()
+                }]),
+            );
+        }
+        let xml = part(&wb, "xl/worksheets/sheet1.xml");
+        assert!(xml.contains(r#"<t xml:space="preserve">  padded </t>"#), "{xml}");
+        assert!(xml.contains("<t>tight</t>"), "{xml}");
+        assert!(xml.contains(r#"<t xml:space="preserve"> run</t>"#), "{xml}");
     }
 }

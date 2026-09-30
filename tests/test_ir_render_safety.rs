@@ -283,3 +283,142 @@ fn test_maximal_row_and_column_spans_render_promptly() {
         assert!(t.contains('A') && t.contains('B') && t.contains('C'), "content lost: {t:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Recursion bound
+// ---------------------------------------------------------------------------
+
+/// Nesting far past anything a bounded reader produces. `DocumentIR` is
+/// `Deserialize`, so a value this deep can be built by any caller.
+const DEEP: usize = 100_000;
+
+fn deep_text_box() -> Element {
+    let mut inner = Element::Paragraph(Paragraph {
+        content: vec![span("leaf")],
+        ..Default::default()
+    });
+    for _ in 0..DEEP {
+        inner = Element::TextBox(TextBox {
+            content: vec![inner],
+            ..Default::default()
+        });
+    }
+    inner
+}
+
+fn deep_list() -> Element {
+    let mut list = List {
+        items: vec![ListItem {
+            content: vec![Element::Paragraph(Paragraph {
+                content: vec![span("leaf")],
+                ..Default::default()
+            })],
+            nested: None,
+        }],
+        ..Default::default()
+    };
+    for _ in 0..DEEP {
+        list = List {
+            items: vec![ListItem {
+                content: vec![Element::Paragraph(Paragraph {
+                    content: vec![span("item")],
+                    ..Default::default()
+                })],
+                nested: Some(list),
+            }],
+            ..Default::default()
+        };
+    }
+    Element::List(list)
+}
+
+fn deep_table() -> Element {
+    let mut inner = Element::Paragraph(Paragraph {
+        content: vec![span("leaf")],
+        ..Default::default()
+    });
+    for _ in 0..DEEP {
+        inner = Element::Table(Table {
+            rows: vec![TableRow {
+                cells: vec![TableCell {
+                    content: vec![inner],
+                    col_span: 1,
+                    row_span: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+    }
+    inner
+}
+
+/// Every renderer walks the element tree recursively. Without a depth
+/// bound, a deeply nested IR overflowed the stack — an abort no caller can
+/// catch. The walk must stop at the shared nesting limit, still render the
+/// content above it, and record the truncation where a caller can see it.
+#[test]
+fn test_renderers_bound_recursion_on_deeply_nested_ir() {
+    // A default-sized (2 MiB) thread: the renderers run on the caller's
+    // stack, which this crate does not control.
+    let handle = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            for (name, element) in [
+                ("text box", deep_text_box()),
+                ("list", deep_list()),
+                ("table", deep_table()),
+            ] {
+                let ir = ir_with(vec![element]);
+                office_oxide::core::xml::reset_truncated_subtrees();
+                let plain = ir.plain_text();
+                let md = ir.to_markdown();
+                let html = ir.to_html();
+                assert!(
+                    office_oxide::core::xml::truncated_subtrees() > 0,
+                    "{name}: truncation was not recorded"
+                );
+                for (surface, out) in [("plain", &plain), ("markdown", &md), ("html", &html)] {
+                    // The leaf sits past the bound, so it must not appear.
+                    assert!(!out.contains("leaf"), "{name}/{surface}: rendered past the bound");
+                    if name == "list" {
+                        assert!(out.contains("item"), "{name}/{surface}: lost shallow content");
+                    }
+                }
+            }
+        })
+        .expect("spawn");
+    handle.join().expect("renderer thread panicked");
+}
+
+/// The IR→PPTX/XLSX/DOCX writers walk the same trees and run on the
+/// caller's stack too; they must stop at the same bound.
+#[test]
+fn test_ir_writers_bound_recursion_on_deeply_nested_ir() {
+    let handle = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            for (name, element) in [
+                ("text box", deep_text_box()),
+                ("list", deep_list()),
+                ("table", deep_table()),
+            ] {
+                let mut ir = ir_with(vec![element]);
+                // Speaker notes are walked by the PPTX notes writer.
+                ir.sections[0].speaker_notes = Some(vec![deep_list()]);
+                for format in [
+                    DocumentFormat::Pptx,
+                    DocumentFormat::Xlsx,
+                    DocumentFormat::Docx,
+                ] {
+                    let mut buf = std::io::Cursor::new(Vec::new());
+                    office_oxide::create::create_from_ir_to_writer(&ir, format, &mut buf)
+                        .unwrap_or_else(|e| panic!("{name}/{format:?}: {e}"));
+                    assert!(!buf.get_ref().is_empty(), "{name}/{format:?}: empty package");
+                }
+            }
+        })
+        .expect("spawn");
+    handle.join().expect("writer thread panicked");
+}

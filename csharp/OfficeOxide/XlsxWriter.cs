@@ -5,6 +5,12 @@ using OfficeOxide.Internal;
 namespace OfficeOxide;
 
 /// <summary>
+/// A formula cell value for <see cref="XlsxWriter.SetCell"/>, e.g.
+/// <c>new Formula("SUM(A1:A3)")</c>. A leading '=' is accepted.
+/// </summary>
+public sealed record Formula(string Text);
+
+/// <summary>
 /// Builder for creating XLSX workbooks from scratch.
 /// </summary>
 public sealed class XlsxWriter : IDisposable
@@ -31,32 +37,19 @@ public sealed class XlsxWriter : IDisposable
         return NativeMethods.OfficeXlsxWriterAddSheet(_handle, name);
     }
 
-    /// <summary>Set a cell value. value may be null, string, double, or bool.</summary>
+    /// <summary>
+    /// Set a cell value. value may be null, a string, a bool, any numeric type,
+    /// or a <see cref="Formula"/>. A string is always text, even one starting
+    /// with '='.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// A <c>long</c>/<c>ulong</c> beyond ±2^53, which Excel (storing doubles) would change.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">The sheet or cell is out of range; nothing was written.</exception>
     public void SetCell(uint sheet, uint row, uint col, object? value)
     {
         EnsureHandle();
-        int t; string? s = null; double n = 0;
-        switch (value)
-        {
-            case null: t = 0; break;
-            case string sv: t = 1; s = sv; break;
-            case double dv: t = 2; n = dv; break;
-            case float fv: t = 2; n = fv; break;
-            case int iv: t = 2; n = iv; break;
-            case long lv: t = 2; n = lv; break;
-            case decimal mv: t = 2; n = (double)mv; break;
-            case short hv: t = 2; n = hv; break;
-            case ushort uhv: t = 2; n = uhv; break;
-            case uint uiv: t = 2; n = uiv; break;
-            case ulong ulv: t = 2; n = ulv; break;
-            case byte byv: t = 2; n = byv; break;
-            case sbyte sbv: t = 2; n = sbv; break;
-            case bool bv: t = 3; n = bv ? 1 : 0; break;
-            // Anything else is rendered with the invariant culture: the
-            // default ToString() made output depend on the host locale, so a
-            // decimal became "1,5" under de-DE.
-            default: t = 1; s = System.Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture); break;
-        }
+        var (t, s, n) = Encode(value);
         // A non-zero status means the value was NOT written — an out-of-grid
         // row/column or a bad sheet index. Ignoring it silently discarded the
         // caller's data while reporting success.
@@ -74,34 +67,62 @@ public sealed class XlsxWriter : IDisposable
     public void SetCellStyled(uint sheet, uint row, uint col, object? value, bool bold, string? bgColor = null)
     {
         EnsureHandle();
-        int t; string? s = null; double n = 0;
-        switch (value)
-        {
-            case null: t = 0; break;
-            case string sv: t = 1; s = sv; break;
-            case double dv: t = 2; n = dv; break;
-            case float fv: t = 2; n = fv; break;
-            case int iv: t = 2; n = iv; break;
-            case long lv: t = 2; n = lv; break;
-            case decimal mv: t = 2; n = (double)mv; break;
-            case short hv: t = 2; n = hv; break;
-            case ushort uhv: t = 2; n = uhv; break;
-            case uint uiv: t = 2; n = uiv; break;
-            case ulong ulv: t = 2; n = ulv; break;
-            case byte byv: t = 2; n = byv; break;
-            case sbyte sbv: t = 2; n = sbv; break;
-            case bool bv: t = 3; n = bv ? 1 : 0; break;
-            // Anything else is rendered with the invariant culture: the
-            // default ToString() made output depend on the host locale, so a
-            // decimal became "1,5" under de-DE.
-            default: t = 1; s = System.Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture); break;
-        }
+        var (t, s, n) = Encode(value);
         int rc = NativeMethods.OfficeXlsxSheetSetCellStyled(
             _handle, sheet, row, col, t, s, n, bold, bgColor);
         if (rc != 0)
         {
             throw new InvalidOperationException(
                 $"SetCellStyled({sheet},{row},{col}) wrote nothing (status {rc})");
+        }
+    }
+
+    /// <summary>Set a formula cell, e.g. <c>SetFormula(0, 3, 1, "SUM(B1:B3)")</c>. A leading '=' is accepted.</summary>
+    /// <exception cref="InvalidOperationException">The sheet or cell is out of range; nothing was written.</exception>
+    public void SetFormula(uint sheet, uint row, uint col, string formula)
+    {
+        ArgumentNullException.ThrowIfNull(formula);
+        SetCell(sheet, row, col, new Formula(formula));
+    }
+
+    /// <summary>The largest magnitude up to which every integer is exactly a double.</summary>
+    private const long MaxExactInt = 1L << 53;
+
+    private static (int Type, string? Str, double Num) Encode(object? value)
+    {
+        switch (value)
+        {
+            case null: return (NativeMethods.OfficeCellEmpty, null, 0);
+            case Formula f: return (NativeMethods.OfficeCellFormula, f.Text, 0);
+            case string sv: return (NativeMethods.OfficeCellString, sv, 0);
+            case bool bv: return (NativeMethods.OfficeCellBoolean, null, bv ? 1 : 0);
+            case double dv: return (NativeMethods.OfficeCellNumber, null, dv);
+            case float fv: return (NativeMethods.OfficeCellNumber, null, fv);
+            case int iv: return (NativeMethods.OfficeCellNumber, null, iv);
+            case short hv: return (NativeMethods.OfficeCellNumber, null, hv);
+            case ushort uhv: return (NativeMethods.OfficeCellNumber, null, uhv);
+            case uint uiv: return (NativeMethods.OfficeCellNumber, null, uiv);
+            case byte byv: return (NativeMethods.OfficeCellNumber, null, byv);
+            case sbyte sbv: return (NativeMethods.OfficeCellNumber, null, sbv);
+            case decimal mv: return (NativeMethods.OfficeCellNumber, null, (double)mv);
+            // A long/ulong beyond 2^53 cannot be held exactly by the double
+            // Excel stores; converting silently changed IDs and account numbers.
+            case long lv:
+                if (lv > MaxExactInt || lv < -MaxExactInt)
+                    throw new ArgumentOutOfRangeException(nameof(value), lv,
+                        "cannot be stored exactly as an Excel number (a double is exact only up to 2^53); write it as a string");
+                return (NativeMethods.OfficeCellNumber, null, lv);
+            case ulong ulv:
+                if (ulv > (ulong)MaxExactInt)
+                    throw new ArgumentOutOfRangeException(nameof(value), ulv,
+                        "cannot be stored exactly as an Excel number (a double is exact only up to 2^53); write it as a string");
+                return (NativeMethods.OfficeCellNumber, null, ulv);
+            // Anything else is rendered with the invariant culture: the
+            // default ToString() made output depend on the host locale, so a
+            // decimal became "1,5" under de-DE.
+            default:
+                return (NativeMethods.OfficeCellString,
+                    System.Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture), 0);
         }
     }
 

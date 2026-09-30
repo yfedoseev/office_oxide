@@ -69,6 +69,15 @@ pub enum Error {
         /// The limit that was exceeded, in bytes.
         limit: u64,
     },
+    /// A caller-supplied argument can never be valid — e.g. an empty search
+    /// string for a text replacement, which matches between every character.
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+    /// The package as a whole exceeds a resource bound — too many entries,
+    /// or more decompressed bytes in total than
+    /// [`crate::limits::max_package_bytes`] allows. See [`crate::limits`].
+    #[error("package limit exceeded: {0}")]
+    PackageLimit(String),
     /// Integer parse error.
     #[error("integer parse error: {0}")]
     ParseInt(#[from] std::num::ParseIntError),

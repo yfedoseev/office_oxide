@@ -61,59 +61,89 @@ pub fn builtin_format_code(fmt_id: u32) -> Option<&'static str> {
 
 /// Apply an Excel number format to a numeric value.
 pub fn apply_format(n: f64, fmt_id: u32, fmt_str: Option<&str>) -> String {
+    if let Some(s) = apply_builtin(n, fmt_id) {
+        return s;
+    }
+    // Custom format string (IDs 164+), or a workbook's explicit override of a
+    // built-in id. Callers must pass the *declared* code here, never one
+    // resolved from the built-in table: the custom-format engine (`CompiledFormat`) is not a general format
+    // engine and garbles codes the match in `apply_builtin` already declined
+    // to handle.
+    match fmt_str.and_then(compile_custom) {
+        Some(compiled) => compiled.render(n),
+        None => format_general(n),
+    }
+}
+
+/// [`apply_format`] with the declared custom code already compiled by
+/// [`compile_custom`] — what a renderer formatting many cells under one
+/// `<numFmt>` uses, so the code is parsed once rather than once per cell.
+pub(crate) fn apply_format_compiled(
+    n: f64,
+    fmt_id: u32,
+    compiled: Option<&CompiledFormat>,
+) -> String {
+    if let Some(s) = apply_builtin(n, fmt_id) {
+        return s;
+    }
+    match compiled {
+        Some(c) => c.render(n),
+        None => format_general(n),
+    }
+}
+
+/// Non-finite values, and the built-in format ids rendered without their
+/// code; `None` when `fmt_id` needs its declared code.
+fn apply_builtin(n: f64, fmt_id: u32) -> Option<String> {
     if n.is_nan() {
-        return "NaN".to_string();
+        return Some("NaN".to_string());
     }
     if n.is_infinite() {
-        return if n < 0.0 {
+        return Some(if n < 0.0 {
             "-Infinity".to_string()
         } else {
             "Infinity".to_string()
-        };
+        });
     }
 
     // Built-in format IDs per OOXML spec §18.8.30.
-    match fmt_id {
-        0 | 49 => return format_general(n),         // General / @
-        1 => return format_integer(n),              // 0
-        2 => return format_fixed(n, 2),             // 0.00
-        3 => return format_commas(n, 0),            // #,##0
-        4 => return format_commas(n, 2),            // #,##0.00
-        5 | 6 => return format_currency(n, "$", 0), // $#,##0
-        7 | 8 => return format_currency(n, "$", 2), // $#,##0.00
-        9 => return format_percent(n, 0),           // 0%
-        10 => return format_percent(n, 2),          // 0.00%
-        11 => return format_scientific(n),          // 0.00E+00
-        12 => return format_general(n),             // # ?/? (fractions — approx)
-        13 => return format_general(n),             // # ??/??
+    Some(match fmt_id {
+        0 | 49 => format_general(n),         // General / @
+        1 => format_integer(n),              // 0
+        2 => format_fixed(n, 2),             // 0.00
+        3 => format_commas(n, 0),            // #,##0
+        4 => format_commas(n, 2),            // #,##0.00
+        5 | 6 => format_currency(n, "$", 0), // $#,##0
+        7 | 8 => format_currency(n, "$", 2), // $#,##0.00
+        9 => format_percent(n, 0),           // 0%
+        10 => format_percent(n, 2),          // 0.00%
+        11 => format_scientific(n),          // 0.00E+00
+        12 => format_general(n),             // # ?/? (fractions — approx)
+        13 => format_general(n),             // # ??/??
         // Accounting/comma built-ins wrap negatives in parentheses rather
         // than using a leading minus — the codes this file's own
         // `builtin_format_code` declares for them (`#,##0 ;(#,##0)`) say so,
         // per ECMA-376 §18.8.30.
-        37 | 38 => return format_accounting(n, 0), // #,##0 accounting variants
-        39 | 40 => return format_accounting(n, 2), // #,##0.00 accounting variants
-        41..=44 => return format_accounting(n, 2), // _(* ...) accounting
-        _ => {},
-    }
+        37 | 38 => format_accounting(n, 0), // #,##0 accounting variants
+        39 | 40 => format_accounting(n, 2), // #,##0.00 accounting variants
+        41..=44 => format_accounting(n, 2), // _(* ...) accounting
+        _ => return None,
+    })
+}
 
-    // Custom format string (IDs 164+), or a workbook's explicit override of a
-    // built-in id. Callers must pass the *declared* code here, never one
-    // resolved from the built-in table: apply_custom is not a general format
-    // engine and garbles codes the match above already declined to handle.
-    if let Some(fmt) = fmt_str {
-        let fmt = fmt.trim();
-        // The General/text sentinels are matched case-insensitively, and
-        // after leading `[...]` directives are stripped: real workbooks
-        // declare `numFmt formatCode="GENERAL"` and
-        // `"[DBNum1][$-804]General"`, and treating either as a literal
-        // format code dropped the cell's value and printed the code.
-        let bare = strip_leading_directives(fmt);
-        if !fmt.is_empty() && !bare.eq_ignore_ascii_case("General") && fmt != "@" {
-            return apply_custom(n, fmt);
-        }
+/// Compile a declared format code, or `None` when it is General/text and
+/// renders as General. The General/text sentinels are matched
+/// case-insensitively, and after leading `[...]` directives are stripped:
+/// real workbooks declare `numFmt formatCode="GENERAL"` and
+/// `"[DBNum1][$-804]General"`, and treating either as a literal format code
+/// dropped the cell's value and printed the code.
+pub(crate) fn compile_custom(fmt: &str) -> Option<CompiledFormat> {
+    let fmt = fmt.trim();
+    let bare = strip_leading_directives(fmt);
+    if fmt.is_empty() || bare.eq_ignore_ascii_case("General") || fmt == "@" {
+        return None;
     }
-
-    format_general(n)
+    Some(CompiledFormat::compile(fmt))
 }
 
 // ── Simple format primitives ───────────────────────────────────────────────
@@ -166,12 +196,10 @@ pub fn format_commas(n: f64, decimals: u8) -> String {
         let divisor = factor as u64;
         push_commas(&mut out, scaled_int / divisor);
         out.push('.');
+        // Zero-padded to `decimals` digits, written in place.
+        use std::fmt::Write;
         let frac = scaled_int % divisor;
-        let digits = frac.to_string();
-        for _ in digits.len()..decimals as usize {
-            out.push('0');
-        }
-        out.push_str(&digits);
+        write!(out, "{frac:0width$}", width = decimals as usize).ok();
     }
     out
 }
@@ -246,253 +274,360 @@ fn push_commas(out: &mut String, mut n: u64) {
 /// Simplified parser for Excel format strings. Handles the common cases:
 /// thousands separators, decimal places, percentages, currency symbols,
 /// and scientific notation. Strips color/condition brackets and literals.
-fn apply_custom(n: f64, fmt: &str) -> String {
-    // Sections are positive;negative;zero;text. Pick the one that applies
-    // to this value: a format like `#,##0;[Red](#,##0)` renders -1234 with
-    // the *second* section, and a two-section `"yes";"no"` is how a boolean
-    // flag column is written.
-    let sections = split_format_sections(fmt);
+///
+/// A custom format code parsed once: its sections, each with the
+/// condition it carries and the placeholders/literals it is made of.
+/// Rendering many cells under one `<numFmt>` re-split and re-parsed the
+/// code for every cell.
+#[derive(Debug, Clone)]
+pub(crate) struct CompiledFormat {
+    /// `[<op><number>]`-conditioned sections are tested in order.
+    conditional: bool,
+    /// The sections (positive;negative;zero;text) and their conditions.
+    sections: Vec<(Option<(&'static str, f64)>, CompiledSection)>,
+    /// The whole code as one section: used when it has no sections, or a
+    /// conditional code has none that applies.
+    whole: CompiledSection,
+}
 
-    // A format whose sections carry `[<op><number>]` conditions is a
-    // *conditional* format, not positive;negative;zero: sections are tested
-    // in order and the first match wins, with an unconditioned section as
-    // the fallback (ECMA-376 §18.8.31). `[>999999]#,,"M";[>999]#,"K";#` is
-    // how a sheet renders 1.02 as `1` and 102102 as `102K`; reading it
-    // positionally scaled every value by 1e6 and produced `0M`.
-    let conditional = sections.iter().any(|s| section_condition(s).is_some());
-    let (section, use_magnitude) = if conditional {
-        let chosen = sections
-            .iter()
-            .find(|s| match section_condition(s) {
-                Some((op, v)) => condition_holds(n, op, v),
-                None => true,
-            })
-            .copied()
-            .unwrap_or(fmt);
-        (chosen, false)
-    } else {
-        let chosen = match sections.len() {
-            0 => fmt,
-            1 => sections[0],
-            2 => {
-                if n < 0.0 {
-                    sections[1]
-                } else {
-                    sections[0]
-                }
-            },
-            _ => {
-                if n < 0.0 {
-                    sections[1]
-                } else if n == 0.0 {
-                    sections[2]
-                } else {
-                    sections[0]
-                }
-            },
+impl CompiledFormat {
+    fn compile(fmt: &str) -> Self {
+        let sections: Vec<_> = split_format_sections(fmt)
+            .into_iter()
+            .map(|s| (section_condition(s), CompiledSection::compile(s)))
+            .collect();
+        Self {
+            conditional: sections.iter().any(|(c, _)| c.is_some()),
+            sections,
+            whole: CompiledSection::compile(fmt),
+        }
+    }
+
+    pub(crate) fn render(&self, n: f64) -> String {
+        // Sections are positive;negative;zero;text. Pick the one that
+        // applies to this value: a format like `#,##0;[Red](#,##0)` renders
+        // -1234 with the *second* section, and a two-section `"yes";"no"`
+        // is how a boolean flag column is written.
+        //
+        // A format whose sections carry `[<op><number>]` conditions is a
+        // *conditional* format, not positive;negative;zero: sections are
+        // tested in order and the first match wins, with an unconditioned
+        // section as the fallback (ECMA-376 §18.8.31).
+        // `[>999999]#,,"M";[>999]#,"K";#` is how a sheet renders 1.02 as
+        // `1` and 102102 as `102K`; reading it positionally scaled every
+        // value by 1e6 and produced `0M`.
+        let (section, use_magnitude) = if self.conditional {
+            let chosen = self
+                .sections
+                .iter()
+                .find(|(cond, _)| match cond {
+                    Some((op, v)) => condition_holds(n, op, *v),
+                    None => true,
+                })
+                .map_or(&self.whole, |(_, s)| s);
+            (chosen, false)
+        } else {
+            let s = &self.sections;
+            let chosen = match s.len() {
+                0 => &self.whole,
+                1 => &s[0].1,
+                2 => {
+                    if n < 0.0 {
+                        &s[1].1
+                    } else {
+                        &s[0].1
+                    }
+                },
+                _ => {
+                    if n < 0.0 {
+                        &s[1].1
+                    } else if n == 0.0 {
+                        &s[2].1
+                    } else {
+                        &s[0].1
+                    }
+                },
+            };
+            // The negative section supplies its own sign (usually
+            // parentheses or a literal '-'), so format its magnitude.
+            (chosen, s.len() >= 2 && n < 0.0)
         };
-        // The negative section supplies its own sign (usually parentheses or
-        // a literal '-'), so format its magnitude.
-        (chosen, sections.len() >= 2 && n < 0.0)
-    };
-    let n = if use_magnitude { n.abs() } else { n };
+        let n = if use_magnitude { n.abs() } else { n };
+        section.render(n)
+    }
+}
 
-    // ── Parse the section ────────────────────────────────────────────────
-    let mut currency_prefix = String::new();
-    let mut suffix = String::new(); // literal text after the number
-    let mut has_percent = false;
-    let mut has_comma_in_num = false;
-    let mut decimal_zeros = 0u8; // '0' chars after '.'
-    let mut _decimal_hashes = 0u8; // '#' chars after '.'  (optional digits)
-    let mut has_scientific = false;
-    let mut in_decimal = false;
-    let mut in_num_part = false;
-    // Divisor accumulated from commas trailing the digit placeholders.
-    let mut scale_divisor = 1.0f64;
-    // Whether the integer part contains a `0` placeholder, which forces a
-    // digit to be shown even when the value rounds to zero.
-    let mut has_forced_integer_digit = false;
-    // Literal text collected before any digit placeholder appears.
-    let mut prefix_literal = String::new();
+/// One `;`-separated section of a custom format code, parsed.
+#[derive(Debug, Clone)]
+struct CompiledSection {
+    currency_prefix: String,
+    prefix_literal: String,
+    suffix: String,
+    has_percent: bool,
+    has_comma_in_num: bool,
+    decimals: u8,
+    has_scientific: bool,
+    in_decimal: bool,
+    in_num_part: bool,
+    scale_divisor: f64,
+    has_forced_integer_digit: bool,
+    /// For a section with no digit placeholder: whether it is a date/time
+    /// code (rendered as the plain number) rather than literal text.
+    literal_is_date: bool,
+}
 
-    let mut chars = section.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            // Bracketed: colour like [Red] or locale/currency like [$€-407]
-            '[' => {
-                let mut inner = String::new();
-                for ch in chars.by_ref() {
-                    if ch == ']' {
-                        break;
+impl CompiledSection {
+    fn compile(section: &str) -> Self {
+        // ── Parse the section ────────────────────────────────────────────────
+        let mut currency_prefix = String::new();
+        let mut suffix = String::new(); // literal text after the number
+        let mut has_percent = false;
+        let mut has_comma_in_num = false;
+        let mut decimal_zeros = 0u8; // '0' chars after '.'
+        let mut has_scientific = false;
+        let mut in_decimal = false;
+        let mut in_num_part = false;
+        // Divisor accumulated from commas trailing the digit placeholders.
+        let mut scale_divisor = 1.0f64;
+        // Whether the integer part contains a `0` placeholder, which forces a
+        // digit to be shown even when the value rounds to zero.
+        let mut has_forced_integer_digit = false;
+        // Literal text collected before any digit placeholder appears.
+        let mut prefix_literal = String::new();
+
+        let mut chars = section.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                // Bracketed: colour like [Red] or locale/currency like [$€-407]
+                '[' => {
+                    let mut inner = String::new();
+                    for ch in chars.by_ref() {
+                        if ch == ']' {
+                            break;
+                        }
+                        inner.push(ch);
                     }
-                    inner.push(ch);
-                }
-                if let Some(rest) = inner.strip_prefix('$') {
-                    // [$symbol-locale] — extract symbol
-                    let sym: String = rest.chars().take_while(|&ch| ch != '-').collect();
-                    if !sym.is_empty() {
-                        currency_prefix = sym;
+                    if let Some(rest) = inner.strip_prefix('$') {
+                        // [$symbol-locale] — extract symbol
+                        let sym: String = rest.chars().take_while(|&ch| ch != '-').collect();
+                        if !sym.is_empty() {
+                            currency_prefix = sym;
+                        }
                     }
-                }
-                // Colour directives ignored.
-            },
-            // Quoted literal text. Before any digit placeholder it is a
-            // prefix; after one it is a suffix.
-            '"' => {
-                for ch in chars.by_ref() {
-                    if ch == '"' {
-                        break;
+                    // Colour directives ignored.
+                },
+                // Quoted literal text. Before any digit placeholder it is a
+                // prefix; after one it is a suffix.
+                '"' => {
+                    for ch in chars.by_ref() {
+                        if ch == '"' {
+                            break;
+                        }
+                        if in_num_part {
+                            suffix.push(ch);
+                        } else {
+                            prefix_literal.push(ch);
+                        }
                     }
+                },
+                // Escape: next char is literal
+                '\\' => {
+                    if let Some(ch) = chars.next() {
+                        if in_num_part {
+                            suffix.push(ch);
+                        } else {
+                            prefix_literal.push(ch);
+                        }
+                    }
+                },
+                // _X = pad with X (alignment) — skip X
+                '_' => {
+                    chars.next();
+                },
+                // *X = repeat X (fill) — skip X
+                '*' => {
+                    chars.next();
+                },
+
+                '%' => {
+                    has_percent = true;
+                    in_num_part = true;
+                },
+                '.' => {
+                    in_decimal = true;
+                    in_num_part = true;
+                },
+                // `0` forces a digit; `#` and `?` are *optional* digit
+                // placeholders (`?` pads with a space instead of nothing).
+                '0' => {
+                    in_num_part = true;
+                    if in_decimal {
+                        decimal_zeros += 1;
+                    } else {
+                        has_forced_integer_digit = true;
+                    }
+                },
+                '#' | '?' => {
+                    in_num_part = true;
+                },
+                ',' => {
+                    // A comma *between* digit placeholders is the thousands
+                    // separator; a comma *after* the last placeholder scales the
+                    // value down by 1000 each. `#,##0,," M"` is how a
+                    // finance sheet renders 12,500,000 as "12 M" — treating the
+                    // trailing commas as separators printed the full number.
                     if in_num_part {
-                        suffix.push(ch);
+                        if chars
+                            .peek()
+                            .is_some_and(|c| matches!(c, '0' | '#' | '?' | '.'))
+                        {
+                            has_comma_in_num = true;
+                        } else {
+                            scale_divisor *= 1000.0;
+                        }
+                    }
+                },
+                'E' | 'e' => {
+                    // Only treat this as scientific notation when followed by
+                    // `+` or `-` (per ECMA-376 §18.8.31). Bare `E` is just
+                    // a literal in formats like "000E" and must not consume
+                    // the next character.
+                    if matches!(chars.peek(), Some('+') | Some('-')) {
+                        has_scientific = true;
+                        chars.next(); // consume the sign
+                        while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                            chars.next();
+                        }
+                    } else if !in_num_part {
+                        currency_prefix.push(c);
                     } else {
-                        prefix_literal.push(ch);
+                        suffix.push(c);
                     }
-                }
-            },
-            // Escape: next char is literal
-            '\\' => {
-                if let Some(ch) = chars.next() {
-                    if in_num_part {
-                        suffix.push(ch);
-                    } else {
-                        prefix_literal.push(ch);
-                    }
-                }
-            },
-            // _X = pad with X (alignment) — skip X
-            '_' => {
-                chars.next();
-            },
-            // *X = repeat X (fill) — skip X
-            '*' => {
-                chars.next();
-            },
-
-            '%' => {
-                has_percent = true;
-                in_num_part = true;
-            },
-            '.' => {
-                in_decimal = true;
-                in_num_part = true;
-            },
-            // `0` forces a digit; `#` and `?` are *optional* digit
-            // placeholders (`?` pads with a space instead of nothing).
-            '0' => {
-                in_num_part = true;
-                if in_decimal {
-                    decimal_zeros += 1;
-                } else {
-                    has_forced_integer_digit = true;
-                }
-            },
-            '#' | '?' => {
-                in_num_part = true;
-                if in_decimal {
-                    _decimal_hashes += 1;
-                }
-            },
-            ',' => {
-                // A comma *between* digit placeholders is the thousands
-                // separator; a comma *after* the last placeholder scales the
-                // value down by 1000 each. `#,##0,," M"` is how a
-                // finance sheet renders 12,500,000 as "12 M" — treating the
-                // trailing commas as separators printed the full number.
-                if in_num_part {
-                    if chars
-                        .peek()
-                        .is_some_and(|c| matches!(c, '0' | '#' | '?' | '.'))
-                    {
-                        has_comma_in_num = true;
-                    } else {
-                        scale_divisor *= 1000.0;
-                    }
-                }
-            },
-            'E' | 'e' => {
-                // Only treat this as scientific notation when followed by
-                // `+` or `-` (per ECMA-376 §18.8.31). Bare `E` is just
-                // a literal in formats like "000E" and must not consume
-                // the next character.
-                if matches!(chars.peek(), Some('+') | Some('-')) {
-                    has_scientific = true;
-                    chars.next(); // consume the sign
-                    while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
-                        chars.next();
-                    }
-                } else if !in_num_part {
+                },
+                '$' => {
+                    currency_prefix = "$".to_string();
+                    in_num_part = true;
+                },
+                // Other literal characters before the number part = currency prefix
+                c if !in_num_part && !c.is_ascii_whitespace() => {
                     currency_prefix.push(c);
-                } else {
-                    suffix.push(c);
-                }
-            },
-            '$' => {
-                currency_prefix = "$".to_string();
-                in_num_part = true;
-            },
-            // Other literal characters before the number part = currency prefix
-            c if !in_num_part && !c.is_ascii_whitespace() => {
-                currency_prefix.push(c);
-            },
-            // ...and after it, a suffix. Dropping these lost the closing
-            // paren of a custom `#,##0;(#,##0)` and any bare trailing
-            // literal, so the rendered string didn't match the format.
-            c => {
-                if in_num_part {
-                    suffix.push(c);
-                }
-            },
+                },
+                // ...and after it, a suffix. Dropping these lost the closing
+                // paren of a custom `#,##0;(#,##0)` and any bare trailing
+                // literal, so the rendered string didn't match the format.
+                c => {
+                    if in_num_part {
+                        suffix.push(c);
+                    }
+                },
+            }
+        }
+
+        let literal_is_date = !in_num_part && super::date::is_date_format_string(section);
+        Self {
+            currency_prefix,
+            prefix_literal,
+            suffix,
+            has_percent,
+            has_comma_in_num,
+            decimals: decimal_zeros,
+            has_scientific,
+            in_decimal,
+            in_num_part,
+            scale_divisor,
+            has_forced_integer_digit,
+            literal_is_date,
         }
     }
 
-    let decimals = decimal_zeros; // treat '0' decimals as the required precision
+    fn render(&self, n: f64) -> String {
+        let Self {
+            currency_prefix,
+            prefix_literal,
+            suffix,
+            has_percent,
+            has_comma_in_num,
+            decimals,
+            has_scientific,
+            in_decimal,
+            in_num_part,
+            scale_divisor,
+            has_forced_integer_digit,
+            literal_is_date,
+        } = self;
+        let (has_percent, has_comma_in_num, decimals, has_scientific, in_decimal, in_num_part) = (
+            *has_percent,
+            *has_comma_in_num,
+            *decimals,
+            *has_scientific,
+            *in_decimal,
+            *in_num_part,
+        );
+        let (scale_divisor, has_forced_integer_digit) = (*scale_divisor, *has_forced_integer_digit);
 
-    // ── Format the value ─────────────────────────────────────────────────
-    // A section with no digit placeholder at all is pure literal text —
-    // `"yes";"no"` names two strings, not two numbers. Emitting the number
-    // alongside them produced "1yes".
-    //
-    // Unquoted literal characters accumulate in `currency_prefix`, so they
-    // must be included: dropping them turned an unrecognised format code
-    // into an empty cell, losing the value entirely.
-    //
-    // A date/time code (`h"时"mm"分"ss"秒"`) also has no digit placeholder,
-    // but it denotes a *value*, not a literal — echoing its letters back
-    // prints the format code where the data should be. Such a cell should
-    // have been rendered by the date path; if it reaches here, fall back to
-    // the plain number rather than inventing text.
-    if !in_num_part {
-        if super::date::is_date_format_string(section) {
-            return format_general(n);
+        // ── Format the value ─────────────────────────────────────────────────
+        // A section with no digit placeholder at all is pure literal text —
+        // `"yes";"no"` names two strings, not two numbers. Emitting the number
+        // alongside them produced "1yes".
+        //
+        // Unquoted literal characters accumulate in `currency_prefix`, so they
+        // must be included: dropping them turned an unrecognised format code
+        // into an empty cell, losing the value entirely.
+        //
+        // A date/time code (`h"时"mm"分"ss"秒"`) also has no digit placeholder,
+        // but it denotes a *value*, not a literal — echoing its letters back
+        // prints the format code where the data should be. Such a cell should
+        // have been rendered by the date path; if it reaches here, fall back to
+        // the plain number rather than inventing text.
+        if !in_num_part {
+            if *literal_is_date {
+                return format_general(n);
+            }
+            return format!("{currency_prefix}{prefix_literal}{suffix}");
         }
-        return format!("{currency_prefix}{prefix_literal}{suffix}");
+
+        let value = if has_percent { n * 100.0 } else { n } / scale_divisor;
+
+        // A value that rounds to zero renders as *nothing* when the integer part
+        // has only optional placeholders (`#`/`?`) — which is exactly how the
+        // accounting formats' zero section, `_-* "-"??_-`, shows a bare dash.
+        // Forcing a digit there printed `0` where Excel prints nothing.
+        let rounds_to_zero = decimals == 0 && value.round() == 0.0;
+        let body = if has_scientific {
+            format_scientific(value)
+        } else if rounds_to_zero && !has_forced_integer_digit && in_num_part {
+            String::new()
+        } else if has_comma_in_num {
+            format_commas(value, decimals)
+        } else if in_decimal && decimals > 0 {
+            format_fixed(value, decimals)
+        } else if in_num_part {
+            format_integer(value)
+        } else {
+            format_general(value)
+        };
+
+        let pct_suffix = if has_percent { "%" } else { "" };
+
+        if currency_prefix.is_empty() && prefix_literal.is_empty() && suffix.is_empty() {
+            let mut body = body;
+            body.push_str(pct_suffix);
+            return body;
+        }
+        let mut out = String::with_capacity(
+            currency_prefix.len() + prefix_literal.len() + body.len() + suffix.len() + 1,
+        );
+        for part in [
+            currency_prefix.as_str(),
+            prefix_literal,
+            &body,
+            suffix,
+            pct_suffix,
+        ] {
+            out.push_str(part);
+        }
+        out
     }
-
-    let value = if has_percent { n * 100.0 } else { n } / scale_divisor;
-
-    // A value that rounds to zero renders as *nothing* when the integer part
-    // has only optional placeholders (`#`/`?`) — which is exactly how the
-    // accounting formats' zero section, `_-* "-"??_-`, shows a bare dash.
-    // Forcing a digit there printed `0` where Excel prints nothing.
-    let rounds_to_zero = decimals == 0 && value.round() == 0.0;
-    let body = if has_scientific {
-        format_scientific(value)
-    } else if rounds_to_zero && !has_forced_integer_digit && in_num_part {
-        String::new()
-    } else if has_comma_in_num {
-        format_commas(value, decimals)
-    } else if in_decimal && decimals > 0 {
-        format_fixed(value, decimals)
-    } else if in_num_part {
-        format_integer(value)
-    } else {
-        format_general(value)
-    };
-
-    let pct_suffix = if has_percent { "%" } else { "" };
-
-    format!("{currency_prefix}{prefix_literal}{body}{suffix}{pct_suffix}")
 }
 
 /// Strip leading `[...]` directives — `[DBNum1]`, `[$-804]`, `[Red]` — from
@@ -949,7 +1084,7 @@ mod builtin_code_tests {
 
     /// `apply_format`'s `fmt_str` branch is for codes a workbook *declares*.
     /// Feeding it a code resolved from the built-in table sends it to
-    /// `apply_custom`, which is not a general format engine: id 47's
+    /// the custom-format engine (`CompiledFormat`), which is not a general format engine: id 47's
     /// `mm:ss.0` came out as the literal `mm:ss0.6`.
     #[test]
     fn test_a_builtin_code_is_not_fed_back_in_as_a_custom_format() {

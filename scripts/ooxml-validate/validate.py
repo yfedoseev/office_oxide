@@ -7,6 +7,12 @@ Known limitation, deliberately suppressed: `a:graphicData` uses a strict
 wildcard, so 2010-era extension content (`wps:wsp` in a text box) has no
 global declaration in this schema set and fails even though real Word files
 contain it. That is a validator artifact, not a defect.
+
+Second known gap: the published SpreadsheetML schema types `<t>` (in shared
+strings, inline strings and comments) as a bare `ST_Xstring`, so it rejects
+`xml:space="preserve"` on it. Excel itself writes that attribute — and
+strips leading/trailing blanks without it — as do openpyxl and
+XlsxWriter, so it is suppressed for that one element and attribute only.
 """
 
 import os
@@ -73,6 +79,12 @@ def validate_pkg(path):
                     if "strict wildcard" in e.message:
                         # 2010 extension content under a:graphicData; see the
                         # module docstring.
+                        continue
+                    if (
+                        "spreadsheetml/2006/main}t'" in e.message
+                        and "XML/1998/namespace}space' is not allowed" in e.message
+                    ):
+                        # xml:space on SpreadsheetML <t>; see the docstring.
                         continue
                     out.append((n, "INVALID", f"line {e.line}: {e.message}"))
     return out

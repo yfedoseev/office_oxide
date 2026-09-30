@@ -2,7 +2,7 @@
 
 use std::io::{Read, Seek};
 
-use crate::cfb::{CfbReader, SummaryProperties, parse_summary_information};
+use crate::cfb::{CfbReader, SummaryProperties};
 
 use super::chpx::{parse_chpx_runs, resolve_deleted_cp_ranges_from_runs};
 use super::error::{DocError, Result};
@@ -340,10 +340,7 @@ impl DocDocument {
         // traversed at all, so an embedded Excel workbook, Equation
         // Editor object, etc. left no trace anywhere.
         let ole_objects = super::ole_objects::extract_ole_objects(&cfb);
-        let summary_properties = cfb
-            .open_stream("\u{5}SummaryInformation")
-            .ok()
-            .and_then(|data| parse_summary_information(&data));
+        let summary_properties = crate::cfb::read_document_properties(&mut cfb);
 
         Ok(Self {
             text,
@@ -388,10 +385,7 @@ impl DocDocument {
             })
             .collect();
         let has_macros = cfb.has_root_entry("_VBA_PROJECT") || fib.ccp[3] != 0;
-        let summary_properties = cfb
-            .open_stream("\u{5}SummaryInformation")
-            .ok()
-            .and_then(|data| parse_summary_information(&data));
+        let summary_properties = crate::cfb::read_document_properties(cfb);
         Ok(Self {
             text,
             data_stream: Vec::new(),
@@ -1280,6 +1274,7 @@ mod tests {
             comments: Some("Declared Comment".to_string()),
             created: Some("2020-01-02T03:04:05Z".to_string()),
             modified: Some("2021-06-07T08:09:10Z".to_string()),
+            ..Default::default()
         });
         let ir = crate::convert_doc::doc_to_ir(&doc);
         assert_eq!(ir.metadata.title.as_deref(), Some("Declared Title"));

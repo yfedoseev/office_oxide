@@ -226,15 +226,22 @@ jobs:
           cargo run --example 05_edit
           cargo run --example 06_from_markdown
 
+      # --workspace: the default members are the root package only, so a
+      # plain `cargo test` never ran the CLI and MCP crates' unit tests or
+      # the CLI's integration tests (closed pipe, /dev/full, markdown
+      # parity).
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --workspace --verbose
 
       - name: Build documentation (warnings as errors)
         run: cargo doc --no-deps --workspace
         env:
           RUSTDOCFLAGS: "-D warnings"
 
-  # Test feature combinations
+  # Test feature combinations. `mmap` and `parallel` change runtime
+  # behaviour (memory-mapped reads, rayon), so they run the test suite, not
+  # just a build. `python` links libpython, so it is only built here; the
+  # Python workflow runs its tests.
   features:
     name: Feature Tests
     runs-on: ubuntu-latest
@@ -257,6 +264,10 @@ jobs:
       - name: Build with features
         run: cargo build -p office_oxide --no-default-features --features "${{ matrix.features }}"
         if: matrix.features != ''
+
+      - name: Test with features
+        run: cargo test -p office_oxide --no-default-features --features "${{ matrix.features }}"
+        if: matrix.features == 'mmap' || matrix.features == 'parallel'
 
       - name: Build without features
         run: cargo build -p office_oxide --no-default-features
@@ -356,6 +367,9 @@ jobs:
 
       - name: Test Python bindings
         run: uv run python -c "import office_oxide; print('office_oxide imported successfully')"
+
+      - name: Run Python binding tests
+        run: uv run pytest -q python/tests
 
       - name: Run Python examples
         if: matrix.python-version == '3.12'
@@ -500,7 +514,9 @@ jobs:
 
       - name: Run Node tests
         working-directory: js
-        run: node --test test/basic.test.mjs
+        # Auto-discovers every test/*.test.mjs (a shell glob would not expand
+        # under the Windows runner's default shell).
+        run: node --test
         env:
           OFFICE_OXIDE_LIB: ${{ steps.lib.outputs.path }}
 
@@ -530,6 +546,29 @@ jobs:
       - name: Build WASM
         run: cargo build -p office_oxide --lib --target wasm32-unknown-unknown --features wasm,default
 
+      # Clippy for the wasm32 target: std types differ there (e.g. File has
+      # no Drop impl), so host-only clippy misses lints that break this build.
+      - name: Clippy (wasm32)
+        run: cargo clippy -p office_oxide --lib --target wasm32-unknown-unknown --features wasm -- -D warnings
+
+      # The wasm-bindgen glue used to be generated only at release time, so a
+      # glue failure surfaced on release day. Generate the Node build and
+      # drive every exported class through it.
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        with:
+          tool: wasm-pack
+
+      - name: Generate wasm-bindgen glue (Node)
+        run: wasm-pack build --target nodejs --dev --out-dir wasm-pkg/node --no-default-features --features wasm
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '20'
+
+      - name: WASM smoke test
+        run: node --test wasm-pkg/test/smoke.test.cjs
+
   # Code coverage with enforcement
   coverage:
     name: Code Coverage
@@ -551,14 +590,17 @@ jobs:
 
       - name: Generate coverage
         run: |
-          cargo llvm-cov --lib --tests --lcov --output-path lcov.info \
+          cargo llvm-cov --workspace --lcov --output-path lcov.info \
             --ignore-filename-regex '(python\.rs|wasm\.rs|ffi\.rs)'
 
-      - name: Enforce 75% coverage threshold
+      # A line floor alone cannot see a whole function that no test runs;
+      # the function floor catches newly added, never-executed code paths.
+      - name: Enforce coverage thresholds (75% lines, 85% functions)
         run: |
           cargo llvm-cov report \
             --ignore-filename-regex '(python\.rs|wasm\.rs|ffi\.rs)' \
-            --fail-under-lines 75
+            --fail-under-lines 75 \
+            --fail-under-functions 85
 
       - name: Upload coverage to Codecov
         if: always()
@@ -611,6 +653,9 @@ jobs:
       - name: Verify CLI --help
         run: cargo run -p office_oxide_cli -- --help
 
+      - name: Test CLI and MCP crates
+        run: cargo test -p office_oxide_cli -p office_oxide_mcp
+
   # Security audit
   audit:
     name: Security Audit
@@ -632,6 +677,15 @@ jobs:
         with:
           command: check
           arguments: --all-features
+
+      # The fuzz crate is its own workspace with its own lockfile
+      # (libfuzzer-sys and its deps); without this it escaped the advisory
+      # gate entirely.
+      - name: Check fuzz dependencies (advisories)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: fuzz/Cargo.toml
+          command: check advisories
 
   # cargo-geiger: report unsafe code in the dependency tree (informational)
   geiger:
@@ -696,6 +750,7 @@ jobs:
   #         feature-group: default-features
 
   # MSRV: verify the oldest supported Rust toolchain still builds the library
+  # and the CLI/MCP binaries, which declare the same rust-version
   msrv:
     name: MSRV build
     runs-on: ubuntu-latest
@@ -713,7 +768,7 @@ jobs:
         with:
           key: msrv
       - name: Build with MSRV toolchain
-        run: cargo build --lib -p office_oxide
+        run: cargo build --workspace
 
   # DCO check disabled — sign-off requirement removed.
   # dco:

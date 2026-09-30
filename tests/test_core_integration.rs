@@ -463,3 +463,40 @@ fn test_part_name_deep_nesting() {
     assert_eq!(pn.filename(), "file.xml");
     assert_eq!(pn.rels_path(), "/a/b/c/d/e/_rels/file.xml.rels");
 }
+
+// ---------------------------------------------------------------------------
+// ISO/IEC 29500 Strict packages
+// ---------------------------------------------------------------------------
+
+/// A Strict package: every namespace and relationship type is the
+/// `purl.oclc.org/ooxml` form. The main-part reader accepts only elements
+/// whose prefix the root binds to WordprocessingML, so without the Strict
+/// namespace mapping the whole body is skipped as foreign markup, and
+/// without the Strict relationship-type mapping the main part is not
+/// found at all.
+#[test]
+fn test_strict_docx_package_reads_text_and_formatting() {
+    const STRICT_W: &str = "http://purl.oclc.org/ooxml/wordprocessingml/main";
+    const STRICT_OFFICE_DOCUMENT: &str =
+        "http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument";
+    let mut w = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
+    let doc = PartName::new("/word/document.xml").unwrap();
+    let body = format!(
+        r#"<w:document xmlns:w="{STRICT_W}" w:conformance="strict"><w:body><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Strict bold</w:t></w:r><w:r><w:t> plain</w:t></w:r></w:p></w:body></w:document>"#
+    );
+    w.add_part(
+        &doc,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+        body.as_bytes(),
+    )
+    .unwrap();
+    w.add_package_rel(STRICT_OFFICE_DOCUMENT, "word/document.xml");
+    let bytes = w.finish().unwrap().into_inner();
+
+    let doc =
+        office_oxide::Document::from_reader(Cursor::new(bytes), office_oxide::DocumentFormat::Docx)
+            .expect("a Strict package opens");
+    let md = doc.to_markdown();
+    assert!(md.contains("**Strict bold**"), "{md}");
+    assert!(md.contains("plain"), "{md}");
+}

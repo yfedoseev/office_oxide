@@ -51,6 +51,21 @@ thread_local! {
         }) };
 }
 
+/// Enter one level of the recursive element walk.
+///
+/// `DocumentIR` is `Deserialize`, so a caller can hand a renderer a tree
+/// nested far deeper than any bounded reader produces, and the renderers
+/// run on the caller's own stack. Past `MAX_NESTING_DEPTH` the subtree is
+/// skipped; the skip is counted in `core::xml::truncated_subtrees` (reset
+/// it before rendering to read a per-call count) as well as logged.
+fn enter_render_level() -> Option<crate::core::xml::DepthGuard> {
+    let guard = crate::core::xml::DepthGuard::enter();
+    if guard.is_none() {
+        log::warn!("render: element nesting exceeds the depth limit; subtree skipped");
+    }
+    guard
+}
+
 /// The media type to put in an image's `data:` URI.
 ///
 /// `Image::format` is authoritative when the converter set it; otherwise the
@@ -173,12 +188,12 @@ mod block_default {
                         return format!("[image-base64:{}]", crate::core::base64::encode(data));
                     }
                 }
-                // A linked picture has a real target to point at.
-                if let Some(url) = img.source_url.as_deref().and_then(super::safe_url) {
+                // A linked image has a real, addressable source.
+                if let Some(src) = img.source_url.as_deref().and_then(super::safe_url) {
                     return format!(
                         "![{}]({})",
                         crate::core::markdown::image_alt(img.alt_text.as_deref().unwrap_or("")),
-                        super::escape_markdown_url(&url)
+                        super::escape_markdown_url(&src)
                     );
                 }
                 // An `![alt]()` with an empty target renders as a broken
@@ -231,16 +246,13 @@ mod block_default {
                         return out;
                     }
                 }
-                // A linked picture has a real target to point at.
-                if let Some(url) = img.source_url.as_deref().and_then(super::safe_url) {
-                    let mut out = String::new();
-                    let _ = write!(
-                        out,
+                if let Some(src) = img.source_url.as_deref().and_then(super::safe_url) {
+                    let alt = img.alt_text.as_deref().unwrap_or("");
+                    return format!(
                         "<img src=\"{}\" alt=\"{}\" />",
-                        super::escape_html(&url),
-                        super::escape_html(img.alt_text.as_deref().unwrap_or(""))
+                        super::escape_html(&src),
+                        super::escape_html(alt)
                     );
-                    return out;
                 }
                 // `src` is required on `<img>`; an element without one is
                 // invalid HTML. With no addressable source in the IR,
@@ -446,6 +458,9 @@ fn render_section_plain(section: &Section) -> String {
 }
 
 fn render_element_plain(element: &Element) -> String {
+    let Some(_depth) = enter_render_level() else {
+        return String::new();
+    };
     match element {
         Element::Heading(h) => render_inline_plain(&h.content),
         Element::Paragraph(p) => render_inline_plain(&p.content),
@@ -501,6 +516,9 @@ fn render_table_plain(table: &Table) -> String {
 }
 
 fn render_list_plain(list: &List, indent: usize) -> String {
+    let Some(_depth) = enter_render_level() else {
+        return String::new();
+    };
     let prefix_str = " ".repeat(indent * 2);
     let mut lines = Vec::new();
     for item in &list.items {
@@ -576,6 +594,9 @@ fn render_section_markdown(section: &Section) -> String {
 }
 
 fn render_element_markdown(element: &Element) -> String {
+    let Some(_depth) = enter_render_level() else {
+        return String::new();
+    };
     match element {
         Element::Heading(h) => {
             let hashes = "#".repeat(h.clamped_level() as usize);
@@ -889,6 +910,9 @@ fn render_cell_markdown(cell: &TableCell) -> String {
 }
 
 fn render_list_markdown(list: &List, indent: usize) -> String {
+    let Some(_depth) = enter_render_level() else {
+        return String::new();
+    };
     let prefix_str = "  ".repeat(indent);
     // A numbered list that starts at 3 in the source must start at 3 here:
     // `start_number` was parsed and then ignored, so every ordered list
@@ -1021,6 +1045,9 @@ fn render_section_html(section: &Section) -> String {
 }
 
 fn render_element_html(element: &Element) -> String {
+    let Some(_depth) = enter_render_level() else {
+        return String::new();
+    };
     match element {
         Element::Heading(h) => {
             let level = h.clamped_level();
@@ -1215,6 +1242,9 @@ fn render_list_html(list: &List) -> String {
 /// fragments that agree on shape are re-joined here; see
 /// [`merge_adjacent_lists`] for what counts as adjacent.
 fn render_list_group_html(lists: &[&List]) -> String {
+    let Some(_depth) = enter_render_level() else {
+        return String::new();
+    };
     let Some(first) = lists.first() else {
         return String::new();
     };

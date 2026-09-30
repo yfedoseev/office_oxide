@@ -31,8 +31,21 @@ const PIDSI_SUBJECT: u32 = 3;
 const PIDSI_AUTHOR: u32 = 4;
 const PIDSI_KEYWORDS: u32 = 5;
 const PIDSI_COMMENTS: u32 = 6;
+/// `PIDSI_LASTAUTHOR` ([MS-OSHARED] §2.3.3.2.1): the last user to save.
+const PIDSI_LASTAUTHOR: u32 = 8;
+/// `PIDSI_REVNUMBER` ([MS-OSHARED] §2.3.3.2.1): the revision number.
+const PIDSI_REVNUMBER: u32 = 9;
 const PIDSI_CREATE_DTM: u32 = 12;
 const PIDSI_LASTSAVE_DTM: u32 = 13;
+
+// Property IDs of the `DocumentSummaryInformation` FMTID
+// ({D5CDD502-2E9C-101B-9397-08002B2CF9AE}), [MS-OSHARED] §2.3.3.2.2.
+/// `PIDDSI_CATEGORY`: the document category.
+const PIDDSI_CATEGORY: u32 = 0x02;
+/// `PIDDSI_MANAGER`: the author's manager.
+const PIDDSI_MANAGER: u32 = 0x0E;
+/// `PIDDSI_COMPANY`: the company.
+const PIDDSI_COMPANY: u32 = 0x0F;
 
 const VT_LPSTR: u16 = 0x001E;
 const VT_LPWSTR: u16 = 0x001F;
@@ -60,19 +73,91 @@ pub struct SummaryProperties {
     pub created: Option<String>,
     /// `PIDSI_LASTSAVE_DTM` (13). See `created`.
     pub modified: Option<String>,
+    /// `PIDSI_LASTAUTHOR` (8).
+    pub last_author: Option<String>,
+    /// `PIDSI_REVNUMBER` (9).
+    pub revision: Option<String>,
+    /// `PIDDSI_CATEGORY`, from `\x05DocumentSummaryInformation`.
+    pub category: Option<String>,
+    /// `PIDDSI_MANAGER`, from `\x05DocumentSummaryInformation`.
+    pub manager: Option<String>,
+    /// `PIDDSI_COMPANY`, from `\x05DocumentSummaryInformation`.
+    pub company: Option<String>,
+    /// The compound file holds a document signature: a root `_signatures`
+    /// storage (CryptoAPI signature, [MS-OFFCRYPTO] §2.5.1) or
+    /// `_xmlsignatures` storage (XML signature, [MS-OFFCRYPTO] §2.5.2).
+    pub has_digital_signature: bool,
 }
 
 impl SummaryProperties {
     fn is_empty(&self) -> bool {
-        self.title.is_none()
-            && self.subject.is_none()
-            && self.author.is_none()
-            && self.keywords.is_none()
-            && self.comments.is_none()
-            && self.created.is_none()
-            && self.modified.is_none()
+        *self == Self::default()
+    }
+
+    /// Fill every field `self` lacks from `other`.
+    fn merge(&mut self, other: SummaryProperties) {
+        let fill = |a: &mut Option<String>, b: Option<String>| {
+            if a.is_none() {
+                *a = b;
+            }
+        };
+        fill(&mut self.title, other.title);
+        fill(&mut self.subject, other.subject);
+        fill(&mut self.author, other.author);
+        fill(&mut self.keywords, other.keywords);
+        fill(&mut self.comments, other.comments);
+        fill(&mut self.created, other.created);
+        fill(&mut self.modified, other.modified);
+        fill(&mut self.last_author, other.last_author);
+        fill(&mut self.revision, other.revision);
+        fill(&mut self.category, other.category);
+        fill(&mut self.manager, other.manager);
+        fill(&mut self.company, other.company);
+        self.has_digital_signature |= other.has_digital_signature;
     }
 }
+
+/// Read every document-level property a legacy compound file carries:
+/// the `\x05SummaryInformation` and `\x05DocumentSummaryInformation`
+/// property sets and the presence of a document signature. `None` when
+/// none of them yields anything.
+pub fn read_document_properties<R: std::io::Read + std::io::Seek>(
+    cfb: &mut super::CfbReader<R>,
+) -> Option<SummaryProperties> {
+    let mut props = cfb
+        .open_stream("\u{5}SummaryInformation")
+        .ok()
+        .and_then(|data| parse_summary_information(&data))
+        .unwrap_or_default();
+    if let Some(dsi) = cfb
+        .open_stream("\u{5}DocumentSummaryInformation")
+        .ok()
+        .and_then(|data| parse_document_summary_information(&data))
+    {
+        props.merge(dsi);
+    }
+    props.has_digital_signature =
+        cfb.has_root_entry("_signatures") || cfb.has_root_entry("_xmlsignatures");
+    (!props.is_empty()).then_some(props)
+}
+
+/// Parse a `\x05DocumentSummaryInformation` stream's first property set
+/// (the `DocumentSummaryInformation` FMTID; the optional second set holds
+/// user-defined properties). Same failure policy as
+/// [`parse_summary_information`].
+pub fn parse_document_summary_information(data: &[u8]) -> Option<SummaryProperties> {
+    let offset = first_property_set_offset(data)?;
+    let props = parse_property_set(data, offset, |p, id| match id {
+        PIDDSI_CATEGORY => Some(&mut p.category),
+        PIDDSI_MANAGER => Some(&mut p.manager),
+        PIDDSI_COMPANY => Some(&mut p.company),
+        _ => None,
+    })?;
+    if props.is_empty() { None } else { Some(props) }
+}
+
+/// Which string field of `SummaryProperties` a property id fills.
+type StringSlot = fn(&mut SummaryProperties, u32) -> Option<&mut Option<String>>;
 
 /// Parse a `\x05SummaryInformation` stream's raw bytes.
 ///
@@ -82,6 +167,22 @@ impl SummaryProperties {
 /// recovered", never a panic or an out-of-bounds read: every offset is
 /// checked against the buffer length before use.
 pub fn parse_summary_information(data: &[u8]) -> Option<SummaryProperties> {
+    let offset = first_property_set_offset(data)?;
+    let props = parse_property_set(data, offset, |p, id| match id {
+        PIDSI_TITLE => Some(&mut p.title),
+        PIDSI_SUBJECT => Some(&mut p.subject),
+        PIDSI_AUTHOR => Some(&mut p.author),
+        PIDSI_KEYWORDS => Some(&mut p.keywords),
+        PIDSI_COMMENTS => Some(&mut p.comments),
+        PIDSI_LASTAUTHOR => Some(&mut p.last_author),
+        PIDSI_REVNUMBER => Some(&mut p.revision),
+        _ => None,
+    })?;
+    if props.is_empty() { None } else { Some(props) }
+}
+
+/// The offset of a PropertySetStream's first property set.
+fn first_property_set_offset(data: &[u8]) -> Option<usize> {
     // PropertySetStream header ([MS-OLEPS] §2.21):
     // ByteOrder(2) Version(2) SystemIdentifier(4) CLSID(16) NumPropertySets(4)
     // then, per property set: FMTID(16) Offset(4).
@@ -109,13 +210,14 @@ pub fn parse_summary_information(data: &[u8]) -> Option<SummaryProperties> {
         data[fmtid_offset + 18],
         data[fmtid_offset + 19],
     ]) as usize;
-
-    let props = parse_property_set(data, offset)?;
-    if props.is_empty() { None } else { Some(props) }
+    Some(offset)
 }
 
-/// Parse one PropertySet packet ([MS-OLEPS] §2.17) at `base` within `data`.
-fn parse_property_set(data: &[u8], base: usize) -> Option<SummaryProperties> {
+/// Parse one PropertySet packet ([MS-OLEPS] §2.17) at `base` within
+/// `data`, storing each string property `slot` maps to a field. The two
+/// `FILETIME` dates are `SummaryInformation` ids and are read only when a
+/// `VT_FILETIME` value sits under them.
+fn parse_property_set(data: &[u8], base: usize, slot: StringSlot) -> Option<SummaryProperties> {
     // Size(4) NumProperties(4) then NumProperties * PropertyIdentifierAndOffset(8).
     let header_end = base.checked_add(8)?;
     if data.len() < header_end {
@@ -166,11 +268,6 @@ fn parse_property_set(data: &[u8], base: usize) -> Option<SummaryProperties> {
     let mut out = SummaryProperties::default();
     for (id, value_at) in entries {
         let field = match id {
-            PIDSI_TITLE => &mut out.title,
-            PIDSI_SUBJECT => &mut out.subject,
-            PIDSI_AUTHOR => &mut out.author,
-            PIDSI_KEYWORDS => &mut out.keywords,
-            PIDSI_COMMENTS => &mut out.comments,
             PIDSI_CREATE_DTM => {
                 out.created = read_filetime(data, value_at);
                 continue;
@@ -179,7 +276,10 @@ fn parse_property_set(data: &[u8], base: usize) -> Option<SummaryProperties> {
                 out.modified = read_filetime(data, value_at);
                 continue;
             },
-            _ => continue,
+            _ => match slot(&mut out, id) {
+                Some(field) => field,
+                None => continue,
+            },
         };
         if let Some(s) = read_string(data, value_at, codepage) {
             if !s.is_empty() {

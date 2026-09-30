@@ -41,7 +41,7 @@ pub struct CoreProperties {
 impl CoreProperties {
     /// Parse core properties from `docProps/core.xml` bytes.
     pub fn parse(xml_data: &[u8]) -> Result<Self> {
-        let mut reader = xml::make_fast_reader(xml_data);
+        let mut reader = property_reader(xml_data);
         let mut props = CoreProperties::default();
 
         // State: which element are we inside?
@@ -89,6 +89,25 @@ impl CoreProperties {
             }
         }
 
+        for slot in [
+            &mut props.title,
+            &mut props.subject,
+            &mut props.creator,
+            &mut props.keywords,
+            &mut props.description,
+            &mut props.last_modified_by,
+            &mut props.revision,
+            &mut props.created,
+            &mut props.modified,
+            &mut props.category,
+            &mut props.content_status,
+            &mut props.language,
+        ] {
+            *slot = slot
+                .take()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+        }
         Ok(props)
     }
 
@@ -142,6 +161,17 @@ impl CoreProperties {
     }
 }
 
+/// A reader for the property parts. Unlike [`xml::make_fast_reader`] it
+/// keeps text whitespace: a value holding an entity reference arrives as
+/// several events, and trimming each one deleted the spaces around the
+/// reference (`AT&amp;T Labs` read as `AT&TLabs`). Values are trimmed
+/// once, whole, after parsing.
+fn property_reader(xml_data: &[u8]) -> quick_xml::Reader<&[u8]> {
+    let mut reader = xml::make_fast_reader(xml_data);
+    reader.config_mut().trim_text(false);
+    reader
+}
+
 fn write_optional_element(w: &mut Writer<Vec<u8>>, tag: &str, value: Option<&str>) {
     if let Some(text) = value {
         w.write_event(Event::Start(BytesStart::new(tag)))
@@ -162,7 +192,7 @@ fn write_optional_element(w: &mut Writer<Vec<u8>>, tag: &str, value: Option<&str
 /// ambiguous) and a single-digit month/day/hour written with a leading
 /// space instead of zero-padding (`2021- 9- 3T20:25:22Z` — a known
 /// PHP-writer quirk, unambiguously `2021-09-03T20:25:22Z`).
-fn normalize_w3cdtf(value: &str) -> Option<String> {
+pub(crate) fn normalize_w3cdtf(value: &str) -> Option<String> {
     let value = value.trim();
     let (date_part, time_part) = match value.split_once('T') {
         Some((d, t)) => (d, Some(t)),
@@ -354,6 +384,247 @@ pub fn read_app_properties<R: std::io::Read + std::io::Seek>(
 }
 
 // ---------------------------------------------------------------------------
+// Package-level properties: custom properties, signature, thumbnail
+// ---------------------------------------------------------------------------
+
+/// The package-level properties beyond `core.xml`/`app.xml`: the custom
+/// properties part, whether the package is signed, and its thumbnail.
+#[derive(Debug, Default, Clone)]
+pub struct PackageProperties {
+    /// User-defined properties from `docProps/custom.xml`.
+    pub custom: Vec<crate::ir::CustomProperty>,
+    /// The package has a digital-signature origin relationship.
+    pub has_digital_signature: bool,
+    /// The package thumbnail, when present.
+    pub thumbnail: Option<crate::ir::Image>,
+}
+
+/// Every package-level property part, located the same way from any
+/// package reader.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PackageMetadata {
+    pub(crate) core: Option<CoreProperties>,
+    pub(crate) app: Option<AppProperties>,
+    pub(crate) package: PackageProperties,
+}
+
+/// Read every package-level property part named by `rels` (the package's
+/// `_rels/.rels`), with `read` returning a zip entry's bytes by its path
+/// (no leading `/`). Parts are found through their relationships, never by
+/// a hard-coded path — except that `core.xml` and `app.xml` fall back to
+/// their conventional paths for packages that omit the relationship.
+/// Malformed parts yield nothing: metadata is never a reason to fail
+/// opening a document.
+pub(crate) fn read_package_metadata(
+    rels: &super::relationships::Relationships,
+    mut read: impl FnMut(&str) -> Option<Vec<u8>>,
+) -> PackageMetadata {
+    use super::relationships::rel_types;
+    let target_of = |rel_type: &str| -> Option<String> {
+        let rel = rels.first_by_type(rel_type)?;
+        if rel.target_mode == super::relationships::TargetMode::External {
+            return None;
+        }
+        let part =
+            super::opc::PartName::new(&format!("/{}", rel.target.trim_start_matches('/'))).ok()?;
+        Some(part.as_str()[1..].to_string())
+    };
+    let mut read_part = |rel_type: &str, fallback: Option<&str>| -> Option<(String, Vec<u8>)> {
+        if let Some(path) = target_of(rel_type) {
+            if let Some(data) = read(&path) {
+                return Some((path, data));
+            }
+        }
+        let path = fallback?;
+        read(path).map(|d| (path.to_string(), d))
+    };
+
+    let core = read_part(rel_types::CORE_PROPERTIES, Some("docProps/core.xml"))
+        .and_then(|(_, d)| CoreProperties::parse(&d).ok());
+    let app = read_part(rel_types::EXTENDED_PROPERTIES, Some("docProps/app.xml"))
+        .and_then(|(_, d)| AppProperties::parse(&d).ok());
+    let custom = read_part(rel_types::CUSTOM_PROPERTIES, None)
+        .map(|(path, d)| {
+            parse_custom_properties(&d).unwrap_or_else(|e| {
+                log::warn!("custom properties part '{path}' is malformed and was skipped: {e}");
+                Vec::new()
+            })
+        })
+        .unwrap_or_default();
+    let thumbnail = read_part(rel_types::THUMBNAIL, None).map(|(path, data)| crate::ir::Image {
+        format: image_format_from_path(&path),
+        data: Some(data),
+        ..Default::default()
+    });
+    PackageMetadata {
+        core,
+        app,
+        package: PackageProperties {
+            custom,
+            has_digital_signature: rels
+                .first_by_type(rel_types::DIGITAL_SIGNATURE_ORIGIN)
+                .is_some(),
+            thumbnail,
+        },
+    }
+}
+
+/// Read the custom properties, signature presence and thumbnail of an open
+/// OPC package. See [`read_package_metadata`].
+pub fn read_package_properties<R: std::io::Read + std::io::Seek>(
+    opc: &mut super::opc::OpcReader<R>,
+) -> PackageProperties {
+    let rels = opc.package_rels().clone();
+    read_package_metadata(&rels, |path| {
+        let part = super::opc::PartName::new(&format!("/{path}")).ok()?;
+        opc.has_part(&part).then(|| opc.read_part(&part).ok())?
+    })
+    .package
+}
+
+/// The image format a package thumbnail's file extension names.
+fn image_format_from_path(path: &str) -> Option<crate::ir::ImageFormat> {
+    use crate::ir::ImageFormat;
+    let ext = path.rsplit_once('.')?.1.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => ImageFormat::Png,
+        "jpg" | "jpeg" | "jpe" => ImageFormat::Jpeg,
+        "gif" => ImageFormat::Gif,
+        "tif" | "tiff" => ImageFormat::Tiff,
+        "bmp" => ImageFormat::Bmp,
+        "emf" => ImageFormat::Emf,
+        "wmf" => ImageFormat::Wmf,
+        _ => return None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Custom Properties — docProps/custom.xml (ECMA-376 Part 1 §22.3)
+// ---------------------------------------------------------------------------
+
+/// Namespace of `docProps/custom.xml` (ECMA-376 Part 1 §22.3).
+const CUSTOM_PROPERTIES_NS: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties";
+/// Namespace of the variant types (ECMA-376 Part 1 §22.4).
+const VT_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes";
+/// The format id every custom property carries (ECMA-376 Part 1
+/// §22.3.2.2: `fmtid` is `{D5CDD505-2E9C-101B-9397-08002B2CF9AE}` for
+/// user-defined properties).
+const CUSTOM_PROPERTY_FMTID: &str = "{D5CDD505-2E9C-101B-9397-08002B2CF9AE}";
+/// The scalar variant types a custom property value can be written back
+/// as (ECMA-376 Part 1 §22.4.2). Anything else is written as `lpwstr`.
+const SCALAR_VARIANT_TYPES: &[&str] = &[
+    "lpwstr", "lpstr", "bstr", "i1", "i2", "i4", "i8", "int", "ui1", "ui2", "ui4", "ui8", "uint",
+    "r4", "r8", "decimal", "bool", "date", "filetime", "cy", "error", "clsid",
+];
+
+/// Parse `docProps/custom.xml`. Properties whose value is not a scalar
+/// variant (a `vt:vector`, `vt:array`, blob or stream) are skipped with a
+/// warning — their text alone cannot be written back faithfully.
+pub fn parse_custom_properties(xml_data: &[u8]) -> Result<Vec<crate::ir::CustomProperty>> {
+    let mut reader = property_reader(xml_data);
+    let mut out = Vec::new();
+    // (name, value type, value) of the property being read.
+    let mut current: Option<(String, Option<String>, String)> = None;
+    let mut depth_in_property = 0u32;
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => {
+                let local = e.local_name().as_ref().to_string();
+                if current.is_none() && local == "property" {
+                    let name = xml::optional_attr_str(e, "name")?
+                        .map(|n| n.into_owned())
+                        .unwrap_or_default();
+                    current = Some((name, None, String::new()));
+                    depth_in_property = 0;
+                } else if let Some((_, ref mut ty, _)) = current {
+                    depth_in_property += 1;
+                    if depth_in_property == 1 {
+                        *ty = Some(local);
+                    }
+                }
+            },
+            Event::Empty(ref e) => {
+                if let Some((_, ref mut ty, _)) = current {
+                    if depth_in_property == 0 {
+                        *ty = Some(e.local_name().as_ref().to_string());
+                    }
+                }
+            },
+            Event::Text(ref e) => {
+                if let Some((_, _, ref mut value)) = current {
+                    if depth_in_property == 1 {
+                        value.push_str(&xml::unescape_text(e)?);
+                    }
+                }
+            },
+            Event::GeneralRef(ref e) => {
+                if let Some((_, _, ref mut value)) = current {
+                    if depth_in_property == 1 {
+                        value.push_str(&xml::resolve_general_ref(e)?);
+                    }
+                }
+            },
+            Event::End(ref e) => {
+                if current.is_some() && depth_in_property > 0 {
+                    depth_in_property -= 1;
+                } else if e.local_name().as_ref() == "property" {
+                    if let Some((name, ty, value)) = current.take() {
+                        match ty {
+                            Some(ty) if SCALAR_VARIANT_TYPES.contains(&ty.as_str()) => {
+                                out.push(crate::ir::CustomProperty {
+                                    name,
+                                    value,
+                                    value_type: ty,
+                                });
+                            },
+                            ty => log::warn!(
+                                "custom property '{name}' has a non-scalar value ({}); skipped",
+                                ty.as_deref().unwrap_or("none")
+                            ),
+                        }
+                    }
+                }
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(out)
+}
+
+/// Serialize custom properties to `docProps/custom.xml` bytes. Property
+/// ids (`pid`) are assigned from 2 upward, as the spec requires
+/// (ECMA-376 Part 1 §22.3.2.2).
+pub fn serialize_custom_properties(props: &[crate::ir::CustomProperty]) -> Vec<u8> {
+    let mut w = Writer::new(Vec::new());
+    w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
+        .expect("write decl");
+    let mut root = BytesStart::new("Properties");
+    root.push_attribute(("xmlns", CUSTOM_PROPERTIES_NS));
+    root.push_attribute(("xmlns:vt", VT_NS));
+    w.write_event(Event::Start(root)).expect("write root");
+    for (i, p) in props.iter().enumerate() {
+        let mut prop = BytesStart::new("property");
+        prop.push_attribute(("fmtid", CUSTOM_PROPERTY_FMTID));
+        prop.push_attribute(("pid", (i + 2).to_string().as_str()));
+        prop.push_attribute(("name", xml::sanitize_xml_text(&p.name).as_ref()));
+        w.write_event(Event::Start(prop)).expect("write property");
+        let ty = if SCALAR_VARIANT_TYPES.contains(&p.value_type.as_str()) {
+            p.value_type.as_str()
+        } else {
+            "lpwstr"
+        };
+        write_optional_element(&mut w, &format!("vt:{ty}"), Some(&p.value));
+        w.write_event(Event::End(BytesEnd::new("property")))
+            .expect("write property end");
+    }
+    w.write_event(Event::End(BytesEnd::new("Properties")))
+        .expect("write root end");
+    w.into_inner()
+}
+
+// ---------------------------------------------------------------------------
 // App (Extended) Properties — docProps/app.xml
 // ---------------------------------------------------------------------------
 
@@ -366,6 +637,9 @@ pub struct AppProperties {
     pub app_version: Option<String>,
     /// Company or organisation name.
     pub company: Option<String>,
+    /// The author's manager (`<Manager>`).
+    #[serde(default)]
+    pub manager: Option<String>,
     /// Template the document is based on.
     pub template: Option<String>,
     /// Total editing time in minutes.
@@ -393,43 +667,33 @@ pub struct AppProperties {
 impl AppProperties {
     /// Parse app properties from `docProps/app.xml` bytes.
     pub fn parse(xml_data: &[u8]) -> Result<Self> {
-        let mut reader = xml::make_fast_reader(xml_data);
+        let mut reader = property_reader(xml_data);
         let mut props = AppProperties::default();
-        let mut current_tag: Option<String> = None;
+        // The element being read and its text so far. A value arrives as
+        // several events when it holds an entity reference (`AT&amp;T` is
+        // Text, GeneralRef, Text), so fragments accumulate and the value
+        // is stored when the element ends.
+        let mut current: Option<(String, String)> = None;
 
         loop {
             match reader.read_event()? {
                 Event::Start(ref e) => {
-                    let local = e.local_name();
-                    let local_bytes = local.as_ref();
-                    current_tag = Some(local_bytes.to_string());
+                    current = Some((e.local_name().as_ref().to_string(), String::new()));
                 },
                 Event::Text(ref e) => {
-                    let text = crate::core::xml::unescape_text(e)?;
-                    if let Some(ref tag) = current_tag {
-                        match tag.as_str() {
-                            "Application" => props.application = Some(text),
-                            "AppVersion" => props.app_version = Some(text),
-                            "Company" => props.company = Some(text),
-                            "Template" => props.template = Some(text),
-                            "TotalTime" => props.total_time = text.parse().ok(),
-                            "Pages" => props.pages = text.parse().ok(),
-                            "Words" => props.words = text.parse().ok(),
-                            "Characters" => props.characters = text.parse().ok(),
-                            "CharactersWithSpaces" => {
-                                props.characters_with_spaces = text.parse().ok();
-                            },
-                            "Lines" => props.lines = text.parse().ok(),
-                            "Paragraphs" => props.paragraphs = text.parse().ok(),
-                            "Slides" => props.slides = text.parse().ok(),
-                            "Notes" => props.notes = text.parse().ok(),
-                            "HiddenSlides" => props.hidden_slides = text.parse().ok(),
-                            _ => {},
-                        }
+                    if let Some((_, ref mut text)) = current {
+                        text.push_str(&crate::core::xml::unescape_text(e)?);
+                    }
+                },
+                Event::GeneralRef(ref e) => {
+                    if let Some((_, ref mut text)) = current {
+                        text.push_str(&crate::core::xml::resolve_general_ref(e)?);
                     }
                 },
                 Event::End(_) => {
-                    current_tag = None;
+                    if let Some((tag, text)) = current.take() {
+                        props.set(&tag, text);
+                    }
                 },
                 Event::Eof => break,
                 _ => {},
@@ -437,6 +701,32 @@ impl AppProperties {
         }
 
         Ok(props)
+    }
+
+    /// Store the text of the `docProps/app.xml` element `tag`.
+    fn set(&mut self, tag: &str, text: String) {
+        let text_field = |v: String| {
+            let v = v.trim();
+            (!v.is_empty()).then(|| v.to_string())
+        };
+        match tag {
+            "Application" => self.application = text_field(text),
+            "AppVersion" => self.app_version = text_field(text),
+            "Company" => self.company = text_field(text),
+            "Manager" => self.manager = text_field(text),
+            "Template" => self.template = text_field(text),
+            "TotalTime" => self.total_time = text.trim().parse().ok(),
+            "Pages" => self.pages = text.trim().parse().ok(),
+            "Words" => self.words = text.trim().parse().ok(),
+            "Characters" => self.characters = text.trim().parse().ok(),
+            "CharactersWithSpaces" => self.characters_with_spaces = text.trim().parse().ok(),
+            "Lines" => self.lines = text.trim().parse().ok(),
+            "Paragraphs" => self.paragraphs = text.trim().parse().ok(),
+            "Slides" => self.slides = text.trim().parse().ok(),
+            "Notes" => self.notes = text.trim().parse().ok(),
+            "HiddenSlides" => self.hidden_slides = text.trim().parse().ok(),
+            _ => {},
+        }
     }
 
     /// Serialize to `docProps/app.xml` bytes.
@@ -460,6 +750,7 @@ impl AppProperties {
         write_optional_element(&mut w, "Application", self.application.as_deref());
         write_optional_element(&mut w, "AppVersion", self.app_version.as_deref());
         write_optional_element(&mut w, "Company", self.company.as_deref());
+        write_optional_element(&mut w, "Manager", self.manager.as_deref());
         write_optional_element(&mut w, "Template", self.template.as_deref());
         write_optional_u32(&mut w, "TotalTime", self.total_time);
         write_optional_u32(&mut w, "Pages", self.pages);
@@ -602,6 +893,34 @@ mod tests {
         assert_eq!(props.pages, Some(3));
         assert_eq!(props.words, Some(1250));
         assert_eq!(props.lines, Some(62));
+    }
+
+    /// Entity references arrive as their own event; `AT&amp;T` used to
+    /// lose its `&` (and anything after the first fragment).
+    #[test]
+    fn test_app_properties_keep_entity_references() {
+        let xml = br#"<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
+  <Company>AT&amp;T &lt;Labs&gt;</Company>
+  <Manager>Smith &#38; Co</Manager>
+  <HeadingPairs><vt:vector size="2" baseType="variant"><vt:variant><vt:lpstr>Title</vt:lpstr></vt:variant><vt:variant><vt:i4>1</vt:i4></vt:variant></vt:vector></HeadingPairs>
+  <Template>A&amp;B.dotm</Template>
+  <Pages> 3 </Pages>
+</Properties>"#;
+        let props = AppProperties::parse(xml).unwrap();
+        assert_eq!(props.company.as_deref(), Some("AT&T <Labs>"));
+        assert_eq!(props.manager.as_deref(), Some("Smith & Co"));
+        assert_eq!(props.template.as_deref(), Some("A&B.dotm"));
+        assert_eq!(props.pages, Some(3));
+    }
+
+    /// The spaces on either side of an entity reference are part of the
+    /// value; per-fragment trimming deleted them.
+    #[test]
+    fn test_core_properties_keep_spaces_around_entity_references() {
+        let xml = br#"<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>  Smith &amp; Co Report </dc:title><dc:creator>   </dc:creator></cp:coreProperties>"#;
+        let props = CoreProperties::parse(xml).unwrap();
+        assert_eq!(props.title.as_deref(), Some("Smith & Co Report"));
+        assert_eq!(props.creator, None);
     }
 
     #[test]

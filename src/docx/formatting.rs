@@ -48,6 +48,11 @@ pub struct RunProperties {
     /// absent from most runs, and a run is the most numerous struct in a
     /// document.
     pub script: Option<Box<ScriptRunProperties>>,
+    /// Theme font the ASCII slot refers to (`w:rFonts/@w:asciiTheme`, or
+    /// `@w:hAnsiTheme` when that is the only theme reference). Per
+    /// ECMA-376 Part 1 §17.3.2.26 a theme reference supersedes the
+    /// literal `w:ascii` face; resolve it with [`ThemeFont::resolve`].
+    pub font_theme: Option<ThemeFont>,
 }
 
 /// Run formatting that applies to text by script (ECMA-376 §17.3.2.26):
@@ -158,6 +163,7 @@ fn apply_script_property(
     }
     match local {
         "rFonts" => {
+            props.font_theme = parse_rfonts_theme(e);
             for attr in xml::attrs(e) {
                 let Ok((key, value)) = attr else { break };
                 match key {
@@ -243,9 +249,11 @@ impl RunProperties {
     /// calling `emit` with each piece and its face. Whitespace joins the
     /// piece before it (or after it, at the start) rather than splitting
     /// a phrase into alternating faces. One piece in the common case.
+    /// `ascii` is the run's ASCII face (see [`Self::face_with_ascii`]).
     pub(crate) fn for_each_script_segment<'s>(
         &'s self,
         text: &str,
+        ascii: Option<&'s str>,
         mut emit: impl FnMut(&str, &ScriptFace<'s>),
     ) {
         let key = |f: &ScriptFace<'s>| (f.font_name, f.font_size);
@@ -255,7 +263,7 @@ impl RunProperties {
             if c.is_whitespace() {
                 continue;
             }
-            let face = self.face_for(self.script_class_of(c));
+            let face = self.face_with_ascii(self.script_class_of(c), ascii);
             match &current {
                 Some(cur) if key(cur) == key(&face) => {},
                 Some(cur) => {
@@ -266,7 +274,7 @@ impl RunProperties {
                 None => current = Some(face),
             }
         }
-        let face = current.unwrap_or_else(|| self.face_for(ScriptClass::Ascii));
+        let face = current.unwrap_or_else(|| self.face_with_ascii(ScriptClass::Ascii, ascii));
         emit(&text[start..], &face);
     }
 
@@ -275,8 +283,18 @@ impl RunProperties {
     /// read; complex-script bold/italic come only from `w:bCs`/`w:iCs`
     /// (`w:b`/`w:i` apply to non-complex-script characters, §17.3.2).
     pub(crate) fn face_for(&self, class: ScriptClass) -> ScriptFace<'_> {
+        self.face_with_ascii(class, self.font_name.as_deref())
+    }
+
+    /// [`Self::face_for`] with the run's ASCII face given explicitly: the
+    /// face a theme reference (`font_theme`) resolves to supersedes the
+    /// literal `w:ascii` one, and only the caller has the theme.
+    pub(crate) fn face_with_ascii<'s>(
+        &'s self,
+        class: ScriptClass,
+        ascii: Option<&'s str>,
+    ) -> ScriptFace<'s> {
         let s = self.script.as_deref();
-        let ascii = self.font_name.as_deref();
         let bold = self.bold.unwrap_or(false);
         let italic = self.italic.unwrap_or(false);
         match class {
@@ -306,6 +324,66 @@ impl RunProperties {
             },
         }
     }
+}
+
+/// A theme font reference (`ST_Theme`, ECMA-376 Part 1 §17.18.96): which
+/// of the theme's major (heading) or minor (body) fonts, for which script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeFont {
+    /// `majorAscii` / `majorHAnsi`: the major Latin font.
+    MajorLatin,
+    /// `majorEastAsia`: the major East Asian font.
+    MajorEastAsia,
+    /// `majorBidi`: the major complex-script font.
+    MajorBidi,
+    /// `minorAscii` / `minorHAnsi`: the minor Latin font.
+    MinorLatin,
+    /// `minorEastAsia`: the minor East Asian font.
+    MinorEastAsia,
+    /// `minorBidi`: the minor complex-script font.
+    MinorBidi,
+}
+
+impl ThemeFont {
+    /// Parse an `ST_Theme` value.
+    pub fn parse(val: &str) -> Option<Self> {
+        Some(match val {
+            "majorAscii" | "majorHAnsi" => Self::MajorLatin,
+            "majorEastAsia" => Self::MajorEastAsia,
+            "majorBidi" => Self::MajorBidi,
+            "minorAscii" | "minorHAnsi" => Self::MinorLatin,
+            "minorEastAsia" => Self::MinorEastAsia,
+            "minorBidi" => Self::MinorBidi,
+            _ => return None,
+        })
+    }
+
+    /// The face name this reference resolves to in `scheme`. `None` when
+    /// the scheme leaves that script's font empty (inherit).
+    pub fn resolve(self, scheme: &crate::core::theme::FontScheme) -> Option<String> {
+        let face = match self {
+            Self::MajorLatin => Some(&scheme.major_latin),
+            Self::MinorLatin => Some(&scheme.minor_latin),
+            Self::MajorEastAsia => scheme.major_ea.as_ref(),
+            Self::MinorEastAsia => scheme.minor_ea.as_ref(),
+            Self::MajorBidi => scheme.major_cs.as_ref(),
+            Self::MinorBidi => scheme.minor_cs.as_ref(),
+        }?;
+        (!face.is_empty()).then(|| face.clone())
+    }
+}
+
+/// The theme font a `w:rFonts` element's ASCII slot refers to:
+/// `w:asciiTheme`, else `w:hAnsiTheme`.
+fn parse_rfonts_theme(e: &BytesStart) -> Option<ThemeFont> {
+    ["w:asciiTheme", "w:hAnsiTheme"]
+        .into_iter()
+        .find_map(|key| {
+            xml::optional_attr_str(e, key)
+                .ok()
+                .flatten()
+                .and_then(|v| ThemeFont::parse(&v))
+        })
 }
 
 /// Paragraph-level formatting properties (`w:pPr`).
@@ -457,7 +535,6 @@ impl RunProperties {
             strike,
             dstrike,
             font_size,
-            font_name,
             color,
             highlight,
             vertical_align,
@@ -472,6 +549,13 @@ impl RunProperties {
             self.script
                 .get_or_insert_with(Default::default)
                 .overlay(src);
+        }
+        // The ASCII face and its theme reference come from one `w:rFonts`
+        // and override together: a level that names a face directly
+        // drops a theme reference inherited from below, and vice versa.
+        if src.font_name.is_some() || src.font_theme.is_some() {
+            self.font_name = src.font_name.clone();
+            self.font_theme = src.font_theme;
         }
     }
 }

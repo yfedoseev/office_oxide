@@ -124,18 +124,26 @@ if err := ed.Save("out.docx"); err != nil {
 | `Document.Format() (string, error)` | Detected format. |
 | `Document.PlainText() (string, error)` | Extract plain text. |
 | `Document.ToMarkdown() (string, error)` | Convert to Markdown. |
+| `Document.ToMarkdownWithImages() (string, error)` | Markdown with each image inline as `[image-base64:…]`. |
 | `Document.ToHTML() (string, error)` | Convert to an HTML fragment. |
 | `Document.ToIRJSON() (string, error)` | Format-agnostic IR as JSON. |
 | `Document.SaveAs(path) error` | Save/convert to a new format. |
 | `OpenEditable(path) (*EditableDocument, error)` | Open for editing (DOCX/XLSX/PPTX). |
-| `EditableDocument.ReplaceText(find, replace) (int64, error)` | In-place replace. |
+| `OpenEditableFromBytes(data, format) (*EditableDocument, error)` | Open in-memory bytes for editing. |
+| `EditableDocument.ReplaceText(find, replace) (int64, error)` | In-place replace; an empty `find` is an error. |
 | `EditableDocument.SetCell(sheet, ref, value) error` | Write an XLSX cell. |
 | `EditableDocument.Save(path) error` | Persist to disk. |
 | `EditableDocument.SaveToBytes() ([]byte, error)` | Persist to memory. |
 | `ExtractText(path)` / `ToMarkdown(path)` / `ToHTML(path)` | One-shot helpers. |
+| `NewXlsxWriter()` / `NewPptxWriter()` | Build workbooks and decks from scratch. |
+| `XlsxWriter.SetCell(sheet, row, col, value) error` | `nil`, string, bool, any int/float, or `Formula`. An integer beyond ±2^53 is an error (Excel stores doubles). |
+| `XlsxWriter.SetFormula(sheet, row, col, formula) error` | Formula cell; a plain string starting with `=` stays text. |
+| `PptxWriter.SetSlideTitle` / `AddSlideText` / `AddSlideImage` | Return an `error` when the slide does not exist. |
 
 Errors returned from FFI are `*Error` values that expose the underlying
-code via `Error.Code` and the originating operation via `Error.Op`.
+code via `Error.Code` and the originating operation via `Error.Op`. The
+writers return an error (code 6) when a write landed nowhere — a missing
+sheet or slide, or a cell outside Excel's grid.
 
 ## Other languages
 

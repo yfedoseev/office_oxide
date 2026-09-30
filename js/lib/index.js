@@ -8,13 +8,22 @@
 import koffi from 'koffi';
 import { native } from './native.js';
 
-export class OfficeOxideError extends Error {
-  constructor(code, operation) {
-    const kind = ({
-      0: 'ok', 1: 'invalid argument', 2: 'io error', 3: 'parse error',
-      4: 'extraction failed', 5: 'internal error', 6: 'unsupported format',
-    })[code] ?? `code=${code}`;
-    super(`office_oxide: ${operation}: ${kind}`);
+const n = native;
+const freeBytesRaw = native.freeBytes;
+
+// ─── Public API ─────────────────────────────────────────────────────────────
+// This block is identical in index.js (ESM) and index.cjs (CommonJS); the
+// test suite checks that the two entry points export the same names.
+
+const ERROR_KINDS = {
+  0: 'ok', 1: 'invalid argument', 2: 'io error', 3: 'parse error',
+  4: 'extraction failed', 5: 'internal error', 6: 'unsupported format',
+};
+
+class OfficeOxideError extends Error {
+  constructor(code, operation, detail = null) {
+    const kind = ERROR_KINDS[code] ?? `code=${code}`;
+    super(`office_oxide: ${operation}: ${detail ?? kind}`);
     this.name = 'OfficeOxideError';
     this.code = code;
     this.operation = operation;
@@ -24,142 +33,176 @@ export class OfficeOxideError extends Error {
 // koffi normalises null C strings to either null, undefined or ''; treat all as absent.
 const emptyToNull = (v) => (v === null || v === undefined || v === '' ? null : v);
 
-export function version() {
-  return native.version() ?? '';
+// The writers return a status so a write that landed nowhere (a missing
+// sheet or slide, a cell outside Excel's grid, an unknown value type) is
+// detectable. Ignoring it made those writes vanish while reporting success.
+function checkStatus(rc, op) {
+  if (rc === 0) return;
+  const detail = rc === 6
+    ? 'the target is out of range, so nothing was written'
+    : null;
+  throw new OfficeOxideError(rc, op, detail);
 }
 
-export function detectFormat(path) {
-  return emptyToNull(native.detectFormat(path));
+// Largest integer a double (every Excel number) holds exactly.
+const MAX_EXACT = 2n ** 53n;
+
+// Encode a cell value for the FFI: [value_type, value_str, value_num].
+// Booleans are value_type 3; they were sent as the number 1/0 by the
+// writer and as the text "true" by setCellStyled.
+function encodeCell(value, op) {
+  if (value === null || value === undefined) return [0, null, 0];
+  if (typeof value === 'string') return [1, value, 0];
+  if (typeof value === 'number') return [2, null, value];
+  if (typeof value === 'boolean') return [3, null, value ? 1 : 0];
+  if (typeof value === 'bigint') {
+    // A bigint beyond 2**53 cannot be stored exactly as an Excel number;
+    // rounding it silently would change an ID or account number.
+    if (value > MAX_EXACT || value < -MAX_EXACT) {
+      throw new RangeError(`${op}: ${value} cannot be stored exactly as an Excel number; write it as a string`);
+    }
+    return [2, null, Number(value)];
+  }
+  if (value instanceof Formula) return [4, value.formula, 0];
+  return [1, String(value), 0];
 }
 
-export class Document {
-  #handle;
-  #source;
+/** A formula cell value, e.g. `new Formula('SUM(A1:A3)')`. */
+class Formula {
+  constructor(formula) {
+    if (typeof formula !== 'string') throw new TypeError('formula must be a string');
+    this.formula = formula;
+  }
+}
 
-  constructor(handle, source = null) {
-    this.#handle = handle;
-    this.#source = source;
+function version() { return n.version() ?? ''; }
+function detectFormat(p) { return emptyToNull(n.detectFormat(p)); }
+
+function takeBytes(ptr, len) {
+  try {
+    return Buffer.from(koffi.decode(ptr, 'uint8_t', len));
+  } finally {
+    freeBytesRaw(ptr, len);
+  }
+}
+
+class Document {
+  constructor(h, src = null) { this._h = h; this._src = src; }
+
+  static open(p) {
+    const e = [0];
+    const h = n.documentOpen(p, e);
+    if (!h) throw new OfficeOxideError(e[0], 'open');
+    return new Document(h, p);
   }
 
-  static open(path) {
-    const err = [0];
-    const h = native.documentOpen(path, err);
-    if (!h) throw new OfficeOxideError(err[0], 'open');
-    return new Document(h, path);
+  static fromBytes(data, fmt) {
+    if (!(data instanceof Uint8Array)) throw new TypeError('data must be a Uint8Array or Buffer');
+    const e = [0];
+    const h = n.documentOpenFromBytes(data, data.length, fmt, e);
+    if (!h) throw new OfficeOxideError(e[0], 'fromBytes');
+    return new Document(h);
   }
 
-  static fromBytes(data, format) {
-    if (!(data instanceof Uint8Array))
-      throw new TypeError('data must be a Uint8Array or Buffer');
-    const err = [0];
-    const h = native.documentOpenFromBytes(data, data.length, format, err);
-    if (!h) throw new OfficeOxideError(err[0], 'fromBytes');
-    return new Document(h, null);
-  }
+  _ensure() { if (!this._h) throw new Error('Document is closed'); }
 
-  #ensure() {
-    if (!this.#handle) throw new Error('Document is closed');
-  }
+  get format() { this._ensure(); return emptyToNull(n.documentFormat(this._h)); }
 
-  get format() {
-    this.#ensure();
-    return emptyToNull(native.documentFormat(this.#handle));
-  }
-
-  #callStr(fn, op) {
-    this.#ensure();
-    const err = [0];
-    const s = fn(this.#handle, err);
-    if (s === null || s === undefined) throw new OfficeOxideError(err[0], op);
+  _call(fn, op) {
+    this._ensure();
+    const e = [0];
+    const s = fn(this._h, e);
+    if (s === null || s === undefined) throw new OfficeOxideError(e[0], op);
     return s;
   }
 
-  plainText() { return this.#callStr(native.documentPlainText, 'plainText'); }
-  toMarkdown() { return this.#callStr(native.documentToMarkdown, 'toMarkdown'); }
-  toHtml() { return this.#callStr(native.documentToHtml, 'toHtml'); }
-  toIr() { return JSON.parse(this.#callStr(native.documentToIrJson, 'toIr')); }
+  plainText() { return this._call(n.documentPlainText, 'plainText'); }
+  toMarkdown() { return this._call(n.documentToMarkdown, 'toMarkdown'); }
+  /** Markdown with each image embedded inline as `[image-base64:…]`. */
+  toMarkdownWithImages() { return this._call(n.documentToMarkdownWithImages, 'toMarkdownWithImages'); }
+  toHtml() { return this._call(n.documentToHtml, 'toHtml'); }
+  toIr() { return JSON.parse(this._call(n.documentToIrJson, 'toIr')); }
 
-  saveAs(path) {
-    this.#ensure();
-    const err = [0];
-    const rc = native.documentSaveAs(this.#handle, path, err);
-    if (rc !== 0) throw new OfficeOxideError(err[0], 'saveAs');
+  saveAs(p) {
+    this._ensure();
+    const e = [0];
+    const rc = n.documentSaveAs(this._h, p, e);
+    if (rc !== 0) throw new OfficeOxideError(e[0], 'saveAs');
   }
 
-  close() {
-    if (this.#handle) {
-      native.documentFree(this.#handle);
-      this.#handle = null;
-    }
-  }
-
+  close() { if (this._h) { n.documentFree(this._h); this._h = null; } }
   [Symbol.dispose]() { this.close(); }
 }
 
-export class EditableDocument {
-  #handle;
+class EditableDocument {
+  constructor(h) { this._h = h; }
 
-  constructor(handle) { this.#handle = handle; }
-
-  static open(path) {
-    const err = [0];
-    const h = native.editableOpen(path, err);
-    if (!h) throw new OfficeOxideError(err[0], 'open');
+  static open(p) {
+    const e = [0];
+    const h = n.editableOpen(p, e);
+    if (!h) throw new OfficeOxideError(e[0], 'open');
     return new EditableDocument(h);
   }
 
-  #ensure() {
-    if (!this.#handle) throw new Error('EditableDocument is closed');
+  /** Open a document for editing from bytes ("docx" | "xlsx" | "pptx"). */
+  static fromBytes(data, fmt) {
+    if (!(data instanceof Uint8Array)) throw new TypeError('data must be a Uint8Array or Buffer');
+    const e = [0];
+    const h = n.editableOpenFromBytes(data, data.length, fmt, e);
+    if (!h) throw new OfficeOxideError(e[0], 'fromBytes');
+    return new EditableDocument(h);
   }
 
-  replaceText(find, replace) {
-    this.#ensure();
-    const err = [0];
-    const n = native.editableReplaceText(this.#handle, find, replace, err);
-    if (n < 0) throw new OfficeOxideError(err[0], 'replaceText');
-    return Number(n);
+  _ensure() { if (!this._h) throw new Error('EditableDocument is closed'); }
+
+  replaceText(find, repl) {
+    this._ensure();
+    const e = [0];
+    const x = n.editableReplaceText(this._h, find, repl, e);
+    if (x < 0) throw new OfficeOxideError(e[0], 'replaceText');
+    return Number(x);
   }
 
   setCell(sheetIndex, cellRef, value) {
-    this.#ensure();
-    let t, s = '', num = 0.0;
-    if (value === null || value === undefined) t = 0;
-    else if (typeof value === 'string') { t = 1; s = value; }
-    else if (typeof value === 'number') { t = 2; num = value; }
-    else if (typeof value === 'boolean') { t = 3; num = value ? 1 : 0; }
-    else throw new TypeError('value must be null, string, number, or boolean');
-    const err = [0];
-    const rc = native.editableSetCell(this.#handle, sheetIndex, cellRef, t, s, num, err);
-    if (rc !== 0) throw new OfficeOxideError(err[0], 'setCell');
+    this._ensure();
+    if (value instanceof Formula) throw new TypeError('setCell: formulas are only supported by XlsxWriter');
+    const [t, s, num] = encodeCell(value, 'setCell');
+    const e = [0];
+    const rc = n.editableSetCell(this._h, sheetIndex, cellRef, t, s ?? '', num, e);
+    if (rc !== 0) throw new OfficeOxideError(e[0], 'setCell');
   }
 
-  save(path) {
-    this.#ensure();
-    const err = [0];
-    const rc = native.editableSave(this.#handle, path, err);
-    if (rc !== 0) throw new OfficeOxideError(err[0], 'save');
+  save(p) {
+    this._ensure();
+    const e = [0];
+    const rc = n.editableSave(this._h, p, e);
+    if (rc !== 0) throw new OfficeOxideError(e[0], 'save');
   }
 
-  close() {
-    if (this.#handle) {
-      native.editableFree(this.#handle);
-      this.#handle = null;
-    }
+  /** Serialize the edited document to a Buffer. */
+  toBytes() {
+    this._ensure();
+    const outLen = [0];
+    const e = [0];
+    const ptr = n.editableSaveToBytes(this._h, outLen, e);
+    if (!ptr) throw new OfficeOxideError(e[0], 'toBytes');
+    return takeBytes(ptr, outLen[0]);
   }
 
+  close() { if (this._h) { n.editableFree(this._h); this._h = null; } }
   [Symbol.dispose]() { this.close(); }
 }
 
-function oneShot(fn, name, path) {
-  const err = [0];
-  const s = fn(path, err);
-  if (s === null || s === undefined) throw new OfficeOxideError(err[0], name);
+function oneShot(fn, name, p) {
+  const e = [0];
+  const s = fn(p, e);
+  if (s === null || s === undefined) throw new OfficeOxideError(e[0], name);
   return s;
 }
 
-export function extractText(path) { return oneShot(native.extractText, 'extractText', path); }
-export function toMarkdown(path) { return oneShot(native.toMarkdown, 'toMarkdown', path); }
-export function toHtml(path) { return oneShot(native.toHtml, 'toHtml', path); }
+function extractText(p) { return oneShot(n.extractText, 'extractText', p); }
+function toMarkdown(p) { return oneShot(n.toMarkdown, 'toMarkdown', p); }
+function toHtml(p) { return oneShot(n.toHtml, 'toHtml', p); }
 
 /**
  * Convert a Markdown string to an Office document file.
@@ -167,129 +210,114 @@ export function toHtml(path) { return oneShot(native.toHtml, 'toHtml', path); }
  * @param {string} format - One of "docx", "xlsx", or "pptx".
  * @param {string} path - Output file path.
  */
-export function createFromMarkdown(markdown, format, path) {
-  const err = [0];
-  const rc = native.createFromMarkdown(markdown, format, path, err);
-  if (rc !== 0) throw new OfficeOxideError(err[0], 'createFromMarkdown');
+function createFromMarkdown(markdown, format, path) {
+  const e = [0];
+  const rc = n.createFromMarkdown(markdown, format, path, e);
+  if (rc !== 0) throw new OfficeOxideError(e[0], 'createFromMarkdown');
 }
 
-export class XlsxWriter {
-  #handle;
-
+class XlsxWriter {
   constructor() {
-    this.#handle = native.xlsxWriterNew();
-    if (!this.#handle) throw new OfficeOxideError(5, 'XlsxWriter.new');
+    this._h = n.xlsxWriterNew();
+    if (!this._h) throw new OfficeOxideError(5, 'XlsxWriter.new');
   }
 
-  #ensure() {
-    if (!this.#handle) throw new Error('XlsxWriter is closed');
-  }
+  _ensure() { if (!this._h) throw new Error('XlsxWriter is closed'); }
 
   /** Add a worksheet; returns its 0-based index. */
   addSheet(name) {
-    this.#ensure();
-    return native.xlsxWriterAddSheet(this.#handle, name);
+    this._ensure();
+    return n.xlsxWriterAddSheet(this._h, name);
   }
 
-  /** Set a cell value. value: null | string | number | boolean */
+  /**
+   * Set a cell value: null | string | number | boolean | bigint | Formula.
+   * A string is always text, even one starting with '='; use setFormula
+   * (or a Formula value) for a formula. Throws when nothing was written.
+   */
   setCell(sheet, row, col, value) {
-    this.#ensure();
-    let t, s = null, n = 0;
-    if (value === null || value === undefined) t = 0;
-    else if (typeof value === 'string') { t = 1; s = value; }
-    else if (typeof value === 'number') { t = 2; n = value; }
-    else if (typeof value === 'boolean') { t = 2; n = value ? 1 : 0; }
-    else { t = 1; s = String(value); }
-    native.xlsxSheetSetCell(this.#handle, sheet, row, col, t, s, n);
+    this._ensure();
+    const [t, s, num] = encodeCell(value, 'XlsxWriter.setCell');
+    checkStatus(n.xlsxSheetSetCell(this._h, sheet, row, col, t, s, num), 'XlsxWriter.setCell');
+  }
+
+  /** Set a formula cell, e.g. setFormula(0, 3, 1, 'SUM(B1:B3)'). A leading '=' is accepted. */
+  setFormula(sheet, row, col, formula) {
+    this.setCell(sheet, row, col, new Formula(formula));
   }
 
   /** Set a cell with styling. bgColor: 6-char hex string or null. */
   setCellStyled(sheet, row, col, value, bold, bgColor = null) {
-    this.#ensure();
-    let t, s = null, n = 0;
-    if (value === null || value === undefined) t = 0;
-    else if (typeof value === 'string') { t = 1; s = value; }
-    else if (typeof value === 'number') { t = 2; n = value; }
-    else { t = 1; s = String(value); }
-    native.xlsxSheetSetCellStyled(this.#handle, sheet, row, col, t, s, n, bold, bgColor);
+    this._ensure();
+    const [t, s, num] = encodeCell(value, 'XlsxWriter.setCellStyled');
+    checkStatus(
+      n.xlsxSheetSetCellStyled(this._h, sheet, row, col, t, s, num, bold, bgColor || null),
+      'XlsxWriter.setCellStyled',
+    );
   }
 
   /** Merge a rectangular range. rowSpan and colSpan must be >= 1. */
   mergeCells(sheet, row, col, rowSpan, colSpan) {
-    this.#ensure();
-    native.xlsxSheetMergeCells(this.#handle, sheet, row, col, rowSpan, colSpan);
+    this._ensure();
+    n.xlsxSheetMergeCells(this._h, sheet, row, col, rowSpan, colSpan);
   }
 
   /** Set column width in Excel character units (e.g. 20.0). */
   setColumnWidth(sheet, col, width) {
-    this.#ensure();
-    native.xlsxSheetSetColumnWidth(this.#handle, sheet, col, width);
+    this._ensure();
+    n.xlsxSheetSetColumnWidth(this._h, sheet, col, width);
   }
 
   save(path) {
-    this.#ensure();
-    const err = [0];
-    const rc = native.xlsxWriterSave(this.#handle, path, err);
-    if (rc !== 0) throw new OfficeOxideError(err[0], 'XlsxWriter.save');
+    this._ensure();
+    const e = [0];
+    const rc = n.xlsxWriterSave(this._h, path, e);
+    if (rc !== 0) throw new OfficeOxideError(e[0], 'XlsxWriter.save');
   }
 
   toBytes() {
-    this.#ensure();
+    this._ensure();
     const outLen = [0];
-    const err = [0];
-    const ptr = native.xlsxWriterToBytes(this.#handle, outLen, err);
-    if (!ptr) throw new OfficeOxideError(err[0], 'XlsxWriter.toBytes');
-    try {
-      return Buffer.from(koffi.decode(ptr, 'uint8_t', outLen[0]));
-    } finally {
-      native.freeBytes(ptr, outLen[0]);
-    }
+    const e = [0];
+    const ptr = n.xlsxWriterToBytes(this._h, outLen, e);
+    if (!ptr) throw new OfficeOxideError(e[0], 'XlsxWriter.toBytes');
+    return takeBytes(ptr, outLen[0]);
   }
 
-  close() {
-    if (this.#handle) {
-      native.xlsxWriterFree(this.#handle);
-      this.#handle = null;
-    }
-  }
-
+  close() { if (this._h) { n.xlsxWriterFree(this._h); this._h = null; } }
   [Symbol.dispose]() { this.close(); }
 }
 
-export class PptxWriter {
-  #handle;
-
+class PptxWriter {
   constructor() {
-    this.#handle = native.pptxWriterNew();
-    if (!this.#handle) throw new OfficeOxideError(5, 'PptxWriter.new');
+    this._h = n.pptxWriterNew();
+    if (!this._h) throw new OfficeOxideError(5, 'PptxWriter.new');
   }
 
-  #ensure() {
-    if (!this.#handle) throw new Error('PptxWriter is closed');
-  }
+  _ensure() { if (!this._h) throw new Error('PptxWriter is closed'); }
 
   /** Override canvas size. 914400 EMU = 1 inch. */
   setPresentationSize(cx, cy) {
-    this.#ensure();
-    native.pptxWriterSetPresentationSize(this.#handle, BigInt(cx), BigInt(cy));
+    this._ensure();
+    n.pptxWriterSetPresentationSize(this._h, BigInt(cx), BigInt(cy));
   }
 
   /** Add a slide; returns its 0-based index. */
   addSlide() {
-    this.#ensure();
-    return native.pptxWriterAddSlide(this.#handle);
+    this._ensure();
+    return n.pptxWriterAddSlide(this._h);
   }
 
-  /** Set the title of a slide. */
+  /** Set the title of a slide. Throws when the slide does not exist. */
   setSlideTitle(slide, title) {
-    this.#ensure();
-    native.pptxSlideSetTitle(this.#handle, slide, title);
+    this._ensure();
+    checkStatus(n.pptxSlideSetTitle(this._h, slide, title), 'PptxWriter.setSlideTitle');
   }
 
-  /** Add a plain text paragraph to the slide body. */
+  /** Add a plain text paragraph to the slide body. Throws when the slide does not exist. */
   addSlideText(slide, text) {
-    this.#ensure();
-    native.pptxSlideAddText(this.#handle, slide, text);
+    this._ensure();
+    checkStatus(n.pptxSlideAddText(this._h, slide, text), 'PptxWriter.addSlideText');
   }
 
   /**
@@ -298,37 +326,45 @@ export class PptxWriter {
    * x, y, cx, cy: EMU coordinates (914400 = 1 inch)
    */
   addSlideImage(slide, data, format, x, y, cx, cy) {
-    this.#ensure();
+    this._ensure();
     const buf = data instanceof Uint8Array ? data : new Uint8Array(data);
-    native.pptxSlideAddImage(this.#handle, slide, buf, buf.length, format, BigInt(x), BigInt(y), BigInt(cx), BigInt(cy));
+    checkStatus(
+      n.pptxSlideAddImage(this._h, slide, buf, buf.length, format, BigInt(x), BigInt(y), BigInt(cx), BigInt(cy)),
+      'PptxWriter.addSlideImage',
+    );
   }
 
   save(path) {
-    this.#ensure();
-    const err = [0];
-    const rc = native.pptxWriterSave(this.#handle, path, err);
-    if (rc !== 0) throw new OfficeOxideError(err[0], 'PptxWriter.save');
+    this._ensure();
+    const e = [0];
+    const rc = n.pptxWriterSave(this._h, path, e);
+    if (rc !== 0) throw new OfficeOxideError(e[0], 'PptxWriter.save');
   }
 
   toBytes() {
-    this.#ensure();
+    this._ensure();
     const outLen = [0];
-    const err = [0];
-    const ptr = native.pptxWriterToBytes(this.#handle, outLen, err);
-    if (!ptr) throw new OfficeOxideError(err[0], 'PptxWriter.toBytes');
-    try {
-      return Buffer.from(koffi.decode(ptr, 'uint8_t', outLen[0]));
-    } finally {
-      native.freeBytes(ptr, outLen[0]);
-    }
+    const e = [0];
+    const ptr = n.pptxWriterToBytes(this._h, outLen, e);
+    if (!ptr) throw new OfficeOxideError(e[0], 'PptxWriter.toBytes');
+    return takeBytes(ptr, outLen[0]);
   }
 
-  close() {
-    if (this.#handle) {
-      native.pptxWriterFree(this.#handle);
-      this.#handle = null;
-    }
-  }
-
+  close() { if (this._h) { n.pptxWriterFree(this._h); this._h = null; } }
   [Symbol.dispose]() { this.close(); }
 }
+
+export {
+  OfficeOxideError,
+  Document,
+  EditableDocument,
+  XlsxWriter,
+  PptxWriter,
+  Formula,
+  version,
+  detectFormat,
+  extractText,
+  toMarkdown,
+  toHtml,
+  createFromMarkdown,
+};

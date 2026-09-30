@@ -53,6 +53,19 @@ pub enum Command {
     },
 }
 
+/// Write a rendered result to stdout.
+///
+/// `print!` panics on any write error other than a closed pipe (which
+/// `main` turns back into a quiet `SIGPIPE` exit): `office-oxide text f >
+/// /dev/full` exited 101 with a panic message. Propagating the error gives
+/// the usual `error: …` and exit status 1 instead.
+fn emit(s: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    out.write_all(s.as_bytes())?;
+    out.flush()
+}
+
 pub fn run(cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         Command::Text { file } => text::run(&file),

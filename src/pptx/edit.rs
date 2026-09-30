@@ -8,6 +8,15 @@ use crate::core::opc::PartName;
 
 use super::Result;
 
+/// Content types (ECMA-376 Part 1 §13.3) of the PresentationML parts whose
+/// `<a:t>` text `replace_text` rewrites.
+const TEXT_PART_CONTENT_TYPES: &[&str] = &[
+    "application/vnd.openxmlformats-officedocument.presentationml.slide+xml",
+    "application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml",
+    "application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml",
+    "application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml",
+];
+
 /// An editable PPTX document that supports text replacement and saving.
 pub struct EditablePptx {
     package: EditablePackage,
@@ -26,19 +35,29 @@ impl EditablePptx {
         Ok(Self { package })
     }
 
-    /// Replace all occurrences of `find` with `replace` across all slides.
+    /// Replace all occurrences of `find` with `replace` in the text of every
+    /// slide, notes slide, slide layout and slide master part.
     /// Returns the total number of replacements made.
+    ///
+    /// Parts are found by content type, not by guessing names: slide part
+    /// numbering has gaps after a deletion, and a deck may have any number
+    /// of slides.
     pub fn replace_text(&mut self, find: &str, replace: &str) -> usize {
         let mut total = 0;
 
-        // Find all slide parts
-        for i in 1..=100 {
-            let part_name = match PartName::new(&format!("/ppt/slides/slide{i}.xml")) {
-                Ok(pn) => pn,
-                Err(_) => break,
-            };
+        let mut targets: Vec<PartName> = self
+            .package
+            .content_types()
+            .overrides()
+            .iter()
+            .filter(|(_, ct)| TEXT_PART_CONTENT_TYPES.contains(&ct.as_str()))
+            .map(|(pn, _)| pn.clone())
+            .collect();
+        targets.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+
+        for part_name in targets {
             let Some(data) = self.package.get_part(&part_name) else {
-                break;
+                continue;
             };
             let xml_str = String::from_utf8_lossy(data);
             let (new_xml, count) = replace_in_at_elements(&xml_str, find, replace);
@@ -72,6 +91,63 @@ fn replace_in_at_elements(xml: &str, find: &str, replace: &str) -> (String, usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A package with slide parts numbered with a gap (slide1, slide3 — the
+    /// shape a deck has after a slide is deleted), plus a notes slide, a
+    /// layout and a master, each carrying the search text once.
+    fn gapped_deck() -> Vec<u8> {
+        use crate::core::opc::OpcWriter;
+        use crate::core::relationships::rel_types;
+        const NS: &str = r#"xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main""#;
+        let tree = |root: &str| {
+            format!(
+                r#"<?xml version="1.0"?><p:{root} {NS}><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>foo</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:{root}>"#
+            )
+        };
+        let mut w = OpcWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+        let pres = PartName::new("/ppt/presentation.xml").unwrap();
+        w.add_package_rel(rel_types::OFFICE_DOCUMENT, "ppt/presentation.xml");
+        w.add_part(
+            &pres,
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
+            format!(r#"<?xml version="1.0"?><p:presentation {NS}/>"#).as_bytes(),
+        )
+        .unwrap();
+        let ct = "application/vnd.openxmlformats-officedocument.presentationml.";
+        for (name, kind, root) in [
+            ("/ppt/slides/slide1.xml", "slide+xml", "sld"),
+            ("/ppt/slides/slide3.xml", "slide+xml", "sld"),
+            ("/ppt/notesSlides/notesSlide3.xml", "notesSlide+xml", "notes"),
+            ("/ppt/slideLayouts/slideLayout1.xml", "slideLayout+xml", "sldLayout"),
+            ("/ppt/slideMasters/slideMaster1.xml", "slideMaster+xml", "sldMaster"),
+        ] {
+            let part = PartName::new(name).unwrap();
+            w.add_part(&part, &format!("{ct}{kind}"), tree(root).as_bytes())
+                .unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    /// Slide numbering has gaps after a deletion; a positional
+    /// `slide1..=slideN` walk stopped at the first missing number, so every
+    /// slide after the gap — and every notes slide, layout and master — was
+    /// silently left unchanged while the caller got a partial count.
+    #[test]
+    fn test_replace_text_reaches_every_slide_notes_layout_and_master_part() {
+        let mut ed = EditablePptx::from_reader(std::io::Cursor::new(gapped_deck())).unwrap();
+        assert_eq!(ed.replace_text("foo", "bar"), 5);
+        for name in [
+            "/ppt/slides/slide1.xml",
+            "/ppt/slides/slide3.xml",
+            "/ppt/notesSlides/notesSlide3.xml",
+            "/ppt/slideLayouts/slideLayout1.xml",
+            "/ppt/slideMasters/slideMaster1.xml",
+        ] {
+            let data = ed.package.get_part(&PartName::new(name).unwrap()).unwrap();
+            let s = String::from_utf8_lossy(data);
+            assert!(s.contains("<a:t>bar</a:t>"), "{name} not rewritten: {s}");
+        }
+    }
 
     #[test]
     fn test_replace_in_at_simple() {

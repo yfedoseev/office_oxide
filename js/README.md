@@ -122,13 +122,17 @@ TypeScript definitions ship with the package (`office-oxide/lib/index.d.ts`).
 | `Document.open(path)` / `fromBytes(data, format)` | Parse a read-only document. |
 | `Document#format` | `"docx" \| "xlsx" \| …` |
 | `Document#plainText()` / `toMarkdown()` / `toHtml()` / `toIr()` | Extraction methods. |
+| `Document#toMarkdownWithImages()` | Markdown with each image inline as `[image-base64:…]`. |
 | `Document#saveAs(path)` | Save/convert to a different format. |
-| `EditableDocument.open(path)` | Open DOCX/XLSX/PPTX for editing. |
-| `EditableDocument#replaceText(find, replace)` | In-place replace. Returns count. |
+| `EditableDocument.open(path)` / `fromBytes(data, format)` | Open DOCX/XLSX/PPTX for editing. |
+| `EditableDocument#replaceText(find, replace)` | In-place replace. Returns count; an empty `find` throws. |
 | `EditableDocument#setCell(sheet, ref, value)` | Write an XLSX cell. |
-| `EditableDocument#save(path)` | Persist to disk. |
+| `EditableDocument#save(path)` / `toBytes()` | Persist to disk (atomically) or to a `Buffer`. |
+| `XlsxWriter` / `PptxWriter` | Build workbooks and decks from scratch. A write that lands nowhere (missing sheet/slide, cell outside the grid) throws. |
+| `XlsxWriter#setFormula(sheet, row, col, formula)` / `new Formula(f)` | Formula cells; a plain string starting with `=` stays text. |
 | `version()` / `detectFormat(path)` | Library info. |
 | `extractText(path)` / `toMarkdown(path)` / `toHtml(path)` | One-shot helpers. |
+| `createFromMarkdown(markdown, format, path)` | Markdown → DOCX/XLSX/PPTX. |
 
 ## Other languages
 

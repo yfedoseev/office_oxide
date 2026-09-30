@@ -5,18 +5,70 @@
 //! string is stored once, the rendered text is the string times the cell
 //! count. A 110 KB `.xlsx` holding a 1 MB string referenced from 12,000
 //! cells rendered to 393 MB; the same string from a million rows would be
-//! 32 GB from a 300 KB file. Every renderer, the IR converter and the
-//! legacy `.xls` reader (which materialises each referencing cell's copy
-//! at open) charge the characters they emit against one per-document
-//! budget and stop, loudly, when it is spent. Apache POI does the same
-//! with `ZipSecureFile.setMaxTextSize`.
+//! 32 GB from a 300 KB file. The spreadsheet paths — XLSX text rendering
+//! (`plain_text`/CSV/Markdown/HTML over cells), the XLSX → IR converter,
+//! and the legacy `.xls` reader (which materialises each referencing
+//! cell's copy at open) — charge the characters they emit against one
+//! per-document budget and stop, loudly, when it is spent. The word-
+//! processing and presentation paths do not: their text is stored once
+//! per occurrence, so its size is already bounded by the package's
+//! decompressed size. Apache POI does the same with
+//! `ZipSecureFile.setMaxTextSize`.
 //!
 //! The default keeps every genuine workbook this crate has been tested
 //! against (the largest, 181 MB of cell text, with room to spare) and
 //! refuses the fan-out shapes. Processes that read larger workbooks raise
 //! it once at startup with [`set_max_text_chars`](crate::limits::set_max_text_chars).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+//!
+//! OOXML packages are zip archives, and the per-part decompression cap
+//! ([`MAX_PART_SIZE`](crate::core::opc::MAX_PART_SIZE)) bounds one part
+//! only. Two package-wide bounds sit on top of it, mirroring Apache POI's
+//! `ZipSecureFile` limits: the number of entries an archive may hold
+//! ([`set_max_package_entries`]) and the total decompressed bytes that may
+//! be read from one package ([`set_max_package_bytes`]). A package that
+//! exceeds either is refused with
+//! [`Error::PackageLimit`](crate::core::Error::PackageLimit).
+
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+/// The default maximum number of entries in one OOXML package: 100,000.
+///
+/// A zip without ZIP64 extensions cannot hold more than 65,535; the
+/// largest genuine packages this crate has been tested against (thousands
+/// of sheets or slides, each with its own relationships part) stay well
+/// below that.
+pub const DEFAULT_MAX_PACKAGE_ENTRIES: usize = 100_000;
+
+/// The default maximum total of decompressed bytes read from one OOXML
+/// package: 2 GiB, four times the per-part cap.
+pub const DEFAULT_MAX_PACKAGE_BYTES: u64 = 2 << 30;
+
+static MAX_PACKAGE_ENTRIES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_PACKAGE_ENTRIES);
+static MAX_PACKAGE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_PACKAGE_BYTES);
+
+/// The maximum number of entries an OOXML package may hold.
+pub fn max_package_entries() -> usize {
+    MAX_PACKAGE_ENTRIES.load(Ordering::Relaxed)
+}
+
+/// Set the maximum number of entries for every package opened afterwards.
+/// `usize::MAX` disables the bound.
+pub fn set_max_package_entries(entries: usize) {
+    MAX_PACKAGE_ENTRIES.store(entries, Ordering::Relaxed);
+}
+
+/// The maximum total of decompressed bytes read from one OOXML package.
+/// Each distinct part is charged once, however often it is read.
+pub fn max_package_bytes() -> u64 {
+    MAX_PACKAGE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Set the package-wide decompressed-byte limit for every package opened
+/// afterwards. `u64::MAX` disables the bound.
+pub fn set_max_package_bytes(bytes: u64) {
+    MAX_PACKAGE_BYTES.store(bytes, Ordering::Relaxed);
+}
 
 /// The default per-document text budget: 256 Mi characters.
 pub const DEFAULT_MAX_TEXT_CHARS: usize = 256 << 20;

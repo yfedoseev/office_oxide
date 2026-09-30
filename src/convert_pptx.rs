@@ -3,18 +3,36 @@ use crate::ir::*;
 
 pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
     // Slide size sits at presentation level — every slide in the
-    // deck shares it. EMU → twips is /635 (914400 EMU per inch,
-    // 1440 twips per inch → 914400/1440 = 635).
-    let page_setup = doc.presentation.slide_size.as_ref().map(|sz| PageSetup {
-        width_twips: (sz.cx.max(0) / 635) as u32,
-        height_twips: (sz.cy.max(0) / 635) as u32,
-        landscape: sz.cx > sz.cy,
-        ..Default::default()
-    });
+    // deck shares it.
+    let page_setup = doc
+        .presentation
+        .slide_size
+        .as_ref()
+        .and_then(slide_page_setup);
 
     let mut sections = Vec::new();
 
     for slide in doc.slides.iter() {
+        if let Some(ref err) = slide.parse_error {
+            // An unreadable slide keeps its place as a notice, so the loss
+            // is visible in every projection of the IR.
+            sections.push(Section {
+                elements: vec![Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(
+                        crate::pptx::text::unreadable_slide_notice(&slide.name, err),
+                    ))],
+                    ..Default::default()
+                })],
+                break_type: if sections.is_empty() {
+                    SectionBreakType::Continuous
+                } else {
+                    SectionBreakType::NextPage
+                },
+                page_setup: page_setup.clone(),
+                ..Default::default()
+            });
+            continue;
+        }
         let title_with_algn = find_title(&slide.shapes);
         let title = title_with_algn.as_ref().map(|(t, _)| t.clone());
         let title_alignment = title_with_algn.as_ref().and_then(|(_, a)| a.clone());
@@ -128,11 +146,47 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
-            text_truncated: false,
+            text_truncated: !doc.unreadable_parts.is_empty(),
+            ..crate::core::core_properties::ooxml_metadata_extras(
+                cp,
+                doc.app_properties.as_ref(),
+                Some(&doc.package_properties),
+            )
         },
         sections,
         defined_names: Vec::new(),
     }
+}
+
+/// Smallest and largest legal `p:sldSz` extent, in EMU
+/// (`ST_SlideSizeCoordinate`, ECMA-376 Part 1 §19.7.18: 1 inch to 56 inches).
+const MIN_SLIDE_EXTENT_EMU: i64 = 914_400;
+const MAX_SLIDE_EXTENT_EMU: i64 = 51_206_400;
+
+/// The IR page geometry for a deck's slide size. EMU → twips is /635
+/// (914400 EMU per inch, 1440 twips per inch).
+///
+/// A size outside the schema's range is not a page size anything can
+/// honour; converting it used to truncate through `as u32` into an
+/// arbitrary, plausible-looking page. It now yields no page setup (with a
+/// warning), so consumers fall back to their own default.
+fn slide_page_setup(sz: &crate::pptx::SlideSize) -> Option<PageSetup> {
+    let legal = MIN_SLIDE_EXTENT_EMU..=MAX_SLIDE_EXTENT_EMU;
+    if !legal.contains(&sz.cx) || !legal.contains(&sz.cy) {
+        log::warn!(
+            "pptx: slide size {}x{} EMU is outside the legal range; page size not set",
+            sz.cx,
+            sz.cy
+        );
+        return None;
+    }
+    // In range, both quotients are well below u32::MAX.
+    Some(PageSetup {
+        width_twips: u32::try_from(sz.cx / 635).ok()?,
+        height_twips: u32::try_from(sz.cy / 635).ok()?,
+        landscape: sz.cx > sz.cy,
+        ..Default::default()
+    })
 }
 
 fn collect_shape_entries<'a>(
@@ -330,6 +384,7 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
                 display_width_emu: display_w,
                 display_height_emu: display_h,
                 hyperlink: pic.hyperlink.as_ref().and_then(hyperlink_info_url),
+                source_url: pic.link_target.clone(),
                 ..Default::default()
             });
             push_positional_textbox(elements, vec![img_el], pic.position.as_ref());
@@ -359,6 +414,34 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
                     .collect();
                 if !paras.is_empty() {
                     push_positional_textbox(elements, paras, gf.position.as_ref());
+                }
+            },
+            // An OLE object is shown as its preview picture. It used to fall
+            // through as an unknown graphic, losing the preview.
+            crate::pptx::GraphicContent::OleObject(ref ole) => {
+                if let Some(ref data) = ole.preview_data {
+                    let (display_w, display_h) = gf
+                        .position
+                        .as_ref()
+                        .map(|p| (Some(p.cx.max(0) as u64), Some(p.cy.max(0) as u64)))
+                        .unwrap_or((None, None));
+                    let img = Element::Image(Image {
+                        data: Some(data.clone()),
+                        format: ole
+                            .preview_format
+                            .as_deref()
+                            .and_then(image_format_from_ext),
+                        display_width_emu: display_w,
+                        display_height_emu: display_h,
+                        ..Default::default()
+                    });
+                    push_positional_textbox(elements, vec![img], gf.position.as_ref());
+                } else {
+                    log::debug!(
+                        "pptx: OLE object {:?} ({:?}) has no preview picture",
+                        ole.name,
+                        ole.prog_id
+                    );
                 }
             },
             crate::pptx::GraphicContent::Unknown => {},
@@ -432,10 +515,12 @@ fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) 
     // bullets all sit at level 0 — the ordinary single-level bullet list —
     // came out as plain paragraphs with no markers, and `<a:buAutoNum>`
     // numbering was lost entirely.
-    let declares_bullet = body
-        .paragraphs
-        .iter()
-        .any(|p| matches!(p.bullet, Some(BulletStyle::Char(_) | BulletStyle::AutoNum { .. })));
+    let declares_bullet = body.paragraphs.iter().any(|p| {
+        matches!(
+            p.bullet,
+            Some(BulletStyle::Char(_) | BulletStyle::AutoNum { .. } | BulletStyle::Picture { .. })
+        )
+    });
     let has_levels = body.paragraphs.iter().any(|p| p.level > 0) || declares_bullet;
 
     if has_levels {
@@ -456,7 +541,9 @@ fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) 
                             style = Some(auto_num_style(scheme));
                             start_number = start_at.filter(|&n| n != 1);
                         },
-                        BulletStyle::Char(_) => {
+                        // A picture bullet is an unordered marker drawn
+                        // as an image.
+                        BulletStyle::Char(_) | BulletStyle::Picture { .. } => {
                             ordered = false;
                             style = Some(ListStyle::Bullet);
                         },
@@ -488,11 +575,47 @@ fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) 
                     content,
                     alignment: para.alignment.clone(),
                     space_before_twips,
+                    space_after_twips: match para.space_after {
+                        Some(crate::pptx::TextSpacing::Points(h)) => Some(h / 5),
+                        // A percentage of the line has no fixed length
+                        // without the resolved font size.
+                        _ => None,
+                    },
+                    line_spacing: para.line_spacing.map(|s| match s {
+                        // Same unit as DOCX `w:line` with lineRule=auto:
+                        // 240ths of a line (100000 = single = 240).
+                        crate::pptx::TextSpacing::Percent(p) => LineSpacing::Auto(
+                            u32::try_from(u64::from(p) * 240 / 100_000).unwrap_or(u32::MAX),
+                        ),
+                        crate::pptx::TextSpacing::Points(h) => LineSpacing::Exact(h / 5),
+                    }),
+                    indent_left_twips: para.margin_left_emu.map(emu_to_twips),
+                    indent_right_twips: para.margin_right_emu.map(emu_to_twips),
+                    first_line_indent_twips: para.indent_emu.map(emu_to_twips),
+                    tabs: para
+                        .tab_stops
+                        .iter()
+                        .map(|t| TabStop {
+                            position_twips: emu_to_twips(t.position_emu),
+                            alignment: match t.alignment.as_deref() {
+                                Some("ctr") => TabAlignment::Center,
+                                Some("r") => TabAlignment::Right,
+                                Some("dec") => TabAlignment::Decimal,
+                                _ => TabAlignment::Left,
+                            },
+                            leader: TabLeader::None,
+                        })
+                        .collect(),
                     ..Default::default()
                 }));
             }
         }
     }
+}
+
+/// EMU → twips (635 EMU per twip), saturating at the `i32` range.
+fn emu_to_twips(emu: i64) -> i32 {
+    i32::try_from(emu / 635).unwrap_or(if emu < 0 { i32::MIN } else { i32::MAX })
 }
 
 /// Resolve a parsed `HyperlinkInfo` (run-level `a:rPr/a:hlinkClick` or
@@ -691,6 +814,31 @@ mod tests {
                 out
             })
             .collect()
+    }
+
+    /// An absurd `p:sldSz` truncated through `as u32` into an arbitrary
+    /// page size; an out-of-range size must yield no page size at all.
+    #[test]
+    fn test_out_of_range_slide_size_does_not_become_a_page_size() {
+        use crate::pptx::SlideSize;
+        let ok = slide_page_setup(&SlideSize {
+            cx: 12_192_000,
+            cy: 6_858_000,
+        })
+        .expect("a 16:9 slide is legal");
+        assert_eq!((ok.width_twips, ok.height_twips, ok.landscape), (19_200, 10_800, true));
+        for (cx, cy) in [
+            (i64::MAX, 6_858_000),
+            (4_294_967_296 * 635, 6_858_000),
+            (0, 6_858_000),
+            (-5, 6_858_000),
+            (12_192_000, 51_206_401),
+        ] {
+            assert!(
+                slide_page_setup(&SlideSize { cx, cy }).is_none(),
+                "{cx}x{cy} must not produce a page size"
+            );
+        }
     }
 
     /// A non-text AutoShape (decorative icon, action

@@ -217,4 +217,36 @@ mod tests {
         assert_eq!(wb.defined_names[1].name, "MyRange");
         assert!(wb.defined_names[1].hidden);
     }
+
+    /// Writers other than Excel bind the relationship namespace to another
+    /// prefix (`d3p1:id`), or write a `<sheet>` with a closing tag; the
+    /// sheet id still resolves, and every `state` value is read.
+    #[test]
+    fn test_sheet_rel_id_under_any_prefix_and_every_visibility_state() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:d3p1="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="A" sheetId="1" d3p1:id="rId7"/>
+    <sheet name="B" sheetId="2" d3p1:id="rId8" state="veryHidden"></sheet>
+    <sheet name="C" sheetId="3" id="rId9" state="visible"/>
+    <sheet name="D" sheetId="4" state="hidden"></sheet>
+  </sheets>
+</workbook>"#;
+        let wb = WorkbookInfo::parse(xml).unwrap();
+        let got: Vec<_> = wb
+            .sheets
+            .iter()
+            .map(|s| (s.name.as_str(), s.rel_id.as_str(), s.state))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("A", "rId7", SheetState::Visible),
+                ("B", "rId8", SheetState::VeryHidden),
+                ("C", "rId9", SheetState::Visible),
+                ("D", "", SheetState::Hidden),
+            ]
+        );
+    }
 }

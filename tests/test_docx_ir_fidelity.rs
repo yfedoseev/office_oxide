@@ -186,6 +186,31 @@ impl Docx {
         self
     }
 
+    /// A theme part whose font scheme has `major` / `minor` Latin faces
+    /// and a `minor` East Asian face `minor_ea`.
+    fn theme_fonts(mut self, major: &str, minor: &str, minor_ea: &str) -> Self {
+        let part = PartName::new("/word/theme/theme1.xml").unwrap();
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="T"><a:themeElements>
+<a:clrScheme name="C"><a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1></a:clrScheme>
+<a:fontScheme name="F">
+<a:majorFont><a:latin typeface="{major}"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont>
+<a:minorFont><a:latin typeface="{minor}"/><a:ea typeface="{minor_ea}"/><a:cs typeface=""/></a:minorFont>
+</a:fontScheme></a:themeElements></a:theme>"#
+        );
+        self.w
+            .add_part(
+                &part,
+                "application/vnd.openxmlformats-officedocument.theme+xml",
+                xml.as_bytes(),
+            )
+            .unwrap();
+        self.w
+            .add_part_rel(&self.doc_part, rel_types::THEME, "theme/theme1.xml");
+        self
+    }
+
     fn core_props(mut self, inner: &str) -> Self {
         let part = PartName::new("/docProps/core.xml").unwrap();
         let xml = format!(
@@ -374,6 +399,51 @@ fn test_complex_script_bold_and_size_survive_a_docx_round_trip() {
     let after = first_span(para(&again, 0));
     assert_eq!((after.bold, after.italic), (true, true));
     assert_eq!(after.font_size_half_pt, Some(30));
+}
+
+/// `w:asciiTheme` names a font of the theme's font scheme and supersedes
+/// the literal `w:ascii` face (ECMA-376 Part 1 §17.3.2.26); it is how
+/// every Office template assigns fonts, and it was never parsed.
+#[test]
+fn test_theme_font_references_resolve_to_the_font_scheme_faces() {
+    let ir = Docx::new(
+        r#"<w:p><w:r><w:rPr><w:rFonts w:asciiTheme="majorHAnsi" w:ascii="Ignored"/></w:rPr><w:t>heading</w:t></w:r></w:p>
+           <w:p><w:r><w:rPr><w:rFonts w:hAnsiTheme="minorHAnsi"/></w:rPr><w:t>body</w:t></w:r></w:p>
+           <w:p><w:r><w:rPr><w:rFonts w:asciiTheme="minorEastAsia"/></w:rPr><w:t>ea</w:t></w:r></w:p>
+           <w:p><w:r><w:rPr><w:rFonts w:asciiTheme="majorBidi" w:ascii="Literal"/></w:rPr><w:t>cs</w:t></w:r></w:p>
+           <w:p><w:r><w:rPr><w:rFonts w:ascii="Direct Face"/></w:rPr><w:t>direct</w:t></w:r></w:p>"#,
+    )
+    .theme_fonts("Heading Face", "Body Face", "EA Face")
+    .ir();
+    let font = |i: usize| first_span(para(&ir, i)).font_name.clone();
+    assert_eq!(font(0).as_deref(), Some("Heading Face"));
+    assert_eq!(font(1).as_deref(), Some("Body Face"));
+    assert_eq!(font(2).as_deref(), Some("EA Face"));
+    // An empty scheme slot falls back to the literal face.
+    assert_eq!(font(3).as_deref(), Some("Literal"));
+    assert_eq!(font(4).as_deref(), Some("Direct Face"));
+}
+
+/// A theme reference inherited from a style is replaced, not kept, by a
+/// face named directly on the run; a theme reference on the run replaces
+/// a style's direct face.
+#[test]
+fn test_theme_font_and_direct_face_override_each_other_as_a_unit() {
+    let ir = Docx::new(
+        r#"<w:p><w:r><w:rPr><w:rStyle w:val="Themed"/><w:rFonts w:ascii="Run Face"/></w:rPr><w:t>a</w:t></w:r></w:p>
+           <w:p><w:r><w:rPr><w:rStyle w:val="Plain"/><w:rFonts w:asciiTheme="minorAscii"/></w:rPr><w:t>b</w:t></w:r></w:p>
+           <w:p><w:r><w:rPr><w:rStyle w:val="Themed"/></w:rPr><w:t>c</w:t></w:r></w:p>"#,
+    )
+    .styles(
+        r#"<w:style w:type="character" w:styleId="Themed"><w:rPr><w:rFonts w:asciiTheme="majorAscii"/></w:rPr></w:style>
+           <w:style w:type="character" w:styleId="Plain"><w:rPr><w:rFonts w:ascii="Style Face"/></w:rPr></w:style>"#,
+    )
+    .theme_fonts("Heading Face", "Body Face", "")
+    .ir();
+    let font = |i: usize| first_span(para(&ir, i)).font_name.clone();
+    assert_eq!(font(0).as_deref(), Some("Run Face"));
+    assert_eq!(font(1).as_deref(), Some("Body Face"));
+    assert_eq!(font(2).as_deref(), Some("Heading Face"));
 }
 
 #[test]

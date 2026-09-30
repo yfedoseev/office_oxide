@@ -42,6 +42,274 @@ pub struct Worksheet {
     /// Data validation rules from `<dataValidations>`/`<dataValidation>`.
     /// Empty when the worksheet defines none.
     pub data_validations: Vec<crate::ir::DataValidation>,
+    /// Visibility from the workbook's `<sheet state>`. Carried on the sheet
+    /// itself: `WorkbookInfo::sheets` also lists sheets that yield no
+    /// worksheet (chartsheets, sheets whose part is missing), so looking
+    /// the state up by position pinned it on the wrong sheet.
+    pub state: super::SheetState,
+    /// Page header/footer text from `<headerFooter>`, as written (with its
+    /// formatting codes); [`SheetHeaderFooter::text`] decodes one.
+    pub header_footer: SheetHeaderFooter,
+    /// Table definitions (`xl/tables/tableN.xml`, [ECMA-376] §18.5) the
+    /// sheet's `<tableParts>` reference: each names a range of the sheet's
+    /// own cells, whose values are in `rows`.
+    pub tables: Vec<SheetTable>,
+    /// Pivot tables anchored on this sheet ([ECMA-376] §18.10). The values
+    /// a pivot table displays are ordinary cells in `rows`; this records
+    /// the pivot itself and where its data comes from.
+    pub pivot_tables: Vec<SheetPivotTable>,
+}
+
+/// A table part ([ECMA-376] §18.5.1.2 `table`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SheetTable {
+    /// `name` — the programmatic name.
+    pub name: String,
+    /// `displayName` — the name formulas use (`Table1[Qty]`).
+    pub display_name: String,
+    /// `ref` — the range the table covers, header and totals rows included.
+    pub range: String,
+    /// The `tableColumn` names, in order.
+    pub columns: Vec<String>,
+    /// `headerRowCount` (default 1).
+    pub header_row_count: u32,
+    /// `totalsRowCount` (default 0).
+    pub totals_row_count: u32,
+}
+
+/// A pivot table part ([ECMA-376] §18.10.1.73 `pivotTableDefinition`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SheetPivotTable {
+    /// `name`.
+    pub name: String,
+    /// `<location ref>` — where on this sheet the pivot is drawn.
+    pub location: String,
+    /// The cache's `<worksheetSource>` ([ECMA-376] §18.10.1.99): the source
+    /// range as `Sheet!A1:C10`, or a defined/table name; `None` for an
+    /// external or consolidation source.
+    pub source: Option<String>,
+}
+
+/// Parse a table part.
+pub(crate) fn parse_table_part(xml_data: &[u8]) -> crate::core::Result<SheetTable> {
+    let mut reader = xml::make_fast_reader(xml_data);
+    let mut table = SheetTable {
+        header_row_count: 1,
+        ..Default::default()
+    };
+    let mut seen_table = false;
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) | Event::Empty(ref e) => match e.local_name().as_ref() {
+                "table" => {
+                    seen_table = true;
+                    let attr = |n: &str| -> crate::core::Result<String> {
+                        Ok(xml::optional_attr_str(e, n)?
+                            .map(|v| v.into_owned())
+                            .unwrap_or_default())
+                    };
+                    table.name = attr("name")?;
+                    table.display_name = attr("displayName")?;
+                    table.range = attr("ref")?;
+                    let count = |n: &str, default: u32| -> crate::core::Result<u32> {
+                        Ok(xml::optional_attr_str(e, n)?
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(default))
+                    };
+                    table.header_row_count = count("headerRowCount", 1)?;
+                    table.totals_row_count = count("totalsRowCount", 0)?;
+                },
+                "tableColumn" => {
+                    if let Some(n) = xml::optional_attr_str(e, "name")? {
+                        table.columns.push(n.into_owned());
+                    }
+                },
+                _ => {},
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    if !seen_table {
+        return Err(crate::core::Error::MalformedXml("table part has no <table>".into()));
+    }
+    Ok(table)
+}
+
+/// Parse a pivot table part's `name` and `<location ref>`.
+pub(crate) fn parse_pivot_table_part(xml_data: &[u8]) -> crate::core::Result<SheetPivotTable> {
+    let mut reader = xml::make_fast_reader(xml_data);
+    let mut pivot = SheetPivotTable::default();
+    let mut seen = false;
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) | Event::Empty(ref e) => match e.local_name().as_ref() {
+                "pivotTableDefinition" => {
+                    seen = true;
+                    pivot.name = xml::optional_attr_str(e, "name")?
+                        .map(|v| v.into_owned())
+                        .unwrap_or_default();
+                },
+                "location" => {
+                    pivot.location = xml::optional_attr_str(e, "ref")?
+                        .map(|v| v.into_owned())
+                        .unwrap_or_default();
+                },
+                _ => {},
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    if !seen {
+        return Err(crate::core::Error::MalformedXml(
+            "pivot table part has no <pivotTableDefinition>".into(),
+        ));
+    }
+    Ok(pivot)
+}
+
+/// The `<worksheetSource>` of a pivot cache definition, as `Sheet!ref`,
+/// the bare `ref`, or the source `name`.
+pub(crate) fn parse_pivot_cache_source(xml_data: &[u8]) -> crate::core::Result<Option<String>> {
+    let mut reader = xml::make_fast_reader(xml_data);
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) | Event::Empty(ref e)
+                if e.local_name().as_ref() == "worksheetSource" =>
+            {
+                let get = |n: &str| -> crate::core::Result<Option<String>> {
+                    Ok(xml::optional_attr_str(e, n)?.map(|v| v.into_owned()))
+                };
+                return Ok(match (get("sheet")?, get("ref")?, get("name")?) {
+                    (Some(sheet), Some(r), _) => Some(format!("{sheet}!{r}")),
+                    (None, Some(r), _) => Some(r),
+                    (_, None, name) => name,
+                });
+            },
+            Event::Eof => return Ok(None),
+            _ => {},
+        }
+    }
+}
+
+/// A sheet's `<headerFooter>` ([ECMA-376] §18.3.1.46): the raw code strings
+/// of each header/footer and the flags that decide which ones are in use.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SheetHeaderFooter {
+    /// `<oddHeader>` — every page's header unless the flags say otherwise.
+    pub odd_header: Option<String>,
+    /// `<oddFooter>`.
+    pub odd_footer: Option<String>,
+    /// `<evenHeader>`, in use only when `different_odd_even` is set.
+    pub even_header: Option<String>,
+    /// `<evenFooter>`, in use only when `different_odd_even` is set.
+    pub even_footer: Option<String>,
+    /// `<firstHeader>`, in use only when `different_first` is set.
+    pub first_header: Option<String>,
+    /// `<firstFooter>`, in use only when `different_first` is set.
+    pub first_footer: Option<String>,
+    /// `differentOddEven`.
+    pub different_odd_even: bool,
+    /// `differentFirst`.
+    pub different_first: bool,
+}
+
+impl SheetHeaderFooter {
+    /// Whether no header or footer text is present at all.
+    pub fn is_empty(&self) -> bool {
+        [
+            &self.odd_header,
+            &self.odd_footer,
+            &self.even_header,
+            &self.even_footer,
+            &self.first_header,
+            &self.first_footer,
+        ]
+        .iter()
+        .all(|h| h.as_deref().is_none_or(|t| t.trim().is_empty()))
+    }
+
+    /// The header/footer text actually in use, decoded, as
+    /// `(first, odd, even)` header triples then footers — inactive even or
+    /// first-page variants (their flag unset) are `None`.
+    pub fn active(&self, sheet_name: &str) -> [Option<String>; 6] {
+        let decode = |h: &Option<String>, on: bool| {
+            h.as_deref()
+                .filter(|_| on)
+                .map(|c| Self::text(c, sheet_name))
+                .filter(|t| !t.trim().is_empty())
+        };
+        [
+            decode(&self.first_header, self.different_first),
+            decode(&self.odd_header, true),
+            decode(&self.even_header, self.different_odd_even),
+            decode(&self.first_footer, self.different_first),
+            decode(&self.odd_footer, true),
+            decode(&self.even_footer, self.different_odd_even),
+        ]
+    }
+
+    /// Decode a header/footer code string ([ECMA-376] §18.3.1.36) to the
+    /// text it shows. `&L`/`&C`/`&R` start the left/centre/right parts
+    /// (text before any marker is centred), which are joined with tabs;
+    /// `&&` is a literal ampersand; font (`&"name,style"`, `&nn`), colour
+    /// (`&K` + 6 characters) and style toggles (`&B`, `&I`, `&U`, ...) are
+    /// dropped; `&A` is the sheet's name; the other fields, whose value
+    /// exists only when printing, show as Excel's header editor shows them
+    /// (`&[Page]`, `&[Pages]`, `&[Date]`, `&[Time]`, `&[File]`, `&[Path]`,
+    /// `&[Picture]`).
+    pub fn text(code: &str, sheet_name: &str) -> String {
+        let mut parts: [String; 3] = Default::default();
+        let mut cur = 1usize;
+        let mut chars = code.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '&' {
+                parts[cur].push(c);
+                continue;
+            }
+            let Some(code) = chars.next() else { break };
+            match code {
+                '&' => parts[cur].push('&'),
+                'L' => cur = 0,
+                'C' => cur = 1,
+                'R' => cur = 2,
+                'P' => parts[cur].push_str("&[Page]"),
+                'N' => parts[cur].push_str("&[Pages]"),
+                'D' => parts[cur].push_str("&[Date]"),
+                'T' => parts[cur].push_str("&[Time]"),
+                'F' => parts[cur].push_str("&[File]"),
+                'Z' => parts[cur].push_str("&[Path]"),
+                'G' => parts[cur].push_str("&[Picture]"),
+                'A' => parts[cur].push_str(sheet_name),
+                '"' => {
+                    for ch in chars.by_ref() {
+                        if ch == '"' {
+                            break;
+                        }
+                    }
+                },
+                'K' => {
+                    for _ in 0..6 {
+                        chars.next();
+                    }
+                },
+                d if d.is_ascii_digit() => {
+                    while chars.peek().is_some_and(char::is_ascii_digit) {
+                        chars.next();
+                    }
+                },
+                // B I U E S X Y O H: style toggles, no text.
+                _ => {},
+            }
+        }
+        parts
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join("\t")
+    }
 }
 
 /// One cell comment from `xl/comments*.xml`.
@@ -72,7 +340,7 @@ pub fn parse_comments(xml_data: &[u8]) -> crate::core::Result<Vec<SheetComment>>
             Event::Start(ref e) => match e.local_name().as_ref() {
                 "authors" => in_authors = true,
                 "author" if in_authors => {
-                    authors.push(xml::read_text_content_fast(&mut reader)?);
+                    authors.push(xml::read_text_content_fast(&mut reader)?.trim().to_string());
                 },
                 "comment" => {
                     let cell_ref = xml::optional_attr_str(e, "ref")?
@@ -357,6 +625,7 @@ impl Worksheet {
         let mut shared = SharedFormulas::default();
         let mut conditional_formats = Vec::new();
         let mut data_validations = Vec::new();
+        let mut header_footer = SheetHeaderFooter::default();
 
         loop {
             match reader.read_event()? {
@@ -397,6 +666,9 @@ impl Worksheet {
                     },
                     "dataValidations" => {
                         data_validations.extend(parse_data_validations(&mut reader)?);
+                    },
+                    "headerFooter" => {
+                        header_footer = parse_header_footer(&mut reader, e)?;
                     },
                     _ => {},
                 },
@@ -445,6 +717,10 @@ impl Worksheet {
         }
 
         Ok(Worksheet {
+            state: super::SheetState::Visible,
+            header_footer,
+            tables: Vec::new(),
+            pivot_tables: Vec::new(),
             comments: Vec::new(),
             name,
             dimension,
@@ -458,6 +734,51 @@ impl Worksheet {
             data_validations,
         })
     }
+}
+
+/// Parse `<headerFooter>` and its six optional code-string children.
+fn parse_header_footer(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    start: &quick_xml::events::BytesStart,
+) -> crate::core::Result<SheetHeaderFooter> {
+    let flag =
+        |name: &str| -> crate::core::Result<bool> {
+            Ok(xml::optional_attr_str(start, name)?
+                .is_some_and(|v| matches!(v.as_ref(), "1" | "true")))
+        };
+    let mut hf = SheetHeaderFooter {
+        different_odd_even: flag("differentOddEven")?,
+        different_first: flag("differentFirst")?,
+        ..Default::default()
+    };
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => {
+                let slot = match e.local_name().as_ref() {
+                    "oddHeader" => &mut hf.odd_header,
+                    "oddFooter" => &mut hf.odd_footer,
+                    "evenHeader" => &mut hf.even_header,
+                    "evenFooter" => &mut hf.even_footer,
+                    "firstHeader" => &mut hf.first_header,
+                    "firstFooter" => &mut hf.first_footer,
+                    _ => {
+                        xml::skip_element_fast(reader)?;
+                        continue;
+                    },
+                };
+                // The raw content, unescaped here: the fast reader trims
+                // each text event, which dropped the spaces next to an
+                // entity (`Page &amp;P` came back as `Page&P`).
+                let raw = reader.read_text(e.to_end().name())?;
+                let text = quick_xml::escape::unescape(&raw).map_err(quick_xml::Error::from)?;
+                *slot = Some(text.into_owned());
+            },
+            Event::End(ref e) if e.local_name().as_ref() == "headerFooter" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(hf)
 }
 
 /// Parse one `<conditionalFormatting sqref="...">` block: its `sqref`
@@ -920,7 +1241,9 @@ fn parse_empty_cell(
         value: CellValue::Empty,
         style_index: attrs.style_index,
         formula: None,
-        vm: None,
+        // A self-closing cell can still name value metadata (`vm`,
+        // [ECMA-376] §18.3.1.4) — an in-cell rich-value image.
+        vm: attrs.vm,
         rich_runs: None,
     })
 }
@@ -1034,6 +1357,15 @@ fn parse_cell_fast(
         Some("e") => match raw_value {
             Some(s) => CellValue::Error(s),
             None => CellValue::Error(String::new()),
+        },
+        // [ECMA-376] §18.18.11: `d` holds an ISO 8601 date/time. Text that
+        // is not one stays the text it is rather than becoming a wrong date.
+        Some("d") => match raw_value {
+            Some(s) => match super::date::DateTimeValue::parse_iso8601(&s) {
+                Some(dt) => CellValue::Date(dt),
+                None => CellValue::String(s),
+            },
+            None => CellValue::Empty,
         },
         _ => match (number, raw_value) {
             (Some(n), _) => CellValue::Number(n),
@@ -1737,6 +2069,32 @@ mod tests {
         assert!(ws.page_setup.is_none());
     }
 
+    /// quick-xml reports an entity reference as its own event, so a
+    /// trimming reader trimmed the text on either side of it separately and
+    /// the spaces around `&amp;` vanished: `see A &amp; &lt;B&gt;` read back
+    /// as `see A&<B>`.
+    #[test]
+    fn test_comment_text_keeps_spaces_around_entity_references() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <authors><author>R &amp; D</author></authors>
+  <commentList>
+    <comment ref="A1" authorId="0"><text><r><t xml:space="preserve">see A &amp; &lt;B&gt; now</t></r></text></comment>
+  </commentList>
+</comments>"#;
+        let comments = parse_comments(xml).unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].text, "see A & <B> now");
+        assert_eq!(comments[0].author.as_deref(), Some("R & D"));
+
+        let threaded = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ThreadedComments xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments">
+  <threadedComment ref="B2" personId="{P1}" id="{ID1}"><text>x &amp; y</text></threadedComment>
+</ThreadedComments>"#;
+        let raw = parse_threaded_comments(threaded).unwrap();
+        assert_eq!(raw[0].text, "x & y");
+    }
+
     // ── Threaded comments ──
 
     #[test]
@@ -1845,5 +2203,40 @@ mod tests {
             merge_threaded_comments(legacy.clone(), Vec::new(), &std::collections::HashMap::new());
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "plain note");
+    }
+
+    /// `t="d"` ([ECMA-376] §18.18.11 ST_CellType) stores an ISO 8601 date
+    /// in `<v>`. It had no arm and fell through as a plain string;
+    /// `CellValue::Date` was constructed nowhere in the reader.
+    #[test]
+    fn test_iso_date_cells_parse_as_dates() {
+        let xml = br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1">
+          <c r="A1" t="d"><v>2024-03-15T10:30:05Z</v></c>
+          <c r="B1" t="d"><v>2024-03-15</v></c>
+          <c r="C1" t="d"><v>2024-03-15T10:30:05.250+02:00</v></c>
+          <c r="D1" t="d"><v>not a date</v></c>
+          <c r="E1" t="d"><v>2024-13-40</v></c>
+        </row></sheetData></worksheet>"#;
+        let ws =
+            Worksheet::parse(xml, "S".into(), &crate::core::relationships::Relationships::empty())
+                .unwrap();
+        let v: Vec<_> = ws.rows[0].cells.iter().map(|c| c.value.clone()).collect();
+        let date = |y, mo, d, h, mi, s, ms| {
+            CellValue::Date(super::super::date::DateTimeValue {
+                year: y,
+                month: mo,
+                day: d,
+                hour: h,
+                minute: mi,
+                second: s,
+                millisecond: ms,
+            })
+        };
+        assert_eq!(format!("{:?}", v[0]), format!("{:?}", date(2024, 3, 15, 10, 30, 5, 0)));
+        assert_eq!(format!("{:?}", v[1]), format!("{:?}", date(2024, 3, 15, 0, 0, 0, 0)));
+        assert_eq!(format!("{:?}", v[2]), format!("{:?}", date(2024, 3, 15, 10, 30, 5, 250)));
+        // Not an ISO date: kept as the text it is, never a wrong date.
+        assert_eq!(format!("{:?}", v[3]), format!("{:?}", CellValue::String("not a date".into())));
+        assert_eq!(format!("{:?}", v[4]), format!("{:?}", CellValue::String("2024-13-40".into())));
     }
 }

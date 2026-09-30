@@ -18,8 +18,8 @@
 //  2. Downstream consumers — set CGO_CFLAGS and CGO_LDFLAGS to point at an
 //     installed prefix that contains the header and library, e.g.:
 //
-//        export CGO_CFLAGS="-I/usr/local/include"
-//        export CGO_LDFLAGS="-L/usr/local/lib -loffice_oxide"
+//     export CGO_CFLAGS="-I/usr/local/include"
+//     export CGO_LDFLAGS="-L/usr/local/lib -loffice_oxide"
 //
 // # Example
 //
@@ -51,6 +51,8 @@ import (
 type Error struct {
 	Code int
 	Op   string
+	// Detail, when set, explains the failure more precisely than Code.
+	Detail string
 }
 
 func (e *Error) Error() string {
@@ -73,7 +75,25 @@ func (e *Error) Error() string {
 	default:
 		kind = fmt.Sprintf("code=%d", e.Code)
 	}
+	if e.Detail != "" {
+		kind = e.Detail
+	}
 	return fmt.Sprintf("office_oxide: %s: %s", e.Op, kind)
+}
+
+// statusErr turns a writer status into an error. The writers return a
+// status precisely so a write that landed nowhere — a missing sheet or
+// slide, a cell outside Excel's grid, an unknown value — is detectable;
+// discarding it reported success for data that was never written.
+func statusErr(rc C.int32_t, op string) error {
+	if rc == 0 {
+		return nil
+	}
+	e := &Error{Code: int(rc), Op: op}
+	if rc == C.OFFICE_ERR_UNSUPPORTED {
+		e.Detail = "the target is out of range, so nothing was written"
+	}
+	return e
 }
 
 // ErrClosed is returned when using a handle that has already been closed.
@@ -193,6 +213,17 @@ func (d *Document) ToMarkdown() (string, error) {
 	return cStrOrErr(C.office_document_to_markdown(d.handle, &errCode), errCode, "ToMarkdown")
 }
 
+// ToMarkdownWithImages converts the document to Markdown with each image
+// embedded inline as `[image-base64:<data>]` at its position in the flow.
+// ToMarkdown drops images entirely.
+func (d *Document) ToMarkdownWithImages() (string, error) {
+	if d.handle == nil {
+		return "", ErrClosed
+	}
+	var errCode C.int
+	return cStrOrErr(C.office_document_to_markdown_with_images(d.handle, &errCode), errCode, "ToMarkdownWithImages")
+}
+
 // ToHTML converts the document to an HTML fragment.
 func (d *Document) ToHTML() (string, error) {
 	if d.handle == nil {
@@ -249,6 +280,30 @@ func OpenEditable(path string) (*EditableDocument, error) {
 	return ed, nil
 }
 
+// OpenEditableFromBytes opens an in-memory document for editing, without a
+// temporary file. `format` must be "docx", "xlsx" or "pptx". Use
+// SaveToBytes to get the edited document back.
+func OpenEditableFromBytes(data []byte, format string) (*EditableDocument, error) {
+	if len(data) == 0 {
+		return nil, &Error{Code: int(C.OFFICE_ERR_INVALID_ARG), Op: "OpenEditableFromBytes"}
+	}
+	cfmt := C.CString(format)
+	defer C.free(unsafe.Pointer(cfmt))
+	var errCode C.int
+	h := C.office_editable_open_from_bytes(
+		(*C.uint8_t)(unsafe.Pointer(&data[0])),
+		C.size_t(len(data)),
+		cfmt,
+		&errCode,
+	)
+	if h == nil {
+		return nil, &Error{Code: int(errCode), Op: "OpenEditableFromBytes"}
+	}
+	ed := &EditableDocument{handle: h}
+	runtime.SetFinalizer(ed, func(ed *EditableDocument) { ed.Close() })
+	return ed, nil
+}
+
 // Close releases the editable document handle.
 func (ed *EditableDocument) Close() error {
 	if ed == nil || ed.handle == nil {
@@ -261,7 +316,8 @@ func (ed *EditableDocument) Close() error {
 }
 
 // ReplaceText replaces every occurrence of `find` with `replace` in text
-// content. Returns the number of replacements.
+// content. Returns the number of replacements. An empty `find` is an
+// invalid-argument error; an XLSX document returns an unsupported error.
 func (ed *EditableDocument) ReplaceText(find, replace string) (int64, error) {
 	if ed.handle == nil {
 		return 0, ErrClosed
@@ -445,143 +501,147 @@ func (w *XlsxWriter) AddSheet(name string) uint32 {
 	return uint32(C.office_xlsx_writer_add_sheet(w.handle, cname))
 }
 
-// SetCell sets a cell value in the given sheet (0-based), row and column.
-// value may be nil (empty), string, float64, or bool.
-func (w *XlsxWriter) SetCell(sheet, row, col uint32, value any) {
-	if w.handle == nil {
-		return
+// Formula is a formula cell value for XlsxWriter.SetCell, e.g.
+// Formula("SUM(A1:A3)"). A leading '=' is accepted. A plain string is always
+// written as text, even one that starts with '='.
+type Formula string
+
+// maxExactInt is the largest magnitude up to which every integer is exactly
+// representable as a float64 — the type every Excel number is stored as.
+const maxExactInt = 1 << 53
+
+// exactInt converts an integer to the double Excel will store, refusing one
+// that would silently change value (an ID of 2^53+1 used to come back as
+// 2^53).
+func exactInt(neg bool, mag uint64, op string) (C.double, error) {
+	if mag > maxExactInt {
+		sign := ""
+		if neg {
+			sign = "-"
+		}
+		return 0, &Error{
+			Code:   int(C.OFFICE_ERR_INVALID_ARG),
+			Op:     op,
+			Detail: fmt.Sprintf("integer %s%d cannot be stored exactly as an Excel number (a double is exact only up to 2^53); write it as a string", sign, mag),
+		}
 	}
-	var vtype C.int32_t
-	var vstr *C.char
-	var vnum C.double
+	if neg {
+		return -C.double(mag), nil
+	}
+	return C.double(mag), nil
+}
+
+// signed splits an int64 into sign and magnitude without overflowing on
+// math.MinInt64.
+func signed(v int64, op string) (C.double, error) {
+	if v < 0 {
+		return exactInt(true, uint64(-(v+1))+1, op)
+	}
+	return exactInt(false, uint64(v), op)
+}
+
+// writerCell encodes a SetCell value. The returned free function releases
+// any C string it allocated.
+func writerCell(value any, op string) (vtype C.int32_t, vstr *C.char, vnum C.double, free func(), err error) {
+	free = func() {}
+	cstr := func(s string) {
+		vstr = C.CString(s)
+		free = func() { C.free(unsafe.Pointer(vstr)) }
+	}
 	switch v := value.(type) {
 	case nil:
-		vtype = 0
+		vtype = C.OFFICE_CELL_EMPTY
+	case Formula:
+		vtype = C.OFFICE_CELL_FORMULA
+		cstr(string(v))
 	case string:
-		vtype = 1
-		vstr = C.CString(v)
-		defer C.free(unsafe.Pointer(vstr))
-	case float64:
-		vtype = 2
-		vnum = C.double(v)
-	case float32:
-		vtype = 2
-		vnum = C.double(v)
-	case int:
-		vtype = 2
-		vnum = C.double(v)
-	case int8:
-		vtype = 2
-		vnum = C.double(v)
-	case int16:
-		vtype = 2
-		vnum = C.double(v)
-	case int32:
-		vtype = 2
-		vnum = C.double(v)
-	case int64:
-		vtype = 2
-		vnum = C.double(v)
-	case uint:
-		vtype = 2
-		vnum = C.double(v)
-	case uint8:
-		vtype = 2
-		vnum = C.double(v)
-	case uint16:
-		vtype = 2
-		vnum = C.double(v)
-	case uint32:
-		vtype = 2
-		vnum = C.double(v)
-	case uint64:
-		vtype = 2
-		vnum = C.double(v)
+		vtype = C.OFFICE_CELL_STRING
+		cstr(v)
 	case bool:
-		vtype = 3
+		vtype = C.OFFICE_CELL_BOOLEAN
 		if v {
 			vnum = 1.0
 		}
+	case float64:
+		vtype, vnum = C.OFFICE_CELL_NUMBER, C.double(v)
+	case float32:
+		vtype, vnum = C.OFFICE_CELL_NUMBER, C.double(v)
+	case int8:
+		vtype, vnum = C.OFFICE_CELL_NUMBER, C.double(v)
+	case int16:
+		vtype, vnum = C.OFFICE_CELL_NUMBER, C.double(v)
+	case int32:
+		vtype, vnum = C.OFFICE_CELL_NUMBER, C.double(v)
+	case uint8:
+		vtype, vnum = C.OFFICE_CELL_NUMBER, C.double(v)
+	case uint16:
+		vtype, vnum = C.OFFICE_CELL_NUMBER, C.double(v)
+	case uint32:
+		vtype, vnum = C.OFFICE_CELL_NUMBER, C.double(v)
+	case int:
+		vtype = C.OFFICE_CELL_NUMBER
+		vnum, err = signed(int64(v), op)
+	case int64:
+		vtype = C.OFFICE_CELL_NUMBER
+		vnum, err = signed(v, op)
+	case uint:
+		vtype = C.OFFICE_CELL_NUMBER
+		vnum, err = exactInt(false, uint64(v), op)
+	case uint64:
+		vtype = C.OFFICE_CELL_NUMBER
+		vnum, err = exactInt(false, v, op)
 	default:
 		// Anything else is rendered rather than discarded: `vtype = 0` wrote
-		// an EMPTY cell, so an int64 or a float32 silently vanished.
-		vtype = 1
-		vstr = C.CString(fmt.Sprintf("%v", v))
-		defer C.free(unsafe.Pointer(vstr))
+		// an EMPTY cell, so an unsupported value silently vanished.
+		vtype = C.OFFICE_CELL_STRING
+		cstr(fmt.Sprintf("%v", v))
 	}
-	C.office_xlsx_sheet_set_cell(w.handle, C.uint32_t(sheet), C.uint32_t(row), C.uint32_t(col), vtype, vstr, vnum)
+	return vtype, vstr, vnum, free, err
+}
+
+// SetCell sets a cell value in the given sheet (0-based), row and column.
+// value may be nil (empty), string, bool, any integer or float type, or a
+// Formula. An integer beyond ±2^53 is an error (Excel stores numbers as
+// doubles and would change it). Returns an error when nothing was written:
+// a missing sheet or a cell outside Excel's grid.
+func (w *XlsxWriter) SetCell(sheet, row, col uint32, value any) error {
+	if w.handle == nil {
+		return ErrClosed
+	}
+	vtype, vstr, vnum, free, err := writerCell(value, "XlsxWriter.SetCell")
+	defer free()
+	if err != nil {
+		return err
+	}
+	rc := C.office_xlsx_sheet_set_cell(w.handle, C.uint32_t(sheet), C.uint32_t(row), C.uint32_t(col), vtype, vstr, vnum)
+	return statusErr(rc, "XlsxWriter.SetCell")
+}
+
+// SetFormula sets a formula cell, e.g. SetFormula(0, 3, 1, "SUM(B1:B3)").
+// A leading '=' is accepted.
+func (w *XlsxWriter) SetFormula(sheet, row, col uint32, formula string) error {
+	return w.SetCell(sheet, row, col, Formula(formula))
 }
 
 // SetCellStyled sets a cell value with bold and/or background color styling.
-// bgColor is a 6-char hex string like "D3D3D3" or "" for no fill.
-func (w *XlsxWriter) SetCellStyled(sheet, row, col uint32, value any, bold bool, bgColor string) {
+// bgColor is a 6-char hex string like "D3D3D3" or "" for no fill. Values and
+// errors as for SetCell.
+func (w *XlsxWriter) SetCellStyled(sheet, row, col uint32, value any, bold bool, bgColor string) error {
 	if w.handle == nil {
-		return
+		return ErrClosed
 	}
-	var vtype C.int32_t
-	var vstr *C.char
-	var vnum C.double
-	switch v := value.(type) {
-	case nil:
-		vtype = 0
-	case string:
-		vtype = 1
-		vstr = C.CString(v)
-		defer C.free(unsafe.Pointer(vstr))
-	case float64:
-		vtype = 2
-		vnum = C.double(v)
-	case float32:
-		vtype = 2
-		vnum = C.double(v)
-	case int:
-		vtype = 2
-		vnum = C.double(v)
-	case int8:
-		vtype = 2
-		vnum = C.double(v)
-	case int16:
-		vtype = 2
-		vnum = C.double(v)
-	case int32:
-		vtype = 2
-		vnum = C.double(v)
-	case int64:
-		vtype = 2
-		vnum = C.double(v)
-	case uint:
-		vtype = 2
-		vnum = C.double(v)
-	case uint8:
-		vtype = 2
-		vnum = C.double(v)
-	case uint16:
-		vtype = 2
-		vnum = C.double(v)
-	case uint32:
-		vtype = 2
-		vnum = C.double(v)
-	case uint64:
-		vtype = 2
-		vnum = C.double(v)
-	case bool:
-		vtype = 3
-		if v {
-			vnum = 1.0
-		}
-	default:
-		// Anything else is rendered rather than discarded: `vtype = 0` wrote
-		// an EMPTY cell, so an int64 or a float32 silently vanished.
-		vtype = 1
-		vstr = C.CString(fmt.Sprintf("%v", v))
-		defer C.free(unsafe.Pointer(vstr))
+	vtype, vstr, vnum, free, err := writerCell(value, "XlsxWriter.SetCellStyled")
+	defer free()
+	if err != nil {
+		return err
 	}
 	var cbg *C.char
 	if bgColor != "" {
 		cbg = C.CString(bgColor)
 		defer C.free(unsafe.Pointer(cbg))
 	}
-	C.office_xlsx_sheet_set_cell_styled(w.handle, C.uint32_t(sheet), C.uint32_t(row), C.uint32_t(col), vtype, vstr, vnum, C.bool(bold), cbg)
+	rc := C.office_xlsx_sheet_set_cell_styled(w.handle, C.uint32_t(sheet), C.uint32_t(row), C.uint32_t(col), vtype, vstr, vnum, C.bool(bold), cbg)
+	return statusErr(rc, "XlsxWriter.SetCellStyled")
 }
 
 // MergeCells merges a rectangular range. rowSpan and colSpan must be >= 1.
@@ -674,42 +734,49 @@ func (w *PptxWriter) AddSlide() uint32 {
 	return uint32(C.office_pptx_writer_add_slide(w.handle))
 }
 
-// SetSlideTitle sets the title of the given slide.
-func (w *PptxWriter) SetSlideTitle(slide uint32, title string) {
+// SetSlideTitle sets the title of the given slide. Returns an error when
+// the slide does not exist (nothing was written).
+func (w *PptxWriter) SetSlideTitle(slide uint32, title string) error {
 	if w.handle == nil {
-		return
+		return ErrClosed
 	}
 	ctitle := C.CString(title)
 	defer C.free(unsafe.Pointer(ctitle))
-	C.office_pptx_slide_set_title(w.handle, C.uint32_t(slide), ctitle)
+	return statusErr(C.office_pptx_slide_set_title(w.handle, C.uint32_t(slide), ctitle), "PptxWriter.SetSlideTitle")
 }
 
-// AddSlideText adds a plain text paragraph to the slide body.
-func (w *PptxWriter) AddSlideText(slide uint32, text string) {
+// AddSlideText adds a plain text paragraph to the slide body. Returns an
+// error when the slide does not exist (nothing was written).
+func (w *PptxWriter) AddSlideText(slide uint32, text string) error {
 	if w.handle == nil {
-		return
+		return ErrClosed
 	}
 	ctext := C.CString(text)
 	defer C.free(unsafe.Pointer(ctext))
-	C.office_pptx_slide_add_text(w.handle, C.uint32_t(slide), ctext)
+	return statusErr(C.office_pptx_slide_add_text(w.handle, C.uint32_t(slide), ctext), "PptxWriter.AddSlideText")
 }
 
 // AddSlideImage embeds an image on a slide.
 // format is "png", "jpeg"/"jpg", or "gif".
 // x, y, cx, cy are in EMU (914400 = 1 inch).
-func (w *PptxWriter) AddSlideImage(slide uint32, data []byte, format string, x, y int64, cx, cy uint64) {
-	if w.handle == nil || len(data) == 0 {
-		return
+// Returns an error for empty data, an unknown format or a missing slide.
+func (w *PptxWriter) AddSlideImage(slide uint32, data []byte, format string, x, y int64, cx, cy uint64) error {
+	if w.handle == nil {
+		return ErrClosed
+	}
+	if len(data) == 0 {
+		return &Error{Code: int(C.OFFICE_ERR_INVALID_ARG), Op: "PptxWriter.AddSlideImage"}
 	}
 	cfmt := C.CString(format)
 	defer C.free(unsafe.Pointer(cfmt))
-	C.office_pptx_slide_add_image(
+	rc := C.office_pptx_slide_add_image(
 		w.handle, C.uint32_t(slide),
 		(*C.uint8_t)(unsafe.Pointer(&data[0])), C.size_t(len(data)),
 		cfmt,
 		C.int64_t(x), C.int64_t(y),
 		C.uint64_t(cx), C.uint64_t(cy),
 	)
+	return statusErr(rc, "PptxWriter.AddSlideImage")
 }
 
 // Save writes the presentation to a file.

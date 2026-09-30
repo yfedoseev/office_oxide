@@ -231,6 +231,11 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
             text_truncated: false,
+            ..crate::core::core_properties::ooxml_metadata_extras(
+                cp,
+                doc.app_properties.as_ref(),
+                Some(&doc.package_properties),
+            )
         },
         sections: ir_sections,
         defined_names: Vec::new(),
@@ -248,14 +253,10 @@ struct SectionHeaders {
     even_footer: Option<HeaderFooter>,
 }
 
-/// Split a `cp:keywords` value. OOXML has no formal separator; Word writes
-/// comma- or semicolon-separated lists, and space-separated is also seen.
+/// Split a `cp:keywords` value; see
+/// [`crate::core::core_properties::split_keywords`].
 pub(crate) fn split_keywords(s: &str) -> Vec<String> {
-    s.split([',', ';'])
-        .flat_map(|part| part.split_whitespace())
-        .map(|k| k.trim().to_string())
-        .filter(|k| !k.is_empty())
-        .collect()
+    crate::core::core_properties::split_keywords(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -1245,6 +1246,15 @@ fn convert_run_content(
         })));
     let bold = run_face.bold;
     let italic = run_face.italic;
+    // A theme reference (`w:asciiTheme`, the default in every Office
+    // template) supersedes the literal face (ECMA-376 Part 1 §17.3.2.26)
+    // and names a font in the theme's font scheme; without a theme to
+    // resolve it, the literal face is the only name there is.
+    let themed_ascii = eff
+        .font_theme
+        .zip(theme)
+        .and_then(|(t, th)| t.resolve(&th.font_scheme));
+    let ascii = themed_ascii.as_deref().or(eff.font_name.as_deref());
     let strike = eff.strike.or(eff.dstrike).unwrap_or(false);
     // Propagate `<w:color w:val="RRGGBB"/>` so PDF→DOCX→PDF round-trips
     // preserve coloured text. Resolve it through the document theme:
@@ -1297,7 +1307,7 @@ fn convert_run_content(
     // half-points, the IR's own encoding (see
     // `crate::core::units::HalfPoint::from_word_sz`).
     let push_text = |text: &str, content: &mut Vec<InlineContent>| {
-        eff.for_each_script_segment(text, |piece, face| {
+        eff.for_each_script_segment(text, ascii, |piece, face| {
             content.push(InlineContent::Text(TextSpan {
                 text: piece.to_string(),
                 bold,

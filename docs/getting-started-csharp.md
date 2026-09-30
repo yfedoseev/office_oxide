@@ -81,7 +81,7 @@ Console.WriteLine($"{n} replacements");
 ed.Save("out.docx");
 ```
 
-`ReplaceText` returns the replacement count (0 on XLSX — use `SetCell` instead).
+`ReplaceText` returns the replacement count. It throws for XLSX (`Unsupported` — use `SetCell` instead) and for an empty search string (`InvalidArg`).
 
 ## Editing Examples
 

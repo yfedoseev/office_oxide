@@ -1178,25 +1178,25 @@ fn test_slide_comments_reach_plain_text_and_markdown() {
 }
 
 // ---------------------------------------------------------------------------
-// SmartArt / chart text
+// Unmodelled graphic text
 // ---------------------------------------------------------------------------
 
+/// A graphicFrame whose uri is not one this reader models used to be
+/// skipped wholesale; any `<a:t>` text inside it is document text. (Real
+/// SmartArt keeps its text in a separate data part — see
+/// `test_smartart_text_is_read_from_the_diagram_data_part`.)
 #[test]
-fn test_smartart_and_chart_text_is_extracted() {
-    // A graphicFrame whose uri is not the table one used to be skipped
-    // wholesale, so a deck built out of SmartArt extracted as empty.
+fn test_inline_text_of_an_unmodelled_graphic_is_extracted() {
     let tree = r#"<p:graphicFrame>
         <p:xfrm><a:off x="0" y="0"/><a:ext cx="100" cy="100"/></p:xfrm>
-        <a:graphic><a:graphicData
-            uri="http://schemas.openxmlformats.org/drawingml/2006/diagram">
-          <dgm:relIds xmlns:dgm="d"/>
-          <a:txBody><a:p><a:r><a:t>DIAGRAM NODE</a:t></a:r></a:p></a:txBody>
+        <a:graphic><a:graphicData uri="urn:example:unmodelled-graphic">
+          <a:txBody><a:p><a:r><a:t>GRAPHIC NODE</a:t></a:r></a:p></a:txBody>
         </a:graphicData></a:graphic>
       </p:graphicFrame>"#;
     let ir = pptx_ir(vec![Slide::new(tree)]);
     assert!(
-        ir.plain_text().contains("DIAGRAM NODE"),
-        "diagram text missing from {:?}",
+        ir.plain_text().contains("GRAPHIC NODE"),
+        "graphic text missing from {:?}",
         ir.plain_text()
     );
 }
@@ -1325,4 +1325,287 @@ fn test_a_duplicate_reference_keeps_the_first_value() {
         .map(cell_text)
         .collect();
     assert_eq!(row, ["first", "b"]);
+}
+
+/// Build `sheet` into a document and convert it on another thread, failing
+/// if the conversion does not finish in `secs`.
+fn ir_within(sheet: Sheet<'static>, secs: u64) -> DocumentIR {
+    let doc = Xlsx::new(vec![sheet]).doc();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(doc.to_ir());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(secs))
+        .expect("to_ir must finish in time proportional to the cells present")
+}
+
+const TWO_BY_TWO: &str = r#"<row r="1"><c r="A1" t="inlineStr"><is><t>a</t></is></c><c r="B1" t="inlineStr"><is><t>b</t></is></c></row>
+    <row r="2"><c r="A2" t="inlineStr"><is><t>c</t></is></c><c r="B2" t="inlineStr"><is><t>d</t></is></c></row>"#;
+
+/// `<mergeCell ref="A1:XFD1048576"/>` names the whole legal grid. Expanding
+/// it position by position was ~17 billion set inserts from a 2 KB file.
+#[test]
+fn test_a_full_grid_merge_cell_converts_in_bounded_time() {
+    let mut sheet = Sheet::new("S", TWO_BY_TWO);
+    sheet.extra = r#"<mergeCells count="1"><mergeCell ref="A1:XFD1048576"/></mergeCells>"#;
+    let ir = ir_within(sheet, 20);
+    let t = only_table(&ir, 0);
+    assert_eq!(t.rows[0].cells.len(), 1, "only the anchor survives: {:?}", t.rows[0]);
+    assert_eq!(cell_text(&t.rows[0].cells[0]), "a");
+    assert_eq!(t.rows[0].cells[0].row_span, 2, "spans the stored rows it covers");
+    assert_eq!(t.rows[0].cells[0].col_span, 2, "clipped to the table's width");
+    assert!(t.rows[1].cells.is_empty(), "{:?}", t.rows[1]);
+}
+
+/// Many overlapping whole-grid merges: bounded work, and a visible notice
+/// for the ranges that were not applied.
+#[test]
+fn test_overlapping_merge_cells_past_the_work_budget_are_reported() {
+    let body: String = (1..=2_000)
+        .map(|r| format!(r#"<row r="{r}"><c r="A{r}"><v>1</v></c><c r="B{r}"><v>2</v></c></row>"#))
+        .collect();
+    let merges: String = (0..30_000)
+        .map(|_| r#"<mergeCell ref="A1:B1048576"/>"#)
+        .collect();
+    let extra = format!(r#"<mergeCells>{merges}</mergeCells>"#);
+    let mut sheet = Sheet::new("S", Box::leak(body.into_boxed_str()));
+    sheet.extra = Box::leak(extra.into_boxed_str());
+    let ir = ir_within(sheet, 120);
+    assert!(ir.plain_text().contains("merged cell ranges"), "{}", ir.plain_text());
+}
+
+// ---------------------------------------------------------------------------
+// Direct renderers keep sparse cells in their own row and column
+// ---------------------------------------------------------------------------
+
+const SPARSE: &str = r#"<row r="1">
+     <c r="A1" t="inlineStr"><is><t>Name</t></is></c>
+     <c r="B1" t="inlineStr"><is><t>Qty</t></is></c>
+     <c r="C1" t="inlineStr"><is><t>Price</t></is></c>
+   </row>
+   <row r="2"><c r="C2"><v>9</v></c></row>
+   <row r="4"><c r="A4" t="inlineStr"><is><t>Pear</t></is></c><c r="C4"><v>4</v></c></row>"#;
+
+/// XLSX stores only non-empty cells, positioned by `r=` (§18.3.1.4,
+/// §18.3.1.73). `to_csv()` emitted cells in encounter order, so `9` landed
+/// under `Name`, and dropped the omitted row 3, shifting row 4 up.
+#[test]
+fn test_csv_places_sparse_cells_by_reference() {
+    let doc = Xlsx::new(vec![Sheet::new("S", SPARSE)]).doc();
+    let csv = doc.as_xlsx().unwrap().to_csv();
+    assert_eq!(csv, "Name,Qty,Price\r\n,,9\r\n,,\r\nPear,,4");
+}
+
+/// `plain_text()` keeps each value in its own tab-separated column.
+#[test]
+fn test_plain_text_places_sparse_cells_by_column() {
+    let doc = Xlsx::new(vec![Sheet::new("S", SPARSE)]).doc();
+    let text = doc.plain_text();
+    assert!(text.contains("Name\tQty\tPrice\n\t\t9\nPear\t\t4"), "{text:?}");
+}
+
+/// `to_markdown()` (the README path, which does not go through the IR)
+/// put `9` under the `Name` header.
+#[test]
+fn test_markdown_places_sparse_cells_by_column() {
+    let doc = Xlsx::new(vec![Sheet::new("S", SPARSE)]).doc();
+    let md = doc.to_markdown();
+    assert!(md.contains("| Name | Qty | Price |"), "{md}");
+    assert!(md.contains("|  |  | 9 |"), "{md}");
+    assert!(md.contains("| Pear |  | 4 |"), "{md}");
+}
+
+/// Cell fills were parsed into the stylesheet and never read: a solid
+/// background colour never reached `TableCell::background_color`, which
+/// the DOCX path already fills from cell shading.
+#[test]
+fn test_solid_cell_fill_reaches_the_table_cell_background() {
+    let styles = r#"<fills count="3">
+          <fill><patternFill patternType="none"/></fill>
+          <fill><patternFill patternType="gray125"/></fill>
+          <fill><patternFill patternType="solid"><fgColor rgb="FFFFC000"/><bgColor indexed="64"/></patternFill></fill>
+        </fills>
+        <cellXfs count="3">
+          <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+          <xf numFmtId="0" fontId="0" fillId="2" borderId="0" applyFill="1"/>
+          <xf numFmtId="0" fontId="0" fillId="1" borderId="0" applyFill="1"/>
+        </cellXfs>"#;
+    let body = r#"<row r="1">
+        <c r="A1" t="inlineStr"><is><t>plain</t></is></c>
+        <c r="B1" s="1" t="inlineStr"><is><t>amber</t></is></c>
+        <c r="C1" s="2" t="inlineStr"><is><t>patterned</t></is></c>
+      </row>"#;
+    let ir = Xlsx::new(vec![Sheet::new("S", body)]).styles(styles).ir();
+    let t = only_table(&ir, 0);
+    let bg: Vec<_> = t.rows[0].cells.iter().map(|c| c.background_color).collect();
+    assert_eq!(bg, [None, Some([0xFF, 0xC0, 0x00]), None]);
+}
+
+/// Cell borders were parsed (style + colour per side) and never read; they
+/// now reach `TableCell::border`.
+#[test]
+fn test_cell_borders_reach_the_table_cell() {
+    let styles = r#"<borders count="2">
+          <border><left/><right/><top/><bottom/><diagonal/></border>
+          <border>
+            <left style="thin"><color rgb="FF112233"/></left>
+            <right style="double"/>
+            <top style="thick"><color rgb="FF000000"/></top>
+            <bottom style="dashed"/>
+          </border>
+        </borders>
+        <cellXfs count="2">
+          <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+          <xf numFmtId="0" fontId="0" fillId="0" borderId="1" applyBorder="1"/>
+        </cellXfs>"#;
+    let body = r#"<row r="1">
+        <c r="A1" t="inlineStr"><is><t>plain</t></is></c>
+        <c r="B1" s="1" t="inlineStr"><is><t>boxed</t></is></c>
+      </row>"#;
+    let ir = Xlsx::new(vec![Sheet::new("S", body)]).styles(styles).ir();
+    let t = only_table(&ir, 0);
+    assert!(t.rows[0].cells[0].border.is_none());
+    let b = t.rows[0].cells[1].border.as_ref().expect("B1 has borders");
+    let left = b.left.as_ref().unwrap();
+    assert_eq!(
+        (left.style.clone(), left.color),
+        (BorderStyle::Single, Some([0x11, 0x22, 0x33]))
+    );
+    assert_eq!(b.right.as_ref().unwrap().style, BorderStyle::Double);
+    assert_eq!(b.top.as_ref().unwrap().style, BorderStyle::Thick);
+    assert_eq!(b.bottom.as_ref().unwrap().style, BorderStyle::Dashed);
+}
+
+/// `<headerFooter>` (§18.3.1.46) carries user-visible text that was never
+/// read. It now reaches the IR's section headers/footers and both direct
+/// renderers, with its formatting codes (§18.3.1.36) decoded: section
+/// markers split the parts, fields show as Excel's editor shows them, and
+/// an inactive even-page header (no `differentOddEven`) stays out.
+#[test]
+fn test_sheet_header_and_footer_text_is_extracted() {
+    let mut sheet = Sheet::new("S", r#"<row r="1"><c r="A1"><v>1</v></c></row>"#);
+    sheet.extra = r#"<headerFooter differentFirst="1">
+        <oddHeader>&amp;L&amp;"Arial,Bold"&amp;14Quarterly Report&amp;RPage &amp;P of &amp;N</oddHeader>
+        <oddFooter>&amp;CConfidential &amp;&amp; internal &amp;KFF0000&amp;A</oddFooter>
+        <evenHeader>&amp;CEven only</evenHeader>
+        <firstHeader>&amp;CCover</firstHeader>
+      </headerFooter>"#;
+    let doc = Xlsx::new(vec![sheet]).doc();
+    let ir = doc.to_ir();
+    let hf_text = |hf: &Option<HeaderFooter>| {
+        hf.as_ref().map(|h| {
+            h.content
+                .iter()
+                .map(|e| match e {
+                    Element::Paragraph(p) => p
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            InlineContent::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                    _ => String::new(),
+                })
+                .collect::<String>()
+        })
+    };
+    let s = &ir.sections[0];
+    assert_eq!(
+        hf_text(&s.header).as_deref(),
+        Some("Quarterly Report\tPage &[Page] of &[Pages]")
+    );
+    assert_eq!(hf_text(&s.footer).as_deref(), Some("Confidential & internal S"));
+    assert_eq!(hf_text(&s.first_page_header).as_deref(), Some("Cover"));
+    assert_eq!(hf_text(&s.even_page_header), None, "differentOddEven is off");
+    for out in [doc.plain_text(), doc.to_markdown()] {
+        assert!(out.contains("Quarterly Report"), "{out}");
+        assert!(out.contains("Confidential & internal"), "{out}");
+        assert!(!out.contains("Even only"), "{out}");
+    }
+}
+
+/// The IR carries defined names and each sheet's hidden flag, but the
+/// XLSX writer emitted neither `<definedNames>` nor `<sheet state>`: a
+/// read→IR→write round trip unhid every hidden sheet and dropped every
+/// named range.
+#[test]
+fn test_defined_names_and_hidden_sheets_survive_an_ir_round_trip() {
+    let mut first = Sheet::new("Data", r#"<row r="1"><c r="A1"><v>1</v></c></row>"#);
+    first.state = Some("hidden");
+    let second = Sheet::new("Report", r#"<row r="1"><c r="A1"><v>2</v></c></row>"#);
+    let ir = Xlsx::new(vec![first, second]).ir();
+    // The builder's workbook has no <definedNames>; add them at the IR,
+    // where a round trip carries them from.
+    let mut ir = ir;
+    ir.defined_names = vec![
+        DefinedName {
+            name: "Totals".into(),
+            value: "Data!$A$1:$A$10".into(),
+            local_sheet_id: None,
+            hidden: false,
+        },
+        DefinedName {
+            name: "_xlnm.Print_Area".into(),
+            value: "Report!$A$1:$B$2".into(),
+            local_sheet_id: Some(1),
+            hidden: true,
+        },
+    ];
+    let bytes = to_bytes(&office_oxide::create::ir_to_xlsx(&ir));
+    let back = Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx)
+        .expect("reopen")
+        .to_ir();
+    assert_eq!(
+        back.sections
+            .iter()
+            .map(|s| (s.title.clone().unwrap_or_default(), s.hidden))
+            .collect::<Vec<_>>(),
+        [("Data".to_string(), true), ("Report".to_string(), false)]
+    );
+    assert_eq!(back.defined_names, ir.defined_names);
+}
+
+/// `<alignment>` inside a cell format (§18.8.1) was never parsed, though
+/// the writer can emit it: read -> IR -> write lost every cell's alignment.
+#[test]
+fn test_cell_alignment_is_read_and_survives_an_ir_round_trip() {
+    let styles = r#"<cellXfs count="3">
+          <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+          <xf numFmtId="0" fontId="0" fillId="0" borderId="0" applyAlignment="1"><alignment horizontal="center" vertical="top" wrapText="1"/></xf>
+          <xf numFmtId="0" fontId="0" fillId="0" borderId="0" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf>
+        </cellXfs>"#;
+    let body = r#"<row r="1">
+        <c r="A1" t="inlineStr"><is><t>plain</t></is></c>
+        <c r="B1" s="1" t="inlineStr"><is><t>centred</t></is></c>
+        <c r="C1" s="2" t="inlineStr"><is><t>right</t></is></c>
+      </row>"#;
+    let ir = Xlsx::new(vec![Sheet::new("S", body)]).styles(styles).ir();
+    let aligns = |ir: &DocumentIR| {
+        only_table(ir, 0).rows[0]
+            .cells
+            .iter()
+            .map(|c| (c.text_align.clone(), c.vertical_align.clone()))
+            .collect::<Vec<_>>()
+    };
+    let expected = vec![
+        (None, None),
+        (Some(ParagraphAlignment::Center), Some(CellVerticalAlign::Top)),
+        (Some(ParagraphAlignment::Right), Some(CellVerticalAlign::Center)),
+    ];
+    assert_eq!(aligns(&ir), expected);
+    let bytes = to_bytes(&office_oxide::create::ir_to_xlsx(&ir));
+    let back = Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx)
+        .expect("reopen")
+        .to_ir();
+    let back_h: Vec<_> = aligns(&back).into_iter().map(|(h, _)| h).collect();
+    assert_eq!(
+        back_h,
+        [
+            None,
+            Some(ParagraphAlignment::Center),
+            Some(ParagraphAlignment::Right)
+        ],
+        "horizontal alignment survives the round trip"
+    );
 }

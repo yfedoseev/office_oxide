@@ -12,7 +12,7 @@ use office_oxide::docx::write::{DocxWriter, HfType, Run as DRun};
 use office_oxide::format::DocumentFormat;
 use office_oxide::ir::*;
 use office_oxide::pptx::write::{PptxWriter, Run as PRun};
-use office_oxide::xlsx::write::{CellData, CellStyle, XlsxWriter};
+use office_oxide::xlsx::write::{CellData, CellStyle, PageSetup as XlsxPageSetup, XlsxWriter};
 
 const PNG: &[u8] = &[
     0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
@@ -20,6 +20,17 @@ const PNG: &[u8] = &[
     0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00,
     0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,
     0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+/// Stand-in font program bytes for `embed_font`. The writers package the
+/// bytes (DOCX obfuscates them, which needs at least 32) and wire up the
+/// font part, its relationship and content type — the OPC plumbing this gate
+/// checks — without interpreting them.
+const FONT: &[u8] = &[
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x80, 0x00, 0x03, 0x00, 0x30, 0x4F, 0x53, 0x2F, 0x32,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x63, 0x6D, 0x61, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x68, 0x65, 0x61, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
 /// Content that has broken XML escaping before: entities, CDATA close,
@@ -196,8 +207,17 @@ fn maximal_properties_corpus(out: &str) {
             elements: vec![Element::Paragraph(para), Element::Table(table)],
             page_setup: Some(PageSetup::default()),
             background_rgb: Some([0x11, 0x22, 0x33]),
+            // A hyperlink in the notes: the notes slide needs its own
+            // relationship for it, which plain-text notes never exercise.
             speaker_notes: Some(vec![Element::Paragraph(Paragraph {
-                content: vec![span("notes")],
+                content: vec![
+                    span("notes with "),
+                    InlineContent::Text(TextSpan {
+                        text: "a link".into(),
+                        hyperlink: Some("https://example.com/notes?a=1&b=2".into()),
+                        ..Default::default()
+                    }),
+                ],
                 ..Default::default()
             })]),
             ..Default::default()
@@ -296,6 +316,7 @@ fn docx_builder_corpus(out: &str) {
         w.add_section_header(t, vec![Element::Paragraph(Default::default())]);
     }
     w.set_section_props(Some(PageSetup::default()), None, SectionBreakType::NextPage);
+    w.embed_font("Validation Sans", FONT.to_vec());
     w.save(format!("{out}/builder.docx")).unwrap();
 }
 
@@ -316,6 +337,7 @@ fn pptx_builder_corpus(out: &str) {
         ]);
     }
     p.add_slide();
+    p.embed_font("Validation Sans", FONT.to_vec());
     p.save(format!("{out}/builder.pptx")).unwrap();
 }
 
@@ -338,21 +360,44 @@ fn xlsx_builder_corpus(out: &str) {
         s.merge_cells(2, 0, 2, 2);
         s.set_column_width(0, 20.0);
         s.add_image(PNG.to_vec(), "png", 0, 0, 500_000, 500_000);
+        // A comment emits xl/commentsN.xml, a VML drawing and two
+        // relationships; a hyperlink an external relationship. Both are the
+        // OPC plumbing opccheck.py exists to catch.
+        s.set_cell_comment(0, 0, Some("Reviewer".into()), HOSTILE);
+        s.set_cell_comment(3, 2, None, "unattributed");
+        s.set_cell_hyperlink(0, 1, "https://example.com/?a=1&b=<2>");
+        s.set_page_setup(XlsxPageSetup {
+            width_twips: 16_838,
+            height_twips: 11_906,
+            margin_top_twips: 1_440,
+            margin_bottom_twips: 1_440,
+            margin_left_twips: 1_080,
+            margin_right_twips: 1_080,
+            header_distance_twips: 720,
+            footer_distance_twips: 720,
+            landscape: true,
+        });
     }
     x.add_sheet("Second");
+    x.embed_font("Validation Sans", FONT.to_vec());
     x.save(format!("{out}/builder.xlsx")).unwrap();
 }
 
 fn conversion_corpus(out: &str) {
     // save_as across all nine pairs: the w:pgMar gutter defect was only
     // reachable through a section that carries a page setup.
+    //
+    // Every step must succeed. Skipping a source that failed to open and
+    // ignoring save_as errors meant a broken save_as simply sent fewer
+    // files to the validators, and the gate stayed green.
     for src in ["docx", "xlsx", "pptx"] {
         let path = format!("{out}/md_rich.{src}");
-        let Ok(doc) = office_oxide::Document::open(&path) else {
-            continue;
-        };
+        let doc = office_oxide::Document::open(&path)
+            .unwrap_or_else(|e| panic!("re-opening {path} for conversion failed: {e}"));
         for dst in ["docx", "xlsx", "pptx"] {
-            let _ = doc.save_as(format!("{out}/conv_{src}_to_{dst}.{dst}"));
+            let target = format!("{out}/conv_{src}_to_{dst}.{dst}");
+            doc.save_as(&target)
+                .unwrap_or_else(|e| panic!("save_as {path} -> {target} failed: {e}"));
         }
     }
 }
@@ -409,6 +454,11 @@ fn main() {
     conversion_corpus(&out);
     extremes_corpus(&out);
     maximal_properties_corpus(&out);
+    // 5 markdown sources x 3 formats, 3 builders, 9 conversions, 3
+    // extremes, 3 maximal. A shortfall means a generator silently produced
+    // nothing, and the validators would pass on what is left.
+    const EXPECTED: usize = 15 + 3 + 9 + 3 + 3;
     let n = std::fs::read_dir(&out).unwrap().count();
+    assert_eq!(n, EXPECTED, "expected {EXPECTED} packages in {out}, found {n}");
     println!("wrote {n} packages to {out}");
 }
