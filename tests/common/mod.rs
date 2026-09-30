@@ -279,6 +279,14 @@ pub fn open_doc(bytes: &[u8]) -> Document {
 /// story sequence.
 #[allow(dead_code)]
 pub fn build_word6_doc(wident: u16, text: &[u8]) -> Vec<u8> {
+    build_word6_doc_with_tail(wident, text, &[])
+}
+
+/// As [`build_word6_doc`], with `tail` stored in the `WordDocument` stream
+/// after the text (outside every story) — where Word 6.0/95 keeps
+/// pictures.
+#[allow(dead_code)]
+pub fn build_word6_doc_with_tail(wident: u16, text: &[u8], tail: &[u8]) -> Vec<u8> {
     let fc_min = 0x300u32;
     let mut wd = vec![0u8; fc_min as usize];
     wd[0..2].copy_from_slice(&wident.to_le_bytes());
@@ -288,6 +296,7 @@ pub fn build_word6_doc(wident: u16, text: &[u8]) -> Vec<u8> {
     wd[0x1C..0x20].copy_from_slice(&(fc_min + text.len() as u32).to_le_bytes());
     wd[0x34..0x38].copy_from_slice(&(text.len() as u32).to_le_bytes());
     wd.extend_from_slice(text);
+    wd.extend_from_slice(tail);
     let pad = (512 - wd.len() % 512) % 512;
     wd.extend(std::iter::repeat_n(0u8, pad));
     build_cfb(&wd, &[0u8; 512])

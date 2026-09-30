@@ -466,6 +466,11 @@ impl DocDocument {
             })
             .collect();
         let has_macros = cfb.has_root_entry("_VBA_PROJECT") || fib.ccp[3] != 0;
+        // Word 6.0/95 has no Data stream: its pictures (`PICF` + metafile)
+        // sit in the WordDocument stream itself. Scanned now, since the
+        // stream is not kept.
+        let images = std::sync::OnceLock::new();
+        let _ = images.set(extract_images(word_doc));
         let summary_properties = cfb
             .open_stream("\u{5}SummaryInformation")
             .ok()
@@ -474,7 +479,7 @@ impl DocDocument {
         Ok(Self {
             text,
             data_stream: Vec::new(),
-            images: std::sync::OnceLock::new(),
+            images,
             paragraphs: Vec::new(),
             subdocuments,
             has_macros,

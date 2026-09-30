@@ -231,3 +231,36 @@ fn test_text_box_stories_are_split_per_box() {
         .collect();
     assert_eq!(boxes, ["Box one\n", "Box two\n"]);
 }
+
+/// Word 6.0/95 stores pictures in the `WordDocument` stream as a `PICF`
+/// header ([MS-DOC] §2.9.192) followed by the metafile; none were ever
+/// extracted, since only the Word 97 `Data` stream was scanned.
+#[test]
+fn test_word6_picf_metafile_picture_is_extracted() {
+    let mut wmf = Vec::new();
+    wmf.extend_from_slice(&1u16.to_le_bytes()); // Type = memory
+    wmf.extend_from_slice(&9u16.to_le_bytes()); // HeaderSize
+    wmf.extend_from_slice(&0x0300u16.to_le_bytes()); // Version
+    wmf.extend_from_slice(&12u32.to_le_bytes()); // Size: 24 bytes
+    wmf.extend_from_slice(&0u16.to_le_bytes());
+    wmf.extend_from_slice(&3u32.to_le_bytes());
+    wmf.extend_from_slice(&0u16.to_le_bytes());
+    wmf.extend_from_slice(&[3, 0, 0, 0, 0, 0]); // META_EOF
+    let mut picf = vec![0u8; 0x44];
+    picf[0..4].copy_from_slice(&((0x44 + wmf.len()) as i32).to_le_bytes());
+    picf[4..6].copy_from_slice(&0x44u16.to_le_bytes());
+    picf[6..8].copy_from_slice(&8u16.to_le_bytes()); // MM_ANISOTROPIC
+    picf.extend_from_slice(&wmf);
+    let bytes = common::build_word6_doc_with_tail(0xA5DC, b"Picture below.\r", &picf);
+    let ir = open_doc(&bytes).to_ir();
+    let images: Vec<_> = ir
+        .sections
+        .iter()
+        .flat_map(|s| s.elements.iter())
+        .filter_map(|e| match e {
+            Element::Image(i) => i.data.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(images, vec![wmf]);
+}
