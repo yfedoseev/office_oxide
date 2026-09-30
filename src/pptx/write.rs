@@ -639,16 +639,10 @@ impl PptxWriter {
         opc.add_package_rel(rel_types::OFFICE_DOCUMENT, "ppt/presentation.xml");
         opc.add_part_rel(&pres_part, rel_types::SLIDE_MASTER, "slideMasters/slideMaster1.xml");
 
-        // Core properties (docProps/core.xml). Written only when the
-        // caller supplied metadata so files generated through the
-        // existing `add_slide` API stay byte-identical when no
-        // metadata was set.
-        if let Some(ref meta) = self.metadata {
-            let core_part = PartName::new("/docProps/core.xml")?;
-            opc.add_package_rel(rel_types::CORE_PROPERTIES, "docProps/core.xml");
-            let core_xml = crate::core::core_properties::generate_xml(meta);
-            opc.add_part(&core_part, crate::core::core_properties::CONTENT_TYPE, &core_xml)?;
-        }
+        // Package properties: core.xml only when the caller supplied
+        // metadata, app.xml (the producer) always, custom.xml when the
+        // metadata carries custom properties.
+        crate::core::core_properties::add_property_parts(&mut opc, self.metadata.as_ref())?;
 
         let mut slide_parts = Vec::with_capacity(self.slides.len());
         for i in 0..self.slides.len() {

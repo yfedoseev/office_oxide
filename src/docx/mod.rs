@@ -128,6 +128,9 @@ pub struct DocxDocument {
     /// carries no extended-properties part. The parser already existed;
     /// nothing on the read side called it until now.
     pub app_properties: Option<crate::core::properties::AppProperties>,
+    /// Package-level properties beyond core/app: custom properties
+    /// (`docProps/custom.xml`), digital-signature presence and thumbnail.
+    pub package_properties: crate::core::properties::PackageProperties,
     /// `true` when the document part's own relationships include a
     /// `vbaProject` entry — a cheap macro-presence signal, no VBA
     /// interpretation.
@@ -201,6 +204,7 @@ impl DocxDocument {
         )?;
         let core_properties = crate::core::properties::read_core_properties(&mut opc);
         let app_properties = crate::core::properties::read_app_properties(&mut opc);
+        let package_properties = crate::core::properties::read_package_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let doc_rels = opc.read_rels_for(&main_part)?;
         let has_macros = doc_rels.has_vba_project();
@@ -522,6 +526,7 @@ impl DocxDocument {
             images,
             core_properties,
             app_properties,
+            package_properties,
             has_macros,
             footnotes,
             endnotes,

@@ -1021,16 +1021,11 @@ impl XlsxWriter {
 
         opc.add_package_rel(rel_types::OFFICE_DOCUMENT, "xl/workbook.xml");
 
-        // Core properties (docProps/core.xml). Optional; written only
-        // when caller supplied metadata via `set_metadata`. Surfaces
-        // PDF /Title /Author etc. in Excel's "Properties" dialog after
-        // a PDF→XLSX→Excel round trip.
-        if let Some(ref meta) = self.metadata {
-            let core_part = PartName::new("/docProps/core.xml")?;
-            opc.add_package_rel(rel_types::CORE_PROPERTIES, "docProps/core.xml");
-            let core_xml = crate::core::core_properties::generate_xml(meta);
-            opc.add_part(&core_part, crate::core::core_properties::CONTENT_TYPE, &core_xml)?;
-        }
+        // Package properties: core.xml only when the caller supplied
+        // metadata via `set_metadata` (it surfaces /Title /Author etc. in
+        // Excel's "Properties" dialog), app.xml (the producer) always,
+        // custom.xml when the metadata carries custom properties.
+        crate::core::core_properties::add_property_parts(opc, self.metadata.as_ref())?;
 
         let mut sheet_rids = Vec::with_capacity(sheets.len());
         for (i, _) in sheets.iter().enumerate() {

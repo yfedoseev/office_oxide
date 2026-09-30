@@ -6,7 +6,8 @@
 
 /// A multi-stream CFB v3 container: every stream sits at the root, in
 /// consecutive 512-byte sectors (no mini stream), chained as right
-/// siblings of the first.
+/// siblings of the first. A name ending in `/` is an empty storage
+/// instead (its data is ignored).
 pub fn cfb_with_streams(streams: &[(&str, &[u8])]) -> Vec<u8> {
     const END_OF_CHAIN: u32 = 0xFFFF_FFFE;
     const FAT_SECT: u32 = 0xFFFF_FFFD;
@@ -16,7 +17,13 @@ pub fn cfb_with_streams(streams: &[(&str, &[u8])]) -> Vec<u8> {
     let dir_sectors = (streams.len() + 1).div_ceil(4);
     let data_sectors: Vec<usize> = streams
         .iter()
-        .map(|(_, d)| d.len().div_ceil(512).max(1))
+        .map(|(n, d)| {
+            if n.ends_with('/') {
+                0
+            } else {
+                d.len().div_ceil(512).max(1)
+            }
+        })
         .collect();
     let total_data: usize = data_sectors.iter().sum();
     // FAT sectors must cover themselves too.
@@ -93,6 +100,15 @@ pub fn cfb_with_streams(streams: &[(&str, &[u8])]) -> Vec<u8> {
 
     let mut next = dir_sectors + fat_sectors;
     for (i, ((name, data), &count)) in streams.iter().zip(&data_sectors).enumerate() {
+        let right = if i + 1 < streams.len() {
+            (i + 2) as u32
+        } else {
+            NO_ENTRY
+        };
+        if let Some(storage) = name.strip_suffix('/') {
+            write_entry(&mut file, i + 1, storage, 1, right, NO_ENTRY, END_OF_CHAIN, 0);
+            continue;
+        }
         let start = next;
         for k in 0..count {
             let s = start + k;
@@ -104,11 +120,6 @@ pub fn cfb_with_streams(streams: &[(&str, &[u8])]) -> Vec<u8> {
         }
         let off = 512 + start * 512;
         file[off..off + data.len()].copy_from_slice(data);
-        let right = if i + 1 < streams.len() {
-            (i + 2) as u32
-        } else {
-            NO_ENTRY
-        };
         write_entry(&mut file, i + 1, name, 2, right, NO_ENTRY, start as u32, data.len() as u32);
         next += count;
     }

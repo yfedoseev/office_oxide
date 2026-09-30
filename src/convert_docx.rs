@@ -224,6 +224,11 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
             text_truncated: false,
+            ..crate::core::core_properties::ooxml_metadata_extras(
+                cp,
+                doc.app_properties.as_ref(),
+                Some(&doc.package_properties),
+            )
         },
         sections: ir_sections,
         defined_names: Vec::new(),
@@ -241,14 +246,10 @@ struct SectionHeaders {
     even_footer: Option<HeaderFooter>,
 }
 
-/// Split a `cp:keywords` value. OOXML has no formal separator; Word writes
-/// comma- or semicolon-separated lists, and space-separated is also seen.
+/// Split a `cp:keywords` value; see
+/// [`crate::core::core_properties::split_keywords`].
 pub(crate) fn split_keywords(s: &str) -> Vec<String> {
-    s.split([',', ';'])
-        .flat_map(|part| part.split_whitespace())
-        .map(|k| k.trim().to_string())
-        .filter(|k| !k.is_empty())
-        .collect()
+    crate::core::core_properties::split_keywords(s)
 }
 
 // ---------------------------------------------------------------------------

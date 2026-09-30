@@ -586,6 +586,92 @@ pub struct Metadata {
     /// self-check, or the check passed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub text_truncated: bool,
+    /// The user who last saved the document (`cp:lastModifiedBy`; the
+    /// legacy SummaryInformation `PIDSI_LASTAUTHOR`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_modified_by: Option<String>,
+    /// The revision number (`cp:revision`; legacy `PIDSI_REVNUMBER`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    /// The document category (`cp:category`; legacy
+    /// DocumentSummaryInformation `PIDDSI_CATEGORY`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// The content status, e.g. "Draft" or "Final" (`cp:contentStatus`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_status: Option<String>,
+    /// The document's language (`dc:language`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// The company (`docProps/app.xml` `<Company>`; legacy
+    /// DocumentSummaryInformation `PIDDSI_COMPANY`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub company: Option<String>,
+    /// The author's manager (`<Manager>`; legacy `PIDDSI_MANAGER`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager: Option<String>,
+    /// User-defined document properties (`docProps/custom.xml`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_properties: Vec<CustomProperty>,
+    /// `true` when the source package carries a digital signature — an
+    /// OOXML digital-signature origin part, or a legacy compound file's
+    /// `_signatures` / `_xmlsignatures` storage. Presence only: the
+    /// signature is not validated, and a converted or re-written document
+    /// no longer carries it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_digital_signature: bool,
+    /// The package thumbnail (the image the file browser shows), when the
+    /// source carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<Image>,
+}
+
+impl Metadata {
+    /// The document properties that are set, as `(label, value)` pairs in
+    /// a fixed order — what a summary view (`office-oxide info`, the MCP
+    /// `info` tool) lists. Flags and custom properties are not included;
+    /// read their fields directly.
+    pub fn properties(&self) -> Vec<(&'static str, String)> {
+        let keywords = (!self.keywords.is_empty()).then(|| self.keywords.join(", "));
+        [
+            ("Title", &self.title),
+            ("Author", &self.author),
+            ("Subject", &self.subject),
+            ("Keywords", &keywords),
+            ("Description", &self.description),
+            ("Category", &self.category),
+            ("Company", &self.company),
+            ("Manager", &self.manager),
+            ("Created", &self.created),
+            ("Modified", &self.modified),
+            ("Last modified by", &self.last_modified_by),
+            ("Revision", &self.revision),
+            ("Content status", &self.content_status),
+            ("Language", &self.language),
+        ]
+        .into_iter()
+        .filter_map(|(label, value)| {
+            value
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .map(|v| (label, v.to_string()))
+        })
+        .collect()
+    }
+}
+
+/// One user-defined document property (ECMA-376 Part 1 §22.3.2.2
+/// `property`). The value is kept as its text form together with the
+/// variant type that holds it, so it can be written back unchanged.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub struct CustomProperty {
+    /// The property name.
+    pub name: String,
+    /// The value, as the text of its variant element.
+    pub value: String,
+    /// The variant type's local name (ECMA-376 Part 1 §22.4, e.g.
+    /// `lpwstr`, `i4`, `r8`, `bool`, `filetime`).
+    pub value_type: String,
 }
 
 /// A conditional formatting rule from a worksheet (XLSX `<cfRule>` inside

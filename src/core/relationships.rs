@@ -31,6 +31,14 @@ pub mod rel_types {
     /// looking for the OOXML-namespace form alone found macros in none.
     pub const VBA_PROJECT_MS: &str =
         "http://schemas.microsoft.com/office/2006/relationships/vbaProject";
+    /// Relationship type for custom (user-defined) properties,
+    /// `docProps/custom.xml` (ECMA-376 Part 1 §15.2.12.2).
+    pub const CUSTOM_PROPERTIES: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties";
+    /// Relationship type for the digital signature origin part
+    /// (ECMA-376 Part 2 §13.2.3); its presence marks a signed package.
+    pub const DIGITAL_SIGNATURE_ORIGIN: &str =
+        "http://schemas.openxmlformats.org/package/2006/relationships/digital-signature/origin";
     /// Relationship type for the package thumbnail.
     pub const THUMBNAIL: &str =
         "http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail";

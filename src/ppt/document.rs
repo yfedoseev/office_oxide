@@ -2,7 +2,7 @@
 
 use std::io::{Read, Seek};
 
-use crate::cfb::{CfbReader, SummaryProperties, parse_summary_information};
+use crate::cfb::{CfbReader, SummaryProperties};
 
 use super::error::{PptError, Result};
 use super::images::{PptImage, extract_images};
@@ -30,10 +30,7 @@ impl PptDocument {
     pub fn from_reader<R: Read + Seek>(reader: R) -> Result<Self> {
         let mut cfb = CfbReader::new(reader)?;
         let has_macros = cfb.has_root_entry("_VBA_PROJECT");
-        let summary_properties = cfb
-            .open_stream("\u{5}SummaryInformation")
-            .ok()
-            .and_then(|data| parse_summary_information(&data));
+        let summary_properties = crate::cfb::read_document_properties(&mut cfb);
 
         // Without the main stream there is no presentation to read. This
         // used to return an empty document with `Ok`, indistinguishable
@@ -971,6 +968,7 @@ mod tests {
                 comments: Some("Declared Comment".to_string()),
                 created: Some("2020-01-02T03:04:05Z".to_string()),
                 modified: Some("2021-06-07T08:09:10Z".to_string()),
+                ..Default::default()
             }),
             slides: vec![make_slide(vec![(TextType::Title, "Slide Title")])],
         };

@@ -433,16 +433,6 @@ enum DocxElement {
     TextBox(DocxTextBox),
 }
 
-struct CoreProps {
-    title: Option<String>,
-    author: Option<String>,
-    subject: Option<String>,
-    keywords: Option<String>,
-    description: Option<String>,
-    created: Option<String>,
-    modified: Option<String>,
-}
-
 /// Resolved `r:id` for each hyperlink URL used anywhere in the package.
 type HyperlinkRids = std::collections::HashMap<String, String>;
 
@@ -631,7 +621,8 @@ pub struct DocxWriter {
     hf_section_start: usize,
     footnotes: Vec<DocxNote>,
     endnotes: Vec<DocxNote>,
-    core_props: Option<CoreProps>,
+    /// Document metadata for the package-property parts.
+    metadata: Option<crate::ir::Metadata>,
     next_num_id: u32,
     /// Embedded font programs to ship inside the package under `word/fonts/`.
     /// Each entry is `(font_name, ttf_or_otf_bytes)`. The reader recognizes
@@ -651,7 +642,7 @@ impl DocxWriter {
             hf_section_start: 0,
             footnotes: Vec::new(),
             endnotes: Vec::new(),
-            core_props: None,
+            metadata: None,
             next_num_id: 3,
             embedded_fonts: Vec::new(),
         }
@@ -955,22 +946,11 @@ impl DocxWriter {
         self
     }
 
-    /// Set document metadata (written to `docProps/core.xml`).
+    /// Set document metadata (written to `docProps/core.xml`, with the
+    /// company/manager in `docProps/app.xml` and custom properties in
+    /// `docProps/custom.xml`).
     pub fn set_metadata(&mut self, meta: &crate::ir::Metadata) -> &mut Self {
-        let keywords = if meta.keywords.is_empty() {
-            None
-        } else {
-            Some(meta.keywords.join(", "))
-        };
-        self.core_props = Some(CoreProps {
-            title: meta.title.clone(),
-            author: meta.author.clone(),
-            subject: meta.subject.clone(),
-            keywords,
-            description: meta.description.clone(),
-            created: meta.created.clone(),
-            modified: meta.modified.clone(),
-        });
+        self.metadata = Some(meta.clone());
         self
     }
 
@@ -1197,17 +1177,8 @@ impl DocxWriter {
             None
         };
 
-        // --- Core properties ---
-        if let Some(ref props) = self.core_props {
-            let core_part = PartName::new("/docProps/core.xml")?;
-            opc.add_package_rel(rel_types::CORE_PROPERTIES, "docProps/core.xml");
-            let xml = generate_core_props_xml(props);
-            opc.add_part(
-                &core_part,
-                "application/vnd.openxmlformats-package.core-properties+xml",
-                &xml,
-            )?;
-        }
+        // --- Package properties (core.xml, app.xml, custom.xml) ---
+        crate::core::core_properties::add_property_parts(&mut opc, self.metadata.as_ref())?;
 
         // --- Gather sectPr info ---
         let mut sectpr_info: Option<SectPrInfo> = None;
@@ -3938,91 +3909,6 @@ fn generate_notes_xml(
 
     w.write_event(Event::End(BytesEnd::new(root_tag)))
         .expect("write notes end");
-    w.into_inner()
-}
-
-// ---------------------------------------------------------------------------
-// Core properties XML
-// ---------------------------------------------------------------------------
-
-fn generate_core_props_xml(props: &CoreProps) -> Vec<u8> {
-    let mut w = Writer::new(Vec::new());
-    w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
-        .expect("write decl");
-
-    let mut root = BytesStart::new("cp:coreProperties");
-    root.push_attribute((
-        "xmlns:cp",
-        "http://schemas.openxmlformats.org/package/2006/metadata/core-properties",
-    ));
-    root.push_attribute(("xmlns:dc", "http://purl.org/dc/elements/1.1/"));
-    root.push_attribute(("xmlns:dcterms", "http://purl.org/dc/terms/"));
-    root.push_attribute(("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance"));
-    w.write_event(Event::Start(root)).expect("write core root");
-
-    if let Some(ref v) = props.title {
-        w.write_event(Event::Start(BytesStart::new("dc:title")))
-            .expect("write title start");
-        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
-            .expect("write title text");
-        w.write_event(Event::End(BytesEnd::new("dc:title")))
-            .expect("write title end");
-    }
-    if let Some(ref v) = props.subject {
-        w.write_event(Event::Start(BytesStart::new("dc:subject")))
-            .expect("write subject start");
-        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
-            .expect("write subject text");
-        w.write_event(Event::End(BytesEnd::new("dc:subject")))
-            .expect("write subject end");
-    }
-    if let Some(ref v) = props.author {
-        w.write_event(Event::Start(BytesStart::new("dc:creator")))
-            .expect("write creator start");
-        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
-            .expect("write creator text");
-        w.write_event(Event::End(BytesEnd::new("dc:creator")))
-            .expect("write creator end");
-    }
-    if let Some(ref v) = props.description {
-        w.write_event(Event::Start(BytesStart::new("dc:description")))
-            .expect("write desc start");
-        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
-            .expect("write desc text");
-        w.write_event(Event::End(BytesEnd::new("dc:description")))
-            .expect("write desc end");
-    }
-    if let Some(ref v) = props.keywords {
-        w.write_event(Event::Start(BytesStart::new("cp:keywords")))
-            .expect("write kw start");
-        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
-            .expect("write kw text");
-        w.write_event(Event::End(BytesEnd::new("cp:keywords")))
-            .expect("write kw end");
-    }
-    if let Some(ref v) = props.created {
-        let mut elem = BytesStart::new("dcterms:created");
-        elem.push_attribute(("xsi:type", "dcterms:W3CDTF"));
-        w.write_event(Event::Start(elem))
-            .expect("write created start");
-        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
-            .expect("write created text");
-        w.write_event(Event::End(BytesEnd::new("dcterms:created")))
-            .expect("write created end");
-    }
-    if let Some(ref v) = props.modified {
-        let mut elem = BytesStart::new("dcterms:modified");
-        elem.push_attribute(("xsi:type", "dcterms:W3CDTF"));
-        w.write_event(Event::Start(elem))
-            .expect("write modified start");
-        w.write_event(Event::Text(BytesText::new(&crate::core::xml::sanitize_xml_text(v))))
-            .expect("write modified text");
-        w.write_event(Event::End(BytesEnd::new("dcterms:modified")))
-            .expect("write modified end");
-    }
-
-    w.write_event(Event::End(BytesEnd::new("cp:coreProperties")))
-        .expect("write core end");
     w.into_inner()
 }
 
