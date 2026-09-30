@@ -691,6 +691,8 @@ mod tests {
             data_validations: Vec::new(),
             state: super::super::SheetState::Visible,
             header_footer: Default::default(),
+            tables: Vec::new(),
+            pivot_tables: Vec::new(),
         };
         let doc = XlsxDocument {
             workbook: super::super::WorkbookInfo {
@@ -751,6 +753,8 @@ mod tests {
             data_validations: Vec::new(),
             state: super::super::SheetState::Visible,
             header_footer: Default::default(),
+            tables: Vec::new(),
+            pivot_tables: Vec::new(),
         };
         let doc = XlsxDocument {
             workbook: super::super::WorkbookInfo {

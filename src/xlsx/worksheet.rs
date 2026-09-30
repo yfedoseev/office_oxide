@@ -50,6 +50,147 @@ pub struct Worksheet {
     /// Page header/footer text from `<headerFooter>`, as written (with its
     /// formatting codes); [`SheetHeaderFooter::text`] decodes one.
     pub header_footer: SheetHeaderFooter,
+    /// Table definitions (`xl/tables/tableN.xml`, [ECMA-376] §18.5) the
+    /// sheet's `<tableParts>` reference: each names a range of the sheet's
+    /// own cells, whose values are in `rows`.
+    pub tables: Vec<SheetTable>,
+    /// Pivot tables anchored on this sheet ([ECMA-376] §18.10). The values
+    /// a pivot table displays are ordinary cells in `rows`; this records
+    /// the pivot itself and where its data comes from.
+    pub pivot_tables: Vec<SheetPivotTable>,
+}
+
+/// A table part ([ECMA-376] §18.5.1.2 `table`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SheetTable {
+    /// `name` — the programmatic name.
+    pub name: String,
+    /// `displayName` — the name formulas use (`Table1[Qty]`).
+    pub display_name: String,
+    /// `ref` — the range the table covers, header and totals rows included.
+    pub range: String,
+    /// The `tableColumn` names, in order.
+    pub columns: Vec<String>,
+    /// `headerRowCount` (default 1).
+    pub header_row_count: u32,
+    /// `totalsRowCount` (default 0).
+    pub totals_row_count: u32,
+}
+
+/// A pivot table part ([ECMA-376] §18.10.1.73 `pivotTableDefinition`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SheetPivotTable {
+    /// `name`.
+    pub name: String,
+    /// `<location ref>` — where on this sheet the pivot is drawn.
+    pub location: String,
+    /// The cache's `<worksheetSource>` ([ECMA-376] §18.10.1.99): the source
+    /// range as `Sheet!A1:C10`, or a defined/table name; `None` for an
+    /// external or consolidation source.
+    pub source: Option<String>,
+}
+
+/// Parse a table part.
+pub(crate) fn parse_table_part(xml_data: &[u8]) -> crate::core::Result<SheetTable> {
+    let mut reader = xml::make_fast_reader(xml_data);
+    let mut table = SheetTable {
+        header_row_count: 1,
+        ..Default::default()
+    };
+    let mut seen_table = false;
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) | Event::Empty(ref e) => match e.local_name().as_ref() {
+                "table" => {
+                    seen_table = true;
+                    let attr = |n: &str| -> crate::core::Result<String> {
+                        Ok(xml::optional_attr_str(e, n)?
+                            .map(|v| v.into_owned())
+                            .unwrap_or_default())
+                    };
+                    table.name = attr("name")?;
+                    table.display_name = attr("displayName")?;
+                    table.range = attr("ref")?;
+                    let count = |n: &str, default: u32| -> crate::core::Result<u32> {
+                        Ok(xml::optional_attr_str(e, n)?
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(default))
+                    };
+                    table.header_row_count = count("headerRowCount", 1)?;
+                    table.totals_row_count = count("totalsRowCount", 0)?;
+                },
+                "tableColumn" => {
+                    if let Some(n) = xml::optional_attr_str(e, "name")? {
+                        table.columns.push(n.into_owned());
+                    }
+                },
+                _ => {},
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    if !seen_table {
+        return Err(crate::core::Error::MalformedXml("table part has no <table>".into()));
+    }
+    Ok(table)
+}
+
+/// Parse a pivot table part's `name` and `<location ref>`.
+pub(crate) fn parse_pivot_table_part(xml_data: &[u8]) -> crate::core::Result<SheetPivotTable> {
+    let mut reader = xml::make_fast_reader(xml_data);
+    let mut pivot = SheetPivotTable::default();
+    let mut seen = false;
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) | Event::Empty(ref e) => match e.local_name().as_ref() {
+                "pivotTableDefinition" => {
+                    seen = true;
+                    pivot.name = xml::optional_attr_str(e, "name")?
+                        .map(|v| v.into_owned())
+                        .unwrap_or_default();
+                },
+                "location" => {
+                    pivot.location = xml::optional_attr_str(e, "ref")?
+                        .map(|v| v.into_owned())
+                        .unwrap_or_default();
+                },
+                _ => {},
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    if !seen {
+        return Err(crate::core::Error::MalformedXml(
+            "pivot table part has no <pivotTableDefinition>".into(),
+        ));
+    }
+    Ok(pivot)
+}
+
+/// The `<worksheetSource>` of a pivot cache definition, as `Sheet!ref`,
+/// the bare `ref`, or the source `name`.
+pub(crate) fn parse_pivot_cache_source(xml_data: &[u8]) -> crate::core::Result<Option<String>> {
+    let mut reader = xml::make_fast_reader(xml_data);
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) | Event::Empty(ref e)
+                if e.local_name().as_ref() == "worksheetSource" =>
+            {
+                let get = |n: &str| -> crate::core::Result<Option<String>> {
+                    Ok(xml::optional_attr_str(e, n)?.map(|v| v.into_owned()))
+                };
+                return Ok(match (get("sheet")?, get("ref")?, get("name")?) {
+                    (Some(sheet), Some(r), _) => Some(format!("{sheet}!{r}")),
+                    (None, Some(r), _) => Some(r),
+                    (_, None, name) => name,
+                });
+            },
+            Event::Eof => return Ok(None),
+            _ => {},
+        }
+    }
 }
 
 /// A sheet's `<headerFooter>` ([ECMA-376] §18.3.1.46): the raw code strings
@@ -578,6 +719,8 @@ impl Worksheet {
         Ok(Worksheet {
             state: super::SheetState::Visible,
             header_footer,
+            tables: Vec::new(),
+            pivot_tables: Vec::new(),
             comments: Vec::new(),
             name,
             dimension,

@@ -259,6 +259,8 @@ impl XlsxDocument {
         struct SheetBundle {
             name: String,
             state: SheetState,
+            tables: Vec<worksheet::SheetTable>,
+            pivot_tables: Vec<worksheet::SheetPivotTable>,
             data: Vec<u8>,
             rels: Relationships,
             images: Vec<crate::xlsx::worksheet::WorksheetPicture>,
@@ -358,9 +360,14 @@ impl XlsxDocument {
             let comments =
                 worksheet::merge_threaded_comments(comments, threaded_comments, &persons);
 
+            let (tables, pivot_tables) =
+                read_tables_and_pivots(&mut archive, &entries, &sheet_path, &ws_rels);
+
             bundles.push(SheetBundle {
                 name: sheet.name.clone(),
                 state: sheet.state,
+                tables,
+                pivot_tables,
                 data: ws_data,
                 rels: ws_rels,
                 images,
@@ -378,6 +385,8 @@ impl XlsxDocument {
                 match Worksheet::parse(&b.data, b.name, &b.rels) {
                     Ok(mut ws) => {
                         ws.state = b.state;
+                        ws.tables = b.tables;
+                        ws.pivot_tables = b.pivot_tables;
                         ws.images = b.images;
                         ws.text_shapes = b.text_shapes;
                         ws.comments = b.comments;
@@ -684,6 +693,65 @@ struct ChartSeries {
 
 /// Compute the .rels path for a worksheet ZIP entry.
 /// e.g. "xl/worksheets/sheet1.xml" → "xl/worksheets/_rels/sheet1.xml.rels"
+/// Worksheet-to-table relationship ([ECMA-376] §12.3.21).
+const TABLE_REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/table";
+/// Worksheet-to-pivot-table relationship ([ECMA-376] §12.3.16).
+const PIVOT_TABLE_REL: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable";
+/// Pivot-table-to-cache-definition relationship ([ECMA-376] §12.3.14).
+const PIVOT_CACHE_DEFINITION_REL: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition";
+
+/// The table parts and pivot tables a worksheet's relationships name. A
+/// part that is missing or does not parse is logged and skipped; the cells
+/// it describes are in the sheet either way.
+fn read_tables_and_pivots<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
+    sheet_path: &str,
+    ws_rels: &Relationships,
+) -> (Vec<worksheet::SheetTable>, Vec<worksheet::SheetPivotTable>) {
+    let mut tables = Vec::new();
+    for rel in ws_rels.get_by_type(TABLE_REL) {
+        let path = resolve_relative_zip_path(sheet_path, &rel.target);
+        match XlsxDocument::read_xml_entry(archive, entries, &path)
+            .map_err(|e| e.to_string())
+            .and_then(|d| worksheet::parse_table_part(&d).map_err(|e| e.to_string()))
+        {
+            Ok(t) => tables.push(t),
+            Err(e) => log::warn!("xlsx: table part {path} skipped: {e}"),
+        }
+    }
+    let mut pivots = Vec::new();
+    for rel in ws_rels.get_by_type(PIVOT_TABLE_REL) {
+        let path = resolve_relative_zip_path(sheet_path, &rel.target);
+        let mut pivot = match XlsxDocument::read_xml_entry(archive, entries, &path)
+            .map_err(|e| e.to_string())
+            .and_then(|d| worksheet::parse_pivot_table_part(&d).map_err(|e| e.to_string()))
+        {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("xlsx: pivot table part {path} skipped: {e}");
+                continue;
+            },
+        };
+        let pivot_rels = XlsxDocument::read_xml_entry(archive, entries, &sheet_rels_path(&path))
+            .ok()
+            .and_then(|d| Relationships::parse(&d).ok());
+        if let Some(cache) = pivot_rels
+            .as_ref()
+            .and_then(|r| r.first_by_type(PIVOT_CACHE_DEFINITION_REL))
+        {
+            let cache_path = resolve_relative_zip_path(&path, &cache.target);
+            pivot.source = XlsxDocument::read_xml_entry(archive, entries, &cache_path)
+                .ok()
+                .and_then(|d| worksheet::parse_pivot_cache_source(&d).ok().flatten());
+        }
+        pivots.push(pivot);
+    }
+    (tables, pivots)
+}
+
 fn sheet_rels_path(sheet_path: &str) -> String {
     if let Some(pos) = sheet_path.rfind('/') {
         let dir = &sheet_path[..pos];
@@ -2261,5 +2329,52 @@ mod tests {
         let ir = crate::convert_xlsx::xlsx_to_ir(&doc);
         assert_eq!(ir.sections.len(), 1);
         assert!(ir.sections[0].hidden, "Data's own state, not the chartsheet's");
+    }
+
+    /// Table parts (`xl/tables/`) and pivot tables were never read: their
+    /// definitions — the table's name, range and columns, the pivot's
+    /// location and source range — dropped without a trace.
+    #[test]
+    fn test_table_parts_and_pivot_tables_are_read() {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Region</t></is></c><c r="B1" t="inlineStr"><is><t>Qty</t></is></c></row></sheetData><tableParts count="1"><tablePart r:id="rId1"/></tableParts></worksheet>"#;
+        let sheet_rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/>
+</Relationships>"#;
+        let table = br#"<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Sales" displayName="SalesTbl" ref="A1:B5" totalsRowCount="1"><autoFilter ref="A1:B4"/><tableColumns count="2"><tableColumn id="1" name="Region"/><tableColumn id="2" name="Qty"/></tableColumns></table>"#;
+        let pivot = br#"<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="PivotTable1" cacheId="3"><location ref="D1:E4" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/></pivotTableDefinition>"#;
+        let pivot_rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="../pivotCache/pivotCacheDefinition1.xml"/></Relationships>"#;
+        let cache = br#"<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cacheSource type="worksheet"><worksheetSource ref="A1:B4" sheet="Sheet1"/></cacheSource></pivotCacheDefinition>"#;
+        let bytes = single_sheet_xlsx(
+            sheet,
+            &[
+                ("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels),
+                ("xl/tables/table1.xml", table),
+                ("xl/pivotTables/pivotTable1.xml", pivot),
+                ("xl/pivotTables/_rels/pivotTable1.xml.rels", pivot_rels),
+                ("xl/pivotCache/pivotCacheDefinition1.xml", cache),
+            ],
+        );
+        let doc = open_bytes(bytes);
+        let ws = &doc.worksheets[0];
+        assert_eq!(
+            ws.tables,
+            [worksheet::SheetTable {
+                name: "Sales".into(),
+                display_name: "SalesTbl".into(),
+                range: "A1:B5".into(),
+                columns: vec!["Region".into(), "Qty".into()],
+                header_row_count: 1,
+                totals_row_count: 1,
+            }]
+        );
+        assert_eq!(
+            ws.pivot_tables,
+            [worksheet::SheetPivotTable {
+                name: "PivotTable1".into(),
+                location: "D1:E4".into(),
+                source: Some("Sheet1!A1:B4".into()),
+            }]
+        );
     }
 }

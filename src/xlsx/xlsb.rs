@@ -462,6 +462,8 @@ fn parse_sheet(data: &[u8], name: String) -> Worksheet {
     Worksheet {
         state: SheetState::Visible,
         header_footer: Default::default(),
+        tables: Vec::new(),
+        pivot_tables: Vec::new(),
         name,
         dimension: None,
         rows,
