@@ -246,3 +246,57 @@ fn test_media_shape_leaves_a_placeholder() {
         .collect();
     assert_eq!(alts, ["Embedded video"]);
 }
+
+/// A `TextCharsAtom` with its `StyleTextPropAtom` and a text-range
+/// hyperlink over part of it: the formatting spans attach to the text and
+/// survive the run being split around the link (`apply_style_text_prop`,
+/// `slice_char_formats`, `slice_para_formats`), each piece keeping only
+/// its own formatting.
+#[test]
+fn test_style_spans_attach_and_survive_a_text_range_hyperlink_split() {
+    const CF_BOLD: u32 = 1;
+    let text = "Click here now";
+    // 6 plain, 4 bold ("here"), 5 plain (incl. the implicit final mark).
+    let prop = style_text_prop(
+        text.len() as u32,
+        &[
+            (6, CF_BOLD, 0u16.to_le_bytes().to_vec()),
+            (4, CF_BOLD, 1u16.to_le_bytes().to_vec()),
+            (5, CF_BOLD, 0u16.to_le_bytes().to_vec()),
+        ],
+    );
+    // InteractiveInfo (II_HyperlinkAction = 4) + TextInteractiveInfoAtom
+    // covering "here" (6..10), after the text atoms.
+    let mut info = vec![0u8; 16];
+    info[4..8].copy_from_slice(&1u32.to_le_bytes());
+    info[8] = 4;
+    let mut extra = prop;
+    extra.extend(container(0x0FF2, 0, &atom(0x0FF3, 0, &info)));
+    extra.extend(atom(0x0FDF, 0, &[&6i32.to_le_bytes()[..], &10i32.to_le_bytes()[..]].concat()));
+    let mut link = atom(0x0FD3, 0, &1u32.to_le_bytes());
+    link.extend(atom(RT_CSTRING, 1, &utf16("http://example.com/")));
+    let deck = PptBuilder {
+        slides: vec![PptSlide {
+            shapes: text_shape(1, text, &extra),
+            ..Default::default()
+        }],
+        doc_children: container(0x0409, 0, &container(0x0FD7, 0, &link)),
+        ..Default::default()
+    };
+    let ir = open(deck.build()).unwrap().to_ir();
+    // One paragraph: a link inside a sentence does not break the sentence.
+    assert_eq!(texts(&ir.sections[0].elements), ["Click here now"]);
+    let s = spans(&ir.sections[0].elements);
+    let summary: Vec<(String, bool, bool)> = s
+        .iter()
+        .map(|t| (t.text.clone(), t.bold, t.hyperlink.is_some()))
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("Click ".to_string(), false, false),
+            ("here".to_string(), true, true),
+            (" now".to_string(), false, false),
+        ]
+    );
+}

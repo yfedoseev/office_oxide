@@ -83,6 +83,21 @@ pub struct TextRun {
     /// it — `None` when the shape has no `OEPlaceholderAtom`, or its
     /// `placeholderId` has no OOXML-equivalent role.
     pub placeholder_role: Option<String>,
+    /// Hyperlinks covering part of the text (a `TextInteractiveInfoAtom`
+    /// range), in `char` indices. The run stays one piece of text — a link
+    /// inside a sentence does not break the sentence.
+    pub link_ranges: Vec<LinkRange>,
+}
+
+/// A hyperlink over `[start, end)` (`char` indices) of a run's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkRange {
+    /// Start character offset (inclusive).
+    pub start: usize,
+    /// End character offset (exclusive).
+    pub end: usize,
+    /// The link target.
+    pub url: String,
 }
 
 /// Extract per-slide text from a "PowerPoint Document" stream.
@@ -976,7 +991,7 @@ fn extract_shape_text(
                                 rec.data[7],
                             ])
                             .max(0) as usize;
-                            split_run_with_hyperlink(out, idx, begin, end, url);
+                            add_link_range(out, idx, begin, end, url);
                         }
                     }
                 }
@@ -1578,121 +1593,32 @@ fn resolve_shape_pib(shape_data: &[u8]) -> Option<usize> {
     None
 }
 
-/// Split `out[idx]` into up to 3 runs at the character offsets `begin..end`
-/// (`TextRange`, [MS-PPT] 2.6.12): the unlinked prefix (if any), the
-/// hyperlinked `[begin, end)` slice, and the unlinked suffix (if any) — the
-/// text-run-level hyperlink mechanism, where a hyperlink covers only part
-/// of a run's text (e.g. a URL appearing mid-sentence) rather than the
-/// whole shape.
-///
-/// `begin`/`end` are [MS-PPT]'s `TextPosition` offsets, which count UTF-16
+/// Record a text-range hyperlink ([MS-PPT] `TextInteractiveInfoAtom`) on
+/// `out[idx]`. `begin`/`end` are `TextPosition` offsets, which count UTF-16
 /// code units (the text is stored as UTF-16); they are converted to `char`
-/// indices before slicing, so an astral-plane character (a surrogate pair)
-/// before the range no longer shifts it by one.
-fn split_run_with_hyperlink(
-    out: &mut Vec<TextRun>,
-    idx: usize,
-    begin: usize,
-    end: usize,
-    url: &str,
-) {
-    let Some(run) = out.get(idx) else { return };
-    let begin = utf16_to_char_index(&run.text, begin);
-    let end = utf16_to_char_index(&run.text, end);
-    let chars: Vec<char> = run.text.chars().collect();
-    let begin = begin.min(chars.len());
-    let end = end.clamp(begin, chars.len());
+/// indices, so an astral-plane character (a surrogate pair) before the
+/// range does not shift it.
+///
+/// The run is not split: splitting it into prefix/link/suffix runs made
+/// each piece its own paragraph downstream, breaking the sentence around
+/// the link into three lines and dropping the spaces at the joins.
+fn add_link_range(out: &mut [TextRun], idx: usize, begin: usize, end: usize, url: &str) {
+    let Some(run) = out.get_mut(idx) else { return };
+    let len = run.text.chars().count();
+    let begin = utf16_to_char_index(&run.text, begin).min(len);
+    let end = utf16_to_char_index(&run.text, end).clamp(begin, len);
     if begin >= end {
         return; // empty or invalid range — leave the run untouched
     }
-
-    let text_type = run.text_type;
-    let surrounding_hyperlink = run.hyperlink.clone();
-    let placeholder_role = run.placeholder_role.clone();
-    let prefix: String = chars[..begin].iter().collect();
-    let linked: String = chars[begin..end].iter().collect();
-    let suffix: String = chars[end..].iter().collect();
-    // Splitting a run must not silently drop its own direct formatting —
-    // slice each formatting span onto whichever piece(s) it overlaps,
-    // re-based to that piece's own character indices.
-    let prefix_char_fmt = slice_char_formats(&run.char_formats, 0..begin);
-    let linked_char_fmt = slice_char_formats(&run.char_formats, begin..end);
-    let suffix_char_fmt = slice_char_formats(&run.char_formats, end..chars.len());
-    let prefix_para_fmt = slice_para_formats(&run.para_formats, 0..begin);
-    let linked_para_fmt = slice_para_formats(&run.para_formats, begin..end);
-    let suffix_para_fmt = slice_para_formats(&run.para_formats, end..chars.len());
-
-    let mut replacement = Vec::with_capacity(3);
-    if !prefix.is_empty() {
-        replacement.push(TextRun {
-            text_type,
-            text: prefix,
-            hyperlink: surrounding_hyperlink.clone(),
-            char_formats: prefix_char_fmt,
-            para_formats: prefix_para_fmt,
-            placeholder_role: placeholder_role.clone(),
-        });
+    if begin == 0 && end == len {
+        run.hyperlink = Some(url.to_string()); // the whole run is the link
+        return;
     }
-    replacement.push(TextRun {
-        text_type,
-        text: linked,
-        hyperlink: Some(url.to_string()),
-        char_formats: linked_char_fmt,
-        para_formats: linked_para_fmt,
-        placeholder_role: placeholder_role.clone(),
+    run.link_ranges.push(LinkRange {
+        start: begin,
+        end,
+        url: url.to_string(),
     });
-    if !suffix.is_empty() {
-        replacement.push(TextRun {
-            text_type,
-            text: suffix,
-            hyperlink: surrounding_hyperlink,
-            char_formats: suffix_char_fmt,
-            para_formats: suffix_para_fmt,
-            placeholder_role,
-        });
-    }
-
-    out.splice(idx..=idx, replacement);
-}
-
-/// Slice/clip a set of character-formatting spans onto `range`, re-based
-/// so the returned spans are relative to `range.start` (i.e. valid over
-/// the substring `text[range]` on its own).
-fn slice_char_formats(
-    spans: &[CharFormatSpan],
-    range: std::ops::Range<usize>,
-) -> Vec<CharFormatSpan> {
-    spans
-        .iter()
-        .filter_map(|s| {
-            let start = s.start.max(range.start);
-            let end = s.end.min(range.end);
-            (start < end).then(|| CharFormatSpan {
-                start: start - range.start,
-                end: end - range.start,
-                format: s.format.clone(),
-            })
-        })
-        .collect()
-}
-
-/// Same as [`slice_char_formats`] for paragraph-formatting spans.
-fn slice_para_formats(
-    spans: &[ParaFormatSpan],
-    range: std::ops::Range<usize>,
-) -> Vec<ParaFormatSpan> {
-    spans
-        .iter()
-        .filter_map(|s| {
-            let start = s.start.max(range.start);
-            let end = s.end.min(range.end);
-            (start < end).then(|| ParaFormatSpan {
-                start: start - range.start,
-                end: end - range.start,
-                format: s.format.clone(),
-            })
-        })
-        .collect()
 }
 
 /// Parse `data` as a `StyleTextPropAtom` body and attach the resulting
@@ -1938,14 +1864,9 @@ mod tests {
             text: text.to_string(),
             ..Default::default()
         }];
-        // Emoji = 2 units, space = 1: "link" is units 3..7.
-        split_run_with_hyperlink(&mut out, 0, 3, 7, "http://example.com/");
-        let linked: Vec<&str> = out
-            .iter()
-            .filter(|r| r.hyperlink.is_some())
-            .map(|r| r.text.as_str())
-            .collect();
-        assert_eq!(linked, ["link"]);
+        // Emoji = 2 units, space = 1: "link" is units 3..7, chars 2..6.
+        add_link_range(&mut out, 0, 3, 7, "http://example.com/");
+        assert_eq!((out[0].link_ranges[0].start, out[0].link_ranges[0].end), (2, 6));
         assert_eq!(utf16_to_char_index(text, 2), 1);
         assert_eq!(utf16_to_char_index(text, 1), 1, "inside the pair rounds up");
         assert_eq!(utf16_to_char_index(text, 99), text.chars().count());
@@ -2362,10 +2283,11 @@ mod tests {
     /// covering only PART of a text run's characters, via a sibling
     /// `MouseClickInteractiveInfoContainer` + `MouseClickTextInteractiveInfoAtom`
     /// pair in the `ClientTextbox` (not nested in `RT_CLIENT_DATA` at all —
-    /// confirmed against real corpus bytes, not just the spec). The run
-    /// must split into unlinked-prefix / linked / unlinked-suffix pieces.
+    /// confirmed against real corpus bytes, not just the spec). The link
+    /// is recorded on the run over exactly its characters; the run itself
+    /// stays whole.
     #[test]
-    fn test_text_range_hyperlink_splits_the_run() {
+    fn test_text_range_hyperlink_is_recorded_on_the_run() {
         let mut hyperlinks = HashMap::new();
         hyperlinks.insert(7u32, "http://example.com/".to_string());
 
@@ -2400,13 +2322,17 @@ mod tests {
             &mut Vec::new(),
         );
 
-        assert_eq!(runs.len(), 3, "must split into prefix/linked/suffix: {runs:?}");
-        assert_eq!(runs[0].text, "See ");
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].text, "See http://example.com/ here");
         assert_eq!(runs[0].hyperlink, None);
-        assert_eq!(runs[1].text, "http://example.com/");
-        assert_eq!(runs[1].hyperlink.as_deref(), Some("http://example.com/"));
-        assert_eq!(runs[2].text, " here");
-        assert_eq!(runs[2].hyperlink, None);
+        assert_eq!(
+            runs[0].link_ranges,
+            [LinkRange {
+                start: 4,
+                end: 23,
+                url: "http://example.com/".to_string()
+            }]
+        );
     }
 
     /// The hyperlinked range can cover the WHOLE run (no unlinked prefix

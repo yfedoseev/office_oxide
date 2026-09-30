@@ -1075,6 +1075,7 @@ mod tests {
                     }],
                     para_formats: Vec::new(),
                     placeholder_role: None,
+                    link_ranges: Vec::new(),
                 }],
                 ..Default::default()
             }],
@@ -1131,6 +1132,7 @@ mod tests {
                     ],
                     para_formats: Vec::new(),
                     placeholder_role: None,
+                    link_ranges: Vec::new(),
                 }],
                 ..Default::default()
             }],
@@ -1180,6 +1182,7 @@ mod tests {
                         }, // Tx_ALIGNCenter
                     }],
                     placeholder_role: None,
+                    link_ranges: Vec::new(),
                 }],
                 ..Default::default()
             }],
@@ -1210,6 +1213,7 @@ mod tests {
                     char_formats: Vec::new(),
                     para_formats: Vec::new(),
                     placeholder_role: Some("ftr".to_string()),
+                    link_ranges: Vec::new(),
                 }],
                 ..Default::default()
             }],
