@@ -147,6 +147,7 @@ fn maximal_properties_corpus(out: &str) {
                 cells: vec![cell.clone(), cell.clone()],
                 is_header: true,
                 height_twips: Some(400),
+                height_rule: Some(office_oxide::ir::RowHeightRule::Exact),
                 repeat_as_header: true,
                 allow_break: false,
             },

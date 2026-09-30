@@ -20,11 +20,19 @@ impl DocxDocument {
     pub fn plain_text(&self) -> String {
         let mut out = String::new();
         let styles = self.styles.as_ref();
-        for hf in self.headers_footers.iter().filter(|h| h.is_header) {
+        for hf in self
+            .headers_footers
+            .iter()
+            .filter(|h| h.active && h.is_header)
+        {
             plain_text_blocks(&hf.content, styles, &mut out);
         }
         plain_text_blocks(&self.body.elements, styles, &mut out);
-        for hf in self.headers_footers.iter().filter(|h| !h.is_header) {
+        for hf in self
+            .headers_footers
+            .iter()
+            .filter(|h| h.active && !h.is_header)
+        {
             plain_text_blocks(&hf.content, styles, &mut out);
         }
         // Footnote/endnote/comment bodies are real document content that
@@ -131,7 +139,7 @@ fn split_headers_footers(doc: &DocxDocument, ctx: &MarkdownCtx) -> (Vec<String>,
     let mut header_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut footer_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for hf in &doc.headers_footers {
+    for hf in doc.headers_footers.iter().filter(|h| h.active) {
         let mut buf = String::new();
         markdown_blocks(&hf.content, ctx, &mut buf, 0);
         let t = buf.trim().to_string();
@@ -259,7 +267,8 @@ fn plain_text_run(run: &Run, ctx: HiddenCtx<'_>, out: &mut String) {
             // the citation point, nothing to render here.
             RunContent::FootnoteRef(..)
             | RunContent::EndnoteRef(..)
-            | RunContent::CommentRef(_) => {},
+            | RunContent::CommentRef(_)
+            | RunContent::CommentRangeStart(_) => {},
             RunContent::FormField(ff) => {
                 if let Some(text) = &ff.display_text {
                     out.push_str(text);
@@ -516,9 +525,20 @@ impl RunStyle {
             },
             None => direct,
         };
+        // Complex-script text takes bold/italic from `w:bCs`/`w:iCs`, by
+        // the same run-level rule as `to_ir()` (`RunProperties::face_for`).
+        let (bold, italic) = rp.map_or((false, false), |rp| {
+            let face =
+                rp.face_for(rp.run_script_class(run.content.iter().filter_map(|rc| match rc {
+                    RunContent::Text(t) => Some(t.as_str()),
+                    RunContent::FormField(ff) => ff.display_text.as_deref(),
+                    _ => None,
+                })));
+            (face.bold, face.italic)
+        });
         Self {
-            bold: rp.and_then(|rp| rp.bold).unwrap_or(false),
-            italic: rp.and_then(|rp| rp.italic).unwrap_or(false),
+            bold,
+            italic,
             strike: rp.and_then(|rp| rp.strike.or(rp.dstrike)).unwrap_or(false),
             vertical_align: rp.and_then(|rp| rp.vertical_align),
         }
@@ -612,7 +632,8 @@ fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, hidden: HiddenCtx<'_>, text: 
             },
             RunContent::FootnoteRef(..)
             | RunContent::EndnoteRef(..)
-            | RunContent::CommentRef(_) => {},
+            | RunContent::CommentRef(_)
+            | RunContent::CommentRangeStart(_) => {},
             RunContent::FormField(ff) => {
                 if let Some(t) = &ff.display_text {
                     text.push_str(t);
@@ -641,13 +662,31 @@ fn markdown_drawing(drawing: &DrawingInfo, out: &mut String) {
         out.push('\n');
         return;
     }
-    out.push_str("![");
-    if let Some(ref desc) = drawing.description {
-        out.push_str(&crate::core::markdown::image_alt(desc));
+    // A linked picture has a real target to point at, as in the IR
+    // renderer.
+    if let Some(url) = drawing
+        .linked_image
+        .as_deref()
+        .and_then(crate::ir_render::safe_url)
+    {
+        out.push_str("![");
+        out.push_str(&crate::core::markdown::image_alt(
+            drawing.description.as_deref().unwrap_or(""),
+        ));
+        out.push_str("](");
+        out.push_str(&crate::ir_render::escape_markdown_url(&url));
+        out.push(')');
+        return;
     }
-    out.push_str("](");
-    out.push_str(&drawing.relationship_id);
-    out.push(')');
+    // The relationship id is not a target a markdown reader can resolve,
+    // and this renderer has no other address for the picture. Describe it
+    // with its alt text as the IR renderer does (italic, nothing when
+    // there is none) rather than emit `![alt](rId7)`.
+    if let Some(desc) = drawing.description.as_deref().filter(|d| !d.is_empty()) {
+        out.push('*');
+        out.push_str(&crate::core::markdown::escape_text(desc));
+        out.push('*');
+    }
 }
 
 fn markdown_table(table: &Table, ctx: &MarkdownCtx, out: &mut String) {

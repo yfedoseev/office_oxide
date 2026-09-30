@@ -484,7 +484,10 @@ fn render_inline_plain(content: &[InlineContent]) -> String {
         match item {
             InlineContent::Text(span) => out.push_str(&span.text),
             InlineContent::LineBreak => out.push('\n'),
-            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
+            InlineContent::FootnoteRef(_)
+            | InlineContent::EndnoteRef(_)
+            | InlineContent::CommentStart(_)
+            | InlineContent::CommentRef(_) => {},
         }
     }
     out
@@ -714,7 +717,10 @@ fn render_inline_markdown(content: &[InlineContent]) -> String {
                 flush(&mut pending, &mut out);
                 out.push_str("  \n");
             },
-            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
+            InlineContent::FootnoteRef(_)
+            | InlineContent::EndnoteRef(_)
+            | InlineContent::CommentStart(_)
+            | InlineContent::CommentRef(_) => {},
         }
     }
     flush(&mut pending, &mut out);
@@ -742,15 +748,38 @@ fn table_grid(table: &Table) -> Vec<Vec<Option<&TableCell>>> {
         .map(|r| {
             r.cells
                 .iter()
-                .map(|c| c.col_span.max(1) as usize)
-                .sum::<usize>()
+                .fold(0usize, |w, c| w.saturating_add(c.col_span.max(1) as usize))
         })
         .max()
         .unwrap_or(0)
         .min(cell_total.saturating_mul(1_000).max(1));
-    let mut grid: Vec<Vec<Option<&TableCell>>> = vec![vec![None; width]; table.rows.len()];
+    let rows = table.rows.len();
+    // The grid is `rows x width`, so one wide row made every other row cost
+    // its width: a table with one row of wide spans over many narrow rows
+    // was quadratic in the input. A real table's positions stay within a
+    // small multiple of its cells (Word's grid is at most 63 columns wide);
+    // past that, lay each row out on its own, which keeps every cell and
+    // its order but not the column alignment spans would have given it.
+    let ragged = || -> Vec<Vec<Option<&TableCell>>> {
+        table
+            .rows
+            .iter()
+            .map(|r| r.cells.iter().map(Some).collect())
+            .collect()
+    };
+    let max_positions = cell_total
+        .saturating_mul(MAX_GRID_POSITIONS_PER_CELL)
+        .max(MIN_GRID_POSITIONS);
+    if rows.saturating_mul(width) > max_positions {
+        log::warn!(
+            "table grid of {rows} x {width} positions for {cell_total} cells exceeds the layout \
+             bound; rendering rows without span alignment"
+        );
+        return ragged();
+    }
+    let mut grid: Vec<Vec<Option<&TableCell>>> = vec![vec![None; width]; rows];
     // Positions already claimed by a cell spanning down from an earlier row.
-    let mut covered: Vec<Vec<bool>> = vec![vec![false; width]; table.rows.len()];
+    let mut covered: Vec<Vec<bool>> = vec![vec![false; width]; rows];
 
     for (r, row) in table.rows.iter().enumerate() {
         let mut c = 0usize;
@@ -759,23 +788,35 @@ fn table_grid(table: &Table) -> Vec<Vec<Option<&TableCell>>> {
                 c += 1;
             }
             if c >= width {
-                break;
+                // Spans that claim more of the grid than exists (only an
+                // inconsistent or clamped IR has these) left no room for
+                // this cell; dropping it lost its text. Keep every cell.
+                log::warn!(
+                    "table spans leave no grid position for a cell; rendering rows without span alignment"
+                );
+                return ragged();
             }
             grid[r][c] = Some(cell);
-            let cs = cell.col_span.max(1) as usize;
-            let rs = cell.row_span.max(1) as usize;
-            for dr in 0..rs {
-                for dc in 0..cs {
-                    if r + dr < covered.len() && c + dc < width {
-                        covered[r + dr][c + dc] = true;
-                    }
-                }
+            // Clip to the grid before looping: the spans are untrusted and
+            // their product is not otherwise bounded.
+            let cs = (cell.col_span.max(1) as usize).min(width - c);
+            let rs = (cell.row_span.max(1) as usize).min(rows - r);
+            for covered_row in &mut covered[r..r + rs] {
+                covered_row[c..c + cs].fill(true);
             }
             c += cs;
         }
     }
     grid
 }
+
+/// See [`table_grid`]: how many grid positions a table may lay out per cell
+/// it actually holds (one more than Word's 63-column grid limit).
+const MAX_GRID_POSITIONS_PER_CELL: usize = 64;
+
+/// Floor for the grid-position bound, so small tables with legitimately
+/// large merged areas always keep their alignment.
+const MIN_GRID_POSITIONS: usize = 1 << 20;
 
 /// A table with one row and one cell whose content holds a table is a
 /// layout frame — Word documents wrap whole forms in one to draw a
@@ -808,7 +849,9 @@ fn render_table_markdown(table: &Table) -> String {
     }
 
     let grid = table_grid(table);
-    let col_count = grid.first().map(|r| r.len()).unwrap_or(0);
+    // Every row of a laid-out grid is the same width; a table past the
+    // layout bound comes back ragged, and its widest row sets the header.
+    let col_count = grid.iter().map(Vec::len).max().unwrap_or(0);
     if col_count == 0 {
         return String::new();
     }
@@ -1139,13 +1182,22 @@ fn render_inline_html(content: &[InlineContent]) -> String {
                     text = format!("<span style=\"{}\">{text}</span>", escape_html(&css));
                 }
                 if let Some(url) = span.hyperlink.as_deref().and_then(safe_url) {
-                    text = format!("<a href=\"{}\">{text}</a>", escape_html(&url));
+                    // The source's hover text is HTML's `title`.
+                    let title = span
+                        .hyperlink_tooltip
+                        .as_deref()
+                        .map(|t| format!(" title=\"{}\"", escape_html(t)))
+                        .unwrap_or_default();
+                    text = format!("<a href=\"{}\"{title}>{text}</a>", escape_html(&url));
                 }
 
                 out.push_str(&text);
             },
             InlineContent::LineBreak => out.push_str("<br />"),
-            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
+            InlineContent::FootnoteRef(_)
+            | InlineContent::EndnoteRef(_)
+            | InlineContent::CommentStart(_)
+            | InlineContent::CommentRef(_) => {},
         }
     }
     out
@@ -1204,7 +1256,15 @@ fn render_list_group_html(lists: &[&List]) -> String {
         Some(n) if first.ordered && n != 1 => format!(" start=\"{n}\""),
         _ => String::new(),
     };
-    let mut html = format!("<{tag}{start_attr}>\n");
+    // Letter and roman markers: HTML's `<ol type>`. Decimal is its default.
+    let type_attr = match first.style {
+        Some(ListStyle::LowerAlpha) if first.ordered => " type=\"a\"",
+        Some(ListStyle::UpperAlpha) if first.ordered => " type=\"A\"",
+        Some(ListStyle::LowerRoman) if first.ordered => " type=\"i\"",
+        Some(ListStyle::UpperRoman) if first.ordered => " type=\"I\"",
+        _ => "",
+    };
+    let mut html = format!("<{tag}{type_attr}{start_attr}>\n");
     for list in lists {
         for item in &list.items {
             let content = render_elements_html(&item.content).join("");
@@ -1878,6 +1938,34 @@ mod tests {
         })]);
         assert!(!bullets.to_html().contains("start="), "{}", bullets.to_html());
         assert!(bullets.to_markdown().contains("- A"), "{}", bullets.to_markdown());
+    }
+
+    /// Letter and roman markers are carried in `List::style` but HTML
+    /// rendered every ordered list as decimal; `<ol type>` is the HTML
+    /// attribute for exactly these four. (Markdown has no such syntax —
+    /// CommonMark ordered-list markers are decimal only — so it keeps
+    /// digits.)
+    #[test]
+    fn test_letter_and_roman_list_styles_reach_the_html_type_attribute() {
+        for (style, attr) in [
+            (ListStyle::LowerAlpha, " type=\"a\""),
+            (ListStyle::UpperAlpha, " type=\"A\""),
+            (ListStyle::LowerRoman, " type=\"i\""),
+            (ListStyle::UpperRoman, " type=\"I\""),
+            (ListStyle::Decimal, ""),
+        ] {
+            let ir = simple_ir(vec![Element::List(List {
+                ordered: true,
+                style: Some(style.clone()),
+                items: vec![ListItem {
+                    content: vec![para("A")],
+                    nested: None,
+                }],
+                ..Default::default()
+            })]);
+            let html = ir.to_html();
+            assert!(html.contains(&format!("<ol{attr}>")), "{style:?}: {html}");
+        }
     }
 
     // ── Defaults centralized in `block_default` ──────────────────────

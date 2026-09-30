@@ -422,6 +422,8 @@ struct SheetDataInner {
     /// no hyperlink concept at all, so a cell's URL was silently dropped
     /// on every write, unconditionally).
     pub hyperlinks: HashMap<(usize, usize), String>,
+    /// Hover text for the hyperlinks above (`hyperlink/@tooltip`).
+    pub hyperlink_tooltips: HashMap<(usize, usize), String>,
     /// Cell comments to write as real `xl/comments*.xml` + VML entries
     /// (these used to have nowhere to go and fell through
     /// to being dumped as plain extra rows below the table).
@@ -442,6 +444,7 @@ impl SheetDataInner {
             images: Vec::new(),
             text_shapes: Vec::new(),
             hyperlinks: HashMap::new(),
+            hyperlink_tooltips: HashMap::new(),
             comments: Vec::new(),
             hidden: false,
         }
@@ -509,6 +512,20 @@ impl SheetDataInner {
             return self;
         }
         self.hyperlinks.insert((row, col), url.into());
+        self
+    }
+
+    /// Set the hover text of a cell's hyperlink (see `set_cell_hyperlink`).
+    pub fn set_cell_hyperlink_tooltip(
+        &mut self,
+        row: usize,
+        col: usize,
+        tooltip: impl Into<String>,
+    ) -> &mut Self {
+        if !in_grid(row, col) {
+            return self;
+        }
+        self.hyperlink_tooltips.insert((row, col), tooltip.into());
         self
     }
 
@@ -727,6 +744,19 @@ impl<'a> SheetData<'a> {
         url: impl Into<String>,
     ) -> &mut Self {
         self.0.set_cell_hyperlink(row, col, url);
+        self
+    }
+
+    /// Set the hover text of a cell's hyperlink, written as
+    /// `hyperlink/@tooltip` (ECMA-376 §18.3.1). Has no effect on a
+    /// cell without a hyperlink.
+    pub fn set_cell_hyperlink_tooltip(
+        &mut self,
+        row: usize,
+        col: usize,
+        tooltip: impl Into<String>,
+    ) -> &mut Self {
+        self.0.set_cell_hyperlink_tooltip(row, col, tooltip);
         self
     }
 
@@ -1331,6 +1361,12 @@ impl XlsxWriter {
                     let mut hl = BytesStart::new("hyperlink");
                     hl.push_attribute(("ref", cell_ref.as_str()));
                     hl.push_attribute(("r:id", rid.as_str()));
+                    if let Some(tip) = sheet.hyperlink_tooltips.get(&(row, col)) {
+                        hl.push_attribute((
+                            "tooltip",
+                            crate::core::xml::sanitize_xml_text(tip).as_ref(),
+                        ));
+                    }
                     w.write_event(Event::Empty(hl))?;
                 }
                 w.write_event(Event::End(BytesEnd::new("hyperlinks")))?;

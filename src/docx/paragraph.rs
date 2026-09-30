@@ -60,6 +60,11 @@ pub enum RunContent {
     EndnoteRef(u32, bool),
     /// A `w:commentReference` mark. See [`RunContent::FootnoteRef`].
     CommentRef(u32),
+    /// A `w:commentRangeStart` (ECMA-376 §17.13.4): where the text a
+    /// comment is about begins. It sits between runs, so the reader wraps
+    /// it in a run of its own. The range ends at the comment's
+    /// [`RunContent::CommentRef`].
+    CommentRangeStart(u32),
     /// Legacy form-field state parsed out of `<w:fldChar><w:ffData>`.
     /// A checkbox's checked state exists nowhere else in the document, so
     /// skipping `w:ffData` lost it unrecoverably.

@@ -682,6 +682,7 @@ fn convert_text_paragraph_inline(para: &crate::pptx::TextParagraph) -> Vec<Inlin
                         // field uses the twentieths-of-a-point units the
                         // DOCX writer emits, so scale by 1/5.
                         char_spacing_half_pt: run.char_spacing_hundredths_pt.map(|s| s / 5),
+                        hyperlink_tooltip: run.hyperlink.as_ref().and_then(|h| h.tooltip.clone()),
                         ..Default::default()
                     }));
                 }

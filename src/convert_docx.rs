@@ -47,6 +47,13 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         let mut slot = SectionHeaders::default();
         for _ in 0..(sp.header_refs.len() + sp.footer_refs.len()) {
             let Some(hf) = hf_iter.next() else { break };
+            // A first-page part in a section without `w:titlePg` is never
+            // shown by Word; carrying it made every surface print it and
+            // the writer, which emits `w:titlePg` for any first-page
+            // part, switch it on.
+            if !hf.active {
+                continue;
+            }
             let mut tmp: Vec<Element> = Vec::new();
             convert_block_elements(&hf.content, &mut tmp, doc);
             if tmp
@@ -267,6 +274,45 @@ fn hex_to_rgb(s: &str) -> Option<[u8; 3]> {
     Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
 }
 
+/// The single colour a `w:shd` (ECMA-376 §17.3.5) paints: its pattern
+/// (`w:val`, ST_Shd) in `w:color` over `w:fill`. A percentage pattern is
+/// exactly that share of the pattern colour; a stripe or cross pattern is
+/// represented by the share of the area its lines cover, the average
+/// colour the eye sees, since the IR holds one colour per area. An
+/// automatic pattern colour is black and an automatic fill white (paper);
+/// `clear` with an automatic fill, and `nil`, are no shading at all.
+fn shading_rgb(sh: &crate::docx::table::Shading) -> Option<[u8; 3]> {
+    let fill = sh.fill.as_deref().and_then(hex_to_rgb);
+    let pattern = sh.pattern.as_deref().unwrap_or("clear");
+    let coverage: f32 = match pattern {
+        "nil" => return None,
+        "clear" => return fill,
+        "solid" => 1.0,
+        "horzStripe" | "vertStripe" | "diagStripe" | "reverseDiagStripe" => 0.5,
+        "thinHorzStripe" | "thinVertStripe" | "thinDiagStripe" | "thinReverseDiagStripe" => 0.25,
+        "horzCross" | "diagCross" => 0.75,
+        "thinHorzCross" | "thinDiagCross" => 0.4375,
+        p => match p.strip_prefix("pct").and_then(|n| n.parse::<u8>().ok()) {
+            Some(n) if n <= 100 => f32::from(n) / 100.0,
+            // An unknown pattern: the fill is the one colour known.
+            _ => return fill,
+        },
+    };
+    let color = sh
+        .color
+        .as_deref()
+        .and_then(hex_to_rgb)
+        .unwrap_or([0, 0, 0]);
+    let base = fill.unwrap_or([0xFF, 0xFF, 0xFF]);
+    let mix =
+        |b: u8, c: u8| (f32::from(b) * (1.0 - coverage) + f32::from(c) * coverage).round() as u8;
+    Some([
+        mix(base[0], color[0]),
+        mix(base[1], color[1]),
+        mix(base[2], color[2]),
+    ])
+}
+
 /// Map a `w:val` border style name onto the IR's `BorderStyle`. Unknown
 /// styles fall back to `Single` — the same rendering Word gives an
 /// unrecognised decorative border.
@@ -377,11 +423,7 @@ fn apply_paragraph_properties(pp: &crate::docx::ParagraphProperties, out: &mut P
     out.page_break_before = pp.page_break_before.unwrap_or(false);
     out.outline_level = pp.outline_level;
     out.border = pp.borders.as_deref().map(para_borders_to_ir);
-    out.background_color = pp
-        .shading
-        .as_ref()
-        .and_then(|sh| sh.fill.as_deref())
-        .and_then(hex_to_rgb);
+    out.background_color = pp.shading.as_deref().and_then(shading_rgb);
     out.tabs = pp
         .tabs
         .iter()
@@ -471,11 +513,7 @@ fn apply_paragraph_properties_to_heading(pp: &crate::docx::ParagraphProperties, 
     out.keep_together = pp.keep_lines.unwrap_or(false);
     out.page_break_before = pp.page_break_before.unwrap_or(false);
     out.border = pp.borders.as_deref().map(para_borders_to_ir);
-    out.background_color = pp
-        .shading
-        .as_ref()
-        .and_then(|sh| sh.fill.as_deref())
-        .and_then(hex_to_rgb);
+    out.background_color = pp.shading.as_deref().and_then(shading_rgb);
     out.tabs = pp
         .tabs
         .iter()
@@ -506,10 +544,14 @@ fn apply_paragraph_properties_to_heading(pp: &crate::docx::ParagraphProperties, 
 /// and reporting `PageSetup::default()` for it would hand the consumer a
 /// Letter-size page the document never claimed.
 fn section_props_to_page_setup(sp: &crate::docx::SectionProperties) -> Option<PageSetup> {
-    if sp.page_size.is_none() && sp.margins.is_none() {
+    if sp.page_size.is_none() && sp.margins.is_none() && sp.page_numbering.is_none() {
         return None;
     }
     let mut ps = PageSetup::default();
+    if let Some(pn) = &sp.page_numbering {
+        ps.page_number_start = pn.start;
+        ps.page_number_format = pn.format.clone();
+    }
     if let Some(size) = &sp.page_size {
         ps.width_twips = size.width.0.max(0) as u32;
         ps.height_twips = size.height.0.max(0) as u32;
@@ -527,6 +569,9 @@ fn section_props_to_page_setup(sp: &crate::docx::SectionProperties) -> Option<Pa
         }
         if let Some(f) = m.footer {
             ps.footer_distance_twips = f.0.max(0) as u32;
+        }
+        if let Some(g) = m.gutter {
+            ps.gutter_twips = g.0.max(0) as u32;
         }
     }
     Some(ps)
@@ -571,12 +616,13 @@ fn convert_block_elements(
                 // style-level list switched off for one paragraph. Treating
                 // it as a list turned an ordinary paragraph into a bullet.
                 if heading_level.is_none()
-                    && let Some(nr) = eff_ref
+                    && let Some(num_id) = eff_ref
                         .and_then(|pp| pp.numbering_ref.as_ref())
-                        .filter(|nr| nr.num_id != 0)
+                        .map(|nr| nr.num_id)
+                        .filter(|&id| id != 0)
                 {
                     let list_element =
-                        convert_list_group(blocks, &mut i, nr.num_id, doc, &mut numbering_counts);
+                        convert_list_group(blocks, &mut i, num_id, doc, &mut numbering_counts, eff);
                     elements.push(list_element);
                     continue;
                 }
@@ -587,11 +633,15 @@ fn convert_block_elements(
                 // with a single bottom border. pdf_to_ir round-trips
                 // ThematicBreak through DOCX as exactly this shape;
                 // recover it here so the renderer draws a rule.
-                let inline = convert_paragraph_inline(p, doc);
-                let is_empty_para = inline.iter().all(|ic| {
-                    matches!(ic,
-                        crate::ir::InlineContent::Text(s) if s.text.is_empty()
-                    )
+                // The paragraph's inline content, cut at hard breaks —
+                // converted once and used for every decision below.
+                let mut segments = split_at_hard_breaks(p, doc);
+                let is_empty_para = segments.iter().all(|(inline, _)| {
+                    inline.iter().all(|ic| {
+                        matches!(ic,
+                            crate::ir::InlineContent::Text(s) if s.text.is_empty()
+                        )
+                    })
                 });
                 let has_bottom_border = eff_ref.is_some_and(|pp| pp.has_bottom_border);
                 if is_empty_para && has_bottom_border {
@@ -641,9 +691,10 @@ fn convert_block_elements(
                         }
                         Element::Paragraph(para)
                     };
-                    let mut segments = split_at_hard_breaks(p, doc);
                     if segments.len() == 1 && segments[0].1.is_none() {
-                        elements.push(make_para(convert_paragraph_inline(p, doc)));
+                        let (mut inline, _) = segments.swap_remove(0);
+                        inline.shrink_to_fit();
+                        elements.push(make_para(inline));
                     } else {
                         // The paragraph's own slot is the first segment when
                         // it holds text; later segments are paragraphs only
@@ -767,11 +818,11 @@ fn collect_paragraph_inline_images(
                     if !d.inline {
                         continue;
                     }
-                    if d.relationship_id.is_empty() {
-                        continue;
-                    }
-                    let (data, ext) = match doc.images.get(&d.relationship_id).cloned() {
-                        Some(v) => v,
+                    // A linked picture has no bytes in the package, only
+                    // its target; it used to be dropped without trace.
+                    let (data, ext) = match embedded_image(d, doc) {
+                        Some((data, ext)) => (Some(data), ext),
+                        None if d.linked_image.is_some() => (None, None),
                         None => continue,
                     };
                     let format =
@@ -784,7 +835,9 @@ fn collect_paragraph_inline_images(
                             });
                     out.push(Element::Image(Image {
                         alt_text: d.description.clone(),
-                        data: Some(data),
+                        decorative: d.decorative,
+                        data,
+                        source_url: d.linked_image.clone(),
                         format,
                         display_width_emu: Some(d.width.0.max(0) as u64),
                         display_height_emu: Some(d.height.0.max(0) as u64),
@@ -914,10 +967,11 @@ fn drawing_to_float_element(
         }));
     }
 
-    if d.relationship_id.is_empty() {
-        return None;
-    }
-    let (data, ext) = doc.images.get(&d.relationship_id).cloned()?;
+    let (data, ext) = match embedded_image(d, doc) {
+        Some((data, ext)) => (Some(data), ext),
+        None if d.linked_image.is_some() => (None, None),
+        None => return None,
+    };
     let format = ext.as_deref().and_then(|e| match e {
         "png" => Some(ImageFormat::Png),
         "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
@@ -925,7 +979,9 @@ fn drawing_to_float_element(
     });
     Some(Element::Image(Image {
         alt_text: d.description.clone(),
-        data: Some(data),
+        decorative: d.decorative,
+        data,
+        source_url: d.linked_image.clone(),
         format,
         display_width_emu: Some(width_emu),
         display_height_emu: Some(height_emu),
@@ -941,6 +997,18 @@ fn drawing_to_float_element(
         }),
         ..Default::default()
     }))
+}
+
+/// A drawing's embedded picture bytes and file extension, if the package
+/// holds them.
+fn embedded_image(
+    d: &crate::docx::DrawingInfo,
+    doc: &crate::docx::DocxDocument,
+) -> Option<(Vec<u8>, Option<String>)> {
+    if d.relationship_id.is_empty() {
+        return None;
+    }
+    doc.images.get(&d.relationship_id).cloned()
 }
 
 /// Translate a paragraph's `<w:jc>` justification into the IR's
@@ -976,10 +1044,25 @@ fn effective_paragraph_props(
     p: &crate::docx::Paragraph,
     doc: &crate::docx::DocxDocument,
 ) -> Option<crate::docx::ParagraphProperties> {
-    match doc.styles.as_ref() {
+    let mut eff = match doc.styles.as_ref() {
         Some(sheet) => Some(sheet.effective_paragraph_properties(p.properties.as_ref())),
         None => p.properties.clone(),
+    };
+    // A numbered paragraph's indentation comes from its numbering level's
+    // `w:pPr/w:ind` (ECMA-376 §17.9) unless the paragraph sets its own;
+    // Word applies it over the paragraph style's.
+    if let Some(pp) = eff.as_mut()
+        && p.properties.as_ref().is_none_or(|d| d.indent.is_none())
+        && let Some(nr) = pp.numbering_ref.as_ref().filter(|nr| nr.num_id != 0)
+        && let Some(ind) = doc
+            .numbering
+            .as_ref()
+            .and_then(|n| n.resolve_level(nr.num_id, nr.ilvl))
+            .and_then(|l| l.indent.clone())
+    {
+        pp.indent = Some(ind);
     }
+    eff
 }
 
 /// Recognise the `Heading1`..`Heading9` style-id convention and the
@@ -1086,8 +1169,9 @@ fn convert_inline_with(p: &crate::docx::Paragraph, ctx: RunContext<'_>) -> Vec<I
             },
             crate::docx::ParagraphContent::Hyperlink(hl) => {
                 let url = hyperlink_url(hl);
+                let link = url.as_deref().map(|u| (u, hl.tooltip.as_deref()));
                 for run in &hl.runs {
-                    convert_run(run, url.as_deref(), &ctx, &mut content);
+                    convert_run(run, link, &ctx, &mut content);
                 }
             },
         }
@@ -1100,7 +1184,21 @@ fn convert_inline_with(p: &crate::docx::Paragraph, ctx: RunContext<'_>) -> Vec<I
 
 fn convert_run(
     run: &crate::docx::Run,
-    hyperlink_url: Option<&str>,
+    // The enclosing hyperlink's URL and hover text.
+    link: Option<(&str, Option<&str>)>,
+    ctx: &RunContext<'_>,
+    content: &mut Vec<InlineContent>,
+) {
+    convert_run_content(run.properties.as_ref(), &run.content, link, ctx, content);
+}
+
+/// [`convert_run`] on a run's properties and a slice of its content, so a
+/// run can be converted in pieces (around a hard break) without copying it.
+fn convert_run_content(
+    run_properties: Option<&crate::docx::RunProperties>,
+    run_content: &[crate::docx::RunContent],
+    // The enclosing hyperlink's URL and hover text.
+    link: Option<(&str, Option<&str>)>,
     ctx: &RunContext<'_>,
     content: &mut Vec<InlineContent>,
 ) {
@@ -1113,11 +1211,10 @@ fn convert_run(
     let resolved;
     let effective: Option<&crate::docx::RunProperties> = match ctx.styles {
         Some(sheet) => {
-            resolved =
-                sheet.effective_run_properties(ctx.paragraph_style_id, run.properties.as_ref());
+            resolved = sheet.effective_run_properties(ctx.paragraph_style_id, run_properties);
             Some(&resolved)
         },
-        None => run.properties.as_ref(),
+        None => run_properties,
     };
     // `<w:vanish/>` — Word never renders this run at all. Excluding it
     // here (rather than carrying a `hidden` flag into the IR for every
@@ -1128,55 +1225,53 @@ fn convert_run(
     if effective.and_then(|rp| rp.hidden).unwrap_or(false) {
         return;
     }
-    let bold = effective.and_then(|rp| rp.bold).unwrap_or(false);
-    let italic = effective.and_then(|rp| rp.italic).unwrap_or(false);
-    let strike = effective
-        .and_then(|rp| rp.strike.or(rp.dstrike))
-        .unwrap_or(false);
-    // `<w:sz w:val="N"/>` is already in half-points; IR uses the
-    // same encoding. See `crate::core::units::HalfPoint::from_word_sz`
-    // for the cross-format invariant (also: PPTX hundredths-pt,
-    // XLSX points-as-f32 must convert here).
-    let font_size_half_pt = effective.and_then(|rp| {
-        rp.font_size
-            .map(|hp| crate::core::units::HalfPoint::from_word_sz(hp.0).0)
-    });
-    // `<w:rFonts w:ascii="...">` carries the run's face name. Without
-    // forwarding it onto `TextSpan.font_name`, the IR→PDF renderer
-    // falls back to the page builder's default font (Helvetica) and
-    // every PDF→DOCX→PDF round-trip loses every typeface — even when
-    // the DOCX writer correctly embedded the source-PDF font program
-    // under `word/fonts/`.
+    let no_properties;
+    let eff: &crate::docx::RunProperties = match effective {
+        Some(rp) => rp,
+        None => {
+            no_properties = crate::docx::RunProperties::default();
+            &no_properties
+        },
+    };
+    // `w:rFonts` names a face per script and complex-script text has its
+    // own size and weight (`w:szCs`, `w:bCs`, `w:iCs`); see
+    // `RunProperties::face_for`. Bold and italic are per run, taken from
+    // the script of its text; face and size may change inside a run, so
+    // each text item is split where they do.
+    let run_face =
+        eff.face_for(eff.run_script_class(run_content.iter().filter_map(|rc| match rc {
+            crate::docx::RunContent::Text(t) => Some(t.as_str()),
+            crate::docx::RunContent::FormField(ff) => ff.display_text.as_deref(),
+            _ => None,
+        })));
+    let bold = run_face.bold;
+    let italic = run_face.italic;
     // A theme reference (`w:asciiTheme`, the default in every Office
     // template) supersedes the literal face (ECMA-376 Part 1 §17.3.2.26)
     // and names a font in the theme's font scheme; without a theme to
     // resolve it, the literal face is the only name there is.
-    let font_name = effective.and_then(|rp| {
-        rp.font_theme
-            .zip(theme)
-            .and_then(|(t, th)| t.resolve(&th.font_scheme))
-            .or_else(|| rp.font_name.clone())
-    });
+    let themed_ascii = eff
+        .font_theme
+        .zip(theme)
+        .and_then(|(t, th)| t.resolve(&th.font_scheme));
+    let ascii = themed_ascii.as_deref().or(eff.font_name.as_deref());
+    let strike = eff.strike.or(eff.dstrike).unwrap_or(false);
     // Propagate `<w:color w:val="RRGGBB"/>` so PDF→DOCX→PDF round-trips
-    // preserve coloured text (red "0" in `pdfs_pdfium/text_color.pdf`
-    // and the like). Theme / system / auto colours fall through to
-    // the renderer default for now — resolving them properly needs the
-    // document's `theme.xml`, which the current convert path doesn't
-    // thread in.
-    // Resolve `<w:color>` through the document theme. Matching only
-    // `ColorRef::Rgb` silently dropped every theme-coloured run — and the
-    // `w:val` fallback OOXML writes next to `w:themeColor` was discarded at
-    // parse time, so even a document with no theme part came out colourless.
-    let text_color = effective
-        .and_then(|rp| rp.color.as_ref())
+    // preserve coloured text. Resolve it through the document theme:
+    // matching only `ColorRef::Rgb` silently dropped every theme-coloured
+    // run — and the `w:val` fallback OOXML writes next to `w:themeColor`
+    // was discarded at parse time, so even a document with no theme part
+    // came out colourless.
+    let text_color = eff
+        .color
+        .as_ref()
         .and_then(|c| c.resolve_opt(theme))
         .map(|rgb| rgb.0);
     // Remaining `w:rPr` toggles. Half of `TextSpan`'s fields used to be
     // permanently empty for DOCX because these were parsed and then never
     // read; underline in particular is the single most common piece of
     // direct formatting after bold/italic.
-    let rp = effective;
-    let underline = rp.and_then(|rp| rp.underline.as_ref()).map(|u| match u {
+    let underline = eff.underline.as_ref().map(|u| match u {
         crate::docx::UnderlineType::Single => UnderlineStyle::Single,
         crate::docx::UnderlineType::Double => UnderlineStyle::Double,
         crate::docx::UnderlineType::Thick => UnderlineStyle::Thick,
@@ -1192,42 +1287,52 @@ fn convert_run(
     // The DOCX writer encodes `TextSpan::highlight` as `<w:shd w:fill>`
     // inside `w:rPr`, so read that first and fall back to Word's named
     // `<w:highlight>` palette for documents authored elsewhere.
-    let highlight = rp
-        .and_then(|rp| rp.shading_fill.as_deref())
+    let highlight = eff
+        .shading_fill
+        .as_deref()
         .and_then(hex_to_rgb)
-        .or_else(|| {
-            rp.and_then(|rp| rp.highlight.as_deref())
-                .and_then(highlight_name_to_rgb)
-        });
-    let vertical_align = rp.and_then(|rp| rp.vertical_align).map(|va| match va {
+        .or_else(|| eff.highlight.as_deref().and_then(highlight_name_to_rgb));
+    let vertical_align = eff.vertical_align.map(|va| match va {
         crate::docx::VerticalAlign::Superscript => VerticalAlign::Superscript,
         crate::docx::VerticalAlign::Subscript => VerticalAlign::Subscript,
         crate::docx::VerticalAlign::Baseline => VerticalAlign::Baseline,
     });
-    let all_caps = rp.and_then(|rp| rp.caps).unwrap_or(false);
-    let small_caps = rp.and_then(|rp| rp.small_caps).unwrap_or(false);
-    let char_spacing_half_pt = rp.and_then(|rp| rp.char_spacing);
+    let all_caps = eff.caps.unwrap_or(false);
+    let small_caps = eff.small_caps.unwrap_or(false);
+    let char_spacing_half_pt = eff.char_spacing;
 
-    for rc in &run.content {
+    // One span per piece of `text` whose face and size stay the same.
+    // The face name reaches `TextSpan.font_name` so the IR→PDF renderer
+    // does not fall back to its default font; `<w:sz>` is already in
+    // half-points, the IR's own encoding (see
+    // `crate::core::units::HalfPoint::from_word_sz`).
+    let push_text = |text: &str, content: &mut Vec<InlineContent>| {
+        eff.for_each_script_segment(text, ascii, |piece, face| {
+            content.push(InlineContent::Text(TextSpan {
+                text: piece.to_string(),
+                bold,
+                italic,
+                strikethrough: strike,
+                hyperlink: link.map(|(url, _)| url.to_string()),
+                hyperlink_tooltip: link.and_then(|(_, tip)| tip).map(str::to_string),
+                font_size_half_pt: face
+                    .font_size
+                    .map(|hp| crate::core::units::HalfPoint::from_word_sz(hp.0).0),
+                font_name: face.font_name.map(str::to_string),
+                color: text_color,
+                underline: underline.clone(),
+                highlight,
+                vertical_align: vertical_align.clone(),
+                all_caps,
+                small_caps,
+                char_spacing_half_pt,
+            }));
+        });
+    };
+
+    for rc in run_content {
         match rc {
-            crate::docx::RunContent::Text(text) => {
-                content.push(InlineContent::Text(TextSpan {
-                    text: text.clone(),
-                    bold,
-                    italic,
-                    strikethrough: strike,
-                    hyperlink: hyperlink_url.map(|s| s.to_string()),
-                    font_size_half_pt,
-                    font_name: font_name.clone(),
-                    color: text_color,
-                    underline: underline.clone(),
-                    highlight,
-                    vertical_align: vertical_align.clone(),
-                    all_caps,
-                    small_caps,
-                    char_spacing_half_pt,
-                }));
-            },
+            crate::docx::RunContent::Text(text) => push_text(text, content),
             crate::docx::RunContent::Break(crate::docx::BreakType::Line) => {
                 content.push(InlineContent::LineBreak);
             },
@@ -1269,28 +1374,18 @@ fn convert_run(
                     marker: None,
                 }));
             },
-            // No IR-level representation for a comment's citation point
-            // today (only the comment body reaches the IR, via the
-            // existing Element::Endnote aliasing) — nothing to add here.
-            crate::docx::RunContent::CommentRef(_) => {},
+            // A comment's anchor: its range start and citation point. The
+            // body reaches the IR as the `Element::Endnote` labelled
+            // "Comment (…)" with the same id.
+            crate::docx::RunContent::CommentRangeStart(id) => {
+                content.push(InlineContent::CommentStart(CommentAnchor { comment_id: *id }));
+            },
+            crate::docx::RunContent::CommentRef(id) => {
+                content.push(InlineContent::CommentRef(CommentAnchor { comment_id: *id }));
+            },
             crate::docx::RunContent::FormField(ff) => {
                 if let Some(text) = &ff.display_text {
-                    content.push(InlineContent::Text(TextSpan {
-                        text: text.clone(),
-                        bold,
-                        italic,
-                        strikethrough: strike,
-                        hyperlink: hyperlink_url.map(|s| s.to_string()),
-                        font_size_half_pt,
-                        font_name: font_name.clone(),
-                        color: text_color,
-                        underline: underline.clone(),
-                        highlight,
-                        vertical_align: vertical_align.clone(),
-                        all_caps,
-                        small_caps,
-                        char_spacing_half_pt,
-                    }));
+                    push_text(text, content);
                 }
             },
             // Resolved into a TextBox sibling during from_opc when the
@@ -1321,14 +1416,17 @@ fn split_at_hard_breaks(
     let mut content = Vec::new();
     let convert_run_split =
         |run: &crate::docx::Run,
-         url: Option<&str>,
+         url: Option<(&str, Option<&str>)>,
          content: &mut Vec<InlineContent>,
          segments: &mut Vec<(Vec<InlineContent>, Option<HardBreak>)>| {
             // A run holding a hard break is converted around it: the run's
-            // pieces before and after the break belong to different segments.
-            let mut piece = run.clone();
-            piece.content.clear();
-            for rc in &run.content {
+            // pieces before and after the break belong to different
+            // segments. The pieces are slices of the run; cloning the whole
+            // run to empty it again cost a copy of every run in the
+            // document.
+            let props = run.properties.as_ref();
+            let mut piece_start = 0;
+            for (i, rc) in run.content.iter().enumerate() {
                 let brk = match rc {
                     crate::docx::RunContent::Break(crate::docx::BreakType::Page) => {
                         Some(HardBreak::Page)
@@ -1338,19 +1436,23 @@ fn split_at_hard_breaks(
                     },
                     _ => None,
                 };
-                match brk {
-                    Some(b) => {
-                        if !piece.content.is_empty() {
-                            convert_run(&piece, url, &ctx, content);
-                            piece.content.clear();
-                        }
-                        segments.push((std::mem::take(content), Some(b)));
-                    },
-                    None => piece.content.push(rc.clone()),
+                if let Some(b) = brk {
+                    if piece_start < i {
+                        convert_run_content(
+                            props,
+                            &run.content[piece_start..i],
+                            url,
+                            &ctx,
+                            content,
+                        );
+                    }
+                    segments.push((std::mem::take(content), Some(b)));
+                    piece_start = i + 1;
                 }
             }
-            if !piece.content.is_empty() {
-                convert_run(&piece, url, &ctx, content);
+            if piece_start < run.content.len() {
+                let piece = &run.content[piece_start..];
+                convert_run_content(props, piece, url, &ctx, content);
             }
         };
     for pc in &p.content {
@@ -1360,8 +1462,9 @@ fn split_at_hard_breaks(
             },
             crate::docx::ParagraphContent::Hyperlink(hl) => {
                 let url = hyperlink_url(hl);
+                let link = url.as_deref().map(|u| (u, hl.tooltip.as_deref()));
                 for run in &hl.runs {
-                    convert_run_split(run, url.as_deref(), &mut content, &mut segments);
+                    convert_run_split(run, link, &mut content, &mut segments);
                 }
             },
         }
@@ -1380,7 +1483,11 @@ fn convert_list_group(
     num_id: u32,
     doc: &crate::docx::DocxDocument,
     numbering_counts: &mut std::collections::HashMap<u32, u32>,
+    // The first paragraph's effective properties, which the caller already
+    // resolved to decide this is a list.
+    first_properties: Option<crate::docx::ParagraphProperties>,
 ) -> Element {
+    let mut first_properties = Some(first_properties);
     let mut items = Vec::new();
     let mut is_ordered = false;
     // How many items at the group's own (shallowest) level this group
@@ -1406,7 +1513,10 @@ fn convert_list_group(
             // and not here: the group consumed nothing, `*i` never advanced,
             // and the caller looped forever appending empty lists until the
             // process was killed.
-            let eff = effective_paragraph_props(p, doc);
+            let eff = match first_properties.take() {
+                Some(eff) => eff,
+                None => effective_paragraph_props(p, doc),
+            };
             if let Some(nr) = eff.as_ref().and_then(|pp| pp.numbering_ref.as_ref()) {
                 if nr.num_id != num_id {
                     break;
@@ -1421,7 +1531,8 @@ fn convert_list_group(
                         );
                         if top_ilvl.is_none_or(|t| nr.ilvl < t) {
                             top_ilvl = Some(nr.ilvl);
-                            style = number_format_to_list_style(&level.format);
+                            style = number_format_to_list_style(&level.format)
+                                .map(|s| bullet_glyph_style(s, &level.level_text));
                             // Honour this instance's own `<w:startOverride>`
                             // when present, falling back to the
                             // abstract level's own `<w:start>`. `w:start`
@@ -1473,6 +1584,26 @@ fn convert_list_group(
     Element::List(list)
 }
 
+/// Refine a bullet level's style by the glyph its `w:lvlText` draws: the
+/// writer encodes `Square`/`Circle`/`Dash` as ▪/○/– and every glyph used
+/// to read back as a plain bullet. Word's own gallery bullets are private
+/// use code points of the Symbol/Wingdings fonts (U+F0A7 is Wingdings'
+/// square, U+F0B7 Symbol's round bullet) and Courier New "o" is its
+/// open-circle bullet.
+fn bullet_glyph_style(style: ListStyle, level_text: &str) -> ListStyle {
+    if style != ListStyle::Bullet {
+        return style;
+    }
+    match level_text.trim() {
+        "\u{25AA}" | "\u{25A0}" | "\u{25FE}" | "\u{25FC}" | "\u{F0A7}" | "\u{F06E}" => {
+            ListStyle::Square
+        },
+        "\u{25CB}" | "\u{25E6}" | "o" | "\u{F06F}" => ListStyle::Circle,
+        "\u{2013}" | "\u{2014}" | "-" | "\u{2212}" => ListStyle::Dash,
+        _ => ListStyle::Bullet,
+    }
+}
+
 fn number_format_to_list_style(f: &crate::docx::NumberFormat) -> Option<ListStyle> {
     use crate::docx::NumberFormat as NF;
     Some(match f {
@@ -1495,8 +1626,14 @@ fn number_format_to_list_style(f: &crate::docx::NumberFormat) -> Option<ListStyl
 /// columns; this leaves generous headroom while keeping the value bounded.
 const MAX_GRID_SPAN: u32 = 1_000;
 
-/// Upper bound for a table's column count after spans are resolved.
-const MAX_TABLE_COLS: usize = 10_000;
+/// A cell's `w:gridSpan`, clamped to `1..=MAX_GRID_SPAN`.
+fn cell_grid_span(cell: &crate::docx::TableCell) -> u32 {
+    cell.properties
+        .as_ref()
+        .and_then(|p| p.grid_span)
+        .unwrap_or(1)
+        .clamp(1, MAX_GRID_SPAN)
+}
 
 fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) -> Element {
     // A table cell can hold another table (`convert_block_elements` ->
@@ -1527,72 +1664,91 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
         });
     };
 
-    // First pass: compute row_span from vMerge patterns
+    // First pass: compute row_span from vMerge patterns.
+    //
+    // `w:gridSpan` is attacker-controlled and parsed as an unbounded u32,
+    // so every span is clamped (`cell_grid_span`). The vMerge pass works
+    // per *cell*, not per grid position: a dense `rows x columns` grid
+    // made every narrow row cost the width of the table's widest row, and
+    // one wide row over many ordinary ones was quadratic in the input.
     let num_rows = table.rows.len();
-    // `w:gridSpan` is attacker-controlled and parsed as an unbounded u32.
-    // Summing it straight into an allocation let a sub-1 KB document ask for
-    // 34 GB (u32::MAX * 2 rows * 4 bytes) and abort the process — and this
-    // runs on `to_ir()`, which backs save_as, to_markdown, the MCP extract
-    // tool and every binding. Clamp each span to the real grid, and the
-    // total to the number of cells actually present: a span cannot
-    // legitimately describe more columns than the table has cells.
-    let cell_total: usize = table.rows.iter().map(|r| r.cells.len()).sum();
-    let num_cols = table
+    // Starting grid column of every cell, row by row (ascending, so a
+    // lookup by column is a binary search).
+    let starts: Vec<Vec<usize>> = table
         .rows
         .iter()
         .map(|r| {
+            let mut col = 0usize;
             r.cells
                 .iter()
                 .map(|c| {
-                    c.properties
-                        .as_ref()
-                        .and_then(|p| p.grid_span)
-                        .unwrap_or(1)
-                        .clamp(1, MAX_GRID_SPAN) as usize
+                    let start = col;
+                    col = col.saturating_add(cell_grid_span(c) as usize);
+                    start
                 })
-                .sum::<usize>()
+                .collect()
         })
-        .max()
-        .unwrap_or(0)
-        .min(cell_total.max(1).saturating_mul(MAX_GRID_SPAN as usize))
-        .min(MAX_TABLE_COLS);
-
-    // Build a grid of (is_continue, row_span) for vMerge tracking
-    let mut row_spans: Vec<Vec<u32>> = vec![vec![1; num_cols]; num_rows];
-
-    // Track vMerge: for each column, walk down from each Restart to count Continue cells
-    for col in 0..num_cols {
-        let mut row = 0;
-        while row < num_rows {
-            let cell = get_cell_at_grid_col(&table.rows[row], col);
-            if let Some(cell) = cell {
-                let vmerge = cell.properties.as_ref().and_then(|p| p.vertical_merge);
-                if matches!(vmerge, Some(crate::docx::table::MergeType::Restart)) {
-                    // Count continuation cells below
-                    let mut span = 1u32;
-                    let mut next = row + 1;
-                    while next < num_rows {
-                        let next_cell = get_cell_at_grid_col(&table.rows[next], col);
-                        if let Some(nc) = next_cell {
-                            if matches!(
-                                nc.properties.as_ref().and_then(|p| p.vertical_merge),
-                                Some(crate::docx::table::MergeType::Continue)
-                            ) {
-                                span += 1;
-                                next += 1;
-                                continue;
-                            }
-                        }
-                        break;
-                    }
-                    if let Some(cell_span) = row_spans[row].get_mut(col) {
-                        *cell_span = span;
-                    }
-                }
+        .collect();
+    let vmerge_at = |row: usize, col: usize| {
+        let i = starts[row].binary_search(&col).ok()?;
+        table.rows[row].cells[i]
+            .properties
+            .as_ref()
+            .and_then(|p| p.vertical_merge)
+    };
+    let mut row_spans: Vec<Vec<u32>> = table.rows.iter().map(|r| vec![1; r.cells.len()]).collect();
+    for (row, cells) in table.rows.iter().enumerate() {
+        for (i, cell) in cells.cells.iter().enumerate() {
+            let vmerge = cell.properties.as_ref().and_then(|p| p.vertical_merge);
+            if !matches!(vmerge, Some(crate::docx::table::MergeType::Restart)) {
+                continue;
             }
-            row += 1;
+            // Count the continuation cells below. Each continuation cell
+            // is reached from at most one restart, so this is linear.
+            let col = starts[row][i];
+            let mut span = 1u32;
+            let mut next = row + 1;
+            while next < num_rows
+                && matches!(vmerge_at(next, col), Some(crate::docx::table::MergeType::Continue))
+            {
+                span = span.saturating_add(1);
+                next += 1;
+            }
+            row_spans[row][i] = span;
         }
     }
+
+    // The table's style: borders it does not set itself, and the
+    // conditional (header, total, first/last column, banded) shading its
+    // `w:tblLook` switches on.
+    let tp = table.properties.as_ref();
+    let style = tp
+        .and_then(|p| p.style_id.as_deref())
+        .zip(doc.styles.as_ref())
+        .map(|(id, sheet)| sheet.resolve_table_style(id))
+        .unwrap_or_default();
+    let grid_width = starts
+        .iter()
+        .zip(&table.rows)
+        .map(|(s, r)| match (s.last(), r.cells.last()) {
+            (Some(&start), Some(cell)) => start.saturating_add(cell_grid_span(cell) as usize),
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0);
+    let layout = TableStyleLayout {
+        look: tp.and_then(|p| p.look),
+        num_rows,
+        grid_width,
+        row_band: tp
+            .and_then(|p| p.row_band_size)
+            .or(style.row_band_size)
+            .unwrap_or(1) as usize,
+        col_band: tp
+            .and_then(|p| p.col_band_size)
+            .or(style.col_band_size)
+            .unwrap_or(1) as usize,
+    };
 
     let mut ir_rows = Vec::new();
     for (row_idx, row) in table.rows.iter().enumerate() {
@@ -1600,19 +1756,13 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
         let is_header = rp.is_some_and(|p| p.is_header);
 
         let mut ir_cells = Vec::new();
-        let mut grid_col = 0;
 
-        for cell in &row.cells {
+        for (cell_idx, cell) in row.cells.iter().enumerate() {
             // Clamped here, where the IR cell is built, so every consumer is
             // covered: ir_render sizes a grid from the summed col_spans, and
             // the DOCX writer loops over them. An unbounded value from the
             // file reached both.
-            let col_span = cell
-                .properties
-                .as_ref()
-                .and_then(|p| p.grid_span)
-                .unwrap_or(1)
-                .clamp(1, MAX_GRID_SPAN);
+            let col_span = cell_grid_span(cell);
 
             // Skip vMerge continue cells
             let is_continue = cell
@@ -1621,27 +1771,18 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
                 .and_then(|p| p.vertical_merge)
                 .is_some_and(|m| matches!(m, crate::docx::table::MergeType::Continue));
 
-            if is_continue {
-                grid_col += col_span as usize;
-                continue;
-            }
-
             // A cell deleted via tracked changes (`w:cellDel`) is excluded
             // from the accepted view — same policy already applied to
-            // run-level `w:del` — but its grid position still needs to be
-            // accounted for, exactly like a vMerge-continue cell, so later
-            // real cells in the row don't shift into the wrong column.
+            // run-level `w:del`. Its grid position is still accounted for
+            // (spans are resolved per cell above), exactly like a
+            // vMerge-continue cell's, so later real cells in the row don't
+            // shift into the wrong column.
             let is_deleted = cell.properties.as_ref().is_some_and(|p| p.deleted);
-            if is_deleted {
-                grid_col += col_span as usize;
+            if is_continue || is_deleted {
                 continue;
             }
 
-            let row_span = if grid_col < num_cols {
-                row_spans[row_idx][grid_col]
-            } else {
-                1
-            };
+            let row_span = row_spans[row_idx][cell_idx];
 
             let mut cell_elements = Vec::new();
             convert_block_elements(&cell.content, &mut cell_elements, doc);
@@ -1665,10 +1806,28 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
                 col_span,
                 row_span,
                 text_align,
-                background_color: cp
-                    .and_then(|p| p.shading.as_ref())
-                    .and_then(|sh| sh.fill.as_deref())
-                    .and_then(hex_to_rgb),
+                // Direct cell shading wins over the table style's; a direct
+                // `w:shd`, even `nil`, is the cell's own choice.
+                background_color: match cp.and_then(|p| p.shading.as_deref()) {
+                    Some(sh) => shading_rgb(sh),
+                    None => {
+                        let start = starts[row_idx][cell_idx];
+                        let end = start.saturating_add(col_span as usize);
+                        layout
+                            .regions(row_idx, start, end)
+                            .iter()
+                            .rev()
+                            .find_map(|kind| {
+                                style
+                                    .conditionals
+                                    .iter()
+                                    .find(|c| c.kind == *kind)
+                                    .and_then(|c| c.cell_properties.as_ref())
+                                    .and_then(|p| p.shading.as_deref())
+                                    .and_then(shading_rgb)
+                            })
+                    },
+                },
                 border: cp
                     .and_then(|p| p.borders.as_deref())
                     .map(table_borders_to_ir),
@@ -1693,24 +1852,29 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
                     }),
                 ..Default::default()
             });
-
-            grid_col += col_span as usize;
         }
 
         ir_rows.push(TableRow {
             cells: ir_cells,
             is_header,
             height_twips: rp.and_then(|p| p.height).map(|h| h.max(0) as u32),
+            height_rule: rp.and_then(|p| p.height_rule).map(|r| match r {
+                crate::docx::table::RowHeightRule::AtLeast => RowHeightRule::AtLeast,
+                crate::docx::table::RowHeightRule::Exact => RowHeightRule::Exact,
+                crate::docx::table::RowHeightRule::Auto => RowHeightRule::Auto,
+            }),
             allow_break: !rp.is_some_and(|p| p.cant_split),
             repeat_as_header: is_header,
         });
     }
 
-    let tp = table.properties.as_ref();
     Element::Table(Table {
         rows: ir_rows,
         column_widths_twips: table.grid.iter().map(|t| t.0.max(0) as u32).collect(),
-        border: tp.and_then(|p| p.borders.as_ref()).map(table_borders_to_ir),
+        border: tp
+            .and_then(|p| p.borders.as_ref())
+            .or(style.borders)
+            .map(table_borders_to_ir),
         alignment: tp.and_then(|p| p.justification).map(|j| match j {
             crate::docx::Justification::Center => TableAlignment::Center,
             crate::docx::Justification::Right => TableAlignment::Right,
@@ -1729,6 +1893,70 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
     })
 }
 
+/// Where a cell sits relative to the regions a table style formats.
+struct TableStyleLayout {
+    /// `None` when the table has no `w:tblLook`: only whole-table
+    /// formatting applies, rather than guessing which regions are on.
+    look: Option<crate::docx::table::TableLook>,
+    num_rows: usize,
+    grid_width: usize,
+    row_band: usize,
+    col_band: usize,
+}
+
+impl TableStyleLayout {
+    /// The `w:tblStylePr` regions covering the cell at `row` spanning grid
+    /// columns `start..end`, in increasing precedence (ECMA-376 §17.7.6:
+    /// whole table, banded columns, banded rows, first/last column,
+    /// first/last row, corner cells).
+    fn regions(&self, row: usize, start: usize, end: usize) -> Vec<&'static str> {
+        let mut out = vec!["wholeTable"];
+        let Some(look) = self.look else {
+            return out;
+        };
+        let first_row = look.first_row && row == 0;
+        let last_row = look.last_row && row + 1 == self.num_rows;
+        let first_col = look.first_column && start == 0;
+        let last_col = look.last_column && end >= self.grid_width;
+        if !look.no_v_band && !first_col && !last_col {
+            let data_col = start.saturating_sub(usize::from(look.first_column));
+            out.push(if (data_col / self.col_band.max(1)).is_multiple_of(2) {
+                "band1Vert"
+            } else {
+                "band2Vert"
+            });
+        }
+        if !look.no_h_band && !first_row && !last_row {
+            let data_row = row.saturating_sub(usize::from(look.first_row));
+            out.push(if (data_row / self.row_band.max(1)).is_multiple_of(2) {
+                "band1Horz"
+            } else {
+                "band2Horz"
+            });
+        }
+        if first_col {
+            out.push("firstCol");
+        }
+        if last_col {
+            out.push("lastCol");
+        }
+        if first_row {
+            out.push("firstRow");
+        }
+        if last_row {
+            out.push("lastRow");
+        }
+        match (first_row, last_row, first_col, last_col) {
+            (true, _, true, _) => out.push("nwCell"),
+            (true, _, _, true) => out.push("neCell"),
+            (_, true, true, _) => out.push("swCell"),
+            (_, true, _, true) => out.push("seCell"),
+            _ => {},
+        }
+        out
+    }
+}
+
 /// Read a `w:tblW` / `w:tcW` preferred width, but only when it is an
 /// absolute twip measurement. `auto`, `nil` and percentage widths carry no
 /// twip value, and reporting one would be a confidently wrong number.
@@ -1740,33 +1968,12 @@ fn dxa_width(w: &crate::docx::TableWidth) -> Option<u32> {
     }
 }
 
-fn get_cell_at_grid_col(
-    row: &crate::docx::TableRow,
-    target_col: usize,
-) -> Option<&crate::docx::TableCell> {
-    let mut col = 0;
-    for cell in &row.cells {
-        let span = cell
-            .properties
-            .as_ref()
-            .and_then(|p| p.grid_span)
-            .unwrap_or(1) as usize;
-        if col == target_col {
-            return Some(cell);
-        }
-        col += span;
-        if col > target_col {
-            return None;
-        }
-    }
-    None
-}
-
 // Also handle images at the block level by scanning for drawings in paragraphs
 impl From<&crate::docx::DrawingInfo> for Image {
     fn from(d: &crate::docx::DrawingInfo) -> Self {
         Image {
             alt_text: d.description.clone(),
+            decorative: d.decorative,
             ..Default::default()
         }
     }

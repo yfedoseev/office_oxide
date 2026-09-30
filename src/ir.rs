@@ -333,6 +333,22 @@ pub struct PageSetup {
     pub header_distance_twips: u32,
     /// Distance from bottom edge to footer in twips (default 720 = 0.5").
     pub footer_distance_twips: u32,
+    /// Extra binding margin in twips (DOCX `w:pgMar/@w:gutter`), added to
+    /// the inside edge for binding. `0` when there is none.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub gutter_twips: u32,
+    /// The number of the section's first page, when it restarts numbering
+    /// (DOCX `w:pgNumType/@w:start`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_number_start: Option<u32>,
+    /// The page-number format (DOCX `w:pgNumType/@w:fmt`: `decimal`,
+    /// `lowerRoman`, `upperLetter`, ...), when not decimal by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_number_format: Option<String>,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 impl Default for PageSetup {
@@ -347,6 +363,9 @@ impl Default for PageSetup {
             landscape: false,
             header_distance_twips: 720,
             footer_distance_twips: 720,
+            gutter_twips: 0,
+            page_number_start: None,
+            page_number_format: None,
         }
     }
 }
@@ -1205,6 +1224,20 @@ pub enum InlineContent {
     FootnoteRef(FootnoteRef),
     /// An inline endnote reference mark.
     EndnoteRef(FootnoteRef),
+    /// Where a comment's anchored range begins. The comment itself is the
+    /// `Element::Endnote` labelled `"Comment"`/`"Comment (author)"` with
+    /// the same id.
+    CommentStart(CommentAnchor),
+    /// A comment's citation point, which also ends its anchored range.
+    CommentRef(CommentAnchor),
+}
+
+/// Identifies the comment an inline [`InlineContent::CommentStart`] or
+/// [`InlineContent::CommentRef`] marker belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct CommentAnchor {
+    /// The comment's id — the `id` of its `Element::Endnote`.
+    pub comment_id: u32,
 }
 
 /// Concatenate a heading/paragraph's inline content into plain text —
@@ -1223,7 +1256,10 @@ pub fn inline_to_text(content: &[InlineContent]) -> String {
         match item {
             InlineContent::Text(span) => out.push_str(&span.text),
             InlineContent::LineBreak => out.push('\n'),
-            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
+            InlineContent::FootnoteRef(_)
+            | InlineContent::EndnoteRef(_)
+            | InlineContent::CommentStart(_)
+            | InlineContent::CommentRef(_) => {},
         }
     }
     out
@@ -1266,6 +1302,10 @@ pub struct TextSpan {
     /// Optional hyperlink URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hyperlink: Option<String>,
+    /// The hyperlink's hover text (DOCX `w:hyperlink/@w:tooltip`, XLSX
+    /// `hyperlink/@tooltip`, PPTX `a:hlinkClick/@tooltip`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperlink_tooltip: Option<String>,
     /// Font size in half-points (e.g. 24 = 12 pt).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_size_half_pt: Option<u32>,
@@ -1344,6 +1384,10 @@ pub struct TableRow {
     /// Row height in twips, if set explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height_twips: Option<u32>,
+    /// How `height_twips` constrains the row. `None` is the OOXML default,
+    /// a minimum height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height_rule: Option<RowHeightRule>,
     /// Whether the row may break across pages.
     #[serde(default = "default_true", skip_serializing_if = "Clone::clone")]
     pub allow_break: bool,
@@ -1352,12 +1396,26 @@ pub struct TableRow {
     pub repeat_as_header: bool,
 }
 
+/// How a table row's height is applied (DOCX `w:trHeight/@w:hRule`,
+/// ECMA-376 §17.18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowHeightRule {
+    /// The height is a minimum; the row grows to fit its content.
+    AtLeast,
+    /// The row is exactly this tall; content beyond it is clipped.
+    Exact,
+    /// The height is ignored and the row fits its content.
+    Auto,
+}
+
 impl Default for TableRow {
     fn default() -> Self {
         Self {
             cells: Vec::new(),
             is_header: false,
             height_twips: None,
+            height_rule: None,
             allow_break: true,
             repeat_as_header: false,
         }

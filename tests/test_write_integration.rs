@@ -2598,6 +2598,68 @@ fn test_images_nested_in_text_box_cell_header_and_note_survive_a_write() {
     assert_eq!(pictures, 4, "every nested picture should come back as an image element");
 }
 
+/// `Image::decorative` reached no writer (both drawing writers took the
+/// flag and ignored it) and no reader parsed Office's
+/// `adec:decorative` docPr extension, so the accessibility marking was
+/// lost in both directions.
+#[test]
+fn test_the_decorative_image_flag_round_trips_through_docx() {
+    use office_oxide::ir::*;
+    use office_oxide::{Document, DocumentFormat};
+
+    const PNG: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    let image = |decorative: bool, positioning: ImagePositioning| {
+        Element::Image(Image {
+            data: Some(PNG.to_vec()),
+            format: Some(ImageFormat::Png),
+            display_width_emu: Some(500_000),
+            display_height_emu: Some(500_000),
+            decorative,
+            positioning,
+            ..Default::default()
+        })
+    };
+    let floating = ImagePositioning::Floating(FloatingImage {
+        x_emu: 0,
+        y_emu: 0,
+        width_emu: 500_000,
+        height_emu: 500_000,
+        h_anchor: FloatAnchor::Page,
+        v_anchor: FloatAnchor::Page,
+        text_wrap: TextWrap::Square,
+        allow_overlap: true,
+    });
+    let ir = DocumentIR {
+        metadata: Metadata {
+            format: DocumentFormat::Docx,
+            ..Default::default()
+        },
+        sections: vec![Section {
+            elements: vec![
+                image(true, ImagePositioning::Inline),
+                image(false, ImagePositioning::Inline),
+                image(true, floating),
+            ],
+            ..Default::default()
+        }],
+        defined_names: Vec::new(),
+    };
+    let mut out = std::io::Cursor::new(Vec::new());
+    office_oxide::create::create_from_ir_to_writer(&ir, DocumentFormat::Docx, &mut out).unwrap();
+    let again = Document::from_reader(std::io::Cursor::new(out.into_inner()), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    let flags: Vec<bool> = again.sections[0]
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            Element::Image(i) => Some(i.decorative),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(flags, [true, false, true]);
+}
+
 /// Images in `e` and, recursively, in the containers below it.
 fn count_images(e: &office_oxide::ir::Element) -> usize {
     use office_oxide::ir::Element;

@@ -402,6 +402,79 @@ fn test_cell_hyperlinks_reach_the_ir() {
     assert_eq!(span.hyperlink.as_deref(), Some("#Sheet2!A1"));
 }
 
+/// A linked span carrying hover text.
+fn tooltip_span(text: &str) -> InlineContent {
+    InlineContent::Text(TextSpan {
+        text: text.to_string(),
+        hyperlink: Some("https://example.com/".to_string()),
+        hyperlink_tooltip: Some("Hover \"text\" & more".to_string()),
+        ..Default::default()
+    })
+}
+
+fn find_tooltip(elements: &[Element]) -> Option<String> {
+    elements.iter().find_map(|e| match e {
+        Element::Paragraph(p) => p.content.iter().find_map(|c| match c {
+            InlineContent::Text(s) => s.hyperlink_tooltip.clone(),
+            _ => None,
+        }),
+        Element::Table(t) => t
+            .rows
+            .iter()
+            .flat_map(|r| &r.cells)
+            .find_map(|c| find_tooltip(&c.content)),
+        Element::TextBox(tb) => find_tooltip(&tb.content),
+        _ => None,
+    })
+}
+
+/// XLSX `hyperlink/@tooltip` (ECMA-376 §18.3.1) and PPTX
+/// `a:hlinkClick/@tooltip` (§21.1.2.3) were parsed and never reached
+/// the IR, and neither writer emitted them.
+#[test]
+fn test_hyperlink_tooltips_round_trip_through_xlsx_and_pptx() {
+    let table = Element::Table(Table {
+        rows: vec![TableRow {
+            cells: vec![TableCell {
+                content: vec![Element::Paragraph(Paragraph {
+                    content: vec![tooltip_span("Docs")],
+                    ..Default::default()
+                })],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let para = Element::Paragraph(Paragraph {
+        content: vec![tooltip_span("Docs")],
+        ..Default::default()
+    });
+    for (format, element) in [(DocumentFormat::Xlsx, table), (DocumentFormat::Pptx, para)] {
+        let ir = DocumentIR {
+            metadata: Metadata {
+                format,
+                ..Default::default()
+            },
+            sections: vec![Section {
+                elements: vec![element],
+                ..Default::default()
+            }],
+            defined_names: Vec::new(),
+        };
+        let mut out = Cursor::new(Vec::new());
+        office_oxide::create::create_from_ir_to_writer(&ir, format, &mut out).expect("write");
+        let again = Document::from_reader(Cursor::new(out.into_inner()), format)
+            .expect("reread")
+            .to_ir();
+        let tip = again
+            .sections
+            .iter()
+            .find_map(|s| find_tooltip(&s.elements));
+        assert_eq!(tip.as_deref(), Some("Hover \"text\" & more"), "{format:?}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Hidden sheets are flagged
 // ---------------------------------------------------------------------------

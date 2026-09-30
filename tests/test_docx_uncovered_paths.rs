@@ -69,8 +69,10 @@ fn test_markdown_wraps_superscript_and_subscript_runs() {
     assert!(md.contains("H<sub>2</sub>O"), "{md}");
 }
 
-/// A drawing renders in the direct markdown as an image carrying its
-/// description, and a chart drawing as the text recovered from its part.
+/// A drawing renders in the direct markdown as its description (the
+/// package has no address a markdown reader could resolve, so it is not
+/// an image link, as in the IR renderer), and a chart drawing as the text
+/// recovered from its part.
 #[test]
 fn test_markdown_renders_drawings_and_chart_text() {
     let picture = r#"<w:p><w:r><w:drawing><wp:inline><wp:extent cx="100" cy="100"/><wp:docPr id="1" name="Picture 1" descr="A red square"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="1" name="p"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rId1"/></pic:blipFill><pic:spPr/></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#;
@@ -90,6 +92,6 @@ fn test_markdown_renders_drawings_and_chart_text() {
         w.add_part_rel(doc, rel_types::CHART, "charts/chart1.xml");
     });
     let md = doc.to_markdown();
-    assert!(md.contains("![A red square]("), "{md}");
+    assert!(md.contains("*A red square*") && !md.contains("rId1"), "{md}");
     assert!(md.contains("Sales by region"), "{md}");
 }
