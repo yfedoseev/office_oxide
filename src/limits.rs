@@ -25,8 +25,10 @@
 //! ([`MAX_PART_SIZE`](crate::core::opc::MAX_PART_SIZE)) bounds one part
 //! only. Two package-wide bounds sit on top of it, mirroring Apache POI's
 //! `ZipSecureFile` limits: the number of entries an archive may hold
-//! ([`set_max_package_entries`](crate::limits::set_max_package_entries)) and the total decompressed bytes that may
-//! be read from one package ([`set_max_package_bytes`](crate::limits::set_max_package_bytes)). A package that
+//! (set with [the entry-count setter](crate::limits::set_max_package_entries))
+//! and the total decompressed bytes that may be read from one package (set
+//! with [the byte-budget setter](crate::limits::set_max_package_bytes)). A
+//! package that
 //! exceeds either is refused with
 //! [`Error::PackageLimit`](crate::core::Error::PackageLimit).
 
