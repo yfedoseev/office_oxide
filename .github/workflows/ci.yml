@@ -357,6 +357,9 @@ jobs:
       - name: Test Python bindings
         run: uv run python -c "import office_oxide; print('office_oxide imported successfully')"
 
+      - name: Run Python binding tests
+        run: uv run pytest -q python/tests
+
       - name: Run Python examples
         if: matrix.python-version == '3.12'
         run: |

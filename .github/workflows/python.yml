@@ -89,6 +89,9 @@ jobs:
       - name: Test Python import
         run: uv run python -c "import office_oxide; print('office_oxide imported successfully')"
 
+      - name: Run Python binding tests
+        run: uv run pytest -q python/tests
+
   # Lint job - check code quality
   lint:
     name: Lint and Format Check
