@@ -1221,26 +1221,56 @@ fn collect_ex_hyperlinks(data: &[u8], depth: usize, out: &mut HashMap<u32, Strin
 }
 
 /// Parse one `ExHyperlinkContainer`'s own children: its `ExHyperlinkAtom`
-/// (`exHyperlinkId`) and its `TargetAtom` (the URL/path).
+/// (`exHyperlinkId`), its `TargetAtom` (the URL/path) and its
+/// `LocationAtom`. A hyperlink with only a location jumps inside this
+/// deck; see [`internal_location_target`].
 fn parse_one_ex_hyperlink(data: &[u8]) -> Option<(u32, String)> {
     let mut id = None;
     let mut target = None;
+    let mut location = None;
     for rec in RecordIter::new(data) {
         let Ok(rec) = rec else { break };
         match rec.header.rec_type {
             RT_EXTERNAL_HYPERLINK_ATOM if rec.data.len() >= 4 => {
                 id = Some(u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]));
             },
-            RT_CSTRING if rec.header.rec_instance == CSTRING_INSTANCE_TARGET => {
+            RT_CSTRING => {
                 let s = decode_utf16le(&rec.data);
-                if !s.is_empty() {
-                    target = Some(s);
+                let s = s.trim_end_matches('\0');
+                if s.is_empty() {
+                    continue;
+                }
+                match rec.header.rec_instance {
+                    CSTRING_INSTANCE_TARGET => target = Some(s.to_string()),
+                    CSTRING_INSTANCE_LOCATION => location = Some(s.to_string()),
+                    _ => {},
                 }
             },
             _ => {},
         }
     }
-    Some((id?, target?))
+    let url = match (target, location) {
+        (Some(t), _) => t,
+        (None, Some(loc)) => internal_location_target(&loc),
+        (None, None) => return None,
+    };
+    Some((id?, url))
+}
+
+/// The IR hyperlink for a deck-internal `LocationAtom`. A slide jump is
+/// written `"<slideId>,<slide number>,<title>"` (as Apache POI reads it);
+/// it becomes `#slide<N>.xml`, the same target the PPTX converter gives a
+/// slide jump. Any other location is kept as a `#` fragment.
+fn internal_location_target(location: &str) -> String {
+    let mut parts = location.splitn(3, ',');
+    if let (Some(id), Some(number)) = (parts.next(), parts.next()) {
+        if id.trim().parse::<u32>().is_ok() {
+            if let Ok(n) = number.trim().parse::<u32>() {
+                return format!("#slide{n}.xml");
+            }
+        }
+    }
+    format!("#{location}")
 }
 
 /// One embedded/linked/ActiveX OLE object's identity, resolved from its
@@ -1728,6 +1758,35 @@ mod tests {
 
     /// Build one `ExHyperlinkContainer`: `ExHyperlinkAtom` (id) +
     /// `TargetAtom` (a `RT_CSTRING` at `CSTRING_INSTANCE_TARGET`, UTF-16LE).
+    /// Slide-jump hyperlinks carry their target in a `LocationAtom`
+    /// (`CString` instance 3) with no `TargetAtom`; only the `TargetAtom`
+    /// was read, so every internal jump resolved to nothing.
+    #[test]
+    fn test_location_atom_hyperlink_resolves_to_an_internal_target() {
+        let mut children = make_atom(RT_EXTERNAL_HYPERLINK_ATOM, 0, &7u32.to_le_bytes());
+        let loc: Vec<u8> = "258,3,Results"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        children.extend(make_atom(RT_CSTRING, CSTRING_INSTANCE_LOCATION, &loc));
+        assert_eq!(parse_one_ex_hyperlink(&children), Some((7, "#slide3.xml".to_string())));
+        assert_eq!(internal_location_target("Bookmark1"), "#Bookmark1");
+        // A target wins over a location (the location is inside it).
+        let with_target = {
+            let mut c = children.clone();
+            let t: Vec<u8> = "http://example.com/"
+                .encode_utf16()
+                .flat_map(|u| u.to_le_bytes())
+                .collect();
+            c.extend(make_atom(RT_CSTRING, CSTRING_INSTANCE_TARGET, &t));
+            c
+        };
+        assert_eq!(
+            parse_one_ex_hyperlink(&with_target).map(|(_, u)| u),
+            Some("http://example.com/".to_string())
+        );
+    }
+
     fn make_ex_hyperlink(id: u32, url: &str) -> Vec<u8> {
         let mut children = make_atom(RT_EXTERNAL_HYPERLINK_ATOM, 0, &id.to_le_bytes());
         let utf16: Vec<u8> = url.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();

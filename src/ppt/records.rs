@@ -79,6 +79,11 @@ pub const RT_CSTRING: u16 = 0x0FBA;
 /// hyperlink's actual target URL/path, as opposed to `FriendlyNameAtom`
 /// or `LocationAtom` (other `RT_CSTRING` children at different instances).
 pub const CSTRING_INSTANCE_TARGET: u16 = 0x001;
+/// `LocationAtom`'s `rh.recInstance` ([MS-PPT] `ExHyperlinkContainer`):
+/// the `RT_CSTRING` naming a location inside the target, or — with no
+/// `TargetAtom` — inside this deck (a slide jump, written as
+/// `"<slideId>,<slide number>,<title>"`).
+pub const CSTRING_INSTANCE_LOCATION: u16 = 0x003;
 
 /// [MS-ODRAW] §2.2.16 `OfficeArtSpgrContainer` — a group of shapes. Its
 /// first child `RT_SHAPE` is the group's own placeholder shape (no
