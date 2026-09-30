@@ -218,7 +218,7 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
         // renderer sees them, the same convention convert_xlsx.rs uses
         // for its own comments.
         for (i, c) in sheet.comments.iter().enumerate() {
-            let cell_ref = crate::xls::condfmt::col_name(c.col) + &(c.row + 1).to_string();
+            let cell_ref = crate::xls::condfmt::cell_ref(c.row, c.col);
             let marker = match c.author.as_deref() {
                 Some(a) => format!("{cell_ref} ({a})"),
                 None => cell_ref,

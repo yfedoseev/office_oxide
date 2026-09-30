@@ -957,7 +957,7 @@ fn builtin_name(id: u8) -> Option<&'static str> {
 /// "Z", 26 -> "AA").
 /// `B2 (Author)` — the same marker `convert_xls` puts on a comment's endnote.
 fn comment_marker(c: &XlsComment) -> String {
-    let cell_ref = super::condfmt::col_name(c.col) + &(c.row + 1).to_string();
+    let cell_ref = super::condfmt::cell_ref(c.row, c.col);
     match c.author.as_deref() {
         Some(a) => format!("{cell_ref} ({a})"),
         None => cell_ref,
@@ -1012,8 +1012,10 @@ fn resolve_defined_names(
         }
     };
 
+    // Widen before the 1-based adjustment: row 0xFFFF is the last legal
+    // BIFF8 row, and `$A$65536` does not fit a u16.
     let cell_ref = |row: u16, col_raw: u16| -> String {
-        format!("${}${}", col_letters((col_raw & 0x3FFF) as u32), row + 1)
+        format!("${}${}", col_letters((col_raw & 0x3FFF) as u32), u32::from(row) + 1)
     };
 
     raw_names
@@ -2457,4 +2459,50 @@ mod tests {
         assert_eq!(doc.defined_names[0].name, "_xlnm.Print_Area");
         assert_eq!(doc.defined_names[0].value, "Sheet1!$A$1:$E$10");
     }
+
+    /// Row index 0xFFFF is the last BIFF8 row (`$A$65536`), a legal target
+    /// for a defined name. Its 1-based row number does not fit a u16.
+    #[test]
+    fn test_defined_name_on_the_last_biff8_row_does_not_overflow() {
+        let globals = vec![
+            supbook_internal_record(1),
+            externsheet_record(&[(0, 0, 0)]),
+            name_record("LastCell", 0, false, &ptg_ref3d(0, 0xFFFF, 0)),
+            name_record("WholeCol", 0, false, &ptg_area3d(0, 0, 0xFFFF, 1, 1)),
+        ];
+        let stream = workbook_stream_with_globals(&globals, &[("Sheet1", 0, label(0, 0, "x"))]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+        assert_eq!(doc.defined_names[0].value, "Sheet1!$A$65536");
+        assert_eq!(doc.defined_names[1].value, "Sheet1!$B$1:$B$65536");
+    }
+
+    /// A comment on the last BIFF8 row renders as `A65536`, in both direct
+    /// renderers and the IR endnote marker.
+    #[test]
+    fn test_comment_on_the_last_biff8_row_does_not_overflow() {
+        let sheet = Sheet {
+            name: "S".into(),
+            comments: vec![XlsComment {
+                row: 0xFFFF,
+                col: 0,
+                author: None,
+                text: "bottom".to_string(),
+            }],
+            ..Default::default()
+        };
+        let doc = XlsDocument::from_sheets(vec![sheet]);
+        assert!(doc.plain_text().contains("A65536: bottom"), "{}", doc.plain_text());
+        assert!(doc.to_markdown().contains("A65536"), "{}", doc.to_markdown());
+        let ir = crate::convert_xls::xls_to_ir(&doc);
+        let markers: Vec<_> = ir.sections[0]
+            .elements
+            .iter()
+            .filter_map(|e| match e {
+                crate::ir::Element::Endnote(n) => n.marker.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers, ["A65536"]);
+    }
 }
+
