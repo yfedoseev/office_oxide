@@ -412,7 +412,7 @@ impl XlsxDocument {
             |n, idx, fmt_id| {
                 // The explicit declaration only: apply_format's fmt_str branch
                 // is for custom codes, and feeding it a resolved built-in makes
-                // apply_custom mangle it (id 47 "mm:ss.0" rendered as
+                // the custom-format engine mangle it (id 47 "mm:ss.0" rendered as
                 // "mm:ss0.6").
                 let fmt_str = styles.and_then(|s| s.number_format_override_for(idx));
                 numfmt::apply_format(n, fmt_id, fmt_str)
