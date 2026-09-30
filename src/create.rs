@@ -316,6 +316,13 @@ fn add_element_to_docx(writer: &mut crate::docx::write::DocxWriter, elem: &Eleme
         Element::Footnote(n) => {
             writer.add_footnote(n.id, &n.content, n.marker.clone());
         },
+        // A comment travels through the IR as an endnote labelled
+        // "Comment"/"Comment (author)" (every reader uses that label).
+        // Writing it as an endnote turned each comment into a numbered
+        // note detached from the text it was about.
+        Element::Endnote(n) if comment_author(n).is_some() => {
+            writer.add_comment(n.id, comment_author(n).flatten(), &n.content);
+        },
         Element::Endnote(n) => {
             writer.add_endnote(n.id, &n.content, n.marker.clone());
         },
@@ -328,6 +335,23 @@ fn add_element_to_docx(writer: &mut crate::docx::write::DocxWriter, elem: &Eleme
             // the markdown→IR→DOCX pipeline.
         },
     }
+}
+
+/// `Some(author)` when `n` is a comment — an endnote labelled `"Comment"`
+/// or `"Comment (author)"` — and `None` for an ordinary endnote. The
+/// structured `author` field wins over the label.
+fn comment_author(n: &crate::ir::Note) -> Option<Option<String>> {
+    let marker = n.marker.as_deref()?;
+    let from_label = match marker {
+        "Comment" => None,
+        _ => Some(
+            marker
+                .strip_prefix("Comment (")?
+                .strip_suffix(')')?
+                .to_string(),
+        ),
+    };
+    Some(n.author.clone().or(from_label))
 }
 
 fn ir_inline_to_runs(content: &[InlineContent]) -> Vec<crate::docx::write::Run> {
@@ -372,6 +396,14 @@ fn ir_inline_to_runs(content: &[InlineContent]) -> Vec<crate::docx::write::Run> 
                     ..Default::default()
                 });
             },
+            InlineContent::CommentStart(a) => runs.push(Run {
+                comment_start: Some(a.comment_id),
+                ..Default::default()
+            }),
+            InlineContent::CommentRef(a) => runs.push(Run {
+                comment_ref: Some(a.comment_id),
+                ..Default::default()
+            }),
         }
     }
     coalesce_runs(runs)
@@ -390,15 +422,18 @@ fn ir_inline_to_runs(content: &[InlineContent]) -> Vec<crate::docx::write::Run> 
 fn coalesce_runs(runs: Vec<crate::docx::write::Run>) -> Vec<crate::docx::write::Run> {
     use crate::docx::write::Run;
     let mut out: Vec<Run> = Vec::with_capacity(runs.len());
+    // Note references, comment anchors and line breaks are markers, not text.
+    let is_marker = |r: &Run| {
+        r.footnote_ref.is_some()
+            || r.endnote_ref.is_some()
+            || r.comment_start.is_some()
+            || r.comment_ref.is_some()
+            || r.text == "\n"
+    };
     for r in runs {
-        let mergeable = r.footnote_ref.is_none() && r.endnote_ref.is_none() && r.text != "\n";
-        if mergeable {
+        if !is_marker(&r) {
             if let Some(last) = out.last_mut() {
-                if last.footnote_ref.is_none()
-                    && last.endnote_ref.is_none()
-                    && last.text != "\n"
-                    && run_props_equal(last, &r)
-                {
+                if !is_marker(last) && run_props_equal(last, &r) {
                     last.text.push_str(&r.text);
                     continue;
                 }

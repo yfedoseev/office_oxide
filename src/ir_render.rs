@@ -450,7 +450,10 @@ fn render_inline_plain(content: &[InlineContent]) -> String {
         match item {
             InlineContent::Text(span) => out.push_str(&span.text),
             InlineContent::LineBreak => out.push('\n'),
-            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
+            InlineContent::FootnoteRef(_)
+            | InlineContent::EndnoteRef(_)
+            | InlineContent::CommentStart(_)
+            | InlineContent::CommentRef(_) => {},
         }
     }
     out
@@ -674,7 +677,10 @@ fn render_inline_markdown(content: &[InlineContent]) -> String {
                 flush(&mut pending, &mut out);
                 out.push_str("  \n");
             },
-            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
+            InlineContent::FootnoteRef(_)
+            | InlineContent::EndnoteRef(_)
+            | InlineContent::CommentStart(_)
+            | InlineContent::CommentRef(_) => {},
         }
     }
     flush(&mut pending, &mut out);
@@ -1136,7 +1142,10 @@ fn render_inline_html(content: &[InlineContent]) -> String {
                 out.push_str(&text);
             },
             InlineContent::LineBreak => out.push_str("<br />"),
-            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
+            InlineContent::FootnoteRef(_)
+            | InlineContent::EndnoteRef(_)
+            | InlineContent::CommentStart(_)
+            | InlineContent::CommentRef(_) => {},
         }
     }
     out

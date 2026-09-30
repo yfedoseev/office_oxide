@@ -259,7 +259,8 @@ fn plain_text_run(run: &Run, ctx: HiddenCtx<'_>, out: &mut String) {
             // the citation point, nothing to render here.
             RunContent::FootnoteRef(..)
             | RunContent::EndnoteRef(..)
-            | RunContent::CommentRef(_) => {},
+            | RunContent::CommentRef(_)
+            | RunContent::CommentRangeStart(_) => {},
             RunContent::FormField(ff) => {
                 if let Some(text) = &ff.display_text {
                     out.push_str(text);
@@ -623,7 +624,8 @@ fn markdown_run_text(run: &Run, ctx: &MarkdownCtx, hidden: HiddenCtx<'_>, text: 
             },
             RunContent::FootnoteRef(..)
             | RunContent::EndnoteRef(..)
-            | RunContent::CommentRef(_) => {},
+            | RunContent::CommentRef(_)
+            | RunContent::CommentRangeStart(_) => {},
             RunContent::FormField(ff) => {
                 if let Some(t) = &ff.display_text {
                     text.push_str(t);

@@ -1119,6 +1119,20 @@ pub enum InlineContent {
     FootnoteRef(FootnoteRef),
     /// An inline endnote reference mark.
     EndnoteRef(FootnoteRef),
+    /// Where a comment's anchored range begins. The comment itself is the
+    /// `Element::Endnote` labelled `"Comment"`/`"Comment (author)"` with
+    /// the same id.
+    CommentStart(CommentAnchor),
+    /// A comment's citation point, which also ends its anchored range.
+    CommentRef(CommentAnchor),
+}
+
+/// Identifies the comment an inline [`InlineContent::CommentStart`] or
+/// [`InlineContent::CommentRef`] marker belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct CommentAnchor {
+    /// The comment's id — the `id` of its `Element::Endnote`.
+    pub comment_id: u32,
 }
 
 /// Concatenate a heading/paragraph's inline content into plain text —
@@ -1137,7 +1151,10 @@ pub fn inline_to_text(content: &[InlineContent]) -> String {
         match item {
             InlineContent::Text(span) => out.push_str(&span.text),
             InlineContent::LineBreak => out.push('\n'),
-            InlineContent::FootnoteRef(_) | InlineContent::EndnoteRef(_) => {},
+            InlineContent::FootnoteRef(_)
+            | InlineContent::EndnoteRef(_)
+            | InlineContent::CommentStart(_)
+            | InlineContent::CommentRef(_) => {},
         }
     }
     out

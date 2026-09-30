@@ -1332,6 +1332,108 @@ fn test_comment_bodies_reach_the_ir_with_their_author() {
     assert!(ir.plain_text().contains("Comment (Reviewer): "), "{}", ir.plain_text());
 }
 
+/// Where a comment's anchored range starts, and its citation point, as a
+/// sequence of markers around the paragraph's text.
+fn comment_shape(p: &Paragraph) -> Vec<String> {
+    p.content
+        .iter()
+        .map(|c| match c {
+            InlineContent::Text(s) => s.text.trim().to_string(),
+            InlineContent::CommentStart(a) => format!("<{}", a.comment_id),
+            InlineContent::CommentRef(a) => format!("{}>", a.comment_id),
+            other => format!("{other:?}"),
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+const COMMENTED_BODY: &str = r#"<w:p><w:r><w:t xml:space="preserve">Before </w:t></w:r>
+  <w:commentRangeStart w:id="4"/><w:r><w:t>commented</w:t></w:r><w:commentRangeEnd w:id="4"/>
+  <w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="4"/></w:r>
+  <w:r><w:t xml:space="preserve"> after</w:t></w:r></w:p>"#;
+const COMMENTS: &str = r#"<w:comment w:id="4" w:author="Reviewer"><w:p><w:r><w:t>Please check</w:t></w:r></w:p></w:comment>"#;
+
+/// `w:commentRangeStart` (ECMA-376 §17.13.4.4) and `w:commentReference`
+/// (§17.13.4.5) were never read into the IR, so a comment's body survived
+/// with no record of what it was about.
+#[test]
+fn test_comment_anchor_reaches_the_ir() {
+    let ir = Docx::new(COMMENTED_BODY)
+        .notes("comments.xml", rel_types::COMMENTS, CT_COMMENTS, COMMENTS)
+        .ir();
+    assert_eq!(comment_shape(para(&ir, 0)), ["Before", "<4", "commented", "4>", "after"]);
+}
+
+/// A DOCX comment read into the IR (an `Endnote` labelled "Comment (…)")
+/// was written back as an endnote: the writer had no comments part at
+/// all, so read→write turned every comment into an endnote detached from
+/// its anchor.
+#[test]
+fn test_a_comment_round_trips_as_an_anchored_comment() {
+    let ir = Docx::new(COMMENTED_BODY)
+        .notes("comments.xml", rel_types::COMMENTS, CT_COMMENTS, COMMENTS)
+        .ir();
+    let bytes = docx_bytes(&ir);
+    let doc = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes.clone())).unwrap();
+    assert_eq!(doc.comments.len(), 1, "written as a comment");
+    assert!(doc.endnotes.is_empty(), "not as an endnote");
+    assert_eq!(doc.comments[0].author.as_deref(), Some("Reviewer"));
+    let again = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(comment_shape(para(&again, 0)), ["Before", "<4", "commented", "4>", "after"]);
+    assert!(
+        again
+            .plain_text()
+            .contains("Comment (Reviewer): Please check")
+    );
+}
+
+/// A comment with no anchor in the IR (one from a slide or built by hand)
+/// is still a comment on write, cited at the end of the body.
+#[test]
+fn test_an_unanchored_comment_is_written_as_a_comment() {
+    let ir = DocumentIR {
+        metadata: Metadata {
+            format: DocumentFormat::Docx,
+            ..Default::default()
+        },
+        sections: vec![Section {
+            elements: vec![
+                Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain("Body"))],
+                    ..Default::default()
+                }),
+                Element::Endnote(Note {
+                    id: 9,
+                    content: vec![Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan::plain("Loose remark"))],
+                        ..Default::default()
+                    })],
+                    marker: Some("Comment (Ann)".to_string()),
+                    author: Some("Ann".to_string()),
+                }),
+            ],
+            ..Default::default()
+        }],
+        defined_names: Vec::new(),
+    };
+    let bytes = docx_bytes(&ir);
+    let doc = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes.clone())).unwrap();
+    assert_eq!(doc.comments.len(), 1);
+    assert!(doc.endnotes.is_empty());
+    let again = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert!(
+        comment_shape(para(&again, 0))
+            .iter()
+            .any(|s| s.ends_with('>')),
+        "the comment is cited in the body: {:?}",
+        para(&again, 0)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Image alt text must not also become body text
 // ---------------------------------------------------------------------------

@@ -1281,10 +1281,15 @@ fn convert_run(
                     marker: None,
                 }));
             },
-            // No IR-level representation for a comment's citation point
-            // today (only the comment body reaches the IR, via the
-            // existing Element::Endnote aliasing) — nothing to add here.
-            crate::docx::RunContent::CommentRef(_) => {},
+            // A comment's anchor: its range start and citation point. The
+            // body reaches the IR as the `Element::Endnote` labelled
+            // "Comment (…)" with the same id.
+            crate::docx::RunContent::CommentRangeStart(id) => {
+                content.push(InlineContent::CommentStart(CommentAnchor { comment_id: *id }));
+            },
+            crate::docx::RunContent::CommentRef(id) => {
+                content.push(InlineContent::CommentRef(CommentAnchor { comment_id: *id }));
+            },
             crate::docx::RunContent::FormField(ff) => {
                 if let Some(text) = &ff.display_text {
                     push_text(text, content);

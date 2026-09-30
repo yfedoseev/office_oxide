@@ -1225,6 +1225,21 @@ fn is_transparent_paragraph_wrapper(local: &str) -> bool {
     )
 }
 
+/// Record a `w:commentRangeStart` (ECMA-376 §17.13.4.4) in paragraph
+/// order. It is range markup between runs, so it gets a run of its own.
+fn push_comment_range_start(
+    e: &quick_xml::events::BytesStart,
+    content: &mut Vec<ParagraphContent>,
+) -> CoreResult<()> {
+    if let Some(id) = xml::optional_attr_str(e, "w:id")?.and_then(|v| v.parse::<u32>().ok()) {
+        content.push(ParagraphContent::Run(Run {
+            properties: None,
+            content: vec![RunContent::CommentRangeStart(id)],
+        }));
+    }
+    Ok(())
+}
+
 fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragraph> {
     let mut paragraph = Paragraph::default();
     // Depth of transparent wrappers we have descended into, so their
@@ -1299,9 +1314,16 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
                 local if is_transparent_paragraph_wrapper(local) => {
                     wrapper_depth += 1;
                 },
+                "commentRangeStart" => {
+                    push_comment_range_start(e, &mut paragraph.content)?;
+                    xml::skip_element_fast(reader)?;
+                },
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
+            },
+            Event::Empty(ref e) if e.local_name().as_ref() == "commentRangeStart" => {
+                push_comment_range_start(e, &mut paragraph.content)?;
             },
             Event::End(ref e) => {
                 let local = e.local_name();

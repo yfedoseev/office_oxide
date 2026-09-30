@@ -59,6 +59,8 @@ const CT_FOOTNOTES: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml";
 const CT_ENDNOTES: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml";
+const CT_COMMENTS: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml";
 
 use crate::core::xml::ns::{R_STR as R_NS, WML_STR as WML_NS};
 
@@ -155,6 +157,14 @@ pub struct Run {
     /// carries `w:customMarkFollows="1"` and the note body gets the glyph
     /// as its own leading run instead of an auto-number.
     pub note_ref_marker: Option<String>,
+    /// Comment range start (special run that emits only
+    /// `<w:commentRangeStart w:id>`). Written only for a comment added
+    /// with [`DocxWriter::add_comment`].
+    pub comment_start: Option<u32>,
+    /// Comment citation point (special run that emits
+    /// `<w:commentRangeEnd>` followed by a `<w:commentReference>` run).
+    /// Written only for a comment added with [`DocxWriter::add_comment`].
+    pub comment_ref: Option<u32>,
 }
 
 impl Run {
@@ -310,6 +320,7 @@ struct DocxTable {
     rows: Vec<Vec<String>>,
 }
 
+#[derive(Clone)]
 struct DocxRichParagraph {
     runs: Vec<Run>,
     props: IrParaProps,
@@ -397,6 +408,12 @@ struct DocxNote {
     elements: Vec<DocxElement>,
     /// Custom mark glyph (e.g. `*`); `None` means Word's own auto-number.
     marker: Option<String>,
+}
+
+struct DocxComment {
+    id: u32,
+    author: Option<String>,
+    elements: Vec<DocxElement>,
 }
 
 struct DocxRichList {
@@ -631,6 +648,7 @@ pub struct DocxWriter {
     hf_section_start: usize,
     footnotes: Vec<DocxNote>,
     endnotes: Vec<DocxNote>,
+    comments: Vec<DocxComment>,
     core_props: Option<CoreProps>,
     next_num_id: u32,
     /// Embedded font programs to ship inside the package under `word/fonts/`.
@@ -651,6 +669,7 @@ impl DocxWriter {
             hf_section_start: 0,
             footnotes: Vec::new(),
             endnotes: Vec::new(),
+            comments: Vec::new(),
             core_props: None,
             next_num_id: 3,
             embedded_fonts: Vec::new(),
@@ -955,6 +974,46 @@ impl DocxWriter {
         self
     }
 
+    /// Add a comment (written to `word/comments.xml`). Its anchor in the
+    /// text is a pair of runs with [`Run::comment_start`] and
+    /// [`Run::comment_ref`] set to `id`; a comment with no
+    /// `comment_ref` anywhere in the body is cited at the end of the last
+    /// body paragraph, so Word still shows it. A comment whose id was
+    /// already added gets a fresh id instead (and so is cited at the end:
+    /// the anchors name the first).
+    pub fn add_comment(
+        &mut self,
+        id: u32,
+        author: Option<String>,
+        content: &[crate::ir::Element],
+    ) -> &mut Self {
+        let id = if self.comments.iter().any(|c| c.id == id) {
+            let used: std::collections::HashSet<u32> = self.comments.iter().map(|c| c.id).collect();
+            let fresh = (0..=u32::MAX)
+                .find(|i| !used.contains(i))
+                .unwrap_or(u32::MAX);
+            log::warn!("docx writer: duplicate comment id {id} renumbered to {fresh}");
+            fresh
+        } else {
+            id
+        };
+        let mut elems: Vec<DocxElement> = Vec::new();
+        for elem in content {
+            convert_ir_element_to_docx_elements(
+                elem,
+                &mut elems,
+                &mut self.next_num_id,
+                &mut self.images,
+            );
+        }
+        self.comments.push(DocxComment {
+            id,
+            author,
+            elements: elems,
+        });
+        self
+    }
+
     /// Set document metadata (written to `docProps/core.xml`).
     pub fn set_metadata(&mut self, meta: &crate::ir::Metadata) -> &mut Self {
         let keywords = if meta.keywords.is_empty() {
@@ -1016,6 +1075,17 @@ impl DocxWriter {
     /// Write the document to an arbitrary `Write + Seek` destination.
     pub fn write_to<W: Write + Seek>(&self, writer: W) -> Result<()> {
         let opc = OpcWriter::new(writer)?;
+        // Comment anchors are written only for comments this package
+        // defines (see `write_run`); the set is scoped to this call.
+        struct Reset(Vec<u32>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                let previous = std::mem::take(&mut self.0);
+                WRITTEN_COMMENT_IDS.with(|ids| *ids.borrow_mut() = previous);
+            }
+        }
+        let ids: Vec<u32> = self.comments.iter().map(|c| c.id).collect();
+        let _reset = Reset(WRITTEN_COMMENT_IDS.with(|cur| cur.replace(ids)));
         self.write_package(opc)?;
         Ok(())
     }
@@ -1197,6 +1267,35 @@ impl DocxWriter {
             None
         };
 
+        // --- Comments ---
+        if !self.comments.is_empty() {
+            let part = PartName::new("/word/comments.xml")?;
+            opc.add_part_rel(&doc_part, rel_types::COMMENTS, "comments.xml");
+            let mut urls = Vec::new();
+            for c in &self.comments {
+                collect_hyperlinks(&c.elements, &mut urls);
+            }
+            let mut links = HyperlinkRids::new();
+            for url in urls {
+                let rid = opc.add_part_rel_with_mode(
+                    &part,
+                    rel_types::HYPERLINK,
+                    &url,
+                    crate::core::relationships::TargetMode::External,
+                );
+                links.insert(url, rid);
+            }
+            let elems: Vec<&[DocxElement]> = self
+                .comments
+                .iter()
+                .map(|c| c.elements.as_slice())
+                .collect();
+            let comment_image_rids =
+                register_part_image_rids(&mut opc, &part, &elems, &image_rids, &self.images);
+            let xml = generate_comments_xml(&self.comments, &comment_image_rids, &links);
+            opc.add_part(&part, CT_COMMENTS, &xml)?;
+        }
+
         // --- Core properties ---
         if let Some(ref props) = self.core_props {
             let core_part = PartName::new("/docProps/core.xml")?;
@@ -1281,6 +1380,53 @@ impl DocxWriter {
 
         opc.finish()?;
         Ok(())
+    }
+
+    /// Ids of added comments that no `Run::comment_ref` anywhere in the
+    /// package cites.
+    fn unanchored_comment_ids(&self) -> Vec<u32> {
+        if self.comments.is_empty() {
+            return Vec::new();
+        }
+        fn walk(elements: &[DocxElement], out: &mut Vec<u32>) {
+            let runs = |runs: &[Run], out: &mut Vec<u32>| {
+                out.extend(runs.iter().filter_map(|r| r.comment_ref));
+            };
+            for e in elements {
+                match e {
+                    DocxElement::Paragraph(p) => runs(&p.runs, out),
+                    DocxElement::RichParagraph(p) => runs(&p.runs, out),
+                    DocxElement::RichList(l) => {
+                        for item in &l.items {
+                            walk(item, out);
+                        }
+                    },
+                    DocxElement::RichTable(t) => {
+                        for row in &t.rows {
+                            for c in &row.cells {
+                                walk(&c.content, out);
+                            }
+                        }
+                    },
+                    DocxElement::TextBox(tb) => walk(&tb.content, out),
+                    _ => {},
+                }
+            }
+        }
+        let mut cited = Vec::new();
+        walk(&self.elements, &mut cited);
+        for hf in &self.headers_footers {
+            walk(&hf.elements, &mut cited);
+        }
+        for n in self.footnotes.iter().chain(&self.endnotes) {
+            walk(&n.elements, &mut cited);
+        }
+        let cited: std::collections::HashSet<u32> = cited.into_iter().collect();
+        self.comments
+            .iter()
+            .map(|c| c.id)
+            .filter(|id| !cited.contains(id))
+            .collect()
     }
 
     fn has_text_boxes(&self) -> bool {
@@ -1391,6 +1537,22 @@ impl DocxWriter {
             .iter()
             .rposition(|e| matches!(e, DocxElement::SectPr(_)));
 
+        // A comment cited nowhere would never be shown; cite each such
+        // comment at the end of the last body paragraph (or in a
+        // paragraph of its own when the body ends in something else).
+        let unanchored = self.unanchored_comment_ids();
+        let last_para_idx = self
+            .elements
+            .iter()
+            .rposition(|e| !matches!(e, DocxElement::SectPr(_)))
+            .filter(|&i| matches!(self.elements[i], DocxElement::RichParagraph(_)));
+        let citations = || {
+            unanchored.iter().map(|&id| Run {
+                comment_ref: Some(id),
+                ..Default::default()
+            })
+        };
+
         let mut image_counter = 0u32;
         for (idx, element) in self.elements.iter().enumerate() {
             if let DocxElement::SectPr(sp) = element {
@@ -1402,7 +1564,22 @@ impl DocxWriter {
                 write_inline_section_break_paragraph(&mut w, sp, &hf_rids[sp.hf_range.clone()]);
                 continue;
             }
+            if Some(idx) == last_para_idx && !unanchored.is_empty() {
+                if let DocxElement::RichParagraph(p) = element {
+                    let mut cited = p.clone();
+                    cited.runs.extend(citations());
+                    write_rich_paragraph(&mut w, &cited, links);
+                    continue;
+                }
+            }
             write_docx_element(&mut w, element, image_rids, &mut image_counter, links);
+        }
+        if last_para_idx.is_none() && !unanchored.is_empty() {
+            let p = DocxRichParagraph {
+                runs: citations().collect(),
+                props: Default::default(),
+            };
+            write_rich_paragraph(&mut w, &p, links);
         }
 
         if let Some(sp) = sect_pr {
@@ -1933,6 +2110,14 @@ fn ir_inline_to_runs(content: &[crate::ir::InlineContent]) -> Vec<Run> {
                 };
                 runs.push(run);
             },
+            InlineContent::CommentStart(a) => runs.push(Run {
+                comment_start: Some(a.comment_id),
+                ..Default::default()
+            }),
+            InlineContent::CommentRef(a) => runs.push(Run {
+                comment_ref: Some(a.comment_id),
+                ..Default::default()
+            }),
         }
     }
     runs
@@ -2467,7 +2652,53 @@ fn write_field_run(w: &mut Writer<Vec<u8>>, run: &Run, instr: &str) {
         .expect("write r end");
 }
 
+thread_local! {
+    /// Ids of the comments the package being written defines, set for the
+    /// duration of [`DocxWriter::write_to`]. An anchor for any other id
+    /// would dangle — a `w:commentReference` whose comment does not exist.
+    static WRITTEN_COMMENT_IDS: std::cell::RefCell<Vec<u32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn comment_is_written(id: u32) -> bool {
+    WRITTEN_COMMENT_IDS.with(|ids| ids.borrow().contains(&id))
+}
+
+/// `<w:commentRangeEnd>` then the `<w:commentReference>` run, the shape
+/// Word writes at a comment's citation point (ECMA-376 §17.13.4.3,
+/// §17.13.4.5).
+fn write_comment_reference(w: &mut Writer<Vec<u8>>, id: u32) {
+    let id = id.to_string();
+    let mut end = BytesStart::new("w:commentRangeEnd");
+    end.push_attribute(("w:id", id.as_str()));
+    w.write_event(Event::Empty(end))
+        .expect("write commentRangeEnd");
+    w.write_event(Event::Start(BytesStart::new("w:r")))
+        .expect("write r start");
+    let mut reference = BytesStart::new("w:commentReference");
+    reference.push_attribute(("w:id", id.as_str()));
+    w.write_event(Event::Empty(reference))
+        .expect("write commentReference");
+    w.write_event(Event::End(BytesEnd::new("w:r")))
+        .expect("write r end");
+}
+
 fn write_run(w: &mut Writer<Vec<u8>>, run: &Run) {
+    if let Some(id) = run.comment_start {
+        if comment_is_written(id) {
+            let mut start = BytesStart::new("w:commentRangeStart");
+            start.push_attribute(("w:id", id.to_string().as_str()));
+            w.write_event(Event::Empty(start))
+                .expect("write commentRangeStart");
+        }
+        return;
+    }
+    if let Some(id) = run.comment_ref {
+        if comment_is_written(id) {
+            write_comment_reference(w, id);
+        }
+        return;
+    }
     if let Some(note_id) = run.footnote_ref {
         write_footnote_ref_run(w, note_id, false, run.note_ref_marker.as_deref());
         return;
@@ -3800,6 +4031,47 @@ fn generate_endnotes_xml(
     links: &HyperlinkRids,
 ) -> Vec<u8> {
     generate_notes_xml(notes, image_rids, true, links)
+}
+
+/// `word/comments.xml` (ECMA-376 §17.13.4.2).
+fn generate_comments_xml(
+    comments: &[DocxComment],
+    image_rids: &[ImageInfo],
+    links: &HyperlinkRids,
+) -> Vec<u8> {
+    let mut w = Writer::new(Vec::new());
+    w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
+        .expect("write decl");
+    let mut root = BytesStart::new("w:comments");
+    root.push_attribute(("xmlns:w", WML_NS));
+    root.push_attribute(("xmlns:r", R_NS));
+    root.push_attribute(("xmlns:wp", DRAWING_NS));
+    root.push_attribute(("xmlns:a", DML_NS));
+    root.push_attribute(("xmlns:pic", PIC_NS));
+    root.push_attribute(("xmlns:wps", WPS_NS));
+    w.write_event(Event::Start(root))
+        .expect("write comments root");
+    for c in comments {
+        let mut elem = BytesStart::new("w:comment");
+        elem.push_attribute(("w:id", c.id.to_string().as_str()));
+        // `w:author` is required by CT_Comment's base type.
+        let author = crate::core::xml::sanitize_xml_text(c.author.as_deref().unwrap_or(""));
+        elem.push_attribute(("w:author", author.as_ref()));
+        w.write_event(Event::Start(elem)).expect("write comment");
+        let mut ic = 0u32;
+        for e in &c.elements {
+            write_docx_element(&mut w, e, image_rids, &mut ic, links);
+        }
+        if c.elements.is_empty() {
+            w.write_event(Event::Empty(BytesStart::new("w:p")))
+                .expect("write p");
+        }
+        w.write_event(Event::End(BytesEnd::new("w:comment")))
+            .expect("write comment end");
+    }
+    w.write_event(Event::End(BytesEnd::new("w:comments")))
+        .expect("write comments end");
+    w.into_inner()
 }
 
 /// `word/settings.xml`, written only when a part depends on it.
