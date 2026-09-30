@@ -114,6 +114,16 @@ pub fn handle_tools_call(id: &Value, params: &Value) -> Value {
     }
 }
 
+/// Largest `extract` result the server will return, in bytes.
+///
+/// A tool result is one JSON string held in memory (and then escaped into a
+/// second copy for the response line), and no MCP client can put tens of
+/// megabytes in front of a model anyway. The CLI documents what an unbounded
+/// buffer did on large workbooks — multi-gigabyte RSS and OOM kills — so an
+/// oversized result is refused with a message saying so, rather than
+/// silently truncated.
+const MAX_EXTRACT_BYTES: usize = 32 * 1024 * 1024;
+
 fn call_extract(id: &Value, args: &Value) -> Value {
     let Some(file_path) = args["file_path"].as_str() else {
         return error_response(id, INVALID_PARAMS, "missing file_path");
@@ -125,6 +135,20 @@ fn call_extract(id: &Value, args: &Value) -> Value {
         Err(e) => return tool_error(id, &e.to_string()),
     };
 
+    match render(&doc, format, MAX_EXTRACT_BYTES) {
+        Ok(content) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [{ "type": "text", "text": content }]
+            }
+        }),
+        Err(message) => tool_error(id, &message),
+    }
+}
+
+/// Render `doc` in `format`, refusing a result larger than `limit` bytes.
+fn render(doc: &office_oxide::Document, format: &str, limit: usize) -> Result<String, String> {
     let content = match format {
         "text" => doc.plain_text(),
         "markdown" => doc.to_markdown(),
@@ -137,20 +161,57 @@ fn call_extract(id: &Value, args: &Value) -> Value {
             })
         },
         "html" => doc.to_html(),
-        "ir" => match serde_json::to_string_pretty(&doc.to_ir()) {
-            Ok(s) => s,
-            Err(e) => return tool_error(id, &e.to_string()),
+        // The IR is serialised through a bounded writer, so an oversized
+        // document stops at the limit instead of building the whole string.
+        "ir" => {
+            let mut out = BoundedBuf {
+                buf: Vec::new(),
+                limit,
+                exceeded: false,
+            };
+            match serde_json::to_writer_pretty(&mut out, &doc.to_ir()) {
+                Ok(()) => String::from_utf8(out.buf).map_err(|e| e.to_string())?,
+                Err(_) if out.exceeded => return Err(too_large(format, limit)),
+                Err(e) => return Err(e.to_string()),
+            }
         },
-        other => return tool_error(id, &format!("unknown format: {other}")),
+        other => return Err(format!("unknown format: {other}")),
     };
+    if content.len() > limit {
+        return Err(too_large(format, limit));
+    }
+    Ok(content)
+}
 
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": {
-            "content": [{ "type": "text", "text": content }]
+fn too_large(format: &str, limit: usize) -> String {
+    format!(
+        "the {format} output of this document exceeds the {} MiB limit for one tool result; \
+         try a more compact format (\"text\" or \"markdown\"), or run the office-oxide CLI, \
+         which streams its output",
+        limit / (1024 * 1024)
+    )
+}
+
+/// A `Vec<u8>` writer that fails once `limit` bytes would be exceeded.
+struct BoundedBuf {
+    buf: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl std::io::Write for BoundedBuf {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len().saturating_add(data.len()) > self.limit {
+            self.exceeded = true;
+            return Err(std::io::Error::other("output limit exceeded"));
         }
-    })
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn call_replace_text(id: &Value, args: &Value) -> Value {
@@ -203,12 +264,8 @@ fn call_info(id: &Value, args: &Value) -> Value {
     };
 
     let ir = doc.to_ir();
-    let info = json!({
-        "format": format!("{:?}", ir.metadata.format),
-        "title": ir.metadata.title,
-        "sections": ir.sections.len(),
-        "section_names": ir.sections.iter().map(|s| s.title.clone()).collect::<Vec<_>>(),
-    });
+    let size = std::fs::metadata(file_path).ok().map(|m| m.len());
+    let info = info_json(&ir, size);
 
     json!({
         "jsonrpc": "2.0",
@@ -216,6 +273,35 @@ fn call_info(id: &Value, args: &Value) -> Value {
         "result": {
             "content": [{ "type": "text", "text": info.to_string() }]
         }
+    })
+}
+
+/// Shown when the parser detected that it could not recover all of the
+/// document's text. Same wording as the CLI's `info`.
+const TRUNCATION_WARNING: &str = "text extraction is incomplete — the source file's own \
+     structure disagrees with itself about how much text there is, and the gap could not be \
+     safely recovered";
+
+/// The `info` tool's result.
+///
+/// `metadata` is the IR's own serde form, so every document property the
+/// library parses (author, subject, keywords, dates, …) reaches the agent
+/// without this tool having to be kept in step by hand. `warnings` carries
+/// the truncation signal the CLI already surfaced: without it an agent had
+/// no way to learn that an extraction was incomplete.
+fn info_json(ir: &office_oxide::DocumentIR, file_size: Option<u64>) -> Value {
+    let mut warnings = Vec::new();
+    if ir.metadata.text_truncated {
+        warnings.push(TRUNCATION_WARNING);
+    }
+    json!({
+        "format": format!("{:?}", ir.metadata.format),
+        "title": ir.metadata.title,
+        "file_size": file_size,
+        "metadata": ir.metadata,
+        "warnings": warnings,
+        "sections": ir.sections.len(),
+        "section_names": ir.sections.iter().map(|s| s.title.clone()).collect::<Vec<_>>(),
     })
 }
 
@@ -254,6 +340,69 @@ mod tests {
         let mut w = office_oxide::docx::write::DocxWriter::new();
         w.add_paragraph(text);
         w.save(path).unwrap();
+    }
+
+    /// The result of `extract` was one unbounded in-memory string — the
+    /// pattern the CLI documents as costing gigabytes on large workbooks —
+    /// with no guard. Over the limit it is now an explicit tool error for
+    /// every format, including the streamed IR path.
+    #[test]
+    fn test_extract_refuses_output_over_the_size_limit() {
+        let dir = scratch_dir("size_limit");
+        let path = dir.join("doc.docx");
+        write_docx(&path, &"lorem ipsum ".repeat(200));
+        let doc = office_oxide::Document::open(&path).unwrap();
+        for format in ["text", "markdown", "markdown-with-images", "html", "ir"] {
+            let full = render(&doc, format, usize::MAX).expect("unbounded render");
+            assert!(full.len() > 64, "{format} too small to test");
+            let err = render(&doc, format, 64).expect_err("over the limit must fail");
+            assert!(err.contains("exceeds"), "{format}: {err}");
+            // At exactly its own size it still fits.
+            assert_eq!(render(&doc, format, full.len()).unwrap(), full, "{format}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `info` returned only format/title/sections: the truncation warning
+    /// the CLI prints never reached an agent, and author, subject,
+    /// keywords and the dates were parsed but not reported.
+    #[test]
+    fn test_info_reports_metadata_and_the_truncation_warning() {
+        use office_oxide::format::DocumentFormat;
+        use office_oxide::ir::Metadata;
+        let mut metadata = Metadata {
+            format: DocumentFormat::Doc,
+            ..Default::default()
+        };
+        metadata.author = Some("Ada".into());
+        metadata.subject = Some("Numbers".into());
+        metadata.keywords = vec!["q3".into()];
+        metadata.created = Some("2024-01-02T03:04:05Z".into());
+        metadata.modified = Some("2024-02-03T04:05:06Z".into());
+        metadata.text_truncated = true;
+        let ir = office_oxide::DocumentIR {
+            metadata,
+            sections: Vec::new(),
+            defined_names: Vec::new(),
+        };
+        let info = info_json(&ir, Some(42));
+        assert_eq!(info["file_size"], json!(42));
+        assert_eq!(info["metadata"]["author"], json!("Ada"));
+        assert_eq!(info["metadata"]["subject"], json!("Numbers"));
+        assert_eq!(info["metadata"]["keywords"], json!(["q3"]));
+        assert_eq!(info["metadata"]["created"], json!("2024-01-02T03:04:05Z"));
+        assert_eq!(info["metadata"]["modified"], json!("2024-02-03T04:05:06Z"));
+        assert_eq!(info["metadata"]["text_truncated"], json!(true));
+        let warnings = info["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].as_str().unwrap().contains("incomplete"));
+
+        let clean = office_oxide::DocumentIR {
+            metadata: Metadata::default(),
+            sections: Vec::new(),
+            defined_names: Vec::new(),
+        };
+        assert_eq!(info_json(&clean, None)["warnings"], json!([]));
     }
 
     /// An empty `find` interleaved the replacement between every character
