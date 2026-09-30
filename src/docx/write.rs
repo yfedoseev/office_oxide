@@ -3151,8 +3151,14 @@ fn write_text_box(
     w.write_event(Event::Start(BytesStart::new("w:txbxContent")))
         .expect("write txbxContent start");
     let mut txb_ic = 0u32;
+    let before = w.get_ref().len();
     for elem in &tb.content {
         write_docx_element(w, elem, image_rids, &mut txb_ic, links);
+    }
+    // CT_TxbxContent (wml.xsd) requires at least one block-level element.
+    if w.get_ref().len() == before {
+        w.write_event(Event::Empty(BytesStart::new("w:p")))
+            .expect("write empty p");
     }
     w.write_event(Event::End(BytesEnd::new("w:txbxContent")))
         .expect("write txbxContent end");
@@ -5362,6 +5368,28 @@ mod tests {
             settings.contains("<w:evenAndOddHeaders/>"),
             "settings.xml must enable even/odd headers: {settings}"
         );
+    }
+
+    /// `CT_TxbxContent` requires at least one block-level element; an empty
+    /// text box wrote `<w:txbxContent></w:txbxContent>`.
+    #[test]
+    fn test_empty_text_box_content_holds_a_paragraph() {
+        for content in [
+            vec![],
+            // Content that writes nothing of its own.
+            vec![crate::ir::Element::Shape(Default::default())],
+        ] {
+            let mut doc = DocxWriter::new();
+            doc.add_text_box(&crate::ir::TextBox {
+                content,
+                ..Default::default()
+            });
+            let xml = &all_parts(doc)["word/document.xml"];
+            let start = xml.find("<w:txbxContent>").expect(xml);
+            let end = xml.find("</w:txbxContent>").expect(xml);
+            let inner = &xml[start + "<w:txbxContent>".len()..end];
+            assert!(inner.starts_with("<w:p"), "empty txbxContent: {xml}");
+        }
     }
 
     /// Word draws `w:background` only when settings.xml carries
