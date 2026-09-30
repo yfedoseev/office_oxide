@@ -1,14 +1,34 @@
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use crate::docx::styles::CellStyleLayer;
 use crate::docx::{DocxDocument, ParagraphProperties, RunProperties};
 use crate::format::DocumentFormat;
 use crate::ir::*;
 
+/// Style-chain folds already computed in one conversion. A run's inherited
+/// formatting depends only on the table-style layer it sits in, its
+/// paragraph style and its character style; folding the chains again for
+/// every run cost several property-set copies per run on documents whose
+/// thousands of runs share a handful of styles. Keys are the stylesheet's
+/// own style-id strings.
+#[derive(Default)]
+struct StyleFolds<'d> {
+    runs: RefCell<HashMap<(u32, Option<&'d str>, Option<&'d str>), Rc<RunProperties>>>,
+    paragraphs: RefCell<HashMap<(u32, Option<&'d str>), Rc<ParagraphProperties>>>,
+    /// Ids for table-style layers; 0 means "not in a styled cell".
+    next_layer: Cell<u32>,
+}
+
 /// Everything the `docx_to_ir` helpers share: the document (which it
-/// dereferences to) and the table-style layer of the cell being converted.
+/// dereferences to), the table-style layer of the cell being converted,
+/// and the per-conversion memo of style folds.
 struct Cx<'a, 'd> {
     doc: &'d DocxDocument,
-    /// The enclosing table cell's style layer.
-    table: Option<&'a CellStyleLayer>,
+    /// The enclosing table cell's style layer and its memo id.
+    table: Option<(u32, &'a CellStyleLayer)>,
+    folds: &'a StyleFolds<'d>,
 }
 
 impl std::ops::Deref for Cx<'_, '_> {
@@ -18,36 +38,88 @@ impl std::ops::Deref for Cx<'_, '_> {
     }
 }
 
+/// A run's effective properties: the memoized inherited set when the run
+/// has no `w:rPr` of its own, otherwise that set with the run's overlaid.
+enum EffectiveRun {
+    Inherited(Rc<RunProperties>),
+    Own(RunProperties),
+}
+
+impl std::ops::Deref for EffectiveRun {
+    type Target = RunProperties;
+    fn deref(&self) -> &RunProperties {
+        match self {
+            EffectiveRun::Inherited(rp) => rp,
+            EffectiveRun::Own(rp) => rp,
+        }
+    }
+}
+
 impl<'a, 'd> Cx<'a, 'd> {
     /// The same context inside a table cell whose style layer is `layer`.
-    fn in_cell<'b>(&'b self, layer: Option<&'b CellStyleLayer>) -> Cx<'b, 'd> {
+    fn in_cell<'b>(&'b self, layer: Option<&'b (u32, CellStyleLayer)>) -> Cx<'b, 'd> {
         Cx {
             doc: self.doc,
-            table: layer,
+            table: layer.map(|(id, l)| (*id, l)),
+            folds: self.folds,
         }
+    }
+
+    /// A fresh memo id for a table-style layer.
+    fn layer_id(&self) -> u32 {
+        let id = self.folds.next_layer.get().saturating_add(1);
+        self.folds.next_layer.set(id);
+        id
+    }
+
+    /// Intern a style id as the stylesheet's own key, so it can key the
+    /// memo for the whole conversion. An id the stylesheet does not define
+    /// contributes nothing to a fold, exactly like no id.
+    fn style_key(&self, id: Option<&str>) -> Option<&'d str> {
+        let sheet = self.doc.styles.as_ref()?;
+        sheet.styles.get_key_value(id?).map(|(k, _)| k.as_str())
     }
 
     /// Effective run properties: document defaults, this cell's table
     /// layer, the paragraph style chain, the character style chain, then
-    /// the run's own `w:rPr`.
+    /// the run's own `w:rPr` — the chains folded once per combination.
     fn run_properties(
         &self,
         paragraph_style_id: Option<&str>,
         direct: Option<&RunProperties>,
-    ) -> Option<RunProperties> {
+    ) -> Option<EffectiveRun> {
         let Some(sheet) = self.doc.styles.as_ref() else {
-            return direct.cloned();
+            return direct.cloned().map(EffectiveRun::Own);
         };
-        Some(sheet.effective_run_properties_in(
-            self.table.map(|l| &l.run),
-            paragraph_style_id,
-            direct,
-        ))
+        let (layer_id, layer) = match self.table {
+            Some((id, l)) => (id, Some(&l.run)),
+            None => (0, None),
+        };
+        let pkey = self.style_key(paragraph_style_id);
+        let ckey = self.style_key(direct.and_then(|d| d.style_id.as_deref()));
+        let key = (layer_id, pkey, ckey);
+        let cached = self.folds.runs.borrow().get(&key).cloned();
+        let base = match cached {
+            Some(b) => b,
+            None => {
+                let b = Rc::new(sheet.run_style_base(layer, pkey, ckey));
+                self.folds.runs.borrow_mut().insert(key, Rc::clone(&b));
+                b
+            },
+        };
+        Some(match direct {
+            None => EffectiveRun::Inherited(base),
+            Some(d) => {
+                let mut own = (*base).clone();
+                own.overlay(d);
+                EffectiveRun::Own(own)
+            },
+        })
     }
 
     /// Effective paragraph properties: document defaults, this cell's
-    /// table layer, the paragraph style chain, then the paragraph's own
-    /// `w:pPr`.
+    /// table layer, the paragraph style chain (folded once per style),
+    /// then the paragraph's own `w:pPr`.
     fn paragraph_properties(
         &self,
         direct: Option<&ParagraphProperties>,
@@ -55,12 +127,39 @@ impl<'a, 'd> Cx<'a, 'd> {
         let Some(sheet) = self.doc.styles.as_ref() else {
             return direct.cloned();
         };
-        Some(sheet.effective_paragraph_properties_in(self.table.map(|l| &l.paragraph), direct))
+        let (layer_id, layer) = match self.table {
+            Some((id, l)) => (id, Some(&l.paragraph)),
+            None => (0, None),
+        };
+        let pkey = self.style_key(direct.and_then(|d| d.style_id.as_deref()));
+        let key = (layer_id, pkey);
+        let cached = self.folds.paragraphs.borrow().get(&key).cloned();
+        let base = match cached {
+            Some(b) => b,
+            None => {
+                let b = Rc::new(sheet.paragraph_style_base(layer, pkey));
+                self.folds
+                    .paragraphs
+                    .borrow_mut()
+                    .insert(key, Rc::clone(&b));
+                b
+            },
+        };
+        let mut out = (*base).clone();
+        if let Some(d) = direct {
+            out.overlay(d);
+        }
+        Some(out)
     }
 }
 
 pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
-    let cx = Cx { doc, table: None };
+    let folds = StyleFolds::default();
+    let cx = Cx {
+        doc,
+        table: None,
+        folds: &folds,
+    };
     let doc = &cx;
     // Build per-section block-element windows from `body.section_breaks`.
     // Each break index is the exclusive end of one section. Trailing
@@ -1281,7 +1380,7 @@ fn convert_run_content(
     let resolved = ctx
         .cx
         .run_properties(ctx.paragraph_style_id, run_properties);
-    let effective: Option<&crate::docx::RunProperties> = resolved.as_ref();
+    let effective: Option<&crate::docx::RunProperties> = resolved.as_deref();
     // `<w:vanish/>` — Word never renders this run at all. Excluding it
     // here (rather than carrying a `hidden` flag into the IR for every
     // renderer to filter separately) keeps plain_text/to_markdown/to_html
@@ -1855,7 +1954,7 @@ fn convert_table(table: &crate::docx::Table, doc: &Cx<'_, '_>) -> Element {
     );
     // The run and paragraph formatting the style gives each distinct set of
     // regions (a bold header row, banded rows, ...), built once per set.
-    let mut layers: Vec<(Vec<&'static str>, Option<CellStyleLayer>)> = Vec::new();
+    let mut layers: Vec<(Vec<&'static str>, Option<(u32, CellStyleLayer)>)> = Vec::new();
 
     let mut ir_rows = Vec::new();
     for (row_idx, row) in table.rows.iter().enumerate() {
@@ -1897,7 +1996,7 @@ fn convert_table(table: &crate::docx::Table, doc: &Cx<'_, '_>) -> Element {
             let slot = match layers.iter().position(|(r, _)| *r == regions) {
                 Some(i) => i,
                 None => {
-                    let layer = style.cell_layer(&regions);
+                    let layer = style.cell_layer(&regions).map(|l| (doc.layer_id(), l));
                     layers.push((regions.clone(), layer));
                     layers.len() - 1
                 },

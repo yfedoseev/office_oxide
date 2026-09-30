@@ -491,3 +491,82 @@ fn test_docx_to_ir_converts_each_paragraph_once() {
     // for the paragraph and for the run.
     assert!(per_para < 16.0, "{per_para:.1} allocations per paragraph");
 }
+
+/// Paragraphs of many runs that carry no formatting of their own, under a
+/// deep paragraph-style chain in which every level names its fonts.
+fn deep_style_chain_docx(paragraphs: usize, runs: usize) -> Vec<u8> {
+    const DEPTH: usize = 6;
+    let run = r#"<w:r><w:t xml:space="preserve">word </w:t></w:r>"#.repeat(runs);
+    let mut body = String::new();
+    for _ in 0..paragraphs {
+        body.push_str(&format!(
+            r#"<w:p><w:pPr><w:pStyle w:val="S{}"/></w:pPr>{run}</w:p>"#,
+            DEPTH - 1
+        ));
+    }
+    let mut styles = String::from(
+        r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+      <w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Calibri" w:cs="Calibri"/></w:rPr></w:rPrDefault></w:docDefaults>"#,
+    );
+    for i in 0..DEPTH {
+        let based = if i == 0 {
+            String::new()
+        } else {
+            format!(r#"<w:basedOn w:val="S{}"/>"#, i - 1)
+        };
+        styles.push_str(&format!(
+            r#"<w:style w:type="paragraph" w:styleId="S{i}"><w:name w:val="S{i}"/>{based}
+               <w:pPr><w:tabs><w:tab w:val="left" w:pos="{p}"/></w:tabs></w:pPr>
+               <w:rPr><w:rFonts w:ascii="F{i}" w:hAnsi="F{i}" w:eastAsia="F{i}" w:cs="F{i}"/></w:rPr></w:style>"#,
+            p = 720 * (i + 1)
+        ));
+    }
+    styles.push_str("</w:styles>");
+    let doc = format!(
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>"#
+    );
+    zip_of(&[
+        (
+            "[Content_Types].xml",
+            br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>"#,
+        ),
+        (
+            "_rels/.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+        ),
+        (
+            "word/_rels/document.xml.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#,
+        ),
+        ("word/document.xml", doc.as_bytes()),
+        ("word/styles.xml", styles.as_bytes()),
+    ])
+}
+
+/// `to_ir()` folded the whole style chain — document defaults, every
+/// paragraph style up the `w:basedOn` chain, the character style — once
+/// per run, copying each level's font names on the way, although the
+/// result depends only on the (paragraph style, character style) pair.
+/// The folds are now memoized for the conversion: a run with no `w:rPr`
+/// of its own shares the folded set, and a paragraph copies it once.
+#[test]
+fn test_docx_to_ir_folds_each_style_chain_once_per_conversion() {
+    let _serial = serial();
+    const PARAS: usize = 200;
+    const RUNS: usize = 10;
+    let doc = |n: usize| {
+        office_oxide::Document::from_reader(
+            Cursor::new(deep_style_chain_docx(n, RUNS)),
+            office_oxide::DocumentFormat::Docx,
+        )
+        .unwrap()
+    };
+    let small = doc(1);
+    let big = doc(PARAS);
+    let (_, baseline) = allocations_during(|| small.to_ir());
+    let (ir, allocs) = allocations_during(|| big.to_ir());
+    assert!(ir.plain_text().contains("word"));
+    let per_run = allocs.saturating_sub(baseline) as f64 / (PARAS * RUNS) as f64;
+    // Folding per run copied four font names at each of seven levels.
+    assert!(per_run < 4.0, "{per_run:.1} allocations per run");
+}
