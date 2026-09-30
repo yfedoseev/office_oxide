@@ -780,6 +780,73 @@ fn test_list_start_number_and_style_reach_the_ir() {
     assert_eq!(list.style, Some(ListStyle::LowerAlpha));
 }
 
+/// A bullet level's `w:lvlText` is the glyph Word draws; the writer maps
+/// `ListStyle::Square`/`Circle`/`Dash` to ▪/○/– and the reader turned every
+/// glyph back into a plain bullet, so the marker changed on a round-trip.
+#[test]
+fn test_bullet_glyph_selects_the_list_style() {
+    let level = |id: u32, glyph: &str| {
+        format!(
+            r#"<w:abstractNum w:abstractNumId="{id}"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/>
+                 <w:lvlText w:val="{glyph}"/></w:lvl></w:abstractNum>
+               <w:num w:numId="{id}"><w:abstractNumId w:val="{id}"/></w:num>"#
+        )
+    };
+    let glyphs = [
+        ("\u{25AA}", ListStyle::Square),
+        ("\u{25CB}", ListStyle::Circle),
+        ("o", ListStyle::Circle),
+        ("\u{2013}", ListStyle::Dash),
+        ("\u{2022}", ListStyle::Bullet),
+        ("\u{F0A7}", ListStyle::Square),
+    ];
+    let mut numbering = String::new();
+    let mut body = String::new();
+    for (i, (glyph, _)) in glyphs.iter().enumerate() {
+        let id = i as u32 + 1;
+        numbering.push_str(&level(id, glyph));
+        body.push_str(&format!(
+            r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="{id}"/></w:numPr></w:pPr>
+                 <w:r><w:t>item {id}</w:t></w:r></w:p><w:p><w:r><w:t>gap</w:t></w:r></w:p>"#
+        ));
+    }
+    let ir = Docx::new(&body).numbering(&numbering).ir();
+    let styles: Vec<_> = ir.sections[0]
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            Element::List(l) => Some(l.style.clone()),
+            _ => None,
+        })
+        .collect();
+    let want: Vec<_> = glyphs.iter().map(|(_, s)| Some(s.clone())).collect();
+    assert_eq!(styles, want);
+}
+
+/// A numbered heading is not turned into a list item, so its level's
+/// `w:pPr/w:ind` is the only place its indentation comes from; direct
+/// `w:ind` still wins.
+#[test]
+fn test_numbering_level_indent_applies_to_a_numbered_heading() {
+    let ir = Docx::new(
+        r#"<w:p><w:pPr><w:outlineLvl w:val="0"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>One</w:t></w:r></w:p>
+           <w:p><w:pPr><w:outlineLvl w:val="0"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr><w:ind w:left="100"/></w:pPr><w:r><w:t>Two</w:t></w:r></w:p>"#,
+    )
+    .numbering(
+        r#"<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/>
+             <w:pPr><w:ind w:left="432" w:hanging="432"/></w:pPr></w:lvl></w:abstractNum>
+           <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#,
+    )
+    .ir();
+    let heading = |i: usize| match &ir.sections[0].elements[i] {
+        Element::Heading(h) => h,
+        other => panic!("not a heading: {other:?}"),
+    };
+    assert_eq!(heading(0).indent_left_twips, Some(432));
+    assert_eq!(heading(0).first_line_indent_twips, Some(-432));
+    assert_eq!(heading(1).indent_left_twips, Some(100));
+}
+
 #[test]
 fn test_num_id_zero_is_not_a_list() {
     // `<w:numId w:val="0"/>` explicitly removes numbering. Treating it as a

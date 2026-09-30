@@ -975,10 +975,25 @@ fn effective_paragraph_props(
     p: &crate::docx::Paragraph,
     doc: &crate::docx::DocxDocument,
 ) -> Option<crate::docx::ParagraphProperties> {
-    match doc.styles.as_ref() {
+    let mut eff = match doc.styles.as_ref() {
         Some(sheet) => Some(sheet.effective_paragraph_properties(p.properties.as_ref())),
         None => p.properties.clone(),
+    };
+    // A numbered paragraph's indentation comes from its numbering level's
+    // `w:pPr/w:ind` (ECMA-376 §17.9.6) unless the paragraph sets its own;
+    // Word applies it over the paragraph style's.
+    if let Some(pp) = eff.as_mut()
+        && p.properties.as_ref().is_none_or(|d| d.indent.is_none())
+        && let Some(nr) = pp.numbering_ref.as_ref().filter(|nr| nr.num_id != 0)
+        && let Some(ind) = doc
+            .numbering
+            .as_ref()
+            .and_then(|n| n.resolve_level(nr.num_id, nr.ilvl))
+            .and_then(|l| l.indent.clone())
+    {
+        pp.indent = Some(ind);
     }
+    eff
 }
 
 /// Recognise the `Heading1`..`Heading9` style-id convention and the
@@ -1403,7 +1418,8 @@ fn convert_list_group(
                         );
                         if top_ilvl.is_none_or(|t| nr.ilvl < t) {
                             top_ilvl = Some(nr.ilvl);
-                            style = number_format_to_list_style(&level.format);
+                            style = number_format_to_list_style(&level.format)
+                                .map(|s| bullet_glyph_style(s, &level.level_text));
                             // Honour this instance's own `<w:startOverride>`
                             // when present, falling back to the
                             // abstract level's own `<w:start>`. `w:start`
@@ -1453,6 +1469,26 @@ fn convert_list_group(
     list.start_number = start_number;
     list.style = style;
     Element::List(list)
+}
+
+/// Refine a bullet level's style by the glyph its `w:lvlText` draws: the
+/// writer encodes `Square`/`Circle`/`Dash` as ▪/○/– and every glyph used
+/// to read back as a plain bullet. Word's own gallery bullets are private
+/// use code points of the Symbol/Wingdings fonts (U+F0A7 is Wingdings'
+/// square, U+F0B7 Symbol's round bullet) and Courier New "o" is its
+/// open-circle bullet.
+fn bullet_glyph_style(style: ListStyle, level_text: &str) -> ListStyle {
+    if style != ListStyle::Bullet {
+        return style;
+    }
+    match level_text.trim() {
+        "\u{25AA}" | "\u{25A0}" | "\u{25FE}" | "\u{25FC}" | "\u{F0A7}" | "\u{F06E}" => {
+            ListStyle::Square
+        },
+        "\u{25CB}" | "\u{25E6}" | "o" | "\u{F06F}" => ListStyle::Circle,
+        "\u{2013}" | "\u{2014}" | "-" | "\u{2212}" => ListStyle::Dash,
+        _ => ListStyle::Bullet,
+    }
 }
 
 fn number_format_to_list_style(f: &crate::docx::NumberFormat) -> Option<ListStyle> {
