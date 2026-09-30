@@ -257,11 +257,13 @@ pub fn resolve_chp_segments(
 /// document-level precomputation [`resolve_chp_segments`] relies on to stay
 /// linear instead of doing this per paragraph.
 pub fn resolve_chp_cp_runs(runs: &[FkpRun], pieces: &[Piece]) -> Vec<(u32, u32, ChpProps)> {
+    let fc_index = super::papx::PieceFcIndex::new(pieces);
     let mut out: Vec<(u32, u32, ChpProps)> = runs
         .iter()
         .flat_map(|r| {
             let props = extract_chp_props(&r.grpprl);
-            super::papx::fc_run_to_cp_ranges(r.fc_start, r.fc_end, pieces)
+            fc_index
+                .cp_ranges(r.fc_start, r.fc_end)
                 .into_iter()
                 .map(move |(a, b)| (a, b, props.clone()))
         })

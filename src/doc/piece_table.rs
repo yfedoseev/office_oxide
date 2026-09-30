@@ -237,7 +237,9 @@ pub fn extract_text_range(
     }
     let max_chars = range_end;
 
-    for piece in pieces {
+    // Pieces are in CP order: start at the first one reaching the range.
+    let first = pieces.partition_point(|p| p.cp_end <= range_start);
+    for piece in &pieces[first..] {
         if piece.cp_start >= max_chars {
             break;
         }
@@ -369,8 +371,18 @@ pub(crate) fn decode_cp_range(
     if cp_end <= cp_start {
         return out;
     }
-    for piece in pieces {
-        if piece.cp_end <= cp_start || piece.cp_start >= cp_end {
+    // The pieces are in CP order (`parse_plc_pcd` rejects a piece whose
+    // range runs backwards, and each starts where the previous ends), so
+    // the first piece that reaches `cp_start` is a binary search away and
+    // the walk stops at the first piece past `cp_end` — not a scan of
+    // every piece for every range, which `build_paragraphs` calls once per
+    // CHP segment of every paragraph.
+    let first = pieces.partition_point(|p| p.cp_end <= cp_start);
+    for piece in &pieces[first..] {
+        if piece.cp_start >= cp_end {
+            break;
+        }
+        if piece.cp_end <= cp_start {
             continue;
         }
         let seg_start = cp_start.max(piece.cp_start);
@@ -658,6 +670,59 @@ fn parse_hyperlink_url(instruction: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `decode_cp_range` starts at the first piece reaching the range and
+    /// stops at the first past it; over many pieces, every range — inside
+    /// one piece, across several, at the edges, past the end — decodes to
+    /// exactly the corresponding slice of the whole text.
+    #[test]
+    fn test_decode_cp_range_over_many_pieces_matches_the_whole_text() {
+        let whole: Vec<char> = (0..600u32)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let mut word_doc = vec![0u8; 0x4000];
+        let mut pieces = Vec::new();
+        let mut cp = 0u32;
+        let mut byte = 0x200u32;
+        let mut i = 0;
+        while (cp as usize) < whole.len() {
+            let len = (1 + i % 9).min(whole.len() as u32 - cp);
+            let compressed = i % 3 == 0;
+            for k in 0..len {
+                let ch = whole[(cp + k) as usize] as u8;
+                if compressed {
+                    word_doc[(byte + k) as usize] = ch;
+                } else {
+                    word_doc[(byte + 2 * k) as usize] = ch;
+                }
+            }
+            pieces.push(Piece {
+                cp_start: cp,
+                cp_end: cp + len,
+                fc: if compressed {
+                    0x4000_0000 | (byte * 2)
+                } else {
+                    byte
+                },
+                is_compressed: compressed,
+                prm_grpprl: Vec::new(),
+            });
+            byte += if compressed { len } else { 2 * len } + 3;
+            cp += len;
+            i += 1;
+        }
+        let text = |a: usize, b: usize| {
+            whole[a.min(whole.len())..b.min(whole.len())]
+                .iter()
+                .collect::<String>()
+        };
+        for a in (0..620usize).step_by(7) {
+            for len in [1usize, 2, 9, 40, 700] {
+                let got = decode_cp_range(&word_doc, &pieces, a as u32, (a + len) as u32, 0x0409);
+                assert_eq!(got, text(a, a + len), "range {a}+{len}");
+            }
+        }
+    }
 
     #[test]
     fn test_parse_clx_with_one_piece() {
