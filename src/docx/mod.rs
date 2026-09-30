@@ -833,6 +833,7 @@ impl VmlContent {
         }
         for (rid, w, h) in self.images {
             out.push(RunContent::Drawing(Box::new(DrawingInfo {
+                decorative: false,
                 relationship_id: rid,
                 description: None,
                 width: w,
@@ -2253,6 +2254,7 @@ fn parse_inline_or_anchor_body(
     let mut shape: Option<crate::docx::image::ShapeInfo> = None;
     let mut chart_rel_id: Option<String> = None;
     let mut dgm_data_rel_id: Option<String> = None;
+    let mut decorative = false;
 
     let mut anchor_x: Option<i64> = None;
     let mut anchor_y: Option<i64> = None;
@@ -2270,7 +2272,7 @@ fn parse_inline_or_anchor_body(
                     if let Some(desc) = xml::optional_attr_str(e, "descr")? {
                         description = Some(desc.into_owned());
                     }
-                    xml::skip_element_fast(reader)?;
+                    decorative = parse_doc_pr_decorative(reader)?;
                 },
                 "positionH" => {
                     if let Some(rf) = xml::optional_attr_str(e, "relativeFrom")? {
@@ -2338,6 +2340,7 @@ fn parse_inline_or_anchor_body(
         || dgm_data_rel_id.is_some()
     {
         Ok(Some(DrawingInfo {
+            decorative,
             relationship_id: relationship_id.unwrap_or_default(),
             description,
             width,
@@ -2353,6 +2356,46 @@ fn parse_inline_or_anchor_body(
     } else {
         Ok(None)
     }
+}
+
+/// Read a `wp:docPr`'s children (its `Start` already consumed) for
+/// Office's decorative-picture flag: `<a:extLst><a:ext><adec:decorative
+/// val="1"/>` ([MS-ODRAWXML]). Consumes through `</wp:docPr>`.
+fn parse_doc_pr_decorative(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<bool> {
+    let flag = |e: &quick_xml::events::BytesStart| -> CoreResult<Option<bool>> {
+        if e.local_name().as_ref() != "decorative" {
+            return Ok(None);
+        }
+        Ok(Some(
+            xml::optional_attr_str(e, "val")?.is_some_and(|v| matches!(v.as_ref(), "1" | "true")),
+        ))
+    };
+    let mut decorative = false;
+    let mut depth = 1u32;
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => {
+                if let Some(v) = flag(e)? {
+                    decorative = v;
+                }
+                depth += 1;
+            },
+            Event::Empty(ref e) => {
+                if let Some(v) = flag(e)? {
+                    decorative = v;
+                }
+            },
+            Event::End(_) => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(decorative)
 }
 
 /// Parse the inside of `<wp:positionH>` or `<wp:positionV>` looking for

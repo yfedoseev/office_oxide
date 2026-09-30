@@ -9,6 +9,10 @@ use crate::core::units::Emu;
 /// decide what kind of IR `Element` to emit.
 #[derive(Debug, Clone)]
 pub struct DrawingInfo {
+    /// Marked decorative (`wp:docPr` extension `adec:decorative`
+    /// `val="1"`): the picture carries no meaning, so assistive
+    /// technology skips it.
+    pub decorative: bool,
     /// Relationship ID pointing to the image part. Empty when the
     /// drawing is a vector shape rather than a raster picture.
     pub relationship_id: String,

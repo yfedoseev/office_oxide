@@ -3430,13 +3430,53 @@ fn write_text_box(
         .expect("write p end");
 }
 
+/// Office's "mark as decorative" extension ([MS-ODRAWXML], the
+/// `adec:decorative` element in a `wp:docPr` extension list).
+const DECORATIVE_EXT_URI: &str = "{C183D7F6-B498-43B3-948B-1728B52AA6E4}";
+const DECORATIVE_NS: &str = "http://schemas.microsoft.com/office/drawing/2017/decorative";
+
+/// `wp:docPr` for a picture, with the decorative flag when set.
+fn write_picture_doc_pr(
+    w: &mut Writer<Vec<u8>>,
+    pic_id: u32,
+    alt_text: Option<&str>,
+    decorative: bool,
+) {
+    let mut doc_pr = BytesStart::new("wp:docPr");
+    doc_pr.push_attribute(("id", pic_id.to_string().as_str()));
+    doc_pr.push_attribute(("name", format!("Image{pic_id}").as_str()));
+    if let Some(alt) = alt_text {
+        doc_pr.push_attribute(("descr", alt));
+    }
+    if !decorative {
+        w.write_event(Event::Empty(doc_pr)).expect("write docPr");
+        return;
+    }
+    w.write_event(Event::Start(doc_pr)).expect("write docPr");
+    w.write_event(Event::Start(BytesStart::new("a:extLst")))
+        .expect("write extLst");
+    let mut ext = BytesStart::new("a:ext");
+    ext.push_attribute(("uri", DECORATIVE_EXT_URI));
+    w.write_event(Event::Start(ext)).expect("write ext");
+    let mut dec = BytesStart::new("adec:decorative");
+    dec.push_attribute(("xmlns:adec", DECORATIVE_NS));
+    dec.push_attribute(("val", "1"));
+    w.write_event(Event::Empty(dec)).expect("write decorative");
+    w.write_event(Event::End(BytesEnd::new("a:ext")))
+        .expect("write ext end");
+    w.write_event(Event::End(BytesEnd::new("a:extLst")))
+        .expect("write extLst end");
+    w.write_event(Event::End(BytesEnd::new("wp:docPr")))
+        .expect("write docPr end");
+}
+
 fn write_inline_image_run(
     w: &mut Writer<Vec<u8>>,
     rid: &str,
     width_emu: u64,
     height_emu: u64,
     alt_text: Option<&str>,
-    _decorative: bool,
+    decorative: bool,
     pic_id: u32,
 ) {
     w.write_event(Event::Start(BytesStart::new("w:p")))
@@ -3457,13 +3497,7 @@ fn write_inline_image_run(
     w.write_event(Event::Empty(extent)).expect("write extent");
 
     // wp:docPr
-    let mut doc_pr = BytesStart::new("wp:docPr");
-    doc_pr.push_attribute(("id", pic_id.to_string().as_str()));
-    doc_pr.push_attribute(("name", format!("Image{pic_id}").as_str()));
-    if let Some(alt) = alt_text {
-        doc_pr.push_attribute(("descr", alt));
-    }
-    w.write_event(Event::Empty(doc_pr)).expect("write docPr");
+    write_picture_doc_pr(w, pic_id, alt_text, decorative);
 
     // a:graphic
     w.write_event(Event::Start(BytesStart::new("a:graphic")))
@@ -3552,7 +3586,7 @@ fn write_floating_image_run(
     rid: &str,
     fi: &crate::ir::FloatingImage,
     alt_text: Option<&str>,
-    _decorative: bool,
+    decorative: bool,
     pic_id: u32,
 ) {
     let float_anchor_val = |a: &crate::ir::FloatAnchor| match a {
@@ -3663,13 +3697,7 @@ fn write_floating_image_run(
 
     // CT_Anchor orders EG_WrapType before docPr; emitting docPr first
     // produces a schema-invalid drawing.
-    let mut doc_pr = BytesStart::new("wp:docPr");
-    doc_pr.push_attribute(("id", pic_id.to_string().as_str()));
-    doc_pr.push_attribute(("name", format!("Image{pic_id}").as_str()));
-    if let Some(alt) = alt_text {
-        doc_pr.push_attribute(("descr", alt));
-    }
-    w.write_event(Event::Empty(doc_pr)).expect("write docPr");
+    write_picture_doc_pr(w, pic_id, alt_text, decorative);
 
     // a:graphic (same pic:pic structure as inline)
     w.write_event(Event::Start(BytesStart::new("a:graphic")))

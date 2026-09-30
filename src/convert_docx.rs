@@ -793,6 +793,7 @@ fn collect_paragraph_inline_images(
                             });
                     out.push(Element::Image(Image {
                         alt_text: d.description.clone(),
+                        decorative: d.decorative,
                         data: Some(data),
                         format,
                         display_width_emu: Some(d.width.0.max(0) as u64),
@@ -934,6 +935,7 @@ fn drawing_to_float_element(
     });
     Some(Element::Image(Image {
         alt_text: d.description.clone(),
+        decorative: d.decorative,
         data: Some(data),
         format,
         display_width_emu: Some(width_emu),
@@ -1763,6 +1765,7 @@ impl From<&crate::docx::DrawingInfo> for Image {
     fn from(d: &crate::docx::DrawingInfo) -> Self {
         Image {
             alt_text: d.description.clone(),
+            decorative: d.decorative,
             ..Default::default()
         }
     }
