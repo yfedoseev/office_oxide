@@ -243,9 +243,24 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
             }));
         }
 
+        // A chart sheet's content is its chart's text, ahead of anything
+        // else — it has no cells.
+        if !sheet.chart_text.is_empty() {
+            elements.splice(
+                0..0,
+                sheet.chart_text.iter().map(|t| {
+                    Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan::plain(t.trim()))],
+                        ..Default::default()
+                    })
+                }),
+            );
+        }
+
         sections.push(Section {
             title: Some(sheet.name.clone()),
             elements,
+            sheet_kind: Some(sheet.kind),
             // A hidden sheet is kept and flagged, not dropped — the same
             // contract `convert_xlsx` already honours.
             hidden: sheet.hidden,

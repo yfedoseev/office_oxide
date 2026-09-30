@@ -29,6 +29,9 @@ pub const RT_MERGEDCELLS: u16 = 0x00E5;
 pub const RT_NAME: u16 = 0x0018;
 pub const RT_EXTERNSHEET: u16 = 0x0017;
 pub const RT_SUPBOOK: u16 = 0x01AE;
+/// Sheet-level flags ([MS-XLS] §2.4.351 `WsBool`); bit 4 of the first
+/// byte, `fDialog`, marks a dialog sheet in a worksheet substream.
+pub const RT_WSBOOL: u16 = 0x0081;
 /// Chart series/trendline/axis/chart title text ([MS-XLS] §2.4.254), found
 /// inside a chart's nested `BOF..EOF` substream.
 pub const RT_SERIESTEXT: u16 = 0x100D;

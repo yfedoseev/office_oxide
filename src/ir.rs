@@ -859,6 +859,31 @@ pub struct Section {
     /// `w:sectPr/w:endnotePr`, ECMA-376 §17.11.5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endnote_settings: Option<NoteSettings>,
+    /// What kind of spreadsheet sheet this section is (XLSX/XLSB/XLS
+    /// only; `None` for every other format). A chart sheet or dialog sheet
+    /// is a named tab with no cells, and an Excel 4.0 macro sheet holds
+    /// cells that are macro code rather than data — a consumer can tell
+    /// them from worksheets by this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sheet_kind: Option<SheetKind>,
+}
+
+/// The kind of a spreadsheet sheet.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SheetKind {
+    /// An ordinary worksheet: a grid of cells.
+    #[default]
+    Worksheet,
+    /// An Excel 4.0 (XLM) macro sheet: the worksheet cell model, whose
+    /// cells hold macro formulas, labels and their cached values.
+    Macro,
+    /// A chart sheet: one chart occupying the whole tab, no cells.
+    Chart,
+    /// A dialog sheet: an Excel 5.0 dialog, no cells.
+    Dialog,
 }
 
 /// Footnote or endnote numbering and placement for one section. Values are

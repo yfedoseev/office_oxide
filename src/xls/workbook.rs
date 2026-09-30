@@ -153,6 +153,14 @@ pub struct Sheet {
     /// Cell comments from `NOTE`/`TXO`/`OBJ` records. No record handling
     /// existed at all before.
     pub comments: Vec<XlsComment>,
+    /// What the sheet is: a worksheet, an Excel 4.0 macro sheet (cells
+    /// like a worksheet's), a chart sheet or a dialog sheet (no cells).
+    pub kind: crate::ir::SheetKind,
+    /// A chart sheet's own chart text (`SeriesText` records of its chart
+    /// substream: series names, axis and chart titles). Empty for every
+    /// other kind; an embedded chart's text is in
+    /// [`XlsDocument::chart_text`].
+    pub chart_text: Vec<String>,
 }
 
 /// Sheet metadata from BOUNDSHEET records.
@@ -164,10 +172,32 @@ struct SheetInfo {
     ply_pos: u32,
 }
 
-/// `BOF.dt` of a worksheet or dialog-sheet substream ([MS-XLS] §2.4.21).
-/// The other substream kinds a sheet can be — chart (0x0020), Excel 4
-/// macro sheet (0x0040), VBA module (0x0006) — hold no worksheet cells.
+/// `BOF.dt` of a worksheet or dialog-sheet substream ([MS-XLS] §2.4.21);
+/// a dialog sheet is told apart by `WsBool.fDialog` ([MS-XLS] §2.4.351).
 const BOF_DT_WORKSHEET: u16 = 0x0010;
+/// `BOF.dt` of a chart-sheet substream ([MS-XLS] §2.4.21): one chart, no
+/// cells — the `NUMBER`/`LABEL` records inside it are the chart's cached
+/// series values.
+const BOF_DT_CHART: u16 = 0x0020;
+/// `BOF.dt` of an Excel 4.0 macro-sheet substream ([MS-XLS] §2.4.21): the
+/// worksheet cell records, holding macro formulas, labels and values.
+const BOF_DT_MACRO: u16 = 0x0040;
+/// `WsBool.fDialog` ([MS-XLS] §2.4.351): bit 4 of the record's first byte.
+const WSBOOL_F_DIALOG: u8 = 0x10;
+
+/// The sheet kind a substream's `BOF.dt` opens, or `None` for a substream
+/// that is not a sheet of cells or a chart (a VBA module sheet, 0x0006,
+/// whose content is VBA source in the VBA project storage).
+fn substream_kind(dt: Option<u16>) -> Option<crate::ir::SheetKind> {
+    use crate::ir::SheetKind;
+    match dt {
+        // A BOF too short to carry `dt` is read as a worksheet, as before.
+        None | Some(BOF_DT_WORKSHEET) => Some(SheetKind::Worksheet),
+        Some(BOF_DT_MACRO) => Some(SheetKind::Macro),
+        Some(BOF_DT_CHART) => Some(SheetKind::Chart),
+        Some(_) => None,
+    }
+}
 
 /// The substream type of a `BOF` record (`dt` at offset 2), when present.
 fn bof_dt(data: &[u8]) -> Option<u16> {
@@ -305,9 +335,15 @@ impl XlsDocument {
         let mut sheet_idx = 0usize;
         // The BOUNDSHEET entry of the substream being read.
         let mut current_info: Option<usize> = None;
-        // Set while walking a chart/macro/module sheet substream: its
-        // records are skipped like a nested chart's, and it yields no sheet.
+        // Set while walking a chart-sheet or VBA-module substream: its
+        // records are skipped like a nested chart's. A chart sheet still
+        // yields a (cell-less) sheet carrying its chart's text; a module
+        // yields nothing.
         let mut skipping_substream = false;
+        // The kind of the sheet substream being read (`None`: not a sheet).
+        let mut current_kind: Option<crate::ir::SheetKind> = None;
+        // SeriesText of the chart sheet being read — its own content.
+        let mut sheet_chart_text: Vec<String> = Vec::new();
         // `SST` bookkeeping: strings read vs declared, and how many cells
         // referenced a string the table does not have.
         let mut sst_declared = 0usize;
@@ -464,8 +500,12 @@ impl XlsDocument {
                             .iter()
                             .position(|i| i.ply_pos != 0 && i.ply_pos as usize == rec.offset)
                             .or_else(|| (sheet_idx < sheet_infos.len()).then_some(sheet_idx));
-                        skipping_substream =
-                            bof_dt(&rec.data).is_some_and(|dt| dt != BOF_DT_WORKSHEET);
+                        current_kind = substream_kind(bof_dt(&rec.data));
+                        skipping_substream = !matches!(
+                            current_kind,
+                            Some(crate::ir::SheetKind::Worksheet | crate::ir::SheetKind::Macro)
+                        );
+                        sheet_chart_text.clear();
                         phase = Phase::InSheet;
                         cells.clear();
                         merged_cells.clear();
@@ -494,6 +534,28 @@ impl XlsDocument {
                         nested_bof_depth -= 1;
                         if nested_bof_depth == 0 && skipping_substream {
                             skipping_substream = false;
+                            if current_kind == Some(crate::ir::SheetKind::Chart) {
+                                // A chart sheet is a named tab; its content
+                                // is its chart's text.
+                                let (name, hidden) = sheet_name_and_state(
+                                    current_info.and_then(|i| sheet_infos.get(i)),
+                                    sheet_idx,
+                                );
+                                let formats = shared_number_formats(
+                                    &mut number_formats,
+                                    &mut formats,
+                                    &mut xf_numfmt,
+                                    date1904,
+                                );
+                                sheets.push(Sheet {
+                                    name,
+                                    formats,
+                                    hidden,
+                                    kind: crate::ir::SheetKind::Chart,
+                                    chart_text: std::mem::take(&mut sheet_chart_text),
+                                    ..Default::default()
+                                });
+                            }
                             sheet_idx += 1;
                             phase = Phase::BetweenSheets;
                         }
@@ -507,7 +569,11 @@ impl XlsDocument {
                         if let Ok((s, _)) = read_short_unicode_string(&rec.data, 2) {
                             let s = s.trim();
                             if !s.is_empty() {
-                                chart_text.push(s.to_string());
+                                if current_kind == Some(crate::ir::SheetKind::Chart) {
+                                    sheet_chart_text.push(s.to_string());
+                                } else {
+                                    chart_text.push(s.to_string());
+                                }
                             }
                         }
                     },
@@ -519,11 +585,18 @@ impl XlsDocument {
                     // cells they overwrote the worksheet's own A1:Cn with a
                     // copy of whatever the chart plotted.
                     _ if nested_bof_depth > 0 => {},
+                    RT_WSBOOL => {
+                        if rec.data.first().is_some_and(|b| b & WSBOOL_F_DIALOG != 0)
+                            && current_kind == Some(crate::ir::SheetKind::Worksheet)
+                        {
+                            current_kind = Some(crate::ir::SheetKind::Dialog);
+                        }
+                    },
                     RT_EOF => {
-                        let (name, hidden) = match current_info.and_then(|i| sheet_infos.get(i)) {
-                            Some(info) => (info.name.clone(), info.hidden),
-                            None => (format!("Sheet{}", sheet_idx + 1), false),
-                        };
+                        let (name, hidden) = sheet_name_and_state(
+                            current_info.and_then(|i| sheet_infos.get(i)),
+                            sheet_idx,
+                        );
                         // A hidden sheet's records were parsed and then
                         // thrown away, so a workbook whose data sat on a
                         // sheet its author merely *hid* came back short with
@@ -533,19 +606,20 @@ impl XlsDocument {
                         // The format tables live in the globals substream,
                         // complete before the first sheet closes; share
                         // one copy across the sheets.
-                        let formats = number_formats.get_or_insert_with(|| {
-                            std::sync::Arc::new(NumberFormats {
-                                formats: std::mem::take(&mut formats),
-                                xf_numfmt: std::mem::take(&mut xf_numfmt),
-                                date1904,
-                            })
-                        });
+                        let formats = shared_number_formats(
+                            &mut number_formats,
+                            &mut formats,
+                            &mut xf_numfmt,
+                            date1904,
+                        );
                         let (rows, xf) = build_grid(&mut cells);
                         sheets.push(Sheet {
                             name,
                             rows,
                             xf,
-                            formats: std::sync::Arc::clone(formats),
+                            formats,
+                            kind: current_kind.unwrap_or_default(),
+                            chart_text: Vec::new(),
                             hidden,
                             merged_cells: std::mem::take(&mut merged_cells),
                             conditional_formats: std::mem::take(&mut conditional_formats),
@@ -816,6 +890,11 @@ impl XlsDocument {
             }
             out.push_str(&sheet.name);
             out.push('\n');
+            // A chart sheet's content is its chart's text.
+            for text in &sheet.chart_text {
+                out.push_str(text.trim());
+                out.push('\n');
+            }
             for (r, row) in sheet.rows.iter().enumerate() {
                 let line_start = out.len();
                 for c in 0..row.len() {
@@ -868,6 +947,10 @@ impl XlsDocument {
             out.push_str("## ");
             out.push_str(&sheet.name);
             out.push_str("\n\n");
+            for text in &sheet.chart_text {
+                out.push_str(&crate::core::markdown::escape_text(text.trim()));
+                out.push_str("\n\n");
+            }
 
             // A sheet with no cells can still carry comments (on cells
             // that hold nothing else); `continue` here skipped them while
@@ -935,6 +1018,33 @@ impl XlsDocument {
         }
         out
     }
+}
+
+/// A sheet's name and hidden flag from its `BOUNDSHEET`, or a positional
+/// name for a substream no `BOUNDSHEET` describes.
+fn sheet_name_and_state(info: Option<&SheetInfo>, sheet_idx: usize) -> (String, bool) {
+    match info {
+        Some(info) => (info.name.clone(), info.hidden),
+        None => (format!("Sheet{}", sheet_idx + 1), false),
+    }
+}
+
+/// The workbook's number-format tables, shared by every sheet. They live
+/// in the globals substream, complete before the first sheet closes, so
+/// they are moved into one `Arc` then.
+fn shared_number_formats(
+    shared: &mut Option<std::sync::Arc<NumberFormats>>,
+    formats: &mut std::collections::HashMap<u16, String>,
+    xf_numfmt: &mut Vec<u16>,
+    date1904: bool,
+) -> std::sync::Arc<NumberFormats> {
+    std::sync::Arc::clone(shared.get_or_insert_with(|| {
+        std::sync::Arc::new(NumberFormats {
+            formats: std::mem::take(formats),
+            xf_numfmt: std::mem::take(xf_numfmt),
+            date1904,
+        })
+    }))
 }
 
 enum Phase {
@@ -1792,6 +1902,176 @@ mod tests {
             .join(" ");
         assert!(charts_text.contains("Revenue Trend"), "IR Charts section: {charts_text}");
         assert!(charts_text.contains("Q1 Sales"), "IR Charts section: {charts_text}");
+    }
+
+    /// A workbook stream whose sheets each name their own substream type
+    /// (`BOF.dt`, [MS-XLS] §2.4.21) and BOUNDSHEET `dt` ([MS-XLS] §2.4.28).
+    fn workbook_stream_typed(sheets: &[(&str, u8, u8, u16, Vec<u8>)]) -> Vec<u8> {
+        let mut s = bof(0x0005);
+        for (name, visibility, sheet_dt, _, _) in sheets {
+            let mut d = Vec::new();
+            d.extend_from_slice(&0u32.to_le_bytes());
+            d.push(*visibility);
+            d.push(*sheet_dt);
+            d.push(name.len() as u8);
+            d.push(0);
+            d.extend_from_slice(name.as_bytes());
+            s.extend(biff_rec(RT_BOUNDSHEET, &d));
+        }
+        s.extend(eof());
+        for (_, _, _, bof_type, body) in sheets {
+            s.extend(bof(*bof_type));
+            s.extend_from_slice(body);
+            s.extend(eof());
+        }
+        s
+    }
+
+    /// A `BOOLERR` boolean cell ([MS-XLS] §2.4.24).
+    fn boolean(row: u16, col: u16, value: bool) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&row.to_le_bytes());
+        d.extend_from_slice(&col.to_le_bytes());
+        d.extend_from_slice(&0u16.to_le_bytes());
+        d.push(u8::from(value));
+        d.push(0); // fError = 0: a Boolean
+        biff_rec(RT_BOOLERR, &d)
+    }
+
+    /// The text of an IR section, rendered on its own.
+    fn section_text(s: &crate::ir::Section) -> String {
+        crate::ir::DocumentIR {
+            sections: vec![s.clone()],
+            ..Default::default()
+        }
+        .plain_text()
+    }
+
+    /// An Excel 4.0 macro sheet (`BOF.dt` 0x0040) holds ordinary cell
+    /// records — labels, formulas and their cached values — and a chart
+    /// sheet (`BOF.dt` 0x0020) is a named tab whose content is its chart.
+    /// Both were dropped whole; a VBA module sheet (0x0006) is not cells
+    /// and stays out. The kinds, the order and the visibility of the rest
+    /// must all survive, in every renderer.
+    #[test]
+    fn test_xls_macro_and_chart_sheets_surface_with_their_kind() {
+        let mut macro_body = label(0, 0, "Auto_Open");
+        macro_body.extend(boolean(1, 0, true));
+        let mut chart_body = series_text("Profile Title");
+        chart_body.extend(number(0, 0, 0, 3.67)); // the chart's cached value
+        let stream = workbook_stream_typed(&[
+            ("Data", 0, 0, 0x0010, label(0, 0, "data cell")),
+            ("Macro1", 2, 1, 0x0040, macro_body),
+            ("Profile", 1, 2, 0x0020, chart_body),
+            ("Module1", 0, 6, 0x0006, label(0, 0, "vba source")),
+            ("Tail", 0, 0, 0x0010, label(0, 0, "tail cell")),
+        ]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+
+        let got: Vec<_> = doc
+            .sheets
+            .iter()
+            .map(|s| (s.name.as_str(), s.kind, s.hidden))
+            .collect();
+        use crate::ir::SheetKind as K;
+        assert_eq!(
+            got,
+            [
+                ("Data", K::Worksheet, false),
+                ("Macro1", K::Macro, true),
+                ("Profile", K::Chart, true),
+                ("Tail", K::Worksheet, false),
+            ]
+        );
+        let chart = &doc.sheets[2];
+        assert!(chart.rows.is_empty(), "a chart sheet has no cells: {:?}", chart.rows);
+        assert_eq!(chart.chart_text, ["Profile Title"]);
+        assert!(doc.chart_text().is_empty(), "the chart sheet's text is its own, not repeated");
+
+        let text = doc.plain_text();
+        let md = doc.to_markdown();
+        let ir = crate::convert_xls::xls_to_ir(&doc);
+        let ir_text = ir.plain_text();
+        let ir_md = ir.to_markdown();
+        let html = ir.to_html();
+        for (what, out) in [
+            ("plain_text", &text),
+            ("to_markdown", &md),
+            ("ir text", &ir_text),
+            ("ir md", &ir_md),
+        ] {
+            for want in [
+                "Data",
+                "data cell",
+                "Macro1",
+                "Auto_Open",
+                "TRUE",
+                "Profile",
+                "Profile Title",
+                "tail cell",
+            ] {
+                assert!(out.contains(want), "{what} lost {want:?}: {out}");
+            }
+            for unwanted in ["3.67", "vba source", "Module1"] {
+                assert!(!out.contains(unwanted), "{what} has {unwanted:?}: {out}");
+            }
+        }
+        assert!(
+            md.contains("## Profile\n") && ir_md.contains("## Profile\n"),
+            "{md}\n--\n{ir_md}"
+        );
+        for want in [
+            "<h2>Profile</h2>",
+            "Profile Title",
+            "Auto_Open",
+            "<h2>Macro1</h2>",
+        ] {
+            assert!(html.contains(want), "to_html lost {want:?}: {html}");
+        }
+
+        let sheets: Vec<_> = ir
+            .sections
+            .iter()
+            .map(|s| (s.title.as_deref().unwrap_or(""), s.sheet_kind, s.hidden))
+            .collect();
+        assert_eq!(
+            sheets,
+            [
+                ("Data", Some(K::Worksheet), false),
+                ("Macro1", Some(K::Macro), true),
+                ("Profile", Some(K::Chart), true),
+                ("Tail", Some(K::Worksheet), false),
+            ]
+        );
+        let chart_section = &ir.sections[2];
+        assert!(
+            !chart_section
+                .elements
+                .iter()
+                .any(|e| matches!(e, crate::ir::Element::Table(_))),
+            "no cells in a chart sheet's section"
+        );
+        assert!(section_text(chart_section).contains("Profile Title"));
+    }
+
+    /// A dialog sheet shares the worksheet substream type and is told
+    /// apart by `WsBool.fDialog` ([MS-XLS] §2.4.351).
+    #[test]
+    fn test_xls_dialog_sheet_is_marked_by_wsbool() {
+        let wsbool = biff_rec(RT_WSBOOL, &[0x10, 0x04]);
+        let stream = workbook_stream(&[("Dialog1", 0, wsbool), ("Sheet1", 0, label(0, 0, "x"))]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+        let kinds: Vec<_> = doc.sheets.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                crate::ir::SheetKind::Dialog,
+                crate::ir::SheetKind::Worksheet
+            ]
+        );
+        assert!(doc.to_markdown().contains("## Dialog1"));
+        let ir = crate::convert_xls::xls_to_ir(&doc);
+        assert_eq!(ir.sections[0].sheet_kind, Some(crate::ir::SheetKind::Dialog));
     }
 
     /// A `SeriesText`-shaped record type value seen *outside* any chart
@@ -2766,7 +3046,11 @@ mod tests {
     /// A chart sheet, an Excel 4 macro sheet and a VBA module are
     /// substreams of their own kind (`BOF.dt`, [MS-XLS] §2.4.21). Parsed as
     /// worksheets, the chart's cached series values became phantom cells
-    /// under the chart sheet's real name.
+    /// under the chart sheet's real name. Dropping all three instead lost
+    /// the macro sheet's cells and the chart sheet's tab: the chart sheet
+    /// is kept with its chart's text and no cells, the macro sheet with
+    /// its cells, and only the VBA module (source code, not cells) is left
+    /// out.
     #[test]
     fn test_chart_macro_and_module_sheets_are_not_worksheets() {
         let mut s = bof(0x0005);
@@ -2792,12 +3076,27 @@ mod tests {
         s.extend(label(0, 0, "second sheet"));
         s.extend(eof());
         let doc = XlsDocument::parse_workbook_stream(&s).expect("parses");
-        let names: Vec<_> = doc.sheets.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["Sheet1", "Sheet2"], "only worksheets are sheets");
-        assert_eq!(doc.chart_text(), ["Revenue".to_string()]);
+        let names: Vec<_> = doc
+            .sheets
+            .iter()
+            .map(|s| (s.name.as_str(), s.kind))
+            .collect();
+        use crate::ir::SheetKind as K;
+        assert_eq!(
+            names,
+            [
+                ("Sheet1", K::Worksheet),
+                ("Chart1", K::Chart),
+                ("Macro1", K::Macro),
+                ("Sheet2", K::Worksheet)
+            ]
+        );
+        assert!(doc.sheets[1].rows.is_empty(), "no phantom cells on the chart sheet");
+        assert_eq!(doc.sheets[1].chart_text, ["Revenue".to_string()]);
+        assert!(doc.chart_text().is_empty());
         let text = doc.plain_text();
-        assert!(text.contains("second sheet"), "{text}");
-        assert!(!text.contains("3.67") && !text.contains("HALT"), "{text}");
+        assert!(text.contains("second sheet") && text.contains("=HALT()"), "{text}");
+        assert!(!text.contains("3.67") && !text.contains("Module1"), "{text}");
     }
 
     /// BIFF5 `FORMAT` carries a byte-counted codepage string; read as a
