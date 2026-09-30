@@ -268,17 +268,19 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
     // directory itself exists to route around for slides).
     let hyperlinks = parse_ex_hyperlinks(&doc_children);
     let ole_objects = parse_ex_ole_objects(&doc_children);
-    // The deck's header/footer/user-date text, applied uniformly to every
-    // slide ("Apply to All" in PowerPoint's own Header and Footer dialog)
-    // rather than stored per-slide — confirmed by direct inspection of a
-    // real corpus file's DocumentContainer.
-    let headers_footers = parse_headers_footers(&doc_children);
+    // The deck's slide header/footer settings ("Apply to All" in
+    // PowerPoint's Header and Footer dialog): the DocumentContainer's
+    // `SlideHeadersFootersContainer`, which a slide's own container
+    // overrides.
+    let deck_headers_footers = find_child(&doc_children, RT_HEADER_FOOTER, HF_INSTANCE_SLIDES)
+        .map(|hf| shown_slide_header_footer_texts(&hf))
+        .unwrap_or_default();
 
     let mut slides = Vec::new();
     // Per slide: its `SlideId` and `SlideAtom.notesIdRef`, to attach notes.
     let mut slide_links: Vec<(u32, Option<u32>)> = Vec::new();
     for entry in slide_list_entries(&slide_list) {
-        let (slide, notes_id_ref) = resolve_slide(
+        let (mut slide, links) = resolve_slide(
             stream,
             dir,
             entry.persist_id_ref,
@@ -286,8 +288,20 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
             &hyperlinks,
             &ole_objects,
         );
+        let hf_texts = links
+            .headers_footers
+            .as_deref()
+            .unwrap_or(&deck_headers_footers);
+        for text in hf_texts {
+            slide.text_runs.push(TextRun {
+                text_type: TextType::Other,
+                text: text.clone(),
+                hyperlink: None,
+                ..Default::default()
+            });
+        }
         slides.push(slide);
-        slide_links.push((entry.slide_id, notes_id_ref));
+        slide_links.push((entry.slide_id, links.notes_id_ref));
     }
 
     // Speaker notes: the `NotesListWithTextContainer` lists every notes
@@ -325,47 +339,54 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
         }
     }
 
-    if !headers_footers.is_empty() {
-        for slide in &mut slides {
-            for text in &headers_footers {
-                slide.text_runs.push(TextRun {
-                    text_type: TextType::Other,
-                    text: text.clone(),
-                    hyperlink: None,
-                    ..Default::default()
-                });
-            }
-        }
-    }
-
     Some(slides)
 }
 
-/// Extract the header/footer/user-date `CString` text from every
-/// `HeadersFootersContainer` (0x0FD9) directly under `doc_children`. A
-/// `DocumentContainer` commonly carries two — one for slides, one for
-/// notes/handouts — collected together (deduplicated) since a deck's
-/// slide-facing header/footer is what's relevant here.
-fn parse_headers_footers(doc_children: &[u8]) -> Vec<String> {
-    let mut texts = Vec::new();
-    for rec in RecordIter::new(doc_children) {
+/// The header/footer text a slides' `HeadersFootersContainer` actually
+/// shows: the footer when `fHasFooter` is set, the user date when both
+/// `fHasDate` and `fHasUserDate` are ([MS-PPT] `HeadersFootersAtom`).
+/// The header string is the notes/handout page's and is never shown on a
+/// slide; an automatic date has no stored text.
+fn shown_slide_header_footer_texts(hf_children: &[u8]) -> Vec<String> {
+    let mut flags = 0u16;
+    let mut user_date = None;
+    let mut footer = None;
+    for rec in RecordIter::new(hf_children) {
         let Ok(rec) = rec else { break };
-        if rec.header.rec_type != RT_HEADER_FOOTER {
-            continue;
-        }
-        for child in RecordIter::new(&rec.data) {
-            let Ok(child) = child else { break };
-            if child.header.rec_type != RT_CSTRING {
-                continue;
-            }
-            let text = decode_utf16le(&child.data);
-            let text = text.trim();
-            if !text.is_empty() && !texts.iter().any(|t: &String| t == text) {
-                texts.push(text.to_string());
-            }
+        match rec.header.rec_type {
+            RT_HEADER_FOOTER_ATOM if rec.data.len() >= 4 => {
+                flags = u16::from_le_bytes([rec.data[2], rec.data[3]]);
+            },
+            RT_CSTRING => {
+                let text = decode_utf16le(&rec.data).trim().to_string();
+                if text.is_empty() {
+                    continue;
+                }
+                match rec.header.rec_instance {
+                    HF_CSTRING_USER_DATE => user_date = Some(text),
+                    HF_CSTRING_FOOTER => footer = Some(text),
+                    _ => {},
+                }
+            },
+            _ => {},
         }
     }
+    let mut texts = Vec::new();
+    if flags & HF_HAS_FOOTER != 0 {
+        texts.extend(footer);
+    }
+    if flags & HF_HAS_DATE != 0 && flags & HF_HAS_USER_DATE != 0 {
+        texts.extend(user_date);
+    }
     texts
+}
+
+/// What resolving a slide found besides its text: its
+/// `SlideAtom.notesIdRef`, and its own slide header/footer settings when it
+/// overrides the deck's.
+struct SlideLinks {
+    notes_id_ref: Option<u32>,
+    headers_footers: Option<Vec<String>>,
 }
 
 /// One `SlidePersistAtom` entry of a `SlideListWithText`-family container
@@ -484,7 +505,8 @@ fn resolve_notes(
 /// Resolve one slide's shape text: locate its `Slide` container via the
 /// persist directory and walk its shape tree, resolving any
 /// `OutlineTextRefAtom` references against `outline_texts`. Also returns
-/// the slide's `SlideAtom.notesIdRef` (body offset 16), when present.
+/// the slide's `SlideAtom.notesIdRef` (body offset 16) and its own
+/// header/footer override, when present.
 ///
 /// Every persist-directory-resolved slide is kept regardless of whether text
 /// was found — an image-only slide is still a slide, and the presentation's
@@ -496,15 +518,18 @@ fn resolve_slide(
     outline_texts: &[TextRun],
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
-) -> (SlideText, Option<u32>) {
+) -> (SlideText, SlideLinks) {
     let mut text_runs = Vec::new();
     let mut tables = Vec::new();
     let mut image_refs = Vec::new();
     let mut ole_object_refs = Vec::new();
     let mut hidden = false;
     let mut notes_id_ref = None;
+    let mut headers_footers = None;
     if let Some(offset) = dir.resolve(persist_id_ref) {
         if let Some(children) = bounded_container_children(stream, offset, RT_SLIDE) {
+            headers_footers = find_child(&children, RT_HEADER_FOOTER, HF_INSTANCE_SLIDES)
+                .map(|hf| shown_slide_header_footer_texts(&hf));
             notes_id_ref = RecordIter::new(&children)
                 .filter_map(Result::ok)
                 .find(|r| r.header.rec_type == RT_SLIDE_ATOM)
@@ -548,7 +573,10 @@ fn resolve_slide(
             ole_object_refs,
             hidden,
         },
-        notes_id_ref,
+        SlideLinks {
+            notes_id_ref,
+            headers_footers,
+        },
     )
 }
 
@@ -2674,7 +2702,11 @@ mod tests {
     /// a `HeadersFootersAtom` (0x0FDA) plus `CString` (0x0FBA) children
     /// for the user date (instance 0) and footer (instance 2) text.
     fn header_footer_container_bytes(date: &str, footer: &str) -> Vec<u8> {
-        let mut children = make_atom(RT_HEADER_FOOTER_ATOM, 0, &[0u8; 4]);
+        // formatId 0; flags fHasDate | fHasUserDate | fHasFooter.
+        let flags = HF_HAS_DATE | HF_HAS_USER_DATE | HF_HAS_FOOTER;
+        let mut atom = 0u16.to_le_bytes().to_vec();
+        atom.extend_from_slice(&flags.to_le_bytes());
+        let mut children = make_atom(RT_HEADER_FOOTER_ATOM, 0, &atom);
         let date_bytes: Vec<u8> = date.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
         children.extend(make_atom(RT_CSTRING, 0, &date_bytes));
         let footer_bytes: Vec<u8> = footer

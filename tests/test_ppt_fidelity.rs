@@ -123,3 +123,54 @@ fn test_encrypt_session_persist_id_ref_is_an_error() {
     };
     assert_encrypted(open(deck.build()));
 }
+
+const HF_HAS_DATE: u16 = 0x01;
+const HF_HAS_USER_DATE: u16 = 0x04;
+const HF_HAS_HEADER: u16 = 0x10;
+const HF_HAS_FOOTER: u16 = 0x20;
+
+/// Header/footer text was taken from every `HeadersFootersContainer` —
+/// slide and notes/handout alike — and appended to every slide, ignoring
+/// the `HeadersFootersAtom` show flags and per-slide overrides ([MS-PPT]
+/// `HeadersFootersAtom`, `SlideHeadersFootersContainer`,
+/// `NotesHeadersFootersContainer`).
+#[test]
+fn test_headers_footers_follow_their_container_and_flags() {
+    let mut doc_children = headers_footers(
+        3,
+        HF_HAS_FOOTER | HF_HAS_DATE | HF_HAS_USER_DATE,
+        &[(2, "Deck footer"), (0, "1 Jan 2000")],
+    );
+    // Notes/handout header: never slide text.
+    doc_children.extend(headers_footers(4, HF_HAS_HEADER, &[(1, "Notes header")]));
+    let mut hidden_footer = slide("Slide two");
+    // Slide two overrides: footer text present but not shown.
+    hidden_footer
+        .shapes
+        .extend(headers_footers(3, 0, &[(2, "Deck footer")]));
+    let deck = PptBuilder {
+        slides: vec![slide("Slide one"), hidden_footer],
+        doc_children,
+        ..Default::default()
+    };
+    let ir = open(deck.build()).unwrap().to_ir();
+    let one = texts(&ir.sections[0].elements);
+    assert!(one.contains(&"Deck footer".to_string()), "{one:?}");
+    assert!(one.contains(&"1 Jan 2000".to_string()), "{one:?}");
+    assert!(!one.iter().any(|t| t.contains("Notes header")), "{one:?}");
+    let two = texts(&ir.sections[1].elements);
+    assert!(!two.iter().any(|t| t.contains("Deck footer")), "{two:?}");
+    assert!(!two.iter().any(|t| t.contains("Notes header")), "{two:?}");
+}
+
+/// A footer whose show flag is off is not slide content.
+#[test]
+fn test_hidden_footer_is_not_injected() {
+    let deck = PptBuilder {
+        slides: vec![slide("Only slide")],
+        doc_children: headers_footers(3, 0, &[(2, "Unshown footer")]),
+        ..Default::default()
+    };
+    let ir = open(deck.build()).unwrap().to_ir();
+    assert_eq!(texts(&ir.sections[0].elements), ["Only slide"]);
+}

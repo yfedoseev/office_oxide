@@ -56,11 +56,22 @@ pub const RT_CURRENT_USER_ATOM: u16 = 0x0FF6;
 /// child.
 pub const RT_HEADER_FOOTER: u16 = 0x0FD9;
 /// `HeadersFootersAtom`: the flags atom nested inside a
-/// `HeadersFootersContainer` ([MS-PPT] 2.4.17, record type 4058 =
-/// 0x0FDA). Not decoded — this fix only surfaces the container's
-/// `CString` text children, not the show/hide flag bits.
-#[cfg(test)]
+/// `HeadersFootersContainer` ([MS-PPT] `HeadersFootersAtom`, record type
+/// 4058 = 0x0FDA): `formatId` (2 bytes), then the show flags (2 bytes).
 pub const RT_HEADER_FOOTER_ATOM: u16 = 0x0FDA;
+/// `HeadersFootersContainer.recInstance` of the slides' header/footer
+/// settings ([MS-PPT] `SlideHeadersFootersContainer`: MUST be 0x003); the
+/// notes/handouts one is 0x004 and never applies to slides.
+pub const HF_INSTANCE_SLIDES: u16 = 0x003;
+/// `HeadersFootersAtom` flag bits ([MS-PPT] `HeadersFootersAtom`):
+/// `fHasDate` (bit 0), `fHasUserDate` (bit 2), `fHasFooter` (bit 5).
+pub const HF_HAS_DATE: u16 = 0x0001;
+pub const HF_HAS_USER_DATE: u16 = 0x0004;
+pub const HF_HAS_FOOTER: u16 = 0x0020;
+/// `CString` instances inside a `HeadersFootersContainer`
+/// ([MS-PPT] `HeadersFootersContainer`): user date 0, header 1, footer 2.
+pub const HF_CSTRING_USER_DATE: u16 = 0;
+pub const HF_CSTRING_FOOTER: u16 = 2;
 pub const RT_STYLE_TEXT_PROP: u16 = 0x0FA1;
 pub const RT_CSTRING: u16 = 0x0FBA;
 /// `TargetAtom`'s own `rh.recInstance` value ([MS-PPT] 2.10.19) — the
