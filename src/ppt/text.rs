@@ -1506,11 +1506,10 @@ fn resolve_shape_pib(shape_data: &[u8]) -> Option<usize> {
 /// of a run's text (e.g. a URL appearing mid-sentence) rather than the
 /// whole shape.
 ///
-/// `begin`/`end` are [MS-PPT]'s `TextPosition` character offsets, which
-/// this slices via `char` count rather than UTF-16 code units — an exact
-/// match for the common case, off by one per astral-plane character
-/// (surrogate pair) in the rare case one appears before the hyperlinked
-/// range, which is judged not worth the extra bookkeeping here.
+/// `begin`/`end` are [MS-PPT]'s `TextPosition` offsets, which count UTF-16
+/// code units (the text is stored as UTF-16); they are converted to `char`
+/// indices before slicing, so an astral-plane character (a surrogate pair)
+/// before the range no longer shifts it by one.
 fn split_run_with_hyperlink(
     out: &mut Vec<TextRun>,
     idx: usize,
@@ -1519,6 +1518,8 @@ fn split_run_with_hyperlink(
     url: &str,
 ) {
     let Some(run) = out.get(idx) else { return };
+    let begin = utf16_to_char_index(&run.text, begin);
+    let end = utf16_to_char_index(&run.text, end);
     let chars: Vec<char> = run.text.chars().collect();
     let begin = begin.min(chars.len());
     let end = end.clamp(begin, chars.len());
@@ -1617,12 +1618,40 @@ fn slice_para_formats(
 
 /// Parse `data` as a `StyleTextPropAtom` body and attach the resulting
 /// character-/paragraph-formatting spans to `run`, clamped against
-/// `run.text`'s own character count.
+/// `run.text`'s own length.
+///
+/// The runs' `count`s are in UTF-16 code units, the unit the text is
+/// stored in; the spans are parsed in those units and then converted to
+/// `char` indices, which is what every consumer slices by.
 fn apply_style_text_prop(run: &mut TextRun, data: &[u8]) {
-    let text_char_len = run.text.chars().count();
-    let (para_spans, char_spans) = style::parse_style_text_prop(data, text_char_len);
+    let text_utf16_len = run.text.encode_utf16().count();
+    let (mut para_spans, mut char_spans) = style::parse_style_text_prop(data, text_utf16_len);
+    if text_utf16_len != run.text.chars().count() {
+        for s in &mut para_spans {
+            s.start = utf16_to_char_index(&run.text, s.start);
+            s.end = utf16_to_char_index(&run.text, s.end);
+        }
+        for s in &mut char_spans {
+            s.start = utf16_to_char_index(&run.text, s.start);
+            s.end = utf16_to_char_index(&run.text, s.end);
+        }
+    }
     run.para_formats = para_spans;
     run.char_formats = char_spans;
+}
+
+/// The `char` index of UTF-16 code unit offset `units` in `text` (an offset
+/// inside a surrogate pair rounds up to the next character; past the end
+/// clamps to the length).
+fn utf16_to_char_index(text: &str, units: usize) -> usize {
+    let mut seen = 0usize;
+    for (i, c) in text.chars().enumerate() {
+        if seen >= units {
+            return i;
+        }
+        seen += c.len_utf16();
+    }
+    text.chars().count()
 }
 
 /// Text content of a single slide.
@@ -1818,6 +1847,60 @@ mod tests {
             parse_one_ex_hyperlink(&with_target).map(|(_, u)| u),
             Some("http://example.com/".to_string())
         );
+    }
+
+    /// Text-range hyperlink offsets count UTF-16 code units; slicing them
+    /// as `char` indices put the link one character late for every emoji
+    /// (surrogate pair) before it.
+    #[test]
+    fn test_hyperlink_range_is_measured_in_utf16_units() {
+        let text = "\u{1F600} link here";
+        let mut out = vec![TextRun {
+            text: text.to_string(),
+            ..Default::default()
+        }];
+        // Emoji = 2 units, space = 1: "link" is units 3..7.
+        split_run_with_hyperlink(&mut out, 0, 3, 7, "http://example.com/");
+        let linked: Vec<&str> = out
+            .iter()
+            .filter(|r| r.hyperlink.is_some())
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(linked, ["link"]);
+        assert_eq!(utf16_to_char_index(text, 2), 1);
+        assert_eq!(utf16_to_char_index(text, 1), 1, "inside the pair rounds up");
+        assert_eq!(utf16_to_char_index(text, 99), text.chars().count());
+    }
+
+    /// `StyleTextPropAtom` run counts are UTF-16 units too: formatting on
+    /// the word after an emoji must cover exactly that word.
+    #[test]
+    fn test_style_runs_are_measured_in_utf16_units() {
+        let text = "\u{1F600} bold";
+        let mut run = TextRun {
+            text: text.to_string(),
+            ..Default::default()
+        };
+        // One paragraph run over all 8 units (+1 mark), then character runs:
+        // 3 units plain, 4 units bold (CF_BOLD, fontStyle bold), 1 plain.
+        let mut data = Vec::new();
+        data.extend_from_slice(&8u32.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        for (count, bold) in [(3u32, false), (4, true), (2, false)] {
+            data.extend_from_slice(&count.to_le_bytes());
+            data.extend_from_slice(&1u32.to_le_bytes()); // CFMasks: bold
+            data.extend_from_slice(&(bold as u16).to_le_bytes()); // fontStyle
+        }
+        apply_style_text_prop(&mut run, &data);
+        let bold: Vec<(usize, usize)> = run
+            .char_formats
+            .iter()
+            .filter(|s| s.format.bold == Some(true))
+            .map(|s| (s.start, s.end))
+            .collect();
+        // chars: emoji(0) space(1) b(2) o(3) l(4) d(5)
+        assert_eq!(bold, [(2, 6)]);
     }
 
     fn make_ex_hyperlink(id: u32, url: &str) -> Vec<u8> {
