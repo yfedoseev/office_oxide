@@ -288,6 +288,7 @@ impl XlsxDocument {
         // Pivot cache records materialised for sources outside the
         // workbook share one text budget, like every other cell text.
         let mut pivot_budget = crate::limits::TextBudget::new();
+        let mut pivot_ctx = PivotContext::new(&mut archive, &entries);
         let mut unreadable_sheets: Vec<(String, String)> = Vec::new();
         // Chart parts a chartsheet displays: their text is that sheet's
         // content, not repeated among the embedded charts'.
@@ -433,6 +434,7 @@ impl XlsxDocument {
                 &sheet_path,
                 &ws_rels,
                 &workbook,
+                &mut pivot_ctx,
                 &mut pivot_budget,
             );
 
@@ -793,12 +795,67 @@ const PIVOT_CACHE_DEFINITION_REL: &str =
 /// The table parts and pivot tables a worksheet's relationships name. A
 /// part that is missing or does not parse is logged and skipped; the cells
 /// it describes are in the sheet either way.
+/// What the pivot readers share across every sheet of one workbook.
+///
+/// A pivot cache is shared by every pivot built on it, and a workbook table
+/// as its source means the source cells are already in the workbook: the
+/// records were parsed once per pivot and then thrown away once the table
+/// turned up, which made a workbook of 17 pivots over 5 table-backed caches
+/// open 4.7x slower than before pivot caches were read, for no output.
+struct PivotContext {
+    /// Every table name and display name in the package, lower-cased, read
+    /// from the table parts before any sheet so a table-backed source is
+    /// recognised before its records are touched.
+    table_names: std::collections::HashSet<String>,
+    /// Materialised cache data by cache-definition part, so a cache shared
+    /// by several pivots is parsed once.
+    parsed: std::collections::HashMap<String, Option<worksheet::PivotCacheData>>,
+}
+
+impl PivotContext {
+    fn new<R: Read + Seek>(archive: &mut ZipArchive<R>, entries: &opc::ZipEntryIndex) -> Self {
+        let mut ctx = PivotContext {
+            table_names: std::collections::HashSet::new(),
+            parsed: std::collections::HashMap::new(),
+        };
+        // Only a package with a pivot cache needs its table names.
+        if !archive
+            .file_names()
+            .any(|n| n.to_ascii_lowercase().contains("pivotcachedefinition"))
+        {
+            return ctx;
+        }
+        let table_parts: Vec<String> = archive
+            .file_names()
+            .filter(|n| {
+                let lower = n.to_ascii_lowercase();
+                lower.starts_with("xl/tables/") && lower.ends_with(".xml")
+            })
+            .map(str::to_string)
+            .collect();
+        for part in table_parts {
+            if let Ok(t) = XlsxDocument::read_xml_entry(archive, entries, &part)
+                .map_err(|e| e.to_string())
+                .and_then(|d| worksheet::parse_table_part(&d).map_err(|e| e.to_string()))
+            {
+                for name in [t.name, t.display_name] {
+                    if !name.is_empty() {
+                        ctx.table_names.insert(name.to_lowercase());
+                    }
+                }
+            }
+        }
+        ctx
+    }
+}
+
 fn read_tables_and_pivots<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &opc::ZipEntryIndex,
     sheet_path: &str,
     ws_rels: &Relationships,
     workbook: &WorkbookInfo,
+    pivot_ctx: &mut PivotContext,
     budget: &mut crate::limits::TextBudget,
 ) -> (Vec<worksheet::SheetTable>, Vec<worksheet::SheetPivotTable>) {
     let mut tables = Vec::new();
@@ -836,9 +893,22 @@ fn read_tables_and_pivots<R: Read + Seek>(
             if let Ok(def) = XlsxDocument::read_xml_entry(archive, entries, &cache_path) {
                 let src = worksheet::parse_pivot_cache_definition(&def).unwrap_or_default();
                 pivot.source = src.display();
-                if !pivot_source_in_workbook(&src, workbook) {
-                    pivot.cache_data =
-                        read_pivot_cache_data(archive, entries, &cache_path, &def, &src, budget);
+                if !pivot_source_in_workbook(&src, workbook, &pivot_ctx.table_names) {
+                    pivot.cache_data = match pivot_ctx.parsed.get(&cache_path) {
+                        Some(data) => data.clone(),
+                        None => {
+                            let data = read_pivot_cache_data(
+                                archive,
+                                entries,
+                                &cache_path,
+                                &def,
+                                &src,
+                                budget,
+                            );
+                            pivot_ctx.parsed.insert(cache_path.clone(), data.clone());
+                            data
+                        },
+                    };
                 }
             }
         }
@@ -849,10 +919,13 @@ fn read_tables_and_pivots<R: Read + Seek>(
 
 /// Whether a pivot cache's source cells are in this workbook: a
 /// `worksheetSource` naming a sheet the workbook has, a bare range, or a
-/// defined name. An external/consolidation source, a missing sheet or an
-/// unknown name is not (a table name is settled once every sheet's tables
-/// are read, in [`drop_pivot_caches_backed_by_tables`]).
-fn pivot_source_in_workbook(src: &worksheet::PivotCacheSource, workbook: &WorkbookInfo) -> bool {
+/// defined name or table. An external/consolidation source, a missing sheet
+/// or an unknown name is not.
+fn pivot_source_in_workbook(
+    src: &worksheet::PivotCacheSource,
+    workbook: &WorkbookInfo,
+    table_names: &std::collections::HashSet<String>,
+) -> bool {
     if !src.is_worksheet {
         return false;
     }
@@ -862,10 +935,13 @@ fn pivot_source_in_workbook(src: &worksheet::PivotCacheSource, workbook: &Workbo
             .iter()
             .any(|s| s.name.eq_ignore_ascii_case(sheet)),
         (None, Some(_), _) => true,
-        (_, None, Some(name)) => workbook
-            .defined_names
-            .iter()
-            .any(|d| d.name.eq_ignore_ascii_case(name)),
+        (_, None, Some(name)) => {
+            table_names.contains(&name.to_lowercase())
+                || workbook
+                    .defined_names
+                    .iter()
+                    .any(|d| d.name.eq_ignore_ascii_case(name))
+        },
         _ => false,
     }
 }
@@ -2862,6 +2938,73 @@ mod tests {
 
         let present = open_bytes(pivot_package(&def("sheet1"), PIVOT_RECORDS));
         assert_eq!(present.worksheets[0].pivot_tables[0].cache_data, None);
+    }
+
+    /// A pivot cache is shared by every pivot built on it, and a workbook
+    /// table as the source means the source cells are already in the
+    /// workbook. The reader parsed the records once per pivot and only then
+    /// found the table and threw the data away: a workbook with 17 pivots
+    /// over 5 table-backed caches spent 80% of its open time there (4.7x
+    /// slower than 0.1.12) for no output. A table-backed cache is now never
+    /// parsed, and a cache that is needed is parsed once.
+    #[test]
+    fn test_pivot_caches_are_parsed_once_and_never_for_a_table_source() {
+        let package = |cache_source: &str| {
+            let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Pivot</t></is></c></row></sheetData></worksheet>"#;
+            let sheet_rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable1.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable2.xml"/>
+  <Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable3.xml"/>
+</Relationships>"#;
+            let table = br#"<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Sales" displayName="SalesTbl" ref="A1:B5"><tableColumns count="2"><tableColumn id="1" name="Region"/><tableColumn id="2" name="Qty"/></tableColumns></table>"#;
+            let pivot = br#"<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="P" cacheId="1"><location ref="D1:E4" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/></pivotTableDefinition>"#;
+            let pivot_rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition" Target="../pivotCache/pivotCacheDefinition1.xml"/></Relationships>"#;
+            let cache_rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheRecords" Target="pivotCacheRecords1.xml"/></Relationships>"#;
+            let def = format!(
+                r#"<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1">{cache_source}{PIVOT_FIELDS}</pivotCacheDefinition>"#
+            );
+            let bytes = single_sheet_xlsx(
+                sheet,
+                &[
+                    ("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels),
+                    ("xl/tables/table1.xml", table),
+                    ("xl/pivotTables/pivotTable1.xml", pivot),
+                    ("xl/pivotTables/pivotTable2.xml", pivot),
+                    ("xl/pivotTables/pivotTable3.xml", pivot),
+                    ("xl/pivotTables/_rels/pivotTable1.xml.rels", pivot_rels),
+                    ("xl/pivotTables/_rels/pivotTable2.xml.rels", pivot_rels),
+                    ("xl/pivotTables/_rels/pivotTable3.xml.rels", pivot_rels),
+                    ("xl/pivotCache/pivotCacheDefinition1.xml", def.as_bytes()),
+                    ("xl/pivotCache/_rels/pivotCacheDefinition1.xml.rels", cache_rels),
+                    ("xl/pivotCache/pivotCacheRecords1.xml", PIVOT_RECORDS.as_bytes()),
+                ],
+            );
+            worksheet::PIVOT_RECORD_PARSES.with(|n| n.set(0));
+            let doc = open_bytes(bytes);
+            (doc, worksheet::PIVOT_RECORD_PARSES.with(std::cell::Cell::get))
+        };
+
+        for source in ["SalesTbl", "Sales"] {
+            let (doc, parses) = package(&format!(
+                r#"<cacheSource type="worksheet"><worksheetSource name="{source}"/></cacheSource>"#
+            ));
+            assert_eq!(parses, 0, "{source}: a table-backed cache was parsed");
+            assert!(
+                doc.worksheets[0]
+                    .pivot_tables
+                    .iter()
+                    .all(|p| p.cache_data.is_none())
+            );
+        }
+
+        let (doc, parses) = package(r#"<cacheSource type="external" connectionId="1"/>"#);
+        assert_eq!(parses, 1, "a cache shared by three pivots was parsed {parses} times");
+        let pivots = &doc.worksheets[0].pivot_tables;
+        assert_eq!(pivots.len(), 3);
+        for p in pivots {
+            assert_eq!(p.cache_data.as_ref().map(|d| d.records.len()), Some(2));
+        }
     }
 
     /// Materialising records is bounded by the text budget: an `x` index

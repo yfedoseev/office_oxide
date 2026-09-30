@@ -249,6 +249,12 @@ pub(crate) fn parse_pivot_cache_fields(
     Ok((fields, truncated))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread parsed a pivot cache records part.
+    pub(crate) static PIVOT_RECORD_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Parse a `pivotCacheRecords` part ([ECMA-376] §18.10.1.68) against the
 /// cache's fields. Stops — and marks the result truncated — at
 /// [`MAX_PIVOT_CACHE_RECORDS`] records or when `budget` is spent: an `x`
@@ -259,6 +265,8 @@ pub(crate) fn parse_pivot_cache_records(
     fields: &[(String, Vec<String>)],
     budget: &mut crate::limits::TextBudget,
 ) -> crate::core::Result<PivotCacheData> {
+    #[cfg(test)]
+    PIVOT_RECORD_PARSES.with(|n| n.set(n.get() + 1));
     let mut reader = xml::make_fast_reader(xml_data);
     let mut data = PivotCacheData {
         fields: fields.iter().map(|(n, _)| n.clone()).collect(),
