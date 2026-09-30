@@ -123,6 +123,19 @@ impl XlsxDocument {
         self.styles.as_ref()
     }
 
+    /// The theme for colour resolution without mutating the document: the
+    /// cached one if `ensure_theme` ran, otherwise parsed from the raw part.
+    pub(crate) fn theme_for_render(&self) -> Option<std::borrow::Cow<'_, Theme>> {
+        match &self.theme {
+            Some(t) => Some(std::borrow::Cow::Borrowed(t)),
+            None => self
+                .theme_data
+                .as_ref()
+                .and_then(|d| Theme::parse(d).ok())
+                .map(std::borrow::Cow::Owned),
+        }
+    }
+
     /// Parse and cache theme on demand. Returns the theme if available.
     pub fn ensure_theme(&mut self) -> Option<&Theme> {
         if self.theme.is_none() {

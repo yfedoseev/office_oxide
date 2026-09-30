@@ -1341,3 +1341,64 @@ fn test_markdown_places_sparse_cells_by_column() {
     assert!(md.contains("|  |  | 9 |"), "{md}");
     assert!(md.contains("| Pear |  | 4 |"), "{md}");
 }
+
+/// Cell fills were parsed into the stylesheet and never read: a solid
+/// background colour never reached `TableCell::background_color`, which
+/// the DOCX path already fills from cell shading.
+#[test]
+fn test_solid_cell_fill_reaches_the_table_cell_background() {
+    let styles = r#"<fills count="3">
+          <fill><patternFill patternType="none"/></fill>
+          <fill><patternFill patternType="gray125"/></fill>
+          <fill><patternFill patternType="solid"><fgColor rgb="FFFFC000"/><bgColor indexed="64"/></patternFill></fill>
+        </fills>
+        <cellXfs count="3">
+          <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+          <xf numFmtId="0" fontId="0" fillId="2" borderId="0" applyFill="1"/>
+          <xf numFmtId="0" fontId="0" fillId="1" borderId="0" applyFill="1"/>
+        </cellXfs>"#;
+    let body = r#"<row r="1">
+        <c r="A1" t="inlineStr"><is><t>plain</t></is></c>
+        <c r="B1" s="1" t="inlineStr"><is><t>amber</t></is></c>
+        <c r="C1" s="2" t="inlineStr"><is><t>patterned</t></is></c>
+      </row>"#;
+    let ir = Xlsx::new(vec![Sheet::new("S", body)]).styles(styles).ir();
+    let t = only_table(&ir, 0);
+    let bg: Vec<_> = t.rows[0].cells.iter().map(|c| c.background_color).collect();
+    assert_eq!(bg, [None, Some([0xFF, 0xC0, 0x00]), None]);
+}
+
+/// Cell borders were parsed (style + colour per side) and never read; they
+/// now reach `TableCell::border`.
+#[test]
+fn test_cell_borders_reach_the_table_cell() {
+    let styles = r#"<borders count="2">
+          <border><left/><right/><top/><bottom/><diagonal/></border>
+          <border>
+            <left style="thin"><color rgb="FF112233"/></left>
+            <right style="double"/>
+            <top style="thick"><color rgb="FF000000"/></top>
+            <bottom style="dashed"/>
+          </border>
+        </borders>
+        <cellXfs count="2">
+          <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+          <xf numFmtId="0" fontId="0" fillId="0" borderId="1" applyBorder="1"/>
+        </cellXfs>"#;
+    let body = r#"<row r="1">
+        <c r="A1" t="inlineStr"><is><t>plain</t></is></c>
+        <c r="B1" s="1" t="inlineStr"><is><t>boxed</t></is></c>
+      </row>"#;
+    let ir = Xlsx::new(vec![Sheet::new("S", body)]).styles(styles).ir();
+    let t = only_table(&ir, 0);
+    assert!(t.rows[0].cells[0].border.is_none());
+    let b = t.rows[0].cells[1].border.as_ref().expect("B1 has borders");
+    let left = b.left.as_ref().unwrap();
+    assert_eq!(
+        (left.style.clone(), left.color),
+        (BorderStyle::Single, Some([0x11, 0x22, 0x33]))
+    );
+    assert_eq!(b.right.as_ref().unwrap().style, BorderStyle::Double);
+    assert_eq!(b.top.as_ref().unwrap().style, BorderStyle::Thick);
+    assert_eq!(b.bottom.as_ref().unwrap().style, BorderStyle::Dashed);
+}

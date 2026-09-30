@@ -54,6 +54,18 @@ pub struct Fill {
     pub bg_color: Option<ColorRef>,
 }
 
+impl Fill {
+    /// The colour a solid fill paints the cell with. For
+    /// `patternType="solid"` that is `fgColor` ([ECMA-376] §18.8.32); a
+    /// patterned fill (`gray125`, hatches) has no single background colour.
+    pub fn solid_color(&self) -> Option<&ColorRef> {
+        if self.pattern_type.as_deref() != Some("solid") {
+            return None;
+        }
+        self.fg_color.as_ref().or(self.bg_color.as_ref())
+    }
+}
+
 /// A border definition.
 #[derive(Debug, Clone, Default)]
 pub struct Border {
@@ -174,6 +186,18 @@ impl StyleSheet {
         let xf = self.cell_formats.get(style_index as usize)?;
         let font_idx = xf.font_index?;
         self.fonts.get(font_idx as usize)
+    }
+
+    /// Get the fill for a cell format index.
+    pub fn fill_for(&self, style_index: u32) -> Option<&Fill> {
+        let xf = self.cell_formats.get(style_index as usize)?;
+        self.fills.get(xf.fill_index? as usize)
+    }
+
+    /// Get the border for a cell format index.
+    pub fn border_for(&self, style_index: u32) -> Option<&Border> {
+        let xf = self.cell_formats.get(style_index as usize)?;
+        self.borders.get(xf.border_index? as usize)
     }
 
     /// Get the number format ID for a cell format index.

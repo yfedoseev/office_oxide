@@ -26,6 +26,8 @@ fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
 pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     // Pre-compute date style indices once — avoids re-scanning format strings per cell.
     let date_indices = doc.date_style_indices();
+    // Theme colours resolve cell fills; parsed once per document.
+    let theme = doc.theme_for_render();
 
     // Single String buffer reused across all cells — clear() keeps the heap
     // allocation; std::mem::take() moves it into TextSpan for non-empty cells.
@@ -325,6 +327,8 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                         number_format: cd.number_format.clone(),
                         number_format_id: cd.number_format_id,
                         formula: cd.formula.clone(),
+                        background_color: cell_background(doc, cd, theme.as_deref()),
+                        border: cell_border(doc, cd, theme.as_deref()),
                         ..Default::default()
                     };
                     while tcells.len() < cd.col as usize {
@@ -797,6 +801,71 @@ fn cell_semantics(
 /// `to_ir` runs after the document has been fully read; if styles weren't
 /// parsed yet they remain `None` and we silently skip per-cell font
 /// recovery rather than mutate the document during a `&self` traversal.
+/// A cell's solid fill colour ([ECMA-376] §18.8.20 fill), resolved
+/// through the theme when it names a theme slot.
+fn cell_background(
+    doc: &crate::xlsx::XlsxDocument,
+    cd: &CellData,
+    theme: Option<&crate::core::theme::Theme>,
+) -> Option<[u8; 3]> {
+    let fill = doc.styles.as_ref()?.fill_for(cd.style_index?)?;
+    fill.solid_color()?.resolve_opt(theme).map(|rgb| rgb.0)
+}
+
+/// A cell's border ([ECMA-376] §18.8.4), one IR line per styled side.
+fn cell_border(
+    doc: &crate::xlsx::XlsxDocument,
+    cd: &CellData,
+    theme: Option<&crate::core::theme::Theme>,
+) -> Option<TableBorder> {
+    let b = doc.styles.as_ref()?.border_for(cd.style_index?)?;
+    let line = |side: &Option<crate::xlsx::styles::BorderSide>| {
+        let side = side.as_ref()?;
+        let (style, size) = border_line_style(&side.style)?;
+        Some(BorderLine {
+            style,
+            color: side
+                .color
+                .as_ref()
+                .and_then(|c| c.resolve_opt(theme))
+                .map(|rgb| rgb.0),
+            size: Some(size),
+            space: None,
+        })
+    };
+    let border = TableBorder {
+        top: line(&b.top),
+        bottom: line(&b.bottom),
+        left: line(&b.left),
+        right: line(&b.right),
+        inside_h: None,
+        inside_v: None,
+    };
+    [&border.top, &border.bottom, &border.left, &border.right]
+        .iter()
+        .any(|l| l.is_some())
+        .then_some(border)
+}
+
+/// An `ST_BorderStyle` ([ECMA-376] §18.18.3) as an IR line style and a
+/// width in eighths of a point (thin 1/2 pt, medium 1 pt, thick 1 1/2 pt;
+/// hair is thinner still). `none` is no line.
+fn border_line_style(style: &str) -> Option<(BorderStyle, u32)> {
+    Some(match style {
+        "thin" => (BorderStyle::Single, 4),
+        "medium" => (BorderStyle::Single, 8),
+        "thick" => (BorderStyle::Thick, 12),
+        "double" => (BorderStyle::Double, 4),
+        "hair" => (BorderStyle::Dotted, 2),
+        "dotted" => (BorderStyle::Dotted, 4),
+        "dashed" | "dashDot" | "dashDotDot" => (BorderStyle::Dashed, 4),
+        "mediumDashed" | "mediumDashDot" | "mediumDashDotDot" | "slantDashDot" => {
+            (BorderStyle::Dashed, 8)
+        },
+        _ => return None,
+    })
+}
+
 fn font_for(
     doc: &crate::xlsx::XlsxDocument,
     style_index: u32,
