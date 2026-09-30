@@ -76,6 +76,10 @@ impl WasmDocument {
 /// but never change one. The document is held in memory with every OPC part
 /// preserved, so parts this crate does not model (images, charts, custom
 /// XML) survive the round-trip untouched.
+///
+/// Supports `replaceText` (DOCX/PPTX), `setCell` (XLSX) and `toBytes`. The
+/// document builders, `createFromMarkdown` and `saveAs` are native-binding
+/// only.
 #[wasm_bindgen]
 pub struct WasmEditableDocument {
     inner: crate::edit::EditableDocument,
@@ -101,6 +105,35 @@ impl WasmEditableDocument {
     pub fn replace_text(&mut self, find: &str, replace: &str) -> Result<usize, JsValue> {
         self.inner
             .replace_text(find, replace)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Set a cell in an XLSX document. `value` is `null`/`undefined`
+    /// (empty), a string, a number or a boolean; anything else throws.
+    /// Throws for a non-XLSX document or a bad cell reference.
+    #[wasm_bindgen(js_name = setCell)]
+    pub fn set_cell(
+        &mut self,
+        sheet_index: usize,
+        cell_ref: &str,
+        value: JsValue,
+    ) -> Result<(), JsValue> {
+        use crate::xlsx::edit::CellValue;
+        let cv = if value.is_null() || value.is_undefined() {
+            CellValue::Empty
+        } else if let Some(b) = value.as_bool() {
+            CellValue::Boolean(b)
+        } else if let Some(s) = value.as_string() {
+            CellValue::String(s)
+        } else if let Some(n) = value.as_f64() {
+            CellValue::Number(n)
+        } else {
+            return Err(JsValue::from_str(
+                "setCell: value must be null, a string, a number or a boolean",
+            ));
+        };
+        self.inner
+            .set_cell(sheet_index, cell_ref, cv)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 

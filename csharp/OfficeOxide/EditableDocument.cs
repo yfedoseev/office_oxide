@@ -21,7 +21,22 @@ public sealed class EditableDocument : IDisposable
         return new EditableDocument(h);
     }
 
-    /// <summary>Replace every occurrence of <paramref name="find"/> with <paramref name="replace"/>. Returns the replacement count.</summary>
+    /// <summary>
+    /// Open an in-memory DOCX/XLSX/PPTX for editing, without a temporary file.
+    /// <paramref name="format"/> is "docx", "xlsx" or "pptx". Use <see cref="SaveToBytes"/> to get the result.
+    /// </summary>
+    public static EditableDocument FromBytes(byte[] data, string format)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        var h = NativeMethods.OfficeEditableOpenFromBytes(data, (nuint)data.Length, format, out var err);
+        if (h == IntPtr.Zero) throw new OfficeOxideException(err, nameof(FromBytes));
+        return new EditableDocument(h);
+    }
+
+    /// <summary>
+    /// Replace every occurrence of <paramref name="find"/> with <paramref name="replace"/>. Returns the replacement count.
+    /// An empty <paramref name="find"/> throws (code InvalidArg); XLSX throws (code Unsupported).
+    /// </summary>
     public long ReplaceText(string find, string replace)
     {
         EnsureOpen();
