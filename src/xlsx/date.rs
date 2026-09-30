@@ -48,6 +48,64 @@ impl DateTimeValue {
         self.to_string()
     }
 
+    /// Parse the ISO 8601 date/time a `t="d"` cell stores ([ECMA-376]
+    /// §18.18.11; xsd:dateTime or xsd:date): `YYYY-MM-DD`, optionally
+    /// followed by `THH:MM[:SS[.fff]]` and a `Z`/`±HH:MM` zone, which is
+    /// dropped — the value is shown as written, as Excel shows it. `None`
+    /// for anything else, or for out-of-range fields.
+    pub fn parse_iso8601(s: &str) -> Option<Self> {
+        let s = s.trim();
+        let (date, time) = match s.split_once('T') {
+            Some((d, t)) => (d, Some(t)),
+            None => (s, None),
+        };
+        let mut d = date.splitn(3, '-');
+        let (y, mo, day) = (d.next()?, d.next()?, d.next()?);
+        if y.len() != 4 || mo.len() != 2 || day.len() != 2 {
+            return None;
+        }
+        let num = |t: &str| -> Option<u32> {
+            (!t.is_empty() && t.bytes().all(|b| b.is_ascii_digit())).then(|| t.parse().ok())?
+        };
+        let (year, month, day) = (num(y)? as i32, num(mo)?, num(day)?);
+        if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+            return None;
+        }
+        let (mut hour, mut minute, mut second, mut millisecond) = (0, 0, 0, 0);
+        if let Some(t) = time {
+            // Drop a trailing zone designator.
+            let t = t.strip_suffix('Z').unwrap_or(t);
+            let t = match t.rfind(['+', '-']) {
+                Some(i) if i >= 5 => &t[..i],
+                _ => t,
+            };
+            let mut parts = t.split(':');
+            hour = num(parts.next()?)?;
+            minute = num(parts.next()?)?;
+            if let Some(sec) = parts.next() {
+                let (whole, frac) = sec.split_once('.').unwrap_or((sec, ""));
+                second = num(whole)?;
+                if !frac.is_empty() {
+                    let digits: String = frac.chars().take(3).collect();
+                    let scale = 10u32.pow(3 - digits.len() as u32);
+                    millisecond = num(&digits)? * scale;
+                }
+            }
+            if parts.next().is_some() || hour > 23 || minute > 59 || second > 59 {
+                return None;
+            }
+        }
+        Some(Self {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            millisecond,
+        })
+    }
+
     /// Convert an Excel serial number to a date/time value.
     ///
     /// Excel stores dates as floating-point days since a base date:
@@ -264,6 +322,16 @@ pub fn is_date_format_string(format: &str) -> bool {
     }
 
     has_date_token
+}
+
+/// Days in `month` of `year` (proleptic Gregorian).
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 31,
+    }
 }
 
 #[cfg(test)]

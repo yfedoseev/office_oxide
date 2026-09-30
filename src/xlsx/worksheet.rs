@@ -1356,6 +1356,15 @@ fn parse_cell_fast(
             Some(s) => CellValue::Error(s),
             None => CellValue::Error(String::new()),
         },
+        // [ECMA-376] §18.18.11: `d` holds an ISO 8601 date/time. Text that
+        // is not one stays the text it is rather than becoming a wrong date.
+        Some("d") => match raw_value {
+            Some(s) => match super::date::DateTimeValue::parse_iso8601(&s) {
+                Some(dt) => CellValue::Date(dt),
+                None => CellValue::String(s),
+            },
+            None => CellValue::Empty,
+        },
         _ => match (number, raw_value) {
             (Some(n), _) => CellValue::Number(n),
             (None, Some(s)) => match fast_float2::parse::<f64, _>(&s) {
@@ -2166,5 +2175,40 @@ mod tests {
             merge_threaded_comments(legacy.clone(), Vec::new(), &std::collections::HashMap::new());
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "plain note");
+    }
+
+    /// `t="d"` ([ECMA-376] §18.18.11 ST_CellType) stores an ISO 8601 date
+    /// in `<v>`. It had no arm and fell through as a plain string;
+    /// `CellValue::Date` was constructed nowhere in the reader.
+    #[test]
+    fn test_iso_date_cells_parse_as_dates() {
+        let xml = br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1">
+          <c r="A1" t="d"><v>2024-03-15T10:30:05Z</v></c>
+          <c r="B1" t="d"><v>2024-03-15</v></c>
+          <c r="C1" t="d"><v>2024-03-15T10:30:05.250+02:00</v></c>
+          <c r="D1" t="d"><v>not a date</v></c>
+          <c r="E1" t="d"><v>2024-13-40</v></c>
+        </row></sheetData></worksheet>"#;
+        let ws =
+            Worksheet::parse(xml, "S".into(), &crate::core::relationships::Relationships::empty())
+                .unwrap();
+        let v: Vec<_> = ws.rows[0].cells.iter().map(|c| c.value.clone()).collect();
+        let date = |y, mo, d, h, mi, s, ms| {
+            CellValue::Date(super::super::date::DateTimeValue {
+                year: y,
+                month: mo,
+                day: d,
+                hour: h,
+                minute: mi,
+                second: s,
+                millisecond: ms,
+            })
+        };
+        assert_eq!(format!("{:?}", v[0]), format!("{:?}", date(2024, 3, 15, 10, 30, 5, 0)));
+        assert_eq!(format!("{:?}", v[1]), format!("{:?}", date(2024, 3, 15, 0, 0, 0, 0)));
+        assert_eq!(format!("{:?}", v[2]), format!("{:?}", date(2024, 3, 15, 10, 30, 5, 250)));
+        // Not an ISO date: kept as the text it is, never a wrong date.
+        assert_eq!(format!("{:?}", v[3]), format!("{:?}", CellValue::String("not a date".into())));
+        assert_eq!(format!("{:?}", v[4]), format!("{:?}", CellValue::String("2024-13-40".into())));
     }
 }
