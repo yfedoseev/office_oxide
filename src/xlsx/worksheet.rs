@@ -340,7 +340,7 @@ pub fn parse_comments(xml_data: &[u8]) -> crate::core::Result<Vec<SheetComment>>
             Event::Start(ref e) => match e.local_name().as_ref() {
                 "authors" => in_authors = true,
                 "author" if in_authors => {
-                    authors.push(xml::read_text_content_fast(&mut reader)?);
+                    authors.push(xml::read_text_content_fast(&mut reader)?.trim().to_string());
                 },
                 "comment" => {
                     let cell_ref = xml::optional_attr_str(e, "ref")?
@@ -2067,6 +2067,32 @@ mod tests {
 </worksheet>"#;
         let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
         assert!(ws.page_setup.is_none());
+    }
+
+    /// quick-xml reports an entity reference as its own event, so a
+    /// trimming reader trimmed the text on either side of it separately and
+    /// the spaces around `&amp;` vanished: `see A &amp; &lt;B&gt;` read back
+    /// as `see A&<B>`.
+    #[test]
+    fn test_comment_text_keeps_spaces_around_entity_references() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <authors><author>R &amp; D</author></authors>
+  <commentList>
+    <comment ref="A1" authorId="0"><text><r><t xml:space="preserve">see A &amp; &lt;B&gt; now</t></r></text></comment>
+  </commentList>
+</comments>"#;
+        let comments = parse_comments(xml).unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].text, "see A & <B> now");
+        assert_eq!(comments[0].author.as_deref(), Some("R & D"));
+
+        let threaded = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ThreadedComments xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments">
+  <threadedComment ref="B2" personId="{P1}" id="{ID1}"><text>x &amp; y</text></threadedComment>
+</ThreadedComments>"#;
+        let raw = parse_threaded_comments(threaded).unwrap();
+        assert_eq!(raw[0].text, "x & y");
     }
 
     // ── Threaded comments ──

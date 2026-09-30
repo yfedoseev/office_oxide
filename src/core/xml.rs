@@ -675,33 +675,82 @@ pub fn resolve_general_ref(e: &quick_xml::events::BytesRef<'_>) -> Result<String
 }
 
 /// Read text content between start and end tags using fast Reader.
+///
+/// A trimming reader (see [`make_fast_reader`]) trims every `Event::Text`
+/// on its own, but quick-xml reports each entity reference as a separate
+/// event, so the text either side of `&amp;` arrived as two fragments and
+/// the spaces at the entity boundary were trimmed away: `see A &amp; B`
+/// read as `see A&B`. Trimming is therefore switched off while the content
+/// is read and re-applied here only where a fragment meets a tag (or the
+/// start/end of the content) — never where it meets an entity reference or
+/// CDATA, which are part of the same run of text.
 pub fn read_text_content_fast(reader: &mut quick_xml::Reader<&[u8]>) -> Result<String> {
     use quick_xml::events::Event;
-    let mut text = String::new();
+    enum Piece {
+        Text(String),
+        Literal(String),
+        Tag,
+    }
+    let trim_start = reader.config().trim_text_start;
+    let trim_end = reader.config().trim_text_end;
+    reader.config_mut().trim_text(false);
+    let mut pieces: Vec<Piece> = Vec::new();
     let mut depth = 1u32;
-    loop {
-        match reader.read_event()? {
+    let result = loop {
+        let event = match reader.read_event() {
+            Ok(e) => e,
+            Err(e) => break Err(e.into()),
+        };
+        match event {
             Event::Text(e) => {
                 // Unescape borrows when there is nothing to resolve, which
-                // is nearly always; `unescape_text` would allocate a copy
-                // only to append it here and drop it.
-                text.push_str(&quick_xml::escape::unescape(&e).map_err(quick_xml::Error::from)?);
+                // is nearly always.
+                match quick_xml::escape::unescape(&e) {
+                    Ok(t) => pieces.push(Piece::Text(t.into_owned())),
+                    Err(err) => break Err(quick_xml::Error::from(err).into()),
+                }
             },
-            Event::GeneralRef(e) => {
-                text.push_str(&resolve_general_ref(&e)?);
+            Event::GeneralRef(e) => match resolve_general_ref(&e) {
+                Ok(t) => pieces.push(Piece::Literal(t)),
+                Err(err) => break Err(err),
             },
-            Event::CData(e) => {
-                text.push_str(&e);
+            Event::CData(e) => pieces.push(Piece::Literal(String::from(&*e))),
+            Event::Start(_) => {
+                depth += 1;
+                pieces.push(Piece::Tag);
             },
-            Event::Start(_) => depth += 1,
             Event::End(_) => {
                 depth -= 1;
                 if depth == 0 {
-                    break;
+                    break Ok(());
                 }
+                pieces.push(Piece::Tag);
             },
-            Event::Eof => break,
+            Event::Empty(_) => pieces.push(Piece::Tag),
+            Event::Eof => break Ok(()),
             _ => {},
+        }
+    };
+    reader.config_mut().trim_text_start = trim_start;
+    reader.config_mut().trim_text_end = trim_end;
+    result?;
+
+    let is_boundary = |p: Option<&Piece>| matches!(p, None | Some(Piece::Tag));
+    let mut text = String::new();
+    for (i, piece) in pieces.iter().enumerate() {
+        match piece {
+            Piece::Text(t) => {
+                let mut t = t.as_str();
+                if trim_start && is_boundary(i.checked_sub(1).and_then(|j| pieces.get(j))) {
+                    t = t.trim_start_matches(|c: char| c.is_ascii_whitespace());
+                }
+                if trim_end && is_boundary(pieces.get(i + 1)) {
+                    t = t.trim_end_matches(|c: char| c.is_ascii_whitespace());
+                }
+                text.push_str(t);
+            },
+            Piece::Literal(t) => text.push_str(t),
+            Piece::Tag => {},
         }
     }
     Ok(text)
@@ -954,6 +1003,41 @@ mod attr_tests {
             attr_value(r#"Target="https://x/?a=1&amp;b=2""#, "Target"),
             "https://x/?a=1&b=2"
         );
+    }
+}
+
+#[cfg(test)]
+mod text_content_tests {
+    use super::*;
+
+    /// Read the content of the first element of `xml` with a trimming reader.
+    fn content(xml: &str) -> String {
+        let mut r = make_fast_reader(xml.as_bytes());
+        loop {
+            if let quick_xml::events::Event::Start(_) = r.read_event().unwrap() {
+                return read_text_content_fast(&mut r).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_trimming_reader_keeps_spaces_at_entity_references() {
+        assert_eq!(content("<t>see A &amp; &lt;B&gt; now</t>"), "see A & <B> now");
+        assert_eq!(content("<t>AT&amp;T</t>"), "AT&T");
+        assert_eq!(content("<t>a <![CDATA[x]]> b</t>"), "a x b");
+    }
+
+    #[test]
+    fn test_trimming_reader_still_trims_at_tags() {
+        // Pretty-print whitespace between child elements is not content.
+        assert_eq!(content("<text>\n  <r><t>a</t></r>\n  <r><t>b</t></r>\n</text>"), "ab");
+        // Leading/trailing whitespace of the whole content is trimmed.
+        assert_eq!(content("<t>  x &amp; y  </t>"), "x & y");
+        // The reader's own configuration is restored afterwards.
+        let mut r = make_fast_reader(b"<a><t>x</t></a>");
+        r.read_event().unwrap();
+        read_text_content_fast(&mut r).unwrap();
+        assert!(r.config().trim_text_start && r.config().trim_text_end);
     }
 }
 
