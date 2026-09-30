@@ -1190,7 +1190,10 @@ fn resolve_hyperlinks_in_run(run: &mut Run, rels: &crate::core::relationships::R
 /// edited with track-changes on and not yet accepted keeps its text there.
 ///
 /// `w:del` is deliberately absent: its `w:delText` children are *deleted*
-/// text and are not part of the document.
+/// text and are not part of the document. So is `w:rt` (ECMA-376
+/// §17.3.3.26), a ruby's phonetic guide: Word draws it above the
+/// `w:rubyBase` text, not in the line, and inlining it doubled every
+/// annotated word (東京 read as とうきょう東京).
 fn is_transparent_paragraph_wrapper(local: &str) -> bool {
     matches!(
         local,
@@ -1201,7 +1204,6 @@ fn is_transparent_paragraph_wrapper(local: &str) -> bool {
             | "sdt"
             | "sdtContent"
             | "ruby"
-            | "rt"
             | "rubyBase"
             | "bdo"
             | "dir"
@@ -4133,6 +4135,20 @@ mod tests {
             },
             other => panic!("expected DropDown, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_ruby_annotation_text_is_not_inlined_into_the_base_text() {
+        // `w:rt` (ECMA-376 §17.3.3.26) is the phonetic guide Word draws
+        // above `w:rubyBase` (§17.3.3.27); it is not part of the line.
+        let xml = r#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:ruby><w:rubyPr><w:rubyAlign w:val="distributeSpace"/></w:rubyPr>
+<w:rt><w:r><w:t>とうきょう</w:t></w:r></w:rt>
+<w:rubyBase><w:r><w:t>東京</w:t></w:r></w:rubyBase></w:ruby>
+<w:r><w:t>へ</w:t></w:r>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml.as_bytes());
+        assert_eq!(run_texts(&p).join(""), "東京へ");
     }
 
     #[test]
