@@ -482,6 +482,9 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
 
     let mut writer = crate::xlsx::write::XlsxWriter::new();
     writer.set_metadata(&ir.metadata);
+    for name in &ir.defined_names {
+        writer.add_defined_name(name.clone());
+    }
 
     // Sheet names must be unique within a workbook (ECMA-376) and Excel
     // additionally rejects names > 31 chars, names containing `:\\/?*[]`,
@@ -503,6 +506,7 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
         let name = unique_sheet_name(raw, idx + 1, &used_names);
         used_names.insert(name.clone());
         let mut sheet = writer.add_sheet(&name);
+        sheet.set_hidden(section.hidden);
 
         // Propagate per-section page geometry so a PDF→XLSX→PDF round
         // trip preserves the source MediaBox. Without this each

@@ -180,7 +180,15 @@ fn render_cell(cell_ref: &str, attrs: &str, value: &CellValue) -> String {
         CellValue::Empty => format!(r#"<c r="{cell_ref}"{attrs}/>"#),
         CellValue::String(s) => {
             let escaped = escape_xml(s);
-            format!(r#"<c r="{cell_ref}"{attrs} t="inlineStr"><is><t>{escaped}</t></is></c>"#)
+            // XML 1.0 §2.10: padded text keeps its spaces only if marked.
+            let space = if escaped.trim() != escaped {
+                r#" xml:space="preserve""#
+            } else {
+                ""
+            };
+            format!(
+                r#"<c r="{cell_ref}"{attrs} t="inlineStr"><is><t{space}>{escaped}</t></is></c>"#
+            )
         },
         CellValue::Number(n) if n.is_finite() => {
             format!(r#"<c r="{cell_ref}"{attrs}><v>{n}</v></c>"#)
@@ -505,6 +513,17 @@ mod tests {
             out,
             r#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><pageMargins/></worksheet>"#
         );
+    }
+
+    /// The editor writes padded text with `xml:space="preserve"`, as the
+    /// writer does.
+    #[test]
+    fn test_padded_text_is_written_with_xml_space_preserve() {
+        let xml = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#;
+        let out = set_cell_in_xml(xml, "A1", &CellValue::String(" lead".into())).unwrap();
+        assert!(out.contains(r#"<t xml:space="preserve"> lead</t>"#), "{out}");
+        let out = set_cell_in_xml(xml, "A1", &CellValue::String("none".into())).unwrap();
+        assert!(out.contains("<t>none</t>"), "{out}");
     }
 
     #[test]

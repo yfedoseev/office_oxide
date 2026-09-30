@@ -1451,3 +1451,44 @@ fn test_sheet_header_and_footer_text_is_extracted() {
         assert!(!out.contains("Even only"), "{out}");
     }
 }
+
+/// The IR carries defined names and each sheet's hidden flag, but the
+/// XLSX writer emitted neither `<definedNames>` nor `<sheet state>`: a
+/// read→IR→write round trip unhid every hidden sheet and dropped every
+/// named range.
+#[test]
+fn test_defined_names_and_hidden_sheets_survive_an_ir_round_trip() {
+    let mut first = Sheet::new("Data", r#"<row r="1"><c r="A1"><v>1</v></c></row>"#);
+    first.state = Some("hidden");
+    let second = Sheet::new("Report", r#"<row r="1"><c r="A1"><v>2</v></c></row>"#);
+    let ir = Xlsx::new(vec![first, second]).ir();
+    // The builder's workbook has no <definedNames>; add them at the IR,
+    // where a round trip carries them from.
+    let mut ir = ir;
+    ir.defined_names = vec![
+        DefinedName {
+            name: "Totals".into(),
+            value: "Data!$A$1:$A$10".into(),
+            local_sheet_id: None,
+            hidden: false,
+        },
+        DefinedName {
+            name: "_xlnm.Print_Area".into(),
+            value: "Report!$A$1:$B$2".into(),
+            local_sheet_id: Some(1),
+            hidden: true,
+        },
+    ];
+    let bytes = to_bytes(&office_oxide::create::ir_to_xlsx(&ir));
+    let back = Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx)
+        .expect("reopen")
+        .to_ir();
+    assert_eq!(
+        back.sections
+            .iter()
+            .map(|s| (s.title.clone().unwrap_or_default(), s.hidden))
+            .collect::<Vec<_>>(),
+        [("Data".to_string(), true), ("Report".to_string(), false)]
+    );
+    assert_eq!(back.defined_names, ir.defined_names);
+}
