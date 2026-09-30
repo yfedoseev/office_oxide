@@ -606,9 +606,18 @@ impl DepthGuard {
     /// way to learn that the document they just wrote or read is missing
     /// content.
     pub fn enter() -> Option<Self> {
+        Self::enter_within(MAX_NESTING_DEPTH)
+    }
+
+    /// [`enter`](Self::enter) with a caller-chosen limit on the same
+    /// thread-local counter — for a walk that spends more than one level
+    /// per nesting step of the tree it walks (the IR renderers), and so
+    /// needs a proportionally larger budget to show everything a reader
+    /// bounded by [`MAX_NESTING_DEPTH`] produced.
+    pub fn enter_within(limit: usize) -> Option<Self> {
         NESTING_DEPTH.with(|d| {
             let cur = d.get();
-            if cur >= MAX_NESTING_DEPTH {
+            if cur >= limit {
                 TRUNCATED_SUBTREES.with(|t| t.set(t.get() + 1));
                 None
             } else {

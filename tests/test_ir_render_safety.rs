@@ -354,6 +354,71 @@ fn deep_table() -> Element {
     inner
 }
 
+/// A table nested `levels` deep with "level N" in each cell.
+fn nested_levels(levels: usize) -> Element {
+    let mut inner = Element::Paragraph(Paragraph {
+        content: vec![span(&format!("level {levels}"))],
+        ..Default::default()
+    });
+    for n in (0..levels).rev() {
+        inner = Element::Table(Table {
+            rows: vec![TableRow {
+                cells: vec![TableCell {
+                    content: vec![
+                        Element::Paragraph(Paragraph {
+                            content: vec![span(&format!("level {n}"))],
+                            ..Default::default()
+                        }),
+                        inner,
+                    ],
+                    col_span: 1,
+                    row_span: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+    }
+    inner
+}
+
+/// The renderers shared the reader's nesting budget but spend more than one
+/// level of it per table, so a table the converter kept in full (its own
+/// cap is `MAX_NESTING_DEPTH` tables) lost its innermost levels on render —
+/// silently, with only a log line. Whatever a reader produces must render
+/// in full, and a subtree the renderer does skip must say so in the output.
+#[test]
+fn test_renderers_show_every_level_a_reader_keeps_and_mark_what_they_skip() {
+    let handle = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let max = office_oxide::core::xml::MAX_NESTING_DEPTH;
+            let ir = ir_with(vec![nested_levels(max)]);
+            for (surface, out) in [
+                ("plain", ir.plain_text()),
+                ("markdown", ir.to_markdown()),
+                ("html", ir.to_html()),
+            ] {
+                for n in [0, max / 2, max - 1, max] {
+                    assert!(out.contains(&format!("level {n}")), "{surface}: lost level {n}");
+                }
+                assert!(!out.contains("not shown"), "{surface}: truncated a reader-sized tree");
+            }
+
+            let ir = ir_with(vec![deep_table()]);
+            for (surface, out) in [
+                ("plain", ir.plain_text()),
+                ("markdown", ir.to_markdown()),
+                ("html", ir.to_html()),
+            ] {
+                assert!(out.contains("not shown"), "{surface}: skipped content without a notice");
+            }
+        })
+        .expect("spawn");
+    handle.join().expect("renderer thread panicked");
+}
+
 /// Every renderer walks the element tree recursively. Without a depth
 /// bound, a deeply nested IR overflowed the stack — an abort no caller can
 /// catch. The walk must stop at the shared nesting limit, still render the

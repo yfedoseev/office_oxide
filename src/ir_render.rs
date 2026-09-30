@@ -58,13 +58,29 @@ thread_local! {
 /// run on the caller's own stack. Past `MAX_NESTING_DEPTH` the subtree is
 /// skipped; the skip is counted in `core::xml::truncated_subtrees` (reset
 /// it before rendering to read a per-call count) as well as logged.
+///
+/// The budget is larger than the readers' [`MAX_NESTING_DEPTH`]: a walk
+/// spends a level on the element that holds a table *and* one on the table
+/// itself, and with the readers' budget a table the converter kept in full
+/// lost its innermost levels here. Two levels per reader level, plus
+/// headroom for the section/cell wrappers, keeps everything a reader
+/// produced visible while still bounding a crafted, deserialized tree.
+///
+/// [`MAX_NESTING_DEPTH`]: crate::core::xml::MAX_NESTING_DEPTH
 fn enter_render_level() -> Option<crate::core::xml::DepthGuard> {
-    let guard = crate::core::xml::DepthGuard::enter();
+    let guard = crate::core::xml::DepthGuard::enter_within(RENDER_NESTING_DEPTH);
     if guard.is_none() {
         log::warn!("render: element nesting exceeds the depth limit; subtree skipped");
     }
     guard
 }
+
+/// See [`enter_render_level`].
+const RENDER_NESTING_DEPTH: usize = 2 * crate::core::xml::MAX_NESTING_DEPTH + 16;
+
+/// What a renderer writes in place of a subtree it skipped at the depth
+/// bound, so the output says content is missing instead of silently ending.
+const SKIPPED_SUBTREE_NOTICE: &str = "[content nested too deeply not shown — document truncated]";
 
 /// The media type to put in an image's `data:` URI.
 ///
@@ -459,7 +475,7 @@ fn render_section_plain(section: &Section) -> String {
 
 fn render_element_plain(element: &Element) -> String {
     let Some(_depth) = enter_render_level() else {
-        return String::new();
+        return format!("{SKIPPED_SUBTREE_NOTICE}\n");
     };
     match element {
         Element::Heading(h) => render_inline_plain(&h.content),
@@ -517,7 +533,7 @@ fn render_table_plain(table: &Table) -> String {
 
 fn render_list_plain(list: &List, indent: usize) -> String {
     let Some(_depth) = enter_render_level() else {
-        return String::new();
+        return format!("{SKIPPED_SUBTREE_NOTICE}\n");
     };
     let prefix_str = " ".repeat(indent * 2);
     let mut lines = Vec::new();
@@ -595,7 +611,7 @@ fn render_section_markdown(section: &Section) -> String {
 
 fn render_element_markdown(element: &Element) -> String {
     let Some(_depth) = enter_render_level() else {
-        return String::new();
+        return format!("*{}*\n\n", escape_markdown(SKIPPED_SUBTREE_NOTICE));
     };
     match element {
         Element::Heading(h) => {
@@ -911,7 +927,7 @@ fn render_cell_markdown(cell: &TableCell) -> String {
 
 fn render_list_markdown(list: &List, indent: usize) -> String {
     let Some(_depth) = enter_render_level() else {
-        return String::new();
+        return format!("*{}*\n", escape_markdown(SKIPPED_SUBTREE_NOTICE));
     };
     let prefix_str = "  ".repeat(indent);
     // A numbered list that starts at 3 in the source must start at 3 here:
@@ -1046,7 +1062,7 @@ fn render_section_html(section: &Section) -> String {
 
 fn render_element_html(element: &Element) -> String {
     let Some(_depth) = enter_render_level() else {
-        return String::new();
+        return format!("<p>{}</p>\n", escape_html(SKIPPED_SUBTREE_NOTICE));
     };
     match element {
         Element::Heading(h) => {
@@ -1243,7 +1259,7 @@ fn render_list_html(list: &List) -> String {
 /// [`merge_adjacent_lists`] for what counts as adjacent.
 fn render_list_group_html(lists: &[&List]) -> String {
     let Some(_depth) = enter_render_level() else {
-        return String::new();
+        return format!("<p>{}</p>\n", escape_html(SKIPPED_SUBTREE_NOTICE));
     };
     let Some(first) = lists.first() else {
         return String::new();
