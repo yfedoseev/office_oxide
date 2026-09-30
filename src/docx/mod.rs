@@ -2565,7 +2565,7 @@ fn parse_graphic(
 /// so we descend through whatever wrappers we encounter rather than
 /// skipping siblings.
 /// The `a:blip` of a `pic:pic`: its embedded picture's `r:embed` and its
-/// linked picture's `r:link` (ECMA-376 §20.1.8.13); a blip may carry
+/// linked picture's `r:link` (ECMA-376 §20.1.8); a blip may carry
 /// either or both.
 fn parse_pic(
     reader: &mut quick_xml::Reader<&[u8]>,
