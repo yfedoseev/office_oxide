@@ -408,6 +408,20 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<D
         &hyperlinks,
         &ole_objects,
     );
+    // The notes/handout header and footer print on every notes page and
+    // handout through the Notes and Handout Masters when shown. They are
+    // never slide text; they belong with the other master-level text, once.
+    if let Some(hf) = find_child(&doc_children, RT_HEADER_FOOTER, HF_INSTANCE_NOTES) {
+        for text in shown_header_footer_texts(&hf, true) {
+            if !master_text.iter().any(|r| r.text == text) {
+                master_text.push(TextRun {
+                    text_type: TextType::Other,
+                    text,
+                    ..Default::default()
+                });
+            }
+        }
+    }
 
     // Every run's `fontRef` names a font in the deck's collection.
     if !fonts.is_empty() {
@@ -671,8 +685,17 @@ fn find_record_any_instance(data: &[u8], rec_type: u16, depth: usize) -> Option<
 /// The header string is the notes/handout page's and is never shown on a
 /// slide; an automatic date has no stored text.
 fn shown_slide_header_footer_texts(hf_children: &[u8]) -> Vec<String> {
+    shown_header_footer_texts(hf_children, false)
+}
+
+/// The shown header/footer text of a `HeadersFootersContainer`: the header
+/// (only when `with_header` — a notes/handout container) under
+/// `fHasHeader`, the footer under `fHasFooter`, the user date under
+/// `fHasDate` + `fHasUserDate` ([MS-PPT] `HeadersFootersAtom`).
+fn shown_header_footer_texts(hf_children: &[u8], with_header: bool) -> Vec<String> {
     let mut flags = 0u16;
     let mut user_date = None;
+    let mut header = None;
     let mut footer = None;
     for rec in RecordIter::new(hf_children) {
         let Ok(rec) = rec else { break };
@@ -687,6 +710,7 @@ fn shown_slide_header_footer_texts(hf_children: &[u8]) -> Vec<String> {
                 }
                 match rec.header.rec_instance {
                     HF_CSTRING_USER_DATE => user_date = Some(text),
+                    HF_CSTRING_HEADER => header = Some(text),
                     HF_CSTRING_FOOTER => footer = Some(text),
                     _ => {},
                 }
@@ -695,6 +719,9 @@ fn shown_slide_header_footer_texts(hf_children: &[u8]) -> Vec<String> {
         }
     }
     let mut texts = Vec::new();
+    if with_header && flags & HF_HAS_HEADER != 0 {
+        texts.extend(header);
+    }
     if flags & HF_HAS_FOOTER != 0 {
         texts.extend(footer);
     }

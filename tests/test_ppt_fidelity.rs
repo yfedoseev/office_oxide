@@ -175,6 +175,47 @@ fn test_hidden_footer_is_not_injected() {
     assert_eq!(texts(&ir.sections[0].elements), ["Only slide"]);
 }
 
+/// The notes/handout header and footer print on every notes page and
+/// handout through the Notes/Handout Master when their show flags are set
+/// (POI's extractor emits them with the notes). They are never slide text,
+/// but dropping them left text the file visibly carries ("DRAFT", a
+/// division name) nowhere at all. They come out once per deck, with the
+/// other master-level text; an unshown one stays out.
+#[test]
+fn test_shown_notes_and_handout_header_footer_appear_once_in_the_master_section() {
+    let mut doc_children =
+        headers_footers(4, HF_HAS_HEADER | HF_HAS_FOOTER, &[(1, "DRAFT"), (2, "Notes footer")]);
+    // A slide footer string whose show flag is off stays hidden.
+    doc_children.extend(headers_footers(3, 0, &[(2, "Unshown footer")]));
+    let deck = PptBuilder {
+        slides: vec![slide("Slide one"), slide("Slide two")],
+        doc_children,
+        ..Default::default()
+    };
+    let doc = open(deck.build()).unwrap();
+    let ir = doc.to_ir();
+    for section in &ir.sections[..2] {
+        let t = texts(&section.elements);
+        assert!(!t.iter().any(|t| t.contains("DRAFT")), "{t:?}");
+    }
+    let last = ir.sections.last().unwrap();
+    assert_eq!(last.title.as_deref(), Some("Slide Master"));
+    assert_eq!(texts(&last.elements), ["DRAFT", "Notes footer"]);
+    for text in [doc.plain_text(), doc.to_markdown(), doc.to_html()] {
+        assert_eq!(text.matches("DRAFT").count(), 1, "{text}");
+        assert!(!text.contains("Unshown footer"), "{text}");
+    }
+
+    // Flags off: the strings are stored but never shown.
+    let hidden = PptBuilder {
+        slides: vec![slide("Slide one")],
+        doc_children: headers_footers(4, 0, &[(1, "DRAFT")]),
+        ..Default::default()
+    };
+    let doc = open(hidden.build()).unwrap();
+    assert!(!doc.plain_text().contains("DRAFT"));
+}
+
 fn spans(elements: &[Element]) -> Vec<office_oxide::ir::TextSpan> {
     let mut out = Vec::new();
     for e in elements {

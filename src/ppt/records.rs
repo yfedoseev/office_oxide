@@ -67,14 +67,22 @@ pub const RT_HEADER_FOOTER_ATOM: u16 = 0x0FDA;
 /// settings ([MS-PPT] `SlideHeadersFootersContainer`: MUST be 0x003); the
 /// notes/handouts one is 0x004 and never applies to slides.
 pub const HF_INSTANCE_SLIDES: u16 = 0x003;
+/// `HeadersFootersContainer.recInstance` of the notes pages' and handouts'
+/// header/footer settings ([MS-PPT] `NotesHeadersFootersContainer`: MUST be
+/// 0x004), shown through the Notes and Handout Masters.
+pub const HF_INSTANCE_NOTES: u16 = 0x004;
 /// `HeadersFootersAtom` flag bits ([MS-PPT] `HeadersFootersAtom`):
-/// `fHasDate` (bit 0), `fHasUserDate` (bit 2), `fHasFooter` (bit 5).
+/// `fHasDate` (bit 0), `fHasUserDate` (bit 2), `fHasHeader` (bit 4),
+/// `fHasFooter` (bit 5).
 pub const HF_HAS_DATE: u16 = 0x0001;
 pub const HF_HAS_USER_DATE: u16 = 0x0004;
 pub const HF_HAS_FOOTER: u16 = 0x0020;
+/// `fHasHeader` (bit 4) — only meaningful for notes pages and handouts.
+pub const HF_HAS_HEADER: u16 = 0x0010;
 /// `CString` instances inside a `HeadersFootersContainer`
 /// ([MS-PPT] `HeadersFootersContainer`): user date 0, header 1, footer 2.
 pub const HF_CSTRING_USER_DATE: u16 = 0;
+pub const HF_CSTRING_HEADER: u16 = 1;
 pub const HF_CSTRING_FOOTER: u16 = 2;
 pub const RT_STYLE_TEXT_PROP: u16 = 0x0FA1;
 pub const RT_CSTRING: u16 = 0x0FBA;
