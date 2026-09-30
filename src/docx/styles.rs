@@ -108,18 +108,23 @@ impl StyleSheet {
     /// so callers can overlay each style in turn and have the most specific
     /// one win. Cycles and pathological `w:basedOn` chains are cut off at 20
     /// links.
-    fn chain(&self, style_id: &str) -> Vec<&Style> {
-        let mut out = Vec::new();
+    ///
+    /// Collected on the stack: this runs for every run and paragraph of a
+    /// document, and a `Vec` per call was a heap allocation each time.
+    fn chain(&self, style_id: &str) -> impl DoubleEndedIterator<Item = &Style> {
+        const MAX_CHAIN: usize = 20;
+        let mut buf: [Option<&Style>; MAX_CHAIN] = [None; MAX_CHAIN];
+        let mut len = 0;
         let mut current = self.styles.get(style_id);
         while let Some(style) = current {
-            if out.len() >= 20 {
+            if len >= MAX_CHAIN {
                 break;
             }
-            out.push(style);
+            buf[len] = Some(style);
+            len += 1;
             current = style.based_on.as_deref().and_then(|id| self.styles.get(id));
         }
-        out.reverse();
-        out
+        buf.into_iter().take(len).rev().flatten()
     }
 
     /// Fold the effective run formatting for a run: document defaults, then

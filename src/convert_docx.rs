@@ -615,12 +615,13 @@ fn convert_block_elements(
                 // style-level list switched off for one paragraph. Treating
                 // it as a list turned an ordinary paragraph into a bullet.
                 if heading_level.is_none()
-                    && let Some(nr) = eff_ref
+                    && let Some(num_id) = eff_ref
                         .and_then(|pp| pp.numbering_ref.as_ref())
-                        .filter(|nr| nr.num_id != 0)
+                        .map(|nr| nr.num_id)
+                        .filter(|&id| id != 0)
                 {
                     let list_element =
-                        convert_list_group(blocks, &mut i, nr.num_id, doc, &mut numbering_counts);
+                        convert_list_group(blocks, &mut i, num_id, doc, &mut numbering_counts, eff);
                     elements.push(list_element);
                     continue;
                 }
@@ -631,11 +632,15 @@ fn convert_block_elements(
                 // with a single bottom border. pdf_to_ir round-trips
                 // ThematicBreak through DOCX as exactly this shape;
                 // recover it here so the renderer draws a rule.
-                let inline = convert_paragraph_inline(p, doc);
-                let is_empty_para = inline.iter().all(|ic| {
-                    matches!(ic,
-                        crate::ir::InlineContent::Text(s) if s.text.is_empty()
-                    )
+                // The paragraph's inline content, cut at hard breaks —
+                // converted once and used for every decision below.
+                let mut segments = split_at_hard_breaks(p, doc);
+                let is_empty_para = segments.iter().all(|(inline, _)| {
+                    inline.iter().all(|ic| {
+                        matches!(ic,
+                            crate::ir::InlineContent::Text(s) if s.text.is_empty()
+                        )
+                    })
                 });
                 let has_bottom_border = eff_ref.is_some_and(|pp| pp.has_bottom_border);
                 if is_empty_para && has_bottom_border {
@@ -685,9 +690,10 @@ fn convert_block_elements(
                         }
                         Element::Paragraph(para)
                     };
-                    let mut segments = split_at_hard_breaks(p, doc);
                     if segments.len() == 1 && segments[0].1.is_none() {
-                        elements.push(make_para(convert_paragraph_inline(p, doc)));
+                        let (mut inline, _) = segments.swap_remove(0);
+                        inline.shrink_to_fit();
+                        elements.push(make_para(inline));
                     } else {
                         // The paragraph's own slot is the first segment when
                         // it holds text; later segments are paragraphs only
@@ -1182,6 +1188,19 @@ fn convert_run(
     ctx: &RunContext<'_>,
     content: &mut Vec<InlineContent>,
 ) {
+    convert_run_content(run.properties.as_ref(), &run.content, link, ctx, content);
+}
+
+/// [`convert_run`] on a run's properties and a slice of its content, so a
+/// run can be converted in pieces (around a hard break) without copying it.
+fn convert_run_content(
+    run_properties: Option<&crate::docx::RunProperties>,
+    run_content: &[crate::docx::RunContent],
+    // The enclosing hyperlink's URL and hover text.
+    link: Option<(&str, Option<&str>)>,
+    ctx: &RunContext<'_>,
+    content: &mut Vec<InlineContent>,
+) {
     let theme = ctx.theme;
     // Fold document defaults, the paragraph style chain, the run's
     // character style and its direct `w:rPr` into one effective set.
@@ -1191,11 +1210,10 @@ fn convert_run(
     let resolved;
     let effective: Option<&crate::docx::RunProperties> = match ctx.styles {
         Some(sheet) => {
-            resolved =
-                sheet.effective_run_properties(ctx.paragraph_style_id, run.properties.as_ref());
+            resolved = sheet.effective_run_properties(ctx.paragraph_style_id, run_properties);
             Some(&resolved)
         },
-        None => run.properties.as_ref(),
+        None => run_properties,
     };
     // `<w:vanish/>` — Word never renders this run at all. Excluding it
     // here (rather than carrying a `hidden` flag into the IR for every
@@ -1220,7 +1238,7 @@ fn convert_run(
     // the script of its text; face and size may change inside a run, so
     // each text item is split where they do.
     let run_face =
-        eff.face_for(eff.run_script_class(run.content.iter().filter_map(|rc| match rc {
+        eff.face_for(eff.run_script_class(run_content.iter().filter_map(|rc| match rc {
             crate::docx::RunContent::Text(t) => Some(t.as_str()),
             crate::docx::RunContent::FormField(ff) => ff.display_text.as_deref(),
             _ => None,
@@ -1302,7 +1320,7 @@ fn convert_run(
         });
     };
 
-    for rc in &run.content {
+    for rc in run_content {
         match rc {
             crate::docx::RunContent::Text(text) => push_text(text, content),
             crate::docx::RunContent::Break(crate::docx::BreakType::Line) => {
@@ -1392,10 +1410,13 @@ fn split_at_hard_breaks(
          content: &mut Vec<InlineContent>,
          segments: &mut Vec<(Vec<InlineContent>, Option<HardBreak>)>| {
             // A run holding a hard break is converted around it: the run's
-            // pieces before and after the break belong to different segments.
-            let mut piece = run.clone();
-            piece.content.clear();
-            for rc in &run.content {
+            // pieces before and after the break belong to different
+            // segments. The pieces are slices of the run; cloning the whole
+            // run to empty it again cost a copy of every run in the
+            // document.
+            let props = run.properties.as_ref();
+            let mut piece_start = 0;
+            for (i, rc) in run.content.iter().enumerate() {
                 let brk = match rc {
                     crate::docx::RunContent::Break(crate::docx::BreakType::Page) => {
                         Some(HardBreak::Page)
@@ -1405,19 +1426,23 @@ fn split_at_hard_breaks(
                     },
                     _ => None,
                 };
-                match brk {
-                    Some(b) => {
-                        if !piece.content.is_empty() {
-                            convert_run(&piece, url, &ctx, content);
-                            piece.content.clear();
-                        }
-                        segments.push((std::mem::take(content), Some(b)));
-                    },
-                    None => piece.content.push(rc.clone()),
+                if let Some(b) = brk {
+                    if piece_start < i {
+                        convert_run_content(
+                            props,
+                            &run.content[piece_start..i],
+                            url,
+                            &ctx,
+                            content,
+                        );
+                    }
+                    segments.push((std::mem::take(content), Some(b)));
+                    piece_start = i + 1;
                 }
             }
-            if !piece.content.is_empty() {
-                convert_run(&piece, url, &ctx, content);
+            if piece_start < run.content.len() {
+                let piece = &run.content[piece_start..];
+                convert_run_content(props, piece, url, &ctx, content);
             }
         };
     for pc in &p.content {
@@ -1448,7 +1473,11 @@ fn convert_list_group(
     num_id: u32,
     doc: &crate::docx::DocxDocument,
     numbering_counts: &mut std::collections::HashMap<u32, u32>,
+    // The first paragraph's effective properties, which the caller already
+    // resolved to decide this is a list.
+    first_properties: Option<crate::docx::ParagraphProperties>,
 ) -> Element {
+    let mut first_properties = Some(first_properties);
     let mut items = Vec::new();
     let mut is_ordered = false;
     // How many items at the group's own (shallowest) level this group
@@ -1474,7 +1503,10 @@ fn convert_list_group(
             // and not here: the group consumed nothing, `*i` never advanced,
             // and the caller looped forever appending empty lists until the
             // process was killed.
-            let eff = effective_paragraph_props(p, doc);
+            let eff = match first_properties.take() {
+                Some(eff) => eff,
+                None => effective_paragraph_props(p, doc),
+            };
             if let Some(nr) = eff.as_ref().and_then(|pp| pp.numbering_ref.as_ref()) {
                 if nr.num_id != num_id {
                     break;

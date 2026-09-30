@@ -378,3 +378,76 @@ fn test_html_alt_chunk_flattening_is_linear() {
         "{bytes} bytes requested for a {SCRIPT}-byte script ({baseline} for a tiny one)"
     );
 }
+
+/// A styled DOCX paragraph with one formatted run.
+fn styled_docx(paragraphs: usize) -> Vec<u8> {
+    let mut body = String::new();
+    for i in 0..paragraphs {
+        body.push_str(&format!(
+            r#"<w:p><w:pPr><w:pStyle w:val="Body"/></w:pPr><w:r><w:rPr><w:rStyle w:val="Em"/><w:b/></w:rPr><w:t>word {i}</w:t></w:r></w:p>"#
+        ));
+        if i % 50 == 0 {
+            // A list item every so often, so list grouping is exercised.
+            body.push_str(r#"<w:p><w:pPr><w:pStyle w:val="Body"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>item</w:t></w:r></w:p>"#);
+        }
+    }
+    let styles = r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+      <w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="22"/></w:rPr></w:rPrDefault>
+        <w:pPrDefault><w:pPr><w:spacing w:after="160"/></w:pPr></w:pPrDefault></w:docDefaults>
+      <w:style w:type="paragraph" w:styleId="Normal"><w:name w:val="Normal"/><w:rPr><w:color w:val="333333"/></w:rPr></w:style>
+      <w:style w:type="paragraph" w:styleId="Body"><w:name w:val="Body"/><w:basedOn w:val="Normal"/><w:pPr><w:ind w:left="10"/></w:pPr><w:rPr><w:i/></w:rPr></w:style>
+      <w:style w:type="character" w:styleId="Em"><w:name w:val="Em"/><w:rPr><w:u w:val="single"/></w:rPr></w:style>
+    </w:styles>"#;
+    let numbering = r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+      <w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="-"/></w:lvl></w:abstractNum>
+      <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#;
+    let doc = format!(
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>"#
+    );
+    zip_of(&[
+        (
+            "[Content_Types].xml",
+            br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/></Types>"#,
+        ),
+        (
+            "_rels/.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+        ),
+        (
+            "word/_rels/document.xml.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/></Relationships>"#,
+        ),
+        ("word/document.xml", doc.as_bytes()),
+        ("word/styles.xml", styles.as_bytes()),
+        ("word/numbering.xml", numbering.as_bytes()),
+    ])
+}
+
+/// `to_ir()` converted every paragraph's inline content up to three times
+/// (once to test for an empty paragraph, once inside the hard-break
+/// splitter — which also cloned each run whole just to clear it — and
+/// once more for the paragraph itself), re-walked the style chains for
+/// every run, and resolved each list item's properties twice.
+#[test]
+fn test_docx_to_ir_converts_each_paragraph_once() {
+    let _serial = serial();
+    const PARAS: usize = 1_000;
+    let doc = |n: usize| {
+        office_oxide::Document::from_reader(
+            Cursor::new(styled_docx(n)),
+            office_oxide::DocumentFormat::Docx,
+        )
+        .unwrap()
+    };
+    let small = doc(1);
+    let big = doc(PARAS);
+    let (_, baseline) = allocations_during(|| small.to_ir());
+    let (ir, allocs) = allocations_during(|| big.to_ir());
+    let text = ir.plain_text();
+    assert!(text.contains("word 999") && text.contains("item"));
+    let per_para = allocs.saturating_sub(baseline) as f64 / PARAS as f64;
+    // 38 before; a formatted paragraph now costs its IR (paragraph, span
+    // text, font name), its segment list and one fold of the style chain
+    // for the paragraph and for the run.
+    assert!(per_para < 16.0, "{per_para:.1} allocations per paragraph");
+}
