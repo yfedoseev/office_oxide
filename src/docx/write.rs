@@ -3857,7 +3857,7 @@ fn write_section_pr_body(
         pg_mar.push_attribute(("w:header", ps.header_distance_twips.to_string().as_str()));
         pg_mar.push_attribute(("w:footer", ps.footer_distance_twips.to_string().as_str()));
         // CT_PageMar declares all seven attributes as use="required".
-        pg_mar.push_attribute(("w:gutter", "0"));
+        pg_mar.push_attribute(("w:gutter", ps.gutter_twips.to_string().as_str()));
         w.write_event(Event::Empty(pg_mar)).expect("write pgMar");
     }
 
@@ -3947,7 +3947,7 @@ fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
         pg_mar.push_attribute(("w:header", ps.header_distance_twips.to_string().as_str()));
         pg_mar.push_attribute(("w:footer", ps.footer_distance_twips.to_string().as_str()));
         // CT_PageMar declares all seven attributes as use="required".
-        pg_mar.push_attribute(("w:gutter", "0"));
+        pg_mar.push_attribute(("w:gutter", ps.gutter_twips.to_string().as_str()));
         w.write_event(Event::Empty(pg_mar)).expect("write pgMar");
     }
 

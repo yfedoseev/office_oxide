@@ -446,6 +446,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 header_distance_twips: wsp.header_distance_twips,
                 footer_distance_twips: wsp.footer_distance_twips,
                 landscape: wsp.landscape,
+                ..default
             }
         });
 

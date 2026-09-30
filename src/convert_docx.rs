@@ -534,6 +534,9 @@ fn section_props_to_page_setup(sp: &crate::docx::SectionProperties) -> Option<Pa
         if let Some(f) = m.footer {
             ps.footer_distance_twips = f.0.max(0) as u32;
         }
+        if let Some(g) = m.gutter {
+            ps.gutter_twips = g.0.max(0) as u32;
+        }
     }
     Some(ps)
 }

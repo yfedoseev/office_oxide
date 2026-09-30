@@ -333,6 +333,14 @@ pub struct PageSetup {
     pub header_distance_twips: u32,
     /// Distance from bottom edge to footer in twips (default 720 = 0.5").
     pub footer_distance_twips: u32,
+    /// Extra binding margin in twips (DOCX `w:pgMar/@w:gutter`), added to
+    /// the inside edge for binding. `0` when there is none.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub gutter_twips: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 impl Default for PageSetup {
@@ -347,6 +355,7 @@ impl Default for PageSetup {
             landscape: false,
             header_distance_twips: 720,
             footer_distance_twips: 720,
+            gutter_twips: 0,
         }
     }
 }

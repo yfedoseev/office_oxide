@@ -714,6 +714,26 @@ fn test_column_layout_keeps_space_separator_and_widths() {
     assert_eq!(c.column_widths_twips, vec![4320, 4320]);
 }
 
+/// `w:pgMar/@w:gutter` was parsed and never read, and the writer
+/// hardcoded `w:gutter="0"`, so a bound document's binding margin was
+/// zeroed on every round-trip.
+#[test]
+fn test_gutter_margin_survives_a_round_trip() {
+    let ir = Docx::new(
+        r#"<w:p><w:r><w:t>body</w:t></w:r></w:p>
+           <w:sectPr><w:pgSz w:w="12240" w:h="15840"/>
+             <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"
+                      w:header="720" w:footer="720" w:gutter="567"/></w:sectPr>"#,
+    )
+    .ir();
+    let gutter = |ir: &DocumentIR| ir.sections[0].page_setup.as_ref().map(|p| p.gutter_twips);
+    assert_eq!(gutter(&ir), Some(567));
+    let again = Document::from_reader(Cursor::new(docx_bytes(&ir)), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(gutter(&again), Some(567));
+}
+
 #[test]
 fn test_a_sect_pr_with_no_page_size_reports_no_page_setup() {
     // Synthesising a Letter page for a section that states none would hand
