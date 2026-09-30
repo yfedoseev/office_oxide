@@ -904,10 +904,10 @@ fn test_outline_levels_markdown() {
         .build();
 
     let doc = parse(&data);
+    // No bullet is declared or inherited (no master here), so the level-0
+    // paragraph is a paragraph; the indented ones form a nested list.
     let md = doc.to_markdown();
-    assert!(md.contains("Top level"));
-    assert!(md.contains("  - Sub item"));
-    assert!(md.contains("    - Sub sub item"));
+    assert!(md.contains("Top level\n\n- Sub item\n  - Sub sub item"), "{md}");
 }
 
 // ---------------------------------------------------------------------------

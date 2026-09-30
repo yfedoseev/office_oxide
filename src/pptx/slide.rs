@@ -1318,6 +1318,9 @@ pub(crate) fn apply_inherited_defaults(
     if para.alignment.is_none() {
         para.alignment.clone_from(&defaults.alignment);
     }
+    if para.bullet.is_none() {
+        para.bullet.clone_from(&defaults.bullet);
+    }
     for content in &mut para.content {
         if let TextContent::Run(run) = content {
             if run.bold.is_none() {
@@ -1772,7 +1775,7 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>, rels: &Relationships) -> C
 
 /// Parse `<a:buNone/>`, `<a:buChar char="•"/>` or
 /// `<a:buAutoNum type="…" startAt="…"/>`.
-fn parse_bullet(e: &quick_xml::events::BytesStart) -> CoreResult<Option<BulletStyle>> {
+pub(crate) fn parse_bullet(e: &quick_xml::events::BytesStart) -> CoreResult<Option<BulletStyle>> {
     Ok(match e.local_name().as_ref() {
         "buNone" => Some(BulletStyle::None),
         "buChar" => Some(BulletStyle::Char(

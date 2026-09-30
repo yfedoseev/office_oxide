@@ -351,9 +351,28 @@ fn markdown_blocks_inner(
     _depth: usize,
     numbering_counts: &mut std::collections::HashMap<(u32, u8), u32>,
 ) {
+    // Blocks are separated by a blank line, except consecutive items of one
+    // list (one `numId`), which stay tight — the layout the IR renderer
+    // produces. Ending every block with a single newline let a table, a
+    // code line or a following paragraph run on as a lazy continuation of
+    // the block before it.
+    let mut prev_list: Option<u32> = None;
+    let separate = |out: &mut String, list: Option<u32>, prev: Option<u32>| {
+        if out.is_empty() {
+            return;
+        }
+        while out.ends_with('\n') {
+            out.pop();
+        }
+        let tight = list.is_some() && list == prev;
+        out.push_str(if tight { "\n" } else { "\n\n" });
+    };
     for elem in elements {
         match elem {
             BlockElement::Paragraph(p) => {
+                let block_out: &mut String = out;
+                let mut para_buf = String::new();
+                let out = &mut para_buf;
                 // Determine heading level from outline_level or style
                 let heading_level = p
                     .properties
@@ -378,6 +397,10 @@ fn markdown_blocks_inner(
                     .styles
                     .map(|sheet| sheet.effective_paragraph_properties(p.properties.as_ref()))
                     .or_else(|| p.properties.clone());
+                let list_num = effective
+                    .as_ref()
+                    .and_then(|pp| pp.numbering_ref.as_ref())
+                    .map(|nr| nr.num_id);
                 let list_prefix = effective.as_ref().and_then(|pp| {
                     let nr = pp.numbering_ref.as_ref().filter(|nr| nr.num_id != 0)?;
                     let numbering = ctx.numbering?;
@@ -494,15 +517,25 @@ fn markdown_blocks_inner(
                     }
                 }
                 flush_run(&mut pending, out);
-                out.push('\n');
 
-                // Add extra newline after headings for readability
-                if heading_level.is_some() {
-                    out.push('\n');
+                // A list item is a list item even when empty; any other
+                // empty paragraph is not a block (as on the IR path).
+                let list = list_prefix
+                    .as_ref()
+                    .and(list_num)
+                    .filter(|_| heading_level.is_none());
+                if list.is_none() && para_buf.trim().is_empty() {
+                    prev_list = None;
+                    continue;
                 }
+                separate(block_out, list, prev_list);
+                block_out.push_str(&para_buf);
+                prev_list = list;
             },
             BlockElement::Table(table) => {
+                separate(out, None, prev_list);
                 markdown_table(table, ctx, out);
+                prev_list = None;
             },
         }
     }

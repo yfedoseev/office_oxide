@@ -169,3 +169,36 @@ fn test_direct_and_ir_markdown_carry_the_same_words() {
         );
     }
 }
+
+/// Markdown with its inline emphasis and link syntax removed: what is
+/// left is the layout — blocks, their order, list markers and nesting,
+/// table rows and blank lines.
+fn layout(md: &str) -> String {
+    let mut out = md.replace("**", "");
+    while let Some(open) = out.find("](") {
+        let start = out[..open].rfind('[').unwrap_or(open);
+        let end = out[open..].find(')').map_or(out.len(), |e| open + e + 1);
+        let text = out[start + 1..open].to_string();
+        out.replace_range(start..end, &text);
+    }
+    out.trim_end().to_string()
+}
+
+/// Beyond the same words, the two commands lay a document out the same
+/// way: PPTX bullets and numbering, an XLSX sheet as a table or as
+/// paragraphs, and the blank lines between DOCX blocks all used to differ.
+/// (XLSX cell emphasis and links are drawn only on the IR path, so inline
+/// markup is set aside.)
+#[test]
+fn test_direct_and_ir_markdown_have_the_same_layout() {
+    for (name, doc, _) in corpus("layout") {
+        let direct = doc.to_markdown();
+        let via_ir = ir_markdown(&doc, ImageEmbed::None);
+        assert_eq!(
+            layout(&direct),
+            layout(&via_ir),
+            "{name}: `markdown` and `markdown --embed-images` lay the document out differently\n\
+             --- direct ---\n{direct}\n--- via IR ---\n{via_ir}"
+        );
+    }
+}

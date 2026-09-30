@@ -312,17 +312,17 @@ impl XlsxDocument {
             return Some(String::new());
         }
 
-        // If the sheet is effectively single-column with prose-length cells
-        // (notes, single-column reports), emit each cell as its own paragraph
-        // instead of wrapping every line in a 1-column GFM table. The table
-        // form looks awful when rendered (tall, narrow, hard to read) and
-        // round-trips badly through markdown→IR→office.
-        let prose = col_count == 1
-            && ws.rows.iter().any(|r| {
-                r.cells
-                    .first()
-                    .is_some_and(|c| fmt.text(c).chars().count() > 20)
-            });
+        // A "document style" sheet (see `rows_read_as_prose`) is emitted a
+        // paragraph per row instead of a tall, narrow GFM table that reads
+        // badly and round-trips badly through markdown→IR→office — the
+        // same decision, and the same row layout, as `to_ir()`.
+        let prose = rows_read_as_prose(ws.rows.iter().map(|r| {
+            r.cells
+                .iter()
+                .map(|c| fmt.text(c).chars().count())
+                .filter(|&n| n > 0)
+                .collect::<Vec<_>>()
+        }));
         let mut cell_text = |cell: &Cell| -> Option<String> {
             let text = fmt.text(cell);
             budget
@@ -332,15 +332,26 @@ impl XlsxDocument {
         if prose {
             let mut out = String::new();
             out.push_str(&format!("## {}\n\n", ws.name));
-            for row in &ws.rows {
-                if let Some(cell) = row.cells.first() {
-                    let Some(text) = cell_text(cell) else { break };
-                    if !text.trim().is_empty() {
-                        // `cell_text` escaped for a table cell; prose keeps
-                        // its line breaks as paragraphs.
-                        out.push_str(&text.replace("<br>", "\n"));
-                        out.push_str("\n\n");
+            'rows: for row in &ws.rows {
+                // Every non-empty cell of the row, tab-separated.
+                let mut line = String::new();
+                for cell in &row.cells {
+                    let Some(text) = cell_text(cell) else {
+                        break 'rows;
+                    };
+                    if text.trim().is_empty() {
+                        continue;
                     }
+                    if !line.is_empty() {
+                        line.push('\t');
+                    }
+                    // `cell_text` escaped for a table cell; prose keeps
+                    // its line breaks.
+                    line.push_str(&text.replace("<br>", "\n"));
+                }
+                if !line.is_empty() {
+                    out.push_str(&line);
+                    out.push_str("\n\n");
                 }
             }
             return Some(out.trim_end().to_string());
@@ -571,6 +582,40 @@ fn csv_escape(field: &str) -> String {
 /// a workbook missing a sheet never passes for a complete one.
 pub(crate) fn unreadable_notice(name: &str, err: &str) -> String {
     format!("[unreadable sheet {name:?}: {err}]")
+}
+
+/// Whether a sheet reads as prose — flowing text laid out one paragraph
+/// per row — rather than as a grid. `rows` yields, per row, the character
+/// count of each non-empty cell.
+///
+/// Prose means: at least three non-empty rows, at least 80 % of them with a
+/// single non-empty cell, and at least one cell of prose length (over 20
+/// characters). A single column of short values (names, numbers, codes) is
+/// data and stays a table. `to_ir()` and `to_markdown()` both decide
+/// through this one predicate; they used to use two different rules, so
+/// one rendered a sheet as a table and the other as paragraphs.
+pub(crate) fn rows_read_as_prose<R, C>(rows: R) -> bool
+where
+    R: IntoIterator<Item = C>,
+    C: IntoIterator<Item = usize>,
+{
+    const PROSE_CHARS: usize = 20;
+    let (mut nonempty, mut single, mut long) = (0usize, 0usize, false);
+    for row in rows {
+        let mut n = 0usize;
+        for len in row {
+            n += 1;
+            long |= len > PROSE_CHARS;
+        }
+        if n == 0 {
+            continue;
+        }
+        nonempty += 1;
+        if n == 1 {
+            single += 1;
+        }
+    }
+    long && nonempty >= 3 && single * 100 >= nonempty * 80
 }
 
 #[cfg(test)]

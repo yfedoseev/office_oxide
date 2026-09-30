@@ -790,6 +790,34 @@ fn test_text_formatting_inherits_through_layout_master_and_presentation() {
     assert_eq!(one.color, Some([0xFF, 0, 0]));
 }
 
+/// A body placeholder's paragraphs are bulleted because the master's
+/// `bodyStyle` says so, not their own `<a:pPr>`. The bullet was not part of
+/// the inherited properties, so such a list read as plain paragraphs — or,
+/// once any paragraph was indented, the whole body became one list.
+#[test]
+fn test_body_placeholder_bullets_inherit_from_the_master_body_style() {
+    let mut pkg = styled_deck("");
+    let master = String::from_utf8(pkg.parts["ppt/slideMasters/slideMaster1.xml"].clone()).unwrap();
+    let master = master
+        .replace(
+            r#"<a:lvl1pPr><a:defRPr sz="3200"/>"#,
+            r#"<a:lvl1pPr><a:buChar char="&#8226;"/><a:defRPr sz="3200"/>"#,
+        )
+        .replace(
+            r#"<a:lvl2pPr><a:defRPr sz="2800" i="1"/>"#,
+            r#"<a:lvl2pPr><a:buChar char="&#8211;"/><a:defRPr sz="2800" i="1"/>"#,
+        );
+    pkg.parts
+        .insert("ppt/slideMasters/slideMaster1.xml".into(), master.into_bytes());
+    let doc = pkg.document();
+    for md in [doc.to_markdown(), doc.to_ir().to_markdown()] {
+        assert!(md.contains("- LEVEL ONE\n  - *LEVEL TWO*"), "{md}");
+        // The text box and the date placeholder use `otherStyle`: no bullets.
+        assert!(!md.contains("- DATE") && !md.contains("- TEXT BOX"), "{md}");
+    }
+    assert_eq!(doc.to_markdown().trim_end(), doc.to_ir().to_markdown().trim_end());
+}
+
 /// With no master `txStyles` for a level, the presentation's
 /// `defaultTextStyle` is the last layer.
 #[test]
