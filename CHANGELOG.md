@@ -65,6 +65,7 @@ Resource bounds for untrusted input — each was reachable from a small file thr
 - Direct and IR markdown lay documents out alike (DOCX block spacing, PPTX lists, XLSX tables).
 - Public structs gained fields and enums gained variants (`Metadata`, `Section`, `List`, `TableCell`, `TableRow`, `Image`, `PageSetup`, `xls::Sheet`, `xlsx::Worksheet`, PPTX shape types, `GraphicContent`, `BulletStyle`); code that builds them with struct literals or matches them exhaustively needs `..Default::default()` / a wildcard arm.
 - Python 3.10+ (abi3-py310), matching the versions CI tests.
+- **Dependencies current**: `cargo update` across the workspace, bench and fuzz lockfiles (`encoding_rs` 0.8.42, `thiserror` 2.0.21, `wasm-bindgen` 0.2.129; no direct dependency has a newer major), `koffi` 3.3.2, `markitdown` 0.1.8 bench pin, `uv.lock` (`ruff` 0.16.9), CodeQL action 4.38.2, `setup-uv` 10.2.0, `install-action` 2.87.22, and a release-workflow action pinned to its tagged release instead of `main`. Swept separately (the release branch before vs after the update, same 10,215 files): all 40,860 outputs byte-identical, no status change, no slowdown.
 - CI now runs the workspace tests (CLI and MCP included), builds and briefly fuzzes the fuzz target, tests the `mmap`/`parallel` features, generates the wasm-bindgen glue, builds the whole workspace at MSRV, and pins the OOXML schema downloads to commits and SHA-256s; the fuzz target renders every document it parses.
 
 ## [0.1.12] - 2026-09-21
