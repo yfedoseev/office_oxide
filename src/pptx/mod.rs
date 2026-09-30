@@ -37,8 +37,9 @@ pub use error::{PptxError, Result};
 pub use presentation::{PresentationInfo, SlideId, SlideSize};
 pub use shape::{
     AutoShape, BulletStyle, ConnectorShape, GraphicContent, GraphicFrame, GroupShape,
-    HyperlinkInfo, HyperlinkTarget, PictureShape, PlaceholderInfo, Shape, ShapePosition, Table,
-    TableCell, TableRow, TextBody, TextContent, TextField, TextParagraph, TextRun,
+    HyperlinkInfo, HyperlinkTarget, MediaKind, MediaReference, OleObject, PictureShape,
+    PlaceholderInfo, Shape, ShapePosition, Table, TableCell, TableRow, TextBody, TextContent,
+    TextField, TextParagraph, TextRun,
 };
 pub use slide::Slide;
 

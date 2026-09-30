@@ -191,7 +191,8 @@ fn collect_text_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePositio
                         entries.push((gf.position.clone(), text));
                     }
                 },
-                GraphicContent::Unknown => {},
+                // An OLE object has no text; its preview is a picture.
+                GraphicContent::OleObject(_) | GraphicContent::Unknown => {},
             },
             Shape::Connector(_) => {},
         }
@@ -332,13 +333,19 @@ fn collect_markdown_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePos
                 }
             },
             Shape::Picture(pic) => {
-                if let Some(ref alt) = pic.alt_text {
-                    if !alt.is_empty() {
-                        entries.push((
-                            pic.position.clone(),
-                            format!("![{}]()", crate::core::markdown::image_alt(alt)),
-                        ));
-                    }
+                let alt = pic.alt_text.as_deref().unwrap_or("");
+                // A linked picture has a real, addressable source.
+                let src = pic
+                    .link_target
+                    .as_deref()
+                    .and_then(crate::ir_render::safe_url)
+                    .map(|u| crate::ir_render::escape_markdown_url(&u))
+                    .unwrap_or_default();
+                if !alt.is_empty() || !src.is_empty() {
+                    entries.push((
+                        pic.position.clone(),
+                        format!("![{}]({src})", crate::core::markdown::image_alt(alt)),
+                    ));
                 }
             },
             Shape::Group(grp) => {
@@ -357,7 +364,8 @@ fn collect_markdown_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePos
                         entries.push((gf.position.clone(), md));
                     }
                 },
-                GraphicContent::Unknown => {},
+                // An OLE object has no text; its preview is a picture.
+                GraphicContent::OleObject(_) | GraphicContent::Unknown => {},
             },
             Shape::Connector(_) => {},
         }

@@ -5,8 +5,9 @@ use crate::core::xml;
 
 use super::shape::{
     AutoShape, BulletStyle, ConnectorShape, GraphicContent, GraphicFrame, GroupShape,
-    HyperlinkInfo, HyperlinkTarget, PictureShape, PlaceholderInfo, Shape, ShapePosition, Table,
-    TableCell, TableRow, TextBody, TextContent, TextField, TextParagraph, TextRun,
+    HyperlinkInfo, HyperlinkTarget, MediaKind, MediaReference, OleObject, PictureShape,
+    PlaceholderInfo, Shape, ShapePosition, Table, TableCell, TableRow, TextBody, TextContent,
+    TextField, TextParagraph, TextRun,
 };
 
 type CoreResult<T> = crate::core::Result<T>;
@@ -244,7 +245,7 @@ fn parse_shape_tree_until(
                 "sp" => shapes.push(parse_auto_shape(reader, rels)?),
                 "pic" => shapes.push(parse_picture(reader, rels, media)?),
                 "grpSp" => shapes.push(parse_group_shape(reader, rels, media, part_text)?),
-                "graphicFrame" => shapes.push(parse_graphic_frame(reader, rels, part_text)?),
+                "graphicFrame" => shapes.push(parse_graphic_frame(reader, rels, media, part_text)?),
                 "cxnSp" => shapes.push(parse_connector(reader)?),
                 "AlternateContent" => {
                     shapes.extend(parse_alternate_content(reader, rels, media, part_text)?);
@@ -377,25 +378,18 @@ fn parse_picture(
     rels: &Relationships,
     media: &std::collections::HashMap<String, (Vec<u8>, String)>,
 ) -> CoreResult<Shape> {
-    let mut id = 0u32;
-    let mut name = String::new();
-    let mut alt_text = None;
+    let mut props = NvPicProps::default();
     let mut position = None;
-    let mut embed_rid: Option<String> = None;
-    let mut hyperlink = None;
+    let mut blip = BlipRefs::default();
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
                 "nvPicPr" => {
-                    let props = parse_nv_pic_props(reader, rels)?;
-                    id = props.0;
-                    name = props.1;
-                    alt_text = props.2;
-                    hyperlink = props.3;
+                    props = parse_nv_pic_props(reader, rels)?;
                 },
                 "blipFill" => {
-                    embed_rid = parse_blip_fill_embed(reader)?;
+                    blip = parse_blip_fill(reader)?;
                 },
                 "spPr" => {
                     position = parse_shape_properties(reader, "spPr")?;
@@ -412,41 +406,61 @@ fn parse_picture(
         }
     }
 
-    let (data, format) = match embed_rid.as_deref().and_then(|rid| media.get(rid)) {
+    let (data, format) = match blip.embed.as_deref().and_then(|rid| media.get(rid)) {
         Some((bytes, ext)) => (Some(bytes.clone()), Some(ext.clone())),
         None => (None, None),
     };
+    // A linked picture's bytes live outside the package; its relationship
+    // target says where.
+    let link_target = blip
+        .link
+        .as_deref()
+        .and_then(|rid| rels.get_by_id(rid))
+        .map(|rel| rel.target.clone());
 
     Ok(Shape::Picture(PictureShape {
-        id,
-        name,
-        alt_text,
+        id: props.id,
+        name: props.name,
+        alt_text: props.alt_text,
         position,
-        embed_rid,
+        embed_rid: blip.embed,
         data,
         format,
-        hyperlink,
+        hyperlink: props.hyperlink,
+        link_target,
+        media: props.media,
     }))
 }
 
-/// Parse `<p:blipFill>…<a:blip r:embed="rIdN"/>…</p:blipFill>` and
-/// return the `r:embed` attribute, if present. Other contents (stretch,
-/// crop, tile) are skipped — only the embed rId is needed to resolve
-/// the underlying media part.
-fn parse_blip_fill_embed(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<String>> {
-    let mut embed: Option<String> = None;
+/// The relationship ids on a picture's `<a:blip>` (ECMA-376 Part 1
+/// §20.1.8.13): `r:embed` names an image part inside the package, `r:link`
+/// an image outside it. A blip may carry either or both.
+#[derive(Default)]
+struct BlipRefs {
+    embed: Option<String>,
+    link: Option<String>,
+}
+
+/// Parse `<p:blipFill>…<a:blip r:embed="rIdN" r:link="rIdM"/>…</p:blipFill>`.
+/// Other contents (stretch, crop, tile) are skipped — only the ids are
+/// needed to resolve the image.
+fn parse_blip_fill(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<BlipRefs> {
+    let mut refs = BlipRefs::default();
+    let mut seen_blip = false;
     let mut depth: u32 = 1;
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == "blip" && embed.is_none() {
-                    embed = read_blip_embed_attr(e)?;
+                if e.local_name().as_ref() == "blip" && !seen_blip {
+                    seen_blip = true;
+                    refs = read_blip_refs(e)?;
                 }
                 depth += 1;
             },
             Event::Empty(ref e) => {
-                if e.local_name().as_ref() == "blip" && embed.is_none() {
-                    embed = read_blip_embed_attr(e)?;
+                if e.local_name().as_ref() == "blip" && !seen_blip {
+                    seen_blip = true;
+                    refs = read_blip_refs(e)?;
                 }
             },
             Event::End(_) => {
@@ -459,18 +473,33 @@ fn parse_blip_fill_embed(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Op
             _ => {},
         }
     }
-    Ok(embed)
+    Ok(refs)
+}
+
+fn read_blip_refs(e: &quick_xml::events::BytesStart) -> CoreResult<BlipRefs> {
+    Ok(BlipRefs {
+        embed: read_blip_embed_attr(e)?,
+        link: read_rel_attr(e, "link")?,
+    })
 }
 
 fn read_blip_embed_attr(e: &quick_xml::events::BytesStart) -> CoreResult<Option<String>> {
     // `<a:blip>` carries `r:embed="rIdN"` (DrawingML namespace `a:`,
     // relationship namespace `r:`). The attribute may be present in
     // either the `Empty` or `Start` form; both routes feed this helper.
+    read_rel_attr(e, "embed")
+}
+
+/// A relationship-namespace attribute (`r:{local}`) under any prefix.
+fn read_rel_attr(e: &quick_xml::events::BytesStart, local: &str) -> CoreResult<Option<String>> {
     for attr in e.attributes().with_checks(false) {
         let attr = attr.map_err(crate::core::Error::from)?;
         let key = attr.key.as_ref();
-        let is_embed = key == "r:embed" || key.ends_with(":embed") || key == "embed";
-        if is_embed {
+        let matches = key == local
+            || key
+                .strip_suffix(local)
+                .is_some_and(|prefix| prefix.ends_with(':'));
+        if matches {
             return Ok(Some(crate::core::xml::unescape_attr_value(&attr)?));
         }
     }
@@ -518,7 +547,9 @@ fn parse_group_shape(
                 "sp" => children.push(parse_auto_shape(reader, rels)?),
                 "pic" => children.push(parse_picture(reader, rels, media)?),
                 "grpSp" => children.push(parse_group_shape(reader, rels, media, part_text)?),
-                "graphicFrame" => children.push(parse_graphic_frame(reader, rels, part_text)?),
+                "graphicFrame" => {
+                    children.push(parse_graphic_frame(reader, rels, media, part_text)?)
+                },
                 "cxnSp" => children.push(parse_connector(reader)?),
                 "AlternateContent" => {
                     children.extend(parse_alternate_content(reader, rels, media, part_text)?);
@@ -672,9 +703,71 @@ fn find_part_rid(
     Ok(rid)
 }
 
+/// Read an OLE object's `<a:graphicData>` payload through its end tag: the
+/// first `<p:oleObj>`'s attributes (in either branch of the
+/// `mc:AlternateContent` PowerPoint wraps it in) and the first
+/// `<a:blip r:embed>` — the preview picture of the Fallback branch —
+/// resolved against the slide's pre-read images.
+fn parse_ole_graphic_data(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    media: &std::collections::HashMap<String, (Vec<u8>, String)>,
+) -> CoreResult<GraphicContent> {
+    let mut ole = OleObject {
+        prog_id: None,
+        name: None,
+        rel_id: None,
+        preview_data: None,
+        preview_format: None,
+    };
+    let mut seen_obj = false;
+    let mut depth = 1i32;
+    loop {
+        let event = reader.read_event()?;
+        let is_start = matches!(event, Event::Start(_));
+        match event {
+            Event::Start(ref e) | Event::Empty(ref e) => {
+                match e.local_name().as_ref() {
+                    "oleObj" if !seen_obj => {
+                        seen_obj = true;
+                        ole.prog_id = xml::optional_attr_str(e, "progId")?.map(|v| v.into_owned());
+                        ole.name = xml::optional_attr_str(e, "name")?.map(|v| v.into_owned());
+                        ole.rel_id = read_rel_attr(e, "id")?;
+                    },
+                    "blip" if ole.preview_data.is_none() => {
+                        if let Some((bytes, ext)) =
+                            read_blip_embed_attr(e)?.and_then(|rid| media.get(&rid))
+                        {
+                            ole.preview_data = Some(bytes.clone());
+                            ole.preview_format = Some(ext.clone());
+                        }
+                    },
+                    _ => {},
+                }
+                if is_start {
+                    depth += 1;
+                }
+            },
+            Event::End(_) => {
+                depth -= 1;
+                if depth <= 0 {
+                    break;
+                }
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(if seen_obj {
+        GraphicContent::OleObject(ole)
+    } else {
+        GraphicContent::Unknown
+    })
+}
+
 fn parse_graphic_frame(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
+    media: &std::collections::HashMap<String, (Vec<u8>, String)>,
     part_text: &std::collections::HashMap<String, Vec<String>>,
 ) -> CoreResult<Shape> {
     let mut id = 0u32;
@@ -732,12 +825,14 @@ fn parse_graphic_frame(
                                 Some(t) if !t.is_empty() => GraphicContent::Text(t),
                                 _ => GraphicContent::Unknown,
                             };
+                        } else if uri.as_deref()
+                            == Some("http://schemas.openxmlformats.org/presentationml/2006/ole")
+                        {
+                            content = parse_ole_graphic_data(reader, media)?;
                         } else {
-                            // Everything else — embedded objects and
-                            // unknown graphics — used to be skipped
-                            // wholesale along with charts. We can't render
-                            // them, but their `<a:t>` runs are document
-                            // text.
+                            // Anything else is a graphic this reader does
+                            // not model. We can't render it, but its `<a:t>`
+                            // runs are document text.
                             let texts = collect_a_t_text(reader, "graphicData")?;
                             content = if texts.is_empty() {
                                 GraphicContent::Unknown
@@ -965,36 +1060,68 @@ fn parse_cnvpr_hyperlink(
     Ok(click.or(hover))
 }
 
-/// Parse `p:nvPicPr` → (id, name, alt_text)
+/// What `p:nvPicPr` says about a picture.
+#[derive(Default)]
+struct NvPicProps {
+    id: u32,
+    name: String,
+    alt_text: Option<String>,
+    hyperlink: Option<HyperlinkInfo>,
+    media: Option<MediaReference>,
+}
+
+/// Parse `p:nvPicPr`: the `p:cNvPr` identity and click action, plus the
+/// audio/video clip a media shape's `p:nvPr` references.
 fn parse_nv_pic_props(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-) -> CoreResult<(u32, String, Option<String>, Option<HyperlinkInfo>)> {
-    let mut id = 0u32;
-    let mut name = String::new();
-    let mut alt_text = None;
-    let mut hyperlink = None;
+) -> CoreResult<NvPicProps> {
+    let mut props = NvPicProps::default();
+    // The declared clip kind (`a:videoFile`/`a:audioFile`/…) and the id of
+    // its relationship; `p14:media` names the embedded copy, when present.
+    let mut declared: Option<(MediaKind, Option<String>)> = None;
+    let mut embedded_media: Option<String> = None;
+
+    let read_cnvpr =
+        |e: &quick_xml::events::BytesStart, props: &mut NvPicProps| -> CoreResult<()> {
+            props.id = xml::optional_attr_str(e, "id")?
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            props.name = xml::optional_attr_str(e, "name")?
+                .map(|v| v.into_owned())
+                .unwrap_or_default();
+            props.alt_text = xml::optional_attr_str(e, "descr")?.map(|v| v.into_owned());
+            Ok(())
+        };
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) if e.local_name().as_ref() == "cNvPr" => {
-                id = xml::optional_attr_str(e, "id")?
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                name = xml::optional_attr_str(e, "name")?
-                    .map(|v| v.into_owned())
-                    .unwrap_or_default();
-                alt_text = xml::optional_attr_str(e, "descr")?.map(|v| v.into_owned());
-                hyperlink = parse_cnvpr_hyperlink(reader, rels)?;
+                read_cnvpr(e, &mut props)?;
+                props.hyperlink = parse_cnvpr_hyperlink(reader, rels)?;
             },
             Event::Empty(ref e) if e.local_name().as_ref() == "cNvPr" => {
-                id = xml::optional_attr_str(e, "id")?
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                name = xml::optional_attr_str(e, "name")?
-                    .map(|v| v.into_owned())
-                    .unwrap_or_default();
-                alt_text = xml::optional_attr_str(e, "descr")?.map(|v| v.into_owned());
+                read_cnvpr(e, &mut props)?;
+            },
+            Event::Start(ref e) | Event::Empty(ref e) => {
+                // ECMA-376 Part 1 §20.1.3: a:audioCd, a:audioFile,
+                // a:quickTimeFile, a:videoFile, a:wavAudioFile.
+                let kind = match e.local_name().as_ref() {
+                    "videoFile" | "quickTimeFile" => Some(MediaKind::Video),
+                    "audioFile" | "wavAudioFile" | "audioCd" => Some(MediaKind::Audio),
+                    // [MS-PPTX] p14:media: the embedded media part.
+                    "media" => {
+                        embedded_media = read_rel_attr(e, "embed")?.or(read_rel_attr(e, "link")?);
+                        None
+                    },
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    if declared.is_none() {
+                        let rid = read_rel_attr(e, "link")?.or(read_rel_attr(e, "embed")?);
+                        declared = Some((kind, rid));
+                    }
+                }
             },
             Event::End(ref e) if e.local_name().as_ref() == "nvPicPr" => {
                 break;
@@ -1004,9 +1131,19 @@ fn parse_nv_pic_props(
         }
     }
 
-    Ok((id, name, alt_text, hyperlink))
-}
+    let kind = declared.as_ref().map_or(MediaKind::Unknown, |(k, _)| *k);
+    let rid = embedded_media.or_else(|| declared.and_then(|(_, rid)| rid));
+    if let Some(rel) = rid.as_deref().and_then(|id| rels.get_by_id(id)) {
+        let external = rel.target_mode == TargetMode::External;
+        props.media = Some(MediaReference {
+            kind,
+            target: rel.target.clone(),
+            external,
+        });
+    }
 
+    Ok(props)
+}
 /// Parse a non-visual-properties wrapper (`p:nvGrpSpPr`, `p:nvGraphicFramePr`,
 /// `p:nvCxnSpPr`) → (id, name) from its `p:cNvPr` child. `end_tag` is the
 /// wrapper's local name, which is the only thing that differs between them.

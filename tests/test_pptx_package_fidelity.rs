@@ -467,3 +467,145 @@ fn test_smartart_text_is_read_from_the_diagram_data_part() {
     let direct = doc.plain_text();
     assert!(direct.contains("Planning") && direct.contains("Delivery"), "{direct:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Linked pictures, media and OLE objects
+// ---------------------------------------------------------------------------
+
+/// A minimal valid PNG header — enough for format sniffing.
+const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0];
+
+fn picture(nv_pr: &str, blip: &str, descr: &str) -> String {
+    format!(
+        r#"<p:pic><p:nvPicPr><p:cNvPr id="5" name="Pic" descr="{descr}"/><p:cNvPicPr/><p:nvPr>{nv_pr}</p:nvPr></p:nvPicPr><p:blipFill>{blip}<a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="10" y="10"/><a:ext cx="100" cy="100"/></a:xfrm></p:spPr></p:pic>"#
+    )
+}
+
+fn images(ir: &DocumentIR) -> Vec<&Image> {
+    fn walk<'a>(els: &'a [Element], out: &mut Vec<&'a Image>) {
+        for e in els {
+            match e {
+                Element::Image(i) => out.push(i),
+                Element::TextBox(tb) => walk(&tb.content, out),
+                _ => {},
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for s in &ir.sections {
+        walk(&s.elements, &mut out);
+    }
+    out
+}
+
+/// `<a:blip r:link>` references an image outside the package. Only
+/// `r:embed` was read, so a linked picture came through with no trace of
+/// where its image lives.
+#[test]
+fn test_a_linked_picture_keeps_its_external_target() {
+    let mut pkg = deck(&[&picture("", r#"<a:blip r:link="rIdL"/>"#, "Company logo")]);
+    pkg.ext_rel(
+        "ppt/slides/slide1.xml",
+        "rIdL",
+        rel_types::IMAGE,
+        "https://example.com/logo.png",
+    );
+    let doc = pkg.open();
+    let office_oxide::pptx::Shape::Picture(ref pic) = doc.slides[0].shapes[0] else {
+        panic!("expected a picture");
+    };
+    assert_eq!(pic.link_target.as_deref(), Some("https://example.com/logo.png"));
+    let ir = pkg.document().to_ir();
+    assert_eq!(images(&ir)[0].source_url.as_deref(), Some("https://example.com/logo.png"));
+    let md = ir.to_markdown();
+    assert!(md.contains("![Company logo](https://example.com/logo.png)"), "{md}");
+    let html = ir.to_html();
+    assert!(
+        html.contains(r#"<img src="https://example.com/logo.png" alt="Company logo" />"#),
+        "{html}"
+    );
+    let direct = pkg.document().to_markdown();
+    assert!(direct.contains("](https://example.com/logo.png)"), "{direct}");
+}
+
+/// A dangerous scheme on a linked picture is not rendered as a source.
+#[test]
+fn test_a_linked_picture_with_a_script_scheme_is_not_rendered_as_a_source() {
+    let mut pkg = deck(&[&picture("", r#"<a:blip r:link="rIdL"/>"#, "x")]);
+    pkg.ext_rel("ppt/slides/slide1.xml", "rIdL", rel_types::IMAGE, "javascript:alert(1)");
+    let doc = pkg.document();
+    for out in [
+        doc.to_ir().to_markdown(),
+        doc.to_ir().to_html(),
+        doc.to_markdown(),
+    ] {
+        assert!(!out.contains("javascript"), "{out}");
+    }
+}
+
+/// A video shape is a picture (its poster frame) whose `p:nvPr` names the
+/// clip; the clip reference was skipped.
+#[test]
+fn test_a_video_shape_surfaces_its_clip() {
+    let nv_pr = r#"<a:videoFile r:link="rIdV"/><p:extLst><p:ext uri="{DAA4B4D4-6D71-4841-9C94-3DA1B2A7D8E3}"><p14:media xmlns:p14="http://schemas.microsoft.com/office/powerpoint/2010/main" r:embed="rIdM"/></p:ext></p:extLst>"#;
+    let mut pkg = deck(&[&picture(nv_pr, r#"<a:blip r:embed="rIdP"/>"#, "")]);
+    pkg.part("ppt/media/image1.png", "", PNG);
+    pkg.part("ppt/media/media1.mp4", "", b"fake mp4".to_vec());
+    pkg.rel("ppt/slides/slide1.xml", "rIdP", rel_types::IMAGE, "../media/image1.png");
+    pkg.rel(
+        "ppt/slides/slide1.xml",
+        "rIdV",
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/video",
+        "../media/media1.mp4",
+    );
+    pkg.rel(
+        "ppt/slides/slide1.xml",
+        "rIdM",
+        "http://schemas.microsoft.com/office/2007/relationships/media",
+        "../media/media1.mp4",
+    );
+    let doc = pkg.open();
+    let office_oxide::pptx::Shape::Picture(ref pic) = doc.slides[0].shapes[0] else {
+        panic!("expected a picture");
+    };
+    let media = pic.media.as_ref().expect("the clip reference");
+    assert_eq!(media.kind, office_oxide::pptx::MediaKind::Video);
+    assert_eq!(media.target, "../media/media1.mp4");
+    assert!(!media.external);
+    assert_eq!(pic.data.as_deref(), Some(PNG), "the poster frame is still the picture");
+}
+
+/// An OLE object frame fell through as an unknown graphic, losing its
+/// preview picture. It is now an `OleObject` and its preview reaches the
+/// IR as an image.
+#[test]
+fn test_an_ole_object_keeps_its_preview_picture() {
+    let frame = r#"<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="6" name="Object 5"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="100" y="100"/><a:ext cx="2000" cy="1000"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/presentationml/2006/ole"><mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice xmlns:v="urn:schemas-microsoft-com:vml" Requires="v"><p:oleObj spid="_x0000_s1026" name="Worksheet" r:id="rIdO" imgW="100" imgH="50" progId="Excel.Sheet.12"><p:embed/></p:oleObj></mc:Choice><mc:Fallback><p:oleObj name="Worksheet" r:id="rIdO" imgW="100" imgH="50" progId="Excel.Sheet.12"><p:embed/><p:pic><p:nvPicPr><p:cNvPr id="0" name=""/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rIdI"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr/></p:pic></p:oleObj></mc:Fallback></mc:AlternateContent></a:graphicData></a:graphic></p:graphicFrame>"#;
+    let mut pkg = deck(&[frame, &text_sp("AFTER")]);
+    pkg.part("ppt/media/image1.png", "", PNG);
+    pkg.part("ppt/embeddings/Microsoft_Excel_Worksheet.xlsx", "", b"PK".to_vec());
+    pkg.rel("ppt/slides/slide1.xml", "rIdI", rel_types::IMAGE, "../media/image1.png");
+    pkg.rel(
+        "ppt/slides/slide1.xml",
+        "rIdO",
+        rel_types::PACKAGE,
+        "../embeddings/Microsoft_Excel_Worksheet.xlsx",
+    );
+
+    let doc = pkg.open();
+    let office_oxide::pptx::Shape::GraphicFrame(ref gf) = doc.slides[0].shapes[0] else {
+        panic!("expected a graphic frame");
+    };
+    let office_oxide::pptx::GraphicContent::OleObject(ref ole) = gf.content else {
+        panic!("expected an OLE object, got {:?}", gf.content);
+    };
+    assert_eq!(ole.prog_id.as_deref(), Some("Excel.Sheet.12"));
+    assert_eq!(ole.name.as_deref(), Some("Worksheet"));
+    assert_eq!(ole.rel_id.as_deref(), Some("rIdO"));
+    assert_eq!(ole.preview_data.as_deref(), Some(PNG));
+    let ir = pkg.document().to_ir();
+    let imgs = images(&ir);
+    assert_eq!(imgs.len(), 1);
+    assert_eq!(imgs[0].data.as_deref(), Some(PNG));
+    assert!(ir.plain_text().contains("AFTER"), "the reader position stays right");
+}

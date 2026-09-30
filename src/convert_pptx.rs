@@ -379,6 +379,7 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
                 display_width_emu: display_w,
                 display_height_emu: display_h,
                 hyperlink: pic.hyperlink.as_ref().and_then(hyperlink_info_url),
+                source_url: pic.link_target.clone(),
                 ..Default::default()
             });
             push_positional_textbox(elements, vec![img_el], pic.position.as_ref());
@@ -408,6 +409,34 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
                     .collect();
                 if !paras.is_empty() {
                     push_positional_textbox(elements, paras, gf.position.as_ref());
+                }
+            },
+            // An OLE object is shown as its preview picture. It used to fall
+            // through as an unknown graphic, losing the preview.
+            crate::pptx::GraphicContent::OleObject(ref ole) => {
+                if let Some(ref data) = ole.preview_data {
+                    let (display_w, display_h) = gf
+                        .position
+                        .as_ref()
+                        .map(|p| (Some(p.cx.max(0) as u64), Some(p.cy.max(0) as u64)))
+                        .unwrap_or((None, None));
+                    let img = Element::Image(Image {
+                        data: Some(data.clone()),
+                        format: ole
+                            .preview_format
+                            .as_deref()
+                            .and_then(image_format_from_ext),
+                        display_width_emu: display_w,
+                        display_height_emu: display_h,
+                        ..Default::default()
+                    });
+                    push_positional_textbox(elements, vec![img], gf.position.as_ref());
+                } else {
+                    log::debug!(
+                        "pptx: OLE object {:?} ({:?}) has no preview picture",
+                        ole.name,
+                        ole.prog_id
+                    );
                 }
             },
             crate::pptx::GraphicContent::Unknown => {},
