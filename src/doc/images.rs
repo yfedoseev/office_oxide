@@ -7,6 +7,7 @@
 
 pub use crate::cfb::blip::BlipFormat as ImageFormat;
 pub use crate::cfb::blip::BlipImage as DocImage;
+use crate::cfb::blip::extract_one_blip;
 
 /// Extract images from a DOC Data stream by scanning for BLIP record signatures.
 pub fn extract_images(data: &[u8]) -> Vec<DocImage> {
@@ -25,21 +26,17 @@ pub fn extract_images(data: &[u8]) -> Vec<DocImage> {
             let inst = ver_inst >> 4;
 
             let data_start = pos + 8;
-            let data_end = (data_start + rec_len).min(data.len());
+            let data_end = data_start.saturating_add(rec_len).min(data.len());
 
-            let skip = uid_size(rec_type, inst) + metafile_header_size(rec_type);
-            let img_start = data_start + skip;
-
-            if img_start < data_end {
-                let img_data = &data[img_start..data_end];
-
-                // Validate: check for known image signatures to avoid false positives.
-                if has_valid_signature(rec_type, img_data) {
-                    images.push(DocImage {
-                        format: ImageFormat::from_record_type(rec_type),
-                        data: img_data.to_vec(),
-                        index: images.len(),
-                    });
+            // The same record decoder the PPT `Pictures` walk uses —
+            // UIDs skipped, compressed metafiles inflated — then the
+            // signature check this heuristic scan needs to reject byte
+            // runs that only look like a record header, applied to the
+            // decoded image rather than to still-compressed bytes.
+            if let Some(mut img) = extract_one_blip(data, rec_type, inst, data_start, data_end) {
+                if has_valid_signature(rec_type, &img.data) {
+                    img.index = images.len();
+                    images.push(img);
                 }
             }
 
@@ -57,21 +54,6 @@ fn is_blip_type(rt: u16) -> bool {
     matches!(rt, 0xF01A..=0xF01F | 0xF029 | 0xF02A)
 }
 
-fn uid_size(rec_type: u16, inst: u16) -> usize {
-    let base = match rec_type {
-        0xF01A..=0xF01C => 16,
-        _ => 17,
-    };
-    if inst & 1 != 0 { base + 16 } else { base }
-}
-
-fn metafile_header_size(rec_type: u16) -> usize {
-    match rec_type {
-        0xF01A..=0xF01C => 34,
-        _ => 0,
-    }
-}
-
 /// Check if the image data starts with a recognizable signature.
 fn has_valid_signature(rec_type: u16, data: &[u8]) -> bool {
     if data.is_empty() {
@@ -86,29 +68,10 @@ fn has_valid_signature(rec_type: u16, data: &[u8]) -> bool {
     }
 }
 
-// Re-export for use in ImageFormat construction
-trait BlipFormatExt {
-    fn from_record_type(rt: u16) -> Self;
-}
-
-impl BlipFormatExt for ImageFormat {
-    fn from_record_type(rt: u16) -> Self {
-        match rt {
-            0xF01A => Self::Emf,
-            0xF01B => Self::Wmf,
-            0xF01C => Self::Pict,
-            0xF01D | 0xF02A => Self::Jpeg,
-            0xF01E => Self::Png,
-            0xF01F => Self::Dib,
-            0xF029 => Self::Tiff,
-            other => Self::Unknown(other),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cfb::blip::{metafile_header_size, uid_size};
 
     fn make_blip_in_data(rec_type: u16, inst: u16, img_data: &[u8]) -> Vec<u8> {
         let ver_inst: u16 = inst << 4;
@@ -169,6 +132,34 @@ mod tests {
         // But UID + tag (17 bytes) then data won't start with 0xFF 0xD8
         let images = extract_images(&data);
         assert!(images.is_empty());
+    }
+
+    /// A compressed EMF ([MS-ODRAW] §2.2.31, `compression` = 0x00) failed
+    /// the EMF signature check on its still-compressed bytes and was
+    /// silently dropped. It is inflated first, then validated.
+    #[test]
+    fn test_scan_finds_compressed_emf_in_data_stream() {
+        use std::io::Write;
+        let mut emf = vec![0x01, 0x00, 0x00, 0x00, 0x6C, 0x00, 0x00, 0x00];
+        emf.extend(std::iter::repeat_n(0x41u8, 120));
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&emf).unwrap();
+        let z = enc.finish().unwrap();
+        let mut body = vec![0u8; 16]; // rgbUid1
+        body.extend_from_slice(&(emf.len() as u32).to_le_bytes()); // cbSize
+        body.extend_from_slice(&[0u8; 24]); // rcBounds + ptSize
+        body.extend_from_slice(&(z.len() as u32).to_le_bytes()); // cbSave
+        body.extend_from_slice(&[0x00, 0xFE]); // compression = deflate, filter
+        body.extend_from_slice(&z);
+        let mut data = vec![0u8; 40];
+        data.extend_from_slice(&(0x3D4u16 << 4).to_le_bytes());
+        data.extend_from_slice(&0xF01Au16.to_le_bytes());
+        data.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        data.extend(body);
+        let images = extract_images(&data);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, ImageFormat::Emf);
+        assert_eq!(images[0].data, emf);
     }
 
     #[test]
