@@ -536,6 +536,47 @@ fn test_empty_paragraph_with_only_a_bottom_border_is_still_a_thematic_break() {
 // Table geometry and borders
 // ---------------------------------------------------------------------------
 
+/// The direct markdown renderer wrote a picture as `![alt](rId7)`: the
+/// relationship id is not a target any markdown reader can resolve. The
+/// IR renderer, with no addressable source, writes the description as
+/// italic text; both must agree.
+#[test]
+fn test_direct_markdown_does_not_use_a_relationship_id_as_an_image_target() {
+    const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let image = |alt: Option<&str>| {
+        Element::Image(Image {
+            data: Some(PNG.to_vec()),
+            format: Some(ImageFormat::Png),
+            display_width_emu: Some(100),
+            display_height_emu: Some(100),
+            alt_text: alt.map(str::to_string),
+            ..Default::default()
+        })
+    };
+    let ir = DocumentIR {
+        metadata: Metadata {
+            format: DocumentFormat::Docx,
+            ..Default::default()
+        },
+        sections: vec![Section {
+            elements: vec![image(Some("A *cat*")), image(None)],
+            ..Default::default()
+        }],
+        defined_names: Vec::new(),
+    };
+    let bytes = docx_bytes(&ir);
+    let direct = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes.clone()))
+        .unwrap()
+        .to_markdown();
+    let via_ir = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir()
+        .to_markdown();
+    assert!(!direct.contains("rId") && !direct.contains("]("), "{direct:?}");
+    assert_eq!(direct.trim(), via_ir.trim());
+    assert!(direct.contains(r"*A \*cat\**"), "{direct:?}");
+}
+
 /// `w:shd` (ECMA-376 §17.3.5) paints its pattern (`w:val`) in `w:color`
 /// over `w:fill`. Only `w:fill` was read, so `solid` shading — the whole
 /// area in `w:color` — and percentage patterns came out as the fill alone

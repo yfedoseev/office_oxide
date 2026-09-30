@@ -662,13 +662,15 @@ fn markdown_drawing(drawing: &DrawingInfo, out: &mut String) {
         out.push('\n');
         return;
     }
-    out.push_str("![");
-    if let Some(ref desc) = drawing.description {
-        out.push_str(&crate::core::markdown::image_alt(desc));
+    // The relationship id is not a target a markdown reader can resolve,
+    // and this renderer has no other address for the picture. Describe it
+    // with its alt text as the IR renderer does (italic, nothing when
+    // there is none) rather than emit `![alt](rId7)`.
+    if let Some(desc) = drawing.description.as_deref().filter(|d| !d.is_empty()) {
+        out.push('*');
+        out.push_str(&crate::core::markdown::escape_text(desc));
+        out.push('*');
     }
-    out.push_str("](");
-    out.push_str(&drawing.relationship_id);
-    out.push(')');
 }
 
 fn markdown_table(table: &Table, ctx: &MarkdownCtx, out: &mut String) {
