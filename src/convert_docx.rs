@@ -1107,8 +1107,9 @@ fn convert_inline_with(p: &crate::docx::Paragraph, ctx: RunContext<'_>) -> Vec<I
             },
             crate::docx::ParagraphContent::Hyperlink(hl) => {
                 let url = hyperlink_url(hl);
+                let link = url.as_deref().map(|u| (u, hl.tooltip.as_deref()));
                 for run in &hl.runs {
-                    convert_run(run, url.as_deref(), &ctx, &mut content);
+                    convert_run(run, link, &ctx, &mut content);
                 }
             },
         }
@@ -1121,7 +1122,8 @@ fn convert_inline_with(p: &crate::docx::Paragraph, ctx: RunContext<'_>) -> Vec<I
 
 fn convert_run(
     run: &crate::docx::Run,
-    hyperlink_url: Option<&str>,
+    // The enclosing hyperlink's URL and hover text.
+    link: Option<(&str, Option<&str>)>,
     ctx: &RunContext<'_>,
     content: &mut Vec<InlineContent>,
 ) {
@@ -1228,7 +1230,8 @@ fn convert_run(
                 bold,
                 italic,
                 strikethrough: strike,
-                hyperlink: hyperlink_url.map(|s| s.to_string()),
+                hyperlink: link.map(|(url, _)| url.to_string()),
+                hyperlink_tooltip: link.and_then(|(_, tip)| tip).map(str::to_string),
                 font_size_half_pt: face
                     .font_size
                     .map(|hp| crate::core::units::HalfPoint::from_word_sz(hp.0).0),
@@ -1330,7 +1333,7 @@ fn split_at_hard_breaks(
     let mut content = Vec::new();
     let convert_run_split =
         |run: &crate::docx::Run,
-         url: Option<&str>,
+         url: Option<(&str, Option<&str>)>,
          content: &mut Vec<InlineContent>,
          segments: &mut Vec<(Vec<InlineContent>, Option<HardBreak>)>| {
             // A run holding a hard break is converted around it: the run's
@@ -1369,8 +1372,9 @@ fn split_at_hard_breaks(
             },
             crate::docx::ParagraphContent::Hyperlink(hl) => {
                 let url = hyperlink_url(hl);
+                let link = url.as_deref().map(|u| (u, hl.tooltip.as_deref()));
                 for run in &hl.runs {
-                    convert_run_split(run, url.as_deref(), &mut content, &mut segments);
+                    convert_run_split(run, link, &mut content, &mut segments);
                 }
             },
         }

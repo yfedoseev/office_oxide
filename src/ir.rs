@@ -1197,6 +1197,10 @@ pub struct TextSpan {
     /// Optional hyperlink URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hyperlink: Option<String>,
+    /// The hyperlink's hover text (DOCX `w:hyperlink/@w:tooltip`, XLSX
+    /// `hyperlink/@tooltip`, PPTX `a:hlinkClick/@tooltip`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyperlink_tooltip: Option<String>,
     /// Font size in half-points (e.g. 24 = 12 pt).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_size_half_pt: Option<u32>,

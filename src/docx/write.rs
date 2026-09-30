@@ -144,6 +144,8 @@ pub struct Run {
     /// Hyperlink target URL. Emitted as a `w:hyperlink` wrapper with an
     /// external relationship; previously read and thrown away.
     pub hyperlink: Option<String>,
+    /// The hyperlink's hover text, written as `w:hyperlink/@w:tooltip`.
+    pub hyperlink_tooltip: Option<String>,
     /// Small-caps text transform.
     pub small_caps: bool,
     /// Character spacing in half-points (positive = expand, negative = condense).
@@ -2086,6 +2088,7 @@ fn ir_inline_to_runs(content: &[crate::ir::InlineContent]) -> Vec<Run> {
                 run.small_caps = span.small_caps;
                 run.char_spacing_half_pt = span.char_spacing_half_pt;
                 run.hyperlink = span.hyperlink.clone();
+                run.hyperlink_tooltip = span.hyperlink_tooltip.clone();
                 runs.push(run);
             },
             InlineContent::LineBreak => {
@@ -2445,6 +2448,7 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph, links: &
     let mut i = 0usize;
     while i < p.runs.len() {
         let url = p.runs[i].hyperlink.as_deref().filter(|u| !u.is_empty());
+        let tooltip = p.runs[i].hyperlink_tooltip.as_deref();
         // A pure `#anchor` URL (empty base) is a same-document link with
         // no relationship at all — `w:anchor` alone. Anything else with a
         // fragment (`https://…#section`) keeps the relationship on the
@@ -2467,9 +2471,17 @@ fn write_rich_paragraph(w: &mut Writer<Vec<u8>>, p: &DocxRichParagraph, links: &
                 if let Some(frag) = frag {
                     link.push_attribute(("w:anchor", frag));
                 }
+                // CT_Hyperlink: `w:tooltip` (ECMA-376 §17.16.22).
+                if let Some(tip) = tooltip {
+                    link.push_attribute((
+                        "w:tooltip",
+                        crate::core::xml::sanitize_xml_text(tip).as_ref(),
+                    ));
+                }
                 w.write_event(Event::Start(link)).expect("write hyperlink");
                 while i < p.runs.len()
                     && p.runs[i].hyperlink.as_deref().filter(|u| !u.is_empty()) == url
+                    && p.runs[i].hyperlink_tooltip.as_deref() == tooltip
                 {
                     write_run(w, &p.runs[i]);
                     i += 1;

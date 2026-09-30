@@ -1292,14 +1292,14 @@ fn parse_paragraph(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Paragrap
                         .as_deref()
                         .and_then(hyperlink_target_from_instr);
                     match target {
-                        Some(target) => {
+                        Some((target, tooltip)) => {
                             let runs = collect_runs_until(reader, "fldSimple")?;
                             paragraph
                                 .content
                                 .push(ParagraphContent::Hyperlink(Hyperlink {
                                     target,
                                     fragment: None,
-                                    tooltip: None,
+                                    tooltip,
                                     runs,
                                 }));
                         },
@@ -1436,7 +1436,7 @@ fn apply_field_parts(
                 if !f.separated {
                     continue;
                 }
-                let Some(target) = hyperlink_target_from_instr(&f.instr) else {
+                let Some((target, tooltip)) = hyperlink_target_from_instr(&f.instr) else {
                     continue;
                 };
                 let start = f.content_start.min(content.len());
@@ -1453,7 +1453,7 @@ fn apply_field_parts(
                 content.push(ParagraphContent::Hyperlink(Hyperlink {
                     target,
                     fragment: None,
-                    tooltip: None,
+                    tooltip,
                     runs,
                 }));
             },
@@ -1826,7 +1826,9 @@ fn field_instr_tokens(instr: &str) -> Vec<String> {
 /// `HYPERLINK \l "bookmark"` → internal `bookmark`. Returns `None` for
 /// every other field type (PAGE, TOC, REF, …), whose display text already
 /// survives as an ordinary run.
-fn hyperlink_target_from_instr(instr: &str) -> Option<HyperlinkTarget> {
+/// The target of a `HYPERLINK` field (ECMA-376 §17.16.5.25) and its `\o`
+/// ScreenTip text.
+fn hyperlink_target_from_instr(instr: &str) -> Option<(HyperlinkTarget, Option<String>)> {
     let tokens = field_instr_tokens(instr);
     let (first, rest) = tokens.split_first()?;
     if !first.eq_ignore_ascii_case("HYPERLINK") {
@@ -1834,17 +1836,20 @@ fn hyperlink_target_from_instr(instr: &str) -> Option<HyperlinkTarget> {
     }
     let mut url: Option<String> = None;
     let mut anchor: Option<String> = None;
+    let mut tooltip: Option<String> = None;
     let mut i = 0;
     while i < rest.len() {
         let tok = &rest[i];
         if let Some(switch) = tok.strip_prefix('\\') {
-            // `\l` takes the sub-address; `\o`/`\t` take an argument we
-            // do not model; `\n`/`\h`/`\m` take none.
+            // `\l` takes the sub-address, `\o` the ScreenTip, `\t` a
+            // target frame we do not model; `\n`/`\h`/`\m` take none.
             let takes_arg = matches!(switch, "l" | "o" | "t" | "L" | "O" | "T");
             if takes_arg {
                 if let Some(arg) = rest.get(i + 1) {
                     if switch.eq_ignore_ascii_case("l") {
                         anchor = Some(arg.clone());
+                    } else if switch.eq_ignore_ascii_case("o") {
+                        tooltip = Some(arg.clone());
                     }
                     i += 1;
                 }
@@ -1854,17 +1859,18 @@ fn hyperlink_target_from_instr(instr: &str) -> Option<HyperlinkTarget> {
         }
         i += 1;
     }
-    match (url, anchor) {
+    let target = match (url, anchor) {
         (Some(mut u), anchor) => {
             if let Some(a) = anchor.filter(|a| !a.is_empty()) {
                 u.push('#');
                 u.push_str(&a);
             }
-            Some(HyperlinkTarget::External(u))
+            HyperlinkTarget::External(u)
         },
-        (None, Some(a)) => Some(HyperlinkTarget::Internal(a)),
-        (None, None) => None,
-    }
+        (None, Some(a)) => HyperlinkTarget::Internal(a),
+        (None, None) => return None,
+    };
+    Some((target, tooltip))
 }
 
 fn parse_hyperlink(

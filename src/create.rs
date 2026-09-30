@@ -366,6 +366,7 @@ fn ir_inline_to_runs(content: &[InlineContent]) -> Vec<crate::docx::write::Run> 
                 run.strikethrough = span.strikethrough;
                 run.font_name = span.font_name.clone();
                 run.hyperlink = span.hyperlink.clone();
+                run.hyperlink_tooltip = span.hyperlink_tooltip.clone();
                 run.font_size_half_pt = span.font_size_half_pt;
                 run.color_rgb = span.color;
                 run.underline_style = span.underline.clone();
@@ -450,6 +451,7 @@ fn run_props_equal(a: &crate::docx::write::Run, b: &crate::docx::write::Run) -> 
     // hyperlink is part of a run's identity: merging a linked run with an
     // unlinked one silently swallows the link.
     a.hyperlink == b.hyperlink
+        && a.hyperlink_tooltip == b.hyperlink_tooltip
         && a.bold == b.bold
         && a.italic == b.italic
         && a.underline == b.underline
@@ -610,8 +612,11 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                             } else {
                                 sheet.set_cell(row_cursor, col, data);
                             }
-                            if let Some(url) = cell_hyperlink(cell) {
+                            if let Some((url, tooltip)) = cell_hyperlink(cell) {
                                 sheet.set_cell_hyperlink(row_cursor, col, url);
+                                if let Some(tip) = tooltip {
+                                    sheet.set_cell_hyperlink_tooltip(row_cursor, col, tip);
+                                }
                             }
                             let cs = cell.col_span.max(1) as usize;
                             let rs = cell.row_span.max(1) as usize;
@@ -1502,10 +1507,14 @@ fn cell_runs(cell: &TableCell) -> Vec<crate::pptx::write::Run> {
 /// (xlsx::write had no hyperlink concept at all, so a
 /// cell's `TextSpan.hyperlink` — the same field DOCX/PPTX runs already
 /// use — was silently dropped on every write).
-fn cell_hyperlink(cell: &TableCell) -> Option<String> {
+/// The first hyperlink in a cell's content, with its hover text.
+fn cell_hyperlink(cell: &TableCell) -> Option<(String, Option<String>)> {
     cell.content.iter().find_map(|e| match e {
         Element::Paragraph(p) => p.content.iter().find_map(|c| match c {
-            InlineContent::Text(t) => t.hyperlink.clone(),
+            InlineContent::Text(t) => t
+                .hyperlink
+                .clone()
+                .map(|url| (url, t.hyperlink_tooltip.clone())),
             _ => None,
         }),
         _ => None,
@@ -1887,6 +1896,7 @@ fn inline_to_pptx_runs(content: &[InlineContent]) -> Vec<crate::pptx::write::Run
                 }
                 if let Some(ref url) = span.hyperlink {
                     run = run.hyperlink(url.clone());
+                    run.hyperlink_tooltip = span.hyperlink_tooltip.clone();
                 }
                 Some(run)
             } else {

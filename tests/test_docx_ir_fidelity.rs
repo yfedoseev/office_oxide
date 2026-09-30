@@ -255,6 +255,30 @@ fn docx_bytes(ir: &DocumentIR) -> Vec<u8> {
     out.into_inner()
 }
 
+/// `w:hyperlink/@w:tooltip` (ECMA-376 §17.16.22) and a `HYPERLINK`
+/// field's `\o` switch (§17.16.5.25) are the link's hover text. Both were
+/// parsed (or skipped) and never reached the IR, any renderer or the
+/// writer.
+#[test]
+fn test_hyperlink_tooltips_reach_the_ir_html_and_the_writer() {
+    let ir = Docx::new(
+        r#"<w:p><w:hyperlink w:anchor="intro" w:tooltip="Jump to the intro"><w:r><w:t>Intro</w:t></w:r></w:hyperlink></w:p>
+           <w:p><w:fldSimple w:instr=" HYPERLINK \l &quot;end&quot; \o &quot;Go to the end&quot; "><w:r><w:t>End</w:t></w:r></w:fldSimple></w:p>"#,
+    )
+    .ir();
+    let tip = |ir: &DocumentIR, i: usize| first_span(para(ir, i)).hyperlink_tooltip.clone();
+    assert_eq!(tip(&ir, 0).as_deref(), Some("Jump to the intro"));
+    assert_eq!(tip(&ir, 1).as_deref(), Some("Go to the end"));
+    let html = ir.to_html();
+    assert!(html.contains(r##"<a href="#intro" title="Jump to the intro">"##), "{html}");
+
+    let again = Document::from_reader(Cursor::new(docx_bytes(&ir)), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(tip(&again, 0).as_deref(), Some("Jump to the intro"));
+    assert_eq!(tip(&again, 1).as_deref(), Some("Go to the end"));
+}
+
 fn spans(p: &Paragraph) -> Vec<&TextSpan> {
     p.content
         .iter()

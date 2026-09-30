@@ -95,6 +95,8 @@ pub struct Run {
     /// had no hyperlink concept at all, so a run's URL was silently
     /// dropped, unconditionally, on every write).
     pub hyperlink: Option<String>,
+    /// The hyperlink's hover text, written as `a:hlinkClick/@tooltip`.
+    pub hyperlink_tooltip: Option<String>,
 }
 
 impl Run {
@@ -894,6 +896,13 @@ fn write_dml_run(w: &mut Writer<Vec<u8>>, run: &Run, hyperlink_rids: &HashMap<St
             if let Some(rid) = rid {
                 let mut hlink = BytesStart::new("a:hlinkClick");
                 hlink.push_attribute(("r:id", rid.as_str()));
+                // CT_Hyperlink `tooltip` (ECMA-376 §21.1.2.3.5).
+                if let Some(tip) = run.hyperlink_tooltip.as_deref() {
+                    hlink.push_attribute((
+                        "tooltip",
+                        crate::core::xml::sanitize_xml_text(tip).as_ref(),
+                    ));
+                }
                 w.write_event(Event::Empty(hlink))
                     .expect("write hlinkClick");
             }

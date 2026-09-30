@@ -50,7 +50,8 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         // `Worksheet::hyperlinks` was parsed and then never rendered, so
         // every clickable cell in a workbook lost its target — DOCX and
         // PPTX both emit links. Index by (row, col) for O(1) lookup.
-        let links: std::collections::HashMap<(u32, u32), String> = ws
+        // The value is the target and its hover text (`@tooltip`).
+        let links: std::collections::HashMap<(u32, u32), (String, Option<String>)> = ws
             .hyperlinks
             .iter()
             .filter_map(|h| {
@@ -62,7 +63,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                     },
                     crate::xlsx::HyperlinkTarget::Internal(_) => return None,
                 };
-                Some(((r.row, r.col), target))
+                Some(((r.row, r.col), (target, h.tooltip.clone())))
             })
             .collect();
 
@@ -149,11 +150,11 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                     crate::xlsx::cell::CellValue::String(_) => cell.rich_runs.clone(),
                     _ => None,
                 };
+                let link = links.get(&(cell.reference.row, cell.reference.col));
                 cells.push(CellData {
                     col: cell.reference.col,
-                    hyperlink: links
-                        .get(&(cell.reference.row, cell.reference.col))
-                        .cloned(),
+                    hyperlink: link.map(|(target, _)| target.clone()),
+                    hyperlink_tooltip: link.and_then(|(_, tip)| tip.clone()),
                     text,
                     style_index: cell.style_index,
                     data_type,
@@ -628,6 +629,7 @@ fn empty_cell() -> TableCell {
 fn cell_span(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> TextSpan {
     let mut span = TextSpan::plain(display_text(cd).to_string());
     span.hyperlink = cd.hyperlink.clone();
+    span.hyperlink_tooltip = cd.hyperlink_tooltip.clone();
     let Some(font) = cd.style_index.and_then(|idx| font_for(doc, idx)) else {
         return span;
     };
@@ -657,6 +659,7 @@ fn cell_spans(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> Vec<InlineConte
         .map(|r| {
             let mut span = TextSpan::plain(r.text.clone());
             span.hyperlink = cd.hyperlink.clone();
+            span.hyperlink_tooltip = cd.hyperlink_tooltip.clone();
             span.bold = r.bold.unwrap_or(false);
             span.italic = r.italic.unwrap_or(false);
             if let Some(size_pt) = r.font_size {
@@ -686,6 +689,8 @@ struct CellData {
     col: u32,
     /// Hyperlink target for this cell, when the sheet declares one.
     hyperlink: Option<String>,
+    /// That hyperlink's hover text (`hyperlink/@tooltip`).
+    hyperlink_tooltip: Option<String>,
     /// Rendered display string (same text `write_cell_value_fast` produces).
     text: String,
     /// Cell format index (`s` attribute) — used for prose-mode font recovery.

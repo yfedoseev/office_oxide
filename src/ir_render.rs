@@ -1136,7 +1136,13 @@ fn render_inline_html(content: &[InlineContent]) -> String {
                     text = format!("<span style=\"{}\">{text}</span>", escape_html(&css));
                 }
                 if let Some(url) = span.hyperlink.as_deref().and_then(safe_url) {
-                    text = format!("<a href=\"{}\">{text}</a>", escape_html(&url));
+                    // The source's hover text is HTML's `title`.
+                    let title = span
+                        .hyperlink_tooltip
+                        .as_deref()
+                        .map(|t| format!(" title=\"{}\"", escape_html(t)))
+                        .unwrap_or_default();
+                    text = format!("<a href=\"{}\"{title}>{text}</a>", escape_html(&url));
                 }
 
                 out.push_str(&text);
