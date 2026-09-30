@@ -288,6 +288,27 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
         });
     }
 
+    // Whatever made the workbook incomplete is stated in the content, as
+    // the direct renderers state it, not only flagged in the metadata.
+    // The title is read before this, so a notice-only section never
+    // becomes the document's title.
+    let first_title = sections.first().and_then(|s| s.title.clone());
+    if !doc.notices().is_empty() {
+        let notices = doc.notices().iter().map(|n| {
+            Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(n.clone()))],
+                ..Default::default()
+            })
+        });
+        match sections.last_mut() {
+            Some(last) => last.elements.extend(notices),
+            None => sections.push(Section {
+                elements: notices.collect(),
+                ..Default::default()
+            }),
+        }
+    }
+
     // The workbook's own declared title (from `\x05SummaryInformation`)
     // beats the first sheet's name — a sheet name is not a document
     // title, it's just the only thing that was ever there to fall back
@@ -296,7 +317,7 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
     let title = summary
         .and_then(|s| s.title.clone())
         .filter(|t| !t.is_empty())
-        .or_else(|| sections.first().and_then(|s| s.title.clone()));
+        .or(first_title);
 
     DocumentIR {
         metadata: Metadata {
