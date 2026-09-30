@@ -752,7 +752,8 @@ fn parse_block_elements_until(
                 // `w:sdtContent` blocks, here exactly as in the body. Word's
                 // own "quote" text-box templates wrap the whole box in one;
                 // skipping it dropped every such text box entirely.
-                "sdt" | "sdtContent" => {},
+                // Block-level custom XML (§17.5.1.6) is the same shape.
+                "sdt" | "sdtContent" | "customXml" => {},
                 _ => xml::skip_element_fast(reader)?,
             },
             Event::End(ref e) if e.local_name().as_ref() == end_local => break,
@@ -2689,6 +2690,17 @@ fn parse_extent_attrs(e: &quick_xml::events::BytesStart, width: &mut Emu, height
 // Table parsing
 // ---------------------------------------------------------------------------
 
+/// Wrappers whose `w:tr` (inside `w:tbl`) or `w:tc` (inside `w:tr`)
+/// children are ordinary rows/cells: content controls (`w:sdt`,
+/// ECMA-376 §17.5.2), custom XML (`w:customXml`, CT_CustomXmlRow /
+/// CT_CustomXmlCell, §17.5.1.5 / §17.5.1.4), and the tracked-insertion
+/// and move-destination markers (`w:ins`, `w:moveTo`) that producers
+/// also wrap whole rows in. `w:del`/`w:moveFrom` are deliberately absent:
+/// what they hold is not part of the accepted document, as at run level.
+fn is_transparent_row_wrapper(local: &str) -> bool {
+    matches!(local, "sdt" | "sdtContent" | "customXml" | "ins" | "moveTo")
+}
+
 fn parse_table(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Table> {
     // Tables nest (a cell may hold another table), so this is the recursion
     // an adversarial file drives. Past the depth limit the subtree is
@@ -2743,7 +2755,7 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Table> {
                 "tr" => {
                     rows.push(parse_table_row(reader)?);
                 },
-                "sdt" | "sdtContent" => {
+                local if is_transparent_row_wrapper(local) => {
                     wrapper_depth += 1;
                 },
                 _ => {
@@ -2755,7 +2767,7 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Table> {
                 if local.as_ref() == "tbl" && wrapper_depth == 0 {
                     break;
                 }
-                if matches!(local.as_ref(), "sdt" | "sdtContent") {
+                if is_transparent_row_wrapper(local.as_ref()) {
                     wrapper_depth = wrapper_depth.saturating_sub(1);
                 } else if local.as_ref() == "tbl" {
                     break;
@@ -2894,7 +2906,7 @@ fn parse_table_row(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableRow
                 "tc" => {
                     cells.push(parse_table_cell(reader)?);
                 },
-                "sdt" | "sdtContent" => {
+                local if is_transparent_row_wrapper(local) => {
                     wrapper_depth += 1;
                 },
                 _ => {
@@ -2906,7 +2918,7 @@ fn parse_table_row(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableRow
                 if local.as_ref() == "tr" && wrapper_depth == 0 {
                     break;
                 }
-                if matches!(local.as_ref(), "sdt" | "sdtContent") {
+                if is_transparent_row_wrapper(local.as_ref()) {
                     wrapper_depth = wrapper_depth.saturating_sub(1);
                 } else if local.as_ref() == "tr" {
                     break;
@@ -2981,8 +2993,9 @@ fn parse_table_cell(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableCe
                 // A content control inside the cell (`w:tc > w:sdt >
                 // w:sdtContent > w:p`) — how a data-bound form lays out
                 // its fields — is a transparent wrapper, as in the body;
-                // skipping it emptied every such cell.
-                "sdt" | "sdtContent" => {},
+                // skipping it emptied every such cell. Block-level custom
+                // XML (CT_CustomXmlBlock, ECMA-376 §17.5.1.6) likewise.
+                "sdt" | "sdtContent" | "customXml" => {},
                 _ => {
                     xml::skip_element_fast(reader)?;
                 },
@@ -4282,6 +4295,59 @@ mod tests {
         assert!(
             md.contains("| SdtCell | SecondCell |"),
             "cells must stay in their original columns: {md:?}"
+        );
+    }
+
+    #[test]
+    fn test_wrapped_table_rows_and_cells_are_not_dropped() {
+        // `w:customXml` is a legal wrapper of both `w:tr` (CT_CustomXmlRow,
+        // ECMA-376 §17.5.1.5) and `w:tc` (CT_CustomXmlCell, §17.5.1.4).
+        // Producers also wrap inserted/moved rows in `w:ins`/`w:moveTo`.
+        // Each was skipped whole, deleting the row's text; a deleted or
+        // moved-away row stays out of the accepted view.
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tr><w:tc><w:p><w:r><w:t>PlainRow</w:t></w:r></w:p></w:tc></w:tr>
+      <w:customXml w:element="row"><w:tr><w:tc><w:p><w:r><w:t>CustomXmlRow</w:t></w:r></w:p></w:tc></w:tr></w:customXml>
+      <w:ins w:id="1" w:author="A"><w:tr><w:tc><w:p><w:r><w:t>InsertedRow</w:t></w:r></w:p></w:tc></w:tr></w:ins>
+      <w:moveTo w:id="2" w:author="A"><w:tr><w:tc><w:p><w:r><w:t>MovedRow</w:t></w:r></w:p></w:tc></w:tr></w:moveTo>
+      <w:del w:id="3" w:author="A"><w:tr><w:tc><w:p><w:r><w:t>DeletedRow</w:t></w:r></w:p></w:tc></w:tr></w:del>
+      <w:moveFrom w:id="4" w:author="A"><w:tr><w:tc><w:p><w:r><w:t>MovedAwayRow</w:t></w:r></w:p></w:tc></w:tr></w:moveFrom>
+      <w:tr>
+        <w:customXml w:element="cell"><w:tc><w:p><w:r><w:t>CustomXmlCell</w:t></w:r></w:p></w:tc></w:customXml>
+        <w:tc><w:p><w:r><w:t>NextCell</w:t></w:r></w:p></w:tc>
+        <w:tc><w:customXml w:element="block"><w:p><w:r><w:t>CustomXmlBlock</w:t></w:r></w:p></w:customXml></w:tc>
+      </w:tr>
+    </w:tbl>
+    <w:p><w:r><w:t>After</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        let data = make_minimal_docx(xml);
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        let Some(BlockElement::Table(table)) = doc.body.elements.first() else {
+            panic!("expected a table first");
+        };
+        assert_eq!(table.rows.len(), 5, "rows: {:?}", table.rows.len());
+        let text = doc.plain_text();
+        for want in [
+            "PlainRow",
+            "CustomXmlRow",
+            "InsertedRow",
+            "MovedRow",
+            "After",
+        ] {
+            assert!(text.contains(want), "{want} missing: {text:?}");
+        }
+        for unwanted in ["DeletedRow", "MovedAwayRow"] {
+            assert!(!text.contains(unwanted), "{unwanted} is not in the accepted view: {text:?}");
+        }
+        assert!(
+            doc.to_markdown()
+                .contains("| CustomXmlCell | NextCell | CustomXmlBlock |"),
+            "a wrapped cell must keep its column: {:?}",
+            doc.to_markdown()
         );
     }
 
