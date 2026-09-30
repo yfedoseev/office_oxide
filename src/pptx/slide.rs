@@ -2229,6 +2229,65 @@ mod tests {
         assert_eq!(p.tabs[0].alignment, crate::ir::TabAlignment::Right);
     }
 
+    /// Percent-form space before/after (`<a:spcBef>`/`<a:spcAft>` holding
+    /// `<a:spcPct>`, §21.1.2.2.11) was parsed but dropped from the IR: it
+    /// is a percentage of the text size, which is now taken from the
+    /// paragraph's resolved run size (own `sz`, or inherited through the
+    /// shape's list style), and 18 pt when nothing in the chain sets one.
+    #[test]
+    fn test_percent_paragraph_spacing_uses_the_resolved_font_size() {
+        let slide = parse_with_rels(
+            r#"<p:sp><p:nvSpPr><p:cNvPr id="2" name="T"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/>
+              <a:p><a:pPr><a:spcBef><a:spcPct val="50000"/></a:spcBef><a:spcAft><a:spcPct val="25000"/></a:spcAft></a:pPr><a:r><a:rPr sz="2400"/><a:t>Own</a:t></a:r></a:p>
+              <a:p><a:pPr><a:spcAft><a:spcPct val="20000"/></a:spcAft></a:pPr><a:r><a:t>Default</a:t></a:r></a:p>
+            </p:txBody></p:sp>
+            <p:sp><p:nvSpPr><p:cNvPr id="3" name="U"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/>
+              <a:lstStyle><a:lvl1pPr><a:defRPr sz="4000"/></a:lvl1pPr></a:lstStyle>
+              <a:p><a:pPr><a:spcBef><a:spcPct val="100000"/></a:spcBef><a:lnSpc><a:spcPct val="90000"/></a:lnSpc></a:pPr><a:r><a:t>Inherited</a:t></a:r></a:p>
+            </p:txBody></p:sp>"#,
+            None,
+        );
+        let doc = crate::pptx::PptxDocument {
+            presentation: crate::pptx::PresentationInfo {
+                slides: Vec::new(),
+                slide_size: None,
+            },
+            slides: vec![slide],
+            theme: None,
+            embedded_fonts: Vec::new(),
+            core_properties: None,
+            app_properties: None,
+            has_macros: false,
+            unreadable_parts: Vec::new(),
+            layouts: Vec::new(),
+            masters: Vec::new(),
+            package_properties: Default::default(),
+        };
+        let ir = crate::convert_pptx::pptx_to_ir(&doc);
+        let paras: Vec<_> = ir.sections[0]
+            .elements
+            .iter()
+            .map(|e| match e {
+                crate::ir::Element::Paragraph(p) => {
+                    (p.space_before_twips, p.space_after_twips, p.line_spacing.clone())
+                },
+                other => panic!("expected a paragraph: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            paras,
+            [
+                // 50% / 25% of 24 pt = 12 pt / 6 pt.
+                (Some(240), Some(120), None),
+                // 20% of the 18 pt default = 3.6 pt.
+                (None, Some(72), None),
+                // 100% of the list style's 40 pt; 90% line spacing stays
+                // proportional (240ths of a line).
+                (Some(800), None, Some(crate::ir::LineSpacing::Auto(216))),
+            ]
+        );
+    }
+
     /// `<a:tblPr/>` followed directly by a row (no `<a:tblGrid>`, which a
     /// damaged or minimal producer can omit): the parser consumed one event
     /// past `tblPr` unconditionally, which swallowed the first `<a:tr>`.
