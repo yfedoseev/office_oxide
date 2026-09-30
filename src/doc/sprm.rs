@@ -1850,7 +1850,7 @@ mod tests {
     /// `sprmCFVanish` hides text, so a wrong *on* deletes content. Without
     /// the style sheet the value a `0x80`/`0x81` operand is relative to is
     /// unknown, and real documents carry `0x81` on ordinary visible form
-    /// text (which 0.1.12 showed and Word displays). Only an explicit
+    /// text (which earlier releases showed and Word displays). Only an explicit
     /// `0x01` hides; `0x80`/`0x81` leave the value in force unchanged.
     #[test]
     fn test_vanish_hides_only_on_an_explicit_operand() {
