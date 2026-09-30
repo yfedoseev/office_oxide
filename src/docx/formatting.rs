@@ -43,6 +43,71 @@ pub struct RunProperties {
     /// internals). Converters use this to exclude the run from every
     /// extraction surface, the same way a run-level `w:del` already is.
     pub hidden: Option<bool>,
+    /// Theme font the ASCII slot refers to (`w:rFonts/@w:asciiTheme`, or
+    /// `@w:hAnsiTheme` when that is the only theme reference). Per
+    /// ECMA-376 Part 1 §17.3.2.26 a theme reference supersedes the
+    /// literal `w:ascii` face; resolve it with [`ThemeFont::resolve`].
+    pub font_theme: Option<ThemeFont>,
+}
+
+/// A theme font reference (`ST_Theme`, ECMA-376 Part 1 §17.18.96): which
+/// of the theme's major (heading) or minor (body) fonts, for which script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeFont {
+    /// `majorAscii` / `majorHAnsi`: the major Latin font.
+    MajorLatin,
+    /// `majorEastAsia`: the major East Asian font.
+    MajorEastAsia,
+    /// `majorBidi`: the major complex-script font.
+    MajorBidi,
+    /// `minorAscii` / `minorHAnsi`: the minor Latin font.
+    MinorLatin,
+    /// `minorEastAsia`: the minor East Asian font.
+    MinorEastAsia,
+    /// `minorBidi`: the minor complex-script font.
+    MinorBidi,
+}
+
+impl ThemeFont {
+    /// Parse an `ST_Theme` value.
+    pub fn parse(val: &str) -> Option<Self> {
+        Some(match val {
+            "majorAscii" | "majorHAnsi" => Self::MajorLatin,
+            "majorEastAsia" => Self::MajorEastAsia,
+            "majorBidi" => Self::MajorBidi,
+            "minorAscii" | "minorHAnsi" => Self::MinorLatin,
+            "minorEastAsia" => Self::MinorEastAsia,
+            "minorBidi" => Self::MinorBidi,
+            _ => return None,
+        })
+    }
+
+    /// The face name this reference resolves to in `scheme`. `None` when
+    /// the scheme leaves that script's font empty (inherit).
+    pub fn resolve(self, scheme: &crate::core::theme::FontScheme) -> Option<String> {
+        let face = match self {
+            Self::MajorLatin => Some(&scheme.major_latin),
+            Self::MinorLatin => Some(&scheme.minor_latin),
+            Self::MajorEastAsia => scheme.major_ea.as_ref(),
+            Self::MinorEastAsia => scheme.minor_ea.as_ref(),
+            Self::MajorBidi => scheme.major_cs.as_ref(),
+            Self::MinorBidi => scheme.minor_cs.as_ref(),
+        }?;
+        (!face.is_empty()).then(|| face.clone())
+    }
+}
+
+/// The theme font a `w:rFonts` element's ASCII slot refers to:
+/// `w:asciiTheme`, else `w:hAnsiTheme`.
+fn parse_rfonts_theme(e: &BytesStart) -> Option<ThemeFont> {
+    ["w:asciiTheme", "w:hAnsiTheme"]
+        .into_iter()
+        .find_map(|key| {
+            xml::optional_attr_str(e, key)
+                .ok()
+                .flatten()
+                .and_then(|v| ThemeFont::parse(&v))
+        })
 }
 
 /// Paragraph-level formatting properties (`w:pPr`).
@@ -194,7 +259,6 @@ impl RunProperties {
             strike,
             dstrike,
             font_size,
-            font_name,
             color,
             highlight,
             vertical_align,
@@ -205,6 +269,13 @@ impl RunProperties {
             shading_fill,
             hidden,
         );
+        // The ASCII face and its theme reference come from one `w:rFonts`
+        // and override together: a level that names a face directly
+        // drops a theme reference inherited from below, and vice versa.
+        if src.font_name.is_some() || src.font_theme.is_some() {
+            self.font_name = src.font_name.clone();
+            self.font_theme = src.font_theme;
+        }
     }
 }
 
@@ -433,6 +504,7 @@ pub(crate) fn parse_run_properties(
                             if let Ok(Some(ascii)) = xml::optional_attr_str(e, "w:ascii") {
                                 props.font_name = Some(ascii.into_owned());
                             }
+                            props.font_theme = parse_rfonts_theme(e);
                             xml::skip_element(reader)?;
                         },
                         "color" => {
@@ -490,6 +562,7 @@ pub(crate) fn parse_run_properties(
                         if let Ok(Some(ascii)) = xml::optional_attr_str(e, "w:ascii") {
                             props.font_name = Some(ascii.into_owned());
                         }
+                        props.font_theme = parse_rfonts_theme(e);
                     },
                     "color" => {
                         props.color = parse_color_ref(e)?;
@@ -670,6 +743,7 @@ pub(crate) fn parse_run_properties_fast(
                         if let Ok(Some(ascii)) = xml::optional_attr_str(e, "w:ascii") {
                             props.font_name = Some(ascii.into_owned());
                         }
+                        props.font_theme = parse_rfonts_theme(e);
                         xml::skip_element_fast(reader)?;
                     },
                     "color" => {
@@ -753,6 +827,7 @@ pub(crate) fn parse_run_properties_fast(
                         if let Ok(Some(ascii)) = xml::optional_attr_str(e, "w:ascii") {
                             props.font_name = Some(ascii.into_owned());
                         }
+                        props.font_theme = parse_rfonts_theme(e);
                     },
                     "color" => {
                         props.color = parse_color_ref(e)?;

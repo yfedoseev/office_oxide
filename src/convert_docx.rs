@@ -1147,7 +1147,16 @@ fn convert_run(
     // every PDF→DOCX→PDF round-trip loses every typeface — even when
     // the DOCX writer correctly embedded the source-PDF font program
     // under `word/fonts/`.
-    let font_name = effective.and_then(|rp| rp.font_name.clone());
+    // A theme reference (`w:asciiTheme`, the default in every Office
+    // template) supersedes the literal face (ECMA-376 Part 1 §17.3.2.26)
+    // and names a font in the theme's font scheme; without a theme to
+    // resolve it, the literal face is the only name there is.
+    let font_name = effective.and_then(|rp| {
+        rp.font_theme
+            .zip(theme)
+            .and_then(|(t, th)| t.resolve(&th.font_scheme))
+            .or_else(|| rp.font_name.clone())
+    });
     // Propagate `<w:color w:val="RRGGBB"/>` so PDF→DOCX→PDF round-trips
     // preserve coloured text (red "0" in `pdfs_pdfium/text_color.pdf`
     // and the like). Theme / system / auto colours fall through to
