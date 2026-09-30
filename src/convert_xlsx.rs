@@ -414,7 +414,18 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         // so they paint underneath the text (positional TextBoxes are
         // absolute regardless of order, but inline images render
         // first). Empty `image_elements` means no drawing on this sheet.
-        let mut combined: Vec<Element> = image_elements;
+        // A chart sheet's content is its chart's text; it has no cells.
+        let mut combined: Vec<Element> = ws
+            .chart_text
+            .iter()
+            .map(|t| {
+                Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(t.trim()))],
+                    ..Default::default()
+                })
+            })
+            .collect();
+        combined.extend(image_elements);
         combined.extend(elements);
 
         // Cell comments are document content — review notes, provenance,
@@ -490,6 +501,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             even_page_header: hf(eh),
             even_page_footer: hf(ef),
             hidden: ws.state != crate::xlsx::SheetState::Visible,
+            sheet_kind: Some(ws.kind),
             conditional_formats: ws.conditional_formats.clone(),
             data_validations: ws.data_validations.clone(),
             ..Default::default()

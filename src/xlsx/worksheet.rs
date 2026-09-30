@@ -58,6 +58,13 @@ pub struct Worksheet {
     /// a pivot table displays are ordinary cells in `rows`; this records
     /// the pivot itself and where its data comes from.
     pub pivot_tables: Vec<SheetPivotTable>,
+    /// What the sheet is. A macro sheet's cells are in `rows` like a
+    /// worksheet's; a chart sheet or dialog sheet has none.
+    pub kind: crate::ir::SheetKind,
+    /// A chart sheet's own chart text (titles, series, categories, in the
+    /// shape of [`super::XlsxDocument::chart_text`]), reached through the
+    /// chartsheet's drawing. Empty for every other kind.
+    pub chart_text: Vec<String>,
 }
 
 /// A table part ([ECMA-376] §18.5.1.2 `table`).
@@ -803,6 +810,30 @@ pub enum HyperlinkTarget {
 }
 
 impl Worksheet {
+    /// A sheet with no cells — a chart sheet or a dialog sheet — under
+    /// `name`.
+    pub(crate) fn without_cells(name: String, kind: crate::ir::SheetKind) -> Self {
+        Worksheet {
+            name,
+            dimension: None,
+            rows: Vec::new(),
+            merged_cells: Vec::new(),
+            hyperlinks: Vec::new(),
+            page_setup: None,
+            images: Vec::new(),
+            comments: Vec::new(),
+            text_shapes: Vec::new(),
+            conditional_formats: Vec::new(),
+            data_validations: Vec::new(),
+            state: super::SheetState::Visible,
+            header_footer: SheetHeaderFooter::default(),
+            tables: Vec::new(),
+            pivot_tables: Vec::new(),
+            kind,
+            chart_text: Vec::new(),
+        }
+    }
+
     /// Parse a worksheet XML part.
     pub fn parse(
         xml_data: &[u8],
@@ -918,6 +949,8 @@ impl Worksheet {
         }
 
         Ok(Worksheet {
+            kind: crate::ir::SheetKind::Worksheet,
+            chart_text: Vec::new(),
             state: super::SheetState::Visible,
             header_footer,
             tables: Vec::new(),
