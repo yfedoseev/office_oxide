@@ -682,6 +682,38 @@ fn parse_notes_part(xml_data: &[u8], end: &str) -> CoreResult<Vec<NoteBody>> {
     Ok(notes)
 }
 
+/// Upper bound on text boxes nested inside text boxes. Word's own UI cannot
+/// place a text box inside another at all; the 2 MiB debug-build cliff for
+/// this recursion was measured at 70-80 levels, so this leaves wide margin
+/// for text boxes that also sit inside nested tables.
+const MAX_TEXT_BOX_NESTING: usize = 16;
+
+thread_local! {
+    static TEXT_BOX_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard for [`MAX_TEXT_BOX_NESTING`], thread-local like
+/// [`xml::DepthGuard`].
+struct TextBoxDepthGuard(());
+
+impl TextBoxDepthGuard {
+    fn enter() -> Option<Self> {
+        TEXT_BOX_DEPTH.with(|d| {
+            let cur = d.get();
+            (cur < MAX_TEXT_BOX_NESTING).then(|| {
+                d.set(cur + 1);
+                TextBoxDepthGuard(())
+            })
+        })
+    }
+}
+
+impl Drop for TextBoxDepthGuard {
+    fn drop(&mut self) {
+        TEXT_BOX_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// Parse block elements (paragraphs and tables) until the matching
 /// `</end_local>`. Used for `<w:txbxContent>` bodies, which hold ordinary
 /// document content inside a shape.
@@ -689,6 +721,27 @@ fn parse_block_elements_until(
     reader: &mut quick_xml::Reader<&[u8]>,
     end_local: &str,
 ) -> CoreResult<Vec<BlockElement>> {
+    // Text boxes nest like tables do (`w:p` -> `w:r` -> a shape ->
+    // `w:txbxContent` -> `w:p` ...), so this is a recursion point in its
+    // own right. `DocxDocument::from_reader` parses on the caller's stack,
+    // so cap the depth here as `parse_table` does and say so in the
+    // content rather than truncate silently. One level of this cycle
+    // passes through `parse_paragraph` and `parse_run`, whose frames are an
+    // order of magnitude larger than `parse_table`'s, so it has its own,
+    // tighter bound on top of the shared one.
+    let guards = (xml::DepthGuard::enter(), TextBoxDepthGuard::enter());
+    let (Some(_depth), Some(_box_depth)) = guards else {
+        xml::skip_element_fast(reader)?;
+        return Ok(vec![BlockElement::Paragraph(Paragraph {
+            properties: None,
+            content: vec![ParagraphContent::Run(Run {
+                properties: None,
+                content: vec![RunContent::Text(
+                    "[text box nested too deeply not shown — document truncated]".to_string(),
+                )],
+            })],
+        })]);
+    };
     let mut elements = Vec::new();
     loop {
         match reader.read_event()? {
