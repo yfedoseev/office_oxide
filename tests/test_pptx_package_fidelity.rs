@@ -836,3 +836,68 @@ fn test_layout_and_master_static_text_is_available_but_not_slide_text() {
     let hidden = styled_deck(r#"showMasterSp="0""#).open();
     assert!(hidden.static_text_for_slide(0).is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Package paths the test suite never executed
+// ---------------------------------------------------------------------------
+
+/// An embedded picture and an embedded chart are pre-loaded from the
+/// slide's relationships before the (parallel) slide parse; neither loop
+/// was exercised by any test. An image target without an extension is
+/// typed by sniffing its bytes.
+#[test]
+fn test_embedded_picture_and_chart_parts_are_loaded_through_the_slide_rels() {
+    let chart_frame = r#"<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="7" name="Chart"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="0" y="3000"/><a:ext cx="100" cy="100"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" r:id="rIdC"/></a:graphicData></a:graphic></p:graphicFrame>"#;
+    let tree = format!("{}{chart_frame}", picture("", r#"<a:blip r:embed="rIdI"/>"#, "logo"));
+    let mut pkg = deck(&[&tree]);
+    pkg.part("ppt/media/image1", "", PNG);
+    pkg.rel("ppt/slides/slide1.xml", "rIdI", rel_types::IMAGE, "../media/image1");
+    pkg.part(
+        "ppt/charts/chart1.xml",
+        "application/vnd.openxmlformats-officedocument.drawingml.chart+xml",
+        r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>Quarterly revenue</a:t></a:r></a:p></c:rich></c:tx></c:title></c:chart></c:chartSpace>"#,
+    );
+    pkg.rel("ppt/slides/slide1.xml", "rIdC", rel_types::CHART, "../charts/chart1.xml");
+
+    let doc = pkg.open();
+    let office_oxide::pptx::Shape::Picture(ref pic) = doc.slides[0].shapes[0] else {
+        panic!("expected a picture");
+    };
+    assert_eq!(pic.data.as_deref(), Some(PNG));
+    assert_eq!(pic.format.as_deref(), Some("png"), "sniffed from the bytes");
+    let ir = pkg.document().to_ir();
+    assert_eq!(images(&ir)[0].format, Some(ImageFormat::Png));
+    assert!(ir.plain_text().contains("Quarterly revenue"), "{}", ir.plain_text());
+}
+
+/// Font programs under `ppt/fonts/` are collected by name.
+#[test]
+fn test_embedded_fonts_are_collected() {
+    let mut pkg = deck(&[&text_sp("X")]);
+    pkg.part("ppt/fonts/font_1_Garamond.ttf", "", b"\0\x01\0\0ttf".to_vec());
+    pkg.part("ppt/fonts/Futura.OTF", "", b"OTTOotf".to_vec());
+    pkg.part("ppt/fonts/font1.fntdata", "", b"obfuscated".to_vec());
+    let doc = pkg.open();
+    let mut fonts: Vec<(String, Vec<u8>)> = doc.embedded_fonts.clone();
+    fonts.sort();
+    assert_eq!(
+        fonts,
+        vec![
+            ("Futura".to_string(), b"OTTOotf".to_vec()),
+            ("Garamond".to_string(), b"\0\x01\0\0ttf".to_vec()),
+        ]
+    );
+}
+
+/// A `<p:sldId>` without an `r:id` (seen in some producers' output) falls
+/// back to the `ppt/slides/slideN.xml` naming convention.
+#[test]
+fn test_a_slide_id_without_r_id_resolves_by_convention() {
+    let mut pkg = deck(&[&text_sp("BY CONVENTION")]);
+    let pres = String::from_utf8(pkg.parts["ppt/presentation.xml"].clone()).unwrap();
+    pkg.parts
+        .insert("ppt/presentation.xml".into(), pres.replace(r#" r:id="rId1""#, "").into_bytes());
+    let doc = pkg.open();
+    assert_eq!(doc.slides.len(), 1);
+    assert!(doc.plain_text().contains("BY CONVENTION"));
+}
