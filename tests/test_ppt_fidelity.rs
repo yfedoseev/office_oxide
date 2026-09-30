@@ -300,3 +300,32 @@ fn test_style_spans_attach_and_survive_a_text_range_hyperlink_split() {
         ]
     );
 }
+
+/// A "PowerPoint Document" stream whose sector chain ends before its
+/// declared size was read short with no signal; the IR now says the text
+/// is incomplete and names the stream.
+#[test]
+fn test_truncated_container_stream_marks_ppt_text_truncated() {
+    let deck = PptBuilder {
+        slides: vec![slide("Short")],
+        ..Default::default()
+    };
+    let mut bytes = deck.build();
+    let ir = open(bytes.clone()).unwrap().to_ir();
+    assert!(!ir.metadata.text_truncated);
+    assert!(ir.metadata.warnings.is_empty(), "{:?}", ir.metadata.warnings);
+    // Directory entry 1 is "PowerPoint Document".
+    let size_at = 512 + 128 + 0x78;
+    let size = u32::from_le_bytes(bytes[size_at..size_at + 4].try_into().unwrap());
+    bytes[size_at..size_at + 4].copy_from_slice(&(size + 4096).to_le_bytes());
+    let ir = open(bytes).unwrap().to_ir();
+    assert!(ir.metadata.text_truncated);
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("PowerPoint Document")),
+        "{:?}",
+        ir.metadata.warnings
+    );
+}

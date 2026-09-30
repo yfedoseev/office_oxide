@@ -23,6 +23,13 @@ pub struct PptDocument {
     /// carries by default — parsed and then never read anywhere in the
     /// crate before.
     summary_properties: Option<SummaryProperties>,
+    /// Structural problems the reader worked around: the container's own
+    /// (header counts that disagree with its chains) and every stream read
+    /// short of its declared size. Reach `Metadata::warnings`.
+    warnings: Vec<String>,
+    /// `false` when a stream the deck's text comes from ("PowerPoint
+    /// Document", "Current User") was read short of its declared size.
+    text_complete: bool,
 }
 
 impl PptDocument {
@@ -74,13 +81,38 @@ impl PptDocument {
         // The Pictures stream (if present) holds the images; decoded lazily.
         let pictures_stream = cfb.open_stream("Pictures").unwrap_or_default();
 
+        let truncated = cfb.truncated_streams();
+        let text_complete = !truncated.iter().any(|n| {
+            n.eq_ignore_ascii_case("PowerPoint Document") || n.eq_ignore_ascii_case("Current User")
+        });
+        let mut warnings = cfb.warnings().to_vec();
+        warnings.extend(
+            truncated
+                .iter()
+                .map(|name| format!("stream {name:?} is shorter than its declared size")),
+        );
+
         Ok(Self {
             slides,
             pictures_stream,
             images: std::sync::OnceLock::new(),
             has_macros,
             summary_properties,
+            warnings,
+            text_complete,
         })
+    }
+
+    /// Structural problems the reader worked around rather than failing
+    /// on; see `Metadata::warnings`.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// `false` when a stream the deck's text comes from was read short of
+    /// its declared size; see `Metadata::text_truncated`.
+    pub fn text_complete(&self) -> bool {
+        self.text_complete
     }
 
     /// `true` when the deck carries a VBA project (a `VBAInfoAtom` with
@@ -487,6 +519,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![
                 SlideText {
                     text_runs: vec![
@@ -529,6 +563,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![SlideText {
                 text_runs: vec![
                     TextRun {
@@ -560,6 +596,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![SlideText {
                 text_runs: vec![
                     TextRun {
@@ -606,6 +644,8 @@ mod tests {
             slides: Vec::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
         assert!(ir.sections.is_empty());
@@ -623,6 +663,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![make_slide(vec![(
                 TextType::Body,
                 "Four Upload\u{b}Stations",
@@ -659,6 +701,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![make_slide(vec![(
                 TextType::Body,
                 "First paragraph\rFour Upload\u{b}Stations",
@@ -681,6 +725,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![make_slide(vec![(
                 TextType::CenterTitle,
                 "Methods & Tools\rAnalyses – national studies\rEvaluation – criteria",
@@ -713,6 +759,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![make_slide(vec![(
                 TextType::Other,
                 "LOASP\rChap. 14: information",
@@ -731,6 +779,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![make_slide(vec![(TextType::Title, "My Slide")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -750,6 +800,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![make_slide(vec![
                 (TextType::from_u32(6), "BSE in the US"), // real title
                 (TextType::from_u32(5), "Lisa A. Ferguson, DVM"), // real subtitle
@@ -793,6 +845,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![SlideText {
                 text_runs: vec![TextRun {
                     text_type: TextType::Body,
@@ -820,6 +874,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![make_slide(vec![(TextType::CenterTitle, "Centered")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -839,6 +895,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![make_slide(vec![
                 (TextType::Title, "Title"),
                 (TextType::Body, "Visible body text"),
@@ -874,6 +932,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![make_slide(vec![(TextType::Body, "Just body text")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -889,6 +949,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![make_slide(vec![
                 (TextType::Notes, "First note"),
                 (TextType::Notes, "Second note"),
@@ -926,6 +988,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![make_slide(vec![
                 (TextType::Body, "Body text"),
                 (TextType::HalfBody, "Half body"),
@@ -948,6 +1012,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![make_slide(vec![(TextType::Notes, "Speaker note")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -966,6 +1032,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![make_slide(vec![(TextType::Other, "misc text")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -979,6 +1047,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![make_slide(vec![(TextType::Body, "content")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -993,6 +1063,8 @@ mod tests {
             slides: Vec::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
         assert_eq!(ir.metadata.format, crate::format::DocumentFormat::Ppt);
@@ -1006,6 +1078,8 @@ mod tests {
             pictures_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             has_macros: false,
+            warnings: Vec::new(),
+            text_complete: true,
             summary_properties: Some(crate::cfb::SummaryProperties {
                 title: Some("Declared Title".to_string()),
                 subject: Some("Declared Subject".to_string()),
@@ -1035,6 +1109,8 @@ mod tests {
             pictures_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             has_macros: false,
+            warnings: Vec::new(),
+            text_complete: true,
             summary_properties: Some(crate::cfb::SummaryProperties {
                 title: Some(String::new()),
                 ..Default::default()
@@ -1060,6 +1136,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![SlideText {
                 text_runs: vec![TextRun {
                     text_type: TextType::Title,
@@ -1107,6 +1185,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![SlideText {
                 text_runs: vec![TextRun {
                     text_type: TextType::Body,
@@ -1167,6 +1247,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![SlideText {
                 text_runs: vec![TextRun {
                     text_type: TextType::Body,
@@ -1205,6 +1287,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![SlideText {
                 text_runs: vec![TextRun {
                     text_type: TextType::Other,
@@ -1239,6 +1323,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![SlideText {
                 text_runs: vec![TextRun {
                     text_type: TextType::Body,
@@ -1288,6 +1374,8 @@ mod tests {
             images: std::sync::OnceLock::new(),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![SlideText {
                 tables: vec![TableBlock {
                     rows: vec![
@@ -1344,6 +1432,8 @@ mod tests {
             ]),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![
                 SlideText {
                     image_refs: vec![0],
@@ -1392,6 +1482,8 @@ mod tests {
             }]),
             has_macros: false,
             summary_properties: None,
+            warnings: Vec::new(),
+            text_complete: true,
             slides: vec![SlideText {
                 ..Default::default()
             }],
