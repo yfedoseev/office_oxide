@@ -348,7 +348,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - name: Create virtual environment
         run: uv venv
@@ -555,7 +555,7 @@ jobs:
       # glue failure surfaced on release day. Generate the Node build and
       # drive every exported class through it.
       - name: Install wasm-pack
-        uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: wasm-pack
 
@@ -586,7 +586,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@d1ca8e406243e67bc0237cec8899b6b53fa9803a # cargo-llvm-cov
+        uses: taiki-e/install-action@72f835688cb6c15903b796f704b01e652a2b8835 # cargo-llvm-cov
 
       - name: Generate coverage
         run: |
@@ -621,7 +621,7 @@ jobs:
         with:
           key: shear
       - name: Install cargo-shear
-        uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-shear
       - name: Check for unused dependencies
@@ -713,7 +713,7 @@ jobs:
         with:
           key: taplo
       - name: Install taplo
-        uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: taplo-cli
       - name: Check TOML formatting
@@ -731,7 +731,7 @@ jobs:
         with:
           key: hack
       - name: Install cargo-hack
-        uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-hack
       - name: Build each feature individually (root crate)

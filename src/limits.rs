@@ -18,7 +18,7 @@
 //! The default keeps every genuine workbook this crate has been tested
 //! against (the largest, 181 MB of cell text, with room to spare) and
 //! refuses the fan-out shapes. Processes that read larger workbooks raise
-//! it once at startup with [`set_max_text_chars`](crate::limits::set_max_text_chars).
+//! it once at startup with [the text-budget setter](crate::limits::set_max_text_chars).
 
 //!
 //! OOXML packages are zip archives, and the per-part decompression cap

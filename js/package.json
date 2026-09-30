@@ -40,15 +40,15 @@
     "test": "node --test test/*.mjs"
   },
   "dependencies": {
-    "koffi": "^3.3.1"
+    "koffi": "^3.3.2"
   },
   "optionalDependencies": {
-    "office-oxide-linux-x64": "0.1.13",
-    "office-oxide-linux-arm64": "0.1.13",
-    "office-oxide-darwin-x64": "0.1.13",
     "office-oxide-darwin-arm64": "0.1.13",
-    "office-oxide-win32-x64": "0.1.13",
-    "office-oxide-win32-arm64": "0.1.13"
+    "office-oxide-darwin-x64": "0.1.13",
+    "office-oxide-linux-arm64": "0.1.13",
+    "office-oxide-linux-x64": "0.1.13",
+    "office-oxide-win32-arm64": "0.1.13",
+    "office-oxide-win32-x64": "0.1.13"
   },
   "keywords": [
     "docx",
