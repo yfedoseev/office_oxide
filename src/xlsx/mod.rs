@@ -173,7 +173,7 @@ impl XlsxDocument {
         name: &str,
     ) -> std::result::Result<Vec<u8>, crate::core::Error> {
         let data = opc::read_zip_entry(archive, entries, name)?;
-        if name.ends_with(".xml") || name.ends_with(".rels") {
+        if opc::is_xml_part_name(name) {
             if let Some(utf8_data) = crate::core::xml::ensure_utf8(&data) {
                 return Ok(utf8_data);
             }

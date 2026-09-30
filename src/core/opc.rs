@@ -199,6 +199,53 @@ fn normalize_path(path: &str) -> String {
     segments.join("/")
 }
 
+/// Content types of a package's main part (ECMA-376 Part 1 §11.3.10,
+/// §12.3.23, §13.3.6 and the macro-enabled / template variants Office
+/// registers), used when `_rels/.rels` does not name the main part.
+const MAIN_PART_CONTENT_TYPES: &[&str] = &[
+    // WordprocessingML: .docx, .dotx, .docm, .dotm
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml",
+    "application/vnd.ms-word.document.macroEnabled.main+xml",
+    "application/vnd.ms-word.template.macroEnabledTemplate.main+xml",
+    // SpreadsheetML: .xlsx, .xltx, .xlsm, .xltm, .xlam, .xlsb
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
+    "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+    "application/vnd.ms-excel.template.macroEnabled.main+xml",
+    "application/vnd.ms-excel.addin.macroEnabled.main+xml",
+    "application/vnd.ms-excel.sheet.binary.macroEnabled.main",
+    // PresentationML: .pptx, .ppsx, .potx, .pptm, .ppsm, .potm
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
+    "application/vnd.openxmlformats-officedocument.presentationml.slideshow.main+xml",
+    "application/vnd.openxmlformats-officedocument.presentationml.template.main+xml",
+    "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml",
+    "application/vnd.ms-powerpoint.slideshow.macroEnabled.main+xml",
+    "application/vnd.ms-powerpoint.template.macroEnabled.main+xml",
+];
+
+/// Whether a zip entry name (`/`-separated, no leading `/`) is a
+/// relationships part: a `*.rels` file directly inside a `_rels` folder
+/// (ECMA-376 Part 2 §9.3.3). Both are compared ASCII-case-insensitively,
+/// as part names are; a `_rels` substring elsewhere (`word/a_rels/x.xml`)
+/// is an ordinary part.
+fn is_relationships_part_name(name: &str) -> bool {
+    let (dir, file) = name.rsplit_once('/').unwrap_or(("", name));
+    let folder = dir.rsplit('/').next().unwrap_or("");
+    folder.eq_ignore_ascii_case("_rels") && ends_with_ignore_ascii_case(file, ".rels")
+}
+
+/// Whether a part name carries an XML payload by extension (`.xml` or
+/// `.rels`, any case) and so goes through encoding normalisation.
+pub(crate) fn is_xml_part_name(name: &str) -> bool {
+    ends_with_ignore_ascii_case(name, ".xml") || ends_with_ignore_ascii_case(name, ".rels")
+}
+
+fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
+    s.len() >= suffix.len()
+        && s.as_bytes()[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+}
+
 // ---------------------------------------------------------------------------
 // OpcReader
 // ---------------------------------------------------------------------------
@@ -304,7 +351,7 @@ impl<R: Read + Seek> OpcReader<R> {
         trace!("read_part '{}' ({} bytes)", name, data.len());
 
         // Transcode non-UTF-8 XML to UTF-8 (handles ISO-8859-1, Windows-1252, etc.)
-        if name.as_str().ends_with(".xml") || name.as_str().ends_with(".rels") {
+        if is_xml_part_name(name.as_str()) {
             if let Some(utf8_data) = super::xml::ensure_utf8(&data) {
                 trace!("read_part '{}': transcoded to UTF-8", name);
                 return Ok(utf8_data);
@@ -348,14 +395,14 @@ impl<R: Read + Seek> OpcReader<R> {
             return PartName::new(&target);
         }
 
-        // Fallback: scan [Content_Types].xml overrides for a main document content type
-        const MAIN_CONTENT_TYPES: &[&str] = &[
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
-        ];
+        // Fallback: scan [Content_Types].xml overrides for a main document
+        // content type — every variant the format readers accept, macro-
+        // enabled and template packages included.
         for (part_name, ct) in self.content_types.overrides() {
-            if MAIN_CONTENT_TYPES.iter().any(|&expected| ct == expected) {
+            if MAIN_PART_CONTENT_TYPES
+                .iter()
+                .any(|&expected| ct == expected)
+            {
                 debug!(
                     "main_document_part: fallback to Content_Types override '{}' ({})",
                     part_name, ct
@@ -382,8 +429,9 @@ impl<R: Read + Seek> OpcReader<R> {
                 if name.eq_ignore_ascii_case("[Content_Types].xml") {
                     return None;
                 }
-                // Skip .rels files in _rels directories
-                if name.contains("_rels/") {
+                // Skip relationships parts; they are read per source part
+                // through `read_rels_for` and regenerated on save.
+                if is_relationships_part_name(&name) {
                     return None;
                 }
                 let part_name = format!("/{name}");
@@ -1260,6 +1308,91 @@ mod tests {
         let entries = ZipEntryIndex::with_byte_limit(&archive, 16);
         let err = read_zip_entry(&mut archive, &entries, "a.bin").unwrap_err();
         assert!(matches!(err, Error::PackageLimit(_)), "{err:?}");
+    }
+
+    /// Only `*.rels` files directly in a `_rels` folder are relationships
+    /// parts, in any case; `a_rels/` is an ordinary folder whose parts must
+    /// survive an edit round trip.
+    #[test]
+    fn test_part_names_skip_exactly_the_relationships_parts() {
+        let bytes = raw_zip(
+            &[
+                ("[Content_Types].xml", MINIMAL_CT),
+                ("_rels/.rels", b"<Relationships/>"),
+                ("word/document.xml", b"<d/>"),
+                ("word/_rels/document.xml.rels", b"<Relationships/>"),
+                ("word/_RELS/other.xml.RELS", b"<Relationships/>"),
+                ("word/a_rels/data.xml", b"<keep/>"),
+                ("word/_rels/notes.xml", b"<keep/>"),
+            ],
+            Eocd::Count(7),
+            &[],
+        );
+        let r = open(bytes.clone()).unwrap();
+        let mut names: Vec<String> = r.part_names().iter().map(|p| p.to_string()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "/word/_rels/notes.xml",
+                "/word/a_rels/data.xml",
+                "/word/document.xml"
+            ]
+        );
+
+        let pkg = super::super::editable::EditablePackage::from_reader(std::io::Cursor::new(bytes))
+            .unwrap();
+        let kept = pkg.get_part(&PartName::new("/word/a_rels/data.xml").unwrap());
+        assert_eq!(kept, Some(&b"<keep/>"[..]));
+    }
+
+    /// With no `_rels/.rels`, the main part is found from the content-type
+    /// overrides — for macro-enabled and template packages too.
+    #[test]
+    fn test_main_part_fallback_accepts_macro_and_template_content_types() {
+        for ct in [
+            "application/vnd.ms-word.document.macroEnabled.main+xml",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml",
+            "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
+            "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml",
+            "application/vnd.openxmlformats-officedocument.presentationml.template.main+xml",
+        ] {
+            let types = format!(
+                r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/main/part.xml" ContentType="{ct}"/></Types>"#
+            );
+            let bytes = raw_zip(
+                &[
+                    ("[Content_Types].xml", types.as_bytes()),
+                    ("main/part.xml", b"<m/>"),
+                ],
+                Eocd::Count(2),
+                &[],
+            );
+            let r = open(bytes).unwrap();
+            assert_eq!(r.main_document_part().unwrap().as_str(), "/main/part.xml", "{ct}");
+        }
+    }
+
+    /// Entry lookup is case-insensitive, so the XML-ness test that gates
+    /// encoding normalisation must be too.
+    #[test]
+    fn test_upper_case_xml_part_is_transcoded_to_utf8() {
+        let latin1 = b"<?xml version=\"1.0\" encoding=\"windows-1252\"?><a>caf\xE9</a>";
+        let bytes = raw_zip(
+            &[
+                ("[Content_Types].xml", MINIMAL_CT),
+                ("WORD/DOCUMENT.XML", latin1),
+            ],
+            Eocd::Count(2),
+            &[],
+        );
+        let mut r = open(bytes).unwrap();
+        let data = r
+            .read_part(&PartName::new("/WORD/DOCUMENT.XML").unwrap())
+            .unwrap();
+        let text = String::from_utf8(data).expect("transcoded to UTF-8");
+        assert!(text.contains("caf\u{e9}"), "{text}");
     }
 
     /// A part whose bytes do not match its recorded CRC-32 is corrupt; the
