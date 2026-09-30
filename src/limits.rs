@@ -5,11 +5,15 @@
 //! string is stored once, the rendered text is the string times the cell
 //! count. A 110 KB `.xlsx` holding a 1 MB string referenced from 12,000
 //! cells rendered to 393 MB; the same string from a million rows would be
-//! 32 GB from a 300 KB file. Every renderer, the IR converter and the
-//! legacy `.xls` reader (which materialises each referencing cell's copy
-//! at open) charge the characters they emit against one per-document
-//! budget and stop, loudly, when it is spent. Apache POI does the same
-//! with `ZipSecureFile.setMaxTextSize`.
+//! 32 GB from a 300 KB file. The spreadsheet paths — XLSX text rendering
+//! (`plain_text`/CSV/Markdown/HTML over cells), the XLSX → IR converter,
+//! and the legacy `.xls` reader (which materialises each referencing
+//! cell's copy at open) — charge the characters they emit against one
+//! per-document budget and stop, loudly, when it is spent. The word-
+//! processing and presentation paths do not: their text is stored once
+//! per occurrence, so its size is already bounded by the package's
+//! decompressed size. Apache POI does the same with
+//! `ZipSecureFile.setMaxTextSize`.
 //!
 //! The default keeps every genuine workbook this crate has been tested
 //! against (the largest, 181 MB of cell text, with room to spare) and
