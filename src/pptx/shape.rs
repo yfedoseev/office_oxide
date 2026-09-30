@@ -88,10 +88,12 @@ pub struct GraphicFrame {
 pub enum GraphicContent {
     /// A DrawingML table.
     Table(Table),
-    /// Flattened text from a graphic whose structure we do not model —
-    /// a SmartArt diagram or an embedded chart. The graphic is not drawn,
-    /// but its words are real document content and used to be dropped
-    /// entirely: a deck built out of SmartArt extracted as empty.
+    /// Flattened text from a graphic whose structure we do not model: a
+    /// SmartArt diagram (one line per node paragraph, read from its
+    /// `ppt/diagrams/dataN.xml` data part), an embedded chart (read from
+    /// its `ppt/charts/chartN.xml` part), or the inline `<a:t>` text of an
+    /// unrecognised graphic. The graphic is not drawn, but its words are
+    /// real document content.
     Text(Vec<String>),
     /// Unsupported or unrecognised graphic type.
     Unknown,

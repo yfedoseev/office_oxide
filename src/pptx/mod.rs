@@ -351,9 +351,13 @@ impl PptxDocument {
 
             // Pre-load and extract every embedded chart part the slide
             // references.
+            // SmartArt data parts are resolved the same way: the slide's
+            // `<dgm:relIds r:dm>` names the part holding the node text.
             let mut charts = std::collections::HashMap::new();
             for rel in slide_rels.all() {
-                if rel.rel_type != rel_types::CHART {
+                let is_chart = rel.rel_type == rel_types::CHART;
+                let is_diagram = rel.rel_type == rel_types::DIAGRAM_DATA;
+                if !is_chart && !is_diagram {
                     continue;
                 }
                 let target = match part_name.resolve_relative(&rel.target) {
@@ -366,7 +370,11 @@ impl PptxDocument {
                 let Ok(data) = opc.read_part(&target) else {
                     continue;
                 };
-                let lines = crate::core::chart::chart_text_lines(&data);
+                let lines = if is_chart {
+                    crate::core::chart::chart_text_lines(&data)
+                } else {
+                    slide::diagram_data_text_lines(&data)
+                };
                 if !lines.is_empty() {
                     charts.insert(rel.id.clone(), lines);
                 }

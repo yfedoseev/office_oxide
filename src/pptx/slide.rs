@@ -103,12 +103,17 @@ fn make_content_reader(xml_data: &[u8]) -> quick_xml::Reader<&[u8]> {
 
 impl Slide {
     /// Parse a slide from its XML data.
+    ///
+    /// `media` maps an image relationship id to its bytes and format;
+    /// `part_text` maps the relationship id of a chart part or a SmartArt
+    /// data part to the text lines extracted from it. Both are resolved by
+    /// the caller, which holds the package reader.
     pub(crate) fn parse(
         xml_data: &[u8],
         name: String,
         rels: &Relationships,
         media: &std::collections::HashMap<String, (Vec<u8>, String)>,
-        charts: &std::collections::HashMap<String, Vec<String>>,
+        part_text: &std::collections::HashMap<String, Vec<String>>,
     ) -> CoreResult<Self> {
         let mut reader = make_content_reader(xml_data);
         let mut shapes = Vec::new();
@@ -125,7 +130,7 @@ impl Slide {
                     background_rgb = parse_slide_bg(&mut reader)?;
                 },
                 Event::Start(ref e) if e.local_name().as_ref() == "spTree" => {
-                    shapes = parse_shape_tree(&mut reader, rels, media, charts)?;
+                    shapes = parse_shape_tree(&mut reader, rels, media, part_text)?;
                 },
                 Event::Eof => break,
                 _ => {},
@@ -216,9 +221,9 @@ fn parse_shape_tree(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
     media: &std::collections::HashMap<String, (Vec<u8>, String)>,
-    charts: &std::collections::HashMap<String, Vec<String>>,
+    part_text: &std::collections::HashMap<String, Vec<String>>,
 ) -> CoreResult<Vec<Shape>> {
-    parse_shape_tree_until(reader, rels, media, charts, "spTree")
+    parse_shape_tree_until(reader, rels, media, part_text, "spTree")
 }
 
 /// Shared shape-tree loop, parameterized on the closing tag so it can also
@@ -228,7 +233,7 @@ fn parse_shape_tree_until(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
     media: &std::collections::HashMap<String, (Vec<u8>, String)>,
-    charts: &std::collections::HashMap<String, Vec<String>>,
+    part_text: &std::collections::HashMap<String, Vec<String>>,
     end_local: &str,
 ) -> CoreResult<Vec<Shape>> {
     let mut shapes = Vec::new();
@@ -238,11 +243,11 @@ fn parse_shape_tree_until(
             Event::Start(ref e) => match e.local_name().as_ref() {
                 "sp" => shapes.push(parse_auto_shape(reader, rels)?),
                 "pic" => shapes.push(parse_picture(reader, rels, media)?),
-                "grpSp" => shapes.push(parse_group_shape(reader, rels, media, charts)?),
-                "graphicFrame" => shapes.push(parse_graphic_frame(reader, rels, charts)?),
+                "grpSp" => shapes.push(parse_group_shape(reader, rels, media, part_text)?),
+                "graphicFrame" => shapes.push(parse_graphic_frame(reader, rels, part_text)?),
                 "cxnSp" => shapes.push(parse_connector(reader)?),
                 "AlternateContent" => {
-                    shapes.extend(parse_alternate_content(reader, rels, media, charts)?);
+                    shapes.extend(parse_alternate_content(reader, rels, media, part_text)?);
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
@@ -271,7 +276,7 @@ fn parse_alternate_content(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
     media: &std::collections::HashMap<String, (Vec<u8>, String)>,
-    charts: &std::collections::HashMap<String, Vec<String>>,
+    part_text: &std::collections::HashMap<String, Vec<String>>,
 ) -> CoreResult<Vec<Shape>> {
     let mut shapes: Vec<Shape> = Vec::new();
     let mut have_choice = false;
@@ -280,14 +285,14 @@ fn parse_alternate_content(
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
                 "Choice" => {
-                    let s = parse_shape_tree_until(reader, rels, media, charts, "Choice")?;
+                    let s = parse_shape_tree_until(reader, rels, media, part_text, "Choice")?;
                     if !s.is_empty() {
                         shapes = s;
                         have_choice = true;
                     }
                 },
                 "Fallback" => {
-                    let s = parse_shape_tree_until(reader, rels, media, charts, "Fallback")?;
+                    let s = parse_shape_tree_until(reader, rels, media, part_text, "Fallback")?;
                     if !have_choice && shapes.is_empty() {
                         shapes = s;
                     }
@@ -480,7 +485,7 @@ fn parse_group_shape(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
     media: &std::collections::HashMap<String, (Vec<u8>, String)>,
-    charts: &std::collections::HashMap<String, Vec<String>>,
+    part_text: &std::collections::HashMap<String, Vec<String>>,
 ) -> CoreResult<Shape> {
     // Groups nest, so this is the recursion an adversarial deck drives.
     // Past the limit the subtree is skipped: a stack overflow aborts the
@@ -512,11 +517,11 @@ fn parse_group_shape(
                 },
                 "sp" => children.push(parse_auto_shape(reader, rels)?),
                 "pic" => children.push(parse_picture(reader, rels, media)?),
-                "grpSp" => children.push(parse_group_shape(reader, rels, media, charts)?),
-                "graphicFrame" => children.push(parse_graphic_frame(reader, rels, charts)?),
+                "grpSp" => children.push(parse_group_shape(reader, rels, media, part_text)?),
+                "graphicFrame" => children.push(parse_graphic_frame(reader, rels, part_text)?),
                 "cxnSp" => children.push(parse_connector(reader)?),
                 "AlternateContent" => {
-                    children.extend(parse_alternate_content(reader, rels, media, charts)?);
+                    children.extend(parse_alternate_content(reader, rels, media, part_text)?);
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
@@ -580,29 +585,73 @@ fn collect_a_t_text(
     Ok(out)
 }
 
-/// Find `<c:chart r:id="…"/>`'s relationship id inside a `<a:graphicData>`
-/// subtree, reading through the matching `</end_local>` regardless of
-/// whether a chart reference was found (so the reader position stays
+/// The text of a SmartArt data part (`ppt/diagrams/dataN.xml`,
+/// `<dgm:dataModel>`, ECMA-376 Part 1 §21.4.3): one line per non-empty
+/// paragraph of each point's `<dgm:t>` body, in point-list order. The runs
+/// of one paragraph are joined without a separator — a word split across
+/// runs stays one word.
+pub(crate) fn diagram_data_text_lines(xml_data: &[u8]) -> Vec<String> {
+    let mut reader = make_content_reader(xml_data);
+    let mut lines = Vec::new();
+    let mut in_point_text = 0u32;
+    let mut current = String::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) => match e.local_name().as_ref() {
+                // `t` is both the point's text body (`dgm:t`) and a run's
+                // text (`a:t`); the outer one is told apart by nesting.
+                "t" if in_point_text == 0 => in_point_text = 1,
+                "t" => {
+                    if let Ok(t) = xml::read_text_content_fast(&mut reader) {
+                        current.push_str(&t);
+                    }
+                },
+                _ if in_point_text > 0 => in_point_text += 1,
+                _ => {},
+            },
+            Ok(Event::End(ref e)) if in_point_text > 0 => {
+                in_point_text -= 1;
+                if matches!(e.local_name().as_ref(), "p" | "t") {
+                    let line = current.trim();
+                    if !line.is_empty() {
+                        lines.push(line.to_string());
+                    }
+                    current.clear();
+                }
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {},
+        }
+    }
+    lines
+}
+
+/// Find a part reference inside a `<a:graphicData>` subtree — the first
+/// `<{element} {attr}="rIdN"/>`, e.g. `<c:chart r:id>` or SmartArt's
+/// `<dgm:relIds r:dm>` — reading through the matching `</end_local>`
+/// regardless of whether one was found (so the reader position stays
 /// correct either way).
-fn find_chart_rid(
+fn find_part_rid(
     reader: &mut quick_xml::Reader<&[u8]>,
     end_local: &str,
+    element: &str,
+    attr: &str,
 ) -> CoreResult<Option<String>> {
     let mut rid = None;
     let mut depth = 1i32;
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => {
-                if rid.is_none() && e.local_name().as_ref() == "chart" {
-                    rid = xml::optional_attr_str(e, "r:id")?
+                if rid.is_none() && e.local_name().as_ref() == element {
+                    rid = xml::optional_attr_str(e, attr)?
                         .filter(|v| !v.is_empty())
                         .map(|v| v.into_owned());
                 }
                 depth += 1;
             },
             Event::Empty(ref e) => {
-                if rid.is_none() && e.local_name().as_ref() == "chart" {
-                    rid = xml::optional_attr_str(e, "r:id")?
+                if rid.is_none() && e.local_name().as_ref() == element {
+                    rid = xml::optional_attr_str(e, attr)?
                         .filter(|v| !v.is_empty())
                         .map(|v| v.into_owned());
                 }
@@ -626,7 +675,7 @@ fn find_chart_rid(
 fn parse_graphic_frame(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    charts: &std::collections::HashMap<String, Vec<String>>,
+    part_text: &std::collections::HashMap<String, Vec<String>>,
 ) -> CoreResult<Shape> {
     let mut id = 0u32;
     let mut name = String::new();
@@ -662,18 +711,33 @@ fn parse_graphic_frame(
                             // and cached data values all live in the
                             // separate part that id resolves to
                             // (ppt/charts/chartN.xml), pre-read into
-                            // `charts`.
-                            let rid = find_chart_rid(reader, "graphicData")?;
-                            let texts = rid.and_then(|r| charts.get(&r)).cloned();
+                            // `part_text`.
+                            let rid = find_part_rid(reader, "graphicData", "chart", "r:id")?;
+                            let texts = rid.and_then(|r| part_text.get(&r)).cloned();
+                            content = match texts {
+                                Some(t) if !t.is_empty() => GraphicContent::Text(t),
+                                _ => GraphicContent::Unknown,
+                            };
+                        } else if uri.as_deref()
+                            == Some("http://schemas.openxmlformats.org/drawingml/2006/diagram")
+                        {
+                            // SmartArt: the frame holds only
+                            // <dgm:relIds r:dm="rIdN" …/>; the node text
+                            // lives in the data part that id resolves to
+                            // (ppt/diagrams/dataN.xml, ECMA-376 Part 1
+                            // §21.4.2.8 relIds), pre-read into `part_text`.
+                            let rid = find_part_rid(reader, "graphicData", "relIds", "r:dm")?;
+                            let texts = rid.and_then(|r| part_text.get(&r)).cloned();
                             content = match texts {
                                 Some(t) if !t.is_empty() => GraphicContent::Text(t),
                                 _ => GraphicContent::Unknown,
                             };
                         } else {
-                            // Everything else — SmartArt diagrams, embedded
-                            // objects — used to be skipped wholesale along
-                            // with charts. We can't render them, but their
-                            // `<a:t>` runs are document text.
+                            // Everything else — embedded objects and
+                            // unknown graphics — used to be skipped
+                            // wholesale along with charts. We can't render
+                            // them, but their `<a:t>` runs are document
+                            // text.
                             let texts = collect_a_t_text(reader, "graphicData")?;
                             content = if texts.is_empty() {
                                 GraphicContent::Unknown

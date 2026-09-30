@@ -1105,25 +1105,25 @@ fn test_slide_comments_reach_plain_text_and_markdown() {
 }
 
 // ---------------------------------------------------------------------------
-// SmartArt / chart text
+// Unmodelled graphic text
 // ---------------------------------------------------------------------------
 
+/// A graphicFrame whose uri is not one this reader models used to be
+/// skipped wholesale; any `<a:t>` text inside it is document text. (Real
+/// SmartArt keeps its text in a separate data part — see
+/// `test_smartart_text_is_read_from_the_diagram_data_part`.)
 #[test]
-fn test_smartart_and_chart_text_is_extracted() {
-    // A graphicFrame whose uri is not the table one used to be skipped
-    // wholesale, so a deck built out of SmartArt extracted as empty.
+fn test_inline_text_of_an_unmodelled_graphic_is_extracted() {
     let tree = r#"<p:graphicFrame>
         <p:xfrm><a:off x="0" y="0"/><a:ext cx="100" cy="100"/></p:xfrm>
-        <a:graphic><a:graphicData
-            uri="http://schemas.openxmlformats.org/drawingml/2006/diagram">
-          <dgm:relIds xmlns:dgm="d"/>
-          <a:txBody><a:p><a:r><a:t>DIAGRAM NODE</a:t></a:r></a:p></a:txBody>
+        <a:graphic><a:graphicData uri="urn:example:unmodelled-graphic">
+          <a:txBody><a:p><a:r><a:t>GRAPHIC NODE</a:t></a:r></a:p></a:txBody>
         </a:graphicData></a:graphic>
       </p:graphicFrame>"#;
     let ir = pptx_ir(vec![Slide::new(tree)]);
     assert!(
-        ir.plain_text().contains("DIAGRAM NODE"),
-        "diagram text missing from {:?}",
+        ir.plain_text().contains("GRAPHIC NODE"),
+        "graphic text missing from {:?}",
         ir.plain_text()
     );
 }

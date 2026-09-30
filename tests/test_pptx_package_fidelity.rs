@@ -429,3 +429,41 @@ fn test_comment_authors_resolve_for_legacy_and_modern_comments() {
         .map(|a| a.map(String::from))
     );
 }
+
+// ---------------------------------------------------------------------------
+// SmartArt
+// ---------------------------------------------------------------------------
+
+/// A real SmartArt `graphicFrame` holds only `<dgm:relIds r:dm=…/>`; the
+/// node text lives in the separate `ppt/diagrams/dataN.xml` part, which
+/// was never resolved — so real SmartArt extracted as nothing.
+#[test]
+fn test_smartart_text_is_read_from_the_diagram_data_part() {
+    let frame = r#"<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="4" name="Diagram 3"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x="100" y="100"/><a:ext cx="5000" cy="3000"/></p:xfrm><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"><dgm:relIds xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" r:dm="rId5" r:lo="rId6" r:qs="rId7" r:cs="rId8"/></a:graphicData></a:graphic></p:graphicFrame>"#;
+    let mut pkg = deck(&[frame]);
+    pkg.part(
+        "ppt/diagrams/data1.xml",
+        "application/vnd.openxmlformats-officedocument.drawingml.diagramData+xml",
+        r#"<?xml version="1.0"?><dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><dgm:ptLst>
+            <dgm:pt modelId="{0}" type="doc"><dgm:prSet/><dgm:spPr/><dgm:t><a:bodyPr/><a:p><a:endParaRPr/></a:p></dgm:t></dgm:pt>
+            <dgm:pt modelId="{1}"><dgm:prSet/><dgm:spPr/><dgm:t><a:bodyPr/><a:p><a:r><a:t>Plan</a:t></a:r><a:r><a:t>ning</a:t></a:r></a:p></dgm:t></dgm:pt>
+            <dgm:pt modelId="{2}" type="parTrans"><dgm:prSet/><dgm:spPr/><dgm:t><a:bodyPr/><a:p><a:endParaRPr/></a:p></dgm:t></dgm:pt>
+            <dgm:pt modelId="{3}"><dgm:prSet/><dgm:spPr/><dgm:t><a:bodyPr/><a:p><a:r><a:t>Delivery</a:t></a:r></a:p></dgm:t></dgm:pt>
+          </dgm:ptLst><dgm:cxnLst/></dgm:dataModel>"#,
+    );
+    pkg.rel(
+        "ppt/slides/slide1.xml",
+        "rId5",
+        rel_types::DIAGRAM_DATA,
+        "../diagrams/data1.xml",
+    );
+
+    let doc = pkg.document();
+    let ir = doc.to_ir();
+    let text = ir.plain_text();
+    assert!(text.contains("Planning"), "runs of one node are one line: {text:?}");
+    assert!(text.contains("Delivery"), "{text:?}");
+    assert!(text.find("Planning") < text.find("Delivery"));
+    let direct = doc.plain_text();
+    assert!(direct.contains("Planning") && direct.contains("Delivery"), "{direct:?}");
+}
