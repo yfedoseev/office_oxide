@@ -20,11 +20,19 @@ impl DocxDocument {
     pub fn plain_text(&self) -> String {
         let mut out = String::new();
         let styles = self.styles.as_ref();
-        for hf in self.headers_footers.iter().filter(|h| h.is_header) {
+        for hf in self
+            .headers_footers
+            .iter()
+            .filter(|h| h.active && h.is_header)
+        {
             plain_text_blocks(&hf.content, styles, &mut out);
         }
         plain_text_blocks(&self.body.elements, styles, &mut out);
-        for hf in self.headers_footers.iter().filter(|h| !h.is_header) {
+        for hf in self
+            .headers_footers
+            .iter()
+            .filter(|h| h.active && !h.is_header)
+        {
             plain_text_blocks(&hf.content, styles, &mut out);
         }
         // Footnote/endnote/comment bodies are real document content that
@@ -131,7 +139,7 @@ fn split_headers_footers(doc: &DocxDocument, ctx: &MarkdownCtx) -> (Vec<String>,
     let mut header_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut footer_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for hf in &doc.headers_footers {
+    for hf in doc.headers_footers.iter().filter(|h| h.active) {
         let mut buf = String::new();
         markdown_blocks(&hf.content, ctx, &mut buf, 0);
         let t = buf.trim().to_string();

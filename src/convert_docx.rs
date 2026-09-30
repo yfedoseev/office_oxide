@@ -47,6 +47,13 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         let mut slot = SectionHeaders::default();
         for _ in 0..(sp.header_refs.len() + sp.footer_refs.len()) {
             let Some(hf) = hf_iter.next() else { break };
+            // A first-page part in a section without `w:titlePg` is never
+            // shown by Word; carrying it made every surface print it and
+            // the writer, which emits `w:titlePg` for any first-page
+            // part, switch it on.
+            if !hf.active {
+                continue;
+            }
             let mut tmp: Vec<Element> = Vec::new();
             convert_block_elements(&hf.content, &mut tmp, doc);
             if tmp

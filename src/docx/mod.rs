@@ -354,49 +354,51 @@ impl DocxDocument {
         let mut part_images: std::collections::HashMap<String, (Vec<u8>, Option<String>)> =
             std::collections::HashMap::new();
         let mut headers_footers = Vec::new();
-        let mut parse_hf = |hf_ref: &HeaderFooterRef, is_header: bool| -> CoreResult<()> {
-            if let Some(rel) = doc_rels.get_by_id(&hf_ref.relationship_id) {
-                if rel.target_mode == TargetMode::Internal {
-                    let part_name = main_part.resolve_relative(&rel.target)?;
-                    if opc.has_part(&part_name) {
-                        let data = opc.read_part(&part_name)?;
-                        // A header or footer part that does not parse (a
-                        // damaged archive with an intact body) is not the
-                        // document: skip it with a warning rather than fail
-                        // the file, as Tika/POI do.
-                        let mut content = match parse_body_elements(&data) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                log::warn!("docx: skipping unreadable {part_name}: {e}");
-                                return Ok(());
-                            },
-                        };
-                        if let Ok(hf_rels) = opc.read_rels_for(&part_name) {
-                            resolve_hyperlinks(&mut content, &hf_rels);
-                            qualify_part_images(
-                                &mut content,
-                                &part_name,
-                                &hf_rels,
-                                &mut opc,
-                                &mut part_images,
-                            );
+        let mut parse_hf =
+            |hf_ref: &HeaderFooterRef, is_header: bool, title_page: bool| -> CoreResult<()> {
+                if let Some(rel) = doc_rels.get_by_id(&hf_ref.relationship_id) {
+                    if rel.target_mode == TargetMode::Internal {
+                        let part_name = main_part.resolve_relative(&rel.target)?;
+                        if opc.has_part(&part_name) {
+                            let data = opc.read_part(&part_name)?;
+                            // A header or footer part that does not parse (a
+                            // damaged archive with an intact body) is not the
+                            // document: skip it with a warning rather than fail
+                            // the file, as Tika/POI do.
+                            let mut content = match parse_body_elements(&data) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    log::warn!("docx: skipping unreadable {part_name}: {e}");
+                                    return Ok(());
+                                },
+                            };
+                            if let Ok(hf_rels) = opc.read_rels_for(&part_name) {
+                                resolve_hyperlinks(&mut content, &hf_rels);
+                                qualify_part_images(
+                                    &mut content,
+                                    &part_name,
+                                    &hf_rels,
+                                    &mut opc,
+                                    &mut part_images,
+                                );
+                            }
+                            headers_footers.push(HeaderFooter {
+                                hf_type: hf_ref.hf_type,
+                                content,
+                                is_header,
+                                active: title_page || hf_ref.hf_type != HeaderFooterType::First,
+                            });
                         }
-                        headers_footers.push(HeaderFooter {
-                            hf_type: hf_ref.hf_type,
-                            content,
-                            is_header,
-                        });
                     }
                 }
-            }
-            Ok(())
-        };
+                Ok(())
+            };
         for section in &sections {
             for hf_ref in &section.header_refs {
-                parse_hf(hf_ref, true)?;
+                parse_hf(hf_ref, true, section.title_page)?;
             }
             for hf_ref in &section.footer_refs {
-                parse_hf(hf_ref, false)?;
+                parse_hf(hf_ref, false, section.title_page)?;
             }
         }
 

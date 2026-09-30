@@ -122,4 +122,9 @@ pub struct HeaderFooter {
     /// the markdown renderer) sort entries into headers vs footers
     /// without trying to back-derive from cumulative ref counts.
     pub is_header: bool,
+    /// Whether Word shows this part. A `w:type="first"` header or footer
+    /// is used only in a section with `w:titlePg` (ECMA-376 §17.10.6);
+    /// without it the part is defined but never displayed, so the
+    /// renderers and `to_ir()` leave it out. The content is kept here.
+    pub active: bool,
 }

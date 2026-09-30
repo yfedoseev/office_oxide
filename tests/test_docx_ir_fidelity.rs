@@ -188,7 +188,13 @@ impl Docx {
         self
     }
 
-    fn ir(mut self) -> DocumentIR {
+    fn ir(self) -> DocumentIR {
+        Document::from_reader(Cursor::new(self.bytes()), DocumentFormat::Docx)
+            .expect("parse")
+            .to_ir()
+    }
+
+    fn bytes(mut self) -> Vec<u8> {
         let xml = format!(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -200,10 +206,7 @@ impl Docx {
         self.w
             .add_part(&self.doc_part, CT_DOC, xml.as_bytes())
             .unwrap();
-        let bytes = self.w.finish().unwrap().into_inner();
-        Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
-            .expect("parse")
-            .to_ir()
+        self.w.finish().unwrap().into_inner()
     }
 }
 
@@ -678,6 +681,7 @@ fn test_first_default_and_even_headers_land_in_distinct_slots() {
              <w:headerReference w:type="default" r:id="rIdH1"/>
              <w:headerReference w:type="first" r:id="rIdH2"/>
              <w:footerReference w:type="default" r:id="rIdF1"/>
+             <w:titlePg/>
            </w:sectPr>"#,
     )
     .hf("header1.xml", "rIdH1", "DEFAULT HEADER")
@@ -686,32 +690,66 @@ fn test_first_default_and_even_headers_land_in_distinct_slots() {
     .ir();
 
     let s = &ir.sections[0];
-    let text = |hf: &Option<HeaderFooter>| -> String {
-        hf.as_ref()
-            .map(|h| {
-                h.content
-                    .iter()
-                    .map(|e| match e {
-                        Element::Paragraph(p) => p
-                            .content
-                            .iter()
-                            .filter_map(|c| match c {
-                                InlineContent::Text(t) => Some(t.text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<String>(),
-                        _ => String::new(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    assert_eq!(text(&s.header), "DEFAULT HEADER");
-    assert_eq!(text(&s.first_page_header), "FIRST HEADER");
-    assert_eq!(text(&s.footer), "DEFAULT FOOTER");
+    assert_eq!(hf_text(&s.header), "DEFAULT HEADER");
+    assert_eq!(hf_text(&s.first_page_header), "FIRST HEADER");
+    assert_eq!(hf_text(&s.footer), "DEFAULT FOOTER");
     // The footer must not have leaked into the header slot, which is what
     // the old cumulative-index split did as soon as the counts were unequal.
-    assert!(!text(&s.header).contains("FOOTER"));
+    assert!(!hf_text(&s.header).contains("FOOTER"));
+}
+
+/// A `w:type="first"` header or footer is shown only in a section with
+/// `w:titlePg` (ECMA-376 §17.10.6). `title_page` was parsed and never
+/// read: the inactive part reached every surface, and the writer, which
+/// emits `w:titlePg` whenever a first-page part exists, made it visible
+/// in Word after a round-trip.
+#[test]
+fn test_an_inactive_first_page_header_is_not_content() {
+    let bytes = Docx::new(
+        r#"<w:p><w:r><w:t>body</w:t></w:r></w:p>
+           <w:sectPr>
+             <w:headerReference w:type="default" r:id="rIdH1"/>
+             <w:headerReference w:type="first" r:id="rIdH2"/>
+             <w:footerReference w:type="first" r:id="rIdF2"/>
+           </w:sectPr>"#,
+    )
+    .hf("header1.xml", "rIdH1", "DEFAULT HEADER")
+    .hf("header2.xml", "rIdH2", "FIRST HEADER")
+    .hf("footer2.xml", "rIdF2", "FIRST FOOTER")
+    .bytes();
+    let doc = Document::from_reader(Cursor::new(bytes.clone()), DocumentFormat::Docx).unwrap();
+    let ir = doc.to_ir();
+    assert_eq!(hf_text(&ir.sections[0].header), "DEFAULT HEADER");
+    assert!(ir.sections[0].first_page_header.is_none());
+    assert!(ir.sections[0].first_page_footer.is_none());
+    let docx = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes)).unwrap();
+    for (surface, out) in [
+        ("ir plain_text", ir.plain_text()),
+        ("ir markdown", ir.to_markdown()),
+        ("plain_text", docx.plain_text()),
+        ("to_markdown", docx.to_markdown()),
+    ] {
+        assert!(out.contains("DEFAULT HEADER"), "{surface}: {out:?}");
+        assert!(!out.contains("FIRST"), "{surface} shows an inactive part: {out:?}");
+    }
+    // Written back, the section stays without a distinct first page.
+    let written = docx_bytes(&ir);
+    let again = office_oxide::docx::DocxDocument::from_reader(Cursor::new(written)).unwrap();
+    assert!(!again.sections.iter().any(|s| s.title_page));
+}
+
+fn hf_text(hf: &Option<HeaderFooter>) -> String {
+    hf.as_ref()
+        .map(|h| {
+            h.content
+                .iter()
+                .map(|e| match e {
+                    Element::Paragraph(p) => inline_to_text(&p.content),
+                    _ => String::new(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
