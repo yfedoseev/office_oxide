@@ -276,6 +276,12 @@ impl<R: Read + Seek> CfbReader<R> {
                     fat_sectors.push(val);
                 }
             }
+            // No valid file holds more FAT sectors than sectors; stop
+            // collecting (the check below reports it) rather than keep
+            // growing the list for the rest of the chain.
+            if fat_sectors.len() as u64 > sectors_in_file.saturating_add(109) {
+                break;
+            }
 
             // Next DIFAT sector.
             let next_off = entries_per_difat * 4;
@@ -285,6 +291,32 @@ impl<R: Read + Seek> CfbReader<R> {
                 sector_buf[next_off + 2],
                 sector_buf[next_off + 3],
             ]);
+        }
+
+        // [MS-CFB] §2.2 `Number of FAT Sectors`: only that many DIFAT
+        // entries name FAT sectors. Slots past it are unused, whatever a
+        // writer left in them.
+        let declared = header.fat_sector_count as usize;
+        if declared > 0 && fat_sectors.len() > declared {
+            fat_sectors.truncate(declared);
+        }
+        // Every FAT sector lives inside the file, and each is listed once:
+        // a repeat would append its entries twice and shift every later FAT
+        // index onto the wrong sector. Both bound the FAT to the file's own
+        // size — a DIFAT naming far-away sectors otherwise sized the FAT at
+        // up to 127 times the file.
+        if fat_sectors.len() as u64 > sectors_in_file {
+            return Err(CfbError::CorruptedStream(format!(
+                "{} FAT sectors declared in a file of {sectors_in_file} sectors",
+                fat_sectors.len()
+            )));
+        }
+        let mut seen = fat_sectors.clone();
+        seen.sort_unstable();
+        if seen.windows(2).any(|w| w[0] == w[1]) {
+            return Err(CfbError::CorruptedStream(
+                "a FAT sector is listed more than once in the DIFAT".into(),
+            ));
         }
 
         // Read each FAT sector and concatenate entries.
@@ -1026,6 +1058,65 @@ mod tests {
         let stream = reader.open_stream("SmallStream").unwrap();
         assert!(stream.capacity() <= 512, "reserved {}", stream.capacity());
         assert!(stream.starts_with(b"Small"));
+    }
+
+    /// Append one extra 512-byte sector to `file` and return its index.
+    fn push_sector(file: &mut Vec<u8>, fill: u8) -> u32 {
+        let idx = (file.len() / 512 - 1) as u32;
+        file.extend(std::iter::repeat_n(fill, 512));
+        idx
+    }
+
+    /// A FAT sector listed twice appended its entries twice, shifting every
+    /// later FAT index, so chains resolved to the wrong sectors.
+    #[test]
+    fn test_fat_sector_listed_twice_is_an_error() {
+        let mut file = build_minimal_cfb();
+        file[0x2C..0x30].copy_from_slice(&2u32.to_le_bytes());
+        file[0x50..0x54].copy_from_slice(&1u32.to_le_bytes()); // DIFAT[1] = sector 1 again
+        let err = CfbReader::new(Cursor::new(file)).err().expect("must be refused");
+        assert!(
+            matches!(err, CfbError::CorruptedStream(ref m) if m.contains("more than once")),
+            "{err:?}"
+        );
+    }
+
+    /// Header DIFAT slots past the declared FAT sector count are not FAT
+    /// sectors, whatever they hold ([MS-CFB] §2.2: `Number of FAT Sectors`).
+    #[test]
+    fn test_difat_slots_past_the_declared_fat_count_are_ignored() {
+        let mut file = build_minimal_cfb();
+        for i in 1..109 {
+            let off = 0x4C + i * 4;
+            file[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+        }
+        let mut reader = CfbReader::new(Cursor::new(file)).unwrap();
+        assert_eq!(reader.open_stream("TestStream").unwrap(), b"Hello, CFB!");
+    }
+
+    /// Every DIFAT sector can name 127 FAT sectors, and each FAT sector
+    /// became 512 bytes of FAT in memory whether or not it lay inside the
+    /// file: a DIFAT chain naming sectors far past the end of a tiny file
+    /// sized the FAT at ~127x the file. A FAT cannot have more sectors than
+    /// the file holds.
+    #[test]
+    fn test_fat_naming_more_sectors_than_the_file_holds_is_an_error() {
+        let mut file = build_minimal_cfb();
+        let difat = push_sector(&mut file, 0xFF);
+        let base = 512 + difat as usize * 512;
+        for i in 0..127u32 {
+            let off = base + i as usize * 4;
+            file[off..off + 4].copy_from_slice(&(10_000 + i).to_le_bytes());
+        }
+        file[base + 508..base + 512].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+        file[0x2C..0x30].copy_from_slice(&128u32.to_le_bytes());
+        file[0x44..0x48].copy_from_slice(&difat.to_le_bytes());
+        file[0x48..0x4C].copy_from_slice(&1u32.to_le_bytes());
+        let err = CfbReader::new(Cursor::new(file)).err().expect("must be refused");
+        assert!(
+            matches!(err, CfbError::CorruptedStream(ref m) if m.contains("FAT sectors")),
+            "{err:?}"
+        );
     }
 
     #[test]
