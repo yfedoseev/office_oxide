@@ -104,3 +104,6 @@ scripts/ooxml-validate/xsd/
 
 # Local review/research notes — kept out of the tree.
 .research/
+
+# cargo-mutants output
+mutants.out*/
