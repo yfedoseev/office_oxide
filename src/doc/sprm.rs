@@ -936,6 +936,44 @@ chp_sprm_dispatch! {
     }
 }
 
+/// `Prm0.isprm` → SPRM opcode, for the character properties this crate
+/// decodes. Transcribed from the `Prm0` table in [MS-DOC] §2.9.177 (the
+/// `isprm` values are Word 6's SPRM numbers); every `Prm0` SPRM takes a
+/// 1-byte operand. Paragraph and other modifiers are not listed and are
+/// not applied to characters.
+const PRM0_CHP_SPRMS: &[(u8, u16)] = &[
+    (0x41, 0x0800), // sprmCFRMarkDel
+    (0x42, 0x0801), // sprmCFRMarkIns
+    (0x4D, 0x2A0C), // sprmCHighlight
+    (0x55, 0x0835), // sprmCFBold
+    (0x56, 0x0836), // sprmCFItalic
+    (0x57, 0x0837), // sprmCFStrike
+    (0x5A, 0x083A), // sprmCFSmallCaps
+    (0x5B, 0x083B), // sprmCFCaps
+    (0x5C, 0x083C), // sprmCFVanish
+    (0x5E, 0x2A3E), // sprmCKul
+    (0x62, 0x2A42), // sprmCIco
+    (0x68, 0x2A48), // sprmCIss
+    (0x73, 0x2A53), // sprmCFDStrike
+];
+
+/// The character SPRM a `Prm0.isprm` names, if it is one this crate
+/// decodes.
+pub(crate) fn prm0_sprm(isprm: u8) -> Option<u16> {
+    PRM0_CHP_SPRMS
+        .iter()
+        .find(|(i, _)| *i == isprm)
+        .map(|&(_, op)| op)
+}
+
+/// Apply a CHP `grpprl` on top of already-resolved properties — a piece
+/// modifier over the run's own CHPX.
+pub fn apply_chp_grpprl(props: &mut ChpProps, grpprl: &[u8]) {
+    for sprm in parse_grpprl(grpprl) {
+        dispatch_chp_sprm(props, sprm.opcode, &sprm.operand);
+    }
+}
+
 /// Decode a CHP `grpprl` into the character flags we care about.
 ///
 /// Unknown SPRMs are ignored. An empty `grpprl` yields the default
@@ -1799,6 +1837,21 @@ mod tests {
             extract_chp_props(&[0x42, 0x2A, 0x06, 0x70, 0x68, 0x12, 0x34, 0x56, 0x00]).color,
             Some([0x12, 0x34, 0x56])
         );
+    }
+
+    /// Every `Prm0` entry maps to a CHP opcode this crate decodes, with a
+    /// 1-byte operand (spra 0 or 1), as the `Prm0` table requires.
+    #[test]
+    fn test_prm0_table_names_decoded_one_byte_chp_sprms() {
+        for &(isprm, opcode) in PRM0_CHP_SPRMS {
+            assert!(
+                CHP_SPRM_REGISTRY.iter().any(|(o, _, _)| *o == opcode),
+                "isprm 0x{isprm:02X} maps to undecoded opcode 0x{opcode:04X}"
+            );
+            assert!((opcode >> 13) <= 1, "0x{opcode:04X} does not take a 1-byte operand");
+        }
+        assert_eq!(prm0_sprm(0x55), Some(0x0835));
+        assert_eq!(prm0_sprm(0x00), None);
     }
 
     #[test]

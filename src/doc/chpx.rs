@@ -164,14 +164,12 @@ pub fn resolve_excluded_cp_ranges_from_runs(
     pieces: &[Piece],
     text_len: u32,
 ) -> Vec<(u32, u32)> {
-    let mut deleted: Vec<(u32, u32)> = runs
-        .iter()
-        .filter(|r| {
-            let props: ChpProps = extract_chp_props(&r.grpprl);
-            props.is_excluded()
-        })
-        .flat_map(|r| super::papx::fc_run_to_cp_ranges(r.fc_start, r.fc_end, pieces))
-        .map(|(a, b)| (a.min(text_len), b.min(text_len)))
+    // Through `resolve_chp_cp_runs`, so a piece modifier that deletes or
+    // hides a piece's text counts as well as the run's own CHPX.
+    let mut deleted: Vec<(u32, u32)> = resolve_chp_cp_runs(runs, pieces)
+        .into_iter()
+        .filter(|(_, _, props)| props.is_excluded())
+        .map(|(a, b, _)| (a.min(text_len), b.min(text_len)))
         .filter(|(a, b)| b > a)
         .collect();
 
@@ -269,6 +267,56 @@ pub fn resolve_chp_cp_runs(runs: &[FkpRun], pieces: &[Piece]) -> Vec<(u32, u32, 
         })
         .collect();
     out.sort_unstable_by_key(|&(s, _, _)| s);
+    apply_piece_prms(out, pieces)
+}
+
+/// Layer each piece's own property modifier (`Pcd.prm`, resolved into
+/// `Piece::prm_grpprl`) over the CHPX runs it covers. [MS-DOC] §2.4.6.1:
+/// a character's properties are its CHPX, then the piece's `prm`.
+///
+/// Returns the input untouched when no piece carries a modifier (every
+/// file that was never fast-saved). Otherwise the result is a gap-filled,
+/// contiguous cover of the characters the runs and modified pieces span,
+/// split at every modified piece boundary.
+fn apply_piece_prms(
+    runs: Vec<(u32, u32, ChpProps)>,
+    pieces: &[Piece],
+) -> Vec<(u32, u32, ChpProps)> {
+    let mut modified: Vec<&Piece> = pieces
+        .iter()
+        .filter(|p| !p.prm_grpprl.is_empty() && p.cp_end > p.cp_start)
+        .collect();
+    if modified.is_empty() {
+        return runs;
+    }
+    modified.sort_unstable_by_key(|p| p.cp_start);
+    let end = runs
+        .iter()
+        .map(|r| r.1)
+        .chain(modified.iter().map(|p| p.cp_end))
+        .max()
+        .unwrap_or(0);
+    let mut out = Vec::new();
+    for (s, e, props) in resolve_chp_segments(&runs, 0, end) {
+        let mut cursor = s;
+        let first = modified.partition_point(|p| p.cp_end <= s);
+        for p in &modified[first..] {
+            if p.cp_start >= e {
+                break;
+            }
+            let (a, b) = (p.cp_start.max(s), p.cp_end.min(e));
+            if a > cursor {
+                out.push((cursor, a, props.clone()));
+            }
+            let mut layered = props.clone();
+            super::sprm::apply_chp_grpprl(&mut layered, &p.prm_grpprl);
+            out.push((a, b, layered));
+            cursor = b;
+        }
+        if cursor < e {
+            out.push((cursor, e, props));
+        }
+    }
     out
 }
 
@@ -298,6 +346,7 @@ mod tests {
             cp_end,
             fc,
             is_compressed: false,
+            prm_grpprl: Vec::new(),
         }
     }
 
@@ -396,6 +445,37 @@ mod tests {
         let runs = parse_chpx_runs(&page, &plc, 0, plc.len() as u32);
         let hidden = resolve_excluded_cp_ranges_from_runs(&runs, &pieces, 6);
         assert_eq!(hidden, vec![(3, 6)]);
+    }
+
+    /// A piece modifier layers over the CHPX of the characters it covers:
+    /// a piece hidden by its `prm` is excluded like a hidden CHPX run, and
+    /// a bold `prm` makes the piece bold on top of its run's italics.
+    #[test]
+    fn test_piece_prm_layers_over_chpx_runs() {
+        let mut hidden = unicode_piece(0x800, 6);
+        hidden.cp_start = 3;
+        hidden.fc = 0x800 + 6;
+        hidden.prm_grpprl = vec![0x3C, 0x08, 0x01]; // sprmCFVanish
+        let mut first = unicode_piece(0x800, 3);
+        first.prm_grpprl = vec![0x35, 0x08, 0x01]; // sprmCFBold
+        let pieces = [first, hidden];
+        // One italic run over the whole text.
+        let runs = vec![FkpRun {
+            fc_start: 0x800,
+            fc_end: 0x800 + 12,
+            grpprl: vec![0x36, 0x08, 0x01],
+        }];
+        let cp_runs = resolve_chp_cp_runs(&runs, &pieces);
+        let at = |cp: u32| {
+            cp_runs
+                .iter()
+                .find(|(s, e, _)| *s <= cp && cp < *e)
+                .map(|(_, _, p)| p.clone())
+                .unwrap()
+        };
+        assert!(at(0).bold && at(0).italic && !at(0).vanish);
+        assert!(at(4).vanish && at(4).italic && !at(4).bold);
+        assert_eq!(resolve_excluded_cp_ranges_from_runs(&runs, &pieces, 6), vec![(3, 6)]);
     }
 
     /// `resolve_chp_segments` decodes each `FkpRun`'s own `grpprl` via

@@ -390,6 +390,7 @@ mod tests {
             cp_end,
             fc,
             is_compressed: false,
+            prm_grpprl: Vec::new(),
         }
     }
 
@@ -412,6 +413,7 @@ mod tests {
             cp_end: 5,
             fc: 0x4000_0010, // compressed, real offset = 0x10/2 = 8
             is_compressed: true,
+            prm_grpprl: Vec::new(),
         }];
         assert_eq!(fc_run_to_cp_ranges(0x4000_0010, 0x4000_0014, &pieces), vec![(0, 2)]);
         // fc 9 (real byte, no bit) → cp 1.
@@ -431,12 +433,14 @@ mod tests {
                 cp_end: 10,
                 fc: 0x4000_0000 | (0x800 * 2),
                 is_compressed: true,
+                prm_grpprl: Vec::new(),
             },
             Piece {
                 cp_start: 10,
                 cp_end: 20,
                 fc: 0x4000_0000 | (0x100 * 2),
                 is_compressed: true,
+                prm_grpprl: Vec::new(),
             },
         ];
         // One FC run covering bytes 0x100..0x900: both pieces, in CP order.
@@ -694,6 +698,7 @@ mod tests {
             cp_end: u32::MAX,
             fc: 0,
             is_compressed: false,
+            prm_grpprl: Vec::new(),
         }];
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             fc_run_to_cp_ranges(0, u32::MAX, &pieces)

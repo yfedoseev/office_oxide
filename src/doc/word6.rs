@@ -183,6 +183,7 @@ pub(super) fn contiguous_piece(word_doc: &[u8], fib: &Word6Fib) -> Piece {
             cp_end,
             fc: fc_min,
             is_compressed: false,
+            prm_grpprl: Vec::new(),
         }
     } else {
         Piece {
@@ -190,6 +191,7 @@ pub(super) fn contiguous_piece(word_doc: &[u8], fib: &Word6Fib) -> Piece {
             cp_end,
             fc: compressed_fc(fc_min).unwrap_or(0x4000_0000),
             is_compressed: true,
+            prm_grpprl: Vec::new(),
         }
     }
 }
