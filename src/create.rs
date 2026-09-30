@@ -1024,6 +1024,10 @@ fn pptx_notes_body_items(notes: &[Element]) -> Vec<crate::pptx::write::BodyItem>
         level: u8,
         out: &mut Vec<(u8, Vec<crate::pptx::write::Run>)>,
     ) {
+        let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+            log::warn!("create: element nesting exceeds the depth limit; subtree skipped");
+            return;
+        };
         for item in &list.items {
             let runs: Vec<crate::pptx::write::Run> = item
                 .content
@@ -1063,6 +1067,10 @@ fn pptx_notes_body_items(notes: &[Element]) -> Vec<crate::pptx::write::BodyItem>
 }
 
 fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) {
+    let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+        log::warn!("create: element nesting exceeds the depth limit; subtree skipped");
+        return;
+    };
     match elem {
         Element::ThematicBreak => {
             // Encode via the marker text + center alignment. The
@@ -1110,6 +1118,10 @@ fn emit_pptx_element(slide: &mut crate::pptx::write::SlideData, elem: &Element) 
                 level: u8,
                 out: &mut Vec<(u8, Vec<crate::pptx::write::Run>)>,
             ) {
+                let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+                    log::warn!("create: element nesting exceeds the depth limit; subtree skipped");
+                    return;
+                };
                 for item in &list.items {
                     let runs: Vec<crate::pptx::write::Run> = item
                         .content
@@ -1675,6 +1687,10 @@ fn parse_xlsx_comment_marker(marker: Option<&str>) -> Option<(String, Option<Str
 }
 
 fn xlsx_text_rows(elem: &Element, out: &mut Vec<String>) {
+    let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+        log::warn!("create: element nesting exceeds the depth limit; subtree skipped");
+        return;
+    };
     match elem {
         Element::Paragraph(p) => {
             let t = inline_to_text(&p.content);
@@ -1690,6 +1706,10 @@ fn xlsx_text_rows(elem: &Element, out: &mut Vec<String>) {
         },
         Element::List(l) => {
             fn walk(list: &crate::ir::List, out: &mut Vec<String>) {
+                let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+                    log::warn!("create: element nesting exceeds the depth limit; subtree skipped");
+                    return;
+                };
                 for item in &list.items {
                     for e in &item.content {
                         xlsx_text_rows(e, out);

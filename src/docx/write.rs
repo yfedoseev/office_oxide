@@ -834,6 +834,12 @@ impl DocxWriter {
     /// child of the parent item, losing the parent/child relationship (and
     /// sometimes the `ordered` flag) on every round trip.
     fn add_ir_list_at(&mut self, list: &crate::ir::List, level: u8, num_id: u32) {
+        // Nested sub-lists recurse here, outside the element walk's own
+        // guard, so the list chain needs its own bound.
+        let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+            log::warn!("docx: list nesting exceeds the depth limit; sub-list skipped");
+            return;
+        };
         let start_number = list.start_number.unwrap_or(1);
         let style = list.style.clone();
 

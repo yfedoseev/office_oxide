@@ -51,6 +51,21 @@ thread_local! {
         }) };
 }
 
+/// Enter one level of the recursive element walk.
+///
+/// `DocumentIR` is `Deserialize`, so a caller can hand a renderer a tree
+/// nested far deeper than any bounded reader produces, and the renderers
+/// run on the caller's own stack. Past `MAX_NESTING_DEPTH` the subtree is
+/// skipped; the skip is counted in `core::xml::truncated_subtrees` (reset
+/// it before rendering to read a per-call count) as well as logged.
+fn enter_render_level() -> Option<crate::core::xml::DepthGuard> {
+    let guard = crate::core::xml::DepthGuard::enter();
+    if guard.is_none() {
+        log::warn!("render: element nesting exceeds the depth limit; subtree skipped");
+    }
+    guard
+}
+
 /// The media type to put in an image's `data:` URI.
 ///
 /// `Image::format` is authoritative when the converter set it; otherwise the
@@ -427,6 +442,9 @@ fn render_section_plain(section: &Section) -> String {
 }
 
 fn render_element_plain(element: &Element) -> String {
+    let Some(_depth) = enter_render_level() else {
+        return String::new();
+    };
     match element {
         Element::Heading(h) => render_inline_plain(&h.content),
         Element::Paragraph(p) => render_inline_plain(&p.content),
@@ -479,6 +497,9 @@ fn render_table_plain(table: &Table) -> String {
 }
 
 fn render_list_plain(list: &List, indent: usize) -> String {
+    let Some(_depth) = enter_render_level() else {
+        return String::new();
+    };
     let prefix_str = " ".repeat(indent * 2);
     let mut lines = Vec::new();
     for item in &list.items {
@@ -554,6 +575,9 @@ fn render_section_markdown(section: &Section) -> String {
 }
 
 fn render_element_markdown(element: &Element) -> String {
+    let Some(_depth) = enter_render_level() else {
+        return String::new();
+    };
     match element {
         Element::Heading(h) => {
             let hashes = "#".repeat(h.clamped_level() as usize);
@@ -827,6 +851,9 @@ fn render_cell_markdown(cell: &TableCell) -> String {
 }
 
 fn render_list_markdown(list: &List, indent: usize) -> String {
+    let Some(_depth) = enter_render_level() else {
+        return String::new();
+    };
     let prefix_str = "  ".repeat(indent);
     // A numbered list that starts at 3 in the source must start at 3 here:
     // `start_number` was parsed and then ignored, so every ordered list
@@ -959,6 +986,9 @@ fn render_section_html(section: &Section) -> String {
 }
 
 fn render_element_html(element: &Element) -> String {
+    let Some(_depth) = enter_render_level() else {
+        return String::new();
+    };
     match element {
         Element::Heading(h) => {
             let level = h.clamped_level();
@@ -1144,6 +1174,9 @@ fn render_list_html(list: &List) -> String {
 /// fragments that agree on shape are re-joined here; see
 /// [`merge_adjacent_lists`] for what counts as adjacent.
 fn render_list_group_html(lists: &[&List]) -> String {
+    let Some(_depth) = enter_render_level() else {
+        return String::new();
+    };
     let Some(first) = lists.first() else {
         return String::new();
     };
