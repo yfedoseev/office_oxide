@@ -41,18 +41,58 @@ impl EditableXlsx {
 
     /// Set a cell value in a worksheet.
     ///
-    /// `sheet_index` is 0-based. `cell_ref` is like "A1", "B2", etc.
+    /// `sheet_index` is the 0-based position of the sheet in the workbook's
+    /// `<sheets>` list. `cell_ref` is like "A1", "B2", etc. Fails — rather
+    /// than reporting a write that did not happen — when the index names no
+    /// sheet or a sheet that is not a worksheet (a chartsheet has no cells),
+    /// when the reference does not parse, or when the worksheet has no
+    /// `sheetData` to write into.
     pub fn set_cell(&mut self, sheet_index: usize, cell_ref: &str, value: CellValue) -> Result<()> {
-        let part_name = PartName::new(&format!("/xl/worksheets/sheet{}.xml", sheet_index + 1))?;
+        let part_name = self.worksheet_part(sheet_index)?;
         let Some(data) = self.package.get_part(&part_name) else {
             return Err(super::XlsxError::Core(crate::core::Error::MissingPart(
                 part_name.as_str().to_string(),
             )));
         };
         let xml_str = String::from_utf8_lossy(data).into_owned();
-        let new_xml = set_cell_in_xml(&xml_str, cell_ref, &value);
+        let new_xml = set_cell_in_xml(&xml_str, cell_ref, &value)?;
         self.package.set_part(part_name, new_xml.into_bytes());
         Ok(())
+    }
+
+    /// The part holding the `sheet_index`-th sheet, resolved the way OPC
+    /// defines it: the package's officeDocument relationship names the
+    /// workbook part, the workbook's `<sheet r:id>` names a relationship,
+    /// and that relationship's target is the part. `sheet{N}.xml` is only
+    /// a naming habit — after a sheet is deleted or moved, or with other
+    /// writers, it names the wrong sheet or none.
+    fn worksheet_part(&self, sheet_index: usize) -> Result<PartName> {
+        use crate::core::relationships::rel_types;
+        let workbook = match self.package.package_rels().first_by_type(rel_types::OFFICE_DOCUMENT)
+        {
+            Some(rel) => self.package.package_rels().resolve_target_from_root(&rel.id)?,
+            None => PartName::new("/xl/workbook.xml")?,
+        };
+        let wb_xml = self
+            .package
+            .get_part(&workbook)
+            .ok_or(super::XlsxError::MissingWorkbook)?;
+        let info = super::WorkbookInfo::parse(wb_xml)?;
+        let missing = || {
+            super::XlsxError::Core(crate::core::Error::MissingPart(format!(
+                "worksheet at index {sheet_index}"
+            )))
+        };
+        let sheet = info.sheets.get(sheet_index).ok_or_else(missing)?;
+        let rels = self.package.part_rels(&workbook).ok_or_else(missing)?;
+        let rel = rels.get_by_id(&sheet.rel_id).ok_or_else(missing)?;
+        if rel.rel_type != rel_types::WORKSHEET {
+            return Err(super::XlsxError::Core(crate::core::Error::Unsupported(format!(
+                "sheet {:?} is not a worksheet ({}); it has no cells to set",
+                sheet.name, rel.rel_type
+            ))));
+        }
+        Ok(rels.resolve_target(&sheet.rel_id, &workbook)?)
     }
 
     /// Save the edited document to a file.
@@ -272,17 +312,15 @@ fn row_insert_offset(xml: &str, sd_body_start: usize, sd_end: usize, row: u32) -
 /// If the cell already exists, its value is replaced and its attributes (style, etc.)
 /// are preserved. Otherwise, a new cell is inserted in column order, into a row
 /// inserted in row order.
-fn set_cell_in_xml(xml: &str, cell_ref: &str, value: &CellValue) -> String {
+fn set_cell_in_xml(xml: &str, cell_ref: &str, value: &CellValue) -> Result<String> {
+    let Some((row, col)) = parse_cell_ref(cell_ref) else {
+        return Err(super::XlsxError::InvalidCellRef(cell_ref.to_string()));
+    };
     if let Some(replaced) = replace_existing_cell(xml, cell_ref, value) {
-        return replaced;
+        return Ok(replaced);
     }
 
     let cell_xml = render_cell(cell_ref, "", value);
-
-    // Cell doesn't exist — find the right row or create one
-    let Some((row, col)) = parse_cell_ref(cell_ref) else {
-        return xml.to_string();
-    };
 
     match locate_row(xml, row) {
         Some(RowShape::SelfClosing {
@@ -296,7 +334,7 @@ fn set_cell_in_xml(xml: &str, cell_ref: &str, value: &CellValue) -> String {
             result.push_str(&xml[..open_start]);
             result.push_str(&reopened);
             result.push_str(&xml[open_end..]);
-            return result;
+            return Ok(result);
         },
         Some(RowShape::Paired {
             body_start,
@@ -307,9 +345,26 @@ fn set_cell_in_xml(xml: &str, cell_ref: &str, value: &CellValue) -> String {
             result.push_str(&xml[..at]);
             result.push_str(&cell_xml);
             result.push_str(&xml[at..]);
-            return result;
+            return Ok(result);
         },
         None => {},
+    }
+
+    let row_xml = format!(r#"<row r="{row}">{cell_xml}</row>"#);
+    // An empty sheet: Excel writes `<sheetData/>`, which has no closing tag
+    // to insert before. It becomes a pair holding the one new row.
+    if let Some(at) = xml.find("<sheetData") {
+        if let Some(close) = xml[at..].find('>').map(|i| at + i) {
+            if xml[..close].ends_with('/') {
+                let mut result = String::with_capacity(xml.len() + row_xml.len() + 16);
+                result.push_str(&xml[..close - 1]);
+                result.push('>');
+                result.push_str(&row_xml);
+                result.push_str("</sheetData>");
+                result.push_str(&xml[close + 1..]);
+                return Ok(result);
+            }
+        }
     }
 
     // Row doesn't exist — insert it in ascending row order.
@@ -319,15 +374,16 @@ fn set_cell_in_xml(xml: &str, cell_ref: &str, value: &CellValue) -> String {
             .and_then(|i| xml[i..].find('>').map(|j| i + j + 1))
             .unwrap_or(sd_end);
         let at = row_insert_offset(xml, sd_body_start, sd_end, row);
-        let row_xml = format!(r#"<row r="{row}">{cell_xml}</row>"#);
         let mut result = String::with_capacity(xml.len() + row_xml.len());
         result.push_str(&xml[..at]);
         result.push_str(&row_xml);
         result.push_str(&xml[at..]);
-        return result;
+        return Ok(result);
     }
 
-    xml.to_string()
+    Err(super::XlsxError::Core(crate::core::Error::MalformedXml(
+        "worksheet has no <sheetData> to write a cell into".into(),
+    )))
 }
 
 fn escape_xml(s: &str) -> String {
@@ -347,7 +403,7 @@ mod tests {
     #[test]
     fn test_set_existing_cell() {
         let xml = r#"<sheetData><row r="1"><c r="A1"><v>42</v></c></row></sheetData>"#;
-        let result = set_cell_in_xml(xml, "A1", &CellValue::Number(99.0));
+        let result = set_cell_in_xml(xml, "A1", &CellValue::Number(99.0)).unwrap();
         assert!(result.contains(r#"<c r="A1"><v>99</v></c>"#));
         assert!(!result.contains("42"));
     }
@@ -355,7 +411,7 @@ mod tests {
     #[test]
     fn test_set_new_cell_existing_row() {
         let xml = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#;
-        let result = set_cell_in_xml(xml, "B1", &CellValue::String("hello".into()));
+        let result = set_cell_in_xml(xml, "B1", &CellValue::String("hello".into())).unwrap();
         assert!(result.contains(r#"<c r="B1" t="inlineStr"><is><t>hello</t></is></c>"#));
         assert!(result.contains(r#"<c r="A1"><v>1</v></c>"#));
     }
@@ -363,14 +419,14 @@ mod tests {
     #[test]
     fn test_set_cell_new_row() {
         let xml = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#;
-        let result = set_cell_in_xml(xml, "A2", &CellValue::Number(2.0));
+        let result = set_cell_in_xml(xml, "A2", &CellValue::Number(2.0)).unwrap();
         assert!(result.contains(r#"<row r="2"><c r="A2"><v>2</v></c></row>"#));
     }
 
     #[test]
     fn test_set_boolean_cell() {
         let xml = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#;
-        let result = set_cell_in_xml(xml, "A1", &CellValue::Boolean(true));
+        let result = set_cell_in_xml(xml, "A1", &CellValue::Boolean(true)).unwrap();
         assert!(result.contains(r#"<c r="A1" t="b"><v>1</v></c>"#));
     }
 
@@ -379,14 +435,14 @@ mod tests {
         // `s="5"` is the cell's style: its number format, fill and font. Rebuilding the
         // <c> element from scratch dropped it, and the written cell came back unstyled.
         let xml = r#"<sheetData><row r="1"><c r="A1" s="5" t="n"><v>42</v></c></row></sheetData>"#;
-        let result = set_cell_in_xml(xml, "A1", &CellValue::Number(99.0));
+        let result = set_cell_in_xml(xml, "A1", &CellValue::Number(99.0)).unwrap();
         assert!(result.contains(r#"<c r="A1" s="5"><v>99</v></c>"#), "result: {result}");
     }
 
     #[test]
     fn test_set_existing_string_cell_preserves_style_index() {
         let xml = r#"<sheetData><row r="1"><c r="A1" s="3" t="inlineStr"><is><t>old</t></is></c></row></sheetData>"#;
-        let result = set_cell_in_xml(xml, "A1", &CellValue::String("new".into()));
+        let result = set_cell_in_xml(xml, "A1", &CellValue::String("new".into())).unwrap();
         assert!(
             result.contains(r#"<c r="A1" s="3" t="inlineStr"><is><t>new</t></is></c>"#),
             "result: {result}"
@@ -397,7 +453,7 @@ mod tests {
     fn test_set_existing_cell_preserves_unrelated_attributes() {
         let xml =
             r#"<sheetData><row r="1"><c r="A1" s="2" cm="1" vm="4"><v>1</v></c></row></sheetData>"#;
-        let result = set_cell_in_xml(xml, "A1", &CellValue::Number(2.0));
+        let result = set_cell_in_xml(xml, "A1", &CellValue::Number(2.0)).unwrap();
         assert!(result.contains(r#"s="2""#), "result: {result}");
         assert!(result.contains(r#"cm="1""#), "result: {result}");
         assert!(result.contains(r#"vm="4""#), "result: {result}");
@@ -410,7 +466,7 @@ mod tests {
         // replacement deleted B1 along the way. A pre-formatted template row is made
         // entirely of such cells, so the nominal case triggered the data loss.
         let xml = r#"<sheetData><row r="1"><c r="A1" s="5"/><c r="B1" s="6"><v>7</v></c></row></sheetData>"#;
-        let result = set_cell_in_xml(xml, "A1", &CellValue::Number(1.0));
+        let result = set_cell_in_xml(xml, "A1", &CellValue::Number(1.0)).unwrap();
 
         assert!(result.contains(r#"<c r="A1" s="5"><v>1</v></c>"#), "result: {result}");
         assert!(
@@ -423,7 +479,7 @@ mod tests {
     fn test_set_self_closing_cell_to_empty_stays_self_closing() {
         let xml =
             r#"<sheetData><row r="1"><c r="A1" s="5"/><c r="B1"><v>7</v></c></row></sheetData>"#;
-        let result = set_cell_in_xml(xml, "A1", &CellValue::Empty);
+        let result = set_cell_in_xml(xml, "A1", &CellValue::Empty).unwrap();
         assert!(result.contains(r#"<c r="A1" s="5"/>"#), "result: {result}");
         assert!(result.contains(r#"<c r="B1"><v>7</v></c>"#), "result: {result}");
     }
@@ -431,8 +487,18 @@ mod tests {
     #[test]
     fn test_set_new_cell_carries_no_borrowed_attributes() {
         let xml = r#"<sheetData><row r="1"><c r="A1" s="9"><v>1</v></c></row></sheetData>"#;
-        let result = set_cell_in_xml(xml, "B1", &CellValue::Number(2.0));
+        let result = set_cell_in_xml(xml, "B1", &CellValue::Number(2.0)).unwrap();
         assert!(result.contains(r#"<c r="B1"><v>2</v></c>"#), "result: {result}");
+    }
+
+    #[test]
+    fn test_set_cell_in_xml_expands_a_self_closing_sheet_data() {
+        let xml = r#"<worksheet><sheetData/><pageMargins/></worksheet>"#;
+        let out = set_cell_in_xml(xml, "A1", &CellValue::Number(1.0)).unwrap();
+        assert_eq!(
+            out,
+            r#"<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><pageMargins/></worksheet>"#
+        );
     }
 
     #[test]
@@ -458,7 +524,7 @@ mod ordering_tests {
             r#"<row r="2"><c r="A2" t="inlineStr"><is><t>row2A</t></is></c></row>"#,
             r#"</sheetData>"#
         );
-        let out = set_cell_in_xml(xml, "A1", &CellValue::Number(111.0));
+        let out = set_cell_in_xml(xml, "A1", &CellValue::Number(111.0)).unwrap();
 
         let row1 = out.find(r#"<row r="1""#).unwrap();
         let row2 = out.find(r#"<row r="2""#).unwrap();
@@ -476,13 +542,13 @@ mod ordering_tests {
             r#"<c r="B2"><v>2</v></c><c r="D2"><v>4</v></c>"#,
             r#"</row></sheetData>"#
         );
-        let out = set_cell_in_xml(xml, "C2", &CellValue::Number(3.0));
+        let out = set_cell_in_xml(xml, "C2", &CellValue::Number(3.0)).unwrap();
         let b = out.find(r#"<c r="B2""#).unwrap();
         let c = out.find(r#"<c r="C2""#).expect("C2 written");
         let d = out.find(r#"<c r="D2""#).unwrap();
         assert!(b < c && c < d, "cells must ascend by column:\n{out}");
 
-        let out = set_cell_in_xml(xml, "A2", &CellValue::Number(1.0));
+        let out = set_cell_in_xml(xml, "A2", &CellValue::Number(1.0)).unwrap();
         let a = out.find(r#"<c r="A2""#).expect("A2 written");
         let b = out.find(r#"<c r="B2""#).unwrap();
         assert!(a < b, "a new first column must come first:\n{out}");
@@ -492,7 +558,7 @@ mod ordering_tests {
     #[test]
     fn test_new_row_is_inserted_in_ascending_row_order() {
         let xml = r#"<sheetData><row r="2"><c r="A2"><v>2</v></c></row></sheetData>"#;
-        let out = set_cell_in_xml(xml, "A1", &CellValue::Number(1.0));
+        let out = set_cell_in_xml(xml, "A1", &CellValue::Number(1.0)).unwrap();
         let r1 = out.find(r#"<row r="1""#).expect("row 1 written");
         let r2 = out.find(r#"<row r="2""#).unwrap();
         assert!(r1 < r2, "rows must ascend:\n{out}");
@@ -503,7 +569,7 @@ mod ordering_tests {
     #[test]
     fn test_control_characters_are_stripped_from_cell_text() {
         let xml = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#;
-        let out = set_cell_in_xml(xml, "B1", &CellValue::String("ctl\u{1}here".into()));
+        let out = set_cell_in_xml(xml, "B1", &CellValue::String("ctl\u{1}here".into())).unwrap();
         assert!(!out.contains('\u{1}'), "control char reached the XML:\n{out}");
         assert!(out.contains("ctlhere"), "surrounding text must survive:\n{out}");
     }
@@ -513,10 +579,131 @@ mod ordering_tests {
     fn test_non_finite_numbers_become_error_cells() {
         let xml = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#;
         for v in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let out = set_cell_in_xml(xml, "B1", &CellValue::Number(v));
+            let out = set_cell_in_xml(xml, "B1", &CellValue::Number(v)).unwrap();
             assert!(out.contains(r#"t="e""#), "expected an error cell for {v}:\n{out}");
             assert!(out.contains("#NUM!"), "expected #NUM! for {v}");
             assert!(!out.contains("NaN") && !out.contains("inf"), "raw float written:\n{out}");
         }
+    }
+}
+
+#[cfg(test)]
+mod package_tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use crate::core::opc::OpcWriter;
+    use crate::core::relationships::rel_types;
+
+    const CT_WB: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml";
+    const CT_WS: &str =
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml";
+    const CT_CS: &str =
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.chartsheet+xml";
+    const NS: &str = r#"xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
+
+    /// A package whose sheets are `(name, part file under xl/, rel type,
+    /// part body)`, listed in workbook order.
+    fn package(sheets: &[(&str, &str, &str, &str)]) -> Vec<u8> {
+        let mut w = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
+        let wb = PartName::new("/xl/workbook.xml").unwrap();
+        w.add_package_rel(rel_types::OFFICE_DOCUMENT, "xl/workbook.xml");
+        let mut tags = String::new();
+        for (i, (name, file, rel_type, body)) in sheets.iter().enumerate() {
+            let rid = w.add_part_rel(&wb, rel_type, file);
+            tags.push_str(&format!(r#"<sheet name="{name}" sheetId="{}" r:id="{rid}"/>"#, i + 1));
+            let ct = if *rel_type == rel_types::WORKSHEET { CT_WS } else { CT_CS };
+            let part = PartName::new(&format!("/xl/{file}")).unwrap();
+            w.add_part(&part, ct, body.as_bytes()).unwrap();
+        }
+        let wb_xml = format!(r#"<?xml version="1.0"?><workbook {NS}><sheets>{tags}</sheets></workbook>"#);
+        w.add_part(&wb, CT_WB, wb_xml.as_bytes()).unwrap();
+        w.finish().unwrap().into_inner()
+    }
+
+    fn sheet_xml(data: &str) -> String {
+        format!(r#"<?xml version="1.0"?><worksheet {NS}>{data}</worksheet>"#)
+    }
+
+    fn edit(bytes: Vec<u8>, sheet: usize, cell: &str, text: &str) -> Result<Vec<u8>> {
+        let mut x = EditableXlsx::from_reader(Cursor::new(bytes))?;
+        x.set_cell(sheet, cell, CellValue::String(text.into()))?;
+        let mut out = Cursor::new(Vec::new());
+        x.write_to(&mut out)?;
+        Ok(out.into_inner())
+    }
+
+    fn sheet_texts(bytes: Vec<u8>) -> Vec<(String, String)> {
+        let doc = crate::xlsx::XlsxDocument::from_reader(Cursor::new(bytes)).unwrap();
+        doc.worksheets
+            .iter()
+            .enumerate()
+            .map(|(i, ws)| (ws.name.clone(), doc.sheet_plain_text(i).unwrap()))
+            .collect()
+    }
+
+    /// Excel writes `<sheetData/>` for an empty sheet. The insert path
+    /// looked only for `</sheetData>`, returned the XML unchanged and
+    /// reported success.
+    #[test]
+    fn test_set_cell_on_a_self_closing_sheet_data_lands() {
+        let body = sheet_xml("<sheetData/>");
+        let bytes = package(&[("Empty", "worksheets/sheet1.xml", rel_types::WORKSHEET, &body)]);
+        let out = edit(bytes, 0, "B2", "written").expect("the write lands");
+        assert_eq!(sheet_texts(out), [("Empty".into(), "\twritten".into())]);
+    }
+
+    /// A worksheet with no `sheetData` at all is not something a cell can
+    /// be written into; that is an error, not a silent no-op.
+    #[test]
+    fn test_set_cell_without_sheet_data_is_an_error() {
+        let body = sheet_xml("");
+        let bytes = package(&[("Bare", "worksheets/sheet1.xml", rel_types::WORKSHEET, &body)]);
+        assert!(edit(bytes, 0, "A1", "x").is_err());
+    }
+
+    /// An unparseable cell reference is refused rather than ignored.
+    #[test]
+    fn test_set_cell_with_an_invalid_reference_is_an_error() {
+        let body = sheet_xml("<sheetData/>");
+        let bytes = package(&[("S", "worksheets/sheet1.xml", rel_types::WORKSHEET, &body)]);
+        assert!(matches!(edit(bytes, 0, "12", "x"), Err(crate::xlsx::XlsxError::InvalidCellRef(_))));
+    }
+
+    /// The part a sheet lives in is named by the workbook's relationships
+    /// (OPC), not by `sheet{N}.xml`: after a reorder, the first sheet is
+    /// `sheet2.xml`. The edit landed on the wrong sheet.
+    #[test]
+    fn test_set_cell_resolves_the_sheet_through_workbook_relationships() {
+        let first = sheet_xml("<sheetData/>");
+        let second = sheet_xml("<sheetData/>");
+        let bytes = package(&[
+            ("First", "worksheets/sheet2.xml", rel_types::WORKSHEET, &first),
+            ("Second", "worksheets/sheet1.xml", rel_types::WORKSHEET, &second),
+        ]);
+        let out = edit(bytes, 0, "A1", "on first").unwrap();
+        assert_eq!(
+            sheet_texts(out),
+            [("First".into(), "on first".into()), ("Second".into(), String::new())]
+        );
+    }
+
+    /// A sheet index naming a chartsheet (or past the last sheet) is an
+    /// error, not a write into some other part.
+    #[test]
+    fn test_set_cell_on_a_chartsheet_or_missing_sheet_is_an_error() {
+        let ws = sheet_xml("<sheetData/>");
+        let cs = r#"<?xml version="1.0"?><chartsheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>"#;
+        let bytes = package(&[
+            ("Chart", "chartsheets/sheet1.xml", rel_types::CHARTSHEET, cs),
+            ("Data", "worksheets/sheet1.xml", rel_types::WORKSHEET, &ws),
+        ]);
+        assert!(edit(bytes.clone(), 0, "A1", "x").is_err(), "a chartsheet has no cells");
+        assert!(edit(bytes.clone(), 2, "A1", "x").is_err(), "no third sheet");
+        let out = edit(bytes, 1, "A1", "data").unwrap();
+        assert!(
+            sheet_texts(out).iter().any(|(n, t)| n == "Data" && t == "data"),
+            "index 1 is the Data worksheet"
+        );
     }
 }
