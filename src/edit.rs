@@ -117,12 +117,17 @@ impl EditableDocument {
     ///
     /// # Errors
     ///
+    /// Returns an invalid-argument error when `find` is empty: it matches
+    /// between every character, so the replacement would be interleaved
+    /// through the whole document.
+    ///
     /// Returns [`crate::OfficeError::UnsupportedFormat`] for XLSX, which has no text
     /// replacement — use [`Self::set_cell`]. Returning `0` instead was
     /// indistinguishable from "the text was not present", so a caller (and
     /// every agent driving the CLI or MCP server) was told the edit
     /// succeeded when the operation is not implemented at all.
     pub fn replace_text(&mut self, find: &str, replace: &str) -> Result<usize> {
+        crate::core::editable::check_find(find)?;
         match &mut self.inner {
             EditableInner::Docx(doc) => Ok(doc.replace_text(find, replace)),
             EditableInner::Pptx(doc) => Ok(doc.replace_text(find, replace)),
@@ -260,6 +265,40 @@ mod tests {
             msg.contains("xlsx") || msg.contains("unsupported"),
             "the error must name the unsupported format: {err}"
         );
+    }
+
+    /// An empty `find` matches at every character boundary, so the
+    /// replacement was interleaved between every character of every text
+    /// run and the call reported success. Only the CLI guarded against it;
+    /// the MCP server, the FFI and every binding went straight through.
+    #[test]
+    fn test_empty_find_is_an_invalid_argument_error_for_every_format() {
+        for (data, fmt) in [
+            (make_docx_bytes(), DocumentFormat::Docx),
+            (make_pptx_bytes(), DocumentFormat::Pptx),
+        ] {
+            let mut doc = EditableDocument::from_reader(Cursor::new(data.clone()), fmt).unwrap();
+            let err = doc
+                .replace_text("", "X")
+                .expect_err("an empty search string must be rejected");
+            assert!(
+                matches!(
+                    err,
+                    crate::OfficeError::Core(crate::core::Error::InvalidArgument(_))
+                ),
+                "expected InvalidArgument, got {err:?}"
+            );
+            // And the document is untouched.
+            let mut out = Cursor::new(Vec::new());
+            doc.write_to(&mut out).unwrap();
+            let reread = crate::Document::from_reader(Cursor::new(out.into_inner()), fmt)
+                .unwrap()
+                .plain_text();
+            let original = crate::Document::from_reader(Cursor::new(data), fmt)
+                .unwrap()
+                .plain_text();
+            assert_eq!(reread, original);
+        }
     }
 
     #[test]

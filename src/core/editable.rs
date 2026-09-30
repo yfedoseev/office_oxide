@@ -91,10 +91,22 @@ impl EditablePackage {
         self.part_rels.get(name)
     }
 
-    /// Save the package to a file.
+    /// Save the package to a file, atomically.
+    ///
+    /// The package is written to a temporary file in the destination's
+    /// directory, flushed to disk, and then renamed over `path`. Opening
+    /// `path` with `File::create` truncated it before a single byte of the
+    /// new package was written, so any failure part-way through — disk
+    /// full, an I/O error, the process being killed, or a part that cannot
+    /// be serialised — destroyed the original when saving in place, which is
+    /// what the CLI `replace` command and the MCP `replace_text` tool do by
+    /// default. On failure the destination is left exactly as it was and the
+    /// temporary file is removed.
+    ///
+    /// Like `python-docx`'s `Document.save` and every Office application,
+    /// an existing file at `path` is replaced.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        let file = File::create(path)?;
-        self.write_to(file)
+        write_atomically(path.as_ref(), |file| self.write_to(file))
     }
 
     /// Write the package to any `Write + Seek` destination.
@@ -166,6 +178,74 @@ impl EditablePackage {
     }
 }
 
+/// Reject a search string no text replacement can sensibly use.
+///
+/// An empty `find` matches at every character boundary, so `str::replace`
+/// interleaves the replacement between every character of every run — and
+/// the edit reports a large, plausible count. Only the CLI used to guard
+/// against it; the MCP server (which then overwrote its input in place), the
+/// FFI and every binding passed it straight through. Checking it here gives
+/// every surface the same `Err`.
+pub fn check_find(find: &str) -> Result<()> {
+    if find.is_empty() {
+        Err(super::error::Error::InvalidArgument("search string cannot be empty".into()))
+    } else {
+        Ok(())
+    }
+}
+
+/// Write a file through a sibling temporary file, then rename it into place.
+///
+/// The temporary file lives in the destination's directory so the final
+/// `rename` stays on one filesystem (and is therefore atomic on POSIX, and a
+/// replace-existing move on Windows). It is flushed with `sync_all` before
+/// the rename, so a crash cannot leave a renamed-but-empty file behind.
+fn write_atomically(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let file_name = path.file_name().ok_or_else(|| {
+        super::error::Error::InvalidArgument(format!("'{}' does not name a file", path.display()))
+    })?;
+
+    // `create_new` refuses to reuse a name, so a stale temporary file from a
+    // killed process (or a concurrent save) is never clobbered or adopted.
+    let (tmp_path, mut file) = loop {
+        let mut name = std::ffi::OsString::from(".");
+        name.push(file_name);
+        name.push(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let candidate = dir.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => break (candidate, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    };
+
+    let result = write(&mut file)
+        .and_then(|()| file.sync_all().map_err(Into::into))
+        .and_then(|()| {
+            drop(file);
+            std::fs::rename(&tmp_path, path).map_err(Into::into)
+        });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
 /// Replace text inside every `<{tag}>…</{tag}>` element of an OOXML part.
 ///
 /// `tag` is the fully-prefixed element name (`w:t`, `a:t`). Returns the
@@ -190,6 +270,12 @@ pub fn replace_in_text_elements(
     find: &str,
     replace: &str,
 ) -> (String, usize) {
+    // An empty `find` matches between every pair of characters; never
+    // substitute on it. Callers that can report an error reject it first via
+    // [`check_find`]; this keeps the direct per-format entry points safe too.
+    if find.is_empty() {
+        return (xml.to_string(), 0);
+    }
     let open_prefix = format!("<{tag}");
     let close = format!("</{tag}>");
     let mut result = String::with_capacity(xml.len());
@@ -285,5 +371,80 @@ mod determinism_tests {
         for _ in 0..15 {
             assert_eq!(first, save(), "the edit path is not byte-deterministic");
         }
+    }
+}
+
+#[cfg(test)]
+mod save_tests {
+    use super::*;
+
+    fn xlsx_bytes() -> Vec<u8> {
+        let mut wb = crate::xlsx::write::XlsxWriter::new();
+        wb.add_sheet("S")
+            .add_row(vec![crate::xlsx::write::CellData::String("keep".into())]);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        wb.write_to(&mut buf).unwrap();
+        buf.into_inner()
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "office_oxide_editable_{tag}_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Saving over the file the package was read from truncated it before a
+    /// single byte of the new package was written, so any failure part-way
+    /// through the write (disk full, an I/O error, a kill, or a package that
+    /// cannot be serialised) destroyed the original. The CLI `replace`
+    /// command and the MCP `replace_text` tool both overwrite their input by
+    /// default.
+    #[test]
+    fn test_a_failed_in_place_save_leaves_the_original_intact() {
+        let dir = scratch_dir("failed_save");
+        let path = dir.join("book.xlsx");
+        let original = xlsx_bytes();
+        std::fs::write(&path, &original).unwrap();
+
+        let mut pkg = EditablePackage::open(&path).unwrap();
+        // A part whose zip entry collides with the package relationships the
+        // writer emits near the end: serialisation fails after most parts
+        // are already out.
+        pkg.set_part(PartName::new("/_rels/.rels").unwrap(), b"<x/>".to_vec());
+        assert!(pkg.save(&path).is_err(), "a colliding entry must fail the save");
+
+        assert!(
+            std::fs::read(&path).unwrap() == original,
+            "a failed save must not touch the original file"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "no temporary file may be left behind: {leftovers:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The successful path still replaces the destination, and leaves
+    /// nothing else behind.
+    #[test]
+    fn test_an_in_place_save_replaces_the_file() {
+        let dir = scratch_dir("ok_save");
+        let path = dir.join("book.xlsx");
+        std::fs::write(&path, xlsx_bytes()).unwrap();
+        let mut pkg = EditablePackage::open(&path).unwrap();
+        pkg.set_part(PartName::new("/extra.bin").unwrap(), b"payload".to_vec());
+        pkg.save(&path).unwrap();
+        let reopened = EditablePackage::open(&path).unwrap();
+        assert_eq!(
+            reopened.get_part(&PartName::new("/extra.bin").unwrap()),
+            Some(&b"payload"[..])
+        );
+        let entries = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(entries, 1, "no temporary file may be left behind");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

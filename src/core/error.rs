@@ -69,6 +69,10 @@ pub enum Error {
         /// The limit that was exceeded, in bytes.
         limit: u64,
     },
+    /// A caller-supplied argument can never be valid — e.g. an empty search
+    /// string for a text replacement, which matches between every character.
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
     /// Integer parse error.
     #[error("integer parse error: {0}")]
     ParseInt(#[from] std::num::ParseIntError),

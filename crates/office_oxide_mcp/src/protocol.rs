@@ -231,3 +231,46 @@ fn tool_error(id: &Value, message: &str) -> Value {
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unique scratch directory for one test.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("office_oxide_mcp_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_docx(path: &std::path::Path, text: &str) {
+        let mut w = office_oxide::docx::write::DocxWriter::new();
+        w.add_paragraph(text);
+        w.save(path).unwrap();
+    }
+
+    /// An empty `find` interleaved the replacement between every character
+    /// and — because `output_path` defaults to `file_path` — overwrote the
+    /// original with the result while reporting success.
+    #[test]
+    fn test_replace_text_with_empty_find_is_an_error_and_leaves_the_file_alone() {
+        let dir = scratch_dir("empty_find");
+        let path = dir.join("doc.docx");
+        write_docx(&path, "Hello world");
+        let before = std::fs::read(&path).unwrap();
+
+        let out = handle_tools_call(
+            &json!(1),
+            &json!({
+                "name": "replace_text",
+                "arguments": {"file_path": path.to_str().unwrap(), "find": "", "replace": "X"}
+            }),
+        );
+        assert_eq!(out["result"]["isError"], json!(true), "{out}");
+        let text = out["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("empty"), "the error must say why: {text}");
+        assert!(std::fs::read(&path).unwrap() == before, "the original was rewritten");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
