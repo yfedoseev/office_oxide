@@ -337,10 +337,12 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<D
     let mut slide_links: Vec<(u32, Option<u32>)> = Vec::new();
     // Per slide: its `(masterIdRef, fMasterObjects)`.
     let mut master_refs: Vec<(u32, bool)> = Vec::new();
+    let master_persist_ids = master_persist_ids(&doc_children);
     for entry in slide_list_entries(&slide_list) {
         let (mut slide, links) = resolve_slide(
             stream,
             dir,
+            &master_persist_ids,
             entry.persist_id_ref,
             &entry.outline_texts,
             &hyperlinks,
@@ -398,7 +400,6 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<D
         }
     }
 
-    let master_persist_ids = master_persist_ids(&doc_children);
     let mut master_text = master_static_text(
         stream,
         dir,
@@ -447,6 +448,34 @@ fn master_persist_ids(doc_children: &[u8]) -> HashMap<u32, u32> {
         .collect()
 }
 
+/// A master resolved from its `masterId`.
+enum MasterContainer {
+    /// A `MainMasterContainer`'s children.
+    Main(Vec<u8>),
+    /// A title master — a `SlideContainer` listed in the master list —
+    /// whose own `SlideAtom` names its main master.
+    Title(Vec<u8>),
+}
+
+/// Resolve a `SlideAtom.masterIdRef` to its master: the `masterId` maps to
+/// a persist id through the `MasterListWithTextContainer`
+/// ([`master_persist_ids`]), and that persist id to a `MainMaster` or a
+/// title-master `Slide` container. The one resolver for both master
+/// formatting inheritance and master static text. `None` when any link is
+/// missing — never a guess from the id's low bits.
+fn resolve_master(
+    stream: &[u8],
+    dir: &PersistDirectory,
+    master_persist_ids: &HashMap<u32, u32>,
+    master_id: u32,
+) -> Option<MasterContainer> {
+    let offset = dir.resolve(*master_persist_ids.get(&master_id)?)?;
+    if let Some(c) = bounded_container_children(stream, offset, RT_MAIN_MASTER) {
+        return Some(MasterContainer::Main(c));
+    }
+    bounded_container_children(stream, offset, RT_SLIDE).map(MasterContainer::Title)
+}
+
 /// Bound on master → master references followed (a title master names
 /// its main master); real decks need one hop.
 const MAX_MASTER_CHAIN: usize = 8;
@@ -482,23 +511,16 @@ fn master_static_text(
             if master_id == 0 || !visited.insert(master_id) {
                 break;
             }
-            let Some(offset) = master_persist_ids
-                .get(&master_id)
-                .and_then(|&pid| dir.resolve(pid))
-            else {
-                break;
-            };
-            let children =
-                if let Some(c) = bounded_container_children(stream, offset, RT_MAIN_MASTER) {
-                    c
-                } else if let Some(c) = bounded_container_children(stream, offset, RT_SLIDE) {
+            let children = match resolve_master(stream, dir, master_persist_ids, master_id) {
+                Some(MasterContainer::Main(c)) => c,
+                Some(MasterContainer::Title(c)) => {
                     // A title master: its own shapes, then its main master's
                     // when it follows that master's objects.
                     next = slide_master_ref(&c).and_then(|(id, follows)| follows.then_some(id));
                     c
-                } else {
-                    break;
-                };
+                },
+                None => break,
+            };
             collect_master_static_runs(&children, 0, hyperlinks, ole_objects, &mut runs);
         }
     }
@@ -817,6 +839,7 @@ fn resolve_notes(
 fn resolve_slide(
     stream: &[u8],
     dir: &PersistDirectory,
+    master_persist_ids: &HashMap<u32, u32>,
     persist_id_ref: u32,
     outline_texts: &[TextRun],
     hyperlinks: &HashMap<u32, String>,
@@ -863,8 +886,10 @@ fn resolve_slide(
             // main master. Best-effort: any missing piece
             // of this chain (no SlideAtom, no master, no matching
             // TxMasterStyleAtom) just leaves direct formatting as-is.
-            if let Some(master_id) = find_master_id(&children) {
-                if let Some(styles) = resolve_master_styles(stream, dir, master_id) {
+            if let Some((master_id, _)) = master {
+                if let Some(styles) =
+                    resolve_master_styles(stream, dir, master_persist_ids, master_id)
+                {
                     apply_master_inheritance(&mut text_runs, &styles);
                 }
             }
@@ -923,39 +948,29 @@ impl MasterStyles {
     }
 }
 
-/// Find a `Slide` container's own `SlideAtom` and return its
-/// `masterIdRef` — the persist ID of the main master this slide
-/// inherits from. Layout ([MS-PPT] 2.4.2, cross-checked against Apache
-/// POI's `SlideAtom`): after the embedded 12-byte `SSlideLayoutAtom`,
-/// `masterIdRef: i32` immediately follows (body-relative offset 12).
-fn find_master_id(slide_children: &[u8]) -> Option<u32> {
-    // `USES_MASTER_SLIDE_ID` (0x80000000, per Apache POI's `SlideAtom`) is
-    // OR'd into `masterID`'s high bit as a "this references a real master"
-    // flag, not part of the persist ID itself — every real corpus file
-    // sets it, and masking it out is required for `dir.resolve()` to ever
-    // find the master (without this, every lookup silently misses).
-    const USES_MASTER_SLIDE_ID: u32 = 0x8000_0000;
-    for rec in RecordIter::new(slide_children) {
-        let Ok(rec) = rec else { break };
-        if rec.header.rec_type == RT_SLIDE_ATOM {
-            let b = rec.data.get(12..16)?;
-            let master_id = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-            return Some(master_id & !USES_MASTER_SLIDE_ID);
-        }
-    }
-    None
-}
-
-/// Resolve `master_id` through the persist directory to its
-/// `MainMaster` container, then parse every `TxMasterStyleAtom` child —
-/// one per text type, up to five indent levels each.
+/// Resolve `master_id` (a `SlideAtom.masterIdRef`) to its main master via
+/// [`resolve_master`] — through a title master to the main master it
+/// names, since only main masters carry text styles — then parse every
+/// `TxMasterStyleAtom` child: one per text type, up to five indent levels
+/// each.
 fn resolve_master_styles(
     stream: &[u8],
     dir: &PersistDirectory,
+    master_persist_ids: &HashMap<u32, u32>,
     master_id: u32,
 ) -> Option<MasterStyles> {
-    let offset = dir.resolve(master_id)?;
-    let children = bounded_container_children(stream, offset, RT_MAIN_MASTER)?;
+    let mut master_id = master_id;
+    let mut children = None;
+    for _ in 0..MAX_MASTER_CHAIN {
+        match resolve_master(stream, dir, master_persist_ids, master_id)? {
+            MasterContainer::Main(c) => {
+                children = Some(c);
+                break;
+            },
+            MasterContainer::Title(c) => master_id = slide_master_ref(&c)?.0,
+        }
+    }
+    let children = children?;
     let mut styles = MasterStyles::default();
     for rec in RecordIter::new(&children) {
         let Ok(rec) = rec else { break };
@@ -3466,25 +3481,38 @@ mod tests {
     fn test_placeholder_formatting_inherits_from_master_when_direct_formatting_is_absent() {
         // A Title placeholder with no StyleTextPropAtom of its own at
         // all (no direct formatting) whose slide's SlideAtom.masterIdRef
-        // points — with the USES_MASTER_SLIDE_ID flag bit (0x80000000)
-        // set, exactly as every real corpus file does — at a MainMaster
-        // carrying a Title TxMasterStyleAtom. The run must end up with
-        // the master's alignment/font_size.
+        // names a MainMaster carrying a Title TxMasterStyleAtom. The run
+        // must end up with the master's alignment/font_size.
+        //
+        // The reference is a `masterId` (0x8000000C here, as in a real
+        // Apache Tika sample), mapped to the master's persist id (3)
+        // through the MasterListWithTextContainer — not a persist id with
+        // its high bit masked, which this test used to encode and which
+        // resolves to nothing on real decks.
         let mut stream = Vec::new();
 
         let doc_offset = stream.len() as u32;
         let mut slide_list_children = slide_persist_atom_bytes(2, 256);
         slide_list_children.extend(make_atom(RT_TEXT_HEADER, 0, &0u32.to_le_bytes())); // type=Title
         slide_list_children.extend(make_atom(RT_TEXT_BYTES, 0, b"Title Text"));
-        let slide_list = make_container(RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES, &slide_list_children);
-        stream.extend(make_container(RT_DOCUMENT, 0, &slide_list));
+        let mut doc_children = make_container(
+            RT_SLIDE_LIST_WITH_TEXT,
+            SLWT_MASTERS,
+            &slide_persist_atom_bytes(3, 0x8000_000C),
+        );
+        doc_children.extend(make_container(
+            RT_SLIDE_LIST_WITH_TEXT,
+            SLWT_SLIDES,
+            &slide_list_children,
+        ));
+        stream.extend(make_container(RT_DOCUMENT, 0, &doc_children));
 
         let slide_offset = stream.len() as u32;
         let index_bytes = 0i32.to_le_bytes();
         let outline_ref = make_atom(RT_OUTLINE_TEXT_REF_ATOM, 0, &index_bytes);
         let textbox = make_container(0xF00D, 0, &outline_ref);
         let shape = make_container(0xF004, 0, &textbox);
-        let mut slide_children = slide_atom_bytes(3 | 0x8000_0000);
+        let mut slide_children = slide_atom_bytes(0x8000_000C);
         slide_children.extend(shape);
         stream.extend(make_container(RT_SLIDE, 0, &slide_children));
 
@@ -3658,6 +3686,8 @@ mod tests {
 
         let main_master_offset = stream.len() as u32;
         let mut main_master = slide_atom_following(0, false);
+        // Tx_TYPE_OTHER style: right-aligned, 30pt.
+        main_master.extend(master_style_bytes(4, 2, 30));
         main_master.extend(other_text_shape("MAIN MASTER TEXT", None));
         main_master.extend(other_text_shape("SHARED TEXT", None));
         main_master.extend(other_text_shape(
@@ -3688,6 +3718,11 @@ mod tests {
         assert_eq!(deck.slides.len(), 2);
         let master: Vec<&str> = deck.master_text.iter().map(|r| r.text.as_str()).collect();
         assert_eq!(master, ["TITLE MASTER TEXT", "SHARED TEXT", "MAIN MASTER TEXT"]);
+        // Text styles come from the main master behind the title master.
+        let slide_run = &deck.slides[0].text_runs[0];
+        assert_eq!(slide_run.text, "SLIDE TEXT");
+        assert_eq!(slide_run.char_formats[0].format.font_size, Some(30));
+        assert_eq!(slide_run.para_formats[0].format.alignment, Some(2));
     }
 
     /// A master reference cycle (title master naming itself through a
