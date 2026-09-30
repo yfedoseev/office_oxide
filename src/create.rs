@@ -203,12 +203,18 @@ pub fn ir_to_docx(ir: &DocumentIR) -> crate::docx::write::DocxWriter {
         if section.page_setup.is_some()
             || section.columns.is_some()
             || section.break_type != SectionBreakType::Continuous
+            || section.footnote_settings.is_some()
+            || section.endnote_settings.is_some()
             || has_hf
         {
             writer.set_section_props(
                 section.page_setup.clone(),
                 section.columns.clone(),
                 section.break_type.clone(),
+            );
+            writer.set_section_note_settings(
+                section.footnote_settings.clone(),
+                section.endnote_settings.clone(),
             );
         }
     }

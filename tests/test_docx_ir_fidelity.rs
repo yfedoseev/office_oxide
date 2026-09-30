@@ -1036,6 +1036,57 @@ fn test_section_page_and_note_numbering_are_read() {
     assert_eq!(numbering(&again), numbering(&ir));
 }
 
+/// The section's `w:footnotePr` / `w:endnotePr` were read onto the
+/// parser's section properties and then dropped: the IR had nowhere to
+/// hold them and the writer emitted an empty `<w:footnotePr/>`, so a
+/// round trip reset roman, restarting footnotes to plain decimal.
+#[test]
+fn test_section_note_settings_reach_the_ir_and_survive_a_round_trip() {
+    let body = r#"<w:p><w:r><w:t>body</w:t></w:r></w:p>
+        <w:sectPr>
+          <w:footnotePr><w:pos w:val="beneathText"/><w:numFmt w:val="lowerRoman"/>
+            <w:numStart w:val="3"/><w:numRestart w:val="eachPage"/></w:footnotePr>
+          <w:endnotePr><w:numFmt w:val="upperLetter"/></w:endnotePr>
+          <w:pgSz w:w="12240" w:h="15840"/>
+        </w:sectPr>"#;
+    let ir = Docx::new(body).ir();
+    let foot = NoteSettings {
+        position: Some("beneathText".into()),
+        number_format: Some("lowerRoman".into()),
+        start: Some(3),
+        restart: Some("eachPage".into()),
+    };
+    let end = NoteSettings {
+        number_format: Some("upperLetter".into()),
+        ..Default::default()
+    };
+    let notes = |ir: &DocumentIR| {
+        let s = &ir.sections[0];
+        (s.footnote_settings.clone(), s.endnote_settings.clone())
+    };
+    assert_eq!(notes(&ir), (Some(foot.clone()), Some(end.clone())));
+
+    let bytes = docx_bytes(&ir);
+    let again = Document::from_reader(Cursor::new(bytes.clone()), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(notes(&again), notes(&ir));
+
+    // Also through an inline (non-final) section break.
+    let mut two = ir.clone();
+    two.sections.push(Section {
+        elements: vec![Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan::plain("second"))],
+            ..Default::default()
+        })],
+        ..Default::default()
+    });
+    let again = Document::from_reader(Cursor::new(docx_bytes(&two)), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(notes(&again), (Some(foot), Some(end)));
+}
+
 /// `w:pgMar/@w:gutter` was parsed and never read, and the writer
 /// hardcoded `w:gutter="0"`, so a bound document's binding margin was
 /// zeroed on every round-trip.

@@ -151,6 +151,16 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             first_page_footer: hf.first_footer,
             even_page_header: hf.even_header,
             even_page_footer: hf.even_footer,
+            footnote_settings: doc
+                .sections
+                .get(idx)
+                .and_then(|sp| sp.footnote_properties.as_ref())
+                .map(note_props_to_ir),
+            endnote_settings: doc
+                .sections
+                .get(idx)
+                .and_then(|sp| sp.endnote_properties.as_ref())
+                .map(note_props_to_ir),
             ..Default::default()
         });
     }
@@ -536,6 +546,15 @@ fn apply_paragraph_properties_to_heading(pp: &crate::docx::ParagraphProperties, 
             },
         })
         .collect();
+}
+
+fn note_props_to_ir(np: &crate::docx::NoteProperties) -> NoteSettings {
+    NoteSettings {
+        position: np.position.clone(),
+        number_format: np.number_format.clone(),
+        start: np.start,
+        restart: np.restart.clone(),
+    }
 }
 
 /// Build an IR `PageSetup` from a section's properties, or `None` when the

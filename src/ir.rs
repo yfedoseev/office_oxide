@@ -850,6 +850,36 @@ pub struct Section {
     /// none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data_validations: Vec<DataValidation>,
+    /// How this section numbers and places its footnotes (DOCX
+    /// `w:sectPr/w:footnotePr`, ECMA-376 §17.11.11). `None` when the section
+    /// states nothing, which means the document-wide settings apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footnote_settings: Option<NoteSettings>,
+    /// How this section numbers and places its endnotes (DOCX
+    /// `w:sectPr/w:endnotePr`, ECMA-376 §17.11.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endnote_settings: Option<NoteSettings>,
+}
+
+/// Footnote or endnote numbering and placement for one section. Values are
+/// kept as the source's ST_* tokens, like [`PageSetup::page_number_format`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NoteSettings {
+    /// Where the notes are placed (`w:pos`: `pageBottom`, `beneathText`,
+    /// `sectEnd`, `docEnd`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<String>,
+    /// The reference-mark number format (`w:numFmt`: `decimal`,
+    /// `lowerRoman`, `chicago`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number_format: Option<String>,
+    /// The first note number (`w:numStart`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<u32>,
+    /// When numbering restarts (`w:numRestart`: `continuous`, `eachSect`,
+    /// `eachPage`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<String>,
 }
 
 /// A block-level content element.

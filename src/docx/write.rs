@@ -34,8 +34,8 @@ use crate::core::opc::{OpcWriter, PartName};
 use crate::core::relationships::rel_types;
 use crate::ir::{
     BorderLine, BorderStyle, CellVerticalAlign, ColumnLayout, ImageFormat, ImagePositioning,
-    LineSpacing, ListStyle, PageSetup, ParagraphAlignment, SectionBreakType, TableAlignment,
-    UnderlineStyle, VerticalAlign,
+    LineSpacing, ListStyle, NoteSettings, PageSetup, ParagraphAlignment, SectionBreakType,
+    TableAlignment, UnderlineStyle, VerticalAlign,
 };
 
 use super::Result;
@@ -379,6 +379,9 @@ struct DocxSectPr {
     page_setup: Option<PageSetup>,
     columns: Option<ColumnLayout>,
     break_type: SectionBreakType,
+    /// `w:footnotePr` / `w:endnotePr` for this section.
+    footnote_settings: Option<NoteSettings>,
+    endnote_settings: Option<NoteSettings>,
     /// The headers/footers (indices into `DocxWriter::headers_footers`)
     /// that belong to this section: those added since the previous
     /// section's `sectPr`. Every section used to share one flat list
@@ -837,9 +840,33 @@ impl DocxWriter {
             page_setup,
             columns,
             break_type,
+            footnote_settings: None,
+            endnote_settings: None,
             hf_range,
         }));
         self
+    }
+
+    /// Set the footnote and endnote numbering/placement of the section most
+    /// recently closed by [`Self::set_section_props`], written as its
+    /// `w:footnotePr` / `w:endnotePr`. Returns `false` (and changes nothing)
+    /// when no section has been closed yet.
+    pub fn set_section_note_settings(
+        &mut self,
+        footnote: Option<NoteSettings>,
+        endnote: Option<NoteSettings>,
+    ) -> bool {
+        let Some(DocxElement::SectPr(sp)) = self
+            .elements
+            .iter_mut()
+            .rev()
+            .find(|e| matches!(e, DocxElement::SectPr(_)))
+        else {
+            return false;
+        };
+        sp.footnote_settings = footnote;
+        sp.endnote_settings = endnote;
+        true
     }
 
     /// Add an IR list with rich style information.
@@ -1293,6 +1320,8 @@ impl DocxWriter {
                     break_type: sp.break_type.clone(),
                     hf_rids: own,
                     has_footnotes: footnote_rid.is_some(),
+                    footnote_settings: sp.footnote_settings.clone(),
+                    endnote_settings: sp.endnote_settings.clone(),
                 });
             }
         }
@@ -1305,6 +1334,8 @@ impl DocxWriter {
                 break_type: SectionBreakType::Continuous,
                 hf_rids: hf_rids.clone(),
                 has_footnotes: footnote_rid.is_some(),
+                footnote_settings: None,
+                endnote_settings: None,
             });
         }
 
@@ -2139,6 +2170,8 @@ struct SectPrInfo {
     hf_rids: Vec<(HfType, String)>,
     /// Presence only: sectPr's `<w:footnotePr/>` carries no relationship id.
     has_footnotes: bool,
+    footnote_settings: Option<NoteSettings>,
+    endnote_settings: Option<NoteSettings>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3781,7 +3814,7 @@ fn write_inline_section_break_paragraph(
         .expect("write inline-section p start");
     w.write_event(Event::Start(BytesStart::new("w:pPr")))
         .expect("write inline-section pPr start");
-    write_section_pr_body(w, sp.page_setup.as_ref(), sp.columns.as_ref(), &sp.break_type, hf_rids);
+    write_section_pr_body(w, sp, hf_rids);
     w.write_event(Event::End(BytesEnd::new("w:pPr")))
         .expect("write inline-section pPr end");
     w.write_event(Event::End(BytesEnd::new("w:p")))
@@ -3818,6 +3851,32 @@ fn write_hf_references(w: &mut Writer<Vec<u8>>, hf_rids: &[(HfType, String)]) ->
     has_first_page
 }
 
+/// A section's `w:footnotePr` / `w:endnotePr` (CT_FtnProps / CT_EdnProps,
+/// ECMA-376 §17.11.11 / §17.11.5): children in schema order `pos`,
+/// `numFmt`, `numStart`, `numRestart`. Nothing is written for `None`.
+fn write_note_pr(w: &mut Writer<Vec<u8>>, tag: &str, settings: Option<&NoteSettings>) {
+    let Some(ns) = settings else {
+        return;
+    };
+    w.write_event(Event::Start(BytesStart::new(tag)))
+        .expect("write note pr start");
+    let children = [
+        ("w:pos", ns.position.clone()),
+        ("w:numFmt", ns.number_format.clone()),
+        ("w:numStart", ns.start.map(|n| n.to_string())),
+        ("w:numRestart", ns.restart.clone()),
+    ];
+    for (child, value) in children {
+        if let Some(v) = value {
+            let mut e = BytesStart::new(child);
+            e.push_attribute(("w:val", crate::core::xml::sanitize_xml_text(&v).as_ref()));
+            w.write_event(Event::Empty(e)).expect("write note pr child");
+        }
+    }
+    w.write_event(Event::End(BytesEnd::new(tag)))
+        .expect("write note pr end");
+}
+
 /// `w:pgNumType` (CT_SectPr puts it after `w:pgMar` and before
 /// `w:cols`), when the section numbers its pages other than by default.
 fn write_pg_num_type(w: &mut Writer<Vec<u8>>, ps: &PageSetup) {
@@ -3837,18 +3896,17 @@ fn write_pg_num_type(w: &mut Writer<Vec<u8>>, ps: &PageSetup) {
 /// Shared `<w:sectPr>...</w:sectPr>` body writer — used by both the
 /// body-level final sectPr and inline (per-paragraph) section breaks.
 /// Caller writes the surrounding `<w:sectPr>`/`</w:sectPr>` tags.
-fn write_section_pr_body(
-    w: &mut Writer<Vec<u8>>,
-    page_setup: Option<&PageSetup>,
-    columns: Option<&ColumnLayout>,
-    break_type: &SectionBreakType,
-    hf_rids: &[(HfType, String)],
-) {
+fn write_section_pr_body(w: &mut Writer<Vec<u8>>, sp: &DocxSectPr, hf_rids: &[(HfType, String)]) {
+    let (page_setup, columns, break_type) =
+        (sp.page_setup.as_ref(), sp.columns.as_ref(), &sp.break_type);
     w.write_event(Event::Start(BytesStart::new("w:sectPr")))
         .expect("write sectPr start");
 
-    // CT_SectPr orders the header/footer references first.
+    // CT_SectPr orders the header/footer references first, then
+    // `footnotePr` and `endnotePr`.
     let has_first_page = write_hf_references(w, hf_rids);
+    write_note_pr(w, "w:footnotePr", sp.footnote_settings.as_ref());
+    write_note_pr(w, "w:endnotePr", sp.endnote_settings.as_ref());
 
     match break_type {
         SectionBreakType::Continuous => {
@@ -3942,10 +4000,13 @@ fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
 
     let has_first_page = write_hf_references(w, &sp.hf_rids);
 
-    if sp.has_footnotes {
+    if sp.footnote_settings.is_some() {
+        write_note_pr(w, "w:footnotePr", sp.footnote_settings.as_ref());
+    } else if sp.has_footnotes {
         w.write_event(Event::Empty(BytesStart::new("w:footnotePr")))
             .expect("write footnotePr");
     }
+    write_note_pr(w, "w:endnotePr", sp.endnote_settings.as_ref());
 
     match sp.break_type {
         SectionBreakType::Continuous => {},
