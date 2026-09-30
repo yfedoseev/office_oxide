@@ -365,6 +365,40 @@ fn test_a_workbook_under_a_doc_extension_opens_as_a_spreadsheet() {
     assert!(Document::from_reader(Cursor::new(other), DocumentFormat::Doc).is_err());
 }
 
+/// Excel keeps a workbook's VBA project in a root `_VBA_PROJECT_CUR`
+/// storage holding the `VBA` storage and the `PROJECT` stream ([MS-OVBA]
+/// §2.2.1 project storage; [MS-XLS] §2.1.7.1). `has_macros` looked only for
+/// a root `_VBA_PROJECT` entry, which Excel 97+ never writes, so it never
+/// fired on a macro-enabled `.xls`.
+#[test]
+fn test_vba_project_cur_storage_sets_xls_has_macros() {
+    use common::{biff, cfb_with_streams};
+    let bof = |kind: u16| {
+        let mut b = 0x0600u16.to_le_bytes().to_vec();
+        b.extend_from_slice(&kind.to_le_bytes());
+        b.extend_from_slice(&[0u8; 12]);
+        biff(0x0809, &b)
+    };
+    let mut s = bof(0x0005);
+    let mut bs = 0u32.to_le_bytes().to_vec();
+    bs.extend_from_slice(&[0, 0, 1, 0, b'S']);
+    s.extend(biff(0x0085, &bs));
+    s.extend(biff(0x000A, &[]));
+    s.extend(bof(0x0010));
+    s.extend(biff(0x000A, &[]));
+
+    let open = |bytes: Vec<u8>| Document::from_reader(Cursor::new(bytes), DocumentFormat::Xls);
+    let with = cfb_with_streams(&[
+        ("Workbook", &s),
+        ("_VBA_PROJECT_CUR/VBA/dir", b"compressed dir stream"),
+        ("_VBA_PROJECT_CUR/PROJECT", b"ID=\"{0}\""),
+    ]);
+    assert!(open(with).unwrap().to_ir().metadata.has_macros);
+
+    let without = cfb_with_streams(&[("Workbook", &s)]);
+    assert!(!open(without).unwrap().to_ir().metadata.has_macros);
+}
+
 /// Word for Windows 2.0 wrote flat files — the FIB at byte 0, no
 /// compound container — with CR LF paragraph marks and code-page text.
 /// They were refused as "not a compound file" while catdoc and antiword

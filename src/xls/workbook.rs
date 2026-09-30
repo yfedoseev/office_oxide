@@ -192,7 +192,11 @@ impl XlsDocument {
         } else {
             return Err(XlsError::MissingStream("neither Workbook nor Book stream found".into()));
         };
-        let has_macros = cfb.has_root_entry("_VBA_PROJECT");
+        // Excel 97+ keeps the VBA project in a root `_VBA_PROJECT_CUR`
+        // storage ([MS-OVBA] §2.2.1, [MS-XLS] §2.1.7.1); a root
+        // `_VBA_PROJECT` entry is still honoured.
+        let has_macros =
+            cfb.has_root_entry("_VBA_PROJECT_CUR") || cfb.has_root_entry("_VBA_PROJECT");
         let summary_properties = crate::cfb::read_document_properties(&mut cfb);
         // Drop CFB early to free file handle and memory.
         drop(cfb);
@@ -735,8 +739,9 @@ impl XlsDocument {
             .get_or_init(|| extract_images(&self.drawing_bytes))
     }
 
-    /// `true` when the file carries a `_VBA_PROJECT` storage — a cheap
-    /// macro-presence signal, no VBA interpretation.
+    /// `true` when the file carries a VBA project storage
+    /// (`_VBA_PROJECT_CUR`) — a cheap macro-presence signal, no VBA
+    /// interpretation.
     pub fn has_macros(&self) -> bool {
         self.has_macros
     }
