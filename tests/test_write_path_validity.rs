@@ -202,3 +202,83 @@ fn test_pptx_ordered_list_is_written_with_auto_numbering() {
     assert_eq!(l.start_number, Some(3));
     assert_eq!(l.style, Some(ListStyle::LowerAlpha));
 }
+
+// ---------------------------------------------------------------------------
+// XML-illegal characters
+// ---------------------------------------------------------------------------
+
+/// Assert no XML part contains a character XML 1.0 cannot represent
+/// (C0 controls other than tab, LF and CR) — raw or as a character
+/// reference.
+fn assert_all_parts_are_legal_xml(bytes: &[u8]) {
+    for name in part_names(bytes) {
+        if !(name.ends_with(".xml") || name.ends_with(".rels") || name.ends_with(".vml")) {
+            continue;
+        }
+        let xml = part(bytes, &name).unwrap();
+        let bad: Vec<char> = xml
+            .chars()
+            .filter(|&c| (c as u32) < 0x20 && !matches!(c, '\t' | '\n' | '\r'))
+            .collect();
+        assert!(bad.is_empty(), "{name} holds XML-illegal characters {bad:?}: {xml}");
+        assert!(!xml.contains("&#x1;") && !xml.contains("&#1;"), "{name}: {xml}");
+    }
+}
+
+/// Comment author/text went through an escaper that handled `&<>` but not
+/// control characters, and relationship targets were written verbatim:
+/// `save()` returned Ok for a package with non-well-formed parts.
+#[test]
+fn test_xlsx_comments_and_hyperlink_targets_carry_no_illegal_characters() {
+    let mut wb = office_oxide::xlsx::write::XlsxWriter::new();
+    {
+        let mut sheet = wb.add_sheet("S");
+        sheet.set_cell(0, 0, office_oxide::xlsx::write::CellData::String("cell".into()));
+        sheet.set_cell_comment(0, 0, Some("Ann\u{0B}Lee".into()), "see\u{01} A & <B>");
+        sheet.set_cell_hyperlink(0, 0, "https://example.com/a\u{01}b");
+    }
+    let mut buf = Cursor::new(Vec::new());
+    wb.write_to(&mut buf).unwrap();
+    let bytes = buf.into_inner();
+    assert_all_parts_are_legal_xml(&bytes);
+
+    let doc = office_oxide::Document::from_reader(Cursor::new(bytes.clone()), DocumentFormat::Xlsx)
+        .unwrap();
+    let text = doc.to_ir().plain_text();
+    assert!(text.contains("see A") && text.contains("<B>"), "{text}");
+    let comments = part(&bytes, "xl/comments1.xml").unwrap();
+    assert!(comments.contains("<author>AnnLee</author>"), "{comments}");
+    assert!(comments.contains("see A &amp; &lt;B&gt;"), "{comments}");
+    // The control character is percent-encoded in the target, as RFC 3986
+    // requires for a URI, rather than silently deleted.
+    let rels = part(&bytes, "xl/worksheets/_rels/sheet1.xml.rels").unwrap();
+    assert!(rels.contains("https://example.com/a%01b"), "{rels}");
+}
+
+/// The same relationship-target rule holds for every format's hyperlinks.
+#[test]
+fn test_hyperlink_targets_with_control_characters_are_percent_encoded_in_every_format() {
+    for format in [
+        DocumentFormat::Docx,
+        DocumentFormat::Pptx,
+        DocumentFormat::Xlsx,
+    ] {
+        let ir = one_section(
+            vec![Element::Table(Table {
+                rows: vec![TableRow {
+                    cells: vec![TableCell {
+                        content: vec![para(vec![linked("x", "https://example.com/\u{02}q")])],
+                        col_span: 1,
+                        row_span: 1,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })],
+            format,
+        );
+        let bytes = write_ir(&ir, format);
+        assert_all_parts_are_legal_xml(&bytes);
+    }
+}
