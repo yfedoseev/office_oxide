@@ -1259,6 +1259,42 @@ fn test_an_inactive_first_page_header_is_not_content() {
     assert!(!again.sections.iter().any(|s| s.title_page));
 }
 
+/// A section that declares no header/footer reference of a type inherits
+/// the previous section's (ECMA-376 §17.10.5), and `w:titlePg` is the
+/// inheriting section's own: a first-page header declared in section one
+/// (no `titlePg`) is shown on the first page of a later section that has
+/// `titlePg`. Judging activity only by the declaring section hid a header
+/// Word shows.
+#[test]
+fn test_an_inherited_first_page_header_is_shown_by_a_later_title_page_section() {
+    let bytes = Docx::new(
+        r#"<w:p><w:pPr><w:sectPr>
+             <w:headerReference w:type="default" r:id="rIdH1"/>
+             <w:headerReference w:type="first" r:id="rIdH2"/>
+             <w:footerReference w:type="first" r:id="rIdF2"/>
+           </w:sectPr></w:pPr><w:r><w:t>first section</w:t></w:r></w:p>
+           <w:p><w:r><w:t>second section</w:t></w:r></w:p>
+           <w:sectPr><w:titlePg/></w:sectPr>"#,
+    )
+    .hf("header1.xml", "rIdH1", "DEFAULT HEADER")
+    .hf("header2.xml", "rIdH2", "FIRST HEADER")
+    .hf("footer2.xml", "rIdF2", "FIRST FOOTER")
+    .bytes();
+    let doc = Document::from_reader(Cursor::new(bytes.clone()), DocumentFormat::Docx).unwrap();
+    let ir = doc.to_ir();
+    let docx = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes)).unwrap();
+    for (surface, out) in [
+        ("ir plain_text", ir.plain_text()),
+        ("ir markdown", ir.to_markdown()),
+        ("plain_text", docx.plain_text()),
+        ("to_markdown", docx.to_markdown()),
+    ] {
+        for text in ["DEFAULT HEADER", "FIRST HEADER", "FIRST FOOTER"] {
+            assert!(out.contains(text), "{surface} lost {text}: {out:?}");
+        }
+    }
+}
+
 fn hf_text(hf: &Option<HeaderFooter>) -> String {
     hf.as_ref()
         .map(|h| {

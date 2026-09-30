@@ -413,12 +413,33 @@ impl DocxDocument {
                 }
                 Ok(())
             };
+        // A first-page part is shown when any section that *uses* it has
+        // `w:titlePg`. A section that declares no reference of a type
+        // inherits the previous section's (ECMA-376 §17.10.5), and
+        // `titlePg` belongs to the inheriting section, so a first-page
+        // header declared in a section without `titlePg` is still shown by
+        // a later section that has it.
+        let mut shown_first: std::collections::HashSet<(bool, String)> =
+            std::collections::HashSet::new();
+        let mut first_in_force: [Option<String>; 2] = [None, None];
         for section in &sections {
-            for hf_ref in &section.header_refs {
-                parse_hf(hf_ref, true, section.title_page)?;
+            for (slot, refs) in [(0, &section.header_refs), (1, &section.footer_refs)] {
+                if let Some(first) = refs.iter().find(|r| r.hf_type == HeaderFooterType::First) {
+                    first_in_force[slot] = Some(first.relationship_id.clone());
+                }
+                if section.title_page {
+                    if let Some(id) = &first_in_force[slot] {
+                        shown_first.insert((slot == 0, id.clone()));
+                    }
+                }
             }
-            for hf_ref in &section.footer_refs {
-                parse_hf(hf_ref, false, section.title_page)?;
+        }
+        for section in &sections {
+            for (is_header, refs) in [(true, &section.header_refs), (false, &section.footer_refs)] {
+                for hf_ref in refs {
+                    let shown = shown_first.contains(&(is_header, hf_ref.relationship_id.clone()));
+                    parse_hf(hf_ref, is_header, shown)?;
+                }
             }
         }
 
