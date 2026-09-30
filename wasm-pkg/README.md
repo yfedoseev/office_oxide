@@ -71,19 +71,42 @@ doc.free();
 
 ## API
 
-`WasmDocument` is the single entry point.
+Two classes: `WasmDocument` reads, `WasmEditableDocument` edits.
+
+### `WasmDocument`
 
 | Method | Description |
 | --- | --- |
 | `new WasmDocument(bytes, format)` | Open from `Uint8Array`. `format`: `"docx" \| "xlsx" \| "pptx" \| "doc" \| "xls" \| "ppt"`. |
 | `.formatName()` | Detected format as a string. |
 | `.plainText()` | Extract plain text. |
-| `.toMarkdown()` | Convert to Markdown. |
+| `.toMarkdown()` | Convert to Markdown (images dropped). |
+| `.toMarkdownWithImages()` | Markdown with each image inline as `[image-base64:…]`. |
 | `.toHtml()` | Convert to an HTML fragment. |
 | `.toIr()` | Return the format-agnostic document IR (JS object). |
 | `.free()` | Release the underlying WASM memory. `[Symbol.dispose]` is also supported. |
 
+### `WasmEditableDocument`
+
+Edits a DOCX, XLSX or PPTX in memory; every part the library does not model
+(images, charts, custom XML) is preserved byte for byte.
+
+| Method | Description |
+| --- | --- |
+| `new WasmEditableDocument(bytes, format)` | Open from `Uint8Array`. `format`: `"docx" \| "xlsx" \| "pptx"`. |
+| `.replaceText(find, replace)` | Replace text in DOCX/PPTX; returns the count. Throws for an empty `find` or for XLSX. |
+| `.setCell(sheetIndex, cellRef, value)` | Set an XLSX cell (`null`, string, number or boolean). Throws for other formats. |
+| `.toBytes()` | The edited document as a `Uint8Array`. |
+| `.free()` | Release the underlying WASM memory. |
+
 TypeScript definitions are shipped.
+
+### What the WASM build does not have
+
+The WASM package covers reading and in-memory editing. It does **not** expose
+the document builders (`XlsxWriter`, `PptxWriter`), `createFromMarkdown`, or
+`saveAs` conversion, which the native bindings (Python, Node, Go, C#) do; and
+it has no file-system access — everything goes in and out as bytes.
 
 ## Package Layout
 
@@ -108,7 +131,7 @@ office_oxide ships the same Rust core through six bindings:
 
 ## Why I built this
 
-I needed Office document processing that works in the browser without a server round-trip — and without pulling in a JVM or a GPL-licensed dependency. The same Rust core that powers the CLI and all native bindings compiles cleanly to WASM, so feature parity is automatic.
+I needed Office document processing that works in the browser without a server round-trip — and without pulling in a JVM or a GPL-licensed dependency. The same Rust core that powers the CLI and all native bindings compiles cleanly to WASM, so parsing and extraction behave identically everywhere; the builder APIs are not exposed to WASM yet (see above).
 
 If something's broken or missing, [open an issue](https://github.com/yfedoseev/office_oxide/issues).
 
