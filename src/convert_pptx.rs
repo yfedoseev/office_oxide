@@ -3,14 +3,12 @@ use crate::ir::*;
 
 pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
     // Slide size sits at presentation level — every slide in the
-    // deck shares it. EMU → twips is /635 (914400 EMU per inch,
-    // 1440 twips per inch → 914400/1440 = 635).
-    let page_setup = doc.presentation.slide_size.as_ref().map(|sz| PageSetup {
-        width_twips: (sz.cx.max(0) / 635) as u32,
-        height_twips: (sz.cy.max(0) / 635) as u32,
-        landscape: sz.cx > sz.cy,
-        ..Default::default()
-    });
+    // deck shares it.
+    let page_setup = doc
+        .presentation
+        .slide_size
+        .as_ref()
+        .and_then(slide_page_setup);
 
     let mut sections = Vec::new();
 
@@ -133,6 +131,37 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         sections,
         defined_names: Vec::new(),
     }
+}
+
+/// Smallest and largest legal `p:sldSz` extent, in EMU
+/// (`ST_SlideSizeCoordinate`, ECMA-376 Part 1 §19.7.18: 1 inch to 56 inches).
+const MIN_SLIDE_EXTENT_EMU: i64 = 914_400;
+const MAX_SLIDE_EXTENT_EMU: i64 = 51_206_400;
+
+/// The IR page geometry for a deck's slide size. EMU → twips is /635
+/// (914400 EMU per inch, 1440 twips per inch).
+///
+/// A size outside the schema's range is not a page size anything can
+/// honour; converting it used to truncate through `as u32` into an
+/// arbitrary, plausible-looking page. It now yields no page setup (with a
+/// warning), so consumers fall back to their own default.
+fn slide_page_setup(sz: &crate::pptx::SlideSize) -> Option<PageSetup> {
+    let legal = MIN_SLIDE_EXTENT_EMU..=MAX_SLIDE_EXTENT_EMU;
+    if !legal.contains(&sz.cx) || !legal.contains(&sz.cy) {
+        log::warn!(
+            "pptx: slide size {}x{} EMU is outside the legal range; page size not set",
+            sz.cx,
+            sz.cy
+        );
+        return None;
+    }
+    // In range, both quotients are well below u32::MAX.
+    Some(PageSetup {
+        width_twips: u32::try_from(sz.cx / 635).ok()?,
+        height_twips: u32::try_from(sz.cy / 635).ok()?,
+        landscape: sz.cx > sz.cy,
+        ..Default::default()
+    })
 }
 
 fn collect_shape_entries<'a>(
@@ -690,6 +719,31 @@ mod tests {
                 out
             })
             .collect()
+    }
+
+    /// An absurd `p:sldSz` truncated through `as u32` into an arbitrary
+    /// page size; an out-of-range size must yield no page size at all.
+    #[test]
+    fn test_out_of_range_slide_size_does_not_become_a_page_size() {
+        use crate::pptx::SlideSize;
+        let ok = slide_page_setup(&SlideSize {
+            cx: 12_192_000,
+            cy: 6_858_000,
+        })
+        .expect("a 16:9 slide is legal");
+        assert_eq!((ok.width_twips, ok.height_twips, ok.landscape), (19_200, 10_800, true));
+        for (cx, cy) in [
+            (i64::MAX, 6_858_000),
+            (4_294_967_296 * 635, 6_858_000),
+            (0, 6_858_000),
+            (-5, 6_858_000),
+            (12_192_000, 51_206_401),
+        ] {
+            assert!(
+                slide_page_setup(&SlideSize { cx, cy }).is_none(),
+                "{cx}x{cy} must not produce a page size"
+            );
+        }
     }
 
     /// A non-text AutoShape (decorative icon, action
