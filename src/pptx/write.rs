@@ -760,10 +760,25 @@ impl PptxWriter {
                     rel_types::NOTES_MASTER,
                     "../notesMasters/notesMaster1.xml",
                 );
+                // Relationship ids are scoped to their source part: the
+                // notes part needs its own hyperlink relationships. Handing
+                // it the slide's map dropped note-only URLs and wrote shared
+                // ones as ids the notes part's `.rels` did not define (or
+                // defined as something else).
+                let mut notes_rids: HashMap<String, String> = HashMap::new();
+                for url in collect_slide_hyperlinks(notes) {
+                    let rid = opc.add_part_rel_with_mode(
+                        &notes_part,
+                        rel_types::HYPERLINK,
+                        &url,
+                        crate::core::relationships::TargetMode::External,
+                    );
+                    notes_rids.insert(url, rid);
+                }
                 opc.add_part(
                     &notes_part,
                     CT_NOTES_SLIDE,
-                    &generate_notes_slide_xml(notes, &hyperlink_rids),
+                    &generate_notes_slide_xml(notes, &notes_rids),
                 )?;
             }
 
