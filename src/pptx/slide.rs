@@ -76,6 +76,11 @@ pub struct Slide {
     pub hidden: bool,
     /// Comments attached to this slide, from `ppt/comments/*.xml`.
     pub comments: Vec<SlideComment>,
+    /// Why this slide's part could not be read, when it could not. The
+    /// slide keeps its place in the deck with no content, so every
+    /// renderer can show a notice where it was; the part and the reason are
+    /// also listed in [`super::PptxDocument::unreadable_parts`].
+    pub parse_error: Option<String>,
 }
 
 /// A comment attached to a slide (`ppt/comments/modernComment*.xml` or the
@@ -134,6 +139,7 @@ impl Slide {
             background_rgb,
             hidden,
             comments: Vec::new(),
+            parse_error: None,
         })
     }
 }
@@ -1592,25 +1598,29 @@ pub(crate) fn parse_comments(xml_data: &[u8]) -> Vec<SlideComment> {
 /// `TextBody` — the same model ordinary slide body text uses, so a
 /// caller converting it (see `convert_text_body` in `convert_pptx.rs`)
 /// gets the same bold/italic/bullet/numbering fidelity for free.
-pub(crate) fn extract_notes_body(xml_data: &[u8]) -> Option<TextBody> {
-    let rels = Relationships::empty();
+///
+/// `rels` are the notes part's own relationships, so hyperlinks in the
+/// notes resolve. A notes part that is not well-formed is an `Err`, for the
+/// caller to record — it used to read as "no notes".
+pub(crate) fn extract_notes_body(
+    xml_data: &[u8],
+    rels: &Relationships,
+) -> CoreResult<Option<TextBody>> {
     let mut reader = make_content_reader(xml_data);
     let mut shapes = Vec::new();
 
     // Parse the notes slide's shape tree
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(ref e)) if e.local_name().as_ref() == "spTree" => {
+        match reader.read_event()? {
+            Event::Start(ref e) if e.local_name().as_ref() == "spTree" => {
                 shapes = parse_shape_tree(
                     &mut reader,
-                    &rels,
+                    rels,
                     &std::collections::HashMap::new(),
                     &std::collections::HashMap::new(),
-                )
-                .ok()?;
+                )?;
             },
-            Ok(Event::Eof) => break,
-            Err(_) => break,
+            Event::Eof => break,
             _ => {},
         }
     }
@@ -1622,7 +1632,7 @@ pub(crate) fn extract_notes_body(xml_data: &[u8]) -> Option<TextBody> {
                 if ph.ph_type.as_deref() == Some("body") {
                     if let Some(ref tb) = auto.text_body {
                         if !extract_plain_text_from_body(tb).is_empty() {
-                            return Some(tb.clone());
+                            return Ok(Some(tb.clone()));
                         }
                     }
                 }
@@ -1630,7 +1640,7 @@ pub(crate) fn extract_notes_body(xml_data: &[u8]) -> Option<TextBody> {
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// Extract plain text from a TextBody.
@@ -2526,7 +2536,9 @@ mod tests {
   </p:cSld>
 </p:notes>"#;
 
-        let body = extract_notes_body(xml).unwrap();
+        let body = extract_notes_body(xml, &Relationships::empty())
+            .unwrap()
+            .unwrap();
         assert_eq!(extract_plain_text_from_body(&body), "Speaker notes here\nSecond line");
     }
 

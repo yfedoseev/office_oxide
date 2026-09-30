@@ -24,6 +24,9 @@ impl PptxDocument {
     /// Extract plain text from a single slide by index.
     pub fn slide_plain_text(&self, index: usize) -> Option<String> {
         let slide = self.slides.get(index)?;
+        if let Some(ref err) = slide.parse_error {
+            return Some(unreadable_slide_notice(&slide.name, err));
+        }
         let mut entries = Vec::new();
         collect_text_entries(&slide.shapes, &mut entries);
         entries.sort_by(|a, b| spatial_cmp(&a.0, &b.0));
@@ -71,6 +74,13 @@ impl PptxDocument {
     /// Convert a single slide to markdown by index.
     pub fn slide_to_markdown(&self, index: usize) -> Option<String> {
         let slide = self.slides.get(index)?;
+        if let Some(ref err) = slide.parse_error {
+            return Some(format!(
+                "## Slide {}\n\n{}",
+                index + 1,
+                unreadable_slide_notice(&slide.name, err)
+            ));
+        }
         let mut result = String::new();
 
         // Slide heading: use title placeholder text or "Slide N"
@@ -186,6 +196,12 @@ fn collect_text_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePositio
             Shape::Connector(_) => {},
         }
     }
+}
+
+/// The text standing in for a slide whose part could not be read — the
+/// same notice on every rendering surface.
+pub(crate) fn unreadable_slide_notice(part: &str, err: &str) -> String {
+    format!("[unreadable slide {part:?}: {err}]")
 }
 
 /// `Comment (Author)` — the label the IR's endnote carries as its marker.
@@ -532,6 +548,7 @@ mod tests {
             slides,
             theme: None,
             embedded_fonts: Vec::new(),
+            unreadable_parts: Vec::new(),
         }
     }
 

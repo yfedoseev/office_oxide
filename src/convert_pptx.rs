@@ -13,6 +13,26 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
     let mut sections = Vec::new();
 
     for slide in doc.slides.iter() {
+        if let Some(ref err) = slide.parse_error {
+            // An unreadable slide keeps its place as a notice, so the loss
+            // is visible in every projection of the IR.
+            sections.push(Section {
+                elements: vec![Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(
+                        crate::pptx::text::unreadable_slide_notice(&slide.name, err),
+                    ))],
+                    ..Default::default()
+                })],
+                break_type: if sections.is_empty() {
+                    SectionBreakType::Continuous
+                } else {
+                    SectionBreakType::NextPage
+                },
+                page_setup: page_setup.clone(),
+                ..Default::default()
+            });
+            continue;
+        }
         let title_with_algn = find_title(&slide.shapes);
         let title = title_with_algn.as_ref().map(|(t, _)| t.clone());
         let title_alignment = title_with_algn.as_ref().and_then(|(_, a)| a.clone());
@@ -126,7 +146,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
-            text_truncated: false,
+            text_truncated: !doc.unreadable_parts.is_empty(),
         },
         sections,
         defined_names: Vec::new(),

@@ -74,6 +74,12 @@ pub struct PptxDocument {
     /// `vbaProject` entry — a cheap macro-presence signal, no VBA
     /// interpretation.
     pub has_macros: bool,
+    /// Parts that could not be used, as `(part, reason)`: an unreadable or
+    /// unresolvable slide (which keeps its place in [`Self::slides`] with
+    /// [`Slide::parse_error`] set) or an auxiliary part such as a notes
+    /// slide or comments part. Each was skipped so the rest of the deck
+    /// could be extracted; a non-empty list means content is missing.
+    pub unreadable_parts: Vec<(String, String)>,
 }
 
 impl PptxDocument {
@@ -147,11 +153,27 @@ impl PptxDocument {
         let pres_data = opc.read_part(&main_part)?;
         let presentation = PresentationInfo::parse(&pres_data)?;
 
+        // Degradation policy. A part this reader cannot use — a slide or
+        // an auxiliary part hanging off one (notes, comments) — is skipped,
+        // logged and recorded in `unreadable_parts`; the rest of the deck is
+        // still extracted. A slide keeps its place with a notice. The deck
+        // is an error only when no slide at all could be read. (An
+        // unreadable notes part used to fail the whole deck while an
+        // unresolvable slide relationship vanished silently.)
+        let mut unreadable_parts: Vec<(String, String)> = Vec::new();
+        let mut record = |part: &str, err: &dyn std::fmt::Display| {
+            log::warn!("pptx: skipping unreadable part {part}: {err}");
+            unreadable_parts.push((part.to_string(), err.to_string()));
+        };
+
         // Phase 1: gather raw data sequentially (requires &mut opc)
         struct SlideBundle {
-            slide_data: Vec<u8>,
+            /// The slide's part name, for error reporting.
+            part_name: String,
+            /// `Err` when the slide part itself could not be read.
+            slide_data: std::result::Result<Vec<u8>, String>,
             slide_rels: Relationships,
-            notes_data: Option<Vec<u8>>,
+            notes: Option<NotesBundle>,
             comments_data: Vec<Vec<u8>>,
             /// rId → (raw bytes, format-extension lowercase like "png" / "jpeg").
             /// Pre-resolved here in Phase 1 so the parallel slide parser
@@ -170,31 +192,52 @@ impl PptxDocument {
             /// when the layout/master chain can't be resolved at all.
             master_styles: Option<master::MasterTextStyles>,
         }
+        struct NotesBundle {
+            part_name: String,
+            data: Vec<u8>,
+            rels: Relationships,
+        }
         // Many slides share one layout/master — resolve and parse each
         // unique master part at most once.
         let mut master_styles_cache: std::collections::HashMap<String, master::MasterTextStyles> =
             std::collections::HashMap::new();
         let mut bundles = Vec::with_capacity(presentation.slides.len());
         for (slide_idx, slide_id) in presentation.slides.iter().enumerate() {
-            // Try to resolve by rel_id, fall back to positional lookup
-            let part_name = if !slide_id.rel_id.is_empty() {
-                match pres_rels.resolve_target(&slide_id.rel_id, &main_part) {
-                    Ok(pn) => pn,
-                    Err(_) => continue,
-                }
+            // Resolve by rel_id, or by the `slideN.xml` convention when the
+            // entry carries no r:id.
+            let resolved = if !slide_id.rel_id.is_empty() {
+                pres_rels
+                    .resolve_target(&slide_id.rel_id, &main_part)
+                    .map_err(|e| (format!("slide relationship {}", slide_id.rel_id), e.to_string()))
             } else {
-                // No r:id — try convention: ppt/slides/slideN.xml
-                let idx = slide_idx + 1;
-                let candidate = format!("/ppt/slides/slide{}.xml", idx);
-                match crate::core::opc::PartName::new(&candidate) {
-                    Ok(pn) if opc.has_part(&pn) => pn,
-                    _ => continue,
-                }
+                let candidate = format!("/ppt/slides/slide{}.xml", slide_idx + 1);
+                crate::core::opc::PartName::new(&candidate)
+                    .map_err(|e| (candidate.clone(), e.to_string()))
+            };
+            let part_name = match resolved {
+                Ok(pn) if opc.has_part(&pn) => pn,
+                Ok(pn) => {
+                    let name = pn.as_str().to_string();
+                    record(&name, &"the part is missing from the package");
+                    bundles.push(SlideBundle::unreadable(name, "the part is missing"));
+                    continue;
+                },
+                Err((what, err)) => {
+                    record(&what, &err);
+                    bundles.push(SlideBundle::unreadable(what, &err));
+                    continue;
+                },
             };
             let slide_rels = opc
                 .read_rels_for(&part_name)
                 .unwrap_or_else(|_| Relationships::empty());
-            let slide_data = opc.read_part(&part_name)?;
+            let slide_data = match opc.read_part(&part_name) {
+                Ok(d) => Ok(d),
+                Err(e) => {
+                    record(part_name.as_str(), &e);
+                    Err(e.to_string())
+                },
+            };
 
             // Slide -> layout -> master, resolved through their own
             // relationships exactly like every other part this reader
@@ -222,17 +265,30 @@ impl PptxDocument {
                 })
                 .filter(|s| !s.is_empty());
 
-            let notes_data =
-                if let Some(notes_rel) = slide_rels.first_by_type(rel_types::NOTES_SLIDE) {
-                    let notes_part = part_name.resolve_relative(&notes_rel.target)?;
-                    if opc.has_part(&notes_part) {
-                        Some(opc.read_part(&notes_part)?)
-                    } else {
+            let notes = match slide_rels.first_by_type(rel_types::NOTES_SLIDE) {
+                None => None,
+                Some(notes_rel) => match part_name.resolve_relative(&notes_rel.target) {
+                    Err(e) => {
+                        record(&notes_rel.target, &e);
                         None
-                    }
-                } else {
-                    None
-                };
+                    },
+                    // A notes relationship to an absent part: nothing to read.
+                    Ok(notes_part) if !opc.has_part(&notes_part) => None,
+                    Ok(notes_part) => match opc.read_part(&notes_part) {
+                        Ok(data) => Some(NotesBundle {
+                            part_name: notes_part.as_str().to_string(),
+                            data,
+                            rels: opc
+                                .read_rels_for(&notes_part)
+                                .unwrap_or_else(|_| Relationships::empty()),
+                        }),
+                        Err(e) => {
+                            record(notes_part.as_str(), &e);
+                            None
+                        },
+                    },
+                },
+            };
 
             // Pre-load all IMAGE-relationship parts the slide references.
             // PPTX picture frames carry `<a:blip r:embed="rIdN"/>`; the
@@ -299,15 +355,17 @@ impl PptxDocument {
                 .collect();
             let mut comments_data: Vec<Vec<u8>> = Vec::new();
             for pn in comment_parts {
-                if let Ok(data) = opc.read_part(&pn) {
-                    comments_data.push(data);
+                match opc.read_part(&pn) {
+                    Ok(data) => comments_data.push(data),
+                    Err(e) => record(pn.as_str(), &e),
                 }
             }
 
             bundles.push(SlideBundle {
+                part_name: part_name.as_str().to_string(),
                 slide_data,
                 slide_rels,
-                notes_data,
+                notes,
                 comments_data,
                 media,
                 charts,
@@ -315,21 +373,80 @@ impl PptxDocument {
             });
         }
 
-        // Phase 2: parse slides (parallel when feature enabled)
-        let slides = crate::core::parallel::map_collect(bundles, |b| -> Result<Slide> {
-            let name = xml_csl_name(&b.slide_data);
-            let mut parsed = Slide::parse(&b.slide_data, name, &b.slide_rels, &b.media, &b.charts)?;
-            if let Some(notes_data) = &b.notes_data {
-                parsed.notes = extract_notes_body(notes_data);
+        impl SlideBundle {
+            fn unreadable(part_name: String, err: &str) -> Self {
+                SlideBundle {
+                    part_name,
+                    slide_data: Err(err.to_string()),
+                    slide_rels: Relationships::empty(),
+                    notes: None,
+                    comments_data: Vec::new(),
+                    media: std::collections::HashMap::new(),
+                    charts: std::collections::HashMap::new(),
+                    master_styles: None,
+                }
             }
-            for data in &b.comments_data {
-                parsed.comments.extend(slide::parse_comments(data));
+        }
+
+        // Phase 2: parse slides (parallel when feature enabled). Each slide
+        // yields its parts that could not be used, merged in order below.
+        type ParsedSlide = (Slide, Vec<(String, String)>);
+        let parsed = crate::core::parallel::map_collect(
+            bundles,
+            |b| -> std::result::Result<ParsedSlide, std::convert::Infallible> {
+                let mut problems = Vec::new();
+                let unreadable_slide = |err: String| Slide {
+                    name: b.part_name.clone(),
+                    parse_error: Some(err),
+                    ..Default::default()
+                };
+                let data = match &b.slide_data {
+                    Ok(d) => d,
+                    // Already recorded in phase 1.
+                    Err(e) => return Ok((unreadable_slide(e.clone()), problems)),
+                };
+                let name = xml_csl_name(data);
+                let mut parsed = match Slide::parse(data, name, &b.slide_rels, &b.media, &b.charts)
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        problems.push((b.part_name.clone(), e.to_string()));
+                        return Ok((unreadable_slide(e.to_string()), problems));
+                    },
+                };
+                if let Some(notes) = &b.notes {
+                    match slide::extract_notes_body(&notes.data, &notes.rels) {
+                        Ok(body) => parsed.notes = body,
+                        Err(e) => problems.push((notes.part_name.clone(), e.to_string())),
+                    }
+                }
+                for data in &b.comments_data {
+                    parsed.comments.extend(slide::parse_comments(data));
+                }
+                if let Some(ref styles) = b.master_styles {
+                    apply_master_inheritance(&mut parsed.shapes, styles);
+                }
+                Ok((parsed, problems))
+            },
+        );
+        let parsed = match parsed {
+            Ok(p) => p,
+            Err(never) => match never {},
+        };
+        let mut slides = Vec::with_capacity(parsed.len());
+        for (slide, problems) in parsed {
+            for (part, err) in problems {
+                record(&part, &err);
             }
-            if let Some(ref styles) = b.master_styles {
-                apply_master_inheritance(&mut parsed.shapes, styles);
-            }
-            Ok(parsed)
-        })?;
+            slides.push(slide);
+        }
+        if !slides.is_empty() && slides.iter().all(|s| s.parse_error.is_some()) {
+            let (part, err) = &unreadable_parts[0];
+            return Err(crate::core::Error::MalformedXml(format!(
+                "no slide could be read; {part}: {err}"
+            ))
+            .into());
+        }
 
         // Scan `ppt/fonts/` for embedded font programs. Mirrors the DOCX
         // reader (`word/fonts/`).
@@ -368,6 +485,7 @@ impl PptxDocument {
             core_properties,
             app_properties,
             has_macros,
+            unreadable_parts,
         })
     }
 }
@@ -394,12 +512,6 @@ fn xml_csl_name(xml_data: &[u8]) -> String {
         }
     }
     String::new()
-}
-
-/// Extract the speaker notes body from a notes slide XML. Finds the
-/// body placeholder (type="body") and returns its structured `TextBody`.
-fn extract_notes_body(xml_data: &[u8]) -> Option<TextBody> {
-    slide::extract_notes_body(xml_data)
 }
 
 /// Fill any unset (`None`) character/paragraph-formatting field on
