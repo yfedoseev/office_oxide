@@ -400,13 +400,21 @@ fn markdown_blocks_inner(
                         numbering_counts.insert(key, next);
                         next
                     };
+                    // `w:lvlText` "%1)" is CommonMark's `1)` marker; every
+                    // other pattern has no CommonMark form and keeps `.`
+                    // (as `List::ordered_delimiter` on the IR path).
+                    let delim = if crate::ir::is_paren_pattern(&level.level_text) {
+                        ')'
+                    } else {
+                        '.'
+                    };
                     let marker = match &level.format {
                         NumberFormat::Bullet => "- ".to_string(),
-                        NumberFormat::Decimal => format!("{}. ", next_ordinal()),
-                        NumberFormat::LowerLetter => format!("{}. ", next_ordinal()),
-                        NumberFormat::UpperLetter => format!("{}. ", next_ordinal()),
-                        NumberFormat::LowerRoman => format!("{}. ", next_ordinal()),
-                        NumberFormat::UpperRoman => format!("{}. ", next_ordinal()),
+                        NumberFormat::Decimal
+                        | NumberFormat::LowerLetter
+                        | NumberFormat::UpperLetter
+                        | NumberFormat::LowerRoman
+                        | NumberFormat::UpperRoman => format!("{}{delim} ", next_ordinal()),
                         NumberFormat::None => String::new(),
                         NumberFormat::Other(_) => "- ".to_string(),
                     };

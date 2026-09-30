@@ -1556,6 +1556,38 @@ pub struct List {
     /// Nesting depth (0 = top-level).
     #[serde(default)]
     pub level: u8,
+    /// How an ordered list's marker is drawn around its number, as a
+    /// DOCX `w:lvlText` pattern (ECMA-376 Part 1 §17.9, numbering): `%N` is the
+    /// level-`N` counter (1-based), so `"%1)"` is `1)`, `"(%1)"` is `(1)`
+    /// and `"%1.%2."` is `1.2.`. `None` for bullets and when the source
+    /// uses the plain `"%N."` form or has no such notion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker_pattern: Option<String>,
+    /// How the marker is aligned in its number area (DOCX `w:lvlJc`,
+    /// ECMA-376 Part 1 §17.9). `None` when unstated (left).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker_alignment: Option<ParagraphAlignment>,
+}
+
+impl List {
+    /// The CommonMark delimiter for this list's ordered markers: `)` when
+    /// the marker pattern is the bare counter followed by `)` (`%N)`),
+    /// otherwise `.` — CommonMark has no form for `(1)` or `1.2.`.
+    pub fn ordered_delimiter(&self) -> char {
+        match self.marker_pattern.as_deref() {
+            Some(p) if is_paren_pattern(p) => ')',
+            _ => '.',
+        }
+    }
+}
+
+/// `true` for a `w:lvlText` of the form `%N)` (one counter, closing paren).
+pub(crate) fn is_paren_pattern(pattern: &str) -> bool {
+    pattern
+        .trim()
+        .strip_prefix('%')
+        .and_then(|rest| rest.strip_suffix(')'))
+        .is_some_and(|n| n.len() == 1 && n.as_bytes()[0].is_ascii_digit())
 }
 
 /// A single item within a list.

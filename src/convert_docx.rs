@@ -1520,6 +1520,11 @@ fn convert_list_group(
     let mut top_ilvl: Option<u8> = None;
     let mut start_number: Option<u32> = None;
     let mut style: Option<ListStyle> = None;
+    // Each level's own marker (ordered-ness, style, `w:lvlText` pattern,
+    // `w:lvlJc`), applied to the sub-list at that level once the tree is
+    // built. Sub-lists used to inherit the ordered flag of whichever item
+    // happened to come last and never got a style at all.
+    let mut markers: std::collections::HashMap<u8, LevelMarker> = std::collections::HashMap::new();
 
     let start_index = *i;
 
@@ -1548,6 +1553,9 @@ fn convert_list_group(
                             level.format,
                             crate::docx::NumberFormat::Bullet | crate::docx::NumberFormat::None
                         );
+                        markers
+                            .entry(nr.ilvl)
+                            .or_insert_with(|| LevelMarker::of(level, nr.ilvl));
                         if top_ilvl.is_none_or(|t| nr.ilvl < t) {
                             top_ilvl = Some(nr.ilvl);
                             style = number_format_to_list_style(&level.format)
@@ -1598,9 +1606,77 @@ fn convert_list_group(
 
     // Build nested list structure from flat (ilvl, content) pairs
     let mut list = crate::ir::build_nested_list(is_ordered, &items, 0);
+    let mut next_item = 0;
+    apply_level_markers(&mut list, &items, &mut next_item, &markers, top_ilvl);
     list.start_number = start_number;
     list.style = style;
     Element::List(list)
+}
+
+/// One numbering level's marker, as the IR's `List` describes it.
+struct LevelMarker {
+    ordered: bool,
+    style: Option<ListStyle>,
+    pattern: Option<String>,
+    alignment: Option<ParagraphAlignment>,
+}
+
+impl LevelMarker {
+    fn of(level: &crate::docx::numbering::NumberingLevel, ilvl: u8) -> Self {
+        use crate::docx::NumberFormat as NF;
+        let ordered = !matches!(level.format, NF::Bullet | NF::None);
+        // Only an ordered level's `w:lvlText` is a pattern around a counter;
+        // a bullet level's is its glyph, which `style` already carries. The
+        // plain `%N.` form for this level is what every consumer assumes,
+        // so only a different pattern is reported.
+        let plain = format!("%{}.", u32::from(ilvl) + 1);
+        let pattern = (ordered && !level.level_text.is_empty() && level.level_text != plain)
+            .then(|| level.level_text.clone());
+        let alignment = level.justification.as_ref().and_then(|jc| match jc {
+            crate::docx::Justification::Center => Some(ParagraphAlignment::Center),
+            crate::docx::Justification::Right => Some(ParagraphAlignment::Right),
+            _ => None,
+        });
+        Self {
+            ordered,
+            style: number_format_to_list_style(&level.format)
+                .map(|s| bullet_glyph_style(s, &level.level_text)),
+            pattern,
+            alignment,
+        }
+    }
+}
+
+/// Give every list in the tree built from `items` the marker of the
+/// numbering level its items come from. The tree holds `items` in
+/// pre-order, so a running index finds each sub-list's first item and, from
+/// it, the level. The top list keeps the style and start its caller
+/// resolved; only its pattern, alignment and ordered-ness are set here.
+fn apply_level_markers(
+    list: &mut List,
+    items: &[(u8, Vec<InlineContent>)],
+    next_item: &mut usize,
+    markers: &std::collections::HashMap<u8, LevelMarker>,
+    // `Some(top level)` for the top list; `None` for a sub-list, whose
+    // level is its first item's.
+    top_ilvl: Option<u8>,
+) {
+    let is_top = top_ilvl.is_some();
+    let ilvl = top_ilvl.or_else(|| items.get(*next_item).map(|(l, _)| *l));
+    if let Some(m) = ilvl.and_then(|l| markers.get(&l)) {
+        list.ordered = m.ordered;
+        list.marker_pattern = m.pattern.clone();
+        list.marker_alignment = m.alignment.clone();
+        if !is_top {
+            list.style = m.style.clone();
+        }
+    }
+    for item in &mut list.items {
+        *next_item += 1;
+        if let Some(nested) = item.nested.as_mut() {
+            apply_level_markers(nested, items, next_item, markers, None);
+        }
+    }
 }
 
 /// Refine a bullet level's style by the glyph its `w:lvlText` draws: the

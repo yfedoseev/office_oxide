@@ -1334,6 +1334,69 @@ fn test_numbering_level_indent_applies_to_a_numbered_heading() {
     assert_eq!(heading(1).indent_left_twips, Some(100));
 }
 
+/// `w:lvlText` (the marker pattern around the counter) and `w:lvlJc` were
+/// parsed and never read: `a)`, `(1)` and `1.1.` all became `1.`, a
+/// sub-list took the ordered flag of whichever item came last, and the
+/// writer always wrote `%N.` with no `w:lvlJc`.
+#[test]
+fn test_numbering_marker_pattern_and_alignment_reach_the_ir_renderers_and_writer() {
+    let numbering = r#"
+      <w:abstractNum w:abstractNumId="0">
+        <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/>
+          <w:lvlText w:val="%1)"/><w:lvlJc w:val="right"/></w:lvl>
+        <w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/>
+          <w:lvlText w:val="%1.%2."/><w:lvlJc w:val="left"/></w:lvl>
+        <w:lvl w:ilvl="2"><w:start w:val="1"/><w:numFmt w:val="bullet"/>
+          <w:lvlText w:val="&#9642;"/></w:lvl>
+      </w:abstractNum>
+      <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#;
+    let para = |ilvl: u8, text: &str| {
+        format!(
+            r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+        )
+    };
+    let body = [
+        para(0, "one"),
+        para(1, "one-a"),
+        para(2, "dot"),
+        para(0, "two"),
+    ]
+    .concat();
+    let bytes = Docx::new(&body).numbering(numbering).bytes();
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+
+    let check = |ir: &DocumentIR| {
+        let top = match first(ir) {
+            Element::List(l) => l,
+            other => panic!("not a list: {other:?}"),
+        };
+        assert!(top.ordered);
+        assert_eq!(top.marker_pattern.as_deref(), Some("%1)"));
+        assert_eq!(top.marker_alignment, Some(ParagraphAlignment::Right));
+        let sub = top.items[0].nested.as_ref().expect("level 1");
+        assert!(sub.ordered);
+        assert_eq!(sub.marker_pattern.as_deref(), Some("%1.%2."));
+        assert_eq!(sub.marker_alignment, None);
+        let dots = sub.items[0].nested.as_ref().expect("level 2");
+        assert!(!dots.ordered, "a bullet level under a numbered one is a bullet list");
+        assert_eq!(dots.style, Some(ListStyle::Square));
+        assert_eq!(dots.marker_pattern, None);
+    };
+    let ir = doc.to_ir();
+    check(&ir);
+
+    // CommonMark has `1)`; both markdown pipelines use it, and agree.
+    let direct = doc.to_markdown();
+    assert!(direct.contains("1) one") && direct.contains("2) two"), "{direct}");
+    assert_eq!(ir.to_markdown().trim_end(), direct.trim_end());
+
+    // The writer keeps the pattern and the alignment.
+    let again = Document::from_reader(Cursor::new(docx_bytes(&ir)), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    check(&again);
+}
+
 #[test]
 fn test_num_id_zero_is_not_a_list() {
     // `<w:numId w:val="0"/>` explicitly removes numbering. Treating it as a

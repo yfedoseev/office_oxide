@@ -931,7 +931,11 @@ fn render_list_markdown(list: &List, indent: usize) -> String {
             .collect::<Vec<_>>()
             .join(" ");
         let marker = if list.ordered {
-            format!("{}. ", start.saturating_add(u32::try_from(i).unwrap_or(u32::MAX)))
+            format!(
+                "{}{} ",
+                start.saturating_add(u32::try_from(i).unwrap_or(u32::MAX)),
+                list.ordered_delimiter()
+            )
         } else {
             "- ".to_string()
         };

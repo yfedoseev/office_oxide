@@ -431,6 +431,10 @@ struct DocxRichList {
     items: Vec<Vec<DocxElement>>,
     start_number: Option<u32>,
     style: Option<ListStyle>,
+    /// `w:lvlText` for an ordered level whose marker is not plain `%N.`.
+    marker_pattern: Option<String>,
+    /// `w:lvlJc`.
+    marker_alignment: Option<ParagraphAlignment>,
     level: u8,
     num_id: u32,
 }
@@ -1663,8 +1667,8 @@ impl DocxWriter {
         // CT_Numbering is `numPicBullet*, abstractNum*, num*`: every abstract
         // definition must precede every instance, so these run as two passes
         // rather than one pair per list.
-        write_abstract_num(&mut w, 0, &[(0, "bullet", "\u{2022}".to_string())]);
-        write_abstract_num(&mut w, 1, &[(0, "decimal", "%1.".to_string())]);
+        write_abstract_num(&mut w, 0, &[(0, "bullet", "\u{2022}".to_string(), None)]);
+        write_abstract_num(&mut w, 1, &[(0, "decimal", "%1.".to_string(), None)]);
 
         // One logical list's recursive nesting levels now share a single
         // `numId`, so group by `num_id` here rather than
@@ -1682,12 +1686,24 @@ impl DocxWriter {
 
         for &num_id in &num_ids {
             let abstract_id = num_id - 3 + 2;
-            let mut levels: Vec<(u8, &str, String)> = Vec::new();
+            let mut levels: Vec<AbstractLevel> = Vec::new();
             for rl in &rich_lists {
                 if rl.num_id == num_id && !levels.iter().any(|(l, ..)| *l == rl.level) {
-                    let (fmt, lvl_text) =
+                    let (fmt, mut lvl_text) =
                         list_style_to_fmt(rl.style.as_ref(), rl.ordered, rl.level);
-                    levels.push((rl.level, fmt, lvl_text));
+                    if let Some(pattern) = rl
+                        .marker_pattern
+                        .as_deref()
+                        .filter(|p| rl.ordered && pattern_fits_level(p, rl.level))
+                    {
+                        lvl_text = pattern.to_string();
+                    }
+                    let jc = rl.marker_alignment.as_ref().map(|a| match a {
+                        ParagraphAlignment::Center => "center",
+                        ParagraphAlignment::Right => "right",
+                        _ => "left",
+                    });
+                    levels.push((rl.level, fmt, lvl_text, jc));
                 }
             }
             write_abstract_num(&mut w, abstract_id, &levels);
@@ -2070,6 +2086,8 @@ fn convert_ir_list_at(
         items,
         start_number: (start_number != 1).then_some(start_number),
         style: list.style.clone(),
+        marker_pattern: list.marker_pattern.clone(),
+        marker_alignment: list.marker_alignment.clone(),
         level,
         num_id,
     })
@@ -4590,17 +4608,30 @@ fn write_character_style(w: &mut Writer<Vec<u8>>, style_id: &str, name: &str) {
 /// paragraph referencing an `ilvl` this abstractNum never defines falls
 /// back to Word's own default numbering behavior instead of the level's
 /// real ordered/bullet style.
-fn write_abstract_num(
-    w: &mut Writer<Vec<u8>>,
-    abstract_num_id: u32,
-    levels: &[(u8, &str, String)],
-) {
+/// One `w:lvl`: `(ilvl, numFmt, lvlText, lvlJc)`.
+type AbstractLevel = (u8, &'static str, String, Option<&'static str>);
+
+/// Whether every `%N` placeholder in a `w:lvlText` pattern names a level at
+/// or above `ilvl` (0-based) — a counter that exists when the pattern is
+/// drawn. A sub-list written at a different depth than it was read at could
+/// otherwise point at a level the list never uses.
+fn pattern_fits_level(pattern: &str, ilvl: u8) -> bool {
+    let bytes = pattern.as_bytes();
+    bytes.iter().enumerate().all(|(i, &b)| {
+        b != b'%'
+            || bytes
+                .get(i + 1)
+                .is_some_and(|d| d.is_ascii_digit() && (1..=ilvl + 1).contains(&(d - b'0')))
+    })
+}
+
+fn write_abstract_num(w: &mut Writer<Vec<u8>>, abstract_num_id: u32, levels: &[AbstractLevel]) {
     let mut elem = BytesStart::new("w:abstractNum");
     elem.push_attribute(("w:abstractNumId", abstract_num_id.to_string().as_str()));
     w.write_event(Event::Start(elem))
         .expect("write abstractNum start");
 
-    for (ilvl, num_fmt, lvl_text) in levels {
+    for (ilvl, num_fmt, lvl_text, lvl_jc) in levels {
         let mut lvl = BytesStart::new("w:lvl");
         lvl.push_attribute(("w:ilvl", ilvl.to_string().as_str()));
         w.write_event(Event::Start(lvl)).expect("write lvl start");
@@ -4610,8 +4641,15 @@ fn write_abstract_num(
         w.write_event(Event::Empty(fmt)).expect("write numFmt");
 
         let mut text = BytesStart::new("w:lvlText");
-        text.push_attribute(("w:val", lvl_text.as_str()));
+        text.push_attribute(("w:val", crate::core::xml::sanitize_xml_text(lvl_text).as_ref()));
         w.write_event(Event::Empty(text)).expect("write lvlText");
+
+        // CT_Lvl puts `lvlJc` right after `lvlText`.
+        if let Some(jc) = lvl_jc {
+            let mut e = BytesStart::new("w:lvlJc");
+            e.push_attribute(("w:val", *jc));
+            w.write_event(Event::Empty(e)).expect("write lvlJc");
+        }
 
         w.write_event(Event::End(BytesEnd::new("w:lvl")))
             .expect("write lvl end");
