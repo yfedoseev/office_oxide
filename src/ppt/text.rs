@@ -342,6 +342,44 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
     Some(slides)
 }
 
+/// Whether the deck carries a VBA project: a `VBAInfoAtom` with
+/// `fHasMacros` set and a non-zero `persistIdRef` in the current
+/// `DocumentContainer` ([MS-PPT] `VBAInfoAtom`). A `.ppt` keeps its project
+/// as a compressed storage inside the "PowerPoint Document" stream, not as
+/// a CFB root storage the way `.xls` (`_VBA_PROJECT_CUR`) and `.doc`
+/// (`Macros`) do.
+pub fn has_vba_project(stream: &[u8], current_user: Option<&[u8]>) -> bool {
+    let doc_children = persist::build(stream, current_user)
+        .and_then(|dir| dir.resolve(dir.doc_persist_id))
+        .and_then(|offset| bounded_container_children(stream, offset, RT_DOCUMENT));
+    let scope = doc_children.as_deref().unwrap_or(stream);
+    find_record_any_instance(scope, RT_VBA_INFO_ATOM, 0).is_some_and(|atom| {
+        atom.len() >= 8
+            && u32::from_le_bytes([atom[0], atom[1], atom[2], atom[3]]) != 0
+            && u32::from_le_bytes([atom[4], atom[5], atom[6], atom[7]]) == 1
+    })
+}
+
+/// Bounded recursive search for the first record of `rec_type`, whatever
+/// its instance, returning its body.
+fn find_record_any_instance(data: &[u8], rec_type: u16, depth: usize) -> Option<Vec<u8>> {
+    if depth > MAX_SHAPE_DEPTH {
+        return None;
+    }
+    for rec in RecordIter::new(data) {
+        let Ok(rec) = rec else { break };
+        if rec.header.rec_type == rec_type {
+            return Some(rec.data);
+        }
+        if rec.header.is_container() {
+            if let Some(found) = find_record_any_instance(&rec.data, rec_type, depth + 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 /// The header/footer text a slides' `HeadersFootersContainer` actually
 /// shows: the footer when `fHasFooter` is set, the user date when both
 /// `fHasDate` and `fHasUserDate` are ([MS-PPT] `HeadersFootersAtom`).

@@ -570,8 +570,9 @@ pub struct Metadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// `true` when the source document carries a macro/VBA project — an
-    /// OOXML part reached via a `vbaProject` relationship, or a legacy
-    /// CFB file's top-level `_VBA_PROJECT` storage. A cheap presence-only
+    /// OOXML part reached via a `vbaProject` relationship, or a
+    /// legacy file's VBA project (a `.doc`'s `Macros/VBA` storage, a
+    /// `.ppt`'s `VBAInfoAtom`, an `.xls`'s project storage). A cheap presence-only
     /// signal for content-safety use cases; office_oxide never
     /// interprets or executes the macro content itself.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

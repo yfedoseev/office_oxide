@@ -148,6 +148,18 @@ pub struct FibTweaks {
 /// Build a synthetic `.doc`, optionally with subdocuments and FIB tweaks.
 #[allow(dead_code)]
 pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> Vec<u8> {
+    let (word_doc, table) = build_doc_streams(paras, subdocs, tweaks);
+    build_cfb(&word_doc, &table)
+}
+
+/// The `WordDocument` and `0Table` stream bytes of
+/// [`build_doc_full`], for a test that assembles its own container.
+#[allow(dead_code)]
+pub fn build_doc_streams(
+    paras: &[Para],
+    subdocs: &Subdocs,
+    tweaks: FibTweaks,
+) -> (Vec<u8>, Vec<u8>) {
     let n = paras.len();
 
     // Build the main text (UTF-16LE) and the CP range of each paragraph.
@@ -265,7 +277,7 @@ pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> V
     word_doc[text_offset as usize..text_offset as usize + text_bytes.len()]
         .copy_from_slice(&text_bytes);
 
-    build_cfb(&word_doc, &table)
+    (word_doc, table)
 }
 
 /// Open a synthetic `.doc` byte buffer through the public API.
@@ -610,17 +622,39 @@ pub fn cfb_with_stream(name: &str, data: &[u8]) -> Vec<u8> {
     file
 }
 
-/// A minimal CFB v3 container holding the given streams at the root, each
-/// in its own run of consecutive sectors (no mini stream, so streams of
-/// any size are read through the FAT). The root's children form a chain
-/// of right siblings.
+/// A minimal CFB v3 container holding the given streams, each in its own
+/// run of consecutive sectors (no mini stream, so streams of any size are
+/// read through the FAT). A name with `/` places the stream in storages
+/// created along its path (`"Macros/VBA/dir"`). Each storage's children
+/// form a chain of right siblings.
 #[allow(dead_code)]
 pub fn cfb_with_streams(streams: &[(&str, &[u8])]) -> Vec<u8> {
+    // Directory entries: (name, type, parent index, data index).
+    let mut entries: Vec<(String, u8, usize, Option<usize>)> =
+        vec![("Root Entry".to_string(), 5, usize::MAX, None)];
+    for (si, (path, _)) in streams.iter().enumerate() {
+        let parts: Vec<&str> = path.split('/').collect();
+        let mut parent = 0usize;
+        for (k, part) in parts.iter().enumerate() {
+            let is_stream = k + 1 == parts.len();
+            let found = entries
+                .iter()
+                .position(|e| e.2 == parent && e.0 == *part && e.1 == 1);
+            parent = match (found, is_stream) {
+                (Some(i), false) => i,
+                _ => {
+                    let kind = if is_stream { 2 } else { 1 };
+                    entries.push((part.to_string(), kind, parent, is_stream.then_some(si)));
+                    entries.len() - 1
+                },
+            };
+        }
+    }
     let sectors: Vec<usize> = streams
         .iter()
         .map(|(_, d)| d.len().div_ceil(512).max(1))
         .collect();
-    let dir_sectors = (streams.len() + 1).div_ceil(4);
+    let dir_sectors = entries.len().div_ceil(4);
     let data_sectors: usize = sectors.iter().sum();
     let mut fat_sectors = 1;
     while fat_sectors * 128 < dir_sectors + fat_sectors + data_sectors {
@@ -659,25 +693,11 @@ pub fn cfb_with_streams(streams: &[(&str, &[u8])]) -> Vec<u8> {
     for i in 0..fat_sectors {
         fat[dir_sectors + i] = FAT_SECT;
     }
-    // Directory: root (entry 0) → entry 1, each entry's right sibling the next.
-    write_dir_entry(&mut file[512..640], "Root Entry", 5, 1, END_OF_CHAIN, 0);
+    // Stream data, in stream order.
+    let mut starts = Vec::with_capacity(streams.len());
     let mut next = dir_sectors + fat_sectors;
-    for (i, ((name, data), &n)) in streams.iter().zip(&sectors).enumerate() {
-        let right = if i + 1 < streams.len() {
-            (i + 2) as u32
-        } else {
-            NO_ENTRY
-        };
-        let off = 512 + (i + 1) * 128;
-        write_dir_entry_with_sibling(
-            &mut file[off..off + 128],
-            name,
-            2,
-            NO_ENTRY,
-            right,
-            next as u32,
-            data.len() as u32,
-        );
+    for ((_, data), &n) in streams.iter().zip(&sectors) {
+        starts.push(next);
         for k in 0..n {
             fat[next + k] = if k + 1 == n {
                 END_OF_CHAIN
@@ -688,6 +708,34 @@ pub fn cfb_with_streams(streams: &[(&str, &[u8])]) -> Vec<u8> {
         let data_off = 512 + next * 512;
         file[data_off..data_off + data.len()].copy_from_slice(data);
         next += n;
+    }
+    // Directory entries: each storage's first child, siblings chained.
+    for (i, (name, kind, parent, data)) in entries.iter().enumerate() {
+        let child = entries
+            .iter()
+            .position(|e| e.2 == i)
+            .map_or(NO_ENTRY, |c| c as u32);
+        let right = entries
+            .iter()
+            .enumerate()
+            .skip(i + 1)
+            .find(|(_, e)| e.2 == *parent)
+            .map_or(NO_ENTRY, |(j, _)| j as u32);
+        let right = if i == 0 { NO_ENTRY } else { right };
+        let (start, size) = match data {
+            Some(si) => (starts[*si] as u32, streams[*si].1.len() as u32),
+            None => (END_OF_CHAIN, 0),
+        };
+        let off = 512 + i * 128;
+        write_dir_entry_with_sibling(
+            &mut file[off..off + 128],
+            name,
+            *kind,
+            child,
+            right,
+            start,
+            size,
+        );
     }
     for (i, v) in fat.iter().enumerate() {
         let off = 512 + dir_sectors * 512 + i * 4;

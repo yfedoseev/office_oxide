@@ -264,3 +264,26 @@ fn test_word6_picf_metafile_picture_is_extracted() {
         .collect();
     assert_eq!(images, vec![wmf]);
 }
+
+/// Word keeps a document's VBA project in a root `Macros` storage holding
+/// the `VBA` storage ([MS-OVBA] project storage; `_VBA_PROJECT_CUR` is
+/// Excel's name). `has_macros` looked for a root `_VBA_PROJECT` entry,
+/// which Word never writes, so it never fired on a macro-enabled `.doc`.
+#[test]
+fn test_macros_storage_sets_has_macros() {
+    let (wd, table) = common::build_doc_streams(
+        &[para("With macros.")],
+        &Subdocs::default(),
+        FibTweaks::default(),
+    );
+    let with = common::cfb_with_streams(&[
+        ("WordDocument", &wd),
+        ("0Table", &table),
+        ("Macros/VBA/dir", b"compressed dir stream"),
+        ("Macros/PROJECT", b"ID=\"{0}\""),
+    ]);
+    assert!(open_doc(&with).to_ir().metadata.has_macros);
+
+    let without = common::cfb_with_streams(&[("WordDocument", &wd), ("0Table", &table)]);
+    assert!(!open_doc(&without).to_ir().metadata.has_macros);
+}

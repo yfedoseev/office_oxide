@@ -29,7 +29,6 @@ impl PptDocument {
     /// Open a PPT file from a reader.
     pub fn from_reader<R: Read + Seek>(reader: R) -> Result<Self> {
         let mut cfb = CfbReader::new(reader)?;
-        let has_macros = cfb.has_root_entry("_VBA_PROJECT");
         let summary_properties = cfb
             .open_stream("\u{5}SummaryInformation")
             .ok()
@@ -70,6 +69,7 @@ impl PptDocument {
             return Err(PptError::Encrypted);
         }
         let slides = extract_slides_text(&stream, current_user.as_deref());
+        let has_macros = super::text::has_vba_project(&stream, current_user.as_deref());
 
         // The Pictures stream (if present) holds the images; decoded lazily.
         let pictures_stream = cfb.open_stream("Pictures").unwrap_or_default();
@@ -83,8 +83,9 @@ impl PptDocument {
         })
     }
 
-    /// `true` when the file carries a `_VBA_PROJECT` storage — a cheap
-    /// macro-presence signal, no VBA interpretation.
+    /// `true` when the deck carries a VBA project (a `VBAInfoAtom` with
+    /// `fHasMacros` set) — a cheap macro-presence signal, no VBA
+    /// interpretation.
     pub fn has_macros(&self) -> bool {
         self.has_macros
     }
@@ -305,11 +306,48 @@ mod tests {
         rec(crate::ppt::records::RT_SLIDE, 0x000F, &textbox)
     }
 
-    /// A legacy deck's macros live in a root-level `_VBA_PROJECT`
-    /// storage — a storage, not a stream, which is what
-    /// `has_root_entry` must see.
+    /// A `.ppt` keeps its VBA project inside the "PowerPoint Document"
+    /// stream, announced by a `VBAInfoAtom` ([MS-PPT]); `has_macros` used
+    /// to look for a root `_VBA_PROJECT` storage, which PowerPoint never
+    /// writes, so it never fired on a real macro-enabled deck. A root
+    /// storage of that name is not a PowerPoint VBA project.
     #[test]
-    fn test_vba_project_storage_sets_has_macros() {
+    fn test_vba_info_atom_sets_has_macros_and_a_root_storage_does_not() {
+        fn rec(rec_type: u16, ver: u16, data: &[u8]) -> Vec<u8> {
+            let mut b = ver.to_le_bytes().to_vec();
+            b.extend_from_slice(&rec_type.to_le_bytes());
+            b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            b.extend_from_slice(data);
+            b
+        }
+        // DocInfoListContainer (0x07D0) > VBAInfoContainer (0x03FF) >
+        // VBAInfoAtom: persistIdRef 5, fHasMacros 1, version 2.
+        let mut atom = 5u32.to_le_bytes().to_vec();
+        atom.extend_from_slice(&1u32.to_le_bytes());
+        atom.extend_from_slice(&2u32.to_le_bytes());
+        let info = rec(0x07D0, 0xF, &rec(0x03FF, 0xF, &rec(0x0400, 0x2, &atom)));
+        let mut stream = rec(crate::ppt::records::RT_DOCUMENT, 0xF, &info);
+        stream.extend(slide_stream("Slide text"));
+        let with_vba = build_cfb(&[
+            Entry {
+                name: "Root Entry",
+                kind: 5,
+                right: NO_ENTRY,
+                child: 1,
+                data: vec![],
+            },
+            Entry {
+                name: "PowerPoint Document",
+                kind: 2,
+                right: NO_ENTRY,
+                child: NO_ENTRY,
+                data: stream,
+            },
+        ]);
+        let doc = PptDocument::from_reader(std::io::Cursor::new(with_vba)).expect("opens");
+        assert!(doc.has_macros());
+        assert!(crate::convert_ppt::ppt_to_ir(&doc).metadata.has_macros);
+
         let bytes = build_cfb(&[
             Entry {
                 name: "Root Entry",
@@ -334,8 +372,7 @@ mod tests {
             },
         ]);
         let doc = PptDocument::from_reader(std::io::Cursor::new(bytes)).expect("opens");
-        assert!(doc.has_macros());
-        assert!(crate::convert_ppt::ppt_to_ir(&doc).metadata.has_macros);
+        assert!(!doc.has_macros());
     }
 
     /// The `Pictures` stream was decoded into images at `open()`, so

@@ -158,6 +158,11 @@ pub const RT_NOTES: u16 = 0x03F0;
 /// `NotesAtom` ([MS-PPT] `NotesAtom`, record type 1009): `slideIdRef`, the
 /// `SlideId` of the slide these notes belong to, at body offset 0.
 pub const RT_NOTES_ATOM: u16 = 0x03F1;
+/// `VBAInfoAtom` ([MS-PPT] `VBAInfoAtom`, record type 1024), inside the
+/// `DocInfoListContainer`'s `VBAInfoContainer`: `persistIdRef` of the
+/// compressed VBA project storage, then `fHasMacros` (1 when it holds a
+/// project), then `version`.
+pub const RT_VBA_INFO_ATOM: u16 = 0x0400;
 
 /// A parsed PPT record header.
 #[derive(Debug, Clone, Copy)]

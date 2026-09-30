@@ -36,8 +36,9 @@ pub struct DocDocument {
     /// were parsed and then never used, so none of this reached any
     /// consumer.
     subdocuments: Vec<SubDocument>,
-    /// `true` when the CFB container has a top-level `_VBA_PROJECT`
-    /// storage — a cheap macro-presence signal, no VBA interpretation.
+    /// `true` when the CFB container has a `Macros/VBA` project storage
+    /// (or, for Word 6.0/95, stored macro text) — a cheap macro-presence
+    /// signal, no VBA interpretation.
     has_macros: bool,
     /// `false` when the piece table has a gap before the FIB's declared
     /// `ccpText` — text in that gap is silently absent from `plain_text()`/
@@ -407,7 +408,7 @@ impl DocDocument {
 
         // The Data stream (if present) holds the pictures; decoded lazily.
         let data_stream = cfb.open_stream("Data").unwrap_or_default();
-        let has_macros = cfb.has_root_entry("_VBA_PROJECT");
+        let has_macros = has_vba_project(&cfb);
         // At minimum, recognize an embedded OLE object exists and
         // surface its identity — before this, `ObjectPool` was never
         // traversed at all, so an embedded Excel workbook, Equation
@@ -465,7 +466,7 @@ impl DocDocument {
                 Some(SubDocument::from_raw(kind, &text))
             })
             .collect();
-        let has_macros = cfb.has_root_entry("_VBA_PROJECT") || fib.ccp[3] != 0;
+        let has_macros = has_vba_project(cfb) || fib.ccp[3] != 0;
         // Word 6.0/95 has no Data stream: its pictures (`PICF` + metafile)
         // sit in the WordDocument stream itself. Scanned now, since the
         // stream is not kept.
@@ -601,7 +602,7 @@ impl DocDocument {
         &self.ole_objects
     }
 
-    /// `true` when the file carries a `_VBA_PROJECT` storage — a cheap
+    /// `true` when the file carries a `Macros/VBA` project storage — a cheap
     /// macro-presence signal, no VBA interpretation.
     pub fn has_macros(&self) -> bool {
         self.has_macros
@@ -686,6 +687,13 @@ impl DocDocument {
     pub fn to_markdown(&self) -> String {
         crate::convert_doc::doc_to_ir(self).to_markdown()
     }
+}
+
+/// Whether the file carries a VBA project: Word keeps it in a root
+/// `Macros` storage holding the `VBA` storage ([MS-OVBA] §2.2.1 project
+/// storage; Excel's equivalent root storage is `_VBA_PROJECT_CUR`).
+fn has_vba_project<R: Read + Seek>(cfb: &CfbReader<R>) -> bool {
+    cfb.find_entry_by_path("Macros/VBA").is_some()
 }
 
 /// The container's own structural warnings plus one line per stream that
