@@ -68,6 +68,33 @@ pub mod ns {
     pub const STRICT_DRAWING: &str = "http://purl.oclc.org/ooxml/drawingml/main";
     /// ISO 29500 Strict variant of `R`.
     pub const STRICT_R: &str = "http://purl.oclc.org/ooxml/officeDocument/relationships";
+
+    // DrawingML sub-vocabularies (ISO/IEC 29500-1:2016 Annex A lists the
+    // Transitional and Strict URI of each schema side by side).
+    /// DrawingML charts (`c:` prefix).
+    pub const CHART: &str = "http://schemas.openxmlformats.org/drawingml/2006/chart";
+    /// ISO 29500 Strict variant of `CHART`.
+    pub const STRICT_CHART: &str = "http://purl.oclc.org/ooxml/drawingml/chart";
+    /// DrawingML WordprocessingML drawing (`wp:` prefix).
+    pub const WORDPROCESSING_DRAWING: &str =
+        "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing";
+    /// ISO 29500 Strict variant of `WORDPROCESSING_DRAWING`.
+    pub const STRICT_WORDPROCESSING_DRAWING: &str =
+        "http://purl.oclc.org/ooxml/drawingml/wordprocessingDrawing";
+    /// DrawingML SpreadsheetML drawing (`xdr:` prefix).
+    pub const SPREADSHEET_DRAWING: &str =
+        "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing";
+    /// ISO 29500 Strict variant of `SPREADSHEET_DRAWING`.
+    pub const STRICT_SPREADSHEET_DRAWING: &str =
+        "http://purl.oclc.org/ooxml/drawingml/spreadsheetDrawing";
+    /// DrawingML pictures (`pic:` prefix).
+    pub const PICTURE: &str = "http://schemas.openxmlformats.org/drawingml/2006/picture";
+    /// ISO 29500 Strict variant of `PICTURE`.
+    pub const STRICT_PICTURE: &str = "http://purl.oclc.org/ooxml/drawingml/picture";
+    /// DrawingML diagrams / SmartArt (`dgm:` prefix).
+    pub const DIAGRAM: &str = "http://schemas.openxmlformats.org/drawingml/2006/diagram";
+    /// ISO 29500 Strict variant of `DIAGRAM`.
+    pub const STRICT_DIAGRAM: &str = "http://purl.oclc.org/ooxml/drawingml/diagram";
 }
 
 /// Return the Strict namespace variant for a Transitional namespace, if one exists.
@@ -79,6 +106,11 @@ fn strict_alternate(ns: &str) -> Option<&'static str> {
         x if x == ns::PML => Some(ns::STRICT_PML),
         x if x == ns::DRAWING_ML => Some(ns::STRICT_DRAWING),
         x if x == ns::R => Some(ns::STRICT_R),
+        x if x == ns::CHART => Some(ns::STRICT_CHART),
+        x if x == ns::WORDPROCESSING_DRAWING => Some(ns::STRICT_WORDPROCESSING_DRAWING),
+        x if x == ns::SPREADSHEET_DRAWING => Some(ns::STRICT_SPREADSHEET_DRAWING),
+        x if x == ns::PICTURE => Some(ns::STRICT_PICTURE),
+        x if x == ns::DIAGRAM => Some(ns::STRICT_DIAGRAM),
         _ => None,
     }
 }
@@ -350,7 +382,8 @@ pub fn check_root_closed(data: &[u8], part: &str, root_local: &str) -> Result<()
     let needle = needle.as_bytes();
 
     // Accept `</root>` and `</prefix:root>`: find the local-name-plus-`>`
-    // and require a `</` at most one short prefix earlier.
+    // and require it to be the *whole* local name — immediately after `</`
+    // or after a `prefix:` — so `</otherroot>` does not pass for `</root>`.
     let found = tail
         .windows(needle.len())
         .enumerate()
@@ -360,8 +393,20 @@ pub fn check_root_closed(data: &[u8], part: &str, root_local: &str) -> Result<()
             match before.iter().rposition(|&b| b == b'<') {
                 Some(lt) => {
                     let between = &before[lt..];
-                    between.starts_with(b"</")
-                        && between[2..].iter().all(|&b| b != b'<' && b != b'>')
+                    let Some(prefix) = between.strip_prefix(b"</") else {
+                        return false;
+                    };
+                    match prefix.split_last() {
+                        None => true,
+                        Some((b':', name)) => {
+                            !name.is_empty()
+                                && name.iter().all(|&b| {
+                                    !b.is_ascii_whitespace()
+                                        && !matches!(b, b'<' | b'>' | b':' | b'/')
+                                })
+                        },
+                        Some(_) => false,
+                    }
                 },
                 None => false,
             }
@@ -909,6 +954,64 @@ mod attr_tests {
             attr_value(r#"Target="https://x/?a=1&amp;b=2""#, "Target"),
             "https://x/?a=1&b=2"
         );
+    }
+}
+
+#[cfg(test)]
+mod root_and_namespace_tests {
+    use super::*;
+    use quick_xml::events::Event;
+
+    #[test]
+    fn test_root_close_must_be_the_whole_local_name() {
+        assert!(check_root_closed(b"<w:document></w:document>", "p", "document").is_ok());
+        assert!(check_root_closed(b"<document></document>", "p", "document").is_ok());
+        // A truncated part whose last end tag merely ends with the root's
+        // local name is still truncated.
+        assert!(check_root_closed(b"<w:document><x></otherdocument>", "p", "document").is_err());
+        assert!(check_root_closed(b"<w:document><x></w:otherdocument>", "p", "document").is_err());
+        assert!(check_root_closed(b"<w:document><x></w :document>", "p", "document").is_err());
+    }
+
+    /// Resolve the namespace of the first start/empty element named
+    /// `local` in `xml`, and test it against `ns` via `matches_start`.
+    fn first_matches(xml: &str, local: &str, ns: &str) -> bool {
+        let mut r = NsReader::from_str(xml);
+        loop {
+            match r.read_resolved_event().unwrap() {
+                (res, Event::Start(e) | Event::Empty(e)) if e.local_name().as_ref() == local => {
+                    return matches_start(&res, &e, ns, local);
+                },
+                (_, Event::Eof) => return false,
+                _ => {},
+            }
+        }
+    }
+
+    /// Every Transitional namespace a parser may check has its ISO/IEC
+    /// 29500 Strict counterpart accepted, and nothing else is.
+    #[test]
+    fn test_strict_namespaces_match_their_transitional_names() {
+        let pairs = [
+            (ns::WML, ns::STRICT_WML),
+            (ns::SML, ns::STRICT_SML),
+            (ns::PML, ns::STRICT_PML),
+            (ns::DRAWING_ML, ns::STRICT_DRAWING),
+            (ns::R, ns::STRICT_R),
+            (ns::CHART, ns::STRICT_CHART),
+            (ns::WORDPROCESSING_DRAWING, ns::STRICT_WORDPROCESSING_DRAWING),
+            (ns::SPREADSHEET_DRAWING, ns::STRICT_SPREADSHEET_DRAWING),
+            (ns::PICTURE, ns::STRICT_PICTURE),
+            (ns::DIAGRAM, ns::STRICT_DIAGRAM),
+        ];
+        for (transitional, strict) in pairs {
+            let doc = format!(r#"<x:e xmlns:x="{strict}"/>"#);
+            assert!(first_matches(&doc, "e", transitional), "{strict}");
+            let doc = format!(r#"<x:e xmlns:x="{transitional}"/>"#);
+            assert!(first_matches(&doc, "e", transitional), "{transitional}");
+        }
+        let other = r#"<x:e xmlns:x="urn:not-ooxml"/>"#;
+        assert!(!first_matches(other, "e", ns::WML));
     }
 }
 

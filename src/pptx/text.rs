@@ -524,6 +524,7 @@ mod tests {
         PptxDocument {
             core_properties: None,
             app_properties: None,
+            package_properties: Default::default(),
             has_macros: false,
             presentation: PresentationInfo {
                 slides: Vec::new(),

@@ -95,6 +95,9 @@ pub struct XlsxDocument {
     /// page/word/character/paragraph counts). `None` when the package
     /// carries no extended-properties part.
     pub app_properties: Option<crate::core::properties::AppProperties>,
+    /// Package-level properties beyond core/app: custom properties
+    /// (`docProps/custom.xml`), digital-signature presence and thumbnail.
+    pub package_properties: crate::core::properties::PackageProperties,
     /// `true` when the workbook part's own relationships include a
     /// `vbaProject` entry — a cheap macro-presence signal, no VBA
     /// interpretation.
@@ -173,12 +176,26 @@ impl XlsxDocument {
         name: &str,
     ) -> std::result::Result<Vec<u8>, crate::core::Error> {
         let data = opc::read_zip_entry(archive, entries, name)?;
-        if name.ends_with(".xml") || name.ends_with(".rels") {
+        if opc::is_xml_part_name(name) {
             if let Some(utf8_data) = crate::core::xml::ensure_utf8(&data) {
                 return Ok(utf8_data);
             }
         }
         Ok(data)
+    }
+
+    /// Every package-level property part, located through `_rels/.rels`.
+    pub(super) fn read_package_metadata<R: Read + Seek>(
+        archive: &mut ZipArchive<R>,
+        entries: &opc::ZipEntryIndex,
+    ) -> crate::core::properties::PackageMetadata {
+        let rels = Self::read_xml_entry(archive, entries, "_rels/.rels")
+            .ok()
+            .and_then(|d| Relationships::parse(&d).ok())
+            .unwrap_or_else(Relationships::empty);
+        crate::core::properties::read_package_metadata(&rels, |path| {
+            Self::read_xml_entry(archive, entries, path).ok()
+        })
     }
 
     /// Fast path: open ZIP directly and read XLSX parts by known paths,
@@ -192,15 +209,13 @@ impl XlsxDocument {
             return xlsb::from_zip(&mut archive, &entries);
         }
 
-        // Document metadata lives at the conventional path in every package
-        // Excel writes; the fast path doesn't consult package relationships,
-        // so read it by name here.
-        let core_properties = Self::read_xml_entry(&mut archive, &entries, "docProps/core.xml")
-            .ok()
-            .and_then(|d| crate::core::properties::CoreProperties::parse(&d).ok());
-        let app_properties = Self::read_xml_entry(&mut archive, &entries, "docProps/app.xml")
-            .ok()
-            .and_then(|d| crate::core::properties::AppProperties::parse(&d).ok());
+        // Document metadata is found through the package relationships
+        // like every other reader does, not at a hard-coded path.
+        let crate::core::properties::PackageMetadata {
+            core: core_properties,
+            app: app_properties,
+            package: package_properties,
+        } = Self::read_package_metadata(&mut archive, &entries);
 
         // Read workbook relationships to resolve sheet targets
         let wb_rels =
@@ -447,6 +462,7 @@ impl XlsxDocument {
             embedded_fonts,
             core_properties,
             app_properties,
+            package_properties,
             has_macros,
             unreadable_sheets,
             styles_data: None,

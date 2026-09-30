@@ -287,27 +287,49 @@ const TRUNCATION_WARNING: &str = "text extraction is incomplete — the source f
      structure disagrees with itself about how much text there is, and the gap could not be \
      safely recovered";
 
-/// The `info` tool's result.
+/// The `info` tool's result: format, file size, every document property
+/// that is set (absent ones are omitted rather than reported as null), the
+/// custom properties, the content flags, the section list, and `warnings`.
 ///
-/// `metadata` is the IR's own serde form, so every document property the
-/// library parses (author, subject, keywords, dates, …) reaches the agent
-/// without this tool having to be kept in step by hand. `warnings` carries
-/// the truncation signal the CLI already surfaced: without it an agent had
-/// no way to learn that an extraction was incomplete.
+/// `warnings` carries the truncation signal the CLI already surfaced:
+/// without it an agent had no way to learn that an extraction was
+/// incomplete.
 fn info_json(ir: &office_oxide::DocumentIR, file_size: Option<u64>) -> Value {
+    let meta = &ir.metadata;
     let mut warnings = Vec::new();
-    if ir.metadata.text_truncated {
+    if meta.text_truncated {
         warnings.push(TRUNCATION_WARNING);
     }
-    json!({
-        "format": format!("{:?}", ir.metadata.format),
-        "title": ir.metadata.title,
+    let mut info = json!({
+        "format": format!("{:?}", meta.format),
         "file_size": file_size,
-        "metadata": ir.metadata,
+        "title": meta.title,
+        "author": meta.author,
+        "subject": meta.subject,
+        "keywords": meta.keywords,
+        "description": meta.description,
+        "created": meta.created,
+        "modified": meta.modified,
+        "last_modified_by": meta.last_modified_by,
+        "revision": meta.revision,
+        "category": meta.category,
+        "content_status": meta.content_status,
+        "language": meta.language,
+        "company": meta.company,
+        "manager": meta.manager,
+        "custom_properties": meta.custom_properties,
+        "has_macros": meta.has_macros,
+        "has_digital_signature": meta.has_digital_signature,
+        "has_thumbnail": meta.thumbnail.is_some(),
+        "text_truncated": meta.text_truncated,
         "warnings": warnings,
         "sections": ir.sections.len(),
         "section_names": ir.sections.iter().map(|s| s.title.clone()).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(map) = info.as_object_mut() {
+        map.retain(|_, v| !v.is_null());
+    }
+    info
 }
 
 fn error_response(id: &Value, code: i64, message: &str) -> Value {
@@ -440,12 +462,12 @@ mod tests {
         };
         let info = info_json(&ir, Some(42));
         assert_eq!(info["file_size"], json!(42));
-        assert_eq!(info["metadata"]["author"], json!("Ada"));
-        assert_eq!(info["metadata"]["subject"], json!("Numbers"));
-        assert_eq!(info["metadata"]["keywords"], json!(["q3"]));
-        assert_eq!(info["metadata"]["created"], json!("2024-01-02T03:04:05Z"));
-        assert_eq!(info["metadata"]["modified"], json!("2024-02-03T04:05:06Z"));
-        assert_eq!(info["metadata"]["text_truncated"], json!(true));
+        assert_eq!(info["author"], json!("Ada"));
+        assert_eq!(info["subject"], json!("Numbers"));
+        assert_eq!(info["keywords"], json!(["q3"]));
+        assert_eq!(info["created"], json!("2024-01-02T03:04:05Z"));
+        assert_eq!(info["modified"], json!("2024-02-03T04:05:06Z"));
+        assert_eq!(info["text_truncated"], json!(true));
         let warnings = info["warnings"].as_array().unwrap();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].as_str().unwrap().contains("incomplete"));
@@ -480,5 +502,39 @@ mod tests {
         assert!(text.contains("empty"), "the error must say why: {text}");
         assert!(std::fs::read(&path).unwrap() == before, "the original was rewritten");
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod info_tests {
+    use super::*;
+
+    #[test]
+    fn test_info_reports_every_set_document_property() {
+        let ir = office_oxide::DocumentIR {
+            metadata: office_oxide::ir::Metadata {
+                format: office_oxide::DocumentFormat::Docx,
+                title: Some("T".into()),
+                author: Some("A".into()),
+                subject: Some("S".into()),
+                keywords: vec!["k1".into(), "k 2".into()],
+                created: Some("2024-01-01T00:00:00Z".into()),
+                modified: Some("2024-02-01T00:00:00Z".into()),
+                last_modified_by: Some("L".into()),
+                company: Some("C".into()),
+                ..Default::default()
+            },
+            sections: Vec::new(),
+            defined_names: Vec::new(),
+        };
+        let v = info_json(&ir, None);
+        assert_eq!(v["author"], "A");
+        assert_eq!(v["subject"], "S");
+        assert_eq!(v["keywords"], json!(["k1", "k 2"]));
+        assert_eq!(v["created"], "2024-01-01T00:00:00Z");
+        assert_eq!(v["modified"], "2024-02-01T00:00:00Z");
+        assert_eq!(v["last_modified_by"], "L");
+        assert_eq!(v["company"], "C");
+        assert!(v.get("manager").is_none(), "absent properties are omitted");
     }
 }

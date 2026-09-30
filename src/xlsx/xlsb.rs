@@ -96,12 +96,11 @@ pub(super) fn from_zip<R: Read + Seek>(
         };
         worksheets.push(parse_sheet(&data, info.name.clone()));
     }
-    let core_properties = XlsxDocument::read_xml_entry(archive, entries, "docProps/core.xml")
-        .ok()
-        .and_then(|d| crate::core::properties::CoreProperties::parse(&d).ok());
-    let app_properties = XlsxDocument::read_xml_entry(archive, entries, "docProps/app.xml")
-        .ok()
-        .and_then(|d| crate::core::properties::AppProperties::parse(&d).ok());
+    let crate::core::properties::PackageMetadata {
+        core: core_properties,
+        app: app_properties,
+        package: package_properties,
+    } = XlsxDocument::read_package_metadata(archive, entries);
     let has_macros = rels.has_vba_project();
     Ok(XlsxDocument {
         workbook: WorkbookInfo {
@@ -117,6 +116,7 @@ pub(super) fn from_zip<R: Read + Seek>(
         embedded_fonts: Vec::new(),
         core_properties,
         app_properties,
+        package_properties,
         has_macros,
         unreadable_sheets: Vec::new(),
         styles_data: None,

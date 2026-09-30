@@ -15,10 +15,12 @@ pub fn run(file: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 /// The `info` report for a parsed document.
 ///
-/// Every document property the IR carries is listed, read off the IR's own
-/// serde form so a property added to `Metadata` shows up here without this
-/// command having to be kept in step by hand. Author, subject, keywords and
-/// the dates were parsed all along but never shown.
+/// Every set document property is listed via [`Metadata::properties`], the
+/// one list the CLI and MCP share, so a property added to `Metadata` is
+/// shown by both. Author, subject, keywords and the dates were parsed all
+/// along but never shown.
+///
+/// [`Metadata::properties`]: office_oxide::ir::Metadata::properties
 fn render(ir: &DocumentIR, file_size: Option<u64>) -> String {
     let mut s = String::new();
     let m = &ir.metadata;
@@ -26,31 +28,20 @@ fn render(ir: &DocumentIR, file_size: Option<u64>) -> String {
     if let Some(size) = file_size {
         let _ = writeln!(s, "Size: {size} bytes");
     }
-    if let Some(ref title) = m.title {
-        let _ = writeln!(s, "Title: {title}");
+    for (label, value) in m.properties() {
+        let _ = writeln!(s, "{label}: {value}");
     }
-    if let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(m) {
-        for (key, value) in fields {
-            // Shown on their own lines, in their own words.
-            if matches!(key.as_str(), "format" | "title" | "has_macros" | "text_truncated") {
-                continue;
-            }
-            let shown = match value {
-                serde_json::Value::String(v) if !v.is_empty() => v,
-                serde_json::Value::Array(items) if !items.is_empty() => items
-                    .iter()
-                    .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                serde_json::Value::Number(n) => n.to_string(),
-                serde_json::Value::Bool(true) => "yes".to_string(),
-                _ => continue,
-            };
-            let _ = writeln!(s, "{}: {shown}", label(&key));
-        }
+    for p in &m.custom_properties {
+        let _ = writeln!(s, "Custom property: {} = {}", p.name, p.value);
     }
     if m.has_macros {
         let _ = writeln!(s, "Macros: yes");
+    }
+    if m.has_digital_signature {
+        let _ = writeln!(s, "Digitally signed: yes");
+    }
+    if m.thumbnail.is_some() {
+        let _ = writeln!(s, "Thumbnail: yes");
     }
     if m.text_truncated {
         let _ = writeln!(
@@ -66,16 +57,6 @@ fn render(ir: &DocumentIR, file_size: Option<u64>) -> String {
         let _ = writeln!(s, "  [{i}] {title} — {} elements", section.elements.len());
     }
     s
-}
-
-/// `last_modified_by` → `Last modified by`.
-fn label(key: &str) -> String {
-    let words = key.replace('_', " ");
-    let mut chars = words.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    }
 }
 
 #[cfg(test)]
