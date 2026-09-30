@@ -4,10 +4,11 @@ use quick_xml::events::Event;
 
 use crate::core::xml;
 
+use super::formatting::TableBorders;
 use super::formatting::{
     ParagraphProperties, RunProperties, parse_paragraph_properties_fast, parse_run_properties_fast,
 };
-use super::table::TableProperties;
+use super::table::{TableCellProperties, TableProperties};
 
 /// Parsed stylesheet from `word/styles.xml`.
 #[derive(Debug, Clone, Default)]
@@ -42,8 +43,26 @@ pub struct Style {
     pub run_properties: Option<RunProperties>,
     /// Paragraph-level overrides for this style.
     pub paragraph_properties: Option<ParagraphProperties>,
-    /// Table-level overrides for this style.
+    /// Table-level overrides for this style (`w:tblPr`).
     pub table_properties: Option<TableProperties>,
+    /// Conditional formats of a table style (`w:tblStylePr`), applied to
+    /// the parts of a table its `w:tblLook` switches on.
+    pub table_conditionals: Vec<TableStyleConditional>,
+}
+
+/// One `w:tblStylePr` (ECMA-376 §17.7.6): formatting a table style applies
+/// to one region of the table.
+#[derive(Debug, Clone)]
+pub struct TableStyleConditional {
+    /// The region (`w:type`): `wholeTable`, `firstRow`, `lastRow`,
+    /// `firstCol`, `lastCol`, `band1Horz`, `band2Horz`, `band1Vert`,
+    /// `band2Vert`, `nwCell`, `neCell`, `swCell` or `seCell`.
+    pub kind: String,
+    /// Cell formatting for the region (`w:tcPr`). The region's run and
+    /// paragraph formatting (`w:rPr`/`w:pPr`, e.g. a bold header row) is
+    /// not read: applying it needs the table context threaded through
+    /// every run renderer, not just `to_ir()`.
+    pub cell_properties: Option<TableCellProperties>,
 }
 
 /// The kind of style.
@@ -324,6 +343,8 @@ fn parse_style(
     let mut based_on = None;
     let mut run_properties = None;
     let mut paragraph_properties = None;
+    let mut table_properties = None;
+    let mut table_conditionals = Vec::new();
 
     loop {
         match reader.read_event()? {
@@ -345,6 +366,15 @@ fn parse_style(
                 },
                 "pPr" => {
                     paragraph_properties = Some(parse_paragraph_properties_fast(reader)?);
+                },
+                "tblPr" => {
+                    table_properties = Some(super::parse_table_properties(reader)?);
+                },
+                "tblStylePr" => {
+                    let kind = xml::optional_attr_str(e, "w:type")?
+                        .map(|v| v.into_owned())
+                        .unwrap_or_default();
+                    table_conditionals.push(parse_table_style_conditional(reader, kind)?);
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
@@ -378,8 +408,66 @@ fn parse_style(
         based_on,
         run_properties,
         paragraph_properties,
-        table_properties: None,
+        table_properties,
+        table_conditionals,
     }))
+}
+
+/// The body of one `w:tblStylePr` (its start already consumed).
+fn parse_table_style_conditional(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    kind: String,
+) -> crate::core::Result<TableStyleConditional> {
+    let mut cond = TableStyleConditional {
+        kind,
+        cell_properties: None,
+    };
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                "tcPr" => cond.cell_properties = Some(super::parse_table_cell_properties(reader)?),
+                _ => xml::skip_element_fast(reader)?,
+            },
+            Event::End(ref e) if e.local_name().as_ref() == "tblStylePr" => break,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(cond)
+}
+
+/// A table style resolved through its `w:basedOn` chain.
+#[derive(Debug, Default)]
+pub(crate) struct ResolvedTableStyle<'a> {
+    /// Borders from the nearest style in the chain that sets them.
+    pub borders: Option<&'a TableBorders>,
+    /// Rows / columns per band.
+    pub row_band_size: Option<u32>,
+    pub col_band_size: Option<u32>,
+    /// Conditional formats by region; a derived style's entry replaces
+    /// its base style's for the same region.
+    pub conditionals: Vec<&'a TableStyleConditional>,
+}
+
+impl StyleSheet {
+    /// Resolve table style `style_id` through its inheritance chain.
+    pub(crate) fn resolve_table_style(&self, style_id: &str) -> ResolvedTableStyle<'_> {
+        let mut out = ResolvedTableStyle::default();
+        for style in self.chain(style_id) {
+            if let Some(tp) = style.table_properties.as_ref() {
+                if tp.borders.is_some() {
+                    out.borders = tp.borders.as_ref();
+                }
+                out.row_band_size = tp.row_band_size.or(out.row_band_size);
+                out.col_band_size = tp.col_band_size.or(out.col_band_size);
+            }
+            for c in &style.table_conditionals {
+                out.conditionals.retain(|prev| prev.kind != c.kind);
+                out.conditionals.push(c);
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]

@@ -1626,6 +1626,38 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
         }
     }
 
+    // The table's style: borders it does not set itself, and the
+    // conditional (header, total, first/last column, banded) shading its
+    // `w:tblLook` switches on.
+    let tp = table.properties.as_ref();
+    let style = tp
+        .and_then(|p| p.style_id.as_deref())
+        .zip(doc.styles.as_ref())
+        .map(|(id, sheet)| sheet.resolve_table_style(id))
+        .unwrap_or_default();
+    let grid_width = starts
+        .iter()
+        .zip(&table.rows)
+        .map(|(s, r)| match (s.last(), r.cells.last()) {
+            (Some(&start), Some(cell)) => start.saturating_add(cell_grid_span(cell) as usize),
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0);
+    let layout = TableStyleLayout {
+        look: tp.and_then(|p| p.look),
+        num_rows,
+        grid_width,
+        row_band: tp
+            .and_then(|p| p.row_band_size)
+            .or(style.row_band_size)
+            .unwrap_or(1) as usize,
+        col_band: tp
+            .and_then(|p| p.col_band_size)
+            .or(style.col_band_size)
+            .unwrap_or(1) as usize,
+    };
+
     let mut ir_rows = Vec::new();
     for (row_idx, row) in table.rows.iter().enumerate() {
         let rp = row.properties.as_ref();
@@ -1682,10 +1714,32 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
                 col_span,
                 row_span,
                 text_align,
+                // Direct cell shading wins over the table style's.
                 background_color: cp
                     .and_then(|p| p.shading.as_ref())
                     .and_then(|sh| sh.fill.as_deref())
-                    .and_then(hex_to_rgb),
+                    .and_then(hex_to_rgb)
+                    .or_else(|| {
+                        let start = starts[row_idx][cell_idx];
+                        let end = start.saturating_add(col_span as usize);
+                        layout
+                            .regions(row_idx, start, end)
+                            .iter()
+                            .rev()
+                            .find_map(|kind| {
+                                style
+                                    .conditionals
+                                    .iter()
+                                    .find(|c| c.kind == *kind)
+                                    .and_then(|c| {
+                                        c.cell_properties
+                                            .as_ref()
+                                            .and_then(|p| p.shading.as_ref())
+                                            .and_then(|sh| sh.fill.as_deref())
+                                            .and_then(hex_to_rgb)
+                                    })
+                            })
+                    }),
                 border: cp
                     .and_then(|p| p.borders.as_deref())
                     .map(table_borders_to_ir),
@@ -1726,11 +1780,13 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
         });
     }
 
-    let tp = table.properties.as_ref();
     Element::Table(Table {
         rows: ir_rows,
         column_widths_twips: table.grid.iter().map(|t| t.0.max(0) as u32).collect(),
-        border: tp.and_then(|p| p.borders.as_ref()).map(table_borders_to_ir),
+        border: tp
+            .and_then(|p| p.borders.as_ref())
+            .or(style.borders)
+            .map(table_borders_to_ir),
         alignment: tp.and_then(|p| p.justification).map(|j| match j {
             crate::docx::Justification::Center => TableAlignment::Center,
             crate::docx::Justification::Right => TableAlignment::Right,
@@ -1747,6 +1803,70 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
         width_twips: tp.and_then(|p| p.width.as_ref()).and_then(dxa_width),
         indent_left_twips: tp.and_then(|p| p.indent).map(|t| t.0),
     })
+}
+
+/// Where a cell sits relative to the regions a table style formats.
+struct TableStyleLayout {
+    /// `None` when the table has no `w:tblLook`: only whole-table
+    /// formatting applies, rather than guessing which regions are on.
+    look: Option<crate::docx::table::TableLook>,
+    num_rows: usize,
+    grid_width: usize,
+    row_band: usize,
+    col_band: usize,
+}
+
+impl TableStyleLayout {
+    /// The `w:tblStylePr` regions covering the cell at `row` spanning grid
+    /// columns `start..end`, in increasing precedence (ECMA-376 §17.7.6:
+    /// whole table, banded columns, banded rows, first/last column,
+    /// first/last row, corner cells).
+    fn regions(&self, row: usize, start: usize, end: usize) -> Vec<&'static str> {
+        let mut out = vec!["wholeTable"];
+        let Some(look) = self.look else {
+            return out;
+        };
+        let first_row = look.first_row && row == 0;
+        let last_row = look.last_row && row + 1 == self.num_rows;
+        let first_col = look.first_column && start == 0;
+        let last_col = look.last_column && end >= self.grid_width;
+        if !look.no_v_band && !first_col && !last_col {
+            let data_col = start.saturating_sub(usize::from(look.first_column));
+            out.push(if (data_col / self.col_band.max(1)) % 2 == 0 {
+                "band1Vert"
+            } else {
+                "band2Vert"
+            });
+        }
+        if !look.no_h_band && !first_row && !last_row {
+            let data_row = row.saturating_sub(usize::from(look.first_row));
+            out.push(if (data_row / self.row_band.max(1)) % 2 == 0 {
+                "band1Horz"
+            } else {
+                "band2Horz"
+            });
+        }
+        if first_col {
+            out.push("firstCol");
+        }
+        if last_col {
+            out.push("lastCol");
+        }
+        if first_row {
+            out.push("firstRow");
+        }
+        if last_row {
+            out.push("lastRow");
+        }
+        match (first_row, last_row, first_col, last_col) {
+            (true, _, true, _) => out.push("nwCell"),
+            (true, _, _, true) => out.push("neCell"),
+            (_, true, true, _) => out.push("swCell"),
+            (_, true, _, true) => out.push("seCell"),
+            _ => {},
+        }
+        out
+    }
 }
 
 /// Read a `w:tblW` / `w:tcW` preferred width, but only when it is an

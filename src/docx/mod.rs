@@ -2887,12 +2887,33 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Table> {
     })
 }
 
-fn parse_table_properties(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableProperties> {
+pub(crate) fn parse_table_properties(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> CoreResult<TableProperties> {
     let mut props = TableProperties::default();
+    let band_size = |e: &quick_xml::events::BytesStart| -> Option<u32> {
+        xml::optional_attr_str(e, "w:val")
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| n > 0)
+    };
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
+                "tblLook" => {
+                    props.look = Some(crate::docx::table::TableLook::parse(e));
+                    xml::skip_element_fast(reader)?;
+                },
+                "tblStyleRowBandSize" => {
+                    props.row_band_size = band_size(e);
+                    xml::skip_element_fast(reader)?;
+                },
+                "tblStyleColBandSize" => {
+                    props.col_band_size = band_size(e);
+                    xml::skip_element_fast(reader)?;
+                },
                 "tblW" => {
                     props.width = parse_table_width(e)?;
                     xml::skip_element_fast(reader)?;
@@ -2932,6 +2953,9 @@ fn parse_table_properties(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<T
                 },
             },
             Event::Empty(ref e) => match e.local_name().as_ref() {
+                "tblLook" => props.look = Some(crate::docx::table::TableLook::parse(e)),
+                "tblStyleRowBandSize" => props.row_band_size = band_size(e),
+                "tblStyleColBandSize" => props.col_band_size = band_size(e),
                 "tblInd" => {
                     props.indent = parse_measure_w(e);
                 },
@@ -3117,7 +3141,7 @@ fn parse_table_cell(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<TableCe
     })
 }
 
-fn parse_table_cell_properties(
+pub(crate) fn parse_table_cell_properties(
     reader: &mut quick_xml::Reader<&[u8]>,
 ) -> CoreResult<TableCellProperties> {
     let mut props = TableCellProperties::default();

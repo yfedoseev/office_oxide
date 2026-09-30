@@ -49,6 +49,65 @@ pub struct TableProperties {
     pub indent: Option<Twip>,
     /// Accessibility caption (`w:tblCaption`).
     pub caption: Option<String>,
+    /// Which of the table style's conditional formats apply (`w:tblLook`).
+    pub look: Option<TableLook>,
+    /// Rows per band for banded-row formatting (`w:tblStyleRowBandSize`,
+    /// set in a table style's `w:tblPr`); `None` means 1.
+    pub row_band_size: Option<u32>,
+    /// Columns per band (`w:tblStyleColBandSize`); `None` means 1.
+    pub col_band_size: Option<u32>,
+}
+
+/// `w:tblLook` (ECMA-376 §17.4): which conditional formats of the table's
+/// style are switched on. Each flag is off unless the table says
+/// otherwise.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TableLook {
+    /// Header-row formatting (`firstRow`).
+    pub first_row: bool,
+    /// Total-row formatting (`lastRow`).
+    pub last_row: bool,
+    /// First-column formatting (`firstColumn`).
+    pub first_column: bool,
+    /// Last-column formatting (`lastColumn`).
+    pub last_column: bool,
+    /// Banded rows switched off (`noHBand`).
+    pub no_h_band: bool,
+    /// Banded columns switched off (`noVBand`).
+    pub no_v_band: bool,
+}
+
+impl TableLook {
+    /// `w:tblLook`: the explicit attributes, or the older `w:val` bitmask
+    /// (firstRow 0x0020, lastRow 0x0040, firstColumn 0x0080, lastColumn
+    /// 0x0100, noHBand 0x0200, noVBand 0x0400), which an explicit
+    /// attribute overrides.
+    pub(crate) fn parse(e: &quick_xml::events::BytesStart) -> Self {
+        let mut look = TableLook::default();
+        if let Ok(Some(v)) = crate::core::xml::optional_attr_str(e, "w:val") {
+            if let Ok(bits) = u16::from_str_radix(v.trim(), 16) {
+                look.first_row = bits & 0x0020 != 0;
+                look.last_row = bits & 0x0040 != 0;
+                look.first_column = bits & 0x0080 != 0;
+                look.last_column = bits & 0x0100 != 0;
+                look.no_h_band = bits & 0x0200 != 0;
+                look.no_v_band = bits & 0x0400 != 0;
+            }
+        }
+        for (attr, flag) in [
+            ("w:firstRow", &mut look.first_row),
+            ("w:lastRow", &mut look.last_row),
+            ("w:firstColumn", &mut look.first_column),
+            ("w:lastColumn", &mut look.last_column),
+            ("w:noHBand", &mut look.no_h_band),
+            ("w:noVBand", &mut look.no_v_band),
+        ] {
+            if let Ok(Some(v)) = crate::core::xml::optional_attr_str(e, attr) {
+                *flag = matches!(v.as_ref(), "1" | "true" | "on");
+            }
+        }
+        look
+    }
 }
 
 /// Cell margins from `w:tblCellMar` / `w:tcMar`, in twips.

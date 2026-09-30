@@ -536,6 +536,77 @@ fn test_empty_paragraph_with_only_a_bottom_border_is_still_a_thematic_break() {
 // Table geometry and borders
 // ---------------------------------------------------------------------------
 
+/// A table whose look lives in its table style: `w:style/w:tblPr` (borders)
+/// and `w:tblStylePr` conditional formatting (header-row and banded-row
+/// shading), switched on per table by `w:tblLook`. `Style.table_properties`
+/// was hardcoded `None` and `w:tblStylePr`/`w:tblLook` were never read, so
+/// such tables converted borderless and unshaded.
+#[test]
+fn test_table_style_borders_and_conditional_shading_reach_the_ir() {
+    let row = |t: &str| format!("<w:tr><w:tc><w:p><w:r><w:t>{t}</w:t></w:r></w:p></w:tc></w:tr>");
+    let body = format!(
+        r#"<w:tbl><w:tblPr><w:tblStyle w:val="Banded"/>
+             <w:tblLook w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="1"/></w:tblPr>
+           <w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid>{}{}{}{}
+           <w:tr><w:tc><w:tcPr><w:shd w:val="clear" w:fill="FF0000"/></w:tcPr><w:p><w:r><w:t>own</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+           <w:p/>
+           <w:tbl><w:tblPr><w:tblStyle w:val="Banded"/><w:tblLook w:val="0600"/></w:tblPr>
+           <w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid>{}{}</w:tbl>"#,
+        row("head"),
+        row("one"),
+        row("two"),
+        row("three"),
+        row("plain head"),
+        row("plain one"),
+    );
+    let ir = Docx::new(&body)
+        .styles(
+            r#"<w:style w:type="table" w:styleId="Base"><w:name w:val="Base"/>
+                 <w:tblPr><w:tblBorders><w:top w:val="single" w:sz="4" w:color="000000"/>
+                   <w:insideH w:val="single" w:sz="4" w:color="000000"/></w:tblBorders></w:tblPr></w:style>
+               <w:style w:type="table" w:styleId="Banded"><w:name w:val="Banded"/><w:basedOn w:val="Base"/>
+                 <w:tblStylePr w:type="firstRow"><w:rPr><w:b/></w:rPr>
+                   <w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="4472C4"/></w:tcPr></w:tblStylePr>
+                 <w:tblStylePr w:type="band1Horz"><w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="D9E2F3"/></w:tcPr></w:tblStylePr>
+               </w:style>"#,
+        )
+        .ir();
+    let tables: Vec<&Table> = ir.sections[0]
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            Element::Table(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    let fills = |t: &Table| -> Vec<Option<[u8; 3]>> {
+        t.rows.iter().map(|r| r.cells[0].background_color).collect()
+    };
+    assert!(
+        tables[0]
+            .border
+            .as_ref()
+            .is_some_and(|b| b.top.is_some() && b.inside_h.is_some()),
+        "the style's borders (through basedOn) apply: {:?}",
+        tables[0].border
+    );
+    assert_eq!(
+        fills(tables[0]),
+        [
+            Some([0x44, 0x72, 0xC4]),
+            Some([0xD9, 0xE2, 0xF3]),
+            None,
+            Some([0xD9, 0xE2, 0xF3]),
+            Some([0xFF, 0x00, 0x00]),
+        ],
+        "header row, banded rows, and a cell's own shading winning"
+    );
+    // The older bitmask form: 0x0600 is noHBand + noVBand with no
+    // header/total/column flags, so every conditional is off.
+    assert_eq!(fills(tables[1]), [None, None]);
+    assert!(tables[1].border.is_some());
+}
+
 /// `w:trHeight/@w:hRule` (ECMA-376 §17.18) was parsed and read by
 /// nothing, and the writer omitted it — the default is `atLeast`, so an
 /// exact-height row (forms, labels) came back as a minimum height.
