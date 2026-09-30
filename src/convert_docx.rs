@@ -1910,7 +1910,7 @@ impl TableStyleLayout {
         let last_col = look.last_column && end >= self.grid_width;
         if !look.no_v_band && !first_col && !last_col {
             let data_col = start.saturating_sub(usize::from(look.first_column));
-            out.push(if (data_col / self.col_band.max(1)) % 2 == 0 {
+            out.push(if (data_col / self.col_band.max(1)).is_multiple_of(2) {
                 "band1Vert"
             } else {
                 "band2Vert"
@@ -1918,7 +1918,7 @@ impl TableStyleLayout {
         }
         if !look.no_h_band && !first_row && !last_row {
             let data_row = row.saturating_sub(usize::from(look.first_row));
-            out.push(if (data_row / self.row_band.max(1)) % 2 == 0 {
+            out.push(if (data_row / self.row_band.max(1)).is_multiple_of(2) {
                 "band1Horz"
             } else {
                 "band2Horz"

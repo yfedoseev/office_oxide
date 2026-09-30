@@ -183,7 +183,6 @@ impl StyleSheet {
             .and_then(|rp| rp.hidden);
         let chain_hidden = |sid: &str| {
             self.chain(sid)
-                .into_iter()
                 .rev()
                 .find_map(|style| style.run_properties.as_ref().and_then(|rp| rp.hidden))
         };
