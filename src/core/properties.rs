@@ -41,7 +41,7 @@ pub struct CoreProperties {
 impl CoreProperties {
     /// Parse core properties from `docProps/core.xml` bytes.
     pub fn parse(xml_data: &[u8]) -> Result<Self> {
-        let mut reader = xml::make_fast_reader(xml_data);
+        let mut reader = property_reader(xml_data);
         let mut props = CoreProperties::default();
 
         // State: which element are we inside?
@@ -89,6 +89,25 @@ impl CoreProperties {
             }
         }
 
+        for slot in [
+            &mut props.title,
+            &mut props.subject,
+            &mut props.creator,
+            &mut props.keywords,
+            &mut props.description,
+            &mut props.last_modified_by,
+            &mut props.revision,
+            &mut props.created,
+            &mut props.modified,
+            &mut props.category,
+            &mut props.content_status,
+            &mut props.language,
+        ] {
+            *slot = slot
+                .take()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+        }
         Ok(props)
     }
 
@@ -140,6 +159,17 @@ impl CoreProperties {
 
         w.into_inner()
     }
+}
+
+/// A reader for the property parts. Unlike [`xml::make_fast_reader`] it
+/// keeps text whitespace: a value holding an entity reference arrives as
+/// several events, and trimming each one deleted the spaces around the
+/// reference (`AT&amp;T Labs` read as `AT&TLabs`). Values are trimmed
+/// once, whole, after parsing.
+fn property_reader(xml_data: &[u8]) -> quick_xml::Reader<&[u8]> {
+    let mut reader = xml::make_fast_reader(xml_data);
+    reader.config_mut().trim_text(false);
+    reader
 }
 
 fn write_optional_element(w: &mut Writer<Vec<u8>>, tag: &str, value: Option<&str>) {
@@ -366,6 +396,9 @@ pub struct AppProperties {
     pub app_version: Option<String>,
     /// Company or organisation name.
     pub company: Option<String>,
+    /// The author's manager (`<Manager>`).
+    #[serde(default)]
+    pub manager: Option<String>,
     /// Template the document is based on.
     pub template: Option<String>,
     /// Total editing time in minutes.
@@ -393,43 +426,33 @@ pub struct AppProperties {
 impl AppProperties {
     /// Parse app properties from `docProps/app.xml` bytes.
     pub fn parse(xml_data: &[u8]) -> Result<Self> {
-        let mut reader = xml::make_fast_reader(xml_data);
+        let mut reader = property_reader(xml_data);
         let mut props = AppProperties::default();
-        let mut current_tag: Option<String> = None;
+        // The element being read and its text so far. A value arrives as
+        // several events when it holds an entity reference (`AT&amp;T` is
+        // Text, GeneralRef, Text), so fragments accumulate and the value
+        // is stored when the element ends.
+        let mut current: Option<(String, String)> = None;
 
         loop {
             match reader.read_event()? {
                 Event::Start(ref e) => {
-                    let local = e.local_name();
-                    let local_bytes = local.as_ref();
-                    current_tag = Some(local_bytes.to_string());
+                    current = Some((e.local_name().as_ref().to_string(), String::new()));
                 },
                 Event::Text(ref e) => {
-                    let text = crate::core::xml::unescape_text(e)?;
-                    if let Some(ref tag) = current_tag {
-                        match tag.as_str() {
-                            "Application" => props.application = Some(text),
-                            "AppVersion" => props.app_version = Some(text),
-                            "Company" => props.company = Some(text),
-                            "Template" => props.template = Some(text),
-                            "TotalTime" => props.total_time = text.parse().ok(),
-                            "Pages" => props.pages = text.parse().ok(),
-                            "Words" => props.words = text.parse().ok(),
-                            "Characters" => props.characters = text.parse().ok(),
-                            "CharactersWithSpaces" => {
-                                props.characters_with_spaces = text.parse().ok();
-                            },
-                            "Lines" => props.lines = text.parse().ok(),
-                            "Paragraphs" => props.paragraphs = text.parse().ok(),
-                            "Slides" => props.slides = text.parse().ok(),
-                            "Notes" => props.notes = text.parse().ok(),
-                            "HiddenSlides" => props.hidden_slides = text.parse().ok(),
-                            _ => {},
-                        }
+                    if let Some((_, ref mut text)) = current {
+                        text.push_str(&crate::core::xml::unescape_text(e)?);
+                    }
+                },
+                Event::GeneralRef(ref e) => {
+                    if let Some((_, ref mut text)) = current {
+                        text.push_str(&crate::core::xml::resolve_general_ref(e)?);
                     }
                 },
                 Event::End(_) => {
-                    current_tag = None;
+                    if let Some((tag, text)) = current.take() {
+                        props.set(&tag, text);
+                    }
                 },
                 Event::Eof => break,
                 _ => {},
@@ -437,6 +460,32 @@ impl AppProperties {
         }
 
         Ok(props)
+    }
+
+    /// Store the text of the `docProps/app.xml` element `tag`.
+    fn set(&mut self, tag: &str, text: String) {
+        let text_field = |v: String| {
+            let v = v.trim();
+            (!v.is_empty()).then(|| v.to_string())
+        };
+        match tag {
+            "Application" => self.application = text_field(text),
+            "AppVersion" => self.app_version = text_field(text),
+            "Company" => self.company = text_field(text),
+            "Manager" => self.manager = text_field(text),
+            "Template" => self.template = text_field(text),
+            "TotalTime" => self.total_time = text.trim().parse().ok(),
+            "Pages" => self.pages = text.trim().parse().ok(),
+            "Words" => self.words = text.trim().parse().ok(),
+            "Characters" => self.characters = text.trim().parse().ok(),
+            "CharactersWithSpaces" => self.characters_with_spaces = text.trim().parse().ok(),
+            "Lines" => self.lines = text.trim().parse().ok(),
+            "Paragraphs" => self.paragraphs = text.trim().parse().ok(),
+            "Slides" => self.slides = text.trim().parse().ok(),
+            "Notes" => self.notes = text.trim().parse().ok(),
+            "HiddenSlides" => self.hidden_slides = text.trim().parse().ok(),
+            _ => {},
+        }
     }
 
     /// Serialize to `docProps/app.xml` bytes.
@@ -460,6 +509,7 @@ impl AppProperties {
         write_optional_element(&mut w, "Application", self.application.as_deref());
         write_optional_element(&mut w, "AppVersion", self.app_version.as_deref());
         write_optional_element(&mut w, "Company", self.company.as_deref());
+        write_optional_element(&mut w, "Manager", self.manager.as_deref());
         write_optional_element(&mut w, "Template", self.template.as_deref());
         write_optional_u32(&mut w, "TotalTime", self.total_time);
         write_optional_u32(&mut w, "Pages", self.pages);
@@ -602,6 +652,34 @@ mod tests {
         assert_eq!(props.pages, Some(3));
         assert_eq!(props.words, Some(1250));
         assert_eq!(props.lines, Some(62));
+    }
+
+    /// Entity references arrive as their own event; `AT&amp;T` used to
+    /// lose its `&` (and anything after the first fragment).
+    #[test]
+    fn test_app_properties_keep_entity_references() {
+        let xml = br#"<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
+  <Company>AT&amp;T &lt;Labs&gt;</Company>
+  <Manager>Smith &#38; Co</Manager>
+  <HeadingPairs><vt:vector size="2" baseType="variant"><vt:variant><vt:lpstr>Title</vt:lpstr></vt:variant><vt:variant><vt:i4>1</vt:i4></vt:variant></vt:vector></HeadingPairs>
+  <Template>A&amp;B.dotm</Template>
+  <Pages> 3 </Pages>
+</Properties>"#;
+        let props = AppProperties::parse(xml).unwrap();
+        assert_eq!(props.company.as_deref(), Some("AT&T <Labs>"));
+        assert_eq!(props.manager.as_deref(), Some("Smith & Co"));
+        assert_eq!(props.template.as_deref(), Some("A&B.dotm"));
+        assert_eq!(props.pages, Some(3));
+    }
+
+    /// The spaces on either side of an entity reference are part of the
+    /// value; per-fragment trimming deleted them.
+    #[test]
+    fn test_core_properties_keep_spaces_around_entity_references() {
+        let xml = br#"<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>  Smith &amp; Co Report </dc:title><dc:creator>   </dc:creator></cp:coreProperties>"#;
+        let props = CoreProperties::parse(xml).unwrap();
+        assert_eq!(props.title.as_deref(), Some("Smith & Co Report"));
+        assert_eq!(props.creator, None);
     }
 
     #[test]
