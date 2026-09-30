@@ -235,6 +235,9 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
                 .unreadable_parts
                 .iter()
                 .map(|p| format!("skipped unreadable part {p}"))
+                .chain(crate::core::core_properties::package_warnings(Some(
+                    &doc.package_properties,
+                )))
                 .collect(),
             ..crate::core::core_properties::ooxml_metadata_extras(
                 cp,

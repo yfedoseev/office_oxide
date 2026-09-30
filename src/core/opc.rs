@@ -338,6 +338,14 @@ impl<R: Read + Seek> OpcReader<R> {
         })
     }
 
+    /// Parts read so far whose bytes failed their recorded CRC-32. They
+    /// were read as stored; a reader reports them through
+    /// `Metadata::warnings` so possibly damaged content is not presented
+    /// as sound.
+    pub fn crc_mismatched_parts(&self) -> Vec<String> {
+        self.entries.crc_mismatched_parts()
+    }
+
     /// Return the package-level relationships from `_rels/.rels`.
     pub fn package_rels(&self) -> &Relationships {
         &self.package_rels
@@ -472,9 +480,24 @@ pub(crate) struct ZipEntryIndex {
     consumed: std::cell::Cell<u64>,
     /// The package-wide byte budget, fixed when the index is built.
     byte_limit: u64,
+    /// Entries whose bytes failed their recorded CRC-32, in read order.
+    crc_mismatched: std::cell::RefCell<Vec<String>>,
 }
 
 impl ZipEntryIndex {
+    /// Record that `name` failed its CRC-32 check (once per entry).
+    fn record_crc_mismatch(&self, name: &str) {
+        let mut seen = self.crc_mismatched.borrow_mut();
+        if !seen.iter().any(|n| n == name) {
+            seen.push(name.to_string());
+        }
+    }
+
+    /// Entries read so far whose bytes failed their recorded CRC-32.
+    pub(crate) fn crc_mismatched_parts(&self) -> Vec<String> {
+        self.crc_mismatched.borrow().clone()
+    }
+
     pub(crate) fn new<R: Read + Seek>(archive: &ZipArchive<R>) -> Self {
         Self::with_byte_limit(archive, crate::limits::max_package_bytes())
     }
@@ -502,6 +525,7 @@ impl ZipEntryIndex {
                 .collect(),
             consumed: std::cell::Cell::new(0),
             byte_limit,
+            crc_mismatched: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -769,17 +793,20 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
     let mut capped = (&mut file).take(MAX_PART_SIZE + 1);
     match capped.read_to_end(&mut buf) {
         Ok(_) => {},
-        // A CRC-32 mismatch means the bytes are not the ones the producer
-        // wrote. Handing them back would turn a bit-rotted part into
-        // plausible-but-wrong text with no signal anywhere; every zip
-        // reader (Python's zipfile, Java's ZipInputStream) refuses it.
+        // A CRC-32 mismatch means the bytes may not be the ones the
+        // producer wrote. Refusing the part cost real documents their
+        // content (a sheet whose only fault was its checksum vanished), so
+        // the bytes are kept — as 7-Zip does when it extracts with a CRC
+        // warning — provided all of them arrived, and the mismatch is
+        // recorded so every reader reports it (`Metadata::warnings`)
+        // rather than presenting possibly damaged text as sound.
         Err(e)
             if e.kind() == std::io::ErrorKind::InvalidData
-                && e.to_string().contains("checksum") =>
+                && e.to_string().contains("checksum")
+                && buf.len() as u64 == file.size() =>
         {
-            return Err(Error::Zip(zip::result::ZipError::InvalidArchive(
-                format!("CRC-32 mismatch in part '{name}': the part is corrupt").into(),
-            )));
+            log::warn!("opc: part '{name}' failed its CRC-32 check; read as stored");
+            entries.record_crc_mismatch(name);
         },
         Err(e) => return Err(e.into()),
     }
@@ -1395,12 +1422,13 @@ mod tests {
         assert!(text.contains("caf\u{e9}"), "{text}");
     }
 
-    /// A part whose bytes do not match its recorded CRC-32 is corrupt; the
-    /// read fails rather than handing back the damaged bytes as if they
-    /// were the document (every zip reader — Python's zipfile, Java's
-    /// ZipInputStream, the zip crate itself — errors here).
+    /// A part whose bytes do not match its recorded CRC-32 may be damaged.
+    /// Failing the read cost real documents their content (a workbook
+    /// whose sheets all carried a bad CRC went from full text to nothing),
+    /// so the bytes are kept — as 7-Zip does when it extracts with a CRC
+    /// warning — and the mismatch is recorded where a caller can see it.
     #[test]
-    fn test_crc_mismatch_fails_the_read() {
+    fn test_crc_mismatch_is_read_and_recorded() {
         let bytes = raw_zip(
             &[
                 ("[Content_Types].xml", MINIMAL_CT),
@@ -1410,10 +1438,13 @@ mod tests {
             &["word/a.xml"],
         );
         let mut r = open(bytes).expect("the directory is well formed");
-        let err = r
-            .read_part(&PartName::new("/word/a.xml").unwrap())
-            .unwrap_err();
-        assert!(err.to_string().contains("CRC-32"), "{err}");
+        assert!(r.crc_mismatched_parts().is_empty());
+        let data = r.read_part(&PartName::new("/word/a.xml").unwrap()).unwrap();
+        assert_eq!(data, b"<a>text</a>");
+        assert_eq!(r.crc_mismatched_parts(), vec!["word/a.xml".to_string()]);
+        // Reading it again does not record it twice.
+        r.read_part(&PartName::new("/word/a.xml").unwrap()).unwrap();
+        assert_eq!(r.crc_mismatched_parts().len(), 1);
     }
 
     #[test]

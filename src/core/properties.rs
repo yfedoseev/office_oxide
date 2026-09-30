@@ -397,6 +397,10 @@ pub struct PackageProperties {
     pub has_digital_signature: bool,
     /// The package thumbnail, when present.
     pub thumbnail: Option<crate::ir::Image>,
+    /// Zip entries read while opening the package whose bytes failed their
+    /// recorded CRC-32. They were read as stored and may be damaged; every
+    /// converter reports them through `Metadata::warnings`.
+    pub crc_mismatched_parts: Vec<String>,
 }
 
 /// Every package-level property part, located the same way from any
@@ -465,6 +469,7 @@ pub(crate) fn read_package_metadata(
                 .first_by_type(rel_types::DIGITAL_SIGNATURE_ORIGIN)
                 .is_some(),
             thumbnail,
+            crc_mismatched_parts: Vec::new(),
         },
     }
 }

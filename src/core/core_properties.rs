@@ -149,8 +149,29 @@ pub(crate) fn ooxml_metadata_extras(
         custom_properties: package.map(|p| p.custom.clone()).unwrap_or_default(),
         has_digital_signature: package.is_some_and(|p| p.has_digital_signature),
         thumbnail: package.and_then(|p| p.thumbnail.clone()),
+        warnings: package_warnings(package),
         ..Default::default()
     }
+}
+
+/// The package-level integrity warnings every OOXML converter reports: one
+/// line per part whose bytes failed their CRC-32 and were read as stored.
+pub(crate) fn package_warnings(
+    package: Option<&crate::core::properties::PackageProperties>,
+) -> Vec<String> {
+    package
+        .map(|p| {
+            p.crc_mismatched_parts
+                .iter()
+                .map(|name| {
+                    format!(
+                        "part '{name}' failed its CRC-32 check; its content was read as \
+                         stored and may be damaged"
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The `Metadata` fields a legacy converter does not fill itself, from

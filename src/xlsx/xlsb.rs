@@ -96,9 +96,17 @@ pub(super) fn from_zip<R: Read + Seek>(
         let path = rel
             .map(|r| super::resolve_relative_zip_path("xl/workbook.bin", &r.target))
             .unwrap_or_else(|| format!("xl/worksheets/sheet{}.bin", i + 1));
-        let Ok(data) = opc::read_zip_entry(archive, entries, &path) else {
-            unreadable_sheets.push((info.name.clone(), format!("worksheet part {path} not found")));
-            continue;
+        let data = match opc::read_zip_entry(archive, entries, &path) {
+            Ok(data) => data,
+            Err(crate::core::Error::MissingPart(_)) => {
+                unreadable_sheets
+                    .push((info.name.clone(), format!("worksheet part {path} not found")));
+                continue;
+            },
+            Err(e) => {
+                unreadable_sheets.push((info.name.clone(), format!("worksheet part {path}: {e}")));
+                continue;
+            },
         };
         let mut ws = parse_sheet(&data, info.name.clone());
         ws.state = info.state;
@@ -107,8 +115,9 @@ pub(super) fn from_zip<R: Read + Seek>(
     let crate::core::properties::PackageMetadata {
         core: core_properties,
         app: app_properties,
-        package: package_properties,
+        package: mut package_properties,
     } = XlsxDocument::read_package_metadata(archive, entries);
+    package_properties.crc_mismatched_parts = entries.crc_mismatched_parts();
     let has_macros = rels.has_vba_project();
     Ok(XlsxDocument {
         workbook: WorkbookInfo {

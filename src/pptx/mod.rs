@@ -150,7 +150,7 @@ impl PptxDocument {
         )?;
         let core_properties = crate::core::properties::read_core_properties(&mut opc);
         let app_properties = crate::core::properties::read_app_properties(&mut opc);
-        let package_properties = crate::core::properties::read_package_properties(&mut opc);
+        let mut package_properties = crate::core::properties::read_package_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let pres_rels = opc.read_rels_for(&main_part)?;
         let has_macros = pres_rels.has_vba_project();
@@ -470,6 +470,7 @@ impl PptxDocument {
             slides.len(),
             embedded_fonts.len()
         );
+        package_properties.crc_mismatched_parts = opc.crc_mismatched_parts();
         Ok(PptxDocument {
             presentation,
             slides,

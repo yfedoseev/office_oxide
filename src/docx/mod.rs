@@ -209,7 +209,7 @@ impl DocxDocument {
         )?;
         let core_properties = crate::core::properties::read_core_properties(&mut opc);
         let app_properties = crate::core::properties::read_app_properties(&mut opc);
-        let package_properties = crate::core::properties::read_package_properties(&mut opc);
+        let mut package_properties = crate::core::properties::read_package_properties(&mut opc);
         let main_part = opc.main_document_part()?;
         let doc_rels = opc.read_rels_for(&main_part)?;
         let has_macros = doc_rels.has_vba_project();
@@ -547,6 +547,7 @@ impl DocxDocument {
             embedded_fonts.len(),
             images.len()
         );
+        package_properties.crc_mismatched_parts = opc.crc_mismatched_parts();
         Ok(DocxDocument {
             body,
             styles,
@@ -5531,12 +5532,13 @@ mod tests {
         CAPTURED.lock().map(|v| v.clone()).unwrap_or_default()
     }
 
-    /// A header whose bytes fail their CRC-32 is corrupt, but it is not the
-    /// document: the read failed the whole file (a real LibreOffice test
-    /// document with a damaged `word/header1.xml` went from its full body
-    /// text to an error). The header is skipped and reported instead.
+    /// A header whose bytes fail their CRC-32 may be damaged, but it is not
+    /// a reason to fail the document: the read failed the whole file (a
+    /// real LibreOffice test document with a damaged `word/header1.xml`
+    /// went from its full body text to an error). The header is read as
+    /// stored and the mismatch reported.
     #[test]
-    fn test_a_header_failing_its_crc_is_skipped_and_reported() {
+    fn test_a_header_failing_its_crc_is_read_and_reported() {
         use std::io::Write as _;
         let w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
         let r = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
@@ -5579,16 +5581,15 @@ mod tests {
         data[at] = b'X';
 
         let doc = DocxDocument::from_reader(Cursor::new(data)).expect("the body still opens");
-        assert!(doc.plain_text().contains("Body survives"));
-        assert!(doc.headers_footers.is_empty());
-        assert_eq!(doc.unreadable_parts.len(), 1, "{:?}", doc.unreadable_parts);
-        assert!(doc.unreadable_parts[0].contains("/word/header1.xml"));
+        let text = doc.plain_text();
+        assert!(text.contains("Body survives"), "{text}");
+        assert!(text.contains("XEADERTEXT"), "the header is read as stored: {text}");
+        assert!(doc.unreadable_parts.is_empty(), "{:?}", doc.unreadable_parts);
         let meta = crate::convert_docx::docx_to_ir(&doc).metadata;
-        assert!(meta.text_truncated);
         assert!(
             meta.warnings
                 .iter()
-                .any(|w| w.contains("/word/header1.xml")),
+                .any(|w| w.contains("word/header1.xml") && w.contains("CRC-32")),
             "{:?}",
             meta.warnings
         );

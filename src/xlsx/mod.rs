@@ -229,7 +229,7 @@ impl XlsxDocument {
         let crate::core::properties::PackageMetadata {
             core: core_properties,
             app: app_properties,
-            package: package_properties,
+            package: mut package_properties,
         } = Self::read_package_metadata(&mut archive, &entries);
 
         // Read workbook relationships to resolve sheet targets
@@ -318,25 +318,27 @@ impl XlsxDocument {
                 format!("xl/worksheets/sheet{}.xml", idx)
             };
 
-            let ws_data = match Self::read_xml_entry(&mut archive, &entries, &sheet_path) {
-                Ok(data) => data,
-                Err(_) => {
-                    // Try alternate index-based name
+            // The index-based name is a fallback for a part that is *missing*
+            // (a relationship pointing nowhere); a part that exists but
+            // cannot be read is that sheet's error, never a cue to read a
+            // different sheet's cells under this sheet's name.
+            let read = match Self::read_xml_entry(&mut archive, &entries, &sheet_path) {
+                Err(crate::core::Error::MissingPart(_)) => {
                     let idx = bundles.len() + 1;
                     let alt = format!("xl/worksheets/sheet{}.xml", idx);
-                    match Self::read_xml_entry(&mut archive, &entries, &alt) {
-                        Ok(data) => data,
-                        // Recorded, not dropped: a workbook missing a sheet
-                        // must not pass for a complete one.
-                        Err(_) => {
-                            log::warn!("xlsx: sheet {:?}: part {sheet_path} not found", sheet.name);
-                            unreadable_sheets.push((
-                                sheet.name.clone(),
-                                format!("worksheet part {sheet_path} not found"),
-                            ));
-                            continue;
-                        },
-                    }
+                    Self::read_xml_entry(&mut archive, &entries, &alt)
+                        .map_err(|_| format!("worksheet part {sheet_path} not found"))
+                },
+                other => other.map_err(|e| format!("worksheet part {sheet_path}: {e}")),
+            };
+            let ws_data = match read {
+                Ok(data) => data,
+                // Recorded, not dropped: a workbook missing a sheet must
+                // not pass for a complete one.
+                Err(reason) => {
+                    log::warn!("xlsx: sheet {:?}: {reason}", sheet.name);
+                    unreadable_sheets.push((sheet.name.clone(), reason));
+                    continue;
                 },
             };
 
@@ -502,6 +504,7 @@ impl XlsxDocument {
             chart_text.len(),
             embedded_fonts.len()
         );
+        package_properties.crc_mismatched_parts = entries.crc_mismatched_parts();
         Ok(XlsxDocument {
             workbook,
             worksheets,
