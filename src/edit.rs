@@ -282,10 +282,7 @@ mod tests {
                 .replace_text("", "X")
                 .expect_err("an empty search string must be rejected");
             assert!(
-                matches!(
-                    err,
-                    crate::OfficeError::Core(crate::core::Error::InvalidArgument(_))
-                ),
+                matches!(err, crate::OfficeError::Core(crate::core::Error::InvalidArgument(_))),
                 "expected InvalidArgument, got {err:?}"
             );
             // And the document is untouched.

@@ -168,10 +168,18 @@ mod tests {
     /// standard `notifications/cancelled` used to draw a -32601 reply.
     #[test]
     fn test_no_notification_gets_a_reply() {
-        for method in ["notifications/cancelled", "notifications/progress", "bogus", "tools/list"] {
+        for method in [
+            "notifications/cancelled",
+            "notifications/progress",
+            "bogus",
+            "tools/list",
+        ] {
             let note = json!({"jsonrpc": "2.0", "method": method, "params": {}});
             assert!(handle_line(note.clone()).is_none(), "{method} notification was answered");
-            assert!(handle_line(json!([note])).is_none(), "{method} notification answered in a batch");
+            assert!(
+                handle_line(json!([note])).is_none(),
+                "{method} notification answered in a batch"
+            );
         }
     }
 
@@ -188,7 +196,8 @@ mod tests {
     /// notification: it is answered with -32600 and `id: null`.
     #[test]
     fn test_invalid_request_without_id_is_still_answered() {
-        let out = handle_line(json!({"method": "tools/list"})).expect("invalid request is answered");
+        let out =
+            handle_line(json!({"method": "tools/list"})).expect("invalid request is answered");
         assert_eq!(out["error"]["code"], json!(-32600));
         assert_eq!(out["id"], json!(null));
     }

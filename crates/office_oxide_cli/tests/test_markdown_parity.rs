@@ -48,13 +48,15 @@ const PNG: &[u8] = &[
 /// Every synthetic document the parity checks run over, with whether it
 /// carries an image.
 fn corpus(tag: &str) -> Vec<(String, Document, bool)> {
-    let dir = std::env::temp_dir().join(format!(
-        "office_oxide_mdparity_{tag}_{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("office_oxide_mdparity_{tag}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut docs = Vec::new();
-    for fmt in [DocumentFormat::Docx, DocumentFormat::Xlsx, DocumentFormat::Pptx] {
+    for fmt in [
+        DocumentFormat::Docx,
+        DocumentFormat::Xlsx,
+        DocumentFormat::Pptx,
+    ] {
         let path = dir.join(format!("rich.{}", fmt.extension()));
         office_oxide::create::create_from_markdown(RICH_MD, fmt, &path).unwrap();
         docs.push((format!("markdown→{fmt:?}"), Document::open(&path).unwrap(), false));

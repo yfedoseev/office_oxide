@@ -388,10 +388,8 @@ mod save_tests {
     }
 
     fn scratch_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "office_oxide_editable_{tag}_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir()
+            .join(format!("office_oxide_editable_{tag}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -439,10 +437,7 @@ mod save_tests {
         pkg.set_part(PartName::new("/extra.bin").unwrap(), b"payload".to_vec());
         pkg.save(&path).unwrap();
         let reopened = EditablePackage::open(&path).unwrap();
-        assert_eq!(
-            reopened.get_part(&PartName::new("/extra.bin").unwrap()),
-            Some(&b"payload"[..])
-        );
+        assert_eq!(reopened.get_part(&PartName::new("/extra.bin").unwrap()), Some(&b"payload"[..]));
         let entries = std::fs::read_dir(&dir).unwrap().count();
         assert_eq!(entries, 1, "no temporary file may be left behind");
         std::fs::remove_dir_all(&dir).ok();
