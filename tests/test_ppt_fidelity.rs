@@ -440,3 +440,47 @@ fn test_ppt_master_text_survives_a_deck_whose_slides_have_no_text() {
     }
     assert_eq!(doc.to_ir().sections.len(), 3);
 }
+
+/// `TxMasterStyleAtom` ([MS-PPT]) record type.
+const RT_TX_MASTER_STYLE_ATOM: u16 = 0x0FA3;
+
+/// A `TxMasterStyleAtom` for `text_type` (< 5, so no per-level
+/// `indentLevel` field) with one level setting alignment (`PFMasks` bit
+/// 11) and font size (`CFMasks` bit 17).
+fn master_style(text_type: u16, alignment: u16, font_size: i16) -> Vec<u8> {
+    let mut b = 1u16.to_le_bytes().to_vec(); // cLevels
+    b.extend_from_slice(&(1u32 << 11).to_le_bytes());
+    b.extend_from_slice(&alignment.to_le_bytes());
+    b.extend_from_slice(&(1u32 << 17).to_le_bytes());
+    b.extend_from_slice(&font_size.to_le_bytes());
+    atom(RT_TX_MASTER_STYLE_ATOM, text_type, &b)
+}
+
+/// A slide's title with no direct formatting takes its size from the
+/// master's title style. `SlideAtom.masterIdRef` is the master's
+/// `masterId` from the `MasterListWithTextContainer` ([MS-PPT]
+/// `MasterIdRef`), which the builder keeps unrelated to its persist id;
+/// resolving it as a persist id (high bit masked) found no master, so
+/// real decks never inherited master formatting.
+#[test]
+fn test_ppt_master_style_resolves_master_id_through_the_master_list() {
+    let deck = PptBuilder {
+        slides: vec![PptSlide {
+            shapes: text_shape(0, "Styled Title", &[]),
+            master: Some(0),
+            ..Default::default()
+        }],
+        masters: vec![master_style(0, 1, 44)], // Title: centred, 44pt
+        ..Default::default()
+    };
+    let ir = open(deck.build()).unwrap().to_ir();
+    let Element::Heading(h) = &ir.sections[0].elements[0] else {
+        panic!("expected a heading: {:?}", ir.sections[0].elements);
+    };
+    let InlineContent::Text(span) = &h.content[0] else {
+        panic!()
+    };
+    assert_eq!(span.text, "Styled Title");
+    assert_eq!(span.font_size_half_pt, Some(88), "44pt from the master title style");
+    assert_eq!(h.alignment, Some(office_oxide::ir::ParagraphAlignment::Center));
+}
