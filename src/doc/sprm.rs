@@ -26,7 +26,8 @@
 //! `cb < 256`, so a ≥12-column table is what exposes the difference.
 
 use crate::ir::{
-    ParagraphAlignment, TabAlignment, TabLeader, TabStop, UnderlineStyle, VerticalAlign,
+    LineSpacing, ParagraphAlignment, TabAlignment, TabLeader, TabStop, UnderlineStyle,
+    VerticalAlign,
 };
 
 /// A single decoded SPRM: opcode plus its operand bytes.
@@ -241,6 +242,9 @@ pub struct PapProps {
     pub space_before_twips: Option<u32>,
     /// `sprmPDyaAfter` (0xA414), in twips.
     pub space_after_twips: Option<u32>,
+    /// `sprmPDyaLine` (0x6412): line spacing, in the IR's DOCX-shaped
+    /// units (240ths of a line for `Auto`, twips otherwise).
+    pub line_spacing: Option<LineSpacing>,
 }
 
 /// One table cell descriptor (TKBKTAP, 20 bytes) distilled from a row's
@@ -601,6 +605,25 @@ pap_sprm_dispatch! {
             if v <= 0x7BC0 {
                 props.space_after_twips = Some(u32::from(v));
             }
+        }
+    }
+
+    /// `LSPD` (4 bytes, spra 3; [MS-DOC] §2.9.150): `dyaLine` (signed
+    /// 16-bit) then `fMultLinespace` (16-bit). With `fMultLinespace` = 1,
+    /// `dyaLine` is in 240ths of a line (single = 240) — DOCX's `auto`
+    /// rule. With 0, a non-negative `dyaLine` is an at-least height in
+    /// twips and a negative one an exact height of `|dyaLine|` twips.
+    "sprmPDyaLine" @ "2.6.2" => [0x6412] (props, operand) {
+        if operand.len() >= 4 {
+            let dya = i16::from_le_bytes([operand[0], operand[1]]);
+            let mult = u16::from_le_bytes([operand[2], operand[3]]);
+            props.line_spacing = Some(if mult == 1 {
+                LineSpacing::Auto(dya.max(0) as u32)
+            } else if dya < 0 {
+                LineSpacing::Exact(u32::from(dya.unsigned_abs()))
+            } else {
+                LineSpacing::AtLeast(dya as u32)
+            });
         }
     }
 }
@@ -999,15 +1022,41 @@ mod tests {
     /// The opcodes that have actually been confused for the ones we decode
     /// must not be decoded as something else. `0x6412` is line spacing and
     /// occurs 758 times in a 246-file corpus; reading it as an outline
-    /// level marked most of those paragraphs as headings.
+    /// level marked most of those paragraphs as headings. It is decoded now
+    /// — as line spacing, and as nothing else.
     #[test]
     fn test_known_confusable_opcodes_are_not_claimed() {
-        for confusable in [0x6412u16, 0x640A] {
-            assert!(
-                !PAP_SPRM_REGISTRY.iter().any(|(o, _, _)| *o == confusable),
-                "0x{confusable:04X} is not a paragraph property this crate decodes"
-            );
-        }
+        let claims: Vec<&str> = PAP_SPRM_REGISTRY
+            .iter()
+            .filter(|(o, _, _)| *o == 0x6412)
+            .map(|(_, n, _)| *n)
+            .collect();
+        assert_eq!(claims, ["sprmPDyaLine"], "0x6412 is sprmPDyaLine only");
+        assert!(
+            !PAP_SPRM_REGISTRY.iter().any(|(o, _, _)| *o == 0x640A),
+            "0x640A is not a paragraph property this crate decodes"
+        );
+        // And line spacing never leaks into the outline level.
+        let props = extract_pap_props(&[0x12, 0x64, 0x01, 0x00, 0x00, 0x00]);
+        assert_eq!(props.outline_level, None);
+    }
+
+    /// `sprmPDyaLine`'s three `LSPD` forms map onto the IR's line-spacing
+    /// rules.
+    #[test]
+    fn test_sprm_pdya_line_decodes_lspd() {
+        // 1.5 lines: dyaLine = 360, fMultLinespace = 1.
+        let p = extract_pap_props(&[0x12, 0x64, 0x68, 0x01, 0x01, 0x00]);
+        assert_eq!(p.line_spacing, Some(LineSpacing::Auto(360)));
+        // At least 12pt: dyaLine = 240 twips, fMultLinespace = 0.
+        let p = extract_pap_props(&[0x12, 0x64, 0xF0, 0x00, 0x00, 0x00]);
+        assert_eq!(p.line_spacing, Some(LineSpacing::AtLeast(240)));
+        // Exactly 18pt: dyaLine = -360, fMultLinespace = 0.
+        let p = extract_pap_props(&[0x12, 0x64, 0x98, 0xFE, 0x00, 0x00]);
+        assert_eq!(p.line_spacing, Some(LineSpacing::Exact(360)));
+        // Truncated operand: ignored.
+        let p = extract_pap_props(&[0x12, 0x64, 0x98]);
+        assert_eq!(p.line_spacing, None);
     }
 
     /// The registry must actually be reachable from the decoder, so a

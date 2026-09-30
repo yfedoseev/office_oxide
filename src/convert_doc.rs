@@ -309,6 +309,7 @@ impl TableBuilder {
                 first_line_indent_twips: p.props.first_line_indent_twips,
                 space_before_twips: p.props.space_before_twips,
                 space_after_twips: p.props.space_after_twips,
+                line_spacing: p.props.line_spacing.clone(),
                 ..Default::default()
             }));
         }
@@ -630,6 +631,7 @@ fn walk_paragraphs(
                     first_line_indent_twips: p.props.first_line_indent_twips,
                     space_before_twips: p.props.space_before_twips,
                     space_after_twips: p.props.space_after_twips,
+                line_spacing: p.props.line_spacing.clone(),
                     ..Default::default()
                 }));
             } else {
@@ -921,6 +923,7 @@ fn emit_prose(
             first_line_indent_twips: props.first_line_indent_twips,
             space_before_twips: props.space_before_twips,
             space_after_twips: props.space_after_twips,
+            line_spacing: props.line_spacing.clone(),
             ..Default::default()
         }));
     }
@@ -1246,6 +1249,7 @@ mod tests {
             first_line_indent_twips: Some(-360),
             space_before_twips: Some(200),
             space_after_twips: Some(100),
+            line_spacing: Some(crate::ir::LineSpacing::Auto(360)),
             ..Default::default()
         };
         let p = para("A centered, indented paragraph.", props);
@@ -1260,6 +1264,7 @@ mod tests {
         assert_eq!(par.first_line_indent_twips, Some(-360));
         assert_eq!(par.space_before_twips, Some(200));
         assert_eq!(par.space_after_twips, Some(100));
+        assert_eq!(par.line_spacing, Some(crate::ir::LineSpacing::Auto(360)));
     }
 
     /// Medium #4: a soft line break (`0x0B`, which `sanitize_text` maps to
