@@ -1403,7 +1403,9 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>, rels: &Relationships) -> C
     let mut last_row_header = false;
 
     loop {
-        match reader.read_event()? {
+        let event = reader.read_event()?;
+        let is_start = matches!(event, Event::Start(_));
+        match event {
             Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == "tblPr" => {
                 // `firstRow` is how a DrawingML table declares a header row.
                 // Assuming row 0 is always a header labelled data rows as
@@ -1412,8 +1414,12 @@ fn parse_table(reader: &mut quick_xml::Reader<&[u8]>, rels: &Relationships) -> C
                     .is_some_and(|v| v.as_ref() == "1" || v.as_ref() == "true");
                 last_row_header = xml::optional_attr_str(e, "lastRow")?
                     .is_some_and(|v| v.as_ref() == "1" || v.as_ref() == "true");
-                if matches!(reader.read_event()?, Event::Eof) {
-                    break;
+                // Only the Start form has children to skip. Reading one
+                // event unconditionally consumed whatever followed
+                // `<a:tblPr/>` — the first `<a:tr>` when there is no
+                // `<a:tblGrid>`.
+                if is_start {
+                    xml::skip_element_fast(reader)?;
                 }
             },
             Event::Start(ref e) => match e.local_name().as_ref() {
@@ -1673,6 +1679,65 @@ mod tests {
 </p:sld>"#
         )
         .into_bytes()
+    }
+
+    /// Parse a slide whose spTree holds `body`, with the given rels.
+    fn parse_with_rels(body: &str, rels_xml: Option<&[u8]>) -> Slide {
+        let xml = make_slide_xml(body);
+        let rels = match rels_xml {
+            Some(r) => Relationships::parse(r).unwrap(),
+            None => Relationships::empty(),
+        };
+        Slide::parse(
+            &xml,
+            String::new(),
+            &rels,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap()
+    }
+
+    fn only_table(slide: &Slide) -> &Table {
+        match slide.shapes.as_slice() {
+            [
+                Shape::GraphicFrame(GraphicFrame {
+                    content: GraphicContent::Table(t),
+                    ..
+                }),
+            ] => t,
+            other => panic!("expected one table frame, got {other:?}"),
+        }
+    }
+
+    /// `<a:tblPr/>` followed directly by a row (no `<a:tblGrid>`, which a
+    /// damaged or minimal producer can omit): the parser consumed one event
+    /// past `tblPr` unconditionally, which swallowed the first `<a:tr>`.
+    #[test]
+    fn test_table_row_directly_after_tbl_pr_is_kept() {
+        for tbl_pr in [
+            r#"<a:tblPr firstRow="1"/>"#,
+            r#"<a:tblPr firstRow="1"><a:tableStyleId>{X}</a:tableStyleId></a:tblPr>"#,
+        ] {
+            let slide = parse_with_rels(
+                &format!(
+                    r#"<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="2" name="T"/></p:nvGraphicFramePr>
+                    <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table">
+                    <a:tbl>{tbl_pr}<a:tr><a:tc><a:txBody><a:p><a:r><a:t>R1</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
+                      <a:tr><a:tc><a:txBody><a:p><a:r><a:t>R2</a:t></a:r></a:p></a:txBody></a:tc></a:tr>
+                    </a:tbl></a:graphicData></a:graphic></p:graphicFrame>"#
+                ),
+                None,
+            );
+            let t = only_table(&slide);
+            assert!(t.first_row_header);
+            let texts: Vec<String> = t
+                .rows
+                .iter()
+                .map(|r| extract_plain_text_from_body(r.cells[0].text_body.as_ref().unwrap()))
+                .collect();
+            assert_eq!(texts, ["R1", "R2"], "{tbl_pr}");
+        }
     }
 
     #[test]
