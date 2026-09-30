@@ -245,6 +245,7 @@ impl XlsxDocument {
         // Phase 1: gather raw data sequentially (requires &mut archive)
         struct SheetBundle {
             name: String,
+            state: SheetState,
             data: Vec<u8>,
             rels: Relationships,
             images: Vec<crate::xlsx::worksheet::WorksheetPicture>,
@@ -252,9 +253,22 @@ impl XlsxDocument {
             comments: Vec<crate::xlsx::worksheet::SheetComment>,
         }
         let mut bundles = Vec::with_capacity(workbook.sheets.len());
+        let mut unreadable_sheets: Vec<(String, String)> = Vec::new();
         for sheet in &workbook.sheets {
             // Skip sheets with empty r:id (virtual sheets, VBA modules, etc.)
             if sheet.rel_id.is_empty() {
+                continue;
+            }
+
+            // A chartsheet, dialog sheet or macro sheet is not a
+            // worksheet ([ECMA-376] §12.3.2, §12.3.7): it has no cells, and
+            // parsed as one it became an empty sheet under the chart's
+            // name. Its chart's text reaches `chart_text` with every other
+            // chart part's.
+            if wb_rels
+                .get_by_id(&sheet.rel_id)
+                .is_some_and(|rel| rel.rel_type != rel_types::WORKSHEET)
+            {
                 continue;
             }
 
@@ -282,7 +296,16 @@ impl XlsxDocument {
                     let alt = format!("xl/worksheets/sheet{}.xml", idx);
                     match Self::read_xml_entry(&mut archive, &entries, &alt) {
                         Ok(data) => data,
-                        Err(_) => continue,
+                        // Recorded, not dropped: a workbook missing a sheet
+                        // must not pass for a complete one.
+                        Err(_) => {
+                            log::warn!("xlsx: sheet {:?}: part {sheet_path} not found", sheet.name);
+                            unreadable_sheets.push((
+                                sheet.name.clone(),
+                                format!("worksheet part {sheet_path} not found"),
+                            ));
+                            continue;
+                        },
                     }
                 },
             };
@@ -324,6 +347,7 @@ impl XlsxDocument {
 
             bundles.push(SheetBundle {
                 name: sheet.name.clone(),
+                state: sheet.state,
                 data: ws_data,
                 rels: ws_rels,
                 images,
@@ -340,6 +364,7 @@ impl XlsxDocument {
                 let name = b.name.clone();
                 match Worksheet::parse(&b.data, b.name, &b.rels) {
                     Ok(mut ws) => {
+                        ws.state = b.state;
                         ws.images = b.images;
                         ws.text_shapes = b.text_shapes;
                         ws.comments = b.comments;
@@ -353,7 +378,6 @@ impl XlsxDocument {
             },
         )?;
         let mut worksheets = Vec::with_capacity(parsed.len());
-        let mut unreadable_sheets = Vec::new();
         for p in parsed {
             match p {
                 Ok(ws) => worksheets.push(ws),
@@ -2135,5 +2159,94 @@ mod tests {
             "the fabricated #VALUE! error must be cleared: {:?}",
             cell.value
         );
+    }
+
+    /// A workbook listing `(name, rel type, target, state, part body)`
+    /// sheets; a `None` body leaves the target part out of the package.
+    fn workbook_of(sheets: &[(&str, &str, &str, Option<&str>, Option<&str>)]) -> Vec<u8> {
+        let mut rels = String::from(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        );
+        let mut tags = String::new();
+        let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
+        for (i, (name, rel_type, target, state, body)) in sheets.iter().enumerate() {
+            let n = i + 1;
+            rels.push_str(&format!(
+                r#"<Relationship Id="rId{n}" Type="{rel_type}" Target="{target}"/>"#
+            ));
+            let state = state
+                .map(|s| format!(r#" state="{s}""#))
+                .unwrap_or_default();
+            tags.push_str(&format!(r#"<sheet name="{name}" sheetId="{n}" r:id="rId{n}"{state}/>"#));
+            if let Some(body) = body {
+                parts.push((format!("xl/{target}"), body.as_bytes().to_vec()));
+            }
+        }
+        rels.push_str("</Relationships>");
+        let wb = format!(
+            r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{tags}</sheets></workbook>"#
+        );
+        let mut all: Vec<(&str, &[u8])> = vec![
+            ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+            ("xl/workbook.xml", wb.as_bytes()),
+        ];
+        all.extend(parts.iter().map(|(n, d)| (n.as_str(), d.as_slice())));
+        zip_parts(&all)
+    }
+
+    fn one_cell_sheet(text: &str) -> String {
+        format!(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>{text}</t></is></c></row></sheetData></worksheet>"#
+        )
+    }
+
+    const WS: &str = rel_types::WORKSHEET;
+
+    /// A sheet whose part is absent from the package used to vanish with no
+    /// record, and the positional hidden-state lookup then pinned every
+    /// later sheet's `hidden` flag on the wrong sheet.
+    #[test]
+    fn test_a_sheet_with_a_missing_part_is_reported_and_hidden_flags_stay_aligned() {
+        let visible = one_cell_sheet("visible data");
+        let bytes = workbook_of(&[
+            ("Gone", WS, "worksheets/gone.xml", Some("hidden"), None),
+            ("Shown", WS, "worksheets/shown.xml", None, Some(&visible)),
+        ]);
+        let doc = open_bytes(bytes);
+        assert_eq!(doc.worksheets.len(), 1);
+        assert_eq!(doc.worksheets[0].name, "Shown");
+        assert!(
+            doc.unreadable_sheets.iter().any(|(n, _)| n == "Gone"),
+            "{:?}",
+            doc.unreadable_sheets
+        );
+        assert!(doc.plain_text().contains("unreadable sheet \"Gone\""), "{}", doc.plain_text());
+        let ir = crate::convert_xlsx::xlsx_to_ir(&doc);
+        let shown = ir
+            .sections
+            .iter()
+            .find(|s| s.title.as_deref() == Some("Shown"))
+            .expect("Shown section");
+        assert!(!shown.hidden, "Shown is visible; the missing sheet's state must not shift");
+        assert!(ir.metadata.text_truncated);
+    }
+
+    /// A chartsheet's relationship is not a worksheet one; parsed as a
+    /// worksheet it became an empty sheet under the chart's name.
+    #[test]
+    fn test_chartsheets_are_not_parsed_as_worksheets() {
+        let data = one_cell_sheet("numbers");
+        let chart = r#"<chartsheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetPr/></chartsheet>"#;
+        let bytes = workbook_of(&[
+            ("Chart1", rel_types::CHARTSHEET, "chartsheets/sheet1.xml", None, Some(chart)),
+            ("Data", WS, "worksheets/sheet1.xml", Some("hidden"), Some(&data)),
+        ]);
+        let doc = open_bytes(bytes);
+        let names: Vec<_> = doc.worksheets.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, ["Data"]);
+        assert!(doc.unreadable_sheets.is_empty());
+        let ir = crate::convert_xlsx::xlsx_to_ir(&doc);
+        assert_eq!(ir.sections.len(), 1);
+        assert!(ir.sections[0].hidden, "Data's own state, not the chartsheet's");
     }
 }

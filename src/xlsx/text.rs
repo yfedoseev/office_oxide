@@ -636,6 +636,7 @@ mod tests {
             }],
             conditional_formats: Vec::new(),
             data_validations: Vec::new(),
+            state: super::super::SheetState::Visible,
         };
         let doc = XlsxDocument {
             workbook: super::super::WorkbookInfo {
@@ -694,6 +695,7 @@ mod tests {
             text_shapes: Vec::new(),
             conditional_formats: Vec::new(),
             data_validations: Vec::new(),
+            state: super::super::SheetState::Visible,
         };
         let doc = XlsxDocument {
             workbook: super::super::WorkbookInfo {

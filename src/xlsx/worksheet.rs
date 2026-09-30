@@ -42,6 +42,11 @@ pub struct Worksheet {
     /// Data validation rules from `<dataValidations>`/`<dataValidation>`.
     /// Empty when the worksheet defines none.
     pub data_validations: Vec<crate::ir::DataValidation>,
+    /// Visibility from the workbook's `<sheet state>`. Carried on the sheet
+    /// itself: `WorkbookInfo::sheets` also lists sheets that yield no
+    /// worksheet (chartsheets, sheets whose part is missing), so looking
+    /// the state up by position pinned it on the wrong sheet.
+    pub state: super::SheetState,
 }
 
 /// One cell comment from `xl/comments*.xml`.
@@ -445,6 +450,7 @@ impl Worksheet {
         }
 
         Ok(Worksheet {
+            state: super::SheetState::Visible,
             comments: Vec::new(),
             name,
             dimension,

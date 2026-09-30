@@ -68,9 +68,15 @@ impl EditableXlsx {
     /// writers, it names the wrong sheet or none.
     fn worksheet_part(&self, sheet_index: usize) -> Result<PartName> {
         use crate::core::relationships::rel_types;
-        let workbook = match self.package.package_rels().first_by_type(rel_types::OFFICE_DOCUMENT)
+        let workbook = match self
+            .package
+            .package_rels()
+            .first_by_type(rel_types::OFFICE_DOCUMENT)
         {
-            Some(rel) => self.package.package_rels().resolve_target_from_root(&rel.id)?,
+            Some(rel) => self
+                .package
+                .package_rels()
+                .resolve_target_from_root(&rel.id)?,
             None => PartName::new("/xl/workbook.xml")?,
         };
         let wb_xml = self
@@ -595,9 +601,9 @@ mod package_tests {
     use crate::core::opc::OpcWriter;
     use crate::core::relationships::rel_types;
 
-    const CT_WB: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml";
-    const CT_WS: &str =
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml";
+    const CT_WB: &str =
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml";
+    const CT_WS: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml";
     const CT_CS: &str =
         "application/vnd.openxmlformats-officedocument.spreadsheetml.chartsheet+xml";
     const NS: &str = r#"xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships""#;
@@ -612,11 +618,16 @@ mod package_tests {
         for (i, (name, file, rel_type, body)) in sheets.iter().enumerate() {
             let rid = w.add_part_rel(&wb, rel_type, file);
             tags.push_str(&format!(r#"<sheet name="{name}" sheetId="{}" r:id="{rid}"/>"#, i + 1));
-            let ct = if *rel_type == rel_types::WORKSHEET { CT_WS } else { CT_CS };
+            let ct = if *rel_type == rel_types::WORKSHEET {
+                CT_WS
+            } else {
+                CT_CS
+            };
             let part = PartName::new(&format!("/xl/{file}")).unwrap();
             w.add_part(&part, ct, body.as_bytes()).unwrap();
         }
-        let wb_xml = format!(r#"<?xml version="1.0"?><workbook {NS}><sheets>{tags}</sheets></workbook>"#);
+        let wb_xml =
+            format!(r#"<?xml version="1.0"?><workbook {NS}><sheets>{tags}</sheets></workbook>"#);
         w.add_part(&wb, CT_WB, wb_xml.as_bytes()).unwrap();
         w.finish().unwrap().into_inner()
     }
@@ -667,7 +678,10 @@ mod package_tests {
     fn test_set_cell_with_an_invalid_reference_is_an_error() {
         let body = sheet_xml("<sheetData/>");
         let bytes = package(&[("S", "worksheets/sheet1.xml", rel_types::WORKSHEET, &body)]);
-        assert!(matches!(edit(bytes, 0, "12", "x"), Err(crate::xlsx::XlsxError::InvalidCellRef(_))));
+        assert!(matches!(
+            edit(bytes, 0, "12", "x"),
+            Err(crate::xlsx::XlsxError::InvalidCellRef(_))
+        ));
     }
 
     /// The part a sheet lives in is named by the workbook's relationships
@@ -684,7 +698,10 @@ mod package_tests {
         let out = edit(bytes, 0, "A1", "on first").unwrap();
         assert_eq!(
             sheet_texts(out),
-            [("First".into(), "on first".into()), ("Second".into(), String::new())]
+            [
+                ("First".into(), "on first".into()),
+                ("Second".into(), String::new())
+            ]
         );
     }
 
@@ -702,7 +719,9 @@ mod package_tests {
         assert!(edit(bytes.clone(), 2, "A1", "x").is_err(), "no third sheet");
         let out = edit(bytes, 1, "A1", "data").unwrap();
         assert!(
-            sheet_texts(out).iter().any(|(n, t)| n == "Data" && t == "data"),
+            sheet_texts(out)
+                .iter()
+                .any(|(n, t)| n == "Data" && t == "data"),
             "index 1 is the Data worksheet"
         );
     }

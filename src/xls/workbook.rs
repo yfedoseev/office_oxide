@@ -2854,8 +2854,7 @@ mod tests {
         sst.extend_from_slice(b"one"); // only one present
         let mut body = labelsst(0, 0);
         body.extend(labelsst(1, 2));
-        let stream =
-            workbook_stream_with_globals(&[biff_rec(RT_SST, &sst)], &[("S", 0, body)]);
+        let stream = workbook_stream_with_globals(&[biff_rec(RT_SST, &sst)], &[("S", 0, body)]);
         let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
         assert_eq!(doc.sheets[0].display_text(0, 0).as_deref(), Some("one"));
         assert!(doc.truncated(), "lost strings must be flagged");
@@ -2892,10 +2891,8 @@ mod tests {
         sst.extend_from_slice(&1u16.to_le_bytes());
         sst.push(0);
         sst.push(b'x');
-        let stream = workbook_stream_with_globals(
-            &[biff_rec(RT_SST, &sst)],
-            &[("S", 0, labelsst(0, 0))],
-        );
+        let stream =
+            workbook_stream_with_globals(&[biff_rec(RT_SST, &sst)], &[("S", 0, labelsst(0, 0))]);
         let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
         assert!(!doc.truncated());
     }

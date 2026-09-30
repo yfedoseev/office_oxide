@@ -99,10 +99,7 @@ pub struct RecordIter<'a> {
 
 impl<'a> RecordIter<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            pos: 0,
-        }
+        Self { data, pos: 0 }
     }
 
     /// Read the next raw record (without merging CONTINUE).

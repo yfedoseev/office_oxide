@@ -852,8 +852,9 @@ mod tests {
     /// work is bounded, and the omission is stated rather than silent.
     #[test]
     fn test_overlapping_merge_ranges_past_the_work_budget_are_reported() {
-        let rows: Vec<Vec<CellValue>> =
-            (0..2_000).map(|_| vec![CellValue::String("v".into())]).collect();
+        let rows: Vec<Vec<CellValue>> = (0..2_000)
+            .map(|_| vec![CellValue::String("v".into())])
+            .collect();
         let sheet = Sheet {
             name: "S".into(),
             rows,
