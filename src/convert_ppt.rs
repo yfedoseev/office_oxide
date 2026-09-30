@@ -224,6 +224,11 @@ fn table_block_to_element(table: &crate::ppt::TableBlock) -> Element {
 /// `subType`/`type` values per [MS-PPT] 2.10.20, cross-checked against
 /// Apache POI's `ExOleObjAtom.Subtype`/`OleType` enums.
 fn describe_ole_object(info: &crate::ppt::OleObjectInfo) -> String {
+    match info.kind {
+        crate::ppt::OleObjectInfo::KIND_MEDIA_VIDEO => return "Embedded video".to_string(),
+        crate::ppt::OleObjectInfo::KIND_MEDIA_AUDIO => return "Embedded sound".to_string(),
+        _ => {},
+    }
     let subtype = match info.subtype {
         0 => "OLE object",
         1 => "Microsoft Clipart Gallery object",

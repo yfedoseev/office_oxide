@@ -214,3 +214,35 @@ fn test_character_typeface_resolves_through_the_font_collection() {
     assert_eq!(s.len(), 1, "{s:?}");
     assert_eq!(s[0].font_name.as_deref(), Some("Georgia"));
 }
+
+/// A movie shape: its `OfficeArtClientData` names the object through an
+/// `ExObjRefAtom`, and the `ExObjListContainer` holds an
+/// `ExAviMovieContainer` whose `ExMediaAtom` carries that id. It reaches
+/// the IR as a data-less image naming the object, as OLE objects do.
+#[test]
+fn test_media_shape_leaves_a_placeholder() {
+    let media_atom = atom(0x1004, 0, &[&9u32.to_le_bytes()[..], &[0u8; 4]].concat());
+    let movie = container(0x1006, 0, &container(0x1005, 0, &media_atom));
+    let ex_obj_list = container(0x0409, 0, &movie);
+    let obj_ref = atom(0x0BC1, 0, &9u32.to_le_bytes());
+    let mut shapes = text_shape(1, "Watch this", &[]);
+    shapes.extend(container(RT_SHAPE, 0, &container(0xF011, 0, &obj_ref)));
+    let deck = PptBuilder {
+        slides: vec![PptSlide {
+            shapes,
+            ..Default::default()
+        }],
+        doc_children: ex_obj_list,
+        ..Default::default()
+    };
+    let ir = open(deck.build()).unwrap().to_ir();
+    let alts: Vec<_> = ir.sections[0]
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            Element::Image(i) => i.alt_text.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(alts, ["Embedded video"]);
+}

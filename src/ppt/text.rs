@@ -1273,15 +1273,27 @@ fn internal_location_target(location: &str) -> String {
     format!("#{location}")
 }
 
-/// One embedded/linked/ActiveX OLE object's identity, resolved from its
-/// `ExOleObjAtom`.
+/// One external object's identity: an embedded/linked/ActiveX OLE object
+/// resolved from its `ExOleObjAtom`, or a video/sound object resolved from
+/// its `ExMediaAtom` (both share the `ExObjListContainer`'s `exObjId`
+/// space, which a shape's `ExObjRefAtom` names).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OleObjectInfo {
     /// `ExOleObjAtom.subType` — 0-15; see `describe_ole_subtype` in
-    /// `convert_ppt.rs` for the enum meaning.
+    /// `convert_ppt.rs` for the enum meaning. 0 for media.
     pub subtype: u32,
-    /// `ExOleObjAtom.type` — 0 = embedded, 1 = linked, 2 = ActiveX control.
+    /// `ExOleObjAtom.type` — 0 = embedded, 1 = linked, 2 = ActiveX control
+    /// — or [`KIND_MEDIA_VIDEO`](Self::KIND_MEDIA_VIDEO) /
+    /// [`KIND_MEDIA_AUDIO`](Self::KIND_MEDIA_AUDIO) for a media object,
+    /// which has no `ExOleObjAtom`.
     pub kind: u32,
+}
+
+impl OleObjectInfo {
+    /// `kind` of a video object (`ExAviMovieContainer`/`ExMCIMovieContainer`).
+    pub const KIND_MEDIA_VIDEO: u32 = 0x100;
+    /// `kind` of a sound object (MIDI, CD audio, embedded or linked WAV).
+    pub const KIND_MEDIA_AUDIO: u32 = 0x101;
 }
 
 /// Build the document-wide `objID -> OleObjectInfo` table from the
@@ -1308,6 +1320,27 @@ fn collect_ex_ole_objects(data: &[u8], depth: usize, out: &mut HashMap<u32, OleO
                 out.insert(id, info);
             }
             continue; // an ExOleObjAtom's own siblings are never other ExOleObjAtoms
+        }
+        // A video or sound object: identified by the `exObjId` of the
+        // `ExMediaAtom` inside it, and — unlike OLE objects — it left no
+        // trace at all before, so a slide's movie or sound vanished.
+        let media_kind = match rec.header.rec_type {
+            RT_EX_AVI_MOVIE | RT_EX_MCI_MOVIE => Some(OleObjectInfo::KIND_MEDIA_VIDEO),
+            RT_EX_MIDI_AUDIO | RT_EX_CD_AUDIO | RT_EX_WAV_AUDIO_EMBEDDED | RT_EX_WAV_AUDIO_LINK => {
+                Some(OleObjectInfo::KIND_MEDIA_AUDIO)
+            },
+            _ => None,
+        };
+        if let Some(kind) = media_kind {
+            let id =
+                find_record_any_instance(&rec.data, RT_EX_MEDIA_ATOM, depth + 1).and_then(|b| {
+                    b.get(0..4)
+                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                });
+            if let Some(id) = id {
+                out.entry(id).or_insert(OleObjectInfo { subtype: 0, kind });
+            }
+            continue;
         }
         if rec.header.is_container() {
             collect_ex_ole_objects(&rec.data, depth + 1, out);
@@ -1990,6 +2023,26 @@ mod tests {
             1,
             "the shape's own text must still be extracted alongside its OLE ref"
         );
+    }
+
+    /// Video and sound objects ([MS-PPT] `ExAviMovieContainer`,
+    /// `ExWAVAudioEmbeddedContainer`, …) are named by their `ExMediaAtom`'s
+    /// `exObjId`; a shape's `ExObjRefAtom` referencing one resolved to
+    /// nothing, so a slide's movie or sound left no trace.
+    #[test]
+    fn test_media_objects_resolve_like_ole_objects() {
+        let media =
+            |id: u32| make_atom(RT_EX_MEDIA_ATOM, 0, &[&id.to_le_bytes()[..], &[0u8; 4]].concat());
+        let video = make_container(
+            RT_EX_AVI_MOVIE,
+            0,
+            &make_container(0x1005, 0, &media(4)), // ExVideoContainer
+        );
+        let sound = make_container(RT_EX_WAV_AUDIO_EMBEDDED, 0, &media(5));
+        let ex_obj_list = make_container(RT_EXTERNAL_OBJECT_LIST, 0, &[video, sound].concat());
+        let map = parse_ex_ole_objects(&ex_obj_list);
+        assert_eq!(map.get(&4).map(|i| i.kind), Some(OleObjectInfo::KIND_MEDIA_VIDEO));
+        assert_eq!(map.get(&5).map(|i| i.kind), Some(OleObjectInfo::KIND_MEDIA_AUDIO));
     }
 
     /// A shape with no `ExObjRefAtom` at all must not resolve anything,

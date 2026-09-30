@@ -168,6 +168,20 @@ pub const RT_NOTES_ATOM: u16 = 0x03F1;
 /// compressed VBA project storage, then `fHasMacros` (1 when it holds a
 /// project), then `version`.
 pub const RT_VBA_INFO_ATOM: u16 = 0x0400;
+/// `ExMediaAtom` ([MS-PPT] `ExMediaAtom`, record type 4100): `exObjId` at
+/// body offset 0 — the id a shape's `ExObjRefAtom` names.
+pub const RT_EX_MEDIA_ATOM: u16 = 0x1004;
+/// Media containers in the `ExObjListContainer` ([MS-PPT]
+/// `ExAviMovieContainer` 4102, `ExMCIMovieContainer` 4103 — video;
+/// `ExMIDIAudioContainer` 4109, `ExCDAudioContainer` 4110,
+/// `ExWAVAudioEmbeddedContainer` 4111, `ExWAVAudioLinkContainer` 4112 —
+/// audio).
+pub const RT_EX_AVI_MOVIE: u16 = 0x1006;
+pub const RT_EX_MCI_MOVIE: u16 = 0x1007;
+pub const RT_EX_MIDI_AUDIO: u16 = 0x100D;
+pub const RT_EX_CD_AUDIO: u16 = 0x100E;
+pub const RT_EX_WAV_AUDIO_EMBEDDED: u16 = 0x100F;
+pub const RT_EX_WAV_AUDIO_LINK: u16 = 0x1010;
 /// `EnvironmentContainer` ([MS-PPT] `EnvironmentContainer`, record type
 /// 1010), a `DocumentContainer` child holding the font collection.
 pub const RT_ENVIRONMENT: u16 = 0x03F2;
