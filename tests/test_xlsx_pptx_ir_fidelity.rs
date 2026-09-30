@@ -1253,3 +1253,50 @@ fn test_a_duplicate_reference_keeps_the_first_value() {
         .collect();
     assert_eq!(row, ["first", "b"]);
 }
+
+/// Build `sheet` into a document and convert it on another thread, failing
+/// if the conversion does not finish in `secs`.
+fn ir_within(sheet: Sheet<'static>, secs: u64) -> DocumentIR {
+    let doc = Xlsx::new(vec![sheet]).doc();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(doc.to_ir());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(secs))
+        .expect("to_ir must finish in time proportional to the cells present")
+}
+
+const TWO_BY_TWO: &str = r#"<row r="1"><c r="A1" t="inlineStr"><is><t>a</t></is></c><c r="B1" t="inlineStr"><is><t>b</t></is></c></row>
+    <row r="2"><c r="A2" t="inlineStr"><is><t>c</t></is></c><c r="B2" t="inlineStr"><is><t>d</t></is></c></row>"#;
+
+/// `<mergeCell ref="A1:XFD1048576"/>` names the whole legal grid. Expanding
+/// it position by position was ~17 billion set inserts from a 2 KB file.
+#[test]
+fn test_a_full_grid_merge_cell_converts_in_bounded_time() {
+    let mut sheet = Sheet::new("S", TWO_BY_TWO);
+    sheet.extra = r#"<mergeCells count="1"><mergeCell ref="A1:XFD1048576"/></mergeCells>"#;
+    let ir = ir_within(sheet, 20);
+    let t = only_table(&ir, 0);
+    assert_eq!(t.rows[0].cells.len(), 1, "only the anchor survives: {:?}", t.rows[0]);
+    assert_eq!(cell_text(&t.rows[0].cells[0]), "a");
+    assert_eq!(t.rows[0].cells[0].row_span, 2, "spans the stored rows it covers");
+    assert_eq!(t.rows[0].cells[0].col_span, 2, "clipped to the table's width");
+    assert!(t.rows[1].cells.is_empty(), "{:?}", t.rows[1]);
+}
+
+/// Many overlapping whole-grid merges: bounded work, and a visible notice
+/// for the ranges that were not applied.
+#[test]
+fn test_overlapping_merge_cells_past_the_work_budget_are_reported() {
+    let body: String = (1..=2_000)
+        .map(|r| format!(r#"<row r="{r}"><c r="A{r}"><v>1</v></c><c r="B{r}"><v>2</v></c></row>"#))
+        .collect();
+    let merges: String = (0..30_000)
+        .map(|_| r#"<mergeCell ref="A1:B1048576"/>"#)
+        .collect();
+    let extra = format!(r#"<mergeCells>{merges}</mergeCells>"#);
+    let mut sheet = Sheet::new("S", Box::leak(body.into_boxed_str()));
+    sheet.extra = Box::leak(extra.into_boxed_str());
+    let ir = ir_within(sheet, 120);
+    assert!(ir.plain_text().contains("merged cell ranges"), "{}", ir.plain_text());
+}

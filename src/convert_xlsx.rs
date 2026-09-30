@@ -1,5 +1,6 @@
 use crate::format::DocumentFormat;
 use crate::ir::*;
+use crate::xlsx::range_sweep::{CellRange, RangeSweep};
 
 /// Maximum worksheet rows materialised into the IR per sheet. A worksheet is
 /// converted eagerly into an in-memory `Table` (or one `Paragraph` per row),
@@ -66,45 +67,26 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             })
             .collect();
 
-        // `merged_cells` ("A1:C1") was parsed and then never read on this
-        // path: every TableCell got col_span/row_span hardcoded to 1, so
-        // a merged header or label flattened to an ordinary unspanned
-        // grid. Reduce each range to the anchor's span plus
-        // the set of positions it covers, so the anchor carries the real
-        // span and covered positions are excluded from the row entirely
-        // — the same sparse, span-driven model every other format's
-        // TableRow already uses (matches ir_render.rs's table_grid,
-        // which resolves col_span/row_span by walking row.cells and
-        // skipping ahead over covered columns).
-        let mut merge_span: std::collections::HashMap<(u32, u32), (u32, u32)> =
-            std::collections::HashMap::new();
-        let mut merge_covered: std::collections::HashSet<(u32, u32)> =
-            std::collections::HashSet::new();
-        for range in &ws.merged_cells {
-            let Some((start, end)) = range.split_once(':') else {
-                continue;
-            };
-            let (Some(s), Some(e)) =
-                (crate::xlsx::CellRef::parse(start), crate::xlsx::CellRef::parse(end))
-            else {
-                continue;
-            };
-            let (row_lo, row_hi) = (s.row.min(e.row), s.row.max(e.row));
-            let (col_lo, col_hi) = (s.col.min(e.col), s.col.max(e.col));
-            let row_span = row_hi - row_lo + 1;
-            let col_span = col_hi - col_lo + 1;
-            if row_span <= 1 && col_span <= 1 {
-                continue;
-            }
-            merge_span.insert((row_lo, col_lo), (row_span, col_span));
-            for r in row_lo..=row_hi {
-                for c in col_lo..=col_hi {
-                    if (r, c) != (row_lo, col_lo) {
-                        merge_covered.insert((r, c));
-                    }
-                }
-            }
-        }
+        // `merged_cells` ("A1:C1"): the anchor carries the real span and
+        // covered positions are excluded from the row entirely — the same
+        // sparse, span-driven model every other format's TableRow uses
+        // (matches ir_render.rs's table_grid, which resolves spans by
+        // walking row.cells and skipping ahead over covered columns).
+        // Each range is kept whole and consulted per stored row: expanding
+        // it into the set of positions it covers cost its declared area,
+        // and one legal `A1:XFD1048576` was ~17 billion inserts.
+        let mut merges = RangeSweep::new(
+            ws.merged_cells
+                .iter()
+                .filter_map(|range| {
+                    let (start, end) = range.split_once(':')?;
+                    let s = crate::xlsx::CellRef::parse(start)?;
+                    let e = crate::xlsx::CellRef::parse(end)?;
+                    let r = CellRange::from_corners(s.row, s.col, e.row, e.col);
+                    (r.row_span() > 1 || r.col_span() > 1).then_some((r, ()))
+                })
+                .collect(),
+        );
 
         let total_rows = ws.rows.len();
         let mut parsed_rows: Vec<Vec<CellData>> =
@@ -369,36 +351,10 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 // (dense-grid -> sparse, span-driven row) rather than
                 // rebuilding the placement loop above around them.
                 let true_row = row_numbers.get(row_idx).copied().unwrap_or(row_idx as u32);
-                if !merge_span.is_empty() {
-                    for (col, cell) in tcells.iter_mut().enumerate() {
-                        if let Some(&(row_span, col_span)) = merge_span.get(&(true_row, col as u32))
-                        {
-                            // The IR table holds only the rows the sheet
-                            // stores; a merge over sheet rows 1-5 in a
-                            // sheet whose next stored row is 6 spans one
-                            // IR row, not five — five hid the four rows
-                            // that followed. Count the stored rows the
-                            // merge covers.
-                            let last = true_row + row_span - 1;
-                            let covered = row_numbers[row_idx..]
-                                .iter()
-                                .take_while(|&&r| r <= last)
-                                .count()
-                                .max(1) as u32;
-                            cell.row_span = covered;
-                            cell.col_span = col_span;
-                        }
-                    }
-                }
-                let tcells: Vec<TableCell> = if merge_covered.is_empty() {
+                let tcells = if merges.is_empty() {
                     tcells
                 } else {
-                    tcells
-                        .into_iter()
-                        .enumerate()
-                        .filter(|(col, _)| !merge_covered.contains(&(true_row, *col as u32)))
-                        .map(|(_, cell)| cell)
-                        .collect()
+                    apply_merges(&mut merges, tcells, true_row, &row_numbers[row_idx..])
                 };
                 rows.push(TableRow {
                     cells: tcells,
@@ -495,6 +451,17 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 content: vec![InlineContent::Text(TextSpan::plain(format!(
                     "[{omitted} of {total_rows} rows not shown — worksheet truncated at {MAX_ROWS_PER_SHEET} rows]"
                 )))],
+                ..Default::default()
+            }));
+        }
+        // Only a file declaring vast numbers of overlapping merge ranges
+        // spends the sweep's work budget; the ranges past it are not
+        // applied, and that is stated.
+        if merges.exhausted() {
+            combined.push(Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(
+                    "[some merged cell ranges not applied — too many overlapping ranges]",
+                ))],
                 ..Default::default()
             }));
         }
@@ -601,6 +568,56 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             })
             .collect(),
     }
+}
+
+/// Give each merge anchor in `tcells` (one per grid column of sheet row
+/// `true_row`) its span and drop every covered position. `rows_from_here`
+/// is the absolute row number of this and every later stored row: the IR
+/// table holds only the rows the sheet stores, so a merge over sheet rows
+/// 1-5 in a sheet whose next stored row is 6 spans one IR row, not five.
+fn apply_merges(
+    merges: &mut RangeSweep<()>,
+    mut tcells: Vec<TableCell>,
+    true_row: u32,
+    rows_from_here: &[u32],
+) -> Vec<TableCell> {
+    let width = tcells.len();
+    let mut covered = vec![false; width];
+    let mut cost = 0u64;
+    for (range, ()) in merges.row(true_row) {
+        let lo = range.col_lo as usize;
+        if lo >= width {
+            continue;
+        }
+        let hi = (range.col_hi as usize).min(width - 1);
+        if range.row_lo == true_row {
+            let last = range.row_hi;
+            let rows = rows_from_here
+                .iter()
+                .take_while(|&&r| r <= last)
+                .count()
+                .max(1);
+            cost += rows as u64;
+            let anchor = &mut tcells[lo];
+            anchor.row_span = rows as u32;
+            // Clipped to the table's width, like the row span to its rows.
+            anchor.col_span = range.col_span().min((width - lo) as u64) as u32;
+            covered[lo + 1..=hi].fill(true);
+        } else {
+            covered[lo..=hi].fill(true);
+        }
+        cost += (hi - lo + 1) as u64;
+    }
+    merges.charge(cost);
+    if !covered.contains(&true) {
+        return tcells;
+    }
+    tcells
+        .into_iter()
+        .zip(covered)
+        .filter(|(_, c)| !c)
+        .map(|(cell, _)| cell)
+        .collect()
 }
 
 /// A grid position with no cell in the source.
