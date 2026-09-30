@@ -1916,20 +1916,32 @@ fn collect_runs_until(
     end_local: &str,
 ) -> CoreResult<Vec<Run>> {
     let mut runs = Vec::new();
+    // The runs may sit inside the same transparent wrappers a paragraph's
+    // can (`w:ins`, `w:smartTag`, `w:sdt`, ...): descend into those, as
+    // `parse_paragraph` does, and skip deleted content (`w:del`,
+    // `w:moveFrom`) and anything else. Reading bare `w:r` children only
+    // dropped the wrapped text from the link.
+    let mut wrapper_depth = 0usize;
     loop {
         match reader.read_event()? {
-            Event::Start(ref e) => {
-                if e.local_name().as_ref() == "r" {
-                    // A field cannot legally nest inside w:fldSimple's own
-                    // display runs, so field-part tracking is a fresh,
-                    // throwaway vec here.
-                    runs.push(parse_run(reader, &mut Vec::new())?);
-                } else {
-                    xml::skip_element_fast(reader)?;
-                }
+            Event::Start(ref e) => match e.local_name().as_ref() {
+                // A field cannot legally nest inside w:fldSimple's own
+                // display runs, so field-part tracking is a fresh,
+                // throwaway vec here.
+                "r" => runs.push(parse_run(reader, &mut Vec::new())?),
+                local if is_transparent_paragraph_wrapper(local) => wrapper_depth += 1,
+                _ => xml::skip_element_fast(reader)?,
             },
-            Event::End(ref e) if e.local_name().as_ref() == end_local => {
-                break;
+            Event::End(ref e) => {
+                let local = e.local_name();
+                if local.as_ref() == end_local && wrapper_depth == 0 {
+                    break;
+                }
+                if is_transparent_paragraph_wrapper(local.as_ref()) {
+                    wrapper_depth = wrapper_depth.saturating_sub(1);
+                } else if local.as_ref() == end_local {
+                    break;
+                }
             },
             Event::Eof => break,
             _ => {},
@@ -4259,6 +4271,38 @@ mod tests {
             },
             other => panic!("expected DropDown, got {other:?}"),
         }
+    }
+
+    /// A hyperlink's (or a HYPERLINK `w:fldSimple`'s) runs can sit inside
+    /// the same transparent wrappers a paragraph's can — a tracked
+    /// insertion, a smart tag, a content control. Only bare `w:r` children
+    /// were read, so the link lost that text.
+    #[test]
+    fn test_wrapped_runs_inside_a_hyperlink_are_not_dropped() {
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:hyperlink w:anchor="a"><w:r><w:t xml:space="preserve">one </w:t></w:r>
+  <w:ins w:id="1"><w:r><w:t xml:space="preserve">two </w:t></w:r></w:ins>
+  <w:smartTag><w:r><w:t xml:space="preserve">three </w:t></w:r></w:smartTag>
+  <w:sdt><w:sdtContent><w:r><w:t xml:space="preserve">four </w:t></w:r></w:sdtContent></w:sdt>
+  <w:del w:id="2"><w:r><w:delText>gone </w:delText></w:r></w:del>
+  <w:r><w:t>five</w:t></w:r></w:hyperlink>
+<w:fldSimple w:instr=" HYPERLINK &quot;https://example.com&quot; "><w:ins w:id="3"><w:r><w:t>six</w:t></w:r></w:ins></w:fldSimple>
+</w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let link_text = |i: usize| match &p.content[i] {
+            ParagraphContent::Hyperlink(h) => h
+                .runs
+                .iter()
+                .flat_map(|r| &r.content)
+                .filter_map(|c| match c {
+                    RunContent::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            other => panic!("not a hyperlink: {other:?}"),
+        };
+        assert_eq!(link_text(0), "one two three four five");
+        assert_eq!(link_text(1), "six");
     }
 
     #[test]
