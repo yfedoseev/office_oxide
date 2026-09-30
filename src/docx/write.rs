@@ -362,7 +362,11 @@ struct DocxRichCell {
 }
 
 struct DocxImage {
+    /// Embedded bytes; empty for a linked picture.
     data: Vec<u8>,
+    /// A linked picture's target (`a:blip/@r:link`), written as an
+    /// external relationship instead of a media part.
+    linked: Option<String>,
     format: ImageFormat,
     display_width_emu: u64,
     display_height_emu: u64,
@@ -556,8 +560,18 @@ fn register_part_image_rids<W: Write + Seek>(
         else {
             continue;
         };
-        let target = format!("media/image{}.{}", idx + 1, img.format.extension());
-        let rid = opc.add_part_rel(part, rel_types::IMAGE, &target);
+        let rid = match img.linked {
+            Some(ref url) => opc.add_part_rel_with_mode(
+                part,
+                rel_types::IMAGE,
+                url,
+                crate::core::relationships::TargetMode::External,
+            ),
+            None => {
+                let target = format!("media/image{}.{}", idx + 1, img.format.extension());
+                opc.add_part_rel(part, rel_types::IMAGE, &target)
+            },
+        };
         out.push(ImageInfo {
             rid,
             ..info.clone()
@@ -628,6 +642,8 @@ fn collect_hyperlinks(elements: &[DocxElement], out: &mut Vec<String>) {
 struct ImageInfo {
     idx: usize,
     rid: String,
+    /// `rid` names an external (linked) picture: `r:link`, not `r:embed`.
+    linked: bool,
     width_emu: u64,
     height_emu: u64,
     alt_text: Option<String>,
@@ -1107,6 +1123,25 @@ impl DocxWriter {
         // --- Register images ---
         let mut image_rids: Vec<ImageInfo> = Vec::new();
         for (idx, img) in self.images.iter().enumerate() {
+            if let Some(ref url) = img.linked {
+                let rid = opc.add_part_rel_with_mode(
+                    &doc_part,
+                    rel_types::IMAGE,
+                    url,
+                    crate::core::relationships::TargetMode::External,
+                );
+                image_rids.push(ImageInfo {
+                    idx,
+                    rid,
+                    linked: true,
+                    width_emu: img.display_width_emu,
+                    height_emu: img.display_height_emu,
+                    alt_text: img.alt_text.clone(),
+                    decorative: img.decorative,
+                    positioning: img.positioning.clone(),
+                });
+                continue;
+            }
             let n = idx + 1;
             let ext = img.format.extension();
             let target = format!("media/image{n}.{ext}");
@@ -1125,6 +1160,7 @@ impl DocxWriter {
             image_rids.push(ImageInfo {
                 idx,
                 rid,
+                linked: false,
                 width_emu: img.display_width_emu,
                 height_emu: img.display_height_emu,
                 alt_text: img.alt_text.clone(),
@@ -1894,7 +1930,13 @@ fn convert_ir_table(
 /// Store an IR image in the writer's media list and return its index,
 /// or `None` when the IR carries no bytes for it.
 fn register_ir_image(image: &crate::ir::Image, images: &mut Vec<DocxImage>) -> Option<usize> {
-    let data = image.data.clone()?;
+    // Embedded bytes win; a picture with none but a `source_url` is a
+    // linked picture, written as one rather than dropped.
+    let (data, linked) = match (&image.data, &image.source_url) {
+        (Some(data), _) => (data.clone(), None),
+        (None, Some(url)) => (Vec::new(), Some(url.clone())),
+        (None, None) => return None,
+    };
     let format = image.format.clone().unwrap_or(ImageFormat::Png);
 
     let (w_emu, h_emu) =
@@ -1909,6 +1951,7 @@ fn register_ir_image(image: &crate::ir::Image, images: &mut Vec<DocxImage>) -> O
     let idx = images.len();
     images.push(DocxImage {
         data,
+        linked,
         format,
         display_width_emu: w_emu,
         display_height_emu: h_emu,
@@ -2190,7 +2233,7 @@ fn write_docx_element(
                     ImagePositioning::Inline => {
                         write_inline_image_run(
                             w,
-                            &info.rid,
+                            (&info.rid, info.linked),
                             info.width_emu,
                             info.height_emu,
                             info.alt_text.as_deref(),
@@ -2201,7 +2244,7 @@ fn write_docx_element(
                     ImagePositioning::Floating(fi) => {
                         write_floating_image_run(
                             w,
-                            &info.rid,
+                            (&info.rid, info.linked),
                             fi,
                             info.alt_text.as_deref(),
                             info.decorative,
@@ -3470,9 +3513,17 @@ fn write_picture_doc_pr(
         .expect("write docPr end");
 }
 
+/// `a:blip` pointing at a picture: `(relationship id, linked)`, `r:link`
+/// for a linked picture and `r:embed` otherwise.
+fn write_blip(w: &mut Writer<Vec<u8>>, (rid, linked): (&str, bool)) {
+    let mut blip = BytesStart::new("a:blip");
+    blip.push_attribute((if linked { "r:link" } else { "r:embed" }, rid));
+    w.write_event(Event::Empty(blip)).expect("write blip");
+}
+
 fn write_inline_image_run(
     w: &mut Writer<Vec<u8>>,
-    rid: &str,
+    rid: (&str, bool),
     width_emu: u64,
     height_emu: u64,
     alt_text: Option<&str>,
@@ -3527,9 +3578,7 @@ fn write_inline_image_run(
     // pic:blipFill
     w.write_event(Event::Start(BytesStart::new("pic:blipFill")))
         .expect("write blipFill start");
-    let mut blip = BytesStart::new("a:blip");
-    blip.push_attribute(("r:embed", rid));
-    w.write_event(Event::Empty(blip)).expect("write blip");
+    write_blip(w, rid);
     w.write_event(Event::Start(BytesStart::new("a:stretch")))
         .expect("write stretch start");
     w.write_event(Event::Empty(BytesStart::new("a:fillRect")))
@@ -3583,7 +3632,7 @@ fn write_inline_image_run(
 
 fn write_floating_image_run(
     w: &mut Writer<Vec<u8>>,
-    rid: &str,
+    rid: (&str, bool),
     fi: &crate::ir::FloatingImage,
     alt_text: Option<&str>,
     decorative: bool,
@@ -3722,9 +3771,7 @@ fn write_floating_image_run(
 
     w.write_event(Event::Start(BytesStart::new("pic:blipFill")))
         .expect("write blipFill start");
-    let mut blip = BytesStart::new("a:blip");
-    blip.push_attribute(("r:embed", rid));
-    w.write_event(Event::Empty(blip)).expect("write blip");
+    write_blip(w, rid);
     w.write_event(Event::Start(BytesStart::new("a:stretch")))
         .expect("write stretch start");
     w.write_event(Event::Empty(BytesStart::new("a:fillRect")))

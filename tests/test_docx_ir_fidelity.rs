@@ -173,6 +173,19 @@ impl Docx {
         self
     }
 
+    /// Add an external relationship from the document part and substitute
+    /// its id into the body's `placeholder` token.
+    fn external_rel(mut self, placeholder: &str, rel_type: &str, target: &str) -> Self {
+        let rid = self.w.add_part_rel_with_mode(
+            &self.doc_part,
+            rel_type,
+            target,
+            office_oxide::core::relationships::TargetMode::External,
+        );
+        self.body = self.body.replace(placeholder, &rid);
+        self
+    }
+
     fn core_props(mut self, inner: &str) -> Self {
         let part = PartName::new("/docProps/core.xml").unwrap();
         let xml = format!(
@@ -535,6 +548,55 @@ fn test_empty_paragraph_with_only_a_bottom_border_is_still_a_thematic_break() {
 // ---------------------------------------------------------------------------
 // Table geometry and borders
 // ---------------------------------------------------------------------------
+
+/// A linked picture (`a:blip/@r:link`, an external image relationship)
+/// has no bytes in the package, only a target. The reader looked at
+/// `r:embed` only, so such a picture vanished without trace.
+#[test]
+fn test_a_linked_picture_reaches_the_ir_renderers_and_the_writer() {
+    let bytes = Docx::new(
+        r#"<w:p><w:r><w:drawing><wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+             <wp:extent cx="100" cy="100"/><wp:docPr id="1" name="P" descr="Linked logo"/>
+             <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData>
+               <pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
+                 <pic:blipFill><a:blip r:link="LINK"/></pic:blipFill></pic:pic>
+             </a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>"#,
+    )
+    .external_rel("LINK", rel_types::IMAGE, "https://example.com/logo.png")
+    .bytes();
+    let image = |ir: &DocumentIR| -> Image {
+        ir.sections[0]
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                Element::Image(i) => Some(i.clone()),
+                _ => None,
+            })
+            .expect("the linked picture reached the IR")
+    };
+    let ir = Document::from_reader(Cursor::new(bytes.clone()), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    let img = image(&ir);
+    assert_eq!(img.source_url.as_deref(), Some("https://example.com/logo.png"));
+    assert!(img.data.is_none());
+    assert_eq!(img.alt_text.as_deref(), Some("Linked logo"));
+    let want = "![Linked logo](https://example.com/logo.png)";
+    assert!(ir.to_markdown().contains(want), "{}", ir.to_markdown());
+    assert!(
+        ir.to_html()
+            .contains(r#"<img src="https://example.com/logo.png""#)
+    );
+    let direct = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes))
+        .unwrap()
+        .to_markdown();
+    assert!(direct.contains(want), "{direct}");
+
+    let again = Document::from_reader(Cursor::new(docx_bytes(&ir)), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(image(&again).source_url, img.source_url);
+}
 
 /// The direct markdown renderer wrote a picture as `![alt](rId7)`: the
 /// relationship id is not a target any markdown reader can resolve. The

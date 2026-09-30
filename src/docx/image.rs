@@ -9,6 +9,11 @@ use crate::core::units::Emu;
 /// decide what kind of IR `Element` to emit.
 #[derive(Debug, Clone)]
 pub struct DrawingInfo {
+    /// A linked (not embedded) picture's relationship id (`a:blip/@r:link`).
+    pub linked_image_rid: Option<String>,
+    /// That picture's target, once resolved through the relationships of
+    /// the part the drawing is in.
+    pub linked_image: Option<String>,
     /// Marked decorative (`wp:docPr` extension `adec:decorative`
     /// `val="1"`): the picture carries no meaning, so assistive
     /// technology skips it.

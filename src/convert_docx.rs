@@ -807,11 +807,11 @@ fn collect_paragraph_inline_images(
                     if !d.inline {
                         continue;
                     }
-                    if d.relationship_id.is_empty() {
-                        continue;
-                    }
-                    let (data, ext) = match doc.images.get(&d.relationship_id).cloned() {
-                        Some(v) => v,
+                    // A linked picture has no bytes in the package, only
+                    // its target; it used to be dropped without trace.
+                    let (data, ext) = match embedded_image(d, doc) {
+                        Some((data, ext)) => (Some(data), ext),
+                        None if d.linked_image.is_some() => (None, None),
                         None => continue,
                     };
                     let format =
@@ -825,7 +825,8 @@ fn collect_paragraph_inline_images(
                     out.push(Element::Image(Image {
                         alt_text: d.description.clone(),
                         decorative: d.decorative,
-                        data: Some(data),
+                        data,
+                        source_url: d.linked_image.clone(),
                         format,
                         display_width_emu: Some(d.width.0.max(0) as u64),
                         display_height_emu: Some(d.height.0.max(0) as u64),
@@ -955,10 +956,11 @@ fn drawing_to_float_element(
         }));
     }
 
-    if d.relationship_id.is_empty() {
-        return None;
-    }
-    let (data, ext) = doc.images.get(&d.relationship_id).cloned()?;
+    let (data, ext) = match embedded_image(d, doc) {
+        Some((data, ext)) => (Some(data), ext),
+        None if d.linked_image.is_some() => (None, None),
+        None => return None,
+    };
     let format = ext.as_deref().and_then(|e| match e {
         "png" => Some(ImageFormat::Png),
         "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
@@ -967,7 +969,8 @@ fn drawing_to_float_element(
     Some(Element::Image(Image {
         alt_text: d.description.clone(),
         decorative: d.decorative,
-        data: Some(data),
+        data,
+        source_url: d.linked_image.clone(),
         format,
         display_width_emu: Some(width_emu),
         display_height_emu: Some(height_emu),
@@ -983,6 +986,18 @@ fn drawing_to_float_element(
         }),
         ..Default::default()
     }))
+}
+
+/// A drawing's embedded picture bytes and file extension, if the package
+/// holds them.
+fn embedded_image(
+    d: &crate::docx::DrawingInfo,
+    doc: &crate::docx::DocxDocument,
+) -> Option<(Vec<u8>, Option<String>)> {
+    if d.relationship_id.is_empty() {
+        return None;
+    }
+    doc.images.get(&d.relationship_id).cloned()
 }
 
 /// Translate a paragraph's `<w:jc>` justification into the IR's

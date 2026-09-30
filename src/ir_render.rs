@@ -173,6 +173,14 @@ mod block_default {
                         return format!("[image-base64:{}]", crate::core::base64::encode(data));
                     }
                 }
+                // A linked picture has a real target to point at.
+                if let Some(url) = img.source_url.as_deref().and_then(super::safe_url) {
+                    return format!(
+                        "![{}]({})",
+                        crate::core::markdown::image_alt(img.alt_text.as_deref().unwrap_or("")),
+                        super::escape_markdown_url(&url)
+                    );
+                }
                 // An `![alt]()` with an empty target renders as a broken
                 // image. With no addressable source, emit the description
                 // as ordinary italic text, and nothing when there is none.
@@ -222,6 +230,17 @@ mod block_default {
                         );
                         return out;
                     }
+                }
+                // A linked picture has a real target to point at.
+                if let Some(url) = img.source_url.as_deref().and_then(super::safe_url) {
+                    let mut out = String::new();
+                    let _ = write!(
+                        out,
+                        "<img src=\"{}\" alt=\"{}\" />",
+                        super::escape_html(&url),
+                        super::escape_html(img.alt_text.as_deref().unwrap_or(""))
+                    );
+                    return out;
                 }
                 // `src` is required on `<img>`; an element without one is
                 // invalid HTML. With no addressable source in the IR,
@@ -911,7 +930,7 @@ fn render_list_markdown(list: &List, indent: usize) -> String {
 /// XSS vector in whatever viewer displays it. Relative URLs, fragments and
 /// the ordinary network schemes pass through; anything with an unknown
 /// scheme is dropped so the link text still renders as plain text.
-fn safe_url(url: &str) -> Option<String> {
+pub(crate) fn safe_url(url: &str) -> Option<String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return None;
@@ -943,7 +962,7 @@ fn escape_markdown(s: &str) -> String {
 }
 
 /// Escape the characters that would terminate a markdown link target early.
-fn escape_markdown_url(s: &str) -> String {
+pub(crate) fn escape_markdown_url(s: &str) -> String {
     s.replace('(', "%28")
         .replace(')', "%29")
         .replace(' ', "%20")

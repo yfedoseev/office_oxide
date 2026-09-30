@@ -662,6 +662,22 @@ fn markdown_drawing(drawing: &DrawingInfo, out: &mut String) {
         out.push('\n');
         return;
     }
+    // A linked picture has a real target to point at, as in the IR
+    // renderer.
+    if let Some(url) = drawing
+        .linked_image
+        .as_deref()
+        .and_then(crate::ir_render::safe_url)
+    {
+        out.push_str("![");
+        out.push_str(&crate::core::markdown::image_alt(
+            drawing.description.as_deref().unwrap_or(""),
+        ));
+        out.push_str("](");
+        out.push_str(&crate::ir_render::escape_markdown_url(&url));
+        out.push(')');
+        return;
+    }
     // The relationship id is not a target a markdown reader can resolve,
     // and this renderer has no other address for the picture. Describe it
     // with its alt text as the IR renderer does (italic, nothing when

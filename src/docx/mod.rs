@@ -834,6 +834,8 @@ impl VmlContent {
         for (rid, w, h) in self.images {
             out.push(RunContent::Drawing(Box::new(DrawingInfo {
                 decorative: false,
+                linked_image_rid: None,
+                linked_image: None,
                 relationship_id: rid,
                 description: None,
                 width: w,
@@ -1197,12 +1199,23 @@ fn resolve_hyperlinks(
     }
 }
 
-/// Resolve hyperlinks nested inside a run's text-box bodies. Text-box
-/// prose is ordinary content and carries ordinary links.
+/// Resolve hyperlinks nested inside a run's text-box bodies (text-box
+/// prose is ordinary content and carries ordinary links), and a linked
+/// picture's relationship id to its target — like a hyperlink's, `r:link`
+/// is scoped to the part it appears in.
 fn resolve_hyperlinks_in_run(run: &mut Run, rels: &crate::core::relationships::Relationships) {
     for rc in &mut run.content {
-        if let RunContent::TextBox(blocks) = rc {
-            resolve_hyperlinks(blocks, rels);
+        match rc {
+            RunContent::TextBox(blocks) => resolve_hyperlinks(blocks, rels),
+            RunContent::Drawing(d) => {
+                if let Some(rid) = d.linked_image_rid.as_deref() {
+                    d.linked_image = rels.get_by_id(rid).map(|rel| rel.target.clone());
+                    if d.linked_image.is_none() {
+                        log::warn!("docx: linked picture {rid} has no relationship");
+                    }
+                }
+            },
+            _ => {},
         }
     }
 }
@@ -2272,6 +2285,7 @@ fn parse_inline_or_anchor_body(
     let mut chart_rel_id: Option<String> = None;
     let mut dgm_data_rel_id: Option<String> = None;
     let mut decorative = false;
+    let mut linked_image_rid: Option<String> = None;
 
     let mut anchor_x: Option<i64> = None;
     let mut anchor_y: Option<i64> = None;
@@ -2307,6 +2321,9 @@ fn parse_inline_or_anchor_body(
                     let g = parse_graphic(reader, text_boxes)?;
                     if let Some(rid) = g.relationship_id {
                         relationship_id = Some(rid);
+                    }
+                    if let Some(rid) = g.link_relationship_id {
+                        linked_image_rid = Some(rid);
                     }
                     if let Some(s) = g.shape {
                         shape = Some(s);
@@ -2352,12 +2369,15 @@ fn parse_inline_or_anchor_body(
     // `prstGeom`, so without these two conditions the whole drawing was
     // discarded and the chart/diagram part was never reachable.
     if relationship_id.is_some()
+        || linked_image_rid.is_some()
         || shape.is_some()
         || chart_rel_id.is_some()
         || dgm_data_rel_id.is_some()
     {
         Ok(Some(DrawingInfo {
             decorative,
+            linked_image_rid,
+            linked_image: None,
             relationship_id: relationship_id.unwrap_or_default(),
             description,
             width,
@@ -2448,6 +2468,8 @@ fn parse_position_offset(
 /// embedded picture (`relationship_id`) or a vector shape (`shape`).
 struct GraphicPayload {
     relationship_id: Option<String>,
+    /// `a:blip/@r:link`: a linked picture's relationship id.
+    link_relationship_id: Option<String>,
     shape: Option<crate::docx::image::ShapeInfo>,
     /// `r:id` of a `<c:chart>` reference, when the graphic is a chart.
     chart_rel_id: Option<String>,
@@ -2463,6 +2485,7 @@ fn parse_graphic(
     text_boxes: &mut Vec<Vec<BlockElement>>,
 ) -> CoreResult<GraphicPayload> {
     let mut relationship_id: Option<String> = None;
+    let mut link_relationship_id: Option<String> = None;
     let mut shape: Option<crate::docx::image::ShapeInfo> = None;
     let mut chart_rel_id: Option<String> = None;
     let mut dgm_data_rel_id: Option<String> = None;
@@ -2471,8 +2494,12 @@ fn parse_graphic(
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
                 "pic" => {
-                    if let Some(rid) = parse_pic(reader)? {
+                    let (embed, link) = parse_pic(reader)?;
+                    if let Some(rid) = embed {
                         relationship_id = Some(rid);
+                    }
+                    if let Some(rid) = link {
+                        link_relationship_id = Some(rid);
                     }
                 },
                 "wsp" => {
@@ -2526,6 +2553,7 @@ fn parse_graphic(
 
     Ok(GraphicPayload {
         relationship_id,
+        link_relationship_id,
         shape,
         chart_rel_id,
         dgm_data_rel_id,
@@ -2536,8 +2564,14 @@ fn parse_graphic(
 /// Reads through `</pic:pic>`. The blip lives inside `<pic:blipFill>`,
 /// so we descend through whatever wrappers we encounter rather than
 /// skipping siblings.
-fn parse_pic(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<String>> {
+/// The `a:blip` of a `pic:pic`: its embedded picture's `r:embed` and its
+/// linked picture's `r:link` (ECMA-376 §20.1.8.13); a blip may carry
+/// either or both.
+fn parse_pic(
+    reader: &mut quick_xml::Reader<&[u8]>,
+) -> CoreResult<(Option<String>, Option<String>)> {
     let mut rid: Option<String> = None;
+    let mut link: Option<String> = None;
     // Track depth relative to <pic:pic>: we entered after its Start was
     // consumed by the caller, so we are at depth 1. Exit when we close
     // back out.
@@ -2550,6 +2584,7 @@ fn parse_pic(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<String>
                     if let Some(embed) = xml::optional_attr_str(e, "r:embed")? {
                         rid = Some(embed.into_owned());
                     }
+                    link = xml::optional_attr_str(e, "r:link")?.map(|v| v.into_owned());
                     // Skip over blip's own children (e.g. <a:extLst>).
                     xml::skip_element_fast(reader)?;
                 } else {
@@ -2560,6 +2595,7 @@ fn parse_pic(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<String>
                 if let Some(embed) = xml::optional_attr_str(e, "r:embed")? {
                     rid = Some(embed.into_owned());
                 }
+                link = xml::optional_attr_str(e, "r:link")?.map(|v| v.into_owned());
             },
             Event::End(_) => {
                 depth -= 1;
@@ -2572,7 +2608,7 @@ fn parse_pic(reader: &mut quick_xml::Reader<&[u8]>) -> CoreResult<Option<String>
         }
     }
 
-    Ok(rid)
+    Ok((rid, link))
 }
 
 /// Parse `<wps:wsp>` (a DrawingML vector shape). Reads through

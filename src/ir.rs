@@ -1615,6 +1615,11 @@ pub struct Image {
     /// navigate" shapes carry their entire purpose here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hyperlink: Option<String>,
+    /// Where a linked (not embedded) picture lives: the external target of
+    /// a DOCX `a:blip/@r:link`. `data` is `None` for such an image — the
+    /// package does not contain it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
 }
 
 #[cfg(test)]
