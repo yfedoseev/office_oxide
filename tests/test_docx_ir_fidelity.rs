@@ -536,6 +536,44 @@ fn test_empty_paragraph_with_only_a_bottom_border_is_still_a_thematic_break() {
 // Table geometry and borders
 // ---------------------------------------------------------------------------
 
+/// `w:shd` (ECMA-376 §17.3.5) paints its pattern (`w:val`) in `w:color`
+/// over `w:fill`. Only `w:fill` was read, so `solid` shading — the whole
+/// area in `w:color` — and percentage patterns came out as the fill alone
+/// (often `auto`, i.e. nothing).
+#[test]
+fn test_cell_and_paragraph_shading_honour_the_pattern_and_its_colour() {
+    let cell = |shd: &str| {
+        format!("<w:tc><w:tcPr>{shd}</w:tcPr><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc>")
+    };
+    let body = format!(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="1000"/></w:tblGrid><w:tr>{}{}{}{}{}</w:tr></w:tbl>
+           <w:p><w:pPr><w:shd w:val="solid" w:color="0000FF" w:fill="auto"/></w:pPr><w:r><w:t>p</w:t></w:r></w:p>"#,
+        cell(r#"<w:shd w:val="solid" w:color="FF0000" w:fill="auto"/>"#),
+        cell(r#"<w:shd w:val="pct50" w:color="000000" w:fill="FFFFFF"/>"#),
+        cell(r#"<w:shd w:val="clear" w:color="auto" w:fill="00FF00"/>"#),
+        cell(r#"<w:shd w:val="nil" w:fill="00FF00"/>"#),
+        cell(r#"<w:shd w:val="pct25" w:color="auto" w:fill="auto"/>"#),
+    );
+    let ir = Docx::new(&body).ir();
+    let fills: Vec<_> = table(&ir).rows[0]
+        .cells
+        .iter()
+        .map(|c| c.background_color)
+        .collect();
+    assert_eq!(
+        fills,
+        [
+            Some([0xFF, 0, 0]),
+            Some([0x80, 0x80, 0x80]),
+            Some([0, 0xFF, 0]),
+            None,
+            // Automatic pattern colour is black, automatic fill white.
+            Some([0xBF, 0xBF, 0xBF]),
+        ]
+    );
+    assert_eq!(para(&ir, 1).background_color, Some([0, 0, 0xFF]));
+}
+
 /// A table whose look lives in its table style: `w:style/w:tblPr` (borders)
 /// and `w:tblStylePr` conditional formatting (header-row and banded-row
 /// shading), switched on per table by `w:tblLook`. `Style.table_properties`

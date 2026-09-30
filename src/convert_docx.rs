@@ -273,6 +273,45 @@ fn hex_to_rgb(s: &str) -> Option<[u8; 3]> {
     Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
 }
 
+/// The single colour a `w:shd` (ECMA-376 §17.3.5) paints: its pattern
+/// (`w:val`, ST_Shd) in `w:color` over `w:fill`. A percentage pattern is
+/// exactly that share of the pattern colour; a stripe or cross pattern is
+/// represented by the share of the area its lines cover, the average
+/// colour the eye sees, since the IR holds one colour per area. An
+/// automatic pattern colour is black and an automatic fill white (paper);
+/// `clear` with an automatic fill, and `nil`, are no shading at all.
+fn shading_rgb(sh: &crate::docx::table::Shading) -> Option<[u8; 3]> {
+    let fill = sh.fill.as_deref().and_then(hex_to_rgb);
+    let pattern = sh.pattern.as_deref().unwrap_or("clear");
+    let coverage: f32 = match pattern {
+        "nil" => return None,
+        "clear" => return fill,
+        "solid" => 1.0,
+        "horzStripe" | "vertStripe" | "diagStripe" | "reverseDiagStripe" => 0.5,
+        "thinHorzStripe" | "thinVertStripe" | "thinDiagStripe" | "thinReverseDiagStripe" => 0.25,
+        "horzCross" | "diagCross" => 0.75,
+        "thinHorzCross" | "thinDiagCross" => 0.4375,
+        p => match p.strip_prefix("pct").and_then(|n| n.parse::<u8>().ok()) {
+            Some(n) if n <= 100 => f32::from(n) / 100.0,
+            // An unknown pattern: the fill is the one colour known.
+            _ => return fill,
+        },
+    };
+    let color = sh
+        .color
+        .as_deref()
+        .and_then(hex_to_rgb)
+        .unwrap_or([0, 0, 0]);
+    let base = fill.unwrap_or([0xFF, 0xFF, 0xFF]);
+    let mix =
+        |b: u8, c: u8| (f32::from(b) * (1.0 - coverage) + f32::from(c) * coverage).round() as u8;
+    Some([
+        mix(base[0], color[0]),
+        mix(base[1], color[1]),
+        mix(base[2], color[2]),
+    ])
+}
+
 /// Map a `w:val` border style name onto the IR's `BorderStyle`. Unknown
 /// styles fall back to `Single` — the same rendering Word gives an
 /// unrecognised decorative border.
@@ -383,11 +422,7 @@ fn apply_paragraph_properties(pp: &crate::docx::ParagraphProperties, out: &mut P
     out.page_break_before = pp.page_break_before.unwrap_or(false);
     out.outline_level = pp.outline_level;
     out.border = pp.borders.as_deref().map(para_borders_to_ir);
-    out.background_color = pp
-        .shading
-        .as_ref()
-        .and_then(|sh| sh.fill.as_deref())
-        .and_then(hex_to_rgb);
+    out.background_color = pp.shading.as_deref().and_then(shading_rgb);
     out.tabs = pp
         .tabs
         .iter()
@@ -477,11 +512,7 @@ fn apply_paragraph_properties_to_heading(pp: &crate::docx::ParagraphProperties, 
     out.keep_together = pp.keep_lines.unwrap_or(false);
     out.page_break_before = pp.page_break_before.unwrap_or(false);
     out.border = pp.borders.as_deref().map(para_borders_to_ir);
-    out.background_color = pp
-        .shading
-        .as_ref()
-        .and_then(|sh| sh.fill.as_deref())
-        .and_then(hex_to_rgb);
+    out.background_color = pp.shading.as_deref().and_then(shading_rgb);
     out.tabs = pp
         .tabs
         .iter()
@@ -1714,12 +1745,11 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
                 col_span,
                 row_span,
                 text_align,
-                // Direct cell shading wins over the table style's.
-                background_color: cp
-                    .and_then(|p| p.shading.as_ref())
-                    .and_then(|sh| sh.fill.as_deref())
-                    .and_then(hex_to_rgb)
-                    .or_else(|| {
+                // Direct cell shading wins over the table style's; a direct
+                // `w:shd`, even `nil`, is the cell's own choice.
+                background_color: match cp.and_then(|p| p.shading.as_deref()) {
+                    Some(sh) => shading_rgb(sh),
+                    None => {
                         let start = starts[row_idx][cell_idx];
                         let end = start.saturating_add(col_span as usize);
                         layout
@@ -1731,15 +1761,12 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
                                     .conditionals
                                     .iter()
                                     .find(|c| c.kind == *kind)
-                                    .and_then(|c| {
-                                        c.cell_properties
-                                            .as_ref()
-                                            .and_then(|p| p.shading.as_ref())
-                                            .and_then(|sh| sh.fill.as_deref())
-                                            .and_then(hex_to_rgb)
-                                    })
+                                    .and_then(|c| c.cell_properties.as_ref())
+                                    .and_then(|p| p.shading.as_deref())
+                                    .and_then(shading_rgb)
                             })
-                    }),
+                    },
+                },
                 border: cp
                     .and_then(|p| p.borders.as_deref())
                     .map(table_borders_to_ir),
