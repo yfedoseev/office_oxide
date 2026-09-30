@@ -175,32 +175,17 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             // bound the allocation below relies on, kept next to it.
             .min(crate::xlsx::cell::MAX_COL as usize + 1);
 
-        // Decide row layout: a worksheet whose rows mostly have at most one
-        // non-empty cell is "document style" — flowing text laid out one
-        // paragraph per row. Render those rows as Paragraphs (not as a
-        // 1-column Table) so the downstream PDF renderer flows them like
-        // body text and honours per-paragraph font sizes.
-        //
-        // We choose Paragraph mode when ≥80 % of non-empty rows have ≤1
-        // non-empty cell. That's permissive enough to handle real
-        // worksheets that mostly hold prose but still emit a Table when a
-        // genuine grid is present.
-        let mut prose_score = 0usize;
-        let mut nonempty_rows = 0usize;
-        for cells in &parsed_rows {
-            let nc = cells
+        // Decide row layout: a "document style" sheet — flowing text laid
+        // out one paragraph per row — becomes Paragraphs, not a 1-column
+        // Table, so the downstream PDF renderer flows it like body text and
+        // honours per-paragraph font sizes. The direct markdown renderer
+        // makes the same decision through the same predicate.
+        let prose_mode = crate::xlsx::text::rows_read_as_prose(parsed_rows.iter().map(|cells| {
+            cells
                 .iter()
                 .filter(|cd| !cd.text.is_empty() || cd.formula.is_some())
-                .count();
-            if nc == 0 {
-                continue;
-            }
-            nonempty_rows += 1;
-            if nc <= 1 {
-                prose_score += 1;
-            }
-        }
-        let prose_mode = nonempty_rows >= 3 && prose_score * 100 >= nonempty_rows * 80;
+                .map(|cd| cd.text.chars().count())
+        }));
 
         // Materialise any pictures or text shapes anchored on the
         // worksheet as positional IR elements so they survive the

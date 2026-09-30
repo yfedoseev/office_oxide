@@ -609,6 +609,18 @@ fn render_section_markdown(section: &Section) -> String {
     parts.join("\n\n")
 }
 
+/// Render a run of block elements the way a section body renders them:
+/// each non-empty block separated by a blank line. For a format's direct
+/// renderer that must lay blocks out exactly as the IR path does.
+pub(crate) fn render_blocks_markdown(elements: &[Element]) -> String {
+    elements
+        .iter()
+        .map(render_element_markdown)
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 fn render_element_markdown(element: &Element) -> String {
     let Some(_depth) = enter_render_level() else {
         return format!("*{}*\n\n", escape_markdown(SKIPPED_SUBTREE_NOTICE));
@@ -947,7 +959,11 @@ fn render_list_markdown(list: &List, indent: usize) -> String {
             .collect::<Vec<_>>()
             .join(" ");
         let marker = if list.ordered {
-            format!("{}. ", start.saturating_add(u32::try_from(i).unwrap_or(u32::MAX)))
+            format!(
+                "{}{} ",
+                start.saturating_add(u32::try_from(i).unwrap_or(u32::MAX)),
+                list.ordered_delimiter()
+            )
         } else {
             "- ".to_string()
         };

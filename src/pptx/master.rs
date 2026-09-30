@@ -38,6 +38,11 @@ pub(crate) struct MasterRunDefaults {
     pub font_size_hundredths_pt: Option<u32>,
     pub color_rgb: Option<[u8; 3]>,
     pub alignment: Option<ParagraphAlignment>,
+    /// The level's bullet (`<a:buNone>`/`<a:buChar>`/`<a:buAutoNum>`,
+    /// ECMA-376 Part 1 §21.1.2.4): a body placeholder's paragraphs are
+    /// bulleted because the master's `bodyStyle` says so, not their own
+    /// `<a:pPr>`.
+    pub bullet: Option<super::shape::BulletStyle>,
 }
 
 impl MasterRunDefaults {
@@ -49,6 +54,7 @@ impl MasterRunDefaults {
         fill(&mut self.font_size_hundredths_pt, &lower.font_size_hundredths_pt);
         fill(&mut self.color_rgb, &lower.color_rgb);
         fill(&mut self.alignment, &lower.alignment);
+        fill(&mut self.bullet, &lower.bullet);
     }
 }
 
@@ -328,6 +334,11 @@ fn parse_lvl_pr(
             },
             Event::Empty(ref e) if e.local_name().as_ref() == "defRPr" => {
                 apply_rpr_attrs(e, &mut defaults)?;
+            },
+            Event::Empty(ref e) if depth == 1 => {
+                if let Some(b) = super::slide::parse_bullet(e)? {
+                    defaults.bullet = Some(b);
+                }
             },
             Event::Start(_) => depth += 1,
             Event::End(_) => {

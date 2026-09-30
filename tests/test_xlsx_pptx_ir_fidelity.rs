@@ -288,7 +288,7 @@ fn test_prose_mode_keeps_every_cell_of_a_multi_cell_row() {
     let cell = |r: &str, t: &str| format!(r#"<c r="{r}" t="inlineStr"><is><t>{t}</t></is></c>"#);
     let body = format!(
         "<row r=\"1\">{}</row><row r=\"2\">{}</row><row r=\"3\">{}</row><row r=\"4\">{}{}</row><row r=\"5\">{}</row>",
-        cell("A1", "Line one"),
+        cell("A1", "Line one of the running report text"),
         cell("A2", "Line two"),
         cell("A3", "Line three"),
         cell("A4", "Left"),
@@ -296,6 +296,13 @@ fn test_prose_mode_keeps_every_cell_of_a_multi_cell_row() {
         cell("A5", "Line five"),
     );
     let ir = Xlsx::new(vec![Sheet::new("S", &body)]).ir();
+    assert!(
+        ir.sections[0]
+            .elements
+            .iter()
+            .all(|e| matches!(e, Element::Paragraph(_))),
+        "a prose sheet reads as paragraphs"
+    );
     let text = ir.plain_text();
     for w in ["Line one", "Left", "Right", "Line five"] {
         assert!(text.contains(w), "{w} missing: {text:?}");

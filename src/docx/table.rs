@@ -227,6 +227,143 @@ pub struct Shading {
     pub pattern: Option<String>,
 }
 
+/// Upper bound for a single `w:gridSpan`. Word's own table limit is 63
+/// columns; this leaves generous headroom while keeping the value bounded.
+pub(crate) const MAX_GRID_SPAN: u32 = 1_000;
+
+impl TableCell {
+    /// This cell's `w:gridSpan`, clamped to `1..=MAX_GRID_SPAN` — the value
+    /// is untrusted and every grid computation sizes something from it.
+    pub(crate) fn grid_span(&self) -> u32 {
+        self.properties
+            .as_ref()
+            .and_then(|p| p.grid_span)
+            .unwrap_or(1)
+            .clamp(1, MAX_GRID_SPAN)
+    }
+}
+
+impl Table {
+    /// The starting grid column of every cell, row by row (ascending, so a
+    /// lookup by column is a binary search).
+    pub(crate) fn grid_starts(&self) -> Vec<Vec<usize>> {
+        self.rows
+            .iter()
+            .map(|r| {
+                let mut col = 0usize;
+                r.cells
+                    .iter()
+                    .map(|c| {
+                        let start = col;
+                        col = col.saturating_add(c.grid_span() as usize);
+                        start
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+}
+
+/// Where a cell sits relative to the regions a table style formats
+/// (`w:tblStylePr`, ECMA-376 Part 1 §17.7.6), as `w:tblLook` switches them
+/// on. Shared by `to_ir()` and the direct renderers so a header row is
+/// bold on every surface or on none.
+pub(crate) struct TableStyleLayout {
+    /// `None` when the table has no `w:tblLook`: only whole-table
+    /// formatting applies, rather than guessing which regions are on.
+    look: Option<TableLook>,
+    num_rows: usize,
+    grid_width: usize,
+    row_band: usize,
+    col_band: usize,
+}
+
+impl TableStyleLayout {
+    /// The layout of `table` (whose cells start at `starts`, from
+    /// [`Table::grid_starts`]) under a style with the given band sizes.
+    pub(crate) fn new(
+        table: &Table,
+        starts: &[Vec<usize>],
+        style_row_band: Option<u32>,
+        style_col_band: Option<u32>,
+    ) -> Self {
+        let tp = table.properties.as_ref();
+        let grid_width = starts
+            .iter()
+            .zip(&table.rows)
+            .map(|(s, r)| match (s.last(), r.cells.last()) {
+                (Some(&start), Some(cell)) => start.saturating_add(cell.grid_span() as usize),
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0);
+        TableStyleLayout {
+            look: tp.and_then(|p| p.look),
+            num_rows: table.rows.len(),
+            grid_width,
+            row_band: tp
+                .and_then(|p| p.row_band_size)
+                .or(style_row_band)
+                .unwrap_or(1) as usize,
+            col_band: tp
+                .and_then(|p| p.col_band_size)
+                .or(style_col_band)
+                .unwrap_or(1) as usize,
+        }
+    }
+
+    /// The `w:tblStylePr` regions covering the cell at `row` spanning grid
+    /// columns `start..end`, in increasing precedence (ECMA-376 §17.7.6:
+    /// whole table, banded columns, banded rows, first/last column,
+    /// first/last row, corner cells).
+    pub(crate) fn regions(&self, row: usize, start: usize, end: usize) -> Vec<&'static str> {
+        let mut out = vec!["wholeTable"];
+        let Some(look) = self.look else {
+            return out;
+        };
+        let first_row = look.first_row && row == 0;
+        let last_row = look.last_row && row + 1 == self.num_rows;
+        let first_col = look.first_column && start == 0;
+        let last_col = look.last_column && end >= self.grid_width;
+        if !look.no_v_band && !first_col && !last_col {
+            let data_col = start.saturating_sub(usize::from(look.first_column));
+            out.push(if (data_col / self.col_band.max(1)).is_multiple_of(2) {
+                "band1Vert"
+            } else {
+                "band2Vert"
+            });
+        }
+        if !look.no_h_band && !first_row && !last_row {
+            let data_row = row.saturating_sub(usize::from(look.first_row));
+            out.push(if (data_row / self.row_band.max(1)).is_multiple_of(2) {
+                "band1Horz"
+            } else {
+                "band2Horz"
+            });
+        }
+        if first_col {
+            out.push("firstCol");
+        }
+        if last_col {
+            out.push("lastCol");
+        }
+        if first_row {
+            out.push("firstRow");
+        }
+        if last_row {
+            out.push("lastRow");
+        }
+        match (first_row, last_row, first_col, last_col) {
+            (true, _, true, _) => out.push("nwCell"),
+            (true, _, _, true) => out.push("neCell"),
+            (_, true, true, _) => out.push("swCell"),
+            (_, true, _, true) => out.push("seCell"),
+            _ => {},
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

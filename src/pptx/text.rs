@@ -1,7 +1,6 @@
 use super::PptxDocument;
 use super::shape::{
-    GraphicContent, HyperlinkTarget, Shape, ShapePosition, Table, TableCell, TableRow, TextBody,
-    TextContent,
+    GraphicContent, Shape, ShapePosition, Table, TableCell, TableRow, TextBody, TextContent,
 };
 
 impl PptxDocument {
@@ -110,8 +109,10 @@ impl PptxDocument {
             // Same `markdown_from_body` ordinary slide body text already
             // uses, so bold/italic/strikethrough/bullets in notes get
             // rendered too, not flattened to plain lines.
+            // Labelled and quoted exactly as the IR renderer does.
             let md = markdown_from_body(notes);
             if !md.is_empty() {
+                result.push_str("> **Notes:**\n");
                 for line in md.lines() {
                     result.push_str("> ");
                     result.push_str(line);
@@ -376,72 +377,16 @@ fn collect_markdown_entries(shapes: &[Shape], entries: &mut Vec<(Option<ShapePos
     }
 }
 
+/// A text body as markdown, through the same block conversion and
+/// renderer `to_ir()` uses: which paragraphs are list items, how runs of
+/// them nest and number, and how blocks are separated are decided in one
+/// place. This renderer used to mark only indented paragraphs as bullets,
+/// so a level-0 bulleted list rendered as plain lines, numbered items lost
+/// their numbers, and the result disagreed with the IR markdown.
 fn markdown_from_body(body: &TextBody) -> String {
-    let mut parts = Vec::new();
-    for para in &body.paragraphs {
-        let text = markdown_paragraph(para);
-        parts.push(text);
-    }
-    parts.join("\n")
-}
-
-fn markdown_paragraph(para: &super::shape::TextParagraph) -> String {
-    let mut text = String::new();
-    for content in &para.content {
-        match content {
-            TextContent::Run(run) => {
-                text.push_str(&markdown_run(run));
-            },
-            TextContent::LineBreak => {
-                text.push_str("  \n");
-            },
-            TextContent::Field(field) => {
-                text.push_str(&field.text);
-            },
-        }
-    }
-    // Add bullet indent for outline levels > 0
-    if para.level > 0 {
-        let indent = "  ".repeat(para.level as usize);
-        format!("{indent}- {text}")
-    } else {
-        text
-    }
-}
-
-fn markdown_run(run: &super::shape::TextRun) -> String {
-    if run.text.is_empty() {
-        return String::new();
-    }
-
-    // Document text must not read as markdown (`*not bold*`, `<tag>`).
-    let mut text = crate::core::markdown::escape_text(&run.text);
-
-    // Apply inline formatting
-    if run.strikethrough {
-        text = format!("~~{text}~~");
-    }
-    if run.bold == Some(true) && run.italic == Some(true) {
-        text = format!("***{text}***");
-    } else if run.bold == Some(true) {
-        text = format!("**{text}**");
-    } else if run.italic == Some(true) {
-        text = format!("*{text}*");
-    }
-
-    // Apply hyperlink
-    if let Some(ref link) = run.hyperlink {
-        match &link.target {
-            HyperlinkTarget::External(url) => {
-                text = format!("[{text}]({url})");
-            },
-            HyperlinkTarget::Internal(_) => {
-                // Internal links — just keep the text
-            },
-        }
-    }
-
-    text
+    let mut elements = Vec::new();
+    crate::convert_pptx::convert_text_body(body, &mut elements);
+    crate::ir_render::render_blocks_markdown(&elements)
 }
 
 fn markdown_table(table: &Table) -> String {
@@ -816,7 +761,11 @@ mod tests {
         }]);
 
         let md = doc.slide_to_markdown(0).unwrap();
-        assert!(md.contains("> Note line 1\n> Note line 2"));
+        // Two note paragraphs: two blocks inside one labelled quote, laid
+        // out as the IR renderer lays them out.
+        assert!(md.contains("> **Notes:**\n> Note line 1\n> \n> Note line 2"), "{md}");
+        let ir = crate::convert_pptx::pptx_to_ir(&doc).to_markdown();
+        assert!(ir.contains("> **Notes:**\n> Note line 1\n> \n> Note line 2"), "{ir}");
     }
 
     /// Speaker notes used to be flattened to plain text

@@ -507,110 +507,157 @@ fn push_positional_textbox(
     }
 }
 
-fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) {
+/// Whether `para` is a list item: it declares a bullet (`buChar`,
+/// `buAutoNum`, `buBlip`), or it is indented and does not switch bullets
+/// off (`buNone`).
+fn is_list_paragraph(para: &crate::pptx::TextParagraph) -> bool {
     use crate::pptx::BulletStyle;
+    match para.bullet {
+        Some(BulletStyle::Char(_) | BulletStyle::AutoNum { .. } | BulletStyle::Picture { .. }) => {
+            true
+        },
+        Some(BulletStyle::None) => false,
+        None => para.level > 0,
+    }
+}
 
-    // A paragraph is a list item when it is indented *or* when it declares
-    // a bullet. Keying only off `level > 0` meant a body placeholder whose
-    // bullets all sit at level 0 — the ordinary single-level bullet list —
-    // came out as plain paragraphs with no markers, and `<a:buAutoNum>`
-    // numbering was lost entirely.
-    let declares_bullet = body.paragraphs.iter().any(|p| {
-        matches!(
-            p.bullet,
-            Some(BulletStyle::Char(_) | BulletStyle::AutoNum { .. } | BulletStyle::Picture { .. })
-        )
-    });
-    let has_levels = body.paragraphs.iter().any(|p| p.level > 0) || declares_bullet;
+/// `Some(true)` for a numbered paragraph, `Some(false)` for a bulleted one,
+/// `None` when it declares neither (an inherited bullet).
+fn paragraph_is_ordered(para: &crate::pptx::TextParagraph) -> Option<bool> {
+    use crate::pptx::BulletStyle;
+    match para.bullet {
+        Some(BulletStyle::AutoNum { .. }) => Some(true),
+        Some(BulletStyle::Char(_) | BulletStyle::Picture { .. }) => Some(false),
+        _ => None,
+    }
+}
 
-    if has_levels {
-        // The shallowest bulleted paragraph decides the list's marker
-        // style and start value.
-        let mut items = Vec::new();
-        let mut top_level: Option<u32> = None;
-        let mut ordered = false;
-        let mut style: Option<ListStyle> = None;
-        let mut start_number: Option<u32> = None;
-        for para in &body.paragraphs {
-            if top_level.is_none_or(|t| para.level < t) {
-                if let Some(b) = para.bullet.as_ref() {
-                    top_level = Some(para.level);
-                    match b {
-                        BulletStyle::AutoNum { scheme, start_at } => {
-                            ordered = true;
-                            style = Some(auto_num_style(scheme));
-                            start_number = start_at.filter(|&n| n != 1);
-                        },
-                        // A picture bullet is an unordered marker drawn
-                        // as an image.
-                        BulletStyle::Char(_) | BulletStyle::Picture { .. } => {
-                            ordered = false;
-                            style = Some(ListStyle::Bullet);
-                        },
-                        BulletStyle::None => {},
-                    }
+/// Convert a text body into block elements: each run of consecutive list
+/// paragraphs becomes one `List`, every other paragraph a `Paragraph`.
+///
+/// Shared by `to_ir()` and the direct markdown renderer, so the two cannot
+/// lay a slide out differently. The whole body used to become one list as
+/// soon as any paragraph was bulleted, so plain paragraphs rendered as
+/// bullets and a numbered run after a bulleted one lost its numbers.
+pub(crate) fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) {
+    let paras = &body.paragraphs;
+    let mut i = 0;
+    while i < paras.len() {
+        if !is_list_paragraph(&paras[i]) {
+            convert_plain_text_paragraph(&paras[i], elements);
+            i += 1;
+            continue;
+        }
+        // One list: consecutive list paragraphs, until a paragraph at the
+        // list's top level switches between numbered and bulleted.
+        let start = i;
+        let mut top_level = paras[i].level;
+        let mut top_ordered = paragraph_is_ordered(&paras[i]);
+        i += 1;
+        while i < paras.len() && is_list_paragraph(&paras[i]) {
+            let p = &paras[i];
+            if p.level <= top_level {
+                let kind = paragraph_is_ordered(p);
+                if kind.is_some() && top_ordered.is_some() && kind != top_ordered {
+                    break;
+                }
+                top_level = p.level;
+                top_ordered = top_ordered.or(kind);
+            }
+            i += 1;
+        }
+        elements.push(Element::List(convert_list_run(&paras[start..i])));
+    }
+}
+
+/// One run of list paragraphs as a nested `List`. The shallowest bulleted
+/// paragraph decides the list's marker style and start value.
+fn convert_list_run(paras: &[crate::pptx::TextParagraph]) -> List {
+    use crate::pptx::BulletStyle;
+    let mut items = Vec::new();
+    let mut top_level: Option<u32> = None;
+    let mut ordered = false;
+    let mut style: Option<ListStyle> = None;
+    let mut start_number: Option<u32> = None;
+    for para in paras {
+        if top_level.is_none_or(|t| para.level < t) {
+            if let Some(b) = para.bullet.as_ref() {
+                top_level = Some(para.level);
+                match b {
+                    BulletStyle::AutoNum { scheme, start_at } => {
+                        ordered = true;
+                        style = Some(auto_num_style(scheme));
+                        start_number = start_at.filter(|&n| n != 1);
+                    },
+                    // A picture bullet is an unordered marker drawn
+                    // as an image.
+                    BulletStyle::Char(_) | BulletStyle::Picture { .. } => {
+                        ordered = false;
+                        style = Some(ListStyle::Bullet);
+                    },
+                    BulletStyle::None => {},
                 }
             }
-            items.push((para.level as u8, convert_text_paragraph_inline(para)));
         }
-        let mut list = crate::ir::build_nested_list(ordered, &items, 0);
-        list.style = style;
-        list.start_number = start_number;
-        elements.push(Element::List(list));
-    } else {
-        for para in &body.paragraphs {
-            let content = convert_text_paragraph_inline(para);
-            // Honour space_before from PPTX so spacer paragraphs
-            // emitted by pdf_to_ir round-trip with their full vertical
-            // gap. Convert hundredths-of-pt → twips: 1pt = 20 twips,
-            // so pt*100 → twips = (pt*100)/5. Plain division keeps the
-            // round-trip exact for values that are multiples of 5;
-            // div_ceil would inflate every non-multiple by 1 twip.
-            let space_before_twips = para
-                .space_before_hundredths_pt
-                .map(|h| h / 5)
-                .or_else(|| percent_spacing_twips(para, para.space_before));
-            // Empty paragraphs serve as vertical spacers — keep them
-            // in the IR even when content is empty so the renderer
-            // can advance the cursor by the requested amount.
-            if !content.is_empty() || space_before_twips.is_some() {
-                elements.push(Element::Paragraph(Paragraph {
-                    content,
-                    alignment: para.alignment.clone(),
-                    space_before_twips,
-                    space_after_twips: match para.space_after {
-                        Some(crate::pptx::TextSpacing::Points(h)) => Some(h / 5),
-                        pct => percent_spacing_twips(para, pct),
+        items.push((para.level as u8, convert_text_paragraph_inline(para)));
+    }
+    let mut list = crate::ir::build_nested_list(ordered, &items, 0);
+    list.style = style;
+    list.start_number = start_number;
+    list
+}
+
+fn convert_plain_text_paragraph(para: &crate::pptx::TextParagraph, elements: &mut Vec<Element>) {
+    let content = convert_text_paragraph_inline(para);
+    // Honour space_before from PPTX so spacer paragraphs
+    // emitted by pdf_to_ir round-trip with their full vertical
+    // gap. Convert hundredths-of-pt → twips: 1pt = 20 twips,
+    // so pt*100 → twips = (pt*100)/5. Plain division keeps the
+    // round-trip exact for values that are multiples of 5;
+    // div_ceil would inflate every non-multiple by 1 twip.
+    let space_before_twips = para
+        .space_before_hundredths_pt
+        .map(|h| h / 5)
+        .or_else(|| percent_spacing_twips(para, para.space_before));
+    // Empty paragraphs serve as vertical spacers — keep them
+    // in the IR even when content is empty so the renderer
+    // can advance the cursor by the requested amount.
+    if !content.is_empty() || space_before_twips.is_some() {
+        elements.push(Element::Paragraph(Paragraph {
+            content,
+            alignment: para.alignment.clone(),
+            space_before_twips,
+            space_after_twips: match para.space_after {
+                Some(crate::pptx::TextSpacing::Points(h)) => Some(h / 5),
+                pct => percent_spacing_twips(para, pct),
+            },
+            line_spacing: para.line_spacing.map(|s| match s {
+                // Same unit as DOCX `w:line` with lineRule=auto:
+                // 240ths of a line (100000 = single = 240).
+                crate::pptx::TextSpacing::Percent(p) => LineSpacing::Auto(
+                    u32::try_from(u64::from(p) * 240 / 100_000).unwrap_or(u32::MAX),
+                ),
+                crate::pptx::TextSpacing::Points(h) => LineSpacing::Exact(h / 5),
+            }),
+            indent_left_twips: para.margin_left_emu.map(emu_to_twips),
+            indent_right_twips: para.margin_right_emu.map(emu_to_twips),
+            first_line_indent_twips: para.indent_emu.map(emu_to_twips),
+            tabs: para
+                .tab_stops
+                .iter()
+                .map(|t| TabStop {
+                    position_twips: emu_to_twips(t.position_emu),
+                    alignment: match t.alignment.as_deref() {
+                        Some("ctr") => TabAlignment::Center,
+                        Some("r") => TabAlignment::Right,
+                        Some("dec") => TabAlignment::Decimal,
+                        _ => TabAlignment::Left,
                     },
-                    line_spacing: para.line_spacing.map(|s| match s {
-                        // Same unit as DOCX `w:line` with lineRule=auto:
-                        // 240ths of a line (100000 = single = 240).
-                        crate::pptx::TextSpacing::Percent(p) => LineSpacing::Auto(
-                            u32::try_from(u64::from(p) * 240 / 100_000).unwrap_or(u32::MAX),
-                        ),
-                        crate::pptx::TextSpacing::Points(h) => LineSpacing::Exact(h / 5),
-                    }),
-                    indent_left_twips: para.margin_left_emu.map(emu_to_twips),
-                    indent_right_twips: para.margin_right_emu.map(emu_to_twips),
-                    first_line_indent_twips: para.indent_emu.map(emu_to_twips),
-                    tabs: para
-                        .tab_stops
-                        .iter()
-                        .map(|t| TabStop {
-                            position_twips: emu_to_twips(t.position_emu),
-                            alignment: match t.alignment.as_deref() {
-                                Some("ctr") => TabAlignment::Center,
-                                Some("r") => TabAlignment::Right,
-                                Some("dec") => TabAlignment::Decimal,
-                                _ => TabAlignment::Left,
-                            },
-                            leader: TabLeader::None,
-                        })
-                        .collect(),
-                    ..Default::default()
-                }));
-            }
-        }
+                    leader: TabLeader::None,
+                })
+                .collect(),
+            ..Default::default()
+        }));
     }
 }
 

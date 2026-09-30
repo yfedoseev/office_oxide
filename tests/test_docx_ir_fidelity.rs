@@ -818,6 +818,78 @@ fn test_table_style_borders_and_conditional_shading_reach_the_ir() {
     assert!(tables[1].border.is_some());
 }
 
+/// A table style's `w:tblStylePr` run and paragraph formatting — the bold
+/// header row of nearly every built-in table style, banded italics, a
+/// centred header — was not read: only its cell shading was. It now
+/// applies through `w:tblLook` in the §17.7.6 region order, beneath the
+/// paragraph style and direct formatting (§17.7.2), identically in
+/// `to_ir()`, the direct markdown and plain-text renderers, and HTML.
+#[test]
+fn test_table_style_conditional_run_and_paragraph_formatting_applies_everywhere() {
+    let cell = |t: &str| format!("<w:tc><w:p><w:r><w:t>{t}</w:t></w:r></w:p></w:tc>");
+    let row = |cells: &[&str]| {
+        format!("<w:tr>{}</w:tr>", cells.iter().map(|t| cell(t)).collect::<String>())
+    };
+    let body = format!(
+        r#"<w:tbl><w:tblPr><w:tblStyle w:val="Report"/>
+             <w:tblLook w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="1"/></w:tblPr>
+           <w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/></w:tblGrid>
+           {}{}{}{}{}
+           <w:tr><w:tc><w:p><w:pPr><w:pStyle w:val="Plain"/></w:pPr><w:r><w:t>styledoff</w:t></w:r></w:p></w:tc>
+             <w:tc><w:p><w:r><w:rPr><w:i w:val="0"/></w:rPr><w:t>directoff</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"#,
+        row(&["Name", "Qty"]),
+        row(&["apple", "3"]),
+        row(&["pear", "5"]),
+        row(&["plum", "7"]),
+        row(&["fig", "9"]),
+    );
+    let styles = r#"
+        <w:style w:type="paragraph" w:styleId="Plain"><w:name w:val="Plain"/><w:rPr><w:i w:val="0"/></w:rPr></w:style>
+        <w:style w:type="table" w:styleId="Base"><w:name w:val="Base"/>
+          <w:tblStylePr w:type="firstRow"><w:pPr><w:jc w:val="center"/></w:pPr><w:rPr><w:b/></w:rPr></w:tblStylePr>
+        </w:style>
+        <w:style w:type="table" w:styleId="Report"><w:name w:val="Report"/><w:basedOn w:val="Base"/>
+          <w:rPr><w:color w:val="112233"/></w:rPr>
+          <w:tblStylePr w:type="band1Horz"><w:rPr><w:i/></w:rPr></w:tblStylePr>
+        </w:style>"#;
+    let bytes = Docx::new(&body).styles(styles).bytes();
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+    let ir = doc.to_ir();
+    let t = table(&ir);
+    let span = |r: usize, c: usize| -> TextSpan {
+        match &t.rows[r].cells[c].content[0] {
+            Element::Paragraph(p) => first_span(p).clone(),
+            other => panic!("not a paragraph: {other:?}"),
+        }
+    };
+    // Header row: bold (inherited from the base style) and centred.
+    assert!(span(0, 0).bold && span(0, 1).bold);
+    assert_eq!(t.rows[0].cells[0].text_align, Some(ParagraphAlignment::Center));
+    // Banded rows: band1 is every other data row, starting with the first.
+    let italics: Vec<bool> = (1..5).map(|r| span(r, 0).italic).collect();
+    assert_eq!(italics, [true, false, true, false]);
+    assert!(!span(1, 0).bold, "data rows are not header rows");
+    // The style's own run formatting reaches every cell.
+    assert_eq!(span(2, 1).color, Some([0x11, 0x22, 0x33]));
+    // A paragraph style and direct formatting both win over the table style.
+    assert!(!span(5, 0).italic && !span(5, 1).italic, "a band1 row, switched off");
+    assert_eq!(span(5, 0).text, "styledoff");
+
+    // Every surface draws the same emphasis.
+    let direct = doc.to_markdown();
+    let via_ir = ir.to_markdown();
+    assert_eq!(direct.trim_end(), via_ir.trim_end());
+    assert!(direct.contains("| **Name** | **Qty** |"), "{direct}");
+    assert!(direct.contains("| *apple* | *3* |"), "{direct}");
+    assert!(direct.contains("| pear | 5 |"), "{direct}");
+    let html = doc.to_html();
+    assert!(
+        html.contains("<strong>Name</strong>") && html.contains("<em>apple</em>"),
+        "{html}"
+    );
+    assert_eq!(doc.plain_text().trim_end(), ir.plain_text().trim_end());
+}
+
 /// `w:trHeight/@w:hRule` (ECMA-376 §17.18) was parsed and read by
 /// nothing, and the writer omitted it — the default is `atLeast`, so an
 /// exact-height row (forms, labels) came back as a minimum height.
@@ -1034,6 +1106,57 @@ fn test_section_page_and_note_numbering_are_read() {
         .unwrap()
         .to_ir();
     assert_eq!(numbering(&again), numbering(&ir));
+}
+
+/// The section's `w:footnotePr` / `w:endnotePr` were read onto the
+/// parser's section properties and then dropped: the IR had nowhere to
+/// hold them and the writer emitted an empty `<w:footnotePr/>`, so a
+/// round trip reset roman, restarting footnotes to plain decimal.
+#[test]
+fn test_section_note_settings_reach_the_ir_and_survive_a_round_trip() {
+    let body = r#"<w:p><w:r><w:t>body</w:t></w:r></w:p>
+        <w:sectPr>
+          <w:footnotePr><w:pos w:val="beneathText"/><w:numFmt w:val="lowerRoman"/>
+            <w:numStart w:val="3"/><w:numRestart w:val="eachPage"/></w:footnotePr>
+          <w:endnotePr><w:numFmt w:val="upperLetter"/></w:endnotePr>
+          <w:pgSz w:w="12240" w:h="15840"/>
+        </w:sectPr>"#;
+    let ir = Docx::new(body).ir();
+    let foot = NoteSettings {
+        position: Some("beneathText".into()),
+        number_format: Some("lowerRoman".into()),
+        start: Some(3),
+        restart: Some("eachPage".into()),
+    };
+    let end = NoteSettings {
+        number_format: Some("upperLetter".into()),
+        ..Default::default()
+    };
+    let notes = |ir: &DocumentIR| {
+        let s = &ir.sections[0];
+        (s.footnote_settings.clone(), s.endnote_settings.clone())
+    };
+    assert_eq!(notes(&ir), (Some(foot.clone()), Some(end.clone())));
+
+    let bytes = docx_bytes(&ir);
+    let again = Document::from_reader(Cursor::new(bytes.clone()), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(notes(&again), notes(&ir));
+
+    // Also through an inline (non-final) section break.
+    let mut two = ir.clone();
+    two.sections.push(Section {
+        elements: vec![Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan::plain("second"))],
+            ..Default::default()
+        })],
+        ..Default::default()
+    });
+    let again = Document::from_reader(Cursor::new(docx_bytes(&two)), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(notes(&again), (Some(foot), Some(end)));
 }
 
 /// `w:pgMar/@w:gutter` was parsed and never read, and the writer
@@ -1281,6 +1404,69 @@ fn test_numbering_level_indent_applies_to_a_numbered_heading() {
     assert_eq!(heading(0).indent_left_twips, Some(432));
     assert_eq!(heading(0).first_line_indent_twips, Some(-432));
     assert_eq!(heading(1).indent_left_twips, Some(100));
+}
+
+/// `w:lvlText` (the marker pattern around the counter) and `w:lvlJc` were
+/// parsed and never read: `a)`, `(1)` and `1.1.` all became `1.`, a
+/// sub-list took the ordered flag of whichever item came last, and the
+/// writer always wrote `%N.` with no `w:lvlJc`.
+#[test]
+fn test_numbering_marker_pattern_and_alignment_reach_the_ir_renderers_and_writer() {
+    let numbering = r#"
+      <w:abstractNum w:abstractNumId="0">
+        <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/>
+          <w:lvlText w:val="%1)"/><w:lvlJc w:val="right"/></w:lvl>
+        <w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/>
+          <w:lvlText w:val="%1.%2."/><w:lvlJc w:val="left"/></w:lvl>
+        <w:lvl w:ilvl="2"><w:start w:val="1"/><w:numFmt w:val="bullet"/>
+          <w:lvlText w:val="&#9642;"/></w:lvl>
+      </w:abstractNum>
+      <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#;
+    let para = |ilvl: u8, text: &str| {
+        format!(
+            r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+        )
+    };
+    let body = [
+        para(0, "one"),
+        para(1, "one-a"),
+        para(2, "dot"),
+        para(0, "two"),
+    ]
+    .concat();
+    let bytes = Docx::new(&body).numbering(numbering).bytes();
+    let doc = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap();
+
+    let check = |ir: &DocumentIR| {
+        let top = match first(ir) {
+            Element::List(l) => l,
+            other => panic!("not a list: {other:?}"),
+        };
+        assert!(top.ordered);
+        assert_eq!(top.marker_pattern.as_deref(), Some("%1)"));
+        assert_eq!(top.marker_alignment, Some(ParagraphAlignment::Right));
+        let sub = top.items[0].nested.as_ref().expect("level 1");
+        assert!(sub.ordered);
+        assert_eq!(sub.marker_pattern.as_deref(), Some("%1.%2."));
+        assert_eq!(sub.marker_alignment, None);
+        let dots = sub.items[0].nested.as_ref().expect("level 2");
+        assert!(!dots.ordered, "a bullet level under a numbered one is a bullet list");
+        assert_eq!(dots.style, Some(ListStyle::Square));
+        assert_eq!(dots.marker_pattern, None);
+    };
+    let ir = doc.to_ir();
+    check(&ir);
+
+    // CommonMark has `1)`; both markdown pipelines use it, and agree.
+    let direct = doc.to_markdown();
+    assert!(direct.contains("1) one") && direct.contains("2) two"), "{direct}");
+    assert_eq!(ir.to_markdown().trim_end(), direct.trim_end());
+
+    // The writer keeps the pattern and the alignment.
+    let again = Document::from_reader(Cursor::new(docx_bytes(&ir)), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    check(&again);
 }
 
 #[test]
@@ -2119,4 +2305,83 @@ fn test_text_box_content_does_not_fuse_with_the_following_run() {
             "{name} fused the text box to the next run: {out:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Nested lists
+// ---------------------------------------------------------------------------
+
+const NESTED_WORDS: [&str; 6] = ["one", "one-a", "one-b", "two", "two-a", "three"];
+
+/// Positions of each of `NESTED_WORDS` as a whole line/item in `s`.
+fn nested_word_positions(s: &str) -> Vec<usize> {
+    let s = format!("{s}\n");
+    NESTED_WORDS
+        .iter()
+        .map(|w| {
+            [format!(" {w}\n"), format!("\n{w}\n"), format!(">{w}<")]
+                .iter()
+                .find_map(|pat| s.find(pat.as_str()))
+                .unwrap_or_else(|| panic!("{w} missing from {s}"))
+        })
+        .collect()
+}
+
+fn assert_nested_order(doc: &Document) {
+    let ir = doc.to_ir();
+    let list = match first(&ir) {
+        Element::List(l) => l,
+        other => panic!("not a list: {other:?}"),
+    };
+    assert_eq!(list.items.len(), 3, "top level: {list:?}");
+    let kids = |i: usize| list.items[i].nested.as_ref().map_or(0, |l| l.items.len());
+    assert_eq!((kids(0), kids(1), kids(2)), (2, 1, 0), "children moved: {list:?}");
+    for s in [
+        doc.to_markdown(),
+        ir.to_markdown(),
+        doc.to_html(),
+        doc.plain_text(),
+    ] {
+        let pos = nested_word_positions(&format!("\n{s}"));
+        assert!(pos.windows(2).all(|w| w[0] < w[1]), "out of order: {s}");
+    }
+}
+
+/// A sub-list written by the DOCX writer belongs under the item it hangs
+/// off. The writer emitted every item of a level first and the sub-lists
+/// after them, so on the way back in both markdown pipelines (and HTML)
+/// showed "one / two / three / one-a …": each child under the wrong parent.
+#[test]
+fn test_written_nested_list_keeps_children_under_their_parent() {
+    let md = "- one\n  - one-a\n  - one-b\n- two\n  - two-a\n- three\n";
+    let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
+    let doc = Document::from_reader(Cursor::new(docx_bytes(&ir)), DocumentFormat::Docx).unwrap();
+    assert_nested_order(&doc);
+
+    // The same list read from Word-shaped paragraphs.
+    let para = |ilvl: u8, text: &str| {
+        format!(
+            r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+        )
+    };
+    let body = [
+        (0, "one"),
+        (1, "one-a"),
+        (1, "one-b"),
+        (0, "two"),
+        (1, "two-a"),
+        (0, "three"),
+    ]
+    .iter()
+    .map(|(l, t)| para(*l, t))
+    .collect::<String>();
+    let bytes = Docx::new(&body)
+        .numbering(
+            r#"<w:abstractNum w:abstractNumId="0">
+                 <w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="&#8226;"/></w:lvl>
+                 <w:lvl w:ilvl="1"><w:numFmt w:val="bullet"/><w:lvlText w:val="&#8226;"/></w:lvl>
+               </w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#,
+        )
+        .bytes();
+    assert_nested_order(&Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap());
 }

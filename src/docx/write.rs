@@ -34,8 +34,8 @@ use crate::core::opc::{OpcWriter, PartName};
 use crate::core::relationships::rel_types;
 use crate::ir::{
     BorderLine, BorderStyle, CellVerticalAlign, ColumnLayout, ImageFormat, ImagePositioning,
-    LineSpacing, ListStyle, PageSetup, ParagraphAlignment, SectionBreakType, TableAlignment,
-    UnderlineStyle, VerticalAlign,
+    LineSpacing, ListStyle, NoteSettings, PageSetup, ParagraphAlignment, SectionBreakType,
+    TableAlignment, UnderlineStyle, VerticalAlign,
 };
 
 use super::Result;
@@ -379,6 +379,9 @@ struct DocxSectPr {
     page_setup: Option<PageSetup>,
     columns: Option<ColumnLayout>,
     break_type: SectionBreakType,
+    /// `w:footnotePr` / `w:endnotePr` for this section.
+    footnote_settings: Option<NoteSettings>,
+    endnote_settings: Option<NoteSettings>,
     /// The headers/footers (indices into `DocxWriter::headers_footers`)
     /// that belong to this section: those added since the previous
     /// section's `sectPr`. Every section used to share one flat list
@@ -428,6 +431,10 @@ struct DocxRichList {
     items: Vec<Vec<DocxElement>>,
     start_number: Option<u32>,
     style: Option<ListStyle>,
+    /// `w:lvlText` for an ordered level whose marker is not plain `%N.`.
+    marker_pattern: Option<String>,
+    /// `w:lvlJc`.
+    marker_alignment: Option<ParagraphAlignment>,
     level: u8,
     num_id: u32,
 }
@@ -837,9 +844,33 @@ impl DocxWriter {
             page_setup,
             columns,
             break_type,
+            footnote_settings: None,
+            endnote_settings: None,
             hf_range,
         }));
         self
+    }
+
+    /// Set the footnote and endnote numbering/placement of the section most
+    /// recently closed by [`Self::set_section_props`], written as its
+    /// `w:footnotePr` / `w:endnotePr`. Returns `false` (and changes nothing)
+    /// when no section has been closed yet.
+    pub fn set_section_note_settings(
+        &mut self,
+        footnote: Option<NoteSettings>,
+        endnote: Option<NoteSettings>,
+    ) -> bool {
+        let Some(DocxElement::SectPr(sp)) = self
+            .elements
+            .iter_mut()
+            .rev()
+            .find(|e| matches!(e, DocxElement::SectPr(_)))
+        else {
+            return false;
+        };
+        sp.footnote_settings = footnote;
+        sp.endnote_settings = endnote;
+        true
     }
 
     /// Add an IR list with rich style information.
@@ -852,60 +883,15 @@ impl DocxWriter {
 
     /// Emit `list` and, recursively, every sub-list hanging off its items.
     ///
-    /// `ListItem::nested` was read by no writer at all, so everything below
-    /// level 0 vanished from the output while the API reported success.
-    ///
-    /// `num_id` is shared across every recursive call for one logical list
-    /// (only `add_ir_list` mints a fresh one) — a nested sub-list used to
-    /// get its own brand-new `numId` per level, which the reader (correctly,
-    /// per spec: one logical list keeps one `numId` across all its levels)
-    /// re-parsed as an unrelated *sibling* top-level list instead of a
-    /// child of the parent item, losing the parent/child relationship (and
-    /// sometimes the `ordered` flag) on every round trip.
+    /// `num_id` is shared across every level of one logical list (only
+    /// `add_ir_list` mints a fresh one): per spec one logical list keeps
+    /// one `numId` across all its levels, and a sub-list with its own
+    /// `numId` re-reads as an unrelated sibling list.
     fn add_ir_list_at(&mut self, list: &crate::ir::List, level: u8, num_id: u32) {
-        // Nested sub-lists recurse here, outside the element walk's own
-        // guard, so the list chain needs its own bound.
-        let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
-            log::warn!("docx: list nesting exceeds the depth limit; sub-list skipped");
-            return;
-        };
-        let start_number = list.start_number.unwrap_or(1);
-        let style = list.style.clone();
-
-        let items: Vec<Vec<DocxElement>> = list
-            .items
-            .iter()
-            .map(|item| {
-                let mut elems: Vec<DocxElement> = Vec::new();
-                for content_elem in &item.content {
-                    convert_ir_element_to_docx_elements(
-                        content_elem,
-                        &mut elems,
-                        &mut self.next_num_id,
-                        &mut self.images,
-                    );
-                }
-                elems
-            })
-            .collect();
-
-        self.elements.push(DocxElement::RichList(DocxRichList {
-            ordered: list.ordered,
-            items,
-            start_number: if start_number != 1 {
-                Some(start_number)
-            } else {
-                None
-            },
-            style,
-            level,
-            num_id,
-        }));
-
-        for item in &list.items {
-            if let Some(ref nested) = item.nested {
-                self.add_ir_list_at(nested, level.saturating_add(1).min(8), num_id);
-            }
+        if let Some(rl) =
+            convert_ir_list_at(list, level, num_id, &mut self.next_num_id, &mut self.images)
+        {
+            self.elements.push(DocxElement::RichList(rl));
         }
     }
 
@@ -1338,6 +1324,8 @@ impl DocxWriter {
                     break_type: sp.break_type.clone(),
                     hf_rids: own,
                     has_footnotes: footnote_rid.is_some(),
+                    footnote_settings: sp.footnote_settings.clone(),
+                    endnote_settings: sp.endnote_settings.clone(),
                 });
             }
         }
@@ -1350,6 +1338,8 @@ impl DocxWriter {
                 break_type: SectionBreakType::Continuous,
                 hf_rids: hf_rids.clone(),
                 has_footnotes: footnote_rid.is_some(),
+                footnote_settings: None,
+                endnote_settings: None,
             });
         }
 
@@ -1677,8 +1667,8 @@ impl DocxWriter {
         // CT_Numbering is `numPicBullet*, abstractNum*, num*`: every abstract
         // definition must precede every instance, so these run as two passes
         // rather than one pair per list.
-        write_abstract_num(&mut w, 0, &[(0, "bullet", "\u{2022}".to_string())]);
-        write_abstract_num(&mut w, 1, &[(0, "decimal", "%1.".to_string())]);
+        write_abstract_num(&mut w, 0, &[(0, "bullet", "\u{2022}".to_string(), None)]);
+        write_abstract_num(&mut w, 1, &[(0, "decimal", "%1.".to_string(), None)]);
 
         // One logical list's recursive nesting levels now share a single
         // `numId`, so group by `num_id` here rather than
@@ -1696,12 +1686,24 @@ impl DocxWriter {
 
         for &num_id in &num_ids {
             let abstract_id = num_id - 3 + 2;
-            let mut levels: Vec<(u8, &str, String)> = Vec::new();
+            let mut levels: Vec<AbstractLevel> = Vec::new();
             for rl in &rich_lists {
                 if rl.num_id == num_id && !levels.iter().any(|(l, ..)| *l == rl.level) {
-                    let (fmt, lvl_text) =
+                    let (fmt, mut lvl_text) =
                         list_style_to_fmt(rl.style.as_ref(), rl.ordered, rl.level);
-                    levels.push((rl.level, fmt, lvl_text));
+                    if let Some(pattern) = rl
+                        .marker_pattern
+                        .as_deref()
+                        .filter(|p| rl.ordered && pattern_fits_level(p, rl.level))
+                    {
+                        lvl_text = pattern.to_string();
+                    }
+                    let jc = rl.marker_alignment.as_ref().map(|a| match a {
+                        ParagraphAlignment::Center => "center",
+                        ParagraphAlignment::Right => "right",
+                        _ => "left",
+                    });
+                    levels.push((rl.level, fmt, lvl_text, jc));
                 }
             }
             write_abstract_num(&mut w, abstract_id, &levels);
@@ -1995,7 +1997,9 @@ fn convert_ir_element_to_docx_elements(
             // analogous top-level-list bug).
             let num_id = *next_num_id;
             *next_num_id += 1;
-            convert_ir_list_at(l, l.level, num_id, out, next_num_id, images);
+            if let Some(rl) = convert_ir_list_at(l, l.level, num_id, next_num_id, images) {
+                out.push(DocxElement::RichList(rl));
+            }
         },
         E::Image(img) => {
             // Every nested image used to be skipped here ("needs the outer
@@ -2034,25 +2038,29 @@ fn convert_ir_element_to_docx_elements(
     }
 }
 
-/// Emit `list` and, recursively, every sub-list hanging off its items, into
-/// `out` — the free-function counterpart of `DocxWriter::add_ir_list_at`
-/// for content nested inside a table cell, text box, header/footer, or
-/// footnote/endnote, which has no `self.elements` to push sibling
-/// `RichList` entries into. `num_id` is shared across every recursive call
-/// for one logical list (only the `E::List` match arm that calls this
-/// mints a fresh one), matching `add_ir_list_at`'s contract that one
-/// logical list keeps one `numId` across all its nesting levels.
+/// Build the `RichList` for `list` at `level`, with every sub-list placed
+/// inside the item it hangs off — after that item's own content and before
+/// the next sibling, which is where Word expects the level-`n+1` paragraphs.
+/// Emitting all of a level's items first and the sub-lists after them moved
+/// every child under the wrong parent on the way back in.
+///
+/// `num_id` is shared across every recursive call for one logical list: per
+/// spec one logical list keeps one `numId` across all its nesting levels.
+/// Returns `None` only when the nesting exceeds the depth limit.
 fn convert_ir_list_at(
     list: &crate::ir::List,
     level: u8,
     num_id: u32,
-    out: &mut Vec<DocxElement>,
     next_num_id: &mut u32,
     images: &mut Vec<DocxImage>,
-) {
+) -> Option<DocxRichList> {
+    // Nested sub-lists recurse here, outside the element walk's own guard,
+    // so the list chain needs its own bound.
+    let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+        log::warn!("docx: list nesting exceeds the depth limit; sub-list skipped");
+        return None;
+    };
     let start_number = list.start_number.unwrap_or(1);
-    let style = list.style.clone();
-
     let items: Vec<Vec<DocxElement>> = list
         .items
         .iter()
@@ -2061,35 +2069,28 @@ fn convert_ir_list_at(
             for content_elem in &item.content {
                 convert_ir_element_to_docx_elements(content_elem, &mut elems, next_num_id, images);
             }
+            if let Some(ref nested) = item.nested {
+                let child_level = level.saturating_add(1).min(8);
+                if let Some(rl) =
+                    convert_ir_list_at(nested, child_level, num_id, next_num_id, images)
+                {
+                    elems.push(DocxElement::RichList(rl));
+                }
+            }
             elems
         })
         .collect();
 
-    out.push(DocxElement::RichList(DocxRichList {
+    Some(DocxRichList {
         ordered: list.ordered,
         items,
-        start_number: if start_number != 1 {
-            Some(start_number)
-        } else {
-            None
-        },
-        style,
+        start_number: (start_number != 1).then_some(start_number),
+        style: list.style.clone(),
+        marker_pattern: list.marker_pattern.clone(),
+        marker_alignment: list.marker_alignment.clone(),
         level,
         num_id,
-    }));
-
-    for item in &list.items {
-        if let Some(ref nested) = item.nested {
-            convert_ir_list_at(
-                nested,
-                level.saturating_add(1).min(8),
-                num_id,
-                out,
-                next_num_id,
-                images,
-            );
-        }
-    }
+    })
 }
 
 fn ir_paragraph_to_runs(p: &crate::ir::Paragraph) -> Vec<Run> {
@@ -2187,6 +2188,8 @@ struct SectPrInfo {
     hf_rids: Vec<(HfType, String)>,
     /// Presence only: sectPr's `<w:footnotePr/>` carries no relationship id.
     has_footnotes: bool,
+    footnote_settings: Option<NoteSettings>,
+    endnote_settings: Option<NoteSettings>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3829,7 +3832,7 @@ fn write_inline_section_break_paragraph(
         .expect("write inline-section p start");
     w.write_event(Event::Start(BytesStart::new("w:pPr")))
         .expect("write inline-section pPr start");
-    write_section_pr_body(w, sp.page_setup.as_ref(), sp.columns.as_ref(), &sp.break_type, hf_rids);
+    write_section_pr_body(w, sp, hf_rids);
     w.write_event(Event::End(BytesEnd::new("w:pPr")))
         .expect("write inline-section pPr end");
     w.write_event(Event::End(BytesEnd::new("w:p")))
@@ -3866,6 +3869,32 @@ fn write_hf_references(w: &mut Writer<Vec<u8>>, hf_rids: &[(HfType, String)]) ->
     has_first_page
 }
 
+/// A section's `w:footnotePr` / `w:endnotePr` (CT_FtnProps / CT_EdnProps,
+/// ECMA-376 §17.11.11 / §17.11.5): children in schema order `pos`,
+/// `numFmt`, `numStart`, `numRestart`. Nothing is written for `None`.
+fn write_note_pr(w: &mut Writer<Vec<u8>>, tag: &str, settings: Option<&NoteSettings>) {
+    let Some(ns) = settings else {
+        return;
+    };
+    w.write_event(Event::Start(BytesStart::new(tag)))
+        .expect("write note pr start");
+    let children = [
+        ("w:pos", ns.position.clone()),
+        ("w:numFmt", ns.number_format.clone()),
+        ("w:numStart", ns.start.map(|n| n.to_string())),
+        ("w:numRestart", ns.restart.clone()),
+    ];
+    for (child, value) in children {
+        if let Some(v) = value {
+            let mut e = BytesStart::new(child);
+            e.push_attribute(("w:val", crate::core::xml::sanitize_xml_text(&v).as_ref()));
+            w.write_event(Event::Empty(e)).expect("write note pr child");
+        }
+    }
+    w.write_event(Event::End(BytesEnd::new(tag)))
+        .expect("write note pr end");
+}
+
 /// `w:pgNumType` (CT_SectPr puts it after `w:pgMar` and before
 /// `w:cols`), when the section numbers its pages other than by default.
 fn write_pg_num_type(w: &mut Writer<Vec<u8>>, ps: &PageSetup) {
@@ -3885,18 +3914,17 @@ fn write_pg_num_type(w: &mut Writer<Vec<u8>>, ps: &PageSetup) {
 /// Shared `<w:sectPr>...</w:sectPr>` body writer — used by both the
 /// body-level final sectPr and inline (per-paragraph) section breaks.
 /// Caller writes the surrounding `<w:sectPr>`/`</w:sectPr>` tags.
-fn write_section_pr_body(
-    w: &mut Writer<Vec<u8>>,
-    page_setup: Option<&PageSetup>,
-    columns: Option<&ColumnLayout>,
-    break_type: &SectionBreakType,
-    hf_rids: &[(HfType, String)],
-) {
+fn write_section_pr_body(w: &mut Writer<Vec<u8>>, sp: &DocxSectPr, hf_rids: &[(HfType, String)]) {
+    let (page_setup, columns, break_type) =
+        (sp.page_setup.as_ref(), sp.columns.as_ref(), &sp.break_type);
     w.write_event(Event::Start(BytesStart::new("w:sectPr")))
         .expect("write sectPr start");
 
-    // CT_SectPr orders the header/footer references first.
+    // CT_SectPr orders the header/footer references first, then
+    // `footnotePr` and `endnotePr`.
     let has_first_page = write_hf_references(w, hf_rids);
+    write_note_pr(w, "w:footnotePr", sp.footnote_settings.as_ref());
+    write_note_pr(w, "w:endnotePr", sp.endnote_settings.as_ref());
 
     match break_type {
         SectionBreakType::Continuous => {
@@ -3990,10 +4018,13 @@ fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
 
     let has_first_page = write_hf_references(w, &sp.hf_rids);
 
-    if sp.has_footnotes {
+    if sp.footnote_settings.is_some() {
+        write_note_pr(w, "w:footnotePr", sp.footnote_settings.as_ref());
+    } else if sp.has_footnotes {
         w.write_event(Event::Empty(BytesStart::new("w:footnotePr")))
             .expect("write footnotePr");
     }
+    write_note_pr(w, "w:endnotePr", sp.endnote_settings.as_ref());
 
     match sp.break_type {
         SectionBreakType::Continuous => {},
@@ -4577,17 +4608,30 @@ fn write_character_style(w: &mut Writer<Vec<u8>>, style_id: &str, name: &str) {
 /// paragraph referencing an `ilvl` this abstractNum never defines falls
 /// back to Word's own default numbering behavior instead of the level's
 /// real ordered/bullet style.
-fn write_abstract_num(
-    w: &mut Writer<Vec<u8>>,
-    abstract_num_id: u32,
-    levels: &[(u8, &str, String)],
-) {
+/// One `w:lvl`: `(ilvl, numFmt, lvlText, lvlJc)`.
+type AbstractLevel = (u8, &'static str, String, Option<&'static str>);
+
+/// Whether every `%N` placeholder in a `w:lvlText` pattern names a level at
+/// or above `ilvl` (0-based) — a counter that exists when the pattern is
+/// drawn. A sub-list written at a different depth than it was read at could
+/// otherwise point at a level the list never uses.
+fn pattern_fits_level(pattern: &str, ilvl: u8) -> bool {
+    let bytes = pattern.as_bytes();
+    bytes.iter().enumerate().all(|(i, &b)| {
+        b != b'%'
+            || bytes
+                .get(i + 1)
+                .is_some_and(|d| d.is_ascii_digit() && (1..=ilvl + 1).contains(&(d - b'0')))
+    })
+}
+
+fn write_abstract_num(w: &mut Writer<Vec<u8>>, abstract_num_id: u32, levels: &[AbstractLevel]) {
     let mut elem = BytesStart::new("w:abstractNum");
     elem.push_attribute(("w:abstractNumId", abstract_num_id.to_string().as_str()));
     w.write_event(Event::Start(elem))
         .expect("write abstractNum start");
 
-    for (ilvl, num_fmt, lvl_text) in levels {
+    for (ilvl, num_fmt, lvl_text, lvl_jc) in levels {
         let mut lvl = BytesStart::new("w:lvl");
         lvl.push_attribute(("w:ilvl", ilvl.to_string().as_str()));
         w.write_event(Event::Start(lvl)).expect("write lvl start");
@@ -4597,8 +4641,15 @@ fn write_abstract_num(
         w.write_event(Event::Empty(fmt)).expect("write numFmt");
 
         let mut text = BytesStart::new("w:lvlText");
-        text.push_attribute(("w:val", lvl_text.as_str()));
+        text.push_attribute(("w:val", crate::core::xml::sanitize_xml_text(lvl_text).as_ref()));
         w.write_event(Event::Empty(text)).expect("write lvlText");
+
+        // CT_Lvl puts `lvlJc` right after `lvlText`.
+        if let Some(jc) = lvl_jc {
+            let mut e = BytesStart::new("w:lvlJc");
+            e.push_attribute(("w:val", *jc));
+            w.write_event(Event::Empty(e)).expect("write lvlJc");
+        }
 
         w.write_event(Event::End(BytesEnd::new("w:lvl")))
             .expect("write lvl end");
