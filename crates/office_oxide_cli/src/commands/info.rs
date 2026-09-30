@@ -4,12 +4,22 @@ pub fn run(file: &str) -> Result<(), Box<dyn std::error::Error>> {
     let doc = Document::open(file)?;
     let ir = doc.to_ir();
 
-    println!("Format: {:?}", ir.metadata.format);
-    if let Some(ref title) = ir.metadata.title {
-        println!("Title: {title}");
+    let meta = &ir.metadata;
+    println!("Format: {:?}", meta.format);
+    for (label, value) in meta.properties() {
+        println!("{label}: {value}");
     }
-    if ir.metadata.has_macros {
+    for p in &meta.custom_properties {
+        println!("Custom property: {} = {}", p.name, p.value);
+    }
+    if meta.has_macros {
         println!("Macros: yes");
+    }
+    if meta.has_digital_signature {
+        println!("Digitally signed: yes");
+    }
+    if meta.thumbnail.is_some() {
+        println!("Thumbnail: yes");
     }
     if ir.metadata.text_truncated {
         println!(

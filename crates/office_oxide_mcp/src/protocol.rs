@@ -197,12 +197,7 @@ fn call_info(id: &Value, args: &Value) -> Value {
     };
 
     let ir = doc.to_ir();
-    let info = json!({
-        "format": format!("{:?}", ir.metadata.format),
-        "title": ir.metadata.title,
-        "sections": ir.sections.len(),
-        "section_names": ir.sections.iter().map(|s| s.title.clone()).collect::<Vec<_>>(),
-    });
+    let info = info_json(&ir);
 
     json!({
         "jsonrpc": "2.0",
@@ -211,6 +206,75 @@ fn call_info(id: &Value, args: &Value) -> Value {
             "content": [{ "type": "text", "text": info.to_string() }]
         }
     })
+}
+
+/// The `info` tool's payload: format, every document property that is
+/// set, the custom properties, the content flags and the section list.
+fn info_json(ir: &office_oxide::DocumentIR) -> Value {
+    let meta = &ir.metadata;
+    let mut info = json!({
+        "format": format!("{:?}", meta.format),
+        "title": meta.title,
+        "author": meta.author,
+        "subject": meta.subject,
+        "keywords": meta.keywords,
+        "description": meta.description,
+        "created": meta.created,
+        "modified": meta.modified,
+        "last_modified_by": meta.last_modified_by,
+        "revision": meta.revision,
+        "category": meta.category,
+        "content_status": meta.content_status,
+        "language": meta.language,
+        "company": meta.company,
+        "manager": meta.manager,
+        "custom_properties": meta.custom_properties,
+        "has_macros": meta.has_macros,
+        "has_digital_signature": meta.has_digital_signature,
+        "has_thumbnail": meta.thumbnail.is_some(),
+        "text_truncated": meta.text_truncated,
+        "sections": ir.sections.len(),
+        "section_names": ir.sections.iter().map(|s| s.title.clone()).collect::<Vec<_>>(),
+    });
+    // Absent properties are omitted rather than reported as null.
+    if let Some(map) = info.as_object_mut() {
+        map.retain(|_, v| !v.is_null());
+    }
+    info
+}
+
+#[cfg(test)]
+mod info_tests {
+    use super::*;
+
+    #[test]
+    fn test_info_reports_every_set_document_property() {
+        let ir = office_oxide::DocumentIR {
+            metadata: office_oxide::ir::Metadata {
+                format: office_oxide::DocumentFormat::Docx,
+                title: Some("T".into()),
+                author: Some("A".into()),
+                subject: Some("S".into()),
+                keywords: vec!["k1".into(), "k 2".into()],
+                created: Some("2024-01-01T00:00:00Z".into()),
+                modified: Some("2024-02-01T00:00:00Z".into()),
+                last_modified_by: Some("L".into()),
+                company: Some("C".into()),
+                ..Default::default()
+            },
+            sections: Vec::new(),
+            defined_names: Vec::new(),
+        };
+        let v = info_json(&ir);
+        assert_eq!(v["author"], "A");
+        assert_eq!(v["subject"], "S");
+        assert_eq!(v["keywords"], json!(["k1", "k 2"]));
+        assert_eq!(v["created"], "2024-01-01T00:00:00Z");
+        assert_eq!(v["modified"], "2024-02-01T00:00:00Z");
+        assert_eq!(v["last_modified_by"], "L");
+        assert_eq!(v["company"], "C");
+        assert!(v.get("manager").is_none(), "absent properties are omitted");
+    }
 }
 
 fn error_response(id: &Value, code: i64, message: &str) -> Value {
