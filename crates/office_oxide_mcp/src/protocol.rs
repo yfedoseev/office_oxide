@@ -243,6 +243,25 @@ fn info_json(ir: &office_oxide::DocumentIR) -> Value {
     info
 }
 
+fn error_response(id: &Value, code: i64, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message }
+    })
+}
+
+fn tool_error(id: &Value, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{ "type": "text", "text": message }],
+            "isError": true
+        }
+    })
+}
+
 #[cfg(test)]
 mod info_tests {
     use super::*;
@@ -275,23 +294,4 @@ mod info_tests {
         assert_eq!(v["company"], "C");
         assert!(v.get("manager").is_none(), "absent properties are omitted");
     }
-}
-
-fn error_response(id: &Value, code: i64, message: &str) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": { "code": code, "message": message }
-    })
-}
-
-fn tool_error(id: &Value, message: &str) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": {
-            "content": [{ "type": "text", "text": message }],
-            "isError": true
-        }
-    })
 }

@@ -313,7 +313,7 @@ fn lpstr(s: &str) -> Vec<u8> {
     v.extend_from_slice(&((s.len() + 1) as u32).to_le_bytes());
     v.extend_from_slice(s.as_bytes());
     v.push(0);
-    while v.len() % 4 != 0 {
+    while !v.len().is_multiple_of(4) {
         v.push(0);
     }
     v
