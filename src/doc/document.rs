@@ -344,6 +344,9 @@ impl DocDocument {
             .open_stream("\u{5}SummaryInformation")
             .ok()
             .and_then(|data| parse_summary_information(&data));
+        // A container stream that came back shorter than its declared size
+        // lost content just as surely as a piece-table gap.
+        let text_complete = text_complete && cfb.truncated_streams().is_empty();
 
         Ok(Self {
             text,
@@ -392,6 +395,7 @@ impl DocDocument {
             .open_stream("\u{5}SummaryInformation")
             .ok()
             .and_then(|data| parse_summary_information(&data));
+        let text_complete = text_complete && cfb.truncated_streams().is_empty();
         Ok(Self {
             text,
             data_stream: Vec::new(),
