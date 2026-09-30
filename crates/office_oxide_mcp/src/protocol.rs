@@ -283,9 +283,8 @@ fn call_info(id: &Value, args: &Value) -> Value {
 
 /// Shown when the parser detected that it could not recover all of the
 /// document's text. Same wording as the CLI's `info`.
-const TRUNCATION_WARNING: &str = "text extraction is incomplete — the source file's own \
-     structure disagrees with itself about how much text there is, and the gap could not be \
-     safely recovered";
+const TRUNCATION_WARNING: &str =
+    "text extraction is incomplete — part of the document could not be recovered safely";
 
 /// The `info` tool's result: format, file size, every document property
 /// that is set (absent ones are omitted rather than reported as null), the
@@ -296,10 +295,13 @@ const TRUNCATION_WARNING: &str = "text extraction is incomplete — the source f
 /// incomplete.
 fn info_json(ir: &office_oxide::DocumentIR, file_size: Option<u64>) -> Value {
     let meta = &ir.metadata;
-    let mut warnings = Vec::new();
+    let mut warnings: Vec<&str> = Vec::new();
     if meta.text_truncated {
         warnings.push(TRUNCATION_WARNING);
     }
+    // What the reader worked around, one line each (a skipped part, a
+    // flattened structure).
+    warnings.extend(meta.warnings.iter().map(String::as_str));
     let mut info = json!({
         "format": format!("{:?}", meta.format),
         "file_size": file_size,
@@ -455,6 +457,7 @@ mod tests {
         metadata.created = Some("2024-01-02T03:04:05Z".into());
         metadata.modified = Some("2024-02-03T04:05:06Z".into());
         metadata.text_truncated = true;
+        metadata.warnings = vec!["skipped unreadable part /word/header1.xml".into()];
         let ir = office_oxide::DocumentIR {
             metadata,
             sections: Vec::new(),
@@ -469,8 +472,9 @@ mod tests {
         assert_eq!(info["modified"], json!("2024-02-03T04:05:06Z"));
         assert_eq!(info["text_truncated"], json!(true));
         let warnings = info["warnings"].as_array().unwrap();
-        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings.len(), 2);
         assert!(warnings[0].as_str().unwrap().contains("incomplete"));
+        assert_eq!(warnings[1], json!("skipped unreadable part /word/header1.xml"));
 
         let clean = office_oxide::DocumentIR {
             metadata: Metadata::default(),

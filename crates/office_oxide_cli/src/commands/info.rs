@@ -46,9 +46,14 @@ fn render(ir: &DocumentIR, file_size: Option<u64>) -> String {
     if m.text_truncated {
         let _ = writeln!(
             s,
-            "Warning: text extraction is incomplete — the source file's own structure disagrees \
-             with itself about how much text there is, and the gap could not be safely recovered"
+            "Warning: text extraction is incomplete — part of the document could not be \
+             recovered safely"
         );
+    }
+    // What the reader worked around, one line each: a skipped part, a
+    // flattened structure, a container whose counts disagree.
+    for w in &m.warnings {
+        let _ = writeln!(s, "Warning: {w}");
     }
     let _ = writeln!(s, "Sections: {}", ir.sections.len());
 
@@ -84,6 +89,7 @@ mod tests {
         metadata.description = Some("Summary".into());
         metadata.has_macros = true;
         metadata.text_truncated = true;
+        metadata.warnings = vec!["skipped unreadable part /word/header1.xml: CRC".into()];
         let ir = DocumentIR {
             metadata,
             sections: vec![Section::default()],
@@ -102,6 +108,7 @@ mod tests {
             "Description: Summary",
             "Macros: yes",
             "Warning: text extraction is incomplete",
+            "Warning: skipped unreadable part /word/header1.xml: CRC",
             "Sections: 1",
         ] {
             assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
