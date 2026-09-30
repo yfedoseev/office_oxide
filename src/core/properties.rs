@@ -475,7 +475,7 @@ pub(crate) fn read_package_metadata(
 }
 
 /// Read the custom properties, signature presence and thumbnail of an open
-/// OPC package. See [`read_package_metadata`].
+/// OPC package. See `read_package_metadata`.
 pub fn read_package_properties<R: std::io::Read + std::io::Seek>(
     opc: &mut super::opc::OpcReader<R>,
 ) -> PackageProperties {

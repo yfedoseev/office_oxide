@@ -34,7 +34,7 @@ pub struct CfbHeader {
     /// First directory sector.
     pub first_dir_sector: u32,
     /// Mini-stream cutoff size. [MS-CFB] §2.2 fixes it at 4096
-    /// ([`MINI_STREAM_CUTOFF`]); a header declaring any other value is
+    /// (`MINI_STREAM_CUTOFF`); a header declaring any other value is
     /// normalized to that constant, so this is always 4096.
     pub mini_stream_cutoff: u32,
     /// First mini-FAT sector.

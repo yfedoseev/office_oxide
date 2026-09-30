@@ -8,7 +8,7 @@
 //! It is surfaced **once per document**, not once per slide: after the
 //! slides, [`PptxDocument::plain_text`], [`PptxDocument::to_markdown`] and
 //! the IR (and so HTML) carry a trailing section titled
-//! [`MASTER_TEXT_SECTION_TITLE`] holding the static text of every layout
+//! [`MASTER_TEXT_SECTION_TITLE`](crate::pptx::layout::MASTER_TEXT_SECTION_TITLE) holding the static text of every layout
 //! and master at least one slide shows, each distinct text once
 //! ([`PptxDocument::master_static_text`]). Repeating it on every slide
 //! would multiply one footer by the slide count; leaving it out (the
