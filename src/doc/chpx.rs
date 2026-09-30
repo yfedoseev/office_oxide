@@ -147,8 +147,9 @@ fn extract_chpx_grpprl(page: &[u8], word_off: usize) -> Vec<u8> {
     page[start..end].to_vec()
 }
 
-/// Resolve the CP ranges within `[0, text_len)` whose CHP marks them as
-/// deleted revision-mark text (`sprmCFRMarkDel`), merged and sorted.
+/// Resolve the CP ranges within `[0, text_len)` whose CHP excludes them
+/// from the accepted view — deleted revision-mark text (`sprmCFRMarkDel`)
+/// or hidden text (`sprmCFVanish`) — merged and sorted.
 ///
 /// This is the "at minimum" fix for deleted revision-mark text: the accepted-view policy
 /// already applied to DOCX's `w:del` extended to DOC, without attempting
@@ -158,7 +159,7 @@ fn extract_chpx_grpprl(page: &[u8], word_off: usize) -> Vec<u8> {
 /// — the caller (`document.rs`) also needs those same runs for
 /// [`resolve_chp_segments`] and must not re-walk the whole
 /// CHPX FKP once per consumer.
-pub fn resolve_deleted_cp_ranges_from_runs(
+pub fn resolve_excluded_cp_ranges_from_runs(
     runs: &[FkpRun],
     pieces: &[Piece],
     text_len: u32,
@@ -167,7 +168,7 @@ pub fn resolve_deleted_cp_ranges_from_runs(
         .iter()
         .filter(|r| {
             let props: ChpProps = extract_chp_props(&r.grpprl);
-            props.f_rmark_del
+            props.is_excluded()
         })
         .flat_map(|r| super::papx::fc_run_to_cp_ranges(r.fc_start, r.fc_end, pieces))
         .map(|(a, b)| (a.min(text_len), b.min(text_len)))
@@ -351,11 +352,11 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_deleted_cp_ranges_finds_deleted_run() {
+    fn test_resolve_excluded_cp_ranges_finds_deleted_and_hidden_runs() {
         // Two runs: cp[0,3) normal, cp[3,6) deleted (sprmCFRMarkDel = 1).
         // Exercises the same two-step pipeline `document.rs` uses:
         // `parse_chpx_runs` (byte-level FKP walk) then
-        // `resolve_deleted_cp_ranges_from_runs` (CP-range resolution).
+        // `resolve_excluded_cp_ranges_from_runs` (CP-range resolution).
         // `parse_chpx_runs` only reads the FKP page out of `word_doc` (via
         // the page number); it never dereferences a piece's `fc` against
         // `word_doc`, so `word_doc` here IS the FKP page (page 0) and the
@@ -384,8 +385,17 @@ mod tests {
         plc.extend_from_slice(&0u32.to_le_bytes()); // page 0
 
         let runs = parse_chpx_runs(&page, &plc, 0, plc.len() as u32);
-        let deleted = resolve_deleted_cp_ranges_from_runs(&runs, &pieces, 6);
+        let deleted = resolve_excluded_cp_ranges_from_runs(&runs, &pieces, 6);
         assert_eq!(deleted, vec![(3, 6)]);
+
+        // Hidden text (sprmCFVanish = 1) is excluded the same way: Word
+        // does not display it, and it used to surface as visible text.
+        let vanish_grpprl = [0x3C, 0x08, 0x01];
+        page[400] = vanish_grpprl.len() as u8;
+        page[401..401 + vanish_grpprl.len()].copy_from_slice(&vanish_grpprl);
+        let runs = parse_chpx_runs(&page, &plc, 0, plc.len() as u32);
+        let hidden = resolve_excluded_cp_ranges_from_runs(&runs, &pieces, 6);
+        assert_eq!(hidden, vec![(3, 6)]);
     }
 
     /// `resolve_chp_segments` decodes each `FkpRun`'s own `grpprl` via

@@ -228,7 +228,7 @@ pub fn extract_text_range(
 /// Extract the text for `[range_start, range_end)`, skipping any CP
 /// sub-ranges named in `excluded` (already sorted, disjoint, and clipped
 /// to `[range_start, range_end)` by the caller — see
-/// `chpx::resolve_deleted_cp_ranges`).
+/// `chpx::resolve_excluded_cp_ranges_from_runs`).
 ///
 /// This is what applies the "accepted view" policy for DOC's deleted
 /// revision-mark text (the same policy already applied to

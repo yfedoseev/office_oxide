@@ -4,7 +4,7 @@ use std::io::{Read, Seek};
 
 use crate::cfb::{CfbReader, SummaryProperties, parse_summary_information};
 
-use super::chpx::{parse_chpx_runs, resolve_deleted_cp_ranges_from_runs};
+use super::chpx::{parse_chpx_runs, resolve_excluded_cp_ranges_from_runs};
 use super::error::{DocError, Result};
 use super::fib::Fib;
 use super::images::{DocImage, extract_images};
@@ -252,16 +252,12 @@ impl DocDocument {
             Vec::new()
         };
 
-        // Deleted revision-mark text (`sprmCFRMarkDel`) is excluded from the
-        // main flat text up front, at extraction time — the same "accepted
-        // view" policy already applied to DOCX's `w:del`.
-        // Structured paragraph text (`paragraphs()`, used by `doc_to_ir`) is
-        // left unfiltered: splicing deletions out of a multi-run paragraph
-        // while preserving field-code (`HYPERLINK`) boundaries, on top of
-        // the per-run character formatting `build_paragraphs` now also
-        // carries, is more than this fix attempts — it stays a
-        // deliberately separate, still-open piece of revision-mark handling.
-        let deleted_ranges = resolve_deleted_cp_ranges_from_runs(&chpx_runs, &pieces, fib.text_len);
+        // Deleted revision-mark text (`sprmCFRMarkDel`) and hidden text
+        // (`sprmCFVanish`) are excluded from the main flat text up front,
+        // at extraction time — the same "accepted view" policy the DOCX
+        // reader applies to `w:del` and `w:vanish`. `build_paragraphs`
+        // applies the same exclusion to the structured paragraphs.
+        let deleted_ranges = resolve_excluded_cp_ranges_from_runs(&chpx_runs, &pieces, fib.text_len);
         let raw_text = extract_text_range_excluding(
             &word_doc,
             &pieces,

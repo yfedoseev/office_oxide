@@ -719,6 +719,11 @@ fn styled_span(text: &str, props: &ChpProps) -> TextSpan {
         underline: props.underline.clone(),
         color: props.color,
         font_size_half_pt: props.font_size_half_pt,
+        strikethrough: props.strike,
+        vertical_align: props.vertical_align(),
+        highlight: props.highlight,
+        all_caps: props.all_caps,
+        small_caps: props.small_caps,
         ..TextSpan::plain(text)
     }
 }
@@ -1208,6 +1213,25 @@ mod tests {
             spans.iter().any(|s| s.text == " " && !s.bold && !s.italic),
             "the gap between the two formatted runs must stay a separate, unformatted span: {spans:?}"
         );
+    }
+
+    /// Strikethrough, super/subscript, highlight and caps decoded from
+    /// CHP SPRMs reach the IR's `TextSpan`; they were never set for DOC.
+    #[test]
+    fn test_chp_decoration_reaches_textspan() {
+        let props = ChpProps {
+            strike: true,
+            iss: Some(crate::ir::VerticalAlign::Superscript),
+            highlight: Some([0xFF, 0xFF, 0x00]),
+            all_caps: true,
+            small_caps: true,
+            ..Default::default()
+        };
+        let span = styled_span("x", &props);
+        assert!(span.strikethrough);
+        assert_eq!(span.vertical_align, Some(crate::ir::VerticalAlign::Superscript));
+        assert_eq!(span.highlight, Some([0xFF, 0xFF, 0x00]));
+        assert!(span.all_caps && span.small_caps);
     }
 
     /// Regression: paragraph alignment/indentation/spacing

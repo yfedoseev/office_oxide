@@ -25,7 +25,9 @@
 //! list/tab-stop PR, not here. The fixtures pass either way only because their
 //! `cb < 256`, so a ≥12-column table is what exposes the difference.
 
-use crate::ir::{ParagraphAlignment, TabAlignment, TabLeader, TabStop, UnderlineStyle};
+use crate::ir::{
+    ParagraphAlignment, TabAlignment, TabLeader, TabStop, UnderlineStyle, VerticalAlign,
+};
 
 /// A single decoded SPRM: opcode plus its operand bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -660,6 +662,72 @@ pub struct ChpProps {
     pub color: Option<[u8; 3]>,
     /// `sprmCHps` (0x4A43): font size in half-points.
     pub font_size_half_pt: Option<u32>,
+    /// `sprmCFStrike` (0x0837) / `sprmCFDStrike` (0x2A53): single or
+    /// double strikethrough.
+    pub strike: bool,
+    /// `sprmCFVanish` (0x083C): hidden text. Word does not display it, so
+    /// it is excluded from extracted text the way the DOCX reader excludes
+    /// `w:vanish` runs.
+    pub vanish: bool,
+    /// `sprmCFCaps` (0x083B): displayed in capitals.
+    pub all_caps: bool,
+    /// `sprmCFSmallCaps` (0x083A): displayed in small capitals.
+    pub small_caps: bool,
+    /// `sprmCIss` (0x2A48): superscript/subscript.
+    pub iss: Option<VerticalAlign>,
+    /// `sprmCHpsPos` (0x4845): baseline offset in half-points, positive
+    /// raised, negative lowered.
+    pub hps_pos: Option<i16>,
+    /// `sprmCHighlight` (0x2A0C): highlight colour, resolved from its `Ico`
+    /// index. `None` for `0` (no highlight).
+    pub highlight: Option<[u8; 3]>,
+}
+
+impl ChpProps {
+    /// The run's vertical alignment: `sprmCIss` when present; otherwise a
+    /// non-zero `sprmCHpsPos` raise/lower, the closest thing the IR has to
+    /// a baseline offset.
+    pub fn vertical_align(&self) -> Option<VerticalAlign> {
+        if let Some(v) = &self.iss {
+            return Some(v.clone());
+        }
+        match self.hps_pos {
+            Some(p) if p > 0 => Some(VerticalAlign::Superscript),
+            Some(p) if p < 0 => Some(VerticalAlign::Subscript),
+            _ => None,
+        }
+    }
+
+    /// Text Word does not show in the accepted view: deleted revision
+    /// text or hidden (`sprmCFVanish`) text.
+    pub fn is_excluded(&self) -> bool {
+        self.f_rmark_del || self.vanish
+    }
+}
+
+/// The `Ico` colour table ([MS-DOC] §2.9.119), used by `sprmCIco` and
+/// `sprmCHighlight`. `0` is "auto" (no colour); indices past 16 are
+/// undefined.
+fn ico_to_rgb(ico: u8) -> Option<[u8; 3]> {
+    Some(match ico {
+        0x01 => [0x00, 0x00, 0x00], // black
+        0x02 => [0x00, 0x00, 0xFF], // blue
+        0x03 => [0x00, 0xFF, 0xFF], // cyan
+        0x04 => [0x00, 0xFF, 0x00], // green
+        0x05 => [0xFF, 0x00, 0xFF], // magenta
+        0x06 => [0xFF, 0x00, 0x00], // red
+        0x07 => [0xFF, 0xFF, 0x00], // yellow
+        0x08 => [0xFF, 0xFF, 0xFF], // white
+        0x09 => [0x00, 0x00, 0x80], // dark blue
+        0x0A => [0x00, 0x80, 0x80], // dark cyan
+        0x0B => [0x00, 0x80, 0x00], // dark green
+        0x0C => [0x80, 0x00, 0x80], // dark magenta
+        0x0D => [0x80, 0x00, 0x00], // dark red
+        0x0E => [0x80, 0x80, 0x00], // dark yellow
+        0x0F => [0x80, 0x80, 0x80], // dark gray
+        0x10 => [0xC0, 0xC0, 0xC0], // light gray
+        _ => return None,
+    })
 }
 
 /// Declare the character SPRM dispatch and its identity registry from one
@@ -768,6 +836,79 @@ chp_sprm_dispatch! {
             if (2..=3276).contains(&hps) {
                 props.font_size_half_pt = Some(u32::from(hps));
             }
+        }
+    }
+
+    /// ToggleOperand (1 byte, spra 0): single strikethrough.
+    "sprmCFStrike" @ "2.6.1" => [0x0837] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.strike = b != 0;
+        }
+    }
+
+    /// ToggleOperand (1 byte, spra 1): double strikethrough — surfaced as
+    /// the IR's single strikethrough flag, as the DOCX reader does for
+    /// `w:dstrike`.
+    "sprmCFDStrike" @ "2.6.1" => [0x2A53] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.strike = b != 0;
+        }
+    }
+
+    /// ToggleOperand (1 byte, spra 0): hidden text.
+    "sprmCFVanish" @ "2.6.1" => [0x083C] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.vanish = b != 0;
+        }
+    }
+
+    /// ToggleOperand (1 byte, spra 0): small capitals.
+    "sprmCFSmallCaps" @ "2.6.1" => [0x083A] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.small_caps = b != 0;
+        }
+    }
+
+    /// ToggleOperand (1 byte, spra 0): all capitals.
+    "sprmCFCaps" @ "2.6.1" => [0x083B] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.all_caps = b != 0;
+        }
+    }
+
+    /// 1-byte operand (spra 1): `0` normal, `1` superscript, `2`
+    /// subscript.
+    "sprmCIss" @ "2.6.1" => [0x2A48] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.iss = match b {
+                1 => Some(VerticalAlign::Superscript),
+                2 => Some(VerticalAlign::Subscript),
+                _ => None,
+            };
+        }
+    }
+
+    /// Signed 2-byte integer (spra 2): baseline offset in half-points.
+    "sprmCHpsPos" @ "2.6.1" => [0x4845] (props, operand) {
+        if operand.len() >= 2 {
+            let v = i16::from_le_bytes([operand[0], operand[1]]);
+            props.hps_pos = (v != 0).then_some(v);
+        }
+    }
+
+    /// `Ico` (1 byte, spra 1): highlight colour; `0` is no highlight.
+    "sprmCHighlight" @ "2.6.1" => [0x2A0C] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.highlight = ico_to_rgb(b);
+        }
+    }
+
+    /// `Ico` (1 byte, spra 1): text colour from the 16-colour table. `0`
+    /// (auto) clears it. Word writes `sprmCCv` after this when it has a
+    /// true colour, so the later SPRM wins in grpprl order.
+    "sprmCIco" @ "2.6.1" => [0x2A42] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.color = ico_to_rgb(b);
         }
     }
 }
@@ -1433,6 +1574,21 @@ mod tests {
         (0x2A3E, "sprmCKul"),
         (0x6870, "sprmCCv"),
         (0x4A43, "sprmCHps"),
+        (0x0837, "sprmCFStrike"),
+        (0x2A53, "sprmCFDStrike"),
+        (0x083C, "sprmCFVanish"),
+        (0x083A, "sprmCFSmallCaps"),
+        (0x083B, "sprmCFCaps"),
+        (0x2A48, "sprmCIss"),
+        (0x4845, "sprmCHpsPos"),
+        (0x2A0C, "sprmCHighlight"),
+        (0x2A42, "sprmCIco"),
+        // Confusable neighbours, not decoded: sprmCFOutline, sprmCFShadow,
+        // sprmCKcd, sprmCFSpec.
+        (0x0838, "sprmCFOutline"),
+        (0x0839, "sprmCFShadow"),
+        (0x2A34, "sprmCKcd"),
+        (0x0855, "sprmCFSpec"),
     ];
 
     #[test]
@@ -1549,6 +1705,59 @@ mod tests {
         // 0 is below the spec's minimum of 2 — ignored, not stored.
         let props = extract_chp_props(&[0x43, 0x4A, 0, 0]);
         assert_eq!(props.font_size_half_pt, None);
+    }
+
+    /// Hidden text, strikethrough, super/subscript, highlight and the
+    /// 16-colour text colour were never decoded: hidden text surfaced as
+    /// visible and the rest of the formatting was lost.
+    #[test]
+    fn test_extract_chp_props_decodes_visibility_and_decoration_sprms() {
+        assert!(extract_chp_props(&[0x3C, 0x08, 0x01]).vanish);
+        assert!(extract_chp_props(&[0x3C, 0x08, 0x01]).is_excluded());
+        assert!(!extract_chp_props(&[0x3C, 0x08, 0x00]).vanish);
+        assert!(extract_chp_props(&[0x37, 0x08, 0x01]).strike);
+        assert!(extract_chp_props(&[0x53, 0x2A, 0x01]).strike);
+        assert!(extract_chp_props(&[0x3B, 0x08, 0x01]).all_caps);
+        assert!(extract_chp_props(&[0x3A, 0x08, 0x01]).small_caps);
+        assert_eq!(
+            extract_chp_props(&[0x48, 0x2A, 0x01]).vertical_align(),
+            Some(VerticalAlign::Superscript)
+        );
+        assert_eq!(
+            extract_chp_props(&[0x48, 0x2A, 0x02]).vertical_align(),
+            Some(VerticalAlign::Subscript)
+        );
+        assert_eq!(extract_chp_props(&[0x48, 0x2A, 0x00]).vertical_align(), None);
+        // sprmCHpsPos: +6 half-points raised, -6 lowered.
+        assert_eq!(
+            extract_chp_props(&[0x45, 0x48, 0x06, 0x00]).vertical_align(),
+            Some(VerticalAlign::Superscript)
+        );
+        assert_eq!(
+            extract_chp_props(&[0x45, 0x48, 0xFA, 0xFF]).vertical_align(),
+            Some(VerticalAlign::Subscript)
+        );
+        // sprmCIss wins over sprmCHpsPos.
+        assert_eq!(
+            extract_chp_props(&[0x45, 0x48, 0x06, 0x00, 0x48, 0x2A, 0x02]).vertical_align(),
+            Some(VerticalAlign::Subscript)
+        );
+        assert_eq!(extract_chp_props(&[0x0C, 0x2A, 0x07]).highlight, Some([0xFF, 0xFF, 0x00]));
+        assert_eq!(extract_chp_props(&[0x0C, 0x2A, 0x00]).highlight, None);
+        assert_eq!(extract_chp_props(&[0x42, 0x2A, 0x06]).color, Some([0xFF, 0x00, 0x00]));
+        // A later sprmCCv overrides the Ico colour.
+        assert_eq!(
+            extract_chp_props(&[0x42, 0x2A, 0x06, 0x70, 0x68, 0x12, 0x34, 0x56, 0x00]).color,
+            Some([0x12, 0x34, 0x56])
+        );
+    }
+
+    #[test]
+    fn test_ico_table_matches_the_spec() {
+        assert_eq!(ico_to_rgb(0), None);
+        assert_eq!(ico_to_rgb(0x02), Some([0, 0, 0xFF]));
+        assert_eq!(ico_to_rgb(0x10), Some([0xC0, 0xC0, 0xC0]));
+        assert_eq!(ico_to_rgb(0x11), None);
     }
 
     #[test]

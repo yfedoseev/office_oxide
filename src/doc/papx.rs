@@ -328,7 +328,9 @@ pub fn build_paragraphs(
                     // `to_ir()`/`to_html()` show sentences `plain_text()`
                     // did not. The paragraph mark itself stays, so a
                     // wholly deleted paragraph still terminates.
-                    if props.f_rmark_del && !is_mark {
+                    // Hidden (`sprmCFVanish`) text likewise: Word does
+                    // not display it.
+                    if props.is_excluded() && !is_mark {
                         continue;
                     }
                     buf.push(ch);
@@ -558,6 +560,17 @@ mod tests {
         let runs = vec![plain(0, 10), del, plain(23, n)];
         let paras = build_paragraphs(&word_doc, &pieces, &fkp, n, 0, &runs);
         assert_eq!(paras.len(), 1);
+        assert_eq!(paras[0].text, "Keep this here.");
+
+        // Hidden text (`sprmCFVanish`) is not displayed by Word either; it
+        // surfaced as visible text.
+        let hidden = FkpRun {
+            fc_start: 0x800 + 10 * 2,
+            fc_end: 0x800 + 23 * 2,
+            grpprl: vec![0x3C, 0x08, 0x01],
+        };
+        let runs = vec![plain(0, 10), hidden, plain(23, n)];
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, n, 0, &runs);
         assert_eq!(paras[0].text, "Keep this here.");
     }
 
