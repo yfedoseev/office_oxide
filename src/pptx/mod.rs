@@ -50,6 +50,15 @@ use crate::core::relationships::{Relationships, rel_types};
 use crate::core::theme::Theme;
 use log::debug;
 
+/// Relationship from the presentation part to the legacy comment-authors
+/// part, `ppt/commentAuthors.xml` (ECMA-376 Part 1 §13.3.1).
+const REL_COMMENT_AUTHORS: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/commentAuthors";
+/// Relationship from the presentation part to the modern-comments authors
+/// part, `ppt/authors.xml` ([MS-PPTX] authors part).
+const REL_MODERN_AUTHORS: &str =
+    "http://schemas.microsoft.com/office/2018/10/relationships/authors";
+
 /// A parsed PPTX document.
 #[derive(Debug, Clone)]
 pub struct PptxDocument {
@@ -165,6 +174,27 @@ impl PptxDocument {
             log::warn!("pptx: skipping unreadable part {part}: {err}");
             unreadable_parts.push((part.to_string(), err.to_string()));
         };
+
+        // Comment author names live in presentation-level parts, keyed by
+        // the id each comment carries. Both the legacy and the modern part
+        // may be present; their ids (integers vs GUIDs) do not collide.
+        let mut comment_authors = std::collections::HashMap::new();
+        for rel in pres_rels.all() {
+            if rel.rel_type != REL_COMMENT_AUTHORS && rel.rel_type != REL_MODERN_AUTHORS {
+                continue;
+            }
+            let Ok(part) = main_part.resolve_relative(&rel.target) else {
+                record(&rel.target, &"unresolvable comment-authors target");
+                continue;
+            };
+            if !opc.has_part(&part) {
+                continue;
+            }
+            match opc.read_part(&part) {
+                Ok(data) => comment_authors.extend(slide::parse_comment_authors(&data)),
+                Err(e) => record(part.as_str(), &e),
+            }
+        }
 
         // Phase 1: gather raw data sequentially (requires &mut opc)
         struct SlideBundle {
@@ -421,7 +451,9 @@ impl PptxDocument {
                     }
                 }
                 for data in &b.comments_data {
-                    parsed.comments.extend(slide::parse_comments(data));
+                    parsed
+                        .comments
+                        .extend(slide::parse_comments(data, &comment_authors));
                 }
                 if let Some(ref styles) = b.master_styles {
                     apply_master_inheritance(&mut parsed.shapes, styles);

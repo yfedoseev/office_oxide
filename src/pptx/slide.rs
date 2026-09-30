@@ -1548,49 +1548,130 @@ fn parse_table_cell(
 /// Parse a slide comments part.
 ///
 /// Handles both shapes PowerPoint writes: the legacy
-/// `<p:cmLst><p:cm authorId="…"><p:text>…` and the modern
-/// `<p188:cmLst><p188:cm><p188:txBody><a:p><a:r><a:t>…`. Author names live
-/// in a separate `commentAuthors` part, so only ids present in the same
-/// file resolve; the text is what matters.
-pub(crate) fn parse_comments(xml_data: &[u8]) -> Vec<SlideComment> {
+/// `<p:cmLst><p:cm authorId="0"><p:text>…` (ECMA-376 Part 1 §19.4) and the
+/// modern `<p188:cmLst><p188:cm authorId="{guid}"><p188:txBody><a:p>…`
+/// ([MS-PPTX] modern comments), whose `<p188:replyLst>` replies each become
+/// a comment of their own, after the comment they answer. `authors` maps an
+/// author id to its display name — read from the presentation's
+/// comment-authors / authors part, see [`parse_comment_authors`].
+pub(crate) fn parse_comments(
+    xml_data: &[u8],
+    authors: &std::collections::HashMap<String, String>,
+) -> Vec<SlideComment> {
+    /// One open `cm` or `reply` element.
+    struct Frame {
+        author_id: Option<String>,
+        text: String,
+        /// Set at the end of an `<a:p>`; the next text starts a new
+        /// paragraph, separated by a space.
+        paragraph_ended: bool,
+        replies: Vec<SlideComment>,
+    }
+    impl Frame {
+        fn finish(self, authors: &std::collections::HashMap<String, String>) -> SlideComment {
+            SlideComment {
+                author: self.author_id.and_then(|id| authors.get(&id).cloned()),
+                text: self.text,
+            }
+        }
+    }
+
     let mut reader = make_content_reader(xml_data);
     let mut out = Vec::new();
-    let mut current = String::new();
-    let mut depth_in_comment = 0i32;
+    let mut frames: Vec<Frame> = Vec::new();
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => match e.local_name().as_ref() {
-                "cm" => {
-                    depth_in_comment = 1;
-                    current.clear();
-                },
-                "text" | "t" if depth_in_comment > 0 => {
+                "cm" | "reply" => frames.push(Frame {
+                    author_id: xml::optional_attr_str(e, "authorId")
+                        .ok()
+                        .flatten()
+                        .map(|v| v.into_owned()),
+                    text: String::new(),
+                    paragraph_ended: false,
+                    replies: Vec::new(),
+                }),
+                "text" | "t" => {
+                    let Some(frame) = frames.last_mut() else {
+                        continue;
+                    };
                     if let Ok(t) = xml::read_text_content_fast(&mut reader) {
-                        if !t.trim().is_empty() {
-                            if !current.is_empty() {
-                                current.push(' ');
+                        if !t.is_empty() {
+                            if frame.paragraph_ended && !frame.text.is_empty() {
+                                frame.text.push(' ');
                             }
-                            current.push_str(t.trim());
+                            frame.paragraph_ended = false;
+                            frame.text.push_str(&t);
                         }
                     }
                 },
                 _ => {},
             },
-            Ok(Event::End(ref e)) if e.local_name().as_ref() == "cm" => {
-                depth_in_comment = 0;
-                if !current.is_empty() {
-                    out.push(SlideComment {
-                        author: None,
-                        text: std::mem::take(&mut current),
-                    });
-                }
+            Ok(Event::End(ref e)) => match e.local_name().as_ref() {
+                "p" => {
+                    if let Some(frame) = frames.last_mut() {
+                        frame.paragraph_ended = true;
+                    }
+                },
+                "reply" => {
+                    if let Some(frame) = frames.pop() {
+                        let reply = frame.finish(authors);
+                        match frames.last_mut() {
+                            Some(parent) if !reply.text.trim().is_empty() => {
+                                parent.replies.push(reply)
+                            },
+                            None if !reply.text.trim().is_empty() => out.push(reply),
+                            _ => {},
+                        }
+                    }
+                },
+                "cm" => {
+                    if let Some(mut frame) = frames.pop() {
+                        let replies = std::mem::take(&mut frame.replies);
+                        let mut comment = frame.finish(authors);
+                        comment.text = comment.text.trim().to_string();
+                        if !comment.text.is_empty() {
+                            out.push(comment);
+                        }
+                        out.extend(replies.into_iter().map(|mut r| {
+                            r.text = r.text.trim().to_string();
+                            r
+                        }));
+                    }
+                },
+                _ => {},
             },
             Ok(Event::Eof) | Err(_) => break,
             _ => {},
         }
     }
     out
+}
+
+/// Parse a comment-authors part into `id → name`: the legacy
+/// `<p:cmAuthorLst><p:cmAuthor id="0" name="…"/>` (ECMA-376 Part 1
+/// §19.4.2) or the modern `<p188:authorLst><p188:author id="{guid}"
+/// name="…"/>` ([MS-PPTX] authors part).
+pub(crate) fn parse_comment_authors(xml_data: &[u8]) -> std::collections::HashMap<String, String> {
+    let mut reader = make_content_reader(xml_data);
+    let mut authors = std::collections::HashMap::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e))
+                if matches!(e.local_name().as_ref(), "cmAuthor" | "author") =>
+            {
+                let id = xml::optional_attr_str(e, "id").ok().flatten();
+                let name = xml::optional_attr_str(e, "name").ok().flatten();
+                if let (Some(id), Some(name)) = (id, name) {
+                    authors.insert(id.into_owned(), name.into_owned());
+                }
+            },
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {},
+        }
+    }
+    authors
 }
 
 /// Extract the speaker notes body from a notes slide XML. Finds the

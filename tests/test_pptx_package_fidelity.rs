@@ -336,3 +336,96 @@ fn test_notes_hyperlinks_resolve_through_the_notes_part_rels() {
         .and_then(|s| s.hyperlink.clone());
     assert_eq!(link.as_deref(), Some("https://example.com/notes"));
 }
+
+// ---------------------------------------------------------------------------
+// Comment authors
+// ---------------------------------------------------------------------------
+
+const REL_LEGACY_COMMENTS: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
+const REL_LEGACY_AUTHORS: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/commentAuthors";
+const REL_MODERN_COMMENTS: &str =
+    "http://schemas.microsoft.com/office/2018/10/relationships/comments";
+const REL_MODERN_AUTHORS: &str =
+    "http://schemas.microsoft.com/office/2018/10/relationships/authors";
+
+/// Comment authors live in a presentation-level part —
+/// `ppt/commentAuthors.xml` for legacy comments, `ppt/authors.xml` for
+/// modern ones — and nothing read either, so every comment's author was
+/// `None`. Modern (threaded) comment parts are read too, replies included.
+#[test]
+fn test_comment_authors_resolve_for_legacy_and_modern_comments() {
+    let mut pkg = deck(&[&text_sp("ONE"), &text_sp("TWO")]);
+    // Legacy comment on slide 1.
+    pkg.part(
+        "ppt/commentAuthors.xml",
+        &format!("{CT_PML}commentAuthors+xml"),
+        format!(
+            r#"<?xml version="1.0"?><p:cmAuthorLst {NS}><p:cmAuthor id="0" name="Ada Lovelace" initials="AL" lastIdx="1" clrIdx="0"/><p:cmAuthor id="1" name="Alan Turing" initials="AT" lastIdx="1" clrIdx="1"/></p:cmAuthorLst>"#
+        ),
+    );
+    pkg.rel("ppt/presentation.xml", "rIdCA", REL_LEGACY_AUTHORS, "commentAuthors.xml");
+    pkg.part(
+        "ppt/comments/comment1.xml",
+        &format!("{CT_PML}comments+xml"),
+        format!(
+            r#"<?xml version="1.0"?><p:cmLst {NS}><p:cm authorId="1" idx="1"><p:pos x="10" y="10"/><p:text>LEGACY NOTE</p:text></p:cm></p:cmLst>"#
+        ),
+    );
+    pkg.rel("ppt/slides/slide1.xml", "rIdC", REL_LEGACY_COMMENTS, "../comments/comment1.xml");
+    // Modern comment with a reply on slide 2.
+    pkg.part(
+        "ppt/authors.xml",
+        "application/vnd.ms-powerpoint.authors+xml",
+        r#"<?xml version="1.0"?><p188:authorLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/2018/8/main"><p188:author id="{A1}" name="Grace Hopper" initials="GH" userId="g" providerId="None"/><p188:author id="{A2}" name="Edsger Dijkstra" initials="ED" userId="e" providerId="None"/></p188:authorLst>"#,
+    );
+    pkg.rel("ppt/presentation.xml", "rIdAU", REL_MODERN_AUTHORS, "authors.xml");
+    pkg.part(
+        "ppt/comments/modernComment_101_0.xml",
+        "application/vnd.ms-powerpoint.comments+xml",
+        r#"<?xml version="1.0"?><p188:cmLst xmlns:p188="http://schemas.microsoft.com/office/powerpoint/2018/8/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p188:cm id="{C1}" authorId="{A1}" created="2026-01-01T00:00:00Z"><p188:replyLst><p188:reply id="{R1}" authorId="{A2}" created="2026-01-02T00:00:00Z"><p188:txBody><a:bodyPr/><a:p><a:r><a:t>REPLY TEXT</a:t></a:r></a:p></p188:txBody></p188:reply></p188:replyLst><p188:txBody><a:bodyPr/><a:p><a:r><a:t>MODERN NOTE</a:t></a:r></a:p></p188:txBody></p188:cm></p188:cmLst>"#,
+    );
+    pkg.rel(
+        "ppt/slides/slide2.xml",
+        "rIdM",
+        REL_MODERN_COMMENTS,
+        "../comments/modernComment_101_0.xml",
+    );
+
+    let doc = pkg.open();
+    let authored = |i: usize| -> Vec<(Option<String>, String)> {
+        doc.slides[i]
+            .comments
+            .iter()
+            .map(|c| (c.author.clone(), c.text.clone()))
+            .collect()
+    };
+    assert_eq!(authored(0), vec![(Some("Alan Turing".into()), "LEGACY NOTE".into())]);
+    assert_eq!(
+        authored(1),
+        vec![
+            (Some("Grace Hopper".into()), "MODERN NOTE".into()),
+            (Some("Edsger Dijkstra".into()), "REPLY TEXT".into()),
+        ]
+    );
+    let ir = pkg.document().to_ir();
+    let authors: Vec<Option<String>> = ir
+        .sections
+        .iter()
+        .flat_map(|s| &s.elements)
+        .filter_map(|e| match e {
+            Element::Endnote(n) => Some(n.author.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        authors,
+        [
+            Some("Alan Turing"),
+            Some("Grace Hopper"),
+            Some("Edsger Dijkstra")
+        ]
+        .map(|a| a.map(String::from))
+    );
+}
