@@ -1269,19 +1269,25 @@ impl DocxWriter {
             opc.add_part(&numbering_part, CT_NUMBERING, &numbering_xml)?;
         }
 
-        // settings.xml carries two switches other parts depend on:
+        // settings.xml carries three switches other parts depend on:
         // w:evenAndOddHeaders, without which a w:type="even" header is never
-        // shown, and w:embedTrueTypeFonts, without which fontTable.xml's
-        // embedded font references are inert.
+        // shown; w:embedTrueTypeFonts, without which fontTable.xml's
+        // embedded font references are inert; and w:displayBackgroundShape,
+        // without which Word does not draw w:background.
         let has_even_hf = self
             .headers_footers
             .iter()
             .any(|hf| matches!(hf.hf_type, HfType::EvenPageHeader | HfType::EvenPageFooter));
         let has_fonts = !self.embedded_fonts.is_empty();
-        if has_even_hf || has_fonts {
+        let has_background = self.background_rgb.is_some();
+        if has_even_hf || has_fonts || has_background {
             let settings_part = PartName::new("/word/settings.xml")?;
             opc.add_part_rel(&doc_part, rel_types::SETTINGS, "settings.xml");
-            let xml = generate_settings_xml(has_even_hf, has_fonts);
+            let xml = generate_settings_xml(SettingsSwitches {
+                display_background_shape: has_background,
+                embed_fonts: has_fonts,
+                even_and_odd_headers: has_even_hf,
+            });
             opc.add_part(&settings_part, CT_SETTINGS, &xml)?;
         }
 
@@ -3799,15 +3805,33 @@ fn generate_endnotes_xml(
     generate_notes_xml(notes, image_rids, true, links)
 }
 
+/// The `word/settings.xml` switches a written document depends on.
+struct SettingsSwitches {
+    display_background_shape: bool,
+    embed_fonts: bool,
+    even_and_odd_headers: bool,
+}
+
 /// `word/settings.xml`, written only when a part depends on it.
-fn generate_settings_xml(even_and_odd_headers: bool, embed_fonts: bool) -> Vec<u8> {
+fn generate_settings_xml(switches: SettingsSwitches) -> Vec<u8> {
+    let SettingsSwitches {
+        display_background_shape,
+        embed_fonts,
+        even_and_odd_headers,
+    } = switches;
     let mut w = Writer::new(Vec::new());
     w.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), Some("yes"))))
         .expect("write decl");
     let mut root = BytesStart::new("w:settings");
     root.push_attribute(("xmlns:w", WML_NS));
     w.write_event(Event::Start(root)).expect("write settings");
-    // CT_Settings is a sequence; embedTrueTypeFonts precedes evenAndOddHeaders.
+    // CT_Settings (ECMA-376 Part 1 §17.15.1.78) is a sequence:
+    // displayBackgroundShape, then embedTrueTypeFonts, then
+    // evenAndOddHeaders.
+    if display_background_shape {
+        w.write_event(Event::Empty(BytesStart::new("w:displayBackgroundShape")))
+            .expect("write displayBackgroundShape");
+    }
     if embed_fonts {
         w.write_event(Event::Empty(BytesStart::new("w:embedTrueTypeFonts")))
             .expect("write embedTrueTypeFonts");
@@ -5337,6 +5361,33 @@ mod tests {
         assert!(
             settings.contains("<w:evenAndOddHeaders/>"),
             "settings.xml must enable even/odd headers: {settings}"
+        );
+    }
+
+    /// Word draws `w:background` only when settings.xml carries
+    /// `w:displayBackgroundShape`; settings.xml was not even written for a
+    /// document with a page colour, so the colour was invisible in Word.
+    #[test]
+    fn test_page_background_is_enabled_in_settings() {
+        let mut doc = DocxWriter::new();
+        doc.add_paragraph("x");
+        doc.set_background_rgb([0x11, 0x22, 0x33]);
+        doc.embed_font("Face", vec![0, 1, 0, 0]);
+        let parts = all_parts(doc);
+        assert!(parts["word/document.xml"].contains("<w:background"));
+        let settings = parts
+            .get("word/settings.xml")
+            .expect("a page background needs settings.xml");
+        // CT_Settings is a sequence: displayBackgroundShape precedes
+        // embedTrueTypeFonts.
+        let bg = settings
+            .find("<w:displayBackgroundShape/>")
+            .expect(settings);
+        let fonts = settings.find("<w:embedTrueTypeFonts/>").expect(settings);
+        assert!(bg < fonts, "{settings}");
+        assert!(
+            parts["word/_rels/document.xml.rels"].contains("settings.xml"),
+            "settings.xml must be related from the document"
         );
     }
 
