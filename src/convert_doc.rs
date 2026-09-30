@@ -12,8 +12,6 @@ use crate::ir::*;
 /// (and, eventually, lists). Otherwise we fall back to a line-based
 /// heuristic over the sanitised text — the original `.doc` behaviour.
 pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
-    let mut elements: Vec<Element> = Vec::new();
-
     let paragraphs = doc.paragraphs();
     // One whole-document decision, taken before the walk, gated on the
     // *outcome*: run the line-shape heading guess only when no paragraph
@@ -27,29 +25,44 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // the first `Element::Heading` below.
     let has_structured_headings = paragraphs.iter().any(|p| p.props.outline_level.is_some());
     let mut warnings = doc.warnings().to_vec();
+
+    // One IR `Section` per document section. `build_paragraphs` ends a
+    // section's last paragraph at its section mark (terminator 0x0C, only
+    // where `PlcfSed` puts a section end), so the paragraphs split there.
+    let mut section_bodies: Vec<Vec<Element>> = Vec::new();
     if !paragraphs.is_empty() {
-        let flattened = walk_paragraphs(
-            paragraphs,
-            has_structured_headings,
-            &mut elements,
-            doc.list_formatting(),
-        );
+        let mut flattened = 0;
+        for group in paragraphs.split_inclusive(|p| p.terminator == '\u{C}') {
+            let mut elements = Vec::new();
+            flattened += walk_paragraphs(
+                group,
+                has_structured_headings,
+                &mut elements,
+                doc.list_formatting(),
+            );
+            section_bodies.push(elements);
+        }
         if flattened > 0 {
             warnings.push(format!(
                 "{flattened} table(s) containing nested tables were flattened into their outer table"
             ));
         }
     } else {
+        let mut elements = Vec::new();
         line_heuristic(doc.plain_text_ref(), &mut elements);
+        section_bodies.push(elements);
     }
 
     // The whole heading, not its first span: a heading with a formatting
     // change mid-way gave a title that matched no heading, so the
     // renderers printed it twice.
-    let heading_title = elements.iter().find_map(|e| match e {
-        Element::Heading(h) => Some(inline_to_text(&h.content)),
-        _ => None,
-    });
+    let first_heading = |elements: &[Element]| {
+        elements.iter().find_map(|e| match e {
+            Element::Heading(h) => Some(inline_to_text(&h.content)),
+            _ => None,
+        })
+    };
+    let heading_title = section_bodies.iter().find_map(|b| first_heading(b));
     // The file's own declared title (from `\x05SummaryInformation`) beats
     // a line-shape guess whenever both exist — a document can style
     // *some* headings and still use plain ALL-CAPS lines for others
@@ -60,32 +73,38 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
         .filter(|t| !t.is_empty())
         .or_else(|| heading_title.clone());
 
-    // The section's title is the heading the section itself carries, as
+    // Each section's title is the heading the section itself carries, as
     // in every other converter. Giving it the file's declared title
     // (metadata, not content) made the IR renderers print a line the
     // document's text does not have.
-    let mut sections = vec![Section {
-        title: heading_title,
-        elements,
-        ..Default::default()
-    }];
-
-    // The header document's PlcfHdd-delimited stories for the first
-    // section — this crate models only one `ir::Section` per DOC
-    // document, so a document with 2+ sections only surfaces the first
-    // one's headers/footers here. When PlcfHdd yielded
-    // nothing (older/malformed files), every field below is `None` and
-    // the generic-TextBox fallback in the loop below still applies.
-    let hf = doc.header_footer();
-    if let Some(section) = sections.last_mut() {
-        section.even_page_header = hf.even_header.as_deref().map(text_to_header_footer);
-        section.header = hf.odd_header.as_deref().map(text_to_header_footer);
-        section.even_page_footer = hf.even_footer.as_deref().map(text_to_header_footer);
-        section.footer = hf.odd_footer.as_deref().map(text_to_header_footer);
-        section.first_page_header = hf.first_header.as_deref().map(text_to_header_footer);
-        section.first_page_footer = hf.first_footer.as_deref().map(text_to_header_footer);
-    }
-    let header_footer_structured = !hf.is_empty();
+    //
+    // Each section gets its own `PlcfHdd` headers/footers (already
+    // inheritance-resolved per [MS-DOC] "Plcfhdd"); a section past the
+    // stories the file holds reuses the last. When PlcfHdd yielded nothing
+    // (older/malformed files), every field is `None` and the generic
+    // TextBox fallback in the loop below still applies.
+    let hfs = doc.header_footers();
+    let mut sections: Vec<Section> = section_bodies
+        .into_iter()
+        .enumerate()
+        .map(|(i, elements)| {
+            let mut section = Section {
+                title: first_heading(&elements),
+                elements,
+                ..Default::default()
+            };
+            if let Some(hf) = hfs.get(i).or(hfs.last()) {
+                section.even_page_header = hf.even_header.as_deref().map(text_to_header_footer);
+                section.header = hf.odd_header.as_deref().map(text_to_header_footer);
+                section.even_page_footer = hf.even_footer.as_deref().map(text_to_header_footer);
+                section.footer = hf.odd_footer.as_deref().map(text_to_header_footer);
+                section.first_page_header = hf.first_header.as_deref().map(text_to_header_footer);
+                section.first_page_footer = hf.first_footer.as_deref().map(text_to_header_footer);
+            }
+            section
+        })
+        .collect();
+    let header_footer_structured = hfs.iter().any(|hf| !hf.is_empty());
 
     // Footnotes, headers, comments, endnotes and text boxes live after the
     // main text in the same character space. Their `ccp*` lengths were

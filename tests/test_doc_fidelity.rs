@@ -128,3 +128,73 @@ fn test_flattened_nested_table_is_a_warning_not_document_text() {
         ir.metadata.warnings
     );
 }
+
+fn header_text(hf: &Option<office_oxide::ir::HeaderFooter>) -> String {
+    let mut out = String::new();
+    for e in hf.iter().flat_map(|h| h.content.iter()) {
+        if let Element::Paragraph(p) = e {
+            for c in &p.content {
+                if let InlineContent::Text(t) = c {
+                    out.push_str(&t.text);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A three-section document: every section's headers are read from its
+/// own `PlcfHdd` story group ([MS-DOC] `Plcfhdd`), an
+/// empty story inherits the previous section's, and each section becomes
+/// its own IR `Section`. Only section 1's headers were read, one `Section`
+/// was built, and a section's last paragraph (ended by its section mark,
+/// 0x0C) merged with the next section's first.
+#[test]
+fn test_every_section_gets_its_own_headers_and_ir_section() {
+    let paras = [
+        Para {
+            text: "Sec one.",
+            terminator: '\u{C}',
+            grpprl: prose_grpprl(),
+        },
+        Para {
+            text: "Sec two.",
+            terminator: '\u{C}',
+            grpprl: prose_grpprl(),
+        },
+        para("Sec three."),
+    ];
+    let subdocs = Subdocs {
+        headers: "H1\rH2",
+        ..Default::default()
+    };
+    // Header document "H1\rH2\r" plus the builder's final mark: 7 CPs.
+    // 6 separator stories, then 6 per section; only the odd headers of
+    // sections 1 and 2 have text, section 3's group is all empty.
+    let mut hdd = vec![0u32; 7]; // separators + sec1 even header start
+    hdd.extend([0, 3, 3, 3, 3, 3]); // sec1 odd hdr = [0,3), rest empty
+    hdd.extend([3, 6, 6, 6, 6, 6]); // sec2 odd hdr = [3,6)
+    hdd.extend([6, 6, 6, 6, 6, 6]); // sec3: nothing
+    hdd.push(6); // trailing aCP (ignored)
+    assert_eq!(hdd.len(), 6 + 18 + 2);
+    let tweaks = FibTweaks {
+        plcf_sed: vec![0, 9, 18, 29],
+        plcf_hdd: hdd,
+        ..Default::default()
+    };
+    let doc = open_doc(&build_doc_full(&paras, &subdocs, tweaks));
+    let ir = doc.to_ir();
+    assert_eq!(ir.sections.len(), 3, "{:#?}", ir.sections);
+    assert_eq!(header_text(&ir.sections[0].header), "H1");
+    assert_eq!(header_text(&ir.sections[1].header), "H2");
+    assert_eq!(header_text(&ir.sections[2].header), "H2", "inherited from section 2");
+    let body = |i: usize| {
+        all_text(&office_oxide::ir::DocumentIR {
+            sections: vec![ir.sections[i].clone()],
+            ..Default::default()
+        })
+    };
+    assert!(body(0).contains("Sec one.") && !body(0).contains("Sec two."), "{}", body(0));
+    assert!(body(1).contains("Sec two.") && !body(1).contains("Sec three."), "{}", body(1));
+    assert!(body(2).contains("Sec three."), "{}", body(2));
+}

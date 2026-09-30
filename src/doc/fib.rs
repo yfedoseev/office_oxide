@@ -83,6 +83,21 @@ pub struct Fib {
     pub fc_plcf_bte_chpx: u32,
     /// Byte length of the PlcBteChpx in the Table stream (0x00FE).
     pub lcb_plcf_bte_chpx: u32,
+    /// Offset of the PlcfSed (section boundaries) in the Table stream
+    /// (0x00CA). Zero when absent.
+    pub fc_plcf_sed: u32,
+    /// Byte length of the PlcfSed (0x00CE).
+    pub lcb_plcf_sed: u32,
+    /// Offset of the PlcftxbxTxt (main-document text-box story boundaries)
+    /// in the Table stream (0x025A). Zero when absent.
+    pub fc_plcftxbx_txt: u32,
+    /// Byte length of the PlcftxbxTxt (0x025E).
+    pub lcb_plcftxbx_txt: u32,
+    /// Offset of the PlcfHdrtxbxTxt (header text-box story boundaries) in
+    /// the Table stream (0x026A). Zero when absent.
+    pub fc_plcf_hdrtxbx_txt: u32,
+    /// Byte length of the PlcfHdrtxbxTxt (0x026E).
+    pub lcb_plcf_hdrtxbx_txt: u32,
 }
 
 impl Fib {
@@ -246,6 +261,29 @@ impl Fib {
             (0, 0)
         };
 
+        // fcPlcfSed/lcbPlcfSed — pair 6 of FibRgFcLcb97 ([MS-DOC] §2.5.6:
+        // fcStshfOrig, fcStshf, fcPlcffndRef, fcPlcffndTxt, fcPlcfandRef,
+        // fcPlcfandTxt, fcPlcfSed, ...): 0x9A + 6*8 = 0xCA.
+        let (fc_plcf_sed, lcb_plcf_sed) = if data.len() > 0x00D2 {
+            (read_u32(data, 0x00CA), read_u32(data, 0x00CE))
+        } else {
+            (0, 0)
+        };
+        // fcPlcftxbxTxt/lcbPlcftxbxTxt — pair 56 (0x9A + 56*8 = 0x25A) and
+        // fcPlcfHdrtxbxTxt/lcbPlcfHdrtxbxTxt — pair 58 (0x26A), counted in
+        // the same [MS-DOC] §2.5.6 order that puts the verified fcClx at
+        // pair 33 (0x1A2) and fcPlfLst at pair 73 (0x2E2).
+        let (fc_plcftxbx_txt, lcb_plcftxbx_txt) = if data.len() > 0x0262 {
+            (read_u32(data, 0x025A), read_u32(data, 0x025E))
+        } else {
+            (0, 0)
+        };
+        let (fc_plcf_hdrtxbx_txt, lcb_plcf_hdrtxbx_txt) = if data.len() > 0x0272 {
+            (read_u32(data, 0x026A), read_u32(data, 0x026E))
+        } else {
+            (0, 0)
+        };
+
         Ok(Self {
             lid,
             use_table1,
@@ -274,6 +312,12 @@ impl Fib {
             lcb_plcf_and_txt,
             fc_plcf_bte_chpx,
             lcb_plcf_bte_chpx,
+            fc_plcf_sed,
+            lcb_plcf_sed,
+            fc_plcftxbx_txt,
+            lcb_plcftxbx_txt,
+            fc_plcf_hdrtxbx_txt,
+            lcb_plcf_hdrtxbx_txt,
         })
     }
 }

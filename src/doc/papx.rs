@@ -262,6 +262,13 @@ fn piece_byte_base(p: &Piece) -> (u32, u32) {
 /// appears. The inner text is run through [`sanitize_text`] (which strips
 /// field codes `0x13/0x14/0x15` and maps control chars); the trailing
 /// character is kept raw as the `terminator` that drives cell/row grouping.
+///
+/// `section_ends` are the section end CPs (`PlcfSed`, sorted): the last
+/// character of every section but the last is its section mark (0x0C),
+/// which also ends that section's last paragraph, so it terminates a
+/// paragraph here (terminator `0x0C`)
+/// rather than merging it with the next section's first. A 0x0C anywhere
+/// else is a page break inside a paragraph.
 pub fn build_paragraphs(
     word_doc: &[u8],
     pieces: &[Piece],
@@ -269,6 +276,7 @@ pub fn build_paragraphs(
     text_len: u32,
     lid: u16,
     chp_runs: &[FkpRun],
+    section_ends: &[u32],
 ) -> Vec<DocParagraph> {
     // PAPX runs in CP space: every FKP run intersected with every piece.
     // A paragraph is then the text up to and including the next paragraph
@@ -320,8 +328,15 @@ pub fn build_paragraphs(
             let segments = resolve_chp_segments(&sorted_chp_runs, seg_a, seg_b);
             for (seg_start, seg_end, props) in &segments {
                 let chunk = decode_cp_range(word_doc, pieces, *seg_start, *seg_end, lid);
+                let mut cp = *seg_start;
                 for ch in chunk.chars() {
-                    let is_mark = matches!(ch, '\r' | '\u{7}');
+                    let this_cp = cp;
+                    cp = cp.saturating_add(ch.len_utf16() as u32);
+                    let is_mark = matches!(ch, '\r' | '\u{7}')
+                        || (ch == '\u{C}'
+                            && section_ends
+                                .binary_search(&this_cp.saturating_add(1))
+                                .is_ok());
                     // Deleted revision-mark text (`sprmCFRMarkDel`) is
                     // not part of the accepted view: the flat text already
                     // excludes it, and keeping it here made
@@ -515,7 +530,7 @@ mod tests {
             mk(5, 6, &rowmark), // "\u{7}" row mark
         ];
 
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 6, 0, &[]);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 6, 0, &[], &[]);
         assert_eq!(paras.len(), 4);
         // leading mark
         assert_eq!(paras[0].text, "");
@@ -562,7 +577,7 @@ mod tests {
             grpprl: Vec::new(),
         };
         let runs = vec![plain(0, 10), del, plain(23, n)];
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, n, 0, &runs);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, n, 0, &runs, &[]);
         assert_eq!(paras.len(), 1);
         assert_eq!(paras[0].text, "Keep this here.");
 
@@ -574,7 +589,7 @@ mod tests {
             grpprl: vec![0x3C, 0x08, 0x01],
         };
         let runs = vec![plain(0, 10), hidden, plain(23, n)];
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, n, 0, &runs);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, n, 0, &runs, &[]);
         assert_eq!(paras[0].text, "Keep this here.");
     }
 
@@ -599,7 +614,7 @@ mod tests {
         };
         let fkp = vec![mk(0, 6), mk(6, 12)];
 
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 12, 0, &[]);
+        let paras = build_paragraphs(&word_doc, &pieces, &fkp, 12, 0, &[], &[]);
         assert_eq!(paras.len(), 2);
         assert_eq!(paras[0].text, "Hi 😀", "emoji must not desync the range");
         assert_eq!(paras[0].terminator, '\r');
@@ -631,7 +646,8 @@ mod tests {
             grpprl: Vec::new(),
         };
         let fkp = vec![mk(0, raw.chars().count() as u32)];
-        let paras = build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, 0, &[]);
+        let paras =
+            build_paragraphs(&word_doc, &pieces, &fkp, raw.chars().count() as u32, 0, &[], &[]);
         assert_eq!(paras.len(), 1);
         assert_eq!(paras[0].terminator, '\r');
         let t = &paras[0].text;

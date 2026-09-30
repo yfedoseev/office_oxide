@@ -127,6 +127,15 @@ pub struct FibTweaks {
     /// text (Word leaves the first `rgfc` at the start of the text area,
     /// not at `fcMin`).
     pub first_fkp_fc_before_text: u32,
+    /// `PlcfSed` section boundary CPs (`aCP`, one more than the section
+    /// count; each `Sed` is written as zeros). Empty: no `PlcfSed`.
+    pub plcf_sed: Vec<u32>,
+    /// `PlcfHdd` header-story CPs (`aCP`, stories + 2 entries). Empty: no
+    /// `PlcfHdd`.
+    pub plcf_hdd: Vec<u32>,
+    /// `PlcftxbxTxt` text-box story CPs (`aCP`, one more than the story
+    /// count; each `FTXBXS` is written as zeros). Empty: no `PlcftxbxTxt`.
+    pub plcf_txbx_txt: Vec<u32>,
 }
 
 /// Build a synthetic `.doc`, optionally with subdocuments and FIB tweaks.
@@ -177,6 +186,25 @@ pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> V
     let fc_plcf = table.len() as u32;
     table.extend_from_slice(&build_plcf_bte_papx(n, &cp_starts, text_len));
     let lcb_plcf = (table.len() as u32) - fc_plcf;
+    // Optional PLCs, each placed after what is already in the table stream:
+    // (FIB fc offset, aCP, data-element size).
+    let mut plcs: Vec<(usize, u32, u32)> = Vec::new();
+    for (fib_off, cps, cb) in [
+        (0x00CA, &tweaks.plcf_sed, 12usize), // fcPlcfSed: Sed = 12 bytes
+        (0x00F2, &tweaks.plcf_hdd, 0),       // fcPlcfHdd: no data elements
+        (0x025A, &tweaks.plcf_txbx_txt, 22), // fcPlcftxbxTxt: FTXBXS = 22 bytes
+    ] {
+        if cps.is_empty() {
+            continue;
+        }
+        let fc = table.len() as u32;
+        for cp in cps.iter() {
+            table.extend_from_slice(&cp.to_le_bytes());
+        }
+        let elems = if cb == 0 { 0 } else { cps.len() - 1 };
+        table.extend(std::iter::repeat_n(0u8, elems * cb));
+        plcs.push((fib_off, fc, table.len() as u32 - fc));
+    }
 
     // ── WordDocument stream: FIB + N FKP pages + text. ──
     let wd_len = text_offset as usize + text_bytes.len();
@@ -206,6 +234,10 @@ pub fn build_doc_full(paras: &[Para], subdocs: &Subdocs, tweaks: FibTweaks) -> V
     }
     if let Some(off) = tweaks.clx_offset {
         word_doc[0x01A2..0x01A6].copy_from_slice(&off.to_le_bytes());
+    }
+    for (fib_off, fc, lcb) in plcs {
+        word_doc[fib_off..fib_off + 4].copy_from_slice(&fc.to_le_bytes());
+        word_doc[fib_off + 4..fib_off + 8].copy_from_slice(&lcb.to_le_bytes());
     }
     for (i, p) in paras.iter().enumerate() {
         let cp0 = cp_starts[i];
