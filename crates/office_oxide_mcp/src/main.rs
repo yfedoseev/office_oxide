@@ -1,8 +1,9 @@
 //! `office-oxide-mcp` — Model Context Protocol server for office_oxide.
 //!
-//! Speaks JSON-RPC 2.0 over stdin/stdout. Exposes two tools:
+//! Speaks JSON-RPC 2.0 over stdin/stdout. Exposes three tools:
 //! `extract` (text / markdown / html / ir from a DOCX/XLSX/PPTX/DOC/
-//! XLS/PPT file) and `info` (format detection + metadata).
+//! XLS/PPT file), `replace_text` (DOCX/PPTX text replacement) and `info`
+//! (format detection + metadata).
 
 #![warn(missing_docs)]
 

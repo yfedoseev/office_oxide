@@ -25,7 +25,8 @@ pub fn handle_tools_list(id: &Value) -> Value {
             "tools": [
                 {
                     "name": "extract",
-                    "description": "Extract content from an Office document (DOCX, XLSX, PPTX)",
+                    "description":
+                        "Extract content from an Office document (DOCX, XLSX, PPTX, DOC, XLS, PPT)",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -62,7 +63,7 @@ pub fn handle_tools_list(id: &Value) -> Value {
                             },
                             "find": {
                                 "type": "string",
-                                "description": "Text to search for"
+                                "description": "Text to search for (must not be empty)"
                             },
                             "replace": {
                                 "type": "string",
@@ -79,7 +80,11 @@ pub fn handle_tools_list(id: &Value) -> Value {
                 },
                 {
                     "name": "info",
-                    "description": "Get metadata about an Office document",
+                    "description":
+                        "Get metadata about an Office document (DOCX, XLSX, PPTX, DOC, XLS, \
+                         PPT): format, file size, title, document properties (author, \
+                         subject, keywords, dates), warnings such as incomplete text \
+                         extraction, and the section list",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -361,6 +366,54 @@ mod tests {
             assert_eq!(render(&doc, format, full.len()).unwrap(), full, "{format}");
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The README documented `extract` as DOCX/XLSX/PPTX-only with three
+    /// formats, omitted `replace_text`, and promised a file size `info` did
+    /// not return; the tool descriptions said DOCX/XLSX/PPTX too. The CLI
+    /// has a clap-vs-README drift test; this is the MCP equivalent, driven
+    /// off the live `tools/list` response.
+    #[test]
+    fn test_readme_documents_every_tool_parameter_and_format() {
+        let readme =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).unwrap();
+        let list = handle_tools_list(&json!(1));
+        let tools = list["result"]["tools"].as_array().unwrap();
+        assert!(!tools.is_empty());
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            let start = readme
+                .find(&format!("### `{name}`"))
+                .unwrap_or_else(|| panic!("README has no section for tool `{name}`"));
+            let end = readme[start + 1..]
+                .find("\n##")
+                .map_or(readme.len(), |i| start + 1 + i);
+            let section = &readme[start..end];
+            let props = tool["inputSchema"]["properties"].as_object().unwrap();
+            for (prop, schema) in props {
+                assert!(
+                    section.contains(&format!("`{prop}`")),
+                    "README section for `{name}` does not document `{prop}`"
+                );
+                for value in schema["enum"].as_array().into_iter().flatten() {
+                    let value = value.as_str().unwrap();
+                    assert!(
+                        section.contains(&format!("`{value}`")),
+                        "README section for `{name}` does not list `{prop}` value `{value}`"
+                    );
+                }
+            }
+            // Tools that read documents read all six formats; say so.
+            let description = tool["description"].as_str().unwrap();
+            if name != "replace_text" {
+                for fmt in ["DOCX", "XLSX", "PPTX", "DOC,", "XLS,", "PPT"] {
+                    assert!(
+                        description.contains(fmt),
+                        "`{name}` description omits {fmt}: {description}"
+                    );
+                }
+            }
+        }
     }
 
     /// `info` returned only format/title/sections: the truncation warning
