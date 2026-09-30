@@ -721,15 +721,17 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
     let mut capped = (&mut file).take(MAX_PART_SIZE + 1);
     match capped.read_to_end(&mut buf) {
         Ok(_) => {},
+        // A CRC-32 mismatch means the bytes are not the ones the producer
+        // wrote. Handing them back would turn a bit-rotted part into
+        // plausible-but-wrong text with no signal anywhere; every zip
+        // reader (Python's zipfile, Java's ZipInputStream) refuses it.
         Err(e)
             if e.kind() == std::io::ErrorKind::InvalidData
-                && e.to_string().contains("checksum")
-                && !buf.is_empty() =>
+                && e.to_string().contains("checksum") =>
         {
-            // CRC32 mismatch — the data was fully decompressed but the checksum
-            // doesn't match. Accept the data anyway for tolerance of real-world
-            // files with minor corruption (e.g., re-saved without recomputing CRC).
-            trace!("read_zip_entry '{}': ignoring CRC mismatch", name);
+            return Err(Error::Zip(zip::result::ZipError::InvalidArchive(
+                format!("CRC-32 mismatch in part '{name}': the part is corrupt").into(),
+            )));
         },
         Err(e) => return Err(e.into()),
     }
@@ -1258,6 +1260,27 @@ mod tests {
         let entries = ZipEntryIndex::with_byte_limit(&archive, 16);
         let err = read_zip_entry(&mut archive, &entries, "a.bin").unwrap_err();
         assert!(matches!(err, Error::PackageLimit(_)), "{err:?}");
+    }
+
+    /// A part whose bytes do not match its recorded CRC-32 is corrupt; the
+    /// read fails rather than handing back the damaged bytes as if they
+    /// were the document (every zip reader — Python's zipfile, Java's
+    /// ZipInputStream, the zip crate itself — errors here).
+    #[test]
+    fn test_crc_mismatch_fails_the_read() {
+        let bytes = raw_zip(
+            &[
+                ("[Content_Types].xml", MINIMAL_CT),
+                ("word/a.xml", b"<a>text</a>"),
+            ],
+            Eocd::Count(2),
+            &["word/a.xml"],
+        );
+        let mut r = open(bytes).expect("the directory is well formed");
+        let err = r
+            .read_part(&PartName::new("/word/a.xml").unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("CRC-32"), "{err}");
     }
 
     #[test]
