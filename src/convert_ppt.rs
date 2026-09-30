@@ -335,7 +335,9 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                     }
                 },
                 TextType::Notes => {
-                    notes_lines.push(run.text.trim());
+                    // One paragraph per notes paragraph (`\r`) or soft
+                    // return (`\x0B`), as on the slide body.
+                    notes_lines.extend(run.text.split(['\r', '\n', '\u{b}']));
                 },
                 // Every other text type (`Other`, subtitles, footers …):
                 // one paragraph per paragraph, as for a body — joining

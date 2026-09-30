@@ -139,6 +139,14 @@ pub const RT_OE_PLACEHOLDER_ATOM: u16 = 0x0BC3;
 // ── SlideListWithText `rh.recInstance` discriminants ([MS-PPT] 2.4.14) ──
 /// `rh.recInstance` value identifying a `SlideListWithTextContainer` (real slides).
 pub const SLWT_SLIDES: u16 = 0;
+/// `NotesListWithTextContainer` is a `SlideListWithText` record with
+/// `recInstance` 2 ([MS-PPT] `NotesListWithTextContainer`; the master list is 1).
+pub const SLWT_NOTES: u16 = 2;
+/// `NotesContainer` ([MS-PPT] `NotesContainer`, record type 1008): one notes page.
+pub const RT_NOTES: u16 = 0x03F0;
+/// `NotesAtom` ([MS-PPT] `NotesAtom`, record type 1009): `slideIdRef`, the
+/// `SlideId` of the slide these notes belong to, at body offset 0.
+pub const RT_NOTES_ATOM: u16 = 0x03F1;
 
 /// A parsed PPT record header.
 #[derive(Debug, Clone, Copy)]

@@ -275,74 +275,54 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
     let headers_footers = parse_headers_footers(&doc_children);
 
     let mut slides = Vec::new();
-    let mut current_persist_id: Option<u32> = None;
-    let mut outline_texts: Vec<TextRun> = Vec::new();
-    let mut current_type = TextType::Other;
-    let mut last_outline_idx: Option<usize> = None;
-
-    for rec in RecordIter::new(&slide_list) {
-        let Ok(rec) = rec else { break };
-        match rec.header.rec_type {
-            RT_SLIDE_PERSIST_ATOM if rec.data.len() >= 4 => {
-                if let Some(persist_id_ref) = current_persist_id.take() {
-                    slides.push(resolve_slide(
-                        stream,
-                        dir,
-                        persist_id_ref,
-                        &outline_texts,
-                        &hyperlinks,
-                        &ole_objects,
-                    ));
-                }
-                current_persist_id =
-                    Some(u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]));
-                outline_texts.clear();
-                current_type = TextType::Other;
-                last_outline_idx = None;
-            },
-            RT_TEXT_HEADER if rec.data.len() >= 4 => {
-                let t = u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]);
-                current_type = TextType::from_u32(t);
-                last_outline_idx = None;
-            },
-            RT_TEXT_CHARS => {
-                // Positional index into this list is meaningful (it's what
-                // OutlineTextRefAtom references) — an empty run still
-                // occupies a slot and must not be skipped here.
-                outline_texts.push(TextRun {
-                    text_type: current_type,
-                    text: decode_utf16le(&rec.data),
-                    hyperlink: None,
-                    ..Default::default()
-                });
-                last_outline_idx = Some(outline_texts.len() - 1);
-            },
-            RT_TEXT_BYTES => {
-                outline_texts.push(TextRun {
-                    text_type: current_type,
-                    text: rec.data.iter().map(|&b| b as char).collect(),
-                    hyperlink: None,
-                    ..Default::default()
-                });
-                last_outline_idx = Some(outline_texts.len() - 1);
-            },
-            RT_STYLE_TEXT_PROP => {
-                if let Some(idx) = last_outline_idx {
-                    apply_style_text_prop(&mut outline_texts[idx], &rec.data);
-                }
-            },
-            _ => {},
-        }
-    }
-    if let Some(persist_id_ref) = current_persist_id.take() {
-        slides.push(resolve_slide(
+    // Per slide: its `SlideId` and `SlideAtom.notesIdRef`, to attach notes.
+    let mut slide_links: Vec<(u32, Option<u32>)> = Vec::new();
+    for entry in slide_list_entries(&slide_list) {
+        let (slide, notes_id_ref) = resolve_slide(
             stream,
             dir,
-            persist_id_ref,
-            &outline_texts,
+            entry.persist_id_ref,
+            &entry.outline_texts,
             &hyperlinks,
             &ole_objects,
-        ));
+        );
+        slides.push(slide);
+        slide_links.push((entry.slide_id, notes_id_ref));
+    }
+
+    // Speaker notes: the `NotesListWithTextContainer` lists every notes
+    // page; a slide names its own through `SlideAtom.notesIdRef` (matching
+    // the notes entry's `SlidePersistAtom.slideId`, [MS-PPT]
+    // `NotesIdRef`), and each notes page names its slide through
+    // `NotesAtom.slideIdRef` — used when the slide's reference is absent.
+    if let Some(notes_list) = find_child(&doc_children, RT_SLIDE_LIST_WITH_TEXT, SLWT_NOTES) {
+        let mut by_notes_id: HashMap<u32, Vec<TextRun>> = HashMap::new();
+        let mut by_slide_id: HashMap<u32, Vec<TextRun>> = HashMap::new();
+        for entry in slide_list_entries(&notes_list) {
+            let Some((runs, slide_id_ref)) = resolve_notes(
+                stream,
+                dir,
+                entry.persist_id_ref,
+                &entry.outline_texts,
+                &hyperlinks,
+                &ole_objects,
+            ) else {
+                continue;
+            };
+            if let Some(sid) = slide_id_ref {
+                by_slide_id.entry(sid).or_insert_with(|| runs.clone());
+            }
+            by_notes_id.entry(entry.slide_id).or_insert(runs);
+        }
+        for (slide, &(slide_id, notes_id_ref)) in slides.iter_mut().zip(&slide_links) {
+            let notes = notes_id_ref
+                .filter(|&id| id != 0)
+                .and_then(|id| by_notes_id.get(&id))
+                .or_else(|| by_slide_id.get(&slide_id));
+            if let Some(runs) = notes {
+                slide.text_runs.extend(runs.iter().cloned());
+            }
+        }
     }
 
     if !headers_footers.is_empty() {
@@ -388,9 +368,123 @@ fn parse_headers_footers(doc_children: &[u8]) -> Vec<String> {
     texts
 }
 
+/// One `SlidePersistAtom` entry of a `SlideListWithText`-family container
+/// and the outline-text sequence that follows it ([MS-PPT] 2.4.14.3).
+struct SlideListEntry {
+    persist_id_ref: u32,
+    /// `SlidePersistAtom.slideId` (body offset 12): the slide's `SlideId`,
+    /// or for a notes list the notes page's `NotesId`.
+    slide_id: u32,
+    outline_texts: Vec<TextRun>,
+}
+
+/// Walk a `SlideListWithText`/`NotesListWithText` container's records into
+/// one entry per `SlidePersistAtom`, each with its outline texts — the
+/// `TextHeaderAtom`/`TextCharsAtom`/`TextBytesAtom` runs that directly
+/// follow it, which an `OutlineTextRefAtom` indexes into.
+fn slide_list_entries(list: &[u8]) -> Vec<SlideListEntry> {
+    let mut entries: Vec<SlideListEntry> = Vec::new();
+    let mut current_type = TextType::Other;
+    let mut last_outline_idx: Option<usize> = None;
+    for rec in RecordIter::new(list) {
+        let Ok(rec) = rec else { break };
+        match rec.header.rec_type {
+            RT_SLIDE_PERSIST_ATOM if rec.data.len() >= 4 => {
+                let persist_id_ref =
+                    u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]);
+                let slide_id = rec
+                    .data
+                    .get(12..16)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .unwrap_or(0);
+                entries.push(SlideListEntry {
+                    persist_id_ref,
+                    slide_id,
+                    outline_texts: Vec::new(),
+                });
+                current_type = TextType::Other;
+                last_outline_idx = None;
+            },
+            RT_TEXT_HEADER if rec.data.len() >= 4 => {
+                let t = u32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]);
+                current_type = TextType::from_u32(t);
+                last_outline_idx = None;
+            },
+            RT_TEXT_CHARS | RT_TEXT_BYTES => {
+                let Some(entry) = entries.last_mut() else {
+                    continue;
+                };
+                let text = if rec.header.rec_type == RT_TEXT_CHARS {
+                    decode_utf16le(&rec.data)
+                } else {
+                    decode_text_bytes(&rec.data)
+                };
+                // Positional index into this list is meaningful (it's what
+                // OutlineTextRefAtom references) — an empty run still
+                // occupies a slot and must not be skipped here.
+                entry.outline_texts.push(TextRun {
+                    text_type: current_type,
+                    text,
+                    hyperlink: None,
+                    ..Default::default()
+                });
+                last_outline_idx = Some(entry.outline_texts.len() - 1);
+            },
+            RT_STYLE_TEXT_PROP => {
+                if let (Some(entry), Some(idx)) = (entries.last_mut(), last_outline_idx) {
+                    apply_style_text_prop(&mut entry.outline_texts[idx], &rec.data);
+                }
+            },
+            _ => {},
+        }
+    }
+    entries
+}
+
+/// Resolve one notes page: its `Notes` container's `Tx_TYPE_NOTES` text
+/// (the notes body — not the page's slide image or date/number
+/// placeholders), and the `NotesAtom.slideIdRef` of the slide it belongs
+/// to. `None` when the container does not resolve.
+fn resolve_notes(
+    stream: &[u8],
+    dir: &PersistDirectory,
+    persist_id_ref: u32,
+    outline_texts: &[TextRun],
+    hyperlinks: &HashMap<u32, String>,
+    ole_objects: &HashMap<u32, OleObjectInfo>,
+) -> Option<(Vec<TextRun>, Option<u32>)> {
+    let offset = dir.resolve(persist_id_ref)?;
+    let children = bounded_container_children(stream, offset, RT_NOTES)?;
+    let slide_id_ref = RecordIter::new(&children)
+        .filter_map(Result::ok)
+        .find(|r| r.header.rec_type == RT_NOTES_ATOM)
+        .and_then(|r| {
+            r.data
+                .get(0..4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        });
+    let mut runs = Vec::new();
+    extract_shape_text(
+        &children,
+        0,
+        outline_texts,
+        hyperlinks,
+        ole_objects,
+        None,
+        None,
+        &mut runs,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+    runs.retain(|r| r.text_type == TextType::Notes && !r.text.trim().is_empty());
+    Some((runs, slide_id_ref))
+}
+
 /// Resolve one slide's shape text: locate its `Slide` container via the
 /// persist directory and walk its shape tree, resolving any
-/// `OutlineTextRefAtom` references against `outline_texts`.
+/// `OutlineTextRefAtom` references against `outline_texts`. Also returns
+/// the slide's `SlideAtom.notesIdRef` (body offset 16), when present.
 ///
 /// Every persist-directory-resolved slide is kept regardless of whether text
 /// was found — an image-only slide is still a slide, and the presentation's
@@ -402,14 +496,23 @@ fn resolve_slide(
     outline_texts: &[TextRun],
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
-) -> SlideText {
+) -> (SlideText, Option<u32>) {
     let mut text_runs = Vec::new();
     let mut tables = Vec::new();
     let mut image_refs = Vec::new();
     let mut ole_object_refs = Vec::new();
     let mut hidden = false;
+    let mut notes_id_ref = None;
     if let Some(offset) = dir.resolve(persist_id_ref) {
         if let Some(children) = bounded_container_children(stream, offset, RT_SLIDE) {
+            notes_id_ref = RecordIter::new(&children)
+                .filter_map(Result::ok)
+                .find(|r| r.header.rec_type == RT_SLIDE_ATOM)
+                .and_then(|r| {
+                    r.data
+                        .get(16..20)
+                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                });
             extract_shape_text(
                 &children,
                 0,
@@ -437,13 +540,16 @@ fn resolve_slide(
             }
         }
     }
-    SlideText {
-        text_runs,
-        tables,
-        image_refs,
-        ole_object_refs,
-        hidden,
-    }
+    (
+        SlideText {
+            text_runs,
+            tables,
+            image_refs,
+            ole_object_refs,
+            hidden,
+        },
+        notes_id_ref,
+    )
 }
 
 /// The level-0 (no indentation) master style for the two placeholder
@@ -620,7 +726,7 @@ fn extract_shape_text(
                 }
             },
             RT_TEXT_BYTES => {
-                let text: String = rec.data.iter().map(|&b| b as char).collect();
+                let text = decode_text_bytes(&rec.data);
                 if !text.is_empty() {
                     out.push(TextRun {
                         text_type: current_type,
@@ -907,7 +1013,7 @@ fn extract_slides_from_slide_list_cache(slide_list: &[u8]) -> Vec<SlideText> {
             },
             RT_TEXT_BYTES => {
                 if let Some(slide) = current.as_mut() {
-                    let text: String = rec.data.iter().map(|&b| b as char).collect();
+                    let text = decode_text_bytes(&rec.data);
                     if !text.is_empty() {
                         slide.text_runs.push(TextRun {
                             text_type: current_type,
@@ -1405,6 +1511,14 @@ fn slide_is_hidden(children: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// Decode a `TextBytesAtom` body ([MS-PPT] `TextBytesAtom`): "each byte is the low
+/// byte of a UTF-16 character whose high byte is 0x00" — i.e. Latin-1,
+/// whatever the deck's language; PowerPoint writes a `TextCharsAtom`
+/// whenever a character needs more.
+fn decode_text_bytes(data: &[u8]) -> String {
+    data.iter().map(|&b| b as char).collect()
 }
 
 fn decode_utf16le(data: &[u8]) -> String {

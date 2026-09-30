@@ -19,6 +19,8 @@ use office_oxide::cfb::{CFB_SIGNATURE, END_OF_CHAIN, FAT_SECT, FREE_SECT};
 use office_oxide::{Document, DocumentFormat};
 use std::io::Cursor;
 
+pub mod ppt;
+
 /// Sentinel directory id: no sibling / child.
 const NO_ENTRY: u32 = 0xFFFF_FFFF;
 
@@ -605,5 +607,91 @@ pub fn cfb_with_stream(name: &str, data: &[u8]) -> Vec<u8> {
     }
     let data_off = 512 + first_data as usize * 512;
     file[data_off..data_off + data.len()].copy_from_slice(data);
+    file
+}
+
+/// A minimal CFB v3 container holding the given streams at the root, each
+/// in its own run of consecutive sectors (no mini stream, so streams of
+/// any size are read through the FAT). The root's children form a chain
+/// of right siblings.
+#[allow(dead_code)]
+pub fn cfb_with_streams(streams: &[(&str, &[u8])]) -> Vec<u8> {
+    let sectors: Vec<usize> = streams
+        .iter()
+        .map(|(_, d)| d.len().div_ceil(512).max(1))
+        .collect();
+    let dir_sectors = (streams.len() + 1).div_ceil(4);
+    let data_sectors: usize = sectors.iter().sum();
+    let mut fat_sectors = 1;
+    while fat_sectors * 128 < dir_sectors + fat_sectors + data_sectors {
+        fat_sectors += 1;
+    }
+    assert!(fat_sectors <= 109, "header DIFAT only");
+    let total = dir_sectors + fat_sectors + data_sectors;
+    let mut file = vec![0u8; 512 * (1 + total)];
+    file[0..8].copy_from_slice(&CFB_SIGNATURE);
+    file[0x18..0x1A].copy_from_slice(&0x003Eu16.to_le_bytes());
+    file[0x1A..0x1C].copy_from_slice(&3u16.to_le_bytes());
+    file[0x1C..0x1E].copy_from_slice(&0xFFFEu16.to_le_bytes());
+    file[0x1E..0x20].copy_from_slice(&9u16.to_le_bytes());
+    file[0x20..0x22].copy_from_slice(&6u16.to_le_bytes());
+    file[0x2C..0x30].copy_from_slice(&(fat_sectors as u32).to_le_bytes());
+    file[0x30..0x34].copy_from_slice(&0u32.to_le_bytes()); // directory at sector 0
+    file[0x38..0x3C].copy_from_slice(&4096u32.to_le_bytes());
+    file[0x3C..0x40].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+    file[0x44..0x48].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+    for i in 0..109 {
+        let v = if i < fat_sectors {
+            (dir_sectors + i) as u32
+        } else {
+            FREE_SECT
+        };
+        file[0x4C + i * 4..0x50 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    let mut fat = vec![FREE_SECT; fat_sectors * 128];
+    for i in 0..dir_sectors {
+        fat[i] = if i + 1 == dir_sectors {
+            END_OF_CHAIN
+        } else {
+            (i + 1) as u32
+        };
+    }
+    for i in 0..fat_sectors {
+        fat[dir_sectors + i] = FAT_SECT;
+    }
+    // Directory: root (entry 0) → entry 1, each entry's right sibling the next.
+    write_dir_entry(&mut file[512..640], "Root Entry", 5, 1, END_OF_CHAIN, 0);
+    let mut next = dir_sectors + fat_sectors;
+    for (i, ((name, data), &n)) in streams.iter().zip(&sectors).enumerate() {
+        let right = if i + 1 < streams.len() {
+            (i + 2) as u32
+        } else {
+            NO_ENTRY
+        };
+        let off = 512 + (i + 1) * 128;
+        write_dir_entry_with_sibling(
+            &mut file[off..off + 128],
+            name,
+            2,
+            NO_ENTRY,
+            right,
+            next as u32,
+            data.len() as u32,
+        );
+        for k in 0..n {
+            fat[next + k] = if k + 1 == n {
+                END_OF_CHAIN
+            } else {
+                (next + k + 1) as u32
+            };
+        }
+        let data_off = 512 + next * 512;
+        file[data_off..data_off + data.len()].copy_from_slice(data);
+        next += n;
+    }
+    for (i, v) in fat.iter().enumerate() {
+        let off = 512 + dir_sectors * 512 + i * 4;
+        file[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
     file
 }
