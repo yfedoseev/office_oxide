@@ -1241,7 +1241,9 @@ fn parse_empty_cell(
         value: CellValue::Empty,
         style_index: attrs.style_index,
         formula: None,
-        vm: None,
+        // A self-closing cell can still name value metadata (`vm`,
+        // [ECMA-376] §18.3.1.4) — an in-cell rich-value image.
+        vm: attrs.vm,
         rich_runs: None,
     })
 }

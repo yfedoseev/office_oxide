@@ -425,7 +425,9 @@ impl XlsxDocument {
                 for row in &mut ws.rows {
                     for cell in &mut row.cells {
                         let Some(vm) = cell.vm else { continue };
-                        if !matches!(cell.value, CellValue::Error(_)) {
+                        // Excel writes an image cell as `t="e"` with
+                        // `#VALUE!`; a self-closing `vm` cell is empty.
+                        if !matches!(cell.value, CellValue::Error(_) | CellValue::Empty) {
                             continue;
                         }
                         if let Some(pic) = rich_value_images.get(&vm) {
@@ -2174,32 +2176,18 @@ mod tests {
         assert!(parsed.text_shapes.is_empty());
     }
 
-    /// Build a minimal SpreadsheetML package whose main part carries
-    /// `content_type`.
-    /// A `vm`-tagged `t="e"` cell whose fallback `<v>` is
-    /// the literal `"#VALUE!"` is Excel 365's in-cell rich-value image
-    /// (`=IMAGE(...)`/"Place in Cell"), not a real formula error. The
-    /// real image is reachable by resolving `vm` through `xl/
-    /// metadata.xml` -> `xl/richData/{rdrichvalue,
-    /// rdrichvaluestructure,richValueRel}.xml` -> `xl/media/*`. This
-    /// fixture mirrors the exact shape of the real-corpus reproducer
-    /// (`phpspreadsheet_drawing_in_cell.xlsx`) byte for byte.
-    #[test]
-    fn test_a_rich_value_image_cell_resolves_to_a_real_image_not_a_value_error() {
-        const PNG: &[u8] = &[
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
-            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
-            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
-            0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
-
-        let sheet_xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+    /// A single-sheet package whose row 2 holds `cell`, with the rich-value
+    /// chain (metadata -> rich value -> structure -> rel -> media) that
+    /// makes `vm="1"` a local image of `RICH_VALUE_PNG`.
+    fn rich_value_image_package(cell: &str) -> Vec<u8> {
+        let sheet_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
   <sheetData>
-    <row r="2"><c r="B2" t="e" vm="1"><v>#VALUE!</v></c></row>
+    <row r="2">{cell}</row>
   </sheetData>
-</worksheet>"#;
+</worksheet>"#
+        );
 
         let metadata_xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:xlrd="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata"><metadataTypes count="1"><metadataType name="XLRICHVALUE" minSupportedVersion="120000"/></metadataTypes><futureMetadata name="XLRICHVALUE" count="1"><bk><extLst><ext uri="{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}"><xlrd:rvb i="0"/></ext></extLst></bk></futureMetadata><valueMetadata count="1"><bk><rc t="1" v="0"/></bk></valueMetadata></metadata>"#;
@@ -2216,22 +2204,56 @@ mod tests {
         let richvaluerel_rels = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/></Relationships>"#;
 
-        let bytes = single_sheet_xlsx(
-            std::str::from_utf8(sheet_xml).unwrap(),
+        single_sheet_xlsx(
+            &sheet_xml,
             &[
                 ("xl/metadata.xml", metadata_xml.as_slice()),
                 ("xl/richData/rdrichvalue.xml", rdrichvalue_xml.as_slice()),
                 ("xl/richData/rdrichvaluestructure.xml", rdrichvaluestructure_xml.as_slice()),
                 ("xl/richData/richValueRel.xml", richvaluerel_xml.as_slice()),
                 ("xl/richData/_rels/richValueRel.xml.rels", richvaluerel_rels.as_slice()),
-                ("xl/media/image1.png", PNG),
+                ("xl/media/image1.png", RICH_VALUE_PNG),
             ],
-        );
-        let doc = open_bytes(bytes);
+        )
+    }
+
+    const RICH_VALUE_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D, 0xB0, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    /// A self-closing `<c r="B2" vm="1"/>` still names value metadata; the
+    /// empty-cell path parsed and then dropped the `vm`, so such a cell's
+    /// rich-value image was lost.
+    #[test]
+    fn test_a_self_closing_vm_cell_keeps_its_value_metadata_link() {
+        let doc = open_bytes(rich_value_image_package(r#"<c r="B2" vm="1"/>"#));
+        let ws = &doc.worksheets[0];
+        assert_eq!(ws.images.len(), 1, "the rich-value image must reach ws.images");
+        assert_eq!(ws.images[0].data, RICH_VALUE_PNG);
+    }
+
+    /// Build a minimal SpreadsheetML package whose main part carries
+    /// `content_type`.
+    /// A `vm`-tagged `t="e"` cell whose fallback `<v>` is
+    /// the literal `"#VALUE!"` is Excel 365's in-cell rich-value image
+    /// (`=IMAGE(...)`/"Place in Cell"), not a real formula error. The
+    /// real image is reachable by resolving `vm` through `xl/
+    /// metadata.xml` -> `xl/richData/{rdrichvalue,
+    /// rdrichvaluestructure,richValueRel}.xml` -> `xl/media/*`. This
+    /// fixture mirrors the exact shape of the real-corpus reproducer
+    /// (`phpspreadsheet_drawing_in_cell.xlsx`) byte for byte.
+    #[test]
+    fn test_a_rich_value_image_cell_resolves_to_a_real_image_not_a_value_error() {
+        let doc =
+            open_bytes(rich_value_image_package(r#"<c r="B2" t="e" vm="1"><v>#VALUE!</v></c>"#));
         let ws = &doc.worksheets[0];
 
         assert_eq!(ws.images.len(), 1, "the rich-value image must reach ws.images");
-        assert_eq!(ws.images[0].data, PNG);
+        assert_eq!(ws.images[0].data, RICH_VALUE_PNG);
         assert_eq!(ws.images[0].format, "png");
 
         let cell = &ws.rows[0].cells[0];
