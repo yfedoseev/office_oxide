@@ -88,6 +88,231 @@ pub struct SheetPivotTable {
     /// range as `Sheet!A1:C10`, or a defined/table name; `None` for an
     /// external or consolidation source.
     pub source: Option<String>,
+    /// The cached source data from the cache's `pivotCacheRecords` part
+    /// ([ECMA-376] §18.10.1.68), materialised only when the source range is
+    /// not in the workbook — an external or consolidation source, a sheet
+    /// the workbook does not have, or a name that resolves to nothing. When
+    /// the source cells exist, they already carry this data.
+    pub cache_data: Option<PivotCacheData>,
+}
+
+/// A pivot cache's source data as cached in the package: one column per
+/// `cacheField`, one row per record.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PivotCacheData {
+    /// The `cacheField` names ([ECMA-376] §18.10.1.3), in order.
+    pub fields: Vec<String>,
+    /// One entry per `r` record ([ECMA-376] §18.10.1.77), each value as
+    /// text: `n`/`s`/`d`/`e` as written, `b` as `TRUE`/`FALSE`, `m` empty,
+    /// and `x` resolved through the field's `sharedItems`.
+    pub records: Vec<Vec<String>>,
+    /// `true` when the record, field or text bound stopped materialising
+    /// before the part ended — later records or values are missing.
+    pub truncated: bool,
+}
+
+/// The most records one pivot cache materialises: Excel's row limit.
+pub(crate) const MAX_PIVOT_CACHE_RECORDS: usize = super::cell::MAX_ROWS as usize;
+/// The most fields one pivot cache materialises: Excel's column limit.
+pub(crate) const MAX_PIVOT_CACHE_FIELDS: usize = 16_384;
+
+/// A pivot cache definition's `worksheetSource` ([ECMA-376] §18.10.1.99)
+/// and the relationship id of its records part.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct PivotCacheSource {
+    pub sheet: Option<String>,
+    pub range: Option<String>,
+    pub name: Option<String>,
+    /// `true` when a `worksheetSource` was present at all.
+    pub is_worksheet: bool,
+    /// `<pivotCacheDefinition r:id>`: the `pivotCacheRecords` part.
+    pub records_rel_id: Option<String>,
+}
+
+impl PivotCacheSource {
+    /// `Sheet!ref`, the bare `ref`, or the source `name`.
+    pub(crate) fn display(&self) -> Option<String> {
+        if !self.is_worksheet {
+            return None;
+        }
+        match (&self.sheet, &self.range, &self.name) {
+            (Some(sheet), Some(r), _) => Some(format!("{sheet}!{r}")),
+            (None, Some(r), _) => Some(r.clone()),
+            (_, None, name) => name.clone(),
+        }
+    }
+}
+
+/// Parse the source and records reference of a pivot cache definition.
+pub(crate) fn parse_pivot_cache_definition(
+    xml_data: &[u8],
+) -> crate::core::Result<PivotCacheSource> {
+    let mut reader = xml::make_fast_reader(xml_data);
+    let mut src = PivotCacheSource::default();
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) | Event::Empty(ref e) => match e.local_name().as_ref() {
+                "pivotCacheDefinition" => {
+                    src.records_rel_id = xml::optional_attr_str(e, "r:id")?.map(|v| v.into_owned());
+                },
+                "worksheetSource" => {
+                    let get = |n: &str| -> crate::core::Result<Option<String>> {
+                        Ok(xml::optional_attr_str(e, n)?.map(|v| v.into_owned()))
+                    };
+                    src.is_worksheet = true;
+                    src.sheet = get("sheet")?;
+                    src.range = get("ref")?;
+                    src.name = get("name")?;
+                    return Ok(src);
+                },
+                _ => {},
+            },
+            Event::Eof => return Ok(src),
+            _ => {},
+        }
+    }
+}
+
+/// A typed cache value (`b`/`d`/`e`/`m`/`n`/`s`, [ECMA-376]
+/// §18.10.1.2/.21/.27/.50/.60/.85) as text; `None` for any other element.
+fn pivot_value_text(e: &quick_xml::events::BytesStart) -> crate::core::Result<Option<String>> {
+    let v = || -> crate::core::Result<String> {
+        Ok(xml::optional_attr_str(e, "v")?
+            .map(|v| v.into_owned())
+            .unwrap_or_default())
+    };
+    Ok(Some(match e.local_name().as_ref() {
+        "b" => match v()?.as_str() {
+            "1" | "true" => "TRUE".to_string(),
+            _ => "FALSE".to_string(),
+        },
+        "m" => String::new(),
+        "n" | "s" | "d" | "e" => v()?,
+        _ => return Ok(None),
+    }))
+}
+
+/// Parse a pivot cache definition's `cacheFields`: each field's name and
+/// its `sharedItems` values (what a record's `x` index points at).
+/// Every name and shared item is charged against `budget`.
+pub(crate) fn parse_pivot_cache_fields(
+    xml_data: &[u8],
+    budget: &mut crate::limits::TextBudget,
+) -> crate::core::Result<(Vec<(String, Vec<String>)>, bool)> {
+    let mut reader = xml::make_fast_reader(xml_data);
+    let mut fields: Vec<(String, Vec<String>)> = Vec::new();
+    let mut in_shared = false;
+    let mut truncated = false;
+    loop {
+        let ev = reader.read_event()?;
+        let is_empty = matches!(ev, Event::Empty(_));
+        match ev {
+            Event::Start(ref e) | Event::Empty(ref e) => match e.local_name().as_ref() {
+                "cacheField" => {
+                    if fields.len() >= MAX_PIVOT_CACHE_FIELDS {
+                        truncated = true;
+                        break;
+                    }
+                    let name = xml::optional_attr_str(e, "name")?
+                        .map(|v| v.into_owned())
+                        .unwrap_or_default();
+                    if !budget.charge(name.chars().count()) {
+                        truncated = true;
+                        break;
+                    }
+                    fields.push((name, Vec::new()));
+                },
+                "sharedItems" => in_shared = !is_empty,
+                _ if in_shared => {
+                    if let (Some(text), Some(field)) = (pivot_value_text(e)?, fields.last_mut()) {
+                        if !budget.charge(text.chars().count()) {
+                            truncated = true;
+                            break;
+                        }
+                        field.1.push(text);
+                    }
+                },
+                _ => {},
+            },
+            Event::End(ref e) if e.local_name().as_ref() == "sharedItems" => in_shared = false,
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok((fields, truncated))
+}
+
+/// Parse a `pivotCacheRecords` part ([ECMA-376] §18.10.1.68) against the
+/// cache's fields. Stops — and marks the result truncated — at
+/// [`MAX_PIVOT_CACHE_RECORDS`] records or when `budget` is spent: an `x`
+/// index repeats one shared item per record, so the text is charged per
+/// materialised value, not per byte of the part.
+pub(crate) fn parse_pivot_cache_records(
+    xml_data: &[u8],
+    fields: &[(String, Vec<String>)],
+    budget: &mut crate::limits::TextBudget,
+) -> crate::core::Result<PivotCacheData> {
+    let mut reader = xml::make_fast_reader(xml_data);
+    let mut data = PivotCacheData {
+        fields: fields.iter().map(|(n, _)| n.clone()).collect(),
+        ..Default::default()
+    };
+    let mut current: Option<Vec<String>> = None;
+    loop {
+        let ev = reader.read_event()?;
+        let is_empty = matches!(ev, Event::Empty(_));
+        match ev {
+            Event::Start(ref e) | Event::Empty(ref e) => {
+                if e.local_name().as_ref() == "r" {
+                    if data.records.len() >= MAX_PIVOT_CACHE_RECORDS {
+                        data.truncated = true;
+                        break;
+                    }
+                    if is_empty {
+                        data.records.push(Vec::new());
+                    } else {
+                        current = Some(Vec::new());
+                    }
+                    continue;
+                }
+                let Some(rec) = current.as_mut() else {
+                    continue;
+                };
+                let text = if e.local_name().as_ref() == "x" {
+                    // §18.10.1.97: an index into this field's sharedItems.
+                    let idx = xml::optional_attr_str(e, "v")?
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    fields
+                        .get(rec.len())
+                        .and_then(|(_, shared)| shared.get(idx))
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    match pivot_value_text(e)? {
+                        Some(t) => t,
+                        None => continue,
+                    }
+                };
+                if rec.len() >= MAX_PIVOT_CACHE_FIELDS {
+                    continue;
+                }
+                if !budget.charge(text.chars().count().max(1)) {
+                    data.truncated = true;
+                    break;
+                }
+                rec.push(text);
+            },
+            Event::End(ref e) if e.local_name().as_ref() == "r" => {
+                if let Some(rec) = current.take() {
+                    data.records.push(rec);
+                }
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    Ok(data)
 }
 
 /// Parse a table part.
@@ -167,30 +392,6 @@ pub(crate) fn parse_pivot_table_part(xml_data: &[u8]) -> crate::core::Result<She
         ));
     }
     Ok(pivot)
-}
-
-/// The `<worksheetSource>` of a pivot cache definition, as `Sheet!ref`,
-/// the bare `ref`, or the source `name`.
-pub(crate) fn parse_pivot_cache_source(xml_data: &[u8]) -> crate::core::Result<Option<String>> {
-    let mut reader = xml::make_fast_reader(xml_data);
-    loop {
-        match reader.read_event()? {
-            Event::Start(ref e) | Event::Empty(ref e)
-                if e.local_name().as_ref() == "worksheetSource" =>
-            {
-                let get = |n: &str| -> crate::core::Result<Option<String>> {
-                    Ok(xml::optional_attr_str(e, n)?.map(|v| v.into_owned()))
-                };
-                return Ok(match (get("sheet")?, get("ref")?, get("name")?) {
-                    (Some(sheet), Some(r), _) => Some(format!("{sheet}!{r}")),
-                    (None, Some(r), _) => Some(r),
-                    (_, None, name) => name,
-                });
-            },
-            Event::Eof => return Ok(None),
-            _ => {},
-        }
-    }
 }
 
 /// A sheet's `<headerFooter>` ([ECMA-376] §18.3.1.46): the raw code strings

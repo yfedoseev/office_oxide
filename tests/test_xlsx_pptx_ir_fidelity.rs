@@ -1609,3 +1609,40 @@ fn test_cell_alignment_is_read_and_survives_an_ir_round_trip() {
         "horizontal alignment survives the round trip"
     );
 }
+
+/// `wrapText` (§18.8.1 `alignment`) was parsed into the style model but
+/// had no IR field, so it never reached a consumer and an IR round trip
+/// through the XLSX writer dropped it.
+#[test]
+fn test_cell_wrap_text_reaches_the_ir_and_survives_a_round_trip() {
+    let styles = r#"<cellXfs count="3">
+          <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+          <xf numFmtId="0" fontId="0" fillId="0" borderId="0" applyAlignment="1"><alignment wrapText="1"/></xf>
+          <xf numFmtId="0" fontId="0" fillId="0" borderId="0" applyAlignment="1"><alignment horizontal="right" wrapText="0"/></xf>
+        </cellXfs>"#;
+    let body = r#"<row r="1">
+        <c r="A1" t="inlineStr"><is><t>plain</t></is></c>
+        <c r="B1" s="1" t="inlineStr"><is><t>wrapped</t></is></c>
+        <c r="C1" s="2" t="inlineStr"><is><t>unwrapped</t></is></c>
+      </row>"#;
+    let ir = Xlsx::new(vec![Sheet::new("S", body)]).styles(styles).ir();
+    let wraps = |ir: &DocumentIR| {
+        only_table(ir, 0).rows[0]
+            .cells
+            .iter()
+            .map(|c| c.wrap_text)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(wraps(&ir), [false, true, false]);
+    let bytes = to_bytes(&office_oxide::create::ir_to_xlsx(&ir));
+    let back = Document::from_reader(Cursor::new(bytes), DocumentFormat::Xlsx)
+        .expect("reopen")
+        .to_ir();
+    assert_eq!(wraps(&back), [false, true, false], "wrapText survives the round trip");
+    let back_h: Vec<_> = only_table(&back, 0).rows[0]
+        .cells
+        .iter()
+        .map(|c| c.text_align.clone())
+        .collect();
+    assert_eq!(back_h, [None, None, Some(ParagraphAlignment::Right)]);
+}

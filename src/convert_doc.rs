@@ -30,17 +30,72 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // section's last paragraph at its section mark (terminator 0x0C, only
     // where `PlcfSed` puts a section end), so the paragraphs split there.
     let mut section_bodies: Vec<Vec<Element>> = Vec::new();
+    // Main-document text boxes whose shape anchor resolved (`PlcSpaMom`,
+    // [MS-DOC] §2.8.27): each is placed after the paragraph holding its
+    // anchor. Only the structured walk knows paragraph CPs; the line
+    // heuristic keeps every box trailing the document as before.
+    let place_anchored_boxes = !paragraphs.is_empty();
+    let mut anchored_boxes: Vec<(u32, Element)> = if place_anchored_boxes {
+        doc.subdocuments()
+            .iter()
+            .filter(|sub| sub.kind == crate::doc::SubDocumentKind::TextBoxes)
+            .flat_map(|sub| sub.anchored_parts())
+            .filter_map(|(body, anchor)| {
+                let anchor = anchor?;
+                let content = story_paragraphs(body);
+                (!content.is_empty()).then(|| {
+                    (
+                        anchor,
+                        Element::TextBox(TextBox {
+                            content,
+                            ..Default::default()
+                        }),
+                    )
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    anchored_boxes.sort_by_key(|&(cp, _)| cp);
+    let mut anchored_boxes = anchored_boxes.into_iter().peekable();
     if !paragraphs.is_empty() {
         let mut flattened = 0;
         for group in paragraphs.split_inclusive(|p| p.terminator == '\u{C}') {
             let mut elements = Vec::new();
+            let mut chunk_start = 0;
+            let mut pending: Vec<Element> = Vec::new();
+            for (j, p) in group.iter().enumerate() {
+                while let Some((_, tb)) = anchored_boxes.next_if(|&(cp, _)| cp < p.cp_end) {
+                    pending.push(tb);
+                }
+                // A box anchored inside a table or a list waits for the
+                // structure to end, so it never splits one in two.
+                if pending.is_empty() || !can_break_after(p, group.get(j + 1)) {
+                    continue;
+                }
+                flattened += walk_paragraphs(
+                    &group[chunk_start..=j],
+                    has_structured_headings,
+                    &mut elements,
+                    doc.list_formatting(),
+                );
+                elements.append(&mut pending);
+                chunk_start = j + 1;
+            }
             flattened += walk_paragraphs(
-                group,
+                &group[chunk_start..],
                 has_structured_headings,
                 &mut elements,
                 doc.list_formatting(),
             );
+            elements.append(&mut pending);
             section_bodies.push(elements);
+        }
+        // An anchor past the last paragraph (a truncated structured view):
+        // the box still reaches the document, at its end.
+        if let Some(last) = section_bodies.last_mut() {
+            last.extend(anchored_boxes.map(|(_, tb)| tb));
         }
         if flattened > 0 {
             warnings.push(format!(
@@ -161,21 +216,18 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             // merged into one Note, same as before endnote/comment splitting existed.
             let bodies: Vec<&str> = if sub.parts.is_empty() {
                 vec![sub.text.as_str()]
+            } else if sub.kind == crate::doc::SubDocumentKind::TextBoxes && place_anchored_boxes {
+                // Boxes with a resolved anchor were placed in the body.
+                sub.anchored_parts()
+                    .filter(|(_, anchor)| anchor.is_none())
+                    .map(|(body, _)| body)
+                    .collect()
             } else {
                 sub.parts.iter().map(String::as_str).collect()
             };
 
             for body in bodies {
-                let content: Vec<Element> = body
-                    .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .map(|l| {
-                        Element::Paragraph(Paragraph {
-                            content: vec![InlineContent::Text(TextSpan::plain(l))],
-                            ..Default::default()
-                        })
-                    })
-                    .collect();
+                let content = story_paragraphs(body);
                 if content.is_empty() {
                     continue;
                 }
@@ -593,6 +645,34 @@ fn count_grid_edges(centers: &[i16], col: usize, grid: &[i32]) -> u32 {
 /// `0x0000` / `0xF801` mean "not in a list"; `0x0001`–`0x07FE` are 1-based
 /// indices into `PlfLfo.rgLfo`; `0xF802`–`0xFFFF` are the negation of a 1-based
 /// index and are still list items. `None` (no sprmPIlfo) defaults to prose.
+/// A subdocument story's text as one plain paragraph per non-blank line.
+fn story_paragraphs(body: &str) -> Vec<Element> {
+    body.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(l))],
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
+/// Whether the structured walk can be cut after `p` without splitting a
+/// table (the next paragraph is still inside one) or a list (both are
+/// list items, which `walk_paragraphs` would otherwise emit as two lists).
+fn can_break_after(p: &DocParagraph, next: Option<&DocParagraph>) -> bool {
+    let Some(next) = next else {
+        return true;
+    };
+    let is_list =
+        |q: &DocParagraph| q.props.outline_level.is_none() && is_doc_list_item(q.props.ilfo);
+    !(next.props.f_in_table
+        || next.props.is_table_trailing_mark
+        || p.props.f_in_table && !p.props.is_table_trailing_mark
+        || is_list(p) && is_list(next))
+}
+
 fn is_doc_list_item(ilfo: Option<i16>) -> bool {
     match ilfo {
         None | Some(0) | Some(-2047) => false, // 0x0000 / 0xF801: not in a list
@@ -1118,6 +1198,7 @@ mod tests {
             terminator: '\r',
             props,
             hyperlinks: Vec::new(),
+            cp_end: 0,
             chp_runs: Vec::new(),
         }
     }
@@ -1138,6 +1219,7 @@ mod tests {
                 range: link_start..link_end,
                 url: "http://testuri.org/".to_string(),
             }],
+            cp_end: 0,
             chp_runs: Vec::new(),
         };
         let mut els = Vec::new();
@@ -1189,6 +1271,7 @@ mod tests {
             terminator: '\r',
             props: PapProps::default(),
             hyperlinks: Vec::new(),
+            cp_end: 0,
             chp_runs: vec![
                 (
                     bold_start..bold_end,
@@ -1630,6 +1713,7 @@ mod tests {
                 ..PapProps::default()
             },
             hyperlinks: Vec::new(),
+            cp_end: 0,
             chp_runs: Vec::new(),
         };
         let cell = DocParagraph {
@@ -1640,6 +1724,7 @@ mod tests {
                 ..PapProps::default()
             },
             hyperlinks: Vec::new(),
+            cp_end: 0,
             chp_runs: Vec::new(),
         };
         let paragraphs = [mark(1), cell, mark(1)];
@@ -1665,6 +1750,7 @@ mod tests {
                 ..PapProps::default()
             },
             hyperlinks: Vec::new(),
+            cp_end: 0,
             chp_runs: Vec::new(),
         };
         let paragraphs = [

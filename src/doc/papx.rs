@@ -54,6 +54,11 @@ pub struct DocParagraph {
     /// span with `ChpProps::default()` (see `resolve_chp_segments`), so
     /// callers never need a separate "no formatting info" case.
     pub chp_runs: Vec<(std::ops::Range<usize>, ChpProps)>,
+    /// Main-text CP just past this paragraph's terminator — the paragraph
+    /// holds every CP below this and at or above the previous paragraph's
+    /// `cp_end`. Lets shape anchors (`PlcSpaMom`) be placed after the
+    /// paragraph that holds them.
+    pub cp_end: u32,
 }
 
 /// Parse every PAPX FKP page referenced by the PlcfBtePapx.
@@ -388,7 +393,7 @@ pub fn build_paragraphs(
                     buf.push(ch);
                     buf_props.push(props.clone());
                     if is_mark {
-                        emit_paragraph(&mut buf, &mut buf_props, run, &mut out);
+                        emit_paragraph(&mut buf, &mut buf_props, run, cp, &mut out);
                     }
                 }
             }
@@ -400,7 +405,7 @@ pub fn build_paragraphs(
         buf.push('\r');
         buf_props.push(buf_props.last().cloned().unwrap_or_default());
         let last = pap.last().map(|&(_, _, fp)| fp).unwrap_or(&empty);
-        emit_paragraph(&mut buf, &mut buf_props, last, &mut out);
+        emit_paragraph(&mut buf, &mut buf_props, last, cursor, &mut out);
     }
     out
 }
@@ -411,6 +416,7 @@ fn emit_paragraph(
     buf: &mut Vec<char>,
     buf_props: &mut Vec<ChpProps>,
     run: &FkpParagraph,
+    cp_end: u32,
     out: &mut Vec<DocParagraph>,
 ) {
     let terminator = buf[buf.len() - 1];
@@ -425,6 +431,7 @@ fn emit_paragraph(
         props,
         hyperlinks,
         chp_runs: chp_spans,
+        cp_end,
     });
     buf.clear();
     buf_props.clear();

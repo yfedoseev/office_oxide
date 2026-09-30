@@ -334,6 +334,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                         border: cell_border(doc, cd, theme.as_deref()),
                         text_align: cell_h_align(doc, cd),
                         vertical_align: cell_v_align(doc, cd),
+                        wrap_text: cell_alignment(doc, cd).is_some_and(|a| a.wrap_text),
                         ..Default::default()
                     };
                     while tcells.len() < cd.col as usize {
@@ -537,6 +538,68 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         });
     }
 
+    // Pivot caches whose source is not in the workbook: the cached records
+    // are the only copy of the data behind the pivot. Like chart text, a
+    // trailing section, one heading and table per pivot.
+    let mut pivot_elements: Vec<Element> = Vec::new();
+    let mut pivot_truncated = false;
+    for (name, data) in doc.pivot_caches() {
+        pivot_elements.push(Element::Heading(Heading {
+            level: 3,
+            content: vec![InlineContent::Text(TextSpan::plain(
+                crate::xlsx::text::pivot_cache_title(name),
+            ))],
+            ..Default::default()
+        }));
+        let text_cell = |t: &str| TableCell {
+            content: vec![Element::Paragraph(Paragraph {
+                content: if t.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![InlineContent::Text(TextSpan::plain(t))]
+                },
+                ..Default::default()
+            })],
+            col_span: 1,
+            row_span: 1,
+            ..Default::default()
+        };
+        let cols = data.fields.len();
+        let mut rows = vec![TableRow {
+            cells: data.fields.iter().map(|f| text_cell(f)).collect(),
+            is_header: true,
+            ..Default::default()
+        }];
+        rows.extend(data.records.iter().map(|rec| {
+            TableRow {
+                cells: (0..cols.max(rec.len()))
+                    .map(|i| text_cell(rec.get(i).map(String::as_str).unwrap_or("")))
+                    .collect(),
+                ..Default::default()
+            }
+        }));
+        pivot_elements.push(Element::Table(Table {
+            rows,
+            ..Default::default()
+        }));
+        if data.truncated {
+            pivot_truncated = true;
+            pivot_elements.push(Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(
+                    crate::xlsx::text::PIVOT_CACHE_TRUNCATED_NOTICE,
+                ))],
+                ..Default::default()
+            }));
+        }
+    }
+    if !pivot_elements.is_empty() {
+        sections.push(Section {
+            title: Some("Pivot Caches".to_string()),
+            elements: pivot_elements,
+            ..Default::default()
+        });
+    }
+
     // A sheet that could not be read is a section holding the notice, so
     // the loss is visible in every projection of the IR.
     for (name, err) in &doc.unreadable_sheets {
@@ -575,7 +638,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
-            text_truncated: !doc.unreadable_sheets.is_empty(),
+            text_truncated: !doc.unreadable_sheets.is_empty() || pivot_truncated,
             ..crate::core::core_properties::ooxml_metadata_extras(
                 cp,
                 doc.app_properties.as_ref(),

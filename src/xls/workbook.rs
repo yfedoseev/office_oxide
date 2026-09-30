@@ -43,6 +43,10 @@ pub struct XlsDocument {
     /// text budget, cells whose shared string is missing), appended by
     /// every renderer so a partial result never passes for a whole one.
     notices: Vec<String>,
+    /// Structural problems in the compound-file container the reader
+    /// worked around (header sector counts that disagree with the chains,
+    /// streams shorter than their declared size); see `Metadata::warnings`.
+    warnings: Vec<String>,
     /// Title/author/subject/keywords/comments/dates from the
     /// `\x05SummaryInformation` OLE property-set stream every real `.xls`
     /// carries by default — parsed and then never read anywhere in the
@@ -85,6 +89,7 @@ impl XlsDocument {
             has_macros: false,
             truncated: false,
             notices: Vec::new(),
+            warnings: Vec::new(),
             summary_properties: None,
             chart_text: Vec::new(),
         }
@@ -198,12 +203,35 @@ impl XlsDocument {
         let has_macros =
             cfb.has_root_entry("_VBA_PROJECT_CUR") || cfb.has_root_entry("_VBA_PROJECT");
         let summary_properties = crate::cfb::read_document_properties(&mut cfb);
+        // A Workbook/Book stream whose sector chain ended before its
+        // declared size came back short: whatever followed the cut is
+        // missing, so the workbook is incomplete even when the records
+        // that were read parse cleanly.
+        let workbook_short = cfb
+            .truncated_streams()
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case("Workbook") || n.eq_ignore_ascii_case("Book"));
+        let mut warnings = cfb.warnings().to_vec();
+        warnings.extend(
+            cfb.truncated_streams()
+                .iter()
+                .map(|name| format!("stream {name:?} is shorter than its declared size")),
+        );
         // Drop CFB early to free file handle and memory.
         drop(cfb);
 
         let mut doc = Self::parse_workbook_stream(&stream_data)?;
         doc.has_macros = has_macros;
         doc.summary_properties = summary_properties;
+        doc.warnings = warnings;
+        if workbook_short {
+            doc.truncated = true;
+            doc.notices.push(
+                "[workbook truncated: the Workbook stream is shorter than its declared size \
+                 — later sheets or cells are missing]"
+                    .to_string(),
+            );
+        }
         Ok(doc)
     }
 
@@ -728,6 +756,7 @@ impl XlsDocument {
             has_macros: false,
             truncated: !notices.is_empty(),
             notices,
+            warnings: Vec::new(),
             summary_properties: None,
             chart_text,
         })
@@ -757,6 +786,12 @@ impl XlsDocument {
     /// renderer appends these.
     pub fn notices(&self) -> &[String] {
         &self.notices
+    }
+
+    /// Structural problems in the compound-file container the reader
+    /// worked around rather than failing on; see `Metadata::warnings`.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// Title/author/subject/keywords/comments/dates from the file's
@@ -1994,6 +2029,7 @@ mod tests {
             defined_names: Vec::new(),
             truncated: false,
             notices: Vec::new(),
+            warnings: Vec::new(),
             summary_properties: None,
             chart_text: Vec::new(),
             sheets: vec![Sheet {
@@ -2023,6 +2059,7 @@ mod tests {
             defined_names: Vec::new(),
             truncated: false,
             notices: Vec::new(),
+            warnings: Vec::new(),
             summary_properties: None,
             chart_text: Vec::new(),
             sheets: vec![Sheet {
@@ -2086,6 +2123,7 @@ mod tests {
             defined_names: Vec::new(),
             truncated: false,
             notices: Vec::new(),
+            warnings: Vec::new(),
             summary_properties: None,
             chart_text: Vec::new(),
             sheets,

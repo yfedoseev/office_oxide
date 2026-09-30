@@ -232,6 +232,104 @@ fn test_text_box_stories_are_split_per_box() {
     assert_eq!(boxes, ["Box one\n", "Box two\n"]);
 }
 
+/// Each main-document text box is anchored in the text: `PlcSpaMom`
+/// ([MS-DOC] §2.8.27 PlcfSpa) gives each shape's anchor CP and `Spa.lid`,
+/// and the box's `FTXBXS.lid` names the shape its text begins in. A box
+/// now follows the paragraph holding its anchor instead of trailing the
+/// whole document; a box whose shape has no anchor is still appended.
+#[test]
+fn test_text_boxes_follow_the_paragraph_holding_their_anchor() {
+    let subdocs = Subdocs {
+        textboxes: "Box A\rBox B\rBox C",
+        ..Default::default()
+    };
+    // Stories [0,6) [6,12) [12,18), then the trailing reusable one.
+    let tweaks = FibTweaks {
+        plcf_txbx_txt: vec![0, 6, 12, 18, 18],
+        txbx_lids: vec![1025, 1026, 1027],
+        // "Fi\x08rst." holds shape 1026's anchor at CP 2; "Sec\x08ond." (CPs
+        // 8..16) holds shape 1025's at CP 11. Shape 1027 has no anchor.
+        plcf_spa: vec![(2, 1026), (11, 1025)],
+        ..Default::default()
+    };
+    let paras = [para("Fi\u{8}rst."), para("Sec\u{8}ond."), para("Third.")];
+    let doc = open_doc(&build_doc_full(&paras, &subdocs, tweaks));
+    let ir = doc.to_ir();
+    let order: Vec<String> = ir.sections[0]
+        .elements
+        .iter()
+        .map(|e| {
+            let (tag, elements) = match e {
+                Element::TextBox(tb) => ("box", tb.content.clone()),
+                other => ("p", vec![other.clone()]),
+            };
+            let text = all_text(&office_oxide::ir::DocumentIR {
+                sections: vec![office_oxide::ir::Section {
+                    elements,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            format!("{tag}:{}", text.trim())
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "p:First.",
+            "box:Box B",
+            "p:Second.",
+            "box:Box A",
+            "p:Third.",
+            "box:Box C"
+        ]
+    );
+}
+
+/// A box anchored inside a table cell is placed after the table, never
+/// between its rows or cells.
+#[test]
+fn test_text_box_anchored_in_a_table_follows_the_table() {
+    use common::{cell_grpprl, row_grpprl};
+    let subdocs = Subdocs {
+        textboxes: "Boxed",
+        ..Default::default()
+    };
+    let tweaks = FibTweaks {
+        plcf_txbx_txt: vec![0, 6, 6],
+        txbx_lids: vec![2049],
+        // "Intro.\r" is CPs 0..7; the cell "C\x08ell" starts at CP 7.
+        plcf_spa: vec![(8, 2049)],
+        ..Default::default()
+    };
+    let paras = [
+        para("Intro."),
+        Para {
+            text: "C\u{8}ell",
+            terminator: '\u{7}',
+            grpprl: cell_grpprl(),
+        },
+        Para {
+            text: "",
+            terminator: '\u{7}',
+            grpprl: row_grpprl(&[0, 1000], &[0]),
+        },
+        para("After."),
+    ];
+    let ir = open_doc(&build_doc_full(&paras, &subdocs, tweaks)).to_ir();
+    let kinds: Vec<&str> = ir.sections[0]
+        .elements
+        .iter()
+        .map(|e| match e {
+            Element::Paragraph(_) => "p",
+            Element::Table(_) => "table",
+            Element::TextBox(_) => "box",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(kinds, ["p", "table", "box", "p"]);
+}
+
 /// Word 6.0/95 stores pictures in the `WordDocument` stream as a `PICF`
 /// header ([MS-DOC] §2.9.192) followed by the metafile; none were ever
 /// extracted, since only the Word 97 `Data` stream was scanned.

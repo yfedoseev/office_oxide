@@ -143,6 +143,13 @@ pub struct FibTweaks {
     /// `PlcftxbxTxt` text-box story CPs (`aCP`, one more than the story
     /// count; each `FTXBXS` is written as zeros). Empty: no `PlcftxbxTxt`.
     pub plcf_txbx_txt: Vec<u32>,
+    /// `FTXBXS.lid` of each `PlcftxbxTxt` story, in order (the shape id the
+    /// box's text begins in). Stories past this list keep `lid` 0; the
+    /// last `FTXBXS` is always written with `fReusable` = 1.
+    pub txbx_lids: Vec<u32>,
+    /// `PlcSpaMom` shape anchors as `(anchor CP, Spa.lid)`, followed by a
+    /// final CP of `text_len`. Empty: no `PlcSpaMom`.
+    pub plcf_spa: Vec<(u32, u32)>,
 }
 
 /// Build a synthetic `.doc`, optionally with subdocuments and FIB tweaks.
@@ -208,10 +215,18 @@ pub fn build_doc_streams(
     // Optional PLCs, each placed after what is already in the table stream:
     // (FIB fc offset, aCP, data-element size).
     let mut plcs: Vec<(usize, u32, u32)> = Vec::new();
+    let spa_cps: Vec<u32> = if tweaks.plcf_spa.is_empty() {
+        Vec::new()
+    } else {
+        let mut v: Vec<u32> = tweaks.plcf_spa.iter().map(|&(cp, _)| cp).collect();
+        v.push(text_len);
+        v
+    };
     for (fib_off, cps, cb) in [
         (0x00CA, &tweaks.plcf_sed, 12usize), // fcPlcfSed: Sed = 12 bytes
         (0x00F2, &tweaks.plcf_hdd, 0),       // fcPlcfHdd: no data elements
         (0x025A, &tweaks.plcf_txbx_txt, 22), // fcPlcftxbxTxt: FTXBXS = 22 bytes
+        (0x01DA, &spa_cps, 26),              // fcPlcSpaMom: Spa = 26 bytes
     ] {
         if cps.is_empty() {
             continue;
@@ -221,7 +236,23 @@ pub fn build_doc_streams(
             table.extend_from_slice(&cp.to_le_bytes());
         }
         let elems = if cb == 0 { 0 } else { cps.len() - 1 };
-        table.extend(std::iter::repeat_n(0u8, elems * cb));
+        for i in 0..elems {
+            let mut elem = vec![0u8; cb];
+            match fib_off {
+                0x025A => {
+                    // FTXBXS: fReusable at 8, lid at 14.
+                    if i + 1 == elems {
+                        elem[8..10].copy_from_slice(&1u16.to_le_bytes());
+                    } else if let Some(lid) = tweaks.txbx_lids.get(i) {
+                        elem[14..18].copy_from_slice(&lid.to_le_bytes());
+                    }
+                },
+                // Spa: lid first.
+                0x01DA => elem[0..4].copy_from_slice(&tweaks.plcf_spa[i].1.to_le_bytes()),
+                _ => {},
+            }
+            table.extend_from_slice(&elem);
+        }
         plcs.push((fib_off, fc, table.len() as u32 - fc));
     }
 

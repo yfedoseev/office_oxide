@@ -630,6 +630,12 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                                 (None, Some(a)) => Some(CellStyle::new().align(a)),
                                 (s, None) => s,
                             };
+                            // So does text wrapping (§18.8.1 `wrapText`).
+                            let style = match (style, cell.wrap_text) {
+                                (Some(s), true) => Some(s.wrap()),
+                                (None, true) => Some(CellStyle::new().wrap()),
+                                (s, false) => s,
+                            };
                             if let Some(style) = style {
                                 sheet.set_cell_styled(row_cursor, col, data, style);
                             } else {

@@ -98,6 +98,11 @@ pub struct Fib {
     pub fc_plcf_hdrtxbx_txt: u32,
     /// Byte length of the PlcfHdrtxbxTxt (0x026E).
     pub lcb_plcf_hdrtxbx_txt: u32,
+    /// Offset of the main document's PlcfSpa (`fcPlcSpaMom`, shape anchors,
+    /// [MS-DOC] §2.8.27) in the Table stream (0x01DA). Zero when absent.
+    pub fc_plc_spa_mom: u32,
+    /// Byte length of the main document's PlcfSpa (`lcbPlcSpaMom`, 0x01DE).
+    pub lcb_plc_spa_mom: u32,
 }
 
 impl Fib {
@@ -283,6 +288,13 @@ impl Fib {
         } else {
             (0, 0)
         };
+        // fcPlcSpaMom/lcbPlcSpaMom — pair 40 (0x9A + 40*8 = 0x1DA) of
+        // FibRgFcLcb97 ([MS-DOC] §2.5.6), right after fcUnused3 (pair 39).
+        let (fc_plc_spa_mom, lcb_plc_spa_mom) = if data.len() > 0x01E2 {
+            (read_u32(data, 0x01DA), read_u32(data, 0x01DE))
+        } else {
+            (0, 0)
+        };
 
         Ok(Self {
             lid,
@@ -318,6 +330,8 @@ impl Fib {
             lcb_plcftxbx_txt,
             fc_plcf_hdrtxbx_txt,
             lcb_plcf_hdrtxbx_txt,
+            fc_plc_spa_mom,
+            lcb_plc_spa_mom,
         })
     }
 }

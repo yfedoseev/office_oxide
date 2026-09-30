@@ -566,7 +566,10 @@ fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) 
             // so pt*100 → twips = (pt*100)/5. Plain division keeps the
             // round-trip exact for values that are multiples of 5;
             // div_ceil would inflate every non-multiple by 1 twip.
-            let space_before_twips = para.space_before_hundredths_pt.map(|h| h / 5);
+            let space_before_twips = para
+                .space_before_hundredths_pt
+                .map(|h| h / 5)
+                .or_else(|| percent_spacing_twips(para, para.space_before));
             // Empty paragraphs serve as vertical spacers — keep them
             // in the IR even when content is empty so the renderer
             // can advance the cursor by the requested amount.
@@ -577,9 +580,7 @@ fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) 
                     space_before_twips,
                     space_after_twips: match para.space_after {
                         Some(crate::pptx::TextSpacing::Points(h)) => Some(h / 5),
-                        // A percentage of the line has no fixed length
-                        // without the resolved font size.
-                        _ => None,
+                        pct => percent_spacing_twips(para, pct),
                     },
                     line_spacing: para.line_spacing.map(|s| match s {
                         // Same unit as DOCX `w:line` with lineRule=auto:
@@ -611,6 +612,35 @@ fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) 
             }
         }
     }
+}
+
+/// Text size a percent spacing is measured against when no run in the
+/// paragraph resolves one through the inheritance chain: 18 pt, the size
+/// PowerPoint and LibreOffice's OOXML import both fall back to.
+const DEFAULT_TEXT_SIZE_HUNDREDTHS_PT: u32 = 1800;
+
+/// A percent-form space before/after (`<a:spcPct>` inside `<a:spcBef>` /
+/// `<a:spcAft>`, ECMA-376 Part 1 §21.1.2.2.11: "a percentage of the text
+/// size") as twips, measured against the first run's resolved font size
+/// (its own `sz`, or the size the list-style / placeholder / master chain
+/// filled in). `None` for any other spacing form.
+fn percent_spacing_twips(
+    para: &crate::pptx::TextParagraph,
+    spacing: Option<crate::pptx::TextSpacing>,
+) -> Option<u32> {
+    let crate::pptx::TextSpacing::Percent(pct) = spacing? else {
+        return None;
+    };
+    let size = para
+        .content
+        .iter()
+        .find_map(|c| match c {
+            crate::pptx::TextContent::Run(r) => r.font_size_hundredths_pt,
+            _ => None,
+        })
+        .unwrap_or(DEFAULT_TEXT_SIZE_HUNDREDTHS_PT);
+    // hundredths-pt × (pct / 100000) × 20 twips/pt ÷ 100.
+    u32::try_from(u64::from(size) * u64::from(pct) / 500_000).ok()
 }
 
 /// EMU → twips (635 EMU per twip), saturating at the `i32` range.
