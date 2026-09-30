@@ -6,13 +6,22 @@ use crate::cfb::{CfbReader, SummaryProperties};
 
 use super::error::{PptError, Result};
 use super::images::{PptImage, extract_images};
-use super::text::{SlideText, TextType, extract_slides_text};
+use super::text::{SlideText, TextRun, TextType, extract_deck_text};
 
 /// A parsed legacy PowerPoint document.
 #[derive(Debug)]
 pub struct PptDocument {
     /// Text content extracted from each slide.
     pub slides: Vec<SlideText>,
+    /// Static text of the slide masters the slides show — text boxes and
+    /// other non-placeholder shapes placed on a master, which PowerPoint
+    /// draws on every slide using it. Each distinct text appears once per
+    /// deck, not once per slide; masters every slide hides
+    /// (`SlideAtom.fMasterObjects` unset) contribute nothing, and master
+    /// placeholder prompts ("Click to edit Master title style") never do.
+    /// Every renderer appends it after the slides, under
+    /// [`crate::pptx::layout::MASTER_TEXT_SECTION_TITLE`].
+    pub master_text: Vec<TextRun>,
     /// The `Pictures` stream, decoded into `images` on first request —
     /// see `DocDocument::data_stream` for why.
     pictures_stream: Vec<u8>,
@@ -72,7 +81,7 @@ impl PptDocument {
         if super::persist::is_encrypted(&stream, current_user.as_deref()) {
             return Err(PptError::Encrypted);
         }
-        let slides = extract_slides_text(&stream, current_user.as_deref());
+        let deck = extract_deck_text(&stream, current_user.as_deref());
         let has_macros = super::text::has_vba_project(&stream, current_user.as_deref());
 
         // The Pictures stream (if present) holds the images; decoded lazily.
@@ -90,7 +99,8 @@ impl PptDocument {
         );
 
         Ok(Self {
-            slides,
+            slides: deck.slides,
+            master_text: deck.master_text,
             pictures_stream,
             images: std::sync::OnceLock::new(),
             has_macros,
@@ -155,6 +165,17 @@ impl PptDocument {
                 }
             }
         }
+        if !self.master_text.is_empty() {
+            if !self.slides.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(crate::pptx::layout::MASTER_TEXT_SECTION_TITLE);
+            out.push('\n');
+            for run in &self.master_text {
+                out.push_str(&run.text.replace(['\r', '\u{b}'], "\n"));
+                out.push('\n');
+            }
+        }
         out
     }
 
@@ -182,6 +203,18 @@ impl PptDocument {
                         out.push_str("\n\n");
                     },
                 }
+            }
+        }
+        if !self.master_text.is_empty() {
+            if !self.slides.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("## ");
+            out.push_str(crate::pptx::layout::MASTER_TEXT_SECTION_TITLE);
+            out.push_str("\n\n");
+            for run in &self.master_text {
+                out.push_str(&markdown_run_text(&run.text));
+                out.push_str("\n\n");
             }
         }
         out
@@ -518,6 +551,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![
                 SlideText {
                     text_runs: vec![
@@ -562,6 +596,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![SlideText {
                 text_runs: vec![
                     TextRun {
@@ -595,6 +630,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![SlideText {
                 text_runs: vec![
                     TextRun {
@@ -643,6 +679,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
         assert!(ir.sections.is_empty());
@@ -662,6 +699,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![make_slide(vec![(
                 TextType::Body,
                 "Four Upload\u{b}Stations",
@@ -700,6 +738,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![make_slide(vec![(
                 TextType::Body,
                 "First paragraph\rFour Upload\u{b}Stations",
@@ -724,6 +763,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![make_slide(vec![(
                 TextType::CenterTitle,
                 "Methods & Tools\rAnalyses – national studies\rEvaluation – criteria",
@@ -758,6 +798,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![make_slide(vec![(
                 TextType::Other,
                 "LOASP\rChap. 14: information",
@@ -778,6 +819,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![make_slide(vec![(TextType::Title, "My Slide")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -799,6 +841,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![make_slide(vec![
                 (TextType::from_u32(6), "BSE in the US"), // real title
                 (TextType::from_u32(5), "Lisa A. Ferguson, DVM"), // real subtitle
@@ -844,6 +887,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![SlideText {
                 text_runs: vec![TextRun {
                     text_type: TextType::Body,
@@ -873,6 +917,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![make_slide(vec![(TextType::CenterTitle, "Centered")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -894,6 +939,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![make_slide(vec![
                 (TextType::Title, "Title"),
                 (TextType::Body, "Visible body text"),
@@ -931,6 +977,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![make_slide(vec![(TextType::Body, "Just body text")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -948,6 +995,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![make_slide(vec![
                 (TextType::Notes, "First note"),
                 (TextType::Notes, "Second note"),
@@ -987,6 +1035,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![make_slide(vec![
                 (TextType::Body, "Body text"),
                 (TextType::HalfBody, "Half body"),
@@ -1011,6 +1060,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![make_slide(vec![(TextType::Notes, "Speaker note")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -1031,6 +1081,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![make_slide(vec![(TextType::Other, "misc text")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -1046,6 +1097,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![make_slide(vec![(TextType::Body, "content")])],
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
@@ -1062,6 +1114,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
         };
         let ir = crate::convert_ppt::ppt_to_ir(&doc);
         assert_eq!(ir.metadata.format, crate::format::DocumentFormat::Ppt);
@@ -1077,6 +1130,7 @@ mod tests {
             has_macros: false,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             summary_properties: Some(crate::cfb::SummaryProperties {
                 title: Some("Declared Title".to_string()),
                 subject: Some("Declared Subject".to_string()),
@@ -1109,6 +1163,7 @@ mod tests {
             has_macros: false,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             summary_properties: Some(crate::cfb::SummaryProperties {
                 title: Some(String::new()),
                 ..Default::default()
@@ -1136,6 +1191,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![SlideText {
                 text_runs: vec![TextRun {
                     text_type: TextType::Title,
@@ -1185,6 +1241,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![SlideText {
                 text_runs: vec![TextRun {
                     text_type: TextType::Body,
@@ -1247,6 +1304,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![SlideText {
                 text_runs: vec![TextRun {
                     text_type: TextType::Body,
@@ -1287,6 +1345,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![SlideText {
                 text_runs: vec![TextRun {
                     text_type: TextType::Other,
@@ -1323,6 +1382,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![SlideText {
                 text_runs: vec![TextRun {
                     text_type: TextType::Body,
@@ -1374,6 +1434,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![SlideText {
                 tables: vec![TableBlock {
                     rows: vec![
@@ -1432,6 +1493,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![
                 SlideText {
                     image_refs: vec![0],
@@ -1482,6 +1544,7 @@ mod tests {
             summary_properties: None,
             warnings: Vec::new(),
             text_complete: true,
+            master_text: Vec::new(),
             slides: vec![SlideText {
                 ..Default::default()
             }],

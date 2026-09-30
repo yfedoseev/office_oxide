@@ -132,6 +132,27 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         .filter(|t| !t.is_empty())
         .or_else(|| sections.first().and_then(|s| s.title.clone()));
 
+    // Layout and master static text, once per deck, after the slides (see
+    // `pptx::layout`) — through the same conversion as slide text, so the
+    // direct markdown renderer and this one agree.
+    let mut master_elements = Vec::new();
+    for (body, _) in doc.master_static_bodies() {
+        convert_text_body(body, &mut master_elements);
+    }
+    if !master_elements.is_empty() {
+        sections.push(Section {
+            title: Some(crate::pptx::layout::MASTER_TEXT_SECTION_TITLE.to_string()),
+            elements: master_elements,
+            break_type: if sections.is_empty() {
+                SectionBreakType::Continuous
+            } else {
+                SectionBreakType::NextPage
+            },
+            page_setup: page_setup.clone(),
+            ..Default::default()
+        });
+    }
+
     DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Pptx,

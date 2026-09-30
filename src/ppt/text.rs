@@ -112,24 +112,63 @@ pub struct LinkRange {
 /// that directory — see the `persist` module — falling back to weaker
 /// heuristics only when a usable directory can't be built at all (e.g. a
 /// minimal hand-built stream that never went through a real save cycle).
+#[cfg(test)]
 pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<SlideText> {
+    extract_deck_text(stream, current_user).slides
+}
+
+/// What a "PowerPoint Document" stream yields: per-slide text, and the
+/// static text of the masters those slides show.
+#[derive(Debug, Clone, Default)]
+pub struct DeckText {
+    /// One entry per slide, in presentation order.
+    pub slides: Vec<SlideText>,
+    /// The static (non-placeholder) text of every master at least one
+    /// slide shows, each distinct text once; see [`master_static_text`].
+    pub master_text: Vec<TextRun>,
+}
+
+/// Extract the deck's slide text (resolved as described on
+/// `extract_slides_text`) and its masters' static text.
+pub fn extract_deck_text(stream: &[u8], current_user: Option<&[u8]>) -> DeckText {
+    let mut resolved = DeckText::default();
+    if let Some(dir) = persist::build(stream, current_user) {
+        if let Some(deck) = extract_slides_via_persist(stream, &dir) {
+            // A resolved-but-entirely-textless result is ambiguous: it's the
+            // correct answer for a genuinely text-free deck (image-only
+            // slides, or slides whose only text is on their master), but
+            // it's also what a corrupted persist chain that resolved to the
+            // wrong offsets looks like. Fall through to the weaker
+            // heuristics below rather than committing to it — if they also
+            // come up empty, this was the right answer all along, and the
+            // resolved slides are kept.
+            if !deck.slides.is_empty() && deck.slides.iter().any(|s| !s.text_runs.is_empty()) {
+                return deck;
+            }
+            resolved = deck;
+        }
+    }
+    let slides = extract_slides_without_persist(stream);
+    DeckText {
+        slides: if slides.is_empty() {
+            resolved.slides
+        } else {
+            slides
+        },
+        // Which masters the slides show is known only through the persist
+        // directory; the weaker paths cannot tell, so they add none.
+        master_text: resolved.master_text,
+    }
+}
+
+/// The slide-text heuristics used when the persist directory yields no
+/// text: the slide list's inline text cache, then every `Slide` container
+/// in the stream, then every text atom outside the masters and notes.
+fn extract_slides_without_persist(stream: &[u8]) -> Vec<SlideText> {
     // A best-effort fallback scope for the weaker paths below, which have
     // no persist-resolved DocumentContainer to search within at all.
     let stream_wide_hyperlinks = parse_ex_hyperlinks(stream);
     let stream_wide_ole_objects = parse_ex_ole_objects(stream);
-    if let Some(dir) = persist::build(stream, current_user) {
-        if let Some(slides) = extract_slides_via_persist(stream, &dir) {
-            // A resolved-but-entirely-textless result is ambiguous: it's the
-            // correct answer for a genuinely text-free deck (image-only
-            // slides), but it's also what a corrupted persist chain that
-            // resolved to the wrong offsets looks like. Fall through to the
-            // weaker heuristics below rather than committing to it — if they
-            // also come up empty, this was the right answer all along.
-            if !slides.is_empty() && slides.iter().any(|s| !s.text_runs.is_empty()) {
-                return slides;
-            }
-        }
-    }
 
     if let Some(slide_list) = find_descendant(stream, RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES, 0) {
         let slides = extract_slides_from_slide_list_cache(&slide_list);
@@ -273,7 +312,7 @@ fn is_field_placeholder_only(text: &str) -> bool {
 /// Returns `None` if the `DocumentContainer` or its slide list can't be
 /// resolved at all (directory present but unusable); returns `Some(vec![])`
 /// if the slide list resolves but is empty.
-fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<Vec<SlideText>> {
+fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<DeckText> {
     let doc_offset = dir.resolve(dir.doc_persist_id)?;
     let doc_children = bounded_container_children(stream, doc_offset, RT_DOCUMENT)?;
     let slide_list = find_child(&doc_children, RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES)?;
@@ -296,6 +335,8 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
     let mut slides = Vec::new();
     // Per slide: its `SlideId` and `SlideAtom.notesIdRef`, to attach notes.
     let mut slide_links: Vec<(u32, Option<u32>)> = Vec::new();
+    // Per slide: its `(masterIdRef, fMasterObjects)`.
+    let mut master_refs: Vec<(u32, bool)> = Vec::new();
     for entry in slide_list_entries(&slide_list) {
         let (mut slide, links) = resolve_slide(
             stream,
@@ -319,6 +360,7 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
         }
         slides.push(slide);
         slide_links.push((entry.slide_id, links.notes_id_ref));
+        master_refs.extend(links.master);
     }
 
     // Speaker notes: the `NotesListWithTextContainer` lists every notes
@@ -356,9 +398,23 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
         }
     }
 
+    let master_persist_ids = master_persist_ids(&doc_children);
+    let mut master_text = master_static_text(
+        stream,
+        dir,
+        &master_persist_ids,
+        master_refs.iter().copied(),
+        &hyperlinks,
+        &ole_objects,
+    );
+
     // Every run's `fontRef` names a font in the deck's collection.
     if !fonts.is_empty() {
-        for run in slides.iter_mut().flat_map(|s| s.text_runs.iter_mut()) {
+        for run in slides
+            .iter_mut()
+            .flat_map(|s| s.text_runs.iter_mut())
+            .chain(master_text.iter_mut())
+        {
             for span in &mut run.char_formats {
                 span.format.typeface = span
                     .format
@@ -369,7 +425,163 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
         }
     }
 
-    Some(slides)
+    Some(DeckText {
+        slides,
+        master_text,
+    })
+}
+
+/// `masterId` → `persistIdRef` for every entry of the
+/// `MasterListWithTextContainer` ([MS-PPT] `MasterListWithTextContainer`,
+/// a `SlideListWithText` record with `recInstance` 1; each child is a
+/// `MasterPersistAtom`, whose `masterId` sits at body offset 12). A
+/// `SlideAtom.masterIdRef` names a master by this `masterId` ([MS-PPT]
+/// `MasterIdRef`), not by its persist id.
+fn master_persist_ids(doc_children: &[u8]) -> HashMap<u32, u32> {
+    let Some(list) = find_child(doc_children, RT_SLIDE_LIST_WITH_TEXT, SLWT_MASTERS) else {
+        return HashMap::new();
+    };
+    slide_list_entries(&list)
+        .into_iter()
+        .map(|e| (e.slide_id, e.persist_id_ref))
+        .collect()
+}
+
+/// Bound on master → master references followed (a title master names
+/// its main master); real decks need one hop.
+const MAX_MASTER_CHAIN: usize = 8;
+
+/// The static text of every master a slide shows, in first-use order,
+/// each distinct text once.
+///
+/// `slide_masters` yields each slide's `(SlideAtom.masterIdRef,
+/// fMasterObjects)`. A slide shows its master's shapes only when
+/// `fMasterObjects` is set ([MS-PPT] `SlideAtom.slideFlags`, bit 0: "the
+/// slide follows the master objects"); a master none of the slides shows
+/// contributes nothing. A title master is itself a `SlideContainer` with a
+/// `SlideAtom` naming its main master, followed the same way.
+///
+/// Only shapes that are not placeholders count — see
+/// [`collect_master_static_runs`]. Placeholder text on a master is
+/// PowerPoint's prompt ("Click to edit Master title style", in the
+/// language PowerPoint ran in), which never appears on a slide.
+fn master_static_text(
+    stream: &[u8],
+    dir: &PersistDirectory,
+    master_persist_ids: &HashMap<u32, u32>,
+    slide_masters: impl Iterator<Item = (u32, bool)>,
+    hyperlinks: &HashMap<u32, String>,
+    ole_objects: &HashMap<u32, OleObjectInfo>,
+) -> Vec<TextRun> {
+    let mut visited = std::collections::HashSet::new();
+    let mut runs = Vec::new();
+    for (first, follows) in slide_masters {
+        let mut next = follows.then_some(first);
+        for _ in 0..MAX_MASTER_CHAIN {
+            let Some(master_id) = next.take() else { break };
+            if master_id == 0 || !visited.insert(master_id) {
+                break;
+            }
+            let Some(offset) = master_persist_ids
+                .get(&master_id)
+                .and_then(|&pid| dir.resolve(pid))
+            else {
+                break;
+            };
+            let children =
+                if let Some(c) = bounded_container_children(stream, offset, RT_MAIN_MASTER) {
+                    c
+                } else if let Some(c) = bounded_container_children(stream, offset, RT_SLIDE) {
+                    // A title master: its own shapes, then its main master's
+                    // when it follows that master's objects.
+                    next = slide_master_ref(&c).and_then(|(id, follows)| follows.then_some(id));
+                    c
+                } else {
+                    break;
+                };
+            collect_master_static_runs(&children, 0, hyperlinks, ole_objects, &mut runs);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    runs.retain(|r| seen.insert(r.text.trim().to_string()));
+    runs
+}
+
+/// A `Slide`/title-master container's `SlideAtom` `(masterIdRef,
+/// fMasterObjects)` ([MS-PPT] `SlideAtom`: `masterIdRef` at body offset
+/// 12, `slideFlags` at 20, `fMasterObjects` its bit 0).
+fn slide_master_ref(children: &[u8]) -> Option<(u32, bool)> {
+    let atom = RecordIter::new(children)
+        .filter_map(Result::ok)
+        .find(|r| r.header.rec_type == RT_SLIDE_ATOM)?;
+    let id = atom.data.get(12..16)?;
+    let flags = atom.data.get(20..22)?;
+    Some((
+        u32::from_le_bytes([id[0], id[1], id[2], id[3]]),
+        u16::from_le_bytes([flags[0], flags[1]]) & SLIDE_FLAG_MASTER_OBJECTS != 0,
+    ))
+}
+
+/// Collect the text of a master's non-placeholder shapes. A shape is a
+/// placeholder when its `OfficeArtClientData` carries an
+/// `OEPlaceholderAtom` or a `RoundTripHFPlaceholder12Atom`; as a second
+/// line of defence only `Tx_TYPE_OTHER` text is kept, since every other
+/// text type (title, body, notes and their variants) is placeholder text
+/// by definition ([MS-PPT] `TextTypeEnum`). Field stand-ins (`*`) and
+/// blank text are dropped too.
+fn collect_master_static_runs(
+    data: &[u8],
+    depth: usize,
+    hyperlinks: &HashMap<u32, String>,
+    ole_objects: &HashMap<u32, OleObjectInfo>,
+    out: &mut Vec<TextRun>,
+) {
+    if depth > MAX_SHAPE_DEPTH {
+        return;
+    }
+    for rec in RecordIter::new(data) {
+        let Ok(rec) = rec else { break };
+        if rec.header.rec_type == RT_SHAPE {
+            if shape_is_placeholder(&rec.data) {
+                continue;
+            }
+            let hyperlink = resolve_shape_hyperlink(&rec.data, hyperlinks);
+            let mut runs = Vec::new();
+            let mut tables = Vec::new();
+            extract_shape_text(
+                &rec.data,
+                depth + 1,
+                &[],
+                hyperlinks,
+                ole_objects,
+                hyperlink.as_deref(),
+                None,
+                &mut runs,
+                &mut tables,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            );
+            let table_runs = tables.into_iter().flat_map(|t| t.rows).flatten().flatten();
+            out.extend(runs.into_iter().chain(table_runs).filter(|r| {
+                r.text_type == TextType::Other
+                    && !r.text.trim().is_empty()
+                    && !is_field_placeholder_only(&r.text)
+            }));
+        } else if rec.header.is_container() {
+            collect_master_static_runs(&rec.data, depth + 1, hyperlinks, ole_objects, out);
+        }
+    }
+}
+
+/// Whether a shape is a placeholder: its `OfficeArtClientData` holds an
+/// `OEPlaceholderAtom` or a `RoundTripHFPlaceholder12Atom`, whatever the
+/// role ([MS-PPT] `OfficeArtClientData`).
+fn shape_is_placeholder(shape_data: &[u8]) -> bool {
+    let Some(client_data) = find_descendant(shape_data, RT_CLIENT_DATA, 0, 0) else {
+        return false;
+    };
+    find_descendant(&client_data, RT_OE_PLACEHOLDER_ATOM, 0, 0).is_some()
+        || find_descendant(&client_data, RT_ROUND_TRIP_HF_PLACEHOLDER12_ATOM, 0, 0).is_some()
 }
 
 /// The deck's typeface names, in `FontCollectionContainer` order — the
@@ -476,6 +688,8 @@ fn shown_slide_header_footer_texts(hf_children: &[u8]) -> Vec<String> {
 struct SlideLinks {
     notes_id_ref: Option<u32>,
     headers_footers: Option<Vec<String>>,
+    /// `SlideAtom` `(masterIdRef, fMasterObjects)`.
+    master: Option<(u32, bool)>,
 }
 
 /// One `SlidePersistAtom` entry of a `SlideListWithText`-family container
@@ -615,8 +829,10 @@ fn resolve_slide(
     let mut hidden = false;
     let mut notes_id_ref = None;
     let mut headers_footers = None;
+    let mut master = None;
     if let Some(offset) = dir.resolve(persist_id_ref) {
         if let Some(children) = bounded_container_children(stream, offset, RT_SLIDE) {
+            master = slide_master_ref(&children);
             headers_footers = find_child(&children, RT_HEADER_FOOTER, HF_INSTANCE_SLIDES)
                 .map(|hf| shown_slide_header_footer_texts(&hf));
             notes_id_ref = RecordIter::new(&children)
@@ -665,6 +881,7 @@ fn resolve_slide(
         SlideLinks {
             notes_id_ref,
             headers_footers,
+            master,
         },
     )
 }
@@ -3370,5 +3587,145 @@ mod tests {
         let slides = extract_slides_text(&stream, Some(&current_user));
         assert_eq!(slides.len(), 1);
         assert_eq!(slides[0].text_runs[0].text, "FALLBACK CACHE TEXT");
+    }
+
+    /// A `SlideAtom` naming `master_id` with `fMasterObjects` as given.
+    fn slide_atom_following(master_id: u32, follows: bool) -> Vec<u8> {
+        let mut body = vec![0u8; 24];
+        body[12..16].copy_from_slice(&master_id.to_le_bytes());
+        if follows {
+            body[20..22].copy_from_slice(&SLIDE_FLAG_MASTER_OBJECTS.to_le_bytes());
+        }
+        make_atom(RT_SLIDE_ATOM, 2, &body)
+    }
+
+    /// A shape holding one `Tx_TYPE_OTHER` text, with `client_data`
+    /// children (a placeholder atom) when given.
+    fn other_text_shape(text: &str, client_data: Option<Vec<u8>>) -> Vec<u8> {
+        let mut children = Vec::new();
+        if let Some(cd) = client_data {
+            children.extend(make_container(RT_CLIENT_DATA, 0, &cd));
+        }
+        let mut tb = make_atom(RT_TEXT_HEADER, 0, &4u32.to_le_bytes());
+        tb.extend(make_atom(RT_TEXT_BYTES, 0, text.as_bytes()));
+        children.extend(make_container(0xF00D, 0, &tb));
+        make_container(RT_SHAPE, 0, &children)
+    }
+
+    /// A title slide names a title master (a `SlideContainer` in the
+    /// master list), which names its main master: both masters' static
+    /// text is shown and extracted, each once, while header/footer
+    /// placeholders (`RoundTripHFPlaceholder12Atom`) are not static text.
+    /// `masterIdRef` values are `masterId`s from the
+    /// `MasterListWithTextContainer`, not persist ids.
+    #[test]
+    fn test_title_master_chain_yields_static_text_of_both_masters() {
+        const TITLE_MASTER: u32 = 0x8000_0010;
+        const MAIN_MASTER: u32 = 0x8000_0020;
+        let mut stream = Vec::new();
+
+        let doc_offset = stream.len() as u32;
+        let mut doc = make_container(
+            RT_SLIDE_LIST_WITH_TEXT,
+            SLWT_MASTERS,
+            &[
+                slide_persist_atom_bytes(3, TITLE_MASTER),
+                slide_persist_atom_bytes(4, MAIN_MASTER),
+            ]
+            .concat(),
+        );
+        doc.extend(make_container(
+            RT_SLIDE_LIST_WITH_TEXT,
+            SLWT_SLIDES,
+            &[
+                slide_persist_atom_bytes(2, 256),
+                slide_persist_atom_bytes(5, 257),
+            ]
+            .concat(),
+        ));
+        stream.extend(make_container(RT_DOCUMENT, 0, &doc));
+
+        let slide_offset = stream.len() as u32;
+        let mut slide = slide_atom_following(TITLE_MASTER, true);
+        slide.extend(other_text_shape("SLIDE TEXT", None));
+        stream.extend(make_container(RT_SLIDE, 0, &slide));
+
+        let title_master_offset = stream.len() as u32;
+        let mut title_master = slide_atom_following(MAIN_MASTER, true);
+        title_master.extend(other_text_shape("TITLE MASTER TEXT", None));
+        title_master.extend(other_text_shape("SHARED TEXT", None));
+        stream.extend(make_container(RT_SLIDE, 0, &title_master));
+
+        let main_master_offset = stream.len() as u32;
+        let mut main_master = slide_atom_following(0, false);
+        main_master.extend(other_text_shape("MAIN MASTER TEXT", None));
+        main_master.extend(other_text_shape("SHARED TEXT", None));
+        main_master.extend(other_text_shape(
+            "FOOTER PROMPT",
+            Some(make_atom(RT_ROUND_TRIP_HF_PLACEHOLDER12_ATOM, 0, &[9])),
+        ));
+        stream.extend(make_container(RT_MAIN_MASTER, 0, &main_master));
+
+        // A second slide on the main master, hiding its objects.
+        let hidden_offset = stream.len() as u32;
+        let mut hidden = slide_atom_following(MAIN_MASTER, false);
+        hidden.extend(other_text_shape("SECOND SLIDE", None));
+        stream.extend(make_container(RT_SLIDE, 0, &hidden));
+
+        let pd_offset = stream.len() as u32;
+        stream.extend(persist_directory_bytes(&[
+            (1, doc_offset),
+            (2, slide_offset),
+            (3, title_master_offset),
+            (4, main_master_offset),
+            (5, hidden_offset),
+        ]));
+        let edit_offset = stream.len() as u32;
+        stream.extend(user_edit_atom_bytes(0, pd_offset, 1));
+        let current_user = current_user_bytes(edit_offset);
+
+        let deck = extract_deck_text(&stream, Some(&current_user));
+        assert_eq!(deck.slides.len(), 2);
+        let master: Vec<&str> = deck.master_text.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(master, ["TITLE MASTER TEXT", "SHARED TEXT", "MAIN MASTER TEXT"]);
+    }
+
+    /// A master reference cycle (title master naming itself through a
+    /// second title master) terminates.
+    #[test]
+    fn test_master_reference_cycle_terminates() {
+        const A: u32 = 0x8000_0001;
+        const B: u32 = 0x8000_0002;
+        let mut stream = Vec::new();
+        let doc_offset = stream.len() as u32;
+        let mut doc = make_container(
+            RT_SLIDE_LIST_WITH_TEXT,
+            SLWT_MASTERS,
+            &[
+                slide_persist_atom_bytes(3, A),
+                slide_persist_atom_bytes(4, B),
+            ]
+            .concat(),
+        );
+        doc.extend(make_container(
+            RT_SLIDE_LIST_WITH_TEXT,
+            SLWT_SLIDES,
+            &slide_persist_atom_bytes(2, 256),
+        ));
+        stream.extend(make_container(RT_DOCUMENT, 0, &doc));
+        let mut offsets = vec![(1, doc_offset)];
+        for (pid, next, text) in [(2, A, "SLIDE"), (3, B, "A TEXT"), (4, A, "B TEXT")] {
+            offsets.push((pid, stream.len() as u32));
+            let mut c = slide_atom_following(next, true);
+            c.extend(other_text_shape(text, None));
+            stream.extend(make_container(RT_SLIDE, 0, &c));
+        }
+        let pd_offset = stream.len() as u32;
+        stream.extend(persist_directory_bytes(&offsets));
+        let edit_offset = stream.len() as u32;
+        stream.extend(user_edit_atom_bytes(0, pd_offset, 1));
+        let deck = extract_deck_text(&stream, Some(&current_user_bytes(edit_offset)));
+        let master: Vec<&str> = deck.master_text.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(master, ["A TEXT", "B TEXT"]);
     }
 }

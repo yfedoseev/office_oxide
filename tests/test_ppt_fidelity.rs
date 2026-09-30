@@ -329,3 +329,114 @@ fn test_truncated_container_stream_marks_ppt_text_truncated() {
         ir.metadata.warnings
     );
 }
+
+// ---------------------------------------------------------------------------
+// Slide-master text
+// ---------------------------------------------------------------------------
+
+const MASTER_STATIC: &str = "Text that I added to the master slide";
+const MASTER_PROMPT: &str = "Klicken Sie, um das Titelformat zu bearbeiten";
+const MASTER_BODY_PROMPT: &str = "Second level";
+
+/// A main master holding a title placeholder prompt (an
+/// `OEPlaceholderAtom` shape), a body-type prompt with no placeholder atom
+/// (caught by its placeholder text type), a date field placeholder and a
+/// static text box (`Tx_TYPE_OTHER`, no placeholder atom).
+fn master_shapes() -> Vec<u8> {
+    let mut m = placeholder_text_shape(0, 1, MASTER_PROMPT); // MasterTitle
+    m.extend(text_shape(1, MASTER_BODY_PROMPT, &[])); // Tx_TYPE_BODY
+    m.extend(placeholder_text_shape(4, 7, "*")); // MasterDate
+    m.extend(text_shape(4, MASTER_STATIC, &[])); // Tx_TYPE_OTHER
+    m
+}
+
+fn master_deck(slides: Vec<PptSlide>) -> PptBuilder {
+    PptBuilder {
+        slides,
+        masters: vec![master_shapes()],
+        ..Default::default()
+    }
+}
+
+fn on_master(text: &str, follow: bool) -> PptSlide {
+    PptSlide {
+        master: Some(0),
+        follow_master_objects: follow,
+        ..slide(text)
+    }
+}
+
+/// Every surface of a document, for "appears exactly once" checks.
+fn surfaces(doc: &Document) -> [(&'static str, String); 5] {
+    let ir = doc.to_ir();
+    [
+        ("plain_text", doc.plain_text()),
+        ("to_markdown", doc.to_markdown()),
+        ("ir.plain_text", ir.plain_text()),
+        ("ir.to_markdown", ir.to_markdown()),
+        ("to_html", doc.to_html()),
+    ]
+}
+
+/// Static text on a slide master is drawn on every slide that shows the
+/// master's objects ([MS-PPT] `SlideAtom.slideFlags.fMasterObjects`), and
+/// reference extractors include it. It is surfaced once per deck, in a
+/// trailing "Slide Master" section, never once per slide; the master's
+/// placeholder prompts ("Click to edit…", in any language) never are.
+#[test]
+fn test_ppt_master_static_text_appears_once_and_prompts_never() {
+    let deck = master_deck(vec![on_master("Slide one", true), on_master("Slide two", true)]);
+    let doc = open(deck.build()).unwrap();
+    for (name, text) in surfaces(&doc) {
+        assert_eq!(text.matches(MASTER_STATIC).count(), 1, "{name}: {text}");
+        assert!(!text.contains(MASTER_PROMPT), "{name}: {text}");
+        assert!(!text.contains(MASTER_BODY_PROMPT), "{name}: {text}");
+        assert!(text.contains("Slide one") && text.contains("Slide two"), "{name}: {text}");
+    }
+    let ir = doc.to_ir();
+    assert_eq!(ir.sections.len(), 3, "two slides plus the master section");
+    let last = ir.sections.last().unwrap();
+    assert_eq!(last.title.as_deref(), Some("Slide Master"));
+    assert_eq!(texts(&last.elements), [MASTER_STATIC]);
+}
+
+/// A master whose objects every slide hides contributes nothing.
+#[test]
+fn test_ppt_master_text_is_absent_when_every_slide_hides_master_objects() {
+    let deck = master_deck(vec![on_master("Slide one", false), on_master("Slide two", false)]);
+    let doc = open(deck.build()).unwrap();
+    for (name, text) in surfaces(&doc) {
+        assert!(!text.contains(MASTER_STATIC), "{name}: {text}");
+        assert!(!text.contains("Slide Master"), "{name}: {text}");
+    }
+    assert_eq!(doc.to_ir().sections.len(), 2);
+}
+
+/// One slide showing the master is enough.
+#[test]
+fn test_ppt_master_text_is_kept_when_one_slide_shows_master_objects() {
+    let deck = master_deck(vec![on_master("Slide one", false), on_master("Slide two", true)]);
+    let doc = open(deck.build()).unwrap();
+    for (name, text) in surfaces(&doc) {
+        assert_eq!(text.matches(MASTER_STATIC).count(), 1, "{name}: {text}");
+    }
+}
+
+/// A deck whose only text is on the master: the slides have no text of
+/// their own. The master text must still come out, and the slides keep
+/// their places.
+#[test]
+fn test_ppt_master_text_survives_a_deck_whose_slides_have_no_text() {
+    let blank = |follow| PptSlide {
+        master: Some(0),
+        follow_master_objects: follow,
+        ..Default::default()
+    };
+    let deck = master_deck(vec![blank(true), blank(true)]);
+    let doc = open(deck.build()).unwrap();
+    for (name, text) in surfaces(&doc) {
+        assert_eq!(text.matches(MASTER_STATIC).count(), 1, "{name}: {text}");
+        assert!(!text.contains(MASTER_PROMPT), "{name}: {text}");
+    }
+    assert_eq!(doc.to_ir().sections.len(), 3);
+}

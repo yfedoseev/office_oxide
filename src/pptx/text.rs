@@ -9,9 +9,10 @@ impl PptxDocument {
     /// Shapes are spatially sorted (top-to-bottom, left-to-right) per slide.
     /// Slides are separated by `\n\n---\n\n`.
     ///
-    /// Only each slide's own shapes are included. Text placed directly on
-    /// a slide layout or master (outside placeholders) is not — the same
-    /// default as python-pptx; see [`Self::static_text_for_slide`].
+    /// Text placed directly on a slide layout or master (outside
+    /// placeholders) follows the slides once, in a section titled
+    /// [`super::layout::MASTER_TEXT_SECTION_TITLE`]; see the
+    /// [`super::layout`] module.
     pub fn plain_text(&self) -> String {
         let mut parts = Vec::new();
         for (i, _) in self.slides.iter().enumerate() {
@@ -20,6 +21,19 @@ impl PptxDocument {
                     parts.push(text);
                 }
             }
+        }
+        let master: Vec<String> = self
+            .master_static_bodies()
+            .into_iter()
+            .map(|(body, _)| plain_text_from_body(body))
+            .filter(|t| !t.is_empty())
+            .collect();
+        if !master.is_empty() {
+            parts.push(format!(
+                "{}\n\n{}",
+                super::layout::MASTER_TEXT_SECTION_TITLE,
+                master.join("\n\n")
+            ));
         }
         parts.join("\n\n---\n\n")
     }
@@ -64,6 +78,9 @@ impl PptxDocument {
     }
 
     /// Convert the entire presentation to markdown.
+    ///
+    /// Layout and master static text follows the slides once, as for
+    /// [`Self::plain_text`].
     pub fn to_markdown(&self) -> String {
         let mut parts = Vec::new();
         for (i, _) in self.slides.iter().enumerate() {
@@ -71,7 +88,25 @@ impl PptxDocument {
                 parts.push(md);
             }
         }
-        parts.join("\n\n")
+        let mut out = parts.join("\n\n");
+        let master: Vec<String> = self
+            .master_static_bodies()
+            .into_iter()
+            .map(|(body, _)| markdown_from_body(body))
+            .filter(|md| !md.is_empty())
+            .collect();
+        if !master.is_empty() {
+            // Set off from the slides by a rule, as the IR renderer
+            // separates sections.
+            if !out.is_empty() {
+                out.push_str("\n\n---\n\n");
+            }
+            out.push_str("## ");
+            out.push_str(super::layout::MASTER_TEXT_SECTION_TITLE);
+            out.push_str("\n\n");
+            out.push_str(&master.join("\n\n"));
+        }
+        out
     }
 
     /// Convert a single slide to markdown by index.

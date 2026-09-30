@@ -21,8 +21,17 @@ pub const RT_NOTES: u16 = 0x03F0;
 pub const RT_NOTES_ATOM: u16 = 0x03F1;
 /// `EnvironmentContainer` ([MS-PPT]).
 pub const RT_ENVIRONMENT: u16 = 0x03F2;
-/// `SlidePersistAtom` ([MS-PPT]).
+/// `SlidePersistAtom` ([MS-PPT]); also `MasterPersistAtom`.
 pub const RT_SLIDE_PERSIST_ATOM: u16 = 0x03F3;
+/// `MainMasterContainer` ([MS-PPT]).
+pub const RT_MAIN_MASTER: u16 = 0x03F8;
+/// `OEPlaceholderAtom` ([MS-PPT]): a shape's placeholder role.
+pub const RT_OE_PLACEHOLDER_ATOM: u16 = 0x0BC3;
+/// `RoundTripHFPlaceholder12Atom` ([MS-PPT]): a header/footer
+/// placeholder's role.
+pub const RT_ROUND_TRIP_HF_PLACEHOLDER12_ATOM: u16 = 0x0420;
+/// `OfficeArtClientData` ([MS-PPT]): a shape's PowerPoint data.
+pub const RT_CLIENT_DATA: u16 = 0xF011;
 /// `FontCollectionContainer` ([MS-PPT]).
 pub const RT_FONT_COLLECTION: u16 = 0x07D5;
 /// `TextHeaderAtom` ([MS-PPT]).
@@ -93,6 +102,20 @@ pub fn text_shape(text_type: u32, text: &str, extra: &[u8]) -> Vec<u8> {
     container(RT_SHAPE, 0, &container(RT_CLIENT_TEXTBOX, 0, &tb))
 }
 
+/// A placeholder text shape: [`text_shape`] plus an `OfficeArtClientData`
+/// holding an `OEPlaceholderAtom` ([MS-PPT]: `placementId` (4),
+/// `placeholderId` (1), `placeholderSize` (1), unused (2)).
+pub fn placeholder_text_shape(text_type: u32, placeholder_id: u8, text: &str) -> Vec<u8> {
+    let mut oe = 0u32.to_le_bytes().to_vec();
+    oe.extend_from_slice(&[placeholder_id, 0, 0, 0]);
+    let client_data = container(RT_CLIENT_DATA, 0, &atom(RT_OE_PLACEHOLDER_ATOM, 0, &oe));
+    let mut tb = atom(RT_TEXT_HEADER, 0, &text_type.to_le_bytes());
+    tb.extend(atom(RT_TEXT_CHARS, 0, &utf16(text)));
+    let mut children = client_data;
+    children.extend(container(RT_CLIENT_TEXTBOX, 0, &tb));
+    container(RT_SHAPE, 0, &children)
+}
+
 /// One slide to write.
 #[derive(Default, Clone)]
 pub struct PptSlide {
@@ -103,6 +126,12 @@ pub struct PptSlide {
     /// Link the notes through `SlideAtom.notesIdRef` (the normal way);
     /// `false` leaves it 0 so only `NotesAtom.slideIdRef` links them.
     pub link_notes_from_slide: bool,
+    /// Index into [`PptBuilder::masters`] written as `SlideAtom.masterIdRef`
+    /// (that master's `masterId`); `None` writes 0.
+    pub master: Option<usize>,
+    /// `SlideAtom.slideFlags.fMasterObjects`: the slide shows its
+    /// master's shapes.
+    pub follow_master_objects: bool,
 }
 
 /// A deck to write.
@@ -120,6 +149,15 @@ pub struct PptBuilder {
     pub encrypt_session_persist_id: Option<u32>,
     /// Extra CFB root streams.
     pub extra_streams: Vec<(String, Vec<u8>)>,
+    /// Main masters: each one's shapes, written after its `SlideAtom` in a
+    /// `MainMasterContainer` and listed by a `MasterListWithTextContainer`.
+    pub masters: Vec<Vec<u8>>,
+}
+
+/// The `masterId` the builder gives master `i` ([MS-PPT] `MasterIdRef`:
+/// at least 0x80000000). Deliberately unrelated to its persist id.
+pub fn master_id(i: usize) -> u32 {
+    0x8000_0000 | (0x100 + i as u32)
 }
 
 impl PptBuilder {
@@ -152,6 +190,12 @@ impl PptBuilder {
             atom(RT_SLIDE_PERSIST_ATOM, 0, &b)
         };
 
+        let mut master_persist_ids = Vec::new();
+        for _ in &self.masters {
+            master_persist_ids.push(next_id);
+            next_id += 1;
+        }
+
         let mut doc_children = Vec::new();
         if !self.fonts.is_empty() {
             let mut fonts = Vec::new();
@@ -174,6 +218,14 @@ impl PptBuilder {
             slwt.extend(persist_atom(pid, sid));
         }
         doc_children.extend(container(RT_SLIDE_LIST_WITH_TEXT, 0, &slwt));
+        let mut mlwt = Vec::new();
+        for (i, &pid) in master_persist_ids.iter().enumerate() {
+            mlwt.extend(persist_atom(pid, master_id(i)));
+        }
+        if !mlwt.is_empty() {
+            // MasterListWithTextContainer: recInstance 1 ([MS-PPT]).
+            doc_children.extend(container(RT_SLIDE_LIST_WITH_TEXT, 1, &mlwt));
+        }
         let mut nlwt = Vec::new();
         for (pid, nid) in notes_ids.iter().flatten() {
             nlwt.extend(persist_atom(*pid, *nid));
@@ -193,6 +245,12 @@ impl PptBuilder {
             // SlideAtom ([MS-PPT]): geom + rgPlaceholderTypes (12),
             // masterIdRef @12, notesIdRef @16, slideFlags @20, unused.
             let mut sa = vec![0u8; 24];
+            if let Some(m) = s.master {
+                sa[12..16].copy_from_slice(&master_id(m).to_le_bytes());
+            }
+            if s.follow_master_objects {
+                sa[20] |= 0x01; // fMasterObjects
+            }
             if let (Some((_, nid)), true) = (notes_ids[i], s.link_notes_from_slide) {
                 sa[16..20].copy_from_slice(&nid.to_le_bytes());
             }
@@ -209,6 +267,14 @@ impl PptBuilder {
                 offsets.push((npid, stream.len() as u32));
                 stream.extend(container(RT_NOTES, 0, &nc));
             }
+        }
+
+        for (i, shapes) in self.masters.iter().enumerate() {
+            // A main master's own SlideAtom: no master, all flags clear.
+            let mut children = atom(RT_SLIDE_ATOM, 2, &[0u8; 24]);
+            children.extend_from_slice(shapes);
+            offsets.push((master_persist_ids[i], stream.len() as u32));
+            stream.extend(container(RT_MAIN_MASTER, 0, &children));
         }
 
         // PersistDirectoryAtom ([MS-PPT]): one entry per id.
