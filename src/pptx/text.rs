@@ -9,6 +9,10 @@ impl PptxDocument {
     ///
     /// Shapes are spatially sorted (top-to-bottom, left-to-right) per slide.
     /// Slides are separated by `\n\n---\n\n`.
+    ///
+    /// Only each slide's own shapes are included. Text placed directly on
+    /// a slide layout or master (outside placeholders) is not — the same
+    /// default as python-pptx; see [`Self::static_text_for_slide`].
     pub fn plain_text(&self) -> String {
         let mut parts = Vec::new();
         for (i, _) in self.slides.iter().enumerate() {
