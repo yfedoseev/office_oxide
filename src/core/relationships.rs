@@ -176,6 +176,8 @@ pub struct Relationships {
     rels: Vec<Relationship>,
     by_id: HashMap<String, usize>,
     by_type: HashMap<String, Vec<usize>>,
+    /// Ids that occur more than once, in first-repeat order.
+    duplicate_ids: Vec<String>,
 }
 
 impl Relationships {
@@ -218,21 +220,47 @@ impl Relationships {
             rels: Vec::new(),
             by_id: HashMap::new(),
             by_type: HashMap::new(),
+            duplicate_ids: Vec::new(),
         }
     }
 
     fn from_vec(rels: Vec<Relationship>) -> Self {
         let mut by_id = HashMap::with_capacity(rels.len());
         let mut by_type: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut duplicate_ids: Vec<String> = Vec::new();
         for (i, r) in rels.iter().enumerate() {
-            by_id.insert(r.id.clone(), i);
+            // Ids must be unique within a part (ECMA-376 Part 2 §9.3.2.2).
+            // When one repeats, Word resolves it to the first occurrence;
+            // do the same, and put the violation on record.
+            match by_id.entry(r.id.clone()) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(i);
+                },
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    if !duplicate_ids.contains(&r.id) {
+                        log::warn!(
+                            "relationship Id '{}' occurs more than once; the first occurrence is used",
+                            r.id
+                        );
+                        duplicate_ids.push(r.id.clone());
+                    }
+                },
+            }
             by_type.entry(r.rel_type.clone()).or_default().push(i);
         }
         Self {
             rels,
             by_id,
             by_type,
+            duplicate_ids,
         }
+    }
+
+    /// Relationship Ids that occur more than once in this part. OPC
+    /// forbids this; [`get_by_id`](Self::get_by_id) resolves each such Id
+    /// to its first occurrence, as Word does.
+    pub fn duplicate_ids(&self) -> &[String] {
+        &self.duplicate_ids
     }
 
     /// Look up a relationship by its ID.
@@ -466,5 +494,29 @@ mod tests {
         let rels = Relationships::parse(&xml).unwrap();
         assert_eq!(rels.all().len(), 1);
         assert_eq!(rels.get_by_id("rId1").unwrap().rel_type, rel_types::OFFICE_DOCUMENT);
+    }
+
+    /// OPC requires relationship Ids to be unique within a part
+    /// (ECMA-376 Part 2 §9.3.2.2). When a producer repeats one, Word
+    /// resolves the Id to its first occurrence; resolving to the last
+    /// made header/image/hyperlink lookups diverge from Word.
+    #[test]
+    fn test_duplicate_relationship_id_resolves_to_the_first_and_is_reported() {
+        let xml = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/first.png"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/other.png"/>
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/second.png"/>
+</Relationships>"#;
+        let rels = Relationships::parse(xml).unwrap();
+        assert_eq!(rels.get_by_id("rId1").unwrap().target, "media/first.png");
+        assert_eq!(rels.duplicate_ids(), ["rId1".to_string()]);
+        // The edit path writes the relationships back verbatim.
+        assert_eq!(rels.all().len(), 3);
+
+        let clean = Relationships::parse(
+            br#"<Relationships><Relationship Id="rId1" Type="t" Target="a"/></Relationships>"#,
+        )
+        .unwrap();
+        assert!(clean.duplicate_ids().is_empty());
     }
 }
