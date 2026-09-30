@@ -19,11 +19,23 @@ struct Counting;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
+thread_local! {
+    /// Bytes requested by this thread, so a byte budget is not disturbed
+    /// by tests running in parallel.
+    static THREAD_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn count_bytes(n: usize) {
+    // `try_with`: the allocator also runs during thread teardown.
+    let _ = THREAD_BYTES.try_with(|b| b.set(b.get().saturating_add(n)));
+}
+
 // SAFETY: every call is forwarded to `System` unchanged; the counter is the
 // only addition and touches no allocator state.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        count_bytes(layout.size());
         // SAFETY: same layout contract as the caller's.
         unsafe { System.alloc(layout) }
     }
@@ -33,6 +45,7 @@ unsafe impl GlobalAlloc for Counting {
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        count_bytes(new_size);
         // SAFETY: forwarded unchanged.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -45,6 +58,20 @@ fn allocations_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let before = ALLOCATIONS.load(Ordering::SeqCst);
     let out = f();
     (out, ALLOCATIONS.load(Ordering::SeqCst) - before)
+}
+
+/// The allocation counter is process-wide, so one test's work would land
+/// in another's window if they ran in parallel.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Bytes this thread requested from the allocator while running `f`.
+fn bytes_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let before = THREAD_BYTES.with(std::cell::Cell::get);
+    let out = f();
+    (out, THREAD_BYTES.with(std::cell::Cell::get) - before)
 }
 
 fn zip_of(parts: &[(&str, &[u8])]) -> Vec<u8> {
@@ -105,6 +132,7 @@ fn open_xlsx(bytes: Vec<u8>) -> office_oxide::Document {
 /// the reference and the number parse from the borrowed XML.
 #[test]
 fn test_numeric_cells_parse_without_a_heap_allocation_per_cell() {
+    let _serial = serial();
     const ROWS: u32 = 200;
     const COLS: u32 = 50;
     let bytes = xlsx_with_cells(ROWS, COLS, |r, c| {
@@ -129,6 +157,7 @@ fn test_numeric_cells_parse_without_a_heap_allocation_per_cell() {
 /// it then parsed and dropped.
 #[test]
 fn test_empty_styled_cells_parse_without_a_heap_allocation_per_cell() {
+    let _serial = serial();
     const ROWS: u32 = 200;
     const COLS: u32 = 50;
     let bytes = xlsx_with_cells(ROWS, COLS, |r, c| format!(r#"<c r="{}{r}" s="1"/>"#, column(c)));
@@ -201,6 +230,7 @@ fn xls_with_cells(rows: u16, cols: u16, strings: &[&str]) -> Vec<u8> {
 /// rendering borrows.
 #[test]
 fn test_xls_cells_open_within_one_allocation_each_and_render_borrowing() {
+    let _serial = serial();
     const ROWS: u16 = 200;
     const COLS: u16 = 50;
     let strings = ["alpha", "beta", "gamma", "delta", "epsilon"];
@@ -229,4 +259,73 @@ fn test_xls_cells_open_within_one_allocation_each_and_render_borrowing() {
         per_cell < 0.8,
         "{render_allocs} allocations rendering {cells} cells ({per_cell:.2} per cell)"
     );
+}
+
+// ---------------------------------------------------------------- DOCX
+
+/// A table whose widest row is wide (here, ten cells spanning 1,000 grid
+/// columns each) and which has many ordinary one-cell rows. The per-span
+/// and per-table clamps bound the *width*, but the converter and the
+/// renderers sized dense `rows x width` grids, so every narrow row cost
+/// the width of the widest one: quadratic in a few kilobytes of
+/// compressed XML.
+#[test]
+fn test_a_wide_row_does_not_make_every_row_cost_the_full_width() {
+    let _serial = serial();
+    const NARROW_ROWS: usize = 2_000;
+    let docx = |span: u32| {
+        let mut body = String::from("<w:tbl><w:tr>");
+        for _ in 0..10 {
+            body.push_str(&format!(
+                r#"<w:tc><w:tcPr><w:gridSpan w:val="{span}"/></w:tcPr><w:p/></w:tc>"#
+            ));
+        }
+        body.push_str("</w:tr>");
+        for i in 0..NARROW_ROWS {
+            body.push_str(&format!(
+                "<w:tr><w:tc><w:p><w:r><w:t>r{i}</w:t></w:r></w:p></w:tc></w:tr>"
+            ));
+        }
+        body.push_str("</w:tbl>");
+        let xml = format!(
+            r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>"#
+        );
+        let bytes = zip_of(&[
+            (
+                "[Content_Types].xml",
+                br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+            ),
+            ("word/document.xml", xml.as_bytes()),
+        ]);
+        office_oxide::Document::from_reader(Cursor::new(bytes), office_oxide::DocumentFormat::Docx)
+            .unwrap()
+    };
+    // Bytes requested by to_ir(), to_markdown() and plain_text().
+    let measure = |doc: &office_oxide::Document| {
+        let (ir, ir_bytes) = bytes_during(|| doc.to_ir());
+        let (md, md_bytes) = bytes_during(|| ir.to_markdown());
+        let (text, text_bytes) = bytes_during(|| ir.plain_text());
+        ([ir_bytes, md_bytes, text_bytes], md, text)
+    };
+    // The same table with one-column cells is the linear baseline.
+    let (baseline, _, _) = measure(&docx(1));
+    let (wide, md, text) = measure(&docx(1_000));
+    for (what, (w, b)) in ["to_ir()", "to_markdown()", "plain_text()"]
+        .iter()
+        .zip(wide.iter().zip(baseline.iter()))
+    {
+        assert!(
+            *w <= b * 3 + (1 << 20),
+            "{what} requested {w} bytes for the wide table, {b} for the narrow one"
+        );
+    }
+    // Every row's content is still there.
+    for i in [0, NARROW_ROWS / 2, NARROW_ROWS - 1] {
+        let needle = format!("r{i}");
+        assert!(md.contains(&needle) && text.contains(&needle), "row {i} lost");
+    }
 }

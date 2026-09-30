@@ -245,3 +245,41 @@ fn test_whitespace_between_two_emphasised_runs_survives() {
     let md = ir.to_markdown();
     assert_eq!(md, "**ONE**   **TWO**", "got {md}");
 }
+
+// ---------------------------------------------------------------------------
+// Untrusted spans in a deserialized IR
+// ---------------------------------------------------------------------------
+
+/// `DocumentIR` is `Deserialize`, so its spans can be anything. Laying a
+/// table out looped over `row_span x col_span` before clipping either to
+/// the grid, so one cell claiming the maximum of both was ~10^19 iterations.
+#[test]
+fn test_maximal_row_and_column_spans_render_promptly() {
+    let cell = |text: &str, col_span: u32, row_span: u32| TableCell {
+        content: vec![Element::Paragraph(Paragraph {
+            content: vec![span(text)],
+            ..Default::default()
+        })],
+        col_span,
+        row_span,
+        ..Default::default()
+    };
+    let ir = ir_with(vec![Element::Table(Table {
+        rows: vec![
+            TableRow {
+                cells: vec![cell("A", u32::MAX, u32::MAX), cell("B", 1, 1)],
+                ..Default::default()
+            },
+            TableRow {
+                cells: vec![cell("C", 1, 1)],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    })]);
+    let md = ir.to_markdown();
+    let text = ir.plain_text();
+    for t in [&md, &text] {
+        assert!(t.contains('A') && t.contains('B') && t.contains('C'), "content lost: {t:?}");
+    }
+}

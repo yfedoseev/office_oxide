@@ -702,15 +702,38 @@ fn table_grid(table: &Table) -> Vec<Vec<Option<&TableCell>>> {
         .map(|r| {
             r.cells
                 .iter()
-                .map(|c| c.col_span.max(1) as usize)
-                .sum::<usize>()
+                .fold(0usize, |w, c| w.saturating_add(c.col_span.max(1) as usize))
         })
         .max()
         .unwrap_or(0)
         .min(cell_total.saturating_mul(1_000).max(1));
-    let mut grid: Vec<Vec<Option<&TableCell>>> = vec![vec![None; width]; table.rows.len()];
+    let rows = table.rows.len();
+    // The grid is `rows x width`, so one wide row made every other row cost
+    // its width: a table with one row of wide spans over many narrow rows
+    // was quadratic in the input. A real table's positions stay within a
+    // small multiple of its cells (Word's grid is at most 63 columns wide);
+    // past that, lay each row out on its own, which keeps every cell and
+    // its order but not the column alignment spans would have given it.
+    let ragged = || -> Vec<Vec<Option<&TableCell>>> {
+        table
+            .rows
+            .iter()
+            .map(|r| r.cells.iter().map(Some).collect())
+            .collect()
+    };
+    let max_positions = cell_total
+        .saturating_mul(MAX_GRID_POSITIONS_PER_CELL)
+        .max(MIN_GRID_POSITIONS);
+    if rows.saturating_mul(width) > max_positions {
+        log::warn!(
+            "table grid of {rows} x {width} positions for {cell_total} cells exceeds the layout \
+             bound; rendering rows without span alignment"
+        );
+        return ragged();
+    }
+    let mut grid: Vec<Vec<Option<&TableCell>>> = vec![vec![None; width]; rows];
     // Positions already claimed by a cell spanning down from an earlier row.
-    let mut covered: Vec<Vec<bool>> = vec![vec![false; width]; table.rows.len()];
+    let mut covered: Vec<Vec<bool>> = vec![vec![false; width]; rows];
 
     for (r, row) in table.rows.iter().enumerate() {
         let mut c = 0usize;
@@ -719,23 +742,35 @@ fn table_grid(table: &Table) -> Vec<Vec<Option<&TableCell>>> {
                 c += 1;
             }
             if c >= width {
-                break;
+                // Spans that claim more of the grid than exists (only an
+                // inconsistent or clamped IR has these) left no room for
+                // this cell; dropping it lost its text. Keep every cell.
+                log::warn!(
+                    "table spans leave no grid position for a cell; rendering rows without span alignment"
+                );
+                return ragged();
             }
             grid[r][c] = Some(cell);
-            let cs = cell.col_span.max(1) as usize;
-            let rs = cell.row_span.max(1) as usize;
-            for dr in 0..rs {
-                for dc in 0..cs {
-                    if r + dr < covered.len() && c + dc < width {
-                        covered[r + dr][c + dc] = true;
-                    }
-                }
+            // Clip to the grid before looping: the spans are untrusted and
+            // their product is not otherwise bounded.
+            let cs = (cell.col_span.max(1) as usize).min(width - c);
+            let rs = (cell.row_span.max(1) as usize).min(rows - r);
+            for covered_row in &mut covered[r..r + rs] {
+                covered_row[c..c + cs].fill(true);
             }
             c += cs;
         }
     }
     grid
 }
+
+/// See [`table_grid`]: how many grid positions a table may lay out per cell
+/// it actually holds (one more than Word's 63-column grid limit).
+const MAX_GRID_POSITIONS_PER_CELL: usize = 64;
+
+/// Floor for the grid-position bound, so small tables with legitimately
+/// large merged areas always keep their alignment.
+const MIN_GRID_POSITIONS: usize = 1 << 20;
 
 /// A table with one row and one cell whose content holds a table is a
 /// layout frame — Word documents wrap whole forms in one to draw a
@@ -768,7 +803,9 @@ fn render_table_markdown(table: &Table) -> String {
     }
 
     let grid = table_grid(table);
-    let col_count = grid.first().map(|r| r.len()).unwrap_or(0);
+    // Every row of a laid-out grid is the same width; a table past the
+    // layout bound comes back ragged, and its widest row sets the header.
+    let col_count = grid.iter().map(Vec::len).max().unwrap_or(0);
     if col_count == 0 {
         return String::new();
     }

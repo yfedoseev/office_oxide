@@ -1485,8 +1485,14 @@ fn number_format_to_list_style(f: &crate::docx::NumberFormat) -> Option<ListStyl
 /// columns; this leaves generous headroom while keeping the value bounded.
 const MAX_GRID_SPAN: u32 = 1_000;
 
-/// Upper bound for a table's column count after spans are resolved.
-const MAX_TABLE_COLS: usize = 10_000;
+/// A cell's `w:gridSpan`, clamped to `1..=MAX_GRID_SPAN`.
+fn cell_grid_span(cell: &crate::docx::TableCell) -> u32 {
+    cell.properties
+        .as_ref()
+        .and_then(|p| p.grid_span)
+        .unwrap_or(1)
+        .clamp(1, MAX_GRID_SPAN)
+}
 
 fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) -> Element {
     // A table cell can hold another table (`convert_block_elements` ->
@@ -1517,70 +1523,57 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
         });
     };
 
-    // First pass: compute row_span from vMerge patterns
+    // First pass: compute row_span from vMerge patterns.
+    //
+    // `w:gridSpan` is attacker-controlled and parsed as an unbounded u32,
+    // so every span is clamped (`cell_grid_span`). The vMerge pass works
+    // per *cell*, not per grid position: a dense `rows x columns` grid
+    // made every narrow row cost the width of the table's widest row, and
+    // one wide row over many ordinary ones was quadratic in the input.
     let num_rows = table.rows.len();
-    // `w:gridSpan` is attacker-controlled and parsed as an unbounded u32.
-    // Summing it straight into an allocation let a sub-1 KB document ask for
-    // 34 GB (u32::MAX * 2 rows * 4 bytes) and abort the process — and this
-    // runs on `to_ir()`, which backs save_as, to_markdown, the MCP extract
-    // tool and every binding. Clamp each span to the real grid, and the
-    // total to the number of cells actually present: a span cannot
-    // legitimately describe more columns than the table has cells.
-    let cell_total: usize = table.rows.iter().map(|r| r.cells.len()).sum();
-    let num_cols = table
+    // Starting grid column of every cell, row by row (ascending, so a
+    // lookup by column is a binary search).
+    let starts: Vec<Vec<usize>> = table
         .rows
         .iter()
         .map(|r| {
+            let mut col = 0usize;
             r.cells
                 .iter()
                 .map(|c| {
-                    c.properties
-                        .as_ref()
-                        .and_then(|p| p.grid_span)
-                        .unwrap_or(1)
-                        .clamp(1, MAX_GRID_SPAN) as usize
+                    let start = col;
+                    col = col.saturating_add(cell_grid_span(c) as usize);
+                    start
                 })
-                .sum::<usize>()
+                .collect()
         })
-        .max()
-        .unwrap_or(0)
-        .min(cell_total.max(1).saturating_mul(MAX_GRID_SPAN as usize))
-        .min(MAX_TABLE_COLS);
-
-    // Build a grid of (is_continue, row_span) for vMerge tracking
-    let mut row_spans: Vec<Vec<u32>> = vec![vec![1; num_cols]; num_rows];
-
-    // Track vMerge: for each column, walk down from each Restart to count Continue cells
-    for col in 0..num_cols {
-        let mut row = 0;
-        while row < num_rows {
-            let cell = get_cell_at_grid_col(&table.rows[row], col);
-            if let Some(cell) = cell {
-                let vmerge = cell.properties.as_ref().and_then(|p| p.vertical_merge);
-                if matches!(vmerge, Some(crate::docx::table::MergeType::Restart)) {
-                    // Count continuation cells below
-                    let mut span = 1u32;
-                    let mut next = row + 1;
-                    while next < num_rows {
-                        let next_cell = get_cell_at_grid_col(&table.rows[next], col);
-                        if let Some(nc) = next_cell {
-                            if matches!(
-                                nc.properties.as_ref().and_then(|p| p.vertical_merge),
-                                Some(crate::docx::table::MergeType::Continue)
-                            ) {
-                                span += 1;
-                                next += 1;
-                                continue;
-                            }
-                        }
-                        break;
-                    }
-                    if let Some(cell_span) = row_spans[row].get_mut(col) {
-                        *cell_span = span;
-                    }
-                }
+        .collect();
+    let vmerge_at = |row: usize, col: usize| {
+        let i = starts[row].binary_search(&col).ok()?;
+        table.rows[row].cells[i]
+            .properties
+            .as_ref()
+            .and_then(|p| p.vertical_merge)
+    };
+    let mut row_spans: Vec<Vec<u32>> = table.rows.iter().map(|r| vec![1; r.cells.len()]).collect();
+    for (row, cells) in table.rows.iter().enumerate() {
+        for (i, cell) in cells.cells.iter().enumerate() {
+            let vmerge = cell.properties.as_ref().and_then(|p| p.vertical_merge);
+            if !matches!(vmerge, Some(crate::docx::table::MergeType::Restart)) {
+                continue;
             }
-            row += 1;
+            // Count the continuation cells below. Each continuation cell
+            // is reached from at most one restart, so this is linear.
+            let col = starts[row][i];
+            let mut span = 1u32;
+            let mut next = row + 1;
+            while next < num_rows
+                && matches!(vmerge_at(next, col), Some(crate::docx::table::MergeType::Continue))
+            {
+                span = span.saturating_add(1);
+                next += 1;
+            }
+            row_spans[row][i] = span;
         }
     }
 
@@ -1590,19 +1583,13 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
         let is_header = rp.is_some_and(|p| p.is_header);
 
         let mut ir_cells = Vec::new();
-        let mut grid_col = 0;
 
-        for cell in &row.cells {
+        for (cell_idx, cell) in row.cells.iter().enumerate() {
             // Clamped here, where the IR cell is built, so every consumer is
             // covered: ir_render sizes a grid from the summed col_spans, and
             // the DOCX writer loops over them. An unbounded value from the
             // file reached both.
-            let col_span = cell
-                .properties
-                .as_ref()
-                .and_then(|p| p.grid_span)
-                .unwrap_or(1)
-                .clamp(1, MAX_GRID_SPAN);
+            let col_span = cell_grid_span(cell);
 
             // Skip vMerge continue cells
             let is_continue = cell
@@ -1611,27 +1598,18 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
                 .and_then(|p| p.vertical_merge)
                 .is_some_and(|m| matches!(m, crate::docx::table::MergeType::Continue));
 
-            if is_continue {
-                grid_col += col_span as usize;
-                continue;
-            }
-
             // A cell deleted via tracked changes (`w:cellDel`) is excluded
             // from the accepted view — same policy already applied to
-            // run-level `w:del` — but its grid position still needs to be
-            // accounted for, exactly like a vMerge-continue cell, so later
-            // real cells in the row don't shift into the wrong column.
+            // run-level `w:del`. Its grid position is still accounted for
+            // (spans are resolved per cell above), exactly like a
+            // vMerge-continue cell's, so later real cells in the row don't
+            // shift into the wrong column.
             let is_deleted = cell.properties.as_ref().is_some_and(|p| p.deleted);
-            if is_deleted {
-                grid_col += col_span as usize;
+            if is_continue || is_deleted {
                 continue;
             }
 
-            let row_span = if grid_col < num_cols {
-                row_spans[row_idx][grid_col]
-            } else {
-                1
-            };
+            let row_span = row_spans[row_idx][cell_idx];
 
             let mut cell_elements = Vec::new();
             convert_block_elements(&cell.content, &mut cell_elements, doc);
@@ -1683,8 +1661,6 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
                     }),
                 ..Default::default()
             });
-
-            grid_col += col_span as usize;
         }
 
         ir_rows.push(TableRow {
@@ -1728,28 +1704,6 @@ fn dxa_width(w: &crate::docx::TableWidth) -> Option<u32> {
     } else {
         None
     }
-}
-
-fn get_cell_at_grid_col(
-    row: &crate::docx::TableRow,
-    target_col: usize,
-) -> Option<&crate::docx::TableCell> {
-    let mut col = 0;
-    for cell in &row.cells {
-        let span = cell
-            .properties
-            .as_ref()
-            .and_then(|p| p.grid_span)
-            .unwrap_or(1) as usize;
-        if col == target_col {
-            return Some(cell);
-        }
-        col += span;
-        if col > target_col {
-            return None;
-        }
-    }
-    None
 }
 
 // Also handle images at the block level by scanning for drawings in paragraphs
