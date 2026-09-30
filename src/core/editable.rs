@@ -201,7 +201,7 @@ pub fn replace_in_text_elements(
             result.push_str(&xml[pos..]);
             break;
         };
-        let Some(tag_end_offset) = xml[tag_start..].find('>') else {
+        let Some(tag_end_offset) = find_tag_end(&xml[tag_start..]) else {
             result.push_str(&xml[pos..]);
             break;
         };
@@ -239,6 +239,23 @@ pub fn replace_in_text_elements(
     (result, count)
 }
 
+/// Offset of the `>` that closes the start tag at the beginning of `tag`.
+/// A `>` inside a quoted attribute value is legal XML (only `<` must be
+/// escaped there, XML 1.0 §3.1 AttValue) and does not end the tag.
+fn find_tag_end(tag: &str) -> Option<usize> {
+    let mut quote: Option<u8> = None;
+    for (i, b) in tag.bytes().enumerate() {
+        match (quote, b) {
+            (Some(q), _) if b == q => quote = None,
+            (Some(_), _) => {},
+            (None, b'"' | b'\'') => quote = Some(b),
+            (None, b'>') => return Some(i),
+            (None, _) => {},
+        }
+    }
+    None
+}
+
 /// Find the next occurrence of `prefix` that is a complete element name —
 /// i.e. followed by `>`, `/` or whitespace.
 fn find_open_tag(xml: &str, from: usize, prefix: &str) -> Option<usize> {
@@ -258,6 +275,23 @@ fn find_open_tag(xml: &str, from: usize, prefix: &str) -> Option<usize> {
 #[cfg(test)]
 mod determinism_tests {
     use super::*;
+
+    /// A `>` inside a quoted attribute value does not end the start tag;
+    /// splitting there treated the rest of the tag as text content.
+    #[test]
+    fn test_replace_ignores_gt_inside_attribute_values() {
+        let xml = r#"<w:p><w:t xml:space="preserve" x:note="a>b">old text</w:t><w:t y='>'>old</w:t></w:p>"#;
+        let (out, n) = replace_in_text_elements(xml, "w:t", "old", "new");
+        assert_eq!(n, 2);
+        assert_eq!(
+            out,
+            r#"<w:p><w:t xml:space="preserve" x:note="a>b">new text</w:t><w:t y='>'>new</w:t></w:p>"#
+        );
+        // An attribute value that itself contains the search string is
+        // markup, not text, and is left alone.
+        let xml = r#"<w:t v="old>">keep</w:t>"#;
+        assert_eq!(replace_in_text_elements(xml, "w:t", "old", "new"), (xml.to_string(), 0));
+    }
 
     /// Saving an unchanged package produced a different byte stream every
     /// time, because parts, part rels and content-type overrides were all
