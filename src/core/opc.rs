@@ -410,12 +410,31 @@ impl<R: Read + Seek> OpcReader<R> {
 /// relationship, and the XLSX loader *probes* for optional parts per sheet,
 /// so package open was quadratic in the number of parts: 8,000 one-cell
 /// sheets took 56 s. This index makes the miss as cheap as the hit.
+///
+/// It also keeps the package-wide decompression account: every distinct
+/// entry read through [`read_zip_entry`] is charged once against
+/// [`crate::limits::max_package_bytes`], so a package of many parts each
+/// just under [`MAX_PART_SIZE`] — or many entries pointing at the same
+/// compressed data — cannot add up to an unbounded allocation.
 pub(crate) struct ZipEntryIndex {
     by_normalized: HashMap<String, usize>,
+    /// Entries already charged against the byte budget, by index.
+    charged: Vec<std::cell::Cell<bool>>,
+    /// Decompressed bytes charged so far.
+    consumed: std::cell::Cell<u64>,
+    /// The package-wide byte budget, fixed when the index is built.
+    byte_limit: u64,
 }
 
 impl ZipEntryIndex {
     pub(crate) fn new<R: Read + Seek>(archive: &ZipArchive<R>) -> Self {
+        Self::with_byte_limit(archive, crate::limits::max_package_bytes())
+    }
+
+    pub(crate) fn with_byte_limit<R: Read + Seek>(
+        archive: &ZipArchive<R>,
+        byte_limit: u64,
+    ) -> Self {
         let mut by_normalized = HashMap::with_capacity(archive.len());
         for name in archive.file_names() {
             let Some(index) = archive.index_for_name(name) else {
@@ -428,7 +447,40 @@ impl ZipEntryIndex {
                 .and_modify(|existing: &mut usize| *existing = (*existing).min(index))
                 .or_insert(index);
         }
-        Self { by_normalized }
+        Self {
+            by_normalized,
+            charged: (0..archive.len())
+                .map(|_| std::cell::Cell::new(false))
+                .collect(),
+            consumed: std::cell::Cell::new(0),
+            byte_limit,
+        }
+    }
+
+    /// Charge `bytes` decompressed from entry `index` against the package
+    /// budget. An entry already charged is free: re-reading a shared image
+    /// allocates nothing that outlives the previous read.
+    fn charge(&self, index: usize, bytes: u64, name: &str) -> Result<()> {
+        if self.charged.get(index).is_some_and(|c| c.get()) {
+            return Ok(());
+        }
+        let total = self.consumed.get().saturating_add(bytes);
+        if total > self.byte_limit {
+            return Err(Error::PackageLimit(format!(
+                "reading '{name}' brings the package's decompressed size past {} bytes",
+                self.byte_limit
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record that entry `index` was read in full, `bytes` long.
+    fn commit(&self, index: usize, bytes: u64) {
+        if let Some(c) = self.charged.get(index) {
+            if !c.replace(true) {
+                self.consumed.set(self.consumed.get().saturating_add(bytes));
+            }
+        }
     }
 
     /// Index of the entry matching `name` case-insensitively, with `\` and
@@ -448,6 +500,67 @@ impl ZipEntryIndex {
         }
         key
     }
+}
+
+/// The total entry count an archive's end-of-central-directory declares —
+/// the ZIP64 record's 8-byte count when the classic record holds the
+/// 0xFFFF sentinel (APPNOTE §4.3.14–§4.3.16). `None` when neither record
+/// can be found; the zip crate then reports the archive as malformed.
+fn declared_entry_count<R: Read + Seek>(reader: &mut R) -> Result<Option<u64>> {
+    /// End of central directory record signature (APPNOTE §4.3.16).
+    const EOCD_SIG: [u8; 4] = [b'P', b'K', 5, 6];
+    /// ZIP64 end of central directory locator signature (APPNOTE §4.3.15).
+    const EOCD64_LOCATOR_SIG: [u8; 4] = [b'P', b'K', 6, 7];
+    /// ZIP64 end of central directory record signature (APPNOTE §4.3.14).
+    const EOCD64_SIG: [u8; 4] = [b'P', b'K', 6, 6];
+    /// The EOCD is 22 bytes plus a comment of at most 64 KiB, preceded by
+    /// the 20-byte ZIP64 locator when present.
+    const MAX_SCAN: u64 = 20 + 22 + 0xFFFF;
+
+    let len = reader.seek(std::io::SeekFrom::End(0))?;
+    if len < 22 {
+        return Ok(None);
+    }
+    let scan = MAX_SCAN.min(len);
+    reader.seek(std::io::SeekFrom::End(-(scan as i64)))?;
+    let mut buf = vec![0u8; scan as usize];
+    reader.read_exact(&mut buf)?;
+
+    // Scan backwards for the signature; the last match is the real EOCD.
+    let Some(pos) = buf
+        .windows(4)
+        .rposition(|w| w == EOCD_SIG)
+        .filter(|&p| p + 22 <= buf.len())
+    else {
+        return Ok(None);
+    };
+    let total = u16::from_le_bytes([buf[pos + 10], buf[pos + 11]]);
+    if total != u16::MAX {
+        return Ok(Some(total as u64));
+    }
+    // ZIP64: the locator sits immediately before the EOCD and gives the
+    // absolute offset of the ZIP64 record, whose total count is at +32.
+    let Some(loc) = pos
+        .checked_sub(20)
+        .filter(|&l| buf[l..l + 4] == EOCD64_LOCATOR_SIG)
+    else {
+        return Ok(None);
+    };
+    let mut off = [0u8; 8];
+    off.copy_from_slice(&buf[loc + 8..loc + 16]);
+    let eocd64_offset = u64::from_le_bytes(off);
+    if eocd64_offset.checked_add(56).is_none_or(|end| end > len) {
+        return Ok(None);
+    }
+    let mut record = [0u8; 56];
+    reader.seek(std::io::SeekFrom::Start(eocd64_offset))?;
+    reader.read_exact(&mut record)?;
+    if record[..4] != EOCD64_SIG {
+        return Ok(None);
+    }
+    let mut count = [0u8; 8];
+    count.copy_from_slice(&record[32..40]);
+    Ok(Some(u64::from_le_bytes(count)))
 }
 
 /// Count the records physically present in the central directory that
@@ -514,17 +627,36 @@ fn count_central_directory_records<R: Read + Seek>(reader: &mut R, start: u64) -
 /// Every OOXML reader must open its archive through this — `OpcReader`
 /// does, and so does the XLSX fast path, which bypasses `OpcReader` for
 /// speed and for a while bypassed this check with it.
-pub(crate) fn open_zip_rejecting_duplicates<R: Read + Seek>(
-    mut reader: R,
-) -> Result<ZipArchive<R>> {
+///
+/// The package's entry count is bounded by
+/// [`crate::limits::max_package_entries`]: the declared count is checked
+/// before the zip crate sizes its entry table from it, and the walked count
+/// after.
+pub(crate) fn open_zip_rejecting_duplicates<R: Read + Seek>(reader: R) -> Result<ZipArchive<R>> {
+    open_zip_checked(reader, crate::limits::max_package_entries())
+}
+
+fn open_zip_checked<R: Read + Seek>(mut reader: R, max_entries: usize) -> Result<ZipArchive<R>> {
+    let too_many = |n: u64| {
+        Error::PackageLimit(format!("the package declares {n} entries; the limit is {max_entries}"))
+    };
+    if let Some(declared) = declared_entry_count(&mut reader)? {
+        if declared > max_entries as u64 {
+            return Err(too_many(declared));
+        }
+    }
     // A first pass lets the crate locate the central directory its own way
     // (EOCD, ZIP64 EOCD, prepended-data offset), so the walk below counts
     // exactly the directory the crate reads.
+    reader.seek(std::io::SeekFrom::Start(0))?;
     let (dir_start, kept) = {
         let archive = ZipArchive::new(&mut reader)?;
         (archive.central_directory_start(), archive.len())
     };
     let present = count_central_directory_records(&mut reader, dir_start)?;
+    if present > max_entries {
+        return Err(too_many(present as u64));
+    }
     if present != kept {
         return Err(Error::DuplicatePart(format!(
             "the central directory holds {present} records but resolves to {kept} distinct entries"
@@ -582,6 +714,9 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
             limit: MAX_PART_SIZE,
         });
     }
+    // The package-wide account, checked against the declared size before
+    // reading and against the actual size after.
+    entries.charge(index, file.size(), name)?;
     let mut buf = Vec::with_capacity((file.size() as usize).min(1 << 20));
     let mut capped = (&mut file).take(MAX_PART_SIZE + 1);
     match capped.read_to_end(&mut buf) {
@@ -604,6 +739,9 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
             limit: MAX_PART_SIZE,
         });
     }
+    // A lying declared size is caught here, before the bytes are kept.
+    entries.charge(index, buf.len() as u64, name)?;
+    entries.commit(index, buf.len() as u64);
     Ok(buf)
 }
 
@@ -1007,6 +1145,119 @@ mod tests {
             &[],
         );
         assert!(matches!(open(bytes), Err(Error::DuplicatePart(_))));
+    }
+
+    /// Overwrite the uncompressed size `name`'s local and central headers
+    /// declare, leaving the data untouched.
+    fn forge_uncompressed_size(bytes: &mut [u8], name: &str, size: u32) {
+        let mut at = 0;
+        while at + 4 <= bytes.len() {
+            let sig = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let (name_at, size_at) = match sig {
+                0x0403_4b50 => (at + 30, at + 22),
+                0x0201_4b50 => (at + 46, at + 24),
+                _ => {
+                    at += 1;
+                    continue;
+                },
+            };
+            if bytes[name_at..].starts_with(name.as_bytes()) {
+                bytes[size_at..size_at + 4].copy_from_slice(&size.to_le_bytes());
+            }
+            at += 1;
+        }
+    }
+
+    /// The per-part guard refuses an entry whose declared size exceeds
+    /// `MAX_PART_SIZE` before allocating anything for it.
+    #[test]
+    fn test_part_declaring_more_than_the_part_cap_is_refused() {
+        let mut bytes = raw_zip(
+            &[("[Content_Types].xml", MINIMAL_CT), ("word/a.xml", b"<a/>")],
+            Eocd::Count(2),
+            &[],
+        );
+        forge_uncompressed_size(&mut bytes, "word/a.xml", (MAX_PART_SIZE + 1) as u32);
+        let mut r = open(bytes).expect("the directory itself is well formed");
+        let err = r
+            .read_part(&PartName::new("/word/a.xml").unwrap())
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::DecompressionLimit { ref part, limit }
+                if part == "word/a.xml" && limit == MAX_PART_SIZE),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn test_entry_count_over_the_limit_is_refused() {
+        let entries: &[(&str, &[u8])] = &[
+            ("[Content_Types].xml", MINIMAL_CT),
+            ("a.xml", b"<a/>"),
+            ("b.xml", b"<b/>"),
+        ];
+        for eocd in [Eocd::Count(3), Eocd::Zip64] {
+            let bytes = raw_zip(entries, eocd, &[]);
+            assert!(open_zip_checked(std::io::Cursor::new(bytes.clone()), 3).is_ok());
+            let err = open_zip_checked(std::io::Cursor::new(bytes), 2).unwrap_err();
+            assert!(matches!(err, Error::PackageLimit(_)), "{err:?}");
+        }
+        // A declared count that hides records does not hide them from
+        // the limit: the walked count is checked too.
+        let bytes = raw_zip(entries, Eocd::Count(1), &[]);
+        let err = open_zip_checked(std::io::Cursor::new(bytes), 2).unwrap_err();
+        assert!(matches!(err, Error::PackageLimit(_)), "{err:?}");
+    }
+
+    /// Distinct parts are charged against one package-wide budget; a part
+    /// read twice is charged once.
+    #[test]
+    fn test_package_byte_budget_spans_parts_and_charges_each_once() {
+        let bytes = raw_zip(
+            &[
+                ("a.bin", &[1u8; 8]),
+                ("b.bin", &[2u8; 8]),
+                ("c.bin", &[3u8; 8]),
+            ],
+            Eocd::Count(3),
+            &[],
+        );
+        let mut archive = ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let entries = ZipEntryIndex::with_byte_limit(&archive, 16);
+        assert_eq!(
+            read_zip_entry(&mut archive, &entries, "a.bin")
+                .unwrap()
+                .len(),
+            8
+        );
+        assert_eq!(
+            read_zip_entry(&mut archive, &entries, "a.bin")
+                .unwrap()
+                .len(),
+            8
+        );
+        assert_eq!(
+            read_zip_entry(&mut archive, &entries, "b.bin")
+                .unwrap()
+                .len(),
+            8
+        );
+        let err = read_zip_entry(&mut archive, &entries, "c.bin").unwrap_err();
+        assert!(matches!(err, Error::PackageLimit(_)), "{err:?}");
+        // Already-charged parts stay readable.
+        assert!(read_zip_entry(&mut archive, &entries, "b.bin").is_ok());
+    }
+
+    /// A declared size that understates the data does not dodge the
+    /// package budget: the actual length is charged after the read.
+    #[test]
+    fn test_package_byte_budget_charges_actual_not_declared_size() {
+        let mut bytes = raw_zip(&[("a.bin", &[7u8; 32])], Eocd::Count(1), &[]);
+        forge_uncompressed_size(&mut bytes, "a.bin", 1);
+        let mut archive = ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let entries = ZipEntryIndex::with_byte_limit(&archive, 16);
+        let err = read_zip_entry(&mut archive, &entries, "a.bin").unwrap_err();
+        assert!(matches!(err, Error::PackageLimit(_)), "{err:?}");
     }
 
     #[test]
