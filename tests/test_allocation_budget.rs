@@ -329,3 +329,52 @@ fn test_a_wide_row_does_not_make_every_row_cost_the_full_width() {
         assert!(md.contains(&needle) && text.contains(&needle), "row {i} lost");
     }
 }
+
+/// Flattening an HTML `w:altChunk` lowercased the whole remaining input
+/// once per character to look for `<script`/`</script>`: quadratic bytes
+/// copied, so a 1 MB script block in a mail-merge chunk was ~10^12.
+#[test]
+fn test_html_alt_chunk_flattening_is_linear() {
+    let _serial = serial();
+    let html = |script_len: usize| {
+        format!(
+            "<html><body><p>Before</p><SCRIPT>{}</Script><p>After &amp; done</p></body></html>",
+            "x<y;".repeat(script_len / 4)
+        )
+    };
+    let docx = |html: &str| {
+        zip_of(&[
+            (
+                "[Content_Types].xml",
+                br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/chunk.html" ContentType="text/html"/></Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+            ),
+            (
+                "word/_rels/document.xml.rels",
+                br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/aFChunk" Target="chunk.html"/></Relationships>"#,
+            ),
+            (
+                "word/document.xml",
+                br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body><w:altChunk r:id="rId9"/></w:body></w:document>"#,
+            ),
+            ("word/chunk.html", html.as_bytes()),
+        ])
+    };
+    const SCRIPT: usize = 64 * 1024;
+    let big = docx(&html(SCRIPT));
+    let small = docx(&html(4));
+    let open = |b: Vec<u8>| office_oxide::docx::DocxDocument::from_reader(Cursor::new(b)).unwrap();
+    let (_, baseline) = bytes_during(|| open(small));
+    let (doc, bytes) = bytes_during(|| open(big));
+    let text = doc.plain_text();
+    assert!(text.contains("Before") && text.contains("After & done"), "{text:?}");
+    assert!(!text.contains("x<y"), "script body leaked: {}", &text[..text.len().min(80)]);
+    // A handful of copies of the input, not one per character.
+    assert!(
+        bytes.saturating_sub(baseline) < 32 * SCRIPT,
+        "{bytes} bytes requested for a {SCRIPT}-byte script ({baseline} for a tiny one)"
+    );
+}

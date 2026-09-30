@@ -603,51 +603,64 @@ fn parse_alt_chunk(data: &[u8], part_name: &str) -> Vec<BlockElement> {
 /// bodies, resolve the handful of entities that matter, and put a line
 /// break where a block element ends.
 fn strip_html_tags(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut chars = html.char_indices().peekable();
-    let mut skip_until: Option<&str> = None;
+    // Case-insensitive prefix test on bytes. Lowercasing the remaining
+    // input to make this test — once per character — copied the rest of
+    // the document every time: quadratic in the chunk's size.
+    fn starts_with_ci(s: &[u8], prefix: &[u8]) -> bool {
+        s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+    }
+    /// Offset just past the first case-insensitive `needle` in `s`.
+    fn find_end_ci(s: &[u8], needle: &[u8]) -> Option<usize> {
+        let first = needle[0];
+        let mut i = 0;
+        while i + needle.len() <= s.len() {
+            if s[i].eq_ignore_ascii_case(&first) && starts_with_ci(&s[i..], needle) {
+                return Some(i + needle.len());
+            }
+            i += 1;
+        }
+        None
+    }
 
-    while let Some((i, c)) = chars.next() {
-        if let Some(end) = skip_until {
-            if html[i..].to_ascii_lowercase().starts_with(end) {
-                for _ in 0..end.len() - 1 {
-                    chars.next();
-                }
-                skip_until = None;
-            }
+    let bytes = html.as_bytes();
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0;
+    while i < html.len() {
+        // `<` is ASCII, so every slice boundary below is a char boundary.
+        let Some(lt) = html[i..].find('<') else {
+            out.push_str(&html[i..]);
+            break;
+        };
+        out.push_str(&html[i..i + lt]);
+        i += lt;
+        let rest = &bytes[i..];
+        let skip_to = if starts_with_ci(rest, b"<script") {
+            Some(&b"</script>"[..])
+        } else if starts_with_ci(rest, b"<style") {
+            Some(&b"</style>"[..])
+        } else {
+            None
+        };
+        if let Some(end) = skip_to {
+            // An unterminated block runs to the end of the input.
+            i = find_end_ci(rest, end).map_or(html.len(), |n| i + n);
             continue;
         }
-        if c != '<' {
-            out.push(c);
-            continue;
-        }
-        let rest = html[i..].to_ascii_lowercase();
-        if rest.starts_with("<script") {
-            skip_until = Some("</script>");
-            continue;
-        }
-        if rest.starts_with("<style") {
-            skip_until = Some("</style>");
-            continue;
-        }
-        // Consume through the closing '>'.
-        let mut tag = String::new();
-        for (_, tc) in chars.by_ref() {
-            if tc == '>' {
-                break;
-            }
-            tag.push(tc);
-        }
+        // The tag runs through the closing '>' (or the end of input).
+        let tag_end = html[i..].find('>').map_or(html.len(), |n| i + n);
+        let tag = &html[i + 1..tag_end];
+        i = (tag_end + 1).min(html.len());
         let name = tag
             .trim_start_matches('/')
             .split(|c: char| c.is_whitespace())
             .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if matches!(
-            name.as_str(),
-            "p" | "div" | "br" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-        ) {
+            .unwrap_or("");
+        if [
+            "p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6",
+        ]
+        .iter()
+        .any(|t| name.eq_ignore_ascii_case(t))
+        {
             out.push('\n');
         }
     }
