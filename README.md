@@ -316,7 +316,7 @@ office_oxide::limits::set_max_text_chars(1 << 30);
 pip install office-oxide
 ```
 
-Wheels available for Linux, macOS, and Windows. Python 3.8–3.14.
+Wheels available for Linux, macOS, and Windows. Python 3.10–3.14.
 
 ### Rust
 

@@ -8,7 +8,7 @@
 pip install office-oxide
 ```
 
-The PyPI distribution name uses a hyphen (`office-oxide`); the Python import is `office_oxide`. Wheels ship for CPython 3.8–3.14 on Linux, macOS, and Windows; there are no runtime dependencies.
+The PyPI distribution name uses a hyphen (`office-oxide`); the Python import is `office_oxide`. Wheels ship for CPython 3.10–3.14 on Linux, macOS, and Windows; there are no runtime dependencies.
 
 ## Quickstart
 

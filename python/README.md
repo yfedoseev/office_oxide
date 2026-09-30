@@ -61,7 +61,7 @@ Full methodology and corpus breakdown in [BENCHMARKS.md](../BENCHMARKS.md).
 pip install office-oxide
 ```
 
-Pre-built wheels for Linux (x86_64, aarch64, musl), macOS (x86_64, arm64), and Windows (x86_64). Python 3.8–3.14. No system dependencies, no Rust toolchain required.
+Pre-built wheels for Linux (x86_64, aarch64, musl), macOS (x86_64, arm64), and Windows (x86_64). Python 3.10–3.14. No system dependencies, no Rust toolchain required.
 
 ## API
 

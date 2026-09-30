@@ -208,5 +208,5 @@ IR types (`src/ir.rs`): `DocumentIR`, `Section`, `Element` (Heading, Paragraph, 
 - **310+ unit and integration tests** across all formats
 - **5,146-file corpus validation** — 98.3% pass rate, all failures are genuinely invalid files
 - **Round-trip testing** — create → write → read back → compare
-- **CI matrix** — Linux/macOS/Windows, stable/beta/nightly Rust, Python 3.8–3.14
+- **CI matrix** — Linux/macOS/Windows, stable/beta/nightly Rust, Python 3.10–3.14
 - **85% code coverage enforcement** via cargo-llvm-cov

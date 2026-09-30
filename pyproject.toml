@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "office-oxide"
 version = "0.1.12"
 description = "The fastest Office document processing library for Python — DOCX, XLSX, PPTX, DOC, XLS, PPT"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = { text = "MIT OR Apache-2.0" }
 authors = [{ name = "Yury Fedoseev" }]
 keywords = [
@@ -28,8 +28,6 @@ classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
