@@ -42,17 +42,21 @@ public sealed class PptxWriter : IDisposable
     }
 
     /// <summary>Set the title of a slide.</summary>
+    /// <exception cref="InvalidOperationException">The slide does not exist; nothing was written.</exception>
     public void SetSlideTitle(uint slide, string title)
     {
         EnsureHandle();
-        NativeMethods.OfficePptxSlideSetTitle(_handle, slide, title);
+        NativeMethods.ThrowIfNotWritten(
+            NativeMethods.OfficePptxSlideSetTitle(_handle, slide, title), $"SetSlideTitle({slide})");
     }
 
     /// <summary>Add a plain text paragraph to a slide's body area.</summary>
+    /// <exception cref="InvalidOperationException">The slide does not exist; nothing was written.</exception>
     public void AddSlideText(uint slide, string text)
     {
         EnsureHandle();
-        NativeMethods.OfficePptxSlideAddText(_handle, slide, text);
+        NativeMethods.ThrowIfNotWritten(
+            NativeMethods.OfficePptxSlideAddText(_handle, slide, text), $"AddSlideText({slide})");
     }
 
     /// <summary>
@@ -60,10 +64,16 @@ public sealed class PptxWriter : IDisposable
     /// format is "png", "jpeg"/"jpg", or "gif".
     /// x, y, cx, cy are in EMU (914400 = 1 inch).
     /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// Empty data, an unknown format, or a missing slide; nothing was written.
+    /// </exception>
     public void AddSlideImage(uint slide, byte[] data, string format, long x, long y, ulong cx, ulong cy)
     {
         EnsureHandle();
-        NativeMethods.OfficePptxSlideAddImage(_handle, slide, data, (nuint)data.Length, format, x, y, cx, cy);
+        ArgumentNullException.ThrowIfNull(data);
+        NativeMethods.ThrowIfNotWritten(
+            NativeMethods.OfficePptxSlideAddImage(_handle, slide, data, (nuint)data.Length, format, x, y, cx, cy),
+            $"AddSlideImage({slide})");
     }
 
     /// <summary>Save the presentation to a file.</summary>

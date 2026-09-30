@@ -24,6 +24,7 @@ internal static partial class NativeMethods
     internal const int OfficeCellString = 1;
     internal const int OfficeCellNumber = 2;
     internal const int OfficeCellBoolean = 3;
+    internal const int OfficeCellFormula = 4;
 
     // ── Library info / memory ──────────────────────────────────────────
 
@@ -60,6 +61,9 @@ internal static partial class NativeMethods
     [LibraryImport(Lib, EntryPoint = "office_document_to_markdown")]
     internal static partial IntPtr OfficeDocumentToMarkdown(IntPtr handle, out int errorCode);
 
+    [LibraryImport(Lib, EntryPoint = "office_document_to_markdown_with_images")]
+    internal static partial IntPtr OfficeDocumentToMarkdownWithImages(IntPtr handle, out int errorCode);
+
     [LibraryImport(Lib, EntryPoint = "office_document_to_html")]
     internal static partial IntPtr OfficeDocumentToHtml(IntPtr handle, out int errorCode);
 
@@ -73,6 +77,10 @@ internal static partial class NativeMethods
 
     [LibraryImport(Lib, EntryPoint = "office_editable_open", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial IntPtr OfficeEditableOpen(string path, out int errorCode);
+
+    [LibraryImport(Lib, EntryPoint = "office_editable_open_from_bytes", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial IntPtr OfficeEditableOpenFromBytes(
+        [In] byte[] data, nuint len, string format, out int errorCode);
 
     [LibraryImport(Lib, EntryPoint = "office_editable_free")]
     internal static partial void OfficeEditableFree(IntPtr handle);
@@ -157,13 +165,13 @@ internal static partial class NativeMethods
     internal static partial uint OfficePptxWriterAddSlide(IntPtr handle);
 
     [LibraryImport(Lib, EntryPoint = "office_pptx_slide_set_title", StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial void OfficePptxSlideSetTitle(IntPtr handle, uint slide, string title);
+    internal static partial int OfficePptxSlideSetTitle(IntPtr handle, uint slide, string title);
 
     [LibraryImport(Lib, EntryPoint = "office_pptx_slide_add_text", StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial void OfficePptxSlideAddText(IntPtr handle, uint slide, string text);
+    internal static partial int OfficePptxSlideAddText(IntPtr handle, uint slide, string text);
 
     [LibraryImport(Lib, EntryPoint = "office_pptx_slide_add_image", StringMarshalling = StringMarshalling.Utf8)]
-    internal static partial void OfficePptxSlideAddImage(
+    internal static partial int OfficePptxSlideAddImage(
         IntPtr handle, uint slide,
         [In] byte[] data, nuint len,
         string format,
@@ -174,6 +182,19 @@ internal static partial class NativeMethods
 
     [LibraryImport(Lib, EntryPoint = "office_pptx_writer_to_bytes")]
     internal static partial IntPtr OfficePptxWriterToBytes(IntPtr handle, out nuint outLen, out int errorCode);
+
+    /// <summary>
+    /// Turn a writer status into an exception. The writers return a status
+    /// precisely so a write that landed nowhere (a missing sheet or slide, a
+    /// cell outside Excel's grid) is detectable; ignoring it — as the PPTX
+    /// writer did, declaring these entry points <c>void</c> — reported
+    /// success for data that was never written.
+    /// </summary>
+    internal static void ThrowIfNotWritten(int rc, string operation)
+    {
+        if (rc != OfficeOk)
+            throw new InvalidOperationException($"{operation} wrote nothing (status {rc})");
+    }
 
     /// <summary>
     /// Take an FFI-allocated UTF-8 C string, copy it to a managed string,

@@ -77,6 +77,12 @@ public sealed class Document : IDisposable
     /// <summary>Convert to Markdown.</summary>
     public string ToMarkdown() => CallString(NativeMethods.OfficeDocumentToMarkdown, nameof(ToMarkdown));
 
+    /// <summary>
+    /// Convert to Markdown with each image embedded inline as
+    /// <c>[image-base64:…]</c> at its position (<see cref="ToMarkdown"/> drops images).
+    /// </summary>
+    public string ToMarkdownWithImages() => CallString(NativeMethods.OfficeDocumentToMarkdownWithImages, nameof(ToMarkdownWithImages));
+
     /// <summary>Convert to an HTML fragment.</summary>
     public string ToHtml() => CallString(NativeMethods.OfficeDocumentToHtml, nameof(ToHtml));
 
