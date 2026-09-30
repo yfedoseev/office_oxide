@@ -96,8 +96,9 @@ pub struct PptxDocument {
     /// could be extracted; a non-empty list means content is missing.
     pub unreadable_parts: Vec<(String, String)>,
     /// The slide layouts the slides use, in first-use order
-    /// ([`Slide::layout_index`] points here). Their static text is not part
-    /// of any slide's text; see [`Self::static_text_for_slide`].
+    /// ([`Slide::layout_index`] points here). Their static text belongs to
+    /// no single slide: every rendering carries it once, after the slides;
+    /// see [`layout`] and [`Self::static_text_for_slide`].
     pub layouts: Vec<layout::SlideLayout>,
     /// The slide masters those layouts belong to.
     pub masters: Vec<layout::SlideMaster>,

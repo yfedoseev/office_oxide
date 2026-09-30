@@ -842,8 +842,12 @@ fn test_presentation_default_text_style_is_the_last_layer() {
     assert_eq!(r.font_size_hundredths_pt, Some(1800));
 }
 
-/// Text placed directly on a layout or master is not slide text (the
-/// python-pptx default), but it is available, honouring `showMasterSp`.
+/// Text placed directly on a layout or master is available per slide,
+/// honouring `showMasterSp`. It is not any one slide's text: the slide's
+/// own text excludes it, and the document carries it once, after the
+/// slides. (This used to assert it was absent from `plain_text()`
+/// altogether, the python-pptx default; that dropped text Apache POI/Tika
+/// extract and PowerPoint shows on every slide.)
 #[test]
 fn test_layout_and_master_static_text_is_available_but_not_slide_text() {
     let doc = styled_deck("").open();
@@ -853,7 +857,9 @@ fn test_layout_and_master_static_text_is_available_but_not_slide_text() {
     assert_eq!(doc.slides[0].layout_index, Some(0));
     assert_eq!(doc.layouts[0].master_index, Some(0));
     assert_eq!(doc.static_text_for_slide(0), vec!["ACME CONFIDENTIAL", "MASTER FOOTER"]);
-    assert!(!doc.plain_text().contains("ACME"), "not slide text");
+    assert!(!doc.slide_plain_text(0).unwrap().contains("ACME"), "not slide text");
+    assert_eq!(doc.plain_text().matches("ACME").count(), 1, "once per document");
+    assert_eq!(doc.master_static_text(), vec!["ACME CONFIDENTIAL", "MASTER FOOTER"]);
     // The layout's prompt text is not static text.
     assert!(
         !doc.static_text_for_slide(0)
@@ -928,4 +934,162 @@ fn test_a_slide_id_without_r_id_resolves_by_convention() {
     let doc = pkg.open();
     assert_eq!(doc.slides.len(), 1);
     assert!(doc.plain_text().contains("BY CONVENTION"));
+}
+
+// ---------------------------------------------------------------------------
+// Master/layout static text in the extracted output
+// ---------------------------------------------------------------------------
+
+const PROMPT: &str = "Click to edit Master title style";
+
+/// A deck whose slides (one per entry of `slide_attrs`, the `<p:sld>`
+/// attributes) all use one layout (`<p:sldLayout>` attributes
+/// `layout_attrs`) on one master. The master and the layout each hold a
+/// placeholder prompt and a static text box, and share one identical line.
+fn master_text_deck(slide_attrs: &[&str], layout_attrs: &str) -> Pkg {
+    let own: Vec<String> = (1..=slide_attrs.len())
+        .map(|n| text_sp(&format!("OWN TEXT {n}")))
+        .collect();
+    let trees: Vec<&str> = own.iter().map(String::as_str).collect();
+    let mut pkg = deck(&trees);
+    for (i, attrs) in slide_attrs.iter().enumerate() {
+        let n = i + 1;
+        pkg.parts.insert(
+            format!("ppt/slides/slide{n}.xml"),
+            format!(
+                r#"<?xml version="1.0"?><p:sld {NS} {attrs}><p:cSld><p:spTree>{}</p:spTree></p:cSld></p:sld>"#,
+                own[i]
+            )
+            .into_bytes(),
+        );
+        pkg.rel(
+            &format!("ppt/slides/slide{n}.xml"),
+            "rIdLay",
+            rel_types::SLIDE_LAYOUT,
+            "../slideLayouts/slideLayout1.xml",
+        );
+    }
+    let layout_tree = [
+        ph_sp(r#"<p:ph type="title"/>"#, "", &format!("<a:p>{}</a:p>", run(PROMPT))),
+        text_sp("LAYOUT STATIC"),
+        text_sp("SHARED LINE"),
+    ]
+    .concat();
+    pkg.part(
+        "ppt/slideLayouts/slideLayout1.xml",
+        &format!("{CT_PML}slideLayout+xml"),
+        format!(
+            r#"<?xml version="1.0"?><p:sldLayout {NS} {layout_attrs}><p:cSld><p:spTree>{layout_tree}</p:spTree></p:cSld></p:sldLayout>"#
+        ),
+    );
+    pkg.rel(
+        "ppt/slideLayouts/slideLayout1.xml",
+        "rIdM",
+        rel_types::SLIDE_MASTER,
+        "../slideMasters/slideMaster1.xml",
+    );
+    let master_tree = [
+        ph_sp(r#"<p:ph type="title"/>"#, "", &format!("<a:p>{}</a:p>", run(PROMPT))),
+        ph_sp(
+            r#"<p:ph type="body" idx="1"/>"#,
+            "",
+            &format!("<a:p>{}</a:p>", run("Second level")),
+        ),
+        text_sp("MASTER STATIC"),
+        text_sp("SHARED LINE"),
+    ]
+    .concat();
+    pkg.part(
+        "ppt/slideMasters/slideMaster1.xml",
+        &format!("{CT_PML}slideMaster+xml"),
+        format!(
+            r#"<?xml version="1.0"?><p:sldMaster {NS}><p:cSld><p:spTree>{master_tree}</p:spTree></p:cSld></p:sldMaster>"#
+        ),
+    );
+    pkg
+}
+
+/// Every text surface of a document.
+fn text_surfaces(doc: &Document) -> [(&'static str, String); 5] {
+    let ir = doc.to_ir();
+    [
+        ("plain_text", doc.plain_text()),
+        ("to_markdown", doc.to_markdown()),
+        ("ir.plain_text", ir.plain_text()),
+        ("ir.to_markdown", ir.to_markdown()),
+        ("to_html", doc.to_html()),
+    ]
+}
+
+/// Static text on the layout and master is drawn on every slide using
+/// them, and reference extractors (Apache POI/Tika) include it. It is
+/// surfaced once per deck — never once per slide — in a trailing
+/// "Slide Master" section, identically on every surface; an identical
+/// line on both the layout and the master appears once. Placeholder
+/// prompts on the layout and master never appear.
+#[test]
+fn test_pptx_master_and_layout_static_text_appear_once_and_prompts_never() {
+    let doc = master_text_deck(&["", ""], "").document();
+    for (name, text) in text_surfaces(&doc) {
+        for line in ["LAYOUT STATIC", "MASTER STATIC", "SHARED LINE"] {
+            assert_eq!(text.matches(line).count(), 1, "{name}: {line}\n{text}");
+        }
+        assert!(!text.contains(PROMPT), "{name}: {text}");
+        assert!(!text.contains("Second level"), "{name}: {text}");
+        assert!(text.contains("OWN TEXT 1") && text.contains("OWN TEXT 2"), "{name}: {text}");
+    }
+    let ir = doc.to_ir();
+    assert_eq!(ir.sections.len(), 3, "two slides plus the master section");
+    assert_eq!(ir.sections[2].title.as_deref(), Some("Slide Master"));
+    // The direct and IR markdown render the master section identically.
+    let tail = |md: String| {
+        md[md.find("## Slide Master").unwrap()..]
+            .trim_end()
+            .to_string()
+    };
+    assert_eq!(tail(doc.to_markdown()), tail(ir.to_markdown()));
+    assert_eq!(
+        tail(doc.to_markdown()),
+        "## Slide Master\n\nLAYOUT STATIC\n\nSHARED LINE\n\nMASTER STATIC"
+    );
+}
+
+/// Slides that hide the master's shapes (`<p:sld showMasterSp="0">`,
+/// ECMA-376 Part 1 §19.3.1.38) show neither layout nor master static text;
+/// when every slide does, the deck has no master section.
+#[test]
+fn test_pptx_static_text_is_absent_when_every_slide_hides_master_shapes() {
+    let doc = master_text_deck(&[r#"showMasterSp="0""#, r#"showMasterSp="0""#], "").document();
+    for (name, text) in text_surfaces(&doc) {
+        for line in [
+            "LAYOUT STATIC",
+            "MASTER STATIC",
+            "SHARED LINE",
+            "Slide Master",
+        ] {
+            assert!(!text.contains(line), "{name}: {line}\n{text}");
+        }
+    }
+    assert_eq!(doc.to_ir().sections.len(), 2);
+}
+
+/// One slide showing the master's shapes is enough.
+#[test]
+fn test_pptx_static_text_is_kept_when_one_slide_shows_master_shapes() {
+    let doc = master_text_deck(&[r#"showMasterSp="0""#, ""], "").document();
+    for (name, text) in text_surfaces(&doc) {
+        assert_eq!(text.matches("MASTER STATIC").count(), 1, "{name}: {text}");
+    }
+}
+
+/// A layout with `showMasterSp="0"` keeps its own static text but hides
+/// the master's.
+#[test]
+fn test_pptx_layout_hiding_master_shapes_keeps_only_layout_static_text() {
+    let doc = master_text_deck(&["", ""], r#"showMasterSp="0""#).document();
+    for (name, text) in text_surfaces(&doc) {
+        assert_eq!(text.matches("LAYOUT STATIC").count(), 1, "{name}: {text}");
+        assert_eq!(text.matches("SHARED LINE").count(), 1, "{name}: {text}");
+        assert!(!text.contains("MASTER STATIC"), "{name}: {text}");
+    }
 }
