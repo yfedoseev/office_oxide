@@ -230,7 +230,12 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
-            text_truncated: false,
+            text_truncated: !doc.unreadable_parts.is_empty(),
+            warnings: doc
+                .unreadable_parts
+                .iter()
+                .map(|p| format!("skipped unreadable part {p}"))
+                .collect(),
             ..crate::core::core_properties::ooxml_metadata_extras(
                 cp,
                 doc.app_properties.as_ref(),

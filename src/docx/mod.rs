@@ -109,6 +109,11 @@ pub struct DocxDocument {
     pub sections: Vec<SectionProperties>,
     /// Parsed headers and footers.
     pub headers_footers: Vec<HeaderFooter>,
+    /// Header, footer and note parts that exist but could not be read or
+    /// parsed (a corrupt entry, malformed XML), one line each naming the
+    /// part and the error. They are skipped so the body still opens —
+    /// the policy Tika/POI follow — and reported here instead of vanishing.
+    pub unreadable_parts: Vec<String>,
     /// Font programs found under `word/fonts/`. Each entry is
     /// `(font_name, ttf_or_otf_bytes)`. PDF→DOCX→PDF round-trips use these
     /// to preserve typeface fidelity (e.g. CJK / math fonts beyond
@@ -358,21 +363,32 @@ impl DocxDocument {
         let mut part_images: std::collections::HashMap<String, (Vec<u8>, Option<String>)> =
             std::collections::HashMap::new();
         let mut headers_footers = Vec::new();
+        let unreadable_parts = std::cell::RefCell::new(Vec::<String>::new());
+        let skip_unreadable = |part: &str, e: &dyn std::fmt::Display| {
+            log::warn!("docx: skipping unreadable {part}: {e}");
+            unreadable_parts.borrow_mut().push(format!("{part}: {e}"));
+        };
         let mut parse_hf =
             |hf_ref: &HeaderFooterRef, is_header: bool, title_page: bool| -> CoreResult<()> {
                 if let Some(rel) = doc_rels.get_by_id(&hf_ref.relationship_id) {
                     if rel.target_mode == TargetMode::Internal {
                         let part_name = main_part.resolve_relative(&rel.target)?;
                         if opc.has_part(&part_name) {
-                            let data = opc.read_part(&part_name)?;
-                            // A header or footer part that does not parse (a
-                            // damaged archive with an intact body) is not the
-                            // document: skip it with a warning rather than fail
-                            // the file, as Tika/POI do.
+                            // A header or footer part that cannot be read
+                            // (a corrupt zip entry) or does not parse is not
+                            // the document: skip and report it rather than
+                            // fail the file, as Tika/POI do.
+                            let data = match opc.read_part(&part_name) {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    skip_unreadable(part_name.as_str(), &e);
+                                    return Ok(());
+                                },
+                            };
                             let mut content = match parse_body_elements(&data) {
                                 Ok(c) => c,
                                 Err(e) => {
-                                    log::warn!("docx: skipping unreadable {part_name}: {e}");
+                                    skip_unreadable(part_name.as_str(), &e);
                                     return Ok(());
                                 },
                             };
@@ -426,14 +442,14 @@ impl DocxDocument {
             let data = match opc.read_part(&part) {
                 Ok(data) => data,
                 Err(e) => {
-                    log::warn!("docx: skipping unreadable {part}: {e}");
+                    skip_unreadable(part.as_str(), &e);
                     return Vec::new();
                 },
             };
             let mut notes = match parse_notes_part(&data, end) {
                 Ok(notes) => notes,
                 Err(e) => {
-                    log::warn!("docx: skipping unreadable {part}: {e}");
+                    skip_unreadable(part.as_str(), &e);
                     return Vec::new();
                 },
             };
@@ -538,6 +554,7 @@ impl DocxDocument {
             theme,
             sections,
             headers_footers,
+            unreadable_parts: unreadable_parts.into_inner(),
             embedded_fonts,
             images,
             core_properties,
@@ -5512,6 +5529,69 @@ mod tests {
             log::set_max_level(log::LevelFilter::Warn);
         });
         CAPTURED.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    /// A header whose bytes fail their CRC-32 is corrupt, but it is not the
+    /// document: the read failed the whole file (a real LibreOffice test
+    /// document with a damaged `word/header1.xml` went from its full body
+    /// text to an error). The header is skipped and reported instead.
+    #[test]
+    fn test_a_header_failing_its_crc_is_skipped_and_reported() {
+        use std::io::Write as _;
+        let w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        let r = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let parts: [(&str, String); 5] = [
+            (
+                "[Content_Types].xml",
+                r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/></Types>"#.to_string(),
+            ),
+            (
+                "_rels/.rels",
+                format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{r}/officeDocument" Target="word/document.xml"/></Relationships>"#),
+            ),
+            (
+                "word/_rels/document.xml.rels",
+                format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{r}/header" Target="header1.xml"/></Relationships>"#),
+            ),
+            (
+                "word/document.xml",
+                format!(r#"<w:document xmlns:w="{w}" xmlns:r="{r}"><w:body><w:p><w:r><w:t>Body survives</w:t></w:r></w:p><w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr></w:body></w:document>"#),
+            ),
+            (
+                "word/header1.xml",
+                format!(r#"<w:hdr xmlns:w="{w}"><w:p><w:r><w:t>HEADERTEXT</w:t></w:r></w:p></w:hdr>"#),
+            ),
+        ];
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in &parts {
+            zip.start_file(*name, stored).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        let mut data = zip.finish().unwrap().into_inner();
+        // Stored entries hold their bytes verbatim: change one so the
+        // recorded CRC-32 no longer matches.
+        let at = data
+            .windows(10)
+            .position(|win| win == b"HEADERTEXT")
+            .expect("stored header bytes");
+        data[at] = b'X';
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).expect("the body still opens");
+        assert!(doc.plain_text().contains("Body survives"));
+        assert!(doc.headers_footers.is_empty());
+        assert_eq!(doc.unreadable_parts.len(), 1, "{:?}", doc.unreadable_parts);
+        assert!(doc.unreadable_parts[0].contains("/word/header1.xml"));
+        let meta = crate::convert_docx::docx_to_ir(&doc).metadata;
+        assert!(meta.text_truncated);
+        assert!(
+            meta.warnings
+                .iter()
+                .any(|w| w.contains("/word/header1.xml")),
+            "{:?}",
+            meta.warnings
+        );
     }
 
     /// A malformed comments/footnotes/endnotes part was dropped with
