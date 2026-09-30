@@ -76,6 +76,10 @@ pub struct DocDocument {
     /// well-known stream name. Empty when there's no `ObjectPool` at
     /// all.
     ole_objects: Vec<super::ole_objects::EmbeddedOleObject>,
+    /// Structural problems the reader worked around (container header
+    /// counts that disagree with its chains, streams shorter than their
+    /// declared size). Reach `Metadata::warnings`.
+    warnings: Vec<String>,
 }
 
 /// One of the subdocuments stored after the main text in a `.doc`.
@@ -257,7 +261,8 @@ impl DocDocument {
         // at extraction time — the same "accepted view" policy the DOCX
         // reader applies to `w:del` and `w:vanish`. `build_paragraphs`
         // applies the same exclusion to the structured paragraphs.
-        let deleted_ranges = resolve_excluded_cp_ranges_from_runs(&chpx_runs, &pieces, fib.text_len);
+        let deleted_ranges =
+            resolve_excluded_cp_ranges_from_runs(&chpx_runs, &pieces, fib.text_len);
         let raw_text = extract_text_range_excluding(
             &word_doc,
             &pieces,
@@ -369,6 +374,7 @@ impl DocDocument {
         // A container stream that came back shorter than its declared size
         // lost content just as surely as a piece-table gap.
         let text_complete = text_complete && cfb.truncated_streams().is_empty();
+        let warnings = container_warnings(&cfb);
 
         Ok(Self {
             text,
@@ -384,6 +390,7 @@ impl DocDocument {
             header_footer,
             comments,
             ole_objects,
+            warnings,
         })
     }
 
@@ -432,6 +439,7 @@ impl DocDocument {
             header_footer: HeaderFooterStories::default(),
             comments: Vec::new(),
             ole_objects: super::ole_objects::extract_ole_objects(cfb),
+            warnings: container_warnings(cfb),
         })
     }
 
@@ -482,6 +490,7 @@ impl DocDocument {
             header_footer: HeaderFooterStories::default(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
+            warnings: Vec::new(),
         })
     }
 
@@ -489,6 +498,12 @@ impl DocDocument {
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
         let file = std::fs::File::open(path)?;
         Self::from_reader(file)
+    }
+
+    /// Structural problems the reader worked around rather than failing
+    /// on; see `Metadata::warnings`.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// Get all extracted images.
@@ -620,6 +635,18 @@ impl DocDocument {
     pub fn to_markdown(&self) -> String {
         crate::convert_doc::doc_to_ir(self).to_markdown()
     }
+}
+
+/// The container's own structural warnings plus one line per stream that
+/// was read short.
+fn container_warnings<R: Read + Seek>(cfb: &CfbReader<R>) -> Vec<String> {
+    let mut out = cfb.warnings().to_vec();
+    out.extend(
+        cfb.truncated_streams()
+            .iter()
+            .map(|name| format!("stream {name:?} is shorter than its declared size")),
+    );
+    out
 }
 
 fn clx_size_zero_or_oob(clx_size: u32, clx_start: usize, stream_len: usize) -> bool {
@@ -911,6 +938,7 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
+            warnings: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
@@ -947,6 +975,7 @@ mod tests {
             images: std::sync::OnceLock::new(),
             text: "Body".into(),
             paragraphs: Vec::new(),
+            warnings: Vec::new(),
         };
         let text = doc.plain_text();
         assert_eq!(text, "Body\n[Embedded Equation Editor/MathType Object]\n");
@@ -974,6 +1003,7 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
+            warnings: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
@@ -997,6 +1027,7 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
+            warnings: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
@@ -1026,6 +1057,7 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
+            warnings: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
@@ -1055,6 +1087,7 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
+            warnings: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
@@ -1080,6 +1113,7 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
+            warnings: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
@@ -1113,6 +1147,7 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
+            warnings: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
@@ -1134,6 +1169,7 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
+            warnings: Vec::new(),
             header_footer: HeaderFooterStories::default(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
@@ -1348,7 +1384,10 @@ mod tests {
     fn test_a_single_comment_author_reaches_the_comments_note() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument::from_raw(SubDocumentKind::Comments, "Here is a comment")];
+        doc.subdocuments = vec![SubDocument::from_raw(
+            SubDocumentKind::Comments,
+            "Here is a comment",
+        )];
         doc.comment_authors = vec!["Michael McCandless".to_string()];
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
@@ -1373,7 +1412,10 @@ mod tests {
     fn test_multiple_comment_authors_leave_the_note_author_unset() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument::from_raw(SubDocumentKind::Comments, "Inner\nOuter")];
+        doc.subdocuments = vec![SubDocument::from_raw(
+            SubDocumentKind::Comments,
+            "Inner\nOuter",
+        )];
         doc.comment_authors = vec!["vmiklos".to_string(), "Miklos Vajna".to_string()];
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
@@ -1403,7 +1445,10 @@ mod tests {
     fn test_footnotes_split_into_one_element_per_reference_mark() {
         use crate::ir::{Element, InlineContent, Note};
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument::from_raw(SubDocumentKind::Footnotes, "\u{2} First footnote.\n\u{2} Second footnote.\n\u{2} Third footnote.\n")];
+        doc.subdocuments = vec![SubDocument::from_raw(
+            SubDocumentKind::Footnotes,
+            "\u{2} First footnote.\n\u{2} Second footnote.\n\u{2} Third footnote.\n",
+        )];
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
         let footnotes: Vec<&Note> = ir.sections[0]
@@ -1448,7 +1493,10 @@ mod tests {
     fn test_comments_stay_merged_into_a_single_note() {
         use crate::ir::{Element, Note};
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument::from_raw(SubDocumentKind::Comments, "First comment.\nSecond comment.\n")];
+        doc.subdocuments = vec![SubDocument::from_raw(
+            SubDocumentKind::Comments,
+            "First comment.\nSecond comment.\n",
+        )];
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
         let comments: Vec<&Note> = ir.sections[0]
@@ -1533,7 +1581,10 @@ mod tests {
     fn test_header_footer_stories_reach_the_section_fields() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument::from_raw(SubDocumentKind::HeadersFooters, "irrelevant merged blob")];
+        doc.subdocuments = vec![SubDocument::from_raw(
+            SubDocumentKind::HeadersFooters,
+            "irrelevant merged blob",
+        )];
         doc.header_footer = HeaderFooterStories {
             odd_header: Some("The Odd Header".to_string()),
             first_footer: Some("The First Footer".to_string()),
@@ -1562,7 +1613,10 @@ mod tests {
     fn test_header_footer_falls_back_to_a_textbox_when_plcf_hdd_is_absent() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument::from_raw(SubDocumentKind::HeadersFooters, "OLD MERGED HEADER BLOB")];
+        doc.subdocuments = vec![SubDocument::from_raw(
+            SubDocumentKind::HeadersFooters,
+            "OLD MERGED HEADER BLOB",
+        )];
         // doc.header_footer left at its default (empty) — no PlcfHdd data.
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
@@ -1674,7 +1728,10 @@ mod tests {
     fn test_split_comments_reach_the_ir_as_separate_notes() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument::from_raw(SubDocumentKind::Comments, "Inner\nOuter\nAs in non-range.")];
+        doc.subdocuments = vec![SubDocument::from_raw(
+            SubDocumentKind::Comments,
+            "Inner\nOuter\nAs in non-range.",
+        )];
         doc.comments = vec![
             ParsedComment {
                 text: "Inner".into(),

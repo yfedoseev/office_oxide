@@ -587,6 +587,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
             text_truncated: !doc.unreadable_sheets.is_empty(),
+            warnings: Vec::new(),
         },
         sections,
         defined_names: doc

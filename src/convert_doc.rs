@@ -26,8 +26,19 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // `metadata.title` and `Section.title`, both of which are derived from
     // the first `Element::Heading` below.
     let has_structured_headings = paragraphs.iter().any(|p| p.props.outline_level.is_some());
+    let mut warnings = doc.warnings().to_vec();
     if !paragraphs.is_empty() {
-        walk_paragraphs(paragraphs, has_structured_headings, &mut elements, doc.list_formatting());
+        let flattened = walk_paragraphs(
+            paragraphs,
+            has_structured_headings,
+            &mut elements,
+            doc.list_formatting(),
+        );
+        if flattened > 0 {
+            warnings.push(format!(
+                "{flattened} table(s) containing nested tables were flattened into their outer table"
+            ));
+        }
     } else {
         line_heuristic(doc.plain_text_ref(), &mut elements);
     }
@@ -226,6 +237,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             modified: summary.and_then(|s| s.modified.clone()),
             has_macros: doc.has_macros(),
             text_truncated: !doc.text_complete(),
+            warnings,
         },
         sections,
         defined_names: Vec::new(),
@@ -268,6 +280,9 @@ struct TableBuilder {
     /// Block elements of the cell under construction (for multi-paragraph
     /// cells where interior paragraphs are `\r`-terminated).
     cell: Vec<Element>,
+    /// Tables flushed so far that held nested rows (`itap > 1`) and were
+    /// flattened into their outer grid.
+    flattened_nested: usize,
 }
 
 impl TableBuilder {
@@ -277,6 +292,7 @@ impl TableBuilder {
             rows: Vec::new(),
             row_cells: Vec::new(),
             cell: Vec::new(),
+            flattened_nested: 0,
         }
     }
 
@@ -352,16 +368,11 @@ impl TableBuilder {
         if !self.rows.is_empty() {
             // Nested tables (itap > 1) are not yet represented as nested
             // `Table` blocks; the rows are flattened into the outer grid.
-            // Surface that as a visible notice rather than silently emitting a
-            // wrong structure (robustness contract: degrade gracefully).
+            // Counted, and reported as a metadata warning by the caller —
+            // not written into the document as a line of text it does not
+            // have.
             if self.rows.iter().any(|r| r.itap > 1) {
-                elements.push(Element::Paragraph(Paragraph {
-                    content: vec![InlineContent::Text(TextSpan::plain(
-                        "[nested table detected — not yet supported, flattened into the \
-                         outer table]",
-                    ))],
-                    ..Default::default()
-                }));
+                self.flattened_nested += 1;
             }
             let rows = build_table_rows(&self.rows);
             elements.push(Element::Table(Table {
@@ -575,12 +586,13 @@ fn is_doc_list_item(ilfo: Option<i16>) -> bool {
     }
 }
 
+/// Returns how many tables holding nested tables were flattened.
 fn walk_paragraphs(
     paragraphs: &[DocParagraph],
     has_structured_headings: bool,
     elements: &mut Vec<Element>,
     list_formatting: &ListFormatting,
-) {
+) -> usize {
     let mut table = TableBuilder::new();
     let mut list_items: Vec<(u8, Vec<InlineContent>)> = Vec::new();
     // The run's own `ilfo` — every item in one contiguous list
@@ -631,7 +643,7 @@ fn walk_paragraphs(
                     first_line_indent_twips: p.props.first_line_indent_twips,
                     space_before_twips: p.props.space_before_twips,
                     space_after_twips: p.props.space_after_twips,
-                line_spacing: p.props.line_spacing.clone(),
+                    line_spacing: p.props.line_spacing.clone(),
                     ..Default::default()
                 }));
             } else {
@@ -641,6 +653,7 @@ fn walk_paragraphs(
     }
     table.flush(elements);
     flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
+    table.flattened_nested
 }
 
 /// Emit the accumulated list run as an `Element::List` and clear it.
@@ -1306,10 +1319,11 @@ mod tests {
         );
     }
 
-    /// Medium #2: a nested table (`itap > 1`) is flattened, not silently
-    /// mis-rendered — a visible notice paragraph must accompany the table.
+    /// A nested table (`itap > 1`) is flattened, not silently mis-rendered:
+    /// the walk reports it (for `Metadata::warnings`) and writes no text
+    /// the document does not have.
     #[test]
-    fn test_nested_table_itap_emits_notice() {
+    fn test_nested_table_itap_is_reported_not_written_as_text() {
         let props = PapProps {
             is_table_trailing_mark: true,
             itap: 2, // nested
@@ -1319,22 +1333,16 @@ mod tests {
         let row = para("", props);
 
         let mut els = Vec::new();
-        walk_paragraphs(&[row], false, &mut els, &ListFormatting::default());
+        let flattened = walk_paragraphs(&[row], false, &mut els, &ListFormatting::default());
 
         assert!(
             els.iter().any(|e| matches!(e, Element::Table(_))),
             "the (flattened) table must still be emitted"
         );
+        assert_eq!(flattened, 1, "the flattening must be reported");
         assert!(
-            els.iter().any(|e| matches!(
-                e,
-                Element::Paragraph(p)
-                    if p.content.iter().any(|c| matches!(
-                        c,
-                        InlineContent::Text(t) if t.text.contains("nested table")
-                    ))
-            )),
-            "a nested-table notice must be emitted (no silent flattening)"
+            !els.iter().any(|e| matches!(e, Element::Paragraph(_))),
+            "no notice paragraph may be written into the document: {els:?}"
         );
     }
 

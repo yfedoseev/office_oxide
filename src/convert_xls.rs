@@ -310,6 +310,7 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
             modified: summary.and_then(|s| s.modified.clone()),
             has_macros: doc.has_macros(),
             text_truncated: doc.truncated(),
+            warnings: Vec::new(),
         },
         sections,
         defined_names: doc

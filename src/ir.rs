@@ -586,6 +586,13 @@ pub struct Metadata {
     /// self-check, or the check passed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub text_truncated: bool,
+    /// Structural problems the reader worked around rather than failing
+    /// on, one human-readable line each — e.g. a legacy container whose
+    /// header counts disagree with its chains, or a structure the IR could
+    /// only represent approximately. Reported here instead of being written
+    /// into the document's text. Empty when there were none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// A conditional formatting rule from a worksheet (XLSX `<cfRule>` inside

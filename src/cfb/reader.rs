@@ -1145,7 +1145,9 @@ mod tests {
         let mut file = build_minimal_cfb();
         file[0x2C..0x30].copy_from_slice(&2u32.to_le_bytes());
         file[0x50..0x54].copy_from_slice(&1u32.to_le_bytes()); // DIFAT[1] = sector 1 again
-        let err = CfbReader::new(Cursor::new(file)).err().expect("must be refused");
+        let err = CfbReader::new(Cursor::new(file))
+            .err()
+            .expect("must be refused");
         assert!(
             matches!(err, CfbError::CorruptedStream(ref m) if m.contains("more than once")),
             "{err:?}"
@@ -1183,7 +1185,9 @@ mod tests {
         file[0x2C..0x30].copy_from_slice(&128u32.to_le_bytes());
         file[0x44..0x48].copy_from_slice(&difat.to_le_bytes());
         file[0x48..0x4C].copy_from_slice(&1u32.to_le_bytes());
-        let err = CfbReader::new(Cursor::new(file)).err().expect("must be refused");
+        let err = CfbReader::new(Cursor::new(file))
+            .err()
+            .expect("must be refused");
         assert!(
             matches!(err, CfbError::CorruptedStream(ref m) if m.contains("FAT sectors")),
             "{err:?}"
