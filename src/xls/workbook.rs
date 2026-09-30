@@ -2956,4 +2956,38 @@ mod tests {
             ]
         );
     }
+
+    /// A BIFF8 `FORMAT` record ([MS-XLS] §2.4.126) defines a custom code by
+    /// id; an `XF` pointing at it makes a `NUMBER` render through it.
+    #[test]
+    fn test_biff8_custom_format_record_applies_to_its_cells() {
+        let mut fmt = 165u16.to_le_bytes().to_vec();
+        let code = "0.0\" kg\"";
+        fmt.extend_from_slice(&(code.len() as u16).to_le_bytes());
+        fmt.push(0); // 8-bit characters
+        fmt.extend_from_slice(code.as_bytes());
+        let mut date_fmt = 166u16.to_le_bytes().to_vec();
+        date_fmt.extend_from_slice(&10u16.to_le_bytes());
+        date_fmt.push(0);
+        date_fmt.extend_from_slice(b"dd/mm/yyyy");
+        let xf = |ifmt: u16| {
+            let mut d = vec![0u8; 20];
+            d[2..4].copy_from_slice(&ifmt.to_le_bytes());
+            biff_rec(RT_XF, &d)
+        };
+        let globals = vec![
+            biff_rec(RT_FORMAT, &fmt),
+            biff_rec(RT_FORMAT, &date_fmt),
+            xf(0),
+            xf(165),
+            xf(166),
+        ];
+        let mut body = number(0, 0, 1, 12.34);
+        body.extend(number(0, 1, 2, 38971.0));
+        let stream = workbook_stream_with_globals(&globals, &[("S", 0, body)]);
+        let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+        assert_eq!(doc.sheets[0].display_text(0, 0).as_deref(), Some("12.3 kg"));
+        let date = doc.sheets[0].display_text(0, 1).unwrap().into_owned();
+        assert!(date.starts_with("2006-09-11"), "{date}");
+    }
 }

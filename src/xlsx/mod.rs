@@ -2399,4 +2399,79 @@ mod tests {
             }]
         );
     }
+
+    /// The lazy public accessors: `ensure_theme` parses the theme part on
+    /// first use and caches it; `ensure_styles` returns the stylesheet the
+    /// reader already parsed.
+    #[test]
+    fn test_ensure_theme_and_ensure_styles_accessors() {
+        let theme = br#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="T"><a:themeElements><a:clrScheme name="C">
+<a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1>
+<a:dk2><a:srgbClr val="111111"/></a:dk2><a:lt2><a:srgbClr val="EEEEEE"/></a:lt2>
+<a:accent1><a:srgbClr val="4472C4"/></a:accent1><a:accent2><a:srgbClr val="ED7D31"/></a:accent2>
+<a:accent3><a:srgbClr val="A5A5A5"/></a:accent3><a:accent4><a:srgbClr val="FFC000"/></a:accent4>
+<a:accent5><a:srgbClr val="5B9BD5"/></a:accent5><a:accent6><a:srgbClr val="70AD47"/></a:accent6>
+<a:hlink><a:srgbClr val="0563C1"/></a:hlink><a:folHlink><a:srgbClr val="954F72"/></a:folHlink>
+</a:clrScheme><a:fontScheme name="F"><a:majorFont><a:latin typeface="Cambria"/></a:majorFont><a:minorFont><a:latin typeface="Calibri"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#;
+        let styles = br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="0"/></cellXfs></styleSheet>"#;
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/></worksheet>"#;
+        let mut doc = open_bytes(single_sheet_xlsx(
+            sheet,
+            &[("xl/theme/theme1.xml", theme), ("xl/styles.xml", styles)],
+        ));
+        assert!(doc.theme.is_none(), "the theme is parsed lazily");
+        let accent1 = doc
+            .ensure_theme()
+            .and_then(|t| {
+                t.resolve_color(crate::core::theme::ThemeColorSlot::Accent1)
+                    .cloned()
+            })
+            .expect("theme parses");
+        assert_eq!(accent1.0, [0x44, 0x72, 0xC4]);
+        assert!(doc.theme.is_some(), "and cached");
+        assert!(doc.ensure_theme().is_some());
+        assert_eq!(doc.ensure_styles().map(|s| s.cell_formats.len()), Some(1));
+    }
+
+    /// The per-sheet public wrappers render one sheet, and name no sheet
+    /// past the last.
+    #[test]
+    fn test_per_sheet_text_and_markdown_wrappers() {
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>h</t></is></c><c r="B1"><v>2</v></c></row></sheetData></worksheet>"#;
+        let doc = open_bytes(single_sheet_xlsx(sheet, &[]));
+        assert_eq!(doc.sheet_plain_text(0).as_deref(), Some("h\t2"));
+        assert_eq!(
+            doc.sheet_to_markdown(0).as_deref(),
+            Some("## Sheet1\n\n| h | 2 |\n| --- | --- |")
+        );
+        assert_eq!(doc.sheet_to_csv(0).as_deref(), Some("h,2"));
+        assert!(doc.sheet_plain_text(1).is_none());
+        assert!(doc.sheet_to_markdown(1).is_none());
+    }
+
+    /// A fill naming a theme slot resolves through the workbook's theme
+    /// part in `to_ir()`, which cannot mutate the document to cache it.
+    #[test]
+    fn test_theme_coloured_fill_resolves_through_the_theme_part() {
+        let theme = br#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="T"><a:themeElements><a:clrScheme name="C">
+<a:dk1><a:srgbClr val="000000"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1>
+<a:dk2><a:srgbClr val="111111"/></a:dk2><a:lt2><a:srgbClr val="EEEEEE"/></a:lt2>
+<a:accent1><a:srgbClr val="4472C4"/></a:accent1><a:accent2><a:srgbClr val="ED7D31"/></a:accent2>
+<a:accent3><a:srgbClr val="A5A5A5"/></a:accent3><a:accent4><a:srgbClr val="FFC000"/></a:accent4>
+<a:accent5><a:srgbClr val="5B9BD5"/></a:accent5><a:accent6><a:srgbClr val="70AD47"/></a:accent6>
+<a:hlink><a:srgbClr val="0563C1"/></a:hlink><a:folHlink><a:srgbClr val="954F72"/></a:folHlink>
+</a:clrScheme><a:fontScheme name="F"><a:majorFont><a:latin typeface="Cambria"/></a:majorFont><a:minorFont><a:latin typeface="Calibri"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#;
+        let styles = br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="solid"><fgColor theme="4"/></patternFill></fill></fills><cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="0" fillId="1" applyFill="1"/></cellXfs></styleSheet>"#;
+        let sheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" s="1"><v>1</v></c><c r="B1"><v>2</v></c></row></sheetData></worksheet>"#;
+        let doc = open_bytes(single_sheet_xlsx(
+            sheet,
+            &[("xl/theme/theme1.xml", theme), ("xl/styles.xml", styles)],
+        ));
+        let ir = crate::convert_xlsx::xlsx_to_ir(&doc);
+        let crate::ir::Element::Table(t) = &ir.sections[0].elements[0] else {
+            panic!("expected a table");
+        };
+        assert_eq!(t.rows[0].cells[0].background_color, Some([0x44, 0x72, 0xC4]));
+        assert_eq!(t.rows[0].cells[1].background_color, None);
+    }
 }

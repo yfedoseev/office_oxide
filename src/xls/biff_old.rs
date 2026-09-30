@@ -341,4 +341,39 @@ mod tests {
             );
         }
     }
+
+    /// The BIFF2 `BOOLERR`, `FORMULA` (every cached-result form) and
+    /// `STRING` arms, and a `LABEL` whose count overruns the record.
+    #[test]
+    fn test_biff2_boolerr_formula_and_string_records_are_read() {
+        let mut s = rec(0x0009, &[0, 0, 0x10, 0]);
+        // BOOLERR: rw, col, 3 attribute bytes, value, fError.
+        s.extend(rec(BIFF2_BOOLERR, &[0, 0, 0, 0, 0, 0, 0, 1, 0]));
+        s.extend(rec(BIFF2_BOOLERR, &[0, 0, 1, 0, 0, 0, 0, 0x2A, 1]));
+        // FORMULA: rw, col, attrs, 8-byte cached result, then the formula.
+        let formula = |col: u8, result: [u8; 8]| {
+            let mut f = vec![1, 0, col, 0, 0, 0, 0];
+            f.extend_from_slice(&result);
+            f.extend_from_slice(&[0, 0, 0]);
+            rec(BIFF2_FORMULA, &f)
+        };
+        s.extend(formula(0, 2.25f64.to_le_bytes()));
+        s.extend(formula(1, [1, 0, 1, 0, 0, 0, 0xFF, 0xFF])); // TRUE
+        s.extend(formula(2, [2, 0, 0x07, 0, 0, 0, 0xFF, 0xFF])); // #DIV/0!
+        s.extend(formula(3, [0, 0, 0, 0, 0, 0, 0xFF, 0xFF])); // string follows
+        s.extend(rec(BIFF2_STRING, &[4, b'd', b'o', b'n', b'e']));
+        // LABEL claiming 9 characters with 2 present: what is there is kept.
+        s.extend(rec(BIFF2_LABEL, &[2, 0, 0, 0, 0, 0, 0, 9, b'o', b'k']));
+        s.extend(rec(EOF, &[]));
+        let doc = parse(&s, 2).unwrap();
+        let sheet = &doc.sheets[0];
+        let at = |r, c| sheet.display_text(r, c).map(|t| t.into_owned());
+        assert_eq!(at(0, 0).as_deref(), Some("TRUE"));
+        assert_eq!(at(0, 1).as_deref(), Some("#N/A"));
+        assert_eq!(at(1, 0).as_deref(), Some("2.25"));
+        assert_eq!(at(1, 1).as_deref(), Some("TRUE"));
+        assert_eq!(at(1, 2).as_deref(), Some("#DIV/0!"));
+        assert_eq!(at(1, 3).as_deref(), Some("done"));
+        assert_eq!(at(2, 0).as_deref(), Some("ok"));
+    }
 }
