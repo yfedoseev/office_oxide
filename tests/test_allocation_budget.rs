@@ -41,6 +41,16 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
+/// The counter is process-wide, so a test allocating on another thread
+/// during a measurement is charged to it. Every test holds this for its
+/// whole body.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn allocations_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let before = ALLOCATIONS.load(Ordering::SeqCst);
     let out = f();
@@ -68,8 +78,20 @@ fn column(mut i: u32) -> String {
     s
 }
 
+const DEFAULT_STYLES: &[u8] = br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font/></fonts><fills count="1"><fill/></fills><borders count="1"><border/></borders><cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="0" applyFont="1"/></cellXfs></styleSheet>"#;
+
 /// One sheet of `rows` × `cols` cells produced by `cell(row, col)`.
 fn xlsx_with_cells(rows: u32, cols: u32, cell: impl Fn(u32, u32) -> String) -> Vec<u8> {
+    xlsx_with_cells_styled(rows, cols, DEFAULT_STYLES, cell)
+}
+
+/// As `xlsx_with_cells`, with the given `xl/styles.xml`.
+fn xlsx_with_cells_styled(
+    rows: u32,
+    cols: u32,
+    styles: &[u8],
+    cell: impl Fn(u32, u32) -> String,
+) -> Vec<u8> {
     let mut sheet = String::from(
         r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>"#,
     );
@@ -83,7 +105,6 @@ fn xlsx_with_cells(rows: u32, cols: u32, cell: impl Fn(u32, u32) -> String) -> V
     sheet.push_str("</sheetData></worksheet>");
     let rels = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#;
     let workbook = br#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
-    let styles = br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font/></fonts><fills count="1"><fill/></fills><borders count="1"><border/></borders><cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="0" applyFont="1"/></cellXfs></styleSheet>"#;
     zip_of(&[
         ("[Content_Types].xml", br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#),
         ("_rels/.rels", br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#),
@@ -105,6 +126,7 @@ fn open_xlsx(bytes: Vec<u8>) -> office_oxide::Document {
 /// the reference and the number parse from the borrowed XML.
 #[test]
 fn test_numeric_cells_parse_without_a_heap_allocation_per_cell() {
+    let _serial = serial();
     const ROWS: u32 = 200;
     const COLS: u32 = 50;
     let bytes = xlsx_with_cells(ROWS, COLS, |r, c| {
@@ -124,11 +146,38 @@ fn test_numeric_cells_parse_without_a_heap_allocation_per_cell() {
     );
 }
 
+/// A custom `<numFmt>` shared by every cell was re-split and re-parsed
+/// for each cell it formatted — a million-cell sheet parsed one format
+/// string a million times. It is compiled once per render now; each cell
+/// costs its rendered text (the formatted number and the cell string), where
+/// parsing the code cost four more allocations per cell.
+#[test]
+fn test_custom_number_format_is_compiled_once_per_render_not_per_cell() {
+    let _serial = serial();
+    const ROWS: u32 = 200;
+    const COLS: u32 = 20;
+    let styles = br##"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="#,##0.00&quot; kg&quot;;[Red]\-#,##0.00&quot; kg&quot;"/></numFmts><cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="164" applyNumberFormat="1"/></cellXfs></styleSheet>"##;
+    let cell =
+        |r: u32, c: u32| format!(r#"<c r="{}{r}" s="1"><v>{}.5</v></c>"#, column(c), r * 1000 + c);
+    let doc = open_xlsx(xlsx_with_cells_styled(ROWS, COLS, styles, cell));
+    let small = open_xlsx(xlsx_with_cells_styled(1, 1, styles, cell));
+    let baseline = allocations_during(|| small.plain_text()).1;
+    let (text, allocs) = allocations_during(|| doc.plain_text());
+    assert!(text.contains("1,000.50 kg"), "{}", &text[..200.min(text.len())]);
+    let per_cell = (allocs.saturating_sub(baseline)) as f64 / (ROWS * COLS) as f64;
+    assert!(
+        per_cell <= 2.5,
+        "{allocs} allocations rendering {} custom-format cells ({per_cell:.2} per cell)",
+        ROWS * COLS
+    );
+}
+
 /// Excel writes `<c r="B7" s="3"/>` for every formatted-but-empty cell in
 /// the used range; each one used to allocate a `String` for the reference
 /// it then parsed and dropped.
 #[test]
 fn test_empty_styled_cells_parse_without_a_heap_allocation_per_cell() {
+    let _serial = serial();
     const ROWS: u32 = 200;
     const COLS: u32 = 50;
     let bytes = xlsx_with_cells(ROWS, COLS, |r, c| format!(r#"<c r="{}{r}" s="1"/>"#, column(c)));
@@ -201,6 +250,7 @@ fn xls_with_cells(rows: u16, cols: u16, strings: &[&str]) -> Vec<u8> {
 /// rendering borrows.
 #[test]
 fn test_xls_cells_open_within_one_allocation_each_and_render_borrowing() {
+    let _serial = serial();
     const ROWS: u16 = 200;
     const COLS: u16 = 50;
     let strings = ["alpha", "beta", "gamma", "delta", "epsilon"];

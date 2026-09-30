@@ -13,6 +13,58 @@ pub(crate) fn comment_marker(cell_ref: &str, author: Option<&str>) -> String {
     }
 }
 
+/// Per-render cell formatting state: the date styles found once
+/// (`date_style_indices`) and each custom `<numFmt>` compiled once, rather
+/// than a date re-check of the format code and a re-parse of it for every
+/// cell. Every direct renderer and `to_ir()` format through this.
+pub(crate) struct CellFormatter<'a> {
+    doc: &'a XlsxDocument,
+    date_indices: std::collections::HashSet<u32>,
+    compiled: std::collections::HashMap<u32, Option<numfmt::CompiledFormat>>,
+}
+
+impl<'a> CellFormatter<'a> {
+    pub(crate) fn new(doc: &'a XlsxDocument) -> Self {
+        Self {
+            doc,
+            date_indices: doc.date_style_indices(),
+            compiled: std::collections::HashMap::new(),
+        }
+    }
+
+    pub(crate) fn date_indices(&self) -> &std::collections::HashSet<u32> {
+        &self.date_indices
+    }
+
+    /// Append `cell`'s display text to `buf`.
+    pub(crate) fn write(&mut self, cell: &Cell, buf: &mut String) {
+        let doc = self.doc;
+        let date_indices = &self.date_indices;
+        let compiled = &mut self.compiled;
+        doc.write_value_with(
+            cell,
+            buf,
+            |idx| date_indices.contains(&idx),
+            |n, idx, fmt_id| {
+                let styles = doc.styles.as_ref();
+                let code = compiled.entry(fmt_id).or_insert_with(|| {
+                    styles
+                        .and_then(|s| s.number_format_override_for(idx))
+                        .and_then(numfmt::compile_custom)
+                });
+                numfmt::apply_format_compiled(n, fmt_id, code.as_ref())
+            },
+        );
+    }
+
+    /// `cell`'s display text.
+    pub(crate) fn text(&mut self, cell: &Cell) -> String {
+        let mut buf = String::new();
+        self.write(cell, &mut buf);
+        buf
+    }
+}
+
 impl XlsxDocument {
     /// Extract all text as a plain string: each sheet's name on its own
     /// line, then its rows with tab-separated cells.
@@ -92,6 +144,7 @@ impl XlsxDocument {
         budget: &mut TextBudget,
     ) -> Option<String> {
         let ws = self.worksheets.get(sheet_index)?;
+        let mut fmt = CellFormatter::new(self);
         let mut buf = String::with_capacity(ws.rows.len() * 64);
         for (row_idx, row) in ws.rows.iter().enumerate() {
             if row_idx > 0 {
@@ -108,7 +161,7 @@ impl XlsxDocument {
                 let tabs = if i == 0 { gap } else { gap + 1 };
                 let before = buf.len();
                 buf.extend(std::iter::repeat_n('\t', tabs));
-                self.write_cell_value(cell, &mut buf);
+                fmt.write(cell, &mut buf);
                 if !budget.charge(buf.len() - before) {
                     buf.truncate(before);
                     return Some(buf);
@@ -130,6 +183,7 @@ impl XlsxDocument {
         let col_count = compute_column_count(&ws.rows);
         let mut lines = Vec::new();
         let mut budget = TextBudget::new();
+        let mut fmt = CellFormatter::new(self);
 
         // Rows the sheet does not store are empty lines, so every value
         // keeps its row number (§18.3.1.73 `r`); the padding is charged to
@@ -153,7 +207,7 @@ impl XlsxDocument {
                 break 'rows;
             }
             for cell in &row.cells {
-                let field = csv_escape(&self.format_cell_value(cell));
+                let field = csv_escape(&fmt.text(cell));
                 if !budget.charge(field.len()) {
                     lines.push(budget.notice());
                     break 'rows;
@@ -235,12 +289,7 @@ impl XlsxDocument {
         }
         // Every cell text passes through here; a spent budget ends the
         // sheet at the cell that spent it.
-        let mut cell_text = |cell: &Cell| -> Option<String> {
-            let text = self.format_cell_value(cell);
-            budget
-                .charge(text.len())
-                .then(|| crate::core::markdown::escape_cell(&text))
-        };
+        let mut fmt = CellFormatter::new(self);
 
         let col_count = compute_column_count(&ws.rows);
         if col_count == 0 {
@@ -252,14 +301,19 @@ impl XlsxDocument {
         // instead of wrapping every line in a 1-column GFM table. The table
         // form looks awful when rendered (tall, narrow, hard to read) and
         // round-trips badly through markdown→IR→office.
-        if col_count == 1
+        let prose = col_count == 1
             && ws.rows.iter().any(|r| {
                 r.cells
                     .first()
-                    .map(|c| self.format_cell_value(c).chars().count() > 20)
-                    .unwrap_or(false)
-            })
-        {
+                    .is_some_and(|c| fmt.text(c).chars().count() > 20)
+            });
+        let mut cell_text = |cell: &Cell| -> Option<String> {
+            let text = fmt.text(cell);
+            budget
+                .charge(text.len())
+                .then(|| crate::core::markdown::escape_cell(&text))
+        };
+        if prose {
             let mut out = String::new();
             out.push_str(&format!("## {}\n\n", ws.name));
             for row in &ws.rows {
@@ -329,7 +383,37 @@ impl XlsxDocument {
     }
 
     /// Write a cell value directly to a buffer (avoids allocation for shared strings).
+    ///
+    /// Re-checks the cell's format for date tokens and re-parses a custom
+    /// format code on every call; a caller rendering many cells should go
+    /// through a per-render formatter instead (as every renderer here does).
     pub fn write_cell_value(&self, cell: &Cell, buf: &mut String) {
+        let styles = self.styles.as_ref();
+        self.write_value_with(
+            cell,
+            buf,
+            |idx| date::is_date_cell(Some(idx), styles),
+            |n, idx, fmt_id| {
+                // The explicit declaration only: apply_format's fmt_str branch
+                // is for custom codes, and feeding it a resolved built-in makes
+                // apply_custom mangle it (id 47 "mm:ss.0" rendered as
+                // "mm:ss0.6").
+                let fmt_str = styles.and_then(|s| s.number_format_override_for(idx));
+                numfmt::apply_format(n, fmt_id, fmt_str)
+            },
+        );
+    }
+
+    /// The one cell-to-text rendering every entry point shares. `is_date`
+    /// answers for a style index; `format_number` renders `(value, style
+    /// index, non-General format id)`.
+    fn write_value_with(
+        &self,
+        cell: &Cell,
+        buf: &mut String,
+        is_date: impl FnOnce(u32) -> bool,
+        format_number: impl FnOnce(f64, u32, u32) -> String,
+    ) {
         match &cell.value {
             // A formula cell with no cached `<v>` (the default output shape
             // of closedxml and similar writers) rendered as a blank cell
@@ -342,23 +426,18 @@ impl XlsxDocument {
                 }
             },
             CellValue::Number(n) => {
-                if date::is_date_cell(cell.style_index, self.styles.as_ref()) {
+                if cell.style_index.is_some_and(is_date) {
                     if let Some(dt) = date::DateTimeValue::from_serial(*n, self.workbook.date1904) {
                         buf.push_str(&dt.to_iso_string());
                         return;
                     }
                 }
+                // Apply number format (thousands, decimals, %, currency, etc.)
                 if let Some(idx) = cell.style_index {
                     if let Some(styles) = self.styles.as_ref() {
                         if let Some(fmt_id) = styles.number_format_id_for(idx) {
                             if fmt_id != 0 {
-                                // The explicit declaration only: apply_format's fmt_str branch is
-                                // for custom codes, and feeding it a resolved
-                                // built-in makes apply_custom mangle it
-                                // (id 47 "mm:ss.0" rendered as "mm:ss0.6").
-                                let fmt_str = styles.number_format_override_for(idx);
-                                let formatted = numfmt::apply_format(*n, fmt_id, fmt_str);
-                                buf.push_str(&formatted);
+                                buf.push_str(&format_number(*n, idx, fmt_id));
                                 return;
                             }
                         }
@@ -418,58 +497,16 @@ impl XlsxDocument {
         buf: &mut String,
         date_indices: &std::collections::HashSet<u32>,
     ) {
-        match &cell.value {
-            // See `write_cell_value`'s identical arm.
-            CellValue::Empty => {
-                if let Some(f) = &cell.formula {
-                    buf.push('=');
-                    buf.push_str(f);
-                }
+        let styles = self.styles.as_ref();
+        self.write_value_with(
+            cell,
+            buf,
+            |idx| date_indices.contains(&idx),
+            |n, idx, fmt_id| {
+                let fmt_str = styles.and_then(|s| s.number_format_override_for(idx));
+                numfmt::apply_format(n, fmt_id, fmt_str)
             },
-            CellValue::Number(n) => {
-                let is_date = cell.style_index.is_some_and(|i| date_indices.contains(&i));
-                if is_date {
-                    if let Some(dt) = date::DateTimeValue::from_serial(*n, self.workbook.date1904) {
-                        buf.push_str(&dt.to_iso_string());
-                        return;
-                    }
-                }
-                // Apply number format (thousands, decimals, %, currency, etc.)
-                if let Some(idx) = cell.style_index {
-                    if let Some(styles) = self.styles.as_ref() {
-                        if let Some(fmt_id) = styles.number_format_id_for(idx) {
-                            if fmt_id != 0 {
-                                // The explicit declaration only: apply_format's fmt_str branch is
-                                // for custom codes, and feeding it a resolved
-                                // built-in makes apply_custom mangle it
-                                // (id 47 "mm:ss.0" rendered as "mm:ss0.6").
-                                let fmt_str = styles.number_format_override_for(idx);
-                                let formatted = numfmt::apply_format(*n, fmt_id, fmt_str);
-                                buf.push_str(&formatted);
-                                return;
-                            }
-                        }
-                    }
-                }
-                write_number(*n, buf);
-            },
-            CellValue::String(s) => buf.push_str(s),
-            CellValue::SharedString(idx) => {
-                let s = self.shared_strings.get(*idx).unwrap_or("");
-                if s.len() <= 32_768 {
-                    buf.push_str(s);
-                } else {
-                    let mut end = 32_768;
-                    while !s.is_char_boundary(end) && end > 0 {
-                        end -= 1;
-                    }
-                    buf.push_str(&s[..end]);
-                }
-            },
-            CellValue::Boolean(b) => buf.push_str(if *b { "TRUE" } else { "FALSE" }),
-            CellValue::Error(e) => buf.push_str(e),
-            CellValue::Date(dt) => buf.push_str(&dt.to_iso_string()),
-        }
+        );
     }
 }
 
@@ -753,5 +790,38 @@ mod tests {
             "plain_text() must include chart text, same as to_markdown(): {:?}",
             doc.plain_text()
         );
+    }
+
+    /// `plain_text()`/`to_csv()`/`to_markdown()` checked every numeric
+    /// cell for a date format by re-scanning its format code; the per-style
+    /// answer is now computed once per render, as `to_ir()` already did.
+    #[test]
+    fn test_direct_renderers_scan_each_date_format_once_not_per_cell() {
+        use crate::xlsx::test_support::{open_bytes, single_sheet_xlsx};
+        let styles =
+            br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy-mm-dd"/></numFmts>
+  <cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="164" applyNumberFormat="1"/></cellXfs>
+</styleSheet>"#;
+        let cells: String = (1..=100)
+            .map(|r| format!(r#"<row r="{r}"><c r="A{r}" s="1"><v>{}</v></c></row>"#, 38000 + r))
+            .collect();
+        let sheet = format!(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{cells}</sheetData></worksheet>"#
+        );
+        let doc = open_bytes(single_sheet_xlsx(&sheet, &[("xl/styles.xml", styles)]));
+        let scans = |f: &dyn Fn() -> String| {
+            date::DATE_FORMAT_SCANS.with(|n| n.set(0));
+            let out = f();
+            assert!(out.contains("2004-01-15"), "{out}");
+            date::DATE_FORMAT_SCANS.with(|n| n.get())
+        };
+        for (name, n) in [
+            ("plain_text", scans(&|| doc.plain_text())),
+            ("to_csv", scans(&|| doc.to_csv())),
+            ("to_markdown", scans(&|| doc.to_markdown())),
+        ] {
+            assert!(n <= 2, "{name} scanned date formats {n} times for 100 cells");
+        }
     }
 }

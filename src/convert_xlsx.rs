@@ -24,8 +24,10 @@ fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
 }
 
 pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
-    // Pre-compute date style indices once — avoids re-scanning format strings per cell.
-    let date_indices = doc.date_style_indices();
+    // Date styles found once and custom number formats compiled once, not
+    // re-scanned and re-parsed per cell.
+    let mut formatter = crate::xlsx::text::CellFormatter::new(doc);
+    let date_indices = formatter.date_indices().clone();
     // Theme colours resolve cell fills; parsed once per document.
     let theme = doc.theme_for_render();
 
@@ -109,7 +111,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             let mut cells: Vec<CellData> = Vec::with_capacity(row.cells.len());
             for cell in &row.cells {
                 buf.clear();
-                doc.write_cell_value_fast(cell, &mut buf, &date_indices);
+                formatter.write(cell, &mut buf);
                 // A row keeps the cells that fit the budget; the sheet
                 // ends after it.
                 if !budget.charge(buf.len()) {

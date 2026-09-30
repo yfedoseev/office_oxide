@@ -220,6 +220,8 @@ pub fn is_date_format_id(id: u32) -> bool {
 /// Scans for date/time tokens (y, m, d, h, s, AM/PM) while ignoring
 /// escaped characters and quoted sections.
 pub fn is_date_format_string(format: &str) -> bool {
+    #[cfg(test)]
+    DATE_FORMAT_SCANS.with(|n| n.set(n.get() + 1));
     let mut chars = format.chars().peekable();
     let mut has_date_token = false;
 
@@ -262,6 +264,13 @@ pub fn is_date_format_string(format: &str) -> bool {
     }
 
     has_date_token
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread scanned a format code for date tokens —
+    /// what a renderer that re-checks every cell spends per cell.
+    pub(crate) static DATE_FORMAT_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Check if a cell should be treated as a date cell given its style.
