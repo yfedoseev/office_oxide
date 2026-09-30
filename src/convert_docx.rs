@@ -1711,6 +1711,11 @@ fn convert_table(table: &crate::docx::Table, doc: &crate::docx::DocxDocument) ->
             cells: ir_cells,
             is_header,
             height_twips: rp.and_then(|p| p.height).map(|h| h.max(0) as u32),
+            height_rule: rp.and_then(|p| p.height_rule).map(|r| match r {
+                crate::docx::table::RowHeightRule::AtLeast => RowHeightRule::AtLeast,
+                crate::docx::table::RowHeightRule::Exact => RowHeightRule::Exact,
+                crate::docx::table::RowHeightRule::Auto => RowHeightRule::Auto,
+            }),
             allow_break: !rp.is_some_and(|p| p.cant_split),
             repeat_as_header: is_header,
         });

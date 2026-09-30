@@ -536,6 +536,38 @@ fn test_empty_paragraph_with_only_a_bottom_border_is_still_a_thematic_break() {
 // Table geometry and borders
 // ---------------------------------------------------------------------------
 
+/// `w:trHeight/@w:hRule` (ECMA-376 §17.18.37) was parsed and read by
+/// nothing, and the writer omitted it — the default is `atLeast`, so an
+/// exact-height row (forms, labels) came back as a minimum height.
+#[test]
+fn test_row_height_rule_survives_a_round_trip() {
+    let ir = Docx::new(
+        r#"<w:tbl><w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid>
+             <w:tr><w:trPr><w:trHeight w:val="400" w:hRule="exact"/></w:trPr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc></w:tr>
+             <w:tr><w:trPr><w:trHeight w:val="500" w:hRule="auto"/></w:trPr><w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc></w:tr>
+             <w:tr><w:trPr><w:trHeight w:val="600"/></w:trPr><w:tc><w:p><w:r><w:t>C</w:t></w:r></w:p></w:tc></w:tr>
+           </w:tbl>"#,
+    )
+    .ir();
+    let rules = |ir: &DocumentIR| -> Vec<_> {
+        table(ir)
+            .rows
+            .iter()
+            .map(|r| (r.height_twips, r.height_rule))
+            .collect()
+    };
+    let want = vec![
+        (Some(400), Some(RowHeightRule::Exact)),
+        (Some(500), Some(RowHeightRule::Auto)),
+        (Some(600), None),
+    ];
+    assert_eq!(rules(&ir), want);
+    let again = Document::from_reader(Cursor::new(docx_bytes(&ir)), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(rules(&again), want);
+}
+
 #[test]
 fn test_table_geometry_reaches_the_ir() {
     let ir = Docx::new(

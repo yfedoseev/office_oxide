@@ -341,6 +341,7 @@ struct DocxRichTable {
 
 struct DocxRichRow {
     height_twips: Option<u32>,
+    height_rule: Option<crate::ir::RowHeightRule>,
     allow_break: bool,
     repeat_as_header: bool,
     cells: Vec<DocxRichCell>,
@@ -1871,6 +1872,7 @@ fn convert_ir_table(
 
         rich_rows.push(DocxRichRow {
             height_twips: row.height_twips,
+            height_rule: row.height_rule,
             allow_break: row.allow_break,
             repeat_as_header: row.repeat_as_header,
             cells: rich_cells,
@@ -2987,6 +2989,17 @@ fn write_rich_table(
             if let Some(h) = row.height_twips {
                 let mut trh = BytesStart::new("w:trHeight");
                 trh.push_attribute(("w:val", h.to_string().as_str()));
+                // `w:hRule` (ECMA-376 §17.18.37) defaults to `atLeast`, so
+                // an exact-height row written without it grew to fit.
+                match row.height_rule {
+                    Some(crate::ir::RowHeightRule::Exact) => {
+                        trh.push_attribute(("w:hRule", "exact"));
+                    },
+                    Some(crate::ir::RowHeightRule::Auto) => {
+                        trh.push_attribute(("w:hRule", "auto"));
+                    },
+                    Some(crate::ir::RowHeightRule::AtLeast) | None => {},
+                }
                 w.write_event(Event::Empty(trh)).expect("write trHeight");
             }
             if row.repeat_as_header {

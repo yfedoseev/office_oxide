@@ -1279,6 +1279,10 @@ pub struct TableRow {
     /// Row height in twips, if set explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height_twips: Option<u32>,
+    /// How `height_twips` constrains the row. `None` is the OOXML default,
+    /// a minimum height.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height_rule: Option<RowHeightRule>,
     /// Whether the row may break across pages.
     #[serde(default = "default_true", skip_serializing_if = "Clone::clone")]
     pub allow_break: bool,
@@ -1287,12 +1291,26 @@ pub struct TableRow {
     pub repeat_as_header: bool,
 }
 
+/// How a table row's height is applied (DOCX `w:trHeight/@w:hRule`,
+/// ECMA-376 §17.18.37).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowHeightRule {
+    /// The height is a minimum; the row grows to fit its content.
+    AtLeast,
+    /// The row is exactly this tall; content beyond it is clipped.
+    Exact,
+    /// The height is ignored and the row fits its content.
+    Auto,
+}
+
 impl Default for TableRow {
     fn default() -> Self {
         Self {
             cells: Vec::new(),
             is_header: false,
             height_twips: None,
+            height_rule: None,
             allow_break: true,
             repeat_as_header: false,
         }
