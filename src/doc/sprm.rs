@@ -1862,6 +1862,202 @@ mod tests {
         assert_eq!(ico_to_rgb(0x11), None);
     }
 
+    // ── Operand framing and tab-stop decoding, behaviourally ──
+
+    /// `spra` 7 ([MS-DOC] §2.2.5.1) is a 3-byte operand: the walker must
+    /// consume exactly three bytes and land on the next SPRM.
+    #[test]
+    fn test_spra_seven_operand_is_three_bytes() {
+        let grpprl = [0x01, 0xE6, 0xAA, 0xBB, 0xCC, 0x16, 0x24, 0x01];
+        let sprms = parse_grpprl(&grpprl);
+        assert_eq!(sprms.len(), 2, "{sprms:?}");
+        assert_eq!(sprms[0].opcode, 0xE601);
+        assert_eq!(sprms[0].operand, [0xAA, 0xBB, 0xCC]);
+        assert_eq!(sprms[1].opcode, 0x2416);
+        assert_eq!(sprms[1].operand, [0x01]);
+    }
+
+    /// Each fixed `spra` class consumes its own width: 1, 1, 2, 4, 2, 2.
+    #[test]
+    fn test_every_fixed_spra_class_consumes_its_width() {
+        for (spra, width) in [
+            (0u16, 1usize),
+            (1, 1),
+            (2, 2),
+            (3, 4),
+            (4, 2),
+            (5, 2),
+            (7, 3),
+        ] {
+            let opcode = (spra << 13) | 0x0001;
+            let mut g = opcode.to_le_bytes().to_vec();
+            g.extend(std::iter::repeat_n(0x5A, width));
+            g.extend_from_slice(&[0x16, 0x24, 0x01]);
+            let sprms = parse_grpprl(&g);
+            assert_eq!(sprms[0].operand.len(), width, "spra {spra}");
+            assert_eq!(sprms[1].opcode, 0x2416, "spra {spra} must land on the next SPRM");
+        }
+    }
+
+    /// A variable SPRM whose length prefix is the last byte (a zero-length
+    /// operand exactly at the end) is still a SPRM, not a truncation.
+    #[test]
+    fn test_variable_sprm_ending_exactly_at_the_grpprl_end_is_kept() {
+        // 1-byte prefix (sprmPChgTabsPapx, cb = 0).
+        let sprms = parse_grpprl(&[0x0D, 0xC6, 0x00]);
+        assert_eq!(
+            sprms,
+            [Sprm {
+                opcode: 0xC60D,
+                operand: vec![]
+            }]
+        );
+        // sprmPChgTabs' own 1-byte cb path.
+        let sprms = parse_grpprl(&[0x15, 0xC6, 0x00]);
+        assert_eq!(
+            sprms,
+            [Sprm {
+                opcode: 0xC615,
+                operand: vec![]
+            }]
+        );
+        // sprmTDefTable's 2-byte cb (cb = 1: empty operand).
+        let sprms = parse_grpprl(&[0x08, 0xD6, 0x01, 0x00]);
+        assert_eq!(
+            sprms,
+            [Sprm {
+                opcode: 0xD608,
+                operand: vec![]
+            }]
+        );
+        // One byte short of the prefix: nothing.
+        assert!(parse_grpprl(&[0x08, 0xD6, 0x01]).is_empty());
+        assert!(parse_grpprl(&[0x0D, 0xC6]).is_empty());
+    }
+
+    /// `sprmPChgTabs` with the `cb` = 255 escape: the operand length is
+    /// `1 + 4·cDel + 1 + 3·cAdd`, derived from the payload, and the next
+    /// SPRM follows it exactly.
+    #[test]
+    fn test_pchg_tabs_escape_length_counts_both_lists() {
+        let mut op = vec![2u8]; // cDel
+        op.extend_from_slice(&[0x10, 0, 0x20, 0, 0x30, 0, 0x40, 0]); // rgdxaDel + rgdxaClose
+        op.push(3); // cAdd
+        op.extend_from_slice(&[0x00, 0x01, 0x00, 0x02, 0x00, 0x03]); // rgdxaAdd
+        op.extend_from_slice(&[0x01, 0x02, 0x03]); // rgtbdAdd
+        assert_eq!(op.len(), 1 + 4 * 2 + 1 + 3 * 3);
+        assert_eq!(pchg_tabs_operand_len(&op, 0), op.len());
+        let mut g = vec![0x15, 0xC6, 255];
+        g.extend_from_slice(&op);
+        g.extend_from_slice(&[0x16, 0x24, 0x01]);
+        let sprms = parse_grpprl(&g);
+        assert_eq!(sprms[0].operand, op);
+        assert_eq!(sprms[1].opcode, 0x2416);
+        // cAdd past the end: the rest of the grpprl.
+        assert_eq!(pchg_tabs_operand_len(&[5, 0, 0], 0), 3);
+        assert_eq!(pchg_tabs_operand_len(&[9, 9, 9], 1), 2);
+    }
+
+    /// Several added tabs decode to their own positions and descriptors,
+    /// in order, for both delete-list framings.
+    #[test]
+    fn test_pchg_tabs_decodes_every_added_tab_in_order() {
+        for (opcode, del_stride) in [(0xC615u16, 4usize), (0xC60D, 2)] {
+            let mut op = vec![1u8];
+            op.extend(std::iter::repeat_n(0x77, del_stride));
+            op.push(3);
+            for pos in [720i16, 1440, -360] {
+                op.extend_from_slice(&pos.to_le_bytes());
+            }
+            op.extend_from_slice(&[0x01, 0x0A, 0x13]); // center; right+dot; decimal+hyphen
+            let tabs = decode_pchg_tabs(opcode, &op);
+            let got: Vec<(i32, TabAlignment, TabLeader)> = tabs
+                .iter()
+                .map(|t| (t.position_twips, t.alignment.clone(), t.leader.clone()))
+                .collect();
+            assert_eq!(
+                got,
+                [
+                    (720, TabAlignment::Center, TabLeader::None),
+                    (1440, TabAlignment::Right, TabLeader::Dot),
+                    (-360, TabAlignment::Decimal, TabLeader::Hyphen),
+                ],
+                "opcode {opcode:#06x}"
+            );
+        }
+    }
+
+    /// A truncated add list stops cleanly — no read past the operand.
+    #[test]
+    fn test_pchg_tabs_truncated_positions_do_not_overrun() {
+        // cDel 0, cAdd 2, one byte of the first position.
+        assert!(decode_pchg_tabs(0xC60D, &[0, 2, 0x10]).is_empty());
+        // Positions present, descriptors missing.
+        assert!(decode_pchg_tabs(0xC60D, &[0, 1, 0x10, 0x00]).is_empty());
+        // Second position truncated: only the first tab.
+        let tabs = decode_pchg_tabs(0xC60D, &[0, 2, 0x10, 0x00, 0x20]);
+        assert!(tabs.len() <= 1);
+    }
+
+    /// Every `jc` (bits 0..2) and `tlc` (bits 3..5) value of a `TBD`
+    /// ([MS-DOC] §2.9.310), with the reserved high bits set to prove they
+    /// are masked off.
+    #[test]
+    fn test_tab_descriptor_decodes_every_alignment_and_leader() {
+        let jcs = [
+            TabAlignment::Left,
+            TabAlignment::Center,
+            TabAlignment::Right,
+            TabAlignment::Decimal,
+            TabAlignment::Bar,
+            TabAlignment::Left,
+            TabAlignment::Left,
+            TabAlignment::Left,
+        ];
+        let tlcs = [
+            TabLeader::None,
+            TabLeader::Dot,
+            TabLeader::Hyphen,
+            TabLeader::Underscore,
+            TabLeader::Heavy,
+            TabLeader::MiddleDot,
+            TabLeader::None,
+            TabLeader::None,
+        ];
+        for (jc, want_align) in jcs.iter().enumerate() {
+            for (tlc, want_leader) in tlcs.iter().enumerate() {
+                let tbd = 0xC0 | (tlc as u8) << 3 | jc as u8;
+                let tab = tab_from_tbd(100, tbd);
+                assert_eq!(&tab.alignment, want_align, "jc {jc} tlc {tlc}");
+                assert_eq!(&tab.leader, want_leader, "jc {jc} tlc {tlc}");
+                assert_eq!(tab.position_twips, 100);
+            }
+        }
+    }
+
+    /// `sprmTDefTable`: `rgdxaCenter` has `itcMac + 1` entries and the
+    /// 20-byte cell descriptors start right after it; each cell's `rgf`
+    /// and width come from its own descriptor.
+    #[test]
+    fn test_tdef_table_reads_each_cell_descriptor_at_its_offset() {
+        let mut op = vec![3u8];
+        for c in [0i16, 1000, 2500, 4000] {
+            op.extend_from_slice(&c.to_le_bytes());
+        }
+        for (rgf, w) in [(0x0060u16, 1000u16), (0x0020, 1500), (0x0000, 1500)] {
+            op.extend_from_slice(&rgf.to_le_bytes());
+            op.extend_from_slice(&w.to_le_bytes());
+            op.extend_from_slice(&[0u8; 16]);
+        }
+        let tap = parse_tdef_table(&op).expect("parses");
+        assert_eq!(tap.itc_mac, 3);
+        assert_eq!(tap.centers, [0, 1000, 2500, 4000]);
+        let cells: Vec<(u16, u16)> = tap.cells.iter().map(|c| (c.rgf, c.w_width)).collect();
+        assert_eq!(cells, [(0x0060, 1000), (0x0020, 1500), (0x0000, 1500)]);
+        // One byte short of the last descriptor: rejected, not misread.
+        assert!(parse_tdef_table(&op[..op.len() - 1]).is_none());
+    }
+
     #[test]
     fn test_extract_chp_props_ignores_unknown_opcodes() {
         // 0x2416 = sprmPFInTable — a PAP opcode, must not affect CHP props.
