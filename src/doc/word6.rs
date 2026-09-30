@@ -183,6 +183,7 @@ pub(super) fn contiguous_piece(word_doc: &[u8], fib: &Word6Fib) -> Piece {
             cp_end,
             fc: fc_min,
             is_compressed: false,
+            prm_grpprl: Vec::new(),
         }
     } else {
         Piece {
@@ -190,6 +191,7 @@ pub(super) fn contiguous_piece(word_doc: &[u8], fib: &Word6Fib) -> Piece {
             cp_end,
             fc: compressed_fc(fc_min).unwrap_or(0x4000_0000),
             is_compressed: true,
+            prm_grpprl: Vec::new(),
         }
     }
 }
@@ -211,11 +213,12 @@ pub(super) fn stories(
         }
         let end = cp.saturating_add(len).min(covered);
         let raw = extract_text_range(word_doc, pieces, cp, end, fib.lid);
-        let text = sanitize_text(&raw);
         if i == 0 {
-            main = text;
-        } else if !text.trim().is_empty() {
-            subs.push((i, text));
+            main = sanitize_text(&raw);
+        } else if !sanitize_text(&raw).trim().is_empty() {
+            // Raw: the caller splits note stories on their reference
+            // marks before sanitising drops them.
+            subs.push((i, raw));
         }
         cp = end;
     }
@@ -330,7 +333,8 @@ mod tests {
         let table = vec![contiguous_piece(&doc, &fib)];
         let (main, subs) = stories(&doc, &fib, &table);
         assert_eq!(main, "Word 2.0 for Windows.\nZweite Zeile: über.\n");
-        assert_eq!(subs, vec![(1, "A footnote.\n".to_string())]);
+        // Story text comes back raw; `SubDocument::from_raw` sanitises it.
+        assert_eq!(subs, vec![(1, "A footnote.\r".to_string())]);
         assert!(parse_word2_fib(&doc[..0x100]).is_err(), "shorter than a FIB");
     }
 

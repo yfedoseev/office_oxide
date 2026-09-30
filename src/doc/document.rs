@@ -4,7 +4,7 @@ use std::io::{Read, Seek};
 
 use crate::cfb::{CfbReader, SummaryProperties};
 
-use super::chpx::{parse_chpx_runs, resolve_deleted_cp_ranges_from_runs};
+use super::chpx::{parse_chpx_runs, resolve_excluded_cp_ranges_from_runs};
 use super::error::{DocError, Result};
 use super::fib::Fib;
 use super::images::{DocImage, extract_images};
@@ -36,8 +36,9 @@ pub struct DocDocument {
     /// were parsed and then never used, so none of this reached any
     /// consumer.
     subdocuments: Vec<SubDocument>,
-    /// `true` when the CFB container has a top-level `_VBA_PROJECT`
-    /// storage — a cheap macro-presence signal, no VBA interpretation.
+    /// `true` when the CFB container has a `Macros/VBA` project storage
+    /// (or, for Word 6.0/95, stored macro text) — a cheap macro-presence
+    /// signal, no VBA interpretation.
     has_macros: bool,
     /// `false` when the piece table has a gap before the FIB's declared
     /// `ccpText` — text in that gap is silently absent from `plain_text()`/
@@ -59,11 +60,10 @@ pub struct DocDocument {
     /// `lcbGrpXstAtnOwners`) were never parsed at all before, so every
     /// `.doc` comment's authorship was unrecoverable.
     comment_authors: Vec<String>,
-    /// The first section's header/footer content, parsed from `PlcfHdd`.
-    /// Before this, the entire header document collapsed into one
-    /// unlabeled, duplicated blob with no way to tell header from
-    /// footer, first-page from default, or one section from another.
-    header_footer: HeaderFooterStories,
+    /// Each section's header/footer content, parsed from `PlcfHdd`, one
+    /// entry per section (`PlcfSed`), with an empty story inheriting the
+    /// previous section's. Empty when the document has no `PlcfHdd`.
+    header_footers: Vec<HeaderFooterStories>,
     /// Individual comments, split from the merged Comments substory using
     /// `PlcfandTxt`'s CP boundaries and attributed via `PlcfandRef`'s
     /// `ATRDPre10.ibst` index into `comment_authors`. Empty when either
@@ -76,6 +76,10 @@ pub struct DocDocument {
     /// well-known stream name. Empty when there's no `ObjectPool` at
     /// all.
     ole_objects: Vec<super::ole_objects::EmbeddedOleObject>,
+    /// Structural problems the reader worked around (container header
+    /// counts that disagree with its chains, streams shorter than their
+    /// declared size). Reach `Metadata::warnings`.
+    warnings: Vec<String>,
 }
 
 /// One of the subdocuments stored after the main text in a `.doc`.
@@ -85,6 +89,54 @@ pub struct SubDocument {
     pub kind: SubDocumentKind,
     /// Sanitised text of the subdocument.
     pub text: String,
+    /// The subdocument's individual stories, each sanitised: one per
+    /// footnote/endnote (split on the auto-numbered reference mark, 0x02,
+    /// that opens each note body in the raw story, before sanitising drops
+    /// it), or one per text box (split at `PlcftxbxTxt`/`PlcfHdrtxbxTxt`
+    /// boundaries). Empty when the subdocument has no such structure.
+    pub(crate) parts: Vec<String>,
+}
+
+impl SubDocument {
+    /// Build a subdocument from its raw (unsanitised) story text.
+    pub(crate) fn from_raw(kind: SubDocumentKind, raw: &str) -> Self {
+        let parts = if matches!(kind, SubDocumentKind::Footnotes | SubDocumentKind::Endnotes)
+            && raw.contains('\u{2}')
+        {
+            raw.split('\u{2}')
+                .map(|body| sanitize_text(body).trim().to_string())
+                .filter(|body| !body.is_empty())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            kind,
+            text: sanitize_text(raw),
+            parts,
+        }
+    }
+
+    /// As [`from_raw`](Self::from_raw), with the stories split at the
+    /// given CP boundaries (story `i` is `bounds[i]..bounds[i + 1]`,
+    /// relative to the subdocument's first character).
+    pub(crate) fn from_raw_stories(kind: SubDocumentKind, raw: &str, bounds: &[u32]) -> Self {
+        let mut sub = Self::from_raw(kind, raw);
+        let chars: Vec<char> = raw.chars().collect();
+        sub.parts = bounds
+            .windows(2)
+            .filter_map(|w| {
+                let (lo, hi) = (w[0] as usize, (w[1] as usize).min(chars.len()));
+                if hi <= lo {
+                    return None;
+                }
+                let story: String = chars[lo..hi].iter().collect();
+                let text = sanitize_text(&story).trim().to_string();
+                (!text.is_empty()).then_some(text)
+            })
+            .collect();
+        sub
+    }
 }
 
 /// One comment, split out of the merged Comments substory by `PlcfandTxt`
@@ -98,10 +150,8 @@ pub struct ParsedComment {
     pub author: Option<String>,
 }
 
-/// The first document section's header/footer content, split out of the
-/// merged header-document blob using `PlcfHdd`'s story boundaries. Only
-/// the first section's 6 stories are captured — matches this crate's DOC
-/// model, which builds exactly one `ir::Section` for the whole document.
+/// One document section's header/footer content, split out of the
+/// merged header-document blob using `PlcfHdd`'s story boundaries.
 #[derive(Debug, Clone, Default)]
 pub struct HeaderFooterStories {
     /// Even-page header (story 0 of a section's group).
@@ -226,16 +276,13 @@ impl DocDocument {
             Vec::new()
         };
 
-        // Deleted revision-mark text (`sprmCFRMarkDel`) is excluded from the
-        // main flat text up front, at extraction time — the same "accepted
-        // view" policy already applied to DOCX's `w:del`.
-        // Structured paragraph text (`paragraphs()`, used by `doc_to_ir`) is
-        // left unfiltered: splicing deletions out of a multi-run paragraph
-        // while preserving field-code (`HYPERLINK`) boundaries, on top of
-        // the per-run character formatting `build_paragraphs` now also
-        // carries, is more than this fix attempts — it stays a
-        // deliberately separate, still-open piece of revision-mark handling.
-        let deleted_ranges = resolve_deleted_cp_ranges_from_runs(&chpx_runs, &pieces, fib.text_len);
+        // Deleted revision-mark text (`sprmCFRMarkDel`) and hidden text
+        // (`sprmCFVanish`) are excluded from the main flat text up front,
+        // at extraction time — the same "accepted view" policy the DOCX
+        // reader applies to `w:del` and `w:vanish`. `build_paragraphs`
+        // applies the same exclusion to the structured paragraphs.
+        let deleted_ranges =
+            resolve_excluded_cp_ranges_from_runs(&chpx_runs, &pieces, fib.text_len);
         let raw_text = extract_text_range_excluding(
             &word_doc,
             &pieces,
@@ -258,7 +305,8 @@ impl DocDocument {
         // The subdocuments follow the main text contiguously in the piece
         // table's character space, each delimited by its own `ccp*` length.
         let mut subdocuments = Vec::new();
-        let mut header_footer = HeaderFooterStories::default();
+        let mut header_footers = Vec::new();
+        let section_ends = parse_plcf_sed_ends(&table_stream, fib.fc_plcf_sed, fib.lcb_plcf_sed);
         let mut comments = Vec::new();
         let mut cp = fib.text_len;
         for (kind, len) in [
@@ -281,8 +329,13 @@ impl DocDocument {
             // the way the split below already keeps them out of the IR.
             let mut text_start = 0;
             if kind == SubDocumentKind::HeadersFooters {
-                header_footer =
-                    parse_plcf_hdd_stories(&table_stream, &raw, fib.fc_plcf_hdd, fib.lcb_plcf_hdd);
+                header_footers = parse_plcf_hdd_stories(
+                    &table_stream,
+                    &raw,
+                    fib.fc_plcf_hdd,
+                    fib.lcb_plcf_hdd,
+                    section_ends.len().max(1),
+                );
                 text_start =
                     plcf_hdd_first_section_cp(&table_stream, fib.fc_plcf_hdd, fib.lcb_plcf_hdd)
                         .unwrap_or(0);
@@ -298,13 +351,26 @@ impl DocDocument {
                     &comment_authors,
                 );
             }
-            let sub = if text_start > 0 {
-                sanitize_text(&raw.chars().skip(text_start).collect::<String>())
-            } else {
-                sanitize_text(&raw)
+            // Text boxes: each box's story is delimited by its PLC.
+            let txbx_plc = match kind {
+                SubDocumentKind::TextBoxes => Some((fib.fc_plcftxbx_txt, fib.lcb_plcftxbx_txt)),
+                SubDocumentKind::HeaderTextBoxes => {
+                    Some((fib.fc_plcf_hdrtxbx_txt, fib.lcb_plcf_hdrtxbx_txt))
+                },
+                _ => None,
             };
-            if !sub.trim().is_empty() {
-                subdocuments.push(SubDocument { kind, text: sub });
+            let story_bounds = txbx_plc
+                .map(|(fc, lcb)| parse_plcf_txbx_bounds(&table_stream, fc, lcb))
+                .unwrap_or_default();
+            let sub = if text_start > 0 {
+                SubDocument::from_raw(kind, &raw.chars().skip(text_start).collect::<String>())
+            } else if story_bounds.len() >= 2 {
+                SubDocument::from_raw_stories(kind, &raw, &story_bounds)
+            } else {
+                SubDocument::from_raw(kind, &raw)
+            };
+            if !sub.text.trim().is_empty() {
+                subdocuments.push(sub);
             }
             cp = end;
         }
@@ -319,7 +385,15 @@ impl DocDocument {
                 fib.fc_plcf_bte_papx,
                 fib.lcb_plcf_bte_papx,
             );
-            build_paragraphs(&word_doc, &pieces, &fkp, fib.text_len, fib.lid, &chpx_runs)
+            build_paragraphs(
+                &word_doc,
+                &pieces,
+                &fkp,
+                fib.text_len,
+                fib.lid,
+                &chpx_runs,
+                &section_ends,
+            )
         } else {
             Vec::new()
         };
@@ -334,13 +408,17 @@ impl DocDocument {
 
         // The Data stream (if present) holds the pictures; decoded lazily.
         let data_stream = cfb.open_stream("Data").unwrap_or_default();
-        let has_macros = cfb.has_root_entry("_VBA_PROJECT");
+        let has_macros = has_vba_project(&cfb);
         // At minimum, recognize an embedded OLE object exists and
         // surface its identity — before this, `ObjectPool` was never
         // traversed at all, so an embedded Excel workbook, Equation
         // Editor object, etc. left no trace anywhere.
         let ole_objects = super::ole_objects::extract_ole_objects(&cfb);
         let summary_properties = crate::cfb::read_document_properties(&mut cfb);
+        // A container stream that came back shorter than its declared size
+        // lost content just as surely as a piece-table gap.
+        let text_complete = text_complete && cfb.truncated_streams().is_empty();
+        let warnings = container_warnings(&cfb);
 
         Ok(Self {
             text,
@@ -353,9 +431,10 @@ impl DocDocument {
             summary_properties,
             list_formatting,
             comment_authors,
-            header_footer,
+            header_footers,
             comments,
             ole_objects,
+            warnings,
         })
     }
 
@@ -381,15 +460,21 @@ impl DocDocument {
                     // Story 3 is the macro text (`ccpMcr`), not document content.
                     _ => return None,
                 };
-                Some(SubDocument { kind, text })
+                Some(SubDocument::from_raw(kind, &text))
             })
             .collect();
-        let has_macros = cfb.has_root_entry("_VBA_PROJECT") || fib.ccp[3] != 0;
+        let has_macros = has_vba_project(cfb) || fib.ccp[3] != 0;
+        // Word 6.0/95 has no Data stream: its pictures (`PICF` + metafile)
+        // sit in the WordDocument stream itself. Scanned now, since the
+        // stream is not kept.
+        let images = std::sync::OnceLock::new();
+        let _ = images.set(extract_images(word_doc));
         let summary_properties = crate::cfb::read_document_properties(cfb);
+        let text_complete = text_complete && cfb.truncated_streams().is_empty();
         Ok(Self {
             text,
             data_stream: Vec::new(),
-            images: std::sync::OnceLock::new(),
+            images,
             paragraphs: Vec::new(),
             subdocuments,
             has_macros,
@@ -397,9 +482,10 @@ impl DocDocument {
             summary_properties,
             list_formatting: ListFormatting::default(),
             comment_authors: Vec::new(),
-            header_footer: HeaderFooterStories::default(),
+            header_footers: Vec::new(),
             comments: Vec::new(),
             ole_objects: super::ole_objects::extract_ole_objects(cfb),
+            warnings: container_warnings(cfb),
         })
     }
 
@@ -430,10 +516,10 @@ impl DocDocument {
                     4 => SubDocumentKind::Comments,
                     _ => return None,
                 };
-                Some(SubDocument {
-                    kind,
-                    text: crlf(text),
-                })
+                let mut sub = SubDocument::from_raw(kind, &text);
+                sub.text = crlf(sub.text);
+                sub.parts = sub.parts.into_iter().map(crlf).collect();
+                Some(sub)
             })
             .collect();
         Ok(Self {
@@ -447,9 +533,10 @@ impl DocDocument {
             summary_properties: None,
             list_formatting: ListFormatting::default(),
             comment_authors: Vec::new(),
-            header_footer: HeaderFooterStories::default(),
+            header_footers: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
+            warnings: Vec::new(),
         })
     }
 
@@ -457,6 +544,12 @@ impl DocDocument {
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
         let file = std::fs::File::open(path)?;
         Self::from_reader(file)
+    }
+
+    /// Structural problems the reader worked around rather than failing
+    /// on; see `Metadata::warnings`.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// Get all extracted images.
@@ -484,8 +577,8 @@ impl DocDocument {
     /// All fields are `None` when the document has no header document at
     /// all, or its `PlcfHdd` doesn't cover a full section's worth of
     /// stories.
-    pub(crate) fn header_footer(&self) -> &HeaderFooterStories {
-        &self.header_footer
+    pub(crate) fn header_footers(&self) -> &[HeaderFooterStories] {
+        &self.header_footers
     }
 
     /// Individual comments split from the merged Comments substory, each
@@ -503,7 +596,7 @@ impl DocDocument {
         &self.ole_objects
     }
 
-    /// `true` when the file carries a `_VBA_PROJECT` storage — a cheap
+    /// `true` when the file carries a `Macros/VBA` project storage — a cheap
     /// macro-presence signal, no VBA interpretation.
     pub fn has_macros(&self) -> bool {
         self.has_macros
@@ -590,6 +683,25 @@ impl DocDocument {
     }
 }
 
+/// Whether the file carries a VBA project: Word keeps it in a root
+/// `Macros` storage holding the `VBA` storage ([MS-OVBA] §2.2.1 project
+/// storage; Excel's equivalent root storage is `_VBA_PROJECT_CUR`).
+fn has_vba_project<R: Read + Seek>(cfb: &CfbReader<R>) -> bool {
+    cfb.find_entry_by_path("Macros/VBA").is_some()
+}
+
+/// The container's own structural warnings plus one line per stream that
+/// was read short.
+fn container_warnings<R: Read + Seek>(cfb: &CfbReader<R>) -> Vec<String> {
+    let mut out = cfb.warnings().to_vec();
+    out.extend(
+        cfb.truncated_streams()
+            .iter()
+            .map(|name| format!("stream {name:?} is shorter than its declared size")),
+    );
+    out
+}
+
 fn clx_size_zero_or_oob(clx_size: u32, clx_start: usize, stream_len: usize) -> bool {
     clx_size == 0 || clx_start + clx_size as usize > stream_len + 1024 // allow some slack
 }
@@ -644,18 +756,21 @@ fn parse_grp_xst_atn_owners(table_stream: &[u8], fc: u32, lcb: u32) -> Vec<Strin
 /// first `n` mark story starts, entry `n` marks the end of the last
 /// story (`== ccpHdd - 1`), and the final entry is undefined/ignored —
 /// so `aCP[0..=n]` (`n + 1` values) are the usual PLC boundary CPs for
-/// `n` elements, per [MS-DOC] "Plcfhdd". This crate models only one
-/// `ir::Section` for the whole document, so only the first section's
-/// group (stories 6..12) is extracted.
+/// `n` elements, per [MS-DOC] "Plcfhdd".
+///
+/// Returns one entry per section, `sections` of them. [MS-DOC] "Plcfhdd":
+/// an empty story means the section uses the corresponding story of the
+/// previous section, so an empty story inherits; a section past the last
+/// group the PLC holds inherits everything.
 fn parse_plcf_hdd_stories(
     table_stream: &[u8],
     raw_header_text: &str,
     fc: u32,
     lcb: u32,
-) -> HeaderFooterStories {
-    let mut result = HeaderFooterStories::default();
+    sections: usize,
+) -> Vec<HeaderFooterStories> {
     let Some(cps) = plcf_hdd_cps(table_stream, fc, lcb) else {
-        return result;
+        return Vec::new();
     };
 
     let char_range = |lo: usize, hi: usize| -> Option<String> {
@@ -672,16 +787,117 @@ fn parse_plcf_hdd_stories(
         }
     };
 
-    // First section's group starts right after the 6 fixed separator
-    // stories, at story index 6.
-    let base = 6;
-    result.even_header = char_range(cps[base], cps[base + 1]);
-    result.odd_header = char_range(cps[base + 1], cps[base + 2]);
-    result.even_footer = char_range(cps[base + 2], cps[base + 3]);
-    result.odd_footer = char_range(cps[base + 3], cps[base + 4]);
-    result.first_header = char_range(cps[base + 4], cps[base + 5]);
-    result.first_footer = char_range(cps[base + 5], cps[base + 6]);
-    result
+    // Section `i`'s group starts after the 6 fixed separator stories, at
+    // story index 6 + 6i; `cps` has one more entry than there are stories.
+    let groups = (cps.len() - 1 - 6) / 6;
+    // A section count far past what the PLC holds is bounded by the text:
+    // every section beyond the last group is a copy of it.
+    let mut out: Vec<HeaderFooterStories> = Vec::with_capacity(sections.min(groups + 1));
+    let mut prev = HeaderFooterStories::default();
+    for i in 0..sections {
+        if i >= groups {
+            // Nothing more in the PLC: the rest inherit the last section.
+            let n = sections - i;
+            out.extend(std::iter::repeat_n(prev.clone(), n.min(4096)));
+            break;
+        }
+        let base = 6 + 6 * i;
+        let own = HeaderFooterStories {
+            even_header: char_range(cps[base], cps[base + 1]),
+            odd_header: char_range(cps[base + 1], cps[base + 2]),
+            even_footer: char_range(cps[base + 2], cps[base + 3]),
+            odd_footer: char_range(cps[base + 3], cps[base + 4]),
+            first_header: char_range(cps[base + 4], cps[base + 5]),
+            first_footer: char_range(cps[base + 5], cps[base + 6]),
+        };
+        let merged = HeaderFooterStories {
+            even_header: own.even_header.or_else(|| prev.even_header.clone()),
+            odd_header: own.odd_header.or_else(|| prev.odd_header.clone()),
+            even_footer: own.even_footer.or_else(|| prev.even_footer.clone()),
+            odd_footer: own.odd_footer.or_else(|| prev.odd_footer.clone()),
+            first_header: own.first_header.or_else(|| prev.first_header.clone()),
+            first_footer: own.first_footer.or_else(|| prev.first_footer.clone()),
+        };
+        out.push(merged.clone());
+        prev = merged;
+    }
+    out
+}
+
+/// The story boundary CPs (`aCP`) of `PlcftxbxTxt`/`PlcfHdrtxbxTxt`
+/// ([MS-DOC] `PlcftxbxTxt`: a PLC of 22-byte `FTXBXS`; text box `i`'s
+/// story is `aCP[i]..aCP[i + 1]` within the text-box subdocument). The
+/// final story is a placeholder with no text box and comes out empty.
+/// Empty when absent or malformed.
+fn parse_plcf_txbx_bounds(table_stream: &[u8], fc: u32, lcb: u32) -> Vec<u32> {
+    const FTXBXS_SIZE: usize = 22;
+    let start = fc as usize;
+    let Some(end) = start.checked_add(lcb as usize) else {
+        return Vec::new();
+    };
+    if lcb < 4 || end > table_stream.len() {
+        return Vec::new();
+    }
+    let cb = end - start;
+    if !(cb - 4).is_multiple_of(4 + FTXBXS_SIZE) {
+        return Vec::new();
+    }
+    let n = (cb - 4) / (4 + FTXBXS_SIZE);
+    let cps: Vec<u32> = (0..=n)
+        .map(|i| {
+            let at = start + i * 4;
+            u32::from_le_bytes([
+                table_stream[at],
+                table_stream[at + 1],
+                table_stream[at + 2],
+                table_stream[at + 3],
+            ])
+        })
+        .collect();
+    // A PLC's CPs are non-decreasing; anything else is not a boundary list.
+    if cps.windows(2).any(|w| w[1] < w[0]) {
+        return Vec::new();
+    }
+    cps
+}
+
+/// The end CP of every section, from `PlcfSed` ([MS-DOC] §2.8.26 — a PLC
+/// of 12-byte `Sed`s whose `aCP[i]..aCP[i+1]` is section `i`). Empty when
+/// the PLC is absent or malformed. The last character of every section but
+/// the last is its section mark (0x0C).
+fn parse_plcf_sed_ends(table_stream: &[u8], fc: u32, lcb: u32) -> Vec<u32> {
+    const SED_SIZE: usize = 12;
+    if lcb < 4 {
+        return Vec::new();
+    }
+    let start = fc as usize;
+    let Some(end) = start.checked_add(lcb as usize) else {
+        return Vec::new();
+    };
+    if end > table_stream.len() {
+        return Vec::new();
+    }
+    let cb = end - start;
+    if !(cb - 4).is_multiple_of(4 + SED_SIZE) {
+        return Vec::new();
+    }
+    let n = (cb - 4) / (4 + SED_SIZE);
+    let mut ends: Vec<u32> = (1..=n)
+        .map(|i| {
+            let at = start + i * 4;
+            u32::from_le_bytes([
+                table_stream[at],
+                table_stream[at + 1],
+                table_stream[at + 2],
+                table_stream[at + 3],
+            ])
+        })
+        .collect();
+    // Callers binary-search these; a malformed PLC out of order must not
+    // make that search silently wrong.
+    ends.sort_unstable();
+    ends.dedup();
+    ends
 }
 
 /// The `aCP[0..=n]` boundary CPs of `PlcfHdd`, or `None` when the PLC is
@@ -879,7 +1095,8 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
-            header_footer: HeaderFooterStories::default(),
+            warnings: Vec::new(),
+            header_footers: Vec::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "First paragraph\nSecond paragraph\n\nAfter gap".into(),
@@ -910,11 +1127,12 @@ mod tests {
             ole_objects: vec![crate::doc::ole_objects::EmbeddedOleObject {
                 description: "Embedded Equation Editor/MathType Object".into(),
             }],
-            header_footer: HeaderFooterStories::default(),
+            header_footers: Vec::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "Body".into(),
             paragraphs: Vec::new(),
+            warnings: Vec::new(),
         };
         let text = doc.plain_text();
         assert_eq!(text, "Body\n[Embedded Equation Editor/MathType Object]\n");
@@ -942,7 +1160,8 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
-            header_footer: HeaderFooterStories::default(),
+            warnings: Vec::new(),
+            header_footers: Vec::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "Price list follows.".into(),
@@ -965,7 +1184,8 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
-            header_footer: HeaderFooterStories::default(),
+            warnings: Vec::new(),
+            header_footers: Vec::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "Hello World".into(),
@@ -983,18 +1203,9 @@ mod tests {
     fn test_plain_text_and_markdown_include_subdocument_bodies() {
         let doc = DocDocument {
             subdocuments: vec![
-                SubDocument {
-                    kind: SubDocumentKind::Footnotes,
-                    text: "FOOTNOTE ONE".into(),
-                },
-                SubDocument {
-                    kind: SubDocumentKind::Comments,
-                    text: "REVIEW NOTE".into(),
-                },
-                SubDocument {
-                    kind: SubDocumentKind::HeaderTextBoxes,
-                    text: "SIDEBAR".into(),
-                },
+                SubDocument::from_raw(SubDocumentKind::Footnotes, "FOOTNOTE ONE"),
+                SubDocument::from_raw(SubDocumentKind::Comments, "REVIEW NOTE"),
+                SubDocument::from_raw(SubDocumentKind::HeaderTextBoxes, "SIDEBAR"),
             ],
             has_macros: false,
             text_complete: true,
@@ -1003,7 +1214,8 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
-            header_footer: HeaderFooterStories::default(),
+            warnings: Vec::new(),
+            header_footers: Vec::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "Main body text".into(),
@@ -1024,10 +1236,7 @@ mod tests {
     #[test]
     fn test_empty_subdocuments_are_skipped_in_both_renderers() {
         let doc = DocDocument {
-            subdocuments: vec![SubDocument {
-                kind: SubDocumentKind::Comments,
-                text: "  \n ".into(),
-            }],
+            subdocuments: vec![SubDocument::from_raw(SubDocumentKind::Comments, "  \n ")],
             has_macros: false,
             text_complete: true,
             summary_properties: None,
@@ -1035,7 +1244,8 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
-            header_footer: HeaderFooterStories::default(),
+            warnings: Vec::new(),
+            header_footers: Vec::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "Body".into(),
@@ -1060,7 +1270,8 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
-            header_footer: HeaderFooterStories::default(),
+            warnings: Vec::new(),
+            header_footers: Vec::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: "only the recovered fragment".into(),
@@ -1093,7 +1304,8 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
-            header_footer: HeaderFooterStories::default(),
+            warnings: Vec::new(),
+            header_footers: Vec::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: text.to_string(),
@@ -1114,7 +1326,8 @@ mod tests {
             comment_authors: Vec::new(),
             comments: Vec::new(),
             ole_objects: Vec::new(),
-            header_footer: HeaderFooterStories::default(),
+            warnings: Vec::new(),
+            header_footers: Vec::new(),
             data_stream: Vec::new(),
             images: std::sync::OnceLock::new(),
             text: String::new(),
@@ -1329,10 +1542,10 @@ mod tests {
     fn test_a_single_comment_author_reaches_the_comments_note() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument {
-            kind: SubDocumentKind::Comments,
-            text: "Here is a comment".into(),
-        }];
+        doc.subdocuments = vec![SubDocument::from_raw(
+            SubDocumentKind::Comments,
+            "Here is a comment",
+        )];
         doc.comment_authors = vec!["Michael McCandless".to_string()];
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
@@ -1357,10 +1570,10 @@ mod tests {
     fn test_multiple_comment_authors_leave_the_note_author_unset() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument {
-            kind: SubDocumentKind::Comments,
-            text: "Inner\nOuter".into(),
-        }];
+        doc.subdocuments = vec![SubDocument::from_raw(
+            SubDocumentKind::Comments,
+            "Inner\nOuter",
+        )];
         doc.comment_authors = vec!["vmiklos".to_string(), "Miklos Vajna".to_string()];
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
@@ -1390,10 +1603,10 @@ mod tests {
     fn test_footnotes_split_into_one_element_per_reference_mark() {
         use crate::ir::{Element, InlineContent, Note};
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument {
-            kind: SubDocumentKind::Footnotes,
-            text: "\u{2} First footnote.\n\u{2} Second footnote.\n\u{2} Third footnote.\n".into(),
-        }];
+        doc.subdocuments = vec![SubDocument::from_raw(
+            SubDocumentKind::Footnotes,
+            "\u{2} First footnote.\n\u{2} Second footnote.\n\u{2} Third footnote.\n",
+        )];
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
         let footnotes: Vec<&Note> = ir.sections[0]
@@ -1438,10 +1651,10 @@ mod tests {
     fn test_comments_stay_merged_into_a_single_note() {
         use crate::ir::{Element, Note};
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument {
-            kind: SubDocumentKind::Comments,
-            text: "First comment.\nSecond comment.\n".into(),
-        }];
+        doc.subdocuments = vec![SubDocument::from_raw(
+            SubDocumentKind::Comments,
+            "First comment.\nSecond comment.\n",
+        )];
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
         let comments: Vec<&Note> = ir.sections[0]
@@ -1476,7 +1689,8 @@ mod tests {
             table_stream.extend_from_slice(&cp.to_le_bytes());
         }
 
-        let stories = parse_plcf_hdd_stories(&table_stream, raw, 0, table_stream.len() as u32);
+        let stories =
+            &parse_plcf_hdd_stories(&table_stream, raw, 0, table_stream.len() as u32, 1)[0];
         assert_eq!(stories.even_header.as_deref(), Some("EVEN HEADER"));
         assert_eq!(stories.odd_header.as_deref(), Some("ODD HEADER"));
         assert_eq!(stories.even_footer.as_deref(), Some("EVEN FOOTER"));
@@ -1505,7 +1719,7 @@ mod tests {
 
     #[test]
     fn test_plcf_hdd_zero_length_yields_no_stories() {
-        let stories = parse_plcf_hdd_stories(&[0u8; 8], "", 0, 0);
+        let stories = parse_plcf_hdd_stories(&[0u8; 8], "", 0, 0, 1);
         assert!(stories.is_empty());
     }
 
@@ -1514,7 +1728,7 @@ mod tests {
         // Only the 6 fixed separators (n=6, needs n+2=8 CPs) — no
         // section's worth of header/footer stories at all.
         let table_stream = vec![0u8; 8 * 4];
-        let stories = parse_plcf_hdd_stories(&table_stream, "", 0, table_stream.len() as u32);
+        let stories = parse_plcf_hdd_stories(&table_stream, "", 0, table_stream.len() as u32, 1);
         assert!(stories.is_empty());
     }
 
@@ -1526,15 +1740,15 @@ mod tests {
     fn test_header_footer_stories_reach_the_section_fields() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument {
-            kind: SubDocumentKind::HeadersFooters,
-            text: "irrelevant merged blob".into(),
-        }];
-        doc.header_footer = HeaderFooterStories {
+        doc.subdocuments = vec![SubDocument::from_raw(
+            SubDocumentKind::HeadersFooters,
+            "irrelevant merged blob",
+        )];
+        doc.header_footers = vec![HeaderFooterStories {
             odd_header: Some("The Odd Header".to_string()),
             first_footer: Some("The First Footer".to_string()),
             ..Default::default()
-        };
+        }];
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
         let section = &ir.sections[0];
@@ -1558,11 +1772,11 @@ mod tests {
     fn test_header_footer_falls_back_to_a_textbox_when_plcf_hdd_is_absent() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument {
-            kind: SubDocumentKind::HeadersFooters,
-            text: "OLD MERGED HEADER BLOB".into(),
-        }];
-        // doc.header_footer left at its default (empty) — no PlcfHdd data.
+        doc.subdocuments = vec![SubDocument::from_raw(
+            SubDocumentKind::HeadersFooters,
+            "OLD MERGED HEADER BLOB",
+        )];
+        // doc.header_footers left empty — no PlcfHdd data.
 
         let ir = crate::convert_doc::doc_to_ir(&doc);
         let section = &ir.sections[0];
@@ -1673,10 +1887,10 @@ mod tests {
     fn test_split_comments_reach_the_ir_as_separate_notes() {
         use crate::ir::Element;
         let mut doc = make_doc("Body text.");
-        doc.subdocuments = vec![SubDocument {
-            kind: SubDocumentKind::Comments,
-            text: "Inner\nOuter\nAs in non-range.".into(),
-        }];
+        doc.subdocuments = vec![SubDocument::from_raw(
+            SubDocumentKind::Comments,
+            "Inner\nOuter\nAs in non-range.",
+        )];
         doc.comments = vec![
             ParsedComment {
                 text: "Inner".into(),

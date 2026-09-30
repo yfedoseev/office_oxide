@@ -56,13 +56,15 @@ fn cluster_positions(mut values: Vec<i32>) -> Vec<i32> {
         return Vec::new();
     }
     values.sort_unstable();
-    let span = (values[values.len() - 1] - values[0]).max(0);
+    // Anchors are raw `i32`s from the file: widen before subtracting or
+    // summing, or anchors near the extremes overflow.
+    let span = i64::from(values[values.len() - 1]) - i64::from(values[0]);
     let tolerance = (span / 50).max(1);
 
     let mut clusters: Vec<Vec<i32>> = vec![vec![values[0]]];
     for &v in &values[1..] {
         let last = clusters.last().unwrap();
-        if v - last[last.len() - 1] <= tolerance {
+        if i64::from(v) - i64::from(last[last.len() - 1]) <= tolerance {
             clusters.last_mut().unwrap().push(v);
         } else {
             clusters.push(vec![v]);
@@ -70,7 +72,11 @@ fn cluster_positions(mut values: Vec<i32>) -> Vec<i32> {
     }
     clusters
         .into_iter()
-        .map(|c| c.iter().sum::<i32>() / c.len() as i32)
+        .map(|c| {
+            let sum: i64 = c.iter().map(|&v| i64::from(v)).sum();
+            // The mean of `i32`s is itself within `i32` range.
+            (sum / c.len() as i64) as i32
+        })
         .collect()
 }
 
@@ -79,7 +85,7 @@ fn nearest_cluster(centers: &[i32], v: i32) -> usize {
     centers
         .iter()
         .enumerate()
-        .min_by_key(|(_, c)| (**c - v).abs())
+        .min_by_key(|(_, c)| (i64::from(**c) - i64::from(v)).abs())
         .map(|(i, _)| i)
         .unwrap()
 }
@@ -138,6 +144,25 @@ mod tests {
             top,
             runs: Vec::new(),
         }
+    }
+
+    /// Child anchors are raw `i32`s from the file. Subtracting the extremes
+    /// and summing a cluster overflowed on anchors near `i32::MIN`/`MAX` —
+    /// a panic in debug builds, wrapped nonsense in release. The grid is
+    /// still recognised, with every cell in its own slot.
+    #[test]
+    fn test_extreme_anchor_coordinates_do_not_overflow() {
+        let cells = vec![
+            cell(i32::MIN, i32::MIN),
+            cell(i32::MAX, i32::MIN),
+            cell(i32::MIN, i32::MAX),
+            cell(i32::MAX, i32::MAX),
+        ];
+        let table = build_table(&cells).expect("a 2x2 grid at the extremes");
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0].len(), 2);
+        assert_eq!(cluster_positions(vec![i32::MAX, i32::MAX - 1]), vec![i32::MAX - 1]);
+        assert_eq!(cluster_positions(vec![i32::MIN, i32::MIN + 1]), vec![i32::MIN + 1]);
     }
 
     #[test]

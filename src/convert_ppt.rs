@@ -1,6 +1,6 @@
 use crate::format::DocumentFormat;
 use crate::ir::*;
-use crate::ppt::{CharFormatSpan, ParaFormatSpan, TextRun, TextType};
+use crate::ppt::{CharFormatSpan, LinkRange, ParaFormatSpan, TextRun, TextType};
 
 /// Split `text` into paragraphs at bare `\r` / `\n` delimiters.
 ///
@@ -52,6 +52,7 @@ fn spans_for_range(
     end: usize,
     char_formats: &[CharFormatSpan],
     hyperlink: Option<&str>,
+    links: &[LinkRange],
 ) -> Vec<InlineContent> {
     let end = end.min(text_chars.len());
     let start = start.min(end);
@@ -70,12 +71,16 @@ fn spans_for_range(
     let mut cuts = std::collections::BTreeSet::new();
     cuts.insert(s);
     cuts.insert(e);
-    for f in char_formats {
-        if f.start > s && f.start < e {
-            cuts.insert(f.start);
+    for (start, end) in char_formats
+        .iter()
+        .map(|f| (f.start, f.end))
+        .chain(links.iter().map(|l| (l.start, l.end)))
+    {
+        if start > s && start < e {
+            cuts.insert(start);
         }
-        if f.end > s && f.end < e {
-            cuts.insert(f.end);
+        if end > s && end < e {
+            cuts.insert(end);
         }
     }
     // A vertical tab (0x0B) is a line break inside the paragraph
@@ -103,7 +108,13 @@ fn spans_for_range(
         let seg: String = text_chars[a..b].iter().collect();
         let fmt = char_formats.iter().find(|f| f.start <= a && b <= f.end);
         let mut span = TextSpan::plain(seg);
-        span.hyperlink = hyperlink.map(str::to_string);
+        // A text-range link over this piece wins over the shape's own.
+        span.hyperlink = links
+            .iter()
+            .find(|l| l.start <= a && b <= l.end)
+            .map(|l| l.url.as_str())
+            .or(hyperlink)
+            .map(str::to_string);
         if let Some(f) = fmt {
             if let Some(bold) = f.format.bold {
                 span.bold = bold;
@@ -123,6 +134,9 @@ fn spans_for_range(
             }
             if let Some(color) = f.format.color {
                 span.color = Some(color);
+            }
+            if let Some(typeface) = &f.format.typeface {
+                span.font_name = Some(typeface.clone());
             }
             if let Some(position) = f.format.position {
                 span.vertical_align = match position.cmp(&0) {
@@ -178,6 +192,7 @@ fn table_cell_content(runs: &[TextRun]) -> Vec<Element> {
                 end,
                 &run.char_formats,
                 run.hyperlink.as_deref(),
+                &run.link_ranges,
             );
             if !content.is_empty() {
                 elements.push(Element::Paragraph(Paragraph {
@@ -221,6 +236,11 @@ fn table_block_to_element(table: &crate::ppt::TableBlock) -> Element {
 /// `subType`/`type` values per [MS-PPT] 2.10.20, cross-checked against
 /// Apache POI's `ExOleObjAtom.Subtype`/`OleType` enums.
 fn describe_ole_object(info: &crate::ppt::OleObjectInfo) -> String {
+    match info.kind {
+        crate::ppt::OleObjectInfo::KIND_MEDIA_VIDEO => return "Embedded video".to_string(),
+        crate::ppt::OleObjectInfo::KIND_MEDIA_AUDIO => return "Embedded sound".to_string(),
+        _ => {},
+    }
     let subtype = match info.subtype {
         0 => "OLE object",
         1 => "Microsoft Clipart Gallery object",
@@ -289,6 +309,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                             end,
                             &run.char_formats,
                             run.hyperlink.as_deref(),
+                            &run.link_ranges,
                         );
                         if content.is_empty() {
                             continue;
@@ -323,6 +344,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                             end,
                             &run.char_formats,
                             run.hyperlink.as_deref(),
+                            &run.link_ranges,
                         );
                         if !content.is_empty() {
                             elements.push(Element::Paragraph(Paragraph {
@@ -335,7 +357,9 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                     }
                 },
                 TextType::Notes => {
-                    notes_lines.push(run.text.trim());
+                    // One paragraph per notes paragraph (`\r`) or soft
+                    // return (`\x0B`), as on the slide body.
+                    notes_lines.extend(run.text.split(['\r', '\n', '\u{b}']));
                 },
                 // Every other text type (`Other`, subtitles, footers …):
                 // one paragraph per paragraph, as for a body — joining
@@ -349,6 +373,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
                             end,
                             &run.char_formats,
                             run.hyperlink.as_deref(),
+                            &run.link_ranges,
                         );
                         if !content.is_empty() {
                             elements.push(Element::Paragraph(Paragraph {
@@ -476,6 +501,8 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
             created: summary.and_then(|s| s.created.clone()),
             modified: summary.and_then(|s| s.modified.clone()),
             has_macros: doc.has_macros(),
+            text_truncated: !doc.text_complete(),
+            warnings: doc.warnings().to_vec(),
             ..crate::core::core_properties::legacy_metadata_extras(summary)
         },
         sections,

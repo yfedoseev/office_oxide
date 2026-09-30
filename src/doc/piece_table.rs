@@ -2,7 +2,10 @@
 //!
 //! The piece table maps character positions to byte ranges in the WordDocument stream.
 //! Each piece can be either:
-//! - Compressed (CP1252): 1 byte per character, fc has bit 30 set, actual offset = (fc & ~0x40000000) / 2
+//! - Compressed (8-bit): 1 byte per character, fc has bit 30 set, actual
+//!   offset = (fc & ~0x40000000) / 2. Decoded in the code page the FIB's
+//!   `lid` implies (`codepage::decode_byte`) — Windows-1252, the mapping
+//!   [MS-DOC] §2.4.1 tabulates, for English and every unrecognised `lid`.
 //! - Unicode (UTF-16LE): 2 bytes per character, fc is used directly
 
 use super::error::{DocError, Result};
@@ -16,8 +19,52 @@ pub struct Piece {
     pub cp_end: u32,
     /// File offset in the WordDocument stream.
     pub fc: u32,
-    /// Whether this piece uses compressed (CP1252) encoding.
+    /// Whether this piece uses compressed (8-bit, `lid` code page) encoding.
     pub is_compressed: bool,
+    /// The piece's `Pcd.prm` ([MS-DOC] §2.9.177 `Prm`) resolved to the
+    /// property modifiers it applies to every character of the piece: a
+    /// `Prm0`'s single SPRM re-encoded as a grpprl, or the `Prc` grpprl a
+    /// `Prm1` indexes. Empty when the piece carries none — the usual case
+    /// outside fast-saved files.
+    pub prm_grpprl: Vec<u8>,
+}
+
+/// `Prc.clxt`: the CLX entry type of a property-modifier block ([MS-DOC]
+/// §2.9.209 `Prc`).
+const CLXT_PRC: u8 = 0x01;
+/// `Pcdt.clxt`: the CLX entry type of the piece table ([MS-DOC] §2.9.178
+/// `Pcdt`).
+const CLXT_PCDT: u8 = 0x02;
+
+/// Resolve a `Pcd.prm` to its grpprl. [MS-DOC] §2.9.177 `Prm`: bit 0
+/// `fComplex`; clear → `Prm0` (`isprm` in bits 1..7, `val` in bits 8..15:
+/// one SPRM from the `Prm0` table with a 1-byte operand); set → `Prm1`
+/// (`igrpprl` in bits 1..15, an index into the CLX's `RgPrc`).
+fn resolve_prm(prm: u16, prcs: &[Vec<u8>]) -> Vec<u8> {
+    if prm & 1 != 0 {
+        let igrpprl = (prm >> 1) as usize;
+        match prcs.get(igrpprl) {
+            Some(g) => g.clone(),
+            None => {
+                log::warn!("doc: piece modifier names Prc {igrpprl} of {}", prcs.len());
+                Vec::new()
+            },
+        }
+    } else {
+        let isprm = ((prm >> 1) & 0x7F) as u8;
+        let val = (prm >> 8) as u8;
+        if isprm == 0 {
+            return Vec::new(); // no modifier
+        }
+        match super::sprm::prm0_sprm(isprm) {
+            Some(opcode) => {
+                let [lo, hi] = opcode.to_le_bytes();
+                vec![lo, hi, val]
+            },
+            // A paragraph or other modifier: not applied to characters.
+            None => Vec::new(),
+        }
+    }
 }
 
 /// Parse the CLX structure to extract the piece table.
@@ -28,17 +75,22 @@ pub struct Piece {
 pub fn parse_clx(data: &[u8]) -> Result<Vec<Piece>> {
     let mut pos = 0;
 
-    // Skip Grpprl entries.
-    while pos < data.len() && data[pos] == 0x01 {
+    // The `RgPrc` array: property-modifier grpprls a piece's `Prm1`
+    // refers to by index ([MS-DOC] §2.9.209 `Prc` / §2.9.210 `PrcData`:
+    // a signed 16-bit `cbGrpprl`, then that many bytes).
+    let mut prcs: Vec<Vec<u8>> = Vec::new();
+    while pos < data.len() && data[pos] == CLXT_PRC {
         if pos + 3 > data.len() {
             return Err(DocError::InvalidPieceTable("Grpprl truncated".into()));
         }
         let size = u16::from_le_bytes([data[pos + 1], data[pos + 2]]) as usize;
+        let start = pos + 3;
+        prcs.push(data[start.min(data.len())..(start + size).min(data.len())].to_vec());
         pos += 3 + size;
     }
 
     // Now we should be at the Pcdt (type 0x02).
-    if pos >= data.len() || data[pos] != 0x02 {
+    if pos >= data.len() || data[pos] != CLXT_PCDT {
         return Err(DocError::InvalidPieceTable(format!(
             "expected Pcdt (0x02) at offset {pos}, found {:?}",
             data.get(pos)
@@ -58,7 +110,7 @@ pub fn parse_clx(data: &[u8]) -> Result<Vec<Piece>> {
     }
 
     let pcd_data = &data[pos..data.len().min(pos + pcdt_size)];
-    parse_plc_pcd(pcd_data)
+    parse_plc_pcd(pcd_data, &prcs)
 }
 
 /// Parse the PlcPcd structure (array of CPs + array of PCDs).
@@ -68,7 +120,7 @@ pub fn parse_clx(data: &[u8]) -> Result<Vec<Piece>> {
 /// - n PCD entries (8 bytes each)
 ///
 /// Where n = (size - 4) / 12 (solve for: (n+1)*4 + n*8 = size)
-fn parse_plc_pcd(data: &[u8]) -> Result<Vec<Piece>> {
+fn parse_plc_pcd(data: &[u8], prcs: &[Vec<u8>]) -> Result<Vec<Piece>> {
     if data.len() < 8 {
         return Err(DocError::InvalidPieceTable("PlcPcd too small".into()));
     }
@@ -112,6 +164,7 @@ fn parse_plc_pcd(data: &[u8]) -> Result<Vec<Piece>> {
 
         // Bit 30 of fc indicates compressed encoding.
         let is_compressed = (fc & 0x40000000) != 0;
+        let prm = u16::from_le_bytes([data[pcd_offset + 6], data[pcd_offset + 7]]);
 
         // A non-monotonic CP range would underflow later subtractions
         // (extract_text / decode_cp_range / fc_to_cp). Reject it here so the
@@ -125,6 +178,7 @@ fn parse_plc_pcd(data: &[u8]) -> Result<Vec<Piece>> {
             cp_end,
             fc,
             is_compressed,
+            prm_grpprl: resolve_prm(prm, prcs),
         });
     }
 
@@ -183,7 +237,9 @@ pub fn extract_text_range(
     }
     let max_chars = range_end;
 
-    for piece in pieces {
+    // Pieces are in CP order: start at the first one reaching the range.
+    let first = pieces.partition_point(|p| p.cp_end <= range_start);
+    for piece in &pieces[first..] {
         if piece.cp_start >= max_chars {
             break;
         }
@@ -195,7 +251,7 @@ pub fn extract_text_range(
         let char_count = piece.cp_end.min(max_chars) - piece.cp_start - skip;
 
         if piece.is_compressed {
-            // Compressed: 1 byte per character, CP1252.
+            // Compressed: 1 byte per character, in the `lid` code page.
             // Actual byte offset = (fc & ~0x40000000) / 2
             let byte_offset = ((piece.fc & !0x40000000) / 2) as usize + skip as usize;
             let byte_count = char_count as usize;
@@ -228,7 +284,7 @@ pub fn extract_text_range(
 /// Extract the text for `[range_start, range_end)`, skipping any CP
 /// sub-ranges named in `excluded` (already sorted, disjoint, and clipped
 /// to `[range_start, range_end)` by the caller — see
-/// `chpx::resolve_deleted_cp_ranges`).
+/// `chpx::resolve_excluded_cp_ranges_from_runs`).
 ///
 /// This is what applies the "accepted view" policy for DOC's deleted
 /// revision-mark text (the same policy already applied to
@@ -301,7 +357,7 @@ pub(crate) fn piece_backed_cp_end(piece: &Piece, word_doc_len: usize) -> u32 {
 /// Unlike [`extract_text_range`] this is *per range*: callers slice by CP without
 /// first collapsing the whole document into a flat `String`, so a surrogate
 /// pair (2 UTF-16 code units) in a Unicode piece is decoded into one `char`
-/// exactly where it belongs, and compressed (CP1252) pieces are decoded by
+/// exactly where it belongs, and compressed (8-bit) pieces are decoded by
 /// their own stride. A truncated/out-of-range segment is skipped per-CP
 /// rather than dropping the entire piece, which keeps later ranges aligned.
 pub(crate) fn decode_cp_range(
@@ -315,8 +371,18 @@ pub(crate) fn decode_cp_range(
     if cp_end <= cp_start {
         return out;
     }
-    for piece in pieces {
-        if piece.cp_end <= cp_start || piece.cp_start >= cp_end {
+    // The pieces are in CP order (`parse_plc_pcd` rejects a piece whose
+    // range runs backwards, and each starts where the previous ends), so
+    // the first piece that reaches `cp_start` is a binary search away and
+    // the walk stops at the first piece past `cp_end` — not a scan of
+    // every piece for every range, which `build_paragraphs` calls once per
+    // CHP segment of every paragraph.
+    let first = pieces.partition_point(|p| p.cp_end <= cp_start);
+    for piece in &pieces[first..] {
+        if piece.cp_start >= cp_end {
+            break;
+        }
+        if piece.cp_end <= cp_start {
             continue;
         }
         let seg_start = cp_start.max(piece.cp_start);
@@ -524,7 +590,11 @@ fn strip_fields(
                     }
                 }
             },
-            '\x01' | '\x08' => {}, // Picture placeholder, historic field-mark — always skip
+            // Picture placeholder, historic field-mark; and the reference
+            // marks [MS-DOC] §2.4.1 puts in a story where a footnote/endnote
+            // (0x02, auto-numbered reference) or comment (0x05, annotation
+            // reference) is anchored — anchors, not text. Always skipped.
+            '\x01' | '\x08' | '\x02' | '\x05' => {},
             _ => {
                 if visible(&stack) {
                     track_chp_run(char_props, idx, &out, &mut chp_spans, &mut open_run);
@@ -556,6 +626,14 @@ fn push_mapped(ch: char, out: &mut String) {
         '\x07' => out.push('\t'), // Cell/row mark → tab
         '\x0C' => out.push('\n'), // Page break / section break
         '\x0B' => out.push('\n'), // Vertical tab → newline
+        // [MS-DOC] §2.4.1: 0x1E is a non-breaking hyphen — a hyphen Word
+        // draws, so it is kept, as U+2011 (the DOCX reader's
+        // `w:noBreakHyphen`).
+        '\x1E' => out.push('\u{2011}'),
+        // 0x1F is an optional hyphen — drawn only where a line happens to
+        // break. Dropped, as the DOCX reader drops `w:softHyphen`: emitting
+        // it splits the word for every consumer doing word-level work.
+        '\x1F' => {},
         _ => out.push(ch),
     }
 }
@@ -593,6 +671,59 @@ fn parse_hyperlink_url(instruction: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// `decode_cp_range` starts at the first piece reaching the range and
+    /// stops at the first past it; over many pieces, every range — inside
+    /// one piece, across several, at the edges, past the end — decodes to
+    /// exactly the corresponding slice of the whole text.
+    #[test]
+    fn test_decode_cp_range_over_many_pieces_matches_the_whole_text() {
+        let whole: Vec<char> = (0..600u32)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let mut word_doc = vec![0u8; 0x4000];
+        let mut pieces = Vec::new();
+        let mut cp = 0u32;
+        let mut byte = 0x200u32;
+        let mut i = 0;
+        while (cp as usize) < whole.len() {
+            let len = (1 + i % 9).min(whole.len() as u32 - cp);
+            let compressed = i % 3 == 0;
+            for k in 0..len {
+                let ch = whole[(cp + k) as usize] as u8;
+                if compressed {
+                    word_doc[(byte + k) as usize] = ch;
+                } else {
+                    word_doc[(byte + 2 * k) as usize] = ch;
+                }
+            }
+            pieces.push(Piece {
+                cp_start: cp,
+                cp_end: cp + len,
+                fc: if compressed {
+                    0x4000_0000 | (byte * 2)
+                } else {
+                    byte
+                },
+                is_compressed: compressed,
+                prm_grpprl: Vec::new(),
+            });
+            byte += if compressed { len } else { 2 * len } + 3;
+            cp += len;
+            i += 1;
+        }
+        let text = |a: usize, b: usize| {
+            whole[a.min(whole.len())..b.min(whole.len())]
+                .iter()
+                .collect::<String>()
+        };
+        for a in (0..620usize).step_by(7) {
+            for len in [1usize, 2, 9, 40, 700] {
+                let got = decode_cp_range(&word_doc, &pieces, a as u32, (a + len) as u32, 0x0409);
+                assert_eq!(got, text(a, a + len), "range {a}+{len}");
+            }
+        }
+    }
+
     #[test]
     fn test_parse_clx_with_one_piece() {
         let mut clx = Vec::new();
@@ -614,6 +745,53 @@ mod tests {
         assert_eq!(pieces[0].cp_start, 0);
         assert_eq!(pieces[0].cp_end, 10);
         assert!(pieces[0].is_compressed);
+    }
+
+    /// Build a CLX: the given `Prc` grpprls, then one piece per `prm`,
+    /// each 5 characters long.
+    fn clx_with_prms(prcs: &[&[u8]], prms: &[u16]) -> Vec<u8> {
+        let mut clx = Vec::new();
+        for g in prcs {
+            clx.push(0x01);
+            clx.extend_from_slice(&(g.len() as u16).to_le_bytes());
+            clx.extend_from_slice(g);
+        }
+        let n = prms.len();
+        clx.push(0x02);
+        clx.extend_from_slice(&(((n + 1) * 4 + n * 8) as u32).to_le_bytes());
+        for i in 0..=n {
+            clx.extend_from_slice(&((i * 5) as u32).to_le_bytes());
+        }
+        for (i, prm) in prms.iter().enumerate() {
+            clx.extend_from_slice(&0u16.to_le_bytes());
+            clx.extend_from_slice(&(0x4000_0000u32 + (i as u32) * 10).to_le_bytes());
+            clx.extend_from_slice(&prm.to_le_bytes());
+        }
+        clx
+    }
+
+    /// `Pcd.prm` ([MS-DOC] §2.9.177) was never read, so a piece's own
+    /// property modifier — how a fast save records a formatting change or
+    /// deletion over a whole piece — was lost. A `Prm1` names a `Prc`
+    /// grpprl; a `Prm0` carries one SPRM by its `isprm`.
+    #[test]
+    fn test_piece_prm_resolves_to_its_grpprl() {
+        let prc: &[u8] = &[0x3C, 0x08, 0x01]; // sprmCFVanish = 1
+        // Piece 0: Prm1 igrpprl = 0 (fComplex set). Piece 1: Prm0
+        // isprm 0x55 (sprmCFBold), val 1. Piece 2: no modifier.
+        let prm1 = 1u16;
+        let prm0_bold = (0x55u16 << 1) | (1u16 << 8);
+        let pieces = parse_clx(&clx_with_prms(&[prc], &[prm1, prm0_bold, 0])).unwrap();
+        assert_eq!(pieces[0].prm_grpprl, prc);
+        assert_eq!(pieces[1].prm_grpprl, vec![0x35, 0x08, 0x01]);
+        assert!(pieces[2].prm_grpprl.is_empty());
+    }
+
+    /// A `Prm1` naming a `Prc` that does not exist resolves to nothing.
+    #[test]
+    fn test_piece_prm_naming_a_missing_prc_is_ignored() {
+        let pieces = parse_clx(&clx_with_prms(&[], &[(7u16 << 1) | 1])).unwrap();
+        assert!(pieces[0].prm_grpprl.is_empty());
     }
 
     #[test]
@@ -649,6 +827,7 @@ mod tests {
             cp_end: 5,
             fc: 0x40000100, // compressed, offset = 0x100/2 = 0x80
             is_compressed: true,
+            prm_grpprl: Vec::new(),
         }];
 
         let text = extract_text_range(&word_doc, &pieces, 0, 5, 0);
@@ -667,6 +846,7 @@ mod tests {
             cp_end: 7,
             fc: 0x4000_0000, // compressed, offset = 0
             is_compressed: true,
+            prm_grpprl: Vec::new(),
         }];
 
         let text = extract_text_range_excluding(&word_doc, &pieces, 0, 7, 0, &[(2, 5)]);
@@ -682,6 +862,7 @@ mod tests {
             cp_end: 5,
             fc: 0x4000_0000,
             is_compressed: true,
+            prm_grpprl: Vec::new(),
         }];
         assert_eq!(
             extract_text_range_excluding(&word_doc, &pieces, 0, 5, 0, &[]),
@@ -699,6 +880,7 @@ mod tests {
             cp_end: 5,
             fc: 0x4000_0000,
             is_compressed: true,
+            prm_grpprl: Vec::new(),
         }];
         assert_eq!(extract_text_range_excluding(&word_doc, &pieces, 0, 5, 0, &[(0, 5)]), "");
     }
@@ -718,6 +900,7 @@ mod tests {
             cp_end: 2,
             fc,
             is_compressed: false,
+            prm_grpprl: Vec::new(),
         }];
 
         let text = extract_text_range(&word_doc, &pieces, 0, 2, 0);
@@ -740,12 +923,14 @@ mod tests {
                 cp_end: 2,
                 fc: 0x40000100, // offset = 0x80
                 is_compressed: true,
+                prm_grpprl: Vec::new(),
             },
             Piece {
                 cp_start: 2,
                 cp_end: 4,
                 fc: 0x40000120, // offset = 0x90
                 is_compressed: true,
+                prm_grpprl: Vec::new(),
             },
         ];
 
@@ -907,6 +1092,7 @@ mod tests {
             cp_end: 5,
             fc: 0x40000100,
             is_compressed: true,
+            prm_grpprl: Vec::new(),
         }];
 
         let text = extract_text_range(&word_doc, &pieces, 0, 3, 0);
@@ -959,6 +1145,7 @@ mod tests {
             cp_end: 20_000_000,
             fc: 4096,
             is_compressed: false,
+            prm_grpprl: Vec::new(),
         };
         assert_eq!(
             piece_backed_cp_end(&unbacked, word_doc.len()),
@@ -978,6 +1165,7 @@ mod tests {
             cp_end: 20_000_000,
             fc: 0,
             is_compressed: false,
+            prm_grpprl: Vec::new(),
         };
         assert_eq!(
             piece_backed_cp_end(&backed, word_doc.len()),
@@ -999,6 +1187,7 @@ mod tests {
             cp_end: 20_000_000,
             fc: 0,
             is_compressed: true,
+            prm_grpprl: Vec::new(),
         };
         assert_eq!(
             piece_backed_cp_end(&compressed, word_doc.len()),
@@ -1022,6 +1211,7 @@ mod tests {
             cp_end: 20_000_000,
             fc: 0,
             is_compressed: false,
+            prm_grpprl: Vec::new(),
         };
         assert_eq!(
             piece_backed_cp_end(&unicode, word_doc.len()),
@@ -1037,6 +1227,7 @@ mod tests {
             cp_end: 20_000_000,
             fc: 0x40000100,
             is_compressed: true,
+            prm_grpprl: Vec::new(),
         };
         assert_eq!(
             piece_backed_cp_end(&compressed_unbacked, word_doc.len()),
@@ -1052,6 +1243,7 @@ mod tests {
             cp_end: 20_000_000,
             fc: 0x40000010,
             is_compressed: true,
+            prm_grpprl: Vec::new(),
         };
         assert_eq!(
             piece_backed_cp_end(&compressed_backed, word_doc.len()),
@@ -1077,6 +1269,7 @@ mod tests {
             cp_end: 10,
             fc: 0,
             is_compressed: false,
+            prm_grpprl: Vec::new(),
         };
         // Request only CP 4..7 -> "oWo".
         let out = decode_cp_range(&word_doc, &[piece], 4, 7, 0);
@@ -1203,6 +1396,7 @@ mod multi_piece_tests {
             cp_end,
             fc: 0,
             is_compressed: true,
+            prm_grpprl: Vec::new(),
         }
     }
 

@@ -589,8 +589,9 @@ pub struct Metadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// `true` when the source document carries a macro/VBA project — an
-    /// OOXML part reached via a `vbaProject` relationship, or a legacy
-    /// CFB file's top-level `_VBA_PROJECT` storage. A cheap presence-only
+    /// OOXML part reached via a `vbaProject` relationship, or a
+    /// legacy file's VBA project (a `.doc`'s `Macros/VBA` storage, a
+    /// `.ppt`'s `VBAInfoAtom`, an `.xls`'s project storage). A cheap presence-only
     /// signal for content-safety use cases; office_oxide never
     /// interprets or executes the macro content itself.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -643,6 +644,13 @@ pub struct Metadata {
     /// source carries one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail: Option<Image>,
+    /// Structural problems the reader worked around rather than failing
+    /// on, one human-readable line each — e.g. a legacy container whose
+    /// header counts disagree with its chains, or a structure the IR could
+    /// only represent approximately. Reported here instead of being written
+    /// into the document's text. Empty when there were none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl Metadata {

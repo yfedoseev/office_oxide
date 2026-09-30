@@ -338,6 +338,7 @@ dependencies = [
  "atoi_simd",
  "encoding_rs",
  "fast-float2",
+ "flate2",
  "log",
  "memmap2",
  "pyo3",

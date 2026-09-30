@@ -319,15 +319,26 @@ fn lpstr(s: &str) -> Vec<u8> {
     v
 }
 
-/// A one-property-set PropertySetStream ([MS-OLEPS] §2.21) holding
-/// `props` as `(property id, TypedPropertyValue)`.
-fn property_set_stream(props: &[(u32, Vec<u8>)]) -> Vec<u8> {
+/// `FMTID_SummaryInformation` {F29F85E0-4FF9-1068-AB91-08002B27B3D9}
+/// ([MS-OLEPS] §1.9), in on-disk GUID byte order.
+const FMTID_SUMMARY_INFORMATION: [u8; 16] = [
+    0xE0, 0x85, 0x9F, 0xF2, 0xF9, 0x4F, 0x68, 0x10, 0xAB, 0x91, 0x08, 0x00, 0x2B, 0x27, 0xB3, 0xD9,
+];
+/// `FMTID_DocSummaryInformation` {D5CDD502-2E9C-101B-9397-08002B2CF9AE}
+/// ([MS-OLEPS] §1.9), in on-disk GUID byte order.
+const FMTID_DOC_SUMMARY_INFORMATION: [u8; 16] = [
+    0x02, 0xD5, 0xCD, 0xD5, 0x9C, 0x2E, 0x1B, 0x10, 0x93, 0x97, 0x08, 0x00, 0x2B, 0x2C, 0xF9, 0xAE,
+];
+
+/// A one-property-set PropertySetStream ([MS-OLEPS] §2.21) whose set has
+/// FMTID `fmtid` and holds `props` as `(property id, TypedPropertyValue)`.
+fn property_set_stream(fmtid: &[u8; 16], props: &[(u32, Vec<u8>)]) -> Vec<u8> {
     let mut out = 0xFFFEu16.to_le_bytes().to_vec();
     out.extend_from_slice(&0u16.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&[0u8; 16]);
     out.extend_from_slice(&1u32.to_le_bytes());
-    out.extend_from_slice(&[0u8; 16]); // FMTID
+    out.extend_from_slice(fmtid);
     out.extend_from_slice(&48u32.to_le_bytes()); // set offset
     let base = out.len();
     out.extend_from_slice(&0u32.to_le_bytes()); // size, patched below
@@ -349,17 +360,23 @@ fn property_set_stream(props: &[(u32, Vec<u8>)]) -> Vec<u8> {
 #[test]
 fn test_legacy_document_summary_information_reaches_the_ir() {
     // SummaryInformation: title (2), last author (8), revision (9).
-    let si = property_set_stream(&[
-        (2, lpstr("Legacy Deck")),
-        (8, lpstr("Saver")),
-        (9, lpstr("4")),
-    ]);
+    let si = property_set_stream(
+        &FMTID_SUMMARY_INFORMATION,
+        &[
+            (2, lpstr("Legacy Deck")),
+            (8, lpstr("Saver")),
+            (9, lpstr("4")),
+        ],
+    );
     // DocumentSummaryInformation: category (2), manager (14), company (15).
-    let dsi = property_set_stream(&[
-        (0x02, lpstr("Sales")),
-        (0x0E, lpstr("Head Office")),
-        (0x0F, lpstr("Contoso Ltd")),
-    ]);
+    let dsi = property_set_stream(
+        &FMTID_DOC_SUMMARY_INFORMATION,
+        &[
+            (0x02, lpstr("Sales")),
+            (0x0E, lpstr("Head Office")),
+            (0x0F, lpstr("Contoso Ltd")),
+        ],
+    );
     let bytes = ppt_builder::build_ppt(
         &["Slide"],
         &[

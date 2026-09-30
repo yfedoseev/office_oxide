@@ -25,7 +25,10 @@
 //! list/tab-stop PR, not here. The fixtures pass either way only because their
 //! `cb < 256`, so a ≥12-column table is what exposes the difference.
 
-use crate::ir::{ParagraphAlignment, TabAlignment, TabLeader, TabStop, UnderlineStyle};
+use crate::ir::{
+    LineSpacing, ParagraphAlignment, TabAlignment, TabLeader, TabStop, UnderlineStyle,
+    VerticalAlign,
+};
 
 /// A single decoded SPRM: opcode plus its operand bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,7 +206,7 @@ pub struct PapProps {
     /// *signed* `i16` [MS-DOC] specifies. `None` when the SPRM is absent
     /// (defaults to "not in a list"). Bands: `0`/`0xF801` = not in a list;
     /// `0x0001`–`0x07FE` = 1-based index; `0xF802`–`0xFFFF` = negated index
-    /// (still a list item — see TODO(ilfo-negated) in `convert_doc.rs`).
+    /// (still a list item, resolved by `ListFormatting::level_for`).
     pub ilfo: Option<i16>,
     /// Parsed row definition (`sprmTDefTable` operand) for row-terminator
     /// paragraphs. `None` when the paragraph is not a row mark or the TAP
@@ -239,6 +242,9 @@ pub struct PapProps {
     pub space_before_twips: Option<u32>,
     /// `sprmPDyaAfter` (0xA414), in twips.
     pub space_after_twips: Option<u32>,
+    /// `sprmPDyaLine` (0x6412): line spacing, in the IR's DOCX-shaped
+    /// units (240ths of a line for `Auto`, twips otherwise).
+    pub line_spacing: Option<LineSpacing>,
 }
 
 /// One table cell descriptor (TKBKTAP, 20 bytes) distilled from a row's
@@ -601,6 +607,25 @@ pap_sprm_dispatch! {
             }
         }
     }
+
+    /// `LSPD` (4 bytes, spra 3; [MS-DOC] §2.9.150): `dyaLine` (signed
+    /// 16-bit) then `fMultLinespace` (16-bit). With `fMultLinespace` = 1,
+    /// `dyaLine` is in 240ths of a line (single = 240) — DOCX's `auto`
+    /// rule. With 0, a non-negative `dyaLine` is an at-least height in
+    /// twips and a negative one an exact height of `|dyaLine|` twips.
+    "sprmPDyaLine" @ "2.6.2" => [0x6412] (props, operand) {
+        if operand.len() >= 4 {
+            let dya = i16::from_le_bytes([operand[0], operand[1]]);
+            let mult = u16::from_le_bytes([operand[2], operand[3]]);
+            props.line_spacing = Some(if mult == 1 {
+                LineSpacing::Auto(dya.max(0) as u32)
+            } else if dya < 0 {
+                LineSpacing::Exact(u32::from(dya.unsigned_abs()))
+            } else {
+                LineSpacing::AtLeast(dya as u32)
+            });
+        }
+    }
 }
 
 /// Decode a PAP `grpprl` into the paragraph flags we care about.
@@ -660,6 +685,72 @@ pub struct ChpProps {
     pub color: Option<[u8; 3]>,
     /// `sprmCHps` (0x4A43): font size in half-points.
     pub font_size_half_pt: Option<u32>,
+    /// `sprmCFStrike` (0x0837) / `sprmCFDStrike` (0x2A53): single or
+    /// double strikethrough.
+    pub strike: bool,
+    /// `sprmCFVanish` (0x083C): hidden text. Word does not display it, so
+    /// it is excluded from extracted text the way the DOCX reader excludes
+    /// `w:vanish` runs.
+    pub vanish: bool,
+    /// `sprmCFCaps` (0x083B): displayed in capitals.
+    pub all_caps: bool,
+    /// `sprmCFSmallCaps` (0x083A): displayed in small capitals.
+    pub small_caps: bool,
+    /// `sprmCIss` (0x2A48): superscript/subscript.
+    pub iss: Option<VerticalAlign>,
+    /// `sprmCHpsPos` (0x4845): baseline offset in half-points, positive
+    /// raised, negative lowered.
+    pub hps_pos: Option<i16>,
+    /// `sprmCHighlight` (0x2A0C): highlight colour, resolved from its `Ico`
+    /// index. `None` for `0` (no highlight).
+    pub highlight: Option<[u8; 3]>,
+}
+
+impl ChpProps {
+    /// The run's vertical alignment: `sprmCIss` when present; otherwise a
+    /// non-zero `sprmCHpsPos` raise/lower, the closest thing the IR has to
+    /// a baseline offset.
+    pub fn vertical_align(&self) -> Option<VerticalAlign> {
+        if let Some(v) = &self.iss {
+            return Some(v.clone());
+        }
+        match self.hps_pos {
+            Some(p) if p > 0 => Some(VerticalAlign::Superscript),
+            Some(p) if p < 0 => Some(VerticalAlign::Subscript),
+            _ => None,
+        }
+    }
+
+    /// Text Word does not show in the accepted view: deleted revision
+    /// text or hidden (`sprmCFVanish`) text.
+    pub fn is_excluded(&self) -> bool {
+        self.f_rmark_del || self.vanish
+    }
+}
+
+/// The `Ico` colour table ([MS-DOC] §2.9.119), used by `sprmCIco` and
+/// `sprmCHighlight`. `0` is "auto" (no colour); indices past 16 are
+/// undefined.
+fn ico_to_rgb(ico: u8) -> Option<[u8; 3]> {
+    Some(match ico {
+        0x01 => [0x00, 0x00, 0x00], // black
+        0x02 => [0x00, 0x00, 0xFF], // blue
+        0x03 => [0x00, 0xFF, 0xFF], // cyan
+        0x04 => [0x00, 0xFF, 0x00], // green
+        0x05 => [0xFF, 0x00, 0xFF], // magenta
+        0x06 => [0xFF, 0x00, 0x00], // red
+        0x07 => [0xFF, 0xFF, 0x00], // yellow
+        0x08 => [0xFF, 0xFF, 0xFF], // white
+        0x09 => [0x00, 0x00, 0x80], // dark blue
+        0x0A => [0x00, 0x80, 0x80], // dark cyan
+        0x0B => [0x00, 0x80, 0x00], // dark green
+        0x0C => [0x80, 0x00, 0x80], // dark magenta
+        0x0D => [0x80, 0x00, 0x00], // dark red
+        0x0E => [0x80, 0x80, 0x00], // dark yellow
+        0x0F => [0x80, 0x80, 0x80], // dark gray
+        0x10 => [0xC0, 0xC0, 0xC0], // light gray
+        _ => return None,
+    })
 }
 
 /// Declare the character SPRM dispatch and its identity registry from one
@@ -770,6 +861,117 @@ chp_sprm_dispatch! {
             }
         }
     }
+
+    /// ToggleOperand (1 byte, spra 0): single strikethrough.
+    "sprmCFStrike" @ "2.6.1" => [0x0837] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.strike = b != 0;
+        }
+    }
+
+    /// ToggleOperand (1 byte, spra 1): double strikethrough — surfaced as
+    /// the IR's single strikethrough flag, as the DOCX reader does for
+    /// `w:dstrike`.
+    "sprmCFDStrike" @ "2.6.1" => [0x2A53] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.strike = b != 0;
+        }
+    }
+
+    /// ToggleOperand (1 byte, spra 0): hidden text.
+    "sprmCFVanish" @ "2.6.1" => [0x083C] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.vanish = b != 0;
+        }
+    }
+
+    /// ToggleOperand (1 byte, spra 0): small capitals.
+    "sprmCFSmallCaps" @ "2.6.1" => [0x083A] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.small_caps = b != 0;
+        }
+    }
+
+    /// ToggleOperand (1 byte, spra 0): all capitals.
+    "sprmCFCaps" @ "2.6.1" => [0x083B] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.all_caps = b != 0;
+        }
+    }
+
+    /// 1-byte operand (spra 1): `0` normal, `1` superscript, `2`
+    /// subscript.
+    "sprmCIss" @ "2.6.1" => [0x2A48] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.iss = match b {
+                1 => Some(VerticalAlign::Superscript),
+                2 => Some(VerticalAlign::Subscript),
+                _ => None,
+            };
+        }
+    }
+
+    /// Signed 2-byte integer (spra 2): baseline offset in half-points.
+    "sprmCHpsPos" @ "2.6.1" => [0x4845] (props, operand) {
+        if operand.len() >= 2 {
+            let v = i16::from_le_bytes([operand[0], operand[1]]);
+            props.hps_pos = (v != 0).then_some(v);
+        }
+    }
+
+    /// `Ico` (1 byte, spra 1): highlight colour; `0` is no highlight.
+    "sprmCHighlight" @ "2.6.1" => [0x2A0C] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.highlight = ico_to_rgb(b);
+        }
+    }
+
+    /// `Ico` (1 byte, spra 1): text colour from the 16-colour table. `0`
+    /// (auto) clears it. Word writes `sprmCCv` after this when it has a
+    /// true colour, so the later SPRM wins in grpprl order.
+    "sprmCIco" @ "2.6.1" => [0x2A42] (props, operand) {
+        if let Some(&b) = operand.first() {
+            props.color = ico_to_rgb(b);
+        }
+    }
+}
+
+/// `Prm0.isprm` → SPRM opcode, for the character properties this crate
+/// decodes. Transcribed from the `Prm0` table in [MS-DOC] §2.9.177 (the
+/// `isprm` values are Word 6's SPRM numbers); every `Prm0` SPRM takes a
+/// 1-byte operand. Paragraph and other modifiers are not listed and are
+/// not applied to characters.
+const PRM0_CHP_SPRMS: &[(u8, u16)] = &[
+    (0x41, 0x0800), // sprmCFRMarkDel
+    (0x42, 0x0801), // sprmCFRMarkIns
+    (0x4D, 0x2A0C), // sprmCHighlight
+    (0x55, 0x0835), // sprmCFBold
+    (0x56, 0x0836), // sprmCFItalic
+    (0x57, 0x0837), // sprmCFStrike
+    (0x5A, 0x083A), // sprmCFSmallCaps
+    (0x5B, 0x083B), // sprmCFCaps
+    (0x5C, 0x083C), // sprmCFVanish
+    (0x5E, 0x2A3E), // sprmCKul
+    (0x62, 0x2A42), // sprmCIco
+    (0x68, 0x2A48), // sprmCIss
+    (0x73, 0x2A53), // sprmCFDStrike
+];
+
+/// The character SPRM a `Prm0.isprm` names, if it is one this crate
+/// decodes.
+pub(crate) fn prm0_sprm(isprm: u8) -> Option<u16> {
+    PRM0_CHP_SPRMS
+        .iter()
+        .find(|(i, _)| *i == isprm)
+        .map(|&(_, op)| op)
+}
+
+/// Apply a CHP `grpprl` on top of already-resolved properties — a piece
+/// modifier over the run's own CHPX.
+pub fn apply_chp_grpprl(props: &mut ChpProps, grpprl: &[u8]) {
+    for sprm in parse_grpprl(grpprl) {
+        dispatch_chp_sprm(props, sprm.opcode, &sprm.operand);
+    }
 }
 
 /// Decode a CHP `grpprl` into the character flags we care about.
@@ -858,15 +1060,41 @@ mod tests {
     /// The opcodes that have actually been confused for the ones we decode
     /// must not be decoded as something else. `0x6412` is line spacing and
     /// occurs 758 times in a 246-file corpus; reading it as an outline
-    /// level marked most of those paragraphs as headings.
+    /// level marked most of those paragraphs as headings. It is decoded now
+    /// — as line spacing, and as nothing else.
     #[test]
     fn test_known_confusable_opcodes_are_not_claimed() {
-        for confusable in [0x6412u16, 0x640A] {
-            assert!(
-                !PAP_SPRM_REGISTRY.iter().any(|(o, _, _)| *o == confusable),
-                "0x{confusable:04X} is not a paragraph property this crate decodes"
-            );
-        }
+        let claims: Vec<&str> = PAP_SPRM_REGISTRY
+            .iter()
+            .filter(|(o, _, _)| *o == 0x6412)
+            .map(|(_, n, _)| *n)
+            .collect();
+        assert_eq!(claims, ["sprmPDyaLine"], "0x6412 is sprmPDyaLine only");
+        assert!(
+            !PAP_SPRM_REGISTRY.iter().any(|(o, _, _)| *o == 0x640A),
+            "0x640A is not a paragraph property this crate decodes"
+        );
+        // And line spacing never leaks into the outline level.
+        let props = extract_pap_props(&[0x12, 0x64, 0x01, 0x00, 0x00, 0x00]);
+        assert_eq!(props.outline_level, None);
+    }
+
+    /// `sprmPDyaLine`'s three `LSPD` forms map onto the IR's line-spacing
+    /// rules.
+    #[test]
+    fn test_sprm_pdya_line_decodes_lspd() {
+        // 1.5 lines: dyaLine = 360, fMultLinespace = 1.
+        let p = extract_pap_props(&[0x12, 0x64, 0x68, 0x01, 0x01, 0x00]);
+        assert_eq!(p.line_spacing, Some(LineSpacing::Auto(360)));
+        // At least 12pt: dyaLine = 240 twips, fMultLinespace = 0.
+        let p = extract_pap_props(&[0x12, 0x64, 0xF0, 0x00, 0x00, 0x00]);
+        assert_eq!(p.line_spacing, Some(LineSpacing::AtLeast(240)));
+        // Exactly 18pt: dyaLine = -360, fMultLinespace = 0.
+        let p = extract_pap_props(&[0x12, 0x64, 0x98, 0xFE, 0x00, 0x00]);
+        assert_eq!(p.line_spacing, Some(LineSpacing::Exact(360)));
+        // Truncated operand: ignored.
+        let p = extract_pap_props(&[0x12, 0x64, 0x98]);
+        assert_eq!(p.line_spacing, None);
     }
 
     /// The registry must actually be reachable from the decoder, so a
@@ -1433,6 +1661,21 @@ mod tests {
         (0x2A3E, "sprmCKul"),
         (0x6870, "sprmCCv"),
         (0x4A43, "sprmCHps"),
+        (0x0837, "sprmCFStrike"),
+        (0x2A53, "sprmCFDStrike"),
+        (0x083C, "sprmCFVanish"),
+        (0x083A, "sprmCFSmallCaps"),
+        (0x083B, "sprmCFCaps"),
+        (0x2A48, "sprmCIss"),
+        (0x4845, "sprmCHpsPos"),
+        (0x2A0C, "sprmCHighlight"),
+        (0x2A42, "sprmCIco"),
+        // Confusable neighbours, not decoded: sprmCFOutline, sprmCFShadow,
+        // sprmCKcd, sprmCFSpec.
+        (0x0838, "sprmCFOutline"),
+        (0x0839, "sprmCFShadow"),
+        (0x2A34, "sprmCKcd"),
+        (0x0855, "sprmCFSpec"),
     ];
 
     #[test]
@@ -1549,6 +1792,270 @@ mod tests {
         // 0 is below the spec's minimum of 2 — ignored, not stored.
         let props = extract_chp_props(&[0x43, 0x4A, 0, 0]);
         assert_eq!(props.font_size_half_pt, None);
+    }
+
+    /// Hidden text, strikethrough, super/subscript, highlight and the
+    /// 16-colour text colour were never decoded: hidden text surfaced as
+    /// visible and the rest of the formatting was lost.
+    #[test]
+    fn test_extract_chp_props_decodes_visibility_and_decoration_sprms() {
+        assert!(extract_chp_props(&[0x3C, 0x08, 0x01]).vanish);
+        assert!(extract_chp_props(&[0x3C, 0x08, 0x01]).is_excluded());
+        assert!(!extract_chp_props(&[0x3C, 0x08, 0x00]).vanish);
+        assert!(extract_chp_props(&[0x37, 0x08, 0x01]).strike);
+        assert!(extract_chp_props(&[0x53, 0x2A, 0x01]).strike);
+        assert!(extract_chp_props(&[0x3B, 0x08, 0x01]).all_caps);
+        assert!(extract_chp_props(&[0x3A, 0x08, 0x01]).small_caps);
+        assert_eq!(
+            extract_chp_props(&[0x48, 0x2A, 0x01]).vertical_align(),
+            Some(VerticalAlign::Superscript)
+        );
+        assert_eq!(
+            extract_chp_props(&[0x48, 0x2A, 0x02]).vertical_align(),
+            Some(VerticalAlign::Subscript)
+        );
+        assert_eq!(extract_chp_props(&[0x48, 0x2A, 0x00]).vertical_align(), None);
+        // sprmCHpsPos: +6 half-points raised, -6 lowered.
+        assert_eq!(
+            extract_chp_props(&[0x45, 0x48, 0x06, 0x00]).vertical_align(),
+            Some(VerticalAlign::Superscript)
+        );
+        assert_eq!(
+            extract_chp_props(&[0x45, 0x48, 0xFA, 0xFF]).vertical_align(),
+            Some(VerticalAlign::Subscript)
+        );
+        // sprmCIss wins over sprmCHpsPos.
+        assert_eq!(
+            extract_chp_props(&[0x45, 0x48, 0x06, 0x00, 0x48, 0x2A, 0x02]).vertical_align(),
+            Some(VerticalAlign::Subscript)
+        );
+        assert_eq!(extract_chp_props(&[0x0C, 0x2A, 0x07]).highlight, Some([0xFF, 0xFF, 0x00]));
+        assert_eq!(extract_chp_props(&[0x0C, 0x2A, 0x00]).highlight, None);
+        assert_eq!(extract_chp_props(&[0x42, 0x2A, 0x06]).color, Some([0xFF, 0x00, 0x00]));
+        // A later sprmCCv overrides the Ico colour.
+        assert_eq!(
+            extract_chp_props(&[0x42, 0x2A, 0x06, 0x70, 0x68, 0x12, 0x34, 0x56, 0x00]).color,
+            Some([0x12, 0x34, 0x56])
+        );
+    }
+
+    /// Every `Prm0` entry maps to a CHP opcode this crate decodes, with a
+    /// 1-byte operand (spra 0 or 1), as the `Prm0` table requires.
+    #[test]
+    fn test_prm0_table_names_decoded_one_byte_chp_sprms() {
+        for &(isprm, opcode) in PRM0_CHP_SPRMS {
+            assert!(
+                CHP_SPRM_REGISTRY.iter().any(|(o, _, _)| *o == opcode),
+                "isprm 0x{isprm:02X} maps to undecoded opcode 0x{opcode:04X}"
+            );
+            assert!((opcode >> 13) <= 1, "0x{opcode:04X} does not take a 1-byte operand");
+        }
+        assert_eq!(prm0_sprm(0x55), Some(0x0835));
+        assert_eq!(prm0_sprm(0x00), None);
+    }
+
+    #[test]
+    fn test_ico_table_matches_the_spec() {
+        assert_eq!(ico_to_rgb(0), None);
+        assert_eq!(ico_to_rgb(0x02), Some([0, 0, 0xFF]));
+        assert_eq!(ico_to_rgb(0x10), Some([0xC0, 0xC0, 0xC0]));
+        assert_eq!(ico_to_rgb(0x11), None);
+    }
+
+    // ── Operand framing and tab-stop decoding, behaviourally ──
+
+    /// `spra` 7 ([MS-DOC] §2.2.5.1) is a 3-byte operand: the walker must
+    /// consume exactly three bytes and land on the next SPRM.
+    #[test]
+    fn test_spra_seven_operand_is_three_bytes() {
+        let grpprl = [0x01, 0xE6, 0xAA, 0xBB, 0xCC, 0x16, 0x24, 0x01];
+        let sprms = parse_grpprl(&grpprl);
+        assert_eq!(sprms.len(), 2, "{sprms:?}");
+        assert_eq!(sprms[0].opcode, 0xE601);
+        assert_eq!(sprms[0].operand, [0xAA, 0xBB, 0xCC]);
+        assert_eq!(sprms[1].opcode, 0x2416);
+        assert_eq!(sprms[1].operand, [0x01]);
+    }
+
+    /// Each fixed `spra` class consumes its own width: 1, 1, 2, 4, 2, 2.
+    #[test]
+    fn test_every_fixed_spra_class_consumes_its_width() {
+        for (spra, width) in [
+            (0u16, 1usize),
+            (1, 1),
+            (2, 2),
+            (3, 4),
+            (4, 2),
+            (5, 2),
+            (7, 3),
+        ] {
+            let opcode = (spra << 13) | 0x0001;
+            let mut g = opcode.to_le_bytes().to_vec();
+            g.extend(std::iter::repeat_n(0x5A, width));
+            g.extend_from_slice(&[0x16, 0x24, 0x01]);
+            let sprms = parse_grpprl(&g);
+            assert_eq!(sprms[0].operand.len(), width, "spra {spra}");
+            assert_eq!(sprms[1].opcode, 0x2416, "spra {spra} must land on the next SPRM");
+        }
+    }
+
+    /// A variable SPRM whose length prefix is the last byte (a zero-length
+    /// operand exactly at the end) is still a SPRM, not a truncation.
+    #[test]
+    fn test_variable_sprm_ending_exactly_at_the_grpprl_end_is_kept() {
+        // 1-byte prefix (sprmPChgTabsPapx, cb = 0).
+        let sprms = parse_grpprl(&[0x0D, 0xC6, 0x00]);
+        assert_eq!(
+            sprms,
+            [Sprm {
+                opcode: 0xC60D,
+                operand: vec![]
+            }]
+        );
+        // sprmPChgTabs' own 1-byte cb path.
+        let sprms = parse_grpprl(&[0x15, 0xC6, 0x00]);
+        assert_eq!(
+            sprms,
+            [Sprm {
+                opcode: 0xC615,
+                operand: vec![]
+            }]
+        );
+        // sprmTDefTable's 2-byte cb (cb = 1: empty operand).
+        let sprms = parse_grpprl(&[0x08, 0xD6, 0x01, 0x00]);
+        assert_eq!(
+            sprms,
+            [Sprm {
+                opcode: 0xD608,
+                operand: vec![]
+            }]
+        );
+        // One byte short of the prefix: nothing.
+        assert!(parse_grpprl(&[0x08, 0xD6, 0x01]).is_empty());
+        assert!(parse_grpprl(&[0x0D, 0xC6]).is_empty());
+    }
+
+    /// `sprmPChgTabs` with the `cb` = 255 escape: the operand length is
+    /// `1 + 4·cDel + 1 + 3·cAdd`, derived from the payload, and the next
+    /// SPRM follows it exactly.
+    #[test]
+    fn test_pchg_tabs_escape_length_counts_both_lists() {
+        let mut op = vec![2u8]; // cDel
+        op.extend_from_slice(&[0x10, 0, 0x20, 0, 0x30, 0, 0x40, 0]); // rgdxaDel + rgdxaClose
+        op.push(3); // cAdd
+        op.extend_from_slice(&[0x00, 0x01, 0x00, 0x02, 0x00, 0x03]); // rgdxaAdd
+        op.extend_from_slice(&[0x01, 0x02, 0x03]); // rgtbdAdd
+        assert_eq!(op.len(), 1 + 4 * 2 + 1 + 3 * 3);
+        assert_eq!(pchg_tabs_operand_len(&op, 0), op.len());
+        let mut g = vec![0x15, 0xC6, 255];
+        g.extend_from_slice(&op);
+        g.extend_from_slice(&[0x16, 0x24, 0x01]);
+        let sprms = parse_grpprl(&g);
+        assert_eq!(sprms[0].operand, op);
+        assert_eq!(sprms[1].opcode, 0x2416);
+        // cAdd past the end: the rest of the grpprl.
+        assert_eq!(pchg_tabs_operand_len(&[5, 0, 0], 0), 3);
+        assert_eq!(pchg_tabs_operand_len(&[9, 9, 9], 1), 2);
+    }
+
+    /// Several added tabs decode to their own positions and descriptors,
+    /// in order, for both delete-list framings.
+    #[test]
+    fn test_pchg_tabs_decodes_every_added_tab_in_order() {
+        for (opcode, del_stride) in [(0xC615u16, 4usize), (0xC60D, 2)] {
+            let mut op = vec![1u8];
+            op.extend(std::iter::repeat_n(0x77, del_stride));
+            op.push(3);
+            for pos in [720i16, 1440, -360] {
+                op.extend_from_slice(&pos.to_le_bytes());
+            }
+            op.extend_from_slice(&[0x01, 0x0A, 0x13]); // center; right+dot; decimal+hyphen
+            let tabs = decode_pchg_tabs(opcode, &op);
+            let got: Vec<(i32, TabAlignment, TabLeader)> = tabs
+                .iter()
+                .map(|t| (t.position_twips, t.alignment, t.leader))
+                .collect();
+            assert_eq!(
+                got,
+                [
+                    (720, TabAlignment::Center, TabLeader::None),
+                    (1440, TabAlignment::Right, TabLeader::Dot),
+                    (-360, TabAlignment::Decimal, TabLeader::Hyphen),
+                ],
+                "opcode {opcode:#06x}"
+            );
+        }
+    }
+
+    /// A truncated add list stops cleanly — no read past the operand.
+    #[test]
+    fn test_pchg_tabs_truncated_positions_do_not_overrun() {
+        // cDel 0, cAdd 2, one byte of the first position.
+        assert!(decode_pchg_tabs(0xC60D, &[0, 2, 0x10]).is_empty());
+        // Positions present, descriptors missing.
+        assert!(decode_pchg_tabs(0xC60D, &[0, 1, 0x10, 0x00]).is_empty());
+        // Second position truncated: only the first tab.
+        let tabs = decode_pchg_tabs(0xC60D, &[0, 2, 0x10, 0x00, 0x20]);
+        assert!(tabs.len() <= 1);
+    }
+
+    /// Every `jc` (bits 0..2) and `tlc` (bits 3..5) value of a `TBD`
+    /// ([MS-DOC] §2.9.310), with the reserved high bits set to prove they
+    /// are masked off.
+    #[test]
+    fn test_tab_descriptor_decodes_every_alignment_and_leader() {
+        let jcs = [
+            TabAlignment::Left,
+            TabAlignment::Center,
+            TabAlignment::Right,
+            TabAlignment::Decimal,
+            TabAlignment::Bar,
+            TabAlignment::Left,
+            TabAlignment::Left,
+            TabAlignment::Left,
+        ];
+        let tlcs = [
+            TabLeader::None,
+            TabLeader::Dot,
+            TabLeader::Hyphen,
+            TabLeader::Underscore,
+            TabLeader::Heavy,
+            TabLeader::MiddleDot,
+            TabLeader::None,
+            TabLeader::None,
+        ];
+        for (jc, want_align) in jcs.iter().enumerate() {
+            for (tlc, want_leader) in tlcs.iter().enumerate() {
+                let tbd = 0xC0 | (tlc as u8) << 3 | jc as u8;
+                let tab = tab_from_tbd(100, tbd);
+                assert_eq!(&tab.alignment, want_align, "jc {jc} tlc {tlc}");
+                assert_eq!(&tab.leader, want_leader, "jc {jc} tlc {tlc}");
+                assert_eq!(tab.position_twips, 100);
+            }
+        }
+    }
+
+    /// `sprmTDefTable`: `rgdxaCenter` has `itcMac + 1` entries and the
+    /// 20-byte cell descriptors start right after it; each cell's `rgf`
+    /// and width come from its own descriptor.
+    #[test]
+    fn test_tdef_table_reads_each_cell_descriptor_at_its_offset() {
+        let mut op = vec![3u8];
+        for c in [0i16, 1000, 2500, 4000] {
+            op.extend_from_slice(&c.to_le_bytes());
+        }
+        for (rgf, w) in [(0x0060u16, 1000u16), (0x0020, 1500), (0x0000, 1500)] {
+            op.extend_from_slice(&rgf.to_le_bytes());
+            op.extend_from_slice(&w.to_le_bytes());
+            op.extend_from_slice(&[0u8; 16]);
+        }
+        let tap = parse_tdef_table(&op).expect("parses");
+        assert_eq!(tap.itc_mac, 3);
+        assert_eq!(tap.centers, [0, 1000, 2500, 4000]);
+        let cells: Vec<(u16, u16)> = tap.cells.iter().map(|c| (c.rgf, c.w_width)).collect();
+        assert_eq!(cells, [(0x0060, 1000), (0x0020, 1500), (0x0000, 1500)]);
+        // One byte short of the last descriptor: rejected, not misread.
+        assert!(parse_tdef_table(&op[..op.len() - 1]).is_none());
     }
 
     #[test]

@@ -26,16 +26,50 @@ pub enum BlipFormat {
     Unknown(u16),
 }
 
+/// `OfficeArtBlipEMF` record type, [MS-ODRAW] §2.2.24.
+const RT_BLIP_EMF: u16 = 0xF01A;
+/// `OfficeArtBlipWMF` record type, [MS-ODRAW] §2.2.25.
+const RT_BLIP_WMF: u16 = 0xF01B;
+/// `OfficeArtBlipPICT` record type, [MS-ODRAW] §2.2.26.
+const RT_BLIP_PICT: u16 = 0xF01C;
+/// `OfficeArtBlipJPEG` record type, [MS-ODRAW] §2.2.27.
+const RT_BLIP_JPEG: u16 = 0xF01D;
+/// `OfficeArtBlipPNG` record type, [MS-ODRAW] §2.2.28.
+const RT_BLIP_PNG: u16 = 0xF01E;
+/// `OfficeArtBlipDIB` record type, [MS-ODRAW] §2.2.29.
+const RT_BLIP_DIB: u16 = 0xF01F;
+/// `OfficeArtBlipTIFF` record type, [MS-ODRAW] §2.2.30.
+const RT_BLIP_TIFF: u16 = 0xF029;
+/// `OfficeArtBlipJPEG` with CMYK colour space, [MS-ODRAW] §2.2.27
+/// (`rh.recType` 0xF02A variant).
+const RT_BLIP_JPEG_CMYK: u16 = 0xF02A;
+
+/// `OfficeArtMetafileHeader.compression` ([MS-ODRAW] §2.2.31):
+/// `msocompressionDeflate` — the metafile bytes are a zlib stream.
+const MSO_COMPRESSION_DEFLATE: u8 = 0x00;
+/// `msocompressionNone` — the metafile bytes are stored as-is.
+const MSO_COMPRESSION_NONE: u8 = 0xFE;
+/// Size of `OfficeArtMetafileHeader` ([MS-ODRAW] §2.2.31): `cbSize`(4) +
+/// `rcBounds`(16) + `ptSize`(8) + `cbSave`(4) + `compression`(1) +
+/// `filter`(1).
+const METAFILE_HEADER_SIZE: usize = 34;
+/// Offset of `compression` within `OfficeArtMetafileHeader`.
+const METAFILE_COMPRESSION_OFFSET: usize = 32;
+/// Upper bound on one inflated metafile, whatever `cbSize` claims: the
+/// same order as the largest single OOXML part this crate accepts.
+const MAX_INFLATED_METAFILE: u64 = 256 << 20;
+
 impl BlipFormat {
-    fn from_record_type(rt: u16) -> Self {
+    /// The format an OfficeArt BLIP record type stores.
+    pub(crate) fn from_record_type(rt: u16) -> Self {
         match rt {
-            0xF01A => Self::Emf,
-            0xF01B => Self::Wmf,
-            0xF01C => Self::Pict,
-            0xF01D | 0xF02A => Self::Jpeg,
-            0xF01E => Self::Png,
-            0xF01F => Self::Dib,
-            0xF029 => Self::Tiff,
+            RT_BLIP_EMF => Self::Emf,
+            RT_BLIP_WMF => Self::Wmf,
+            RT_BLIP_PICT => Self::Pict,
+            RT_BLIP_JPEG | RT_BLIP_JPEG_CMYK => Self::Jpeg,
+            RT_BLIP_PNG => Self::Png,
+            RT_BLIP_DIB => Self::Dib,
+            RT_BLIP_TIFF => Self::Tiff,
             other => Self::Unknown(other),
         }
     }
@@ -93,22 +127,43 @@ pub struct BlipImage {
     pub index: usize,
 }
 
+fn is_metafile(rec_type: u16) -> bool {
+    matches!(rec_type, RT_BLIP_EMF | RT_BLIP_WMF | RT_BLIP_PICT)
+}
+
 /// UID header size for each BLIP type.
-fn uid_size(rec_type: u16, inst: u16) -> usize {
-    let base = match rec_type {
-        0xF01A..=0xF01C => 16, // Metafiles: 16 bytes UID only
-        _ => 17,               // Bitmaps: 16 bytes UID + 1 byte tag
+pub(crate) fn uid_size(rec_type: u16, inst: u16) -> usize {
+    let base = if is_metafile(rec_type) {
+        16 // Metafiles: 16 bytes UID only
+    } else {
+        17 // Bitmaps: 16 bytes UID + 1 byte tag
     };
     // If inst bit 0 is set, there's a secondary UID (16 more bytes).
     if inst & 1 != 0 { base + 16 } else { base }
 }
 
 /// Extra header size for metafile BLIPs (EMF/WMF/PICT).
-fn metafile_header_size(rec_type: u16) -> usize {
-    match rec_type {
-        0xF01A..=0xF01C => 34,
-        _ => 0,
+#[cfg(test)]
+pub(crate) fn metafile_header_size(rec_type: u16) -> usize {
+    if is_metafile(rec_type) {
+        METAFILE_HEADER_SIZE
+    } else {
+        0
     }
+}
+
+/// Inflate a zlib-compressed metafile, reading at most `cb_size` bytes
+/// (the header's declared uncompressed size), itself capped. `None` when
+/// the stream is not valid zlib.
+fn inflate_metafile(compressed: &[u8], cb_size: u32) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let limit = u64::from(cb_size).min(MAX_INFLATED_METAFILE);
+    let mut out = Vec::with_capacity((limit as usize).min(compressed.len().saturating_mul(4)));
+    flate2::read::ZlibDecoder::new(compressed)
+        .take(limit)
+        .read_to_end(&mut out)
+        .ok()?;
+    Some(out)
 }
 
 /// `OfficeArtFBSE` ("File BLIP Store Entry", [MS-ODRAW] §2.2.32):
@@ -120,9 +175,12 @@ const FBSE_FIXED_SIZE: usize = 36;
 /// Offset of `cbName` within an FBSE record's body (right after `rh`).
 const FBSE_CBNAME_OFFSET: usize = 33;
 
-/// Extract a single `OfficeArtBlip` record's image bytes, given its own
-/// record header fields already decoded.
-fn extract_one_blip(
+/// Decode a single `OfficeArtBlip` record's image bytes, given its own
+/// record header fields already decoded: skip the UID(s), and for a
+/// metafile (EMF/WMF/PICT) read the `OfficeArtMetafileHeader` and inflate
+/// the payload when it is compressed ([MS-ODRAW] §2.2.31). Shared by the
+/// PPT `Pictures` walk and the DOC `Data` stream scan.
+pub(crate) fn extract_one_blip(
     data: &[u8],
     rec_type: u16,
     inst: u16,
@@ -133,18 +191,42 @@ fn extract_one_blip(
     if !format.is_image() {
         return None;
     }
-    let skip = uid_size(rec_type, inst) + metafile_header_size(rec_type);
-    let img_start = data_start + skip;
-    if img_start >= data_end {
-        return None;
-    }
-    let img_data = &data[img_start..data_end];
-    if img_data.is_empty() {
+    let data_end = data_end.min(data.len());
+    let body_start = data_start.checked_add(uid_size(rec_type, inst))?;
+    let bytes = if is_metafile(rec_type) {
+        let header_end = body_start.checked_add(METAFILE_HEADER_SIZE)?;
+        if header_end > data_end {
+            return None;
+        }
+        let header = &data[body_start..header_end];
+        let cb_size = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let payload = &data[header_end..data_end];
+        match header[METAFILE_COMPRESSION_OFFSET] {
+            MSO_COMPRESSION_DEFLATE => match inflate_metafile(payload, cb_size) {
+                Some(v) => v,
+                None => {
+                    log::warn!("office art: compressed {format:?} picture is not valid zlib");
+                    return None;
+                },
+            },
+            MSO_COMPRESSION_NONE => payload.to_vec(),
+            other => {
+                log::warn!("office art: {format:?} picture has unknown compression 0x{other:02X}");
+                return None;
+            },
+        }
+    } else {
+        if body_start >= data_end {
+            return None;
+        }
+        data[body_start..data_end].to_vec()
+    };
+    if bytes.is_empty() {
         return None;
     }
     Some(BlipImage {
         format,
-        data: img_data.to_vec(),
+        data: bytes,
         index: 0,
     })
 }
@@ -390,6 +472,100 @@ mod tests {
         let images = extract_blip_images(&stream);
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, BlipFormat::Jpeg);
+    }
+
+    /// zlib-compress `raw` (what Office writes into a compressed metafile).
+    fn zlib(raw: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(raw).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// An `OfficeArtBlipEMF`/`WMF`/`PICT` record: `rh`, one UID, the
+    /// 34-byte `OfficeArtMetafileHeader` ([MS-ODRAW] §2.2.31) and the
+    /// payload, compressed when `compressed` is set.
+    fn make_metafile_blip(rec_type: u16, inst: u16, raw: &[u8], compressed: bool) -> Vec<u8> {
+        let payload = if compressed { zlib(raw) } else { raw.to_vec() };
+        let mut mf = Vec::new();
+        mf.extend_from_slice(&(raw.len() as u32).to_le_bytes()); // cbSize
+        mf.extend_from_slice(&[0u8; 16]); // rcBounds
+        mf.extend_from_slice(&[0u8; 8]); // ptSize
+        mf.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // cbSave
+        mf.push(if compressed { 0x00 } else { 0xFE }); // compression
+        mf.push(0xFE); // filter
+        let mut body = vec![0u8; uid_size(rec_type, inst)];
+        body.extend_from_slice(&mf);
+        body.extend_from_slice(&payload);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(inst << 4).to_le_bytes());
+        buf.extend_from_slice(&rec_type.to_le_bytes());
+        buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        buf.extend(body);
+        buf
+    }
+
+    fn fake_emf() -> Vec<u8> {
+        let mut emf = vec![0x01, 0x00, 0x00, 0x00, 0x6C, 0x00, 0x00, 0x00];
+        emf.extend(std::iter::repeat_n(0x20u8, 200));
+        emf.extend_from_slice(b" EMF");
+        emf
+    }
+
+    /// [MS-ODRAW] §2.2.31: a metafile BLIP whose `compression` is
+    /// `msocompressionDeflate` (0x00) holds a zlib stream. It was returned
+    /// still compressed, labelled `image/x-emf`.
+    #[test]
+    fn test_compressed_emf_blip_is_inflated() {
+        let emf = fake_emf();
+        let stream = make_metafile_blip(0xF01A, 0x3D4, &emf, true);
+        let images = extract_blip_images(&stream);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, BlipFormat::Emf);
+        assert_eq!(images[0].data, emf);
+    }
+
+    #[test]
+    fn test_compressed_wmf_and_pict_blips_are_inflated() {
+        let raw: Vec<u8> = (0..300u32).map(|i| (i % 7) as u8).collect();
+        for (rt, inst) in [(0xF01B, 0x216), (0xF01C, 0x543)] {
+            let stream = make_metafile_blip(rt, inst, &raw, true);
+            let images = extract_blip_images(&stream);
+            assert_eq!(images.len(), 1, "record 0x{rt:04X}");
+            assert_eq!(images[0].data, raw, "record 0x{rt:04X}");
+        }
+    }
+
+    /// `msocompressionNone` (0xFE) payloads are returned as stored.
+    #[test]
+    fn test_uncompressed_metafile_blip_is_returned_as_stored() {
+        let emf = fake_emf();
+        let stream = make_metafile_blip(0xF01A, 0x3D4, &emf, false);
+        let images = extract_blip_images(&stream);
+        assert_eq!(images[0].data, emf);
+    }
+
+    /// A payload flagged compressed that is not a valid zlib stream is
+    /// not passed off as an image.
+    #[test]
+    fn test_corrupt_compressed_metafile_is_not_returned() {
+        let mut stream = make_metafile_blip(0xF01A, 0x3D4, &fake_emf(), true);
+        let payload_at = 8 + 16 + 34;
+        stream[payload_at] ^= 0xFF;
+        stream[payload_at + 1] ^= 0xFF;
+        assert!(extract_blip_images(&stream).is_empty());
+    }
+
+    /// Inflation stops at the header's declared uncompressed size.
+    #[test]
+    fn test_inflation_is_bounded_by_the_declared_size() {
+        let raw = vec![0u8; 100_000];
+        let mut stream = make_metafile_blip(0xF01B, 0x216, &raw, true);
+        // cbSize claims 1000 bytes.
+        let cb_at = 8 + 16;
+        stream[cb_at..cb_at + 4].copy_from_slice(&1000u32.to_le_bytes());
+        let images = extract_blip_images(&stream);
+        assert_eq!(images[0].data.len(), 1000);
     }
 
     #[test]

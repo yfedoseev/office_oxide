@@ -18,6 +18,12 @@ pub struct CfbReader<R> {
     entries: Vec<DirEntry>,
     /// The mini-stream data (read from the root entry's stream chain).
     mini_stream: Vec<u8>,
+    /// Names of streams whose read came back shorter than the size their
+    /// directory entry declares (see [`truncated_streams`](Self::truncated_streams)).
+    truncated: Vec<String>,
+    /// Structural disagreements found while opening the container (see
+    /// [`warnings`](Self::warnings)).
+    warnings: Vec<String>,
 }
 
 impl<R: Read + Seek> CfbReader<R> {
@@ -35,8 +41,16 @@ impl<R: Read + Seek> CfbReader<R> {
         }
         let header = CfbHeader::parse(&header_buf)?;
 
+        let mut warnings = Vec::new();
+
         // Build the FAT.
-        let fat = Self::read_fat(&mut reader, &header)?;
+        let (fat, difat_sectors_walked) = Self::read_fat(&mut reader, &header)?;
+        if difat_sectors_walked != u64::from(header.difat_sector_count) {
+            warnings.push(format!(
+                "header declares {} DIFAT sectors; the DIFAT chain has {difat_sectors_walked}",
+                header.difat_sector_count
+            ));
+        }
 
         // Read directory entries.
         let dir_data = Self::read_chain(&mut reader, &header, &fat, header.first_dir_sector)?;
@@ -46,6 +60,13 @@ impl<R: Read + Seek> CfbReader<R> {
         let mini_fat = if header.first_mini_fat_sector <= MAX_REG_SECT {
             let mini_fat_data =
                 Self::read_chain(&mut reader, &header, &fat, header.first_mini_fat_sector)?;
+            let walked = mini_fat_data.len().div_ceil(header.sector_size);
+            if walked != header.mini_fat_sector_count as usize {
+                warnings.push(format!(
+                    "header declares {} mini FAT sectors; the mini FAT chain has {walked}",
+                    header.mini_fat_sector_count
+                ));
+            }
             let (quads, _rest) = mini_fat_data.as_chunks::<4>();
             quads.iter().copied().map(u32::from_le_bytes).collect()
         } else {
@@ -57,11 +78,20 @@ impl<R: Read + Seek> CfbReader<R> {
             && entries[0].entry_type == EntryType::RootStorage
             && entries[0].start_sector <= MAX_REG_SECT
         {
-            Self::read_chain(&mut reader, &header, &fat, entries[0].start_sector)?
+            // [MS-CFB] §2.5: the mini stream is exactly the root entry's
+            // `stream_size` bytes; the chain is read in whole sectors, and
+            // anything past the declared size is not part of it.
+            let mut ms = Self::read_chain(&mut reader, &header, &fat, entries[0].start_sector)?;
+            let declared = usize::try_from(entries[0].stream_size).unwrap_or(usize::MAX);
+            ms.truncate(declared);
+            ms
         } else {
             Vec::new()
         };
 
+        for w in &warnings {
+            log::warn!("cfb: {w}");
+        }
         Ok(Self {
             reader,
             header,
@@ -69,7 +99,26 @@ impl<R: Read + Seek> CfbReader<R> {
             mini_fat,
             entries,
             mini_stream,
+            truncated: Vec::new(),
+            warnings,
         })
+    }
+
+    /// Names of the streams read so far whose data came back shorter than
+    /// the size their directory entry declares — the sector chain ran off
+    /// the end of the file or of the FAT, or the mini stream ended first.
+    /// The short data is still returned (a truncated file stays readable);
+    /// this is how a caller tells it apart from a complete stream.
+    pub fn truncated_streams(&self) -> &[String] {
+        &self.truncated
+    }
+
+    /// Structural disagreements found while opening the container that did
+    /// not prevent reading it: header sector counts ([MS-CFB] §2.2
+    /// `Number of DIFAT Sectors` / `Number of Mini FAT Sectors`) that do
+    /// not match the chains actually present.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// Get all directory entries.
@@ -158,7 +207,6 @@ impl<R: Read + Seek> CfbReader<R> {
         // bound and overflowed the stack — an abort no caller can catch,
         // reachable from `open_stream` on every legacy format. Each entry
         // is visited at most once, so the walk is bounded by the directory.
-        let lower = name.to_ascii_lowercase();
         let mut visited = vec![false; self.entries.len()];
         let mut stack = vec![node_id];
         while let Some(id) = stack.pop() {
@@ -167,7 +215,7 @@ impl<R: Read + Seek> CfbReader<R> {
             }
             visited[id as usize] = true;
             let entry = &self.entries[id as usize];
-            if entry.name.to_ascii_lowercase() == lower {
+            if cfb_names_equal(&entry.name, name) {
                 return Some(id as usize);
             }
             // Search both subtrees (the tree may not be well-ordered in
@@ -194,16 +242,24 @@ impl<R: Read + Seek> CfbReader<R> {
 
         // Decide: regular stream or mini-stream?
         // Use mini-stream only if: size < cutoff, not root, and mini-stream exists.
-        if size < self.header.mini_stream_cutoff as usize
+        let is_mini = size < self.header.mini_stream_cutoff as usize
             && entry.entry_type != EntryType::RootStorage
-            && !self.mini_stream.is_empty()
-        {
-            self.read_mini_stream(start, size)
+            && !self.mini_stream.is_empty();
+        let name = entry.name.clone();
+        let data = if is_mini {
+            self.read_mini_stream(start, size)?
         } else {
             let mut data = Self::read_chain(&mut self.reader, &self.header, &self.fat, start)?;
             data.truncate(size);
-            Ok(data)
+            data
+        };
+        if data.len() < size {
+            log::warn!("cfb: stream {name:?} is truncated: {} of {size} bytes", data.len());
+            if !self.truncated.contains(&name) {
+                self.truncated.push(name);
+            }
         }
+        Ok(data)
     }
 
     /// Open a stream by name (case-insensitive).
@@ -230,7 +286,8 @@ impl<R: Read + Seek> CfbReader<R> {
     // ── Internal helpers ──
 
     /// Build the complete FAT from DIFAT entries (header + DIFAT chain).
-    fn read_fat(reader: &mut R, header: &CfbHeader) -> Result<Vec<u32>> {
+    /// Also returns how many DIFAT sectors the chain walked.
+    fn read_fat(reader: &mut R, header: &CfbHeader) -> Result<(Vec<u32>, u64)> {
         // Collect all FAT sector locations from DIFAT.
         let mut fat_sectors: Vec<u32> = header
             .header_difat
@@ -276,6 +333,12 @@ impl<R: Read + Seek> CfbReader<R> {
                     fat_sectors.push(val);
                 }
             }
+            // No valid file holds more FAT sectors than sectors; stop
+            // collecting (the check below reports it) rather than keep
+            // growing the list for the rest of the chain.
+            if fat_sectors.len() as u64 > sectors_in_file.saturating_add(109) {
+                break;
+            }
 
             // Next DIFAT sector.
             let next_off = entries_per_difat * 4;
@@ -285,6 +348,32 @@ impl<R: Read + Seek> CfbReader<R> {
                 sector_buf[next_off + 2],
                 sector_buf[next_off + 3],
             ]);
+        }
+
+        // [MS-CFB] §2.2 `Number of FAT Sectors`: only that many DIFAT
+        // entries name FAT sectors. Slots past it are unused, whatever a
+        // writer left in them.
+        let declared = header.fat_sector_count as usize;
+        if declared > 0 && fat_sectors.len() > declared {
+            fat_sectors.truncate(declared);
+        }
+        // Every FAT sector lives inside the file, and each is listed once:
+        // a repeat would append its entries twice and shift every later FAT
+        // index onto the wrong sector. Both bound the FAT to the file's own
+        // size — a DIFAT naming far-away sectors otherwise sized the FAT at
+        // up to 127 times the file.
+        if fat_sectors.len() as u64 > sectors_in_file {
+            return Err(CfbError::CorruptedStream(format!(
+                "{} FAT sectors declared in a file of {sectors_in_file} sectors",
+                fat_sectors.len()
+            )));
+        }
+        let mut seen = fat_sectors.clone();
+        seen.sort_unstable();
+        if seen.windows(2).any(|w| w[0] == w[1]) {
+            return Err(CfbError::CorruptedStream(
+                "a FAT sector is listed more than once in the DIFAT".into(),
+            ));
         }
 
         // Read each FAT sector and concatenate entries.
@@ -310,7 +399,7 @@ impl<R: Read + Seek> CfbReader<R> {
             }
         }
 
-        Ok(fat)
+        Ok((fat, visited_difat))
     }
 
     /// Read a chain of sectors starting at `start` and return the concatenated data.
@@ -382,7 +471,9 @@ impl<R: Read + Seek> CfbReader<R> {
 
     /// Read from the mini-stream using mini-FAT chain.
     fn read_mini_stream(&self, start: u32, size: usize) -> Result<Vec<u8>> {
-        let mut data = Vec::with_capacity(size);
+        // The declared size comes from the file; the mini stream is what
+        // actually backs it, so never reserve past that.
+        let mut data = Vec::with_capacity(size.min(self.mini_stream.len()));
         let mut sector = start;
         let mut remaining = size;
         let mini_sector_size = self.header.mini_sector_size;
@@ -420,6 +511,20 @@ impl<R: Read + Seek> CfbReader<R> {
 
         Ok(data)
     }
+}
+
+/// Directory-entry name equality per [MS-CFB] §2.6.4: case-insensitive by
+/// Unicode simple upper-case mapping — each character upper-cases to at
+/// most one character (so `ß` stays `ß`, it does not expand to `SS`).
+fn cfb_names_equal(a: &str, b: &str) -> bool {
+    fn simple_upper(c: char) -> char {
+        let mut up = c.to_uppercase();
+        match (up.next(), up.next()) {
+            (Some(u), None) => u,
+            _ => c,
+        }
+    }
+    a.chars().map(simple_upper).eq(b.chars().map(simple_upper))
 }
 
 /// Read as much as possible into `buf`, returning the number of bytes read.
@@ -989,6 +1094,182 @@ mod tests {
         let mut reader = CfbReader::new(cursor).unwrap();
         let stream = reader.open_stream("SmallStream").unwrap();
         assert_eq!(&stream, b"Small");
+    }
+
+    /// [MS-CFB] §2.2 fixes the mini stream cutoff at 4096 bytes. A header
+    /// declaring a huge cutoff sent a stream claiming ~4 GB down the
+    /// mini-stream path, which reserved the whole claimed size up front.
+    /// The cutoff is the spec constant, and no read reserves more than the
+    /// bytes that back it.
+    #[test]
+    fn test_header_mini_stream_cutoff_does_not_size_an_allocation() {
+        let mut data = build_cfb_with_mini_stream();
+        data[0x38..0x3C].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let e1 = 512 + 128;
+        data[e1 + 0x78..e1 + 0x7C].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+        let file_len = data.len();
+        let mut reader = CfbReader::new(Cursor::new(data)).unwrap();
+        assert_eq!(reader.header().mini_stream_cutoff, 4096);
+        let stream = reader.open_stream("SmallStream").unwrap();
+        assert!(
+            stream.capacity() <= file_len,
+            "reserved {} bytes for a {file_len}-byte file",
+            stream.capacity()
+        );
+    }
+
+    /// A stream under the cutoff whose declared size exceeds the whole
+    /// mini stream reserves no more than the mini stream holds.
+    #[test]
+    fn test_mini_stream_read_reserves_at_most_the_mini_stream() {
+        let mut data = build_cfb_with_mini_stream();
+        let e1 = 512 + 128;
+        data[e1 + 0x78..e1 + 0x7C].copy_from_slice(&4000u32.to_le_bytes());
+        let mut reader = CfbReader::new(Cursor::new(data)).unwrap();
+        let stream = reader.open_stream("SmallStream").unwrap();
+        assert!(stream.capacity() <= 512, "reserved {}", stream.capacity());
+        assert!(stream.starts_with(b"Small"));
+    }
+
+    /// Append one extra 512-byte sector to `file` and return its index.
+    fn push_sector(file: &mut Vec<u8>, fill: u8) -> u32 {
+        let idx = (file.len() / 512 - 1) as u32;
+        file.extend(std::iter::repeat_n(fill, 512));
+        idx
+    }
+
+    /// A FAT sector listed twice appended its entries twice, shifting every
+    /// later FAT index, so chains resolved to the wrong sectors.
+    #[test]
+    fn test_fat_sector_listed_twice_is_an_error() {
+        let mut file = build_minimal_cfb();
+        file[0x2C..0x30].copy_from_slice(&2u32.to_le_bytes());
+        file[0x50..0x54].copy_from_slice(&1u32.to_le_bytes()); // DIFAT[1] = sector 1 again
+        let err = CfbReader::new(Cursor::new(file))
+            .err()
+            .expect("must be refused");
+        assert!(
+            matches!(err, CfbError::CorruptedStream(ref m) if m.contains("more than once")),
+            "{err:?}"
+        );
+    }
+
+    /// Header DIFAT slots past the declared FAT sector count are not FAT
+    /// sectors, whatever they hold ([MS-CFB] §2.2: `Number of FAT Sectors`).
+    #[test]
+    fn test_difat_slots_past_the_declared_fat_count_are_ignored() {
+        let mut file = build_minimal_cfb();
+        for i in 1..109 {
+            let off = 0x4C + i * 4;
+            file[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+        }
+        let mut reader = CfbReader::new(Cursor::new(file)).unwrap();
+        assert_eq!(reader.open_stream("TestStream").unwrap(), b"Hello, CFB!");
+    }
+
+    /// Every DIFAT sector can name 127 FAT sectors, and each FAT sector
+    /// became 512 bytes of FAT in memory whether or not it lay inside the
+    /// file: a DIFAT chain naming sectors far past the end of a tiny file
+    /// sized the FAT at ~127x the file. A FAT cannot have more sectors than
+    /// the file holds.
+    #[test]
+    fn test_fat_naming_more_sectors_than_the_file_holds_is_an_error() {
+        let mut file = build_minimal_cfb();
+        let difat = push_sector(&mut file, 0xFF);
+        let base = 512 + difat as usize * 512;
+        for i in 0..127u32 {
+            let off = base + i as usize * 4;
+            file[off..off + 4].copy_from_slice(&(10_000 + i).to_le_bytes());
+        }
+        file[base + 508..base + 512].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+        file[0x2C..0x30].copy_from_slice(&128u32.to_le_bytes());
+        file[0x44..0x48].copy_from_slice(&difat.to_le_bytes());
+        file[0x48..0x4C].copy_from_slice(&1u32.to_le_bytes());
+        let err = CfbReader::new(Cursor::new(file))
+            .err()
+            .expect("must be refused");
+        assert!(
+            matches!(err, CfbError::CorruptedStream(ref m) if m.contains("FAT sectors")),
+            "{err:?}"
+        );
+    }
+
+    /// [MS-CFB] §2.5: the mini stream is the root entry's stream, exactly
+    /// `stream_size` bytes. The whole root chain was kept, rounded up to
+    /// full sectors, so a mini-sector past the declared end still read
+    /// bytes that are not part of the mini stream.
+    #[test]
+    fn test_mini_stream_is_bounded_by_the_root_stream_size() {
+        let mut data = build_cfb_with_mini_stream();
+        // Root: mini stream is 64 bytes (one mini-sector).
+        let root = 512;
+        data[root + 0x78..root + 0x7C].copy_from_slice(&64u32.to_le_bytes());
+        // SmallStream starts at mini-sector 1 — past the declared end.
+        let e1 = 512 + 128;
+        data[e1 + 0x74..e1 + 0x78].copy_from_slice(&1u32.to_le_bytes());
+        let ms = 512 + 2 * 512;
+        data[ms + 64..ms + 69].copy_from_slice(b"Stale");
+        let mf = 512 + 3 * 512;
+        data[mf + 4..mf + 8].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+        let mut reader = CfbReader::new(Cursor::new(data)).unwrap();
+        let stream = reader.open_stream("SmallStream").unwrap();
+        assert_ne!(stream, b"Stale", "read past the mini stream's declared end");
+        assert_eq!(reader.truncated_streams(), ["SmallStream"]);
+    }
+
+    /// A stream whose chain ends before its declared size came back short
+    /// with nothing to tell it apart from a complete one. The short read
+    /// is still returned — truncated files stay readable — and recorded.
+    #[test]
+    fn test_a_short_stream_read_is_recorded_as_truncated() {
+        let (mut file, payload) = build_cfb_with_contiguous_stream(1);
+        let e1 = 512 + 128;
+        file[e1 + 0x78..e1 + 0x7C].copy_from_slice(&2000u32.to_le_bytes());
+        let mut reader = CfbReader::new(Cursor::new(file)).unwrap();
+        assert!(reader.truncated_streams().is_empty());
+        let data = reader.open_stream("BigStream").unwrap();
+        assert!(data.starts_with(&payload));
+        assert_eq!(reader.truncated_streams(), ["BigStream"]);
+    }
+
+    /// A complete read records nothing.
+    #[test]
+    fn test_a_complete_stream_read_is_not_recorded_as_truncated() {
+        let mut reader = CfbReader::new(Cursor::new(build_minimal_cfb())).unwrap();
+        reader.open_stream("TestStream").unwrap();
+        assert!(reader.truncated_streams().is_empty());
+    }
+
+    /// [MS-CFB] §2.6.4 compares directory names case-insensitively by
+    /// Unicode simple upper-casing, not ASCII only.
+    #[test]
+    fn test_directory_names_match_unicode_case_insensitively() {
+        let mut file = build_minimal_cfb();
+        let e1 = 512 + 128;
+        file[e1..e1 + 64].fill(0);
+        write_dir_entry(&mut file[e1..e1 + 128], "Ärger", 2, NO_ENTRY, 2, 11);
+        let mut reader = CfbReader::new(Cursor::new(file)).unwrap();
+        assert_eq!(reader.open_stream("äRGER").unwrap(), b"Hello, CFB!");
+        // Simple case mapping only: `ß` does not expand to `SS`.
+        assert!(!cfb_names_equal("ß", "SS"));
+        assert!(cfb_names_equal("ǆ", "Ǆ"));
+        assert!(!cfb_names_equal("Ärger", "Ärge"));
+    }
+
+    /// The header's DIFAT and mini-FAT sector counts are cross-checked
+    /// against the chains actually walked; a disagreement is reported.
+    #[test]
+    fn test_declared_sector_counts_are_cross_checked() {
+        let reader = CfbReader::new(Cursor::new(build_cfb_with_mini_stream())).unwrap();
+        assert!(reader.warnings().is_empty(), "{:?}", reader.warnings());
+
+        let mut data = build_cfb_with_mini_stream();
+        data[0x40..0x44].copy_from_slice(&7u32.to_le_bytes()); // mini-FAT sectors
+        data[0x48..0x4C].copy_from_slice(&3u32.to_le_bytes()); // DIFAT sectors
+        let reader = CfbReader::new(Cursor::new(data)).unwrap();
+        let w = reader.warnings().join("\n");
+        assert!(w.contains("mini FAT"), "{w}");
+        assert!(w.contains("DIFAT"), "{w}");
     }
 
     #[test]

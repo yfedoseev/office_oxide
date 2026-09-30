@@ -76,6 +76,9 @@ log = "0.4"
 encoding_rs = "0.8"
 atoi_simd = "0.18"
 fast-float2 = "0.2"
+# zlib inflate for compressed OfficeArt metafile BLIPs ([MS-ODRAW]); the
+# same flate2/zlib-rs build `zip`'s deflate feature already pulls in.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 
 # Optional
 memmap2 = { version = "0.9", optional = true }

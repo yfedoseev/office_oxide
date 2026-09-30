@@ -12,8 +12,6 @@ use crate::ir::*;
 /// (and, eventually, lists). Otherwise we fall back to a line-based
 /// heuristic over the sanitised text — the original `.doc` behaviour.
 pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
-    let mut elements: Vec<Element> = Vec::new();
-
     let paragraphs = doc.paragraphs();
     // One whole-document decision, taken before the walk, gated on the
     // *outcome*: run the line-shape heading guess only when no paragraph
@@ -26,19 +24,45 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     // `metadata.title` and `Section.title`, both of which are derived from
     // the first `Element::Heading` below.
     let has_structured_headings = paragraphs.iter().any(|p| p.props.outline_level.is_some());
+    let mut warnings = doc.warnings().to_vec();
+
+    // One IR `Section` per document section. `build_paragraphs` ends a
+    // section's last paragraph at its section mark (terminator 0x0C, only
+    // where `PlcfSed` puts a section end), so the paragraphs split there.
+    let mut section_bodies: Vec<Vec<Element>> = Vec::new();
     if !paragraphs.is_empty() {
-        walk_paragraphs(paragraphs, has_structured_headings, &mut elements, doc.list_formatting());
+        let mut flattened = 0;
+        for group in paragraphs.split_inclusive(|p| p.terminator == '\u{C}') {
+            let mut elements = Vec::new();
+            flattened += walk_paragraphs(
+                group,
+                has_structured_headings,
+                &mut elements,
+                doc.list_formatting(),
+            );
+            section_bodies.push(elements);
+        }
+        if flattened > 0 {
+            warnings.push(format!(
+                "{flattened} table(s) containing nested tables were flattened into their outer table"
+            ));
+        }
     } else {
+        let mut elements = Vec::new();
         line_heuristic(doc.plain_text_ref(), &mut elements);
+        section_bodies.push(elements);
     }
 
     // The whole heading, not its first span: a heading with a formatting
     // change mid-way gave a title that matched no heading, so the
     // renderers printed it twice.
-    let heading_title = elements.iter().find_map(|e| match e {
-        Element::Heading(h) => Some(inline_to_text(&h.content)),
-        _ => None,
-    });
+    let first_heading = |elements: &[Element]| {
+        elements.iter().find_map(|e| match e {
+            Element::Heading(h) => Some(inline_to_text(&h.content)),
+            _ => None,
+        })
+    };
+    let heading_title = section_bodies.iter().find_map(|b| first_heading(b));
     // The file's own declared title (from `\x05SummaryInformation`) beats
     // a line-shape guess whenever both exist — a document can style
     // *some* headings and still use plain ALL-CAPS lines for others
@@ -49,32 +73,38 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
         .filter(|t| !t.is_empty())
         .or_else(|| heading_title.clone());
 
-    // The section's title is the heading the section itself carries, as
+    // Each section's title is the heading the section itself carries, as
     // in every other converter. Giving it the file's declared title
     // (metadata, not content) made the IR renderers print a line the
     // document's text does not have.
-    let mut sections = vec![Section {
-        title: heading_title,
-        elements,
-        ..Default::default()
-    }];
-
-    // The header document's PlcfHdd-delimited stories for the first
-    // section — this crate models only one `ir::Section` per DOC
-    // document, so a document with 2+ sections only surfaces the first
-    // one's headers/footers here. When PlcfHdd yielded
-    // nothing (older/malformed files), every field below is `None` and
-    // the generic-TextBox fallback in the loop below still applies.
-    let hf = doc.header_footer();
-    if let Some(section) = sections.last_mut() {
-        section.even_page_header = hf.even_header.as_deref().map(text_to_header_footer);
-        section.header = hf.odd_header.as_deref().map(text_to_header_footer);
-        section.even_page_footer = hf.even_footer.as_deref().map(text_to_header_footer);
-        section.footer = hf.odd_footer.as_deref().map(text_to_header_footer);
-        section.first_page_header = hf.first_header.as_deref().map(text_to_header_footer);
-        section.first_page_footer = hf.first_footer.as_deref().map(text_to_header_footer);
-    }
-    let header_footer_structured = !hf.is_empty();
+    //
+    // Each section gets its own `PlcfHdd` headers/footers (already
+    // inheritance-resolved per [MS-DOC] "Plcfhdd"); a section past the
+    // stories the file holds reuses the last. When PlcfHdd yielded nothing
+    // (older/malformed files), every field is `None` and the generic
+    // TextBox fallback in the loop below still applies.
+    let hfs = doc.header_footers();
+    let mut sections: Vec<Section> = section_bodies
+        .into_iter()
+        .enumerate()
+        .map(|(i, elements)| {
+            let mut section = Section {
+                title: first_heading(&elements),
+                elements,
+                ..Default::default()
+            };
+            if let Some(hf) = hfs.get(i).or(hfs.last()) {
+                section.even_page_header = hf.even_header.as_deref().map(text_to_header_footer);
+                section.header = hf.odd_header.as_deref().map(text_to_header_footer);
+                section.even_page_footer = hf.even_footer.as_deref().map(text_to_header_footer);
+                section.footer = hf.odd_footer.as_deref().map(text_to_header_footer);
+                section.first_page_header = hf.first_header.as_deref().map(text_to_header_footer);
+                section.first_page_footer = hf.first_footer.as_deref().map(text_to_header_footer);
+            }
+            section
+        })
+        .collect();
+    let header_footer_structured = hfs.iter().any(|hf| !hf.is_empty());
 
     // Footnotes, headers, comments, endnotes and text boxes live after the
     // main text in the same character space. Their `ccp*` lengths were
@@ -129,19 +159,10 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             // fallback path for a Comments substory whose `doc.comments()`
             // came back empty (PLC absent/malformed/mismatched) — it stays
             // merged into one Note, same as before endnote/comment splitting existed.
-            let splittable = matches!(
-                sub.kind,
-                crate::doc::SubDocumentKind::Footnotes | crate::doc::SubDocumentKind::Endnotes
-            ) && sub.text.contains('\u{2}');
-
-            let bodies: Vec<&str> = if splittable {
-                sub.text
-                    .split('\u{2}')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            } else {
+            let bodies: Vec<&str> = if sub.parts.is_empty() {
                 vec![sub.text.as_str()]
+            } else {
+                sub.parts.iter().map(String::as_str).collect()
             };
 
             for body in bodies {
@@ -235,6 +256,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             modified: summary.and_then(|s| s.modified.clone()),
             has_macros: doc.has_macros(),
             text_truncated: !doc.text_complete(),
+            warnings,
             ..crate::core::core_properties::legacy_metadata_extras(summary)
         },
         sections,
@@ -278,6 +300,9 @@ struct TableBuilder {
     /// Block elements of the cell under construction (for multi-paragraph
     /// cells where interior paragraphs are `\r`-terminated).
     cell: Vec<Element>,
+    /// Tables flushed so far that held nested rows (`itap > 1`) and were
+    /// flattened into their outer grid.
+    flattened_nested: usize,
 }
 
 impl TableBuilder {
@@ -287,6 +312,7 @@ impl TableBuilder {
             rows: Vec::new(),
             row_cells: Vec::new(),
             cell: Vec::new(),
+            flattened_nested: 0,
         }
     }
 
@@ -319,6 +345,7 @@ impl TableBuilder {
                 first_line_indent_twips: p.props.first_line_indent_twips,
                 space_before_twips: p.props.space_before_twips,
                 space_after_twips: p.props.space_after_twips,
+                line_spacing: p.props.line_spacing.clone(),
                 ..Default::default()
             }));
         }
@@ -361,16 +388,11 @@ impl TableBuilder {
         if !self.rows.is_empty() {
             // Nested tables (itap > 1) are not yet represented as nested
             // `Table` blocks; the rows are flattened into the outer grid.
-            // Surface that as a visible notice rather than silently emitting a
-            // wrong structure (robustness contract: degrade gracefully).
+            // Counted, and reported as a metadata warning by the caller —
+            // not written into the document as a line of text it does not
+            // have.
             if self.rows.iter().any(|r| r.itap > 1) {
-                elements.push(Element::Paragraph(Paragraph {
-                    content: vec![InlineContent::Text(TextSpan::plain(
-                        "[nested table detected — not yet supported, flattened into the \
-                         outer table]",
-                    ))],
-                    ..Default::default()
-                }));
+                self.flattened_nested += 1;
             }
             let rows = build_table_rows(&self.rows);
             elements.push(Element::Table(Table {
@@ -574,22 +596,21 @@ fn count_grid_edges(centers: &[i16], col: usize, grid: &[i32]) -> u32 {
 fn is_doc_list_item(ilfo: Option<i16>) -> bool {
     match ilfo {
         None | Some(0) | Some(-2047) => false, // 0x0000 / 0xF801: not in a list
-        // TODO(ilfo-negated): 0xF802..=0xFFFF (i16 -2046..=-1) are list items
-        // whose `ilfo` is the negation of a 1-based index; resolve to the
-        // positive index when list-id grouping is implemented. Until then they
-        // must still be emitted as list items, not dropped to prose.
+        // 0xF802..=0xFFFF (i16 -2046..=-1): the negation of a 1-based index,
+        // still a list item; `ListFormatting::level_for` resolves it.
         Some(v) if (1..=0x07FE).contains(&v) => true, // 0x0001..0x07FE normal
         Some(v) if (-0x07FE..=-1).contains(&v) => true, // 0xF802..0xFFFF negated
         _ => false,                                   // 0x07FF and other non-spec
     }
 }
 
+/// Returns how many tables holding nested tables were flattened.
 fn walk_paragraphs(
     paragraphs: &[DocParagraph],
     has_structured_headings: bool,
     elements: &mut Vec<Element>,
     list_formatting: &ListFormatting,
-) {
+) -> usize {
     let mut table = TableBuilder::new();
     let mut list_items: Vec<(u8, Vec<InlineContent>)> = Vec::new();
     // The run's own `ilfo` — every item in one contiguous list
@@ -640,6 +661,7 @@ fn walk_paragraphs(
                     first_line_indent_twips: p.props.first_line_indent_twips,
                     space_before_twips: p.props.space_before_twips,
                     space_after_twips: p.props.space_after_twips,
+                    line_spacing: p.props.line_spacing.clone(),
                     ..Default::default()
                 }));
             } else {
@@ -649,6 +671,7 @@ fn walk_paragraphs(
     }
     table.flush(elements);
     flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
+    table.flattened_nested
 }
 
 /// Emit the accumulated list run as an `Element::List` and clear it.
@@ -729,6 +752,11 @@ fn styled_span(text: &str, props: &ChpProps) -> TextSpan {
         underline: props.underline.clone(),
         color: props.color,
         font_size_half_pt: props.font_size_half_pt,
+        strikethrough: props.strike,
+        vertical_align: props.vertical_align(),
+        highlight: props.highlight,
+        all_caps: props.all_caps,
+        small_caps: props.small_caps,
         ..TextSpan::plain(text)
     }
 }
@@ -926,6 +954,7 @@ fn emit_prose(
             first_line_indent_twips: props.first_line_indent_twips,
             space_before_twips: props.space_before_twips,
             space_after_twips: props.space_after_twips,
+            line_spacing: props.line_spacing.clone(),
             ..Default::default()
         }));
     }
@@ -1220,6 +1249,25 @@ mod tests {
         );
     }
 
+    /// Strikethrough, super/subscript, highlight and caps decoded from
+    /// CHP SPRMs reach the IR's `TextSpan`; they were never set for DOC.
+    #[test]
+    fn test_chp_decoration_reaches_textspan() {
+        let props = ChpProps {
+            strike: true,
+            iss: Some(crate::ir::VerticalAlign::Superscript),
+            highlight: Some([0xFF, 0xFF, 0x00]),
+            all_caps: true,
+            small_caps: true,
+            ..Default::default()
+        };
+        let span = styled_span("x", &props);
+        assert!(span.strikethrough);
+        assert_eq!(span.vertical_align, Some(crate::ir::VerticalAlign::Superscript));
+        assert_eq!(span.highlight, Some([0xFF, 0xFF, 0x00]));
+        assert!(span.all_caps && span.small_caps);
+    }
+
     /// Regression: paragraph alignment/indentation/spacing
     /// from PAP SPRMs reach the IR's `Paragraph`, not the always-`None`
     /// defaults from before this fix.
@@ -1232,6 +1280,7 @@ mod tests {
             first_line_indent_twips: Some(-360),
             space_before_twips: Some(200),
             space_after_twips: Some(100),
+            line_spacing: Some(crate::ir::LineSpacing::Auto(360)),
             ..Default::default()
         };
         let p = para("A centered, indented paragraph.", props);
@@ -1246,6 +1295,7 @@ mod tests {
         assert_eq!(par.first_line_indent_twips, Some(-360));
         assert_eq!(par.space_before_twips, Some(200));
         assert_eq!(par.space_after_twips, Some(100));
+        assert_eq!(par.line_spacing, Some(crate::ir::LineSpacing::Auto(360)));
     }
 
     /// Medium #4: a soft line break (`0x0B`, which `sanitize_text` maps to
@@ -1287,10 +1337,11 @@ mod tests {
         );
     }
 
-    /// Medium #2: a nested table (`itap > 1`) is flattened, not silently
-    /// mis-rendered — a visible notice paragraph must accompany the table.
+    /// A nested table (`itap > 1`) is flattened, not silently mis-rendered:
+    /// the walk reports it (for `Metadata::warnings`) and writes no text
+    /// the document does not have.
     #[test]
-    fn test_nested_table_itap_emits_notice() {
+    fn test_nested_table_itap_is_reported_not_written_as_text() {
         let props = PapProps {
             is_table_trailing_mark: true,
             itap: 2, // nested
@@ -1300,22 +1351,16 @@ mod tests {
         let row = para("", props);
 
         let mut els = Vec::new();
-        walk_paragraphs(&[row], false, &mut els, &ListFormatting::default());
+        let flattened = walk_paragraphs(&[row], false, &mut els, &ListFormatting::default());
 
         assert!(
             els.iter().any(|e| matches!(e, Element::Table(_))),
             "the (flattened) table must still be emitted"
         );
+        assert_eq!(flattened, 1, "the flattening must be reported");
         assert!(
-            els.iter().any(|e| matches!(
-                e,
-                Element::Paragraph(p)
-                    if p.content.iter().any(|c| matches!(
-                        c,
-                        InlineContent::Text(t) if t.text.contains("nested table")
-                    ))
-            )),
-            "a nested-table notice must be emitted (no silent flattening)"
+            !els.iter().any(|e| matches!(e, Element::Paragraph(_))),
+            "no notice paragraph may be written into the document: {els:?}"
         );
     }
 
@@ -1376,7 +1421,7 @@ mod tests {
     }
 
     /// `0xF802`–`0xFFFF` is the negation of a 1-based index and is still a list
-    /// item (see TODO(ilfo-negated)); it must not be dropped to prose.
+    /// item; it must not be dropped to prose.
     #[test]
     fn test_ilfo_negated_band_is_list() {
         let props = PapProps {
@@ -1391,6 +1436,39 @@ mod tests {
             els.iter().any(|e| matches!(e, Element::List(_))),
             "0xF802 (negated index) must still be a list item"
         );
+    }
+
+    /// A negated `ilfo` ([MS-DOC] §2.6.2 `sprmPIlfo`: `0xF802`–`0xFFFF` is
+    /// the negation of a 1-based `PlfLfo` index) resolves to the same list
+    /// as its positive form. It was passed on negative and resolved to
+    /// nothing: a bullet with no start number even when the LFO said
+    /// otherwise.
+    #[test]
+    fn test_negated_ilfo_resolves_through_list_formatting() {
+        let list_formatting = crate::doc::ListFormatting::from_parts(
+            vec![(
+                7,
+                vec![crate::doc::ListLevel {
+                    start_at: 3,
+                    nfc: 0x00,
+                }],
+            )],
+            vec![7],
+        );
+        let props = PapProps {
+            ilvl: Some(0),
+            ilfo: Some(-1), // 0xFFFF: negated index 1
+            ..PapProps::default()
+        };
+        let mut els = Vec::new();
+        walk_paragraphs(&[para("Item", props)], false, &mut els, &list_formatting);
+        let Element::List(list) = &els[0] else {
+            panic!("expected a List element, got {els:#?}");
+        };
+        assert!(list.ordered);
+        assert_eq!(list.start_number, Some(3));
+        // 0xF801 is still "not in a list".
+        assert!(list_formatting.level_for(-2047, 0).is_none());
     }
 
     /// A list run's `ilfo` must resolve through `PlfLfo`'s
