@@ -274,6 +274,8 @@ impl XlsxDocument {
         struct SheetBundle {
             name: String,
             state: SheetState,
+            kind: crate::ir::SheetKind,
+            chart_text: Vec<String>,
             tables: Vec<worksheet::SheetTable>,
             pivot_tables: Vec<worksheet::SheetPivotTable>,
             data: Vec<u8>,
@@ -287,23 +289,23 @@ impl XlsxDocument {
         // workbook share one text budget, like every other cell text.
         let mut pivot_budget = crate::limits::TextBudget::new();
         let mut unreadable_sheets: Vec<(String, String)> = Vec::new();
+        // Chart parts a chartsheet displays: their text is that sheet's
+        // content, not repeated among the embedded charts'.
+        let mut chartsheet_charts: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for sheet in &workbook.sheets {
             // Skip sheets with empty r:id (virtual sheets, VBA modules, etc.)
             if sheet.rel_id.is_empty() {
                 continue;
             }
 
-            // A chartsheet, dialog sheet or macro sheet is not a
-            // worksheet ([ECMA-376] §12.3.2, §12.3.7): it has no cells, and
-            // parsed as one it became an empty sheet under the chart's
-            // name. Its chart's text reaches `chart_text` with every other
-            // chart part's.
-            if wb_rels
-                .get_by_id(&sheet.rel_id)
-                .is_some_and(|rel| rel.rel_type != rel_types::WORKSHEET)
-            {
+            // What the sheet is comes from its relationship type. A
+            // macro sheet has a worksheet's cell content; a chartsheet or
+            // dialog sheet ([ECMA-376] §12.3.2, §12.3.7) is a named tab with
+            // no cells. Anything else is not a sheet.
+            let Some(kind) = sheet_kind_of(wb_rels.get_by_id(&sheet.rel_id)) else {
                 continue;
-            }
+            };
 
             // Resolve sheet path from relationships, or fall back to convention
             let sheet_path = if let Some(rel) = wb_rels.get_by_id(&sheet.rel_id) {
@@ -321,16 +323,61 @@ impl XlsxDocument {
                 format!("xl/worksheets/sheet{}.xml", idx)
             };
 
+            if matches!(kind, crate::ir::SheetKind::Chart | crate::ir::SheetKind::Dialog) {
+                // No cells to read. A chartsheet's content is the text of
+                // the chart its drawing references.
+                let chart_text = if kind == crate::ir::SheetKind::Chart {
+                    let paths = chartsheet_chart_parts(&mut archive, &entries, &sheet_path);
+                    let mut texts = Vec::new();
+                    for path in paths {
+                        if let Ok(data) = Self::read_xml_entry(&mut archive, &entries, &path) {
+                            let text = extract_chart_text(&data);
+                            if !text.is_empty() {
+                                texts.push(text);
+                            }
+                        }
+                        chartsheet_charts.insert(path);
+                    }
+                    texts
+                } else {
+                    Vec::new()
+                };
+                bundles.push(SheetBundle {
+                    name: sheet.name.clone(),
+                    state: sheet.state,
+                    kind,
+                    chart_text,
+                    tables: Vec::new(),
+                    pivot_tables: Vec::new(),
+                    data: Vec::new(),
+                    rels: Relationships::empty(),
+                    images: Vec::new(),
+                    text_shapes: Vec::new(),
+                    comments: Vec::new(),
+                });
+                continue;
+            }
+
             // The index-based name is a fallback for a part that is *missing*
             // (a relationship pointing nowhere); a part that exists but
             // cannot be read is that sheet's error, never a cue to read a
-            // different sheet's cells under this sheet's name.
+            // different sheet's cells under this sheet's name. Only a
+            // worksheet has a conventional name to fall back to.
             let read = match Self::read_xml_entry(&mut archive, &entries, &sheet_path) {
-                Err(crate::core::Error::MissingPart(_)) => {
-                    let idx = bundles.len() + 1;
+                Err(crate::core::Error::MissingPart(_))
+                    if kind == crate::ir::SheetKind::Worksheet =>
+                {
+                    let idx = bundles
+                        .iter()
+                        .filter(|b| b.kind == crate::ir::SheetKind::Worksheet)
+                        .count()
+                        + 1;
                     let alt = format!("xl/worksheets/sheet{}.xml", idx);
                     Self::read_xml_entry(&mut archive, &entries, &alt)
                         .map_err(|_| format!("worksheet part {sheet_path} not found"))
+                },
+                Err(crate::core::Error::MissingPart(_)) => {
+                    Err(format!("sheet part {sheet_path} not found"))
                 },
                 other => other.map_err(|e| format!("worksheet part {sheet_path}: {e}")),
             };
@@ -392,6 +439,8 @@ impl XlsxDocument {
             bundles.push(SheetBundle {
                 name: sheet.name.clone(),
                 state: sheet.state,
+                kind,
+                chart_text: Vec::new(),
                 tables,
                 pivot_tables,
                 data: ws_data,
@@ -408,8 +457,15 @@ impl XlsxDocument {
             bundles,
             |b| -> Result<std::result::Result<Worksheet, (String, String)>> {
                 let name = b.name.clone();
+                if matches!(b.kind, crate::ir::SheetKind::Chart | crate::ir::SheetKind::Dialog) {
+                    let mut ws = Worksheet::without_cells(b.name, b.kind);
+                    ws.state = b.state;
+                    ws.chart_text = b.chart_text;
+                    return Ok(Ok(ws));
+                }
                 match Worksheet::parse(&b.data, b.name, &b.rels) {
                     Ok(mut ws) => {
+                        ws.kind = b.kind;
                         ws.state = b.state;
                         ws.tables = b.tables;
                         ws.pivot_tables = b.pivot_tables;
@@ -475,6 +531,7 @@ impl XlsxDocument {
         let chart_names: Vec<String> = (0..archive.len())
             .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
             .filter(|n| n.starts_with("xl/charts/chart") && n.ends_with(".xml"))
+            .filter(|n| !chartsheet_charts.contains(n))
             .collect();
         for name in chart_names {
             if let Ok(data) = Self::read_xml_entry(&mut archive, &entries, &name) {
@@ -881,6 +938,54 @@ fn drop_pivot_caches_backed_by_tables(worksheets: &mut [Worksheet]) {
             pivot.cache_data = None;
         }
     }
+}
+
+/// The kind of sheet a workbook `<sheet>`'s relationship names, or `None`
+/// for one that is not a sheet. A sheet with no relationship at all is
+/// read as a worksheet at its conventional path.
+pub(super) fn sheet_kind_of(
+    rel: Option<&crate::core::relationships::Relationship>,
+) -> Option<crate::ir::SheetKind> {
+    use crate::ir::SheetKind;
+    match rel.map(|r| r.rel_type.as_str()) {
+        None | Some(rel_types::WORKSHEET) => Some(SheetKind::Worksheet),
+        Some(rel_types::MACROSHEET | rel_types::INTL_MACROSHEET) => Some(SheetKind::Macro),
+        Some(rel_types::CHARTSHEET) => Some(SheetKind::Chart),
+        Some(rel_types::DIALOGSHEET) => Some(SheetKind::Dialog),
+        Some(_) => None,
+    }
+}
+
+/// The chart parts a chartsheet displays: its drawing's chart
+/// relationships ([ECMA-376] §12.3.2 — a chartsheet shows one chart
+/// through a drawing part). A part that is missing or unrelated yields
+/// nothing; the sheet is then its name alone.
+pub(super) fn chartsheet_chart_parts<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
+    sheet_path: &str,
+) -> Vec<String> {
+    let read_rels = |archive: &mut ZipArchive<R>, part: &str| {
+        XlsxDocument::read_xml_entry(archive, entries, &sheet_rels_path(part))
+            .ok()
+            .and_then(|d| Relationships::parse(&d).ok())
+    };
+    let Some(sheet_rels) = read_rels(archive, sheet_path) else {
+        return Vec::new();
+    };
+    let mut charts = Vec::new();
+    for drawing in sheet_rels.get_by_type(rel_types::DRAWING) {
+        let drawing_path = resolve_relative_zip_path(sheet_path, &drawing.target);
+        if let Some(drawing_rels) = read_rels(archive, &drawing_path) {
+            for chart in drawing_rels.get_by_type(rel_types::CHART) {
+                let path = resolve_relative_zip_path(&drawing_path, &chart.target);
+                if !charts.contains(&path) {
+                    charts.push(path);
+                }
+            }
+        }
+    }
+    charts
 }
 
 fn sheet_rels_path(sheet_path: &str) -> String {
@@ -2396,6 +2501,15 @@ mod tests {
     /// A workbook listing `(name, rel type, target, state, part body)`
     /// sheets; a `None` body leaves the target part out of the package.
     fn workbook_of(sheets: &[(&str, &str, &str, Option<&str>, Option<&str>)]) -> Vec<u8> {
+        workbook_of_with(sheets, &[])
+    }
+
+    /// As `workbook_of`, plus `extra` parts (relationships, drawings,
+    /// charts) at their full package paths.
+    fn workbook_of_with(
+        sheets: &[(&str, &str, &str, Option<&str>, Option<&str>)],
+        extra: &[(&str, &[u8])],
+    ) -> Vec<u8> {
         let mut rels = String::from(
             r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
         );
@@ -2423,6 +2537,7 @@ mod tests {
             ("xl/workbook.xml", wb.as_bytes()),
         ];
         all.extend(parts.iter().map(|(n, d)| (n.as_str(), d.as_slice())));
+        all.extend_from_slice(extra);
         zip_parts(&all)
     }
 
@@ -2464,7 +2579,9 @@ mod tests {
     }
 
     /// A chartsheet's relationship is not a worksheet one; parsed as a
-    /// worksheet it became an empty sheet under the chart's name.
+    /// worksheet it became an empty sheet under the chart's name. It is a
+    /// sheet of its own kind — the tab, with no cells — and each sheet
+    /// keeps its own state.
     #[test]
     fn test_chartsheets_are_not_parsed_as_worksheets() {
         let data = one_cell_sheet("numbers");
@@ -2474,12 +2591,193 @@ mod tests {
             ("Data", WS, "worksheets/sheet1.xml", Some("hidden"), Some(&data)),
         ]);
         let doc = open_bytes(bytes);
-        let names: Vec<_> = doc.worksheets.iter().map(|w| w.name.as_str()).collect();
-        assert_eq!(names, ["Data"]);
+        let names: Vec<_> = doc
+            .worksheets
+            .iter()
+            .map(|w| (w.name.as_str(), w.kind))
+            .collect();
+        use crate::ir::SheetKind as K;
+        assert_eq!(names, [("Chart1", K::Chart), ("Data", K::Worksheet)]);
+        assert!(doc.worksheets[0].rows.is_empty());
         assert!(doc.unreadable_sheets.is_empty());
         let ir = crate::convert_xlsx::xlsx_to_ir(&doc);
-        assert_eq!(ir.sections.len(), 1);
-        assert!(ir.sections[0].hidden, "Data's own state, not the chartsheet's");
+        assert_eq!(ir.sections.len(), 2);
+        assert!(!ir.sections[0].hidden, "the chartsheet is visible");
+        assert!(ir.sections[1].hidden, "Data's own state, not the chartsheet's");
+    }
+
+    const CHART_NS: &str = r#"xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main""#;
+
+    /// A chart part titled `title`, with one cached value `value`.
+    fn titled_chart(title: &str, value: &str) -> String {
+        format!(
+            r#"<c:chartSpace {CHART_NS}><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>{title}</a:t></a:r></a:p></c:rich></c:tx></c:title><c:plotArea><c:barChart><c:ser><c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>{value}</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#
+        )
+    }
+
+    fn rels_xml(rels: &[(&str, &str)]) -> String {
+        let mut x = String::from(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        );
+        for (i, (ty, target)) in rels.iter().enumerate() {
+            x.push_str(&format!(
+                r#"<Relationship Id="rId{}" Type="{ty}" Target="{target}"/>"#,
+                i + 1
+            ));
+        }
+        x.push_str("</Relationships>");
+        x
+    }
+
+    /// Text of one IR section, rendered on its own.
+    fn section_text(s: &crate::ir::Section) -> String {
+        crate::ir::DocumentIR {
+            sections: vec![s.clone()],
+            ..Default::default()
+        }
+        .plain_text()
+    }
+
+    /// An Excel 4.0 macro sheet (`xl/macrosheets/`, root `xne:macrosheet`,
+    /// a `CT_Worksheet`) holds real cells — labels, formulas and cached
+    /// values — and a chartsheet or dialog sheet is a named tab. All three
+    /// were dropped whole. They are sheets of their own kind now, in
+    /// workbook order with their own state; the chartsheet's content is
+    /// the text of the chart its drawing references, which is no longer
+    /// repeated among the embedded charts.
+    #[test]
+    fn test_macro_chart_and_dialog_sheets_surface_with_their_kind() {
+        let data = one_cell_sheet("data cell");
+        let tail = one_cell_sheet("tail cell");
+        let macro_sheet = r#"<xne:macrosheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:xne="http://schemas.microsoft.com/office/excel/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Auto_Open</t></is></c></row><row r="2"><c r="A2" t="b"><f>ISNUMBER(1)</f><v>1</v></c></row></sheetData></xne:macrosheet>"#;
+        let chartsheet = r#"<chartsheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><drawing r:id="rId1"/></chartsheet>"#;
+        let dialog =
+            r#"<dialogsheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>"#;
+        let drawing = r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>"#;
+        let cs_rels = rels_xml(&[(rel_types::DRAWING, "../drawings/drawing1.xml")]);
+        let dr_rels = rels_xml(&[(rel_types::CHART, "../charts/chart1.xml")]);
+        let own_chart = titled_chart("Profile Title", "3.67");
+        let embedded = titled_chart("Embedded Title", "5");
+        let bytes = workbook_of_with(
+            &[
+                ("Data", WS, "worksheets/sheet1.xml", None, Some(&data)),
+                (
+                    "Macro1",
+                    rel_types::MACROSHEET,
+                    "macrosheets/sheet1.xml",
+                    Some("veryHidden"),
+                    Some(macro_sheet),
+                ),
+                (
+                    "Profile",
+                    rel_types::CHARTSHEET,
+                    "chartsheets/sheet1.xml",
+                    Some("hidden"),
+                    Some(chartsheet),
+                ),
+                ("Dialog1", rel_types::DIALOGSHEET, "dialogsheets/sheet1.xml", None, Some(dialog)),
+                ("Tail", WS, "worksheets/sheet2.xml", None, Some(&tail)),
+            ],
+            &[
+                ("xl/chartsheets/_rels/sheet1.xml.rels", cs_rels.as_bytes()),
+                ("xl/drawings/drawing1.xml", drawing.as_bytes()),
+                ("xl/drawings/_rels/drawing1.xml.rels", dr_rels.as_bytes()),
+                ("xl/charts/chart1.xml", own_chart.as_bytes()),
+                ("xl/charts/chart2.xml", embedded.as_bytes()),
+            ],
+        );
+        let doc = open_bytes(bytes);
+        use crate::ir::SheetKind as K;
+        let got: Vec<_> = doc
+            .worksheets
+            .iter()
+            .map(|w| (w.name.as_str(), w.kind, w.state))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("Data", K::Worksheet, SheetState::Visible),
+                ("Macro1", K::Macro, SheetState::VeryHidden),
+                ("Profile", K::Chart, SheetState::Hidden),
+                ("Dialog1", K::Dialog, SheetState::Visible),
+                ("Tail", K::Worksheet, SheetState::Visible),
+            ]
+        );
+        assert!(doc.unreadable_sheets.is_empty(), "{:?}", doc.unreadable_sheets);
+        let profile = &doc.worksheets[2];
+        assert!(profile.rows.is_empty());
+        assert_eq!(profile.chart_text.len(), 1);
+        assert!(profile.chart_text[0].contains("Profile Title"), "{:?}", profile.chart_text);
+        assert_eq!(doc.chart_text.len(), 1, "only the embedded chart: {:?}", doc.chart_text);
+        assert!(doc.chart_text[0].contains("Embedded Title"));
+
+        let text = doc.plain_text();
+        let md = doc.to_markdown();
+        let ir = crate::convert_xlsx::xlsx_to_ir(&doc);
+        let ir_text = ir.plain_text();
+        let ir_md = ir.to_markdown();
+        let html = ir.to_html();
+        for (what, out) in [
+            ("plain_text", &text),
+            ("to_markdown", &md),
+            ("ir text", &ir_text),
+            ("ir md", &ir_md),
+        ] {
+            for want in [
+                "Data",
+                "data cell",
+                "Macro1",
+                "Auto_Open",
+                "TRUE",
+                "Profile",
+                "Profile Title",
+                "Dialog1",
+                "tail cell",
+                "Embedded Title",
+            ] {
+                assert!(out.contains(want), "{what} lost {want:?}: {out}");
+            }
+            assert_eq!(out.matches("Profile Title").count(), 1, "{what}: {out}");
+        }
+        assert!(
+            md.contains("## Profile\n") && ir_md.contains("## Profile\n"),
+            "{md}\n--\n{ir_md}"
+        );
+        assert!(md.contains("## Dialog1") && ir_md.contains("## Dialog1"), "{md}\n--\n{ir_md}");
+        for want in [
+            "<h2>Profile</h2>",
+            "Profile Title",
+            "Auto_Open",
+            "<h2>Dialog1</h2>",
+        ] {
+            assert!(html.contains(want), "to_html lost {want:?}: {html}");
+        }
+
+        let sections: Vec<_> = ir
+            .sections
+            .iter()
+            .filter(|s| s.sheet_kind.is_some())
+            .map(|s| (s.title.as_deref().unwrap_or(""), s.sheet_kind, s.hidden))
+            .collect();
+        assert_eq!(
+            sections,
+            [
+                ("Data", Some(K::Worksheet), false),
+                ("Macro1", Some(K::Macro), true),
+                ("Profile", Some(K::Chart), true),
+                ("Dialog1", Some(K::Dialog), false),
+                ("Tail", Some(K::Worksheet), false),
+            ]
+        );
+        let chart_section = &ir.sections[2];
+        assert!(
+            !chart_section
+                .elements
+                .iter()
+                .any(|e| matches!(e, crate::ir::Element::Table(_))),
+            "no cells in a chart sheet's section"
+        );
+        assert!(section_text(chart_section).contains("Profile Title"));
     }
 
     /// A single-sheet package with one pivot table whose cache definition

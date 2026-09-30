@@ -101,6 +101,20 @@ pub mod rel_types {
     /// sheet that is one chart, with no cells.
     pub const CHARTSHEET: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet";
+    /// Relationship type for dialog sheet parts ([ECMA-376] §12.3.7) — an
+    /// Excel 5.0 dialog, with no cells.
+    pub const DIALOGSHEET: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/dialogsheet";
+    /// Relationship type for an Excel 4.0 macro sheet part (a Microsoft
+    /// extension: root `xne:macrosheet`, a `CT_Worksheet`, [MS-XLSX]
+    /// §2.2.2.1; the Open XML SDK's `MacroSheetPart`).
+    pub const MACROSHEET: &str =
+        "http://schemas.microsoft.com/office/2006/relationships/xlMacrosheet";
+    /// Relationship type for an Excel 4.0 international macro sheet part
+    /// (the Open XML SDK's `InternationalMacroSheetPart`), the same
+    /// content model as [`MACROSHEET`].
+    pub const INTL_MACROSHEET: &str =
+        "http://schemas.microsoft.com/office/2006/relationships/xlIntlMacrosheet";
     /// Relationship type for the shared string table.
     pub const SHARED_STRINGS: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings";

@@ -3,6 +3,7 @@ use super::cell::{Cell, CellValue};
 use super::date;
 use super::numfmt;
 use super::worksheet::Row;
+use crate::ir::SheetKind;
 use crate::limits::TextBudget;
 
 /// The heading every renderer gives a pivot's cached source data.
@@ -109,6 +110,11 @@ impl XlsxDocument {
             for h in [fh, oh, eh].into_iter().flatten() {
                 sheet.push('\n');
                 sheet.push_str(&h);
+            }
+            // A chart sheet's content is its chart's text.
+            for text in &ws.chart_text {
+                sheet.push('\n');
+                sheet.push_str(text.trim());
             }
             if let Some(text) = self.sheet_plain_text_within(i, &mut budget) {
                 if !text.is_empty() {
@@ -277,11 +283,17 @@ impl XlsxDocument {
                 } else if !ws.comments.is_empty()
                     || ws.text_shapes.iter().any(|t| !t.text.trim().is_empty())
                     || !ws.header_footer.is_empty()
+                    || !matches!(ws.kind, SheetKind::Worksheet | SheetKind::Macro)
                 {
                     // No cells, but comments, drawn text or page
                     // headers: they still belong under the sheet's heading.
+                    // A chart sheet or dialog sheet has no cells at all;
+                    // its tab is still a sheet of the workbook.
                     parts.push(format!("## {}", ws.name));
                 }
+            }
+            for text in &ws.chart_text {
+                parts.push(text.trim().to_string());
             }
             for hf in [fh, oh, eh, ff, of, ef].into_iter().flatten() {
                 parts.push(crate::core::markdown::escape_text(&hf));
@@ -800,6 +812,8 @@ mod tests {
             header_footer: Default::default(),
             tables: Vec::new(),
             pivot_tables: Vec::new(),
+            kind: crate::ir::SheetKind::Worksheet,
+            chart_text: Vec::new(),
         };
         let doc = XlsxDocument {
             workbook: super::super::WorkbookInfo {
@@ -863,6 +877,8 @@ mod tests {
             header_footer: Default::default(),
             tables: Vec::new(),
             pivot_tables: Vec::new(),
+            kind: crate::ir::SheetKind::Worksheet,
+            chart_text: Vec::new(),
         };
         let doc = XlsxDocument {
             workbook: super::super::WorkbookInfo {

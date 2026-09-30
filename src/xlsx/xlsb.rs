@@ -27,7 +27,8 @@ use super::workbook::{SheetInfo, SheetState, WorkbookInfo};
 use super::worksheet::{Row, Worksheet};
 use super::{Result, XlsxDocument};
 use crate::core::opc::{self, ZipEntryIndex};
-use crate::core::relationships::{Relationships, rel_types};
+use crate::core::relationships::Relationships;
+use crate::ir::SheetKind;
 
 // Record ids ([MS-XLSB] §2.3, decimal as the specification lists them).
 const BRT_ROW_HDR: u32 = 0;
@@ -89,13 +90,32 @@ pub(super) fn from_zip<R: Read + Seek>(
     let mut unreadable_sheets = Vec::new();
     for (i, info) in sheets.iter().enumerate() {
         let rel = rels.get_by_id(&info.rel_id);
-        // A chartsheet (or macro/dialog sheet) has no cells to read.
-        if rel.is_some_and(|r| r.rel_type != rel_types::WORKSHEET) {
+        // A macro sheet has the same cell records as a worksheet (its part
+        // holds a cell table like a worksheet part); a chartsheet or dialog
+        // sheet has no cells, only its tab and, for a chartsheet, the text
+        // of the chart its drawing references.
+        let Some(kind) = super::sheet_kind_of(rel) else {
             continue;
-        }
+        };
         let path = rel
             .map(|r| super::resolve_relative_zip_path("xl/workbook.bin", &r.target))
             .unwrap_or_else(|| format!("xl/worksheets/sheet{}.bin", i + 1));
+        if matches!(kind, SheetKind::Chart | SheetKind::Dialog) {
+            let mut ws = Worksheet::without_cells(info.name.clone(), kind);
+            ws.state = info.state;
+            if kind == SheetKind::Chart {
+                for chart in super::chartsheet_chart_parts(archive, entries, &path) {
+                    if let Ok(data) = XlsxDocument::read_xml_entry(archive, entries, &chart) {
+                        let text = super::extract_chart_text(&data);
+                        if !text.is_empty() {
+                            ws.chart_text.push(text);
+                        }
+                    }
+                }
+            }
+            worksheets.push(ws);
+            continue;
+        }
         let data = match opc::read_zip_entry(archive, entries, &path) {
             Ok(data) => data,
             Err(crate::core::Error::MissingPart(_)) => {
@@ -110,6 +130,7 @@ pub(super) fn from_zip<R: Read + Seek>(
         };
         let mut ws = parse_sheet(&data, info.name.clone());
         ws.state = info.state;
+        ws.kind = kind;
         worksheets.push(ws);
     }
     let crate::core::properties::PackageMetadata {
@@ -470,21 +491,9 @@ fn parse_sheet(data: &[u8], name: String) -> Worksheet {
         rows.push(r);
     }
     Worksheet {
-        state: SheetState::Visible,
-        header_footer: Default::default(),
-        tables: Vec::new(),
-        pivot_tables: Vec::new(),
-        name,
-        dimension: None,
         rows,
         merged_cells,
-        hyperlinks: Vec::new(),
-        page_setup: None,
-        images: Vec::new(),
-        comments: Vec::new(),
-        text_shapes: Vec::new(),
-        conditional_formats: Vec::new(),
-        data_validations: Vec::new(),
+        ..Worksheet::without_cells(name, crate::ir::SheetKind::Worksheet)
     }
 }
 
@@ -638,5 +647,108 @@ mod tests {
         let table = parse_shared_strings(&sst);
         let texts: Vec<&str> = table.strings.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(texts, ["plain", "rich"]);
+    }
+
+    /// A `BrtBundleSh` for sheet `name` behind relationship `rel_id`.
+    fn bundle_sheet(state: u32, id: u32, rel_id: &str, name: &str) -> Vec<u8> {
+        let mut sh = state.to_le_bytes().to_vec();
+        sh.extend_from_slice(&id.to_le_bytes());
+        sh.extend(wide(rel_id));
+        sh.extend(wide(name));
+        rec(BRT_BUNDLE_SH, &sh)
+    }
+
+    /// One row holding one inline-string cell and one Boolean cell.
+    fn string_and_bool_sheet(text: &str) -> Vec<u8> {
+        let mut s = rec(BRT_ROW_HDR, &[0u8; 17]);
+        s.extend(rec(BRT_CELL_ST, &cell(0, 0, &wide(text))));
+        s.extend(rec(BRT_CELL_BOOL, &cell(1, 0, &[1])));
+        s
+    }
+
+    /// The `.xlsb` reader dropped macro sheets, chartsheets and dialog
+    /// sheets whole, as the `.xlsx` one did. A macro sheet's cells are
+    /// the worksheet records; a chartsheet is its tab and its chart's text.
+    #[test]
+    fn test_xlsb_macro_and_chart_sheets_surface_with_their_kind() {
+        use crate::core::relationships::rel_types;
+        let mut wb = bundle_sheet(0, 1, "rId1", "Data");
+        wb.extend(bundle_sheet(2, 2, "rId2", "Macro1"));
+        wb.extend(bundle_sheet(1, 3, "rId3", "Profile"));
+        wb.extend(bundle_sheet(0, 4, "rId4", "Tail"));
+        let rels = format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{}" Target="worksheets/sheet1.bin"/><Relationship Id="rId2" Type="{}" Target="macrosheets/sheet1.bin"/><Relationship Id="rId3" Type="{}" Target="chartsheets/sheet1.bin"/><Relationship Id="rId4" Type="{}" Target="worksheets/sheet2.bin"/></Relationships>"#,
+            rel_types::WORKSHEET,
+            rel_types::MACROSHEET,
+            rel_types::CHARTSHEET,
+            rel_types::WORKSHEET
+        );
+        let cs_rels = format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{}" Target="../drawings/drawing1.xml"/></Relationships>"#,
+            rel_types::DRAWING
+        );
+        let dr_rels = format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{}" Target="../charts/chart1.xml"/></Relationships>"#,
+            rel_types::CHART
+        );
+        let chart = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>Profile Title</a:t></a:r></a:p></c:rich></c:tx></c:title></c:chart></c:chartSpace>"#;
+        let data = string_and_bool_sheet("data cell");
+        let macro_sheet = string_and_bool_sheet("Auto_Open");
+        let tail = string_and_bool_sheet("tail cell");
+        let bytes = super::super::test_support::zip_parts(&[
+            (WORKBOOK, &wb),
+            (WORKBOOK_RELS, rels.as_bytes()),
+            ("xl/worksheets/sheet1.bin", &data),
+            ("xl/macrosheets/sheet1.bin", &macro_sheet),
+            ("xl/chartsheets/sheet1.bin", &[]),
+            ("xl/chartsheets/_rels/sheet1.bin.rels", cs_rels.as_bytes()),
+            ("xl/drawings/drawing1.xml", b"<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\"/>"),
+            ("xl/drawings/_rels/drawing1.xml.rels", dr_rels.as_bytes()),
+            ("xl/charts/chart1.xml", chart.as_bytes()),
+            ("xl/worksheets/sheet2.bin", &tail),
+        ]);
+        let doc = super::super::test_support::open_bytes(bytes);
+        let got: Vec<_> = doc
+            .worksheets
+            .iter()
+            .map(|w| (w.name.as_str(), w.kind, w.state))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("Data", SheetKind::Worksheet, SheetState::Visible),
+                ("Macro1", SheetKind::Macro, SheetState::VeryHidden),
+                ("Profile", SheetKind::Chart, SheetState::Hidden),
+                ("Tail", SheetKind::Worksheet, SheetState::Visible),
+            ]
+        );
+        let profile = &doc.worksheets[2];
+        assert!(profile.rows.is_empty());
+        assert!(
+            profile
+                .chart_text
+                .iter()
+                .any(|t| t.contains("Profile Title"))
+        );
+        let ir = crate::convert_xlsx::xlsx_to_ir(&doc);
+        for (what, out) in [
+            ("plain_text", doc.plain_text()),
+            ("to_markdown", doc.to_markdown()),
+            ("ir text", ir.plain_text()),
+            ("to_html", ir.to_html()),
+        ] {
+            for want in [
+                "data cell",
+                "Auto_Open",
+                "TRUE",
+                "Profile",
+                "Profile Title",
+                "tail cell",
+            ] {
+                assert!(out.contains(want), "{what} lost {want:?}: {out}");
+            }
+        }
+        assert_eq!(ir.sections[1].sheet_kind, Some(SheetKind::Macro));
+        assert_eq!(ir.sections[2].sheet_kind, Some(SheetKind::Chart));
     }
 }
