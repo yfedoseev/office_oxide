@@ -155,10 +155,21 @@ pub const RT_EXTERNAL_OBJECT_REF_ATOM: u16 = 0x0BC1;
 /// (1 byte) + `placeholderSize` (1 byte) + `unusedShort` (2 bytes) = 8
 /// bytes, confirmed against Apache POI's `OEPlaceholderAtom.java`.
 pub const RT_OE_PLACEHOLDER_ATOM: u16 = 0x0BC3;
+/// [MS-PPT] `RoundTripHFPlaceholder12Atom` (record type 0x0420) — the
+/// placeholder role of a header/footer placeholder shape, found directly
+/// inside its `RT_CLIENT_DATA` in place of an `OEPlaceholderAtom`.
+pub const RT_ROUND_TRIP_HF_PLACEHOLDER12_ATOM: u16 = 0x0420;
+/// [MS-PPT] `SlideAtom.slideFlags` bit 0, `fMasterObjects`: the slide
+/// shows the shapes of its master (unset = "Hide background graphics").
+pub const SLIDE_FLAG_MASTER_OBJECTS: u16 = 0x0001;
 
 // ── SlideListWithText `rh.recInstance` discriminants ([MS-PPT] 2.4.14) ──
 /// `rh.recInstance` value identifying a `SlideListWithTextContainer` (real slides).
 pub const SLWT_SLIDES: u16 = 0;
+/// `MasterListWithTextContainer` is a `SlideListWithText` record with
+/// `recInstance` 1 ([MS-PPT] `MasterListWithTextContainer`): one
+/// `MasterPersistAtom` per main master and title master.
+pub const SLWT_MASTERS: u16 = 1;
 /// `NotesListWithTextContainer` is a `SlideListWithText` record with
 /// `recInstance` 2 ([MS-PPT] `NotesListWithTextContainer`; the master list is 1).
 pub const SLWT_NOTES: u16 = 2;

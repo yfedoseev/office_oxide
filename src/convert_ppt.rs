@@ -267,6 +267,30 @@ fn describe_ole_object(info: &crate::ppt::OleObjectInfo) -> String {
     }
 }
 
+/// One paragraph per paragraph of `run`, with its formatting, links and
+/// alignment.
+fn push_run_paragraphs(run: &TextRun, elements: &mut Vec<Element>) {
+    let text_chars: Vec<char> = run.text.chars().collect();
+    for (start, end) in split_paragraphs(&run.text) {
+        let content = spans_for_range(
+            &text_chars,
+            start,
+            end,
+            &run.char_formats,
+            run.hyperlink.as_deref(),
+            &run.link_ranges,
+        );
+        if !content.is_empty() {
+            elements.push(Element::Paragraph(Paragraph {
+                content,
+                alignment: alignment_at(&run.para_formats, start),
+                placeholder_role: run.placeholder_role.clone(),
+                ..Default::default()
+            }));
+        }
+    }
+}
+
 pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
     let mut sections = Vec::new();
     // Every picture shape successfully resolved to a specific image
@@ -471,6 +495,26 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
         .collect();
     crate::convert_xls::append_legacy_images(&mut sections, &leftover_images);
 
+    // The deck's title falls back to the first *slide's* title, never to
+    // the master section below.
+    let first_slide_title = sections.first().and_then(|s| s.title.clone());
+
+    // Static master text, once per deck (see `PptDocument::master_text`),
+    // after the slides — the same trailing section `.pptx` gets.
+    if !doc.master_text.is_empty() {
+        let mut elements = Vec::new();
+        for run in &doc.master_text {
+            push_run_paragraphs(run, &mut elements);
+        }
+        if !elements.is_empty() {
+            sections.push(Section {
+                title: Some(crate::pptx::layout::MASTER_TEXT_SECTION_TITLE.to_string()),
+                elements,
+                ..Default::default()
+            });
+        }
+    }
+
     // The deck's own declared title (from `\x05SummaryInformation`) beats
     // the first slide's own title — a slide title is not a document
     // title, it's just the only thing that was ever there to fall back
@@ -479,7 +523,7 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
     let title = summary
         .and_then(|s| s.title.clone())
         .filter(|t| !t.is_empty())
-        .or_else(|| sections.first().and_then(|s| s.title.clone()));
+        .or(first_slide_title);
 
     DocumentIR {
         metadata: Metadata {
