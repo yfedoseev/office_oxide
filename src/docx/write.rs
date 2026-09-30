@@ -852,60 +852,15 @@ impl DocxWriter {
 
     /// Emit `list` and, recursively, every sub-list hanging off its items.
     ///
-    /// `ListItem::nested` was read by no writer at all, so everything below
-    /// level 0 vanished from the output while the API reported success.
-    ///
-    /// `num_id` is shared across every recursive call for one logical list
-    /// (only `add_ir_list` mints a fresh one) — a nested sub-list used to
-    /// get its own brand-new `numId` per level, which the reader (correctly,
-    /// per spec: one logical list keeps one `numId` across all its levels)
-    /// re-parsed as an unrelated *sibling* top-level list instead of a
-    /// child of the parent item, losing the parent/child relationship (and
-    /// sometimes the `ordered` flag) on every round trip.
+    /// `num_id` is shared across every level of one logical list (only
+    /// `add_ir_list` mints a fresh one): per spec one logical list keeps
+    /// one `numId` across all its levels, and a sub-list with its own
+    /// `numId` re-reads as an unrelated sibling list.
     fn add_ir_list_at(&mut self, list: &crate::ir::List, level: u8, num_id: u32) {
-        // Nested sub-lists recurse here, outside the element walk's own
-        // guard, so the list chain needs its own bound.
-        let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
-            log::warn!("docx: list nesting exceeds the depth limit; sub-list skipped");
-            return;
-        };
-        let start_number = list.start_number.unwrap_or(1);
-        let style = list.style.clone();
-
-        let items: Vec<Vec<DocxElement>> = list
-            .items
-            .iter()
-            .map(|item| {
-                let mut elems: Vec<DocxElement> = Vec::new();
-                for content_elem in &item.content {
-                    convert_ir_element_to_docx_elements(
-                        content_elem,
-                        &mut elems,
-                        &mut self.next_num_id,
-                        &mut self.images,
-                    );
-                }
-                elems
-            })
-            .collect();
-
-        self.elements.push(DocxElement::RichList(DocxRichList {
-            ordered: list.ordered,
-            items,
-            start_number: if start_number != 1 {
-                Some(start_number)
-            } else {
-                None
-            },
-            style,
-            level,
-            num_id,
-        }));
-
-        for item in &list.items {
-            if let Some(ref nested) = item.nested {
-                self.add_ir_list_at(nested, level.saturating_add(1).min(8), num_id);
-            }
+        if let Some(rl) =
+            convert_ir_list_at(list, level, num_id, &mut self.next_num_id, &mut self.images)
+        {
+            self.elements.push(DocxElement::RichList(rl));
         }
     }
 
@@ -1995,7 +1950,9 @@ fn convert_ir_element_to_docx_elements(
             // analogous top-level-list bug).
             let num_id = *next_num_id;
             *next_num_id += 1;
-            convert_ir_list_at(l, l.level, num_id, out, next_num_id, images);
+            if let Some(rl) = convert_ir_list_at(l, l.level, num_id, next_num_id, images) {
+                out.push(DocxElement::RichList(rl));
+            }
         },
         E::Image(img) => {
             // Every nested image used to be skipped here ("needs the outer
@@ -2034,25 +1991,29 @@ fn convert_ir_element_to_docx_elements(
     }
 }
 
-/// Emit `list` and, recursively, every sub-list hanging off its items, into
-/// `out` — the free-function counterpart of `DocxWriter::add_ir_list_at`
-/// for content nested inside a table cell, text box, header/footer, or
-/// footnote/endnote, which has no `self.elements` to push sibling
-/// `RichList` entries into. `num_id` is shared across every recursive call
-/// for one logical list (only the `E::List` match arm that calls this
-/// mints a fresh one), matching `add_ir_list_at`'s contract that one
-/// logical list keeps one `numId` across all its nesting levels.
+/// Build the `RichList` for `list` at `level`, with every sub-list placed
+/// inside the item it hangs off — after that item's own content and before
+/// the next sibling, which is where Word expects the level-`n+1` paragraphs.
+/// Emitting all of a level's items first and the sub-lists after them moved
+/// every child under the wrong parent on the way back in.
+///
+/// `num_id` is shared across every recursive call for one logical list: per
+/// spec one logical list keeps one `numId` across all its nesting levels.
+/// Returns `None` only when the nesting exceeds the depth limit.
 fn convert_ir_list_at(
     list: &crate::ir::List,
     level: u8,
     num_id: u32,
-    out: &mut Vec<DocxElement>,
     next_num_id: &mut u32,
     images: &mut Vec<DocxImage>,
-) {
+) -> Option<DocxRichList> {
+    // Nested sub-lists recurse here, outside the element walk's own guard,
+    // so the list chain needs its own bound.
+    let Some(_depth) = crate::core::xml::DepthGuard::enter() else {
+        log::warn!("docx: list nesting exceeds the depth limit; sub-list skipped");
+        return None;
+    };
     let start_number = list.start_number.unwrap_or(1);
-    let style = list.style.clone();
-
     let items: Vec<Vec<DocxElement>> = list
         .items
         .iter()
@@ -2061,35 +2022,26 @@ fn convert_ir_list_at(
             for content_elem in &item.content {
                 convert_ir_element_to_docx_elements(content_elem, &mut elems, next_num_id, images);
             }
+            if let Some(ref nested) = item.nested {
+                let child_level = level.saturating_add(1).min(8);
+                if let Some(rl) =
+                    convert_ir_list_at(nested, child_level, num_id, next_num_id, images)
+                {
+                    elems.push(DocxElement::RichList(rl));
+                }
+            }
             elems
         })
         .collect();
 
-    out.push(DocxElement::RichList(DocxRichList {
+    Some(DocxRichList {
         ordered: list.ordered,
         items,
-        start_number: if start_number != 1 {
-            Some(start_number)
-        } else {
-            None
-        },
-        style,
+        start_number: (start_number != 1).then_some(start_number),
+        style: list.style.clone(),
         level,
         num_id,
-    }));
-
-    for item in &list.items {
-        if let Some(ref nested) = item.nested {
-            convert_ir_list_at(
-                nested,
-                level.saturating_add(1).min(8),
-                num_id,
-                out,
-                next_num_id,
-                images,
-            );
-        }
-    }
+    })
 }
 
 fn ir_paragraph_to_runs(p: &crate::ir::Paragraph) -> Vec<Run> {

@@ -2120,3 +2120,82 @@ fn test_text_box_content_does_not_fuse_with_the_following_run() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Nested lists
+// ---------------------------------------------------------------------------
+
+const NESTED_WORDS: [&str; 6] = ["one", "one-a", "one-b", "two", "two-a", "three"];
+
+/// Positions of each of `NESTED_WORDS` as a whole line/item in `s`.
+fn nested_word_positions(s: &str) -> Vec<usize> {
+    let s = format!("{s}\n");
+    NESTED_WORDS
+        .iter()
+        .map(|w| {
+            [format!(" {w}\n"), format!("\n{w}\n"), format!(">{w}<")]
+                .iter()
+                .find_map(|pat| s.find(pat.as_str()))
+                .unwrap_or_else(|| panic!("{w} missing from {s}"))
+        })
+        .collect()
+}
+
+fn assert_nested_order(doc: &Document) {
+    let ir = doc.to_ir();
+    let list = match first(&ir) {
+        Element::List(l) => l,
+        other => panic!("not a list: {other:?}"),
+    };
+    assert_eq!(list.items.len(), 3, "top level: {list:?}");
+    let kids = |i: usize| list.items[i].nested.as_ref().map_or(0, |l| l.items.len());
+    assert_eq!((kids(0), kids(1), kids(2)), (2, 1, 0), "children moved: {list:?}");
+    for s in [
+        doc.to_markdown(),
+        ir.to_markdown(),
+        doc.to_html(),
+        doc.plain_text(),
+    ] {
+        let pos = nested_word_positions(&format!("\n{s}"));
+        assert!(pos.windows(2).all(|w| w[0] < w[1]), "out of order: {s}");
+    }
+}
+
+/// A sub-list written by the DOCX writer belongs under the item it hangs
+/// off. The writer emitted every item of a level first and the sub-lists
+/// after them, so on the way back in both markdown pipelines (and HTML)
+/// showed "one / two / three / one-a …": each child under the wrong parent.
+#[test]
+fn test_written_nested_list_keeps_children_under_their_parent() {
+    let md = "- one\n  - one-a\n  - one-b\n- two\n  - two-a\n- three\n";
+    let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
+    let doc = Document::from_reader(Cursor::new(docx_bytes(&ir)), DocumentFormat::Docx).unwrap();
+    assert_nested_order(&doc);
+
+    // The same list read from Word-shaped paragraphs.
+    let para = |ilvl: u8, text: &str| {
+        format!(
+            r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="{ilvl}"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+        )
+    };
+    let body = [
+        (0, "one"),
+        (1, "one-a"),
+        (1, "one-b"),
+        (0, "two"),
+        (1, "two-a"),
+        (0, "three"),
+    ]
+    .iter()
+    .map(|(l, t)| para(*l, t))
+    .collect::<String>();
+    let bytes = Docx::new(&body)
+        .numbering(
+            r#"<w:abstractNum w:abstractNumId="0">
+                 <w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="&#8226;"/></w:lvl>
+                 <w:lvl w:ilvl="1"><w:numFmt w:val="bullet"/><w:lvlText w:val="&#8226;"/></w:lvl>
+               </w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#,
+        )
+        .bytes();
+    assert_nested_order(&Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx).unwrap());
+}
