@@ -89,12 +89,9 @@ fn picf_picture_at(data: &[u8], pos: usize) -> Option<(DocImage, usize)> {
         return None;
     }
     let payload = &data[pos + PICF_HEADER_SIZE..pos + lcb];
-    let (format, len) = if let Some(n) = wmf_len(payload) {
-        (ImageFormat::Wmf, n)
-    } else if let Some(n) = dib_len(payload) {
-        (ImageFormat::Dib, n)
-    } else {
-        return None;
+    let (format, len) = match wmf_len(payload) {
+        Some(n) => (ImageFormat::Wmf, n),
+        None => (ImageFormat::Dib, dib_len(payload)?),
     };
     Some((
         DocImage {

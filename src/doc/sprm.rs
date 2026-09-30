@@ -1973,7 +1973,7 @@ mod tests {
             let tabs = decode_pchg_tabs(opcode, &op);
             let got: Vec<(i32, TabAlignment, TabLeader)> = tabs
                 .iter()
-                .map(|t| (t.position_twips, t.alignment.clone(), t.leader.clone()))
+                .map(|t| (t.position_twips, t.alignment, t.leader))
                 .collect();
             assert_eq!(
                 got,

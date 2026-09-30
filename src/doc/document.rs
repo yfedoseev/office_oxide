@@ -845,7 +845,7 @@ fn parse_plcf_txbx_bounds(table_stream: &[u8], fc: u32, lcb: u32) -> Vec<u32> {
         return Vec::new();
     }
     let cb = end - start;
-    if (cb - 4) % (4 + FTXBXS_SIZE) != 0 {
+    if !(cb - 4).is_multiple_of(4 + FTXBXS_SIZE) {
         return Vec::new();
     }
     let n = (cb - 4) / (4 + FTXBXS_SIZE);
@@ -884,7 +884,7 @@ fn parse_plcf_sed_ends(table_stream: &[u8], fc: u32, lcb: u32) -> Vec<u32> {
         return Vec::new();
     }
     let cb = end - start;
-    if (cb - 4) % (4 + SED_SIZE) != 0 {
+    if !(cb - 4).is_multiple_of(4 + SED_SIZE) {
         return Vec::new();
     }
     let n = (cb - 4) / (4 + SED_SIZE);

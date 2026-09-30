@@ -503,7 +503,6 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
             has_macros: doc.has_macros(),
             text_truncated: !doc.text_complete(),
             warnings: doc.warnings().to_vec(),
-            ..Default::default()
         },
         sections,
         defined_names: Vec::new(),
