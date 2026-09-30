@@ -96,21 +96,27 @@ pub fn handle_tools_list(id: &Value) -> Value {
     })
 }
 
+/// JSON-RPC 2.0 §5.1 "Invalid params". MCP also uses it for an unknown tool
+/// name: `tools/call` itself exists, so -32601 "Method not found" is wrong.
+const INVALID_PARAMS: i64 = -32602;
+
 pub fn handle_tools_call(id: &Value, params: &Value) -> Value {
-    let tool_name = params["name"].as_str().unwrap_or("");
+    let Some(tool_name) = params.get("name").and_then(Value::as_str) else {
+        return error_response(id, INVALID_PARAMS, "tools/call requires a string \"name\"");
+    };
     let arguments = &params["arguments"];
 
     match tool_name {
         "extract" => call_extract(id, arguments),
         "replace_text" => call_replace_text(id, arguments),
         "info" => call_info(id, arguments),
-        _ => error_response(id, -32601, &format!("unknown tool: {tool_name}")),
+        _ => error_response(id, INVALID_PARAMS, &format!("unknown tool: {tool_name}")),
     }
 }
 
 fn call_extract(id: &Value, args: &Value) -> Value {
     let Some(file_path) = args["file_path"].as_str() else {
-        return error_response(id, -32602, "missing file_path");
+        return error_response(id, INVALID_PARAMS, "missing file_path");
     };
     let format = args["format"].as_str().unwrap_or("text");
 
@@ -149,13 +155,13 @@ fn call_extract(id: &Value, args: &Value) -> Value {
 
 fn call_replace_text(id: &Value, args: &Value) -> Value {
     let Some(file_path) = args["file_path"].as_str() else {
-        return error_response(id, -32602, "missing file_path");
+        return error_response(id, INVALID_PARAMS, "missing file_path");
     };
     let Some(find) = args["find"].as_str() else {
-        return error_response(id, -32602, "missing find");
+        return error_response(id, INVALID_PARAMS, "missing find");
     };
     let Some(replace) = args["replace"].as_str() else {
-        return error_response(id, -32602, "missing replace");
+        return error_response(id, INVALID_PARAMS, "missing replace");
     };
     let output_path = args["output_path"].as_str().unwrap_or(file_path);
 
@@ -188,7 +194,7 @@ fn call_replace_text(id: &Value, args: &Value) -> Value {
 
 fn call_info(id: &Value, args: &Value) -> Value {
     let Some(file_path) = args["file_path"].as_str() else {
-        return error_response(id, -32602, "missing file_path");
+        return error_response(id, INVALID_PARAMS, "missing file_path");
     };
 
     let doc = match office_oxide::Document::open(file_path) {
