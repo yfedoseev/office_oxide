@@ -38,8 +38,8 @@ pub use presentation::{PresentationInfo, SlideId, SlideSize};
 pub use shape::{
     AutoShape, BulletStyle, ConnectorShape, GraphicContent, GraphicFrame, GroupShape,
     HyperlinkInfo, HyperlinkTarget, MediaKind, MediaReference, OleObject, PictureShape,
-    PlaceholderInfo, Shape, ShapePosition, Table, TableCell, TableRow, TextBody, TextContent,
-    TextField, TextParagraph, TextRun,
+    PlaceholderInfo, Shape, ShapePosition, TabStop, Table, TableCell, TableRow, TextBody,
+    TextContent, TextField, TextParagraph, TextRun, TextSpacing,
 };
 pub use slide::Slide;
 

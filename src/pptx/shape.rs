@@ -208,10 +208,46 @@ pub struct TextParagraph {
     /// attribute is absent (renderer-default left alignment).
     pub alignment: Option<crate::ir::ParagraphAlignment>,
     /// Space before the paragraph, in 100ths of a point — read from
-    /// `<a:pPr><a:spcBef><a:spcPts val="…"/></a:spcBef></a:pPr>`.
+    /// `<a:pPr><a:spcBef><a:spcPts val="…"/></a:spcBef></a:pPr>`. The
+    /// percent form is in [`Self::space_before`].
     pub space_before_hundredths_pt: Option<u32>,
+    /// Space before the paragraph in either form (`<a:spcBef>`).
+    pub space_before: Option<TextSpacing>,
+    /// Space after the paragraph (`<a:spcAft>`).
+    pub space_after: Option<TextSpacing>,
+    /// Line spacing (`<a:lnSpc>`).
+    pub line_spacing: Option<TextSpacing>,
+    /// Left margin in EMU (`<a:pPr marL>`).
+    pub margin_left_emu: Option<i64>,
+    /// Right margin in EMU (`<a:pPr marR>`).
+    pub margin_right_emu: Option<i64>,
+    /// First-line indent in EMU, negative for a hanging indent
+    /// (`<a:pPr indent>`).
+    pub indent_emu: Option<i64>,
+    /// Custom tab stops (`<a:tabLst>`).
+    pub tab_stops: Vec<TabStop>,
     /// Inline content items in this paragraph.
     pub content: Vec<TextContent>,
+}
+
+/// A DrawingML spacing value (`CT_TextSpacing`, ECMA-376 Part 1
+/// §21.1.2.2.10/.11/.12/.18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextSpacing {
+    /// `<a:spcPts val>` — hundredths of a point.
+    Points(u32),
+    /// `<a:spcPct val>` — thousandths of a percent of the line
+    /// (`100000` = single spacing).
+    Percent(u32),
+}
+
+/// A custom tab stop (`<a:tab pos algn>`, ECMA-376 Part 1 §21.1.2.2.13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabStop {
+    /// Position in EMU from the text box's left edge.
+    pub position_emu: i64,
+    /// `l`, `ctr`, `r` or `dec` (`None` = left).
+    pub alignment: Option<String>,
 }
 
 /// How a paragraph's bullet marker is produced.
@@ -227,6 +263,12 @@ pub enum BulletStyle {
         scheme: String,
         /// `startAt`, when the numbering does not begin at 1.
         start_at: Option<u32>,
+    },
+    /// `<a:buBlip><a:blip r:embed="rIdN"/></a:buBlip>` — an unordered
+    /// marker drawn as a picture (ECMA-376 Part 1 §21.1.2.4.2).
+    Picture {
+        /// Relationship id of the marker image.
+        rel_id: Option<String>,
     },
 }
 

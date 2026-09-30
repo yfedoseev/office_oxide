@@ -510,10 +510,12 @@ fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) 
     // bullets all sit at level 0 — the ordinary single-level bullet list —
     // came out as plain paragraphs with no markers, and `<a:buAutoNum>`
     // numbering was lost entirely.
-    let declares_bullet = body
-        .paragraphs
-        .iter()
-        .any(|p| matches!(p.bullet, Some(BulletStyle::Char(_) | BulletStyle::AutoNum { .. })));
+    let declares_bullet = body.paragraphs.iter().any(|p| {
+        matches!(
+            p.bullet,
+            Some(BulletStyle::Char(_) | BulletStyle::AutoNum { .. } | BulletStyle::Picture { .. })
+        )
+    });
     let has_levels = body.paragraphs.iter().any(|p| p.level > 0) || declares_bullet;
 
     if has_levels {
@@ -534,7 +536,9 @@ fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) 
                             style = Some(auto_num_style(scheme));
                             start_number = start_at.filter(|&n| n != 1);
                         },
-                        BulletStyle::Char(_) => {
+                        // A picture bullet is an unordered marker drawn
+                        // as an image.
+                        BulletStyle::Char(_) | BulletStyle::Picture { .. } => {
                             ordered = false;
                             style = Some(ListStyle::Bullet);
                         },
@@ -566,11 +570,47 @@ fn convert_text_body(body: &crate::pptx::TextBody, elements: &mut Vec<Element>) 
                     content,
                     alignment: para.alignment.clone(),
                     space_before_twips,
+                    space_after_twips: match para.space_after {
+                        Some(crate::pptx::TextSpacing::Points(h)) => Some(h / 5),
+                        // A percentage of the line has no fixed length
+                        // without the resolved font size.
+                        _ => None,
+                    },
+                    line_spacing: para.line_spacing.map(|s| match s {
+                        // Same unit as DOCX `w:line` with lineRule=auto:
+                        // 240ths of a line (100000 = single = 240).
+                        crate::pptx::TextSpacing::Percent(p) => LineSpacing::Auto(
+                            u32::try_from(u64::from(p) * 240 / 100_000).unwrap_or(u32::MAX),
+                        ),
+                        crate::pptx::TextSpacing::Points(h) => LineSpacing::Exact(h / 5),
+                    }),
+                    indent_left_twips: para.margin_left_emu.map(emu_to_twips),
+                    indent_right_twips: para.margin_right_emu.map(emu_to_twips),
+                    first_line_indent_twips: para.indent_emu.map(emu_to_twips),
+                    tabs: para
+                        .tab_stops
+                        .iter()
+                        .map(|t| TabStop {
+                            position_twips: emu_to_twips(t.position_emu),
+                            alignment: match t.alignment.as_deref() {
+                                Some("ctr") => TabAlignment::Center,
+                                Some("r") => TabAlignment::Right,
+                                Some("dec") => TabAlignment::Decimal,
+                                _ => TabAlignment::Left,
+                            },
+                            leader: TabLeader::None,
+                        })
+                        .collect(),
                     ..Default::default()
                 }));
             }
         }
     }
+}
+
+/// EMU → twips (635 EMU per twip), saturating at the `i32` range.
+fn emu_to_twips(emu: i64) -> i32 {
+    i32::try_from(emu / 635).unwrap_or(if emu < 0 { i32::MIN } else { i32::MAX })
 }
 
 /// Resolve a parsed `HyperlinkInfo` (run-level `a:rPr/a:hlinkClick` or

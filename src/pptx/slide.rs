@@ -6,8 +6,8 @@ use crate::core::xml;
 use super::shape::{
     AutoShape, BulletStyle, ConnectorShape, GraphicContent, GraphicFrame, GroupShape,
     HyperlinkInfo, HyperlinkTarget, MediaKind, MediaReference, OleObject, PictureShape,
-    PlaceholderInfo, Shape, ShapePosition, Table, TableCell, TableRow, TextBody, TextContent,
-    TextField, TextParagraph, TextRun,
+    PlaceholderInfo, Shape, ShapePosition, TabStop, Table, TableCell, TableRow, TextBody,
+    TextContent, TextField, TextParagraph, TextRun, TextSpacing,
 };
 
 type CoreResult<T> = crate::core::Result<T>;
@@ -1286,73 +1286,14 @@ fn parse_text_paragraph(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
 ) -> CoreResult<TextParagraph> {
-    use crate::ir::ParagraphAlignment;
-    let mut level = 0u32;
-    let mut alignment: Option<ParagraphAlignment> = None;
-    let mut space_before_hundredths_pt: Option<u32> = None;
-    let mut bullet: Option<BulletStyle> = None;
+    let mut para = TextParagraph::default();
     let mut content = Vec::new();
-
-    let parse_algn = |e: &quick_xml::events::BytesStart| -> CoreResult<Option<ParagraphAlignment>> {
-        Ok(xml::optional_attr_str(e, "algn")?.and_then(|v| match v.as_ref() {
-            "l" => Some(ParagraphAlignment::Left),
-            "ctr" => Some(ParagraphAlignment::Center),
-            "r" => Some(ParagraphAlignment::Right),
-            "just" | "justLow" => Some(ParagraphAlignment::Justify),
-            "dist" | "thaiDist" => Some(ParagraphAlignment::Distribute),
-            _ => None,
-        }))
-    };
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
                 "pPr" => {
-                    level = xml::optional_attr_str(e, "lvl")?
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
-                    alignment = parse_algn(e)?;
-                    // <a:pPr> with body — scan for <a:spcBef><a:spcPts/> and
-                    // the bullet declaration.
-                    let depth_start = 1i32;
-                    let mut depth = depth_start;
-                    let mut in_spc_bef = false;
-                    loop {
-                        match reader.read_event()? {
-                            Event::Start(ref ee) => {
-                                depth += 1;
-                                if ee.local_name().as_ref() == "spcBef" {
-                                    in_spc_bef = true;
-                                }
-                                if let Some(b) = parse_bullet(ee)? {
-                                    bullet = Some(b);
-                                }
-                            },
-                            Event::Empty(ref ee) => {
-                                if in_spc_bef && ee.local_name().as_ref() == "spcPts" {
-                                    if let Some(v) = xml::optional_attr_str(ee, "val")? {
-                                        if let Ok(n) = v.parse::<u32>() {
-                                            space_before_hundredths_pt = Some(n);
-                                        }
-                                    }
-                                }
-                                if let Some(b) = parse_bullet(ee)? {
-                                    bullet = Some(b);
-                                }
-                            },
-                            Event::End(ref ee) => {
-                                depth -= 1;
-                                if ee.local_name().as_ref() == "spcBef" {
-                                    in_spc_bef = false;
-                                }
-                                if depth <= 0 && ee.local_name().as_ref() == "pPr" {
-                                    break;
-                                }
-                            },
-                            Event::Eof => break,
-                            _ => {},
-                        }
-                    }
+                    para = parse_paragraph_properties(reader, e, true)?;
                 },
                 "r" => {
                     content.push(TextContent::Run(parse_text_run(reader, rels)?));
@@ -1384,10 +1325,7 @@ fn parse_text_paragraph(
             },
             Event::Empty(ref e) => match e.local_name().as_ref() {
                 "pPr" => {
-                    level = xml::optional_attr_str(e, "lvl")?
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
-                    alignment = parse_algn(e)?;
+                    para = parse_paragraph_properties(reader, e, false)?;
                 },
                 "br" => {
                     content.push(TextContent::LineBreak);
@@ -1402,13 +1340,136 @@ fn parse_text_paragraph(
         }
     }
 
-    Ok(TextParagraph {
-        bullet,
-        level,
-        alignment,
-        space_before_hundredths_pt,
-        content,
-    })
+    para.content = content;
+    Ok(para)
+}
+
+/// Parse `<a:pPr>` (`CT_TextParagraphProperties`, ECMA-376 Part 1
+/// §21.1.2.2.7) into a paragraph with no content yet: `lvl`, `algn`,
+/// `marL`/`marR`/`indent`, and — for the Start form, read through its end
+/// tag — spacing before/after, line spacing, tab stops and the bullet.
+fn parse_paragraph_properties(
+    reader: &mut quick_xml::Reader<&[u8]>,
+    start: &quick_xml::events::BytesStart,
+    is_start: bool,
+) -> CoreResult<TextParagraph> {
+    let emu = |key: &str| -> CoreResult<Option<i64>> {
+        Ok(xml::optional_attr_str(start, key)?.and_then(|v| v.parse().ok()))
+    };
+    let mut para = TextParagraph {
+        level: xml::optional_attr_str(start, "lvl")?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        alignment: parse_algn_attr(start)?,
+        margin_left_emu: emu("marL")?,
+        margin_right_emu: emu("marR")?,
+        indent_emu: emu("indent")?,
+        ..Default::default()
+    };
+    if !is_start {
+        return Ok(para);
+    }
+
+    /// Which spacing element (`spcBef`/`spcAft`/`lnSpc`) is open.
+    #[derive(Clone, Copy)]
+    enum Slot {
+        Before,
+        After,
+        Line,
+    }
+    let mut slot: Option<Slot> = None;
+    let mut in_bu_blip = false;
+    let mut depth = 1i32;
+    loop {
+        let event = reader.read_event()?;
+        let is_start_ev = matches!(event, Event::Start(_));
+        match event {
+            Event::Start(ref e) | Event::Empty(ref e) => {
+                match e.local_name().as_ref() {
+                    "spcBef" => slot = Some(Slot::Before),
+                    "spcAft" => slot = Some(Slot::After),
+                    "lnSpc" => slot = Some(Slot::Line),
+                    // §21.1.2.2.11 spcPts: hundredths of a point;
+                    // §21.1.2.2.12 spcPct: thousandths of a percent.
+                    name @ ("spcPts" | "spcPct") => {
+                        let val = xml::optional_attr_str(e, "val")?.and_then(|v| v.parse().ok());
+                        if let (Some(s), Some(v)) = (slot, val) {
+                            let spacing = if name == "spcPts" {
+                                TextSpacing::Points(v)
+                            } else {
+                                TextSpacing::Percent(v)
+                            };
+                            match s {
+                                Slot::Before => para.space_before = Some(spacing),
+                                Slot::After => para.space_after = Some(spacing),
+                                Slot::Line => para.line_spacing = Some(spacing),
+                            }
+                        }
+                    },
+                    "tab" => {
+                        if let Some(pos) =
+                            xml::optional_attr_str(e, "pos")?.and_then(|v| v.parse().ok())
+                        {
+                            para.tab_stops.push(TabStop {
+                                position_emu: pos,
+                                alignment: xml::optional_attr_str(e, "algn")?
+                                    .map(|v| v.into_owned()),
+                            });
+                        }
+                    },
+                    "buBlip" => {
+                        in_bu_blip = is_start_ev;
+                        para.bullet = Some(BulletStyle::Picture { rel_id: None });
+                    },
+                    "blip" if in_bu_blip => {
+                        para.bullet = Some(BulletStyle::Picture {
+                            rel_id: read_blip_embed_attr(e)?,
+                        });
+                    },
+                    _ => {
+                        if let Some(b) = parse_bullet(e)? {
+                            para.bullet = Some(b);
+                        }
+                    },
+                }
+                if is_start_ev {
+                    depth += 1;
+                }
+            },
+            Event::End(ref e) => {
+                depth -= 1;
+                match e.local_name().as_ref() {
+                    "spcBef" | "spcAft" | "lnSpc" => slot = None,
+                    "buBlip" => in_bu_blip = false,
+                    _ => {},
+                }
+                if depth <= 0 {
+                    break;
+                }
+            },
+            Event::Eof => break,
+            _ => {},
+        }
+    }
+    if let Some(TextSpacing::Points(v)) = para.space_before {
+        para.space_before_hundredths_pt = Some(v);
+    }
+    Ok(para)
+}
+
+/// `<a:pPr algn>` → alignment.
+fn parse_algn_attr(
+    e: &quick_xml::events::BytesStart,
+) -> CoreResult<Option<crate::ir::ParagraphAlignment>> {
+    use crate::ir::ParagraphAlignment;
+    Ok(xml::optional_attr_str(e, "algn")?.and_then(|v| match v.as_ref() {
+        "l" => Some(ParagraphAlignment::Left),
+        "ctr" => Some(ParagraphAlignment::Center),
+        "r" => Some(ParagraphAlignment::Right),
+        "just" | "justLow" => Some(ParagraphAlignment::Justify),
+        "dist" | "thaiDist" => Some(ParagraphAlignment::Distribute),
+        _ => None,
+    }))
 }
 
 /// Parse `<a:r>` text run.
@@ -1999,6 +2060,112 @@ mod tests {
             ] => t,
             other => panic!("expected one table frame, got {other:?}"),
         }
+    }
+
+    fn only_paragraphs(slide: &Slide) -> &[TextParagraph] {
+        match slide.shapes.as_slice() {
+            [
+                Shape::AutoShape(AutoShape {
+                    text_body: Some(tb),
+                    ..
+                }),
+            ] => &tb.paragraphs,
+            other => panic!("expected one text shape, got {other:?}"),
+        }
+    }
+
+    /// Only `spcBef`/`spcPts` and the bullet were read from `<a:pPr>`:
+    /// space after, line spacing, the percent form of every spacing, the
+    /// margins/indent, tab stops and picture bullets were dropped.
+    #[test]
+    fn test_paragraph_properties_spacing_indent_tabs_and_picture_bullet() {
+        let slide = parse_with_rels(
+            r#"<p:sp><p:nvSpPr><p:cNvPr id="2" name="T"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/>
+              <a:p><a:pPr marL="457200" marR="91440" indent="-228600" lvl="1">
+                <a:lnSpc><a:spcPct val="150000"/></a:lnSpc>
+                <a:spcBef><a:spcPct val="20000"/></a:spcBef>
+                <a:spcAft><a:spcPts val="600"/></a:spcAft>
+                <a:buBlip><a:blip r:embed="rIdB"/></a:buBlip>
+                <a:tabLst><a:tab pos="914400" algn="ctr"/><a:tab pos="1828800"/></a:tabLst>
+              </a:pPr><a:r><a:t>X</a:t></a:r></a:p>
+              <a:p><a:pPr><a:spcBef><a:spcPts val="1200"/></a:spcBef><a:lnSpc><a:spcPts val="2400"/></a:lnSpc></a:pPr><a:r><a:t>Y</a:t></a:r></a:p>
+            </p:txBody></p:sp>"#,
+            None,
+        );
+        let paras = only_paragraphs(&slide);
+        let p = &paras[0];
+        assert_eq!(p.level, 1);
+        assert_eq!(
+            (p.margin_left_emu, p.margin_right_emu, p.indent_emu),
+            (Some(457_200), Some(91_440), Some(-228_600))
+        );
+        assert_eq!(p.line_spacing, Some(TextSpacing::Percent(150_000)));
+        assert_eq!(p.space_before, Some(TextSpacing::Percent(20_000)));
+        assert_eq!(p.space_before_hundredths_pt, None, "a percentage is not points");
+        assert_eq!(p.space_after, Some(TextSpacing::Points(600)));
+        assert_eq!(
+            p.bullet,
+            Some(BulletStyle::Picture {
+                rel_id: Some("rIdB".into())
+            })
+        );
+        assert_eq!(
+            p.tab_stops,
+            vec![
+                TabStop {
+                    position_emu: 914_400,
+                    alignment: Some("ctr".into())
+                },
+                TabStop {
+                    position_emu: 1_828_800,
+                    alignment: None
+                },
+            ]
+        );
+        let q = &paras[1];
+        assert_eq!(q.space_before_hundredths_pt, Some(1200));
+        assert_eq!(q.line_spacing, Some(TextSpacing::Points(2400)));
+        assert_eq!(
+            extract_plain_text_from_body(&TextBody {
+                paragraphs: paras.to_vec()
+            }),
+            "X\nY"
+        );
+    }
+
+    /// The same properties reach the IR paragraph.
+    #[test]
+    fn test_paragraph_properties_reach_the_ir() {
+        let slide = parse_with_rels(
+            r#"<p:sp><p:nvSpPr><p:cNvPr id="2" name="T"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/>
+              <a:p><a:pPr marL="457200" indent="-228600"><a:lnSpc><a:spcPct val="150000"/></a:lnSpc><a:spcAft><a:spcPts val="600"/></a:spcAft><a:tabLst><a:tab pos="914400" algn="r"/></a:tabLst></a:pPr><a:r><a:t>X</a:t></a:r></a:p>
+            </p:txBody></p:sp>"#,
+            None,
+        );
+        let doc = crate::pptx::PptxDocument {
+            presentation: crate::pptx::PresentationInfo {
+                slides: Vec::new(),
+                slide_size: None,
+            },
+            slides: vec![slide],
+            theme: None,
+            embedded_fonts: Vec::new(),
+            core_properties: None,
+            app_properties: None,
+            has_macros: false,
+            unreadable_parts: Vec::new(),
+        };
+        let ir = crate::convert_pptx::pptx_to_ir(&doc);
+        let crate::ir::Element::Paragraph(ref p) = ir.sections[0].elements[0] else {
+            panic!("expected a paragraph: {:?}", ir.sections[0].elements);
+        };
+        assert_eq!(p.indent_left_twips, Some(720));
+        assert_eq!(p.first_line_indent_twips, Some(-360));
+        assert_eq!(p.space_after_twips, Some(120));
+        assert_eq!(p.line_spacing, Some(crate::ir::LineSpacing::Auto(360)));
+        assert_eq!(p.tabs.len(), 1);
+        assert_eq!(p.tabs[0].position_twips, 1440);
+        assert_eq!(p.tabs[0].alignment, crate::ir::TabAlignment::Right);
     }
 
     /// `<a:tblPr/>` followed directly by a row (no `<a:tblGrid>`, which a
