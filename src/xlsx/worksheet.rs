@@ -766,12 +766,11 @@ fn parse_header_footer(
                         continue;
                     },
                 };
-                // The raw content, unescaped here: the fast reader trims
-                // each text event, which dropped the spaces next to an
-                // entity (`Page &amp;P` came back as `Page&P`).
-                let raw = reader.read_text(e.to_end().name())?;
-                let text = quick_xml::escape::unescape(&raw).map_err(quick_xml::Error::from)?;
-                *slot = Some(text.into_owned());
+                // Entity references and CDATA both resolve here: a code
+                // string is often written as CDATA precisely because its
+                // `&C`/`&B` codes are bare ampersands, which the XML
+                // unescaper rejects.
+                *slot = Some(xml::read_text_content_fast(reader)?);
             },
             Event::End(ref e) if e.local_name().as_ref() == "headerFooter" => break,
             Event::Eof => break,
@@ -2073,6 +2072,23 @@ mod tests {
     /// trimming reader trimmed the text on either side of it separately and
     /// the spaces around `&amp;` vanished: `see A &amp; &lt;B&gt;` read back
     /// as `see A&<B>`.
+    /// A header written as CDATA carries Excel's `&C`/`&B` formatting codes
+    /// as literal ampersands. Running CDATA through the XML unescaper
+    /// failed on `&C` ("cannot find ';' after '&'") and the whole sheet was
+    /// reported unreadable.
+    #[test]
+    fn test_cdata_header_codes_are_literal_and_do_not_fail_the_sheet() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>cell</t></is></c></row></sheetData>
+  <headerFooter><oddHeader><![CDATA[&C&BWorkforce TeleStaff&B]]></oddHeader><oddFooter>Page &amp;P of &amp;N</oddFooter></headerFooter>
+</worksheet>"#;
+        let ws = Worksheet::parse(xml, "S".to_string(), &empty_rels()).unwrap();
+        let hf = ws.header_footer;
+        assert_eq!(hf.odd_header.as_deref(), Some("&C&BWorkforce TeleStaff&B"));
+        assert_eq!(hf.odd_footer.as_deref(), Some("Page &P of &N"));
+    }
+
     #[test]
     fn test_comment_text_keeps_spaces_around_entity_references() {
         let xml = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
