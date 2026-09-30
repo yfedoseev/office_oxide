@@ -413,10 +413,24 @@ impl DocxDocument {
             if !opc.has_part(&part) {
                 return Vec::new();
             }
-            let Ok(data) = opc.read_part(&part) else {
-                return Vec::new();
+            // A notes part that cannot be read or parsed is skipped with a
+            // warning, as a header or footer part is: it is not the
+            // document, but dropping it without a word left no trace that
+            // every note body had gone.
+            let data = match opc.read_part(&part) {
+                Ok(data) => data,
+                Err(e) => {
+                    log::warn!("docx: skipping unreadable {part}: {e}");
+                    return Vec::new();
+                },
             };
-            let mut notes = parse_notes_part(&data, end).unwrap_or_default();
+            let mut notes = match parse_notes_part(&data, end) {
+                Ok(notes) => notes,
+                Err(e) => {
+                    log::warn!("docx: skipping unreadable {part}: {e}");
+                    return Vec::new();
+                },
+            };
             // `r:id` is scoped per OPC part: a hyperlink inside a
             // footnote/endnote/comment resolves against *that* part's
             // `_rels`, not `document.xml.rels`. Resolving against the
@@ -5202,6 +5216,72 @@ mod tests {
                 "{surface} lacks the comment: {out:?}"
             );
         }
+    }
+
+    /// Records every log message, for tests that assert a warning.
+    struct CapturingLogger;
+    static CAPTURED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    impl log::Log for CapturingLogger {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            if let Ok(mut v) = CAPTURED.lock() {
+                v.push(format!("{} {}", record.level(), record.args()));
+            }
+        }
+        fn flush(&self) {}
+    }
+    fn captured_logs() -> Vec<String> {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = log::set_logger(&CapturingLogger);
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+        CAPTURED.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    /// A malformed comments/footnotes/endnotes part was dropped with
+    /// `unwrap_or_default()` and no trace; the header/footer path warns.
+    #[test]
+    fn test_an_unreadable_notes_part_is_skipped_with_a_warning() {
+        let _ = captured_logs();
+        let document_xml =
+            br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>Body survives</w:t></w:r></w:p></w:body></w:document>"#;
+        let comments_xml =
+            br#"<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:comment w:id="0"><w:p><w:r><w:t>x</w:t></w:r><!-- never closed"#;
+        let mut writer = OpcWriter::new(Cursor::new(Vec::new())).unwrap();
+        let doc_part = PartName::new("/word/document.xml").unwrap();
+        writer
+            .add_part(
+                &doc_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+                document_xml,
+            )
+            .unwrap();
+        writer.add_package_rel(rel_types::OFFICE_DOCUMENT, "word/document.xml");
+        let comments_part = PartName::new("/word/comments.xml").unwrap();
+        writer
+            .add_part(
+                &comments_part,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml",
+                comments_xml,
+            )
+            .unwrap();
+        writer.add_part_rel(&doc_part, rel_types::COMMENTS, "comments.xml");
+        let data = writer.finish().unwrap().into_inner();
+
+        let doc = DocxDocument::from_reader(Cursor::new(data)).unwrap();
+        assert!(doc.plain_text().contains("Body survives"));
+        assert!(doc.comments.is_empty());
+        let logs = captured_logs();
+        assert!(
+            logs.iter()
+                .any(|l| l.starts_with("WARN") && l.contains("/word/comments.xml")),
+            "no warning names the skipped part: {logs:?}"
+        );
     }
 
     #[test]
