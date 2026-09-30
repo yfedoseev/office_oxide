@@ -103,6 +103,22 @@ pub struct CellFormat {
     pub apply_number_format: bool,
     /// Reference to a `cellStyleXfs` entry.
     pub xf_id: Option<u32>,
+    /// The `<alignment>` child ([ECMA-376] §18.8.1), when present.
+    pub alignment: Option<CellAlignment>,
+}
+
+/// A cell format's `<alignment>` ([ECMA-376] §18.8.1).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CellAlignment {
+    /// `horizontal` (ST_HorizontalAlignment §18.18.40): `left`, `center`,
+    /// `right`, `justify`, `distributed`, `fill`, `centerContinuous`,
+    /// `general`.
+    pub horizontal: Option<String>,
+    /// `vertical` (ST_VerticalAlignment §18.18.88): `top`, `center`,
+    /// `bottom`, `justify`, `distributed`.
+    pub vertical: Option<String>,
+    /// `wrapText`.
+    pub wrap_text: bool,
 }
 
 impl StyleSheet {
@@ -198,6 +214,14 @@ impl StyleSheet {
     pub fn border_for(&self, style_index: u32) -> Option<&Border> {
         let xf = self.cell_formats.get(style_index as usize)?;
         self.borders.get(xf.border_index? as usize)
+    }
+
+    /// Get the alignment for a cell format index.
+    pub fn alignment_for(&self, style_index: u32) -> Option<&CellAlignment> {
+        self.cell_formats
+            .get(style_index as usize)?
+            .alignment
+            .as_ref()
     }
 
     /// Get the number format ID for a cell format index.
@@ -521,7 +545,20 @@ fn parse_xfs(reader: &mut quick_xml::Reader<&[u8]>) -> crate::core::Result<Vec<C
                     border_index,
                     apply_number_format,
                     xf_id,
+                    alignment: None,
                 });
+            },
+            // `<alignment>` is a child of the `<xf>` just pushed.
+            Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == "alignment" => {
+                if let Some(xf) = formats.last_mut() {
+                    xf.alignment = Some(CellAlignment {
+                        horizontal: xml::optional_attr_str(e, "horizontal")?
+                            .map(|v| v.into_owned()),
+                        vertical: xml::optional_attr_str(e, "vertical")?.map(|v| v.into_owned()),
+                        wrap_text: xml::optional_attr_str(e, "wrapText")?
+                            .is_some_and(|v| matches!(v.as_ref(), "1" | "true")),
+                    });
+                }
             },
             Event::End(ref e) => {
                 let local = e.local_name();
@@ -622,6 +659,7 @@ mod tests {
                     border_index: None,
                     apply_number_format: false,
                     xf_id: None,
+                    alignment: None,
                 },
                 CellFormat {
                     number_format_id: 164,
@@ -630,6 +668,7 @@ mod tests {
                     border_index: None,
                     apply_number_format: true,
                     xf_id: None,
+                    alignment: None,
                 },
             ],
             cell_style_formats: vec![],
@@ -678,6 +717,7 @@ mod tests {
                 border_index: None,
                 apply_number_format: false,
                 xf_id: None,
+                alignment: None,
             }],
             cell_style_formats: vec![],
         };

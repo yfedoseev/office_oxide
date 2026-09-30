@@ -331,6 +331,8 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                         formula: cd.formula.clone(),
                         background_color: cell_background(doc, cd, theme.as_deref()),
                         border: cell_border(doc, cd, theme.as_deref()),
+                        text_align: cell_h_align(doc, cd),
+                        vertical_align: cell_v_align(doc, cd),
                         ..Default::default()
                     };
                     while tcells.len() < cd.col as usize {
@@ -880,6 +882,36 @@ fn border_line_style(style: &str) -> Option<(BorderStyle, u32)> {
         "mediumDashed" | "mediumDashDot" | "mediumDashDotDot" | "slantDashDot" => {
             (BorderStyle::Dashed, 8)
         },
+        _ => return None,
+    })
+}
+
+fn cell_alignment<'d>(
+    doc: &'d crate::xlsx::XlsxDocument,
+    cd: &CellData,
+) -> Option<&'d crate::xlsx::styles::CellAlignment> {
+    doc.styles.as_ref()?.alignment_for(cd.style_index?)
+}
+
+/// `horizontal` (§18.18.40) as IR paragraph alignment; `general`, `fill`
+/// and `centerContinuous` have no IR equivalent and stay unset.
+fn cell_h_align(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> Option<ParagraphAlignment> {
+    Some(match cell_alignment(doc, cd)?.horizontal.as_deref()? {
+        "left" => ParagraphAlignment::Left,
+        "center" => ParagraphAlignment::Center,
+        "right" => ParagraphAlignment::Right,
+        "justify" => ParagraphAlignment::Justify,
+        "distributed" => ParagraphAlignment::Distribute,
+        _ => return None,
+    })
+}
+
+/// `vertical` (§18.18.88) as IR cell vertical alignment.
+fn cell_v_align(doc: &crate::xlsx::XlsxDocument, cd: &CellData) -> Option<CellVerticalAlign> {
+    Some(match cell_alignment(doc, cd)?.vertical.as_deref()? {
+        "top" => CellVerticalAlign::Top,
+        "center" => CellVerticalAlign::Center,
+        "bottom" => CellVerticalAlign::Bottom,
         _ => return None,
     })
 }

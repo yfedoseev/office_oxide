@@ -570,11 +570,30 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
                             }
                             let text = cell_text(cell);
                             let data = ir_cell_to_cell_data(cell, &text);
-                            if let Some(style) = xlsx_cell_style(
+                            let style = xlsx_cell_style(
                                 row.is_header,
                                 cell.background_color,
                                 cell.number_format.as_deref(),
-                            ) {
+                            );
+                            // A cell's horizontal alignment round-trips.
+                            let halign = match cell.text_align {
+                                Some(crate::ir::ParagraphAlignment::Left) => {
+                                    Some(crate::xlsx::write::HAlign::Left)
+                                },
+                                Some(crate::ir::ParagraphAlignment::Center) => {
+                                    Some(crate::xlsx::write::HAlign::Center)
+                                },
+                                Some(crate::ir::ParagraphAlignment::Right) => {
+                                    Some(crate::xlsx::write::HAlign::Right)
+                                },
+                                _ => None,
+                            };
+                            let style = match (style, halign) {
+                                (Some(s), Some(a)) => Some(s.align(a)),
+                                (None, Some(a)) => Some(CellStyle::new().align(a)),
+                                (s, None) => s,
+                            };
+                            if let Some(style) = style {
                                 sheet.set_cell_styled(row_cursor, col, data, style);
                             } else {
                                 sheet.set_cell(row_cursor, col, data);

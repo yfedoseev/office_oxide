@@ -307,6 +307,7 @@ fn parse_styles(data: &[u8]) -> StyleSheet {
                         border_index: Some(u16::from_le_bytes([b[8], b[9]]) as u32),
                         apply_number_format: true,
                         xf_id: Some(u16::from_le_bytes([b[0], b[1]]) as u32),
+                        alignment: None,
                     });
                 }
             },
