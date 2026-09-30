@@ -163,6 +163,16 @@ pub const RT_NOTES_ATOM: u16 = 0x03F1;
 /// compressed VBA project storage, then `fHasMacros` (1 when it holds a
 /// project), then `version`.
 pub const RT_VBA_INFO_ATOM: u16 = 0x0400;
+/// `EnvironmentContainer` ([MS-PPT] `EnvironmentContainer`, record type
+/// 1010), a `DocumentContainer` child holding the font collection.
+pub const RT_ENVIRONMENT: u16 = 0x03F2;
+/// `FontCollectionContainer` ([MS-PPT] `FontCollectionContainer`, record
+/// type 2005).
+pub const RT_FONT_COLLECTION: u16 = 0x07D5;
+/// `FontEntityAtom` ([MS-PPT] `FontEntityAtom`, record type 4023): the
+/// face name as 32 UTF-16 units (NUL-terminated/padded), then charset and
+/// pitch/family bytes. A run's `fontRef` indexes these in order.
+pub const RT_FONT_ENTITY_ATOM: u16 = 0x0FB7;
 
 /// A parsed PPT record header.
 #[derive(Debug, Clone, Copy)]

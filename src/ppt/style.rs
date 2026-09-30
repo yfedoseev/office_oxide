@@ -48,6 +48,12 @@ pub struct CharFormat {
     /// Baseline position, percent of line height (-100..=100); positive
     /// is superscript-like, negative subscript-like.
     pub position: Option<i16>,
+    /// `fontRef`: index of the run's typeface in the deck's
+    /// `FontCollectionContainer` ([MS-PPT] `TextCFException`).
+    pub font_ref: Option<u16>,
+    /// The typeface name `font_ref` resolves to, filled in once the deck's
+    /// font collection is known.
+    pub typeface: Option<String>,
 }
 
 /// Paragraph-level formatting resolved from a single `TextPFRun`.
@@ -281,7 +287,7 @@ fn parse_cf_body(c: &mut Cursor, masks: u32) -> Option<CharFormat> {
         }
     }
     if masks & CF_TYPEFACE != 0 {
-        c.skip(2)?; // fontRef
+        fmt.font_ref = c.u16();
     }
     if masks & CF_OLD_EA_TYPEFACE != 0 {
         c.skip(2)?; // oldEAFontRef
@@ -377,6 +383,8 @@ impl CharFormat {
             font_size: self.font_size.or(master.font_size),
             color: self.color.or(master.color),
             position: self.position.or(master.position),
+            font_ref: self.font_ref.or(master.font_ref),
+            typeface: self.typeface.clone().or_else(|| master.typeface.clone()),
         }
     }
 }

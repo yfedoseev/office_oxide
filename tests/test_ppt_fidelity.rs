@@ -174,3 +174,43 @@ fn test_hidden_footer_is_not_injected() {
     let ir = open(deck.build()).unwrap().to_ir();
     assert_eq!(texts(&ir.sections[0].elements), ["Only slide"]);
 }
+
+fn spans(elements: &[Element]) -> Vec<office_oxide::ir::TextSpan> {
+    let mut out = Vec::new();
+    for e in elements {
+        let content = match e {
+            Element::Paragraph(p) => &p.content,
+            Element::Heading(h) => &h.content,
+            _ => continue,
+        };
+        for c in content {
+            if let InlineContent::Text(t) = c {
+                out.push(t.clone());
+            }
+        }
+    }
+    out
+}
+
+/// A run's typeface is a `fontRef` index into the deck's
+/// `FontCollectionContainer` of `FontEntityAtom`s ([MS-PPT]
+/// `TextCFException`, `FontEntityAtom`). The collection was never parsed,
+/// so no `.ppt` span ever had a font name.
+#[test]
+fn test_character_typeface_resolves_through_the_font_collection() {
+    const CF_TYPEFACE: u32 = 1 << 16;
+    let text = "Styled";
+    let prop = style_text_prop(text.len() as u32, &[(7, CF_TYPEFACE, 1u16.to_le_bytes().to_vec())]);
+    let deck = PptBuilder {
+        slides: vec![PptSlide {
+            shapes: text_shape(1, text, &prop),
+            ..Default::default()
+        }],
+        fonts: vec!["Arial".into(), "Georgia".into()],
+        ..Default::default()
+    };
+    let ir = open(deck.build()).unwrap().to_ir();
+    let s = spans(&ir.sections[0].elements);
+    assert_eq!(s.len(), 1, "{s:?}");
+    assert_eq!(s[0].font_name.as_deref(), Some("Georgia"));
+}

@@ -124,6 +124,9 @@ fn spans_for_range(
             if let Some(color) = f.format.color {
                 span.color = Some(color);
             }
+            if let Some(typeface) = &f.format.typeface {
+                span.font_name = Some(typeface.clone());
+            }
             if let Some(position) = f.format.position {
                 span.vertical_align = match position.cmp(&0) {
                     std::cmp::Ordering::Greater => Some(VerticalAlign::Superscript),

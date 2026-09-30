@@ -276,6 +276,8 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
         .map(|hf| shown_slide_header_footer_texts(&hf))
         .unwrap_or_default();
 
+    let fonts = font_collection(&doc_children);
+
     let mut slides = Vec::new();
     // Per slide: its `SlideId` and `SlideAtom.notesIdRef`, to attach notes.
     let mut slide_links: Vec<(u32, Option<u32>)> = Vec::new();
@@ -339,7 +341,41 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<V
         }
     }
 
+    // Every run's `fontRef` names a font in the deck's collection.
+    if !fonts.is_empty() {
+        for run in slides.iter_mut().flat_map(|s| s.text_runs.iter_mut()) {
+            for span in &mut run.char_formats {
+                span.format.typeface = span
+                    .format
+                    .font_ref
+                    .and_then(|r| fonts.get(r as usize))
+                    .cloned();
+            }
+        }
+    }
+
     Some(slides)
+}
+
+/// The deck's typeface names, in `FontCollectionContainer` order — the
+/// index a `TextCFException.fontRef` uses ([MS-PPT] `FontEntityAtom`:
+/// `lfFaceName` is 32 UTF-16 units, NUL-terminated or padded).
+fn font_collection(doc_children: &[u8]) -> Vec<String> {
+    let Some(env) = find_child(doc_children, RT_ENVIRONMENT, 0) else {
+        return Vec::new();
+    };
+    let Some(collection) = find_child(&env, RT_FONT_COLLECTION, 0) else {
+        return Vec::new();
+    };
+    RecordIter::new(&collection)
+        .filter_map(Result::ok)
+        .filter(|r| r.header.rec_type == RT_FONT_ENTITY_ATOM)
+        .map(|r| {
+            let name = r.data.get(..64).unwrap_or(&r.data);
+            let name = decode_utf16le(name);
+            name.split('\0').next().unwrap_or_default().to_string()
+        })
+        .collect()
 }
 
 /// Whether the deck carries a VBA project: a `VBAInfoAtom` with
