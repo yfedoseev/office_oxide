@@ -95,6 +95,11 @@ pub struct SubDocument {
     /// it), or one per text box (split at `PlcftxbxTxt`/`PlcfHdrtxbxTxt`
     /// boundaries). Empty when the subdocument has no such structure.
     pub(crate) parts: Vec<String>,
+    /// For a main-document text-box subdocument: the main-text CP of the
+    /// anchor of each entry of [`parts`](Self::parts) (same length), or
+    /// `None` when that box's shape has no resolvable anchor. Empty when
+    /// no box could be anchored at all.
+    pub(crate) part_anchors: Vec<Option<u32>>,
 }
 
 impl SubDocument {
@@ -114,28 +119,51 @@ impl SubDocument {
             kind,
             text: sanitize_text(raw),
             parts,
+            part_anchors: Vec::new(),
         }
     }
 
     /// As [`from_raw`](Self::from_raw), with the stories split at the
     /// given CP boundaries (story `i` is `bounds[i]..bounds[i + 1]`,
     /// relative to the subdocument's first character).
-    pub(crate) fn from_raw_stories(kind: SubDocumentKind, raw: &str, bounds: &[u32]) -> Self {
+    ///
+    /// `anchors[i]`, when present, is story `i`'s anchor CP in the main
+    /// text; it is carried onto the matching entry of `part_anchors`.
+    pub(crate) fn from_raw_stories(
+        kind: SubDocumentKind,
+        raw: &str,
+        bounds: &[u32],
+        anchors: &[Option<u32>],
+    ) -> Self {
         let mut sub = Self::from_raw(kind, raw);
         let chars: Vec<char> = raw.chars().collect();
-        sub.parts = bounds
+        let (parts, part_anchors): (Vec<String>, Vec<Option<u32>>) = bounds
             .windows(2)
-            .filter_map(|w| {
+            .enumerate()
+            .filter_map(|(i, w)| {
                 let (lo, hi) = (w[0] as usize, (w[1] as usize).min(chars.len()));
                 if hi <= lo {
                     return None;
                 }
                 let story: String = chars[lo..hi].iter().collect();
                 let text = sanitize_text(&story).trim().to_string();
-                (!text.is_empty()).then_some(text)
+                (!text.is_empty()).then(|| (text, anchors.get(i).copied().flatten()))
             })
-            .collect();
+            .unzip();
+        sub.parts = parts;
+        if part_anchors.iter().any(Option::is_some) {
+            sub.part_anchors = part_anchors;
+        }
         sub
+    }
+
+    /// Each story with the main-text CP of its anchor, when known (see
+    /// [`part_anchors`](Self::part_anchors)).
+    pub(crate) fn anchored_parts(&self) -> impl Iterator<Item = (&str, Option<u32>)> {
+        self.parts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.as_str(), self.part_anchors.get(i).copied().flatten()))
     }
 }
 
@@ -362,10 +390,30 @@ impl DocDocument {
             let story_bounds = txbx_plc
                 .map(|(fc, lcb)| parse_plcf_txbx_bounds(&table_stream, fc, lcb))
                 .unwrap_or_default();
+            // Main-document boxes are anchored in the main text: each
+            // FTXBXS names the shape its text begins in, and PlcSpaMom
+            // gives that shape's anchor CP. Header-document boxes anchor
+            // in header stories, which are not interleaved with body
+            // paragraphs, so they keep trailing the document.
+            let story_anchors = if kind == SubDocumentKind::TextBoxes && story_bounds.len() >= 2 {
+                let spa = parse_plcf_spa(&table_stream, fib.fc_plc_spa_mom, fib.lcb_plc_spa_mom);
+                parse_plcf_txbx_lids(&table_stream, fib.fc_plcftxbx_txt, fib.lcb_plcftxbx_txt)
+                    .into_iter()
+                    .map(|lid| {
+                        let lid = lid?;
+                        spa.iter()
+                            .find(|&&(_, spid)| spid == lid)
+                            .map(|&(cp, _)| cp)
+                            .filter(|&cp| cp < fib.text_len)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let sub = if text_start > 0 {
                 SubDocument::from_raw(kind, &raw.chars().skip(text_start).collect::<String>())
             } else if story_bounds.len() >= 2 {
-                SubDocument::from_raw_stories(kind, &raw, &story_bounds)
+                SubDocument::from_raw_stories(kind, &raw, &story_bounds, &story_anchors)
             } else {
                 SubDocument::from_raw(kind, &raw)
             };
@@ -830,7 +878,6 @@ fn parse_plcf_hdd_stories(
 /// final story is a placeholder with no text box and comes out empty.
 /// Empty when absent or malformed.
 fn parse_plcf_txbx_bounds(table_stream: &[u8], fc: u32, lcb: u32) -> Vec<u32> {
-    const FTXBXS_SIZE: usize = 22;
     let start = fc as usize;
     let Some(end) = start.checked_add(lcb as usize) else {
         return Vec::new();
@@ -859,6 +906,78 @@ fn parse_plcf_txbx_bounds(table_stream: &[u8], fc: u32, lcb: u32) -> Vec<u32> {
         return Vec::new();
     }
     cps
+}
+
+/// Size of an `FTXBXS` ([MS-DOC] §2.9.106): `ftxbxsunion` (8),
+/// `fReusable` (2), `itxbxsDest` (4), `lid` (4), `txidUndo` (4).
+const FTXBXS_SIZE: usize = 22;
+
+/// Each `PlcftxbxTxt` ([MS-DOC] §2.8.32) story's `FTXBXS.lid` — the
+/// OfficeArt shape id (`OfficeArtFSP.spid`) the box's text begins in — or
+/// `None` for a reusable spare (`fReusable` != 0) and for the final entry,
+/// which §2.9.106 says is always reusable. Same length as the PLC's story
+/// count; empty when the PLC is absent or malformed.
+fn parse_plcf_txbx_lids(table_stream: &[u8], fc: u32, lcb: u32) -> Vec<Option<u32>> {
+    let Some((n, data_at)) = plc_layout(table_stream, fc, lcb, FTXBXS_SIZE) else {
+        return Vec::new();
+    };
+    (0..n)
+        .map(|i| {
+            let at = data_at + i * FTXBXS_SIZE;
+            let f_reusable = u16::from_le_bytes([table_stream[at + 8], table_stream[at + 9]]);
+            let lid = u32::from_le_bytes([
+                table_stream[at + 14],
+                table_stream[at + 15],
+                table_stream[at + 16],
+                table_stream[at + 17],
+            ]);
+            (f_reusable == 0 && i + 1 < n).then_some(lid)
+        })
+        .collect()
+}
+
+/// Size of a `Spa` ([MS-DOC] §2.9.253): `lid` (4), `rca` (16), flags (2),
+/// `cTxbx` (4).
+const SPA_SIZE: usize = 26;
+
+/// The main document's shape anchors from `PlcSpaMom`, a `PlcfSpa`
+/// ([MS-DOC] §2.8.27): `(aCP[i], aSpa[i].lid)` for every shape, where
+/// `aCP[i]` is the main-text CP of the shape's anchor character and `lid`
+/// is its OfficeArt shape id. The final `aCP` bounds the PLC and carries no
+/// shape. Empty when the PLC is absent or malformed.
+fn parse_plcf_spa(table_stream: &[u8], fc: u32, lcb: u32) -> Vec<(u32, u32)> {
+    let Some((n, data_at)) = plc_layout(table_stream, fc, lcb, SPA_SIZE) else {
+        return Vec::new();
+    };
+    let start = fc as usize;
+    let u32_at = |at: usize| {
+        u32::from_le_bytes([
+            table_stream[at],
+            table_stream[at + 1],
+            table_stream[at + 2],
+            table_stream[at + 3],
+        ])
+    };
+    (0..n)
+        .map(|i| (u32_at(start + i * 4), u32_at(data_at + i * SPA_SIZE)))
+        .collect()
+}
+
+/// A PLC ([MS-DOC] §2.2.2) of `elem`-byte data elements at `fc..fc + lcb`
+/// in the Table stream: `(n, offset of aData[0])` when it is in bounds and
+/// `lcb` is exactly `4 * (n + 1) + elem * n` for some `n`.
+fn plc_layout(table_stream: &[u8], fc: u32, lcb: u32, elem: usize) -> Option<(usize, usize)> {
+    let start = fc as usize;
+    let end = start.checked_add(lcb as usize)?;
+    if lcb < 4 || end > table_stream.len() {
+        return None;
+    }
+    let cb = end - start;
+    if !(cb - 4).is_multiple_of(4 + elem) {
+        return None;
+    }
+    let n = (cb - 4) / (4 + elem);
+    Some((n, start + (n + 1) * 4))
 }
 
 /// The end CP of every section, from `PlcfSed` ([MS-DOC] §2.8.26 — a PLC
@@ -1342,6 +1461,7 @@ mod tests {
             terminator: '\r',
             props,
             hyperlinks: Vec::new(),
+            cp_end: 0,
             chp_runs: Vec::new(),
         }
     }
