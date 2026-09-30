@@ -3,8 +3,11 @@
 
 [advisories]
 version = 2
-# Threshold for unmaintained crates
-unmaintained = "none"
+# An unmaintained-crate advisory against one of our direct (workspace)
+# dependencies fails the check; the parsers consume untrusted input, so a
+# dependency whose maintainers are gone needs a decision. ("none" silenced
+# every such advisory.)
+unmaintained = "workspace"
 # Threshold for crates that have been yanked from their source registry
 yanked = "deny"
 # Ignore certain advisories (use sparingly)
