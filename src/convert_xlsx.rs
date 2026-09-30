@@ -334,6 +334,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                         border: cell_border(doc, cd, theme.as_deref()),
                         text_align: cell_h_align(doc, cd),
                         vertical_align: cell_v_align(doc, cd),
+                        wrap_text: cell_alignment(doc, cd).is_some_and(|a| a.wrap_text),
                         ..Default::default()
                     };
                     while tcells.len() < cd.col as usize {

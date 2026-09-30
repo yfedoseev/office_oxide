@@ -1507,6 +1507,10 @@ pub struct TableCell {
     /// produced it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub formula: Option<String>,
+    /// Text wraps onto multiple lines within the cell (XLSX `wrapText`,
+    /// ECMA-376 §18.8.1 `alignment`). `false` for prose formats.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wrap_text: bool,
 }
 
 /// An ordered or unordered list.
