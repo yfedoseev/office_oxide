@@ -82,6 +82,11 @@ pub struct Slide {
     /// renderer can show a notice where it was; the part and the reason are
     /// also listed in [`super::PptxDocument::unreadable_parts`].
     pub parse_error: Option<String>,
+    /// Index into [`super::PptxDocument::layouts`] of the slide's layout.
+    pub layout_index: Option<usize>,
+    /// `<p:sld showMasterSp="0">` — the slide hides the shapes of its
+    /// layout and master.
+    pub hide_master_shapes: bool,
 }
 
 /// A comment attached to a slide (`ppt/comments/modernComment*.xml` or the
@@ -120,11 +125,18 @@ impl Slide {
         let mut shapes = Vec::new();
         let mut background_rgb = None;
         let mut hidden = false;
+        let mut hide_master_shapes = false;
 
         loop {
             match reader.read_event()? {
-                Event::Start(ref e) | Event::Empty(ref e) if e.local_name().as_ref() == "sld" => {
+                // The root: `p:sld`, or `p:sldLayout`/`p:sldMaster` when a
+                // layout or master part is read with the same parser.
+                Event::Start(ref e) | Event::Empty(ref e)
+                    if matches!(e.local_name().as_ref(), "sld" | "sldLayout" | "sldMaster") =>
+                {
                     hidden = xml::optional_attr_str(e, "show")?
+                        .is_some_and(|v| matches!(v.as_ref(), "0" | "false"));
+                    hide_master_shapes = xml::optional_attr_str(e, "showMasterSp")?
                         .is_some_and(|v| matches!(v.as_ref(), "0" | "false"));
                 },
                 Event::Start(ref e) if e.local_name().as_ref() == "bg" => {
@@ -146,6 +158,8 @@ impl Slide {
             hidden,
             comments: Vec::new(),
             parse_error: None,
+            layout_index: None,
+            hide_master_shapes,
         })
     }
 }
@@ -1258,12 +1272,18 @@ fn parse_text_body(
     rels: &Relationships,
 ) -> CoreResult<TextBody> {
     let mut paragraphs = Vec::new();
+    let mut list_style = None;
 
     loop {
         match reader.read_event()? {
             Event::Start(ref e) => match e.local_name().as_ref() {
                 "p" => {
                     paragraphs.push(parse_text_paragraph(reader, rels)?);
+                },
+                // The shape's own list style: the first inherited layer
+                // under the paragraph's and runs' direct formatting.
+                "lstStyle" => {
+                    list_style = Some(super::master::parse_level_styles(reader, "lstStyle")?);
                 },
                 _ => {
                     xml::skip_element_fast(reader)?;
@@ -1278,7 +1298,45 @@ fn parse_text_body(
         }
     }
 
-    Ok(TextBody { paragraphs })
+    let mut body = TextBody { paragraphs };
+    if let Some(styles) = list_style.filter(|s| !s.is_empty()) {
+        for para in &mut body.paragraphs {
+            if let Some(d) = styles.level(para.level) {
+                apply_inherited_defaults(para, d);
+            }
+        }
+    }
+    Ok(body)
+}
+
+/// Fill every unset formatting field of `para` and its runs from inherited
+/// defaults — never overriding a value the paragraph or run specifies.
+pub(crate) fn apply_inherited_defaults(
+    para: &mut TextParagraph,
+    defaults: &super::master::MasterRunDefaults,
+) {
+    if para.alignment.is_none() {
+        para.alignment.clone_from(&defaults.alignment);
+    }
+    for content in &mut para.content {
+        if let TextContent::Run(run) = content {
+            if run.bold.is_none() {
+                run.bold = defaults.bold;
+            }
+            if run.italic.is_none() {
+                run.italic = defaults.italic;
+            }
+            if run.underline.is_none() {
+                run.underline.clone_from(&defaults.underline);
+            }
+            if run.font_size_hundredths_pt.is_none() {
+                run.font_size_hundredths_pt = defaults.font_size_hundredths_pt;
+            }
+            if run.color_rgb.is_none() {
+                run.color_rgb = defaults.color_rgb;
+            }
+        }
+    }
 }
 
 /// Parse `<a:p>`.
@@ -2154,6 +2212,8 @@ mod tests {
             app_properties: None,
             has_macros: false,
             unreadable_parts: Vec::new(),
+            layouts: Vec::new(),
+            masters: Vec::new(),
         };
         let ir = crate::convert_pptx::pptx_to_ir(&doc);
         let crate::ir::Element::Paragraph(ref p) = ir.sections[0].elements[0] else {

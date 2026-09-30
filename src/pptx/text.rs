@@ -557,6 +557,8 @@ mod tests {
             theme: None,
             embedded_fonts: Vec::new(),
             unreadable_parts: Vec::new(),
+            layouts: Vec::new(),
+            masters: Vec::new(),
         }
     }
 

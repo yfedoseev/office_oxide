@@ -609,3 +609,230 @@ fn test_an_ole_object_keeps_its_preview_picture() {
     assert_eq!(imgs[0].data.as_deref(), Some(PNG));
     assert!(ir.plain_text().contains("AFTER"), "the reader position stays right");
 }
+
+// ---------------------------------------------------------------------------
+// Text-style inheritance and layout/master static text
+// ---------------------------------------------------------------------------
+
+fn ph_sp(ph: &str, lst_style: &str, paragraphs: &str) -> String {
+    format!(
+        r#"<p:sp><p:nvSpPr><p:cNvPr id="2" name="S"/><p:cNvSpPr/><p:nvPr>{ph}</p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle>{lst_style}</a:lstStyle>{paragraphs}</p:txBody></p:sp>"#
+    )
+}
+
+fn run(text: &str) -> String {
+    format!("<a:r><a:rPr/><a:t>{text}</a:t></a:r>")
+}
+
+/// A deck whose one slide uses a layout (with a static text box) on a
+/// master with `txStyles`, in a presentation with a `defaultTextStyle`.
+fn styled_deck(slide_attrs: &str) -> Pkg {
+    let slide = [
+        ph_sp(r#"<p:ph type="title"/>"#, "", &format!("<a:p>{}</a:p>", run("TITLE"))),
+        ph_sp(
+            r#"<p:ph idx="1"/>"#,
+            "",
+            &format!(
+                r#"<a:p>{}</a:p><a:p><a:pPr lvl="1"/>{}</a:p>"#,
+                run("LEVEL ONE"),
+                run("LEVEL TWO")
+            ),
+        ),
+        ph_sp(r#"<p:ph type="dt" idx="10"/>"#, "", &format!("<a:p>{}</a:p>", run("DATE"))),
+        ph_sp(
+            "",
+            r#"<a:lvl1pPr><a:defRPr b="1"/></a:lvl1pPr>"#,
+            &format!("<a:p>{}</a:p>", run("TEXT BOX")),
+        ),
+    ]
+    .concat();
+    let mut pkg = deck(&[&slide]);
+    pkg.parts.insert(
+        "ppt/slides/slide1.xml".into(),
+        format!(
+            r#"<?xml version="1.0"?><p:sld {NS} {slide_attrs}><p:cSld><p:spTree>{slide}</p:spTree></p:cSld></p:sld>"#
+        )
+        .into_bytes(),
+    );
+    let pres = String::from_utf8(pkg.parts["ppt/presentation.xml"].clone()).unwrap();
+    pkg.parts.insert(
+        "ppt/presentation.xml".into(),
+        pres.replace(
+            "</p:presentation>",
+            r#"<p:defaultTextStyle><a:defPPr><a:defRPr sz="1800"/></a:defPPr></p:defaultTextStyle></p:presentation>"#,
+        )
+        .into_bytes(),
+    );
+    // Layout: the body placeholder centres and underlines level 1; a
+    // plain text box carries boilerplate.
+    let layout_tree = [
+        ph_sp(
+            r#"<p:ph idx="1"/>"#,
+            r#"<a:lvl1pPr algn="ctr"><a:defRPr u="sng"/></a:lvl1pPr>"#,
+            &format!("<a:p>{}</a:p>", run("Click to edit")),
+        ),
+        text_sp("ACME CONFIDENTIAL"),
+    ]
+    .concat();
+    pkg.part(
+        "ppt/slideLayouts/slideLayout1.xml",
+        &format!("{CT_PML}slideLayout+xml"),
+        format!(
+            r#"<?xml version="1.0"?><p:sldLayout {NS}><p:cSld name="Title and Content"><p:spTree>{layout_tree}</p:spTree></p:cSld></p:sldLayout>"#
+        ),
+    );
+    pkg.rel(
+        "ppt/slides/slide1.xml",
+        "rIdLay",
+        rel_types::SLIDE_LAYOUT,
+        "../slideLayouts/slideLayout1.xml",
+    );
+    // Master: its body placeholder colours level 1 red; txStyles give
+    // sizes per level and category.
+    let master_tree = [
+        ph_sp(r#"<p:ph type="body" idx="1"/>"#, r#"<a:lvl1pPr><a:defRPr><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></a:defRPr></a:lvl1pPr>"#, ""),
+        text_sp("MASTER FOOTER"),
+    ]
+    .concat();
+    pkg.part(
+        "ppt/slideMasters/slideMaster1.xml",
+        &format!("{CT_PML}slideMaster+xml"),
+        format!(
+            r#"<?xml version="1.0"?><p:sldMaster {NS}><p:cSld><p:spTree>{master_tree}</p:spTree></p:cSld><p:txStyles>
+              <p:titleStyle><a:lvl1pPr><a:defRPr sz="4400" b="1"/></a:lvl1pPr></p:titleStyle>
+              <p:bodyStyle><a:lvl1pPr><a:defRPr sz="3200"/></a:lvl1pPr><a:lvl2pPr><a:defRPr sz="2800" i="1"/></a:lvl2pPr></p:bodyStyle>
+              <p:otherStyle><a:lvl1pPr><a:defRPr sz="1200"/></a:lvl1pPr></p:otherStyle>
+            </p:txStyles></p:sldMaster>"#
+        ),
+    );
+    pkg.rel(
+        "ppt/slideLayouts/slideLayout1.xml",
+        "rIdM",
+        rel_types::SLIDE_MASTER,
+        "../slideMasters/slideMaster1.xml",
+    );
+    pkg
+}
+
+fn span_named<'a>(ir: &'a DocumentIR, text: &str) -> &'a TextSpan {
+    let mut all = Vec::new();
+    for s in &ir.sections {
+        all.extend(spans(&s.elements));
+        for e in &s.elements {
+            if let Element::Heading(h) = e {
+                all.extend(h.content.iter().filter_map(|c| match c {
+                    InlineContent::Text(t) => Some(t),
+                    _ => None,
+                }));
+            }
+        }
+    }
+    all.into_iter()
+        .find(|s| s.text == text)
+        .unwrap_or_else(|| panic!("no span {text:?}"))
+}
+
+/// Formatting is inherited through the whole ECMA-376 chain: the layout's
+/// placeholder, the master's placeholder, the master's per-level
+/// `txStyles` (title/body/other) and the presentation default. Only the
+/// master's level-1 title/body style used to be read.
+#[test]
+fn test_text_formatting_inherits_through_layout_master_and_presentation() {
+    let doc = styled_deck("").open();
+    let runs = |i: usize| -> Vec<(String, office_oxide::pptx::TextRun)> {
+        let office_oxide::pptx::Shape::AutoShape(ref a) = doc.slides[0].shapes[i] else {
+            panic!()
+        };
+        a.text_body
+            .as_ref()
+            .unwrap()
+            .paragraphs
+            .iter()
+            .flat_map(|p| &p.content)
+            .filter_map(|c| match c {
+                office_oxide::pptx::TextContent::Run(r) => Some((r.text.clone(), r.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+    // Title: master titleStyle.
+    let (_, title) = &runs(0)[0];
+    assert_eq!((title.font_size_hundredths_pt, title.bold), (Some(4400), Some(true)));
+    // Body level 1: layout placeholder (underline), master placeholder
+    // (colour), master bodyStyle level 1 (size).
+    let body = runs(1);
+    let one = &body[0].1;
+    assert_eq!(one.underline.as_deref(), Some("sng"));
+    assert_eq!(one.color_rgb, Some([0xFF, 0, 0]));
+    assert_eq!(one.font_size_hundredths_pt, Some(3200));
+    // Body level 2: master bodyStyle level 2; the level-1-only layout and
+    // master placeholder styles do not apply.
+    let two = &body[1].1;
+    assert_eq!((two.font_size_hundredths_pt, two.italic), (Some(2800), Some(true)));
+    assert_eq!((two.underline.as_deref(), two.color_rgb), (None, None));
+    // Date placeholder: otherStyle.
+    assert_eq!(runs(2)[0].1.font_size_hundredths_pt, Some(1200));
+    // A plain text box: its own list style, then otherStyle.
+    let tb = &runs(3)[0].1;
+    assert_eq!((tb.bold, tb.font_size_hundredths_pt), (Some(true), Some(1200)));
+    let office_oxide::pptx::Shape::AutoShape(ref a) = doc.slides[0].shapes[1] else {
+        panic!()
+    };
+    assert_eq!(
+        a.text_body.as_ref().unwrap().paragraphs[0].alignment,
+        Some(ParagraphAlignment::Center),
+        "layout placeholder alignment"
+    );
+
+    let ir = styled_deck("").document().to_ir();
+    let one = span_named(&ir, "LEVEL ONE");
+    assert_eq!(one.font_size_half_pt, Some(64));
+    assert_eq!(one.color, Some([0xFF, 0, 0]));
+}
+
+/// With no master `txStyles` for a level, the presentation's
+/// `defaultTextStyle` is the last layer.
+#[test]
+fn test_presentation_default_text_style_is_the_last_layer() {
+    let mut pkg = styled_deck("");
+    let master = String::from_utf8(pkg.parts["ppt/slideMasters/slideMaster1.xml"].clone()).unwrap();
+    pkg.parts.insert(
+        "ppt/slideMasters/slideMaster1.xml".into(),
+        master
+            .replace(r#"<a:lvl1pPr><a:defRPr sz="1200"/></a:lvl1pPr>"#, "")
+            .into_bytes(),
+    );
+    let doc = pkg.open();
+    let office_oxide::pptx::Shape::AutoShape(ref a) = doc.slides[0].shapes[2] else {
+        panic!()
+    };
+    let office_oxide::pptx::TextContent::Run(ref r) =
+        a.text_body.as_ref().unwrap().paragraphs[0].content[0]
+    else {
+        panic!()
+    };
+    assert_eq!(r.font_size_hundredths_pt, Some(1800));
+}
+
+/// Text placed directly on a layout or master is not slide text (the
+/// python-pptx default), but it is available, honouring `showMasterSp`.
+#[test]
+fn test_layout_and_master_static_text_is_available_but_not_slide_text() {
+    let doc = styled_deck("").open();
+    assert_eq!(doc.layouts.len(), 1);
+    assert_eq!(doc.masters.len(), 1);
+    assert_eq!(doc.layouts[0].name, "Title and Content");
+    assert_eq!(doc.slides[0].layout_index, Some(0));
+    assert_eq!(doc.layouts[0].master_index, Some(0));
+    assert_eq!(doc.static_text_for_slide(0), vec!["ACME CONFIDENTIAL", "MASTER FOOTER"]);
+    assert!(!doc.plain_text().contains("ACME"), "not slide text");
+    // The layout's prompt text is not static text.
+    assert!(
+        !doc.static_text_for_slide(0)
+            .iter()
+            .any(|t| t.contains("Click"))
+    );
+
+    let hidden = styled_deck(r#"showMasterSp="0""#).open();
+    assert!(hidden.static_text_for_slide(0).is_empty());
+}
