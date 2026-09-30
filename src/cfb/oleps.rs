@@ -18,6 +18,13 @@
 //! metadata, not a caught error, and this format has a real CVE history
 //! (integer overflow in offset arithmetic) in peer implementations.
 
+/// `FMTID_SummaryInformation`, {F29F85E0-4FF9-1068-AB91-08002B27B3D9}
+/// ([MS-OLEPS] §1.9 / §2.25.1), in its on-disk GUID byte order (the first
+/// three fields little-endian).
+const FMTID_SUMMARY_INFORMATION: [u8; 16] = [
+    0xE0, 0x85, 0x9F, 0xF2, 0xF9, 0x4F, 0x68, 0x10, 0xAB, 0x91, 0x08, 0x00, 0x2B, 0x27, 0xB3, 0xD9,
+];
+
 /// Well-known property IDs in the `SummaryInformation` FMTID
 /// ({F29F85E0-4FF9-1068-AB91-08002B27B3D9}), [MS-OLEPS] §2.16.
 /// `PID_CODEPAGE` ([MS-OLEPS] §2.18.2): the code page of every
@@ -92,23 +99,20 @@ pub fn parse_summary_information(data: &[u8]) -> Option<SummaryProperties> {
     if byte_order != 0xFFFE {
         return None;
     }
-    let num_property_sets = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
-    if num_property_sets == 0 {
-        return None;
-    }
-    // Only the first property set matters here — SummaryInformation is
-    // always a single-property-set stream; DocumentSummaryInformation's
-    // (rarely present) second set carries different, unrelated properties.
-    let fmtid_offset = 28usize;
-    if data.len() < fmtid_offset + 20 {
-        return None;
-    }
-    let offset = u32::from_le_bytes([
-        data[fmtid_offset + 16],
-        data[fmtid_offset + 17],
-        data[fmtid_offset + 18],
-        data[fmtid_offset + 19],
-    ]) as usize;
+    let num_property_sets = u32::from_le_bytes([data[24], data[25], data[26], data[27]]) as usize;
+    // Property IDs mean title/author/... only within the
+    // `SummaryInformation` FMTID; the same IDs in any other set are
+    // different properties. Find that set by FMTID among the
+    // FMTID/offset pairs actually present, rather than taking whichever
+    // set comes first.
+    let pairs_present = (data.len() - 28) / 20;
+    let offset = (0..num_property_sets.min(pairs_present)).find_map(|i| {
+        let at = 28 + i * 20;
+        (data[at..at + 16] == FMTID_SUMMARY_INFORMATION).then(|| {
+            u32::from_le_bytes([data[at + 16], data[at + 17], data[at + 18], data[at + 19]])
+                as usize
+        })
+    })?;
 
     let props = parse_property_set(data, offset)?;
     if props.is_empty() { None } else { Some(props) }
@@ -128,8 +132,9 @@ fn parse_property_set(data: &[u8], base: usize) -> Option<SummaryProperties> {
         data[base + 7],
     ]) as usize;
     // A hostile stream can claim billions of properties; bound the work
-    // to what a real SummaryInformation set could ever hold.
-    let num_properties = num_properties.min(64);
+    // by the PropertyIdentifierAndOffset entries the bytes can hold, not
+    // by a fixed count that would drop genuine properties past it.
+    let num_properties = num_properties.min((data.len() - header_end) / 8);
 
     let entries: Vec<(u32, usize)> = (0..num_properties)
         .filter_map(|i| {
@@ -348,6 +353,10 @@ mod tests {
     /// Build a minimal, valid `SummaryInformation` stream with exactly
     /// the properties in `props`, each `(id, TypedPropertyValue bytes)`.
     fn build_stream(props: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        build_stream_with_fmtid(&FMTID_SUMMARY_INFORMATION, props)
+    }
+
+    fn build_stream_with_fmtid(fmtid: &[u8; 16], props: &[(u32, Vec<u8>)]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&0xFFFEu16.to_le_bytes()); // ByteOrder
         out.extend_from_slice(&0u16.to_le_bytes()); // Version
@@ -355,9 +364,9 @@ mod tests {
         out.extend_from_slice(&[0u8; 16]); // CLSID
         out.extend_from_slice(&1u32.to_le_bytes()); // NumPropertySets
 
-        // FMTID (arbitrary — not checked by the decoder) + Offset.
+        // FMTID + Offset.
         let fmtid_and_offset_pos = out.len();
-        out.extend_from_slice(&[0u8; 16]); // FMTID
+        out.extend_from_slice(fmtid);
         out.extend_from_slice(&0u32.to_le_bytes()); // Offset placeholder
         let property_set_offset = out.len() as u32;
         out[fmtid_and_offset_pos + 16..fmtid_and_offset_pos + 20]
@@ -537,6 +546,64 @@ mod tests {
         ]);
         let props = parse_summary_information(&stream).expect("must parse");
         assert_eq!(props.subject.as_deref(), Some("Real Subject"));
+    }
+
+    /// Only the `SummaryInformation` FMTID's property IDs mean title,
+    /// author and so on; the same IDs in another property set (here the
+    /// `DocumentSummaryInformation` FMTID, where PID 2 is the category)
+    /// were read as if they did.
+    #[test]
+    fn test_property_set_with_another_fmtid_is_not_read_as_summary_information() {
+        let doc_summary: [u8; 16] = [
+            0x02, 0xD5, 0xCD, 0xD5, 0x9C, 0x2E, 0x1B, 0x10, 0x93, 0x97, 0x08, 0x00, 0x2B, 0x2C,
+            0xF9, 0xAE,
+        ];
+        let data = build_stream_with_fmtid(&doc_summary, &[(PIDSI_TITLE, lpstr("Category"))]);
+        assert_eq!(parse_summary_information(&data), None);
+    }
+
+    /// The `SummaryInformation` set is found by FMTID, not by position:
+    /// here it is the second of two property sets.
+    #[test]
+    fn test_summary_information_set_is_found_by_fmtid() {
+        let other = [0x11u8; 16];
+        let wrong = build_stream_with_fmtid(&other, &[(PIDSI_TITLE, lpstr("Wrong"))]);
+        let real = build_stream(&[(PIDSI_TITLE, lpstr("Real"))]);
+        // Header, two FMTID/offset pairs, then both packets.
+        let mut data = real[..24].to_vec();
+        data.extend_from_slice(&2u32.to_le_bytes());
+        let off1 = 28 + 40;
+        let off2 = off1 + (wrong.len() - 48);
+        data.extend_from_slice(&other);
+        data.extend_from_slice(&(off1 as u32).to_le_bytes());
+        data.extend_from_slice(&FMTID_SUMMARY_INFORMATION);
+        data.extend_from_slice(&(off2 as u32).to_le_bytes());
+        data.extend_from_slice(&wrong[48..]);
+        data.extend_from_slice(&real[48..]);
+        let props = parse_summary_information(&data).expect("found by FMTID");
+        assert_eq!(props.title.as_deref(), Some("Real"));
+    }
+
+    /// Properties past the 64th were silently dropped. The count is now
+    /// bounded by what the packet can hold, not by a fixed number.
+    #[test]
+    fn test_properties_past_the_sixty_fourth_are_read() {
+        let mut props: Vec<(u32, Vec<u8>)> = (100..170).map(|id| (id, i2(0))).collect();
+        props.push((PIDSI_AUTHOR, lpstr("Late")));
+        let data = build_stream(&props);
+        let parsed = parse_summary_information(&data).expect("parsed");
+        assert_eq!(parsed.author.as_deref(), Some("Late"));
+    }
+
+    /// A count claiming billions of properties is bounded by the bytes
+    /// present, without reading past them.
+    #[test]
+    fn test_huge_property_count_is_bounded_by_the_packet() {
+        let mut data = build_stream(&[(PIDSI_TITLE, lpstr("T"))]);
+        let base = 48;
+        data[base + 4..base + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        // Parses (or not) without panicking or reserving billions of slots.
+        let _ = parse_summary_information(&data);
     }
 
     #[test]
