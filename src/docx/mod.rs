@@ -1588,6 +1588,11 @@ fn parse_run(
                     run.content.push(RunContent::Break(BreakType::Line));
                     xml::skip_element_fast(reader)?;
                 },
+                // `<w:tab></w:tab>`: the same element as `<w:tab/>`.
+                "tab" => {
+                    run.content.push(RunContent::Tab);
+                    xml::skip_element_fast(reader)?;
+                },
                 "noBreakHyphen" => {
                     run.content.push(RunContent::Text("\u{2011}".to_string()));
                     xml::skip_element_fast(reader)?;
@@ -4303,6 +4308,24 @@ mod tests {
         };
         assert_eq!(link_text(0), "one two three four five");
         assert_eq!(link_text(1), "six");
+    }
+
+    /// `<w:tab></w:tab>` is the same element as `<w:tab/>`; only the
+    /// empty-element form was read, so the other one lost the tab.
+    #[test]
+    fn test_a_tab_written_with_an_end_tag_is_a_tab() {
+        let xml = br#"<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:r><w:t>a</w:t><w:tab></w:tab><w:t>b</w:t><w:tab/><w:t>c</w:t></w:r></w:p>"#;
+        let p = parse_paragraph_fragment(xml);
+        let ParagraphContent::Run(run) = &p.content[0] else {
+            panic!("expected a run");
+        };
+        let tabs = run
+            .content
+            .iter()
+            .filter(|c| matches!(c, RunContent::Tab))
+            .count();
+        assert_eq!(tabs, 2);
     }
 
     #[test]
