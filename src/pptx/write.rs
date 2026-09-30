@@ -698,9 +698,14 @@ impl PptxWriter {
             .slides
             .iter()
             .any(|s| s.notes.as_ref().is_some_and(|n| !n.is_empty()));
+        let mut notes_master_rid = None;
         if has_notes {
             let nm_part = PartName::new("/ppt/notesMasters/notesMaster1.xml")?;
-            opc.add_part_rel(&pres_part, rel_types::NOTES_MASTER, "notesMasters/notesMaster1.xml");
+            notes_master_rid = Some(opc.add_part_rel(
+                &pres_part,
+                rel_types::NOTES_MASTER,
+                "notesMasters/notesMaster1.xml",
+            ));
             opc.add_part_rel(&nm_part, rel_types::THEME, "../theme/theme1.xml");
             opc.add_part(&nm_part, CT_NOTES_MASTER, &generate_notes_master_xml())?;
         }
@@ -710,7 +715,12 @@ impl PptxWriter {
         let pres_props_part = PartName::new("/ppt/presProps.xml")?;
         opc.add_part(&pres_props_part, CT_PRES_PROPS, &generate_pres_props_xml())?;
 
-        let pres_xml = generate_presentation_xml(self.slides.len(), self.cx, self.cy);
+        let pres_xml = generate_presentation_xml(
+            self.slides.len(),
+            self.cx,
+            self.cy,
+            notes_master_rid.as_deref(),
+        );
         opc.add_part(&pres_part, CT_PRESENTATION, &pres_xml)?;
 
         let master_xml = generate_slide_master_xml();
@@ -956,7 +966,12 @@ fn write_dml_run(w: &mut Writer<Vec<u8>>, run: &Run, hyperlink_rids: &HashMap<St
 // presentation.xml
 // ---------------------------------------------------------------------------
 
-fn generate_presentation_xml(slide_count: usize, cx: u64, cy: u64) -> Vec<u8> {
+fn generate_presentation_xml(
+    slide_count: usize,
+    cx: u64,
+    cy: u64,
+    notes_master_rid: Option<&str>,
+) -> Vec<u8> {
     let mut w = Writer::new(Vec::new());
     write_decl(&mut w);
 
@@ -971,6 +986,20 @@ fn generate_presentation_xml(slide_count: usize, cx: u64, cy: u64) -> Vec<u8> {
     w.write_event(Event::Empty(master_id)).expect("write");
     w.write_event(Event::End(BytesEnd::new("p:sldMasterIdLst")))
         .expect("write");
+
+    // CT_Presentation (ECMA-376 Part 1 §19.2.1.26) lists the notes master
+    // after the slide masters. Optional in the schema, but every
+    // PowerPoint-authored deck with notes declares the notesMaster it
+    // relates to here.
+    if let Some(rid) = notes_master_rid {
+        w.write_event(Event::Start(BytesStart::new("p:notesMasterIdLst")))
+            .expect("write");
+        let mut nm_id = BytesStart::new("p:notesMasterId");
+        nm_id.push_attribute(("r:id", rid));
+        w.write_event(Event::Empty(nm_id)).expect("write");
+        w.write_event(Event::End(BytesEnd::new("p:notesMasterIdLst")))
+            .expect("write");
+    }
 
     w.write_event(Event::Start(BytesStart::new("p:sldIdLst")))
         .expect("write");

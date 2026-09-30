@@ -282,3 +282,48 @@ fn test_hyperlink_targets_with_control_characters_are_percent_encoded_in_every_f
         assert_all_parts_are_legal_xml(&bytes);
     }
 }
+
+// ---------------------------------------------------------------------------
+// PPTX notes master declaration
+// ---------------------------------------------------------------------------
+
+/// A deck with notes relates a notes master from the presentation part;
+/// PowerPoint-authored decks also declare it in `<p:notesMasterIdLst>`,
+/// which the writer never emitted.
+#[test]
+fn test_pptx_with_notes_declares_its_notes_master() {
+    let mut w = office_oxide::pptx::write::PptxWriter::new();
+    w.add_slide().add_text("body").set_notes("a note");
+    let mut buf = Cursor::new(Vec::new());
+    w.write_to(&mut buf).unwrap();
+    let bytes = buf.into_inner();
+    let pres = part(&bytes, "ppt/presentation.xml").unwrap();
+    let rels = part(&bytes, "ppt/_rels/presentation.xml.rels").unwrap();
+    let key = r#"<p:notesMasterId r:id=""#;
+    let at = pres
+        .find(key)
+        .unwrap_or_else(|| panic!("no notesMasterIdLst: {pres}"));
+    let rid = &pres[at + key.len()..];
+    let rid = &rid[..rid.find('"').unwrap()];
+    let rel = rels
+        .split("<Relationship ")
+        .find(|r| r.contains(&format!(r#"Id="{rid}""#)))
+        .unwrap_or_else(|| panic!("{rid} not in {rels}"));
+    assert!(rel.contains("/notesMaster\""), "{rel}");
+    // Schema order: after the slide masters, before the slides.
+    let (masters, notes_master, slides) = (
+        pres.find("<p:sldMasterIdLst>").unwrap(),
+        pres.find("<p:notesMasterIdLst>").unwrap(),
+        pres.find("<p:sldIdLst>").unwrap(),
+    );
+    assert!(masters < notes_master && notes_master < slides, "{pres}");
+    assert_no_dangling_rel_ids(&bytes);
+
+    // Without notes there is no notes master to declare.
+    let mut w = office_oxide::pptx::write::PptxWriter::new();
+    w.add_slide().add_text("body");
+    let mut buf = Cursor::new(Vec::new());
+    w.write_to(&mut buf).unwrap();
+    let pres = part(&buf.into_inner(), "ppt/presentation.xml").unwrap();
+    assert!(!pres.contains("notesMaster"), "{pres}");
+}
