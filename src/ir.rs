@@ -337,6 +337,14 @@ pub struct PageSetup {
     /// the inside edge for binding. `0` when there is none.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub gutter_twips: u32,
+    /// The number of the section's first page, when it restarts numbering
+    /// (DOCX `w:pgNumType/@w:start`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_number_start: Option<u32>,
+    /// The page-number format (DOCX `w:pgNumType/@w:fmt`: `decimal`,
+    /// `lowerRoman`, `upperLetter`, ...), when not decimal by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_number_format: Option<String>,
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -356,6 +364,8 @@ impl Default for PageSetup {
             header_distance_twips: 720,
             footer_distance_twips: 720,
             gutter_twips: 0,
+            page_number_start: None,
+            page_number_format: None,
         }
     }
 }

@@ -22,6 +22,36 @@ pub struct SectionProperties {
     pub break_type: Option<SectionBreakKind>,
     /// `<w:titlePg/>` — this section uses a distinct first-page header/footer.
     pub title_page: bool,
+    /// `<w:pgNumType>` — how this section's pages are numbered.
+    pub page_numbering: Option<PageNumbering>,
+    /// `<w:footnotePr>` — this section's footnote placement and numbering.
+    pub footnote_properties: Option<NoteProperties>,
+    /// `<w:endnotePr>` — this section's endnote placement and numbering.
+    pub endnote_properties: Option<NoteProperties>,
+}
+
+/// `<w:pgNumType>` (ECMA-376 §17.6): a section's page numbering.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PageNumbering {
+    /// `w:fmt` — the number format (`decimal`, `lowerRoman`, ...).
+    pub format: Option<String>,
+    /// `w:start` — the number of the section's first page.
+    pub start: Option<u32>,
+}
+
+/// `<w:footnotePr>` / `<w:endnotePr>` in a section (ECMA-376 §17.11).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NoteProperties {
+    /// `w:pos` — where the notes are placed (`pageBottom`, `beneathText`,
+    /// `sectEnd`, `docEnd`).
+    pub position: Option<String>,
+    /// `w:numFmt` — the reference-mark number format.
+    pub number_format: Option<String>,
+    /// `w:numStart` — the first note number.
+    pub start: Option<u32>,
+    /// `w:numRestart` — when numbering restarts (`continuous`,
+    /// `eachSect`, `eachPage`).
+    pub restart: Option<String>,
 }
 
 /// `<w:cols>` layout details beyond the bare column count.

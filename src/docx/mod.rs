@@ -50,8 +50,8 @@ pub use formatting::{
     VerticalAlign,
 };
 pub use headers::{
-    ColumnDefs, HeaderFooter, HeaderFooterType, PageMargins, PageOrientation, PageSize,
-    SectionBreakKind, SectionProperties,
+    ColumnDefs, HeaderFooter, HeaderFooterType, NoteProperties, PageMargins, PageNumbering,
+    PageOrientation, PageSize, SectionBreakKind, SectionProperties,
 };
 pub use hyperlink::{Hyperlink, HyperlinkTarget};
 pub use image::{AnchorFrame, AnchorPosition, DrawingInfo, ShapeInfo, ShapeKind};
@@ -3376,10 +3376,65 @@ pub(crate) fn parse_section_properties(
     _start: &quick_xml::events::BytesStart,
 ) -> CoreResult<SectionProperties> {
     let mut props = SectionProperties::default();
+    // Inside `w:footnotePr` (false) or `w:endnotePr` (true): their
+    // children share names, so the container decides which set they fill.
+    let mut in_note_pr: Option<bool> = None;
+    let val = |e: &quick_xml::events::BytesStart| -> CoreResult<Option<String>> {
+        Ok(xml::optional_attr_str(e, "w:val")?.map(|v| v.into_owned()))
+    };
 
     loop {
-        match reader.read_event()? {
+        let event = reader.read_event()?;
+        if let Event::Start(ref e) = event {
+            match e.local_name().as_ref() {
+                "footnotePr" => in_note_pr = Some(false),
+                "endnotePr" => in_note_pr = Some(true),
+                _ => {},
+            }
+        }
+        if let Event::End(ref e) = event {
+            if matches!(e.local_name().as_ref(), "footnotePr" | "endnotePr") {
+                in_note_pr = None;
+            }
+        }
+        match event {
+            Event::Start(ref e) | Event::Empty(ref e)
+                if in_note_pr.is_some()
+                    && matches!(
+                        e.local_name().as_ref(),
+                        "pos" | "numFmt" | "numStart" | "numRestart"
+                    ) =>
+            {
+                let target = if in_note_pr == Some(true) {
+                    &mut props.endnote_properties
+                } else {
+                    &mut props.footnote_properties
+                };
+                let np = target.get_or_insert_with(Default::default);
+                match e.local_name().as_ref() {
+                    "pos" => np.position = val(e)?,
+                    "numFmt" => np.number_format = val(e)?,
+                    "numStart" => np.start = val(e)?.and_then(|v| v.parse().ok()),
+                    _ => np.restart = val(e)?,
+                }
+            },
             Event::Start(ref e) | Event::Empty(ref e) => match e.local_name().as_ref() {
+                "footnotePr" => {
+                    props
+                        .footnote_properties
+                        .get_or_insert_with(Default::default);
+                },
+                "endnotePr" => {
+                    props
+                        .endnote_properties
+                        .get_or_insert_with(Default::default);
+                },
+                "pgNumType" => {
+                    props.page_numbering = Some(PageNumbering {
+                        format: xml::optional_attr_str(e, "w:fmt")?.map(|v| v.into_owned()),
+                        start: xml::optional_attr_str(e, "w:start")?.and_then(|v| v.parse().ok()),
+                    });
+                },
                 "pgSz" => {
                     let w: i32 = xml::optional_attr_str(e, "w:w")?
                         .and_then(|v| v.parse().ok())

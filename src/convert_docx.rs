@@ -543,10 +543,14 @@ fn apply_paragraph_properties_to_heading(pp: &crate::docx::ParagraphProperties, 
 /// and reporting `PageSetup::default()` for it would hand the consumer a
 /// Letter-size page the document never claimed.
 fn section_props_to_page_setup(sp: &crate::docx::SectionProperties) -> Option<PageSetup> {
-    if sp.page_size.is_none() && sp.margins.is_none() {
+    if sp.page_size.is_none() && sp.margins.is_none() && sp.page_numbering.is_none() {
         return None;
     }
     let mut ps = PageSetup::default();
+    if let Some(pn) = &sp.page_numbering {
+        ps.page_number_start = pn.start;
+        ps.page_number_format = pn.format.clone();
+    }
     if let Some(size) = &sp.page_size {
         ps.width_twips = size.width.0.max(0) as u32;
         ps.height_twips = size.height.0.max(0) as u32;

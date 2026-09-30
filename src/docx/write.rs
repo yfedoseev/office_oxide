@@ -3874,6 +3874,22 @@ fn write_hf_references(w: &mut Writer<Vec<u8>>, hf_rids: &[(HfType, String)]) ->
     has_first_page
 }
 
+/// `w:pgNumType` (CT_SectPr puts it after `w:pgMar` and before
+/// `w:cols`), when the section numbers its pages other than by default.
+fn write_pg_num_type(w: &mut Writer<Vec<u8>>, ps: &PageSetup) {
+    if ps.page_number_start.is_none() && ps.page_number_format.is_none() {
+        return;
+    }
+    let mut pn = BytesStart::new("w:pgNumType");
+    if let Some(ref fmt) = ps.page_number_format {
+        pn.push_attribute(("w:fmt", crate::core::xml::sanitize_xml_text(fmt).as_ref()));
+    }
+    if let Some(start) = ps.page_number_start {
+        pn.push_attribute(("w:start", start.to_string().as_str()));
+    }
+    w.write_event(Event::Empty(pn)).expect("write pgNumType");
+}
+
 /// Shared `<w:sectPr>...</w:sectPr>` body writer — used by both the
 /// body-level final sectPr and inline (per-paragraph) section breaks.
 /// Caller writes the surrounding `<w:sectPr>`/`</w:sectPr>` tags.
@@ -3934,6 +3950,7 @@ fn write_section_pr_body(
         // CT_PageMar declares all seven attributes as use="required".
         pg_mar.push_attribute(("w:gutter", ps.gutter_twips.to_string().as_str()));
         w.write_event(Event::Empty(pg_mar)).expect("write pgMar");
+        write_pg_num_type(w, ps);
     }
 
     if let Some(cols) = columns {
@@ -4024,6 +4041,7 @@ fn write_body_sect_pr(w: &mut Writer<Vec<u8>>, sp: &SectPrInfo) {
         // CT_PageMar declares all seven attributes as use="required".
         pg_mar.push_attribute(("w:gutter", ps.gutter_twips.to_string().as_str()));
         w.write_event(Event::Empty(pg_mar)).expect("write pgMar");
+        write_pg_num_type(w, ps);
     }
 
     if let Some(ref cols) = sp.columns {

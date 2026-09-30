@@ -926,6 +926,46 @@ fn test_column_layout_keeps_space_separator_and_widths() {
     assert_eq!(c.column_widths_twips, vec![4320, 4320]);
 }
 
+/// A section's `w:pgNumType`, `w:footnotePr` and `w:endnotePr` were never
+/// parsed. Page numbering now reaches the IR and the writer; the note
+/// settings are read onto the section's properties.
+#[test]
+fn test_section_page_and_note_numbering_are_read() {
+    let body = r#"<w:p><w:r><w:t>body</w:t></w:r></w:p>
+        <w:sectPr>
+          <w:footnotePr><w:pos w:val="beneathText"/><w:numFmt w:val="lowerRoman"/>
+            <w:numStart w:val="3"/><w:numRestart w:val="eachPage"/></w:footnotePr>
+          <w:endnotePr><w:numFmt w:val="upperLetter"/></w:endnotePr>
+          <w:pgSz w:w="12240" w:h="15840"/>
+          <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/>
+          <w:pgNumType w:fmt="lowerRoman" w:start="5"/>
+        </w:sectPr>"#;
+    let bytes = Docx::new(body).bytes();
+    let docx = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes.clone())).unwrap();
+    let sp = &docx.sections[0];
+    let foot = sp.footnote_properties.as_ref().expect("footnotePr");
+    assert_eq!(foot.position.as_deref(), Some("beneathText"));
+    assert_eq!(foot.number_format.as_deref(), Some("lowerRoman"));
+    assert_eq!(foot.start, Some(3));
+    assert_eq!(foot.restart.as_deref(), Some("eachPage"));
+    let end = sp.endnote_properties.as_ref().expect("endnotePr");
+    assert_eq!(end.number_format.as_deref(), Some("upperLetter"));
+    assert_eq!(end.position, None);
+
+    let ir = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    let numbering = |ir: &DocumentIR| {
+        let ps = ir.sections[0].page_setup.as_ref().expect("page setup");
+        (ps.page_number_start, ps.page_number_format.clone())
+    };
+    assert_eq!(numbering(&ir), (Some(5), Some("lowerRoman".to_string())));
+    let again = Document::from_reader(Cursor::new(docx_bytes(&ir)), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(numbering(&again), numbering(&ir));
+}
+
 /// `w:pgMar/@w:gutter` was parsed and never read, and the writer
 /// hardcoded `w:gutter="0"`, so a bound document's binding margin was
 /// zeroed on every round-trip.
