@@ -92,3 +92,34 @@ fn test_speaker_notes_are_read_from_notes_containers() {
     );
     assert!(!doc.plain_text().contains("Say hello first."));
 }
+
+fn assert_encrypted(result: Result<Document, office_oxide::OfficeError>) {
+    let err = result.err().expect("an encrypted deck must be an error");
+    assert!(err.to_string().contains("encrypted"), "{err}");
+}
+
+/// A password-protected deck parsed as an empty or garbage deck with `Ok`:
+/// `PptError::Encrypted` was declared but never raised. [MS-PPT]
+/// `CurrentUserAtom.headerToken` is 0xF3D1C4DF for an encrypted document.
+#[test]
+fn test_encrypted_header_token_is_an_error() {
+    let deck = PptBuilder {
+        slides: vec![slide("Ciphertext")],
+        header_token: Some(HEADER_TOKEN_ENCRYPTED),
+        ..Default::default()
+    };
+    assert_encrypted(open(deck.build()));
+}
+
+/// The other spec signal: `UserEditAtom.encryptSessionPersistIdRef`, the
+/// optional field present only when the document is encrypted — caught
+/// even when the "Current User" stream says nothing.
+#[test]
+fn test_encrypt_session_persist_id_ref_is_an_error() {
+    let deck = PptBuilder {
+        slides: vec![slide("Ciphertext")],
+        encrypt_session_persist_id: Some(9),
+        ..Default::default()
+    };
+    assert_encrypted(open(deck.build()));
+}

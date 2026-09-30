@@ -63,6 +63,12 @@ impl PptDocument {
                 cfb.open_stream("Current User").ok(),
             ),
         };
+        // A password-protected deck: the records past the edit are
+        // ciphertext. Fail loudly, as `.doc` and `.xls` do, rather than
+        // return an empty or garbage deck with `Ok`.
+        if super::persist::is_encrypted(&stream, current_user.as_deref()) {
+            return Err(PptError::Encrypted);
+        }
         let slides = extract_slides_text(&stream, current_user.as_deref());
 
         // The Pictures stream (if present) holds the images; decoded lazily.

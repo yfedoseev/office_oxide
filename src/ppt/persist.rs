@@ -101,13 +101,44 @@ struct UserEditAtom {
     offset_last_edit: u32,
     offset_persist_directory: u32,
     doc_persist_id_ref: u32,
+    /// The optional `encryptSessionPersistIdRef` (body offset 28), present
+    /// only in an encrypted document.
+    encrypt_session_persist_id_ref: Option<u32>,
+}
+
+/// `CurrentUserAtom.headerToken` of an encrypted document ([MS-PPT] 2.3.2:
+/// 0xE391C05F unencrypted, 0xF3D1C4DF encrypted).
+const HEADER_TOKEN_ENCRYPTED: u32 = 0xF3D1_C4DF;
+
+/// Whether the deck is encrypted, by either spec-defined signal:
+/// `CurrentUserAtom.headerToken` ([MS-PPT] 2.3.2), or a current
+/// `UserEditAtom` carrying `encryptSessionPersistIdRef` ([MS-PPT] 2.3.3:
+/// the field exists only when the document is encrypted). Either way the
+/// record stream past the edit is ciphertext, and reading it as a deck
+/// yields nothing or garbage.
+pub fn is_encrypted(stream: &[u8], current_user: Option<&[u8]>) -> bool {
+    let token_says = current_user
+        .and_then(|cu| cu.get(12..16))
+        .is_some_and(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) == HEADER_TOKEN_ENCRYPTED);
+    if token_says {
+        return true;
+    }
+    let start = current_user
+        .and_then(offset_to_current_edit)
+        .filter(|&off| user_edit_atom_at(stream, off).is_some())
+        .or_else(|| find_latest_user_edit_atom(stream));
+    start
+        .and_then(|off| user_edit_atom_at(stream, off))
+        .and_then(|edit| edit.encrypt_session_persist_id_ref)
+        .is_some_and(|id| id != 0 && id != u32::MAX)
 }
 
 /// Parse a `UserEditAtom` ([MS-PPT] 2.3.3) at an absolute offset in `stream`.
 ///
 /// Body layout: `lastSlideIdRef`(4)@0, packed version fields(4)@4,
 /// `offsetLastEdit`(4)@8, `offsetPersistDirectory`(4)@12,
-/// `docPersistIdRef`(4)@16, `persistIdSeed`(4)@20, `lastView`+`unused`(4)@24.
+/// `docPersistIdRef`(4)@16, `persistIdSeed`(4)@20, `lastView`+`unused`(4)@24,
+/// then the optional `encryptSessionPersistIdRef`(4)@28.
 fn user_edit_atom_at(stream: &[u8], offset: usize) -> Option<UserEditAtom> {
     let header_bytes = stream.get(offset..offset + 8)?;
     let header = RecordHeader::parse(header_bytes).ok()?;
@@ -126,6 +157,9 @@ fn user_edit_atom_at(stream: &[u8], offset: usize) -> Option<UserEditAtom> {
         offset_last_edit: u32::from_le_bytes([body[8], body[9], body[10], body[11]]),
         offset_persist_directory: u32::from_le_bytes([body[12], body[13], body[14], body[15]]),
         doc_persist_id_ref: u32::from_le_bytes([body[16], body[17], body[18], body[19]]),
+        encrypt_session_persist_id_ref: body
+            .get(28..32)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
     })
 }
 
