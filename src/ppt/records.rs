@@ -24,6 +24,10 @@ pub const RT_SLIDE_ATOM: u16 = 0x03EF;
 /// character/paragraph formatting a placeholder shape falls back to for
 /// any property its own direct `StyleTextPropAtom` didn't set.
 pub const RT_MAIN_MASTER: u16 = 0x03F8;
+/// `HandoutContainer` ([MS-PPT] `HandoutContainer`, record type 4041):
+/// the handout master, whose text is prompt/placeholder text like a
+/// slide master's.
+pub const RT_HANDOUT: u16 = 0x0FC9;
 /// TxMasterStyleAtom ([MS-PPT] 2.9.5, record type 4003). `recInstance`
 /// is itself the `TextTypeEnum` value this atom's styles apply to — "the
 /// atom instance value is the text type", per Apache POI's own doc

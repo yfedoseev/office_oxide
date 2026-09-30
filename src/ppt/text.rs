@@ -125,10 +125,10 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
 
     // Weaker fallback: walk only `Slide` containers found anywhere in the
     // stream. A whole-stream scan also picks up `MainMaster` containers,
-    // whose placeholder prompts ("Click to edit Master title style", the
-    // `*` bullet placeholders) are PowerPoint's own UI strings and never
-    // render on a slide — in two POI corpus files they were 116 of the 137
-    // and 121 extracted characters respectively.
+    // whose placeholder prompts ("Click to edit Master title style", in
+    // whatever language PowerPoint was running) are its own UI strings and
+    // never render on a slide — in two POI corpus files they were 116 of
+    // the 137 and 121 extracted characters respectively.
     let mut slides = Vec::new();
     collect_slide_containers(
         stream,
@@ -142,13 +142,27 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
     }
 
     // Last resort: no resolvable structure at all — dump whatever text atoms
-    // exist anywhere in the stream, minus the master boilerplate.
+    // exist anywhere in the stream, except inside the masters (slide, title,
+    // notes and handout masters), whose text is prompt boilerplate. That is
+    // decided by structure, not by matching the English prompt strings: a
+    // localized master's prompts leaked, and a slide's own text that
+    // happened to start with "Click to add title" was deleted. Notes pages
+    // are skipped too — speaker notes are not slide text.
+    let mut content = Vec::new();
+    for rec in RecordIter::new(stream) {
+        let Ok(rec) = rec else { break };
+        if matches!(rec.header.rec_type, RT_MAIN_MASTER | RT_NOTES | RT_HANDOUT) {
+            continue;
+        }
+        let end = rec.offset + 8 + rec.data.len();
+        content.extend_from_slice(&stream[rec.offset..end]);
+    }
     let mut runs = Vec::new();
     let mut tables = Vec::new();
     let mut image_refs = Vec::new();
     let mut ole_object_refs = Vec::new();
     extract_shape_text(
-        stream,
+        &content,
         0,
         &[],
         &stream_wide_hyperlinks,
@@ -160,7 +174,7 @@ pub fn extract_slides_text(stream: &[u8], current_user: Option<&[u8]>) -> Vec<Sl
         &mut image_refs,
         &mut ole_object_refs,
     );
-    runs.retain(|r| !is_master_placeholder_prompt(&r.text));
+    runs.retain(|r| !is_field_placeholder_only(&r.text));
     if runs.is_empty() && tables.is_empty() && image_refs.is_empty() {
         Vec::new()
     } else {
@@ -205,7 +219,7 @@ fn collect_slide_containers(
                 &mut image_refs,
                 &mut ole_object_refs,
             );
-            runs.retain(|r| !is_master_placeholder_prompt(&r.text));
+            runs.retain(|r| !is_field_placeholder_only(&r.text));
             let hidden = slide_is_hidden(&rec.data);
             out.push(SlideText {
                 text_runs: runs,
@@ -222,26 +236,12 @@ fn collect_slide_containers(
     }
 }
 
-/// Whether a text run is a slide-master placeholder prompt rather than
-/// document content.
-///
-/// PowerPoint stores the master's prompt strings as ordinary text atoms.
-/// They are shown in master view and never rendered on a slide, so a
-/// consumer that receives them gets a document whose "content" is the
-/// application's own UI strings.
-fn is_master_placeholder_prompt(text: &str) -> bool {
+/// Whether a text run is nothing but `*` — the stand-in character
+/// PowerPoint stores for a date, slide-number or footer field placeholder,
+/// not text anyone typed. Language-independent, unlike a prompt string.
+fn is_field_placeholder_only(text: &str) -> bool {
     let t = text.trim();
-    if t.is_empty() {
-        return false;
-    }
-    // The English prompts PowerPoint 97–2003 writes, plus the bare bullet
-    // placeholders that accompany them.
-    t.starts_with("Click to edit Master")
-        || t.starts_with("Click to edit the outline text format")
-        || t.starts_with("Click to add title")
-        || t.starts_with("Click to add text")
-        || t.starts_with("Click to add notes")
-        || t.chars().all(|c| c == '*' || c.is_whitespace())
+    !t.is_empty() && t.chars().all(|c| c == '*' || c.is_whitespace())
 }
 
 /// Resolve the current "Slides" list through the persist directory and
@@ -2743,6 +2743,38 @@ mod tests {
         textbox_children.extend(make_atom(RT_TEXT_BYTES, 0, title.as_bytes()));
         let textbox = make_container(0xF00D, 0, &textbox_children); // ClientTextbox
         make_container(RT_SLIDE, 0, &textbox)
+    }
+
+    /// A slide's own text that starts like an English master prompt was
+    /// deleted on the degraded (no persist directory) paths; the masters
+    /// are excluded by structure now, so slide text is never string-matched.
+    #[test]
+    fn test_slide_text_that_reads_like_a_prompt_is_kept() {
+        let stream = slide_container_bytes("Click to add title: our roadmap");
+        let slides = extract_slides_text(&stream, None);
+        assert_eq!(slides[0].text_runs[0].text, "Click to add title: our roadmap");
+    }
+
+    /// The last-resort whole-stream dump skipped only *English* master
+    /// prompts; a localized master's prompts leaked as content. Master
+    /// containers are skipped whatever language their prompts are in.
+    #[test]
+    fn test_last_resort_dump_skips_master_containers_in_any_language() {
+        let prompt = "Klicken Sie, um das Titelformat zu bearbeiten";
+        let mut master_tb = make_atom(RT_TEXT_HEADER, 0, &0u32.to_le_bytes());
+        master_tb.extend(make_atom(RT_TEXT_BYTES, 0, prompt.as_bytes()));
+        let mut stream = make_container(RT_MAIN_MASTER, 0, &make_container(0xF00D, 0, &master_tb));
+        // Loose text outside any slide container (the degraded shape).
+        let mut loose = make_atom(RT_TEXT_HEADER, 0, &4u32.to_le_bytes());
+        loose.extend(make_atom(RT_TEXT_BYTES, 0, b"Loose text"));
+        stream.extend(make_container(0xF00D, 0, &loose));
+        let slides = extract_slides_text(&stream, None);
+        let all: Vec<&str> = slides
+            .iter()
+            .flat_map(|s| &s.text_runs)
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(all, ["Loose text"]);
     }
 
     /// Same shape as `slide_container_bytes`, plus a
