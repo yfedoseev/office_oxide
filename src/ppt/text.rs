@@ -1973,7 +1973,8 @@ mod tests {
     }
 
     fn make_table_cell_shape(left: i32, top: i32, text: &[u8]) -> Vec<u8> {
-        let mut children = make_child_anchor(left, top, left + 100, top + 50);
+        let mut children =
+            make_child_anchor(left, top, left.saturating_add(100), top.saturating_add(50));
         // Tx_TYPE_OTHER
         let mut textbox_children = make_atom(RT_TEXT_HEADER, 0, &4u32.to_le_bytes());
         textbox_children.extend(make_atom(RT_TEXT_BYTES, 0, text));
@@ -2018,6 +2019,36 @@ mod tests {
         assert_eq!(t.rows[0][1][0].text, "B1");
         assert_eq!(t.rows[1][0][0].text, "A2");
         assert_eq!(t.rows[1][1][0].text, "B2");
+    }
+
+    /// Child anchors at the `i32` extremes reach the table heuristic
+    /// straight from the file; they must neither overflow nor lose text.
+    #[test]
+    fn test_spgr_container_with_extreme_child_anchors_does_not_overflow() {
+        let mut spgr_children = make_container(RT_SHAPE, 0, &[]);
+        spgr_children.extend(make_table_cell_shape(i32::MIN, i32::MIN, b"A1"));
+        spgr_children.extend(make_table_cell_shape(i32::MAX, i32::MIN, b"B1"));
+        spgr_children.extend(make_table_cell_shape(i32::MIN, i32::MAX, b"A2"));
+        spgr_children.extend(make_table_cell_shape(i32::MAX, i32::MAX, b"B2"));
+        let spgr = make_container(RT_SPGR_CONTAINER, 0, &spgr_children);
+
+        let mut runs = Vec::new();
+        let mut tables = Vec::new();
+        extract_shape_text(
+            &spgr,
+            0,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            None,
+            &mut runs,
+            &mut tables,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].rows[1][1][0].text, "B2");
     }
 
     /// A group that ISN'T a clean grid (here: only 3
