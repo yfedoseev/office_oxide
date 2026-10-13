@@ -9,7 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`.doc` heading levels come from the style sheet ([#132](https://github.com/yfedoseev/office_oxide/issues/132)).** A paragraph whose style is a built-in `Heading 1`–`Heading 9`, or a user-defined `Heading N`, now renders at that level. Previously the level came from a line-shape guess that could only ever produce 1 or 2, and a heading that was not ALL-CAPS was missed entirely. On the maintainer's 763-file corpus this adds **1,279 headings and 17 documents with headings** over v0.1.12 (headings 3,427 → 4,706; docs-with-headings 439 → 456); on the author's local 351-file corpus it resolves a real level for 163 headings across 35 files. No document loses a heading that v0.1.12 had — the sole regression, `tdf81705_outlineLevel.doc`, is a paragraph explicitly marked body text that is no longer guessed back into a heading. The guess is unchanged for paragraphs with no styled or explicit level.
+- **`.doc` heading levels come from the style sheet ([#132](https://github.com/yfedoseev/office_oxide/issues/132); contributed by @xugangqiang in [#127](https://github.com/yfedoseev/office_oxide/pull/127)).** A paragraph whose style is a built-in `Heading 1`–`Heading 9`, or a user-defined `Heading N`, now renders at that level; previously the level came from a line-shape guess that could only produce 1 or 2 and missed any heading that was not ALL-CAPS. A direct `sprmPOutLvl` still beats the style, in both directions (operand 9 is explicit body text), and the line-shape guess stays as the fallback for paragraphs with no level, switched off only by a paragraph that states its own.
+- **A style that is not named `Heading N` can still be a heading.** A style's own outline level and the style it is based on (`istdBase`) are now followed, to a bounded depth, so styles such as "H2", "Level 1" or a "Section Head" based on `Heading 2` resolve to their real level. A cyclic or over-deep base chain resolves to no level and is reported once.
+
+  Measured against v0.1.14 on the 634 unique `.doc` files under `~/projects` that an independent MS-DOC reader (FIB, piece table, PAPX, STSH with inheritance; sharing no code with the crate) could score: 990 of about 3,250 true headings found before, **3,216** now (misses 2,262 → 36), and 77% → **97.5%** of the matched headings at the correct level. No scored document gets worse. The one heading lost, in `tdf81705_outlineLevel.doc`, is a paragraph explicitly marked body text. All other formats, and the `text` output of every `.doc`, are byte-identical across all 10,170 unique files. A style sheet that defines only part of the hierarchy still falls back to the guess for the rest, and a heading-styled paragraph that is a whole sentence (a run-in head) becomes one long heading, as it is in the document.
+
+### Fixed
+
+- **A rejected or truncated `.doc` style sheet is reported instead of dropped.** An absent or out-of-range style sheet, a bad header or `cbSTDBaseInFile`, or a sheet that declares more styles than it carries now adds a warning to `Metadata::warnings`; the styles read before a cut are kept. Four of the 804 `.doc` files in the local corpus carry one; no other output changes.
+
+### Changed
+
+- The DOCX text extractor, DOCX writer and DOCX-to-IR converter now clamp heading depth through the IR's single `MAX_HEADING_DEPTH` constant instead of a literal 6 (no behaviour change).
 
 ## [0.1.14] - 2026-10-14
 
