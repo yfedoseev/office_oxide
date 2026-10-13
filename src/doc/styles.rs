@@ -6,9 +6,11 @@
 //! us derive a paragraph's real heading level instead of the line heuristic in
 //! `convert_doc.rs`.
 //!
-//! Every parse step is bounds-checked: a malformed or truncated style sheet
-//! yields an empty `Vec`, so callers degrade to "no style" (and the heuristic)
-//! rather than panicking (AGENTS.md rule 6).
+//! Every parse step is bounds-checked: a malformed style sheet yields no styles
+//! and a truncated one yields the styles read before the cut, so callers
+//! degrade to "no style" (and the heuristic) rather than panicking (AGENTS.md
+//! rule 6). Either way [`StyleSheet::warning`] says why, so the loss reaches
+//! `Metadata::warnings` instead of passing unnoticed.
 
 use super::{MAX_OUTLINE_LEVEL, fib::Fib};
 
@@ -21,10 +23,33 @@ pub struct StyleDef {
     pub name: String,
 }
 
+/// The styles read from an STSH, and why the read fell short, if it did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StyleSheet {
+    /// Styles indexed by `istd`. Empty when the sheet was rejected; the styles
+    /// read before the cut when it was truncated.
+    pub styles: Vec<StyleDef>,
+    /// Set when the sheet was absent, rejected, or cut short. Surfaced through
+    /// `Metadata::warnings`: style-derived headings are unavailable (or only
+    /// partly available) for this document.
+    pub warning: Option<String>,
+}
+
+impl StyleSheet {
+    fn rejected(reason: String) -> Self {
+        Self {
+            styles: Vec::new(),
+            warning: Some(format!(
+                "style sheet (STSH) {reason}; heading levels from paragraph styles are unavailable"
+            )),
+        }
+    }
+}
+
 /// Parse the document style sheet (STSH) from the Table stream.
 ///
-/// Returns an empty vector when the style sheet is absent (`lcbStshf == 0`),
-/// out of bounds, or malformed.
+/// Yields no styles, with a warning, when the style sheet is absent
+/// (`lcbStshf == 0`), out of bounds, or malformed.
 ///
 /// Only the *length* is a valid absence test. `fcStshf` is an offset into
 /// the Table stream and `0` is the usual value, because the style sheet is
@@ -32,11 +57,11 @@ pub struct StyleDef {
 /// `lcbStshf` to be non-zero and `STSH` states every FIB contains a style
 /// sheet. Testing the offset silently discarded the style sheet of nearly
 /// every real document.
-pub fn parse_style_sheet(table_stream: &[u8], fib: &Fib) -> Vec<StyleDef> {
+pub fn parse_style_sheet(table_stream: &[u8], fib: &Fib) -> StyleSheet {
     // Guard on the length only: `fc_stshf` is an offset and 0 is its normal
     // value, so treating 0 as "absent" drops real style sheets.
     if fib.lcb_stshf == 0 {
-        return Vec::new();
+        return StyleSheet::rejected("is absent (lcbStshf is 0)".into());
     }
     let start = fib.fc_stshf as usize;
     // `saturating_add` so a malformed `fc_stshf`/`lcb_stshf` (e.g. near
@@ -47,7 +72,11 @@ pub fn parse_style_sheet(table_stream: &[u8], fib: &Fib) -> Vec<StyleDef> {
         .saturating_add(fib.lcb_stshf as usize)
         .min(table_stream.len());
     if start >= table_stream.len() || end <= start {
-        return Vec::new();
+        return StyleSheet::rejected(format!(
+            "lies outside the Table stream (fcStshf {start}, lcbStshf {}, stream {} bytes)",
+            fib.lcb_stshf,
+            table_stream.len()
+        ));
     }
     parse_stsh(&table_stream[start..end])
 }
@@ -103,14 +132,16 @@ fn heading_level_from_name(name: &str) -> Option<u8> {
 /// exactly 18 bytes and carries no names (§2.9.274). Each style's name lives
 /// inside its own `STD`, which is `stdf` + `xstzName` + `grLPUpxSw` (§2.9.258),
 /// and `stdf` occupies `cbSTDBaseInFile` bytes.
-fn parse_stsh(data: &[u8]) -> Vec<StyleDef> {
+fn parse_stsh(data: &[u8]) -> StyleSheet {
     if data.len() < 2 {
-        return Vec::new();
+        return StyleSheet::rejected("is too short to hold its header".into());
     }
     let cb_stshi = u16::from_le_bytes([data[0], data[1]]) as usize;
     let mut pos = 2;
     if cb_stshi < 18 || pos + cb_stshi > data.len() {
-        return Vec::new();
+        return StyleSheet::rejected(format!(
+            "header rejected (cbStshi {cb_stshi} is below 18 or runs past the sheet)"
+        ));
     }
     // Stshif (§2.9.274): `cstd` at 0 (u16), `cbSTDBaseInFile` at 2 (u16).
     let cstd = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
@@ -124,7 +155,9 @@ fn parse_stsh(data: &[u8]) -> Vec<StyleDef> {
     // degrade to the line heuristic rather than guess (AGENTS.md rule: fail
     // loudly, never fall back to a silent plausible-but-wrong result).
     if cb_std_base != 0x000A && cb_std_base != 0x0012 {
-        return Vec::new();
+        return StyleSheet::rejected(format!(
+            "rejected (cbSTDBaseInFile {cb_std_base:#06x} is neither 0x000A nor 0x0012)"
+        ));
     }
 
     // `rglpstd`: `cstd` `LPStd` entries (§2.9.135).
@@ -165,7 +198,17 @@ fn parse_stsh(data: &[u8]) -> Vec<StyleDef> {
             pos += 1;
         }
     }
-    styles
+    // The loop stops early on a truncated entry and is capped at 4096 entries,
+    // so one comparison covers a cut sheet, a lying `cstd`, and the cap. The
+    // styles already read are kept: they are correct, only incomplete.
+    let warning = (styles.len() < cstd).then(|| {
+        format!(
+            "style sheet (STSH) declares {cstd} styles but only {} could be read; \
+             heading levels from the remaining paragraph styles are unavailable",
+            styles.len()
+        )
+    });
+    StyleSheet { styles, warning }
 }
 
 /// Parse an `Xstz` (§2.9.354) — a style name: an `Xst` (a `cch: u16` followed
@@ -258,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_parse_stsh_reads_sti_and_names() {
-        let styles = parse_stsh(&synthetic_stsh());
+        let styles = parse_stsh(&synthetic_stsh()).styles;
         assert_eq!(styles.len(), 16, "all 16 LPStd entries must be decoded");
         // istd 0: Normal.
         assert_eq!(styles[0].sti, 0);
@@ -316,7 +359,7 @@ mod tests {
         // has to be pinned is the *behaviour* — these bytes must not keep
         // producing a Heading 3, which they did when names were attached by
         // index from that table.
-        let styles = parse_stsh(&d);
+        let styles = parse_stsh(&d).styles;
         assert!(
             heading_level_for_istd(&styles, 3).is_none(),
             "a spurious name table must not keep yielding Heading 3; got {styles:?}"
@@ -324,7 +367,7 @@ mod tests {
         // Contrast, so the line above cannot pass by doing nothing: the same
         // intent expressed in the spec layout does resolve.
         assert_eq!(
-            heading_level_for_istd(&parse_stsh(&synthetic_stsh()), 3),
+            heading_level_for_istd(&parse_stsh(&synthetic_stsh()).styles, 3),
             Some(3),
             "the spec layout must still resolve istd 3 to Heading 3"
         );
@@ -340,7 +383,7 @@ mod tests {
         // only 0x000A / 0x0012; anything else is malformed.
         stsh[4..6].copy_from_slice(&0x0020u16.to_le_bytes());
         assert!(
-            parse_stsh(&stsh).is_empty(),
+            parse_stsh(&stsh).styles.is_empty(),
             "a bogus cbSTDBaseInFile must be rejected, not guess a name offset"
         );
     }
@@ -365,7 +408,7 @@ mod tests {
         stsh.truncate(20); // keep cbStshi + Stshif
         stsh.extend_from_slice(&rglpstd);
 
-        let styles = parse_stsh(&stsh);
+        let styles = parse_stsh(&stsh).styles;
         assert_eq!(styles.len(), 2, "both entries must be read");
         assert_eq!(styles[0].sti, 2, "odd-sized entry decodes normally");
         assert_eq!(
@@ -376,7 +419,7 @@ mod tests {
 
     #[test]
     fn test_heading_level_resolves_builtin_and_user() {
-        let styles = parse_stsh(&synthetic_stsh());
+        let styles = parse_stsh(&synthetic_stsh()).styles;
         // Built-in: sti 1..9 resolve directly (istd 1..9).
         assert_eq!(heading_level_for_istd(&styles, 1), Some(1));
         assert_eq!(heading_level_for_istd(&styles, 3), Some(3));
@@ -478,8 +521,8 @@ mod tests {
 
     #[test]
     fn test_truncated_style_sheet_is_empty() {
-        assert!(parse_stsh(&[0u8; 4]).is_empty());
-        assert!(parse_stsh(&[18, 0, 0, 0]).is_empty());
+        assert!(parse_stsh(&[0u8; 4]).styles.is_empty());
+        assert!(parse_stsh(&[18, 0, 0, 0]).styles.is_empty());
     }
 
     /// Build a `Fib` whose only non-zero fields are `fc_stshf` / `lcb_stshf`,
@@ -504,7 +547,7 @@ mod tests {
         let mut table_stream = vec![0u8; start + stsh.len()];
         table_stream[start..start + stsh.len()].copy_from_slice(&stsh);
         let fib = fib_with_stsh(start as u32, stsh.len() as u32);
-        let styles = parse_style_sheet(&table_stream, &fib);
+        let styles = parse_style_sheet(&table_stream, &fib).styles;
         assert_eq!(styles.len(), 16);
         assert_eq!(styles[0].sti, 0);
         assert_eq!(styles[0].name, "Normal");
@@ -530,7 +573,7 @@ mod tests {
         let mut table_stream = stsh.clone();
         table_stream.resize(stsh.len() + 64, 0);
         let fib = fib_with_stsh(0, stsh.len() as u32);
-        let styles = parse_style_sheet(&table_stream, &fib);
+        let styles = parse_style_sheet(&table_stream, &fib).styles;
         assert_eq!(styles.len(), 16, "an offset of 0 must not be read as 'no style sheet'");
         assert_eq!(styles[3].name, "Heading 3");
     }
@@ -538,7 +581,11 @@ mod tests {
     #[test]
     fn test_parse_style_sheet_absent_is_empty() {
         let table_stream = vec![0u8; 64];
-        assert!(parse_style_sheet(&table_stream, &fib_with_stsh(0, 0)).is_empty());
+        assert!(
+            parse_style_sheet(&table_stream, &fib_with_stsh(0, 0))
+                .styles
+                .is_empty()
+        );
     }
 
     /// Malformed `fc_stshf` / `lcb_stshf` near `u32::MAX` must not overflow the
@@ -554,7 +601,9 @@ mod tests {
         let table_stream = vec![0u8; 64];
         for (start, len) in [(u32::MAX, 100u32), (60u32, u32::MAX), (u32::MAX, u32::MAX)] {
             assert!(
-                parse_style_sheet(&table_stream, &fib_with_stsh(start, len)).is_empty(),
+                parse_style_sheet(&table_stream, &fib_with_stsh(start, len))
+                    .styles
+                    .is_empty(),
                 "fc_stshf={start:#x} lcb_stshf={len:#x} must yield no styles"
             );
         }
@@ -570,7 +619,7 @@ mod tests {
         d.extend_from_slice(&0x000Au16.to_le_bytes()); // cbSTDBaseInFile
         d.extend_from_slice(&[0u8; 14]);
         d.extend_from_slice(&lpstd(3, "Heading 3"));
-        let styles = parse_stsh(&d);
+        let styles = parse_stsh(&d).styles;
         assert_eq!(styles.len(), 1, "only the one entry actually present");
         assert_eq!(styles[0].name, "Heading 3");
     }
@@ -579,6 +628,61 @@ mod tests {
     fn test_parse_style_sheet_out_of_bounds_is_empty() {
         let stsh = synthetic_stsh();
         // Point `fc_stshf` past the end of the table stream.
-        assert!(parse_style_sheet(&stsh, &fib_with_stsh(1000, stsh.len() as u32)).is_empty());
+        assert!(
+            parse_style_sheet(&stsh, &fib_with_stsh(1000, stsh.len() as u32))
+                .styles
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_a_well_formed_style_sheet_carries_no_warning() {
+        let sheet = parse_stsh(&synthetic_stsh());
+        assert_eq!(sheet.styles.len(), 16);
+        assert_eq!(sheet.warning, None);
+    }
+
+    #[test]
+    fn test_a_rejected_style_sheet_says_why() {
+        let mut stsh = synthetic_stsh();
+        stsh[4..6].copy_from_slice(&0x0020u16.to_le_bytes()); // cbSTDBaseInFile
+        let sheet = parse_stsh(&stsh);
+        assert!(sheet.styles.is_empty());
+        let w = sheet.warning.expect("a rejected sheet must warn");
+        assert!(w.contains("cbSTDBaseInFile 0x0020"), "{w}");
+
+        let w = parse_stsh(&[0u8; 1]).warning.expect("too short");
+        assert!(w.contains("too short"), "{w}");
+
+        let mut stsh = synthetic_stsh();
+        stsh[0..2].copy_from_slice(&4u16.to_le_bytes()); // cbStshi < 18
+        let w = parse_stsh(&stsh).warning.expect("bad cbStshi");
+        assert!(w.contains("cbStshi 4"), "{w}");
+    }
+
+    /// A sheet cut mid-entry keeps the styles read before the cut and says how
+    /// many are missing.
+    #[test]
+    fn test_a_truncated_style_sheet_keeps_what_it_read_and_warns() {
+        let mut stsh = synthetic_stsh();
+        stsh.truncate(stsh.len() - 20); // lose the tail entries
+        let sheet = parse_stsh(&stsh);
+        assert!(!sheet.styles.is_empty() && sheet.styles.len() < 16);
+        assert_eq!(sheet.styles[1].name, "Heading 1");
+        let w = sheet.warning.expect("a cut sheet must warn");
+        assert!(w.contains("declares 16 styles"), "{w}");
+    }
+
+    #[test]
+    fn test_an_absent_or_out_of_bounds_style_sheet_warns() {
+        let table_stream = vec![0u8; 64];
+        let w = parse_style_sheet(&table_stream, &fib_with_stsh(0, 0))
+            .warning
+            .expect("lcbStshf 0");
+        assert!(w.contains("absent"), "{w}");
+        let w = parse_style_sheet(&table_stream, &fib_with_stsh(1000, 50))
+            .warning
+            .expect("out of bounds");
+        assert!(w.contains("outside the Table stream"), "{w}");
     }
 }

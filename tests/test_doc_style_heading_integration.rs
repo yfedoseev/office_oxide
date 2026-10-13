@@ -341,3 +341,76 @@ fn test_sprm_p_istd_overrides_the_papx_header_istd() {
         "the override, not the header istd, decides which style applies"
     );
 }
+
+/// The warnings a document reports through its IR metadata.
+fn warnings(doc: &office_oxide::Document) -> Vec<String> {
+    doc.to_ir().metadata.warnings
+}
+
+/// An opening prose line, then a paragraph whose style (istd 3) is `Heading 3`.
+/// The opener keeps the old line-shape guess from claiming the second line.
+fn prose_then_styled_paragraph() -> [Para; 2] {
+    [
+        Para {
+            text: "Introduction.",
+            terminator: '\r',
+            grpprl: Vec::new(),
+        },
+        Para {
+            text: "Subsection Three",
+            terminator: '\r',
+            grpprl: Vec::new(),
+        },
+    ]
+}
+
+/// A style sheet that is rejected must not cost the document its style-derived
+/// headings in silence: the reason reaches `Metadata::warnings`. The
+/// well-formed sheet is the contrast, so the assertion cannot be satisfied by
+/// a build that warns about everything.
+#[test]
+fn test_a_rejected_style_sheet_is_reported_in_the_metadata_warnings() {
+    let mut bad = heading_style_sheet();
+    bad[4..6].copy_from_slice(&0x0020u16.to_le_bytes()); // cbSTDBaseInFile
+
+    let good_doc = open_doc(&build_doc_with_styles(
+        &prose_then_styled_paragraph(),
+        &[0, 3],
+        &heading_style_sheet(),
+    ));
+    assert!(
+        warnings(&good_doc)
+            .iter()
+            .all(|w| !w.contains("style sheet")),
+        "a well-formed sheet must not warn; got {:?}",
+        warnings(&good_doc)
+    );
+
+    let bad_doc = open_doc(&build_doc_with_styles(&prose_then_styled_paragraph(), &[0, 3], &bad));
+    assert!(headings(&bad_doc).is_empty(), "a rejected sheet yields no style heading");
+    assert!(
+        warnings(&bad_doc)
+            .iter()
+            .any(|w| w.contains("style sheet") && w.contains("cbSTDBaseInFile")),
+        "the rejection must be reported; got {:?}",
+        warnings(&bad_doc)
+    );
+}
+
+/// A sheet cut off mid-entry keeps the headings it did read, and reports that
+/// it is incomplete.
+#[test]
+fn test_a_truncated_style_sheet_is_reported_and_keeps_the_styles_it_read() {
+    let mut cut = heading_style_sheet();
+    cut.truncate(cut.len() - 20);
+
+    let doc = open_doc(&build_doc_with_styles(&prose_then_styled_paragraph(), &[0, 3], &cut));
+    assert_eq!(headings(&doc), vec![(3, "Subsection Three".to_string())]);
+    assert!(
+        warnings(&doc)
+            .iter()
+            .any(|w| w.contains("style sheet") && w.contains("declares")),
+        "the truncation must be reported; got {:?}",
+        warnings(&doc)
+    );
+}

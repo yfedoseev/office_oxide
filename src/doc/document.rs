@@ -13,7 +13,7 @@ use super::papx::{DocParagraph, build_paragraphs, parse_papx_paragraphs};
 use super::piece_table::{
     covers_declared_length, extract_text_range_excluding, parse_clx, sanitize_text,
 };
-use super::styles::{StyleDef, parse_style_sheet};
+use super::styles::parse_style_sheet;
 
 /// A parsed legacy Word document.
 #[derive(Debug)]
@@ -427,6 +427,7 @@ impl DocDocument {
         // Build structured paragraphs (with table / list PAP flags) from the
         // PAPX FKP, when the FIB advertises one. Without it we cannot detect
         // tables or lists, so `doc_to_ir` falls back to the line heuristic.
+        let mut style_warning: Option<String> = None;
         let paragraphs = if fib.fc_plcf_bte_papx != 0 && fib.lcb_plcf_bte_papx != 0 {
             let fkp = parse_papx_paragraphs(
                 &word_doc,
@@ -436,9 +437,12 @@ impl DocDocument {
             );
             // Parse the style sheet so paragraph styles (incl. built-in
             // Heading 1-9 and user-defined "Heading N") can be resolved to a
-            // real heading level. A malformed/absent sheet yields an empty
-            // list and headings fall back to the line heuristic.
-            let styles: Vec<StyleDef> = parse_style_sheet(&table_stream, &fib);
+            // real heading level. A malformed/absent sheet yields no styles,
+            // headings fall back to the line heuristic, and the reason is
+            // reported as a warning rather than dropped.
+            let sheet = parse_style_sheet(&table_stream, &fib);
+            style_warning = sheet.warning;
+            let styles = sheet.styles;
             build_paragraphs(
                 &word_doc,
                 &pieces,
@@ -473,7 +477,8 @@ impl DocDocument {
         // A container stream that came back shorter than its declared size
         // lost content just as surely as a piece-table gap.
         let text_complete = text_complete && cfb.truncated_streams().is_empty();
-        let warnings = container_warnings(&cfb);
+        let mut warnings = container_warnings(&cfb);
+        warnings.extend(style_warning);
 
         Ok(Self {
             text,

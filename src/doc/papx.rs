@@ -1391,7 +1391,7 @@ mod tests {
         let mut table_stream = vec![0u8; start + stsh.len()];
         table_stream[start..start + stsh.len()].copy_from_slice(&stsh);
         let fib = fib_with_stsh(start as u32, stsh.len() as u32);
-        let styles = parse_style_sheet(&table_stream, &fib);
+        let styles = parse_style_sheet(&table_stream, &fib).styles;
         assert_eq!(styles.len(), 15, "the 15 fixed-index LPStd entries");
         assert_eq!(styles[3].sti, 3);
         assert_eq!(styles[3].name, "Heading 3");
