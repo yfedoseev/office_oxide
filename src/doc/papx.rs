@@ -924,6 +924,8 @@ mod tests {
             StyleDef {
                 sti: 3,
                 name: "Heading 3".into(),
+
+                ..Default::default()
             }, // istd 3: built-in Heading 3
         ];
         let raw = "Subsection\r";
@@ -972,6 +974,8 @@ mod tests {
             StyleDef {
                 sti: 3,
                 name: "Heading 3".into(),
+
+                ..Default::default()
             }, // istd 3: built-in Heading 3
         ];
         let raw = "Subsection\r";
@@ -1022,6 +1026,8 @@ mod tests {
             StyleDef {
                 sti: 0x0FFE,
                 name: "heading 3".into(),
+
+                ..Default::default()
             }, // istd 2: user-defined, name carries level
         ];
         let raw = "Subsection\r";
@@ -1114,6 +1120,8 @@ mod tests {
             StyleDef {
                 sti: 3,
                 name: "Heading 3".into(),
+
+                ..Default::default()
             }, // istd 3: built-in Heading 3
         ];
         let raw = "Section Five\r";
@@ -1165,6 +1173,8 @@ mod tests {
             StyleDef {
                 sti: 3,
                 name: "Heading 3".into(),
+
+                ..Default::default()
             }, // istd 1: a heading style exists in the document
         ];
         let raw = "Ordinary body prose.\r";
@@ -1209,6 +1219,8 @@ mod tests {
             StyleDef {
                 sti: 3,
                 name: "Heading 3".into(),
+
+                ..Default::default()
             }, // istd 3: built-in Heading 3
         ];
         let raw = "Restyled to body text\r";
@@ -1260,6 +1272,8 @@ mod tests {
             StyleDef {
                 sti: 3,
                 name: "Heading 3".into(),
+
+                ..Default::default()
             }, // istd 3: built-in Heading 3
         ];
         let raw = "Not a heading\r";

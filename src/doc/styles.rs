@@ -1,10 +1,12 @@
 //! Style sheet (STSH) parsing for legacy binary `.doc` (MS-DOC §2.7.1).
 //!
 //! The style sheet maps a paragraph's style index (`istd`) to a built-in
-//! style id (`sti`) and a name. Built-in heading styles carry `sti` 1–9
-//! (Heading 1–9); user-defined heading styles are named `Heading N`. Both let
-//! us derive a paragraph's real heading level instead of the line heuristic in
-//! `convert_doc.rs`.
+//! style id (`sti`), a name, the style it is based on (`istdBase`) and the
+//! outline level its own paragraph properties state. Built-in heading styles
+//! carry `sti` 1–9 (Heading 1–9); user-defined heading styles are named
+//! `Heading N`; any other style may state an outline level itself or inherit
+//! one from its base. All of these let us derive a paragraph's real heading
+//! level instead of the line heuristic in `convert_doc.rs`.
 //!
 //! Every parse step is bounds-checked: a malformed style sheet yields no styles
 //! and a truncated one yields the styles read before the cut, so callers
@@ -12,7 +14,7 @@
 //! rule 6). Either way [`StyleSheet::warning`] says why, so the loss reaches
 //! `Metadata::warnings` instead of passing unnoticed.
 
-use super::{MAX_OUTLINE_LEVEL, fib::Fib};
+use super::{MAX_OUTLINE_LEVEL, OutlineLevel, fib::Fib, sprm::extract_pap_props};
 
 /// One style definition, indexed by `istd`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -21,7 +23,21 @@ pub struct StyleDef {
     pub sti: u16,
     /// Style name (from the style's `xstzName` inside `STD`, [MS-DOC] §2.9.271).
     pub name: String,
+    /// `istdBase` ([MS-DOC] §2.9.260 `StdfBase`): the style this one inherits
+    /// from. `None` when the field is `0x0FFF` ("no base").
+    pub base: Option<u16>,
+    /// The outline level the style's *own* paragraph properties state: the
+    /// `sprmPOutLvl` (0x2640) in its `UpxPapx`. Zero-based like the SPRM
+    /// operand: `0..=8` are Heading 1–9 and `9` is explicit body text. `None`
+    /// when the style states none (it may still inherit one from `base`).
+    pub own_outline: Option<u8>,
 }
+
+/// The longest `istdBase` chain followed when resolving a style's heading
+/// level. Real style sheets nest a handful of levels; the bound is what ends a
+/// cyclic chain (or a hostile one thousands deep) without a visited set, and
+/// it caps the work per paragraph.
+const MAX_STYLE_CHAIN: usize = 32;
 
 /// The styles read from an STSH, and why the read fell short, if it did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -29,19 +45,20 @@ pub struct StyleSheet {
     /// Styles indexed by `istd`. Empty when the sheet was rejected; the styles
     /// read before the cut when it was truncated.
     pub styles: Vec<StyleDef>,
-    /// Set when the sheet was absent, rejected, or cut short. Surfaced through
+    /// Why the sheet could not be used in full: absent, rejected, cut short, or
+    /// carrying base chains that cannot be followed. Surfaced through
     /// `Metadata::warnings`: style-derived headings are unavailable (or only
     /// partly available) for this document.
-    pub warning: Option<String>,
+    pub warnings: Vec<String>,
 }
 
 impl StyleSheet {
     fn rejected(reason: String) -> Self {
         Self {
             styles: Vec::new(),
-            warning: Some(format!(
+            warnings: vec![format!(
                 "style sheet (STSH) {reason}; heading levels from paragraph styles are unavailable"
-            )),
+            )],
         }
     }
 }
@@ -83,17 +100,45 @@ pub fn parse_style_sheet(table_stream: &[u8], fib: &Fib) -> StyleSheet {
 
 /// Resolve a paragraph's `istd` (optionally overridden by `sprmPIstd`) to a
 /// heading level (1–9), or `None` when the style is not a heading.
+///
+/// A style's level is, in order: the outline level its own paragraph
+/// properties state (`9` meaning explicit body text, which also stops the
+/// walk), else Heading 1–9 by built-in `sti`, else by a `Heading N` name, else
+/// whatever the style it is based on resolves to. The base chain is followed at
+/// most [`MAX_STYLE_CHAIN`] steps, so a cycle resolves to `None`.
 pub fn heading_level_for_istd(styles: &[StyleDef], istd: u16) -> Option<u8> {
-    let s = styles.get(istd as usize)?;
-    // Built-in heading styles: `sti` 1..9 == Heading 1..9.
-    if (1..=u16::from(MAX_OUTLINE_LEVEL)).contains(&s.sti) {
-        return Some(s.sti as u8);
+    resolve_heading_level(styles, istd).0
+}
+
+/// The level of `istd` and whether the walk gave up at [`MAX_STYLE_CHAIN`]
+/// steps (a cycle, or a chain too deep to be real) before it could decide.
+fn resolve_heading_level(styles: &[StyleDef], istd: u16) -> (Option<u8>, bool) {
+    let mut current = istd;
+    for _ in 0..MAX_STYLE_CHAIN {
+        let Some(s) = styles.get(current as usize) else {
+            return (None, false);
+        };
+        match s.own_outline {
+            Some(zero_based) if zero_based < MAX_OUTLINE_LEVEL => {
+                return (Some(zero_based + 1), false);
+            },
+            Some(MAX_OUTLINE_LEVEL) => return (None, false),
+            _ => {},
+        }
+        // Built-in heading styles: `sti` 1..9 == Heading 1..9.
+        if (1..=u16::from(MAX_OUTLINE_LEVEL)).contains(&s.sti) {
+            return (Some(s.sti as u8), false);
+        }
+        // User-defined heading styles are named "Heading N".
+        if let Some(level) = heading_level_from_name(&s.name) {
+            return (Some(level), false);
+        }
+        match s.base {
+            Some(base) => current = base,
+            None => return (None, false),
+        }
     }
-    // User-defined heading styles are named "Heading N".
-    if let Some(level) = heading_level_from_name(&s.name) {
-        return Some(level);
-    }
-    None
+    (None, true)
 }
 
 fn heading_level_from_name(name: &str) -> Option<u8> {
@@ -192,7 +237,13 @@ fn parse_stsh(data: &[u8]) -> StyleSheet {
         } else {
             String::new()
         };
-        styles.push(StyleDef { sti, name });
+        let (base, own_outline) = style_inheritance(std, cb_std_base);
+        styles.push(StyleDef {
+            sti,
+            name,
+            base,
+            own_outline,
+        });
         pos += cb_std;
         // LPStd entries are stored on even-byte boundaries and `cbStd` does NOT
         // include that padding byte (§2.9.135).
@@ -203,14 +254,79 @@ fn parse_stsh(data: &[u8]) -> StyleSheet {
     // The loop stops early on a truncated entry and is capped at 4096 entries,
     // so one comparison covers a cut sheet, a lying `cstd`, and the cap. The
     // styles already read are kept: they are correct, only incomplete.
-    let warning = (styles.len() < cstd).then(|| {
-        format!(
+    let mut warnings = Vec::new();
+    if styles.len() < cstd {
+        warnings.push(format!(
             "style sheet (STSH) declares {cstd} styles but only {} could be read; \
              heading levels from the remaining paragraph styles are unavailable",
             styles.len()
-        )
-    });
-    StyleSheet { styles, warning }
+        ));
+    }
+    let unfollowable = (0..styles.len())
+        .filter(|&i| resolve_heading_level(&styles, i as u16).1)
+        .count();
+    if unfollowable > 0 {
+        warnings.push(format!(
+            "style sheet (STSH) has {unfollowable} styles whose istdBase chain is cyclic or \
+             deeper than {MAX_STYLE_CHAIN}, so their heading levels are unavailable"
+        ));
+    }
+    StyleSheet { styles, warnings }
+}
+
+/// A style's `istdBase` and the outline level its own paragraph properties
+/// state, read from the `STD` ([MS-DOC] §2.9.258).
+///
+/// `StdfBase` holds `sgc` in the low 4 bits of its second word and `istdBase` in
+/// the high 12; the third word's low 4 bits are `cupx`, the number of `UPX`
+/// entries that follow the name. Only a paragraph style (`sgc` 1) carries a
+/// `UpxPapx`, which is the first `LPUpx` after the name: `cbUpx(u16)`, then
+/// `istd(u16)`, then the paragraph `grpprl`. Any bound that does not hold
+/// yields no outline level rather than a guess.
+fn style_inheritance(std: &[u8], cb_std_base: usize) -> (Option<u16>, Option<u8>) {
+    if std.len() < 6 {
+        return (None, None);
+    }
+    let word1 = u16::from_le_bytes([std[2], std[3]]);
+    let sgc = word1 & 0x000F;
+    let base = (word1 >> 4 != 0x0FFF).then_some(word1 >> 4);
+    let cupx = u16::from_le_bytes([std[4], std[5]]) & 0x000F;
+    const PARAGRAPH_STYLE: u16 = 1; // sgc, [MS-DOC] §2.9.260
+    if sgc != PARAGRAPH_STYLE || cupx == 0 {
+        return (base, None);
+    }
+    // `xstzName` is `cch(u16)` + `cch` UTF-16 units + a 2-byte terminator; the
+    // `LPUpx` array starts on the next even offset within the `STD`.
+    let Some(cch) = std
+        .get(cb_std_base..cb_std_base.saturating_add(2))
+        .map(|b| usize::from(u16::from_le_bytes([b[0], b[1]])))
+    else {
+        return (base, None);
+    };
+    let mut at = cb_std_base + 2 + 2 * cch + 2;
+    if !at.is_multiple_of(2) {
+        at += 1;
+    }
+    let Some(cb_upx) = std
+        .get(at..at.saturating_add(2))
+        .map(|b| usize::from(u16::from_le_bytes([b[0], b[1]])))
+    else {
+        return (base, None);
+    };
+    // `UpxPapx`: the style's own `istd` (2 bytes), then its `grpprl`.
+    let Some(grpprl) = std
+        .get(at + 2..at + 2 + cb_upx)
+        .filter(|upx| upx.len() >= 2)
+        .map(|upx| &upx[2..])
+    else {
+        return (base, None);
+    };
+    let own_outline = match extract_pap_props(grpprl).outline_level {
+        Some(OutlineLevel::Heading { level, .. }) => Some(level),
+        Some(OutlineLevel::BodyText) => Some(MAX_OUTLINE_LEVEL),
+        None => None,
+    };
+    (base, own_outline)
 }
 
 /// Parse an `Xstz` (§2.9.354) — a style name: an `Xst` (a `cch: u16` followed
@@ -239,14 +355,31 @@ mod tests {
 
     /// Build one `LPStd` for a style sheet: `cbStd(u16)` + `STD`.
     ///
-    /// `STD` = `stdf` (`cbSTDBaseInFile` bytes, here `StdfBase` alone) +
-    /// `xstzName`, per MS-DOC §2.9.258. `xstzName` is an `Xstz`: `cch(u16)` +
-    /// `cch` UTF-16 code units + a 2-byte null terminator (§2.9.354).
+    /// A paragraph style (`sgc` 1) based on nothing (`istdBase` 0x0FFF) and
+    /// stating no outline level of its own; see [`lpstd_styled`].
     fn lpstd(sti: u16, name: &str) -> Vec<u8> {
+        lpstd_styled(sti, name, None, None)
+    }
+
+    /// Build one `LPStd` for a paragraph style: `cbStd(u16)` + `STD`.
+    ///
+    /// `STD` = `stdf` (`cbSTDBaseInFile` bytes, here `StdfBase` alone) +
+    /// `xstzName` + `grLPUpxSw`, per MS-DOC §2.9.258. `xstzName` is an `Xstz`:
+    /// `cch(u16)` + `cch` UTF-16 code units + a 2-byte null terminator
+    /// (§2.9.354). `StdfBase` carries `sti` (low 12 bits of word 0), `sgc` (low 4
+    /// bits of word 1) with `istdBase` above it, and `cupx` (low 4 bits of word
+    /// 2). When `outline` is given the style states it in its own `UpxPapx`: an
+    /// `LPUpx` (`cbUpx` + the style's `istd` + a `sprmPOutLvl` grpprl), starting
+    /// on an even offset within the `STD`.
+    fn lpstd_styled(sti: u16, name: &str, base: Option<u16>, outline: Option<u8>) -> Vec<u8> {
         const CB_STD_BASE: usize = 0x000A;
-        // `StdfBase` (10 bytes): `sti` is the low 12 bits of the first u16.
+        const SGC_PARAGRAPH: u16 = 1;
         let mut std = vec![0u8; CB_STD_BASE];
         std[0..2].copy_from_slice(&sti.to_le_bytes());
+        let istd_base = base.unwrap_or(0x0FFF);
+        std[2..4].copy_from_slice(&(SGC_PARAGRAPH | (istd_base << 4)).to_le_bytes());
+        let cupx: u16 = u16::from(outline.is_some());
+        std[4..6].copy_from_slice(&cupx.to_le_bytes());
         // `xstzName`.
         let units: Vec<u16> = name.encode_utf16().collect();
         std.extend_from_slice(&(units.len() as u16).to_le_bytes()); // cch
@@ -254,10 +387,23 @@ mod tests {
             std.extend_from_slice(&u.to_le_bytes());
         }
         std.extend_from_slice(&0u16.to_le_bytes()); // chTerm
+        if let Some(op) = outline {
+            if std.len() % 2 == 1 {
+                std.push(0); // LPUpx starts on an even offset
+            }
+            let grpprl = [0x40, 0x26, op]; // sprmPOutLvl, 1-byte operand
+            let cb_upx = (2 + grpprl.len()) as u16; // istd + grpprl
+            std.extend_from_slice(&cb_upx.to_le_bytes());
+            std.extend_from_slice(&0u16.to_le_bytes()); // UpxPapx.istd
+            std.extend_from_slice(&grpprl);
+        }
 
         let mut out = Vec::new();
         out.extend_from_slice(&(std.len() as u16).to_le_bytes()); // cbStd
         out.extend_from_slice(&std);
+        if std.len() % 2 == 1 {
+            out.push(0); // the next LPStd starts on an even offset; cbStd excludes this
+        }
         out
     }
 
@@ -451,14 +597,19 @@ mod tests {
             StyleDef {
                 sti: 3,
                 name: "\u{00dc}berschrift 3".into(),
+                ..Default::default()
             }, // istd 1 (de)
             StyleDef {
                 sti: 5,
                 name: "Titre 5".into(),
+
+                ..Default::default()
             }, // istd 2 (fr)
             StyleDef {
                 sti: 0x0FFE,
                 name: "Custom".into(),
+
+                ..Default::default()
             }, // istd 3
         ];
         assert_eq!(heading_level_for_istd(&styles, 1), Some(3));
@@ -476,6 +627,8 @@ mod tests {
             StyleDef {
                 sti: 0x0FFE,
                 name: "Heading 4,Title 4".into(),
+
+                ..Default::default()
             },
         ];
         assert_eq!(heading_level_for_istd(&styles, 1), Some(4));
@@ -513,6 +666,8 @@ mod tests {
             StyleDef {
                 sti: 0x0FFE,
                 name: "Body Text".into(),
+
+                ..Default::default()
             },
         ];
         assert_eq!(heading_level_for_istd(&styles, 0), None);
@@ -640,7 +795,7 @@ mod tests {
     fn test_a_well_formed_style_sheet_carries_no_warning() {
         let sheet = parse_stsh(&synthetic_stsh());
         assert_eq!(sheet.styles.len(), 16);
-        assert_eq!(sheet.warning, None);
+        assert!(sheet.warnings.is_empty(), "{:?}", sheet.warnings);
     }
 
     #[test]
@@ -649,15 +804,27 @@ mod tests {
         stsh[4..6].copy_from_slice(&0x0020u16.to_le_bytes()); // cbSTDBaseInFile
         let sheet = parse_stsh(&stsh);
         assert!(sheet.styles.is_empty());
-        let w = sheet.warning.expect("a rejected sheet must warn");
+        let w = sheet
+            .warnings
+            .first()
+            .cloned()
+            .expect("a rejected sheet must warn");
         assert!(w.contains("cbSTDBaseInFile 0x0020"), "{w}");
 
-        let w = parse_stsh(&[0u8; 1]).warning.expect("too short");
+        let w = parse_stsh(&[0u8; 1])
+            .warnings
+            .first()
+            .cloned()
+            .expect("too short");
         assert!(w.contains("too short"), "{w}");
 
         let mut stsh = synthetic_stsh();
         stsh[0..2].copy_from_slice(&4u16.to_le_bytes()); // cbStshi < 18
-        let w = parse_stsh(&stsh).warning.expect("bad cbStshi");
+        let w = parse_stsh(&stsh)
+            .warnings
+            .first()
+            .cloned()
+            .expect("bad cbStshi");
         assert!(w.contains("cbStshi 4"), "{w}");
     }
 
@@ -670,7 +837,11 @@ mod tests {
         let sheet = parse_stsh(&stsh);
         assert!(!sheet.styles.is_empty() && sheet.styles.len() < 16);
         assert_eq!(sheet.styles[1].name, "Heading 1");
-        let w = sheet.warning.expect("a cut sheet must warn");
+        let w = sheet
+            .warnings
+            .first()
+            .cloned()
+            .expect("a cut sheet must warn");
         assert!(w.contains("declares 16 styles"), "{w}");
     }
 
@@ -678,12 +849,195 @@ mod tests {
     fn test_an_absent_or_out_of_bounds_style_sheet_warns() {
         let table_stream = vec![0u8; 64];
         let w = parse_style_sheet(&table_stream, &fib_with_stsh(0, 0))
-            .warning
+            .warnings
+            .first()
+            .cloned()
             .expect("lcbStshf 0");
         assert!(w.contains("absent"), "{w}");
         let w = parse_style_sheet(&table_stream, &fib_with_stsh(1000, 50))
-            .warning
+            .warnings
+            .first()
+            .cloned()
             .expect("out of bounds");
         assert!(w.contains("outside the Table stream"), "{w}");
+    }
+
+    /// Build an STSH from `LPStd` entries with `cbSTDBaseInFile` = 0x0A.
+    fn stsh_of(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut d = 18u16.to_le_bytes().to_vec(); // cbStshi
+        d.extend_from_slice(&(entries.len() as u16).to_le_bytes()); // cstd
+        d.extend_from_slice(&0x000Au16.to_le_bytes()); // cbSTDBaseInFile
+        d.extend_from_slice(&[0u8; 14]);
+        for e in entries {
+            d.extend_from_slice(e);
+        }
+        d
+    }
+
+    #[test]
+    fn test_parse_stsh_reads_istd_base_and_own_outline_level() {
+        let sheet = parse_stsh(&stsh_of(&[
+            lpstd(0, "Normal"),
+            lpstd_styled(1, "Heading 1", Some(0), Some(0)),
+            lpstd_styled(0x0FFE, "Custom", Some(1), Some(3)),
+            lpstd_styled(0x0FFE, "Plain Body", Some(0), Some(9)),
+            lpstd_styled(0x0FFE, "No Outline", Some(1), None),
+        ]));
+        assert!(sheet.warnings.is_empty(), "{:?}", sheet.warnings);
+        let st = &sheet.styles;
+        assert_eq!((st[0].base, st[0].own_outline), (None, None), "0x0FFF means no base");
+        assert_eq!((st[1].base, st[1].own_outline), (Some(0), Some(0)));
+        assert_eq!((st[2].base, st[2].own_outline), (Some(1), Some(3)));
+        assert_eq!((st[3].base, st[3].own_outline), (Some(0), Some(9)), "9 = body text");
+        assert_eq!((st[4].base, st[4].own_outline), (Some(1), None));
+        assert_eq!(st[2].name, "Custom", "the name is still read at the right offset");
+    }
+
+    /// A style's own outline level wins over its name and over what it would
+    /// inherit; level 9 ends the walk as explicit body text.
+    #[test]
+    fn test_heading_level_prefers_the_styles_own_outline_then_name_then_base() {
+        let sheet = parse_stsh(&stsh_of(&[
+            lpstd(0, "Normal"),                                    // 0
+            lpstd_styled(1, "Heading 1", Some(0), None),           // 1: by sti
+            lpstd_styled(0x0FFE, "H4", Some(0), Some(3)),          // 2: own outline 3 -> level 4
+            lpstd_styled(0x0FFE, "Child", Some(2), None),          // 3: inherits H4
+            lpstd_styled(0x0FFE, "Grandchild", Some(3), None),     // 4: inherits through two
+            lpstd_styled(0x0FFE, "Heading 5", Some(1), Some(1)),   // 5: own outline beats its name
+            lpstd_styled(0x0FFE, "Not Heading", Some(1), Some(9)), // 6: body text beats base Heading 1
+            lpstd_styled(0x0FFE, "Under Body", Some(6), None),     // 7: inherits explicit body text
+            lpstd_styled(0x0FFE, "Plain", Some(0), None),          // 8: nothing anywhere
+        ]));
+        let lvl = |i| heading_level_for_istd(&sheet.styles, i);
+        assert_eq!(lvl(1), Some(1));
+        assert_eq!(lvl(2), Some(4));
+        assert_eq!(lvl(3), Some(4), "one step of inheritance");
+        assert_eq!(lvl(4), Some(4), "two steps of inheritance");
+        assert_eq!(lvl(5), Some(2), "the style's own outline level beats its name");
+        assert_eq!(lvl(6), None, "explicit body text beats an inherited heading");
+        assert_eq!(lvl(7), None, "and is itself inherited");
+        assert_eq!(lvl(8), None);
+        assert_eq!(lvl(99), None, "out of range istd");
+    }
+
+    /// A cycle, a self-base and a chain deeper than the bound must all end, give
+    /// no level, and be reported once as a warning.
+    #[test]
+    fn test_cyclic_and_over_deep_base_chains_end_and_are_reported() {
+        let mut entries = vec![
+            lpstd(0, "Normal"),                        // 0
+            lpstd_styled(0x0FFE, "A", Some(2), None),  // 1 -> 2
+            lpstd_styled(0x0FFE, "B", Some(1), None),  // 2 -> 1 (cycle)
+            lpstd_styled(0x0FFE, "Me", Some(3), None), // 3 -> 3 (self)
+        ];
+        // 40 styles deep, the last one a real Heading 1: the bound is 32.
+        let first_deep = entries.len() as u16;
+        for i in 0..40u16 {
+            let base = if i == 0 { 0 } else { first_deep + i - 1 };
+            entries.push(lpstd_styled(0x0FFE, "Deep", Some(base), None));
+        }
+        entries.push(lpstd_styled(1, "Heading 1", Some(first_deep + 39), None));
+        let sheet = parse_stsh(&stsh_of(&entries));
+        let lvl = |i| heading_level_for_istd(&sheet.styles, i);
+        assert_eq!(lvl(1), None);
+        assert_eq!(lvl(2), None);
+        assert_eq!(lvl(3), None);
+        assert_eq!(lvl(first_deep + 40), Some(1), "a Heading 1 by sti needs no base");
+        assert_eq!(lvl(first_deep + 39), None, "40 steps from any heading is past the bound");
+        let w = sheet.warnings.join(" | ");
+        assert!(w.contains("istdBase chain is cyclic or deeper than 32"), "{w}");
+        assert_eq!(sheet.warnings.len(), 1, "reported once, not per style: {w}");
+    }
+
+    /// Frame `std` as an `LPStd` (`cbStd` + `STD` + the even-offset pad).
+    fn frame_std(std: &[u8]) -> Vec<u8> {
+        let mut e = (std.len() as u16).to_le_bytes().to_vec();
+        e.extend_from_slice(std);
+        if std.len() % 2 == 1 {
+            e.push(0);
+        }
+        e
+    }
+
+    /// The `STD` bytes inside an `LPStd` built by [`lpstd_styled`].
+    fn std_of(lpstd: &[u8]) -> Vec<u8> {
+        let cb = usize::from(u16::from_le_bytes([lpstd[0], lpstd[1]]));
+        lpstd[2..2 + cb].to_vec()
+    }
+
+    /// A style whose `UpxPapx` is cut short or lies about its size yields no
+    /// outline level and no panic; the name is still read.
+    #[test]
+    fn test_malformed_style_upx_degrades_to_no_outline_level() {
+        let std = std_of(&lpstd_styled(0x0FFE, "Cut Short", Some(0), Some(2)));
+        // The STD ends with `cbUpx`(2) + `istd`(2) + grpprl(3). Cut into those 7
+        // bytes one at a time, re-framing so only the UPX is short.
+        for cut in 1..=7usize {
+            let e = frame_std(&std[..std.len() - cut]);
+            let sheet = parse_stsh(&stsh_of(&[lpstd(0, "Normal"), e]));
+            assert_eq!(sheet.styles[1].name, "Cut Short", "cut {cut}");
+            assert_eq!(sheet.styles[1].own_outline, None, "cut {cut}");
+            assert!(
+                sheet.warnings.is_empty(),
+                "a short UPX is not a sheet error: {:?}",
+                sheet.warnings
+            );
+        }
+        // `cbUpx` claiming far more than the STD holds.
+        let mut lying = std.clone();
+        let at = lying.len() - 7;
+        lying[at..at + 2].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        let sheet = parse_stsh(&stsh_of(&[lpstd(0, "Normal"), frame_std(&lying)]));
+        assert_eq!(sheet.styles[1].own_outline, None);
+        // A non-paragraph style (`sgc` 2 = character) never reads a PAPX.
+        let mut character = std.clone();
+        character[2] = (character[2] & 0xF0) | 0x02;
+        let sheet = parse_stsh(&stsh_of(&[lpstd(0, "Normal"), frame_std(&character)]));
+        assert_eq!(sheet.styles[1].own_outline, None);
+        // `cupx` = 0: the style has no UPX at all, whatever bytes follow.
+        let mut no_upx = std.clone();
+        no_upx[4] &= 0xF0;
+        let sheet = parse_stsh(&stsh_of(&[lpstd(0, "Normal"), frame_std(&no_upx)]));
+        assert_eq!(sheet.styles[1].own_outline, None);
+    }
+
+    /// An operand above 9 is not an outline level: ignored, so the style falls
+    /// through to its name and base instead of inventing a level.
+    #[test]
+    fn test_an_out_of_range_style_outline_operand_is_ignored() {
+        let sheet = parse_stsh(&stsh_of(&[
+            lpstd(0, "Normal"),
+            lpstd_styled(0x0FFE, "Heading 2", Some(0), Some(200)),
+        ]));
+        assert_eq!(sheet.styles[1].own_outline, None);
+        assert_eq!(heading_level_for_istd(&sheet.styles, 1), Some(2));
+    }
+
+    /// The base-chain bound is part of the behaviour: a heading reached in 31
+    /// hops resolves and is not warned about; one 32 hops away does neither.
+    #[test]
+    fn test_the_base_chain_bound_is_pinned() {
+        let chain = |hops: u16| {
+            // 0 Normal, 1 Heading 1, then `hops` styles, each based on the last;
+            // the paragraph's style is the final one, `hops` hops from Heading 1.
+            let mut entries = vec![
+                lpstd(0, "Normal"),
+                lpstd_styled(1, "Heading 1", Some(0), None),
+            ];
+            for i in 0..hops {
+                entries.push(lpstd_styled(0x0FFE, "Link", Some(1 + i), None));
+            }
+            let sheet = parse_stsh(&stsh_of(&entries));
+            let level = heading_level_for_istd(&sheet.styles, hops + 1);
+            (level, sheet.warnings.len())
+        };
+        assert_eq!(chain(1), (Some(1), 0));
+        assert_eq!(chain(30), (Some(1), 0));
+        assert_eq!(chain(31), (Some(1), 0), "the longest chain that still resolves");
+        assert_eq!(
+            chain(32),
+            (None, 1),
+            "one hop past the bound neither resolves nor goes unreported"
+        );
     }
 }

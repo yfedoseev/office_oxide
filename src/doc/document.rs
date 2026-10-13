@@ -427,7 +427,7 @@ impl DocDocument {
         // Build structured paragraphs (with table / list PAP flags) from the
         // PAPX FKP, when the FIB advertises one. Without it we cannot detect
         // tables or lists, so `doc_to_ir` falls back to the line heuristic.
-        let mut style_warning: Option<String> = None;
+        let mut style_warnings: Vec<String> = Vec::new();
         let paragraphs = if fib.fc_plcf_bte_papx != 0 && fib.lcb_plcf_bte_papx != 0 {
             let fkp = parse_papx_paragraphs(
                 &word_doc,
@@ -441,7 +441,7 @@ impl DocDocument {
             // headings fall back to the line heuristic, and the reason is
             // reported as a warning rather than dropped.
             let sheet = parse_style_sheet(&table_stream, &fib);
-            style_warning = sheet.warning;
+            style_warnings = sheet.warnings;
             let styles = sheet.styles;
             build_paragraphs(
                 &word_doc,
@@ -478,7 +478,7 @@ impl DocDocument {
         // lost content just as surely as a piece-table gap.
         let text_complete = text_complete && cfb.truncated_streams().is_empty();
         let mut warnings = container_warnings(&cfb);
-        warnings.extend(style_warning);
+        warnings.extend(style_warnings);
 
         Ok(Self {
             text,

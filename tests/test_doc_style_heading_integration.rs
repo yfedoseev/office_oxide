@@ -13,7 +13,9 @@
 
 mod common;
 
-use common::{Para, build_doc_with_styles, heading_style_sheet, open_doc, prose_grpprl};
+use common::{
+    Para, Style, build_doc_with_styles, heading_style_sheet, open_doc, prose_grpprl, style_sheet,
+};
 use office_oxide::ir::Element;
 
 /// Pull the `(level, text)` of every `Heading` out of a parsed document.
@@ -415,4 +417,249 @@ fn test_a_truncated_style_sheet_is_reported_and_keeps_the_styles_it_read() {
         "the truncation must be reported; got {:?}",
         warnings(&doc)
     );
+}
+
+// ── Style inheritance (`istdBase`) and a style's own outline level ───────────
+//
+// A paragraph's heading level can come from a style that is not named
+// `Heading N` and has no built-in `sti`: it may state a level in its own
+// paragraph properties or inherit one from the style it is based on. In every
+// test below the opener keeps the old line-shape guess away from the second
+// paragraph, so a heading can only come from the style sheet.
+
+/// An opening prose line, then one paragraph per `istds` entry after the first.
+fn document_with_styles(
+    styles: &[Style],
+    istds: &[u16],
+) -> (office_oxide::Document, Vec<(u8, String)>) {
+    let texts = [
+        "Introduction.",
+        "Second Paragraph",
+        "Third Paragraph",
+        "Fourth Paragraph",
+    ];
+    let paras: Vec<Para> = istds
+        .iter()
+        .enumerate()
+        .map(|(i, _)| Para {
+            text: texts[i],
+            terminator: '\r',
+            grpprl: Vec::new(),
+        })
+        .collect();
+    let bytes = build_doc_with_styles(&paras, istds, &style_sheet(styles));
+    let doc = open_doc(&bytes);
+    let found = headings(&doc);
+    (doc, found)
+}
+
+/// A user style based on `Heading 2` inherits level 2. The contrast is the
+/// same style based on Normal, which is not a heading.
+#[test]
+fn test_a_style_based_on_a_heading_style_inherits_its_level() {
+    let heading_2 = |base| {
+        [
+            Style::new(0, "Normal"),
+            Style::new(2, "Heading 2"),
+            Style::based_on("Section Head", base),
+        ]
+    };
+    let (_, found) = document_with_styles(&heading_2(1), &[0, 2]);
+    assert_eq!(found, vec![(2, "Second Paragraph".to_string())]);
+
+    let (_, found) = document_with_styles(&heading_2(0), &[0, 2]);
+    assert!(found.is_empty(), "based on Normal it is not a heading; got {found:?}");
+}
+
+/// Inheritance is transitive: a style based on a style based on `Heading 3`.
+#[test]
+fn test_a_level_is_inherited_through_several_base_styles() {
+    let styles = [
+        Style::new(0, "Normal"),
+        Style::new(3, "Heading 3"),
+        Style::based_on("Child", 1),
+        Style::based_on("Grandchild", 2),
+    ];
+    let (_, found) = document_with_styles(&styles, &[0, 3]);
+    assert_eq!(found, vec![(3, "Second Paragraph".to_string())]);
+}
+
+/// A style that states an outline level in its own properties is a heading at
+/// that level whatever it is called. `sprmPOutLvl` operand 3 is Heading 4.
+#[test]
+fn test_a_style_with_its_own_outline_level_is_a_heading_at_that_level() {
+    let styles = [
+        Style::new(0, "Normal"),
+        Style::based_on("H4", 0).outline(3),
+        Style::based_on("Sub Head", 1),
+    ];
+    let (_, found) = document_with_styles(&styles, &[0, 1, 2]);
+    assert_eq!(
+        found,
+        vec![
+            (4, "Second Paragraph".to_string()),
+            (4, "Third Paragraph".to_string()),
+        ],
+        "the styled paragraph and the one inheriting from it"
+    );
+}
+
+/// The style's own outline level wins over its name: a style called
+/// `Heading 5` that states level 2 is a level-2 heading.
+#[test]
+fn test_a_styles_own_outline_level_beats_its_name() {
+    let styles = [
+        Style::new(0, "Normal"),
+        Style::based_on("Heading 5", 0).outline(1),
+    ];
+    let (_, found) = document_with_styles(&styles, &[0, 1]);
+    assert_eq!(found, vec![(2, "Second Paragraph".to_string())]);
+}
+
+/// Explicit body text (operand 9) on a style stops inheritance: a style based
+/// on `Heading 1` that states body text is not a heading, and neither is a
+/// style based on that one.
+#[test]
+fn test_a_style_stating_body_text_does_not_inherit_a_heading() {
+    let styles = [
+        Style::new(0, "Normal"),
+        Style::new(1, "Heading 1"),
+        Style::based_on("Plain", 1).outline(9),
+        Style::based_on("Plainer", 2),
+    ];
+    let (_, found) = document_with_styles(&styles, &[0, 1, 2, 3]);
+    assert_eq!(
+        found,
+        vec![(1, "Second Paragraph".to_string())],
+        "only the paragraph in Heading 1 itself"
+    );
+}
+
+/// Direct formatting beats every style: `sprmPOutLvl` on the paragraph decides,
+/// in both directions, over an inherited level.
+#[test]
+fn test_direct_outline_level_beats_an_inherited_style_level() {
+    let styles = [
+        Style::new(0, "Normal"),
+        Style::new(1, "Heading 1"),
+        Style::based_on("Inherits H1", 1),
+    ];
+    let paras = [
+        Para {
+            text: "Introduction.",
+            terminator: '\r',
+            grpprl: Vec::new(),
+        },
+        Para {
+            text: "Forced Deeper",
+            terminator: '\r',
+            grpprl: vec![0x40, 0x26, 0x04], // Heading 5 over the inherited 1
+        },
+        Para {
+            text: "Forced Body",
+            terminator: '\r',
+            grpprl: vec![0x40, 0x26, 0x09], // body text over the inherited 1
+        },
+        Para {
+            text: "Inherited",
+            terminator: '\r',
+            grpprl: Vec::new(),
+        },
+    ];
+    let bytes = build_doc_with_styles(&paras, &[0, 2, 2, 2], &style_sheet(&styles));
+    let found = headings(&open_doc(&bytes));
+    assert_eq!(
+        found,
+        vec![
+            (5, "Forced Deeper".to_string()),
+            (1, "Inherited".to_string())
+        ]
+    );
+}
+
+/// A cycle of base styles, a style based on itself, and a chain deeper than the
+/// bound all end without a level, do not hang, and are reported once.
+#[test]
+fn test_cyclic_and_over_deep_base_chains_give_no_level_and_a_warning() {
+    let mut styles = vec![
+        Style::new(0, "Normal"),
+        Style::based_on("A", 2),  // 1 -> 2
+        Style::based_on("B", 1),  // 2 -> 1
+        Style::based_on("Me", 3), // 3 -> itself
+    ];
+    // 40 styles deep, ending in a real Heading 1 at istd 44.
+    let deep_start = styles.len() as u16;
+    for i in 0..40u16 {
+        styles.push(Style::based_on("Deep", if i == 0 { 0 } else { deep_start + i - 1 }));
+    }
+    styles.push(Style {
+        sti: 1,
+        name: "Heading 1",
+        base: Some(deep_start + 39),
+        outline: None,
+    });
+
+    let (doc, found) = document_with_styles(&styles, &[0, 1, 2, 3]);
+    assert!(found.is_empty(), "no cycle member resolves a level; got {found:?}");
+    let warnings = doc.to_ir().metadata.warnings;
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|w| w.contains("istdBase chain"))
+            .count(),
+        1,
+        "reported once for the whole sheet; got {warnings:?}"
+    );
+
+    // The Heading 1 at the end of the long chain needs no base to be one.
+    let (_, found) = document_with_styles(&styles, &[0, deep_start + 40]);
+    assert_eq!(found, vec![(1, "Second Paragraph".to_string())]);
+}
+
+/// A sheet with a base chain that is merely long (well inside the bound) is a
+/// well-formed document: it resolves and does not warn.
+#[test]
+fn test_a_long_but_reasonable_base_chain_resolves_without_a_warning() {
+    let mut styles = vec![Style::new(0, "Normal"), Style::new(2, "Heading 2")];
+    for i in 0..20u16 {
+        styles.push(Style::based_on("Link", if i == 0 { 1 } else { 1 + i }));
+    }
+    let (doc, found) = document_with_styles(&styles, &[0, 21]);
+    assert_eq!(found, vec![(2, "Second Paragraph".to_string())]);
+    assert!(
+        doc.to_ir()
+            .metadata
+            .warnings
+            .iter()
+            .all(|w| !w.contains("style sheet")),
+        "{:?}",
+        doc.to_ir().metadata.warnings
+    );
+}
+
+/// The default style is not special-cased: if `Normal` itself states an outline
+/// level, every paragraph in it is at that level, because the outline level is a
+/// style property and that is how Word's navigation pane reads the file. A
+/// paragraph that opts out with a direct body-text level stays prose.
+///
+/// This pins a deliberate reading of the file, not a heuristic: guessing that a
+/// "too many headings" document must be mistaken would be a silent
+/// plausible-but-wrong result in the other direction.
+#[test]
+fn test_a_default_style_that_states_an_outline_level_applies_it() {
+    let styles = [Style::new(0, "Normal").outline(1)];
+    let paras = [
+        Para {
+            text: "First Paragraph",
+            terminator: '\r',
+            grpprl: Vec::new(),
+        },
+        Para {
+            text: "Opted Out",
+            terminator: '\r',
+            grpprl: vec![0x40, 0x26, 0x09],
+        },
+    ];
+    let bytes = build_doc_with_styles(&paras, &[0, 0], &style_sheet(&styles));
+    assert_eq!(headings(&open_doc(&bytes)), vec![(2, "First Paragraph".to_string())]);
 }

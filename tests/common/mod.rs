@@ -342,22 +342,96 @@ fn build_streams(
     (word_doc, table)
 }
 
-/// One `LPStd` for a style sheet: `cbStd(u16)` + `STD`.
+/// One paragraph style of a synthetic style sheet, in `istd` order.
 ///
-/// `STD` = `stdf` (10 bytes of `StdfBase`, whose low 12 bits are `sti`) plus
-/// `xstzName` (`cch(u16)` + `cch` UTF-16 code units + a 2-byte terminator).
-fn lpstd(sti: u16, name: &str) -> Vec<u8> {
+/// Built from the spec ([MS-DOC] §2.9.258 `STD`), not from the crate's parser,
+/// so a fixture cannot merely re-encode the parser's own bugs.
+#[allow(dead_code)]
+pub struct Style<'a> {
+    /// Built-in style id (`StdfBase.sti`); `0x0FFE` = user-defined.
+    pub sti: u16,
+    /// `xstzName`.
+    pub name: &'a str,
+    /// `istdBase`: the style this one is based on (`None` = `0x0FFF`).
+    pub base: Option<u16>,
+    /// The `sprmPOutLvl` operand in the style's own `UpxPapx` (`0..=8` heading,
+    /// `9` body text); `None` = the style states no level.
+    pub outline: Option<u8>,
+}
+
+#[allow(dead_code)]
+impl<'a> Style<'a> {
+    /// A style with no base and no level of its own.
+    pub fn new(sti: u16, name: &'a str) -> Self {
+        Style {
+            sti,
+            name,
+            base: None,
+            outline: None,
+        }
+    }
+    /// A user-defined style based on `base`.
+    pub fn based_on(name: &'a str, base: u16) -> Self {
+        Style {
+            sti: 0x0FFE,
+            name,
+            base: Some(base),
+            outline: None,
+        }
+    }
+    /// States its own outline level (zero-based operand; 9 = body text).
+    pub fn outline(mut self, operand: u8) -> Self {
+        self.outline = Some(operand);
+        self
+    }
+}
+
+/// One `LPStd`: `cbStd(u16)` + `STD` (+ the pad that keeps the next entry on an
+/// even offset; `cbStd` excludes it, §2.9.135).
+///
+/// `STD` = `StdfBase` (10 bytes: `sti`; `sgc` 1 = paragraph with `istdBase`
+/// above it; `cupx`) + `xstzName` + an even-aligned `LPUpx` holding a
+/// `UpxPapx` (`istd` + a `sprmPOutLvl` grpprl) when the style states a level.
+fn lpstd(style: &Style) -> Vec<u8> {
     let mut std = vec![0u8; 10];
-    std[0..2].copy_from_slice(&sti.to_le_bytes());
-    let units: Vec<u16> = name.encode_utf16().collect();
+    std[0..2].copy_from_slice(&style.sti.to_le_bytes());
+    let istd_base = style.base.unwrap_or(0x0FFF);
+    std[2..4].copy_from_slice(&(1u16 | (istd_base << 4)).to_le_bytes());
+    std[4..6].copy_from_slice(&u16::from(style.outline.is_some()).to_le_bytes());
+    let units: Vec<u16> = style.name.encode_utf16().collect();
     std.extend_from_slice(&(units.len() as u16).to_le_bytes());
     for u in &units {
         std.extend_from_slice(&u.to_le_bytes());
     }
     std.extend_from_slice(&0u16.to_le_bytes());
+    if let Some(operand) = style.outline {
+        if std.len() % 2 == 1 {
+            std.push(0);
+        }
+        std.extend_from_slice(&5u16.to_le_bytes()); // cbUpx: istd(2) + grpprl(3)
+        std.extend_from_slice(&0u16.to_le_bytes()); // UpxPapx.istd
+        std.extend_from_slice(&[0x40, 0x26, operand]); // sprmPOutLvl
+    }
     let mut out = (std.len() as u16).to_le_bytes().to_vec();
     out.extend_from_slice(&std);
+    if std.len() % 2 == 1 {
+        out.push(0);
+    }
     out
+}
+
+/// A spec-conformant STSH ([MS-DOC] §2.7.1 / §2.9.274) holding `styles` in
+/// `istd` order: `LPStshi` (`cbStshi` = 18) followed by one `LPStd` each.
+#[allow(dead_code)]
+pub fn style_sheet(styles: &[Style]) -> Vec<u8> {
+    let mut d = 18u16.to_le_bytes().to_vec(); // cbStshi
+    d.extend_from_slice(&(styles.len() as u16).to_le_bytes()); // cstd
+    d.extend_from_slice(&0x000Au16.to_le_bytes()); // cbSTDBaseInFile
+    d.extend_from_slice(&[0u8; 14]); // rest of the 18-byte Stshif
+    for style in styles {
+        d.extend_from_slice(&lpstd(style));
+    }
+    d
 }
 
 /// A spec-conformant STSH ([MS-DOC] §2.7.1 / §2.9.274) whose `istd` 1-9 are the
@@ -365,16 +439,21 @@ fn lpstd(sti: u16, name: &str) -> Vec<u8> {
 /// paragraph whose PAPX `istd` is 3 resolves to Heading 3.
 #[allow(dead_code)]
 pub fn heading_style_sheet() -> Vec<u8> {
-    let mut d = 18u16.to_le_bytes().to_vec(); // cbStshi
-    d.extend_from_slice(&15u16.to_le_bytes()); // cstd
-    d.extend_from_slice(&0x000Au16.to_le_bytes()); // cbSTDBaseInFile
-    d.extend_from_slice(&[0u8; 14]); // rest of the 18-byte Stshif
-    d.extend_from_slice(&lpstd(0, "Normal"));
-    for lvl in 1..=9u16 {
-        d.extend_from_slice(&lpstd(lvl, &format!("Heading {lvl}")));
+    let mut styles = vec![Style::new(0, "Normal")];
+    let names: Vec<String> = (1..=9).map(|lvl| format!("Heading {lvl}")).collect();
+    for (lvl, name) in (1..=9u16).zip(&names) {
+        styles.push(Style {
+            sti: lvl,
+            name,
+            base: Some(0),
+            outline: None,
+        });
     }
+    let mut d = style_sheet(&styles);
+    // Five empty `LPStd` slots (`cbStd` = 0), counted in `cstd`.
+    d[2..4].copy_from_slice(&15u16.to_le_bytes());
     for _ in 0..5 {
-        d.extend_from_slice(&[0u8; 2]); // empty LPStd (cbStd = 0)
+        d.extend_from_slice(&[0u8; 2]);
     }
     d
 }
