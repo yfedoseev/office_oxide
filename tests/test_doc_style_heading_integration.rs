@@ -275,3 +275,69 @@ fn test_sprm_derived_heading_switches_off_line_shape_guess() {
     assert_eq!(found[0].1, "Real Heading");
     assert_eq!(found[0].0, 2, "sprmPOutLvl operand 0x01 must become Heading level 2");
 }
+
+/// A direct `sprmPOutLvl` of 9 is [MS-DOC]'s explicit "body text" level, and
+/// direct formatting beats the style: a paragraph styled `Heading 3` that
+/// carries it must come out as prose, not fall through to its style.
+///
+/// The first paragraph is the contrast. It has the same style and no override,
+/// so it must be a level-3 heading; that is only true when the style sheet is
+/// parsed, which keeps this test from passing on a build without the feature.
+#[test]
+fn test_direct_body_text_level_suppresses_a_heading_style() {
+    let body_text_grpprl = vec![0x40, 0x26, 0x09]; // sprmPOutLvl, operand 9 = body text
+    let paras = [
+        Para {
+            text: "Subsection Three",
+            terminator: '\r',
+            grpprl: prose_grpprl(),
+        },
+        Para {
+            text: "Styled but body text",
+            terminator: '\r',
+            grpprl: body_text_grpprl,
+        },
+    ];
+    // Both paragraphs carry istd 3 = Heading 3.
+    let bytes = build_doc_with_styles(&paras, &[3, 3], &heading_style_sheet());
+    let doc = open_doc(&bytes);
+
+    let found = headings(&doc);
+    assert_eq!(
+        found,
+        vec![(3, "Subsection Three".to_string())],
+        "only the paragraph without the body-text override is a heading"
+    );
+}
+
+/// `sprmPIstd` (0x4600, 2-byte operand) overrides the `istd` in the PAPX
+/// header ([MS-DOC] §2.6.2). Checked in both directions: a Normal header
+/// pointed at `Heading 3` becomes a heading, and a `Heading 3` header pointed
+/// at Normal stops being one.
+#[test]
+fn test_sprm_p_istd_overrides_the_papx_header_istd() {
+    let to_heading_3 = vec![0x00, 0x46, 0x03, 0x00]; // sprmPIstd = 3
+    let to_normal = vec![0x00, 0x46, 0x00, 0x00]; // sprmPIstd = 0
+    let paras = [
+        Para {
+            text: "Promoted By Override",
+            terminator: '\r',
+            grpprl: to_heading_3,
+        },
+        Para {
+            text: "Demoted By Override",
+            terminator: '\r',
+            grpprl: to_normal,
+        },
+    ];
+    // Header istds are the opposite of the overrides: Normal, then Heading 3.
+    let bytes = build_doc_with_styles(&paras, &[0, 3], &heading_style_sheet());
+    let doc = open_doc(&bytes);
+
+    let found = headings(&doc);
+    assert_eq!(
+        found,
+        vec![(3, "Promoted By Override".to_string())],
+        "the override, not the header istd, decides which style applies"
+    );
+}
