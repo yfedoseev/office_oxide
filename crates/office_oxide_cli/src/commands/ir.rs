@@ -96,7 +96,6 @@ mod tests {
                 }],
                 ..Default::default()
             }],
-            defined_names: Vec::new(),
         };
 
         let mut buf = Vec::new();

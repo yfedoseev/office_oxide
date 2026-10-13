@@ -415,7 +415,6 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             )
         },
         sections: ir_sections,
-        defined_names: Vec::new(),
     }
 }
 

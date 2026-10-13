@@ -550,6 +550,5 @@ pub(crate) fn ppt_to_ir(doc: &crate::ppt::PptDocument) -> DocumentIR {
             ..crate::core::core_properties::legacy_metadata_extras(summary)
         },
         sections,
-        defined_names: Vec::new(),
     }
 }

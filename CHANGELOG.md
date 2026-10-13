@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-10-14
+
+### Fixed
+
+- **`DocumentIR` is source-compatible with 0.1.11 again.** 0.1.12 added a public `defined_names` field to `DocumentIR`, so any crate that builds it with a literal naming every field — including the published `pdf_oxide` 0.3.78 — failed to compile (`E0063`) as soon as Cargo resolved office_oxide 0.1.12 or 0.1.13. `DocumentIR` is back to exactly `{ metadata, sections }`, and the defined names (named ranges, print areas; XLSX and XLS) now live on `Metadata::defined_names`. The workaround of pinning `office_oxide = "=0.1.11"` is no longer needed. A guard test builds `DocumentIR` from those two fields alone.
+
+### Changed
+
+- **Migration for 0.1.12 / 0.1.13 users of `defined_names`:** read `ir.metadata.defined_names` instead of `ir.defined_names`. In the IR JSON the `defined_names` array moved from the top level into `metadata`. Nothing else in the IR changed: a 1,500-file comparison against 0.1.13 (250 each of `.docx/.xlsx/.pptx/.doc/.xls/.ppt`, four output surfaces) was identical once that field is mapped across.
+
 ## [0.1.13] - 2026-09-30
 
 > Every finding of the 2026-09-27 audit — 19 issues, 165 checklist items — plus ten resource-bound defects reported privately, fixed test-first: each with a minimal synthetic document built in code, a test that fails before the fix and passes after. A two-arm sweep of 10,215 unique real Office documents against v0.1.12 then found nine regressions introduced by those fixes; all nine are fixed below, each with its own regression test, and the re-run sweep shows no crash, no timeout, no unintended new failure and no real slowdown.

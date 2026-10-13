@@ -461,7 +461,6 @@ mod tests {
         let ir = office_oxide::DocumentIR {
             metadata,
             sections: Vec::new(),
-            defined_names: Vec::new(),
         };
         let info = info_json(&ir, Some(42));
         assert_eq!(info["file_size"], json!(42));
@@ -479,7 +478,6 @@ mod tests {
         let clean = office_oxide::DocumentIR {
             metadata: Metadata::default(),
             sections: Vec::new(),
-            defined_names: Vec::new(),
         };
         assert_eq!(info_json(&clean, None)["warnings"], json!([]));
     }
@@ -529,7 +527,6 @@ mod info_tests {
                 ..Default::default()
             },
             sections: Vec::new(),
-            defined_names: Vec::new(),
         };
         let v = info_json(&ir, None);
         assert_eq!(v["author"], "A");

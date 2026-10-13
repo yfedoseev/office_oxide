@@ -356,19 +356,19 @@ pub(crate) fn xls_to_ir(doc: &crate::xls::XlsDocument) -> DocumentIR {
             has_macros: doc.has_macros(),
             text_truncated: doc.truncated(),
             warnings: doc.warnings().to_vec(),
+            defined_names: doc
+                .defined_names
+                .iter()
+                .map(|dn| DefinedName {
+                    name: dn.name.clone(),
+                    value: dn.value.clone(),
+                    local_sheet_id: dn.local_sheet_id,
+                    hidden: dn.hidden,
+                })
+                .collect(),
             ..crate::core::core_properties::legacy_metadata_extras(summary)
         },
         sections,
-        defined_names: doc
-            .defined_names
-            .iter()
-            .map(|dn| DefinedName {
-                name: dn.name.clone(),
-                value: dn.value.clone(),
-                local_sheet_id: dn.local_sheet_id,
-                hidden: dn.hidden,
-            })
-            .collect(),
     }
 }
 

@@ -96,7 +96,6 @@ fn one_section(elements: Vec<Element>, format: DocumentFormat) -> DocumentIR {
             elements,
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     }
 }
 

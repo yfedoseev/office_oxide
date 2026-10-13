@@ -636,6 +636,17 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
             text_truncated: !doc.unreadable_sheets.is_empty() || pivot_truncated,
+            defined_names: doc
+                .workbook
+                .defined_names
+                .iter()
+                .map(|dn| DefinedName {
+                    name: dn.name.clone(),
+                    value: dn.value.clone(),
+                    local_sheet_id: dn.local_sheet_id,
+                    hidden: dn.hidden,
+                })
+                .collect(),
             ..crate::core::core_properties::ooxml_metadata_extras(
                 cp,
                 doc.app_properties.as_ref(),
@@ -643,17 +654,6 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             )
         },
         sections,
-        defined_names: doc
-            .workbook
-            .defined_names
-            .iter()
-            .map(|dn| DefinedName {
-                name: dn.name.clone(),
-                value: dn.value.clone(),
-                local_sheet_id: dn.local_sheet_id,
-                hidden: dn.hidden,
-            })
-            .collect(),
     }
 }
 

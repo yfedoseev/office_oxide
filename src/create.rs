@@ -525,7 +525,7 @@ pub fn ir_to_xlsx(ir: &DocumentIR) -> crate::xlsx::write::XlsxWriter {
 
     let mut writer = crate::xlsx::write::XlsxWriter::new();
     writer.set_metadata(&ir.metadata);
-    for name in &ir.defined_names {
+    for name in &ir.metadata.defined_names {
         writer.add_defined_name(name.clone());
     }
 
@@ -2018,7 +2018,6 @@ mod xlsx_table_write_tests {
                 elements: vec![Element::Table(table)],
                 ..Default::default()
             }],
-            defined_names: Vec::new(),
         };
 
         let mut buf = Cursor::new(Vec::new());
@@ -2115,7 +2114,6 @@ mod xlsx_table_write_tests {
                 elements: vec![Element::Table(table), comment],
                 ..Default::default()
             }],
-            defined_names: Vec::new(),
         };
 
         let mut buf = Cursor::new(Vec::new());
@@ -2208,7 +2206,6 @@ mod xlsx_table_write_tests {
                 elements: vec![Element::Table(table)],
                 ..Default::default()
             }],
-            defined_names: Vec::new(),
         };
 
         let mut buf = Cursor::new(Vec::new());
@@ -2305,7 +2302,6 @@ mod docx_section_title_tests {
                 elements: vec![heading, body],
                 ..Default::default()
             }],
-            defined_names: Vec::new(),
         };
 
         let mut buf = Cursor::new(Vec::new());
@@ -2359,7 +2355,6 @@ mod pptx_notes_write_tests {
                 speaker_notes: Some(notes),
                 ..Default::default()
             }],
-            defined_names: Vec::new(),
         };
 
         let mut buf = Cursor::new(Vec::new());

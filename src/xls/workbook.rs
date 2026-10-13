@@ -2903,9 +2903,9 @@ mod tests {
         let doc = XlsDocument::parse_workbook_stream(&stream).expect("parses");
 
         let ir = crate::convert_xls::xls_to_ir(&doc);
-        assert_eq!(ir.defined_names.len(), 1);
-        assert_eq!(ir.defined_names[0].name, "MyRange");
-        assert_eq!(ir.defined_names[0].value, "Sheet1!$A$1:$A$1");
+        assert_eq!(ir.metadata.defined_names.len(), 1);
+        assert_eq!(ir.metadata.defined_names[0].name, "MyRange");
+        assert_eq!(ir.metadata.defined_names[0].value, "Sheet1!$A$1:$A$1");
     }
 
     /// A built-in name's `Name` field is a `BuiltInName` ID byte, not text

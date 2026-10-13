@@ -467,7 +467,6 @@ fn test_hyperlink_tooltips_round_trip_through_xlsx_and_pptx() {
                 elements: vec![element],
                 ..Default::default()
             }],
-            defined_names: Vec::new(),
         };
         let mut out = Cursor::new(Vec::new());
         office_oxide::create::create_from_ir_to_writer(&ir, format, &mut out).expect("write");
@@ -812,7 +811,6 @@ fn test_a_row_spanning_cell_leaves_the_covered_position_empty() {
             })],
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     };
     let md = ir.to_markdown();
     let second_row = md.lines().nth(2).expect("a second body row");
@@ -1545,7 +1543,7 @@ fn test_defined_names_and_hidden_sheets_survive_an_ir_round_trip() {
     // The builder's workbook has no <definedNames>; add them at the IR,
     // where a round trip carries them from.
     let mut ir = ir;
-    ir.defined_names = vec![
+    ir.metadata.defined_names = vec![
         DefinedName {
             name: "Totals".into(),
             value: "Data!$A$1:$A$10".into(),
@@ -1570,7 +1568,7 @@ fn test_defined_names_and_hidden_sheets_survive_an_ir_round_trip() {
             .collect::<Vec<_>>(),
         [("Data".to_string(), true), ("Report".to_string(), false)]
     );
-    assert_eq!(back.defined_names, ir.defined_names);
+    assert_eq!(back.metadata.defined_names, ir.metadata.defined_names);
 }
 
 /// `<alignment>` inside a cell format (§18.8.1) was never parsed, though

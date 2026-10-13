@@ -93,7 +93,6 @@ mod tests {
         let ir = DocumentIR {
             metadata,
             sections: vec![Section::default()],
-            defined_names: Vec::new(),
         };
         let out = render(&ir, Some(1234));
         for needle in [
@@ -124,7 +123,6 @@ mod tests {
                 ..Default::default()
             },
             sections: Vec::new(),
-            defined_names: Vec::new(),
         };
         let out = render(&ir, None);
         assert_eq!(out, "Format: Xlsx\nSections: 0\n");

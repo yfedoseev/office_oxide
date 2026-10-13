@@ -694,7 +694,6 @@ fn test_direct_markdown_does_not_use_a_relationship_id_as_an_image_target() {
             elements: vec![image(Some("A *cat*")), image(None)],
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     };
     let bytes = docx_bytes(&ir);
     let direct = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes.clone()))
@@ -2074,7 +2073,6 @@ fn test_an_unanchored_comment_is_written_as_a_comment() {
             ],
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     };
     let bytes = docx_bytes(&ir);
     let doc = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes.clone())).unwrap();

@@ -172,7 +172,6 @@ fn test_writers_normalise_or_drop_malformed_dates() {
             ..Default::default()
         },
         sections: Vec::new(),
-        defined_names: Vec::new(),
     };
     for format in [
         DocumentFormat::Docx,
@@ -212,7 +211,6 @@ fn test_custom_property_values_are_written_back_with_their_type() {
             ..Default::default()
         },
         sections: Vec::new(),
-        defined_names: Vec::new(),
     };
     let mut out = Cursor::new(Vec::new());
     create_from_ir_to_writer(&ir, DocumentFormat::Docx, &mut out).unwrap();

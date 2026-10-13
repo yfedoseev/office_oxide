@@ -102,7 +102,6 @@ fn test_docx_heading_not_first_element_does_not_duplicate_on_roundtrip() {
             ],
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());
@@ -155,7 +154,6 @@ fn test_pptx_independent_text_boxes_stay_independent_on_roundtrip() {
             ],
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     };
 
     let (ir1, _) = write_parse(&ir, DocumentFormat::Pptx);
@@ -224,7 +222,6 @@ fn test_pptx_title_heading_not_first_element_does_not_duplicate_on_roundtrip() {
             ],
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     };
 
     let mut buf = Cursor::new(Vec::new());

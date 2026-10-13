@@ -536,13 +536,6 @@ pub struct DocumentIR {
     pub metadata: Metadata,
     /// Ordered list of sections (pages, worksheets, slides, etc.).
     pub sections: Vec<Section>,
-    /// Defined names (named ranges, print areas) — currently populated
-    /// for XLSX/XLS only. Parsed correctly by both format readers but
-    /// unreachable through any documented API before this: XLSX's own
-    /// parser output was discarded before reaching the IR, and XLS had
-    /// no NAME-record parser at all.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub defined_names: Vec<DefinedName>,
 }
 
 /// A defined name (named range, print area, …) from a spreadsheet
@@ -596,6 +589,13 @@ pub struct Metadata {
     /// interprets or executes the macro content itself.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub has_macros: bool,
+    /// Defined names (named ranges, print areas) — populated for XLSX/XLS
+    /// only. Lives on `Metadata` rather than `DocumentIR` so that
+    /// `DocumentIR` stays exactly `{ metadata, sections }`: downstream
+    /// crates build it with a full literal, and a new public field there
+    /// is a compile error for them on a patch release.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub defined_names: Vec<DefinedName>,
     /// `true` when parsing hit a known, detectable cause of missing
     /// content this crate could not safely recover, and no other signal
     /// would tell a caller that anything is wrong: DOC (the piece table

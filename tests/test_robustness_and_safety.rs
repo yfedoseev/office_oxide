@@ -488,7 +488,6 @@ fn test_control_characters_do_not_reach_the_generated_xml() {
             })],
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     };
 
     for fmt in [
@@ -644,7 +643,6 @@ fn test_every_renderer_agrees_on_an_out_of_range_heading_level() {
             })],
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     };
     assert!(ir.to_markdown().starts_with("# Zero"), "markdown: {:?}", ir.to_markdown());
     assert!(ir.to_html().contains("<h1>Zero</h1>"), "html: {}", ir.to_html());
@@ -777,7 +775,6 @@ fn test_adjacent_runs_with_the_same_formatting_are_merged() {
             })],
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     };
     let md = ir.to_markdown();
     assert_eq!(md, "**BOLD_ABOLD_B**", "got {md}");
@@ -807,7 +804,6 @@ fn test_superscript_survives_the_markdown_renderer() {
             })],
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     };
     assert_eq!(ir.to_markdown(), "E=mc<sup>2</sup>");
 }
@@ -833,7 +829,6 @@ fn test_emphasis_delimiters_do_not_wrap_leading_or_trailing_spaces() {
             })],
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     };
     assert_eq!(ir.to_markdown(), " **padded** ");
 }
@@ -869,7 +864,6 @@ fn test_images_can_be_embedded_as_base64_at_their_position_in_the_flow() {
             ],
             ..Default::default()
         }],
-        defined_names: Vec::new(),
     };
 
     // Without the option, images stay out of the markdown entirely.
@@ -907,7 +901,6 @@ fn test_base64_padding_is_correct_for_every_input_length() {
                 })],
                 ..Default::default()
             }],
-            defined_names: Vec::new(),
         };
         let md = ir.to_markdown_with(MarkdownOptions {
             image_embed: ImageEmbed::Base64,

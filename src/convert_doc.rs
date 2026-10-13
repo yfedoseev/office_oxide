@@ -312,7 +312,6 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
             ..crate::core::core_properties::legacy_metadata_extras(summary)
         },
         sections,
-        defined_names: Vec::new(),
     }
 }
 

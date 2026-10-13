@@ -175,7 +175,6 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             )
         },
         sections,
-        defined_names: Vec::new(),
     }
 }
 
