@@ -969,10 +969,6 @@ fn shift_chp_runs_for_trim(
         .collect()
 }
 
-/// Classify a prose paragraph as a heading or paragraph and push it.
-///
-/// Mirrors the line-based heuristic so a PAPX-bearing document keeps the same
-/// heading/title detection as the fallback path.
 /// Emit a heading at an explicit level, honouring soft line breaks.
 fn emit_heading(
     text: &str,

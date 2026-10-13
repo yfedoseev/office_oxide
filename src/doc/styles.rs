@@ -161,7 +161,9 @@ fn parse_stsh(data: &[u8]) -> StyleSheet {
     }
 
     // `rglpstd`: `cstd` `LPStd` entries (§2.9.135).
-    let cap = cstd.min(4096);
+    // Every entry takes at least its 2-byte `cbStd`, so no more than half the
+    // remaining bytes can be entries: a lying `cstd` reserves nothing like 4096.
+    let cap = cstd.min(4096).min(data.len() / 2);
     let mut styles = Vec::with_capacity(cap);
     for _ in 0..cap {
         if pos + 2 > data.len() {
@@ -502,9 +504,8 @@ mod tests {
         assert_eq!(heading_level_from_name("Headin 3"), None, "prefix must match fully");
     }
 
-    /// The name parser runs for every paragraph whose style is not a built-in
-    /// heading, so it must not allocate per call. Asserted by construction
-    /// (no `String` is built on any path) rather than by an allocator counter.
+    /// A style that is neither a built-in heading (`sti` 1-9) nor named
+    /// `Heading N`, and an `istd` past the end of the sheet, resolve to no level.
     #[test]
     fn test_heading_level_for_istd_does_not_resolve_unstyled_paragraphs() {
         let styles = vec![

@@ -746,9 +746,9 @@ impl DocxWriter {
 
     /// Add a heading paragraph at the given level (1-6).
     ///
-    /// Level is clamped to `1..=6`.
+    /// Level is clamped to `1..=MAX_HEADING_DEPTH` (6).
     pub fn add_heading(&mut self, text: &str, level: u8) -> &mut Self {
-        let level = level.clamp(1, 6);
+        let level = level.clamp(1, crate::ir::MAX_HEADING_DEPTH);
         self.elements
             .push(DocxElement::Paragraph(DocxParagraph::plain(
                 text,

@@ -534,7 +534,8 @@ fn markdown_blocks_inner(
                     // One definition of the valid heading range, shared with the IR
                     // renderers: `min(9)` emitted up to nine `#`, which no
                     // markdown reader treats as a heading at all.
-                    let hashes = "#".repeat(level.clamp(1, 6));
+                    let hashes =
+                        "#".repeat(level.clamp(1, usize::from(crate::ir::MAX_HEADING_DEPTH)));
                     out.push_str(&hashes);
                     out.push(' ');
                 } else if let Some(ref prefix) = list_prefix {

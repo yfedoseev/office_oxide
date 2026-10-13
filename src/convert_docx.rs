@@ -845,7 +845,7 @@ fn convert_block_elements(
 
                 if let Some(level) = heading_level {
                     let mut heading = Heading {
-                        level: (level + 1).min(6),
+                        level: (level + 1).min(MAX_HEADING_DEPTH),
                         content: convert_heading_inline(p, doc),
                         frame_position: paragraph_frame_position(p),
                         alignment,

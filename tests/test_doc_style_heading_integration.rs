@@ -203,9 +203,10 @@ fn test_style_derived_heading_does_not_switch_off_line_shape_guess() {
 /// Both paragraphs are Normal (istd 0), so the Heading level comes solely from
 /// the SPRM, not the style sheet — and the line heuristic (which tops out at
 /// level 2) would never produce level 5. This is the integration twin of the
-/// unit test that used to live under `src/doc/document.rs`; it survives
-/// `scripts/revert-check.sh`, so reverting the outline-SPRM parser must make
-/// *this* fail.
+/// unit test that used to live under `src/doc/document.rs`. It guards
+/// behaviour that already existed before the style-sheet work (the outline
+/// SPRM was read first), so it passes on a build without that work; the tests
+/// above and below it are the ones that prove the style sheet.
 #[test]
 fn test_sprm_outline_papx_sets_the_real_level() {
     let outline_grpprl = vec![0x40, 0x26, 0x04]; // sprmPOutLvl, operand 0x04 -> Heading 5
@@ -243,8 +244,9 @@ fn test_sprm_outline_papx_sets_the_real_level() {
 /// would otherwise turn into a heading. With a stated level present it must
 /// stay prose, so exactly one heading (the stated one) reaches the IR. This is
 /// the integration twin of the unit test that used to live under
-/// `src/doc/document.rs`; it survives `scripts/revert-check.sh`, so reverting
-/// the outline-SPRM parse must make *this* fail.
+/// `src/doc/document.rs`. Like the test above it guards pre-existing behaviour
+/// (a stated level switches the guess off) and passes without the style-sheet
+/// work; it pins that gate against regressing, not the style sheet itself.
 #[test]
 fn test_sprm_derived_heading_switches_off_line_shape_guess() {
     let outline_grpprl = vec![0x40, 0x26, 0x01]; // sprmPOutLvl, operand 0x01 -> Heading 2
