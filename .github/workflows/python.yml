@@ -158,7 +158,7 @@ jobs:
           manylinux: ${{ matrix.manylinux }}
           args: --release --features python --out dist
       - name: Upload wheels as artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-linux-${{ matrix.target }}-${{ matrix.manylinux }}
           path: dist/*.whl
@@ -184,7 +184,7 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --features python --out dist
       - name: Upload wheels as artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-macos-${{ matrix.target }}
           path: dist/*.whl
@@ -211,7 +211,7 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --features python --out dist
       - name: Upload wheels as artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-windows-${{ matrix.target }}
           path: dist/*.whl
@@ -229,7 +229,7 @@ jobs:
           command: sdist
           args: --out dist
       - name: Upload sdist as artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sdist
           path: dist/*.tar.gz
