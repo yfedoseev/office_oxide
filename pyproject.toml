@@ -49,7 +49,7 @@ Changelog = "https://github.com/yfedoseev/office_oxide/blob/main/CHANGELOG.md"
 # ruff is pinned to a minor series on purpose: the lint gate runs
 # `ruff check python/`, and an unpinned range silently adopts new default
 # rules on each release, turning every open PR red without a code change.
-dev = ["maturin>=1.0", "pytest>=7.0", "ruff>=0.16,<0.17"]
+dev = ["maturin>=1.0", "pytest>=7.0", "ruff>=0.17,<0.18"]
 
 [tool.maturin]
 features = ["python"]
