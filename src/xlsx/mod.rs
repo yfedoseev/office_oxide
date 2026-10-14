@@ -531,7 +531,12 @@ impl XlsxDocument {
         // indexes, accessibility readers, our PDF text fallback).
         let mut chart_text: Vec<String> = Vec::new();
         let chart_names: Vec<String> = (0..archive.len())
-            .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
+            .filter_map(|i| {
+                archive
+                    .by_index(i)
+                    .ok()
+                    .and_then(|f| f.name().ok().map(|n| n.into_owned()))
+            })
             .filter(|n| n.starts_with("xl/charts/chart") && n.ends_with(".xml"))
             .filter(|n| !chartsheet_charts.contains(n))
             .collect();
@@ -548,7 +553,12 @@ impl XlsxDocument {
         // DOCX (`word/fonts/`) and PPTX (`ppt/fonts/`) readers.
         let mut embedded_fonts: Vec<(String, Vec<u8>)> = Vec::new();
         let font_names: Vec<String> = (0..archive.len())
-            .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
+            .filter_map(|i| {
+                archive
+                    .by_index(i)
+                    .ok()
+                    .and_then(|f| f.name().ok().map(|n| n.into_owned()))
+            })
             .filter(|n| {
                 n.starts_with("xl/fonts/")
                     && (n.to_lowercase().ends_with(".ttf") || n.to_lowercase().ends_with(".otf"))
@@ -821,17 +831,18 @@ impl PivotContext {
         // Only a package with a pivot cache needs its table names.
         if !archive
             .file_names()
-            .any(|n| n.to_ascii_lowercase().contains("pivotcachedefinition"))
+            .any(|n| n.is_ok_and(|n| n.to_ascii_lowercase().contains("pivotcachedefinition")))
         {
             return ctx;
         }
         let table_parts: Vec<String> = archive
             .file_names()
+            .filter_map(|n| n.ok())
             .filter(|n| {
                 let lower = n.to_ascii_lowercase();
                 lower.starts_with("xl/tables/") && lower.ends_with(".xml")
             })
-            .map(str::to_string)
+            .map(std::borrow::Cow::into_owned)
             .collect();
         for part in table_parts {
             if let Ok(t) = XlsxDocument::read_xml_entry(archive, entries, &part)
@@ -1847,7 +1858,7 @@ pub(crate) mod test_support {
     /// Build a zip from `(entry_name, bytes)` pairs, in order.
     pub(crate) fn zip_parts(parts: &[(&str, &[u8])]) -> Vec<u8> {
         let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
         for (name, data) in parts {
             zip.start_file(*name, opts).unwrap();
             zip.write_all(data).unwrap();

@@ -5527,7 +5527,7 @@ mod tests {
         let mut out = std::collections::HashMap::new();
         for i in 0..zip.len() {
             let mut e = zip.by_index(i).unwrap();
-            let name = e.name().to_string();
+            let name = e.name().unwrap().to_string();
             let mut xml = String::new();
             if std::io::Read::read_to_string(&mut e, &mut xml).is_ok() {
                 out.insert(name, xml);

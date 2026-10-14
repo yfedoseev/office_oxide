@@ -121,7 +121,7 @@ fn test_duplicate_part_names_are_refused() {
     // documents from the same bytes. Whichever copy we picked would be
     // accidental, so the package is refused.
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
 
     zip.start_file("[Content_Types].xml", opts).unwrap();
     zip.write_all(
@@ -184,7 +184,7 @@ fn test_duplicate_part_names_are_refused() {
 #[test]
 fn test_duplicate_part_names_are_refused_by_the_xlsx_fast_path() {
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
     zip.start_file("xl/workbook.xml", opts).unwrap();
     zip.write_all(
         br#"<?xml version="1.0"?><workbook
@@ -237,7 +237,7 @@ fn test_duplicate_part_names_are_refused_by_the_xlsx_fast_path() {
 #[test]
 fn test_a_cell_reference_past_the_grid_does_not_size_the_table_to_it() {
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
     zip.start_file("xl/workbook.xml", opts).unwrap();
     zip.write_all(
         br#"<?xml version="1.0"?><workbook
@@ -987,7 +987,7 @@ fn build_minimal_docx(document_xml: &[u8]) -> Vec<u8> {
     let mut buf = std::io::Cursor::new(Vec::new());
     {
         let mut zip = zip::ZipWriter::new(&mut buf);
-        let opts: zip::write::FileOptions<'_, ()> =
+        let opts: zip::write::FileOptions<'_, '_, ()> =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         for (name, body) in [
             (

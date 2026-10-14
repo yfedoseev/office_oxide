@@ -2124,7 +2124,7 @@ mod xlsx_table_write_tests {
         // companion VML drawing, not just plain sheet data.
         let mut zip = zip::ZipArchive::new(buf.clone()).unwrap();
         let names: Vec<String> = (0..zip.len())
-            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .map(|i| zip.by_index(i).unwrap().name().unwrap().to_string())
             .collect();
         assert!(
             names

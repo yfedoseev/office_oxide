@@ -1477,7 +1477,7 @@ fn test_ir_footnote_endnote_round_trip() {
     // The package should now contain a footnotes part and an endnotes part.
     let zip_bytes = buf.into_inner();
     let zip = zip::ZipArchive::new(Cursor::new(zip_bytes)).unwrap();
-    let names: Vec<String> = zip.file_names().map(String::from).collect();
+    let names: Vec<String> = zip.file_names().map(|n| n.unwrap().into_owned()).collect();
     assert!(
         names.iter().any(|n| n == "word/footnotes.xml"),
         "expected word/footnotes.xml in: {names:?}"
@@ -2185,7 +2185,7 @@ fn test_a_drawing_in_a_header_keeps_the_part_well_formed() {
     buf.set_position(0);
     let mut zip = zip::ZipArchive::new(buf).unwrap();
     let name = (0..zip.len())
-        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .map(|i| zip.by_index(i).unwrap().name().unwrap().to_string())
         .find(|n| n.starts_with("word/header"))
         .expect("a header part");
     let mut xml = String::new();

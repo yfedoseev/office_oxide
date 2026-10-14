@@ -79,7 +79,7 @@ fn bytes_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
 
 fn zip_of(parts: &[(&str, &[u8])]) -> Vec<u8> {
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
     for (name, data) in parts {
         zip.start_file(*name, opts).unwrap();
         zip.write_all(data).unwrap();

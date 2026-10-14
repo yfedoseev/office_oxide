@@ -2483,7 +2483,7 @@ mod tests {
         buf.set_position(0);
         let mut zip = zip::ZipArchive::new(buf).unwrap();
         (0..zip.len())
-            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .map(|i| zip.by_index(i).unwrap().name().unwrap().to_string())
             .collect()
     }
 

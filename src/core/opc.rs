@@ -427,6 +427,9 @@ impl<R: Read + Seek> OpcReader<R> {
         self.archive
             .file_names()
             .filter_map(|name| {
+                // A name that cannot be decoded never reaches here: opening the
+                // package rejects the archive (see `open_zip_rejecting_duplicates`).
+                let name = name.ok()?;
                 // Normalize backslash separators (Windows-created ZIPs)
                 let name = name.replace('\\', "/");
                 // Skip directories
@@ -508,13 +511,16 @@ impl ZipEntryIndex {
     ) -> Self {
         let mut by_normalized = HashMap::with_capacity(archive.len());
         for name in archive.file_names() {
-            let Some(index) = archive.index_for_name(name) else {
+            let Ok(name) = name else {
+                continue;
+            };
+            let Some(index) = archive.index_for_name(&name) else {
                 continue;
             };
             // Two names that normalise to the same key keep the lower
             // index, which is what the scan they replace returned.
             by_normalized
-                .entry(Self::normalize(name))
+                .entry(Self::normalize(&name))
                 .and_modify(|existing: &mut usize| *existing = (*existing).min(index))
                 .or_insert(index);
         }
@@ -739,7 +745,10 @@ fn open_zip_checked<R: Read + Seek>(mut reader: R, max_entries: usize) -> Result
 
     let mut seen = std::collections::HashSet::with_capacity(archive.len());
     for name in archive.file_names() {
-        if !seen.insert(ZipEntryIndex::normalize(name)) {
+        // An entry whose name cannot be decoded cannot be checked for a
+        // duplicate, so the archive is refused rather than the entry skipped.
+        let name = name?;
+        if !seen.insert(ZipEntryIndex::normalize(&name)) {
             return Err(Error::DuplicatePart(format!(
                 "'{name}' names the same part as another entry (part names are case-insensitive)"
             )));
@@ -1325,8 +1334,11 @@ mod tests {
         assert!(read_zip_entry(&mut archive, &entries, "b.bin").is_ok());
     }
 
-    /// A declared size that understates the data does not dodge the
-    /// package budget: the actual length is charged after the read.
+    /// A declared size that understates the data does not dodge the package
+    /// budget. The zip reader now refuses such an entry itself ("larger than
+    /// its declared uncompressed size"); the budget charging the actual length
+    /// after the read is the second line of defence. Either way the read must
+    /// fail, never succeed with more bytes than the budget allows.
     #[test]
     fn test_package_byte_budget_charges_actual_not_declared_size() {
         let mut bytes = raw_zip(&[("a.bin", &[7u8; 32])], Eocd::Count(1), &[]);
@@ -1334,7 +1346,11 @@ mod tests {
         let mut archive = ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
         let entries = ZipEntryIndex::with_byte_limit(&archive, 16);
         let err = read_zip_entry(&mut archive, &entries, "a.bin").unwrap_err();
-        assert!(matches!(err, Error::PackageLimit(_)), "{err:?}");
+        assert!(
+            matches!(err, Error::PackageLimit(_))
+                || matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidData),
+            "{err:?}"
+        );
     }
 
     /// Only `*.rels` files directly in a `_rels` folder are relationships

@@ -2503,7 +2503,7 @@ mod tests {
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
         let mut media_names = Vec::new();
         for i in 0..zip.len() {
-            let name = zip.by_index(i).unwrap().name().to_string();
+            let name = zip.by_index(i).unwrap().name().unwrap().to_string();
             assert!(
                 !name.bytes().any(|b| b.is_ascii_control()),
                 "ZIP entry name must not carry a raw control character from the \

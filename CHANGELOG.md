@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - The DOCX text extractor, DOCX writer and DOCX-to-IR converter now clamp heading depth through the IR's single `MAX_HEADING_DEPTH` constant instead of a literal 6 (no behaviour change).
+- **Every dependency is current.** `zip` 9.0.3 (a major bump), `pyo3` 0.29.3, `serde_json` 1.0.154, `libc` 0.2.190 and the other compatible Rust updates in the root, bench and fuzz lockfiles; `koffi` 3.3.3, `ruff` 0.17 (the lint pin moves to `>=0.17,<0.18`), the C# test packages (`Microsoft.NET.Test.Sdk` 18.11.0, `xunit.runner.visualstudio` 4.0.1), and every pinned GitHub Action. The benchmark competitor pins stay put, as they must match the published tables.
+  - `zip` 9 makes an entry name fallible and refuses an entry whose data exceeds its declared uncompressed size. An archive with a name that cannot be decoded is now rejected when it is opened, never skipped, so the duplicate-entry check cannot be dodged; and a forged declared size now fails inside the zip reader (an `Io` error) instead of at the package byte budget, which stays as the second line of defence.
+  - Checked against the previous build on all 10,170 unique files under `~/projects` over `text`, `markdown`, `html` and `ir`: no file changes status, and every output is byte-identical except two deliberately corrupt archives, where the same sheets are unreadable as before and only the wording of the note changes ("Invalid checksum" becomes "File is larger than its declared uncompressed size"). The Python, Node, Go, C# and WebAssembly binding tests pass against the rebuilt library, and the crate still builds on its minimum supported Rust, 1.88.
 
 ## [0.1.14] - 2026-10-14
 

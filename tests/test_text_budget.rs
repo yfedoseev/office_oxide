@@ -23,7 +23,7 @@ const BUDGET: usize = 12_000;
 fn xlsx_fan_out(cells: usize) -> Vec<u8> {
     let big = "x".repeat(5_000);
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
     let parts: Vec<(&str, String)> = vec![
         ("[Content_Types].xml", r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#.into()),
         ("_rels/.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#.into()),
