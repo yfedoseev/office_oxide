@@ -61,8 +61,8 @@ jobs:
       - name: Check the fuzz lockfile is current
         run: cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 > /dev/null
 
-      - name: Build the fuzz target
-        run: cargo fuzz build fuzz_parse
+      - name: Build the fuzz targets
+        run: cargo fuzz build
 
       # 60 s on every change, 10 min on the daily run. Any crash fails the job.
       - name: Fuzz
@@ -72,6 +72,16 @@ jobs:
           secs=60
           if [ "$EVENT_NAME" = "schedule" ]; then secs=600; fi
           cargo fuzz run fuzz_parse -- -max_total_time="$secs" -rss_limit_mb=4096
+
+      # Whole-file fuzzing rarely reaches the legacy style sheet; this target
+      # builds a valid .doc around the fuzzer's bytes so every run does.
+      - name: Fuzz the .doc style sheet
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          secs=60
+          if [ "$EVENT_NAME" = "schedule" ]; then secs=600; fi
+          cargo fuzz run fuzz_doc_stsh -- -max_total_time="$secs" -rss_limit_mb=4096
 
       - name: Upload crash artifacts
         if: failure()

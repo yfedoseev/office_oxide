@@ -1040,4 +1040,66 @@ mod tests {
             "one hop past the bound neither resolves nor goes unreported"
         );
     }
+
+    /// Deterministic mutation fuzzing of the whole STSH path: thousands of
+    /// byte flips, truncations, extensions and size-field overwrites of a rich
+    /// sheet (bases, own outline levels, an odd-length entry) must never panic
+    /// or hang, never yield more styles than the 4096 cap, and every level that
+    /// does resolve must be a real one (1-9). The same property the
+    /// `fuzz_doc_stsh` target explores open-endedly.
+    #[test]
+    fn test_mutated_style_sheets_never_panic_and_resolve_only_real_levels() {
+        let seed_sheet = stsh_of(&[
+            lpstd(0, "Normal"),
+            lpstd_styled(1, "Heading 1", Some(0), None),
+            lpstd_styled(0x0FFE, "H4", Some(0), Some(3)),
+            lpstd_styled(0x0FFE, "Child", Some(2), None),
+            lpstd_styled(0x0FFE, "Body", Some(1), Some(9)),
+            lpstd_styled(0x0FFE, "Odd Len", Some(0), Some(1)),
+            empty_lpstd(),
+            lpstd_styled(0x0FFE, "Loop", Some(8), None),
+            lpstd_styled(0x0FFE, "Loop 2", Some(7), None),
+        ]);
+        // xorshift64: deterministic, no dependency.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..6000u32 {
+            let mut d = seed_sheet.clone();
+            match round % 4 {
+                0 => {
+                    for _ in 0..=(next() % 8) {
+                        let at = (next() as usize) % d.len();
+                        d[at] = next() as u8;
+                    }
+                },
+                1 => d.truncate((next() as usize) % (d.len() + 1)),
+                2 => {
+                    d.extend((0..(next() % 64)).map(|_| next() as u8));
+                    let at =
+                        (next() as usize) % d.len().max(2).min(d.len().saturating_sub(1)).max(1);
+                    d[at] = next() as u8;
+                },
+                _ => {
+                    // Overwrite a u16 anywhere: sizes, counts and bases alike.
+                    let at = (next() as usize) % d.len().saturating_sub(1).max(1);
+                    d[at..at + 2].copy_from_slice(&(next() as u16).to_le_bytes());
+                },
+            }
+            let sheet = parse_stsh(&d);
+            assert!(sheet.styles.len() <= 4096, "round {round}: {} styles", sheet.styles.len());
+            for istd in 0..sheet.styles.len().min(64) as u16 {
+                if let Some(level) = heading_level_for_istd(&sheet.styles, istd) {
+                    assert!(
+                        (1..=MAX_OUTLINE_LEVEL).contains(&level),
+                        "round {round}: level {level}"
+                    );
+                }
+            }
+        }
+    }
 }
