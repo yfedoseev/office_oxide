@@ -8,8 +8,8 @@
 
 use crate::format::DocumentFormat;
 use crate::ir::{
-    DocumentIR, Element, Heading, InlineContent, List, ListItem, Metadata, Paragraph, Section,
-    Table, TableCell, TableRow, TextSpan,
+    BorderLine, BorderStyle, DocumentIR, Element, Heading, InlineContent, List, ListItem, Metadata,
+    Paragraph, Section, Table, TableBorder, TableCell, TableRow, TextSpan,
 };
 
 impl DocumentIR {
@@ -261,27 +261,54 @@ impl<'a> MarkdownParser<'a> {
 
         let mut rows: Vec<TableRow> = Vec::new();
         for (i, row_line) in data_rows.iter().enumerate() {
+            let is_header = i == 0;
             let cells = split_pipe_row(row_line)
                 .into_iter()
-                .map(|cell_text| TableCell {
-                    content: vec![Element::Paragraph(Paragraph {
-                        content: parse_inline(cell_text.trim()),
+                .map(|cell_text| {
+                    // The header is marked by its rule and `repeat_as_header`,
+                    // not by bold text: bolding would make the cell render as
+                    // `**Col A**` and break the Markdown round trip.
+                    let content = parse_inline(cell_text.trim());
+                    TableCell {
+                        content: vec![Element::Paragraph(Paragraph {
+                            content,
+                            ..Default::default()
+                        })],
+                        col_span: 1,
+                        row_span: 1,
+                        border: is_header.then(|| TableBorder {
+                            top: None,
+                            bottom: Some(border_line(HEADER_RULE_EIGHTHS_PT)),
+                            left: None,
+                            right: None,
+                            inside_h: None,
+                            inside_v: None,
+                        }),
                         ..Default::default()
-                    })],
-                    col_span: 1,
-                    row_span: 1,
-                    ..Default::default()
+                    }
                 })
                 .collect();
             rows.push(TableRow {
                 cells,
-                is_header: i == 0,
+                is_header,
+                repeat_as_header: is_header,
                 ..Default::default()
             });
         }
 
+        // A Markdown table has no styling of its own; without borders and a
+        // distinct header row, a written table is unreadable.
+        let thin = Some(border_line(CELL_RULE_EIGHTHS_PT));
         Some(Table {
             rows,
+            border: Some(TableBorder {
+                top: thin.clone(),
+                bottom: thin.clone(),
+                left: thin.clone(),
+                right: thin.clone(),
+                inside_h: thin.clone(),
+                inside_v: thin,
+            }),
             ..Default::default()
         })
     }
@@ -357,6 +384,20 @@ fn ordered_marker_number(line: &str) -> Option<u32> {
 // ---------------------------------------------------------------------------
 // Inline parser (bold, italic, plain)
 // ---------------------------------------------------------------------------
+
+/// Cell rule width, in eighths of a point (0.5 pt).
+const CELL_RULE_EIGHTHS_PT: u32 = 4;
+/// Rule under the header row, in eighths of a point (1.5 pt).
+const HEADER_RULE_EIGHTHS_PT: u32 = 12;
+
+fn border_line(size_eighths_pt: u32) -> BorderLine {
+    BorderLine {
+        style: BorderStyle::Single,
+        color: None,
+        size: Some(size_eighths_pt),
+        space: None,
+    }
+}
 
 fn parse_inline(text: &str) -> Vec<InlineContent> {
     let mut out: Vec<InlineContent> = Vec::new();

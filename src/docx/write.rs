@@ -2866,21 +2866,61 @@ fn write_column_break(w: &mut Writer<Vec<u8>>) {
 
 /// Write `w:tblGrid`, which `CT_Tbl` requires. Uses `widths` when known and
 /// otherwise emits `col_count` auto-width columns.
-fn write_tbl_grid(w: &mut Writer<Vec<u8>>, widths: &[u32], col_count: usize) {
+/// Text width of a Letter page with one-inch margins, in twips. The hint
+/// split across an unsized table's columns; a `pct` table width rescales it
+/// to the real page.
+const DEFAULT_TABLE_WIDTH_TWIPS: u32 = 9360;
+
+/// Whether a table's column widths say nothing: none, or all zero (a grid
+/// whose widths could not be read).
+fn is_unsized(widths: &[u32]) -> bool {
+    widths.iter().all(|&w| w == 0)
+}
+
+/// `w:tblW` for a table: its explicit width, else `pct` 5000 (the full text
+/// width) when the columns carry no widths either, else `auto`.
+fn write_tbl_w(w: &mut Writer<Vec<u8>>, width_twips: Option<u32>, widths_known: bool) {
+    let mut tbl_w = BytesStart::new("w:tblW");
+    match width_twips {
+        Some(twips) => {
+            tbl_w.push_attribute(("w:w", twips.to_string().as_str()));
+            tbl_w.push_attribute(("w:type", "dxa"));
+        },
+        None if !widths_known => {
+            tbl_w.push_attribute(("w:w", "5000"));
+            tbl_w.push_attribute(("w:type", "pct"));
+        },
+        None => {
+            tbl_w.push_attribute(("w:w", "0"));
+            tbl_w.push_attribute(("w:type", "auto"));
+        },
+    }
+    w.write_event(Event::Empty(tbl_w)).expect("write tblW");
+}
+
+/// `w:tblGrid` is required by CT_Tbl. `w:gridCol` has no "auto" value — Word
+/// sizes the columns from it, so a zero collapses the column — which makes
+/// an unsized table split `width_twips` (or the default text width) equally.
+fn write_tbl_grid(
+    w: &mut Writer<Vec<u8>>,
+    widths: &[u32],
+    col_count: usize,
+    width_twips: Option<u32>,
+) {
     w.write_event(Event::Start(BytesStart::new("w:tblGrid")))
         .expect("write tblGrid start");
-    if widths.is_empty() {
-        for _ in 0..col_count {
-            let mut gc = BytesStart::new("w:gridCol");
-            gc.push_attribute(("w:w", "0"));
-            w.write_event(Event::Empty(gc)).expect("write gridCol");
-        }
+    let equal;
+    let widths = if is_unsized(widths) && col_count > 0 {
+        let each = (width_twips.unwrap_or(DEFAULT_TABLE_WIDTH_TWIPS) / col_count as u32).max(1);
+        equal = vec![each; col_count];
+        &equal[..]
     } else {
-        for &cw in widths {
-            let mut gc = BytesStart::new("w:gridCol");
-            gc.push_attribute(("w:w", cw.to_string().as_str()));
-            w.write_event(Event::Empty(gc)).expect("write gridCol");
-        }
+        widths
+    };
+    for &cw in widths {
+        let mut gc = BytesStart::new("w:gridCol");
+        gc.push_attribute(("w:w", cw.to_string().as_str()));
+        w.write_event(Event::Empty(gc)).expect("write gridCol");
     }
     w.write_event(Event::End(BytesEnd::new("w:tblGrid")))
         .expect("write tblGrid end");
@@ -2893,13 +2933,10 @@ fn write_table(w: &mut Writer<Vec<u8>>, table: &DocxTable) {
     // CT_Tbl requires tblPr and tblGrid before the rows.
     w.write_event(Event::Start(BytesStart::new("w:tblPr")))
         .expect("write tblPr start");
-    let mut tbl_w = BytesStart::new("w:tblW");
-    tbl_w.push_attribute(("w:w", "0"));
-    tbl_w.push_attribute(("w:type", "auto"));
-    w.write_event(Event::Empty(tbl_w)).expect("write tblW");
+    write_tbl_w(w, None, false);
     w.write_event(Event::End(BytesEnd::new("w:tblPr")))
         .expect("write tblPr end");
-    write_tbl_grid(w, &[], table.rows.iter().map(|r| r.len()).max().unwrap_or(0));
+    write_tbl_grid(w, &[], table.rows.iter().map(|r| r.len()).max().unwrap_or(0), None);
 
     for row in &table.rows {
         w.write_event(Event::Start(BytesStart::new("w:tr")))
@@ -2944,15 +2981,7 @@ fn write_rich_table(
     // CT_TblPrBase is a strict sequence: tblW, jc, tblInd, tblBorders,
     // shd, tblCellMar, tblCaption. Emitting tblCaption first and jc after
     // the borders made every table carrying either one invalid.
-    let mut tbl_w = BytesStart::new("w:tblW");
-    if let Some(w_twips) = table.width_twips {
-        tbl_w.push_attribute(("w:w", w_twips.to_string().as_str()));
-        tbl_w.push_attribute(("w:type", "dxa"));
-    } else {
-        tbl_w.push_attribute(("w:w", "0"));
-        tbl_w.push_attribute(("w:type", "auto"));
-    }
-    w.write_event(Event::Empty(tbl_w)).expect("write tblW");
+    write_tbl_w(w, table.width_twips, !is_unsized(&table.column_widths_twips));
 
     if let Some(align) = &table.alignment {
         let val = match align {
@@ -3001,13 +3030,23 @@ fn write_rich_table(
     w.write_event(Event::End(BytesEnd::new("w:tblPr")))
         .expect("write tblPr end");
 
-    // tblGrid is required by CT_Tbl (minOccurs=1), so it is written even when
-    // no explicit widths are known — markdown tables carry none. A zero width
-    // means "auto", which is what Word writes for an unsized column.
+    // Markdown tables carry no widths; the grid is then split equally.
     write_tbl_grid(
         w,
         &table.column_widths_twips,
-        table.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0),
+        table
+            .rows
+            .iter()
+            .map(|r| {
+                r.cells
+                    .iter()
+                    .map(|c| (c.col_span.max(1) as usize).min(MAX_TABLE_COLS))
+                    .sum::<usize>()
+                    .min(MAX_TABLE_COLS)
+            })
+            .max()
+            .unwrap_or(0),
+        table.width_twips,
     );
 
     for row in &table.rows {
