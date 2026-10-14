@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-10-15
+
 ### Added
 
 - **`.doc` heading levels come from the style sheet ([#132](https://github.com/yfedoseev/office_oxide/issues/132); contributed by @xugangqiang in [#127](https://github.com/yfedoseev/office_oxide/pull/127)).** A paragraph whose style is a built-in `Heading 1`–`Heading 9`, or a user-defined `Heading N`, now renders at that level; previously the level came from a line-shape guess that could only produce 1 or 2 and missed any heading that was not ALL-CAPS. A direct `sprmPOutLvl` still beats the style, in both directions (operand 9 is explicit body text), and the line-shape guess stays as the fallback for paragraphs with no level, switched off only by a paragraph that states its own.

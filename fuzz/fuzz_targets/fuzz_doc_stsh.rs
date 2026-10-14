@@ -8,7 +8,6 @@
 // `istdBase` walk and the heading resolution. None may panic, overflow or hang;
 // a malformed sheet must degrade to "no style" and a warning.
 #[path = "../../tests/common/mod.rs"]
-#[allow(dead_code)]
 mod common;
 
 use std::io::Cursor;

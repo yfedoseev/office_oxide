@@ -311,7 +311,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "office_oxide"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "atoi_simd",
  "encoding_rs",
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "office_oxide_cli"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "clap",
  "libc",
@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "office_oxide_mcp"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "office_oxide",
  "serde_json",
