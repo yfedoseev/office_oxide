@@ -91,7 +91,7 @@ rayon = { version = "1.12", optional = true }
 # (maturin otherwise fails with "Couldn't find any python interpreters").
 # `generate-import-lib` synthesises the `python3.lib` import library for abi3
 # on Windows so the wheel links without a matching local Python install.
-pyo3 = { version = "0.29", features = [
+pyo3 = { version = "0.30", features = [
     "extension-module",
     "abi3-py310",
     "generate-import-lib",
