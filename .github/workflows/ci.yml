@@ -555,7 +555,7 @@ jobs:
       # glue failure surfaced on release day. Generate the Node build and
       # drive every exported class through it.
       - name: Install wasm-pack
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: wasm-pack
 
@@ -586,7 +586,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@32e16a23c68a001a1621efca19f131f965d4d122 # cargo-llvm-cov
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # cargo-llvm-cov
 
       - name: Generate coverage
         run: |
@@ -621,7 +621,7 @@ jobs:
         with:
           key: shear
       - name: Install cargo-shear
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-shear
       - name: Check for unused dependencies
@@ -713,7 +713,7 @@ jobs:
         with:
           key: taplo
       - name: Install taplo
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: taplo-cli
       - name: Check TOML formatting
@@ -731,7 +731,7 @@ jobs:
         with:
           key: hack
       - name: Install cargo-hack
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-hack
       - name: Build each feature individually (root crate)
