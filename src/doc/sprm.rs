@@ -669,13 +669,15 @@ pap_sprm_dispatch! {
         }
     }
 
-    /// 4-byte signed operand: the table nesting depth. Saturated into a `u8`
-    /// rather than truncated: 257 truncates to 1 and would pass for an outer
-    /// paragraph, where it is out of range and must stay visibly so.
+    /// 4-byte signed operand: the table nesting depth. An out-of-range value
+    /// saturates to the top of a `u8` instead of being truncated (257 would
+    /// become 1) or clamped to the bottom (a negative depth would become 0): it
+    /// must not pass for an ordinary paragraph, and the top is where the table
+    /// builder reports it.
     "sprmPItap" @ "2.6.2" => [0x6649] (props, operand) {
         if operand.len() >= 4 {
             let v = i32::from_le_bytes([operand[0], operand[1], operand[2], operand[3]]);
-            props.itap = v.clamp(0, i32::from(u8::MAX)) as u8;
+            props.itap = u8::try_from(v).unwrap_or(u8::MAX);
         }
     }
 
@@ -1609,6 +1611,21 @@ mod tests {
         let mut grpprl = vec![0x13, 0xA4];
         grpprl.extend_from_slice(&0x7BC1u16.to_le_bytes());
         assert_eq!(extract_pap_props(&grpprl).space_before_twips, None);
+    }
+
+    #[test]
+    fn test_a_negative_table_depth_stays_out_of_range_instead_of_becoming_outermost() {
+        // 0x6649 is a signed 4-byte operand. A negative depth is as invalid as
+        // one past 255: both saturate to the top, where the table builder
+        // reports them, and neither passes for an ordinary outermost paragraph.
+        for v in [-1i32, i32::MIN, 256, i32::MAX] {
+            let mut g = vec![0x49, 0x66];
+            g.extend_from_slice(&v.to_le_bytes());
+            assert_eq!(extract_pap_props(&g).itap, u8::MAX, "operand {v}");
+        }
+        let mut g = vec![0x49, 0x66];
+        g.extend_from_slice(&2i32.to_le_bytes());
+        assert_eq!(extract_pap_props(&g).itap, 2);
     }
 
     #[test]

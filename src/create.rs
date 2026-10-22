@@ -1568,12 +1568,23 @@ fn nested_table_text(table: &Table) -> String {
 /// the PPTX writer at all. A table nested in the cell is written as the plain
 /// text of its cells, as the slide's table has no cell-in-cell.
 fn cell_runs(cell: &TableCell) -> Vec<crate::pptx::write::Run> {
+    let last = cell.content.len().saturating_sub(1);
     cell.content
         .iter()
-        .flat_map(|e| match e {
+        .enumerate()
+        .flat_map(|(i, e)| match e {
             Element::Paragraph(p) => inline_to_pptx_runs(&p.content),
+            // The nested table's words are kept apart from the text before and
+            // after it, which they would otherwise run into.
             Element::Table(t) => {
-                inline_to_pptx_runs(&[InlineContent::Text(TextSpan::plain(nested_table_text(t)))])
+                let mut text = nested_table_text(t);
+                if i > 0 {
+                    text.insert(0, ' ');
+                }
+                if i < last {
+                    text.push(' ');
+                }
+                inline_to_pptx_runs(&[InlineContent::Text(TextSpan::plain(text))])
             },
             _ => Vec::new(),
         })
@@ -1697,8 +1708,32 @@ fn ir_cell_rich_runs(cell: &TableCell) -> Vec<crate::xlsx::write::RichRun> {
     let mut runs: Vec<RichRun> = Vec::new();
     let mut first_paragraph = true;
     for elem in &cell.content {
-        let Element::Paragraph(p) = elem else {
-            continue;
+        // A table nested in the cell is written as its plain text, as
+        // `cell_text` does; skipping it lost every word of it.
+        let nested_text = match elem {
+            Element::Table(t) => Some(nested_table_text(t)),
+            _ => None,
+        };
+        let p = match elem {
+            Element::Paragraph(p) => p,
+            Element::Table(_) => {
+                let text = nested_text.unwrap_or_default();
+                if !text.is_empty() {
+                    if !first_paragraph {
+                        runs.push(RichRun {
+                            text: " ".to_string(),
+                            ..Default::default()
+                        });
+                    }
+                    first_paragraph = false;
+                    runs.push(RichRun {
+                        text,
+                        ..Default::default()
+                    });
+                }
+                continue;
+            },
+            _ => continue,
         };
         if !first_paragraph {
             runs.push(RichRun {

@@ -304,11 +304,14 @@ fn test_doc_table_nesting_deeper_than_word_allows_is_bounded() {
 
 #[test]
 fn test_doc_nested_table_renders_in_markdown_and_html() {
-    let doc = open_doc(&build_doc(&table_with_a_nested_table()));
+    // Distinctive words: a one-letter probe is found in any markup.
+    let doc = open_doc(&build_doc(&nested_table_with_distinctive_words()));
     let md = doc.to_markdown();
     let html = doc.to_html();
     for out in [&md, &html] {
-        for w in ["A", "E", "1", "2", "3", "4", "G", "J"] {
+        for w in [
+            "Dleft", "Emid", "Nalpha", "Nbeta", "Ngamma", "Ndelta", "Gright",
+        ] {
             assert!(out.contains(w), "{w} missing from {out}");
         }
     }

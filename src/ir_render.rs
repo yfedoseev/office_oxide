@@ -970,33 +970,40 @@ fn gfm_row_cells(row: &str) -> Vec<String> {
 /// A rendered nested table as lines for the cell that holds it: its separator
 /// row dropped and each row's cells joined by an escaped pipe, so the outer
 /// table keeps its own columns.
+///
+/// The separator is the second line of a rendered table and nothing else:
+/// recognising it by its look would also drop a data row of `-`, a common
+/// "nil" placeholder, which renders the same way. An empty cell keeps its place
+/// so the columns stay where they were; a row with no text at all is dropped.
 fn nested_table_as_cell_lines(table_md: &str) -> String {
-    let is_separator = |cells: &[String]| {
-        !cells.is_empty()
-            && cells
-                .iter()
-                .all(|c| !c.is_empty() && c.trim_matches(':').chars().all(|ch| ch == '-'))
-    };
-    table_md
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if !line.starts_with('|') {
-                return (!line.is_empty()).then(|| line.to_owned());
-            }
-            let cells = gfm_row_cells(line);
-            if is_separator(&cells) {
+    let lines: Vec<&str> = table_md.lines().map(str::trim).collect();
+    let is_table = lines.first().is_some_and(|l| l.starts_with('|'))
+        && lines.get(1).is_some_and(|l| is_separator_row(l));
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            if is_table && i == 1 {
                 return None;
             }
-            let cells: Vec<&str> = cells
+            if !line.starts_with('|') {
+                return (!line.is_empty()).then(|| (*line).to_owned());
+            }
+            let cells = gfm_row_cells(line);
+            cells
                 .iter()
-                .map(String::as_str)
-                .filter(|c| !c.is_empty())
-                .collect();
-            (!cells.is_empty()).then(|| cells.join(" \\| "))
+                .any(|c| !c.is_empty())
+                .then(|| cells.join(" \\| "))
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Whether `line` is the separator row `render_table_markdown` writes
+/// (`| --- | --- |`).
+fn is_separator_row(line: &str) -> bool {
+    let cells = gfm_row_cells(line);
+    !cells.is_empty() && cells.iter().all(|c| c == "---")
 }
 
 fn render_list_markdown(list: &List, indent: usize) -> String {
