@@ -324,6 +324,9 @@ pub struct PapProps {
     /// from its `istd` (so `extract_pap_props` alone leaves it `None`). `None`
     /// also for the default style (`istd` 0) and for a style with no name.
     pub style_name: Option<String>,
+    /// `sprmPFInnerTableCell` (0x244B): the last paragraph of a cell of a
+    /// nested table, which ends in a paragraph mark and not in `\x07`.
+    pub f_inner_table_cell: bool,
     /// List level (0-based) when the paragraph is a list item. `None` when
     /// the paragraph carries no list SPRM. (Reserved for list support; the
     /// `table.doc` fixture has no in-body lists to verify this against.)
@@ -666,11 +669,30 @@ pap_sprm_dispatch! {
         }
     }
 
-    /// 4-byte operand: the table nesting depth.
+    /// 4-byte signed operand: the table nesting depth. Saturated into a `u8`
+    /// rather than truncated: 257 truncates to 1 and would pass for an outer
+    /// paragraph, where it is out of range and must stay visibly so.
     "sprmPItap" @ "2.6.2" => [0x6649] (props, operand) {
         if operand.len() >= 4 {
-            let v = u32::from_le_bytes([operand[0], operand[1], operand[2], operand[3]]);
-            props.itap = v as u8;
+            let v = i32::from_le_bytes([operand[0], operand[1], operand[2], operand[3]]);
+            props.itap = v.clamp(0, i32::from(u8::MAX)) as u8;
+        }
+    }
+
+    /// 1-byte `Bool8` operand, bit 0: this paragraph is the last one of a cell
+    /// of a **nested** table (`itap` >= 2). Word ends such a cell with an
+    /// ordinary paragraph mark carrying this flag; only an outermost cell ends
+    /// with the `\x07` cell mark.
+    "sprmPFInnerTableCell" @ "2.6.2" => [0x244B] (props, operand) {
+        props.f_inner_table_cell = operand.first().is_some_and(|&b| b & 1 != 0);
+    }
+
+    /// 1-byte `Bool8` operand, bit 0: this paragraph ends a row of a
+    /// **nested** table. It is the nested counterpart of `sprmPFTtp`, carried
+    /// by an ordinary paragraph mark together with the row definition.
+    "sprmPFInnerTtp" @ "2.6.2" => [0x244C] (props, operand) {
+        if operand.first().is_some_and(|&b| b & 1 != 0) {
+            props.is_table_trailing_mark = true;
         }
     }
 
@@ -1237,6 +1259,8 @@ mod tests {
         (0x460B, "sprmPIlfo"),
         (0x6412, "sprmPDyaLine"),
         (0x6649, "sprmPItap"),
+        (0x244B, "sprmPFInnerTableCell"),
+        (0x244C, "sprmPFInnerTtp"),
         (0xC60D, "sprmPChgTabsPapx"),
         (0xC615, "sprmPChgTabs"),
         (0xD608, "sprmTDefTable"),

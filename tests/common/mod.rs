@@ -61,7 +61,13 @@ pub fn list_grpprl(ilvl: u8) -> Vec<u8> {
 /// Cell paragraph grpprl: `sprmPFInTable` (0x2416)=1, `sprmPItap` (0x6649)=1.
 #[allow(dead_code)]
 pub fn cell_grpprl() -> Vec<u8> {
-    vec![0x16, 0x24, 0x01, 0x49, 0x66, 0x01, 0x00, 0x00, 0x00]
+    cell_grpprl_at(1)
+}
+
+/// Cell paragraph grpprl at table nesting depth `itap` (`sprmPItap`, 1 = outermost).
+#[allow(dead_code)]
+pub fn cell_grpprl_at(itap: u8) -> Vec<u8> {
+    vec![0x16, 0x24, 0x01, 0x49, 0x66, itap, 0x00, 0x00, 0x00]
 }
 
 /// Row-terminator grpprl: `fInTable` + `fInTableTtp` + `itap`, then
@@ -71,6 +77,12 @@ pub fn cell_grpprl() -> Vec<u8> {
 /// `TCGRF` 2-bit `fVertMerge` field: `fvmMerge` = 0x0020, `fvmRestart` = 0x0060).
 #[allow(dead_code)]
 pub fn row_grpprl(centers: &[i16], rgfs: &[u16]) -> Vec<u8> {
+    row_grpprl_at(1, centers, rgfs)
+}
+
+/// [`row_grpprl`] for a row at table nesting depth `itap`.
+#[allow(dead_code)]
+pub fn row_grpprl_at(itap: u8, centers: &[i16], rgfs: &[u16]) -> Vec<u8> {
     assert_eq!(centers.len(), rgfs.len() + 1, "centers = cells + 1");
     let itc_mac = (centers.len() - 1) as u8;
     let mut operand = Vec::new();
@@ -90,10 +102,35 @@ pub fn row_grpprl(centers: &[i16], rgfs: &[u16]) -> Vec<u8> {
 
     // Head: sprmPFInTable = 1, sprmPFInTableTtp = 1, sprmPItap = 1.
     let mut head = vec![
-        0x16, 0x24, 0x01, 0x17, 0x24, 0x01, 0x49, 0x66, 0x01, 0x00, 0x00, 0x00,
+        0x16, 0x24, 0x01, 0x17, 0x24, 0x01, 0x49, 0x66, itap, 0x00, 0x00, 0x00,
     ];
     head.extend_from_slice(&g);
     head
+}
+
+/// Last paragraph of a cell of a **nested** table (`itap` >= 2) as Word writes
+/// it: an ordinary `\r`-terminated paragraph carrying `sprmPFInTable` (0x2416),
+/// `sprmPItap` (0x6649) and `sprmPFInnerTableCell` (0x244B) -- not the `\x07`
+/// end mark of an outermost cell.
+#[allow(dead_code)]
+pub fn inner_cell_grpprl(itap: u8) -> Vec<u8> {
+    vec![
+        0x16, 0x24, 0x01, 0x49, 0x66, itap, 0x00, 0x00, 0x00, 0x4B, 0x24, 0x01,
+    ]
+}
+
+/// Row end of a **nested** table as Word writes it: a `\r` paragraph carrying
+/// `sprmPFInTable`, `sprmPFInnerTtp` (0x244C, not the outermost `sprmPFTtp`),
+/// `sprmPItap` and the row definition (`sprmTDefTable`).
+#[allow(dead_code)]
+pub fn inner_row_grpprl(itap: u8, centers: &[i16], rgfs: &[u16]) -> Vec<u8> {
+    // Reuse the TAP bytes of the outermost row definition, then swap the head.
+    let outer = row_grpprl_at(itap, centers, rgfs);
+    let mut g = vec![
+        0x16, 0x24, 0x01, 0x4C, 0x24, 0x01, 0x49, 0x66, itap, 0x00, 0x00, 0x00,
+    ];
+    g.extend_from_slice(&outer[12..]);
+    g
 }
 
 /// Build a complete synthetic `.doc` from the given paragraphs.

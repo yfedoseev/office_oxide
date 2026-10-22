@@ -1525,20 +1525,56 @@ fn cell_text(cell: &TableCell) -> String {
         .iter()
         .map(|e| match e {
             Element::Paragraph(p) => inline_to_text(&p.content),
+            Element::Table(t) => nested_table_text(t),
             _ => String::new(),
         })
         .collect::<Vec<_>>()
         .join(" ")
 }
 
+/// The text of a table nested in a cell, in reading order, for the writers
+/// that have no cell-in-cell (spreadsheet cells, slide tables).
+///
+/// Walked with an explicit stack: the IR can nest far deeper than the call
+/// stack tolerates, and the text of a table is not worth a recursion.
+fn nested_table_text(table: &Table) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    // Pending elements, the next one to read on top.
+    let mut stack: Vec<&Element> = Vec::new();
+    fn push_table<'a>(t: &'a Table, stack: &mut Vec<&'a Element>) {
+        let cells: Vec<&TableCell> = t.rows.iter().flat_map(|r| &r.cells).collect();
+        for cell in cells.into_iter().rev() {
+            stack.extend(cell.content.iter().rev());
+        }
+    }
+    push_table(table, &mut stack);
+    while let Some(e) = stack.pop() {
+        match e {
+            Element::Paragraph(p) => {
+                let text = inline_to_text(&p.content);
+                if !text.is_empty() {
+                    parts.push(text);
+                }
+            },
+            Element::Table(t) => push_table(t, &mut stack),
+            _ => {},
+        }
+    }
+    parts.join(" ")
+}
+
 /// A PPTX table cell's content as styled `Run`s instead of `cell_text`'s
 /// plain string — needed so a cell's hyperlink/bold/italic/color reaches
-/// the PPTX writer at all.
+/// the PPTX writer at all. A table nested in the cell is written as the plain
+/// text of its cells, as the slide's table has no cell-in-cell.
 fn cell_runs(cell: &TableCell) -> Vec<crate::pptx::write::Run> {
     cell.content
         .iter()
         .flat_map(|e| match e {
             Element::Paragraph(p) => inline_to_pptx_runs(&p.content),
+            Element::Table(t) => {
+                inline_to_pptx_runs(&[InlineContent::Text(TextSpan::plain(nested_table_text(t)))])
+            },
             _ => Vec::new(),
         })
         .collect()

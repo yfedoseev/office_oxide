@@ -69,7 +69,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
     anchored_boxes.sort_by_key(|&(cp, _)| cp);
     let mut anchored_boxes = anchored_boxes.into_iter().peekable();
     if !paragraphs.is_empty() {
-        let mut flattened = 0;
+        let mut depth_anomalies = 0;
         for group in paragraphs.split_inclusive(|p| p.terminator == '\u{C}') {
             let mut elements = Vec::new();
             let mut chunk_start = 0;
@@ -83,7 +83,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
                 if pending.is_empty() || !can_break_after(p, group.get(j + 1)) {
                     continue;
                 }
-                flattened += walk_paragraphs(
+                depth_anomalies += walk_paragraphs(
                     &group[chunk_start..=j],
                     has_structured_headings,
                     &mut elements,
@@ -92,7 +92,7 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
                 elements.append(&mut pending);
                 chunk_start = j + 1;
             }
-            flattened += walk_paragraphs(
+            depth_anomalies += walk_paragraphs(
                 &group[chunk_start..],
                 has_structured_headings,
                 &mut elements,
@@ -106,9 +106,10 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
         if let Some(last) = section_bodies.last_mut() {
             last.extend(anchored_boxes.map(|(_, tb)| tb));
         }
-        if flattened > 0 {
+        if depth_anomalies > 0 {
             warnings.push(format!(
-                "{flattened} table(s) containing nested tables were flattened into their outer table"
+                "{depth_anomalies} table paragraph(s) had a nesting depth beyond {MAX_TABLE_DEPTH} \
+                 and were folded into the deepest supported level"
             ));
         }
     } else {
@@ -327,12 +328,13 @@ pub(crate) fn doc_to_ir(doc: &DocDocument) -> DocumentIR {
 // ---------------------------------------------------------------------------
 // Structured-paragraph walk (tables)
 // ---------------------------------------------------------------------------
-// Known limitation: the row-mark `sprmTDefTable` operand carries `itap` (the
-// nesting depth), but this walk builds a single flat table run. Nested tables
-// are therefore flattened into their containing table rather than represented
-// as nested `TableRow`/`TableCell` blocks. This is a documented gap, not a
-// deliberate silent merge of cells; merged-cell spans are still computed from
-// `rgdxaCenter` and the vertical-merge flags as described below.
+// A paragraph's `sprmPItap` (0x6649) is its table nesting depth ([MS-DOC]
+// §2.6.2): 1 is the outermost table, and the cells of a table at depth N + 1
+// sit inside a cell of the table at depth N, before that cell's own end mark.
+// The walk keeps one builder per open depth; a table that closes (a shallower
+// paragraph arrives) becomes a block of the cell that held it. Merged-cell
+// spans are computed per table from `rgdxaCenter` and the vertical-merge
+// flags as described below.
 
 /// A completed table row awaiting span resolution: its cells plus the row
 /// definition (TAP) from the row-terminator paragraph, when one was present.
@@ -342,60 +344,116 @@ struct PendingRow {
     /// Parsed `sprmTDefTable` of the row mark. `None` for rows closed without
     /// an explicit terminator, which then get `col_span = row_span = 1`.
     tap: Option<TapInfo>,
-    /// Table nesting depth from `sprmPItap` (1 = top-level). `> 1` means a
-    /// nested table, which this walk flattens.
-    itap: u8,
     /// `sprmTTableHeader` on the row mark: a header row, repeated on each page.
     header: bool,
+}
+
+/// The deepest table nesting honoured (15 levels); anything deeper is folded
+/// into this one so the tree, and the walk that builds it, stay bounded. A
+/// bound for hostile input, not a limit taken from a specification.
+const MAX_TABLE_DEPTH: usize = 15;
+
+/// The table being built at one nesting depth.
+#[derive(Default)]
+struct TableLevel {
+    /// Completed rows.
+    rows: Vec<PendingRow>,
+    /// Cells of the row under construction; each cell is its block elements.
+    row_cells: Vec<Vec<Element>>,
+    /// Block elements of the cell under construction: its paragraphs, and any
+    /// tables nested in it that have already closed.
+    cell: Vec<Element>,
+}
+
+impl TableLevel {
+    /// The table this level built, with any cell or row left without its
+    /// terminator (the text ends inside the table) kept, without a TAP.
+    fn finish(mut self) -> Option<Table> {
+        if !self.cell.is_empty() {
+            self.row_cells.push(std::mem::take(&mut self.cell));
+        }
+        if !self.row_cells.is_empty() {
+            let cells = std::mem::take(&mut self.row_cells);
+            self.rows.push(PendingRow {
+                cells,
+                tap: None,
+                header: false,
+            });
+        }
+        (!self.rows.is_empty()).then(|| Table {
+            rows: build_table_rows(&self.rows),
+            ..Default::default()
+        })
+    }
 }
 
 /// Accumulator for the table currently being built from a run of `fInTable`
 /// paragraphs. A row ends at a table-trailing-mark paragraph (one carrying
 /// `sprmTDefTable`); a cell ends at a `\x07`-terminated paragraph within a row.
+///
+/// `levels[d - 1]` is the table open at depth `d`. A paragraph at depth `d`
+/// belongs to `levels[d - 1]`; reaching it first closes every deeper level,
+/// each into the cell of its parent that holds it, and opens a new level when
+/// `d` is one deeper than the table open now.
 struct TableBuilder {
-    /// Whether we are currently inside a table run.
-    in_table: bool,
-    /// Completed rows of the table under construction.
-    rows: Vec<PendingRow>,
-    /// Cells of the row under construction; each cell is its block elements.
-    row_cells: Vec<Vec<Element>>,
-    /// Block elements of the cell under construction (for multi-paragraph
-    /// cells where interior paragraphs are `\r`-terminated).
-    cell: Vec<Element>,
-    /// Tables flushed so far that held nested rows (`itap > 1`) and were
-    /// flattened into their outer grid.
-    flattened_nested: usize,
+    /// The open tables, outermost first. Empty when not inside a table run.
+    levels: Vec<TableLevel>,
+    /// Paragraphs whose nesting depth exceeds [`MAX_TABLE_DEPTH`]. They are
+    /// kept, folded into the deepest level, and counted for the caller.
+    depth_anomalies: usize,
 }
 
 impl TableBuilder {
     fn new() -> Self {
         Self {
-            in_table: false,
-            rows: Vec::new(),
-            row_cells: Vec::new(),
-            cell: Vec::new(),
-            flattened_nested: 0,
+            levels: Vec::new(),
+            depth_anomalies: 0,
         }
     }
 
-    /// Begin a new table run if not already inside one.
-    fn ensure_open(&mut self) {
-        if !self.in_table {
-            self.in_table = true;
-            self.rows.clear();
-            self.row_cells.clear();
-            self.cell.clear();
+    /// Make `levels[depth - 1]` the innermost open table (closing deeper ones,
+    /// opening the missing ones) and return its index.
+    ///
+    /// A paragraph at depth `d` implies a table at every depth above it, so an
+    /// enclosing table that has not been seen yet is opened here: the first cell
+    /// of a table can begin with a nested table, which then arrives before any
+    /// paragraph of its own.
+    fn enter(&mut self, depth: u8) -> usize {
+        let mut want = usize::from(depth).max(1);
+        if want > MAX_TABLE_DEPTH {
+            self.depth_anomalies += 1;
+            want = MAX_TABLE_DEPTH;
+        }
+        while self.levels.len() > want {
+            self.close_innermost();
+        }
+        while self.levels.len() < want {
+            self.levels.push(TableLevel::default());
+        }
+        want - 1
+    }
+
+    /// Close the innermost table into the cell of its parent that holds it.
+    /// Only called with a parent open.
+    fn close_innermost(&mut self) {
+        let Some(level) = self.levels.pop() else {
+            return;
+        };
+        if let (Some(table), Some(parent)) = (level.finish(), self.levels.last_mut()) {
+            parent.cell.push(Element::Table(table));
         }
     }
 
     /// Add a cell paragraph (`fInTable`, not a row mark).
     ///
-    /// A `\x07` terminator closes the current cell; any other terminator
-    /// (e.g. `\r`) is an interior paragraph break within the same cell.
+    /// A `\x07` terminator (or, in a nested table, the inner-cell flag) closes
+    /// the current cell; any other terminator (e.g. `\r`) is an interior
+    /// paragraph break within the same cell.
     fn add_cell_paragraph(&mut self, p: &DocParagraph) {
-        self.ensure_open();
+        let level = self.enter(p.props.itap);
+        let level = &mut self.levels[level];
         if !p.text.is_empty() {
-            self.cell.push(Element::Paragraph(Paragraph {
+            level.cell.push(Element::Paragraph(Paragraph {
                 content: inline_content_for(&p.text, &p.hyperlinks, &p.chp_runs),
                 // `tabs` is always empty in the tables-only build (it is
                 // populated by the list/tab-stop PR); cloning keeps the IR
@@ -412,64 +470,34 @@ impl TableBuilder {
                 ..Default::default()
             }));
         }
-        if p.terminator == '\u{7}' {
-            self.row_cells.push(std::mem::take(&mut self.cell));
+        // An outermost cell ends with `\x07`; a cell of a nested table ends
+        // with a paragraph mark flagged `sprmPFInnerTableCell`.
+        if p.terminator == '\u{7}' || p.props.f_inner_table_cell {
+            level.row_cells.push(std::mem::take(&mut level.cell));
         }
     }
 
-    /// A row-terminator paragraph: close the in-flight cell, then the row.
-    fn end_row(&mut self, tap: Option<TapInfo>, itap: u8, header: bool) {
-        self.ensure_open();
-        if !self.cell.is_empty() {
-            self.row_cells.push(std::mem::take(&mut self.cell));
+    /// A row-terminator paragraph at nesting depth `depth`: close the
+    /// in-flight cell, then the row.
+    fn end_row(&mut self, tap: Option<TapInfo>, depth: u8, header: bool) {
+        let level = self.enter(depth);
+        let level = &mut self.levels[level];
+        if !level.cell.is_empty() {
+            level.row_cells.push(std::mem::take(&mut level.cell));
         }
-        let cells = std::mem::take(&mut self.row_cells);
-        self.rows.push(PendingRow {
-            cells,
-            tap,
-            itap,
-            header,
-        });
+        let cells = std::mem::take(&mut level.row_cells);
+        level.rows.push(PendingRow { cells, tap, header });
     }
 
-    /// Flush any open table as an `Element::Table`. Called when prose (a
+    /// Flush every open table as an `Element::Table`. Called when prose (a
     /// non-`fInTable` paragraph) interrupts a table run, and at end-of-doc.
     fn flush(&mut self, elements: &mut Vec<Element>) {
-        if !self.in_table {
-            return;
+        while self.levels.len() > 1 {
+            self.close_innermost();
         }
-        // A cell or row left without its terminator (the text ends inside
-        // the table) — keep it, without a TAP. The open cell's paragraphs
-        // were dropped here with the cell, so a document whose last
-        // paragraph sat in a table lost it from the structured view.
-        if !self.cell.is_empty() {
-            self.row_cells.push(std::mem::take(&mut self.cell));
+        if let Some(table) = self.levels.pop().and_then(TableLevel::finish) {
+            elements.push(Element::Table(table));
         }
-        if !self.row_cells.is_empty() {
-            let cells = std::mem::take(&mut self.row_cells);
-            self.rows.push(PendingRow {
-                cells,
-                tap: None,
-                itap: 0,
-                header: false,
-            });
-        }
-        if !self.rows.is_empty() {
-            // Nested tables (itap > 1) are not yet represented as nested
-            // `Table` blocks; the rows are flattened into the outer grid.
-            // Counted, and reported as a metadata warning by the caller —
-            // not written into the document as a line of text it does not
-            // have.
-            if self.rows.iter().any(|r| r.itap > 1) {
-                self.flattened_nested += 1;
-            }
-            let rows = build_table_rows(&self.rows);
-            elements.push(Element::Table(Table {
-                rows,
-                ..Default::default()
-            }));
-        }
-        self.in_table = false;
     }
 }
 
@@ -704,10 +732,11 @@ fn is_doc_list_item(ilfo: Option<i16>) -> bool {
     }
 }
 
-/// Returns how many tables holding nested tables were flattened.
 /// One accumulated list item: its level, inline content and paragraph style.
 type ListItemSource = (u8, Vec<InlineContent>, Option<String>);
 
+/// Returns how many paragraphs had a table nesting depth beyond what is
+/// honoured ([`MAX_TABLE_DEPTH`]) and were folded into the deepest level.
 fn walk_paragraphs(
     paragraphs: &[DocParagraph],
     has_structured_headings: bool,
@@ -726,13 +755,7 @@ fn walk_paragraphs(
     for p in paragraphs {
         if p.props.is_table_trailing_mark {
             flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
-            // A nested row (`itap > 1`) is flattened into its outer grid, where its
-            // header flag would mark an arbitrary row in the middle of the table.
-            table.end_row(
-                p.props.tap.clone(),
-                p.props.itap,
-                p.props.f_table_header && p.props.itap <= 1,
-            );
+            table.end_row(p.props.tap.clone(), p.props.itap, p.props.f_table_header);
         } else if p.props.f_in_table {
             flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
             table.add_cell_paragraph(p);
@@ -793,7 +816,7 @@ fn walk_paragraphs(
     }
     table.flush(elements);
     flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
-    table.flattened_nested
+    table.depth_anomalies
 }
 
 /// Emit the accumulated list run as an `Element::List` and clear it.
@@ -1217,13 +1240,11 @@ mod tests {
             PendingRow {
                 cells: vec![vec![], vec![]],
                 tap: Some(tap(&[0, 1000, 2000])),
-                itap: 1,
                 header: false,
             },
             PendingRow {
                 cells: vec![vec![], vec![]],
                 tap: Some(tap(&[0, 1003, 2000])),
-                itap: 1,
                 header: false,
             },
         ];
@@ -1466,27 +1487,33 @@ mod tests {
         );
     }
 
-    /// A nested table (`itap > 1`) is flattened, not silently mis-rendered:
-    /// the walk reports it (for `Metadata::warnings`) and writes no text
-    /// the document does not have.
+    /// A nested row mark with no enclosing table seen yet: the enclosing table
+    /// is implied (its first cell begins with the nested one), nothing is
+    /// reported, and no text the document does not have is written.
     #[test]
-    fn test_nested_table_itap_is_reported_not_written_as_text() {
+    fn test_nested_row_mark_opens_its_enclosing_table() {
         let props = PapProps {
             is_table_trailing_mark: true,
-            itap: 2, // nested
+            itap: 2,
             tap: Some(tap(&[0, 1000, 2000])),
             ..PapProps::default()
         };
         let row = para("", props);
 
         let mut els = Vec::new();
-        let flattened = walk_paragraphs(&[row], false, &mut els, &ListFormatting::default());
+        let anomalies = walk_paragraphs(&[row], false, &mut els, &ListFormatting::default());
 
+        let Some(Element::Table(outer)) = els.first() else {
+            panic!("a table must be emitted: {els:?}");
+        };
         assert!(
-            els.iter().any(|e| matches!(e, Element::Table(_))),
-            "the (flattened) table must still be emitted"
+            outer.rows[0].cells[0]
+                .content
+                .iter()
+                .any(|e| matches!(e, Element::Table(_))),
+            "the nested table sits in the implied outer table's first cell"
         );
-        assert_eq!(flattened, 1, "the flattening must be reported");
+        assert_eq!(anomalies, 0);
         assert!(
             !els.iter().any(|e| matches!(e, Element::Paragraph(_))),
             "no notice paragraph may be written into the document: {els:?}"
@@ -1949,7 +1976,6 @@ mod tests {
                 centers: vec![0, 1000],
                 cells: vec![cell],
             }),
-            itap: 1,
             header: false,
         }
     }

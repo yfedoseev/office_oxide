@@ -89,12 +89,12 @@ fn test_reference_marks_and_hyphen_controls_do_not_leak_into_text() {
     assert_eq!(notes.len(), 2, "{:?}", ir.sections[0].elements);
 }
 
-/// A nested table (`sprmPItap` > 1) is flattened into its outer table.
-/// That used to be announced by a paragraph of text the document does not
-/// have; it is a metadata warning now, and the document's own text is
-/// untouched.
+/// A nested table (`sprmPItap` = 2) used to be announced by a paragraph of
+/// text the document does not have, then flattened into its outer table. It
+/// is now a table inside the cell that holds it, and the document's own text
+/// is untouched: no notice is written into it.
 #[test]
-fn test_flattened_nested_table_is_a_warning_not_document_text() {
+fn test_nested_table_is_kept_and_never_announced_in_document_text() {
     use common::{cell_grpprl, row_grpprl};
     // Depth-2 cell and row mark: sprmPItap operand = 2.
     let mut cell = cell_grpprl();
@@ -117,14 +117,11 @@ fn test_flattened_nested_table_is_a_warning_not_document_text() {
     let doc = open_doc(&build_doc_full(&paras, &Subdocs::default(), FibTweaks::default()));
     let ir = doc.to_ir();
     let md = ir.to_markdown();
-    assert!(!md.contains("nested table"), "fabricated text in the output: {md}");
+    assert!(!md.contains("nesting depth"), "fabricated text in the output: {md}");
     assert!(md.contains("Inner"), "{md}");
     assert!(
-        ir.metadata
-            .warnings
-            .iter()
-            .any(|w| w.contains("nested table")),
-        "{:?}",
+        !ir.metadata.warnings.iter().any(|w| w.contains("nest")),
+        "a well-formed nested table needs no warning: {:?}",
         ir.metadata.warnings
     );
 }

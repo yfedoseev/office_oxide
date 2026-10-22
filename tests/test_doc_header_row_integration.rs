@@ -313,39 +313,3 @@ fn test_doc_huge_papx_negative_length_is_rejected() {
             .any(|w| w.contains("sprmPHugePapx"))
     );
 }
-
-#[test]
-fn test_doc_nested_table_header_flag_does_not_mark_a_flattened_row() {
-    // A nested table (itap = 2) is flattened into its outer grid, so its
-    // header row is just a row in the middle of the outer table: the flag
-    // must not carry over.
-    let nested_cell = || Para {
-        text: "n",
-        terminator: '\u{7}',
-        // sprmPFInTable = 1, sprmPItap = 2.
-        grpprl: vec![0x16, 0x24, 0x01, 0x49, 0x66, 0x02, 0x00, 0x00, 0x00],
-    };
-    let mut nested_mark = row_grpprl(&CENTERS, &[0, 0]);
-    // row_grpprl writes sprmPItap = 1; raise it to 2 (operand byte at index 8).
-    assert_eq!(&nested_mark[6..9], &[0x49, 0x66, 0x01]);
-    nested_mark[8] = 0x02;
-    nested_mark.extend_from_slice(&TABLE_HEADER_ON);
-    let paras = vec![
-        cell("o1"),
-        cell("o2"),
-        row_mark(row_grpprl(&CENTERS, &[0, 0])),
-        nested_cell(),
-        nested_cell(),
-        row_mark(nested_mark),
-    ];
-    let bytes = build_doc(&paras);
-    let doc = common::open_doc(&bytes);
-    let ir = doc.to_ir();
-
-    let tables = tables(&ir);
-    assert_eq!(tables.len(), 1, "the nested rows are flattened into the outer table");
-    assert!(
-        tables[0].rows.iter().all(|r| !r.is_header),
-        "a nested table's header flag must not mark a row of the flattened outer table"
-    );
-}
