@@ -259,3 +259,65 @@ fn test_doc_vertical_merge_matches_the_cell_above_by_column_position() {
         "the continuation under Y is absorbed and nothing else is"
     );
 }
+
+fn plain_cell(text: &'static str) -> Para {
+    Para {
+        text,
+        terminator: '\u{7}',
+        grpprl: cell_grpprl(),
+    }
+}
+
+fn row_end_of(centers: &[i16], rgfs: &[u16]) -> Para {
+    Para {
+        text: "",
+        terminator: '\u{7}',
+        grpprl: row_grpprl(centers, rgfs),
+    }
+}
+
+#[test]
+fn test_doc_vertical_merge_continuation_must_cover_the_same_columns() {
+    // The second cell of row 1 sits under the merged cell but covers only half
+    // of it, so it is an ordinary cell and is not swallowed.
+    let bytes = build_doc(&[
+        plain_cell("a"),
+        plain_cell("merged"),
+        row_end_of(&[0, 1000, 3000], &[0, 0x0060]),
+        plain_cell("b"),
+        plain_cell("c"),
+        plain_cell("d"),
+        row_end_of(&[0, 1000, 2000, 3000], &[0, 0x0020, 0]),
+    ]);
+    let ir = open_doc(&bytes).to_ir();
+    let table = first_table(&ir).expect("a table");
+    let texts: Vec<String> = table.rows[1].cells.iter().map(cell_text).collect();
+    assert_eq!(texts, vec!["b", "c", "d"], "nothing in row 1 is dropped");
+    assert!(
+        table
+            .rows
+            .iter()
+            .flat_map(|r| &r.cells)
+            .all(|c| c.row_span == 1)
+    );
+}
+
+#[test]
+fn test_doc_vertical_merge_continuation_text_is_kept_in_the_merged_cell() {
+    // Word leaves a continuation empty; a damaged file can put text in one, and
+    // that text is added to the merged cell instead of being dropped.
+    let bytes = build_doc(&[
+        plain_cell("top"),
+        row_end_of(&[0, 1000], &[0x0060]),
+        plain_cell("second"),
+        row_end_of(&[0, 1000], &[0x0020]),
+        plain_cell(""),
+        row_end_of(&[0, 1000], &[0x0020]),
+    ]);
+    let ir = open_doc(&bytes).to_ir();
+    let table = first_table(&ir).expect("a table");
+    assert_eq!(table.rows[0].cells.len(), 1);
+    assert_eq!(table.rows[0].cells[0].row_span, 3);
+    assert_eq!(cell_text(&table.rows[0].cells[0]), "top\nsecond");
+    assert!(table.rows[1].cells.is_empty() && table.rows[2].cells.is_empty());
+}
