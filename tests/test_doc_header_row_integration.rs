@@ -271,6 +271,34 @@ fn test_doc_huge_papx_shared_by_many_rows_is_expanded_once_and_keeps_one_table()
 }
 
 #[test]
+fn test_doc_huge_papx_copies_that_differ_by_a_byte_are_each_charged() {
+    // Every paragraph names the same maximum-size PrcData, but each also carries
+    // a property of its own, so no two property lists are identical and each
+    // gets its own 16 KB copy. Charging the stream once for the shared offset
+    // would let a few kilobytes of references copy out hundreds of megabytes;
+    // each copy is charged, and the excess is reported.
+    let prc = [0x03u8, 0x24, 0x00].repeat(5_430); // 16,290 bytes, the spec maximum
+    let data = data_with_prc_data(0, &prc);
+    let paras: Vec<Para> = (0..200u8)
+        .map(|i| {
+            let mut g = huge_papx_grpprl(0);
+            g.extend_from_slice(&[0x02, 0x24, i]); // a distinct property each
+            row_mark(g)
+        })
+        .collect();
+    let doc = open_with_data(&paras, &data);
+    let ir = doc.to_ir();
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("sprmPHugePapx")),
+        "copies past the budget must be reported, got {:?}",
+        ir.metadata.warnings
+    );
+}
+
+#[test]
 fn test_doc_huge_papx_negative_length_is_rejected() {
     let fc = 0x08usize;
     let mut data = vec![0u8; fc];

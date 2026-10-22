@@ -216,37 +216,30 @@ const PRC_DATA_MAX_CB: usize = 0x3FA2;
 /// The allowance for copying `PrcData` out of the `Data` stream, shared by all
 /// the paragraphs of one document.
 ///
-/// A `PrcData` is charged once, the first time its `fc` is expanded: a real
-/// document stores each one once and points every paragraph that shares it
-/// (the rows of a long table, say) at that `fc`, so those later references
-/// are free. Distinct, possibly overlapping, `fc`s are what a hostile file
-/// multiplies, and those spend the `remaining` bytes.
+/// Every copy is charged its full length. Paragraphs whose property lists are
+/// byte for byte the same (the row ends of a long table, as a rule) are
+/// expanded once and share the result, so they spend the allowance once; that
+/// sharing is done by the caller, not here. Two property lists that merely name
+/// the same `PrcData` each get a buffer of their own, and each is charged: a
+/// budget that skipped repeated offsets would let a few bytes per paragraph
+/// copy out 16 KB each.
 #[derive(Debug, Default)]
 pub struct HugeBudget {
     remaining: usize,
-    charged: std::collections::HashSet<usize>,
 }
 
 impl HugeBudget {
-    /// A budget of `remaining` bytes and no `PrcData` charged yet.
+    /// A budget of `remaining` bytes.
     pub fn new(remaining: usize) -> Self {
-        Self {
-            remaining,
-            charged: std::collections::HashSet::new(),
-        }
+        Self { remaining }
     }
 
-    /// Whether the `PrcData` at `fc` of `len` bytes may be expanded, charging
-    /// it the first time.
-    fn admit(&mut self, fc: usize, len: usize) -> bool {
-        if self.charged.contains(&fc) {
-            return true;
-        }
+    /// Whether a `PrcData` of `len` bytes may be copied, charging it.
+    fn admit(&mut self, len: usize) -> bool {
         if len > self.remaining {
             return false;
         }
         self.remaining -= len;
-        self.charged.insert(fc);
         true
     }
 }
@@ -261,7 +254,7 @@ impl HugeBudget {
 /// the list.
 ///
 /// `budget` bounds the bytes copied out of `data` across all calls, charging
-/// each distinct `PrcData` once (see [`HugeBudget`]). A 6-byte reference
+/// every copy (see [`HugeBudget`]). A 6-byte reference
 /// expands to up to 16 KB, so without it a small file multiplies into
 /// gigabytes.
 ///
@@ -287,8 +280,7 @@ pub fn expand_huge_papx(
             let buf = out.get_or_insert_with(Vec::new);
             buf.extend_from_slice(&grpprl[copied..p]);
             copied = next.min(grpprl.len());
-            match prc_data_grpprl(&sprm.operand, data).filter(|&(fc, g)| budget.admit(fc, g.len()))
-            {
+            match prc_data_grpprl(&sprm.operand, data).filter(|&(_, g)| budget.admit(g.len())) {
                 Some((_, g)) => buf.extend_from_slice(g),
                 None => unresolved += 1,
             }
@@ -2573,23 +2565,19 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_huge_papx_stops_at_the_budget_and_counts_the_rest() {
+    fn test_expand_huge_papx_charges_every_copy_and_counts_the_rest() {
         let prc = [0x17, 0x24, 0x01, 0x16, 0x24, 0x01]; // 6 bytes
         let data = data_with(0, &prc);
-        let mut budget = HugeBudget::new(10); // room for one expansion, not two
+        let mut budget = HugeBudget::new(10); // room for one copy, not two
         let mut g = huge(0);
-        g.extend_from_slice(&huge(0)); // the same PrcData: charged once
+        g.extend_from_slice(&huge(0)); // the same PrcData named twice
         let (out, bad) = expand_huge_papx(&g, &data, &mut budget).unwrap();
-        assert_eq!(bad, 0, "a PrcData already charged is free");
-        assert_eq!(out.len(), 2 * prc.len());
+        assert_eq!(bad, 1, "the second copy is charged too");
+        assert_eq!(out.len(), prc.len());
         assert_eq!(budget.remaining, 4);
-        // A different PrcData needs budget of its own: 4 bytes left, 6 wanted.
-        let mut data2 = data.clone();
-        let fc2 = data2.len();
-        data2.extend_from_slice(&(prc.len() as i16).to_le_bytes());
-        data2.extend_from_slice(&prc);
-        let (out, bad) = expand_huge_papx(&huge(fc2 as u32), &data2, &mut budget).unwrap();
-        assert_eq!((out.len(), bad), (0, 1), "a second distinct PrcData is over budget");
+        // Another list naming the same PrcData is charged again: 4 left, 6 wanted.
+        let (out, bad) = expand_huge_papx(&huge(0), &data, &mut budget).unwrap();
+        assert_eq!((out.len(), bad), (0, 1));
     }
 
     #[test]
