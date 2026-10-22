@@ -345,6 +345,8 @@ struct PendingRow {
     /// Table nesting depth from `sprmPItap` (1 = top-level). `> 1` means a
     /// nested table, which this walk flattens.
     itap: u8,
+    /// `sprmTTableHeader` on the row mark: a header row, repeated on each page.
+    header: bool,
 }
 
 /// Accumulator for the table currently being built from a run of `fInTable`
@@ -415,13 +417,18 @@ impl TableBuilder {
     }
 
     /// A row-terminator paragraph: close the in-flight cell, then the row.
-    fn end_row(&mut self, tap: Option<TapInfo>, itap: u8) {
+    fn end_row(&mut self, tap: Option<TapInfo>, itap: u8, header: bool) {
         self.ensure_open();
         if !self.cell.is_empty() {
             self.row_cells.push(std::mem::take(&mut self.cell));
         }
         let cells = std::mem::take(&mut self.row_cells);
-        self.rows.push(PendingRow { cells, tap, itap });
+        self.rows.push(PendingRow {
+            cells,
+            tap,
+            itap,
+            header,
+        });
     }
 
     /// Flush any open table as an `Element::Table`. Called when prose (a
@@ -443,6 +450,7 @@ impl TableBuilder {
                 cells,
                 tap: None,
                 itap: 0,
+                header: false,
             });
         }
         if !self.rows.is_empty() {
@@ -551,6 +559,9 @@ fn build_table_rows(pending: &[PendingRow]) -> Vec<TableRow> {
             };
             TableRow {
                 cells,
+                // The same pair .docx sets from `w:tblHeader`.
+                is_header: prow.header,
+                repeat_as_header: prow.header,
                 ..Default::default()
             }
         })
@@ -711,7 +722,13 @@ fn walk_paragraphs(
     for p in paragraphs {
         if p.props.is_table_trailing_mark {
             flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
-            table.end_row(p.props.tap.clone(), p.props.itap);
+            // A nested row (`itap > 1`) is flattened into its outer grid, where its
+            // header flag would mark an arbitrary row in the middle of the table.
+            table.end_row(
+                p.props.tap.clone(),
+                p.props.itap,
+                p.props.f_table_header && p.props.itap <= 1,
+            );
         } else if p.props.f_in_table {
             flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
             table.add_cell_paragraph(p);
@@ -1186,11 +1203,13 @@ mod tests {
                 cells: vec![vec![], vec![]],
                 tap: Some(tap(&[0, 1000, 2000])),
                 itap: 1,
+                header: false,
             },
             PendingRow {
                 cells: vec![vec![], vec![]],
                 tap: Some(tap(&[0, 1003, 2000])),
                 itap: 1,
+                header: false,
             },
         ];
         let out = build_table_rows(&rows);
@@ -1916,6 +1935,7 @@ mod tests {
                 cells: vec![cell],
             }),
             itap: 1,
+            header: false,
         }
     }
 

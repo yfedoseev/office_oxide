@@ -124,9 +124,22 @@ fn pchg_tabs_operand_len(grpprl: &[u8], start: usize) -> usize {
 pub fn parse_grpprl(grpprl: &[u8]) -> Vec<Sprm> {
     let mut out = Vec::new();
     let mut p = 0usize;
-    let len = grpprl.len();
+    while let Some((sprm, next)) = next_sprm(grpprl, p) {
+        out.push(sprm);
+        p = next;
+    }
+    out
+}
 
-    while p + 2 <= len {
+/// Decode the SPRM starting at `p`, returning it and the offset of the next
+/// one (which may lie past the end when the operand is truncated). `None`
+/// when fewer than two bytes remain or a length prefix is cut off.
+fn next_sprm(grpprl: &[u8], p: usize) -> Option<(Sprm, usize)> {
+    let len = grpprl.len();
+    if p + 2 > len {
+        return None;
+    }
+    {
         let opcode = u16::from_le_bytes([grpprl[p], grpprl[p + 1]]);
         let (operand, next) = match operand_size(opcode) {
             OperandSize::Fixed(n) => {
@@ -142,7 +155,7 @@ pub fn parse_grpprl(grpprl: &[u8]) -> Vec<Sprm> {
                     // 2 (opcode) + 2 (cb) + (cb - 1) = cb + 3.
                     if p + 4 > len {
                         // `cb` itself is truncated — stop.
-                        break;
+                        return None;
                     }
                     let cb = u16::from_le_bytes([grpprl[p + 2], grpprl[p + 3]]) as usize;
                     let start = p + 4;
@@ -159,7 +172,7 @@ pub fn parse_grpprl(grpprl: &[u8]) -> Vec<Sprm> {
                     // `pchg_tabs_operand_len`). The 1-byte `cb` is always
                     // consumed; the operand starts at `p + 3` either way.
                     if p + 3 > len {
-                        break;
+                        return None;
                     }
                     let cb = grpprl[p + 2] as usize;
                     let start = p + 3;
@@ -173,7 +186,7 @@ pub fn parse_grpprl(grpprl: &[u8]) -> Vec<Sprm> {
                 } else {
                     if p + 3 > len {
                         // Length prefix itself is truncated — stop.
-                        break;
+                        return None;
                     }
                     let n = grpprl[p + 2] as usize;
                     let start = p + 3;
@@ -182,11 +195,83 @@ pub fn parse_grpprl(grpprl: &[u8]) -> Vec<Sprm> {
                 }
             },
         };
-        out.push(Sprm { opcode, operand });
+        Some((Sprm { opcode, operand }, next))
+    }
+}
+
+/// `sprmPHugePapx` ([MS-DOC] §2.6.2, `0x6646`): the paragraph's property
+/// list is too large for the PAPX and lives in the `Data` stream. The
+/// 4-byte operand is the `fc` of a `PrcData` ([MS-DOC] §2.9.210) there.
+pub const SPRM_P_HUGE_PAPX: u16 = 0x6646;
+
+/// The same sprm under its Word 97 number. [MS-DOC] §2.6.2 lists only
+/// `0x6646`; Apache POI (`PAPX.findHuge`) and LibreOffice (`LN_PHugePapx`)
+/// both also accept `0x6645` with the same 4-byte `fc` operand.
+const SPRM_P_HUGE_PAPX_WORD97: u16 = 0x6645;
+
+/// `PrcData.cbGrpprl` is at most `0x3FA2` ([MS-DOC] §2.9.210); anything
+/// larger or negative is not a valid `PrcData`.
+const PRC_DATA_MAX_CB: usize = 0x3FA2;
+
+/// Replace each `sprmPHugePapx` in `grpprl` with the property list its
+/// `PrcData` holds in the `Data` stream, in place so SPRM order is kept.
+///
+/// Returns `None` when `grpprl` has no `sprmPHugePapx`. Otherwise returns the
+/// expanded list and how many references could not be resolved (an operand
+/// that is not 4 bytes, an `fc` outside `data`, a negative or oversized
+/// `cbGrpprl`, or no `budget` left); an unresolved reference is dropped from
+/// the list.
+///
+/// `budget` is the number of bytes the caller still allows to be copied out of
+/// `data`, and is reduced by each expansion. A 6-byte reference expands to up
+/// to 16 KB, and many paragraphs may name the same `PrcData`, so without a
+/// shared budget a small file multiplies into gigabytes.
+///
+/// The expansion is one level deep: a `sprmPHugePapx` inside a `PrcData` is not
+/// followed, so a self-referencing `Data` stream cannot loop.
+pub fn expand_huge_papx(
+    grpprl: &[u8],
+    data: &[u8],
+    budget: &mut usize,
+) -> Option<(Vec<u8>, usize)> {
+    // Almost no paragraph has one; skip the SPRM walk unless an opcode's
+    // bytes appear at all.
+    let has = |op: u16| grpprl.windows(2).any(|w| w == op.to_le_bytes());
+    if !has(SPRM_P_HUGE_PAPX) && !has(SPRM_P_HUGE_PAPX_WORD97) {
+        return None;
+    }
+    let mut out: Option<Vec<u8>> = None;
+    let mut unresolved = 0usize;
+    let mut copied = 0usize;
+    let mut p = 0usize;
+    while let Some((sprm, next)) = next_sprm(grpprl, p) {
+        if sprm.opcode == SPRM_P_HUGE_PAPX || sprm.opcode == SPRM_P_HUGE_PAPX_WORD97 {
+            let buf = out.get_or_insert_with(Vec::new);
+            buf.extend_from_slice(&grpprl[copied..p]);
+            copied = next.min(grpprl.len());
+            match prc_data_grpprl(&sprm.operand, data).filter(|g| g.len() <= *budget) {
+                Some(g) => {
+                    *budget -= g.len();
+                    buf.extend_from_slice(g);
+                },
+                None => unresolved += 1,
+            }
+        }
         p = next;
     }
+    out.map(|mut buf| {
+        buf.extend_from_slice(&grpprl[copied..]);
+        (buf, unresolved)
+    })
+}
 
-    out
+/// The `GrpPrl` of the `PrcData` that a `sprmPHugePapx` operand points at.
+fn prc_data_grpprl<'a>(operand: &[u8], data: &'a [u8]) -> Option<&'a [u8]> {
+    let fc = u32::from_le_bytes(operand.get(..4)?.try_into().ok()?) as usize;
+    let cb = i16::from_le_bytes(data.get(fc..fc.checked_add(2)?)?.try_into().ok()?);
+    let cb = usize::try_from(cb).ok().filter(|&c| c <= PRC_DATA_MAX_CB)?;
+    let start = fc + 2;
+    data.get(start..start.checked_add(cb)?)
 }
 
 /// Paragraph-property flags distilled from a PAP grpprl.
@@ -201,6 +286,9 @@ pub struct PapProps {
     /// 0xD608). Such a paragraph is the row-terminator ("table trailing
     /// paragraph") and is NOT itself a cell.
     pub is_table_trailing_mark: bool,
+    /// `sprmTTableHeader` (0x3404): the row this paragraph terminates is a
+    /// header row, repeated at the top of each page.
+    pub f_table_header: bool,
     /// `sprmPItap` (0x6649): table nesting depth (1 = top-level table).
     pub itap: u8,
     /// List level (0-based) when the paragraph is a list item. `None` when
@@ -551,6 +639,12 @@ pap_sprm_dispatch! {
             let v = u32::from_le_bytes([operand[0], operand[1], operand[2], operand[3]]);
             props.itap = v as u8;
         }
+    }
+
+    /// 1-byte `Bool8` operand: the row is a header row (`fTableHeader`).
+    /// Carried by the row-terminator paragraph, like the rest of the TAP.
+    "sprmTTableHeader" @ "2.6.3" => [0x3404] (props, operand) {
+        props.f_table_header = operand.first().is_some_and(|&b| b & 1 != 0);
     }
 
     /// Presence marks a row-terminator paragraph; the operand carries the
@@ -1113,6 +1207,8 @@ mod tests {
         (0xC60D, "sprmPChgTabsPapx"),
         (0xC615, "sprmPChgTabs"),
         (0xD608, "sprmTDefTable"),
+        (0x3404, "sprmTTableHeader"),
+        (0x6646, "sprmPHugePapx"),
         (0x2461, "sprmPJc"),
         (0x2403, "sprmPJc80"),
         (0x845E, "sprmPDxaLeft"),
@@ -2339,5 +2435,114 @@ mod tests {
         // 0x2416 = sprmPFInTable — a PAP opcode, must not affect CHP props.
         let props = extract_chp_props(&[0x16, 0x24, 0x01]);
         assert_eq!(props, ChpProps::default());
+    }
+
+    /// A `Data` stream with `PrcData` (`cbGrpprl: i16` + grpprl) at `fc`.
+    fn data_with(fc: usize, grpprl: &[u8]) -> Vec<u8> {
+        let mut d = vec![0xEE; fc];
+        d.extend_from_slice(&(grpprl.len() as i16).to_le_bytes());
+        d.extend_from_slice(grpprl);
+        d
+    }
+
+    fn huge(fc: u32) -> Vec<u8> {
+        let mut g = SPRM_P_HUGE_PAPX.to_le_bytes().to_vec();
+        g.extend_from_slice(&fc.to_le_bytes());
+        g
+    }
+
+    #[test]
+    fn test_expand_huge_papx_absent_returns_none() {
+        assert_eq!(expand_huge_papx(&[0x16, 0x24, 0x01], &[0u8; 8], &mut 1_000_000), None);
+        assert_eq!(expand_huge_papx(&[], &[], &mut 1_000_000), None);
+    }
+
+    #[test]
+    fn test_expand_huge_papx_splices_in_place_keeping_order() {
+        let prc = [0x17, 0x24, 0x01]; // sprmPFTtp = 1
+        let data = data_with(6, &prc);
+        let mut g = vec![0x16, 0x24, 0x01]; // sprmPFInTable = 1 (before)
+        g.extend_from_slice(&huge(6));
+        g.extend_from_slice(&[0x49, 0x66, 0x01, 0, 0, 0]); // sprmPItap (after)
+        let (out, bad) = expand_huge_papx(&g, &data, &mut 1_000_000).expect("huge present");
+        assert_eq!(bad, 0);
+        let ops: Vec<u16> = parse_grpprl(&out).iter().map(|s| s.opcode).collect();
+        assert_eq!(ops, vec![0x2416, 0x2417, 0x6649]);
+    }
+
+    #[test]
+    fn test_expand_huge_papx_counts_and_drops_unresolvable_references() {
+        let data = data_with(0, &[0x17, 0x24, 0x01]);
+        for fc in [0x1000_0000u32, u32::MAX] {
+            let (out, bad) = expand_huge_papx(&huge(fc), &data, &mut 1_000_000).unwrap();
+            assert!(out.is_empty());
+            assert_eq!(bad, 1);
+        }
+        // cbGrpprl longer than the stream, negative, and above the spec cap.
+        let mut short = vec![0u8; 2];
+        short.extend_from_slice(&[1, 2, 3]);
+        short[..2].copy_from_slice(&100i16.to_le_bytes());
+        assert_eq!(
+            expand_huge_papx(&huge(0), &short, &mut 1_000_000)
+                .unwrap()
+                .1,
+            1
+        );
+        short[..2].copy_from_slice(&(-5i16).to_le_bytes());
+        assert_eq!(
+            expand_huge_papx(&huge(0), &short, &mut 1_000_000)
+                .unwrap()
+                .1,
+            1
+        );
+        let mut big = vec![0u8; 2 + 0x3FA3];
+        big[..2].copy_from_slice(&0x3FA3i16.to_le_bytes());
+        assert_eq!(expand_huge_papx(&huge(0), &big, &mut 1_000_000).unwrap().1, 1);
+    }
+
+    #[test]
+    fn test_expand_huge_papx_does_not_follow_a_reference_inside_prc_data() {
+        let data = data_with(4, &huge(4)); // PrcData that names itself
+        let (out, bad) = expand_huge_papx(&huge(4), &data, &mut 1_000_000).unwrap();
+        assert_eq!(bad, 0);
+        assert_eq!(out, huge(4), "the inner reference is copied, not followed");
+    }
+
+    #[test]
+    fn test_expand_huge_papx_truncated_operand_is_unresolved_not_a_panic() {
+        // Opcode with only two operand bytes left.
+        let mut g = SPRM_P_HUGE_PAPX.to_le_bytes().to_vec();
+        g.extend_from_slice(&[0x01, 0x00]);
+        let (out, bad) = expand_huge_papx(&g, &[0u8; 16], &mut 1_000_000).unwrap();
+        assert_eq!((out.len(), bad), (0, 1));
+    }
+
+    #[test]
+    fn test_table_header_sprm_decodes_the_flag_bit() {
+        assert!(extract_pap_props(&[0x04, 0x34, 0x01]).f_table_header);
+        assert!(!extract_pap_props(&[0x04, 0x34, 0x00]).f_table_header);
+        assert!(!extract_pap_props(&[0x03, 0x34, 0x01]).f_table_header, "0x3403 is fCantSplit");
+    }
+
+    #[test]
+    fn test_expand_huge_papx_stops_at_the_budget_and_counts_the_rest() {
+        let prc = [0x17, 0x24, 0x01, 0x16, 0x24, 0x01]; // 6 bytes
+        let data = data_with(0, &prc);
+        let mut budget = 10usize; // room for one expansion, not two
+        let mut g = huge(0);
+        g.extend_from_slice(&huge(0));
+        let (out, bad) = expand_huge_papx(&g, &data, &mut budget).unwrap();
+        assert_eq!(bad, 1, "the second reference is over budget");
+        assert_eq!(out.len(), prc.len(), "only the first was expanded");
+        assert_eq!(budget, 4);
+    }
+
+    #[test]
+    fn test_expand_huge_papx_accepts_the_word97_opcode() {
+        let data = data_with(2, &[0x17, 0x24, 0x01]);
+        let mut g = vec![0x45, 0x66];
+        g.extend_from_slice(&2u32.to_le_bytes());
+        let (out, bad) = expand_huge_papx(&g, &data, &mut 1_000_000).unwrap();
+        assert_eq!((out, bad), (vec![0x17, 0x24, 0x01], 0));
     }
 }

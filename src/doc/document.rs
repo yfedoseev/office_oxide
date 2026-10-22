@@ -9,7 +9,7 @@ use super::error::{DocError, Result};
 use super::fib::Fib;
 use super::images::{DocImage, extract_images};
 use super::list_format::ListFormatting;
-use super::papx::{DocParagraph, build_paragraphs, parse_papx_paragraphs};
+use super::papx::{DocParagraph, build_paragraphs, parse_papx_paragraphs, resolve_huge_papx};
 use super::piece_table::{
     covers_declared_length, extract_text_range_excluding, parse_clx, sanitize_text,
 };
@@ -428,20 +428,31 @@ impl DocDocument {
         // PAPX FKP, when the FIB advertises one. Without it we cannot detect
         // tables or lists, so `doc_to_ir` falls back to the line heuristic.
         let mut style_warnings: Vec<String> = Vec::new();
+        // The Data stream (if present) holds the pictures, decoded lazily, and
+        // the property lists of paragraphs whose PAPX is too large to fit.
+        let data_stream = cfb.open_stream("Data").unwrap_or_default();
         let paragraphs = if fib.fc_plcf_bte_papx != 0 && fib.lcb_plcf_bte_papx != 0 {
-            let fkp = parse_papx_paragraphs(
+            let mut fkp = parse_papx_paragraphs(
                 &word_doc,
                 &table_stream,
                 fib.fc_plcf_bte_papx,
                 fib.lcb_plcf_bte_papx,
             );
+            let unresolved = resolve_huge_papx(&mut fkp, &data_stream);
+            if unresolved > 0 {
+                style_warnings.push(format!(
+                    "{unresolved} sprmPHugePapx reference(s) point outside the Data stream, at \
+                     an invalid PrcData, or exceed the expansion budget; those paragraphs lose their properties (table structure \
+                     may be affected)"
+                ));
+            }
             // Parse the style sheet so paragraph styles (incl. built-in
             // Heading 1-9 and user-defined "Heading N") can be resolved to a
             // real heading level. A malformed/absent sheet yields no styles,
             // headings fall back to the line heuristic, and the reason is
             // reported as a warning rather than dropped.
             let sheet = parse_style_sheet(&table_stream, &fib);
-            style_warnings = sheet.warnings;
+            style_warnings.extend(sheet.warnings);
             let styles = sheet.styles;
             build_paragraphs(
                 &word_doc,
@@ -465,8 +476,6 @@ impl DocDocument {
             fib.lcb_plf_lfo,
         );
 
-        // The Data stream (if present) holds the pictures; decoded lazily.
-        let data_stream = cfb.open_stream("Data").unwrap_or_default();
         let has_macros = has_vba_project(&cfb);
         // At minimum, recognize an embedded OLE object exists and
         // surface its identity — before this, `ObjectPool` was never

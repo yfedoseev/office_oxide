@@ -131,6 +131,34 @@ pub fn parse_papx_paragraphs(
     out
 }
 
+/// Fixed allowance added to the `Data`-stream-proportional expansion budget.
+const HUGE_PAPX_ALLOWANCE: usize = 1 << 20;
+
+/// Expand every `sprmPHugePapx` in the paragraphs' property lists from the
+/// `Data` stream ([MS-DOC] §2.6.2, §2.9.210), so a paragraph whose real
+/// properties are too large for the PAPX keeps its table flags and TAP.
+///
+/// The total copied out of `data` is budgeted: a real document reads each
+/// `PrcData` about once, so twice the stream plus a fixed allowance is ample,
+/// while a hostile one that points thousands of paragraphs at the same
+/// maximum-size `PrcData` cannot multiply its size.
+///
+/// Returns how many references could not be resolved.
+pub fn resolve_huge_papx(paragraphs: &mut [FkpParagraph], data: &[u8]) -> usize {
+    let mut budget = data
+        .len()
+        .saturating_mul(2)
+        .saturating_add(HUGE_PAPX_ALLOWANCE);
+    let mut unresolved = 0;
+    for p in paragraphs {
+        if let Some((grpprl, bad)) = super::sprm::expand_huge_papx(&p.grpprl, data, &mut budget) {
+            p.grpprl = grpprl;
+            unresolved += bad;
+        }
+    }
+    unresolved
+}
+
 /// Parse a single 512-byte PAPX FKP page, appending `FkpParagraph`s to `out`.
 fn parse_fkp_page(page: &[u8], out: &mut Vec<FkpParagraph>) {
     let crun = page[511] as usize;
