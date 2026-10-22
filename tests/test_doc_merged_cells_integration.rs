@@ -216,3 +216,46 @@ fn test_doc_vertical_merge_sets_row_span() {
     assert_eq!(c.row_span, 2, "C merges with the empty cell in row 2");
     assert_eq!(c.col_span, 1);
 }
+
+/// A vertical merge continues the cell above it in the same column, not the
+/// cell with the same index. Row 0 has `X` over two grid columns and `Y`, which
+/// starts a vertical merge; row 1 has three cells and the third continues `Y`.
+fn vertical_merge_between_rows_of_different_widths() -> Vec<u8> {
+    let cell = |text| Para {
+        text,
+        terminator: '\u{7}',
+        grpprl: cell_grpprl(),
+    };
+    let row_end = |centers: &[i16], rgfs: &[u16]| Para {
+        text: "",
+        terminator: '\u{7}',
+        grpprl: row_grpprl(centers, rgfs),
+    };
+    build_doc(&[
+        cell("X"),
+        cell("Y"),
+        row_end(&[0, 2000, 3000], &[0, 0x0060]),
+        cell("P"),
+        cell("Q"),
+        cell(""),
+        row_end(&[0, 1000, 2000, 3000], &[0, 0, 0x0020]),
+    ])
+}
+
+#[test]
+fn test_doc_vertical_merge_matches_the_cell_above_by_column_position() {
+    let doc = open_doc(&vertical_merge_between_rows_of_different_widths());
+    let ir = doc.to_ir();
+    let table = first_table(&ir).expect("a table");
+    let shapes = |row: usize| -> Vec<_> { table.rows[row].cells.iter().map(cell_shape).collect() };
+    assert_eq!(
+        shapes(0),
+        vec![("X".to_string(), 2, 1), ("Y".to_string(), 1, 2)],
+        "Y is two rows tall"
+    );
+    assert_eq!(
+        shapes(1),
+        vec![("P".to_string(), 1, 1), ("Q".to_string(), 1, 1)],
+        "the continuation under Y is absorbed and nothing else is"
+    );
+}

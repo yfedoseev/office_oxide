@@ -41,7 +41,9 @@ pub(crate) use list_format::ListFormatting;
 pub use ole_objects::EmbeddedOleObject;
 pub(crate) use papx::DocParagraph;
 pub(crate) use piece_table::HyperlinkSpan;
-pub(crate) use sprm::{ChpProps, LevelSource, OutlineLevel, PapProps, TapCellInfo, TapInfo};
+#[cfg(test)]
+pub(crate) use sprm::TapCellInfo;
+pub(crate) use sprm::{ChpProps, LevelSource, OutlineLevel, PapProps, TapInfo};
 // `ListLevel` is only needed by unit tests inside this crate, so its
 // re-export is test-gated to avoid an unused-import warning in non-test
 // builds.

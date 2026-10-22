@@ -1,6 +1,6 @@
 use crate::doc::{
     ChpProps, DocDocument, DocParagraph, HyperlinkSpan, LevelSource, ListFormatting, OutlineLevel,
-    PapProps, TapCellInfo, TapInfo,
+    PapProps, TapInfo,
 };
 use crate::format::DocumentFormat;
 use crate::ir::*;
@@ -503,10 +503,9 @@ impl TableBuilder {
 
 /// The vertical-merge state lives in a 2-bit field of the `TCGRF` `rgf`
 /// (MS-DOC §2.9.185 `TCGRF`): bits 5-6, `fVertMerge`. The three legal values
-/// are `fvmClear = 0` (not merged), `fvmMerge = 1` (continuation of the merge
+/// are `fvmClear = 0` (not merged, no constant: it is the default), `fvmMerge = 1` (continuation of the merge
 /// started above), and `fvmRestart = 3` (first cell of a merge). As raw `rgf`
 /// bits that is `fvmMerge = 0x0020` and `fvmRestart = 0x0060` (both bits set).
-const FVM_CLEAR: u8 = 0;
 const FVM_MERGE: u8 = 1; // rgf 0x0020
 const FVM_RESTART: u8 = 3; // rgf 0x0060
 
@@ -527,9 +526,10 @@ const EDGE_TOLERANCE_TWIPS: i32 = 4;
 /// boundaries — the same array Apache POI's `buildTableCellEdgesArray`
 /// computes. A cell's `col_span` is the number of grid edges inside its own
 /// boundary interval `[centers[i], centers[i+1])`, which matches POI's
-/// `getNumberColumnsSpanned`. `row_span` walks `fVertMerge`/`fVertRestart`
-/// down the column; continuation cells are absorbed into the cell above and
-/// not emitted (the same convention as the `.docx` converter).
+/// `getNumberColumnsSpanned`. `row_span` follows `fVertMerge`/`fVertRestart`
+/// down the column (see [`resolve_vertical_merges`]); continuation cells are
+/// absorbed into the cell above and not emitted (the same convention as the
+/// `.docx` converter).
 fn build_table_rows(pending: &[PendingRow]) -> Vec<TableRow> {
     let mut edges: Vec<i32> = pending
         .iter()
@@ -549,6 +549,7 @@ fn build_table_rows(pending: &[PendingRow]) -> Vec<TableRow> {
         }
     }
 
+    let merges = resolve_vertical_merges(pending);
     pending
         .iter()
         .enumerate()
@@ -558,7 +559,7 @@ fn build_table_rows(pending: &[PendingRow]) -> Vec<TableRow> {
                     if tap.centers.len() == tap.cells.len() + 1
                         && tap.cells.len() == prow.cells.len() =>
                 {
-                    let (absorbed, spans) = resolve_row_spans(row_idx, pending, tap);
+                    let (absorbed, spans) = &merges[row_idx];
                     (0..tap.cells.len())
                         .filter_map(|col| {
                             if absorbed[col] {
@@ -597,68 +598,90 @@ fn build_table_rows(pending: &[PendingRow]) -> Vec<TableRow> {
         .collect()
 }
 
-/// Per-column `(is_absorbed, row_span)` for one table row.
+/// A vertical merge still open at the bottom of the rows read so far.
+struct OpenMerge {
+    /// The left boundary of the column it runs down, in twips, as of the last
+    /// row it reached.
+    edge: i32,
+    /// The row and cell that started it, which carries its `row_span`.
+    origin: (usize, usize),
+    /// Already continued by a cell of the row being read.
+    taken: bool,
+}
+
+/// Per row, `(is_absorbed, row_span)` for each of its cells.
 ///
 /// The 2-bit `fVertMerge` field (MS-DOC `TCGRF`) drives the logic:
 /// `fvmRestart` starts a new merge, `fvmMerge` continues the merge above, and
-/// `fvmClear` is an ordinary cell. A `fvmMerge` is absorbed into the cell above
-/// and not emitted; the restart cell that begins each merge carries the
-/// `row_span`. Every `fvmRestart` is a genuine new merge — it is never treated
-/// as a continuation, so a `fvmRestart` that immediately follows another
-/// `fvmRestart` opens its own separate merge. The only other representable
-/// 2-bit value (the reserved `0x0040`) is treated as `fvmClear` rather than
-/// panicking, keeping decoding robust against malformed input.
-fn resolve_row_spans(
-    row_idx: usize,
-    pending: &[PendingRow],
-    tap: &TapInfo,
-) -> (Vec<bool>, Vec<u32>) {
-    let mut absorbed = vec![false; tap.cells.len()];
-    let mut spans = vec![1u32; tap.cells.len()];
-
-    for (col, tc) in tap.cells.iter().enumerate() {
-        match vert_merge_state(tc.rgf) {
-            FVM_CLEAR => continue,             // ordinary cell, span 1, not absorbed
-            FVM_MERGE => absorbed[col] = true, // continuation of the merge above
-            FVM_RESTART => {
-                // Genuine restart: count consecutive continuation cells below.
-                // A `fvmRestart` is never a continuation, so an immediately
-                // following `fvmRestart` opens a distinct merge (span 1 here).
-                let mut span = 1u32;
-                for rr in row_idx + 1..pending.len() {
-                    if is_merge_continuation(pending, rr, col) {
-                        span += 1;
-                    } else {
-                        break;
-                    }
-                }
-                spans[col] = span;
-            },
-            // The reserved 2-bit value (0x0040) is malformed but representable;
-            // treat it as an ordinary cell rather than panicking.
-            _ => continue,
-        }
-    }
-    (absorbed, spans)
-}
-
-/// The 2-bit `fVertMerge` state of the cell at `(row, col)`, or `FVM_CLEAR`
-/// when the row has no TAP or no such column.
-fn cell_state(pending: &[PendingRow], row: usize, col: usize) -> u8 {
-    pending[row]
-        .tap
-        .as_ref()
-        .and_then(|tap| tap.cells.get(col))
-        .map(|tc: &TapCellInfo| vert_merge_state(tc.rgf))
-        .unwrap_or(FVM_CLEAR)
-}
-
-/// Whether the cell at `(row, col)` continues the vertical merge above it.
+/// `fvmClear` is an ordinary cell. A merge runs down a *column*: a `fvmMerge`
+/// cell continues the merge whose left boundary it shares (within
+/// [`EDGE_TOLERANCE_TWIPS`], as for the column grid), not the cell with the same
+/// index, since the rows above and below can have different numbers of cells
+/// (horizontally merged cells above, for one). A continuation is absorbed into
+/// the cell that started the merge, which carries the `row_span`. A `fvmMerge`
+/// cell with no merge open in its column has nothing to continue and stays an
+/// ordinary cell, so its content is not lost. Every `fvmRestart` is a genuine
+/// new merge, never a continuation: one that immediately follows another opens
+/// its own. A row without a usable row definition ends every open merge. The
+/// only other representable 2-bit value (the reserved `0x0040`) is treated as
+/// `fvmClear` rather than panicking, keeping decoding robust against malformed
+/// input.
 ///
-/// Only a `fvmMerge` cell continues. A `fvmRestart` cell always opens a new
-/// merge, never a continuation, so it stops the span begun by the cell above.
-fn is_merge_continuation(pending: &[PendingRow], row: usize, col: usize) -> bool {
-    cell_state(pending, row, col) == FVM_MERGE
+/// One pass over the rows, with a binary search per continuation: the work is
+/// linear in the cells however tall a merge is.
+fn resolve_vertical_merges(pending: &[PendingRow]) -> Vec<(Vec<bool>, Vec<u32>)> {
+    let mut out: Vec<(Vec<bool>, Vec<u32>)> = pending
+        .iter()
+        .map(|r| {
+            let n = r.tap.as_ref().map_or(0, |t| t.cells.len());
+            (vec![false; n], vec![1u32; n])
+        })
+        .collect();
+    // Sorted by `edge`.
+    let mut open: Vec<OpenMerge> = Vec::new();
+    for (row, prow) in pending.iter().enumerate() {
+        let usable = prow.tap.as_ref().filter(|tap| {
+            tap.centers.len() == tap.cells.len() + 1 && tap.cells.len() == prow.cells.len()
+        });
+        let Some(tap) = usable else {
+            open.clear();
+            continue;
+        };
+        let mut next: Vec<OpenMerge> = Vec::new();
+        for (col, tc) in tap.cells.iter().enumerate() {
+            let edge = i32::from(tap.centers[col]);
+            match vert_merge_state(tc.rgf) {
+                FVM_RESTART => next.push(OpenMerge {
+                    edge,
+                    origin: (row, col),
+                    taken: false,
+                }),
+                FVM_MERGE => {
+                    let first = open.partition_point(|m| m.edge < edge - EDGE_TOLERANCE_TWIPS);
+                    let found = open[first..]
+                        .iter()
+                        .take_while(|m| m.edge <= edge + EDGE_TOLERANCE_TWIPS)
+                        .position(|m| !m.taken)
+                        .map(|i| first + i);
+                    if let Some(i) = found {
+                        open[i].taken = true;
+                        let (origin_row, origin_col) = open[i].origin;
+                        out[origin_row].1[origin_col] += 1;
+                        out[row].0[col] = true;
+                        next.push(OpenMerge {
+                            edge,
+                            origin: open[i].origin,
+                            taken: false,
+                        });
+                    }
+                },
+                _ => {},
+            }
+        }
+        next.sort_by_key(|m| m.edge);
+        open = next;
+    }
+    out
 }
 
 /// Number of column-grid edges inside the cell's boundary interval
@@ -2062,6 +2085,127 @@ mod tests {
         assert_eq!(out[0].cells[0].row_span, 3, "one continuous 3-row merge");
         assert!(out[1].cells.is_empty());
         assert!(out[2].cells.is_empty());
+    }
+
+    /// A `PendingRow` of `rgfs.len()` cells whose boundaries are `centers`; each
+    /// cell holds its own index and the row number as text.
+    fn merge_row(row: usize, centers: &[i16], rgfs: &[u16]) -> PendingRow {
+        PendingRow {
+            cells: (0..rgfs.len())
+                .map(|c| {
+                    vec![Element::Paragraph(Paragraph {
+                        content: vec![InlineContent::Text(TextSpan::plain(format!("r{row}c{c}")))],
+                        ..Default::default()
+                    })]
+                })
+                .collect(),
+            tap: Some(TapInfo {
+                itc_mac: rgfs.len() as u8,
+                centers: centers.to_vec(),
+                cells: rgfs
+                    .iter()
+                    .map(|&rgf| TapCellInfo {
+                        rgf,
+                        ..Default::default()
+                    })
+                    .collect(),
+            }),
+            header: false,
+        }
+    }
+
+    fn shape(row: &TableRow) -> Vec<(u32, u32)> {
+        row.cells.iter().map(|c| (c.col_span, c.row_span)).collect()
+    }
+
+    /// A vertical merge continues the cell above it in the same column, not the
+    /// cell with the same index: here the restart is cell 1 of a row whose first
+    /// cell spans two grid columns, and its continuation is cell 2 of a row that
+    /// has three cells.
+    #[test]
+    fn test_vertical_merge_continues_the_cell_above_by_column_position() {
+        let rows = vec![
+            merge_row(0, &[0, 2000, 3000], &[0, 0x0060]),
+            merge_row(1, &[0, 1000, 2000, 3000], &[0, 0, 0x0020]),
+        ];
+        let out = build_table_rows(&rows);
+        assert_eq!(shape(&out[0]), vec![(2, 1), (1, 2)], "the merged cell is two rows tall");
+        assert_eq!(shape(&out[1]), vec![(1, 1), (1, 1)], "its continuation is absorbed");
+    }
+
+    /// The other direction: the restart's index is larger than its continuation's.
+    #[test]
+    fn test_vertical_merge_continues_when_the_cell_below_has_a_smaller_index() {
+        let rows = vec![
+            merge_row(0, &[0, 1000, 2000, 3000], &[0, 0, 0x0060]),
+            merge_row(1, &[0, 2000, 3000], &[0, 0x0020]),
+        ];
+        let out = build_table_rows(&rows);
+        assert_eq!(shape(&out[0]), vec![(1, 1), (1, 1), (1, 2)]);
+        assert_eq!(shape(&out[1]), vec![(2, 1)]);
+    }
+
+    /// A continuation with nothing above it in its column is not dropped: it
+    /// stays an ordinary cell, with its content.
+    #[test]
+    fn test_vertical_merge_continuation_without_a_cell_above_is_kept() {
+        let rows = vec![
+            merge_row(0, &[0, 1000, 2000], &[0x0020, 0]),
+            // The restart is in the first column; this continuation is in the second.
+            merge_row(1, &[0, 1000, 2000], &[0x0060, 0x0020]),
+        ];
+        let out = build_table_rows(&rows);
+        assert_eq!(out[0].cells.len(), 2, "a first-row continuation has nothing to continue");
+        assert_eq!(out[1].cells.len(), 2, "so does one under a different column");
+        assert!(out.iter().flat_map(|r| &r.cells).all(|c| c.row_span == 1));
+    }
+
+    /// Boundaries are compared with the column grid's 4-twip tolerance.
+    #[test]
+    fn test_vertical_merge_matches_boundaries_within_the_grid_tolerance() {
+        let close = vec![
+            merge_row(0, &[0, 1000, 2000], &[0, 0x0060]),
+            merge_row(1, &[0, 1003, 2000], &[0, 0x0020]),
+        ];
+        assert_eq!(shape(&build_table_rows(&close)[0]), vec![(1, 1), (1, 2)]);
+        let far = vec![
+            merge_row(0, &[0, 1000, 2000], &[0, 0x0060]),
+            merge_row(1, &[0, 1100, 2000], &[0, 0x0020]),
+        ];
+        let out = build_table_rows(&far);
+        // The extra grid edge at 1100 makes the cell two grid columns wide; what
+        // matters is that it is not extended downwards.
+        assert_eq!(
+            shape(&out[0]),
+            vec![(1, 1), (2, 1)],
+            "a column 100 twips away is another column"
+        );
+        assert_eq!(out[1].cells.len(), 2, "so the cell is kept");
+    }
+
+    /// A long merge in a column that is not the first stays one cell, and the
+    /// rows' other cells keep their place.
+    #[test]
+    fn test_vertical_merge_down_a_long_column_is_one_cell() {
+        let mut rows = vec![merge_row(0, &[0, 1000, 2000], &[0, 0x0060])];
+        for r in 1..3_000 {
+            // Alternate the cell count above the merged column.
+            let (centers, rgfs): (&[i16], &[u16]) = if r % 2 == 0 {
+                (&[0, 500, 1000, 2000], &[0, 0, 0x0020])
+            } else {
+                (&[0, 1000, 2000], &[0, 0x0020])
+            };
+            rows.push(merge_row(r, centers, rgfs));
+        }
+        let out = build_table_rows(&rows);
+        assert_eq!(out[0].cells[1].row_span, 3_000);
+        assert!(
+            out.iter()
+                .skip(1)
+                .all(|r| r.cells.iter().all(|c| c.row_span == 1))
+        );
+        assert_eq!(out[2].cells.len(), 2, "the extra cell of an even row is kept");
+        assert_eq!(out[1].cells.len(), 1);
     }
 
     // ── Line-shape heading guess tightening ────────────────────
