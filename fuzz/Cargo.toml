@@ -39,3 +39,9 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "fuzz_doc_pieces"
+path = "fuzz_targets/fuzz_doc_pieces.rs"
+test = false
+doc = false
