@@ -242,7 +242,19 @@ const SPRMS: &[(u8, Operand)] = &[
     (207, Operand::Var),       // (unnamed)
 ];
 
-fn operand_of(sprm: u8) -> Option<Operand> {
+/// Whether `wident` is one of the three Macintosh Word 6/95 variants.
+fn is_macintosh(wident: u16) -> bool {
+    matches!(wident, 0xA697..=0xA699)
+}
+
+/// The operand of `sprm`. On the Macintosh variants sprms 111-113 are the
+/// font codes of the script systems and carry a 2-byte operand, where the
+/// Windows table has them as variable-length (LibreOffice's
+/// `patchCJKVariant` makes the same change).
+fn operand_of(sprm: u8, macintosh: bool) -> Option<Operand> {
+    if macintosh && (111..=113).contains(&sprm) {
+        return Some(Operand::Fixed(2));
+    }
     SPRMS
         .binary_search_by_key(&sprm, |&(s, _)| s)
         .ok()
@@ -270,7 +282,7 @@ struct Translated {
     lost_row_definition: bool,
 }
 
-fn translate(list: &[u8]) -> Translated {
+fn translate(list: &[u8], macintosh: bool) -> Translated {
     let mut out = Vec::new();
     let mut p = 0usize;
     let mut complete = true;
@@ -280,7 +292,7 @@ fn translate(list: &[u8]) -> Translated {
     while p < list.len() {
         let sprm = list[p];
         p += 1;
-        let Some(kind) = operand_of(sprm) else {
+        let Some(kind) = operand_of(sprm, macintosh) else {
             complete = false;
             break;
         };
@@ -470,6 +482,7 @@ fn fill_uncovered(runs: &mut Vec<FkpParagraph>, stream_len: u32) {
 
 /// Read the paragraph properties of a Word 6.0/95 file.
 pub(super) fn read_papx(word_doc: &[u8], fib: &Word6Fib) -> PapxScan {
+    let macintosh = is_macintosh(fib.wident);
     let mut scan = PapxScan {
         runs: Vec::new(),
         has_table: false,
@@ -548,7 +561,7 @@ pub(super) fn read_papx(word_doc: &[u8], fib: &Word6Fib) -> PapxScan {
                     let cb = usize::from(rest[0]) * 2;
                     let body = &rest[1..(1 + cb).min(rest.len() - 1)];
                     if body.len() >= 2 {
-                        let t = translate(&body[2..]);
+                        let t = translate(&body[2..], macintosh);
                         partial_lists += usize::from(!t.complete);
                         lost_row_definitions += usize::from(t.lost_row_definition);
                         let istd = u16::from_le_bytes([body[0], body[1]]);
@@ -585,7 +598,7 @@ pub(super) fn read_papx(word_doc: &[u8], fib: &Word6Fib) -> PapxScan {
     if unreadable_pages > 0 {
         scan.warnings.push(format!(
             "{unreadable_pages} paragraph-properties (PAPX) page(s) of this Word 6/95 file lie \
-             outside the file; the paragraphs they describe have no structure"
+             outside the file; any tables in them cannot be read"
         ));
     }
     if partial_lists > 0 {
@@ -620,17 +633,31 @@ mod tests {
 
     #[test]
     fn test_the_four_table_sprms_have_the_sizes_the_walk_depends_on() {
-        assert!(matches!(operand_of(SPRM_P_F_IN_TABLE), Some(Operand::Fixed(1))));
-        assert!(matches!(operand_of(SPRM_P_F_TTP), Some(Operand::Fixed(1))));
-        assert!(matches!(operand_of(SPRM_T_TABLE_HEADER), Some(Operand::Fixed(1))));
-        assert!(matches!(operand_of(SPRM_T_DEF_TABLE), Some(Operand::Var2)));
+        assert!(matches!(operand_of(SPRM_P_F_IN_TABLE, false), Some(Operand::Fixed(1))));
+        assert!(matches!(operand_of(SPRM_P_F_TTP, false), Some(Operand::Fixed(1))));
+        assert!(matches!(operand_of(SPRM_T_TABLE_HEADER, false), Some(Operand::Fixed(1))));
+        assert!(matches!(operand_of(SPRM_T_DEF_TABLE, false), Some(Operand::Var2)));
+    }
+
+    #[test]
+    fn test_macintosh_font_sprms_have_a_two_byte_operand_and_windows_ones_do_not() {
+        for sprm in 111..=113u8 {
+            assert!(matches!(operand_of(sprm, true), Some(Operand::Fixed(2))), "{sprm}");
+            assert!(matches!(operand_of(sprm, false), Some(Operand::Var)), "{sprm}");
+        }
+        // Nothing else changes.
+        assert!(matches!(operand_of(110, true), Some(Operand::Fixed(2))));
+        assert!(matches!(operand_of(114, true), Some(Operand::Var)));
+        let list = [111, 0x7F, 0x00, 24, 1];
+        assert!(translate(&list, true).complete);
+        assert!(!translate(&list, false).complete);
     }
 
     #[test]
     fn test_translate_row_end_gives_the_word97_row_definition_with_zeroed_cells() {
         // 24=1, 25=1, 190 (cb 8: itcMac 2, three boundaries).
         let list = [24, 1, 25, 1, 190, 8, 0, 2, 0, 0, 0xE8, 3, 0xD0, 7];
-        let t = translate(&list);
+        let t = translate(&list, false);
         assert!(t.complete);
         let p97 = super::super::sprm::extract_pap_props(&t.grpprl);
         assert!(p97.f_in_table && p97.is_table_trailing_mark);
@@ -641,7 +668,7 @@ mod tests {
 
     #[test]
     fn test_translate_ttp_without_a_row_definition_still_marks_the_row_end() {
-        let t = translate(&[24, 1, 25, 1]);
+        let t = translate(&[24, 1, 25, 1], false);
         let p97 = super::super::sprm::extract_pap_props(&t.grpprl);
         assert!(p97.is_table_trailing_mark);
         assert!(p97.tap.is_none());
@@ -649,7 +676,7 @@ mod tests {
 
     #[test]
     fn test_translate_stops_at_an_unknown_sprm_and_says_so() {
-        let t = translate(&[24, 1, 250, 9]);
+        let t = translate(&[24, 1, 250, 9], false);
         assert!(!t.complete);
         assert!(super::super::sprm::extract_pap_props(&t.grpprl).f_in_table);
     }
@@ -663,7 +690,7 @@ mod tests {
             &[24][..],
             &[23, 200, 1][..],
         ] {
-            let _ = translate(list);
+            let _ = translate(list, false);
         }
     }
 
@@ -681,6 +708,7 @@ mod tests {
     /// A Word 6 FIB with only the PAPX bin table filled in.
     fn fib_for(plc_at: usize, plc_len: usize) -> Word6Fib {
         Word6Fib {
+            wident: 0xA5DC,
             lid: 0x0409,
             complex: false,
             ext_char: false,

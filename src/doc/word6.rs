@@ -66,6 +66,8 @@ pub(super) fn parse_word2_fib(data: &[u8]) -> Result<Word6Fib> {
 /// The FIB fields the extractor needs, bounded to the stream.
 #[derive(Debug)]
 pub(super) struct Word6Fib {
+    /// `wIdent`: `0xA5DC` for Windows, `0xA697..=0xA699` for the Macintosh variants.
+    pub wident: u16,
     pub lid: u16,
     pub complex: bool,
     /// `fExtChar`: the text is stored in two-byte code units (UTF-16LE)
@@ -119,6 +121,7 @@ pub(super) fn parse_fib(data: &[u8]) -> Result<Word6Fib> {
         *slot = u32_at(0x34 + i * 4);
     }
     Ok(Word6Fib {
+        wident: u16_at(0x00),
         lid: u16_at(0x06),
         complex: flags & 0x0004 != 0,
         ext_char: flags & 0x1000 != 0,
@@ -167,6 +170,10 @@ pub(super) fn pieces(word_doc: &[u8], fib: &Word6Fib) -> Result<Vec<Piece>> {
         // shared extractor reads. A piece that points past the stream
         // contributes nothing.
         for piece in &mut pieces {
+            // A piece's property modifier (`Prm1`, naming a `Prc`) is a list of
+            // one-byte Word 6 sprms here. The shared reader takes it for Word
+            // 97's two-byte opcodes, and a misread one can hide a piece's text.
+            piece.prm_grpprl.clear();
             let fc = if piece.is_compressed {
                 (piece.fc & !0x4000_0000) / 2
             } else {

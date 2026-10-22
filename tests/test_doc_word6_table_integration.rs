@@ -425,3 +425,59 @@ fn test_word6_pieces_that_share_a_few_bytes_are_still_walked() {
     let ir = open_doc(&spec.build()).to_ir();
     assert_eq!(tables(&ir).len(), 1);
 }
+
+/// A one-row, one-cell table, with `prefix` ahead of each paragraph's own table
+/// sprms (a property list as Word writes it, other sprms first).
+fn one_cell_table(prefix: &[u8]) -> Vec<(&'static [u8], Vec<u8>)> {
+    let with = |tail: Vec<u8>| [prefix, &tail].concat();
+    vec![
+        (b"Cell text\x07", with(w6_in_table())),
+        (b"\x07", with(w6_row_end(1, false))),
+    ]
+}
+
+#[test]
+fn test_word6_piece_modifier_is_not_read_as_a_word97_property_list() {
+    // A fast-saved file's pieces can name a property modifier. In Word 6 it is
+    // a list of one-byte sprms; read as Word 97's two-byte opcodes, these bytes
+    // are `sprmCFRMarkDel` (0x0800) = 1 and hide the text of every piece.
+    let mut spec = common::Word6Spec::new(vec![one_cell_table(&[])]);
+    spec.complex = true;
+    spec.piece_prc = vec![0x00, 0x08, 0x01];
+    let ir = open_doc(&spec.build()).to_ir();
+    let t = tables(&ir);
+    assert_eq!(t.len(), 1);
+    assert_eq!(text_of(&t[0].rows[0].cells[0]), "Cell text");
+}
+
+#[test]
+fn test_word6_macintosh_font_sprms_are_two_byte_operands_not_lengths() {
+    // On the Macintosh variants sprms 111-113 carry a 2-byte operand. Read as a
+    // length byte, 0x7F skips past the rest of the list and the table sprms
+    // that follow are never seen.
+    let page = one_cell_table(&[111, 0x7F, 0x00]);
+    for wident in [0xA697u16, 0xA698, 0xA699] {
+        let mut spec = common::Word6Spec::new(vec![page.clone()]);
+        spec.wident = wident;
+        let ir = open_doc(&spec.build()).to_ir();
+        assert_eq!(tables(&ir).len(), 1, "wIdent {wident:#X}");
+    }
+}
+
+#[test]
+fn test_word6_pages_past_the_file_are_reported_as_lost_tables() {
+    // `cpnBtePap` claims far more pages than the file holds. The warning must
+    // say what is lost: for a Word 6/95 file the paragraphs have no structure
+    // to lose, the tables are what cannot be found.
+    let mut spec = common::Word6Spec::new(vec![one_cell_table(&[])]);
+    spec.claimed_pages = Some(300);
+    let ir = open_doc(&spec.build()).to_ir();
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("lie outside the file") && w.contains("tables")),
+        "{:?}",
+        ir.metadata.warnings
+    );
+}

@@ -607,6 +607,11 @@ pub struct Word6Spec<'a> {
     /// pieces are ever over a byte, but a reader that walks every span from the
     /// long one revisits it for every run.
     pub nested_pieces: usize,
+    /// With `complex`: a property modifier (`Prc` grpprl, in Word 6 one-byte
+    /// sprms) that every piece names; empty for none.
+    pub piece_prc: Vec<u8>,
+    /// What the FIB's `cpnBtePap` claims, when it is not the number of pages.
+    pub claimed_pages: Option<usize>,
 }
 
 #[allow(dead_code)]
@@ -624,6 +629,8 @@ impl<'a> Word6Spec<'a> {
             complex: false,
             overlapping_pieces: 1,
             nested_pieces: 0,
+            piece_prc: Vec::new(),
+            claimed_pages: None,
         }
     }
 
@@ -718,7 +725,9 @@ impl<'a> Word6Spec<'a> {
         wd[0xC4..0xC8].copy_from_slice(&plc_len.to_le_bytes());
         // pnPapFirst / cpnBtePap: where the pages are, and how many there are.
         wd[0x18C..0x18E].copy_from_slice(&(first_pn as i16).to_le_bytes());
-        wd[0x190..0x192].copy_from_slice(&(self.pages.len() as i16).to_le_bytes());
+        wd[0x190..0x192].copy_from_slice(
+            &(self.claimed_pages.unwrap_or(self.pages.len()) as i16).to_le_bytes(),
+        );
 
         if !self.section_ends.is_empty() {
             let sed_at = wd.len() as u32;
@@ -762,7 +771,19 @@ impl<'a> Word6Spec<'a> {
                 }
             }
             cps.push(ccp);
-            let mut clx = vec![0x02u8];
+            let mut clx = Vec::new();
+            // A property modifier is a `Prc` (type 1, 2-byte size, grpprl) ahead
+            // of the piece table, named by each piece's `Prm1`: bit 0 set, the
+            // grpprl index in the other 15 bits.
+            let prm: u16 = if self.piece_prc.is_empty() {
+                0
+            } else {
+                clx.push(0x01);
+                clx.extend_from_slice(&(self.piece_prc.len() as u16).to_le_bytes());
+                clx.extend_from_slice(&self.piece_prc);
+                1
+            };
+            clx.push(0x02u8);
             clx.extend_from_slice(&((4 * cps.len() + 8 * fcs.len()) as u32).to_le_bytes());
             for cp in &cps {
                 clx.extend_from_slice(&cp.to_le_bytes());
@@ -770,7 +791,7 @@ impl<'a> Word6Spec<'a> {
             for fc in &fcs {
                 clx.extend_from_slice(&0u16.to_le_bytes());
                 clx.extend_from_slice(&fc.to_le_bytes());
-                clx.extend_from_slice(&0u16.to_le_bytes());
+                clx.extend_from_slice(&prm.to_le_bytes());
             }
             wd.extend_from_slice(&clx);
             wd[0x160..0x164].copy_from_slice(&clx_at.to_le_bytes());
