@@ -80,6 +80,20 @@ pub(super) struct Word6Fib {
     pub ccp: [u32; 8],
     pub fc_clx: u32,
     pub lcb_clx: u32,
+    /// `fcPlcfbtePapx` / `lcbPlcfbtePapx` (at 0xC0 / 0xC4): where the table of
+    /// paragraph-property pages is in the `WordDocument` stream.
+    pub fc_plcf_bte_papx: u32,
+    pub lcb_plcf_bte_papx: u32,
+    /// `pnPapFirst` and `cpnBtePap` (16-bit, at 0x18C and 0x190): the page
+    /// number of the first PAPX page and how many there are. The bin table can
+    /// list fewer than `cpnBtePap`; the rest follow the first in order. Zero
+    /// when the FIB is too short to hold them.
+    pub pn_pap_first: u16,
+    pub cpn_bte_pap: u16,
+    /// `fcPlcfsed` / `lcbPlcfsed` (at 0x88 / 0x8C): the section table, in the
+    /// `WordDocument` stream.
+    pub fc_plcf_sed: u32,
+    pub lcb_plcf_sed: u32,
 }
 
 const FIB_LEN: usize = 0x168;
@@ -113,6 +127,16 @@ pub(super) fn parse_fib(data: &[u8]) -> Result<Word6Fib> {
         ccp,
         fc_clx: u32_at(0x160),
         lcb_clx: u32_at(0x164),
+        fc_plcf_bte_papx: u32_at(0xC0),
+        lcb_plcf_bte_papx: u32_at(0xC4),
+        pn_pap_first: data
+            .get(0x18C..0x18E)
+            .map_or(0, |b| u16::from_le_bytes([b[0], b[1]])),
+        cpn_bte_pap: data
+            .get(0x190..0x192)
+            .map_or(0, |b| u16::from_le_bytes([b[0], b[1]])),
+        fc_plcf_sed: u32_at(0x88),
+        lcb_plcf_sed: u32_at(0x8C),
     })
 }
 

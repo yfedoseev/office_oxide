@@ -542,6 +542,259 @@ pub fn build_word6_doc_with_tail(wident: u16, text: &[u8], tail: &[u8]) -> Vec<u
     build_cfb(&wd, &[0u8; 512])
 }
 
+/// Word 6.0/95 `sprmPFInTable` (sprm 24): the paragraph is in a table.
+#[allow(dead_code)]
+pub fn w6_in_table() -> Vec<u8> {
+    vec![24, 1]
+}
+
+/// Word 6.0/95 row end as Word writes it: `sprmPFInTable` (24), `sprmPFTtp`
+/// (25), the row's other table sprms (`sprmTDxaGapHalf` 184, `sprmTFCantSplit`
+/// 185, `sprmTDyaRowHeight` 189 and the 12-byte `sprmTTableBorders` 187), then
+/// `sprmTDefTable` (190, a 2-byte length counting itself) for `cols` equal
+/// columns: `itcMac`, the column boundaries and one 10-byte `TC` per cell.
+#[allow(dead_code)]
+pub fn w6_row_end(cols: usize, header: bool) -> Vec<u8> {
+    let mut g = vec![24, 1, 25, 1];
+    if header {
+        g.extend_from_slice(&[186, 1]); // sprmTTableHeader
+    }
+    g.extend_from_slice(&[184, 0x6C, 0x00]); // sprmTDxaGapHalf
+    g.extend_from_slice(&[185, 1]); // sprmTFCantSplit
+    g.push(187); // sprmTTableBorders
+    g.extend_from_slice(&[0u8; 12]);
+    g.extend_from_slice(&[189, 0x20, 0x00]); // sprmTDyaRowHeight
+    let mut operand = vec![cols as u8];
+    for c in 0..=cols {
+        operand.extend_from_slice(&((c * 1000) as i16).to_le_bytes());
+    }
+    if cols <= 16 {
+        // rgtc: one 10-byte TC per cell (a very wide row would not fit a page)
+        operand.extend(std::iter::repeat_n(0u8, 10 * cols));
+    }
+    g.push(190); // sprmTDefTable
+    g.extend_from_slice(&((operand.len() + 1) as u16).to_le_bytes());
+    g.extend_from_slice(&operand);
+    g
+}
+
+/// How a synthetic Word 6.0/95 `.doc` is laid out.
+#[allow(dead_code)]
+pub struct Word6Spec<'a> {
+    /// `wIdent`: `0xA5DC`, or one of the three Macintosh variants.
+    pub wident: u16,
+    /// FKP pages; each page's paragraphs are `(text, Word 6 grpprl)` and the
+    /// pages follow one another in the text.
+    pub pages: Vec<Vec<(&'a [u8], Vec<u8>)>>,
+    /// Text after the last page's paragraphs that no FKP run describes.
+    pub tail: &'a [u8],
+    /// How many pages the bin table lists. The FIB's `cpnBtePap` always counts
+    /// them all, so listing fewer is an incomplete bin table.
+    pub listed_pages: usize,
+    /// Name each listed page twice.
+    pub duplicate_listed: bool,
+    /// `PlcfSed` section end CPs; empty writes no `PlcfSed`.
+    pub section_ends: Vec<u32>,
+    /// `fExtChar`: the text is two-byte code units.
+    pub ext_char: bool,
+    /// A fast-saved file: a CLX with one piece describes the text.
+    pub complex: bool,
+}
+
+#[allow(dead_code)]
+impl<'a> Word6Spec<'a> {
+    pub fn new(pages: Vec<Vec<(&'a [u8], Vec<u8>)>>) -> Self {
+        let listed_pages = pages.len();
+        Self {
+            wident: 0xA5DC,
+            pages,
+            tail: &[],
+            listed_pages,
+            duplicate_listed: false,
+            section_ends: Vec::new(),
+            ext_char: false,
+            complex: false,
+        }
+    }
+
+    /// The `.doc`: FIB, text, one 512-byte FKP page per spec page, then the
+    /// `PlcfBtePapx` (FCs, then 2-byte page numbers), the `PlcfSed` and the CLX.
+    pub fn build(&self) -> Vec<u8> {
+        let unit = if self.ext_char { 2 } else { 1 };
+        let widen = |t: &[u8]| -> Vec<u8> {
+            if self.ext_char {
+                t.iter().flat_map(|&b| [b, 0]).collect()
+            } else {
+                t.to_vec()
+            }
+        };
+        let fc_min = 0x300u32;
+        let mut text = Vec::new();
+        for page in &self.pages {
+            for (t, _) in page {
+                text.extend(widen(t));
+            }
+        }
+        text.extend(widen(self.tail));
+        let ccp = (text.len() / unit) as u32;
+
+        let mut wd = vec![0u8; fc_min as usize];
+        wd[0..2].copy_from_slice(&self.wident.to_le_bytes());
+        wd[2..4].copy_from_slice(&101u16.to_le_bytes());
+        wd[6..8].copy_from_slice(&0x0409u16.to_le_bytes());
+        let mut flags = 0u16;
+        if self.complex {
+            flags |= 0x0004;
+        }
+        if self.ext_char {
+            flags |= 0x1000;
+        }
+        wd[0x0A..0x0C].copy_from_slice(&flags.to_le_bytes());
+        wd[0x18..0x1C].copy_from_slice(&fc_min.to_le_bytes());
+        wd[0x1C..0x20].copy_from_slice(&(fc_min + text.len() as u32).to_le_bytes());
+        wd[0x34..0x38].copy_from_slice(&ccp.to_le_bytes());
+        wd.extend_from_slice(&text);
+        wd.resize(wd.len().div_ceil(512) * 512, 0);
+
+        // The FKP pages.
+        let first_pn = (wd.len() / 512) as u16;
+        let mut fc = fc_min;
+        for page_runs in &self.pages {
+            let crun = page_runs.len();
+            let mut page = vec![0u8; 512];
+            let mut papx_at = 4 * (crun + 1) + 7 * crun;
+            papx_at += papx_at % 2;
+            for (i, (t, grpprl)) in page_runs.iter().enumerate() {
+                page[4 * i..4 * i + 4].copy_from_slice(&fc.to_le_bytes());
+                fc += (t.len() * unit) as u32;
+                let mut body = vec![0u8, 0u8]; // istd
+                body.extend_from_slice(grpprl);
+                if body.len() % 2 == 1 {
+                    body.push(0);
+                }
+                page[4 * (crun + 1) + 7 * i] = (papx_at / 2) as u8;
+                page[papx_at] = (body.len() / 2) as u8;
+                page[papx_at + 1..papx_at + 1 + body.len()].copy_from_slice(&body);
+                papx_at += 1 + body.len();
+                papx_at += papx_at % 2;
+            }
+            page[4 * crun..4 * crun + 4].copy_from_slice(&fc.to_le_bytes());
+            page[511] = crun as u8;
+            wd.extend_from_slice(&page);
+        }
+
+        // The PlcfBtePapx lists the first `listed_pages` pages.
+        let listed: Vec<u16> = (0..self.listed_pages.min(self.pages.len()))
+            .flat_map(|i| {
+                let pn = first_pn + i as u16;
+                if self.duplicate_listed {
+                    vec![pn, pn]
+                } else {
+                    vec![pn]
+                }
+            })
+            .collect();
+        let plc_at = wd.len() as u32;
+        for i in 0..=listed.len() {
+            let fc_i = fc_min + (i as u32) * 8;
+            wd.extend_from_slice(&fc_i.to_le_bytes());
+        }
+        for pn in &listed {
+            wd.extend_from_slice(&pn.to_le_bytes());
+        }
+        let plc_len = (4 * (listed.len() + 1) + 2 * listed.len()) as u32;
+        wd[0xC0..0xC4].copy_from_slice(&plc_at.to_le_bytes());
+        wd[0xC4..0xC8].copy_from_slice(&plc_len.to_le_bytes());
+        // pnPapFirst / cpnBtePap: where the pages are, and how many there are.
+        wd[0x18C..0x18E].copy_from_slice(&(first_pn as i16).to_le_bytes());
+        wd[0x190..0x192].copy_from_slice(&(self.pages.len() as i16).to_le_bytes());
+
+        if !self.section_ends.is_empty() {
+            let sed_at = wd.len() as u32;
+            wd.extend_from_slice(&0u32.to_le_bytes());
+            for cp in &self.section_ends {
+                wd.extend_from_slice(&cp.to_le_bytes());
+            }
+            wd.extend(std::iter::repeat_n(0u8, 12 * self.section_ends.len())); // SEDs
+            let len = (4 * (self.section_ends.len() + 1) + 12 * self.section_ends.len()) as u32;
+            wd[0x88..0x8C].copy_from_slice(&sed_at.to_le_bytes());
+            wd[0x8C..0x90].copy_from_slice(&len.to_le_bytes());
+        }
+
+        if self.complex {
+            // A CLX with one 8-bit (or, with `fExtChar`, 16-bit) piece over all
+            // the text: `fc` carries `byte offset * 2` with bit 30 set.
+            let clx_at = wd.len() as u32;
+            let mut clx = vec![0x02u8];
+            clx.extend_from_slice(&16u32.to_le_bytes());
+            clx.extend_from_slice(&0u32.to_le_bytes());
+            clx.extend_from_slice(&ccp.to_le_bytes());
+            clx.extend_from_slice(&0u16.to_le_bytes());
+            let piece_fc = if self.ext_char {
+                fc_min
+            } else {
+                (fc_min * 2) | 0x4000_0000
+            };
+            clx.extend_from_slice(&piece_fc.to_le_bytes());
+            clx.extend_from_slice(&0u16.to_le_bytes());
+            wd.extend_from_slice(&clx);
+            wd[0x160..0x164].copy_from_slice(&clx_at.to_le_bytes());
+            wd[0x164..0x168].copy_from_slice(&(clx.len() as u32).to_le_bytes());
+        }
+        wd.resize(wd.len().div_ceil(512) * 512, 0);
+        build_cfb(&wd, &[0u8; 512])
+    }
+}
+
+/// A Word 6.0/95 `.doc` whose paragraphs carry PAPX property lists: one FKP
+/// page, every paragraph described.
+#[allow(dead_code)]
+pub fn build_word6_doc_with_papx(wident: u16, paras: &[(&[u8], Vec<u8>)]) -> Vec<u8> {
+    let mut spec = Word6Spec::new(vec![paras.to_vec()]);
+    spec.wident = wident;
+    spec.build()
+}
+
+/// As [`build_word6_doc_with_papx`], but the FKP describes only the first
+/// `covered` paragraphs: the rest of the text has no PAPX run, as in a real file
+/// whose last page stops short of the text it is indexed for.
+#[allow(dead_code)]
+pub fn build_word6_doc_with_papx_covering(
+    wident: u16,
+    paras: &[(&[u8], Vec<u8>)],
+    covered: usize,
+) -> Vec<u8> {
+    let covered = covered.min(paras.len());
+    let tail: Vec<u8> = paras[covered..]
+        .iter()
+        .flat_map(|(t, _)| t.iter().copied())
+        .collect();
+    let mut spec = Word6Spec::new(vec![paras[..covered].to_vec()]);
+    spec.wident = wident;
+    spec.tail = &tail;
+    spec.build()
+}
+
+/// A Word 6.0/95 document whose FIB points `PlcfBtePapx` far past the end of the
+/// stream.
+#[allow(dead_code)]
+pub fn open_word6_with_bad_papx_pointer(wident: u16) -> Document {
+    let fc_min = 0x300u32;
+    let text = b"A\x07B\x07\x07";
+    let mut wd = vec![0u8; fc_min as usize];
+    wd[0..2].copy_from_slice(&wident.to_le_bytes());
+    wd[2..4].copy_from_slice(&101u16.to_le_bytes());
+    wd[6..8].copy_from_slice(&0x0409u16.to_le_bytes());
+    wd[0x18..0x1C].copy_from_slice(&fc_min.to_le_bytes());
+    wd[0x1C..0x20].copy_from_slice(&(fc_min + text.len() as u32).to_le_bytes());
+    wd[0x34..0x38].copy_from_slice(&(text.len() as u32).to_le_bytes());
+    wd[0xC0..0xC4].copy_from_slice(&0x00F0_0000u32.to_le_bytes());
+    wd[0xC4..0xC8].copy_from_slice(&16u32.to_le_bytes());
+    wd.extend_from_slice(text);
+    wd.resize(wd.len().div_ceil(512) * 512, 0);
+    open_doc(&build_cfb(&wd, &[0u8; 512]))
+}
+
 // ── CFB / DOC byte construction ──
 
 /// Write the FIB into the first 512 bytes of `word_doc`.

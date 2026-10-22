@@ -508,9 +508,11 @@ impl DocDocument {
     }
 
     /// Word 6.0/95: the text of every story, decoded from the document's
-    /// code page, with no paragraph structure (there is no PAPX index
-    /// this reader understands for the format) — `doc_to_ir` falls back
-    /// to its line heuristic, as it does for any Word 97 file without one.
+    /// code page. Paragraph properties are read only for the tables they
+    /// describe (see `word6_papx`): a file with a table is walked paragraph by
+    /// paragraph, and any other file has no paragraph structure, so
+    /// `doc_to_ir` falls back to its line heuristic, as it does for any Word 97
+    /// file without one.
     fn from_word6<R: Read + Seek>(cfb: &mut CfbReader<R>, word_doc: &[u8]) -> Result<Self> {
         let fib = super::word6::parse_fib(word_doc)?;
         let pieces = super::word6::pieces(word_doc, &fib)?;
@@ -540,11 +542,33 @@ impl DocDocument {
         let _ = images.set(extract_images(word_doc));
         let summary_properties = crate::cfb::read_document_properties(cfb);
         let text_complete = text_complete && cfb.truncated_streams().is_empty();
+        // The paragraph properties, for the tables they describe. A file with no
+        // table (or none readable) keeps the text-only line heuristic, so only a
+        // file that gains tables changes; sections, styles and the rest of the
+        // paragraph properties are not read for Word 6/95.
+        let papx = super::word6_papx::read_papx(word_doc, &fib);
+        let paragraphs = if !papx.has_table {
+            Vec::new()
+        } else {
+            let section_ends = parse_plcf_sed_ends(word_doc, fib.fc_plcf_sed, fib.lcb_plcf_sed);
+            build_paragraphs(
+                word_doc,
+                &pieces,
+                &papx.runs,
+                fib.ccp[0],
+                fib.lid,
+                &[],
+                &section_ends,
+                &[],
+            )
+        };
+        let mut warnings = container_warnings(cfb);
+        warnings.extend(papx.warnings);
         Ok(Self {
             text,
             data_stream: Vec::new(),
             images,
-            paragraphs: Vec::new(),
+            paragraphs,
             subdocuments,
             has_macros,
             text_complete,
@@ -554,7 +578,7 @@ impl DocDocument {
             header_footers: Vec::new(),
             comments: Vec::new(),
             ole_objects: super::ole_objects::extract_ole_objects(cfb),
-            warnings: container_warnings(cfb),
+            warnings,
         })
     }
 

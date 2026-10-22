@@ -22,6 +22,7 @@ mod piece_table;
 mod sprm;
 pub(crate) mod styles;
 mod word6;
+mod word6_papx;
 
 /// The deepest outline level MS-DOC stores: `Heading 1`–`Heading 9`. The
 /// `StdfBase.sti` and a user-defined `Heading N` style name use this range,

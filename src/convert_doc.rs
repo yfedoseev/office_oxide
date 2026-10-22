@@ -755,6 +755,12 @@ fn walk_paragraphs(
     for p in paragraphs {
         if p.props.is_table_trailing_mark {
             flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
+            // A row end carries no text in a well-formed file. A damaged
+            // property list can mark a paragraph that does as the row end; its
+            // text is a cell's content, and dropping it would lose it silently.
+            if !p.text.is_empty() {
+                table.add_cell_paragraph(p);
+            }
             table.end_row(p.props.tap.clone(), p.props.itap, p.props.f_table_header);
         } else if p.props.f_in_table {
             flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
