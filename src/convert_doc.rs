@@ -408,6 +408,7 @@ impl TableBuilder {
                 space_before_twips: p.props.space_before_twips,
                 space_after_twips: p.props.space_after_twips,
                 line_spacing: p.props.line_spacing.clone(),
+                style: p.props.style_name.clone(),
                 ..Default::default()
             }));
         }
@@ -704,6 +705,9 @@ fn is_doc_list_item(ilfo: Option<i16>) -> bool {
 }
 
 /// Returns how many tables holding nested tables were flattened.
+/// One accumulated list item: its level, inline content and paragraph style.
+type ListItemSource = (u8, Vec<InlineContent>, Option<String>);
+
 fn walk_paragraphs(
     paragraphs: &[DocParagraph],
     has_structured_headings: bool,
@@ -711,7 +715,7 @@ fn walk_paragraphs(
     list_formatting: &ListFormatting,
 ) -> usize {
     let mut table = TableBuilder::new();
-    let mut list_items: Vec<(u8, Vec<InlineContent>)> = Vec::new();
+    let mut list_items: Vec<ListItemSource> = Vec::new();
     // The run's own `ilfo` — every item in one contiguous list
     // run shares the same `ilfo`/`ilvl`-derived list identity in practice
     // (a change of `ilfo` mid-run would itself interrupt list-item
@@ -752,7 +756,11 @@ fn walk_paragraphs(
             if list_ilfo.is_none() {
                 list_ilfo = p.props.ilfo;
             }
-            list_items.push((ilvl, inline_content_for(&p.text, &p.hyperlinks, &p.chp_runs)));
+            list_items.push((
+                ilvl,
+                inline_content_for(&p.text, &p.hyperlinks, &p.chp_runs),
+                p.props.style_name.clone(),
+            ));
         } else {
             table.flush(elements);
             flush_list(&mut list_items, list_ilfo.take(), list_formatting, elements);
@@ -775,6 +783,7 @@ fn walk_paragraphs(
                     space_before_twips: p.props.space_before_twips,
                     space_after_twips: p.props.space_after_twips,
                     line_spacing: p.props.line_spacing.clone(),
+                    style: p.props.style_name.clone(),
                     ..Default::default()
                 }));
             } else {
@@ -795,7 +804,7 @@ fn walk_paragraphs(
 /// that doesn't resolve) degrades to the pre-list-format contract — bullet,
 /// `start_number: None` — rather than erroring.
 fn flush_list(
-    items: &mut Vec<(u8, Vec<InlineContent>)>,
+    items: &mut Vec<ListItemSource>,
     ilfo: Option<i16>,
     list_formatting: &ListFormatting,
     elements: &mut Vec<Element>,
@@ -807,14 +816,19 @@ fn flush_list(
     // level in this run as the base so a run whose top level is e.g. 1 is not
     // collapsed by `build_nested_list` (which would otherwise treat every
     // item as a child of the first and drop the rest when base_level is 0).
-    let base_level = items.iter().map(|(lvl, _)| *lvl).min().unwrap_or(0);
+    let base_level = items.iter().map(|(lvl, _, _)| *lvl).min().unwrap_or(0);
     let level = ilfo.and_then(|ilfo| list_formatting.level_for(ilfo, base_level));
     let ordered = level.is_some_and(|l| l.is_numbered());
     let start_number = level
         .filter(|l| l.is_numbered() && l.start_at != 1)
         .map(|l| l.start_at as u32);
 
-    let mut list = build_nested_list(ordered, items, base_level);
+    let flat: Vec<(u8, Vec<InlineContent>)> = items
+        .iter()
+        .map(|(lvl, content, _)| (*lvl, content.clone()))
+        .collect();
+    let mut list = build_nested_list(ordered, &flat, base_level);
+    crate::ir::assign_list_item_styles(&mut list, &mut items.drain(..).map(|(_, _, style)| style));
     list.start_number = start_number;
     elements.push(Element::List(list));
     items.clear();
@@ -1064,6 +1078,7 @@ fn emit_prose(
             space_before_twips: props.space_before_twips,
             space_after_twips: props.space_after_twips,
             line_spacing: props.line_spacing.clone(),
+            style: props.style_name.clone(),
             ..Default::default()
         }));
     }

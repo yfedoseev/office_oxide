@@ -199,6 +199,8 @@ fn maximal_properties_corpus(out: &str) {
         // Not exercised here: no writer currently emits `<p:ph type="...">`
         // from this field (placeholder roles are read-only: PPTX/PPT -> IR).
         placeholder_role: None,
+        // Read-only too: the writers do not emit `w:pStyle` from it.
+        style: None,
     };
 
     let ir = DocumentIR {

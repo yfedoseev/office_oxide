@@ -25,7 +25,7 @@ use super::piece_table::{
 };
 use super::sprm::{ChpProps, HugeBudget, PapProps};
 use super::sprm::{LevelSource, OutlineLevel};
-use super::styles::{StyleDef, heading_level_for_istd};
+use super::styles::{StyleDef, heading_level_for_istd, style_name_for_istd};
 
 /// A paragraph descriptor recovered from a PAPX FKP page.
 #[derive(Debug, Clone)]
@@ -573,6 +573,7 @@ fn emit_paragraph(
     // PAPX header `istd` when the override is absent.
     let istd = props.style_istd.unwrap_or(run.istd);
     props.outline_level = resolve_outline_level(&props, istd, styles);
+    props.style_name = style_name_for_istd(styles, istd);
     out.push(DocParagraph {
         text: content,
         terminator,

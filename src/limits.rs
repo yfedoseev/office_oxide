@@ -12,8 +12,10 @@
 //! per-document budget and stop, loudly, when it is spent. The word-
 //! processing and presentation paths do not: their text is stored once
 //! per occurrence, so its size is already bounded by the package's
-//! decompressed size. Apache POI does the same with
-//! `ZipSecureFile.setMaxTextSize`.
+//! decompressed size. The one exception is a paragraph style's name,
+//! which is stored once in the style sheet and copied into every
+//! paragraph that uses the style; `clean_style_name` bounds it. Apache
+//! POI does the same with `ZipSecureFile.setMaxTextSize`.
 //!
 //! The default keeps every genuine workbook this crate has been tested
 //! against (the largest, 181 MB of cell text, with room to spare) and
@@ -143,6 +145,38 @@ impl TextBudget {
             self.total
         )
     }
+}
+
+/// The longest paragraph-style name exposed, in characters: Word's own limit
+/// for a style name.
+///
+/// A style's name is stored once in the style sheet and copied into every
+/// paragraph that uses the style, so without a bound a few kilobytes of
+/// document multiply into gigabytes of output (one megabyte of name times the
+/// number of paragraphs).
+pub(crate) const MAX_STYLE_NAME_CHARS: usize = 255;
+
+/// The name without surrounding whitespace and without a NUL terminator.
+///
+/// `xstzName` is a null-terminated string, and some producers count the
+/// terminator in its length, so `body\0` is the name `body`.
+fn trim_style_name(raw: &str) -> &str {
+    raw.trim_matches(|c: char| c.is_whitespace() || c == '\0')
+}
+
+/// Whether `raw` is a style name that cannot be exposed: longer than
+/// [`MAX_STYLE_NAME_CHARS`] or containing a control character. (A blank name
+/// is not a name either, but it is simply absent, not worth a warning.)
+pub(crate) fn is_unusable_style_name(raw: &str) -> bool {
+    let name = trim_style_name(raw);
+    name.chars().count() > MAX_STYLE_NAME_CHARS || name.chars().any(char::is_control)
+}
+
+/// A style name as exposed on `Paragraph::style`: trimmed, or `None` when it
+/// is blank or [unusable](is_unusable_style_name).
+pub(crate) fn clean_style_name(raw: &str) -> Option<String> {
+    let name = trim_style_name(raw);
+    (!name.is_empty() && !is_unusable_style_name(name)).then(|| name.to_owned())
 }
 
 #[cfg(test)]

@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Measured against v0.1.15 on the 712 unique `.doc`/`.dot` files under `~/projects`: 673 are byte-identical in both the IR and the text output, 39 change, none gains an error, and none loses or gains a word, a row, or a character of text. The 39 are all tables: for example 307 tables become 5, 161 become 6, and 134 become 33. On those files the table count and the header-row count match Apache POI's HWPF (`Table`, `TableRow.isTableHeader()`) in every file POI opens, except for table counts in four: three where this fix changes nothing (nested-table handling) and one that moves toward POI's count.
 
+### Added
+
+- **`Paragraph::style`: the paragraph style a document applies ([#455](https://github.com/yfedoseev/office_oxide/issues/455); requested by @xugangqiang, with the legislation use case from @nils-blockkin).** A paragraph in Word's Caption style, or in a legislation style such as `section-e`, used to come out as a plain paragraph in the IR, so a consumer could not tell it from body text. The IR now carries the style's display name (`"style": "Caption"` in the JSON, omitted when absent) for body, table-cell and list-item paragraphs of `.docx` and `.doc`; `None` means the default style or no known name. Names follow python-docx: DOCX shows Word's lower-case built-ins capitalized (`caption` → `Caption`), and an id the style sheet does not define, or one naming a character or table style, is the default style. In `.doc`, Heading 1–9, Header, Footer and Caption are reported under those English names whatever language the file was saved in; other styles keep the stored name, which may be localized. The default style is recognised by `w:default` / `istd` 0, never by its name. A name that is blank, longer than 255 characters (Word's limit) or holds a control character is not exposed and is reported once in `Metadata::warnings`; the cap also stops one huge style name from being copied into every paragraph that uses it.
+
+  **Source compatibility:** `ir::Paragraph` gained a public field and is not `#[non_exhaustive]`, so a struct literal that names every field no longer compiles; build it with `..Default::default()` (the pdf_oxide crate already does). The JSON is compatible both ways. The DOCX and PPTX writers do not emit the style.
+
+  Measured against the unmodified build on 10,060 unique `.doc`/`.docx`/`.xls`/`.xlsx`/`.ppt`/`.pptx` files: with the new key removed from paragraphs the IR is identical for every file that opens (9,736 files, and 313 that fail identically in both builds).
+
 ## [0.1.15] - 2026-10-15
 
 ### Added

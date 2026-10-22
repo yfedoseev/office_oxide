@@ -407,6 +407,18 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
                 .chain(crate::core::core_properties::package_warnings(Some(
                     &doc.package_properties,
                 )))
+                .chain(
+                    doc.styles
+                        .as_ref()
+                        .filter(|s| s.unusable_style_names > 0)
+                        .map(|s| {
+                            format!(
+                                "{} paragraph style name(s) were not exposed because they exceed \
+                                 255 characters or contain control characters",
+                                s.unusable_style_names
+                            )
+                        }),
+                )
                 .collect(),
             ..crate::core::core_properties::ooxml_metadata_extras(
                 cp,
@@ -864,11 +876,13 @@ fn convert_block_elements(
                     // from every IR-backed surface while `plain_text()`
                     // kept it (75 corpus files).
                     let frame_pos = paragraph_frame_position(p);
+                    let style = paragraph_style_name(p, doc);
                     let make_para = |content: Vec<InlineContent>| {
                         let mut para = Paragraph {
                             content,
                             frame_position: frame_pos.clone(),
                             alignment: alignment.clone(),
+                            style: style.clone(),
                             ..Default::default()
                         };
                         if let Some(pp) = eff_ref {
@@ -1288,6 +1302,13 @@ fn resolve_heading_level(
         .and_then(heading_level_from_style_name)
 }
 
+/// The display name of the paragraph's explicit style, `None` for the default
+/// style, no style, or one the document does not define.
+fn paragraph_style_name(p: &crate::docx::Paragraph, doc: &Cx<'_, '_>) -> Option<String> {
+    let id = p.properties.as_ref()?.style_id.as_deref()?;
+    doc.styles.as_ref()?.paragraph_style_name(id)
+}
+
 /// Everything `convert_run` needs from the enclosing document to resolve a
 /// run's effective formatting.
 struct RunContext<'a, 'd> {
@@ -1661,6 +1682,7 @@ fn convert_list_group(
 ) -> Element {
     let mut first_properties = Some(first_properties);
     let mut items = Vec::new();
+    let mut item_styles: Vec<Option<String>> = Vec::new();
     let mut is_ordered = false;
     // How many items at the group's own (shallowest) level this group
     // contributes — used to advance `numbering_counts` for
@@ -1731,6 +1753,7 @@ fn convert_list_group(
                     top_level_item_count += 1;
                 }
                 items.push((nr.ilvl, convert_paragraph_inline(p, doc)));
+                item_styles.push(paragraph_style_name(p, doc));
                 *i += 1;
                 continue;
             }
@@ -1759,6 +1782,7 @@ fn convert_list_group(
 
     // Build nested list structure from flat (ilvl, content) pairs
     let mut list = crate::ir::build_nested_list(is_ordered, &items, 0);
+    crate::ir::assign_list_item_styles(&mut list, &mut item_styles.into_iter());
     let mut next_item = 0;
     apply_level_markers(&mut list, &items, &mut next_item, &markers, top_ilvl);
     list.start_number = start_number;

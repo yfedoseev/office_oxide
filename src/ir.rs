@@ -1204,6 +1204,36 @@ pub struct TabStop {
 pub struct Paragraph {
     /// Inline runs making up this paragraph.
     pub content: Vec<InlineContent>,
+    /// Display name of the paragraph style the document applies to this
+    /// paragraph (`Caption`, `Body Text`, a legislation style such as
+    /// `section-e`, …) in body text, table cells and list items.
+    ///
+    /// `None` means no style name is known, which includes:
+    /// - the document's default paragraph style (what Word calls `Normal`),
+    ///   recognised by `w:default` in DOCX and by `istd` 0 in `.doc`, never by
+    ///   name, which Word localizes;
+    /// - a style the document does not define, or one that is not a paragraph
+    ///   style (the default style applies, as in python-docx);
+    /// - a name that is blank, longer than 255 characters or holds a control
+    ///   character (reported once in `Metadata::warnings`);
+    /// - paragraphs the converter builds itself or does not take from a styled
+    ///   source paragraph: `.doc` headers, footers, footnotes, comments and
+    ///   text boxes, Word 6/95 files, and every PPTX, XLSX, XLS and PPT
+    ///   paragraph.
+    ///
+    /// Headings are `Element::Heading` and carry their level instead, though a
+    /// paragraph in a heading style that states it is body text stays a
+    /// `Paragraph` with the name.
+    ///
+    /// DOCX: the style's `w:name`, with Word's lower-case spellings of the
+    /// built-ins it displays capitalized (`caption`, `heading 1`, `header`,
+    /// `footer`) capitalized. `.doc`: Heading 1–9, Header, Footer and Caption
+    /// under those same English names whatever language the file was saved
+    /// in; any other style keeps the name stored in the file, which may be
+    /// localized, without an alias after a comma. Other built-in styles are
+    /// therefore not comparable between the formats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
     /// Horizontal alignment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alignment: Option<ParagraphAlignment>,
@@ -1711,6 +1741,28 @@ pub fn build_nested_list(
         ordered,
         items: list_items,
         ..Default::default()
+    }
+}
+
+/// Give each item of a list built by [`build_nested_list`] the paragraph style
+/// of the source paragraph it came from.
+///
+/// `styles` is in the order of the flat items the list was built from, which is
+/// the pre-order of the finished tree: an item, then its nested sub-list, then
+/// its next sibling. An item with no content has no paragraph to carry a
+/// style, but still consumes its entry.
+pub(crate) fn assign_list_item_styles(
+    list: &mut List,
+    styles: &mut impl Iterator<Item = Option<String>>,
+) {
+    for item in &mut list.items {
+        let style = styles.next().flatten();
+        if let Some(Element::Paragraph(p)) = item.content.first_mut() {
+            p.style = style;
+        }
+        if let Some(nested) = item.nested.as_mut() {
+            assign_list_item_styles(nested, styles);
+        }
     }
 }
 

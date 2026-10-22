@@ -33,6 +33,38 @@ pub struct StyleDef {
     pub own_outline: Option<u8>,
 }
 
+/// The display name of style `istd`, or `None` for the default style, a style
+/// with no usable name, or an index outside the sheet.
+///
+/// `istd` 0 is the default paragraph style (`Normal`, [MS-DOC] §2.9.260
+/// `StdfBase.sti` 0) however the producing application named it: the name is
+/// localized, so it is the position and not the name that identifies it. A
+/// built-in style is identified by its `sti` and its stored name is the
+/// producing Word's language, so the styles `.docx` also normalizes (Heading
+/// 1–9, Header, Footer, Caption) are reported under their canonical English
+/// name; the others keep the stored name. A name may be stored as
+/// `"primary,alias,alias"` ([MS-DOC] §2.9.258); only the primary is the style's
+/// name.
+pub fn style_name_for_istd(styles: &[StyleDef], istd: u16) -> Option<String> {
+    if istd == 0 {
+        return None;
+    }
+    let style = styles.get(usize::from(istd))?;
+    let canonical = match style.sti {
+        // [MS-DOC] §2.9.260 `sti`: 1–9 Heading 1–9, 31 Header, 32 Footer,
+        // 34 Caption.
+        n @ 1..=9 => return Some(format!("Heading {n}")),
+        31 => Some("Header"),
+        32 => Some("Footer"),
+        34 => Some("Caption"),
+        _ => None,
+    };
+    match canonical {
+        Some(name) => Some(name.to_owned()),
+        None => crate::limits::clean_style_name(style.name.split(',').next()?),
+    }
+}
+
 /// The longest `istdBase` chain followed when resolving a style's heading
 /// level. Real style sheets nest a handful of levels; the bound is what ends a
 /// cyclic chain (or a hostile one thousands deep) without a visited set, and
@@ -95,7 +127,19 @@ pub fn parse_style_sheet(table_stream: &[u8], fib: &Fib) -> StyleSheet {
             table_stream.len()
         ));
     }
-    parse_stsh(&table_stream[start..end])
+    let mut sheet = parse_stsh(&table_stream[start..end]);
+    let unusable = sheet
+        .styles
+        .iter()
+        .filter(|s| crate::limits::is_unusable_style_name(s.name.split(',').next().unwrap_or("")))
+        .count();
+    if unusable > 0 {
+        sheet.warnings.push(format!(
+            "{unusable} style name(s) were not exposed because they exceed 255 characters or \
+             contain control characters"
+        ));
+    }
+    sheet
 }
 
 /// Resolve a paragraph's `istd` (optionally overridden by `sprmPIstd`) to a
@@ -1101,5 +1145,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_style_name_for_istd_default_alias_empty_and_out_of_range() {
+        let def = |name: &str| StyleDef {
+            sti: 0x0FFE,
+            name: name.to_owned(),
+            base: None,
+            own_outline: None,
+        };
+        let styles = vec![
+            def("Normal"),
+            def("Caption,Legende"),
+            def(""),
+            def("  spaced  ,x"),
+        ];
+        assert_eq!(style_name_for_istd(&styles, 0), None, "istd 0 is the default style");
+        assert_eq!(style_name_for_istd(&styles, 1).as_deref(), Some("Caption"));
+        assert_eq!(style_name_for_istd(&styles, 2), None, "an unnamed slot");
+        assert_eq!(style_name_for_istd(&styles, 3).as_deref(), Some("spaced"));
+        assert_eq!(style_name_for_istd(&styles, 4), None, "past the end of the sheet");
+        assert_eq!(style_name_for_istd(&styles, u16::MAX), None);
+        assert_eq!(style_name_for_istd(&[], 5), None);
+    }
+
+    #[test]
+    fn test_style_name_for_istd_built_ins_are_canonical_and_the_rest_keep_the_stored_name() {
+        let def = |sti: u16, name: &str| StyleDef {
+            sti,
+            name: name.to_owned(),
+            base: None,
+            own_outline: None,
+        };
+        let styles = vec![
+            def(0, "Standard"),
+            def(1, "Überschrift 1"),
+            def(9, "Überschrift 9"),
+            def(31, "Kopfzeile"),
+            def(32, "Fußzeile"),
+            def(34, "Beschriftung"),
+            def(30, "Commentaire"),
+            def(0x0FFE, "section-e"),
+        ];
+        let n = |i| style_name_for_istd(&styles, i);
+        assert_eq!(n(0), None);
+        assert_eq!(n(1).as_deref(), Some("Heading 1"));
+        assert_eq!(n(2).as_deref(), Some("Heading 9"));
+        assert_eq!(n(3).as_deref(), Some("Header"));
+        assert_eq!(n(4).as_deref(), Some("Footer"));
+        assert_eq!(n(5).as_deref(), Some("Caption"));
+        assert_eq!(n(6).as_deref(), Some("Commentaire"), "not in the canonical set");
+        assert_eq!(n(7).as_deref(), Some("section-e"));
+    }
+
+    #[test]
+    fn test_style_name_for_istd_rejects_unusable_names() {
+        let def = |name: &str| StyleDef {
+            sti: 0x0FFE,
+            name: name.to_owned(),
+            base: None,
+            own_outline: None,
+        };
+        let styles = vec![
+            def("Normal"),
+            def(&"N".repeat(256)),
+            def("a\u{0}b"),
+            def(&"M".repeat(255)),
+        ];
+        assert_eq!(style_name_for_istd(&styles, 1), None, "over 255 characters");
+        assert_eq!(style_name_for_istd(&styles, 2), None, "control character");
+        assert_eq!(style_name_for_istd(&styles, 3).map(|n| n.len()), Some(255));
     }
 }

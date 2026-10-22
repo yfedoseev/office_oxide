@@ -320,6 +320,10 @@ pub struct PapProps {
     pub f_table_header: bool,
     /// `sprmPItap` (0x6649): table nesting depth (1 = top-level table).
     pub itap: u8,
+    /// Display name of the paragraph's style, resolved by `build_paragraphs`
+    /// from its `istd` (so `extract_pap_props` alone leaves it `None`). `None`
+    /// also for the default style (`istd` 0) and for a style with no name.
+    pub style_name: Option<String>,
     /// List level (0-based) when the paragraph is a list item. `None` when
     /// the paragraph carries no list SPRM. (Reserved for list support; the
     /// `table.doc` fixture has no in-body lists to verify this against.)
