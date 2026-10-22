@@ -503,9 +503,10 @@ impl TableBuilder {
 
 /// The vertical-merge state lives in a 2-bit field of the `TCGRF` `rgf`
 /// (MS-DOC §2.9.185 `TCGRF`): bits 5-6, `fVertMerge`. The three legal values
-/// are `fvmClear = 0` (not merged, no constant: it is the default), `fvmMerge = 1` (continuation of the merge
-/// started above), and `fvmRestart = 3` (first cell of a merge). As raw `rgf`
-/// bits that is `fvmMerge = 0x0020` and `fvmRestart = 0x0060` (both bits set).
+/// are `fvmClear = 0` (not merged; the default, so it has no constant here),
+/// `fvmMerge = 1` (continuation of the merge started above), and
+/// `fvmRestart = 3` (first cell of a merge). As raw `rgf` bits that is
+/// `fvmMerge = 0x0020` and `fvmRestart = 0x0060` (both bits set).
 const FVM_MERGE: u8 = 1; // rgf 0x0020
 const FVM_RESTART: u8 = 3; // rgf 0x0060
 
@@ -605,8 +606,20 @@ struct OpenMerge {
     edge: i32,
     /// The row and cell that started it, which carries its `row_span`.
     origin: (usize, usize),
-    /// Already continued by a cell of the row being read.
-    taken: bool,
+}
+
+/// The first index at or after `i` not yet taken, where `skip[j] == j` marks a
+/// free entry and a taken one points at a later candidate. Path compression
+/// makes a run of taken entries cost the length of the run once, not for every
+/// cell that looks at it.
+fn first_free(skip: &mut [usize], mut i: usize) -> usize {
+    while skip[i] != i {
+        #[cfg(test)]
+        MERGE_STEPS.with(|p| p.set(p.get() + 1));
+        skip[i] = skip[skip[i]];
+        i = skip[i];
+    }
+    i
 }
 
 /// Per row, `(is_absorbed, row_span)` for each of its cells.
@@ -627,8 +640,10 @@ struct OpenMerge {
 /// `fvmClear` rather than panicking, keeping decoding robust against malformed
 /// input.
 ///
-/// One pass over the rows, with a binary search per continuation: the work is
-/// linear in the cells however tall a merge is.
+/// One pass over the rows, with a binary search per continuation and a
+/// "next free" pointer to step over merges already continued in the row (many can
+/// share one boundary): the work is near-linear in the cells, however tall a merge
+/// is or however many share a boundary.
 fn resolve_vertical_merges(pending: &[PendingRow]) -> Vec<(Vec<bool>, Vec<u32>)> {
     let mut out: Vec<(Vec<bool>, Vec<u32>)> = pending
         .iter()
@@ -647,6 +662,9 @@ fn resolve_vertical_merges(pending: &[PendingRow]) -> Vec<(Vec<bool>, Vec<u32>)>
             open.clear();
             continue;
         };
+        // `skip[i] == i` while `open[i]` is not yet continued in this row; the
+        // extra last entry ends every search.
+        let mut skip: Vec<usize> = (0..=open.len()).collect();
         let mut next: Vec<OpenMerge> = Vec::new();
         for (col, tc) in tap.cells.iter().enumerate() {
             let edge = i32::from(tap.centers[col]);
@@ -654,24 +672,21 @@ fn resolve_vertical_merges(pending: &[PendingRow]) -> Vec<(Vec<bool>, Vec<u32>)>
                 FVM_RESTART => next.push(OpenMerge {
                     edge,
                     origin: (row, col),
-                    taken: false,
                 }),
                 FVM_MERGE => {
                     let first = open.partition_point(|m| m.edge < edge - EDGE_TOLERANCE_TWIPS);
-                    let found = open[first..]
-                        .iter()
-                        .take_while(|m| m.edge <= edge + EDGE_TOLERANCE_TWIPS)
-                        .position(|m| !m.taken)
-                        .map(|i| first + i);
-                    if let Some(i) = found {
-                        open[i].taken = true;
+                    let i = first_free(&mut skip, first);
+                    if i < open.len() && open[i].edge <= edge + EDGE_TOLERANCE_TWIPS {
+                        skip[i] = i + 1;
                         let (origin_row, origin_col) = open[i].origin;
                         out[origin_row].1[origin_col] += 1;
                         out[row].0[col] = true;
+                        // The merge keeps the boundary it started at, so
+                        // continuations that each drift a few twips do not chain
+                        // across the table.
                         next.push(OpenMerge {
-                            edge,
+                            edge: open[i].edge,
                             origin: open[i].origin,
-                            taken: false,
                         });
                     }
                 },
@@ -700,6 +715,12 @@ fn count_grid_edges(centers: &[i16], col: usize, grid: &[i32]) -> u32 {
         })
     };
     below(hi).saturating_sub(below(lo)).max(1) as u32
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many open merges `resolve_vertical_merges` has looked at, on this thread.
+    static MERGE_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -2206,6 +2227,57 @@ mod tests {
         );
         assert_eq!(out[2].cells.len(), 2, "the extra cell of an even row is kept");
         assert_eq!(out[1].cells.len(), 1);
+    }
+
+    /// Many merges can share one boundary (a row of zero-width cells): finding
+    /// the next one not yet continued must not walk past all the taken ones.
+    #[test]
+    fn test_vertical_merges_sharing_a_boundary_are_resolved_in_near_linear_work() {
+        let centers = vec![0i16; 256];
+        let restarts = vec![0x0060u16; 255];
+        let continuations = vec![0x0020u16; 255];
+        let mut rows = vec![merge_row(0, &centers, &restarts)];
+        for r in 1..200 {
+            rows.push(merge_row(r, &centers, &continuations));
+        }
+        MERGE_STEPS.with(|p| p.set(0));
+        let merges = resolve_vertical_merges(&rows);
+        let steps = MERGE_STEPS.with(std::cell::Cell::get);
+        let cells = 200 * 255;
+        // Quadratic in the cells of a row is ~32,000 steps a row, 6.5 million here.
+        assert!(steps <= cells * 4, "{steps} steps for {cells} cells");
+        // Every continuation joined a distinct merge: each started one row_span of 200.
+        assert!(merges[0].1.iter().all(|&s| s == 200));
+    }
+
+    /// The tolerance is 4 twips, inclusive.
+    #[test]
+    fn test_vertical_merge_tolerance_is_four_twips_inclusive() {
+        let at = |dx: i16| {
+            let rows = vec![
+                merge_row(0, &[0, 1000, 2000], &[0, 0x0060]),
+                merge_row(1, &[0, 1000 + dx, 2000], &[0, 0x0020]),
+            ];
+            shape(&build_table_rows(&rows)[0])
+        };
+        assert_eq!(at(4), vec![(1, 1), (1, 2)], "4 twips away still continues");
+        // The extra grid edge makes the cell two columns wide; it is not extended down.
+        assert_eq!(at(5), vec![(1, 1), (2, 1)], "5 twips away is another column");
+    }
+
+    /// A merge keeps the boundary it started at: continuations that each drift
+    /// a few twips from the one above do not chain across the whole table.
+    #[test]
+    fn test_vertical_merge_does_not_drift_with_its_continuations() {
+        let rows = vec![
+            merge_row(0, &[0, 1000, 2000], &[0, 0x0060]),
+            merge_row(1, &[0, 1004, 2000], &[0, 0x0020]),
+            merge_row(2, &[0, 1008, 2000], &[0, 0x0020]),
+        ];
+        let out = build_table_rows(&rows);
+        assert_eq!(out[0].cells[1].row_span, 2, "the 4-twip continuation joins");
+        assert_eq!(out[1].cells.len(), 1, "and is absorbed");
+        assert_eq!(out[2].cells.len(), 2, "the one 8 twips from the start is kept");
     }
 
     // ── Line-shape heading guess tightening ────────────────────
