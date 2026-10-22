@@ -348,3 +348,42 @@ fn test_word6_row_definition_that_cannot_be_used_is_reported() {
         ir.metadata.warnings
     );
 }
+
+#[test]
+fn test_word6_pieces_piled_on_the_same_bytes_do_not_get_a_structured_view() {
+    // The paragraph builder intersects every property run with every piece it
+    // touches. Pieces of a fast-saved file that all start at the same bytes
+    // multiply against the runs there. A real file reuses a byte or two (two
+    // pieces deep); a pile of a dozen is not an edit history. For one, the
+    // text-only view stands and the reason is reported.
+    let mut page: Vec<(&'static [u8], Vec<u8>)> = Vec::new();
+    for _ in 0..3 {
+        page.push((b"A\x07", w6_in_table()));
+        page.push((b"\x07", w6_row_end(1, false)));
+    }
+    let mut spec = common::Word6Spec::new(vec![page]);
+    spec.complex = true;
+    spec.overlapping_pieces = 12;
+    let doc = open_doc(&spec.build());
+    let ir = doc.to_ir();
+    assert!(tables(&ir).is_empty(), "overlapping pieces must not be walked structurally");
+    assert!(
+        ir.metadata.warnings.iter().any(|w| w.contains("overlap")),
+        "{:?}",
+        ir.metadata.warnings
+    );
+    assert!(doc.plain_text().contains('A'), "the text survives");
+}
+
+#[test]
+fn test_word6_pieces_that_share_a_few_bytes_are_still_walked() {
+    // A guard for the check above. Real fast-saved files do share bytes between
+    // pieces (a piece can sit inside another); that must not cost the tables.
+    let page: Vec<(&'static [u8], Vec<u8>)> =
+        vec![(b"A\x07", w6_in_table()), (b"\x07", w6_row_end(1, false))];
+    let mut spec = common::Word6Spec::new(vec![page]);
+    spec.complex = true;
+    spec.overlapping_pieces = 2;
+    let ir = open_doc(&spec.build()).to_ir();
+    assert_eq!(tables(&ir).len(), 1);
+}

@@ -599,6 +599,9 @@ pub struct Word6Spec<'a> {
     pub ext_char: bool,
     /// A fast-saved file: a CLX with one piece describes the text.
     pub complex: bool,
+    /// With `complex`: split the text into this many pieces that all start at
+    /// the same file position, so their byte ranges overlap one another.
+    pub overlapping_pieces: usize,
 }
 
 #[allow(dead_code)]
@@ -614,6 +617,7 @@ impl<'a> Word6Spec<'a> {
             section_ends: Vec::new(),
             ext_char: false,
             complex: false,
+            overlapping_pieces: 1,
         }
     }
 
@@ -725,18 +729,25 @@ impl<'a> Word6Spec<'a> {
             // A CLX with one 8-bit (or, with `fExtChar`, 16-bit) piece over all
             // the text: `fc` carries `byte offset * 2` with bit 30 set.
             let clx_at = wd.len() as u32;
+            let pieces = self.overlapping_pieces.max(1) as u32;
+            let step = (ccp / pieces).max(1);
+            let mut cps: Vec<u32> = (0..pieces).map(|i| (i * step).min(ccp)).collect();
+            cps.push(ccp);
             let mut clx = vec![0x02u8];
-            clx.extend_from_slice(&16u32.to_le_bytes());
-            clx.extend_from_slice(&0u32.to_le_bytes());
-            clx.extend_from_slice(&ccp.to_le_bytes());
-            clx.extend_from_slice(&0u16.to_le_bytes());
+            clx.extend_from_slice(&((4 * cps.len() + 8 * pieces as usize) as u32).to_le_bytes());
+            for cp in &cps {
+                clx.extend_from_slice(&cp.to_le_bytes());
+            }
             let piece_fc = if self.ext_char {
                 fc_min
             } else {
                 (fc_min * 2) | 0x4000_0000
             };
-            clx.extend_from_slice(&piece_fc.to_le_bytes());
-            clx.extend_from_slice(&0u16.to_le_bytes());
+            for _ in 0..pieces {
+                clx.extend_from_slice(&0u16.to_le_bytes());
+                clx.extend_from_slice(&piece_fc.to_le_bytes());
+                clx.extend_from_slice(&0u16.to_le_bytes());
+            }
             wd.extend_from_slice(&clx);
             wd[0x160..0x164].copy_from_slice(&clx_at.to_le_bytes());
             wd[0x164..0x168].copy_from_slice(&(clx.len() as u32).to_le_bytes());
