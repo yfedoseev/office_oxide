@@ -462,7 +462,7 @@ fn fill_uncovered(runs: &mut Vec<FkpParagraph>, stream_len: u32) {
             .map(|(fc_start, fc_end)| FkpParagraph {
                 fc_start,
                 fc_end,
-                grpprl: Vec::new(),
+                grpprl: Vec::new().into(),
                 istd: 0,
             }),
     );
@@ -571,7 +571,7 @@ pub(super) fn read_papx(word_doc: &[u8], fib: &Word6Fib) -> PapxScan {
             scan.runs.push(FkpParagraph {
                 fc_start: fc_at(k),
                 fc_end: fc_at(k + 1),
-                grpprl,
+                grpprl: grpprl.into(),
                 istd,
             });
         }
@@ -821,7 +821,7 @@ mod tests {
         FkpParagraph {
             fc_start,
             fc_end,
-            grpprl: Vec::new(),
+            grpprl: Vec::new().into(),
             istd: 0,
         }
     }
