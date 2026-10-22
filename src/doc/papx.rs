@@ -329,6 +329,28 @@ impl<'a> PieceFcIndex<'a> {
         Self { spans, max_end }
     }
 
+    /// How many spans [`cp_ranges`](Self::cp_ranges) walks for the run
+    /// `[fc_start, fc_end)`: from the first whose running maximum end is past
+    /// the run to the last that starts before it ends. One long span keeps that
+    /// maximum high, so this can be far more than the spans the run actually
+    /// intersects; it is the work, and a caller bounds the work by summing it.
+    pub fn scan_cost(&self, fc_start: u32, fc_end: u32) -> usize {
+        let norm = |fc: u32| {
+            if fc & 0x4000_0000 != 0 {
+                (fc & !0x4000_0000) / 2
+            } else {
+                fc
+            }
+        };
+        let (run_start, run_end) = (norm(fc_start) as u64, norm(fc_end) as u64);
+        if run_end <= run_start {
+            return 0;
+        }
+        let first = self.max_end.partition_point(|&e| e <= run_start);
+        let last = self.spans.partition_point(|&(base, _, _)| base < run_end);
+        last.saturating_sub(first)
+    }
+
     /// The CP ranges an FC run `[fc_start, fc_end)` covers, in CP order.
     pub fn cp_ranges(&self, fc_start: u32, fc_end: u32) -> Vec<(u32, u32)> {
         let norm = |fc: u32| {

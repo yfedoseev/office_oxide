@@ -602,6 +602,11 @@ pub struct Word6Spec<'a> {
     /// With `complex`: split the text into this many pieces that all start at
     /// the same file position, so their byte ranges overlap one another.
     pub overlapping_pieces: usize,
+    /// With `complex`: one piece covers all the text and this many one-character
+    /// pieces follow, each pointing inside the first piece's bytes. Only two
+    /// pieces are ever over a byte, but a reader that walks every span from the
+    /// long one revisits it for every run.
+    pub nested_pieces: usize,
 }
 
 #[allow(dead_code)]
@@ -618,6 +623,7 @@ impl<'a> Word6Spec<'a> {
             ext_char: false,
             complex: false,
             overlapping_pieces: 1,
+            nested_pieces: 0,
         }
     }
 
@@ -640,7 +646,8 @@ impl<'a> Word6Spec<'a> {
             }
         }
         text.extend(widen(self.tail));
-        let ccp = (text.len() / unit) as u32;
+        let text_chars = (text.len() / unit) as u32;
+        let ccp = text_chars + self.nested_pieces as u32;
 
         let mut wd = vec![0u8; fc_min as usize];
         wd[0..2].copy_from_slice(&self.wident.to_le_bytes());
@@ -729,23 +736,40 @@ impl<'a> Word6Spec<'a> {
             // A CLX with one 8-bit (or, with `fExtChar`, 16-bit) piece over all
             // the text: `fc` carries `byte offset * 2` with bit 30 set.
             let clx_at = wd.len() as u32;
-            let pieces = self.overlapping_pieces.max(1) as u32;
-            let step = (ccp / pieces).max(1);
-            let mut cps: Vec<u32> = (0..pieces).map(|i| (i * step).min(ccp)).collect();
+            let piece_fc_at = |byte: u32| {
+                if self.ext_char {
+                    byte
+                } else {
+                    (byte * 2) | 0x4000_0000
+                }
+            };
+            let mut cps: Vec<u32> = Vec::new();
+            let mut fcs: Vec<u32> = Vec::new();
+            if self.nested_pieces > 0 {
+                cps.push(0);
+                fcs.push(piece_fc_at(fc_min));
+                for i in 0..self.nested_pieces as u32 {
+                    cps.push(text_chars + i);
+                    // One character each, inside the first piece's bytes.
+                    fcs.push(piece_fc_at(fc_min + (i * unit as u32).min(text_chars - 1)));
+                }
+            } else {
+                let pieces = self.overlapping_pieces.max(1) as u32;
+                let step = (ccp / pieces).max(1);
+                for i in 0..pieces {
+                    cps.push((i * step).min(ccp));
+                    fcs.push(piece_fc_at(fc_min));
+                }
+            }
             cps.push(ccp);
             let mut clx = vec![0x02u8];
-            clx.extend_from_slice(&((4 * cps.len() + 8 * pieces as usize) as u32).to_le_bytes());
+            clx.extend_from_slice(&((4 * cps.len() + 8 * fcs.len()) as u32).to_le_bytes());
             for cp in &cps {
                 clx.extend_from_slice(&cp.to_le_bytes());
             }
-            let piece_fc = if self.ext_char {
-                fc_min
-            } else {
-                (fc_min * 2) | 0x4000_0000
-            };
-            for _ in 0..pieces {
+            for fc in &fcs {
                 clx.extend_from_slice(&0u16.to_le_bytes());
-                clx.extend_from_slice(&piece_fc.to_le_bytes());
+                clx.extend_from_slice(&fc.to_le_bytes());
                 clx.extend_from_slice(&0u16.to_le_bytes());
             }
             wd.extend_from_slice(&clx);

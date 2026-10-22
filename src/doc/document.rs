@@ -547,7 +547,8 @@ impl DocDocument {
         // file that gains tables changes; sections, styles and the rest of the
         // paragraph properties are not read for Word 6/95.
         let papx = super::word6_papx::read_papx(word_doc, &fib);
-        let overlapping = papx.has_table && super::word6_papx::pieces_piled_too_deep(&pieces);
+        let overlapping =
+            papx.has_table && super::word6_papx::builder_work_too_large(&pieces, &papx.runs);
         let paragraphs = if !papx.has_table || overlapping {
             Vec::new()
         } else {
@@ -567,8 +568,8 @@ impl DocDocument {
         warnings.extend(papx.warnings);
         if overlapping {
             warnings.push(
-                "too many pieces of this Word 6/95 file overlap in the file; its tables and \
-                 paragraph structure were not read"
+                "the pieces of this Word 6/95 file are laid out so that reading its paragraphs \
+                 would take too long; its tables and paragraph structure were not read"
                     .into(),
             );
         }

@@ -349,30 +349,68 @@ fn test_word6_row_definition_that_cannot_be_used_is_reported() {
     );
 }
 
+/// `pages` pages of table rows: `rows_per_page` one-cell rows on each.
+fn many_runs(pages: usize, rows_per_page: usize) -> Vec<Vec<(&'static [u8], Vec<u8>)>> {
+    (0..pages)
+        .map(|_| {
+            (0..rows_per_page)
+                .flat_map(|_| {
+                    [
+                        (&b"A\x07"[..], w6_in_table()),
+                        (&b"\x07"[..], w6_row_end(1, false)),
+                    ]
+                })
+                .collect()
+        })
+        .collect()
+}
+
 #[test]
 fn test_word6_pieces_piled_on_the_same_bytes_do_not_get_a_structured_view() {
     // The paragraph builder intersects every property run with every piece it
     // touches. Pieces of a fast-saved file that all start at the same bytes
-    // multiply against the runs there. A real file reuses a byte or two (two
-    // pieces deep); a pile of a dozen is not an edit history. For one, the
-    // text-only view stands and the reason is reported.
-    let mut page: Vec<(&'static [u8], Vec<u8>)> = Vec::new();
-    for _ in 0..3 {
-        page.push((b"A\x07", w6_in_table()));
-        page.push((b"\x07", w6_row_end(1, false)));
-    }
-    let mut spec = common::Word6Spec::new(vec![page]);
+    // multiply against the runs there. A real file reuses a byte or two; a pile
+    // of hundreds is not an edit history. For one, the text-only view stands
+    // and the reason is reported.
+    let mut spec = common::Word6Spec::new(many_runs(8, 3));
+    // 600 pieces of about 70 bytes each, all starting where the table is.
+    let tail = vec![b'x'; 44_000];
+    spec.tail = &tail;
     spec.complex = true;
-    spec.overlapping_pieces = 12;
+    spec.overlapping_pieces = 600;
     let doc = open_doc(&spec.build());
     let ir = doc.to_ir();
-    assert!(tables(&ir).is_empty(), "overlapping pieces must not be walked structurally");
+    assert!(tables(&ir).is_empty(), "this layout must not be walked structurally");
     assert!(
-        ir.metadata.warnings.iter().any(|w| w.contains("overlap")),
+        ir.metadata.warnings.iter().any(|w| w.contains("pieces")),
         "{:?}",
         ir.metadata.warnings
     );
     assert!(doc.plain_text().contains('A'), "the text survives");
+}
+
+#[test]
+fn test_word6_one_long_piece_with_many_small_ones_inside_is_not_walked_structurally() {
+    // Only two pieces are ever over a byte here, but the builder starts its
+    // search for a run at the first span whose running maximum end is past the
+    // run, and the long piece keeps that maximum high: every run revisits every
+    // small piece. What is bounded is the work the builder does, not the depth.
+    // 700 bytes of text first, so 600 distinct one-byte pieces can sit inside
+    // the long one there, and the table's runs come after them.
+    let pad = vec![b'x'; 700];
+    let mut pages = many_runs(8, 3);
+    pages[0].insert(0, (&pad[..], vec![]));
+    let mut spec = common::Word6Spec::new(pages);
+    spec.complex = true;
+    spec.nested_pieces = 600;
+    let doc = open_doc(&spec.build());
+    let ir = doc.to_ir();
+    assert!(tables(&ir).is_empty(), "this layout must not be walked structurally");
+    assert!(
+        ir.metadata.warnings.iter().any(|w| w.contains("pieces")),
+        "{:?}",
+        ir.metadata.warnings
+    );
 }
 
 #[test]

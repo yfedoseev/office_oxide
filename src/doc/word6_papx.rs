@@ -377,50 +377,36 @@ pub(super) struct PapxScan {
     pub warnings: Vec<String>,
 }
 
-/// The most pieces allowed to cover the same byte of the stream.
-///
-/// Real fast-saved files share a byte or two between pieces (one piece can sit
-/// inside another; the corpus has files two deep). Pieces piled on the same
-/// bytes are not an edit history, and they are what makes the paragraph builder
-/// quadratic.
-const MAX_PIECE_OVERLAP: usize = 8;
+/// Spans the paragraph builder may walk per run and piece before the file is
+/// not read paragraph by paragraph. A well-formed file walks a handful per run.
+const WORK_PER_ITEM: usize = 16;
+/// Work allowed on top of that, so a small file is never refused for a few
+/// extra steps.
+const WORK_ALLOWANCE: usize = 1000;
 
-/// How many pieces cover the most-covered byte of the stream.
+/// Whether the paragraph builder would do too much work for these runs and
+/// pieces.
 ///
-/// The paragraph builder intersects every property run with every piece it
-/// touches. Clipping the runs to a disjoint set bounds that only while the
-/// pieces are shallow: with at most `d` pieces over any byte, the intersections
-/// number at most `d * (runs + pieces)`. For a file deeper than
-/// [`MAX_PIECE_OVERLAP`] the caller does not walk paragraph by paragraph.
-pub(super) fn piece_overlap_depth(pieces: &[Piece]) -> usize {
-    // `+1` at a piece's first byte, `-1` just past its last; at one position the
-    // ends sort first, so abutting pieces do not count as overlapping.
-    let mut events: Vec<(u64, i32)> = Vec::with_capacity(2 * pieces.len());
-    for p in pieces {
-        let len = u64::from(p.cp_end.saturating_sub(p.cp_start));
-        let (base, bytes) = if p.is_compressed {
-            // 8-bit: `fc` carries `byte offset * 2` with bit 30 set.
-            (u64::from(p.fc & !0x4000_0000) / 2, len)
-        } else {
-            (u64::from(p.fc), 2 * len)
-        };
-        if bytes > 0 {
-            events.push((base, 1));
-            events.push((base + bytes, -1));
+/// The builder intersects every property run with the pieces whose bytes it
+/// touches. Clipping the runs to a disjoint set does not bound that, because
+/// the search for a run's pieces starts at the first span whose *running
+/// maximum* end is past the run: a single long piece keeps that maximum high,
+/// so every run revisits every small piece inside it, however shallow the
+/// overlap (two deep), and pieces piled on the same bytes multiply the same
+/// way. So the bound is on the work itself, measured with the builder's own
+/// index: a file whose total exceeds `WORK_PER_ITEM` per run and piece (plus
+/// an allowance) keeps the text-only view.
+pub(super) fn builder_work_too_large(pieces: &[Piece], runs: &[FkpParagraph]) -> bool {
+    let index = super::papx::PieceFcIndex::new(pieces);
+    let limit = WORK_PER_ITEM * (runs.len() + pieces.len()) + WORK_ALLOWANCE;
+    let mut work = 0usize;
+    for run in runs {
+        work = work.saturating_add(index.scan_cost(run.fc_start, run.fc_end));
+        if work > limit {
+            return true;
         }
     }
-    events.sort_unstable();
-    let (mut depth, mut deepest) = (0i64, 0i64);
-    for (_, delta) in events {
-        depth += i64::from(delta);
-        deepest = deepest.max(depth);
-    }
-    deepest as usize
-}
-
-/// Whether the pieces are piled too deep to walk paragraph by paragraph.
-pub(super) fn pieces_piled_too_deep(pieces: &[Piece]) -> bool {
-    piece_overlap_depth(pieces) > MAX_PIECE_OVERLAP
+    false
 }
 
 /// Clip the runs to a disjoint set, earliest first, dropping any that an
@@ -831,44 +817,56 @@ mod tests {
         }
     }
 
+    fn run(fc_start: u32, fc_end: u32) -> FkpParagraph {
+        FkpParagraph {
+            fc_start,
+            fc_end,
+            grpprl: Vec::new(),
+            istd: 0,
+        }
+    }
+
     #[test]
-    fn test_piece_overlap_depth_counts_pieces_over_the_same_byte() {
+    fn test_builder_work_is_small_for_pieces_that_abut_or_nest_a_little() {
         let compressed = |fc: u32| (fc * 2) | 0x4000_0000;
-        // Back to back: each takes 10 bytes, no byte is covered twice.
+        // Back to back.
         let abutting = [
             piece(0, 10, compressed(100), true),
             piece(10, 20, compressed(110), true),
         ];
-        assert_eq!(piece_overlap_depth(&abutting), 1);
-        // A piece inside another, as in a real fast-saved file.
+        assert!(!builder_work_too_large(&abutting, &[run(100, 110), run(110, 120)]));
+        // One piece inside another, as in a real fast-saved file.
         let nested = [
             piece(0, 42, compressed(768), true),
             piece(44, 45, compressed(803), true),
         ];
-        assert_eq!(piece_overlap_depth(&nested), 2);
-        // 16-bit pieces take two bytes per character.
-        assert_eq!(piece_overlap_depth(&[piece(0, 10, 100, false), piece(10, 20, 110, false)]), 2);
-        assert_eq!(piece_overlap_depth(&[piece(0, 10, 100, false), piece(10, 20, 120, false)]), 1);
-        assert_eq!(piece_overlap_depth(&[]), 0);
+        assert!(!builder_work_too_large(&nested, &[run(768, 803), run(803, 810)]));
+        assert!(!builder_work_too_large(&[], &[]));
     }
 
     #[test]
-    fn test_pieces_piled_too_deep_is_the_ninth_over_one_byte() {
-        let pile = |n: usize| -> Vec<Piece> {
-            (0..n)
-                .map(|i| piece(i as u32 * 10, i as u32 * 10 + 10, 0x4000_0000, true))
-                .collect()
-        };
-        assert!(!pieces_piled_too_deep(&pile(MAX_PIECE_OVERLAP)));
-        assert!(pieces_piled_too_deep(&pile(MAX_PIECE_OVERLAP + 1)));
+    fn test_builder_work_counts_what_a_long_piece_makes_every_run_revisit() {
+        // One long piece and 2,000 one-byte pieces inside it: two deep, but
+        // each of 2,000 runs would walk every small piece before it.
+        let mut pieces = vec![piece(0, 4000, 0x4000_0000, true)];
+        for i in 0..2000u32 {
+            pieces.push(piece(4000 + i, 4001 + i, (i * 2) | 0x4000_0000, true));
+        }
+        let runs: Vec<_> = (0..2000u32).map(|i| run(i, i + 1)).collect();
+        assert!(builder_work_too_large(&pieces, &runs));
+        // The same pieces with a handful of runs are fine.
+        assert!(!builder_work_too_large(&pieces, &runs[..3]));
     }
 
     #[test]
-    fn test_piece_overlap_depth_never_overflows() {
-        let _ = piece_overlap_depth(&[
-            piece(0, u32::MAX, u32::MAX, false),
-            piece(u32::MAX, 0, u32::MAX, true),
-            piece(5, 4, 0, true),
-        ]);
+    fn test_builder_work_never_overflows() {
+        let _ = builder_work_too_large(
+            &[
+                piece(0, u32::MAX, u32::MAX, false),
+                piece(u32::MAX, 0, u32::MAX, true),
+                piece(5, 4, 0, true),
+            ],
+            &[run(0, u32::MAX), run(u32::MAX, 0), run(7, 7)],
+        );
     }
 }
