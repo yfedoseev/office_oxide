@@ -9,7 +9,9 @@ use super::error::{DocError, Result};
 use super::fib::Fib;
 use super::images::{DocImage, extract_images};
 use super::list_format::ListFormatting;
-use super::papx::{DocParagraph, build_paragraphs, parse_papx_paragraphs, resolve_huge_papx};
+use super::papx::{
+    DocParagraph, build_paragraphs, parse_papx_paragraphs, resolve_huge_papx, runs_work_too_large,
+};
 use super::piece_table::{
     covers_declared_length, extract_text_range_excluding, parse_clx, sanitize_text,
 };
@@ -299,11 +301,25 @@ impl DocDocument {
         // consumer) since both the deleted-revision-mark filter below and
         // `build_paragraphs`'s per-run character formatting
         // need it, and a CHPX FKP walk is not cheap to repeat.
-        let chpx_runs = if fib.fc_plcf_bte_chpx != 0 && fib.lcb_plcf_bte_chpx != 0 {
+        let mut chpx_runs = if fib.fc_plcf_bte_chpx != 0 && fib.lcb_plcf_bte_chpx != 0 {
             parse_chpx_runs(&word_doc, &table_stream, fib.fc_plcf_bte_chpx, fib.lcb_plcf_bte_chpx)
         } else {
             Vec::new()
         };
+        // Mapping every run to the pieces it overlaps is runs x pieces for a
+        // file whose pieces are piled on the same bytes. Such a file keeps its
+        // text, without character formatting or the deleted/hidden-text
+        // exclusion, and says so.
+        let mut work_warnings: Vec<String> = Vec::new();
+        if runs_work_too_large(&pieces, chpx_runs.iter().map(|r| (r.fc_start, r.fc_end))) {
+            chpx_runs.clear();
+            work_warnings.push(
+                "the pieces of this file are laid out so that reading its character formatting \
+                 would take too long; character formatting was not read, and deleted or hidden \
+                 text was not excluded"
+                    .into(),
+            );
+        }
 
         // Deleted revision-mark text (`sprmCFRMarkDel`) and hidden text
         // (`sprmCFVanish`) are excluded from the main flat text up front,
@@ -439,6 +455,15 @@ impl DocDocument {
                 fib.lcb_plcf_bte_papx,
             );
             let unresolved = resolve_huge_papx(&mut fkp, &data_stream);
+            let too_large =
+                runs_work_too_large(&pieces, fkp.iter().map(|r| (r.fc_start, r.fc_end)));
+            if too_large {
+                work_warnings.push(
+                    "the pieces of this file are laid out so that reading its paragraphs would \
+                     take too long; its tables and paragraph structure were not read"
+                        .into(),
+                );
+            }
             if unresolved > 0 {
                 style_warnings.push(format!(
                     "{unresolved} sprmPHugePapx reference(s) point outside the Data stream, at \
@@ -446,24 +471,28 @@ impl DocDocument {
                      may be affected)"
                 ));
             }
-            // Parse the style sheet so paragraph styles (incl. built-in
-            // Heading 1-9 and user-defined "Heading N") can be resolved to a
-            // real heading level. A malformed/absent sheet yields no styles,
-            // headings fall back to the line heuristic, and the reason is
-            // reported as a warning rather than dropped.
-            let sheet = parse_style_sheet(&table_stream, &fib);
-            style_warnings.extend(sheet.warnings);
-            let styles = sheet.styles;
-            build_paragraphs(
-                &word_doc,
-                &pieces,
-                &fkp,
-                fib.text_len,
-                fib.lid,
-                &chpx_runs,
-                &section_ends,
-                &styles,
-            )
+            if too_large {
+                Vec::new()
+            } else {
+                // Parse the style sheet so paragraph styles (incl. built-in
+                // Heading 1-9 and user-defined "Heading N") can be resolved to a
+                // real heading level. A malformed/absent sheet yields no styles,
+                // headings fall back to the line heuristic, and the reason is
+                // reported as a warning rather than dropped.
+                let sheet = parse_style_sheet(&table_stream, &fib);
+                style_warnings.extend(sheet.warnings);
+                let styles = sheet.styles;
+                build_paragraphs(
+                    &word_doc,
+                    &pieces,
+                    &fkp,
+                    fib.text_len,
+                    fib.lid,
+                    &chpx_runs,
+                    &section_ends,
+                    &styles,
+                )
+            }
         } else {
             Vec::new()
         };
@@ -488,6 +517,7 @@ impl DocDocument {
         let text_complete = text_complete && cfb.truncated_streams().is_empty();
         let mut warnings = container_warnings(&cfb);
         warnings.extend(style_warnings);
+        warnings.extend(work_warnings);
 
         Ok(Self {
             text,

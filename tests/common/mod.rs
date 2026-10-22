@@ -187,6 +187,9 @@ pub struct FibTweaks {
     /// `PlcSpaMom` shape anchors as `(anchor CP, Spa.lid)`, followed by a
     /// final CP of `text_len`. Empty: no `PlcSpaMom`.
     pub plcf_spa: Vec<(u32, u32)>,
+    /// Write the piece table with this many pieces all pointing at the same
+    /// text bytes (0 or 1: the usual single piece).
+    pub piled_pieces: usize,
 }
 
 /// Build a synthetic `.doc`, optionally with subdocuments and FIB tweaks.
@@ -269,7 +272,8 @@ fn build_streams(
     let text_offset = ((n + FIB_PAGES) as u32) * 512;
 
     // ── 0Table stream: CLX (piece table) followed by PlcfBtePapx. ──
-    let mut table = build_clx(text_offset, total_chars);
+    let mut table = build_clx(text_offset, total_chars, tweaks.piled_pieces);
+    let clx_len = table.len() as u32;
     let fc_plcf = table.len() as u32;
     table.extend_from_slice(&build_plcf_bte_papx(n, &cp_starts, text_len));
     let lcb_plcf = (table.len() as u32) - fc_plcf;
@@ -328,6 +332,7 @@ fn build_streams(
     let wd_sectors = wd_len.div_ceil(512);
     let mut word_doc = vec![0u8; wd_sectors * 512];
     write_fib(&mut word_doc, text_len, fc_plcf, lcb_plcf, fc_stshf, lcb_stshf);
+    word_doc[0x01A6..0x01AA].copy_from_slice(&clx_len.to_le_bytes()); // lcbClx
     // [MS-DOC] FibRgLw97 real offsets for these fields: 0x58
     // is `reserved3`, MUST be zero/ignored, and sits between ccpHdd and
     // ccpAtn — not a slot in this array, so the mapping isn't a flat
@@ -875,17 +880,21 @@ fn write_fib(
     word_doc[0x0106..0x010A].copy_from_slice(&lcb_plcf.to_le_bytes());
 }
 
-/// Build the CLX: a single Pcdt piece table with one Unicode piece.
-fn build_clx(text_offset: u32, text_len: u32) -> Vec<u8> {
+/// Build the CLX: a single Pcdt piece table of `piles` (at least one) Unicode
+/// pieces, each pointing at the same bytes and covering `text_len` characters.
+fn build_clx(text_offset: u32, text_len: u32, piles: usize) -> Vec<u8> {
+    let piles = piles.max(1) as u32;
     let mut clx = Vec::new();
     clx.push(0x02); // Pcdt marker
-    clx.extend_from_slice(&16u32.to_le_bytes()); // PlcPcd size
-    // PlcPcd: CP[0]=0, CP[1]=text_len, then one PCD (8 bytes).
-    clx.extend_from_slice(&0u32.to_le_bytes());
-    clx.extend_from_slice(&text_len.to_le_bytes());
-    clx.extend_from_slice(&0u16.to_le_bytes()); // PCD: unused u16
-    clx.extend_from_slice(&text_offset.to_le_bytes()); // fc (byte offset in WordDocument)
-    clx.extend_from_slice(&0u16.to_le_bytes()); // PCD: prm u16
+    clx.extend_from_slice(&(4 * (piles + 1) + 8 * piles).to_le_bytes()); // PlcPcd size
+    for i in 0..=piles {
+        clx.extend_from_slice(&(i * text_len).to_le_bytes()); // CP[i]
+    }
+    for _ in 0..piles {
+        clx.extend_from_slice(&0u16.to_le_bytes()); // PCD: unused u16
+        clx.extend_from_slice(&text_offset.to_le_bytes()); // fc (byte offset in WordDocument)
+        clx.extend_from_slice(&0u16.to_le_bytes()); // PCD: prm u16
+    }
     clx
 }
 

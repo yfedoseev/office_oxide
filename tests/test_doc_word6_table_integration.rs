@@ -390,13 +390,12 @@ fn test_word6_pieces_piled_on_the_same_bytes_do_not_get_a_structured_view() {
 }
 
 #[test]
-fn test_word6_one_long_piece_with_many_small_ones_inside_is_not_walked_structurally() {
-    // Only two pieces are ever over a byte here, but the builder starts its
-    // search for a run at the first span whose running maximum end is past the
-    // run, and the long piece keeps that maximum high: every run revisits every
-    // small piece. What is bounded is the work the builder does, not the depth.
-    // 700 bytes of text first, so 600 distinct one-byte pieces can sit inside
-    // the long one there, and the table's runs come after them.
+fn test_word6_one_long_piece_with_many_small_ones_inside_is_still_walked() {
+    // Only two pieces are ever over a byte here. The search for a run's pieces
+    // used to start at the first span whose running maximum end is past the
+    // run, and the long piece kept that maximum high, so every run revisited
+    // every small piece. The search now costs what the run overlaps, so this
+    // layout is cheap and its table is kept.
     let pad = vec![b'x'; 700];
     let mut pages = many_runs(8, 3);
     pages[0].insert(0, (&pad[..], vec![]));
@@ -405,9 +404,9 @@ fn test_word6_one_long_piece_with_many_small_ones_inside_is_not_walked_structura
     spec.nested_pieces = 600;
     let doc = open_doc(&spec.build());
     let ir = doc.to_ir();
-    assert!(tables(&ir).is_empty(), "this layout must not be walked structurally");
+    assert_eq!(tables(&ir).len(), 1);
     assert!(
-        ir.metadata.warnings.iter().any(|w| w.contains("pieces")),
+        !ir.metadata.warnings.iter().any(|w| w.contains("pieces")),
         "{:?}",
         ir.metadata.warnings
     );

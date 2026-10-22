@@ -389,36 +389,10 @@ pub(super) struct PapxScan {
     pub warnings: Vec<String>,
 }
 
-/// Spans the paragraph builder may walk per run and piece before the file is
-/// not read paragraph by paragraph. A well-formed file walks a handful per run.
-const WORK_PER_ITEM: usize = 16;
-/// Work allowed on top of that, so a small file is never refused for a few
-/// extra steps.
-const WORK_ALLOWANCE: usize = 1000;
-
 /// Whether the paragraph builder would do too much work for these runs and
-/// pieces.
-///
-/// The builder intersects every property run with the pieces whose bytes it
-/// touches. Clipping the runs to a disjoint set does not bound that, because
-/// the search for a run's pieces starts at the first span whose *running
-/// maximum* end is past the run: a single long piece keeps that maximum high,
-/// so every run revisits every small piece inside it, however shallow the
-/// overlap (two deep), and pieces piled on the same bytes multiply the same
-/// way. So the bound is on the work itself, measured with the builder's own
-/// index: a file whose total exceeds `WORK_PER_ITEM` per run and piece (plus
-/// an allowance) keeps the text-only view.
+/// pieces; see [`runs_work_too_large`](super::papx::runs_work_too_large).
 pub(super) fn builder_work_too_large(pieces: &[Piece], runs: &[FkpParagraph]) -> bool {
-    let index = super::papx::PieceFcIndex::new(pieces);
-    let limit = WORK_PER_ITEM * (runs.len() + pieces.len()) + WORK_ALLOWANCE;
-    let mut work = 0usize;
-    for run in runs {
-        work = work.saturating_add(index.scan_cost(run.fc_start, run.fc_end));
-        if work > limit {
-            return true;
-        }
-    }
-    false
+    super::papx::runs_work_too_large(pieces, runs.iter().map(|r| (r.fc_start, r.fc_end)))
 }
 
 /// Clip the runs to a disjoint set, earliest first, dropping any that an
@@ -873,16 +847,26 @@ mod tests {
     }
 
     #[test]
-    fn test_builder_work_counts_what_a_long_piece_makes_every_run_revisit() {
-        // One long piece and 2,000 one-byte pieces inside it: two deep, but
-        // each of 2,000 runs would walk every small piece before it.
+    fn test_builder_work_ignores_what_a_long_piece_used_to_make_every_run_revisit() {
+        // One long piece and 2,000 one-byte pieces inside it: each of 2,000
+        // runs overlaps its own piece and the long one, nothing more.
         let mut pieces = vec![piece(0, 4000, 0x4000_0000, true)];
         for i in 0..2000u32 {
             pieces.push(piece(4000 + i, 4001 + i, (i * 2) | 0x4000_0000, true));
         }
         let runs: Vec<_> = (0..2000u32).map(|i| run(i, i + 1)).collect();
+        assert!(!builder_work_too_large(&pieces, &runs));
+    }
+
+    #[test]
+    fn test_builder_work_counts_pieces_piled_on_the_same_bytes() {
+        // 2,000 pieces on the same 2,000 bytes, and 2,000 runs over them: every
+        // overlap is a real output range, so the volume is runs × pieces.
+        let pieces: Vec<_> = (0..2000u32)
+            .map(|i| piece(i * 2000, i * 2000 + 2000, 0x4000_0000, true))
+            .collect();
+        let runs: Vec<_> = (0..2000u32).map(|i| run(i, i + 1)).collect();
         assert!(builder_work_too_large(&pieces, &runs));
-        // The same pieces with a handful of runs are fine.
         assert!(!builder_work_too_large(&pieces, &runs[..3]));
     }
 

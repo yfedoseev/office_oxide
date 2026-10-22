@@ -296,15 +296,35 @@ fn extract_grpprl(page: &[u8], word_off: usize) -> PapxData {
 /// whatever CPs lay *between* those two points — a paragraph gained the
 /// text of its neighbours, a formatting run covered characters it did
 /// not format, a start below every piece mapped to nothing. Each piece is
-/// intersected with the run instead — but only the pieces whose bytes can
-/// overlap it, found by binary search, rather than every piece for every
-/// run (runs × pieces on a fast-saved file with thousands of each).
+/// intersected with the run instead.
+///
+/// The pieces that can overlap a run are found in time proportional to how
+/// many there are, not to how many pieces the file has or how long a piece
+/// sitting before the run is: the spans form an implicit balanced search tree
+/// (the midpoint of each index range is its node) whose nodes remember the
+/// largest end below them, so a subtree that ends before the run starts is
+/// skipped whole. A binary search on a running maximum end is not enough — one
+/// long piece keeps that maximum high, so every run revisits every small piece
+/// inside it.
 pub struct PieceFcIndex<'a> {
     /// `(byte start, byte end, piece)`, sorted by byte start.
     spans: Vec<(u64, u64, &'a Piece)>,
-    /// `max_end[i]` = the largest byte end among `spans[..=i]`: monotonic
-    /// even when pieces overlap, so it can be binary-searched.
-    max_end: Vec<u64>,
+    /// `sub_max[i]` = the largest byte end in the subtree rooted at `i`, i.e.
+    /// in the index range whose midpoint is `i`.
+    sub_max: Vec<u64>,
+}
+
+/// Map an FC run to the byte range it names (`0x4000_0000` marks the
+/// halved-offset form of a compressed piece).
+fn norm_run(fc_start: u32, fc_end: u32) -> (u64, u64) {
+    let norm = |fc: u32| {
+        if fc & 0x4000_0000 != 0 {
+            (fc & !0x4000_0000) / 2
+        } else {
+            fc
+        }
+    };
+    (norm(fc_start) as u64, norm(fc_end) as u64)
 }
 
 impl<'a> PieceFcIndex<'a> {
@@ -320,72 +340,129 @@ impl<'a> PieceFcIndex<'a> {
             })
             .collect();
         spans.sort_unstable_by_key(|&(start, _, _)| start);
-        let mut max_end = Vec::with_capacity(spans.len());
-        let mut m = 0u64;
-        for &(_, end, _) in &spans {
-            m = m.max(end);
-            max_end.push(m);
+        let mut sub_max = vec![0u64; spans.len()];
+        // Explicit stack: post-order fill without recursion.
+        let mut stack = vec![(0usize, spans.len(), false)];
+        while let Some((lo, hi, done)) = stack.pop() {
+            if lo >= hi {
+                continue;
+            }
+            let mid = lo + (hi - lo) / 2;
+            if done {
+                let mut m = spans[mid].1;
+                if lo < mid {
+                    m = m.max(sub_max[lo + (mid - lo) / 2]);
+                }
+                if mid + 1 < hi {
+                    m = m.max(sub_max[mid + 1 + (hi - mid - 1) / 2]);
+                }
+                sub_max[mid] = m;
+            } else {
+                stack.push((lo, hi, true));
+                stack.push((lo, mid, false));
+                stack.push((mid + 1, hi, false));
+            }
         }
-        Self { spans, max_end }
+        Self { spans, sub_max }
     }
 
-    /// How many spans [`cp_ranges`](Self::cp_ranges) walks for the run
-    /// `[fc_start, fc_end)`: from the first whose running maximum end is past
-    /// the run to the last that starts before it ends. One long span keeps that
-    /// maximum high, so this can be far more than the spans the run actually
-    /// intersects; it is the work, and a caller bounds the work by summing it.
-    pub fn scan_cost(&self, fc_start: u32, fc_end: u32) -> usize {
-        let norm = |fc: u32| {
-            if fc & 0x4000_0000 != 0 {
-                (fc & !0x4000_0000) / 2
-            } else {
-                fc
-            }
-        };
-        let (run_start, run_end) = (norm(fc_start) as u64, norm(fc_end) as u64);
+    /// Call `f(span)` for every span whose bytes overlap `[run_start, run_end)`,
+    /// in no particular order, until it returns `false`. The work is
+    /// O((overlaps + 1) · log n).
+    fn for_each_overlap(
+        &self,
+        run_start: u64,
+        run_end: u64,
+        mut f: impl FnMut(&(u64, u64, &'a Piece)) -> bool,
+    ) {
         if run_end <= run_start {
-            return 0;
+            return;
         }
-        let first = self.max_end.partition_point(|&e| e <= run_start);
-        let last = self.spans.partition_point(|&(base, _, _)| base < run_end);
-        last.saturating_sub(first)
+        let mut stack = vec![(0usize, self.spans.len())];
+        while let Some((lo, hi)) = stack.pop() {
+            if lo >= hi {
+                continue;
+            }
+            let mid = lo + (hi - lo) / 2;
+            // Nothing here ends after the run starts, or everything here
+            // starts at or after it ends (`spans[lo]` starts first).
+            if self.sub_max[mid] <= run_start || self.spans[lo].0 >= run_end {
+                continue;
+            }
+            let span = &self.spans[mid];
+            if span.0 < run_end && span.1 > run_start && !f(span) {
+                return;
+            }
+            stack.push((lo, mid));
+            stack.push((mid + 1, hi));
+        }
+    }
+
+    /// How many spans overlap the run `[fc_start, fc_end)`, counting no more
+    /// than `cap`: the work [`cp_ranges`](Self::cp_ranges) will do for it, so a
+    /// caller can bound the work of a whole file before doing it.
+    pub fn overlap_count(&self, fc_start: u32, fc_end: u32, cap: usize) -> usize {
+        let (run_start, run_end) = norm_run(fc_start, fc_end);
+        let mut n = 0usize;
+        self.for_each_overlap(run_start, run_end, |_| {
+            n += 1;
+            n < cap
+        });
+        n
     }
 
     /// The CP ranges an FC run `[fc_start, fc_end)` covers, in CP order.
     pub fn cp_ranges(&self, fc_start: u32, fc_end: u32) -> Vec<(u32, u32)> {
-        let norm = |fc: u32| {
-            if fc & 0x4000_0000 != 0 {
-                (fc & !0x4000_0000) / 2
-            } else {
-                fc
-            }
-        };
-        let (run_start, run_end) = (norm(fc_start) as u64, norm(fc_end) as u64);
+        let (run_start, run_end) = norm_run(fc_start, fc_end);
         let mut out = Vec::new();
-        if run_end <= run_start {
-            return out;
-        }
-        // Every span before `first` ends at or before the run starts.
-        let first = self.max_end.partition_point(|&e| e <= run_start);
-        for &(base, piece_end, p) in &self.spans[first..] {
-            if base >= run_end {
-                break; // sorted by start: every later piece starts later
-            }
+        self.for_each_overlap(run_start, run_end, |&(base, piece_end, p)| {
             let stride = if p.is_compressed { 1 } else { 2 };
             let lo = run_start.max(base);
             let hi = run_end.min(piece_end);
-            if hi <= lo {
-                continue;
-            }
             let cp_lo = p.cp_start as u64 + (lo - base) / stride;
             let cp_hi = p.cp_start as u64 + (hi - base).div_ceil(stride);
             if cp_hi > cp_lo {
                 out.push((cp_lo.min(u32::MAX as u64) as u32, cp_hi.min(u32::MAX as u64) as u32));
             }
-        }
+            true
+        });
         out.sort_unstable();
         out
     }
+}
+
+/// Spans the paragraph and character-run builders may walk per run and piece
+/// before a file is not read run by run. A well-formed file overlaps a handful.
+const WORK_PER_ITEM: usize = 16;
+/// Work allowed on top of that, so a small file is never refused for a few
+/// extra steps.
+const WORK_ALLOWANCE: usize = 1000;
+
+/// Whether mapping these FC runs to CP ranges would do too much work.
+///
+/// Every overlap between a run and a piece becomes an output range, so a file
+/// whose pieces are piled on the same bytes costs runs × pieces however the
+/// search is done. The bound is therefore on the overlaps themselves: a file
+/// whose total exceeds `WORK_PER_ITEM` per run and piece (plus an allowance) is
+/// refused. Real fast-saved files do share bytes between pieces, so overlap as
+/// such is never the test, only its volume. Counting stops at the limit, so
+/// the check costs about as much as the limit however hostile the input.
+pub fn runs_work_too_large(
+    pieces: &[Piece],
+    runs: impl ExactSizeIterator<Item = (u32, u32)>,
+) -> bool {
+    let limit = WORK_PER_ITEM
+        .saturating_mul(runs.len().saturating_add(pieces.len()))
+        .saturating_add(WORK_ALLOWANCE);
+    let index = PieceFcIndex::new(pieces);
+    let mut work = 0usize;
+    for (fc_start, fc_end) in runs {
+        work = work.saturating_add(index.overlap_count(fc_start, fc_end, limit - work + 1));
+        if work > limit {
+            return true;
+        }
+    }
+    false
 }
 
 /// Real byte offset and stride (bytes per character) of a piece's start.
@@ -675,6 +752,67 @@ mod tests {
         for a in (0xF000..0x10040u32).step_by(13) {
             for len in [1u32, 5, 64, 300, 4000] {
                 assert_eq!(index.cp_ranges(a, a + len), brute(a, a + len), "run {a:#x}+{len}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_fc_index_matches_brute_force_on_overlapping_and_nested_pieces() {
+        // Pieces of every size piled, nested and abutting, from a fixed
+        // pseudo-random sequence: the tree must report exactly the overlaps.
+        let mut x = 0x2545_F491u32;
+        let mut next = move |m: u32| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x % m
+        };
+        for round in 0..40 {
+            let n = 1 + next(60) as usize;
+            let mut pieces = Vec::new();
+            let mut cp = 0u32;
+            for _ in 0..n {
+                let len = 1 + next(if round % 2 == 0 { 8 } else { 400 });
+                let compressed = next(2) == 0;
+                let byte = next(300);
+                pieces.push(Piece {
+                    cp_start: cp,
+                    cp_end: cp + len,
+                    fc: if compressed {
+                        0x4000_0000 | (byte * 2)
+                    } else {
+                        byte
+                    },
+                    is_compressed: compressed,
+                    prm_grpprl: Vec::new(),
+                });
+                cp += len;
+            }
+            let brute = |a: u32, b: u32| {
+                let mut out = Vec::new();
+                for p in &pieces {
+                    let (base, stride) = piece_byte_base(p);
+                    let (base, stride) = (base as u64, stride as u64);
+                    let end = base + (p.cp_end - p.cp_start) as u64 * stride;
+                    let (lo, hi) = ((a as u64).max(base), (b as u64).min(end));
+                    if hi > lo {
+                        out.push((
+                            (p.cp_start as u64 + (lo - base) / stride) as u32,
+                            (p.cp_start as u64 + (hi - base).div_ceil(stride)) as u32,
+                        ));
+                    }
+                }
+                out.sort_unstable();
+                out
+            };
+            let index = PieceFcIndex::new(&pieces);
+            for _ in 0..200 {
+                let a = next(900);
+                let b = a + next(120);
+                let want = brute(a, b);
+                assert_eq!(index.cp_ranges(a, b), want, "round {round} run {a}..{b}");
+                assert_eq!(index.overlap_count(a, b, usize::MAX), want.len());
+                assert_eq!(index.overlap_count(a, b, 2), want.len().min(2));
             }
         }
     }
