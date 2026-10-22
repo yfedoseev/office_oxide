@@ -213,6 +213,44 @@ const SPRM_P_HUGE_PAPX_WORD97: u16 = 0x6645;
 /// larger or negative is not a valid `PrcData`.
 const PRC_DATA_MAX_CB: usize = 0x3FA2;
 
+/// The allowance for copying `PrcData` out of the `Data` stream, shared by all
+/// the paragraphs of one document.
+///
+/// A `PrcData` is charged once, the first time its `fc` is expanded: a real
+/// document stores each one once and points every paragraph that shares it
+/// (the rows of a long table, say) at that `fc`, so those later references
+/// are free. Distinct, possibly overlapping, `fc`s are what a hostile file
+/// multiplies, and those spend the `remaining` bytes.
+#[derive(Debug, Default)]
+pub struct HugeBudget {
+    remaining: usize,
+    charged: std::collections::HashSet<usize>,
+}
+
+impl HugeBudget {
+    /// A budget of `remaining` bytes and no `PrcData` charged yet.
+    pub fn new(remaining: usize) -> Self {
+        Self {
+            remaining,
+            charged: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Whether the `PrcData` at `fc` of `len` bytes may be expanded, charging
+    /// it the first time.
+    fn admit(&mut self, fc: usize, len: usize) -> bool {
+        if self.charged.contains(&fc) {
+            return true;
+        }
+        if len > self.remaining {
+            return false;
+        }
+        self.remaining -= len;
+        self.charged.insert(fc);
+        true
+    }
+}
+
 /// Replace each `sprmPHugePapx` in `grpprl` with the property list its
 /// `PrcData` holds in the `Data` stream, in place so SPRM order is kept.
 ///
@@ -222,17 +260,17 @@ const PRC_DATA_MAX_CB: usize = 0x3FA2;
 /// `cbGrpprl`, or no `budget` left); an unresolved reference is dropped from
 /// the list.
 ///
-/// `budget` is the number of bytes the caller still allows to be copied out of
-/// `data`, and is reduced by each expansion. A 6-byte reference expands to up
-/// to 16 KB, and many paragraphs may name the same `PrcData`, so without a
-/// shared budget a small file multiplies into gigabytes.
+/// `budget` bounds the bytes copied out of `data` across all calls, charging
+/// each distinct `PrcData` once (see [`HugeBudget`]). A 6-byte reference
+/// expands to up to 16 KB, so without it a small file multiplies into
+/// gigabytes.
 ///
 /// The expansion is one level deep: a `sprmPHugePapx` inside a `PrcData` is not
 /// followed, so a self-referencing `Data` stream cannot loop.
 pub fn expand_huge_papx(
     grpprl: &[u8],
     data: &[u8],
-    budget: &mut usize,
+    budget: &mut HugeBudget,
 ) -> Option<(Vec<u8>, usize)> {
     // Almost no paragraph has one; skip the SPRM walk unless an opcode's
     // bytes appear at all.
@@ -249,11 +287,9 @@ pub fn expand_huge_papx(
             let buf = out.get_or_insert_with(Vec::new);
             buf.extend_from_slice(&grpprl[copied..p]);
             copied = next.min(grpprl.len());
-            match prc_data_grpprl(&sprm.operand, data).filter(|g| g.len() <= *budget) {
-                Some(g) => {
-                    *budget -= g.len();
-                    buf.extend_from_slice(g);
-                },
+            match prc_data_grpprl(&sprm.operand, data).filter(|&(fc, g)| budget.admit(fc, g.len()))
+            {
+                Some((_, g)) => buf.extend_from_slice(g),
                 None => unresolved += 1,
             }
         }
@@ -265,13 +301,14 @@ pub fn expand_huge_papx(
     })
 }
 
-/// The `GrpPrl` of the `PrcData` that a `sprmPHugePapx` operand points at.
-fn prc_data_grpprl<'a>(operand: &[u8], data: &'a [u8]) -> Option<&'a [u8]> {
+/// The `fc` and `GrpPrl` of the `PrcData` that a `sprmPHugePapx` operand
+/// points at.
+fn prc_data_grpprl<'a>(operand: &[u8], data: &'a [u8]) -> Option<(usize, &'a [u8])> {
     let fc = u32::from_le_bytes(operand.get(..4)?.try_into().ok()?) as usize;
     let cb = i16::from_le_bytes(data.get(fc..fc.checked_add(2)?)?.try_into().ok()?);
     let cb = usize::try_from(cb).ok().filter(|&c| c <= PRC_DATA_MAX_CB)?;
     let start = fc + 2;
-    data.get(start..start.checked_add(cb)?)
+    Some((fc, data.get(start..start.checked_add(cb)?)?))
 }
 
 /// Paragraph-property flags distilled from a PAP grpprl.
@@ -2453,8 +2490,11 @@ mod tests {
 
     #[test]
     fn test_expand_huge_papx_absent_returns_none() {
-        assert_eq!(expand_huge_papx(&[0x16, 0x24, 0x01], &[0u8; 8], &mut 1_000_000), None);
-        assert_eq!(expand_huge_papx(&[], &[], &mut 1_000_000), None);
+        assert_eq!(
+            expand_huge_papx(&[0x16, 0x24, 0x01], &[0u8; 8], &mut HugeBudget::new(1_000_000)),
+            None
+        );
+        assert_eq!(expand_huge_papx(&[], &[], &mut HugeBudget::new(1_000_000)), None);
     }
 
     #[test]
@@ -2464,7 +2504,8 @@ mod tests {
         let mut g = vec![0x16, 0x24, 0x01]; // sprmPFInTable = 1 (before)
         g.extend_from_slice(&huge(6));
         g.extend_from_slice(&[0x49, 0x66, 0x01, 0, 0, 0]); // sprmPItap (after)
-        let (out, bad) = expand_huge_papx(&g, &data, &mut 1_000_000).expect("huge present");
+        let (out, bad) =
+            expand_huge_papx(&g, &data, &mut HugeBudget::new(1_000_000)).expect("huge present");
         assert_eq!(bad, 0);
         let ops: Vec<u16> = parse_grpprl(&out).iter().map(|s| s.opcode).collect();
         assert_eq!(ops, vec![0x2416, 0x2417, 0x6649]);
@@ -2474,7 +2515,8 @@ mod tests {
     fn test_expand_huge_papx_counts_and_drops_unresolvable_references() {
         let data = data_with(0, &[0x17, 0x24, 0x01]);
         for fc in [0x1000_0000u32, u32::MAX] {
-            let (out, bad) = expand_huge_papx(&huge(fc), &data, &mut 1_000_000).unwrap();
+            let (out, bad) =
+                expand_huge_papx(&huge(fc), &data, &mut HugeBudget::new(1_000_000)).unwrap();
             assert!(out.is_empty());
             assert_eq!(bad, 1);
         }
@@ -2483,27 +2525,33 @@ mod tests {
         short.extend_from_slice(&[1, 2, 3]);
         short[..2].copy_from_slice(&100i16.to_le_bytes());
         assert_eq!(
-            expand_huge_papx(&huge(0), &short, &mut 1_000_000)
+            expand_huge_papx(&huge(0), &short, &mut HugeBudget::new(1_000_000))
                 .unwrap()
                 .1,
             1
         );
         short[..2].copy_from_slice(&(-5i16).to_le_bytes());
         assert_eq!(
-            expand_huge_papx(&huge(0), &short, &mut 1_000_000)
+            expand_huge_papx(&huge(0), &short, &mut HugeBudget::new(1_000_000))
                 .unwrap()
                 .1,
             1
         );
         let mut big = vec![0u8; 2 + 0x3FA3];
         big[..2].copy_from_slice(&0x3FA3i16.to_le_bytes());
-        assert_eq!(expand_huge_papx(&huge(0), &big, &mut 1_000_000).unwrap().1, 1);
+        assert_eq!(
+            expand_huge_papx(&huge(0), &big, &mut HugeBudget::new(1_000_000))
+                .unwrap()
+                .1,
+            1
+        );
     }
 
     #[test]
     fn test_expand_huge_papx_does_not_follow_a_reference_inside_prc_data() {
         let data = data_with(4, &huge(4)); // PrcData that names itself
-        let (out, bad) = expand_huge_papx(&huge(4), &data, &mut 1_000_000).unwrap();
+        let (out, bad) =
+            expand_huge_papx(&huge(4), &data, &mut HugeBudget::new(1_000_000)).unwrap();
         assert_eq!(bad, 0);
         assert_eq!(out, huge(4), "the inner reference is copied, not followed");
     }
@@ -2513,7 +2561,7 @@ mod tests {
         // Opcode with only two operand bytes left.
         let mut g = SPRM_P_HUGE_PAPX.to_le_bytes().to_vec();
         g.extend_from_slice(&[0x01, 0x00]);
-        let (out, bad) = expand_huge_papx(&g, &[0u8; 16], &mut 1_000_000).unwrap();
+        let (out, bad) = expand_huge_papx(&g, &[0u8; 16], &mut HugeBudget::new(1_000_000)).unwrap();
         assert_eq!((out.len(), bad), (0, 1));
     }
 
@@ -2528,13 +2576,20 @@ mod tests {
     fn test_expand_huge_papx_stops_at_the_budget_and_counts_the_rest() {
         let prc = [0x17, 0x24, 0x01, 0x16, 0x24, 0x01]; // 6 bytes
         let data = data_with(0, &prc);
-        let mut budget = 10usize; // room for one expansion, not two
+        let mut budget = HugeBudget::new(10); // room for one expansion, not two
         let mut g = huge(0);
-        g.extend_from_slice(&huge(0));
+        g.extend_from_slice(&huge(0)); // the same PrcData: charged once
         let (out, bad) = expand_huge_papx(&g, &data, &mut budget).unwrap();
-        assert_eq!(bad, 1, "the second reference is over budget");
-        assert_eq!(out.len(), prc.len(), "only the first was expanded");
-        assert_eq!(budget, 4);
+        assert_eq!(bad, 0, "a PrcData already charged is free");
+        assert_eq!(out.len(), 2 * prc.len());
+        assert_eq!(budget.remaining, 4);
+        // A different PrcData needs budget of its own: 4 bytes left, 6 wanted.
+        let mut data2 = data.clone();
+        let fc2 = data2.len();
+        data2.extend_from_slice(&(prc.len() as i16).to_le_bytes());
+        data2.extend_from_slice(&prc);
+        let (out, bad) = expand_huge_papx(&huge(fc2 as u32), &data2, &mut budget).unwrap();
+        assert_eq!((out.len(), bad), (0, 1), "a second distinct PrcData is over budget");
     }
 
     #[test]
@@ -2542,7 +2597,7 @@ mod tests {
         let data = data_with(2, &[0x17, 0x24, 0x01]);
         let mut g = vec![0x45, 0x66];
         g.extend_from_slice(&2u32.to_le_bytes());
-        let (out, bad) = expand_huge_papx(&g, &data, &mut 1_000_000).unwrap();
+        let (out, bad) = expand_huge_papx(&g, &data, &mut HugeBudget::new(1_000_000)).unwrap();
         assert_eq!((out, bad), (vec![0x17, 0x24, 0x01], 0));
     }
 }

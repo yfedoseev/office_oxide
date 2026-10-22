@@ -570,3 +570,54 @@ fn test_docx_to_ir_folds_each_style_chain_once_per_conversion() {
     // Folding per run copied four font names at each of seven levels.
     assert!(per_run < 4.0, "{per_run:.1} allocations per run");
 }
+
+// ----------------------------------------------------------------- DOC
+
+/// One PAPX run covers every paragraph mark in a long stretch of text, and
+/// its property list is a reference into the `Data` stream to a maximum-size
+/// `PrcData`. The run's properties are the same for each of those marks, so
+/// decoding the 16 KB list once per mark made a 60 KB file cost seconds.
+#[test]
+fn test_doc_huge_papx_run_is_decoded_once_not_once_per_paragraph_mark() {
+    use common::{FibTweaks, Para, Subdocs, build_doc_streams, cfb_with_streams};
+    let _serial = serial();
+    let open_with_marks = |marks: usize| {
+        let text: &'static str = Box::leak("x\r".repeat(marks).into_boxed_str());
+        // sprmPHugePapx naming fc 0.
+        let mut huge = vec![0x46, 0x66];
+        huge.extend_from_slice(&0u32.to_le_bytes());
+        let paras = vec![Para {
+            text,
+            terminator: '\r',
+            grpprl: huge,
+        }];
+        let (word_doc, table) =
+            build_doc_streams(&paras, &Subdocs::default(), FibTweaks::default());
+        // 16,290 bytes of benign sprmPJc80 = 0.
+        let prc = [0x03u8, 0x24, 0x00].repeat(5430);
+        let mut data = (prc.len() as i16).to_le_bytes().to_vec();
+        data.extend_from_slice(&prc);
+        let bytes = cfb_with_streams(&[
+            ("WordDocument", &word_doc),
+            ("0Table", &table),
+            ("Data", &data),
+        ]);
+        allocations_during(|| {
+            office_oxide::Document::from_reader(
+                Cursor::new(bytes),
+                office_oxide::DocumentFormat::Doc,
+            )
+            .unwrap()
+        })
+    };
+    let (_, few) = open_with_marks(50);
+    let (doc, many) = open_with_marks(2_000);
+    let extra = many.saturating_sub(few) as f64 / 1_950.0;
+    // Decoding the list costs thousands of allocations; a paragraph that only
+    // clones the decoded result costs a handful.
+    assert!(
+        extra < 200.0,
+        "{extra:.0} allocations per extra paragraph mark ({few} for 50, {many} for 2,000)"
+    );
+    assert_eq!(doc.plain_text().matches('x').count(), 2_000);
+}

@@ -16,11 +16,14 @@
 //!
 //! The `grpprl` is decoded by [`super::sprm::extract_pap_props`].
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use super::chpx::{FkpRun, resolve_chp_cp_runs, resolve_chp_segments};
 use super::piece_table::{
     HyperlinkSpan, Piece, decode_cp_range, sanitize_text_with_hyperlinks_and_chp,
 };
-use super::sprm::{ChpProps, PapProps};
+use super::sprm::{ChpProps, HugeBudget, PapProps};
 use super::sprm::{LevelSource, OutlineLevel};
 use super::styles::{StyleDef, heading_level_for_istd};
 
@@ -31,8 +34,9 @@ pub struct FkpParagraph {
     pub fc_start: u32,
     /// End FC of the paragraph, exclusive.
     pub fc_end: u32,
-    /// The PAP `grpprl` bytes (without the `cw`/`istd` header).
-    pub grpprl: Vec<u8>,
+    /// The PAP `grpprl` bytes (without the `cw`/`istd` header). Shared, so
+    /// paragraphs that name one `Data`-stream `PrcData` hold one copy of it.
+    pub grpprl: Arc<[u8]>,
     /// The paragraph style index (`istd`) from the PAPX header, before any
     /// `sprmPIstd` (0x4600) override carried in the `grpprl`.
     pub istd: u16,
@@ -145,13 +149,24 @@ const HUGE_PAPX_ALLOWANCE: usize = 1 << 20;
 ///
 /// Returns how many references could not be resolved.
 pub fn resolve_huge_papx(paragraphs: &mut [FkpParagraph], data: &[u8]) -> usize {
-    let mut budget = data
-        .len()
-        .saturating_mul(2)
-        .saturating_add(HUGE_PAPX_ALLOWANCE);
+    let mut budget = HugeBudget::new(
+        data.len()
+            .saturating_mul(2)
+            .saturating_add(HUGE_PAPX_ALLOWANCE),
+    );
+    // Paragraphs with the same property list (every row end of a table, as a
+    // rule) expand to the same result: expand once, share the copy.
+    let mut expanded: HashMap<Arc<[u8]>, (Arc<[u8]>, usize)> = HashMap::new();
     let mut unresolved = 0;
     for p in paragraphs {
-        if let Some((grpprl, bad)) = super::sprm::expand_huge_papx(&p.grpprl, data, &mut budget) {
+        if let Some((grpprl, bad)) = expanded.get(&p.grpprl) {
+            p.grpprl = Arc::clone(grpprl);
+            unresolved += bad;
+        } else if let Some((grpprl, bad)) =
+            super::sprm::expand_huge_papx(&p.grpprl, data, &mut budget)
+        {
+            let grpprl: Arc<[u8]> = grpprl.into();
+            expanded.insert(Arc::clone(&p.grpprl), (Arc::clone(&grpprl), bad));
             p.grpprl = grpprl;
             unresolved += bad;
         }
@@ -198,7 +213,7 @@ fn parse_fkp_page(page: &[u8], out: &mut Vec<FkpParagraph>) {
         out.push(FkpParagraph {
             fc_start,
             fc_end,
-            grpprl: papx.grpprl,
+            grpprl: papx.grpprl.into(),
             istd: papx.istd,
         });
     }
@@ -455,9 +470,12 @@ pub fn build_paragraphs(
     let empty = FkpParagraph {
         fc_start: 0,
         fc_end: 0,
-        grpprl: Vec::new(),
+        grpprl: Arc::from([]),
         istd: 0,
     };
+    // A run's property list is decoded once, however many paragraph marks it
+    // covers: a run can span thousands of them, and a list may be 16 KB.
+    let mut pap_cache: HashMap<(usize, usize), PapProps> = HashMap::new();
     for idx in 0..pap.len() {
         let (a, b, fp) = pap[idx];
         // Text no PAPX run covers still belongs to a paragraph: decode it
@@ -498,7 +516,15 @@ pub fn build_paragraphs(
                     buf.push(ch);
                     buf_props.push(props.clone());
                     if is_mark {
-                        emit_paragraph(&mut buf, &mut buf_props, run, cp, styles, &mut out);
+                        emit_paragraph(
+                            &mut buf,
+                            &mut buf_props,
+                            run,
+                            cp,
+                            styles,
+                            &mut pap_cache,
+                            &mut out,
+                        );
                     }
                 }
             }
@@ -510,7 +536,7 @@ pub fn build_paragraphs(
         buf.push('\r');
         buf_props.push(buf_props.last().cloned().unwrap_or_default());
         let last = pap.last().map(|&(_, _, fp)| fp).unwrap_or(&empty);
-        emit_paragraph(&mut buf, &mut buf_props, last, cursor, styles, &mut out);
+        emit_paragraph(&mut buf, &mut buf_props, last, cursor, styles, &mut pap_cache, &mut out);
     }
     out
 }
@@ -528,6 +554,7 @@ fn emit_paragraph(
     run: &FkpParagraph,
     cp_end: u32,
     styles: &[StyleDef],
+    pap_cache: &mut HashMap<(usize, usize), PapProps>,
     out: &mut Vec<DocParagraph>,
 ) {
     let terminator = buf[buf.len() - 1];
@@ -535,7 +562,12 @@ fn emit_paragraph(
     let content_props = &buf_props[..buf_props.len() - 1];
     let (content, hyperlinks, chp_spans) =
         sanitize_text_with_hyperlinks_and_chp(&content_str, content_props);
-    let mut props = super::sprm::extract_pap_props(&run.grpprl);
+    // Keyed by the shared buffer itself: runs that share a list share its decode.
+    let key = (run.grpprl.as_ptr() as usize, run.grpprl.len());
+    let mut props = pap_cache
+        .entry(key)
+        .or_insert_with(|| super::sprm::extract_pap_props(&run.grpprl))
+        .clone();
     // Style-driven heading level: `style_istd` already folds in any
     // `sprmPIstd` (0x4600) override carried in the grpprl; fall back to the
     // PAPX header `istd` when the override is absent.
@@ -705,7 +737,7 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].fc_start, 0x800);
         assert_eq!(out[0].fc_end, 0x806);
-        assert_eq!(out[0].grpprl, vec![0x16, 0x24, 0x01, 0x49, 0x66, 0x01, 0x00, 0x00, 0x00]);
+        assert_eq!(&*out[0].grpprl, &[0x16, 0x24, 0x01, 0x49, 0x66, 0x01, 0x00, 0x00, 0x00][..]);
     }
 
     #[test]
@@ -781,7 +813,7 @@ mod tests {
         let mk = |cp0: u32, cp1: u32, grpprl: &[u8]| FkpParagraph {
             fc_start: 0x800 + cp0 * 2,
             fc_end: 0x800 + cp1 * 2,
-            grpprl: grpprl.to_vec(),
+            grpprl: grpprl.into(),
             istd: 0,
         };
         let cell = [0x16, 0x24, 0x01, 0x49, 0x66, 0x01, 0x00, 0x00, 0x00];
@@ -829,7 +861,7 @@ mod tests {
         let fkp = vec![FkpParagraph {
             fc_start: 0x800,
             fc_end: 0x800 + n * 2,
-            grpprl: Vec::new(),
+            grpprl: Arc::from([]),
             istd: 0,
         }];
         // "deleted text " (cp 10..23) carries sprmCFRMarkDel = 1.
@@ -877,7 +909,7 @@ mod tests {
         let mk = |cp0: u32, cp1: u32| FkpParagraph {
             fc_start: 0x800 + cp0 * 2,
             fc_end: 0x800 + cp1 * 2,
-            grpprl: Vec::new(),
+            grpprl: Arc::from([]),
             istd: 0,
         };
         let fkp = vec![mk(0, 6), mk(6, 12)];
@@ -911,7 +943,7 @@ mod tests {
         let mk = |cp0: u32, cp1: u32| FkpParagraph {
             fc_start: 0x800 + cp0 * 2,
             fc_end: 0x800 + cp1 * 2,
-            grpprl: Vec::new(),
+            grpprl: Arc::from([]),
             istd: 0,
         };
         let fkp = vec![mk(0, raw.chars().count() as u32)];
@@ -964,7 +996,7 @@ mod tests {
         let fkp = [FkpParagraph {
             fc_start: 0x800,
             fc_end: 0x800 + raw.chars().count() as u32 * 2,
-            grpprl: Vec::new(),
+            grpprl: Arc::from([]),
             istd: 3,
         }];
         let paras = build_paragraphs(
@@ -1018,7 +1050,7 @@ mod tests {
         let fkp = [FkpParagraph {
             fc_start: 0x800,
             fc_end: 0x800 + raw.chars().count() as u32 * 2,
-            grpprl,
+            grpprl: grpprl.into(),
             istd: 0,
         }];
         let paras = build_paragraphs(
@@ -1066,7 +1098,7 @@ mod tests {
         let fkp = [FkpParagraph {
             fc_start: 0x800,
             fc_end: 0x800 + raw.chars().count() as u32 * 2,
-            grpprl: Vec::new(),
+            grpprl: Arc::from([]),
             istd: 2,
         }];
         let paras = build_paragraphs(
@@ -1109,7 +1141,7 @@ mod tests {
         let fkp = [FkpParagraph {
             fc_start: 0x800,
             fc_end: 0x800 + raw.chars().count() as u32 * 2,
-            grpprl,
+            grpprl: grpprl.into(),
             istd: 0, // PAPX says Normal; the SPRM overrides it to Heading 5
         }];
         let paras = build_paragraphs(
@@ -1161,7 +1193,7 @@ mod tests {
         let fkp = [FkpParagraph {
             fc_start: 0x800,
             fc_end: 0x800 + raw.chars().count() as u32 * 2,
-            grpprl,
+            grpprl: grpprl.into(),
             istd: 3, // would resolve to Heading 3 on its own
         }];
         let paras = build_paragraphs(
@@ -1213,7 +1245,7 @@ mod tests {
         let fkp = [FkpParagraph {
             fc_start: 0x800,
             fc_end: 0x800 + raw.chars().count() as u32 * 2,
-            grpprl: Vec::new(),
+            grpprl: Arc::from([]),
             istd: 0, // Normal
         }];
         let paras = build_paragraphs(
@@ -1262,7 +1294,7 @@ mod tests {
         let fkp = [FkpParagraph {
             fc_start: 0x800,
             fc_end: 0x800 + raw.chars().count() as u32 * 2,
-            grpprl,
+            grpprl: grpprl.into(),
             istd: 3,
         }];
         let paras = build_paragraphs(
@@ -1314,7 +1346,7 @@ mod tests {
         let fkp = [FkpParagraph {
             fc_start: 0x800,
             fc_end: 0x800 + raw.chars().count() as u32 * 2,
-            grpprl,
+            grpprl: grpprl.into(),
             istd: 3, // the style alone would resolve to Heading 3
         }];
         let paras = build_paragraphs(
@@ -1352,7 +1384,7 @@ mod tests {
         let fkp = [FkpParagraph {
             fc_start: 0x800,
             fc_end: 0x800 + raw.chars().count() as u32 * 2,
-            grpprl,
+            grpprl: grpprl.into(),
             istd: 0,
         }];
         let paras = build_paragraphs(
@@ -1446,7 +1478,7 @@ mod tests {
         let fkp = [FkpParagraph {
             fc_start: 0x800,
             fc_end: 0x800 + raw.chars().count() as u32 * 2,
-            grpprl: Vec::new(),
+            grpprl: Arc::from([]),
             istd: 3,
         }];
         let paras = build_paragraphs(

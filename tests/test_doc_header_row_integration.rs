@@ -220,13 +220,14 @@ fn test_doc_huge_papx_word97_opcode_keeps_the_table_whole() {
 
 #[test]
 fn test_doc_huge_papx_expansion_is_bounded_by_the_data_stream() {
-    // Many paragraphs naming one maximum-size PrcData must not each get a
-    // private 16 KB copy: the total expansion is budgeted against the size of
-    // the Data stream, and the excess is reported.
-    let prc = [0x16u8, 0x24, 0x01].repeat(5430); // 16,290 bytes of benign sprms
-    assert_eq!(prc.len(), 16_290);
-    let data = data_with_prc_data(0, &prc);
-    let paras: Vec<Para> = (0..200).map(|_| row_mark(huge_papx_grpprl(0))).collect();
+    // Overlapping PrcData: every even offset of this 40 KB stream is a valid
+    // maximum-size PrcData, so distinct references can name far more bytes
+    // than the stream holds. The total expansion is budgeted against the size
+    // of the stream, and the excess is reported.
+    let data = [0xA2u8, 0x3F].repeat(20_000); // cbGrpprl = 0x3FA2 at every even fc
+    let paras: Vec<Para> = (0..200u32)
+        .map(|i| row_mark(huge_papx_grpprl(i * 2)))
+        .collect();
     let doc = open_with_data(&paras, &data);
     let ir = doc.to_ir();
     assert!(
@@ -235,6 +236,36 @@ fn test_doc_huge_papx_expansion_is_bounded_by_the_data_stream() {
             .iter()
             .any(|w| w.contains("sprmPHugePapx")),
         "an over-budget expansion must be reported, got {:?}",
+        ir.metadata.warnings
+    );
+}
+
+#[test]
+fn test_doc_huge_papx_shared_by_many_rows_is_expanded_once_and_keeps_one_table() {
+    // A long, wide table: every row end names the same PrcData, which holds
+    // the row definition plus a few kilobytes of other properties. The Data
+    // stream stores it once, so the expansion budget is spent once, not once
+    // per row.
+    let mut prc = row_grpprl(&CENTERS, &[0, 0]);
+    prc.extend_from_slice(&[0x03, 0x24, 0x00].repeat(1_500)); // sprmPJc80 padding
+    let data = data_with_prc_data(0, &prc);
+    let mut paras = Vec::new();
+    for _ in 0..1_000 {
+        paras.push(cell("a"));
+        paras.push(cell("b"));
+        paras.push(row_mark(huge_papx_grpprl(0)));
+    }
+    let doc = open_with_data(&paras, &data);
+    let ir = doc.to_ir();
+    let tables = tables(&ir);
+    assert_eq!(tables.len(), 1, "rows sharing one PrcData must stay one table");
+    assert_eq!(tables[0].rows.len(), 1_000);
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .all(|w| !w.contains("sprmPHugePapx")),
+        "a shared PrcData is within budget, got {:?}",
         ir.metadata.warnings
     );
 }
