@@ -14,7 +14,7 @@
 //! per occurrence, so its size is already bounded by the package's
 //! decompressed size. The one exception is a paragraph style's name,
 //! which is stored once in the style sheet and copied into every
-//! paragraph that uses the style; `clean_style_name` bounds it. Apache
+//! paragraph that uses the style; `classify_style_name` bounds it. Apache
 //! POI does the same with `ZipSecureFile.setMaxTextSize`.
 //!
 //! The default keeps every genuine workbook this crate has been tested
@@ -156,27 +156,55 @@ impl TextBudget {
 /// number of paragraphs).
 pub(crate) const MAX_STYLE_NAME_CHARS: usize = 255;
 
+#[cfg(test)]
+thread_local! {
+    /// Bytes of style name examined on this thread, so a test can assert that a
+    /// name is examined once per style rather than once per paragraph.
+    pub(crate) static STYLE_NAME_BYTES_SCANNED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// The name without surrounding whitespace and without a NUL terminator.
 ///
 /// `xstzName` is a null-terminated string, and some producers count the
 /// terminator in its length, so `body\0` is the name `body`.
 fn trim_style_name(raw: &str) -> &str {
+    #[cfg(test)]
+    STYLE_NAME_BYTES_SCANNED.with(|c| c.set(c.get() + raw.len()));
     raw.trim_matches(|c: char| c.is_whitespace() || c == '\0')
 }
 
-/// Whether `raw` is a style name that cannot be exposed: longer than
-/// [`MAX_STYLE_NAME_CHARS`] or containing a control character. (A blank name
-/// is not a name either, but it is simply absent, not worth a warning.)
-pub(crate) fn is_unusable_style_name(raw: &str) -> bool {
-    let name = trim_style_name(raw);
-    name.chars().count() > MAX_STYLE_NAME_CHARS || name.chars().any(char::is_control)
+/// What a stored style name is, as far as `Paragraph::style` is concerned.
+pub(crate) enum StyleName {
+    /// Blank: simply no name, not worth a warning.
+    Absent,
+    /// Longer than [`MAX_STYLE_NAME_CHARS`] or containing a control
+    /// character: not exposed, and reported.
+    Unusable,
+    /// The trimmed name.
+    Usable(String),
 }
 
-/// A style name as exposed on `Paragraph::style`: trimmed, or `None` when it
-/// is blank or [unusable](is_unusable_style_name).
-pub(crate) fn clean_style_name(raw: &str) -> Option<String> {
+/// Classify a stored style name in one pass over it.
+///
+/// Callers do this once per style when the style sheet is parsed and keep the
+/// result: a name can be a megabyte, and it is looked up for every paragraph
+/// that uses the style.
+pub(crate) fn classify_style_name(raw: &str) -> StyleName {
     let name = trim_style_name(raw);
-    (!name.is_empty() && !is_unusable_style_name(name)).then(|| name.to_owned())
+    if name.is_empty() {
+        return StyleName::Absent;
+    }
+    // Stops at the first control character or at the 256th, so the cost is
+    // bounded by the limit rather than by the name's length once it is over.
+    let mut chars = 0usize;
+    for c in name.chars() {
+        chars += 1;
+        if chars > MAX_STYLE_NAME_CHARS || c.is_control() {
+            return StyleName::Unusable;
+        }
+    }
+    StyleName::Usable(name.to_owned())
 }
 
 #[cfg(test)]

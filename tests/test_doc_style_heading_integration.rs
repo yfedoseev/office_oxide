@@ -597,6 +597,7 @@ fn test_cyclic_and_over_deep_base_chains_give_no_level_and_a_warning() {
         name: "Heading 1",
         base: Some(deep_start + 39),
         outline: None,
+        kind: 1,
     });
 
     let (doc, found) = document_with_styles(&styles, &[0, 1, 2, 3]);

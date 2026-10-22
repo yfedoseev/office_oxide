@@ -1268,9 +1268,15 @@ fn effective_paragraph_props(
 /// matching `heading 1`..`heading 9` style names. Returns a 0-based
 /// outline level to match `w:outlineLvl`.
 fn heading_level_from_style_name(name: &str) -> Option<u8> {
-    let lower = name.trim().to_ascii_lowercase();
-    let digits = lower.strip_prefix("heading")?.trim();
-    let n: u8 = digits.parse().ok()?;
+    const PREFIX: &[u8] = b"heading";
+    let name = name.trim();
+    // Compared in place: this runs for every paragraph that names a style, and
+    // lower-casing would copy the whole name each time. The first seven bytes
+    // are ASCII when they match, so slicing after them is on a boundary.
+    if name.len() < PREFIX.len() || !name.as_bytes()[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+        return None;
+    }
+    let n: u8 = name[PREFIX.len()..].trim().parse().ok()?;
     (1..=9).contains(&n).then(|| n - 1)
 }
 
@@ -1298,7 +1304,7 @@ fn resolve_heading_level(
     styles
         .styles
         .get(style_id)
-        .and_then(|s| s.name.as_deref())
+        .and_then(|s| s.display_name.as_deref())
         .and_then(heading_level_from_style_name)
 }
 

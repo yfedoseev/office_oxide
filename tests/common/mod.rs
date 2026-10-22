@@ -357,6 +357,9 @@ pub struct Style<'a> {
     /// The `sprmPOutLvl` operand in the style's own `UpxPapx` (`0..=8` heading,
     /// `9` body text); `None` = the style states no level.
     pub outline: Option<u8>,
+    /// `StdfBase.stk` ([MS-DOC] §2.9.253): 1 paragraph, 2 character, 3 table,
+    /// 4 numbering.
+    pub kind: u16,
 }
 
 #[allow(dead_code)]
@@ -368,6 +371,7 @@ impl<'a> Style<'a> {
             name,
             base: None,
             outline: None,
+            kind: 1,
         }
     }
     /// A user-defined style based on `base`.
@@ -377,7 +381,13 @@ impl<'a> Style<'a> {
             name,
             base: Some(base),
             outline: None,
+            kind: 1,
         }
+    }
+    /// The same style with a different style kind (`stk`).
+    pub fn kind(mut self, stk: u16) -> Self {
+        self.kind = stk;
+        self
     }
     /// States its own outline level (zero-based operand; 9 = body text).
     pub fn outline(mut self, operand: u8) -> Self {
@@ -396,7 +406,7 @@ fn lpstd(style: &Style) -> Vec<u8> {
     let mut std = vec![0u8; 10];
     std[0..2].copy_from_slice(&style.sti.to_le_bytes());
     let istd_base = style.base.unwrap_or(0x0FFF);
-    std[2..4].copy_from_slice(&(1u16 | (istd_base << 4)).to_le_bytes());
+    std[2..4].copy_from_slice(&(style.kind | (istd_base << 4)).to_le_bytes());
     std[4..6].copy_from_slice(&u16::from(style.outline.is_some()).to_le_bytes());
     let units: Vec<u16> = style.name.encode_utf16().collect();
     std.extend_from_slice(&(units.len() as u16).to_le_bytes());
@@ -447,6 +457,7 @@ pub fn heading_style_sheet() -> Vec<u8> {
             name,
             base: Some(0),
             outline: None,
+            kind: 1,
         });
     }
     let mut d = style_sheet(&styles);

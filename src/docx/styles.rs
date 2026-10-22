@@ -17,9 +17,6 @@ pub struct StyleSheet {
     pub doc_defaults: Option<DocDefaults>,
     /// Map from style ID to style definition.
     pub styles: HashMap<String, Style>,
-    /// Whether any paragraph style carries `w:default="1"`. When none does,
-    /// the style named `Normal` is the default.
-    pub(crate) has_default_paragraph_style: bool,
     /// Paragraph styles whose name cannot be exposed (over-long, or holding a
     /// control character); reported once in `Metadata::warnings`.
     pub(crate) unusable_style_names: usize,
@@ -45,7 +42,13 @@ pub struct Style {
     pub name: Option<String>,
     /// `w:default="1"`: the style applied to content of this kind that names
     /// none (for paragraphs, what Word calls `Normal`).
-    pub is_default: bool,
+    pub(crate) is_default: bool,
+    /// The name exposed on `Paragraph::style`, worked out once when the sheet
+    /// is parsed (see `StyleSheet::resolve_display_names`): `None` for the
+    /// default paragraph style, a style that is not a paragraph style, or a
+    /// name that is blank or unusable. It is not kept in step with edits made
+    /// to the public `name` afterwards.
+    pub(crate) display_name: Option<String>,
     /// ID of the parent style this style inherits from.
     pub based_on: Option<String>,
     /// Run-level overrides for this style.
@@ -103,15 +106,6 @@ impl StyleSheet {
                     },
                     "style" => {
                         if let Some(style) = parse_style(&mut reader, e)? {
-                            if style.style_type == StyleType::Paragraph {
-                                sheet.has_default_paragraph_style |= style.is_default;
-                                sheet.unusable_style_names += usize::from(
-                                    style
-                                        .name
-                                        .as_deref()
-                                        .is_some_and(crate::limits::is_unusable_style_name),
-                                );
-                            }
                             sheet.styles.insert(style.style_id.clone(), style);
                         }
                     },
@@ -121,7 +115,41 @@ impl StyleSheet {
                 _ => {},
             }
         }
+        sheet.resolve_display_names();
         Ok(sheet)
+    }
+
+    /// Work out each paragraph style's exposed name, once, and count the names
+    /// that cannot be exposed.
+    ///
+    /// The default is the style flagged `w:default` (recognised by the flag,
+    /// not the name, which Word localizes); when no paragraph style is flagged
+    /// it is the one named `Normal`.
+    fn resolve_display_names(&mut self) {
+        use crate::limits::{StyleName, classify_style_name};
+        let flagged = self
+            .styles
+            .values()
+            .any(|s| s.style_type == StyleType::Paragraph && s.is_default);
+        let mut unusable = 0;
+        for style in self
+            .styles
+            .values_mut()
+            .filter(|s| s.style_type == StyleType::Paragraph)
+        {
+            let raw = style.name.as_deref().unwrap_or("");
+            let is_default =
+                style.is_default || (!flagged && raw.trim().eq_ignore_ascii_case("Normal"));
+            if is_default {
+                continue;
+            }
+            match classify_style_name(raw) {
+                StyleName::Usable(name) => style.display_name = Some(display_style_name(name)),
+                StyleName::Unusable => unusable += 1,
+                StyleName::Absent => {},
+            }
+        }
+        self.unusable_style_names = unusable;
     }
 
     /// Return the inheritance chain for `style_id`, **root ancestor first**,
@@ -510,6 +538,7 @@ fn parse_style(
         style_type,
         name,
         is_default,
+        display_name: None,
         based_on,
         run_properties,
         paragraph_properties,
@@ -613,23 +642,12 @@ impl StyleSheet {
     /// the default paragraph style, is not a paragraph style the sheet
     /// defines, or has no usable name.
     ///
-    /// The default is the style flagged `w:default` (recognised by the flag,
-    /// not the name, which Word localizes); when no paragraph style is flagged
-    /// it is the one named `Normal`. An id the sheet does not define, or that
-    /// names a character or table style, applies the default, as python-docx's
-    /// `get_by_id` does, so it is `None`.
+    /// An id the sheet does not define, or that names a character or table
+    /// style, applies the default, as python-docx's `get_by_id` does, so it is
+    /// `None`. The name is resolved once when the sheet is parsed, so a lookup
+    /// per paragraph costs a clone of at most 255 characters.
     pub(crate) fn paragraph_style_name(&self, style_id: &str) -> Option<String> {
-        let style = self.styles.get(style_id)?;
-        if style.style_type != StyleType::Paragraph {
-            return None;
-        }
-        let name = style.name.as_deref().unwrap_or("");
-        let is_default = style.is_default
-            || (!self.has_default_paragraph_style && name.trim().eq_ignore_ascii_case("Normal"));
-        if is_default {
-            return None;
-        }
-        crate::limits::clean_style_name(display_style_name(name.trim()))
+        self.styles.get(style_id)?.display_name.clone()
     }
 
     /// Resolve table style `style_id` through its inheritance chain.
@@ -658,8 +676,8 @@ impl StyleSheet {
 /// Word stores the names of a few built-in styles in lower case (`caption`,
 /// `heading 1`) while displaying them capitalized; consumers expect the
 /// displayed form (this is the set python-docx maps).
-fn display_style_name(name: &str) -> &str {
-    match name {
+fn display_style_name(name: String) -> String {
+    let shown = match name.as_str() {
         "caption" => "Caption",
         "header" => "Header",
         "footer" => "Footer",
@@ -672,8 +690,9 @@ fn display_style_name(name: &str) -> &str {
         "heading 7" => "Heading 7",
         "heading 8" => "Heading 8",
         "heading 9" => "Heading 9",
-        other => other,
-    }
+        _ => return name,
+    };
+    shown.to_owned()
 }
 
 #[cfg(test)]
@@ -777,5 +796,31 @@ mod tests {
         // A paragraph style is flagged, so a style merely *named* Normal is not
         // the default.
         assert_eq!(sheet.paragraph_style_name("Normal").as_deref(), Some("Normal"));
+    }
+
+    #[test]
+    fn test_paragraph_style_name_is_examined_once_per_style_not_once_per_lookup() {
+        use crate::limits::STYLE_NAME_BYTES_SCANNED as SCANNED;
+        let long = "N".repeat(1 << 20);
+        let xml = format!(
+            r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+              <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+              <w:style w:type="paragraph" w:styleId="Long"><w:name w:val="{long}"/></w:style>
+              <w:style w:type="paragraph" w:styleId="Short"><w:name w:val="caption"/></w:style>
+            </w:styles>"#
+        );
+        let sheet = StyleSheet::parse(xml.as_bytes()).unwrap();
+        let after_parse = SCANNED.with(std::cell::Cell::get);
+        for _ in 0..2_000 {
+            assert_eq!(sheet.paragraph_style_name("Long"), None, "over 255 characters");
+            assert_eq!(sheet.paragraph_style_name("Short").as_deref(), Some("Caption"));
+            assert_eq!(sheet.paragraph_style_name("Normal"), None);
+        }
+        assert_eq!(
+            SCANNED.with(std::cell::Cell::get),
+            after_parse,
+            "looking a style name up must not re-examine the stored name"
+        );
+        assert_eq!(sheet.unusable_style_names, 1, "the unusable name is counted once");
     }
 }

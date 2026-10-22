@@ -620,4 +620,56 @@ fn test_doc_huge_papx_run_is_decoded_once_not_once_per_paragraph_mark() {
         "{extra:.0} allocations per extra paragraph mark ({few} for 50, {many} for 2,000)"
     );
     assert_eq!(doc.plain_text().matches('x').count(), 2_000);
+||||||| parent of 4ca6fd7 (perf(styles): resolve paragraph style names once per style; fix(doc): only paragraph styles are named)
+
+/// A document whose paragraphs all use one paragraph style with a 1 MiB name.
+fn docx_with_huge_style_name(paragraphs: usize) -> Vec<u8> {
+    let name = "N".repeat(1 << 20);
+    let body = r#"<w:p><w:pPr><w:pStyle w:val="Huge"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>"#
+        .repeat(paragraphs);
+    let styles = format!(
+        r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+          <w:style w:type="paragraph" w:styleId="Huge"><w:name w:val="{name}"/></w:style>
+        </w:styles>"#
+    );
+    let doc = format!(
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>"#
+    );
+    zip_of(&[
+        (
+            "[Content_Types].xml",
+            br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>"#,
+        ),
+        (
+            "_rels/.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+        ),
+        (
+            "word/_rels/document.xml.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#,
+        ),
+        ("word/document.xml", doc.as_bytes()),
+        ("word/styles.xml", styles.as_bytes()),
+    ])
+}
+
+/// One style name of 1 MiB, used by every paragraph, used to be copied (for
+/// the heading-name check) once per paragraph: paragraphs x 1 MiB requested.
+#[test]
+fn test_docx_to_ir_does_not_copy_a_huge_style_name_per_paragraph() {
+    let _serial = serial();
+    const PARAS: usize = 200;
+    let doc = office_oxide::Document::from_reader(
+        Cursor::new(docx_with_huge_style_name(PARAS)),
+        office_oxide::DocumentFormat::Docx,
+    )
+    .unwrap();
+    let (ir, bytes) = bytes_during(|| doc.to_ir());
+    assert!(ir.plain_text().contains('x'));
+    // Far under one copy of the name per paragraph (200 MiB before).
+    assert!(
+        bytes < 8 << 20,
+        "{bytes} bytes requested converting {PARAS} paragraphs that share a 1 MiB style name"
+    );
 }

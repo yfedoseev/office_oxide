@@ -469,3 +469,28 @@ fn test_doc_list_item_paragraphs_keep_their_style() {
     assert_eq!(style_of(&p, "styled nested item").as_deref(), Some("Caption"));
     assert_eq!(style_of(&p, "plain top item"), None);
 }
+
+#[test]
+fn test_doc_paragraph_whose_istd_names_a_non_paragraph_style_has_no_style() {
+    // A paragraph's `istd` can point at a character or table style; `.docx`
+    // reports no style for that, and so must `.doc`.
+    let stsh = style_sheet(&[
+        Style::new(0, "Normal"),
+        Style::new(0x0FFE, "section-e"),
+        Style::new(0x0FFE, "Emphasis").kind(2),
+        Style::new(0x0FFE, "Table Grid").kind(3),
+        Style::new(34, "Beschriftung").kind(2),
+    ]);
+    let paras = [
+        para("A paragraph in a paragraph style."),
+        para("A paragraph pointing at a character style."),
+        para("A paragraph pointing at a table style."),
+        para("A paragraph pointing at a built-in character style."),
+    ];
+    let doc = open_doc(&build_doc_with_styles(&paras, &[1, 2, 3, 4], &stsh));
+    let p = paragraphs(&doc);
+    assert_eq!(style_of(&p, "A paragraph in a paragraph style.").as_deref(), Some("section-e"));
+    assert_eq!(style_of(&p, "A paragraph pointing at a character style."), None);
+    assert_eq!(style_of(&p, "A paragraph pointing at a table style."), None);
+    assert_eq!(style_of(&p, "A paragraph pointing at a built-in character style."), None);
+}

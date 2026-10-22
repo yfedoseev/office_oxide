@@ -31,38 +31,77 @@ pub struct StyleDef {
     /// operand: `0..=8` are Heading 1–9 and `9` is explicit body text. `None`
     /// when the style states none (it may still inherit one from `base`).
     pub own_outline: Option<u8>,
+    /// Style kind (`StdfBase.stk`, [MS-DOC] §2.9.253): 1 paragraph, 2
+    /// character, 3 table, 4 numbering. 0 for an empty slot.
+    pub stk: u16,
+    /// The name exposed on `Paragraph::style`, worked out once when the style
+    /// sheet is parsed (see [`assign_display_names`]) so that a lookup per
+    /// paragraph does not re-examine a name that can be tens of kilobytes.
+    /// `None` for a style that is not a paragraph style, one with a blank or
+    /// unusable name, and the built-ins reported under a canonical name
+    /// (those do not need one stored).
+    pub(crate) display_name: Option<String>,
+}
+
+/// `StdfBase.stk` of a paragraph style ([MS-DOC] §2.9.253).
+const STK_PARAGRAPH: u16 = 1;
+
+/// The canonical English name of a built-in paragraph style that `.docx` also
+/// normalizes, from its `sti` ([MS-DOC] §2.9.260): 1–9 Heading 1–9, 31
+/// Header, 32 Footer, 34 Caption.
+fn canonical_name(sti: u16) -> Option<String> {
+    match sti {
+        n @ 1..=9 => Some(format!("Heading {n}")),
+        31 => Some("Header".to_owned()),
+        32 => Some("Footer".to_owned()),
+        34 => Some("Caption".to_owned()),
+        _ => None,
+    }
+}
+
+/// Work out every paragraph style's exposed name, once. Returns how many
+/// stored names cannot be exposed (longer than 255 characters or holding a
+/// control character).
+///
+/// A name may be stored as `"primary,alias,alias"` ([MS-DOC] §2.9.258); only
+/// the primary is the style's name. `istd` 0 is the default style however it is
+/// named, so it never gets one.
+fn assign_display_names(styles: &mut [StyleDef]) -> usize {
+    use crate::limits::{StyleName, classify_style_name};
+    let mut unusable = 0;
+    for style in styles.iter_mut().skip(1) {
+        style.display_name = None;
+        if style.stk != STK_PARAGRAPH {
+            continue;
+        }
+        if let Some(name) = canonical_name(style.sti) {
+            style.display_name = Some(name);
+            continue;
+        }
+        match classify_style_name(style.name.split(',').next().unwrap_or("")) {
+            StyleName::Usable(name) => style.display_name = Some(name),
+            StyleName::Unusable => unusable += 1,
+            StyleName::Absent => {},
+        }
+    }
+    unusable
 }
 
 /// The display name of style `istd`, or `None` for the default style, a style
-/// with no usable name, or an index outside the sheet.
+/// that is not a paragraph style, a style with no usable name, or an index
+/// outside the sheet.
 ///
 /// `istd` 0 is the default paragraph style (`Normal`, [MS-DOC] §2.9.260
 /// `StdfBase.sti` 0) however the producing application named it: the name is
 /// localized, so it is the position and not the name that identifies it. A
-/// built-in style is identified by its `sti` and its stored name is the
-/// producing Word's language, so the styles `.docx` also normalizes (Heading
-/// 1–9, Header, Footer, Caption) are reported under their canonical English
-/// name; the others keep the stored name. A name may be stored as
-/// `"primary,alias,alias"` ([MS-DOC] §2.9.258); only the primary is the style's
-/// name.
+/// paragraph's `istd` can name a character, table or numbering style
+/// (`StdfBase.stk`, §2.9.253); only a paragraph style is the paragraph's style,
+/// as in `.docx`. A built-in style is identified by its `sti` and its stored
+/// name is the producing Word's language, so the styles `.docx` also
+/// normalizes (Heading 1–9, Header, Footer, Caption) are reported under their
+/// canonical English name; the others keep the stored name.
 pub fn style_name_for_istd(styles: &[StyleDef], istd: u16) -> Option<String> {
-    if istd == 0 {
-        return None;
-    }
-    let style = styles.get(usize::from(istd))?;
-    let canonical = match style.sti {
-        // [MS-DOC] §2.9.260 `sti`: 1–9 Heading 1–9, 31 Header, 32 Footer,
-        // 34 Caption.
-        n @ 1..=9 => return Some(format!("Heading {n}")),
-        31 => Some("Header"),
-        32 => Some("Footer"),
-        34 => Some("Caption"),
-        _ => None,
-    };
-    match canonical {
-        Some(name) => Some(name.to_owned()),
-        None => crate::limits::clean_style_name(style.name.split(',').next()?),
-    }
+    styles.get(usize::from(istd))?.display_name.clone()
 }
 
 /// The longest `istdBase` chain followed when resolving a style's heading
@@ -127,19 +166,7 @@ pub fn parse_style_sheet(table_stream: &[u8], fib: &Fib) -> StyleSheet {
             table_stream.len()
         ));
     }
-    let mut sheet = parse_stsh(&table_stream[start..end]);
-    let unusable = sheet
-        .styles
-        .iter()
-        .filter(|s| crate::limits::is_unusable_style_name(s.name.split(',').next().unwrap_or("")))
-        .count();
-    if unusable > 0 {
-        sheet.warnings.push(format!(
-            "{unusable} style name(s) were not exposed because they exceed 255 characters or \
-             contain control characters"
-        ));
-    }
-    sheet
+    parse_stsh(&table_stream[start..end])
 }
 
 /// Resolve a paragraph's `istd` (optionally overridden by `sprmPIstd`) to a
@@ -282,11 +309,19 @@ fn parse_stsh(data: &[u8]) -> StyleSheet {
             String::new()
         };
         let (base, own_outline) = style_inheritance(std, cb_std_base);
+        // `StdfBase.stk` is the low 4 bits of the second u16 (§2.9.253).
+        let stk = if std.len() >= 4 {
+            u16::from_le_bytes([std[2], std[3]]) & 0x000F
+        } else {
+            0
+        };
         styles.push(StyleDef {
             sti,
             name,
             base,
             own_outline,
+            stk,
+            display_name: None,
         });
         pos += cb_std;
         // LPStd entries are stored on even-byte boundaries and `cbStd` does NOT
@@ -315,15 +350,22 @@ fn parse_stsh(data: &[u8]) -> StyleSheet {
              deeper than {MAX_STYLE_CHAIN}, so their heading levels are unavailable"
         ));
     }
+    let unusable = assign_display_names(&mut styles);
+    if unusable > 0 {
+        warnings.push(format!(
+            "{unusable} style name(s) were not exposed because they exceed 255 characters or \
+             contain control characters"
+        ));
+    }
     StyleSheet { styles, warnings }
 }
 
 /// A style's `istdBase` and the outline level its own paragraph properties
 /// state, read from the `STD` ([MS-DOC] §2.9.258).
 ///
-/// `StdfBase` holds `sgc` in the low 4 bits of its second word and `istdBase` in
+/// `StdfBase` holds `stk` in the low 4 bits of its second word and `istdBase` in
 /// the high 12; the third word's low 4 bits are `cupx`, the number of `UPX`
-/// entries that follow the name. Only a paragraph style (`sgc` 1) carries a
+/// entries that follow the name. Only a paragraph style (`stk` 1) carries a
 /// `UpxPapx`, which is the first `LPUpx` after the name: `cbUpx(u16)`, then
 /// `istd(u16)`, then the paragraph `grpprl`. Any bound that does not hold
 /// yields no outline level rather than a guess.
@@ -332,11 +374,10 @@ fn style_inheritance(std: &[u8], cb_std_base: usize) -> (Option<u16>, Option<u8>
         return (None, None);
     }
     let word1 = u16::from_le_bytes([std[2], std[3]]);
-    let sgc = word1 & 0x000F;
+    let stk = word1 & 0x000F;
     let base = (word1 >> 4 != 0x0FFF).then_some(word1 >> 4);
     let cupx = u16::from_le_bytes([std[4], std[5]]) & 0x000F;
-    const PARAGRAPH_STYLE: u16 = 1; // sgc, [MS-DOC] §2.9.260
-    if sgc != PARAGRAPH_STYLE || cupx == 0 {
+    if stk != STK_PARAGRAPH || cupx == 0 {
         return (base, None);
     }
     // `xstzName` is `cch(u16)` + `cch` UTF-16 units + a 2-byte terminator; the
@@ -1149,46 +1190,35 @@ mod tests {
 
     #[test]
     fn test_style_name_for_istd_default_alias_empty_and_out_of_range() {
-        let def = |name: &str| StyleDef {
-            sti: 0x0FFE,
-            name: name.to_owned(),
-            base: None,
-            own_outline: None,
-        };
-        let styles = vec![
-            def("Normal"),
-            def("Caption,Legende"),
-            def(""),
-            def("  spaced  ,x"),
-        ];
-        assert_eq!(style_name_for_istd(&styles, 0), None, "istd 0 is the default style");
-        assert_eq!(style_name_for_istd(&styles, 1).as_deref(), Some("Caption"));
-        assert_eq!(style_name_for_istd(&styles, 2), None, "an unnamed slot");
-        assert_eq!(style_name_for_istd(&styles, 3).as_deref(), Some("spaced"));
-        assert_eq!(style_name_for_istd(&styles, 4), None, "past the end of the sheet");
-        assert_eq!(style_name_for_istd(&styles, u16::MAX), None);
+        let sheet = parse_stsh(&stsh_bytes(&[
+            (0, 1, "Normal"),
+            (0x0FFE, 1, "Caption,Legende"),
+            (0x0FFE, 1, ""),
+            (0x0FFE, 1, "  spaced  ,x"),
+        ]));
+        let styles = &sheet.styles;
+        assert_eq!(style_name_for_istd(styles, 0), None, "istd 0 is the default style");
+        assert_eq!(style_name_for_istd(styles, 1).as_deref(), Some("Caption"));
+        assert_eq!(style_name_for_istd(styles, 2), None, "an unnamed slot");
+        assert_eq!(style_name_for_istd(styles, 3).as_deref(), Some("spaced"));
+        assert_eq!(style_name_for_istd(styles, 4), None, "past the end of the sheet");
+        assert_eq!(style_name_for_istd(styles, u16::MAX), None);
         assert_eq!(style_name_for_istd(&[], 5), None);
     }
 
     #[test]
     fn test_style_name_for_istd_built_ins_are_canonical_and_the_rest_keep_the_stored_name() {
-        let def = |sti: u16, name: &str| StyleDef {
-            sti,
-            name: name.to_owned(),
-            base: None,
-            own_outline: None,
-        };
-        let styles = vec![
-            def(0, "Standard"),
-            def(1, "Überschrift 1"),
-            def(9, "Überschrift 9"),
-            def(31, "Kopfzeile"),
-            def(32, "Fußzeile"),
-            def(34, "Beschriftung"),
-            def(30, "Commentaire"),
-            def(0x0FFE, "section-e"),
-        ];
-        let n = |i| style_name_for_istd(&styles, i);
+        let sheet = parse_stsh(&stsh_bytes(&[
+            (0, 1, "Standard"),
+            (1, 1, "Überschrift 1"),
+            (9, 1, "Überschrift 9"),
+            (31, 1, "Kopfzeile"),
+            (32, 1, "Fußzeile"),
+            (34, 1, "Beschriftung"),
+            (30, 1, "Commentaire"),
+            (0x0FFE, 1, "section-e"),
+        ]));
+        let n = |i| style_name_for_istd(&sheet.styles, i);
         assert_eq!(n(0), None);
         assert_eq!(n(1).as_deref(), Some("Heading 1"));
         assert_eq!(n(2).as_deref(), Some("Heading 9"));
@@ -1201,20 +1231,102 @@ mod tests {
 
     #[test]
     fn test_style_name_for_istd_rejects_unusable_names() {
-        let def = |name: &str| StyleDef {
-            sti: 0x0FFE,
-            name: name.to_owned(),
-            base: None,
-            own_outline: None,
-        };
-        let styles = vec![
-            def("Normal"),
-            def(&"N".repeat(256)),
-            def("a\u{0}b"),
-            def(&"M".repeat(255)),
-        ];
-        assert_eq!(style_name_for_istd(&styles, 1), None, "over 255 characters");
-        assert_eq!(style_name_for_istd(&styles, 2), None, "control character");
-        assert_eq!(style_name_for_istd(&styles, 3).map(|n| n.len()), Some(255));
+        let long = "N".repeat(256);
+        let exact = "M".repeat(255);
+        let sheet = parse_stsh(&stsh_bytes(&[
+            (0, 1, "Normal"),
+            (0x0FFE, 1, &long),
+            (0x0FFE, 1, "a\u{0}b"),
+            (0x0FFE, 1, &exact),
+        ]));
+        let n = |i| style_name_for_istd(&sheet.styles, i);
+        assert_eq!(n(1), None, "over 255 characters");
+        assert_eq!(n(2), None, "control character");
+        assert_eq!(n(3).map(|n| n.len()), Some(255));
+    }
+
+    /// A style sheet of `entries` (`sti`, `stk`, name) in `istd` order, written
+    /// as the bytes `parse_stsh` reads ([MS-DOC] §2.9.274 `Stshif`, §2.9.135
+    /// `LPStd`, §2.9.253 `StdfBase`).
+    fn stsh_bytes(entries: &[(u16, u16, &str)]) -> Vec<u8> {
+        let mut d = 18u16.to_le_bytes().to_vec(); // cbStshi
+        d.extend_from_slice(&(entries.len() as u16).to_le_bytes()); // cstd
+        d.extend_from_slice(&0x000Au16.to_le_bytes()); // cbSTDBaseInFile
+        d.extend_from_slice(&[0u8; 14]);
+        for &(sti, stk, name) in entries {
+            let mut std = vec![0u8; 10];
+            std[0..2].copy_from_slice(&sti.to_le_bytes());
+            std[2..4].copy_from_slice(&(stk | (0x0FFF << 4)).to_le_bytes());
+            let units: Vec<u16> = name.encode_utf16().collect();
+            std.extend_from_slice(&(units.len() as u16).to_le_bytes());
+            for u in &units {
+                std.extend_from_slice(&u.to_le_bytes());
+            }
+            std.extend_from_slice(&0u16.to_le_bytes());
+            d.extend_from_slice(&(std.len() as u16).to_le_bytes());
+            d.extend_from_slice(&std);
+        }
+        d
+    }
+
+    #[test]
+    fn test_style_name_is_examined_once_per_style_not_once_per_paragraph() {
+        use crate::limits::STYLE_NAME_BYTES_SCANNED as SCANNED;
+        // A name of 60 KB (the 16-bit `cbStd` allows little more): looked up for every
+        // paragraph that uses the style.
+        let long = "N".repeat(30_000);
+        let sheet = parse_stsh(&stsh_bytes(&[
+            (0, 1, "Normal"),
+            (0x0FFE, 1, &long),
+            (0x0FFE, 1, "section-e"),
+        ]));
+        let after_parse = SCANNED.with(std::cell::Cell::get);
+        for _ in 0..2_000 {
+            assert_eq!(style_name_for_istd(&sheet.styles, 1), None, "over 255 characters");
+            assert_eq!(style_name_for_istd(&sheet.styles, 2).as_deref(), Some("section-e"));
+        }
+        assert_eq!(
+            SCANNED.with(std::cell::Cell::get),
+            after_parse,
+            "looking a style name up must not re-examine the stored name"
+        );
+    }
+
+    #[test]
+    fn test_unusable_style_name_is_reported_once_per_style_sheet() {
+        let long = "N".repeat(300);
+        let sheet = parse_stsh(&stsh_bytes(&[
+            (0, 1, "Normal"),
+            (0x0FFE, 1, &long),
+            (0x0FFE, 1, "a\u{1}b"),
+        ]));
+        let hits = sheet
+            .warnings
+            .iter()
+            .filter(|w| w.contains("style name"))
+            .count();
+        assert_eq!(hits, 1, "{:?}", sheet.warnings);
+        assert!(sheet.warnings.iter().any(|w| w.starts_with('2')), "{:?}", sheet.warnings);
+    }
+
+    #[test]
+    fn test_style_name_is_none_unless_the_style_is_a_paragraph_style() {
+        // [MS-DOC] §2.9.253 `StdfBase.stk`: 1 paragraph, 2 character, 3 table,
+        // 4 numbering. A paragraph's `istd` can name any kind of style; only a
+        // paragraph style is the paragraph's style.
+        let sheet = parse_stsh(&stsh_bytes(&[
+            (0, 1, "Normal"),
+            (0x0FFE, 1, "section-e"),
+            (0x0FFE, 2, "Emphasis"),
+            (0x0FFE, 3, "Table Grid"),
+            (0x0FFE, 4, "List Bullet Style"),
+            (34, 2, "Beschriftung"),
+        ]));
+        let n = |i| style_name_for_istd(&sheet.styles, i);
+        assert_eq!(n(1).as_deref(), Some("section-e"));
+        assert_eq!(n(2), None, "character style");
+        assert_eq!(n(3), None, "table style");
+        assert_eq!(n(4), None, "numbering style");
+        assert_eq!(n(5), None, "a character style is not Caption whatever its sti");
     }
 }
