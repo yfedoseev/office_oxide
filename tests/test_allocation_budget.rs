@@ -620,7 +620,7 @@ fn test_doc_huge_papx_run_is_decoded_once_not_once_per_paragraph_mark() {
         "{extra:.0} allocations per extra paragraph mark ({few} for 50, {many} for 2,000)"
     );
     assert_eq!(doc.plain_text().matches('x').count(), 2_000);
-||||||| parent of 4ca6fd7 (perf(styles): resolve paragraph style names once per style; fix(doc): only paragraph styles are named)
+}
 
 /// A document whose paragraphs all use one paragraph style with a 1 MiB name.
 fn docx_with_huge_style_name(paragraphs: usize) -> Vec<u8> {
