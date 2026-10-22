@@ -5,7 +5,8 @@
 // Whole-file fuzzing rarely reaches either behind a valid CFB container, FIB and
 // piece table. This target builds a well-formed table `.doc` in code with the
 // fuzzer choosing how many pieces pile on the same bytes, how many rows there
-// are, and each row's `rgdxaCenter` boundaries. None may panic, overflow or hang.
+// are, how many character runs cover the text and each row's `rgdxaCenter`
+// boundaries. None may panic, overflow or hang.
 #[path = "../../tests/common/mod.rs"]
 mod common;
 
@@ -16,13 +17,17 @@ use libfuzzer_sys::fuzz_target;
 use office_oxide::{Document, DocumentFormat};
 
 fuzz_target!(|data: &[u8]| {
-    // bytes 0-1: piled pieces (0-399) and row count (1-24); the rest are
-    // little-endian i16 boundaries dealt out to the rows, up to eight a row.
-    let [pieces, rows, rest @ ..] = data else {
+    // bytes 0-2: piled pieces (0-399), row count (1-24) and character runs
+    // (0-120, each hiding its text when the low bit of the byte is set); the
+    // rest are little-endian i16 boundaries dealt out to the rows, up to eight a
+    // row.
+    let [pieces, rows, runs, rest @ ..] = data else {
         return;
     };
     let piled_pieces = usize::from(*pieces) * 400 / 256;
     let rows = usize::from(*rows % 24) + 1;
+    let chpx_runs = usize::from(*runs >> 1) % 121;
+    let vanish = *runs & 1;
     let mut centers = rest
         .chunks_exact(2)
         .map(|c| i16::from_le_bytes([c[0], c[1]]));
@@ -44,7 +49,12 @@ fuzz_target!(|data: &[u8]| {
             grpprl: row_grpprl(&row, &vec![0; cells]),
         });
     }
-    let tweaks = FibTweaks { piled_pieces, ..Default::default() };
+    let tweaks = FibTweaks {
+        piled_pieces,
+        chpx_runs,
+        chpx_grpprl: vec![0x3C, 0x08, vanish], // sprmCFVanish
+        ..Default::default()
+    };
     let bytes = build_doc_full(&paras, &Subdocs::default(), tweaks);
     if let Ok(doc) = Document::from_reader(Cursor::new(bytes), DocumentFormat::Doc) {
         let _ = doc.plain_text();

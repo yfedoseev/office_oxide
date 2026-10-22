@@ -190,6 +190,11 @@ pub struct FibTweaks {
     /// Write the piece table with this many pieces all pointing at the same
     /// text bytes (0 or 1: the usual single piece).
     pub piled_pieces: usize,
+    /// Write a `PlcfBteChpx` with this many one-character runs from the start
+    /// of the text, each carrying `chpx_grpprl`; 0 writes none.
+    pub chpx_runs: usize,
+    /// The character property list of each of those runs.
+    pub chpx_grpprl: Vec<u8>,
 }
 
 /// Build a synthetic `.doc`, optionally with subdocuments and FIB tweaks.
@@ -269,7 +274,10 @@ fn build_streams(
     let total_chars = units.len() as u32;
     // Text lives after the FIB pages (0..FIB_PAGES) and the N FKP pages.
     // Text lives after the FIB page (page 0) and the N FKP pages (pages 1..N).
-    let text_offset = ((n + FIB_PAGES) as u32) * 512;
+    // A CHPX FKP page holds at most 63 runs the reader accepts.
+    const CHPX_RUNS_PER_PAGE: usize = 60;
+    let chpx_pages = tweaks.chpx_runs.div_ceil(CHPX_RUNS_PER_PAGE);
+    let text_offset = ((n + chpx_pages + FIB_PAGES) as u32) * 512;
 
     // ── 0Table stream: CLX (piece table) followed by PlcfBtePapx. ──
     let mut table = build_clx(text_offset, total_chars, tweaks.piled_pieces);
@@ -277,6 +285,18 @@ fn build_streams(
     let fc_plcf = table.len() as u32;
     table.extend_from_slice(&build_plcf_bte_papx(n, &cp_starts, text_len));
     let lcb_plcf = (table.len() as u32) - fc_plcf;
+    // PlcBteChpx: `chpx_pages + 1` FCs, then one page number per page.
+    let fc_chpx = table.len() as u32;
+    if chpx_pages > 0 {
+        for page in 0..=chpx_pages {
+            let cp = (page * CHPX_RUNS_PER_PAGE).min(tweaks.chpx_runs) as u32;
+            table.extend_from_slice(&(text_offset + 2 * cp).to_le_bytes());
+        }
+        for page in 0..chpx_pages {
+            table.extend_from_slice(&((FIB_PAGES + n + page) as u32).to_le_bytes());
+        }
+    }
+    let lcb_chpx = table.len() as u32 - fc_chpx;
     // Optional PLCs, each placed after what is already in the table stream:
     // (FIB fc offset, aCP, data-element size).
     let mut plcs: Vec<(usize, u32, u32)> = Vec::new();
@@ -356,6 +376,30 @@ fn build_streams(
     }
     if let Some(off) = tweaks.clx_offset {
         word_doc[0x01A2..0x01A6].copy_from_slice(&off.to_le_bytes());
+    }
+    if chpx_pages > 0 {
+        word_doc[0x00FA..0x00FE].copy_from_slice(&fc_chpx.to_le_bytes());
+        word_doc[0x00FE..0x0102].copy_from_slice(&lcb_chpx.to_le_bytes());
+        for page in 0..chpx_pages {
+            let first = page * CHPX_RUNS_PER_PAGE;
+            let crun = (tweaks.chpx_runs - first).min(CHPX_RUNS_PER_PAGE);
+            let mut buf = [0u8; 512];
+            for k in 0..=crun {
+                let fc = text_offset + 2 * (first + k) as u32;
+                buf[4 * k..4 * k + 4].copy_from_slice(&fc.to_le_bytes());
+            }
+            // The Chpx (a size byte, then the list) sits after the offsets, at
+            // an even byte; every run names it.
+            let at = (4 * (crun + 1) + crun + 1) & !1;
+            buf[at] = tweaks.chpx_grpprl.len() as u8;
+            buf[at + 1..at + 1 + tweaks.chpx_grpprl.len()].copy_from_slice(&tweaks.chpx_grpprl);
+            for k in 0..crun {
+                buf[4 * (crun + 1) + k] = (at / 2) as u8;
+            }
+            buf[511] = crun as u8;
+            let off = (FIB_PAGES + n + page) * 512;
+            word_doc[off..off + 512].copy_from_slice(&buf);
+        }
     }
     for (fib_off, fc, lcb) in plcs {
         word_doc[fib_off..fib_off + 4].copy_from_slice(&fc.to_le_bytes());

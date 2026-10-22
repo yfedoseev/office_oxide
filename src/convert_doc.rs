@@ -669,8 +669,20 @@ fn count_grid_edges(centers: &[i16], col: usize, grid: &[i32]) -> u32 {
     let hi = centers[col + 1] as i32;
     // `grid` is sorted, so the edges in `[lo, hi)` are a run found by search;
     // scanning all of it for every cell is cells x edges.
-    let below = |bound: i32| grid.partition_point(|&e| e < bound);
+    let below = |bound: i32| {
+        grid.partition_point(|&e| {
+            #[cfg(test)]
+            GRID_PROBES.with(|p| p.set(p.get() + 1));
+            e < bound
+        })
+    };
     below(hi).saturating_sub(below(lo)).max(1) as u32
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many grid edges `count_grid_edges` has compared, on this thread.
+    static GRID_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Walk structured paragraphs in document order, emitting tables, lists,
@@ -2120,7 +2132,6 @@ mod tests {
                 centers,
                 cells: vec![TapCellInfo::default(); n],
             }),
-            itap: 1,
             header: false,
         }
     }
@@ -2129,8 +2140,8 @@ mod tests {
     fn test_grid_edges_are_counted_by_search_not_by_scanning_the_whole_grid() {
         // Rows whose boundaries all differ fill the column grid (the i16 twip
         // range, deduplicated to 4 twips, is ~16k edges). Every cell used to be
-        // checked against every edge: cells x edges. 40k cells must not take
-        // seconds.
+        // checked against every edge: cells x edges, about 640 million
+        // comparisons here. A search compares about 15 edges per bound.
         let rows: Vec<PendingRow> = (0..400i32)
             .map(|r| {
                 let centers: Vec<i16> = (0..=100i32)
@@ -2141,13 +2152,13 @@ mod tests {
                 row_of_cells(centers)
             })
             .collect();
-        let start = std::time::Instant::now();
+        GRID_PROBES.with(|p| p.set(0));
         let table = build_table_rows(&rows);
-        assert!(
-            start.elapsed() < std::time::Duration::from_millis(1500),
-            "took {:?}",
-            start.elapsed()
-        );
+        let probes = GRID_PROBES.with(std::cell::Cell::get);
+        let cells: usize = table.iter().map(|r| r.cells.len()).sum();
+        assert!(cells > 30_000, "{cells} cells");
+        // Two searches per cell, each at most log2(grid) + 1 = 15 probes.
+        assert!(probes > 0 && probes <= cells * 2 * 15, "{probes} probes for {cells} cells");
         assert_eq!(table.len(), 400);
     }
 
