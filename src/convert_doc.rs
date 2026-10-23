@@ -550,7 +550,7 @@ fn build_table_rows(pending: &[PendingRow]) -> Vec<TableRow> {
         }
     }
 
-    let merges = resolve_vertical_merges(pending, &grid);
+    let merges = resolve_vertical_merges(pending);
     // What the absorbed continuations hold, by the merged cell it joins.
     let mut carried: std::collections::HashMap<(usize, usize), Vec<Element>> =
         std::collections::HashMap::new();
@@ -612,11 +612,62 @@ fn build_table_rows(pending: &[PendingRow]) -> Vec<TableRow> {
         .collect()
 }
 
-/// The columns a cell covers, as the indexes of the column-grid edges its left
-/// and right boundaries fall on. Boundaries the grid treats as one edge (within
-/// [`EDGE_TOLERANCE_TWIPS`]) have the same index, so two cells cover the same
-/// columns exactly when their keys are equal.
-type ColumnKey = (usize, usize);
+/// A vertical merge still open at the bottom of the rows read so far: the
+/// boundaries of the cell that started it, and that cell.
+struct OpenMerge {
+    left: i32,
+    right: i32,
+    origin: (usize, usize),
+}
+
+/// Boundaries are bucketed this many twips wide, one more than
+/// [`EDGE_TOLERANCE_TWIPS`]: two boundaries in one bucket differ by at most the
+/// tolerance, and two within the tolerance of each other lie in the same or in
+/// adjacent buckets.
+const BUCKET_TWIPS: i32 = EDGE_TOLERANCE_TWIPS + 1;
+
+/// The bucket of a cell's left and right boundary.
+type Bucket = (i32, i32);
+
+/// The merges still open, by bucket, each list in the order the merges were
+/// opened.
+type OpenMerges = std::collections::HashMap<Bucket, std::collections::VecDeque<OpenMerge>>;
+
+fn bucket_of(left: i32, right: i32) -> Bucket {
+    (left.div_euclid(BUCKET_TWIPS), right.div_euclid(BUCKET_TWIPS))
+}
+
+/// Take the oldest open merge whose left and right boundaries are both within
+/// [`EDGE_TOLERANCE_TWIPS`] of these.
+///
+/// Every merge in the same bucket matches, so the common case (a continuation on
+/// the same boundaries as its merge) is one lookup however many merges share
+/// them. A continuation a little off looks at the eight neighbouring buckets,
+/// where only some merges match.
+fn take_open_merge(open: &mut OpenMerges, left: i32, right: i32) -> Option<OpenMerge> {
+    let (bl, br) = bucket_of(left, right);
+    if let Some(m) = open.get_mut(&(bl, br)).and_then(|l| l.pop_front()) {
+        return Some(m);
+    }
+    for dl in -1..=1 {
+        for dr in -1..=1 {
+            if (dl, dr) == (0, 0) {
+                continue;
+            }
+            let Some(list) = open.get_mut(&(bl + dl, br + dr)) else {
+                continue;
+            };
+            let fits = |m: &OpenMerge| {
+                (m.left - left).abs() <= EDGE_TOLERANCE_TWIPS
+                    && (m.right - right).abs() <= EDGE_TOLERANCE_TWIPS
+            };
+            if let Some(i) = list.iter().position(fits) {
+                return list.remove(i);
+            }
+        }
+    }
+    None
+}
 
 /// The merges resolved for every row of a table.
 struct VerticalMerges {
@@ -645,23 +696,25 @@ fn cell_is_empty(content: &[Element]) -> bool {
 /// The 2-bit `fVertMerge` field (MS-DOC `TCGRF`) drives the logic:
 /// `fvmRestart` starts a new merge, `fvmMerge` continues the merge above, and
 /// `fvmClear` is an ordinary cell. A merge runs down a *column*: a `fvmMerge`
-/// cell continues the open merge that covers the same columns (the same left
-/// and right boundary, as [`ColumnKey`] defines it), not the cell with the same
-/// index, since the rows above and below can have different numbers of cells
-/// (horizontally merged cells above, for one). A continuation is absorbed into
-/// the cell that started the merge, which carries the `row_span`; if it holds
-/// anything, its content is added to the merged cell, so nothing is dropped. A
-/// `fvmMerge` cell with no open merge over its columns (none above, or one of a
-/// different width) has nothing to continue and stays an ordinary cell. Every
-/// `fvmRestart` is a genuine new merge, never a continuation: one that
-/// immediately follows another opens its own. A row without a usable row
-/// definition ends every open merge. The only other representable 2-bit value
-/// (the reserved `0x0040`) is treated as `fvmClear` rather than panicking,
-/// keeping decoding robust against malformed input.
+/// cell continues the open merge that covers the same columns, its left and
+/// right boundary each within [`EDGE_TOLERANCE_TWIPS`] of those of the cell that
+/// started the merge, not the cell with the same index, since the rows above and
+/// below can have different numbers of cells (horizontally merged cells above,
+/// for one). A continuation is absorbed into the cell that started the merge,
+/// which carries the `row_span`; if it holds anything, its content is added to
+/// the merged cell, so nothing is dropped. A `fvmMerge` cell with no open merge
+/// over its columns (none above, or one of a different width) has nothing to
+/// continue and stays an ordinary cell. Every `fvmRestart` is a genuine new
+/// merge, never a continuation: one that immediately follows another opens its
+/// own. A row without a usable row definition ends every open merge. The only
+/// other representable 2-bit value (the reserved `0x0040`) is treated as
+/// `fvmClear` rather than panicking, keeping decoding robust against malformed
+/// input.
 ///
-/// One pass over the rows with a hash lookup per continuation: the work is
-/// linear in the cells, however tall a merge is or however many share a column.
-fn resolve_vertical_merges(pending: &[PendingRow], grid: &[i32]) -> VerticalMerges {
+/// One pass over the rows. A continuation on the boundaries of its merge is a
+/// single hash lookup however many merges share them; one slightly off scans
+/// the merges of the neighbouring buckets, at most the 255 cells of a row.
+fn resolve_vertical_merges(pending: &[PendingRow]) -> VerticalMerges {
     let mut cells: Vec<(Vec<bool>, Vec<u32>)> = pending
         .iter()
         .map(|r| {
@@ -670,14 +723,7 @@ fn resolve_vertical_merges(pending: &[PendingRow], grid: &[i32]) -> VerticalMerg
         })
         .collect();
     let mut carried = Vec::new();
-    // The merges still open, by the columns they cover, each as the cell that
-    // started it. Several can share a key (zero-width cells).
-    let mut open: std::collections::HashMap<ColumnKey, Vec<(usize, usize)>> =
-        std::collections::HashMap::new();
-    let grid_edge = |twips: i16| {
-        grid.partition_point(|&g| g <= i32::from(twips))
-            .saturating_sub(1)
-    };
+    let mut open = OpenMerges::new();
     for (row, prow) in pending.iter().enumerate() {
         let usable = prow.tap.as_ref().filter(|tap| {
             tap.centers.len() == tap.cells.len() + 1 && tap.cells.len() == prow.cells.len()
@@ -686,20 +732,34 @@ fn resolve_vertical_merges(pending: &[PendingRow], grid: &[i32]) -> VerticalMerg
             open.clear();
             continue;
         };
-        let mut next: std::collections::HashMap<ColumnKey, Vec<(usize, usize)>> =
-            std::collections::HashMap::new();
+        let mut next = OpenMerges::new();
         for (col, tc) in tap.cells.iter().enumerate() {
-            let key = (grid_edge(tap.centers[col]), grid_edge(tap.centers[col + 1]));
+            let left = i32::from(tap.centers[col]);
+            let right = i32::from(tap.centers[col + 1]);
             match vert_merge_state(tc.rgf) {
-                FVM_RESTART => next.entry(key).or_default().push((row, col)),
+                FVM_RESTART => {
+                    next.entry(bucket_of(left, right))
+                        .or_default()
+                        .push_back(OpenMerge {
+                            left,
+                            right,
+                            origin: (row, col),
+                        })
+                },
                 FVM_MERGE => {
-                    if let Some(origin) = open.get_mut(&key).and_then(Vec::pop) {
+                    if let Some(merge) = take_open_merge(&mut open, left, right) {
+                        let origin = merge.origin;
                         cells[origin.0].1[origin.1] += 1;
                         cells[row].0[col] = true;
                         if !cell_is_empty(&prow.cells[col]) {
                             carried.push((origin, (row, col)));
                         }
-                        next.entry(key).or_default().push(origin);
+                        // The merge keeps the boundaries it started with, so
+                        // continuations that each drift a few twips do not chain
+                        // across the table.
+                        next.entry(bucket_of(merge.left, merge.right))
+                            .or_default()
+                            .push_back(merge);
                     }
                 },
                 _ => {},
@@ -2372,6 +2432,47 @@ mod tests {
         ];
         let out = build_table_rows(&rows);
         assert_eq!(paragraph_texts(&out[0].cells[0]), vec!["top"]);
+    }
+
+    /// Boundaries a few twips apart continue one another whatever else is on the
+    /// column grid: here a third row puts an edge between 1003 and 1005, which
+    /// are two separate grid edges but 2 twips apart.
+    #[test]
+    fn test_vertical_merge_tolerance_does_not_depend_on_other_rows_edges() {
+        let rows = vec![
+            tap_row(&[0, 1005, 2000], &[0, 0x0060], &["a", "merged"]),
+            tap_row(&[0, 1003, 2000], &[0, 0x0020], &["b", ""]),
+            tap_row(&[0, 1000, 2000], &[0, 0], &["c", "d"]),
+        ];
+        let out = build_table_rows(&rows);
+        assert_eq!(out[0].cells[1].row_span, 2, "the continuation 2 twips away joins");
+        assert_eq!(out[1].cells.len(), 1);
+    }
+
+    /// The same for the right boundary.
+    #[test]
+    fn test_vertical_merge_right_boundary_tolerance_does_not_depend_on_other_rows_edges() {
+        let rows = vec![
+            tap_row(&[0, 1000, 2000], &[0, 0x0060], &["a", "merged"]),
+            tap_row(&[0, 1000, 1997], &[0, 0x0020], &["b", ""]),
+            tap_row(&[0, 1000, 1995], &[0, 0], &["c", "d"]),
+        ];
+        let out = build_table_rows(&rows);
+        assert_eq!(out[0].cells[1].row_span, 2);
+        assert_eq!(out[1].cells.len(), 1);
+    }
+
+    /// Merges that cover the same columns are continued in the order they were
+    /// opened: the first continuation belongs to the first merge.
+    #[test]
+    fn test_vertical_merges_over_the_same_columns_pair_up_in_order() {
+        let rows = vec![
+            tap_row(&[0, 0, 0], &[0x0060, 0x0060], &["A", "B"]),
+            tap_row(&[0, 0, 0], &[0x0020, 0x0020], &["a1", "b1"]),
+        ];
+        let out = build_table_rows(&rows);
+        assert_eq!(paragraph_texts(&out[0].cells[0]), vec!["A", "a1"]);
+        assert_eq!(paragraph_texts(&out[0].cells[1]), vec!["B", "b1"]);
     }
 
     // ── Line-shape heading guess tightening ────────────────────
