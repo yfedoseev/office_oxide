@@ -637,13 +637,17 @@ fn bucket_of(left: i32, right: i32) -> Bucket {
     (left.div_euclid(BUCKET_TWIPS), right.div_euclid(BUCKET_TWIPS))
 }
 
-/// Take the oldest open merge whose left and right boundaries are both within
+/// Take an open merge whose left and right boundaries are both within
 /// [`EDGE_TOLERANCE_TWIPS`] of these.
 ///
 /// Every merge in the same bucket matches, so the common case (a continuation on
 /// the same boundaries as its merge) is one lookup however many merges share
-/// them. A continuation a little off looks at the eight neighbouring buckets,
-/// where only some merges match.
+/// them, and the oldest of those is taken. Only if that bucket is empty does a
+/// continuation a little off look at the eight neighbouring buckets, where only
+/// some merges match; it takes the first that does, in a fixed bucket order. Two
+/// merges can both match one continuation only when their cells lie within twice
+/// the tolerance of each other on both edges, which with increasing boundaries
+/// needs a cell no wider than that.
 fn take_open_merge(open: &mut OpenMerges, left: i32, right: i32) -> Option<OpenMerge> {
     let (bl, br) = bucket_of(left, right);
     if let Some(m) = open.get_mut(&(bl, br)).and_then(|l| l.pop_front()) {
@@ -2324,6 +2328,31 @@ mod tests {
         assert_eq!(at(4), vec![(1, 1), (1, 2)], "4 twips away still continues");
         // The extra grid edge makes the cell two columns wide; it is not extended down.
         assert_eq!(at(5), vec![(1, 1), (2, 1)], "5 twips away is another column");
+    }
+
+    /// The tolerance is inclusive on both boundaries even when the two sit in
+    /// different buckets, where the exact comparison decides: 1003 and 1007 are
+    /// 4 apart across a bucket line, 1003 and 1008 are 5.
+    #[test]
+    fn test_vertical_merge_tolerance_is_inclusive_across_bucket_lines() {
+        let left = |restart: i16, cont: i16| {
+            let rows = vec![
+                tap_row(&[0, restart, 2000], &[0, 0x0060], &["a", "m"]),
+                tap_row(&[0, cont, 2000], &[0, 0x0020], &["b", ""]),
+            ];
+            build_table_rows(&rows)[0].cells[1].row_span
+        };
+        assert_eq!(left(1003, 1007), 2, "4 twips apart joins");
+        assert_eq!(left(1003, 1008), 1, "5 twips apart does not");
+        let right = |restart: i16, cont: i16| {
+            let rows = vec![
+                tap_row(&[0, 1000, restart], &[0, 0x0060], &["a", "m"]),
+                tap_row(&[0, 1000, cont], &[0, 0x0020], &["b", ""]),
+            ];
+            build_table_rows(&rows)[0].cells[1].row_span
+        };
+        assert_eq!(right(1998, 2002), 2, "4 twips apart joins");
+        assert_eq!(right(1998, 2003), 1, "5 twips apart does not");
     }
 
     /// A merge keeps the boundary it started at: continuations that each drift
