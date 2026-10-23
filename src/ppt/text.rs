@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use super::downrev;
 use super::persist::{self, PersistDirectory};
 use super::records::*;
 use super::style::{self, CharFormatSpan, ParaFormatSpan};
@@ -330,6 +331,7 @@ fn collect_slide_containers(
                 budget,
             );
             runs.retain(|r| !is_field_placeholder_only(&r.text));
+            downrev::append_slide_downrev(&rec.data, &mut runs);
             let hidden = slide_is_hidden(&rec.data);
             out.push(SlideText {
                 text_runs: runs,
@@ -1129,6 +1131,10 @@ fn resolve_slide(
                 budget,
             );
             hidden = slide_is_hidden(&children);
+
+            // Shapes WPS wrote back as OOXML downrev packages keep their
+            // text in those packages, not in the legacy text atoms.
+            downrev::append_slide_downrev(&children, &mut text_runs);
 
             // Placeholder character/paragraph formatting a direct
             // StyleTextPropAtom left unset falls back to the slide's
