@@ -591,6 +591,11 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     let mut pivot_elements: Vec<Element> = Vec::new();
     let mut pivot_truncated = false;
     for (name, data) in doc.pivot_caches() {
+        // Pivots that name one cache each render it, so the table is
+        // charged to the budget however many of them share the data.
+        if budget.exhausted() {
+            break;
+        }
         pivot_elements.push(Element::Heading(Heading {
             level: 3,
             content: vec![InlineContent::Text(TextSpan::plain(
@@ -617,14 +622,17 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             is_header: true,
             ..Default::default()
         }];
-        rows.extend(data.records.iter().map(|rec| {
-            TableRow {
+        for rec in &data.records {
+            if !budget.charge(rec.iter().map(String::len).sum::<usize>() + cols.max(rec.len())) {
+                break;
+            }
+            rows.push(TableRow {
                 cells: (0..cols.max(rec.len()))
                     .map(|i| text_cell(rec.get(i).map(String::as_str).unwrap_or("")))
                     .collect(),
                 ..Default::default()
-            }
-        }));
+            });
+        }
         pivot_elements.push(Element::Table(Table {
             rows,
             ..Default::default()
@@ -638,6 +646,12 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 ..Default::default()
             }));
         }
+    }
+    if budget.exhausted() && !pivot_elements.is_empty() {
+        pivot_elements.push(Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan::plain(budget.notice()))],
+            ..Default::default()
+        }));
     }
     if !pivot_elements.is_empty() {
         sections.push(Section {

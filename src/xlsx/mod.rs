@@ -834,7 +834,7 @@ struct PivotContext {
     table_names: std::collections::HashSet<String>,
     /// Materialised cache data by cache-definition part, so a cache shared
     /// by several pivots is parsed once.
-    parsed: std::collections::HashMap<String, Option<worksheet::PivotCacheData>>,
+    parsed: std::collections::HashMap<String, Option<std::sync::Arc<worksheet::PivotCacheData>>>,
 }
 
 impl PivotContext {
@@ -931,6 +931,7 @@ fn read_tables_and_pivots<R: Read + Seek>(
                                 &src,
                                 budget,
                             );
+                            let data = data.map(std::sync::Arc::new);
                             pivot_ctx.parsed.insert(cache_path.clone(), data.clone());
                             data
                         },

@@ -24,7 +24,7 @@ impl XlsxDocument {
         self.worksheets
             .iter()
             .flat_map(|ws| &ws.pivot_tables)
-            .filter_map(|p| Some((p.name.as_str(), p.cache_data.as_ref()?)))
+            .filter_map(|p| Some((p.name.as_str(), p.cache_data.as_deref()?)))
     }
 }
 
@@ -188,17 +188,31 @@ impl XlsxDocument {
                 parts.push(text.trim().to_string());
             }
         }
+        // Pivots that name one cache each render it, so the output is
+        // charged to the budget however many of them share the data.
+        let mut pivots_spent = false;
         for (name, data) in self.pivot_caches() {
+            if budget.exhausted() {
+                break;
+            }
             let mut block = pivot_cache_title(name);
             for row in std::iter::once(&data.fields).chain(&data.records) {
+                let line = row.join("\t");
+                if !budget.charge(line.len() + 1) {
+                    pivots_spent = true;
+                    break;
+                }
                 block.push('\n');
-                block.push_str(&row.join("\t"));
+                block.push_str(&line);
             }
             if data.truncated {
                 block.push('\n');
                 block.push_str(PIVOT_CACHE_TRUNCATED_NOTICE);
             }
             parts.push(block);
+        }
+        if pivots_spent {
+            parts.push(budget.notice());
         }
         for (name, err) in &self.unreadable_sheets {
             parts.push(unreadable_notice(name, err));
@@ -361,7 +375,13 @@ impl XlsxDocument {
                 parts.push(format!("## Chart {}\n\n{}", i + 1, text));
             }
         }
+        // Pivots that name one cache each render it, so the output is
+        // charged to the budget however many of them share the data.
+        let mut pivots_spent = false;
         for (name, data) in self.pivot_caches() {
+            if budget.exhausted() {
+                break;
+            }
             let cols = data.fields.len().max(1);
             let md_row = |row: &[String]| {
                 let mut line = String::from("|");
@@ -379,14 +399,22 @@ impl XlsxDocument {
             block.push('|');
             block.push_str(&" --- |".repeat(cols));
             for rec in &data.records {
+                let line = md_row(rec);
+                if !budget.charge(line.len() + 1) {
+                    pivots_spent = true;
+                    break;
+                }
                 block.push('\n');
-                block.push_str(&md_row(rec));
+                block.push_str(&line);
             }
             if data.truncated {
                 block.push_str("\n\n");
                 block.push_str(PIVOT_CACHE_TRUNCATED_NOTICE);
             }
             parts.push(block);
+        }
+        if pivots_spent {
+            parts.push(budget.notice());
         }
         for (name, err) in &self.unreadable_sheets {
             parts.push(format!("## {name}\n\n{}", unreadable_notice(name, err)));

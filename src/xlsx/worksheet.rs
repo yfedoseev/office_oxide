@@ -103,7 +103,9 @@ pub struct SheetPivotTable {
     /// not in the workbook — an external or consolidation source, a sheet
     /// the workbook does not have, or a name that resolves to nothing. When
     /// the source cells exist, they already carry this data.
-    pub cache_data: Option<PivotCacheData>,
+    ///
+    /// Shared by every pivot that names the same cache part.
+    pub cache_data: Option<std::sync::Arc<PivotCacheData>>,
 }
 
 /// A pivot cache's source data as cached in the package: one column per

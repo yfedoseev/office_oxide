@@ -511,3 +511,81 @@ fn test_threaded_comment_flood_keeps_the_cells_and_reports_the_truncation() {
     let ir = doc.to_ir();
     assert!(ir.metadata.text_truncated);
 }
+
+/// One sheet with `pivots` relationships to the same pivot table part, whose
+/// cache (external source) holds `records` records of `value_len` characters.
+fn pivot_fan_out_workbook(pivots: usize, records: usize, value_len: usize) -> Vec<u8> {
+    let mut sheet_rels = format!(r#"<Relationships xmlns="{REL_NS}">"#);
+    for i in 1..=pivots {
+        sheet_rels.push_str(&format!(
+            r#"<Relationship Id="rId{i}" Type="{R}/pivotTable" Target="../pivotTables/pivotTable1.xml"/>"#
+        ));
+    }
+    sheet_rels.push_str("</Relationships>");
+    let mut cache_records = format!(r#"<pivotCacheRecords xmlns="{NS}">"#);
+    for _ in 0..records {
+        cache_records.push_str(&format!(r#"<r><s v="{}"/></r>"#, "p".repeat(value_len)));
+    }
+    cache_records.push_str("</pivotCacheRecords>");
+    package(
+        r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#,
+        &worksheet_rel("rId1", "worksheets/sheet1.xml"),
+        &[
+            (
+                "xl/worksheets/sheet1.xml",
+                format!(r#"<worksheet xmlns="{NS}"><sheetData><row r="1"><c r="A1"><v>42</v></c></row></sheetData></worksheet>"#).into_bytes(),
+            ),
+            ("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels.into_bytes()),
+            (
+                "xl/pivotTables/pivotTable1.xml",
+                format!(r#"<pivotTableDefinition xmlns="{NS}" name="P"><location ref="A1:B2"/></pivotTableDefinition>"#).into_bytes(),
+            ),
+            (
+                "xl/pivotTables/_rels/pivotTable1.xml.rels",
+                format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/pivotCacheDefinition" Target="../pivotCache/pivotCacheDefinition1.xml"/></Relationships>"#).into_bytes(),
+            ),
+            (
+                "xl/pivotCache/pivotCacheDefinition1.xml",
+                format!(r#"<pivotCacheDefinition xmlns="{NS}" xmlns:r="{R}" r:id="rId1"><cacheSource type="external"/><cacheFields count="1"><cacheField name="F"><sharedItems/></cacheField></cacheFields></pivotCacheDefinition>"#).into_bytes(),
+            ),
+            (
+                "xl/pivotCache/_rels/pivotCacheDefinition1.xml.rels",
+                format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/pivotCacheRecords" Target="pivotCacheRecords1.xml"/></Relationships>"#).into_bytes(),
+            ),
+            ("xl/pivotCache/pivotCacheRecords1.xml", cache_records.into_bytes()),
+        ],
+    )
+}
+
+#[test]
+fn test_one_pivot_cache_named_by_many_pivots_is_shared_and_its_output_charged() {
+    set_budgets();
+    // 40 pivots over a cache of 50 records of 100 characters: 5,000
+    // characters stored once, 200,000 rendered against a 60,000 budget.
+    let doc = open(pivot_fan_out_workbook(40, 50, 100)).unwrap();
+    let pivots = &doc.as_xlsx().unwrap().worksheets[0].pivot_tables;
+    assert_eq!(pivots.len(), 40);
+    assert!(
+        std::sync::Arc::ptr_eq(
+            pivots[0].cache_data.as_ref().unwrap(),
+            pivots[39].cache_data.as_ref().unwrap()
+        ),
+        "every pivot holds its own copy of the cache"
+    );
+    for (surface, out) in [
+        ("plain_text", doc.plain_text()),
+        ("to_markdown", doc.to_markdown()),
+    ] {
+        assert!(out.contains("character budget"), "{surface}: no truncation notice");
+        assert!(out.len() < 2 * TEXT_BUDGET, "{surface}: {} bytes", out.len());
+    }
+    assert!(doc.to_ir().metadata.text_truncated);
+}
+
+#[test]
+fn test_a_few_pivots_over_one_cache_are_unaffected() {
+    set_budgets();
+    let doc = open(pivot_fan_out_workbook(2, 5, 20)).unwrap();
+    assert!(!doc.to_markdown().contains("character budget"));
+    assert!(!doc.to_ir().metadata.text_truncated);
+}
