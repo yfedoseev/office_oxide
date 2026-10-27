@@ -283,6 +283,7 @@ impl XlsxDocument {
             images: Vec<crate::xlsx::worksheet::WorksheetPicture>,
             text_shapes: Vec<crate::xlsx::worksheet::WorksheetTextShape>,
             comments: Vec<crate::xlsx::worksheet::SheetComment>,
+            comments_truncated: bool,
         }
         let mut bundles = Vec::with_capacity(workbook.sheets.len());
         // Pivot cache records materialised for sources outside the
@@ -359,6 +360,7 @@ impl XlsxDocument {
                     images: Vec::new(),
                     text_shapes: Vec::new(),
                     comments: Vec::new(),
+                    comments_truncated: false,
                 });
                 continue;
             }
@@ -429,19 +431,12 @@ impl XlsxDocument {
                 .and_then(|path| Self::read_xml_entry(&mut archive, &entries, &path).ok())
                 .and_then(|data| worksheet::parse_threaded_comments(&data).ok())
                 .unwrap_or_default();
-            let comments = match worksheet::merge_threaded_comments(
+            let (comments, comments_truncated) = worksheet::merge_threaded_comments(
                 comments,
                 threaded_comments,
                 &persons,
                 &mut comment_budget,
-            ) {
-                Ok(comments) => comments,
-                Err(e) => {
-                    log::warn!("xlsx: sheet {:?}: {e}", sheet.name);
-                    unreadable_sheets.push((sheet.name.clone(), e.to_string()));
-                    continue;
-                },
-            };
+            );
 
             let (tables, pivot_tables) = read_tables_and_pivots(
                 &mut archive,
@@ -465,6 +460,7 @@ impl XlsxDocument {
                 images,
                 text_shapes,
                 comments,
+                comments_truncated,
             });
         }
 
@@ -492,6 +488,7 @@ impl XlsxDocument {
                         ws.images = b.images;
                         ws.text_shapes = b.text_shapes;
                         ws.comments = b.comments;
+                        ws.comments_truncated = b.comments_truncated;
                         Ok(Ok(ws))
                     },
                     Err(e) => {

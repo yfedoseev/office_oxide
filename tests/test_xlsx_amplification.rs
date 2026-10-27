@@ -446,3 +446,68 @@ fn test_a_few_comments_by_one_author_are_unaffected() {
     assert!(!doc.plain_text().contains("character budget"));
     assert!(!doc.to_ir().metadata.text_truncated);
 }
+
+/// Two sheets, each with a cell and `threads` threaded comments (one
+/// message each) by one person whose name is `author_len` characters.
+fn threaded_comment_workbook(threads: usize, author_len: usize) -> Vec<u8> {
+    let persons = format!(
+        r#"<personList xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments"><person displayName="{}" id="{{P}}" userId="u" providerId="AD"/></personList>"#,
+        "a".repeat(author_len)
+    );
+    let mut sheets = String::new();
+    let mut rels = String::new();
+    let mut parts: Vec<(String, Vec<u8>)> =
+        vec![("xl/persons/person.xml".to_string(), persons.into_bytes())];
+    for i in 1..=2 {
+        sheets.push_str(&format!(r#"<sheet name="S{i}" sheetId="{i}" r:id="rId{i}"/>"#));
+        rels.push_str(&worksheet_rel(&format!("rId{i}"), &format!("worksheets/sheet{i}.xml")));
+        parts.push((
+            format!("xl/worksheets/sheet{i}.xml"),
+            format!(
+                r#"<worksheet xmlns="{NS}"><sheetData><row r="1"><c r="A1"><v>4{i}</v></c></row></sheetData></worksheet>"#
+            )
+            .into_bytes(),
+        ));
+        parts.push((
+            format!("xl/worksheets/_rels/sheet{i}.xml.rels"),
+            format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="http://schemas.microsoft.com/office/2017/10/relationships/threadedComment" Target="../threadedComments/t{i}.xml"/></Relationships>"#).into_bytes(),
+        ));
+        let mut tc = String::from(
+            r#"<ThreadedComments xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments">"#,
+        );
+        for t in 1..=threads {
+            tc.push_str(&format!(
+                r#"<threadedComment ref="A{t}" id="{{T{t}}}" personId="{{P}}"><text>note</text></threadedComment>"#
+            ));
+        }
+        tc.push_str("</ThreadedComments>");
+        parts.push((format!("xl/threadedComments/t{i}.xml"), tc.into_bytes()));
+    }
+    let parts: Vec<(&str, Vec<u8>)> = parts.iter().map(|(n, d)| (n.as_str(), d.clone())).collect();
+    package(&sheets, &rels, &parts)
+}
+
+#[test]
+fn test_threaded_comment_flood_keeps_the_cells_and_reports_the_truncation() {
+    set_budgets();
+    // 20 threads of 2,000 characters on each of two sheets: 40,000 per
+    // sheet, under the 60,000 budget alone, 80,000 together.
+    let doc = open(threaded_comment_workbook(20, 2_000)).unwrap();
+    let xlsx = doc.as_xlsx().unwrap();
+    assert!(xlsx.unreadable_sheets.is_empty(), "no sheet is dropped for its comments");
+    assert_eq!(xlsx.worksheets.len(), 2);
+    assert!(!xlsx.worksheets[0].comments_truncated);
+    assert!(
+        xlsx.worksheets[1].comments_truncated,
+        "the budget is the document's, not each sheet's"
+    );
+    assert!(xlsx.worksheets[1].comments.len() < 20);
+    for ws in &xlsx.worksheets {
+        assert_eq!(ws.rows.len(), 1, "{}: the cells are kept", ws.name);
+    }
+    for out in [doc.plain_text(), doc.to_markdown()] {
+        assert!(out.contains("truncated"), "the truncation is not reported");
+    }
+    let ir = doc.to_ir();
+    assert!(ir.metadata.text_truncated);
+}

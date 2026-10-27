@@ -44,6 +44,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     // their own, also for the whole document: a row that spends the text
     // budget is still laid out, and its padding is still paid for.
     let mut image_budget = crate::limits::TextBudget::with_limit(crate::limits::max_image_bytes());
+    let mut comments_truncated = false;
     let mut padding_budget = crate::limits::TextBudget::new();
 
     for (ws_idx, ws) in doc.worksheets.iter().enumerate() {
@@ -478,6 +479,15 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             }));
         }
 
+        if ws.comments_truncated {
+            combined.push(Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(
+                    crate::xlsx::text::COMMENTS_TRUNCATED_NOTICE,
+                ))],
+                ..Default::default()
+            }));
+            comments_truncated = true;
+        }
         // Graceful truncation notice: when the sheet exceeded the row cap,
         // the dropped rows are not silently lost — a visible paragraph records
         // how many rows were omitted so downstream text/markdown/PDF makes the
@@ -679,6 +689,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 || pivot_truncated
                 || budget.exhausted()
                 || padding_budget.exhausted()
+                || comments_truncated
                 || image_budget.exhausted(),
             defined_names: doc
                 .workbook

@@ -30,6 +30,9 @@ pub struct Worksheet {
     /// Cell comments from the sheet's `xl/comments*.xml` part, in document
     /// order. Empty when the sheet has no comments.
     pub comments: Vec<SheetComment>,
+    /// `true` when the comments stopped at the document's text budget: the
+    /// threaded comments past it are missing (or show their legacy note).
+    pub comments_truncated: bool,
     /// Layout-preserving text shapes anchored on this worksheet via a
     /// DrawingML drawing part. Each entry is one `<xdr:sp>` carrying a
     /// single styled run — populated by the round-trip from
@@ -669,23 +672,21 @@ pub(crate) fn merge_threaded_comments(
     threaded: Vec<RawThreadedComment>,
     persons: &std::collections::HashMap<String, std::sync::Arc<str>>,
     budget: &mut crate::limits::TextBudget,
-) -> crate::core::Result<Vec<SheetComment>> {
+) -> (Vec<SheetComment>, bool) {
     if threaded.is_empty() {
-        return Ok(legacy);
+        return (legacy, false);
     }
 
-    let mut by_ref: std::collections::HashMap<String, Vec<&RawThreadedComment>> =
-        std::collections::HashMap::new();
+    let mut by_ref: std::collections::BTreeMap<&str, Vec<&RawThreadedComment>> =
+        std::collections::BTreeMap::new();
     for tc in &threaded {
-        by_ref.entry(tc.cell_ref.clone()).or_default().push(tc);
+        by_ref.entry(tc.cell_ref.as_str()).or_default().push(tc);
     }
 
-    let mut out: Vec<SheetComment> = legacy
-        .into_iter()
-        .filter(|c| !by_ref.contains_key(&c.cell_ref))
-        .collect();
-
-    for (cell_ref, mut msgs) in by_ref {
+    let mut threads: Vec<SheetComment> = Vec::new();
+    let mut resolved: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut truncated = false;
+    'threads: for (cell_ref, mut msgs) in by_ref {
         // The root message (no parentId) leads; replies follow in their
         // original file order — a stable sort on "has a parent" keeps
         // that order within each group.
@@ -698,27 +699,33 @@ pub(crate) fn merge_threaded_comments(
                 thread_author = author.clone();
             }
             // Each message line names its author, so a long name repeated
-            // down a long thread is charged for every message.
+            // down a long thread is charged for every message. A thread
+            // that does not fit is left out whole, and so are the rest.
             let line_chars = author.as_ref().map_or(0, |a| a.len() + 2) + m.text.len();
             if !budget.charge(line_chars) {
-                return Err(crate::core::Error::PackageLimit(format!(
-                    "the threaded comments exceed the {} character budget \
-                     (office_oxide::limits::set_max_text_chars)",
-                    budget.limit()
-                )));
+                truncated = true;
+                break 'threads;
             }
             match author {
                 Some(a) => lines.push(format!("{a}: {}", m.text)),
                 None => lines.push(m.text.clone()),
             }
         }
-        out.push(SheetComment {
-            cell_ref,
+        resolved.insert(cell_ref);
+        threads.push(SheetComment {
+            cell_ref: cell_ref.to_string(),
             author: thread_author,
             text: lines.join("\n"),
         });
     }
-    Ok(out)
+
+    // A cell whose thread was left out keeps its legacy note.
+    let mut out: Vec<SheetComment> = legacy
+        .into_iter()
+        .filter(|c| !resolved.contains(c.cell_ref.as_str()))
+        .collect();
+    out.extend(threads);
+    (out, truncated)
 }
 
 /// A text shape anchored on a worksheet via a DrawingML drawing part.
@@ -842,6 +849,7 @@ impl Worksheet {
             page_setup: None,
             images: Vec::new(),
             comments: Vec::new(),
+            comments_truncated: false,
             text_shapes: Vec::new(),
             conditional_formats: Vec::new(),
             data_validations: Vec::new(),
@@ -987,6 +995,7 @@ impl Worksheet {
             tables: Vec::new(),
             pivot_tables: Vec::new(),
             comments: Vec::new(),
+            comments_truncated: false,
             name,
             dimension,
             rows,
@@ -2442,7 +2451,7 @@ mod tests {
             &persons,
             &mut crate::limits::TextBudget::new(),
         )
-        .unwrap();
+        .0;
         assert_eq!(merged.len(), 2);
 
         let c2 = merged.iter().find(|c| c.cell_ref == "C2").unwrap();
@@ -2479,7 +2488,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &mut crate::limits::TextBudget::new(),
         )
-        .unwrap();
+        .0;
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "the root message\na reply");
     }
@@ -2499,9 +2508,10 @@ mod tests {
         let mut persons = std::collections::HashMap::new();
         persons.insert("{P1}".to_string(), "n".repeat(100).into());
         let mut budget = crate::limits::TextBudget::with_limit(1_000);
-        let err = merge_threaded_comments(Vec::new(), threaded, &persons, &mut budget)
-            .expect_err("5,000 characters of thread text exceed a 1,000 budget");
-        assert!(matches!(err, crate::core::Error::PackageLimit(_)), "{err:?}");
+        let (merged, truncated) =
+            merge_threaded_comments(Vec::new(), threaded, &persons, &mut budget);
+        assert!(truncated, "5,000 characters of thread text exceed a 1,000 budget");
+        assert!(merged.is_empty(), "a thread that does not fit is left out whole");
     }
 
     #[test]
@@ -2517,7 +2527,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &mut crate::limits::TextBudget::new(),
         )
-        .unwrap();
+        .0;
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "plain note");
     }

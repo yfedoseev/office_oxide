@@ -31,6 +31,10 @@ impl XlsxDocument {
 /// What an unused column of a Markdown table row costs: `" | "`.
 const MARKDOWN_PAD_CHARS: usize = 3;
 
+/// The line every renderer gives a sheet whose threaded comments stopped at
+/// the document's text budget.
+pub(crate) const COMMENTS_TRUNCATED_NOTICE: &str = "[comments truncated: the threaded comments exceed the character budget (office_oxide::limits::set_max_text_chars) — later threads are missing]";
+
 /// What a comment adds to a rendering: its cell reference, author and text.
 /// The author is stored once and named by every comment, so this is what
 /// the renderers charge to the budget for each.
@@ -155,6 +159,10 @@ impl XlsxDocument {
                     comment_marker(&c.cell_ref, c.author.as_deref()),
                     c.text
                 ));
+            }
+            if ws.comments_truncated {
+                sheet.push('\n');
+                sheet.push_str(COMMENTS_TRUNCATED_NOTICE);
             }
             if budget.exhausted() {
                 sheet.push('\n');
@@ -331,6 +339,9 @@ impl XlsxDocument {
                     comment_marker(&c.cell_ref, c.author.as_deref()),
                     c.text.trim()
                 ));
+            }
+            if ws.comments_truncated {
+                parts.push(COMMENTS_TRUNCATED_NOTICE.to_string());
             }
             if budget.exhausted() {
                 parts.push(budget.notice());
@@ -835,6 +846,7 @@ mod tests {
             page_setup: None,
             images: Vec::new(),
             comments: Vec::new(),
+            comments_truncated: false,
             text_shapes: vec![super::super::worksheet::WorksheetTextShape {
                 text: "Lorem ipsum drawn in a text box".to_string(),
                 font_name: None,
@@ -911,6 +923,7 @@ mod tests {
             page_setup: None,
             images: Vec::new(),
             comments: Vec::new(),
+            comments_truncated: false,
             text_shapes: Vec::new(),
             conditional_formats: Vec::new(),
             data_validations: Vec::new(),
