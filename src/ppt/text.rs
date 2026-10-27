@@ -126,14 +126,29 @@ pub struct DeckText {
     /// The static (non-placeholder) text of every master at least one
     /// slide shows, each distinct text once; see [`master_static_text`].
     pub master_text: Vec<TextRun>,
+    /// What the reader left out to stay within its bounds (slide-list
+    /// entries that name a slide already read, text past the document's
+    /// text budget); reaches `Metadata::warnings`. Empty for an ordinary
+    /// deck.
+    pub notices: Vec<String>,
 }
 
 /// Extract the deck's slide text (resolved as described on
 /// `extract_slides_text`) and its masters' static text.
 pub fn extract_deck_text(stream: &[u8], current_user: Option<&[u8]>) -> DeckText {
+    extract_deck_text_with_budget(stream, current_user, crate::limits::TextBudget::new())
+}
+
+/// As [`extract_deck_text`], with the text budget as an explicit parameter so
+/// tests can exhaust it without a multi-hundred-megabyte deck.
+fn extract_deck_text_with_budget(
+    stream: &[u8],
+    current_user: Option<&[u8]>,
+    text_budget: crate::limits::TextBudget,
+) -> DeckText {
     let mut resolved = DeckText::default();
     if let Some(dir) = persist::build(stream, current_user) {
-        if let Some(deck) = extract_slides_via_persist(stream, &dir) {
+        if let Some(deck) = extract_slides_via_persist(stream, &dir, text_budget) {
             // A resolved-but-entirely-textless result is ambiguous: it's the
             // correct answer for a genuinely text-free deck (image-only
             // slides, or slides whose only text is on their master), but
@@ -158,6 +173,7 @@ pub fn extract_deck_text(stream: &[u8], current_user: Option<&[u8]>) -> DeckText
         // Which masters the slides show is known only through the persist
         // directory; the weaker paths cannot tell, so they add none.
         master_text: resolved.master_text,
+        notices: resolved.notices,
     }
 }
 
@@ -312,7 +328,11 @@ fn is_field_placeholder_only(text: &str) -> bool {
 /// Returns `None` if the `DocumentContainer` or its slide list can't be
 /// resolved at all (directory present but unusable); returns `Some(vec![])`
 /// if the slide list resolves but is empty.
-fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<DeckText> {
+fn extract_slides_via_persist(
+    stream: &[u8],
+    dir: &PersistDirectory,
+    mut text_budget: crate::limits::TextBudget,
+) -> Option<DeckText> {
     let doc_offset = dir.resolve(dir.doc_persist_id)?;
     let doc_children = bounded_container_children(stream, doc_offset, RT_DOCUMENT)?;
     let slide_list = find_child(&doc_children, RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES)?;
@@ -338,7 +358,21 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<D
     // Per slide: its `(masterIdRef, fMasterObjects)`.
     let mut master_refs: Vec<(u32, bool)> = Vec::new();
     let master_persist_ids = master_persist_ids(&doc_children);
+    // A slide is read once, however many list entries name it. Entries carry
+    // distinct persist ids, but the persist directory can map any number of
+    // ids to one `Slide` container, and reading it for each would copy its
+    // text once per entry: 10,000 entries over a 100,000-character slide
+    // were a gigabyte of text from a 395 KB file.
+    let mut slide_offsets: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut aliased_entries = 0usize;
+    let mut slides_cut_by_budget = false;
     for entry in slide_list_entries(&slide_list) {
+        if let Some(offset) = dir.resolve(entry.persist_id_ref) {
+            if !slide_offsets.insert(offset) {
+                aliased_entries += 1;
+                continue;
+            }
+        }
         let (mut slide, links) = resolve_slide(
             stream,
             dir,
@@ -360,6 +394,12 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<D
                 ..Default::default()
             });
         }
+        // The slides read so far stay; the one that does not fit, and the
+        // rest, are left out.
+        if !text_budget.charge(slide_text_len(&slide)) {
+            slides_cut_by_budget = true;
+            break;
+        }
         slides.push(slide);
         slide_links.push((entry.slide_id, links.notes_id_ref));
         master_refs.extend(links.master);
@@ -373,7 +413,14 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<D
     if let Some(notes_list) = find_child(&doc_children, RT_SLIDE_LIST_WITH_TEXT, SLWT_NOTES) {
         let mut by_notes_id: HashMap<u32, Vec<TextRun>> = HashMap::new();
         let mut by_slide_id: HashMap<u32, Vec<TextRun>> = HashMap::new();
+        let mut notes_offsets: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for entry in slide_list_entries(&notes_list) {
+            if let Some(offset) = dir.resolve(entry.persist_id_ref) {
+                if !notes_offsets.insert(offset) {
+                    aliased_entries += 1;
+                    continue;
+                }
+            }
             let Some((runs, slide_id_ref)) = resolve_notes(
                 stream,
                 dir,
@@ -395,6 +442,11 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<D
                 .and_then(|id| by_notes_id.get(&id))
                 .or_else(|| by_slide_id.get(&slide_id));
             if let Some(runs) = notes {
+                // Many slides can name one notes page; each gets a copy.
+                if !text_budget.charge(runs.iter().map(|r| r.text.len()).sum()) {
+                    slides_cut_by_budget = true;
+                    break;
+                }
                 slide.text_runs.extend(runs.iter().cloned());
             }
         }
@@ -440,10 +492,33 @@ fn extract_slides_via_persist(stream: &[u8], dir: &PersistDirectory) -> Option<D
         }
     }
 
+    let mut notices = Vec::new();
+    if aliased_entries > 0 {
+        notices.push(format!(
+            "{aliased_entries} slide-list entries name a slide or notes page that an earlier \
+             entry already names; they were left out"
+        ));
+    }
+    if slides_cut_by_budget || text_budget.exhausted() {
+        notices.push(text_budget.notice());
+    }
     Some(DeckText {
         slides,
         master_text,
+        notices,
     })
+}
+
+/// The characters of text a resolved slide holds, for the text budget.
+fn slide_text_len(slide: &SlideText) -> usize {
+    let runs = |runs: &[TextRun]| runs.iter().map(|r| r.text.len()).sum::<usize>();
+    runs(&slide.text_runs)
+        + slide
+            .tables
+            .iter()
+            .flat_map(|t| t.rows.iter().flatten())
+            .map(|cell| runs(cell))
+            .sum::<usize>()
 }
 
 /// `masterId` → `persistIdRef` for every entry of the
@@ -3750,6 +3825,78 @@ mod tests {
         assert_eq!(slide_run.text, "SLIDE TEXT");
         assert_eq!(slide_run.char_formats[0].format.font_size, Some(30));
         assert_eq!(slide_run.para_formats[0].format.alignment, Some(2));
+    }
+
+    /// A deck of one slide per text in `texts` (persist ids 2..), whose slide
+    /// list also holds `aliases` further entries, each with its own persist id
+    /// that the persist directory maps to the first slide's container.
+    fn deck_with_aliased_entries(texts: &[String], aliases: u32) -> (Vec<u8>, Vec<u8>) {
+        let n = texts.len() as u32;
+        let ids: Vec<u32> = (2..2 + n + aliases).collect();
+        let entries: Vec<u8> = ids
+            .iter()
+            .map(|&id| slide_persist_atom_bytes(id, 256 + id))
+            .collect::<Vec<_>>()
+            .concat();
+        let doc = make_container(RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES, &entries);
+        let mut stream = make_container(RT_DOCUMENT, 0, &doc);
+        let mut offsets = vec![0u32];
+        for text in texts {
+            offsets.push(stream.len() as u32);
+            let mut c = slide_atom_following(0, false);
+            c.extend(other_text_shape(text, None));
+            stream.extend(make_container(RT_SLIDE, 0, &c));
+        }
+        let first_slide = offsets[1];
+        offsets.extend(std::iter::repeat(first_slide).take(aliases as usize));
+        let pd_offset = stream.len() as u32;
+        let dir: Vec<(u32, u32)> = offsets
+            .iter()
+            .enumerate()
+            .map(|(i, &off)| (1 + i as u32, off))
+            .collect();
+        stream.extend(persist_directory_bytes(&dir));
+        let edit_offset = stream.len() as u32;
+        stream.extend(user_edit_atom_bytes(0, pd_offset, 1));
+        (stream, current_user_bytes(edit_offset))
+    }
+
+    /// Slide-list entries with distinct persist ids that the directory maps to
+    /// one slide container name that slide, not a copy each: the text is read
+    /// once and the rest are reported.
+    #[test]
+    fn test_slide_list_entries_aliasing_one_slide_are_read_once() {
+        let (stream, cu) = deck_with_aliased_entries(&["ALIASED TEXT".repeat(100)], 500);
+        let deck = extract_deck_text(&stream, Some(&cu));
+        assert_eq!(deck.slides.len(), 1);
+        assert_eq!(deck.notices.len(), 1);
+        assert!(deck.notices[0].contains("500 slide-list entries"), "{:?}", deck.notices);
+    }
+
+    /// Distinct slides are all kept while the text budget lasts; past it the
+    /// slide that does not fit and those after it are left out, and the deck
+    /// says so.
+    #[test]
+    fn test_text_budget_cuts_the_slide_list() {
+        let texts: Vec<String> = vec!["x".repeat(100); 4];
+        let (stream, cu) = deck_with_aliased_entries(&texts, 0);
+        let whole = extract_deck_text(&stream, Some(&cu));
+        assert_eq!(whole.slides.len(), 4);
+        assert!(whole.notices.is_empty());
+
+        let cut = extract_deck_text_with_budget(
+            &stream,
+            Some(&cu),
+            crate::limits::TextBudget::with_limit(250),
+        );
+        assert_eq!(cut.slides.len(), 2);
+        assert!(
+            cut.notices
+                .iter()
+                .any(|n| n.contains("250 character budget")),
+            "{:?}",
+            cut.notices
+        );
     }
 
     /// A master reference cycle (title master naming itself through a

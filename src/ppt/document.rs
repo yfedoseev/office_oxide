@@ -91,7 +91,10 @@ impl PptDocument {
         let text_complete = !truncated.iter().any(|n| {
             n.eq_ignore_ascii_case("PowerPoint Document") || n.eq_ignore_ascii_case("Current User")
         });
+        // Slides or text the deck reader left out to stay within its bounds.
+        let text_complete = text_complete && deck.notices.is_empty();
         let mut warnings = cfb.warnings().to_vec();
+        warnings.extend(deck.notices);
         warnings.extend(
             truncated
                 .iter()
