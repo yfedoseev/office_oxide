@@ -94,16 +94,10 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             let (converted, chars) = notes_cache.entry(key).or_insert_with(|| {
                 let mut converted = Vec::new();
                 convert_text_body(tb, &mut converted);
-                let chars = DocumentIR {
-                    sections: vec![Section {
-                        elements: converted.clone(),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                }
-                .plain_text()
-                .chars()
-                .count();
+                // The size of a copy: its serialised form, which holds every
+                // string (link targets, tooltips, font names), the structure
+                // and any image bytes, not just the visible text.
+                let chars = serde_json::to_vec(&converted).map_or(usize::MAX, |v| v.len());
                 (converted, chars)
             });
             (!converted.is_empty() && notes_budget.charge(*chars)).then(|| converted.clone())

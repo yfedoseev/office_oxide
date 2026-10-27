@@ -229,16 +229,9 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
                 {
                     None
                 } else {
-                    let chars = DocumentIR {
-                        sections: vec![Section {
-                            elements: tmp.clone(),
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    }
-                    .plain_text()
-                    .chars()
-                    .count();
+                    // The size of a copy: its serialised form, which holds the
+                    // text, the structure and the image bytes (as base64).
+                    let chars = serde_json::to_vec(&tmp).map_or(usize::MAX, |v| v.len());
                     Some((HeaderFooter { content: tmp }, chars))
                 }
             });

@@ -213,3 +213,67 @@ fn test_pptx_pictures_sharing_one_image_stop_copying_at_the_budget() {
             .any(|w| w.contains("image bytes"))
     );
 }
+
+/// Notes whose size is almost all link target, not visible text: the
+/// per-slide copies are charged by what they hold, not by what they show.
+#[test]
+fn test_pptx_shared_notes_made_of_link_targets_stay_bounded() {
+    limits();
+    let n = 20;
+    let url = format!("http://example.com/{}", "u".repeat(3_000));
+    let notes = format!(
+        r#"<p:notes xmlns:p="{PML}" xmlns:a="{DML}" xmlns:r="{REL}"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="N"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:p><a:r><a:rPr><a:hlinkClick r:id="rId1"/></a:rPr><a:t>x</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>"#
+    );
+    let slide = format!(
+        r#"<p:sld xmlns:p="{PML}" xmlns:a="{DML}" xmlns:r="{REL}"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/></p:spTree></p:cSld></p:sld>"#
+    );
+    let mut ct = String::from(
+        r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/><Override PartName="/ppt/notesSlides/notesSlide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml"/>"#,
+    );
+    let mut list = String::new();
+    let mut pres_rels = Vec::new();
+    let mut parts = Vec::new();
+    for i in 1..=n {
+        ct.push_str(&format!(r#"<Override PartName="/ppt/slides/slide{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>"#));
+        list.push_str(&format!(r#"<p:sldId id="{}" r:id="rId{}"/>"#, 255 + i, i + 1));
+        pres_rels.push((format!("rId{}", i + 1), format!("slides/slide{i}.xml")));
+        parts.push((format!("ppt/slides/slide{i}.xml"), slide.clone().into_bytes()));
+        parts.push((
+            format!("ppt/slides/_rels/slide{i}.xml.rels"),
+            rels(&[("rId1", "notesSlide", "../notesSlides/notesSlide1.xml")]).into_bytes(),
+        ));
+    }
+    ct.push_str("</Types>");
+    let pr: Vec<(&str, &str, &str)> = pres_rels
+        .iter()
+        .map(|(a, c)| (a.as_str(), "slide", c.as_str()))
+        .collect();
+    parts.push(("[Content_Types].xml".to_string(), ct.into_bytes()));
+    parts.push((
+        "_rels/.rels".to_string(),
+        rels(&[("rId1", "officeDocument", "ppt/presentation.xml")]).into_bytes(),
+    ));
+    parts.push((
+        "ppt/presentation.xml".to_string(),
+        format!(r#"<p:presentation xmlns:p="{PML}" xmlns:r="{REL}"><p:sldIdLst>{list}</p:sldIdLst><p:sldSz cx="9144000" cy="6858000"/></p:presentation>"#).into_bytes(),
+    ));
+    parts.push(("ppt/_rels/presentation.xml.rels".to_string(), rels(&pr).into_bytes()));
+    parts.push(("ppt/notesSlides/notesSlide1.xml".to_string(), notes.into_bytes()));
+    parts.push((
+        "ppt/notesSlides/_rels/notesSlide1.xml.rels".to_string(),
+        format!(
+            r#"<Relationships xmlns="{PKG_REL}"><Relationship Id="rId1" Type="{REL}/hyperlink" Target="{url}" TargetMode="External"/></Relationships>"#
+        )
+        .into_bytes(),
+    ));
+    let doc = Document::from_reader(Cursor::new(zip_of(parts)), DocumentFormat::Pptx).unwrap();
+    let ir = doc.to_ir();
+    assert_eq!(ir.sections.len(), n);
+    let with_notes = ir
+        .sections
+        .iter()
+        .filter(|s| s.speaker_notes.is_some())
+        .count();
+    assert_eq!(with_notes, 2, "copies are charged by what they hold, not by their visible text");
+    assert!(ir.metadata.text_truncated);
+}
