@@ -254,3 +254,44 @@ fn test_shared_formula_budget_is_per_document_not_per_sheet() {
     );
     assert!(text.contains("S1"), "the sheets within it are read");
 }
+
+#[test]
+fn test_padding_is_charged_after_the_text_has_spent_its_budget() {
+    set_budgets();
+    // The last row's text spends the whole text budget; the rows before it
+    // are still laid out 200 columns wide and must still be paid for.
+    let far = col_name(200);
+    let mut sheet = format!(r#"<worksheet xmlns="{NS}"><sheetData>"#);
+    for r in 1..=2_000 {
+        sheet.push_str(&format!(r#"<row r="{r}"><c r="A{r}" t="inlineStr"><is><t>x</t></is></c>"#));
+        if r == 1 {
+            sheet.push_str(&format!(r#"<c r="{far}1" t="inlineStr"><is><t>y</t></is></c>"#));
+        }
+        if r == 2_000 {
+            sheet.push_str(&format!(
+                r#"<c r="B{r}" t="inlineStr"><is><t>{}</t></is></c>"#,
+                "z".repeat(TEXT_BUDGET + 1)
+            ));
+        }
+        sheet.push_str("</row>");
+    }
+    sheet.push_str("</sheetData></worksheet>");
+    let bytes = package(
+        r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#,
+        &worksheet_rel("rId1", "worksheets/sheet1.xml"),
+        &[("xl/worksheets/sheet1.xml", sheet.into_bytes())],
+    );
+    let ir = open(bytes).unwrap().to_ir();
+    let cells: usize = ir
+        .sections
+        .iter()
+        .flat_map(|s| &s.elements)
+        .filter_map(|e| match e {
+            office_oxide::ir::Element::Table(t) => {
+                Some(t.rows.iter().map(|r| r.cells.len()).sum::<usize>())
+            },
+            _ => None,
+        })
+        .sum();
+    assert!(cells < 2_000, "{cells} table cells were built after the text budget was spent");
+}

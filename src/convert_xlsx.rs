@@ -40,9 +40,13 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     // shared string referenced from every cell is copied into every
     // cell's span here.
     let mut budget = crate::limits::TextBudget::new();
+    // The empty cells that pad rows out to the sheet's width have a budget of
+    // their own, also for the whole document: a row that spends the text
+    // budget is still laid out, and its padding is still paid for.
+    let mut padding_budget = crate::limits::TextBudget::new();
 
     for (ws_idx, ws) in doc.worksheets.iter().enumerate() {
-        if budget.exhausted() {
+        if budget.exhausted() || padding_budget.exhausted() {
             break;
         }
         // First pass: parse all rows into `CellData` — the rendered display
@@ -287,9 +291,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             }
             out
         } else {
-            // Genuine grid → emit a Table. Rows are already cut where the
-            // text spent the budget, so only the padding is charged below.
-            let text_spent = budget.exhausted();
+            // Genuine grid → emit a Table.
             let mut rows: Vec<TableRow> = Vec::with_capacity(parsed_rows.len());
             for (row_idx, cells) in parsed_rows.iter().enumerate() {
                 // Lay the row out on the grid: a cell goes at its own column
@@ -301,8 +303,8 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 // that spends it: a sheet with cells at A1 and XFD1 and a
                 // thousand rows between would otherwise be 16 million cells.
                 let padding = grid_width.saturating_sub(cells.len());
-                if !text_spent
-                    && !budget.charge(padding.saturating_mul(crate::limits::EMPTY_TABLE_CELL_CHARS))
+                if !padding_budget
+                    .charge(padding.saturating_mul(crate::limits::EMPTY_TABLE_CELL_CHARS))
                 {
                     break;
                 }
@@ -485,7 +487,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 ..Default::default()
             }));
         }
-        if budget.exhausted() {
+        if budget.exhausted() || padding_budget.exhausted() {
             combined.push(Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain(budget.notice()))],
                 ..Default::default()
@@ -650,7 +652,8 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             has_macros: doc.has_macros,
             text_truncated: !doc.unreadable_sheets.is_empty()
                 || pivot_truncated
-                || budget.exhausted(),
+                || budget.exhausted()
+                || padding_budget.exhausted(),
             defined_names: doc
                 .workbook
                 .defined_names
