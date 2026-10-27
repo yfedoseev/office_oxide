@@ -2,6 +2,7 @@ use crate::format::DocumentFormat;
 use crate::ir::*;
 
 pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
+    crate::limits::begin_image_budget();
     // Slide size sits at presentation level — every slide in the
     // deck shares it.
     let page_setup = doc
@@ -198,6 +199,9 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
     if notes_budget.exhausted() {
         ir.metadata.warnings.push(notes_budget.notice());
     }
+    ir.metadata
+        .warnings
+        .extend(crate::limits::image_budget_warning());
     ir
 }
 
@@ -422,7 +426,13 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
                 .unwrap_or((None, None));
             let img_el = Element::Image(Image {
                 alt_text: pic.alt_text.clone(),
-                data: pic.data.clone(),
+                // Pictures share the media bytes; each IR image owns a copy,
+                // charged to the image-byte budget.
+                data: pic
+                    .data
+                    .as_deref()
+                    .filter(|d| crate::limits::charge_image_bytes(d.len()))
+                    .map(<[u8]>::to_vec),
                 format,
                 display_width_emu: display_w,
                 display_height_emu: display_h,

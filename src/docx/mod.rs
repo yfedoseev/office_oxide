@@ -132,7 +132,7 @@ pub struct DocxDocument {
     /// IR converter populate `Image::data` so downstream renderers
     /// (the positional PDF reader, plain-text export with alt-text,
     /// etc.) can place actual bitmap content.
-    pub images: std::collections::HashMap<String, (Vec<u8>, Option<String>)>,
+    pub images: std::collections::HashMap<String, (std::sync::Arc<[u8]>, Option<String>)>,
     /// Parsed `docProps/core.xml`. `None` when the package carries no
     /// core-properties part.
     pub core_properties: Option<crate::core::properties::CoreProperties>,
@@ -368,8 +368,10 @@ impl DocxDocument {
         // Images referenced from a part other than the main document
         // (a header's logo, a picture in a footnote), keyed as
         // `<part>:<rId>` — see `qualify_part_images`.
-        let mut part_images: std::collections::HashMap<String, (Vec<u8>, Option<String>)> =
-            std::collections::HashMap::new();
+        let mut part_images: std::collections::HashMap<
+            String,
+            (std::sync::Arc<[u8]>, Option<String>),
+        > = std::collections::HashMap::new();
         let mut headers_footers: Vec<HeaderFooter> = Vec::new();
         // A header or footer part is parsed and stored once per (part,
         // type, role), however many sections reference it: sections that
@@ -566,7 +568,9 @@ impl DocxDocument {
         // relationships. We capture the raw bytes plus the lower-cased
         // file extension so downstream code can decide on the format
         // without re-sniffing magic bytes.
-        let mut images: std::collections::HashMap<String, (Vec<u8>, Option<String>)> =
+        let mut images: std::collections::HashMap<String, (std::sync::Arc<[u8]>, Option<String>)> =
+            std::collections::HashMap::new();
+        let mut image_by_part: std::collections::HashMap<String, std::sync::Arc<[u8]>> =
             std::collections::HashMap::new();
         for rel in doc_rels.get_by_type(rel_types::IMAGE) {
             if rel.target_mode != TargetMode::Internal {
@@ -579,9 +583,17 @@ impl DocxDocument {
             if !opc.has_part(&part_name) {
                 continue;
             }
-            let data = match opc.read_part(&part_name) {
-                Ok(d) => d,
-                Err(_) => continue,
+            // Relationships that name one image part share its bytes.
+            let data = match image_by_part.get(part_name.as_str()) {
+                Some(d) => std::sync::Arc::clone(d),
+                None => {
+                    let d: std::sync::Arc<[u8]> = match opc.read_part(&part_name) {
+                        Ok(d) => d.into(),
+                        Err(_) => continue,
+                    };
+                    image_by_part.insert(part_name.as_str().to_string(), std::sync::Arc::clone(&d));
+                    d
+                },
             };
             let ext = part_name
                 .as_str()
@@ -2066,7 +2078,7 @@ fn qualify_part_images<R: Read + Seek>(
     part: &crate::core::opc::PartName,
     rels: &crate::core::relationships::Relationships,
     opc: &mut OpcReader<R>,
-    images: &mut std::collections::HashMap<String, (Vec<u8>, Option<String>)>,
+    images: &mut std::collections::HashMap<String, (std::sync::Arc<[u8]>, Option<String>)>,
 ) {
     let prefix = format!("{}:", part.as_str().rsplit('/').next().unwrap_or(""));
     let mut any = false;
@@ -2088,7 +2100,7 @@ fn qualify_part_images<R: Read + Seek>(
             .rsplit('.')
             .next()
             .map(|s| s.to_lowercase());
-        images.insert(format!("{prefix}{}", rel.id), (data, ext));
+        images.insert(format!("{prefix}{}", rel.id), (data.into(), ext));
         any = true;
     }
     if any {

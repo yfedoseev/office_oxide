@@ -154,6 +154,7 @@ impl<'a, 'd> Cx<'a, 'd> {
 }
 
 pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
+    crate::limits::begin_image_budget();
     let folds = StyleFolds::default();
     let cx = Cx {
         doc,
@@ -431,6 +432,7 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
                 .iter()
                 .map(|p| format!("skipped unreadable part {p}"))
                 .chain(hf_truncated)
+                .chain(crate::limits::image_budget_warning())
                 .chain(crate::core::core_properties::package_warnings(Some(
                     &doc.package_properties,
                 )))
@@ -1047,7 +1049,7 @@ fn collect_paragraph_inline_images(
                     // A linked picture has no bytes in the package, only
                     // its target; it used to be dropped without trace.
                     let (data, ext) = match embedded_image(d, doc) {
-                        Some((data, ext)) => (Some(data), ext),
+                        Some((data, ext)) => (data, ext),
                         None if d.linked_image.is_some() => (None, None),
                         None => continue,
                     };
@@ -1197,7 +1199,7 @@ fn drawing_to_float_element(
     }
 
     let (data, ext) = match embedded_image(d, doc) {
-        Some((data, ext)) => (Some(data), ext),
+        Some((data, ext)) => (data, ext),
         None if d.linked_image.is_some() => (None, None),
         None => return None,
     };
@@ -1230,14 +1232,20 @@ fn drawing_to_float_element(
 
 /// A drawing's embedded picture bytes and file extension, if the package
 /// holds them.
+///
+/// The bytes are shared in the document and copied into each IR `Image`;
+/// each copy is charged to the image-byte budget (`limits::set_max_image_bytes`)
+/// and, once it is spent, the image keeps its place without its bytes.
 fn embedded_image(
     d: &crate::docx::DrawingInfo,
     doc: &crate::docx::DocxDocument,
-) -> Option<(Vec<u8>, Option<String>)> {
+) -> Option<(Option<Vec<u8>>, Option<String>)> {
     if d.relationship_id.is_empty() {
         return None;
     }
-    doc.images.get(&d.relationship_id).cloned()
+    let (data, ext) = doc.images.get(&d.relationship_id)?;
+    let copy = crate::limits::charge_image_bytes(data.len()).then(|| data.to_vec());
+    Some((copy, ext.clone()))
 }
 
 /// Translate a paragraph's `<w:jc>` justification into the IR's

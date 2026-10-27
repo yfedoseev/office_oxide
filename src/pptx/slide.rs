@@ -121,7 +121,7 @@ impl Slide {
         xml_data: &[u8],
         name: String,
         rels: &Relationships,
-        media: &std::collections::HashMap<String, (Vec<u8>, String)>,
+        media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
         part_text: &std::collections::HashMap<String, Vec<String>>,
     ) -> CoreResult<Self> {
         let mut reader = make_content_reader(xml_data);
@@ -238,7 +238,7 @@ fn parse_hex_rgb(s: &str) -> Option<[u8; 3]> {
 fn parse_shape_tree(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    media: &std::collections::HashMap<String, (Vec<u8>, String)>,
+    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
     part_text: &std::collections::HashMap<String, Vec<String>>,
 ) -> CoreResult<Vec<Shape>> {
     parse_shape_tree_until(reader, rels, media, part_text, "spTree")
@@ -250,7 +250,7 @@ fn parse_shape_tree(
 fn parse_shape_tree_until(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    media: &std::collections::HashMap<String, (Vec<u8>, String)>,
+    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
     part_text: &std::collections::HashMap<String, Vec<String>>,
     end_local: &str,
 ) -> CoreResult<Vec<Shape>> {
@@ -293,7 +293,7 @@ fn parse_shape_tree_until(
 fn parse_alternate_content(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    media: &std::collections::HashMap<String, (Vec<u8>, String)>,
+    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
     part_text: &std::collections::HashMap<String, Vec<String>>,
 ) -> CoreResult<Vec<Shape>> {
     let mut shapes: Vec<Shape> = Vec::new();
@@ -393,7 +393,7 @@ fn parse_auto_shape(
 fn parse_picture(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    media: &std::collections::HashMap<String, (Vec<u8>, String)>,
+    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
 ) -> CoreResult<Shape> {
     let mut props = NvPicProps::default();
     let mut position = None;
@@ -530,7 +530,7 @@ fn read_rel_attr(e: &quick_xml::events::BytesStart, local: &str) -> CoreResult<O
 fn parse_group_shape(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    media: &std::collections::HashMap<String, (Vec<u8>, String)>,
+    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
     part_text: &std::collections::HashMap<String, Vec<String>>,
 ) -> CoreResult<Shape> {
     // Groups nest, so this is the recursion an adversarial deck drives.
@@ -727,7 +727,7 @@ fn find_part_rid(
 /// resolved against the slide's pre-read images.
 fn parse_ole_graphic_data(
     reader: &mut quick_xml::Reader<&[u8]>,
-    media: &std::collections::HashMap<String, (Vec<u8>, String)>,
+    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
 ) -> CoreResult<GraphicContent> {
     let mut ole = OleObject {
         prog_id: None,
@@ -754,7 +754,7 @@ fn parse_ole_graphic_data(
                         if let Some((bytes, ext)) =
                             read_blip_embed_attr(e)?.and_then(|rid| media.get(&rid))
                         {
-                            ole.preview_data = Some(bytes.clone());
+                            ole.preview_data = Some(bytes.to_vec());
                             ole.preview_format = Some(ext.clone());
                         }
                     },
@@ -784,7 +784,7 @@ fn parse_ole_graphic_data(
 fn parse_graphic_frame(
     reader: &mut quick_xml::Reader<&[u8]>,
     rels: &Relationships,
-    media: &std::collections::HashMap<String, (Vec<u8>, String)>,
+    media: &std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
     part_text: &std::collections::HashMap<String, Vec<String>>,
 ) -> CoreResult<Shape> {
     let mut id = 0u32;
@@ -3315,7 +3315,10 @@ mod tests {
         );
 
         let mut media = std::collections::HashMap::new();
-        media.insert("rId7".to_string(), (vec![0xDEu8, 0xADu8, 0xBEu8, 0xEFu8], "png".to_string()));
+        media.insert(
+            "rId7".to_string(),
+            (vec![0xDEu8, 0xADu8, 0xBEu8, 0xEFu8].into(), "png".to_string()),
+        );
 
         let slide = Slide::parse(
             &xml,

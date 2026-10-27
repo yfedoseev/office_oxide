@@ -224,7 +224,7 @@ impl PptxDocument {
             /// rId → (raw bytes, format-extension lowercase like "png" / "jpeg").
             /// Pre-resolved here in Phase 1 so the parallel slide parser
             /// (Phase 2) doesn't need access to the OPC reader.
-            media: std::collections::HashMap<String, (Vec<u8>, String)>,
+            media: std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
             /// rId → text lines of a chart part (`ppt/charts/chartN.xml`)
             /// or SmartArt data part (`ppt/diagrams/dataN.xml`). The slide
             /// XML holds only the reference; the text lives in the part.
@@ -601,7 +601,10 @@ struct PartCache {
     masters: Vec<MasterEntry>,
     master_index: std::collections::HashMap<crate::core::opc::PartName, Option<usize>>,
     /// Target part → (bytes, extension); `None` when unreadable.
-    images: std::collections::HashMap<crate::core::opc::PartName, Option<(Vec<u8>, String)>>,
+    images: std::collections::HashMap<
+        crate::core::opc::PartName,
+        Option<(std::sync::Arc<[u8]>, String)>,
+    >,
     /// (target part, is-chart) → text lines.
     part_text: std::collections::HashMap<(crate::core::opc::PartName, bool), Vec<String>>,
     /// Every part this cache decompressed, in order — what the caching
@@ -727,7 +730,7 @@ impl PartCache {
         opc: &mut OpcReader<R>,
         source: &crate::core::opc::PartName,
         rels: &Relationships,
-    ) -> std::collections::HashMap<String, (Vec<u8>, String)> {
+    ) -> std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)> {
         let mut media = std::collections::HashMap::new();
         for rel in rels.all() {
             if rel.rel_type != rel_types::IMAGE
@@ -750,7 +753,7 @@ impl PartCache {
                     .and_then(|s| s.to_str())
                     .map(|s| s.to_ascii_lowercase())
                     .unwrap_or_else(|| guess_format_from_bytes(&bytes).to_string());
-                Some((bytes, ext))
+                Some((bytes.into(), ext))
             });
             if let Some(found) = entry {
                 media.insert(rel.id.clone(), found.clone());

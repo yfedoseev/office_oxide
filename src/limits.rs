@@ -91,6 +91,70 @@ pub fn set_max_text_chars(chars: usize) {
     MAX_TEXT_CHARS.store(chars, Ordering::Relaxed);
 }
 
+/// The default per-document budget for image bytes copied into an IR: 1 GiB.
+///
+/// One image part can be used by any number of pictures; the reader keeps
+/// the bytes once, but each `Image` in the IR owns its own copy.
+pub const DEFAULT_MAX_IMAGE_BYTES: u64 = 1 << 30;
+
+static MAX_IMAGE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_IMAGE_BYTES);
+
+/// The maximum total of image bytes one converted document's IR may hold.
+pub fn max_image_bytes() -> u64 {
+    MAX_IMAGE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Set the image-byte budget for every conversion afterwards. `u64::MAX`
+/// disables the bound.
+pub fn set_max_image_bytes(bytes: u64) {
+    MAX_IMAGE_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+thread_local! {
+    /// Image bytes still available to the conversion running on this
+    /// thread, and whether it ran out.
+    static IMAGE_BUDGET: std::cell::Cell<(u64, bool)> =
+        const { std::cell::Cell::new((u64::MAX, false)) };
+}
+
+/// Start a conversion's image budget at the configured limit.
+pub(crate) fn begin_image_budget() {
+    IMAGE_BUDGET.with(|b| b.set((max_image_bytes(), false)));
+}
+
+/// Charge `bytes` of image data against the running conversion's budget.
+/// `false` (from the first refusal on) means the caller leaves the bytes out.
+pub(crate) fn charge_image_bytes(bytes: usize) -> bool {
+    IMAGE_BUDGET.with(|b| {
+        let (remaining, exhausted) = b.get();
+        if exhausted {
+            return false;
+        }
+        match remaining.checked_sub(bytes as u64) {
+            Some(rest) => {
+                b.set((rest, false));
+                true
+            },
+            None => {
+                b.set((0, true));
+                false
+            },
+        }
+    })
+}
+
+/// The warning a conversion records when image bytes were left out, or
+/// `None` when the budget held.
+pub(crate) fn image_budget_warning() -> Option<String> {
+    IMAGE_BUDGET.with(|b| b.get().1).then(|| {
+        format!(
+            "some image bytes were left out: the document's images exceed the {} byte budget \
+             (office_oxide::limits::set_max_image_bytes)",
+            max_image_bytes()
+        )
+    })
+}
+
 /// A document's remaining text budget.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TextBudget {

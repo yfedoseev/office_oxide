@@ -48,8 +48,9 @@ pub struct PictureShape {
     /// Relationship ID (`r:embed`) of the underlying media part, if any.
     pub embed_rid: Option<String>,
     /// Raw image bytes resolved via `embed_rid`, if the slide carried a
-    /// resolvable IMAGE relationship at parse time.
-    pub data: Option<Vec<u8>>,
+    /// resolvable IMAGE relationship at parse time. Shared (`Arc`): every
+    /// picture that embeds one media part holds the same bytes.
+    pub data: Option<std::sync::Arc<[u8]>>,
     /// Image format inferred from the relationship target extension or
     /// byte signature (e.g. `"png"`, `"jpeg"`, `"gif"`, `"emf"`).
     pub format: Option<String>,
