@@ -514,7 +514,13 @@ fn test_threaded_comment_flood_keeps_the_cells_and_reports_the_truncation() {
 
 /// One sheet with `pivots` relationships to the same pivot table part, whose
 /// cache (external source) holds `records` records of `value_len` characters.
-fn pivot_fan_out_workbook(pivots: usize, records: usize, value_len: usize) -> Vec<u8> {
+fn pivot_fan_out_workbook(
+    pivots: usize,
+    records: usize,
+    value_len: usize,
+    fields: usize,
+    field_len: usize,
+) -> Vec<u8> {
     let mut sheet_rels = format!(r#"<Relationships xmlns="{REL_NS}">"#);
     for i in 1..=pivots {
         sheet_rels.push_str(&format!(
@@ -527,6 +533,14 @@ fn pivot_fan_out_workbook(pivots: usize, records: usize, value_len: usize) -> Ve
         cache_records.push_str(&format!(r#"<r><s v="{}"/></r>"#, "p".repeat(value_len)));
     }
     cache_records.push_str("</pivotCacheRecords>");
+    let mut cache_fields = format!(r#"<cacheFields count="{fields}">"#);
+    for f in 0..fields {
+        cache_fields.push_str(&format!(
+            r#"<cacheField name="{}{f}"><sharedItems/></cacheField>"#,
+            "f".repeat(field_len)
+        ));
+    }
+    cache_fields.push_str("</cacheFields>");
     package(
         r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#,
         &worksheet_rel("rId1", "worksheets/sheet1.xml"),
@@ -546,7 +560,7 @@ fn pivot_fan_out_workbook(pivots: usize, records: usize, value_len: usize) -> Ve
             ),
             (
                 "xl/pivotCache/pivotCacheDefinition1.xml",
-                format!(r#"<pivotCacheDefinition xmlns="{NS}" xmlns:r="{R}" r:id="rId1"><cacheSource type="external"/><cacheFields count="1"><cacheField name="F"><sharedItems/></cacheField></cacheFields></pivotCacheDefinition>"#).into_bytes(),
+                format!(r#"<pivotCacheDefinition xmlns="{NS}" xmlns:r="{R}" r:id="rId1"><cacheSource type="external"/>{cache_fields}</pivotCacheDefinition>"#).into_bytes(),
             ),
             (
                 "xl/pivotCache/_rels/pivotCacheDefinition1.xml.rels",
@@ -562,7 +576,7 @@ fn test_one_pivot_cache_named_by_many_pivots_is_shared_and_its_output_charged() 
     set_budgets();
     // 40 pivots over a cache of 50 records of 100 characters: 5,000
     // characters stored once, 200,000 rendered against a 60,000 budget.
-    let doc = open(pivot_fan_out_workbook(40, 50, 100)).unwrap();
+    let doc = open(pivot_fan_out_workbook(40, 50, 100, 1, 1)).unwrap();
     let pivots = &doc.as_xlsx().unwrap().worksheets[0].pivot_tables;
     assert_eq!(pivots.len(), 40);
     assert!(
@@ -585,7 +599,7 @@ fn test_one_pivot_cache_named_by_many_pivots_is_shared_and_its_output_charged() 
 #[test]
 fn test_a_few_pivots_over_one_cache_are_unaffected() {
     set_budgets();
-    let doc = open(pivot_fan_out_workbook(2, 5, 20)).unwrap();
+    let doc = open(pivot_fan_out_workbook(2, 5, 20, 1, 1)).unwrap();
     assert!(!doc.to_markdown().contains("character budget"));
     assert!(!doc.to_ir().metadata.text_truncated);
 }
@@ -610,4 +624,34 @@ fn test_sheets_naming_one_part_are_read_once_and_the_rest_reported() {
     assert_eq!(xlsx.worksheets.len(), 1, "the part is parsed once");
     assert_eq!(xlsx.unreadable_sheets.len(), 29, "the other entries are reported");
     assert!(doc.plain_text().contains("already the content of sheet"));
+}
+
+#[test]
+fn test_pivot_headers_are_charged_when_a_cache_has_no_records() {
+    set_budgets();
+    // 100 pivots over a cache of 100 fields of 100 characters and no
+    // records: the field names are stored once (10,000 characters) and
+    // written once per pivot, which is 1,000,000 against a 60,000 budget.
+    let doc = open(pivot_fan_out_workbook(100, 0, 0, 100, 100)).unwrap();
+    for (surface, out) in [
+        ("plain_text", doc.plain_text()),
+        ("to_markdown", doc.to_markdown()),
+    ] {
+        assert!(out.contains("character budget"), "{surface}: no truncation notice");
+        assert!(out.len() < 3 * TEXT_BUDGET, "{surface}: {} bytes", out.len());
+    }
+    let ir = doc.to_ir();
+    let cells: usize = ir
+        .sections
+        .iter()
+        .flat_map(|s| &s.elements)
+        .filter_map(|e| match e {
+            office_oxide::ir::Element::Table(t) => {
+                Some(t.rows.iter().map(|r| r.cells.len()).sum::<usize>())
+            },
+            _ => None,
+        })
+        .sum();
+    assert!(cells < 100 * 100, "{cells} header cells were built");
+    assert!(ir.metadata.text_truncated);
 }

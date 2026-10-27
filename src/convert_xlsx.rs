@@ -596,11 +596,23 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         if budget.exhausted() {
             break;
         }
+        // The heading and the header row are paid for before they are built
+        // (an empty field name still costs its cell); a pivot whose header
+        // does not fit is left out, and so is every later one.
+        let title = crate::xlsx::text::pivot_cache_title(name);
+        let header_cost = title.len()
+            + data
+                .fields
+                .iter()
+                .map(|f| f.len().max(1))
+                .sum::<usize>()
+                .max(1);
+        if !budget.charge(header_cost) {
+            break;
+        }
         pivot_elements.push(Element::Heading(Heading {
             level: 3,
-            content: vec![InlineContent::Text(TextSpan::plain(
-                crate::xlsx::text::pivot_cache_title(name),
-            ))],
+            content: vec![InlineContent::Text(TextSpan::plain(title))],
             ..Default::default()
         }));
         let text_cell = |t: &str| TableCell {

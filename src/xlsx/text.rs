@@ -393,11 +393,19 @@ impl XlsxDocument {
                 }
                 line
             };
+            // The heading, the header row and the separator are paid for
+            // before they are written; a pivot whose header does not fit is
+            // not written, and no later one is.
             let mut block = format!("## {}\n\n", pivot_cache_title(name));
-            block.push_str(&md_row(&data.fields));
+            let header = md_row(&data.fields);
+            let separator = format!("|{}", " --- |".repeat(cols));
+            if !budget.charge(block.len() + header.len() + separator.len() + 2) {
+                pivots_spent = true;
+                break;
+            }
+            block.push_str(&header);
             block.push('\n');
-            block.push('|');
-            block.push_str(&" --- |".repeat(cols));
+            block.push_str(&separator);
             for rec in &data.records {
                 let line = md_row(rec);
                 if !budget.charge(line.len() + 1) {
