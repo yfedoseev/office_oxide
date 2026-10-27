@@ -45,6 +45,12 @@ fn slide_xml(shapes: &str) -> String {
     )
 }
 
+fn notes_xml(text: &str) -> String {
+    format!(
+        r#"<p:notes xmlns:p="{PML}" xmlns:a="{DML}"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="N"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:p><a:r><a:t>{text}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>"#
+    )
+}
+
 /// A deck whose slide list is `sld_ids` (each entry `(id, rId)`), with the
 /// `slides` slide parts `slide1.xml..` wired to `rId{n+1}`, the optional
 /// per-slide relationships, and any extra parts.
@@ -128,6 +134,42 @@ fn test_distinct_slides_listed_in_order_are_all_kept() {
     let doc = PptxDocument::from_reader(Cursor::new(bytes)).unwrap();
     assert_eq!(doc.slides.len(), 2);
     assert!(doc.unreadable_parts.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// A notes part related to by many slides
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_notes_part_shared_by_many_slides_is_parsed_once() {
+    let n = 30;
+    let slides: Vec<String> = (0..n).map(|i| slide_xml(&sp(&format!("s{i}")))).collect();
+    let rel = Some(rels(&[("rId1", "notesSlide", "../notesSlides/notesSlide1.xml")]));
+    let slide_rels: Vec<Option<String>> = (0..n).map(|_| rel.clone()).collect();
+    let ids: Vec<(u32, String)> = (0..n)
+        .map(|i| (256 + i as u32, format!("rId{}", i + 2)))
+        .collect();
+    let notes = "n".repeat(1_000);
+    let bytes = pptx(
+        &ids,
+        &slides,
+        &slide_rels,
+        vec![("ppt/notesSlides/notesSlide1.xml".to_string(), notes_xml(&notes))],
+    );
+    let doc = PptxDocument::from_reader(Cursor::new(bytes.clone())).unwrap();
+    assert_eq!(doc.slides.len(), n);
+    let first = doc.slides[0].notes.as_ref().expect("notes are read");
+    assert!(
+        doc.slides
+            .iter()
+            .all(|s| std::sync::Arc::ptr_eq(s.notes.as_ref().unwrap(), first)),
+        "every slide shares the one parsed notes body"
+    );
+    // Each slide still shows its notes.
+    let md = Document::from_reader(Cursor::new(bytes), DocumentFormat::Pptx)
+        .unwrap()
+        .to_markdown();
+    assert_eq!(md.matches(&notes).count(), n);
 }
 
 // ---------------------------------------------------------------------------

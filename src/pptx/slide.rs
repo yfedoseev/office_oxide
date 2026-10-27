@@ -65,7 +65,10 @@ pub struct Slide {
     /// structured `TextBody` (same model ordinary slide body text uses)
     /// rather than flattened text, so bold/italic/bullets/numbering in
     /// notes survive through to the IR.
-    pub notes: Option<TextBody>,
+    ///
+    /// Shared (`Arc`): several slides can relate to one notes part, which
+    /// is then parsed and held once.
+    pub notes: Option<std::sync::Arc<TextBody>>,
     /// Solid background colour (RGB) extracted from the slide's
     /// `<p:cSld><p:bg><p:bgPr><a:solidFill>` element. Only the solid
     /// case is parsed; gradient / image / theme-reference fills are

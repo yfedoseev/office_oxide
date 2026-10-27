@@ -15,12 +15,21 @@ impl PptxDocument {
     /// [`super::layout`] module.
     pub fn plain_text(&self) -> String {
         let mut parts = Vec::new();
+        // Notes shared by many slides are printed with each (see
+        // `crate::limits`), so the slides' text is charged to the budget.
+        let mut budget = crate::limits::TextBudget::new();
         for (i, _) in self.slides.iter().enumerate() {
             if let Some(text) = self.slide_plain_text(i) {
                 if !text.is_empty() {
+                    if !budget.charge(text.chars().count()) {
+                        break;
+                    }
                     parts.push(text);
                 }
             }
+        }
+        if budget.exhausted() {
+            parts.push(budget.notice());
         }
         let master: Vec<String> = self
             .master_static_bodies()
@@ -83,10 +92,17 @@ impl PptxDocument {
     /// [`Self::plain_text`].
     pub fn to_markdown(&self) -> String {
         let mut parts = Vec::new();
+        let mut budget = crate::limits::TextBudget::new();
         for (i, _) in self.slides.iter().enumerate() {
             if let Some(md) = self.slide_to_markdown(i) {
+                if !budget.charge(md.chars().count()) {
+                    break;
+                }
                 parts.push(md);
             }
+        }
+        if budget.exhausted() {
+            parts.push(budget.notice());
         }
         let mut out = parts.join("\n\n");
         let master: Vec<String> = self
@@ -667,7 +683,7 @@ mod tests {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![text_shape("Text", "Hello", 0, 0)],
-            notes: Some(notes_body(&["Speaker notes"])),
+            notes: Some(std::sync::Arc::new(notes_body(&["Speaker notes"]))),
             background_rgb: None,
             ..Default::default()
         }]);
@@ -790,7 +806,7 @@ mod tests {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![text_shape("Text", "Content", 0, 0)],
-            notes: Some(notes_body(&["Note line 1", "Note line 2"])),
+            notes: Some(std::sync::Arc::new(notes_body(&["Note line 1", "Note line 2"]))),
             background_rgb: None,
             ..Default::default()
         }]);
@@ -831,7 +847,7 @@ mod tests {
         let doc = make_doc(vec![Slide {
             name: String::new(),
             shapes: vec![text_shape("Text", "Content", 0, 0)],
-            notes: Some(notes),
+            notes: Some(std::sync::Arc::new(notes)),
             background_rgb: None,
             ..Default::default()
         }]);

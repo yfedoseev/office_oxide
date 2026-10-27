@@ -11,6 +11,11 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         .and_then(slide_page_setup);
 
     let mut sections = Vec::new();
+    // Converted notes, by the shared body they came from, and the budget
+    // their per-slide copies are charged against.
+    let mut notes_cache: std::collections::HashMap<usize, (Vec<Element>, usize)> =
+        std::collections::HashMap::new();
+    let mut notes_budget = crate::limits::TextBudget::new();
 
     for slide in doc.slides.iter() {
         if let Some(ref err) = slide.parse_error {
@@ -79,14 +84,28 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         // Converted through the same `convert_text_body` ordinary slide
         // body text already uses, so bold/italic/bullets/numbering in
         // notes survive instead of being flattened to plain lines.
+        //
+        // Slides that share a notes part share one parsed body; it is
+        // converted once and each slide gets a copy of the result, whose
+        // text is charged to the document's text budget.
         let speaker_notes = slide.notes.as_ref().and_then(|tb| {
-            let mut converted = Vec::new();
-            convert_text_body(tb, &mut converted);
-            if converted.is_empty() {
-                None
-            } else {
-                Some(converted)
-            }
+            let key = std::sync::Arc::as_ptr(tb) as usize;
+            let (converted, chars) = notes_cache.entry(key).or_insert_with(|| {
+                let mut converted = Vec::new();
+                convert_text_body(tb, &mut converted);
+                let chars = DocumentIR {
+                    sections: vec![Section {
+                        elements: converted.clone(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }
+                .plain_text()
+                .chars()
+                .count();
+                (converted, chars)
+            });
+            (!converted.is_empty() && notes_budget.charge(*chars)).then(|| converted.clone())
         });
 
         // Slide comments are review content that reached no consumer at
@@ -153,7 +172,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         });
     }
 
-    DocumentIR {
+    let mut ir = DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Pptx,
             title,
@@ -167,7 +186,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
-            text_truncated: !doc.unreadable_parts.is_empty(),
+            text_truncated: !doc.unreadable_parts.is_empty() || notes_budget.exhausted(),
             ..crate::core::core_properties::ooxml_metadata_extras(
                 cp,
                 doc.app_properties.as_ref(),
@@ -175,7 +194,11 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             )
         },
         sections,
+    };
+    if notes_budget.exhausted() {
+        ir.metadata.warnings.push(notes_budget.notice());
     }
+    ir
 }
 
 /// Smallest and largest legal `p:sldSz` extent, in EMU

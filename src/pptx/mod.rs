@@ -217,7 +217,9 @@ impl PptxDocument {
             /// `Err` when the slide part itself could not be read.
             slide_data: std::result::Result<Vec<u8>, String>,
             slide_rels: Relationships,
-            notes: Option<NotesBundle>,
+            /// The slide's notes, parsed once per notes part and shared by
+            /// every slide that relates to it.
+            notes: Option<std::sync::Arc<TextBody>>,
             comments_data: Vec<Vec<u8>>,
             /// rId → (raw bytes, format-extension lowercase like "png" / "jpeg").
             /// Pre-resolved here in Phase 1 so the parallel slide parser
@@ -230,11 +232,6 @@ impl PptxDocument {
             /// Index into `layouts` of the slide's layout, when its
             /// layout relationship resolves.
             layout_index: Option<usize>,
-        }
-        struct NotesBundle {
-            part_name: String,
-            data: Vec<u8>,
-            rels: Relationships,
         }
         impl SlideBundle {
             fn unreadable(part_name: String, err: &str) -> Self {
@@ -267,6 +264,14 @@ impl PptxDocument {
             ))
             .into());
         }
+        // Notes parts already read, by part name: the body parsed from each
+        // (`None` when absent, unreadable or empty). Several slides can
+        // relate to one notes part; reading and holding it per slide
+        // multiplied its size by the slide count.
+        let mut notes_cache: std::collections::HashMap<
+            crate::core::opc::PartName,
+            Option<std::sync::Arc<TextBody>>,
+        > = std::collections::HashMap::new();
         let mut bundles = Vec::with_capacity(presentation.slides.len());
         // A slide part is read and kept once however many `p:sldId` entries
         // name it (ECMA-376 Part 1 §19.2.1.34: the list orders the slides
@@ -335,18 +340,31 @@ impl PptxDocument {
                     },
                     // A notes relationship to an absent part: nothing to read.
                     Ok(notes_part) if !opc.has_part(&notes_part) => None,
-                    Ok(notes_part) => match opc.read_part(&notes_part) {
-                        Ok(data) => Some(NotesBundle {
-                            part_name: notes_part.as_str().to_string(),
-                            data,
-                            rels: opc
-                                .read_rels_for(&notes_part)
-                                .unwrap_or_else(|_| Relationships::empty()),
-                        }),
-                        Err(e) => {
-                            record(notes_part.as_str(), &e);
-                            None
-                        },
+                    Ok(notes_part) => {
+                        if let Some(cached) = notes_cache.get(&notes_part) {
+                            cached.clone()
+                        } else {
+                            let body = match opc.read_part(&notes_part) {
+                                Ok(data) => {
+                                    let rels = opc
+                                        .read_rels_for(&notes_part)
+                                        .unwrap_or_else(|_| Relationships::empty());
+                                    match slide::extract_notes_body(&data, &rels) {
+                                        Ok(body) => body.map(std::sync::Arc::new),
+                                        Err(e) => {
+                                            record(notes_part.as_str(), &e);
+                                            None
+                                        },
+                                    }
+                                },
+                                Err(e) => {
+                                    record(notes_part.as_str(), &e);
+                                    None
+                                },
+                            };
+                            notes_cache.insert(notes_part, body.clone());
+                            body
+                        }
                     },
                 },
             };
@@ -422,12 +440,7 @@ impl PptxDocument {
                         },
                     };
                 parsed.layout_index = b.layout_index;
-                if let Some(notes) = &b.notes {
-                    match slide::extract_notes_body(&notes.data, &notes.rels) {
-                        Ok(body) => parsed.notes = body,
-                        Err(e) => problems.push((notes.part_name.clone(), e.to_string())),
-                    }
-                }
+                parsed.notes = b.notes.clone();
                 for data in &b.comments_data {
                     parsed
                         .comments
