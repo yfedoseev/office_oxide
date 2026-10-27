@@ -290,6 +290,7 @@ impl XlsxDocument {
         let mut pivot_budget = crate::limits::TextBudget::new();
         let mut pivot_ctx = PivotContext::new(&mut archive, &entries);
         let mut unreadable_sheets: Vec<(String, String)> = Vec::new();
+        let mut media = MediaCache::new();
         // Chart parts a chartsheet displays: their text is that sheet's
         // content, not repeated among the embedded charts'.
         let mut chartsheet_charts: std::collections::HashSet<String> =
@@ -406,7 +407,7 @@ impl XlsxDocument {
             // media bytes so Phase 2's parallel parser doesn't need
             // the archive.
             let (images, text_shapes) =
-                read_drawing_for_sheet(&mut archive, &entries, &sheet_path, &ws_rels);
+                read_drawing_for_sheet(&mut archive, &entries, &mut media, &sheet_path, &ws_rels);
 
             // Cell comments live in a separate part reached through the
             // sheet's own relationships.
@@ -507,7 +508,7 @@ impl XlsxDocument {
         // metadata/richData chain is a real embedded image, not a
         // genuine formula error — swap its fabricated `#VALUE!` text
         // for the actual picture.
-        let rich_value_images = read_rich_value_images(&mut archive, &entries);
+        let rich_value_images = read_rich_value_images(&mut archive, &entries, &mut media);
         if !rich_value_images.is_empty() {
             for ws in &mut worksheets {
                 for row in &mut ws.rows {
@@ -1103,9 +1104,29 @@ impl crate::core::OfficeDocument for XlsxDocument {
 /// bytes. Returns `(pictures, text_shapes)`. Soft failures (no rel,
 /// missing part, parse error) yield empty vectors — drawings are
 /// best-effort extras and shouldn't fail worksheet loading.
+/// Media parts already read, by part name. A picture's bytes are shared by
+/// every anchor and rich value that names the part, where each used to get a
+/// copy (and a decompression) of its own.
+type MediaCache = std::collections::HashMap<String, std::sync::Arc<[u8]>>;
+
+fn read_media_cached<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
+    path: &str,
+    cache: &mut MediaCache,
+) -> Option<std::sync::Arc<[u8]>> {
+    if let Some(hit) = cache.get(path) {
+        return Some(hit.clone());
+    }
+    let bytes: std::sync::Arc<[u8]> = opc::read_zip_entry(archive, entries, path).ok()?.into();
+    cache.insert(path.to_string(), bytes.clone());
+    Some(bytes)
+}
+
 fn read_drawing_for_sheet<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &opc::ZipEntryIndex,
+    media: &mut MediaCache,
     sheet_path: &str,
     sheet_rels: &Relationships,
 ) -> (
@@ -1152,9 +1173,8 @@ fn read_drawing_for_sheet<R: Read + Seek>(
             None => continue,
         };
         let media_path = resolve_relative_zip_path(&drawing_path, &rel.target);
-        let bytes = match opc::read_zip_entry(archive, entries, &media_path) {
-            Ok(b) => b,
-            Err(_) => continue,
+        let Some(bytes) = read_media_cached(archive, entries, &media_path, media) else {
+            continue;
         };
         let ext = std::path::Path::new(&rel.target)
             .extension()
@@ -1207,6 +1227,7 @@ fn read_drawing_for_sheet<R: Read + Seek>(
 fn read_rich_value_images<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &opc::ZipEntryIndex,
+    media: &mut MediaCache,
 ) -> std::collections::HashMap<u32, crate::xlsx::worksheet::WorksheetPicture> {
     let mut out = std::collections::HashMap::new();
 
@@ -1275,7 +1296,7 @@ fn read_rich_value_images<R: Read + Seek>(
             continue;
         };
         let media_path = resolve_relative_zip_path(rel_path, &rel.target);
-        let Ok(bytes) = opc::read_zip_entry(archive, entries, &media_path) else {
+        let Some(bytes) = read_media_cached(archive, entries, &media_path, media) else {
             continue;
         };
         let ext = Path::new(&rel.target)
@@ -2557,7 +2578,7 @@ mod tests {
         let doc = open_bytes(rich_value_image_package(r#"<c r="B2" vm="1"/>"#));
         let ws = &doc.worksheets[0];
         assert_eq!(ws.images.len(), 1, "the rich-value image must reach ws.images");
-        assert_eq!(ws.images[0].data, RICH_VALUE_PNG);
+        assert_eq!(&*ws.images[0].data, RICH_VALUE_PNG);
     }
 
     /// Build a minimal SpreadsheetML package whose main part carries
@@ -2577,7 +2598,7 @@ mod tests {
         let ws = &doc.worksheets[0];
 
         assert_eq!(ws.images.len(), 1, "the rich-value image must reach ws.images");
-        assert_eq!(ws.images[0].data, RICH_VALUE_PNG);
+        assert_eq!(&*ws.images[0].data, RICH_VALUE_PNG);
         assert_eq!(ws.images[0].format, "png");
 
         let cell = &ws.rows[0].cells[0];

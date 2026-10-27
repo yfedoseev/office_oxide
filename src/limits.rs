@@ -91,6 +91,24 @@ pub fn set_max_text_chars(chars: usize) {
     MAX_TEXT_CHARS.store(chars, Ordering::Relaxed);
 }
 
+/// The default budget for picture bytes in the IR: 1 GiB.
+pub const DEFAULT_MAX_IMAGE_BYTES: usize = 1 << 30;
+
+static MAX_IMAGE_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_IMAGE_BYTES);
+
+/// The bytes of picture data a spreadsheet's IR may hold, counting a picture
+/// once for every anchor that draws it: the workbook stores a media part once,
+/// and the IR gives each image its own copy.
+pub fn max_image_bytes() -> usize {
+    MAX_IMAGE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Set the picture-byte budget for every document converted afterwards.
+/// `usize::MAX` disables the bound.
+pub fn set_max_image_bytes(bytes: usize) {
+    MAX_IMAGE_BYTES.store(bytes, Ordering::Relaxed);
+}
+
 /// A text budget shared by every worksheet of one document, which are parsed
 /// on several threads: each charge comes off one document-wide total, so the
 /// limit is per document however many sheets there are.
@@ -164,6 +182,11 @@ impl TextBudget {
                 false
             },
         }
+    }
+
+    /// The limit this budget was created with.
+    pub(crate) fn limit(&self) -> usize {
+        self.total
     }
 
     pub(crate) fn exhausted(&self) -> bool {

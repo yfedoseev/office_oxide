@@ -295,3 +295,84 @@ fn test_padding_is_charged_after_the_text_has_spent_its_budget() {
         .sum();
     assert!(cells < 2_000, "{cells} table cells were built after the text budget was spent");
 }
+
+/// The picture budget every test here runs under.
+const IMAGE_BUDGET: usize = 10_000;
+
+/// A sheet whose one drawing anchors the same `media_len`-byte picture
+/// `anchors` times.
+fn picture_fan_out_workbook(anchors: usize, media_len: usize) -> Vec<u8> {
+    let mut drawing = String::from(
+        r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">"#,
+    );
+    for i in 0..anchors {
+        drawing.push_str(&format!(
+            r#"<xdr:oneCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>{i}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx="100" cy="100"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="{}" name="P{i}"/><xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill><xdr:spPr/></xdr:pic><xdr:clientData/></xdr:oneCellAnchor>"#,
+            i + 2
+        ));
+    }
+    drawing.push_str("</xdr:wsDr>");
+    let sheet = format!(
+        r#"<worksheet xmlns="{NS}" xmlns:r="{R}"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><drawing r:id="rId1"/></worksheet>"#
+    );
+    package(
+        r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#,
+        &worksheet_rel("rId1", "worksheets/sheet1.xml"),
+        &[
+            ("xl/worksheets/sheet1.xml", sheet.into_bytes()),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels",
+                format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#).into_bytes(),
+            ),
+            ("xl/drawings/drawing1.xml", drawing.into_bytes()),
+            (
+                "xl/drawings/_rels/drawing1.xml.rels",
+                format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/image" Target="../media/image1.png"/></Relationships>"#).into_bytes(),
+            ),
+            ("xl/media/image1.png", vec![7u8; media_len]),
+        ],
+    )
+}
+
+fn ir_image_count(ir: &office_oxide::DocumentIR) -> usize {
+    fn count(elements: &[office_oxide::ir::Element]) -> usize {
+        elements
+            .iter()
+            .map(|e| match e {
+                office_oxide::ir::Element::Image(_) => 1,
+                office_oxide::ir::Element::TextBox(t) => count(&t.content),
+                _ => 0,
+            })
+            .sum()
+    }
+    ir.sections.iter().map(|s| count(&s.elements)).sum()
+}
+
+#[test]
+fn test_one_picture_drawn_from_many_anchors_shares_its_bytes_and_is_bounded_in_the_ir() {
+    set_budgets();
+    office_oxide::limits::set_max_image_bytes(IMAGE_BUDGET);
+    // 100 anchors of a 1,000-byte picture: 100,000 bytes of IR images
+    // against a 10,000-byte budget.
+    let doc = open(picture_fan_out_workbook(100, 1_000)).unwrap();
+    let ws = &doc.as_xlsx().unwrap().worksheets[0];
+    assert_eq!(ws.images.len(), 100);
+    assert!(
+        std::sync::Arc::ptr_eq(&ws.images[0].data, &ws.images[99].data),
+        "the anchors each hold their own copy of the picture"
+    );
+    let ir = doc.to_ir();
+    assert_eq!(ir_image_count(&ir), 10, "pictures past the budget are left out");
+    assert!(ir.metadata.text_truncated);
+    assert!(ir.plain_text().contains("picture budget"));
+}
+
+#[test]
+fn test_many_distinct_small_pictures_within_the_budget_are_all_kept() {
+    set_budgets();
+    office_oxide::limits::set_max_image_bytes(IMAGE_BUDGET);
+    let doc = open(picture_fan_out_workbook(5, 1_000)).unwrap();
+    let ir = doc.to_ir();
+    assert_eq!(ir_image_count(&ir), 5);
+    assert!(!ir.metadata.text_truncated);
+}

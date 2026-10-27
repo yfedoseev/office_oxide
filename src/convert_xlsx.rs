@@ -43,6 +43,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     // The empty cells that pad rows out to the sheet's width have a budget of
     // their own, also for the whole document: a row that spends the text
     // budget is still laid out, and its padding is still paid for.
+    let mut image_budget = crate::limits::TextBudget::with_limit(crate::limits::max_image_bytes());
     let mut padding_budget = crate::limits::TextBudget::new();
 
     for (ws_idx, ws) in doc.worksheets.iter().enumerate() {
@@ -234,10 +235,16 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             }));
         }
         for pic in &ws.images {
+            // A picture drawn from many anchors shares its bytes in the
+            // workbook, but each IR image owns a copy, so every one is paid
+            // for: the pictures past the budget are left out, and said so.
+            if !image_budget.charge(pic.data.len()) {
+                break;
+            }
             let format = image_format_from_ext(&pic.format);
             let img = Image {
                 alt_text: pic.alt_text.clone(),
-                data: Some(pic.data.clone()),
+                data: Some(pic.data.to_vec()),
                 format,
                 display_width_emu: Some(pic.cx_emu.max(0) as u64),
                 display_height_emu: Some(pic.cy_emu.max(0) as u64),
@@ -487,6 +494,16 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 ..Default::default()
             }));
         }
+        if image_budget.exhausted() {
+            combined.push(Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(format!(
+                    "[some pictures not shown: together they exceed the {} byte picture budget \
+                     (office_oxide::limits::set_max_image_bytes)]",
+                    image_budget.limit()
+                )))],
+                ..Default::default()
+            }));
+        }
         if budget.exhausted() || padding_budget.exhausted() {
             combined.push(Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain(budget.notice()))],
@@ -653,7 +670,8 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             text_truncated: !doc.unreadable_sheets.is_empty()
                 || pivot_truncated
                 || budget.exhausted()
-                || padding_budget.exhausted(),
+                || padding_budget.exhausted()
+                || image_budget.exhausted(),
             defined_names: doc
                 .workbook
                 .defined_names

@@ -744,8 +744,8 @@ pub struct WorksheetTextShape {
 /// part contents; `format` is the lowercase file extension.
 #[derive(Debug, Clone)]
 pub struct WorksheetPicture {
-    /// Image bytes.
-    pub data: Vec<u8>,
+    /// Image bytes, shared by every picture that names the same media part.
+    pub data: std::sync::Arc<[u8]>,
     /// Lowercase file extension (`"png"`, `"jpeg"`, ...).
     pub format: String,
     /// X anchor in EMU.
