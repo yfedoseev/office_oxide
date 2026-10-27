@@ -294,7 +294,14 @@ impl DocDocument {
 
         let clx_end = clx_end.min(table_stream.len());
         let clx_data = &table_stream[clx_start..clx_end];
-        let pieces = parse_clx(clx_data)?;
+        let mut pieces = parse_clx(clx_data)?;
+        // Refuse pieces that read far more than the stream holds, and cut the
+        // table where the text budget runs out, before any text is decoded.
+        let mut text_budget = crate::limits::TextBudget::new();
+        let mut work_warnings: Vec<String> = Vec::new();
+        if super::piece_table::bound_piece_reads(&mut pieces, word_doc.len(), &mut text_budget)? {
+            work_warnings.push(text_budget.notice());
+        }
         let text_complete = covers_declared_length(&pieces, fib.text_len);
 
         // The CHPX FKP is parsed once here (rather than separately by each
@@ -310,7 +317,6 @@ impl DocDocument {
         // file whose pieces are piled on the same bytes. Such a file keeps its
         // text, without character formatting or the deleted/hidden-text
         // exclusion, and says so.
-        let mut work_warnings: Vec<String> = Vec::new();
         if runs_work_too_large(&pieces, chpx_runs.iter().map(|r| (r.fc_start, r.fc_end))) {
             chpx_runs.clear();
             work_warnings.push(
@@ -545,7 +551,10 @@ impl DocDocument {
     /// file without one.
     fn from_word6<R: Read + Seek>(cfb: &mut CfbReader<R>, word_doc: &[u8]) -> Result<Self> {
         let fib = super::word6::parse_fib(word_doc)?;
-        let pieces = super::word6::pieces(word_doc, &fib)?;
+        let mut pieces = super::word6::pieces(word_doc, &fib)?;
+        let mut text_budget = crate::limits::TextBudget::new();
+        let budget_cut =
+            super::piece_table::bound_piece_reads(&mut pieces, word_doc.len(), &mut text_budget)?;
         let text_complete = covers_declared_length(&pieces, fib.ccp[0]);
         let (text, subs) = super::word6::stories(word_doc, &fib, &pieces);
         let subdocuments = subs
@@ -596,6 +605,9 @@ impl DocDocument {
         };
         let mut warnings = container_warnings(cfb);
         warnings.extend(papx.warnings);
+        if budget_cut {
+            warnings.push(text_budget.notice());
+        }
         if overlapping {
             warnings.push(
                 "the pieces of this Word 6/95 file are laid out so that reading its paragraphs \

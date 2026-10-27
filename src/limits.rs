@@ -210,6 +210,18 @@ impl TextBudget {
         }
     }
 
+    /// Take up to `want` characters from what is left: all of them while the
+    /// budget lasts, otherwise whatever remains, after which the budget is
+    /// spent. For a caller that can use a part of a run (cut a piece short)
+    /// rather than all of it or none.
+    pub(crate) fn take(&mut self, want: usize) -> usize {
+        let granted = want.min(self.remaining);
+        if !self.charge(want) {
+            return granted;
+        }
+        want
+    }
+
     pub(crate) fn exhausted(&self) -> bool {
         self.exhausted
     }
@@ -298,6 +310,15 @@ mod tests {
         assert!(b.exhausted());
         assert!(!b.charge(0), "spent stays spent");
         assert!(b.notice().contains("10 character budget"));
+    }
+
+    #[test]
+    fn test_take_grants_what_is_left_then_nothing() {
+        let mut b = TextBudget::with_limit(10);
+        assert_eq!(b.take(4), 4);
+        assert_eq!(b.take(10), 6, "the rest is granted, and the budget is spent");
+        assert!(b.exhausted());
+        assert_eq!(b.take(1), 0);
     }
 
     /// Raising the limit is safe under the parallel test runner; lowering

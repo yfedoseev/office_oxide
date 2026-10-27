@@ -185,6 +185,68 @@ fn parse_plc_pcd(data: &[u8], prcs: &[Vec<u8>]) -> Result<Vec<Piece>> {
     Ok(pieces)
 }
 
+/// How many times over the `WordDocument` stream's own size the pieces may
+/// read (plus [`PIECE_READ_ALLOWANCE`]). Pieces are meant to select distinct
+/// byte ranges, so they read about the stream's size at most. Fast-saved
+/// files reuse some bytes, and a hostile file points any number of pieces at
+/// the same ones (157 KB of pieces over the same 60 KB paragraph decoded to
+/// 180 MB). Sixteen times the stream is far above any real overlap.
+const PIECE_READ_FACTOR: u64 = 16;
+/// Bytes of slack added to the bound above, so a very small stream is not
+/// held to a ratio of its own length.
+const PIECE_READ_ALLOWANCE: u64 = 1 << 20;
+
+/// What a piece table asks the reader to decode: refuse it when its pieces
+/// read far more than the stream holds, and cut it short where it would
+/// exceed the document's text budget.
+///
+/// A piece whose bytes lie past the end of the stream reads nothing (see
+/// [`piece_backed_cp_end`]) and costs nothing here. Returns whether the
+/// table was cut short; the caller reports that, the way the other readers
+/// report an exhausted text budget.
+pub(crate) fn bound_piece_reads(
+    pieces: &mut Vec<Piece>,
+    word_doc_len: usize,
+    budget: &mut crate::limits::TextBudget,
+) -> Result<bool> {
+    let backed_chars = |piece: &Piece| -> u64 {
+        let backed_end = piece_backed_cp_end(piece, word_doc_len);
+        u64::from(piece.cp_end.min(backed_end).saturating_sub(piece.cp_start))
+    };
+    let bytes_per_char = |piece: &Piece| if piece.is_compressed { 1 } else { 2 };
+    let read: u64 = pieces
+        .iter()
+        .map(|p| backed_chars(p) * bytes_per_char(p))
+        .sum();
+    let allowed = (word_doc_len as u64)
+        .saturating_mul(PIECE_READ_FACTOR)
+        .saturating_add(PIECE_READ_ALLOWANCE);
+    if read > allowed {
+        return Err(DocError::InvalidPieceTable(format!(
+            "the pieces read {read} bytes from a {word_doc_len}-byte WordDocument stream; \
+             pieces that overlap this much are refused"
+        )));
+    }
+    let mut kept = 0usize;
+    let mut cut = false;
+    for piece in pieces.iter_mut() {
+        let want = backed_chars(piece) as usize;
+        let granted = budget.take(want);
+        if granted < want {
+            // Cut the piece where the budget ran out; what follows is dropped.
+            piece.cp_end = piece.cp_start + granted as u32;
+            cut = true;
+            if granted > 0 {
+                kept += 1;
+            }
+            break;
+        }
+        kept += 1;
+    }
+    pieces.truncate(kept);
+    Ok(cut)
+}
+
 /// Whether `pieces` fully covers `[0, text_len)` with no gaps.
 ///
 /// A well-formed piece table starts at CP 0 and each piece picks up exactly
@@ -1386,6 +1448,74 @@ mod multi_piece_tests {
         let c = clx(&[(0, 6, 512)]);
         let pieces = parse_clx(&c).expect("parse");
         assert_eq!(extract_text_range(&word_doc, &pieces, 2, 5, 0), "CDE");
+    }
+
+    // ── Bounds on what a piece table makes the reader decode ────────
+
+    fn compressed_piece(cp_start: u32, cp_end: u32, byte_offset: u32) -> Piece {
+        Piece {
+            cp_start,
+            cp_end,
+            fc: (byte_offset * 2) | 0x4000_0000,
+            is_compressed: true,
+            prm_grpprl: Vec::new(),
+        }
+    }
+
+    /// Many pieces over the same bytes read the stream many times over; the
+    /// table is refused rather than expanded.
+    #[test]
+    fn test_pieces_piled_on_the_same_bytes_are_refused() {
+        let stream = vec![b'A'; 4000];
+        let mut pieces: Vec<Piece> = (0..2000u32)
+            .map(|i| compressed_piece(i * 2000, (i + 1) * 2000, 0))
+            .collect();
+        let mut budget = crate::limits::TextBudget::with_limit(usize::MAX);
+        let err = bound_piece_reads(&mut pieces, stream.len(), &mut budget).unwrap_err();
+        assert!(err.to_string().contains("overlap"), "{err}");
+    }
+
+    /// Distinct pieces, and pieces that reuse some bytes, are accepted whole.
+    #[test]
+    fn test_pieces_over_distinct_or_slightly_shared_bytes_are_kept() {
+        let stream = vec![b'A'; 4000];
+        let mut pieces = vec![
+            compressed_piece(0, 2000, 0),
+            compressed_piece(2000, 4000, 2000),
+            compressed_piece(4000, 6000, 0),
+        ];
+        let mut budget = crate::limits::TextBudget::with_limit(usize::MAX);
+        assert!(!bound_piece_reads(&mut pieces, stream.len(), &mut budget).unwrap());
+        assert_eq!(pieces.len(), 3);
+    }
+
+    /// A piece whose bytes are not in the stream reads nothing, so it is not
+    /// counted against the bound.
+    #[test]
+    fn test_unbacked_pieces_cost_nothing() {
+        let mut pieces: Vec<Piece> = (0..5000u32)
+            .map(|i| compressed_piece(i * 1000, (i + 1) * 1000, 100_000))
+            .collect();
+        let mut budget = crate::limits::TextBudget::with_limit(usize::MAX);
+        assert!(!bound_piece_reads(&mut pieces, 10, &mut budget).unwrap());
+    }
+
+    /// The text budget cuts the table where it runs out: the piece it ends in
+    /// is shortened, the pieces after it are dropped, and the caller is told.
+    #[test]
+    fn test_text_budget_cuts_the_piece_table() {
+        let stream = vec![b'A'; 6000];
+        let mut pieces = vec![
+            compressed_piece(0, 2000, 0),
+            compressed_piece(2000, 4000, 2000),
+            compressed_piece(4000, 6000, 4000),
+        ];
+        let mut budget = crate::limits::TextBudget::with_limit(3000);
+        assert!(bound_piece_reads(&mut pieces, stream.len(), &mut budget).unwrap());
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(pieces[1].cp_end, 3000);
+        assert_eq!(extract_text_range(&stream, &pieces, 0, 6000, 0).len(), 3000);
+        assert!(budget.exhausted());
     }
 
     // ── Piece table coverage vs the FIB's declared text length ──────
