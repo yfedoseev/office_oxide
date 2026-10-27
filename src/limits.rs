@@ -91,6 +91,84 @@ pub fn set_max_text_chars(chars: usize) {
     MAX_TEXT_CHARS.store(chars, Ordering::Relaxed);
 }
 
+/// The default per-document allowance of empty grid slots: 32 Mi.
+///
+/// A legacy `.xls` sheet is stored as rows that run to their last used
+/// column, so one number in column 255 of each of 65,535 rows costs 256
+/// slots per row: 16.7M slots from 65,535 records, and six such sheets
+/// made a 7 MB file allocate 2.6 GB. Only the *empty* slots that pad a
+/// row out to its last cell are charged, never the cells themselves, so a
+/// dense 65,536 x 256 sheet (which carries 16.7M cells and a file to
+/// match) costs nothing, and one sheet with a cell in the last column of
+/// every row still fits.
+pub const DEFAULT_MAX_GRID_PADDING_CELLS: usize = 32 << 20;
+
+static MAX_GRID_PADDING_CELLS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_GRID_PADDING_CELLS);
+
+/// The per-document allowance of empty slots padding spreadsheet rows.
+pub fn max_grid_padding_cells() -> usize {
+    MAX_GRID_PADDING_CELLS.load(Ordering::Relaxed)
+}
+
+/// Set the per-document empty-slot allowance for every document read
+/// afterwards. `usize::MAX` disables the bound.
+pub fn set_max_grid_padding_cells(cells: usize) {
+    MAX_GRID_PADDING_CELLS.store(cells, Ordering::Relaxed);
+}
+
+/// A document's remaining allowance of empty grid slots.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GridBudget {
+    total: usize,
+    remaining: usize,
+    exhausted: bool,
+}
+
+impl GridBudget {
+    pub(crate) fn new() -> Self {
+        Self::with_limit(max_grid_padding_cells())
+    }
+
+    pub(crate) fn with_limit(total: usize) -> Self {
+        Self {
+            total,
+            remaining: total,
+            exhausted: false,
+        }
+    }
+
+    /// Charge `slots` empty slots. Returns `false` — once, and thereafter —
+    /// when the allowance is spent; the caller stops building rows.
+    pub(crate) fn charge(&mut self, slots: usize) -> bool {
+        if self.exhausted {
+            return false;
+        }
+        match self.remaining.checked_sub(slots) {
+            Some(rest) => {
+                self.remaining = rest;
+                true
+            },
+            None => {
+                self.remaining = 0;
+                self.exhausted = true;
+                false
+            },
+        }
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    pub(crate) fn notice(&self) -> String {
+        format!(
+            "[workbook truncated: its sparse rows need more than {} empty cells of padding \
+             (office_oxide::limits::set_max_grid_padding_cells) — later rows are missing]",
+            self.total
+        )
+    }
+}
+
 /// A document's remaining text budget.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TextBudget {

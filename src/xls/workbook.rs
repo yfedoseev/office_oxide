@@ -76,8 +76,12 @@ pub struct DefinedName {
 impl XlsDocument {
     /// A workbook of exactly one sheet and nothing else — what a BIFF2–4
     /// file is.
-    pub(super) fn from_one_sheet(sheet: Sheet) -> Self {
-        Self::from_sheets_inner(vec![sheet])
+    /// Flagged truncated when `notices` is not empty.
+    pub(super) fn from_one_sheet(sheet: Sheet, notices: Vec<String>) -> Self {
+        let mut doc = Self::from_sheets_inner(vec![sheet]);
+        doc.truncated = !notices.is_empty();
+        doc.notices = notices;
+        doc
     }
 
     fn from_sheets_inner(sheets: Vec<Sheet>) -> Self {
@@ -279,6 +283,20 @@ impl XlsDocument {
     /// as an explicit parameter so tests can exercise the
     /// exhausted-budget path without a multi-million-record fixture.
     fn parse_workbook_stream_with_budget(data: &[u8], record_budget: u32) -> Result<Self> {
+        Self::parse_workbook_stream_with_limits(
+            data,
+            record_budget,
+            crate::limits::GridBudget::new(),
+        )
+    }
+
+    /// As `parse_workbook_stream_with_budget`, with the allowance of empty
+    /// slots padding sparse rows as an explicit parameter too.
+    fn parse_workbook_stream_with_limits(
+        data: &[u8],
+        record_budget: u32,
+        grid_budget: crate::limits::GridBudget,
+    ) -> Result<Self> {
         let mut sheet_infos: Vec<SheetInfo> = Vec::new();
         let mut sst: Vec<String> = Vec::new();
         let mut sheets = Vec::new();
@@ -382,6 +400,8 @@ impl XlsDocument {
         // remaining string cells are skipped and the workbook is flagged
         // truncated, as when the record budget runs out.
         let mut text_budget = crate::limits::TextBudget::new();
+        // Empty slots padding sparse rows, across every sheet.
+        let mut grid_budget = grid_budget;
         let mut number_formats: Option<std::sync::Arc<NumberFormats>> = None;
         // OfficeArt payloads, kept for the lazy picture decode.
         let mut drawing_bytes: Vec<u8> = Vec::new();
@@ -612,7 +632,7 @@ impl XlsDocument {
                             &mut xf_numfmt,
                             date1904,
                         );
-                        let (rows, xf) = build_grid(&mut cells);
+                        let (rows, xf) = build_grid(&mut cells, &mut grid_budget);
                         sheets.push(Sheet {
                             name,
                             rows,
@@ -807,6 +827,9 @@ impl XlsDocument {
         }
         if text_budget.exhausted() {
             notices.push(text_budget.notice());
+        }
+        if grid_budget.exhausted() {
+            notices.push(grid_budget.notice());
         }
         if missing_sst_refs > 0 {
             let table = if sst_malformed {
@@ -1473,7 +1496,10 @@ impl Sheet {
     }
 }
 
-pub(super) fn build_grid(cells: &mut [Cell]) -> (Vec<Vec<CellValue>>, Vec<Vec<u16>>) {
+pub(super) fn build_grid(
+    cells: &mut [Cell],
+    budget: &mut crate::limits::GridBudget,
+) -> (Vec<Vec<CellValue>>, Vec<Vec<u16>>) {
     // Jagged, like every other spreadsheet
     // reader's storage (POI keeps a sparse map of rows, each holding cells
     // up to its last used column): a row is only as long as its last
@@ -1487,19 +1513,38 @@ pub(super) fn build_grid(cells: &mut [Cell]) -> (Vec<Vec<CellValue>>, Vec<Vec<u1
     // 2.5x slower than allocating the rows up front.
     let in_grid = |cell: &Cell| cell.col <= 255 && !matches!(cell.value, CellValue::Empty);
     let mut width: Vec<u16> = Vec::new();
+    let mut filled: Vec<u16> = Vec::new();
     for cell in cells.iter().filter(|c| in_grid(c)) {
         let r = cell.row as usize;
         if width.len() <= r {
             width.resize(r + 1, 0);
+            filled.resize(r + 1, 0);
         }
         width[r] = width[r].max(cell.col + 1);
+        filled[r] = filled[r].saturating_add(1);
     }
+    // The empty slots that pad a row out to its last cell are what a sparse
+    // sheet multiplies (one cell in column 255 of every row is 255 empty
+    // slots per record), so they are charged against the document's
+    // allowance, row by row. The row that does not fit, and every row after
+    // it, is left out and the caller reports the workbook truncated.
+    for (r, (&w, &f)) in width.iter().zip(&filled).enumerate() {
+        // A record can repeat a cell, so `f` may exceed `w`.
+        if !budget.charge((w as usize).saturating_sub(f as usize)) {
+            width.truncate(r);
+            break;
+        }
+    }
+    let rows_kept = width.len();
     let mut grid: Vec<Vec<CellValue>> = width
         .iter()
         .map(|&w| vec![CellValue::Empty; w as usize])
         .collect();
     let mut xf: Vec<Vec<u16>> = width.iter().map(|&w| vec![0u16; w as usize]).collect();
-    for cell in cells.iter_mut().filter(|c| in_grid(c)) {
+    for cell in cells
+        .iter_mut()
+        .filter(|c| in_grid(c) && (c.row as usize) < rows_kept)
+    {
         let (r, c) = (cell.row as usize, cell.col as usize);
         grid[r][c] = std::mem::take(&mut cell.value);
         xf[r][c] = cell.xf_index;
@@ -2245,7 +2290,7 @@ mod tests {
                 value: CellValue::String("A2".into()),
             },
         ];
-        let (grid, _) = build_grid(&mut cells);
+        let (grid, _) = build_grid(&mut cells, &mut crate::limits::GridBudget::new());
         assert_eq!(grid.len(), 2);
         assert_eq!(grid[0].len(), 2);
         assert_eq!(grid[0][0], CellValue::String("A1".into()));
@@ -2270,7 +2315,7 @@ mod tests {
             mk(65535, 0, "BL"),
             mk(65535, 255, "BR"),
         ];
-        let (grid, _) = build_grid(&mut cells);
+        let (grid, _) = build_grid(&mut cells, &mut crate::limits::GridBudget::new());
         assert_eq!(grid.len(), 65536);
         assert_eq!(grid[0].len(), 256);
         assert_eq!(grid[65535].len(), 256);
@@ -2279,9 +2324,61 @@ mod tests {
         assert_eq!(grid[65535][255], CellValue::String("BR".into()));
     }
 
+    /// A sparse sheet (one cell in the last column of each row) is capped by
+    /// the allowance of empty padding slots: the rows that fit are kept and
+    /// the workbook is flagged truncated, loudly. Memory follows the
+    /// allowance, not the 255 slots per record a hostile file asks for.
+    #[test]
+    fn test_sparse_rows_are_capped_by_the_padding_allowance() {
+        let mut body = Vec::new();
+        for r in 0..10u16 {
+            body.extend(number(r, 255, 0, 1.0));
+        }
+        let stream = workbook_stream(&[("Sheet1", 0, body.clone()), ("Sheet2", 0, body)]);
+        // Room for three rows of 255 empty slots.
+        let doc = XlsDocument::parse_workbook_stream_with_limits(
+            &stream,
+            20_000_000,
+            crate::limits::GridBudget::with_limit(255 * 3),
+        )
+        .expect("parses");
+        assert_eq!(doc.sheets[0].rows.len(), 3, "rows past the allowance are left out");
+        assert!(doc.sheets[1].rows.is_empty(), "the allowance is per document, not per sheet");
+        assert!(doc.truncated());
+        let ir = crate::convert_xls::xls_to_ir(&doc);
+        assert!(ir.metadata.text_truncated);
+        assert!(doc.plain_text().contains("empty cells of padding"));
+
+        // The same file under the default allowance is complete.
+        let whole = XlsDocument::parse_workbook_stream(&stream).expect("parses");
+        assert_eq!(whole.sheets[0].rows.len(), 10);
+        assert!(!whole.truncated());
+    }
+
+    /// Padding is charged for empty slots only: a dense row costs nothing,
+    /// whatever its width.
+    #[test]
+    fn test_dense_rows_cost_no_padding() {
+        let mut body = Vec::new();
+        for r in 0..4u16 {
+            for c in 0..256u16 {
+                body.extend(number(r, c, 0, 1.0));
+            }
+        }
+        let stream = workbook_stream(&[("Sheet1", 0, body)]);
+        let doc = XlsDocument::parse_workbook_stream_with_limits(
+            &stream,
+            20_000_000,
+            crate::limits::GridBudget::with_limit(0),
+        )
+        .expect("parses");
+        assert_eq!(doc.sheets[0].rows.len(), 4);
+        assert!(!doc.truncated());
+    }
+
     #[test]
     fn test_build_grid_empty() {
-        let (grid, _) = build_grid(&mut Vec::new());
+        let (grid, _) = build_grid(&mut Vec::new(), &mut crate::limits::GridBudget::new());
         assert!(grid.is_empty());
     }
 
