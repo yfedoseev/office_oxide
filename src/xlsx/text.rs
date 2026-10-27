@@ -31,6 +31,13 @@ impl XlsxDocument {
 /// What an unused column of a Markdown table row costs: `" | "`.
 const MARKDOWN_PAD_CHARS: usize = 3;
 
+/// What a comment adds to a rendering: its cell reference, author and text.
+/// The author is stored once and named by every comment, so this is what
+/// the renderers charge to the budget for each.
+pub(crate) fn comment_chars(c: &super::worksheet::SheetComment) -> usize {
+    c.cell_ref.len() + c.author.as_ref().map_or(0, |a| a.len()) + c.text.len()
+}
+
 /// `B2 (Author)` — the same marker `to_ir()` puts on a comment's endnote.
 pub(crate) fn comment_marker(cell_ref: &str, author: Option<&str>) -> String {
     match author {
@@ -138,12 +145,22 @@ impl XlsxDocument {
             // Cell comments are document content; `to_ir()` carries them
             // as endnotes, and this direct renderer dropped them.
             for c in &ws.comments {
+                // The author's name is repeated by every comment of theirs.
+                if !budget.charge(comment_chars(c)) {
+                    break;
+                }
                 sheet.push('\n');
                 sheet.push_str(&format!(
                     "{}: {}",
                     comment_marker(&c.cell_ref, c.author.as_deref()),
                     c.text
                 ));
+            }
+            if budget.exhausted() {
+                sheet.push('\n');
+                sheet.push_str(&budget.notice());
+                parts.push(sheet);
+                break;
             }
             // Text boxes and WordArt drawn on the sheet reached `to_ir()`
             // as text boxes and this renderer not at all — a sheet whose
@@ -306,11 +323,18 @@ impl XlsxDocument {
                 break;
             }
             for c in &ws.comments {
+                if !budget.charge(comment_chars(c)) {
+                    break;
+                }
                 parts.push(format!(
                     "> **{}:** {}",
                     comment_marker(&c.cell_ref, c.author.as_deref()),
                     c.text.trim()
                 ));
+            }
+            if budget.exhausted() {
+                parts.push(budget.notice());
+                break;
             }
             for ts in &ws.text_shapes {
                 if !ts.text.trim().is_empty() {

@@ -533,8 +533,9 @@ impl SheetHeaderFooter {
 pub struct SheetComment {
     /// Cell reference the comment is attached to, e.g. `"B2"`.
     pub cell_ref: String,
-    /// Comment author, resolved through the part's `<authors>` list.
-    pub author: Option<String>,
+    /// Comment author, resolved through the part's `<authors>` list. Shared by
+    /// every comment of the same author: a name is stored once in the part.
+    pub author: Option<std::sync::Arc<str>>,
     /// Comment body text.
     pub text: String,
 }
@@ -547,7 +548,7 @@ pub struct SheetComment {
 pub fn parse_comments(xml_data: &[u8]) -> crate::core::Result<Vec<SheetComment>> {
     use quick_xml::events::Event;
     let mut reader = xml::make_fast_reader(xml_data);
-    let mut authors: Vec<String> = Vec::new();
+    let mut authors: Vec<std::sync::Arc<str>> = Vec::new();
     let mut out: Vec<SheetComment> = Vec::new();
     let mut in_authors = false;
 
@@ -556,7 +557,7 @@ pub fn parse_comments(xml_data: &[u8]) -> crate::core::Result<Vec<SheetComment>>
             Event::Start(ref e) => match e.local_name().as_ref() {
                 "authors" => in_authors = true,
                 "author" if in_authors => {
-                    authors.push(xml::read_text_content_fast(&mut reader)?.trim().to_string());
+                    authors.push(xml::read_text_content_fast(&mut reader)?.trim().into());
                 },
                 "comment" => {
                     let cell_ref = xml::optional_attr_str(e, "ref")?
@@ -630,7 +631,7 @@ pub(crate) fn parse_threaded_comments(
 /// Parse a `xl/persons/person.xml` part: `personId -> displayName`.
 pub(crate) fn parse_persons(
     xml_data: &[u8],
-) -> crate::core::Result<std::collections::HashMap<String, String>> {
+) -> crate::core::Result<std::collections::HashMap<String, std::sync::Arc<str>>> {
     use quick_xml::events::Event;
     let mut reader = xml::make_fast_reader(xml_data);
     let mut out = std::collections::HashMap::new();
@@ -641,7 +642,7 @@ pub(crate) fn parse_persons(
                 let id = xml::optional_attr_str(e, "id")?.map(|v| v.into_owned());
                 let name = xml::optional_attr_str(e, "displayName")?.map(|v| v.into_owned());
                 if let (Some(id), Some(name)) = (id, name) {
-                    out.insert(id, name);
+                    out.insert(id, name.into());
                 }
             },
             Event::Eof => break,
@@ -666,10 +667,11 @@ pub(crate) fn parse_persons(
 pub(crate) fn merge_threaded_comments(
     legacy: Vec<SheetComment>,
     threaded: Vec<RawThreadedComment>,
-    persons: &std::collections::HashMap<String, String>,
-) -> Vec<SheetComment> {
+    persons: &std::collections::HashMap<String, std::sync::Arc<str>>,
+    budget: &mut crate::limits::TextBudget,
+) -> crate::core::Result<Vec<SheetComment>> {
     if threaded.is_empty() {
-        return legacy;
+        return Ok(legacy);
     }
 
     let mut by_ref: std::collections::HashMap<String, Vec<&RawThreadedComment>> =
@@ -695,6 +697,16 @@ pub(crate) fn merge_threaded_comments(
             if i == 0 {
                 thread_author = author.clone();
             }
+            // Each message line names its author, so a long name repeated
+            // down a long thread is charged for every message.
+            let line_chars = author.as_ref().map_or(0, |a| a.len() + 2) + m.text.len();
+            if !budget.charge(line_chars) {
+                return Err(crate::core::Error::PackageLimit(format!(
+                    "the threaded comments exceed the {} character budget \
+                     (office_oxide::limits::set_max_text_chars)",
+                    budget.limit()
+                )));
+            }
             match author {
                 Some(a) => lines.push(format!("{a}: {}", m.text)),
                 None => lines.push(m.text.clone()),
@@ -706,7 +718,7 @@ pub(crate) fn merge_threaded_comments(
             text: lines.join("\n"),
         });
     }
-    out
+    Ok(out)
 }
 
 /// A text shape anchored on a worksheet via a DrawingML drawing part.
@@ -2390,7 +2402,7 @@ mod tests {
   <person displayName="Pankaj Chaudhary" id="{P1}" userId="S::x" providerId="AD"/>
 </personList>"#;
         let out = parse_persons(xml).unwrap();
-        assert_eq!(out.get("{P1}").map(String::as_str), Some("Pankaj Chaudhary"));
+        assert_eq!(out.get("{P1}").map(|n| &**n), Some("Pankaj Chaudhary"));
     }
 
     /// A `ref` with a resolved threaded-comment thread must
@@ -2404,14 +2416,14 @@ mod tests {
         let legacy = vec![
             SheetComment {
                 cell_ref: "C2".to_string(),
-                author: Some("tc={ID1}".to_string()),
+                author: Some("tc={ID1}".into()),
                 text: "[Threaded comment]\n\nYour version of Excel allows you to read this \
                        threaded comment... Comment:\n    testing"
                     .to_string(),
             },
             SheetComment {
                 cell_ref: "B3".to_string(),
-                author: Some("Microsoft Office User".to_string()),
+                author: Some("Microsoft Office User".into()),
                 text: "Microsoft Office User:\nSample Notes".to_string(),
             },
         ];
@@ -2422,9 +2434,15 @@ mod tests {
             text: "testing".to_string(),
         }];
         let mut persons = std::collections::HashMap::new();
-        persons.insert("{P1}".to_string(), "Pankaj Chaudhary".to_string());
+        persons.insert("{P1}".to_string(), "Pankaj Chaudhary".into());
 
-        let merged = merge_threaded_comments(legacy, threaded, &persons);
+        let merged = merge_threaded_comments(
+            legacy,
+            threaded,
+            &persons,
+            &mut crate::limits::TextBudget::new(),
+        )
+        .unwrap();
         assert_eq!(merged.len(), 2);
 
         let c2 = merged.iter().find(|c| c.cell_ref == "C2").unwrap();
@@ -2455,10 +2473,35 @@ mod tests {
                 text: "the root message".to_string(),
             },
         ];
-        let merged =
-            merge_threaded_comments(Vec::new(), threaded, &std::collections::HashMap::new());
+        let merged = merge_threaded_comments(
+            Vec::new(),
+            threaded,
+            &std::collections::HashMap::new(),
+            &mut crate::limits::TextBudget::new(),
+        )
+        .unwrap();
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "the root message\na reply");
+    }
+
+    /// Every message of a thread names its author, so a long name down a
+    /// long thread multiplies; the thread text is charged to the budget.
+    #[test]
+    fn test_threaded_comment_author_repeated_down_a_thread_is_budgeted() {
+        let threaded: Vec<RawThreadedComment> = (0..50)
+            .map(|_| RawThreadedComment {
+                cell_ref: "A1".to_string(),
+                parent_id: None,
+                person_id: Some("{P1}".to_string()),
+                text: "x".to_string(),
+            })
+            .collect();
+        let mut persons = std::collections::HashMap::new();
+        persons.insert("{P1}".to_string(), "n".repeat(100).into());
+        let mut budget = crate::limits::TextBudget::with_limit(1_000);
+        let err = merge_threaded_comments(Vec::new(), threaded, &persons, &mut budget)
+            .expect_err("5,000 characters of thread text exceed a 1,000 budget");
+        assert!(matches!(err, crate::core::Error::PackageLimit(_)), "{err:?}");
     }
 
     #[test]
@@ -2468,8 +2511,13 @@ mod tests {
             author: None,
             text: "plain note".to_string(),
         }];
-        let merged =
-            merge_threaded_comments(legacy.clone(), Vec::new(), &std::collections::HashMap::new());
+        let merged = merge_threaded_comments(
+            legacy.clone(),
+            Vec::new(),
+            &std::collections::HashMap::new(),
+            &mut crate::limits::TextBudget::new(),
+        )
+        .unwrap();
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].text, "plain note");
     }

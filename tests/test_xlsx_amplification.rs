@@ -376,3 +376,73 @@ fn test_many_distinct_small_pictures_within_the_budget_are_all_kept() {
     assert_eq!(ir_image_count(&ir), 5);
     assert!(!ir.metadata.text_truncated);
 }
+
+/// A sheet with `comments` comments by one author whose name is
+/// `author_len` characters.
+fn comment_fan_out_workbook(comments: usize, author_len: usize) -> Vec<u8> {
+    let author = "a".repeat(author_len);
+    let mut part = format!(
+        r#"<comments xmlns="{NS}"><authors><author>{author}</author></authors><commentList>"#
+    );
+    for i in 1..=comments {
+        part.push_str(&format!(
+            r#"<comment ref="A{i}" authorId="0"><text><r><t>note</t></r></text></comment>"#
+        ));
+    }
+    part.push_str("</commentList></comments>");
+    let sheet = format!(
+        r#"<worksheet xmlns="{NS}" xmlns:r="{R}"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>"#
+    );
+    package(
+        r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#,
+        &worksheet_rel("rId1", "worksheets/sheet1.xml"),
+        &[
+            ("xl/worksheets/sheet1.xml", sheet.into_bytes()),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels",
+                format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/comments" Target="../comments1.xml"/></Relationships>"#).into_bytes(),
+            ),
+            ("xl/comments1.xml", part.into_bytes()),
+        ],
+    )
+}
+
+#[test]
+fn test_one_comment_author_named_by_many_comments_is_charged_to_the_text_budget() {
+    set_budgets();
+    // 100 comments by an author whose name is 2,000 characters: 200,000
+    // characters of rendered names against a 60,000 budget.
+    let doc = open(comment_fan_out_workbook(100, 2_000)).unwrap();
+    let ws = &doc.as_xlsx().unwrap().worksheets[0];
+    assert!(
+        std::sync::Arc::ptr_eq(
+            ws.comments[0].author.as_ref().unwrap(),
+            ws.comments[99].author.as_ref().unwrap()
+        ),
+        "every comment holds its own copy of the author's name"
+    );
+    for (surface, out) in [
+        ("plain_text", doc.plain_text()),
+        ("to_markdown", doc.to_markdown()),
+    ] {
+        assert!(out.contains("character budget"), "{surface}: no truncation notice");
+        assert!(out.len() < 2 * TEXT_BUDGET, "{surface}: {} bytes", out.len());
+    }
+    let ir = doc.to_ir();
+    let notes: usize = ir
+        .sections
+        .iter()
+        .flat_map(|s| &s.elements)
+        .filter(|e| matches!(e, office_oxide::ir::Element::Endnote(_)))
+        .count();
+    assert!(notes < 100, "{notes} comment notes were built");
+    assert!(ir.metadata.text_truncated);
+}
+
+#[test]
+fn test_a_few_comments_by_one_author_are_unaffected() {
+    set_budgets();
+    let doc = open(comment_fan_out_workbook(3, 20)).unwrap();
+    assert!(!doc.plain_text().contains("character budget"));
+    assert!(!doc.to_ir().metadata.text_truncated);
+}

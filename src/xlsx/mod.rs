@@ -291,6 +291,9 @@ impl XlsxDocument {
         let mut pivot_ctx = PivotContext::new(&mut archive, &entries);
         let mut unreadable_sheets: Vec<(String, String)> = Vec::new();
         let mut media = MediaCache::new();
+        // Threaded-comment text, which repeats each author's name on every
+        // message, shares one budget across the workbook.
+        let mut comment_budget = crate::limits::TextBudget::new();
         // Chart parts a chartsheet displays: their text is that sheet's
         // content, not repeated among the embedded charts'.
         let mut chartsheet_charts: std::collections::HashSet<String> =
@@ -426,8 +429,19 @@ impl XlsxDocument {
                 .and_then(|path| Self::read_xml_entry(&mut archive, &entries, &path).ok())
                 .and_then(|data| worksheet::parse_threaded_comments(&data).ok())
                 .unwrap_or_default();
-            let comments =
-                worksheet::merge_threaded_comments(comments, threaded_comments, &persons);
+            let comments = match worksheet::merge_threaded_comments(
+                comments,
+                threaded_comments,
+                &persons,
+                &mut comment_budget,
+            ) {
+                Ok(comments) => comments,
+                Err(e) => {
+                    log::warn!("xlsx: sheet {:?}: {e}", sheet.name);
+                    unreadable_sheets.push((sheet.name.clone(), e.to_string()));
+                    continue;
+                },
+            };
 
             let (tables, pivot_tables) = read_tables_and_pivots(
                 &mut archive,

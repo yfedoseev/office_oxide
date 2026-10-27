@@ -455,6 +455,14 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         // them as endnotes so every renderer sees them, with the author and
         // cell in the marker.
         for (i, c) in ws.comments.iter().enumerate() {
+            // The author is named in the marker and again as the note's
+            // author, for every comment: charged like any other text.
+            if !budget.charge(
+                crate::xlsx::text::comment_chars(c)
+                    .saturating_add(c.author.as_ref().map_or(0, |a| a.len())),
+            ) {
+                break;
+            }
             let marker = match c.author.as_deref() {
                 Some(a) => format!("{} ({a})", c.cell_ref),
                 None => c.cell_ref.clone(),
@@ -462,7 +470,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             combined.push(Element::Endnote(Note {
                 id: i as u32,
                 marker: Some(marker),
-                author: c.author.clone(),
+                author: c.author.as_deref().map(str::to_string),
                 content: vec![Element::Paragraph(Paragraph {
                     content: vec![InlineContent::Text(TextSpan::plain(c.text.clone()))],
                     ..Default::default()
