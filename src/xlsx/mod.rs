@@ -317,20 +317,15 @@ impl XlsxDocument {
             // Resolve sheet path from relationships, or fall back to convention
             let sheet_path = if let Some(rel) = wb_rels.get_by_id(&sheet.rel_id) {
                 // rel.target is typically "worksheets/sheet1.xml" (relative to xl/)
-                let target = &rel.target;
-                if let Some(stripped) = target.strip_prefix('/') {
-                    // Absolute path — strip leading slash for ZIP entry name
-                    stripped.to_string()
-                } else {
-                    format!("xl/{}", target)
-                }
+                // Relative to the workbook part, or absolute from the root.
+                resolve_relative_zip_path("xl/workbook.xml", &rel.target)
             } else {
                 // Fallback: guess by index
                 let idx = bundles.len() + 1;
                 format!("xl/worksheets/sheet{}.xml", idx)
             };
 
-            if let Err(reason) = sheet_parts.claim(&sheet_path, &sheet.name) {
+            if let Err(reason) = sheet_parts.claim(&entries, &sheet_path, &sheet.name) {
                 log::warn!("xlsx: sheet {:?}: {reason}", sheet.name);
                 unreadable_sheets.push((sheet.name.clone(), reason));
                 continue;
@@ -387,8 +382,13 @@ impl XlsxDocument {
                         .count()
                         + 1;
                     let alt = format!("xl/worksheets/sheet{}.xml", idx);
-                    Self::read_xml_entry(&mut archive, &entries, &alt)
-                        .map_err(|_| format!("worksheet part {sheet_path} not found"))
+                    // The fallback part is a sheet's content like any other.
+                    sheet_parts
+                        .claim(&entries, &alt, &sheet.name)
+                        .and_then(|()| {
+                            Self::read_xml_entry(&mut archive, &entries, &alt)
+                                .map_err(|_| format!("worksheet part {sheet_path} not found"))
+                        })
                 },
                 Err(crate::core::Error::MissingPart(_)) => {
                     Err(format!("sheet part {sheet_path} not found"))
@@ -927,7 +927,7 @@ fn read_tables_and_pivots<R: Read + Seek>(
                 let src = worksheet::parse_pivot_cache_definition(&def).unwrap_or_default();
                 pivot.source = src.display();
                 if !pivot_source_in_workbook(&src, workbook, &pivot_ctx.table_names) {
-                    pivot.cache_data = match pivot_ctx.parsed.get(&cache_path) {
+                    pivot.cache_data = match pivot_ctx.parsed.get(&part_key(entries, &cache_path)) {
                         Some(data) => data.clone(),
                         None => {
                             let data = read_pivot_cache_data(
@@ -939,7 +939,9 @@ fn read_tables_and_pivots<R: Read + Seek>(
                                 budget,
                             );
                             let data = data.map(std::sync::Arc::new);
-                            pivot_ctx.parsed.insert(cache_path.clone(), data.clone());
+                            pivot_ctx
+                                .parsed
+                                .insert(part_key(entries, &cache_path), data.clone());
                             data
                         },
                     };
@@ -1131,18 +1133,35 @@ impl crate::core::OfficeDocument for XlsxDocument {
 pub(crate) struct SheetPartClaims(std::collections::HashMap<String, String>);
 
 impl SheetPartClaims {
-    /// Claim `path` for `sheet`; `Err` with the reason when another sheet
-    /// has it, so the entry is reported like any unreadable sheet.
-    pub(crate) fn claim(&mut self, path: &str, sheet: &str) -> std::result::Result<(), String> {
-        match self.0.get(path) {
+    /// Claim the part `path` names for `sheet`; `Err` with the reason when
+    /// another sheet has it, so the entry is reported like any unreadable
+    /// sheet. A part is identified by the zip entry the path resolves to, so
+    /// the spellings the zip layer treats alike (case, `\` and `/`) are one
+    /// part here too.
+    pub(crate) fn claim(
+        &mut self,
+        entries: &opc::ZipEntryIndex,
+        path: &str,
+        sheet: &str,
+    ) -> std::result::Result<(), String> {
+        match self.0.get(&part_key(entries, path)) {
             Some(owner) => {
                 Err(format!("sheet part {path} is already the content of sheet {owner:?}"))
             },
             None => {
-                self.0.insert(path.to_string(), sheet.to_string());
+                self.0.insert(part_key(entries, path), sheet.to_string());
                 Ok(())
             },
         }
+    }
+}
+
+/// What identifies the part `path` names: its zip entry, however the path is
+/// spelled; for a part the package lacks, the path itself, lower-cased.
+fn part_key(entries: &opc::ZipEntryIndex, path: &str) -> String {
+    match entries.lookup(path) {
+        Some(index) => format!("#{index}"),
+        None => path.replace('\\', "/").to_ascii_lowercase(),
     }
 }
 
@@ -1157,11 +1176,12 @@ fn read_media_cached<R: Read + Seek>(
     path: &str,
     cache: &mut MediaCache,
 ) -> Option<std::sync::Arc<[u8]>> {
-    if let Some(hit) = cache.get(path) {
+    let key = part_key(entries, path);
+    if let Some(hit) = cache.get(&key) {
         return Some(hit.clone());
     }
     let bytes: std::sync::Arc<[u8]> = opc::read_zip_entry(archive, entries, path).ok()?.into();
-    cache.insert(path.to_string(), bytes.clone());
+    cache.insert(key, bytes.clone());
     Some(bytes)
 }
 
@@ -1581,6 +1601,10 @@ fn parse_rich_value_rel(xml: &[u8]) -> Vec<String> {
 /// operates on plain ZIP paths (the `from_zip` fast path doesn't use
 /// `PartName`).
 pub(super) fn resolve_relative_zip_path(source: &str, target: &str) -> String {
+    // The zip layer reads `\` as `/`; so must the path arithmetic, or one
+    // part has as many names as there are ways to spell its separators.
+    let (source, target) = (source.replace('\\', "/"), target.replace('\\', "/"));
+    let (source, target) = (source.as_str(), target.as_str());
     if target.starts_with('/') {
         return target.trim_start_matches('/').to_string();
     }

@@ -655,3 +655,34 @@ fn test_pivot_headers_are_charged_when_a_cache_has_no_records() {
     assert!(cells < 100 * 100, "{cells} header cells were built");
     assert!(ir.metadata.text_truncated);
 }
+
+#[test]
+fn test_one_sheet_part_under_several_spellings_is_still_read_once() {
+    set_budgets();
+    // The zip layer finds one entry under all of these.
+    let spellings = [
+        "worksheets/sheet2.xml",
+        "Worksheets\\Sheet2.xml",
+        "worksheets/../worksheets/sheet2.xml",
+        "/xl/worksheets/sheet2.xml",
+        "./worksheets/SHEET2.XML",
+        // A part the package lacks falls back to the entry its position
+        // names, which is the same part.
+        "worksheets/missing.xml",
+    ];
+    let mut sheets = String::new();
+    let mut rels = String::new();
+    for (i, target) in spellings.iter().enumerate() {
+        let n = i + 1;
+        sheets.push_str(&format!(r#"<sheet name="S{n}" sheetId="{n}" r:id="rId{n}"/>"#));
+        rels.push_str(&worksheet_rel(&format!("rId{n}"), target));
+    }
+    let sheet = format!(
+        r#"<worksheet xmlns="{NS}"><sheetData><row r="1"><c r="A1"><v>42</v></c></row></sheetData></worksheet>"#
+    );
+    let doc =
+        open(package(&sheets, &rels, &[("xl/worksheets/sheet2.xml", sheet.into_bytes())])).unwrap();
+    let xlsx = doc.as_xlsx().unwrap();
+    assert_eq!(xlsx.worksheets.len(), 1, "the part is parsed once");
+    assert_eq!(xlsx.unreadable_sheets.len(), spellings.len() - 1);
+}

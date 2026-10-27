@@ -101,7 +101,7 @@ pub(super) fn from_zip<R: Read + Seek>(
         let path = rel
             .map(|r| super::resolve_relative_zip_path("xl/workbook.bin", &r.target))
             .unwrap_or_else(|| format!("xl/worksheets/sheet{}.bin", i + 1));
-        if let Err(reason) = sheet_parts.claim(&path, &info.name) {
+        if let Err(reason) = sheet_parts.claim(entries, &path, &info.name) {
             log::warn!("xlsb: sheet {:?}: {reason}", info.name);
             unreadable_sheets.push((info.name.clone(), reason));
             continue;
