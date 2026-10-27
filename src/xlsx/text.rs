@@ -24,8 +24,22 @@ impl XlsxDocument {
         self.worksheets
             .iter()
             .flat_map(|ws| &ws.pivot_tables)
-            .filter_map(|p| Some((p.name.as_str(), p.cache_data.as_ref()?)))
+            .filter_map(|p| Some((p.name.as_str(), p.cache_data.as_deref()?)))
     }
+}
+
+/// What an unused column of a Markdown table row costs: `" | "`.
+const MARKDOWN_PAD_CHARS: usize = 3;
+
+/// The line every renderer gives a sheet whose threaded comments stopped at
+/// the document's text budget.
+pub(crate) const COMMENTS_TRUNCATED_NOTICE: &str = "[comments truncated: the threaded comments exceed the character budget (office_oxide::limits::set_max_text_chars) — later threads are missing]";
+
+/// What a comment adds to a rendering: its cell reference, author and text.
+/// The author is stored once and named by every comment, so this is what
+/// the renderers charge to the budget for each.
+pub(crate) fn comment_chars(c: &super::worksheet::SheetComment) -> usize {
+    c.cell_ref.len() + c.author.as_ref().map_or(0, |a| a.len()) + c.text.len()
 }
 
 /// `B2 (Author)` — the same marker `to_ir()` puts on a comment's endnote.
@@ -135,12 +149,26 @@ impl XlsxDocument {
             // Cell comments are document content; `to_ir()` carries them
             // as endnotes, and this direct renderer dropped them.
             for c in &ws.comments {
+                // The author's name is repeated by every comment of theirs.
+                if !budget.charge(comment_chars(c)) {
+                    break;
+                }
                 sheet.push('\n');
                 sheet.push_str(&format!(
                     "{}: {}",
                     comment_marker(&c.cell_ref, c.author.as_deref()),
                     c.text
                 ));
+            }
+            if ws.comments_truncated {
+                sheet.push('\n');
+                sheet.push_str(COMMENTS_TRUNCATED_NOTICE);
+            }
+            if budget.exhausted() {
+                sheet.push('\n');
+                sheet.push_str(&budget.notice());
+                parts.push(sheet);
+                break;
             }
             // Text boxes and WordArt drawn on the sheet reached `to_ir()`
             // as text boxes and this renderer not at all — a sheet whose
@@ -160,17 +188,31 @@ impl XlsxDocument {
                 parts.push(text.trim().to_string());
             }
         }
+        // Pivots that name one cache each render it, so the output is
+        // charged to the budget however many of them share the data.
+        let mut pivots_spent = false;
         for (name, data) in self.pivot_caches() {
+            if budget.exhausted() {
+                break;
+            }
             let mut block = pivot_cache_title(name);
             for row in std::iter::once(&data.fields).chain(&data.records) {
+                let line = row.join("\t");
+                if !budget.charge(line.len() + 1) {
+                    pivots_spent = true;
+                    break;
+                }
                 block.push('\n');
-                block.push_str(&row.join("\t"));
+                block.push_str(&line);
             }
             if data.truncated {
                 block.push('\n');
                 block.push_str(PIVOT_CACHE_TRUNCATED_NOTICE);
             }
             parts.push(block);
+        }
+        if pivots_spent {
+            parts.push(budget.notice());
         }
         for (name, err) in &self.unreadable_sheets {
             parts.push(unreadable_notice(name, err));
@@ -303,11 +345,21 @@ impl XlsxDocument {
                 break;
             }
             for c in &ws.comments {
+                if !budget.charge(comment_chars(c)) {
+                    break;
+                }
                 parts.push(format!(
                     "> **{}:** {}",
                     comment_marker(&c.cell_ref, c.author.as_deref()),
                     c.text.trim()
                 ));
+            }
+            if ws.comments_truncated {
+                parts.push(COMMENTS_TRUNCATED_NOTICE.to_string());
+            }
+            if budget.exhausted() {
+                parts.push(budget.notice());
+                break;
             }
             for ts in &ws.text_shapes {
                 if !ts.text.trim().is_empty() {
@@ -323,7 +375,13 @@ impl XlsxDocument {
                 parts.push(format!("## Chart {}\n\n{}", i + 1, text));
             }
         }
+        // Pivots that name one cache each render it, so the output is
+        // charged to the budget however many of them share the data.
+        let mut pivots_spent = false;
         for (name, data) in self.pivot_caches() {
+            if budget.exhausted() {
+                break;
+            }
             let cols = data.fields.len().max(1);
             let md_row = |row: &[String]| {
                 let mut line = String::from("|");
@@ -335,20 +393,36 @@ impl XlsxDocument {
                 }
                 line
             };
+            // The heading, the header row and the separator are paid for
+            // before they are written; a pivot whose header does not fit is
+            // not written, and no later one is.
             let mut block = format!("## {}\n\n", pivot_cache_title(name));
-            block.push_str(&md_row(&data.fields));
+            let header = md_row(&data.fields);
+            let separator = format!("|{}", " --- |".repeat(cols));
+            if !budget.charge(block.len() + header.len() + separator.len() + 2) {
+                pivots_spent = true;
+                break;
+            }
+            block.push_str(&header);
             block.push('\n');
-            block.push('|');
-            block.push_str(&" --- |".repeat(cols));
+            block.push_str(&separator);
             for rec in &data.records {
+                let line = md_row(rec);
+                if !budget.charge(line.len() + 1) {
+                    pivots_spent = true;
+                    break;
+                }
                 block.push('\n');
-                block.push_str(&md_row(rec));
+                block.push_str(&line);
             }
             if data.truncated {
                 block.push_str("\n\n");
                 block.push_str(PIVOT_CACHE_TRUNCATED_NOTICE);
             }
             parts.push(block);
+        }
+        if pivots_spent {
+            parts.push(budget.notice());
         }
         for (name, err) in &self.unreadable_sheets {
             parts.push(format!("## {name}\n\n{}", unreadable_notice(name, err)));
@@ -396,7 +470,7 @@ impl XlsxDocument {
                 .filter(|&n| n > 0)
                 .collect::<Vec<_>>()
         }));
-        let mut cell_text = |cell: &Cell| -> Option<String> {
+        let mut cell_text = |cell: &Cell, budget: &mut TextBudget| -> Option<String> {
             let text = fmt.text(cell);
             budget
                 .charge(text.len())
@@ -409,7 +483,7 @@ impl XlsxDocument {
                 // Every non-empty cell of the row, tab-separated.
                 let mut line = String::new();
                 for cell in &row.cells {
-                    let Some(text) = cell_text(cell) else {
+                    let Some(text) = cell_text(cell, budget) else {
                         break 'rows;
                     };
                     if text.trim().is_empty() {
@@ -440,11 +514,18 @@ impl XlsxDocument {
         // A row keeps the cells that fit the budget (the rest empty) and
         // reports that the budget is spent, so the table ends after it.
         // Each cell goes under its own column's header (§18.3.1.4 `r`).
-        let mut row_line = |row: &Row| -> (String, bool) {
+        // Every row is laid out the sheet's full width, so the columns a
+        // row does not use are output too: " | " for each one. They are
+        // charged like text, which bounds a sheet whose cells sit at A1
+        // and XFD1 however many rows it stores, as `to_csv` does.
+        let mut row_line = |row: &Row, budget: &mut TextBudget| -> (Option<String>, bool) {
             let mut cells: Vec<String> = vec![String::new(); col_count];
+            if !budget.charge(col_count.saturating_mul(MARKDOWN_PAD_CHARS)) {
+                return (None, true);
+            }
             let mut spent = false;
             for c in &row.cells {
-                match cell_text(c) {
+                match cell_text(c, budget) {
                     Some(t) => place(&mut cells, c.reference.col, t),
                     None => {
                         spent = true;
@@ -452,20 +533,27 @@ impl XlsxDocument {
                     },
                 }
             }
-            (format!("| {} |", cells.join(" | ")), spent)
+            (Some(format!("| {} |", cells.join(" | "))), spent)
         };
-        let (header, spent) = row_line(&ws.rows[0]);
+        let (header, spent) = row_line(&ws.rows[0], budget);
+        let Some(header) = header else {
+            // Not even the header fits: the sheet is its heading alone.
+            return Some(lines.join("\n"));
+        };
         lines.push(header);
 
-        // Separator row
+        // Separator row, as wide as the table.
+        if !budget.charge(col_count.saturating_mul(MARKDOWN_PAD_CHARS + 2)) {
+            return Some(lines.join("\n"));
+        }
         let sep: Vec<&str> = vec!["---"; col_count];
         lines.push(format!("| {} |", sep.join(" | ")));
 
         // Data rows
         if !spent {
             for row in ws.rows.iter().skip(1) {
-                let (line, spent) = row_line(row);
-                lines.push(line);
+                let (line, spent) = row_line(row, budget);
+                lines.extend(line);
                 if spent {
                     break;
                 }
@@ -794,6 +882,7 @@ mod tests {
             page_setup: None,
             images: Vec::new(),
             comments: Vec::new(),
+            comments_truncated: false,
             text_shapes: vec![super::super::worksheet::WorksheetTextShape {
                 text: "Lorem ipsum drawn in a text box".to_string(),
                 font_name: None,
@@ -870,6 +959,7 @@ mod tests {
             page_setup: None,
             images: Vec::new(),
             comments: Vec::new(),
+            comments_truncated: false,
             text_shapes: Vec::new(),
             conditional_formats: Vec::new(),
             data_validations: Vec::new(),

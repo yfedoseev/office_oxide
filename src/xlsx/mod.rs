@@ -283,6 +283,7 @@ impl XlsxDocument {
             images: Vec<crate::xlsx::worksheet::WorksheetPicture>,
             text_shapes: Vec<crate::xlsx::worksheet::WorksheetTextShape>,
             comments: Vec<crate::xlsx::worksheet::SheetComment>,
+            comments_truncated: bool,
         }
         let mut bundles = Vec::with_capacity(workbook.sheets.len());
         // Pivot cache records materialised for sources outside the
@@ -290,6 +291,11 @@ impl XlsxDocument {
         let mut pivot_budget = crate::limits::TextBudget::new();
         let mut pivot_ctx = PivotContext::new(&mut archive, &entries);
         let mut unreadable_sheets: Vec<(String, String)> = Vec::new();
+        let mut media = MediaCache::new();
+        let mut sheet_parts = SheetPartClaims::default();
+        // Threaded-comment text, which repeats each author's name on every
+        // message, shares one budget across the workbook.
+        let mut comment_budget = crate::limits::TextBudget::new();
         // Chart parts a chartsheet displays: their text is that sheet's
         // content, not repeated among the embedded charts'.
         let mut chartsheet_charts: std::collections::HashSet<String> =
@@ -311,18 +317,19 @@ impl XlsxDocument {
             // Resolve sheet path from relationships, or fall back to convention
             let sheet_path = if let Some(rel) = wb_rels.get_by_id(&sheet.rel_id) {
                 // rel.target is typically "worksheets/sheet1.xml" (relative to xl/)
-                let target = &rel.target;
-                if let Some(stripped) = target.strip_prefix('/') {
-                    // Absolute path — strip leading slash for ZIP entry name
-                    stripped.to_string()
-                } else {
-                    format!("xl/{}", target)
-                }
+                // Relative to the workbook part, or absolute from the root.
+                resolve_relative_zip_path("xl/workbook.xml", &rel.target)
             } else {
                 // Fallback: guess by index
                 let idx = bundles.len() + 1;
                 format!("xl/worksheets/sheet{}.xml", idx)
             };
+
+            if let Err(reason) = sheet_parts.claim(&entries, &sheet_path, &sheet.name) {
+                log::warn!("xlsx: sheet {:?}: {reason}", sheet.name);
+                unreadable_sheets.push((sheet.name.clone(), reason));
+                continue;
+            }
 
             if matches!(kind, crate::ir::SheetKind::Chart | crate::ir::SheetKind::Dialog) {
                 // No cells to read. A chartsheet's content is the text of
@@ -355,6 +362,7 @@ impl XlsxDocument {
                     images: Vec::new(),
                     text_shapes: Vec::new(),
                     comments: Vec::new(),
+                    comments_truncated: false,
                 });
                 continue;
             }
@@ -374,8 +382,13 @@ impl XlsxDocument {
                         .count()
                         + 1;
                     let alt = format!("xl/worksheets/sheet{}.xml", idx);
-                    Self::read_xml_entry(&mut archive, &entries, &alt)
-                        .map_err(|_| format!("worksheet part {sheet_path} not found"))
+                    // The fallback part is a sheet's content like any other.
+                    sheet_parts
+                        .claim(&entries, &alt, &sheet.name)
+                        .and_then(|()| {
+                            Self::read_xml_entry(&mut archive, &entries, &alt)
+                                .map_err(|_| format!("worksheet part {sheet_path} not found"))
+                        })
                 },
                 Err(crate::core::Error::MissingPart(_)) => {
                     Err(format!("sheet part {sheet_path} not found"))
@@ -406,7 +419,7 @@ impl XlsxDocument {
             // media bytes so Phase 2's parallel parser doesn't need
             // the archive.
             let (images, text_shapes) =
-                read_drawing_for_sheet(&mut archive, &entries, &sheet_path, &ws_rels);
+                read_drawing_for_sheet(&mut archive, &entries, &mut media, &sheet_path, &ws_rels);
 
             // Cell comments live in a separate part reached through the
             // sheet's own relationships.
@@ -425,8 +438,12 @@ impl XlsxDocument {
                 .and_then(|path| Self::read_xml_entry(&mut archive, &entries, &path).ok())
                 .and_then(|data| worksheet::parse_threaded_comments(&data).ok())
                 .unwrap_or_default();
-            let comments =
-                worksheet::merge_threaded_comments(comments, threaded_comments, &persons);
+            let (comments, comments_truncated) = worksheet::merge_threaded_comments(
+                comments,
+                threaded_comments,
+                &persons,
+                &mut comment_budget,
+            );
 
             let (tables, pivot_tables) = read_tables_and_pivots(
                 &mut archive,
@@ -450,11 +467,15 @@ impl XlsxDocument {
                 images,
                 text_shapes,
                 comments,
+                comments_truncated,
             });
         }
 
         // Phase 2: parse worksheets (parallel when feature enabled). A
-        // sheet whose part does not parse is recorded, not fatal.
+        // sheet whose part does not parse is recorded, not fatal. The
+        // translated shared-formula text of all sheets is charged to one
+        // document-wide budget.
+        let formula_budget = crate::limits::SharedTextBudget::new();
         let parsed = crate::core::parallel::map_collect(
             bundles,
             |b| -> Result<std::result::Result<Worksheet, (String, String)>> {
@@ -465,7 +486,7 @@ impl XlsxDocument {
                     ws.chart_text = b.chart_text;
                     return Ok(Ok(ws));
                 }
-                match Worksheet::parse(&b.data, b.name, &b.rels) {
+                match Worksheet::parse_within(&b.data, b.name, &b.rels, formula_budget.clone()) {
                     Ok(mut ws) => {
                         ws.kind = b.kind;
                         ws.state = b.state;
@@ -474,6 +495,7 @@ impl XlsxDocument {
                         ws.images = b.images;
                         ws.text_shapes = b.text_shapes;
                         ws.comments = b.comments;
+                        ws.comments_truncated = b.comments_truncated;
                         Ok(Ok(ws))
                     },
                     Err(e) => {
@@ -504,7 +526,7 @@ impl XlsxDocument {
         // metadata/richData chain is a real embedded image, not a
         // genuine formula error — swap its fabricated `#VALUE!` text
         // for the actual picture.
-        let rich_value_images = read_rich_value_images(&mut archive, &entries);
+        let rich_value_images = read_rich_value_images(&mut archive, &entries, &mut media);
         if !rich_value_images.is_empty() {
             for ws in &mut worksheets {
                 for row in &mut ws.rows {
@@ -819,7 +841,7 @@ struct PivotContext {
     table_names: std::collections::HashSet<String>,
     /// Materialised cache data by cache-definition part, so a cache shared
     /// by several pivots is parsed once.
-    parsed: std::collections::HashMap<String, Option<worksheet::PivotCacheData>>,
+    parsed: std::collections::HashMap<String, Option<std::sync::Arc<worksheet::PivotCacheData>>>,
 }
 
 impl PivotContext {
@@ -905,7 +927,7 @@ fn read_tables_and_pivots<R: Read + Seek>(
                 let src = worksheet::parse_pivot_cache_definition(&def).unwrap_or_default();
                 pivot.source = src.display();
                 if !pivot_source_in_workbook(&src, workbook, &pivot_ctx.table_names) {
-                    pivot.cache_data = match pivot_ctx.parsed.get(&cache_path) {
+                    pivot.cache_data = match pivot_ctx.parsed.get(&part_key(entries, &cache_path)) {
                         Some(data) => data.clone(),
                         None => {
                             let data = read_pivot_cache_data(
@@ -916,7 +938,10 @@ fn read_tables_and_pivots<R: Read + Seek>(
                                 &src,
                                 budget,
                             );
-                            pivot_ctx.parsed.insert(cache_path.clone(), data.clone());
+                            let data = data.map(std::sync::Arc::new);
+                            pivot_ctx
+                                .parsed
+                                .insert(part_key(entries, &cache_path), data.clone());
                             data
                         },
                     };
@@ -1100,9 +1125,70 @@ impl crate::core::OfficeDocument for XlsxDocument {
 /// bytes. Returns `(pictures, text_shapes)`. Soft failures (no rel,
 /// missing part, parse error) yield empty vectors — drawings are
 /// best-effort extras and shouldn't fail worksheet loading.
+/// The sheet parts a workbook's `<sheet>` entries have named so far. Each
+/// sheet is a part of its own ([ECMA-376] §18.2.19), so an entry naming a part
+/// another entry already read is not read, copied and parsed again: that
+/// multiplied the work by the number of entries.
+#[derive(Default)]
+pub(crate) struct SheetPartClaims(std::collections::HashMap<String, String>);
+
+impl SheetPartClaims {
+    /// Claim the part `path` names for `sheet`; `Err` with the reason when
+    /// another sheet has it, so the entry is reported like any unreadable
+    /// sheet. A part is identified by the zip entry the path resolves to, so
+    /// the spellings the zip layer treats alike (case, `\` and `/`) are one
+    /// part here too.
+    pub(crate) fn claim(
+        &mut self,
+        entries: &opc::ZipEntryIndex,
+        path: &str,
+        sheet: &str,
+    ) -> std::result::Result<(), String> {
+        match self.0.get(&part_key(entries, path)) {
+            Some(owner) => {
+                Err(format!("sheet part {path} is already the content of sheet {owner:?}"))
+            },
+            None => {
+                self.0.insert(part_key(entries, path), sheet.to_string());
+                Ok(())
+            },
+        }
+    }
+}
+
+/// What identifies the part `path` names: its zip entry, however the path is
+/// spelled; for a part the package lacks, the path itself, lower-cased.
+fn part_key(entries: &opc::ZipEntryIndex, path: &str) -> String {
+    match entries.lookup(path) {
+        Some(index) => format!("#{index}"),
+        None => path.replace('\\', "/").to_ascii_lowercase(),
+    }
+}
+
+/// Media parts already read, by part name. A picture's bytes are shared by
+/// every anchor and rich value that names the part, where each used to get a
+/// copy (and a decompression) of its own.
+type MediaCache = std::collections::HashMap<String, std::sync::Arc<[u8]>>;
+
+fn read_media_cached<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    entries: &opc::ZipEntryIndex,
+    path: &str,
+    cache: &mut MediaCache,
+) -> Option<std::sync::Arc<[u8]>> {
+    let key = part_key(entries, path);
+    if let Some(hit) = cache.get(&key) {
+        return Some(hit.clone());
+    }
+    let bytes: std::sync::Arc<[u8]> = opc::read_zip_entry(archive, entries, path).ok()?.into();
+    cache.insert(key, bytes.clone());
+    Some(bytes)
+}
+
 fn read_drawing_for_sheet<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &opc::ZipEntryIndex,
+    media: &mut MediaCache,
     sheet_path: &str,
     sheet_rels: &Relationships,
 ) -> (
@@ -1149,9 +1235,8 @@ fn read_drawing_for_sheet<R: Read + Seek>(
             None => continue,
         };
         let media_path = resolve_relative_zip_path(&drawing_path, &rel.target);
-        let bytes = match opc::read_zip_entry(archive, entries, &media_path) {
-            Ok(b) => b,
-            Err(_) => continue,
+        let Some(bytes) = read_media_cached(archive, entries, &media_path, media) else {
+            continue;
         };
         let ext = std::path::Path::new(&rel.target)
             .extension()
@@ -1204,6 +1289,7 @@ fn read_drawing_for_sheet<R: Read + Seek>(
 fn read_rich_value_images<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &opc::ZipEntryIndex,
+    media: &mut MediaCache,
 ) -> std::collections::HashMap<u32, crate::xlsx::worksheet::WorksheetPicture> {
     let mut out = std::collections::HashMap::new();
 
@@ -1272,7 +1358,7 @@ fn read_rich_value_images<R: Read + Seek>(
             continue;
         };
         let media_path = resolve_relative_zip_path(rel_path, &rel.target);
-        let Ok(bytes) = opc::read_zip_entry(archive, entries, &media_path) else {
+        let Some(bytes) = read_media_cached(archive, entries, &media_path, media) else {
             continue;
         };
         let ext = Path::new(&rel.target)
@@ -1515,6 +1601,10 @@ fn parse_rich_value_rel(xml: &[u8]) -> Vec<String> {
 /// operates on plain ZIP paths (the `from_zip` fast path doesn't use
 /// `PartName`).
 pub(super) fn resolve_relative_zip_path(source: &str, target: &str) -> String {
+    // The zip layer reads `\` as `/`; so must the path arithmetic, or one
+    // part has as many names as there are ways to spell its separators.
+    let (source, target) = (source.replace('\\', "/"), target.replace('\\', "/"));
+    let (source, target) = (source.as_str(), target.as_str());
     if target.starts_with('/') {
         return target.trim_start_matches('/').to_string();
     }
@@ -2554,7 +2644,7 @@ mod tests {
         let doc = open_bytes(rich_value_image_package(r#"<c r="B2" vm="1"/>"#));
         let ws = &doc.worksheets[0];
         assert_eq!(ws.images.len(), 1, "the rich-value image must reach ws.images");
-        assert_eq!(ws.images[0].data, RICH_VALUE_PNG);
+        assert_eq!(&*ws.images[0].data, RICH_VALUE_PNG);
     }
 
     /// Build a minimal SpreadsheetML package whose main part carries
@@ -2574,7 +2664,7 @@ mod tests {
         let ws = &doc.worksheets[0];
 
         assert_eq!(ws.images.len(), 1, "the rich-value image must reach ws.images");
-        assert_eq!(ws.images[0].data, RICH_VALUE_PNG);
+        assert_eq!(&*ws.images[0].data, RICH_VALUE_PNG);
         assert_eq!(ws.images[0].format, "png");
 
         let cell = &ws.rows[0].cells[0];

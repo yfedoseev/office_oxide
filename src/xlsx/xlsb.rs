@@ -88,6 +88,7 @@ pub(super) fn from_zip<R: Read + Seek>(
         .map(|d| parse_styles(&d));
     let mut worksheets = Vec::with_capacity(sheets.len());
     let mut unreadable_sheets = Vec::new();
+    let mut sheet_parts = super::SheetPartClaims::default();
     for (i, info) in sheets.iter().enumerate() {
         let rel = rels.get_by_id(&info.rel_id);
         // A macro sheet has the same cell records as a worksheet (its part
@@ -100,6 +101,11 @@ pub(super) fn from_zip<R: Read + Seek>(
         let path = rel
             .map(|r| super::resolve_relative_zip_path("xl/workbook.bin", &r.target))
             .unwrap_or_else(|| format!("xl/worksheets/sheet{}.bin", i + 1));
+        if let Err(reason) = sheet_parts.claim(entries, &path, &info.name) {
+            log::warn!("xlsb: sheet {:?}: {reason}", info.name);
+            unreadable_sheets.push((info.name.clone(), reason));
+            continue;
+        }
         if matches!(kind, SheetKind::Chart | SheetKind::Dialog) {
             let mut ws = Worksheet::without_cells(info.name.clone(), kind);
             ws.state = info.state;
@@ -664,6 +670,30 @@ mod tests {
         s.extend(rec(BRT_CELL_ST, &cell(0, 0, &wide(text))));
         s.extend(rec(BRT_CELL_BOOL, &cell(1, 0, &[1])));
         s
+    }
+
+    /// Sheets that name one part are not read and parsed once each: the first
+    /// owns the part, the others are reported as unreadable.
+    #[test]
+    fn test_xlsb_sheets_naming_one_part_are_read_once() {
+        use crate::core::relationships::rel_types;
+        let mut wb = Vec::new();
+        for i in 1..=20 {
+            wb.extend(bundle_sheet(0, i, "rId1", &format!("S{i}")));
+        }
+        let rels = format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{}" Target="worksheets/sheet1.bin"/></Relationships>"#,
+            rel_types::WORKSHEET
+        );
+        let data = string_and_bool_sheet("only cell");
+        let bytes = super::super::test_support::zip_parts(&[
+            (WORKBOOK, &wb),
+            (WORKBOOK_RELS, rels.as_bytes()),
+            ("xl/worksheets/sheet1.bin", &data),
+        ]);
+        let doc = super::super::test_support::open_bytes(bytes);
+        assert_eq!(doc.worksheets.len(), 1);
+        assert_eq!(doc.unreadable_sheets.len(), 19);
     }
 
     /// The `.xlsb` reader dropped macro sheets, chartsheets and dialog

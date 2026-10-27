@@ -169,6 +169,58 @@ impl GridBudget {
     }
 }
 
+/// The default budget for picture bytes in the IR: 1 GiB.
+pub const DEFAULT_MAX_IMAGE_BYTES: usize = 1 << 30;
+
+static MAX_IMAGE_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_IMAGE_BYTES);
+
+/// The bytes of picture data a spreadsheet's IR may hold, counting a picture
+/// once for every anchor that draws it: the workbook stores a media part once,
+/// and the IR gives each image its own copy.
+pub fn max_image_bytes() -> usize {
+    MAX_IMAGE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Set the picture-byte budget for every document converted afterwards.
+/// `usize::MAX` disables the bound.
+pub fn set_max_image_bytes(bytes: usize) {
+    MAX_IMAGE_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// A text budget shared by every worksheet of one document, which are parsed
+/// on several threads: each charge comes off one document-wide total, so the
+/// limit is per document however many sheets there are.
+#[derive(Debug, Clone)]
+pub(crate) struct SharedTextBudget {
+    total: usize,
+    remaining: std::sync::Arc<AtomicUsize>,
+}
+
+impl SharedTextBudget {
+    /// A fresh budget at the configured limit.
+    pub(crate) fn new() -> Self {
+        Self::with_limit(max_text_chars())
+    }
+
+    pub(crate) fn with_limit(total: usize) -> Self {
+        Self {
+            total,
+            remaining: std::sync::Arc::new(AtomicUsize::new(total)),
+        }
+    }
+
+    /// Charge `chars`; `false` when the document's total would be exceeded.
+    pub(crate) fn charge(&self, chars: usize) -> bool {
+        self.remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |r| r.checked_sub(chars))
+            .is_ok()
+    }
+
+    pub(crate) fn limit(&self) -> usize {
+        self.total
+    }
+}
+
 /// A document's remaining text budget.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TextBudget {
@@ -222,6 +274,11 @@ impl TextBudget {
         want
     }
 
+    /// The limit this budget was created with.
+    pub(crate) fn limit(&self) -> usize {
+        self.total
+    }
+
     pub(crate) fn exhausted(&self) -> bool {
         self.exhausted
     }
@@ -245,6 +302,16 @@ impl TextBudget {
 /// document multiply into gigabytes of output (one megabyte of name times the
 /// number of paragraphs).
 pub(crate) const MAX_STYLE_NAME_CHARS: usize = 255;
+
+/// The longest formula, in characters: Excel's own limit (ECMA-376 Part 1
+/// §18.17, 8,192 characters). A shared formula's master is copied into every
+/// cell that follows it, so a longer one is refused.
+pub(crate) const MAX_FORMULA_CHARS: usize = 8192;
+
+/// What one empty table cell in the IR counts for against the text budget:
+/// its allocation is a few hundred bytes, where a character of text is one,
+/// so the default budget admits about four million of them.
+pub(crate) const EMPTY_TABLE_CELL_CHARS: usize = 64;
 
 #[cfg(test)]
 thread_local! {

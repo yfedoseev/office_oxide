@@ -40,9 +40,15 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     // shared string referenced from every cell is copied into every
     // cell's span here.
     let mut budget = crate::limits::TextBudget::new();
+    // The empty cells that pad rows out to the sheet's width have a budget of
+    // their own, also for the whole document: a row that spends the text
+    // budget is still laid out, and its padding is still paid for.
+    let mut image_budget = crate::limits::TextBudget::with_limit(crate::limits::max_image_bytes());
+    let mut comments_truncated = false;
+    let mut padding_budget = crate::limits::TextBudget::new();
 
     for (ws_idx, ws) in doc.worksheets.iter().enumerate() {
-        if budget.exhausted() {
+        if budget.exhausted() || padding_budget.exhausted() {
             break;
         }
         // First pass: parse all rows into `CellData` — the rendered display
@@ -230,10 +236,16 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             }));
         }
         for pic in &ws.images {
+            // A picture drawn from many anchors shares its bytes in the
+            // workbook, but each IR image owns a copy, so every one is paid
+            // for: the pictures past the budget are left out, and said so.
+            if !image_budget.charge(pic.data.len()) {
+                break;
+            }
             let format = image_format_from_ext(&pic.format);
             let img = Image {
                 alt_text: pic.alt_text.clone(),
-                data: Some(pic.data.clone()),
+                data: Some(pic.data.to_vec()),
                 format,
                 display_width_emu: Some(pic.cx_emu.max(0) as u64),
                 display_height_emu: Some(pic.cy_emu.max(0) as u64),
@@ -293,6 +305,17 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 // Lay the row out on the grid: a cell goes at its own column
                 // index and skipped columns become empty cells, so `B2`
                 // stays under the `B` header even when `A2` is absent.
+                // Every row is as wide as the sheet, so the columns it does
+                // not use become empty cells, each an allocation. They
+                // are charged to the budget, which ends the table at the row
+                // that spends it: a sheet with cells at A1 and XFD1 and a
+                // thousand rows between would otherwise be 16 million cells.
+                let padding = grid_width.saturating_sub(cells.len());
+                if !padding_budget
+                    .charge(padding.saturating_mul(crate::limits::EMPTY_TABLE_CELL_CHARS))
+                {
+                    break;
+                }
                 let mut tcells: Vec<TableCell> = Vec::with_capacity(grid_width);
                 for cd in cells {
                     let content = if cd.text.is_empty() {
@@ -433,6 +456,14 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
         // them as endnotes so every renderer sees them, with the author and
         // cell in the marker.
         for (i, c) in ws.comments.iter().enumerate() {
+            // The author is named in the marker and again as the note's
+            // author, for every comment: charged like any other text.
+            if !budget.charge(
+                crate::xlsx::text::comment_chars(c)
+                    .saturating_add(c.author.as_ref().map_or(0, |a| a.len())),
+            ) {
+                break;
+            }
             let marker = match c.author.as_deref() {
                 Some(a) => format!("{} ({a})", c.cell_ref),
                 None => c.cell_ref.clone(),
@@ -440,7 +471,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             combined.push(Element::Endnote(Note {
                 id: i as u32,
                 marker: Some(marker),
-                author: c.author.clone(),
+                author: c.author.as_deref().map(str::to_string),
                 content: vec![Element::Paragraph(Paragraph {
                     content: vec![InlineContent::Text(TextSpan::plain(c.text.clone()))],
                     ..Default::default()
@@ -448,6 +479,15 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             }));
         }
 
+        if ws.comments_truncated {
+            combined.push(Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(
+                    crate::xlsx::text::COMMENTS_TRUNCATED_NOTICE,
+                ))],
+                ..Default::default()
+            }));
+            comments_truncated = true;
+        }
         // Graceful truncation notice: when the sheet exceeded the row cap,
         // the dropped rows are not silently lost — a visible paragraph records
         // how many rows were omitted so downstream text/markdown/PDF makes the
@@ -472,7 +512,17 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 ..Default::default()
             }));
         }
-        if budget.exhausted() {
+        if image_budget.exhausted() {
+            combined.push(Element::Paragraph(Paragraph {
+                content: vec![InlineContent::Text(TextSpan::plain(format!(
+                    "[some pictures not shown: together they exceed the {} byte picture budget \
+                     (office_oxide::limits::set_max_image_bytes)]",
+                    image_budget.limit()
+                )))],
+                ..Default::default()
+            }));
+        }
+        if budget.exhausted() || padding_budget.exhausted() {
             combined.push(Element::Paragraph(Paragraph {
                 content: vec![InlineContent::Text(TextSpan::plain(budget.notice()))],
                 ..Default::default()
@@ -541,11 +591,28 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     let mut pivot_elements: Vec<Element> = Vec::new();
     let mut pivot_truncated = false;
     for (name, data) in doc.pivot_caches() {
+        // Pivots that name one cache each render it, so the table is
+        // charged to the budget however many of them share the data.
+        if budget.exhausted() {
+            break;
+        }
+        // The heading and the header row are paid for before they are built
+        // (an empty field name still costs its cell); a pivot whose header
+        // does not fit is left out, and so is every later one.
+        let title = crate::xlsx::text::pivot_cache_title(name);
+        let header_cost = title.len()
+            + data
+                .fields
+                .iter()
+                .map(|f| f.len().max(1))
+                .sum::<usize>()
+                .max(1);
+        if !budget.charge(header_cost) {
+            break;
+        }
         pivot_elements.push(Element::Heading(Heading {
             level: 3,
-            content: vec![InlineContent::Text(TextSpan::plain(
-                crate::xlsx::text::pivot_cache_title(name),
-            ))],
+            content: vec![InlineContent::Text(TextSpan::plain(title))],
             ..Default::default()
         }));
         let text_cell = |t: &str| TableCell {
@@ -567,14 +634,17 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             is_header: true,
             ..Default::default()
         }];
-        rows.extend(data.records.iter().map(|rec| {
-            TableRow {
+        for rec in &data.records {
+            if !budget.charge(rec.iter().map(String::len).sum::<usize>() + cols.max(rec.len())) {
+                break;
+            }
+            rows.push(TableRow {
                 cells: (0..cols.max(rec.len()))
                     .map(|i| text_cell(rec.get(i).map(String::as_str).unwrap_or("")))
                     .collect(),
                 ..Default::default()
-            }
-        }));
+            });
+        }
         pivot_elements.push(Element::Table(Table {
             rows,
             ..Default::default()
@@ -588,6 +658,12 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                 ..Default::default()
             }));
         }
+    }
+    if budget.exhausted() && !pivot_elements.is_empty() {
+        pivot_elements.push(Element::Paragraph(Paragraph {
+            content: vec![InlineContent::Text(TextSpan::plain(budget.notice()))],
+            ..Default::default()
+        }));
     }
     if !pivot_elements.is_empty() {
         sections.push(Section {
@@ -635,7 +711,12 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
-            text_truncated: !doc.unreadable_sheets.is_empty() || pivot_truncated,
+            text_truncated: !doc.unreadable_sheets.is_empty()
+                || pivot_truncated
+                || budget.exhausted()
+                || padding_budget.exhausted()
+                || comments_truncated
+                || image_budget.exhausted(),
             defined_names: doc
                 .workbook
                 .defined_names
