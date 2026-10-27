@@ -589,3 +589,25 @@ fn test_a_few_pivots_over_one_cache_are_unaffected() {
     assert!(!doc.to_markdown().contains("character budget"));
     assert!(!doc.to_ir().metadata.text_truncated);
 }
+
+#[test]
+fn test_sheets_naming_one_part_are_read_once_and_the_rest_reported() {
+    set_budgets();
+    let mut sheets = String::new();
+    for i in 1..=30 {
+        sheets.push_str(&format!(r#"<sheet name="S{i}" sheetId="{i}" r:id="rId1"/>"#));
+    }
+    let sheet = format!(
+        r#"<worksheet xmlns="{NS}"><sheetData><row r="1"><c r="A1"><v>42</v></c></row></sheetData></worksheet>"#
+    );
+    let doc = open(package(
+        &sheets,
+        &worksheet_rel("rId1", "worksheets/sheet1.xml"),
+        &[("xl/worksheets/sheet1.xml", sheet.into_bytes())],
+    ))
+    .unwrap();
+    let xlsx = doc.as_xlsx().unwrap();
+    assert_eq!(xlsx.worksheets.len(), 1, "the part is parsed once");
+    assert_eq!(xlsx.unreadable_sheets.len(), 29, "the other entries are reported");
+    assert!(doc.plain_text().contains("already the content of sheet"));
+}

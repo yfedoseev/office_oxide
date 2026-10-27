@@ -292,6 +292,7 @@ impl XlsxDocument {
         let mut pivot_ctx = PivotContext::new(&mut archive, &entries);
         let mut unreadable_sheets: Vec<(String, String)> = Vec::new();
         let mut media = MediaCache::new();
+        let mut sheet_parts = SheetPartClaims::default();
         // Threaded-comment text, which repeats each author's name on every
         // message, shares one budget across the workbook.
         let mut comment_budget = crate::limits::TextBudget::new();
@@ -328,6 +329,12 @@ impl XlsxDocument {
                 let idx = bundles.len() + 1;
                 format!("xl/worksheets/sheet{}.xml", idx)
             };
+
+            if let Err(reason) = sheet_parts.claim(&sheet_path, &sheet.name) {
+                log::warn!("xlsx: sheet {:?}: {reason}", sheet.name);
+                unreadable_sheets.push((sheet.name.clone(), reason));
+                continue;
+            }
 
             if matches!(kind, crate::ir::SheetKind::Chart | crate::ir::SheetKind::Dialog) {
                 // No cells to read. A chartsheet's content is the text of
@@ -1116,6 +1123,29 @@ impl crate::core::OfficeDocument for XlsxDocument {
 /// bytes. Returns `(pictures, text_shapes)`. Soft failures (no rel,
 /// missing part, parse error) yield empty vectors — drawings are
 /// best-effort extras and shouldn't fail worksheet loading.
+/// The sheet parts a workbook's `<sheet>` entries have named so far. Each
+/// sheet is a part of its own ([ECMA-376] §18.2.19), so an entry naming a part
+/// another entry already read is not read, copied and parsed again: that
+/// multiplied the work by the number of entries.
+#[derive(Default)]
+pub(crate) struct SheetPartClaims(std::collections::HashMap<String, String>);
+
+impl SheetPartClaims {
+    /// Claim `path` for `sheet`; `Err` with the reason when another sheet
+    /// has it, so the entry is reported like any unreadable sheet.
+    pub(crate) fn claim(&mut self, path: &str, sheet: &str) -> std::result::Result<(), String> {
+        match self.0.get(path) {
+            Some(owner) => {
+                Err(format!("sheet part {path} is already the content of sheet {owner:?}"))
+            },
+            None => {
+                self.0.insert(path.to_string(), sheet.to_string());
+                Ok(())
+            },
+        }
+    }
+}
+
 /// Media parts already read, by part name. A picture's bytes are shared by
 /// every anchor and rich value that names the part, where each used to get a
 /// copy (and a decompression) of its own.
