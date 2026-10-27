@@ -257,7 +257,23 @@ impl PptxDocument {
             presentation_default: std::sync::Arc::new(master::parse_default_text_style(&pres_data)),
             ..Default::default()
         };
+        // Every distinct slide is a part of the package, so a slide list
+        // longer than the package may hold entries can only repeat itself.
+        if presentation.slides.len() > crate::limits::max_package_entries() {
+            return Err(crate::core::Error::PackageLimit(format!(
+                "the slide list names {} slides; the limit is {} (the package entry limit)",
+                presentation.slides.len(),
+                crate::limits::max_package_entries()
+            ))
+            .into());
+        }
         let mut bundles = Vec::with_capacity(presentation.slides.len());
+        // A slide part is read and kept once however many `p:sldId` entries
+        // name it (ECMA-376 Part 1 §19.2.1.34: the list orders the slides
+        // of the presentation; a slide is one part). Repeats would
+        // otherwise re-parse, store and render the same part once per entry.
+        let mut seen_slides: std::collections::HashSet<crate::core::opc::PartName> =
+            std::collections::HashSet::new();
         for (slide_idx, slide_id) in presentation.slides.iter().enumerate() {
             // Resolve by rel_id, or by the `slideN.xml` convention when the
             // entry carries no r:id.
@@ -271,6 +287,14 @@ impl PptxDocument {
                     .map_err(|e| (candidate.clone(), e.to_string()))
             };
             let part_name = match resolved {
+                Ok(pn) if !seen_slides.insert(pn.clone()) => {
+                    record(
+                        pn.as_str(),
+                        &"the slide list names this part more than once; \
+                        only its first entry is kept",
+                    );
+                    continue;
+                },
                 Ok(pn) if opc.has_part(&pn) => pn,
                 Ok(pn) => {
                     let name = pn.as_str().to_string();
