@@ -200,12 +200,18 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
     // `Section.header` as soon as any section had an unequal number of
     // header and footer refs, and gave every section every other section's
     // headers on top of that.
-    let mut hf_iter = doc.headers_footers.iter();
+    // Each stored entry is converted once; a section that shares it gets a
+    // copy, whose text is charged to the document's text budget so that a
+    // package of many sections over one large header cannot multiply it
+    // without bound.
+    let mut hf_converted: Vec<Option<Option<(HeaderFooter, usize)>>> =
+        vec![None; doc.headers_footers.len()];
+    let mut hf_budget = crate::limits::TextBudget::new();
     let mut per_section: Vec<SectionHeaders> = Vec::new();
-    for sp in &doc.sections {
+    for slots in &doc.hf_by_ref {
         let mut slot = SectionHeaders::default();
-        for _ in 0..(sp.header_refs.len() + sp.footer_refs.len()) {
-            let Some(hf) = hf_iter.next() else { break };
+        for idx in slots.iter().flatten().copied() {
+            let hf = &doc.headers_footers[idx];
             // A first-page part in a section without `w:titlePg` is never
             // shown by Word; carrying it made every surface print it and
             // the writer, which emits `w:titlePg` for any first-page
@@ -213,15 +219,34 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             if !hf.active {
                 continue;
             }
-            let mut tmp: Vec<Element> = Vec::new();
-            convert_block_elements(&hf.content, &mut tmp, doc);
-            if tmp
-                .iter()
-                .all(|e| matches!(e, Element::Paragraph(p) if p.content.is_empty()))
-            {
+            let converted = hf_converted[idx].get_or_insert_with(|| {
+                let mut tmp: Vec<Element> = Vec::new();
+                convert_block_elements(&hf.content, &mut tmp, doc);
+                if tmp
+                    .iter()
+                    .all(|e| matches!(e, Element::Paragraph(p) if p.content.is_empty()))
+                {
+                    None
+                } else {
+                    let chars = DocumentIR {
+                        sections: vec![Section {
+                            elements: tmp.clone(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }
+                    .plain_text()
+                    .chars()
+                    .count();
+                    Some((HeaderFooter { content: tmp }, chars))
+                }
+            });
+            let Some((part, chars)) = converted.clone() else {
+                continue;
+            };
+            if !hf_budget.charge(chars) {
                 continue;
             }
-            let part = HeaderFooter { content: tmp };
             let target = match (hf.is_header, hf.hf_type) {
                 (true, crate::docx::HeaderFooterType::First) => &mut slot.first_header,
                 (true, crate::docx::HeaderFooterType::Even) => &mut slot.even_header,
@@ -234,6 +259,7 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         }
         per_section.push(slot);
     }
+    let hf_truncated = hf_budget.exhausted().then(|| hf_budget.notice());
 
     let mut ir_sections: Vec<Section> = Vec::with_capacity(windows.len());
     let mut doc_title: Option<String> = None;
@@ -399,11 +425,12 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
-            text_truncated: !doc.unreadable_parts.is_empty(),
+            text_truncated: !doc.unreadable_parts.is_empty() || hf_truncated.is_some(),
             warnings: doc
                 .unreadable_parts
                 .iter()
                 .map(|p| format!("skipped unreadable part {p}"))
+                .chain(hf_truncated)
                 .chain(crate::core::core_properties::package_warnings(Some(
                     &doc.package_properties,
                 )))

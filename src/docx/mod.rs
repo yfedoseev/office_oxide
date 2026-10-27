@@ -108,7 +108,15 @@ pub struct DocxDocument {
     /// Section properties (from the last `w:sectPr` in the body).
     pub sections: Vec<SectionProperties>,
     /// Parsed headers and footers.
+    ///
+    /// One entry per distinct part, type and role: sections that share a
+    /// header or footer share its entry. (Each section's references are
+    /// recovered by the converters through `hf_by_ref`.)
     pub headers_footers: Vec<HeaderFooter>,
+    /// For each section, the `headers_footers` entry each of its header
+    /// references and then each of its footer references resolved to
+    /// (`None` when the part is missing or unreadable).
+    pub(crate) hf_by_ref: Vec<Vec<Option<usize>>>,
     /// Header, footer and note parts that exist but could not be read or
     /// parsed (a corrupt entry, malformed XML), one line each naming the
     /// part and the error. They are skipped so the body still opens —
@@ -362,57 +370,77 @@ impl DocxDocument {
         // `<part>:<rId>` — see `qualify_part_images`.
         let mut part_images: std::collections::HashMap<String, (Vec<u8>, Option<String>)> =
             std::collections::HashMap::new();
-        let mut headers_footers = Vec::new();
+        let mut headers_footers: Vec<HeaderFooter> = Vec::new();
+        // A header or footer part is parsed and stored once per (part,
+        // type, role), however many sections reference it: sections that
+        // share one header all point at the same part (ECMA-376 §17.10.5),
+        // and re-parsing it per reference multiplied its size by the
+        // section count. `hf_by_ref` records which stored entry each
+        // reference resolved to.
+        let mut hf_cache: std::collections::HashMap<(String, u8, bool), usize> =
+            std::collections::HashMap::new();
+        let mut hf_by_ref: Vec<Vec<Option<usize>>> = Vec::new();
         let unreadable_parts = std::cell::RefCell::new(Vec::<String>::new());
         let skip_unreadable = |part: &str, e: &dyn std::fmt::Display| {
             log::warn!("docx: skipping unreadable {part}: {e}");
             unreadable_parts.borrow_mut().push(format!("{part}: {e}"));
         };
-        let mut parse_hf =
-            |hf_ref: &HeaderFooterRef, is_header: bool, title_page: bool| -> CoreResult<()> {
-                if let Some(rel) = doc_rels.get_by_id(&hf_ref.relationship_id) {
-                    if rel.target_mode == TargetMode::Internal {
-                        let part_name = main_part.resolve_relative(&rel.target)?;
-                        if opc.has_part(&part_name) {
-                            // A header or footer part that cannot be read
-                            // (a corrupt zip entry) or does not parse is not
-                            // the document: skip and report it rather than
-                            // fail the file, as Tika/POI do.
-                            let data = match opc.read_part(&part_name) {
-                                Ok(d) => d,
-                                Err(e) => {
-                                    skip_unreadable(part_name.as_str(), &e);
-                                    return Ok(());
-                                },
-                            };
-                            let mut content = match parse_body_elements(&data) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    skip_unreadable(part_name.as_str(), &e);
-                                    return Ok(());
-                                },
-                            };
-                            if let Ok(hf_rels) = opc.read_rels_for(&part_name) {
-                                resolve_hyperlinks(&mut content, &hf_rels);
-                                qualify_part_images(
-                                    &mut content,
-                                    &part_name,
-                                    &hf_rels,
-                                    &mut opc,
-                                    &mut part_images,
-                                );
-                            }
-                            headers_footers.push(HeaderFooter {
-                                hf_type: hf_ref.hf_type,
-                                content,
-                                is_header,
-                                active: title_page || hf_ref.hf_type != HeaderFooterType::First,
-                            });
+        let mut parse_hf = |hf_ref: &HeaderFooterRef,
+                            is_header: bool,
+                            title_page: bool|
+         -> CoreResult<Option<usize>> {
+            if let Some(rel) = doc_rels.get_by_id(&hf_ref.relationship_id) {
+                if rel.target_mode == TargetMode::Internal {
+                    let part_name = main_part.resolve_relative(&rel.target)?;
+                    if opc.has_part(&part_name) {
+                        let active = title_page || hf_ref.hf_type != HeaderFooterType::First;
+                        let key = (part_name.as_str().to_string(), hf_ref.hf_type as u8, is_header);
+                        if let Some(&idx) = hf_cache.get(&key) {
+                            // Shown wherever any reference to it is.
+                            headers_footers[idx].active |= active;
+                            return Ok(Some(idx));
                         }
+                        // A header or footer part that cannot be read
+                        // (a corrupt zip entry) or does not parse is not
+                        // the document: skip and report it rather than
+                        // fail the file, as Tika/POI do.
+                        let data = match opc.read_part(&part_name) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                skip_unreadable(part_name.as_str(), &e);
+                                return Ok(None);
+                            },
+                        };
+                        let mut content = match parse_body_elements(&data) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                skip_unreadable(part_name.as_str(), &e);
+                                return Ok(None);
+                            },
+                        };
+                        if let Ok(hf_rels) = opc.read_rels_for(&part_name) {
+                            resolve_hyperlinks(&mut content, &hf_rels);
+                            qualify_part_images(
+                                &mut content,
+                                &part_name,
+                                &hf_rels,
+                                &mut opc,
+                                &mut part_images,
+                            );
+                        }
+                        headers_footers.push(HeaderFooter {
+                            hf_type: hf_ref.hf_type,
+                            content,
+                            is_header,
+                            active,
+                        });
+                        hf_cache.insert(key, headers_footers.len() - 1);
+                        return Ok(Some(headers_footers.len() - 1));
                     }
                 }
-                Ok(())
-            };
+            }
+            Ok(None)
+        };
         // A first-page part is shown when any section that *uses* it has
         // `w:titlePg`. A section that declares no reference of a type
         // inherits the previous section's (ECMA-376 §17.10.5), and
@@ -435,12 +463,15 @@ impl DocxDocument {
             }
         }
         for section in &sections {
+            let mut slots =
+                Vec::with_capacity(section.header_refs.len() + section.footer_refs.len());
             for (is_header, refs) in [(true, &section.header_refs), (false, &section.footer_refs)] {
                 for hf_ref in refs {
                     let shown = shown_first.contains(&(is_header, hf_ref.relationship_id.clone()));
-                    parse_hf(hf_ref, is_header, shown)?;
+                    slots.push(parse_hf(hf_ref, is_header, shown)?);
                 }
             }
+            hf_by_ref.push(slots);
         }
 
         // Footnotes, endnotes and comments are separate parts referenced
@@ -576,6 +607,7 @@ impl DocxDocument {
             theme,
             sections,
             headers_footers,
+            hf_by_ref,
             unreadable_parts: unreadable_parts.into_inner(),
             embedded_fonts,
             images,

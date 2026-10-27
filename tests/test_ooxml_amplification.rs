@@ -129,3 +129,65 @@ fn test_distinct_slides_listed_in_order_are_all_kept() {
     assert_eq!(doc.slides.len(), 2);
     assert!(doc.unreadable_parts.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// DOCX: one header part referenced from every section
+// ---------------------------------------------------------------------------
+
+const WML: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+
+/// A document of `sections` sections, each `w:sectPr` referencing the
+/// default header `rId1` and the default footer `rId2` (one part each).
+fn docx_with_shared_header(sections: usize, header_text: &str) -> Vec<u8> {
+    let mut body = String::new();
+    for i in 0..sections {
+        body.push_str(&format!(
+            r#"<w:p><w:r><w:t>s{i}</w:t></w:r><w:pPr><w:sectPr><w:headerReference w:type="default" r:id="rId1"/><w:footerReference w:type="default" r:id="rId2"/></w:sectPr></w:pPr></w:p>"#
+        ));
+    }
+    let parts = vec![
+        ("[Content_Types].xml".to_string(), r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/><Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/></Types>"#.to_string()),
+        ("_rels/.rels".to_string(), rels(&[("rId1", "officeDocument", "word/document.xml")])),
+        (
+            "word/document.xml".to_string(),
+            format!(r#"<w:document xmlns:w="{WML}" xmlns:r="{REL}"><w:body>{body}</w:body></w:document>"#),
+        ),
+        (
+            "word/_rels/document.xml.rels".to_string(),
+            rels(&[("rId1", "header", "header1.xml"), ("rId2", "footer", "footer1.xml")]),
+        ),
+        (
+            "word/header1.xml".to_string(),
+            format!(r#"<w:hdr xmlns:w="{WML}"><w:p><w:r><w:t>{header_text}</w:t></w:r></w:p></w:hdr>"#),
+        ),
+        (
+            "word/footer1.xml".to_string(),
+            format!(r#"<w:ftr xmlns:w="{WML}"><w:p><w:r><w:t>foot</w:t></w:r></w:p></w:ftr>"#),
+        ),
+    ];
+    zip_of(parts)
+}
+
+#[test]
+fn test_header_shared_by_many_sections_is_stored_once() {
+    let hdr = "h".repeat(1_500);
+    let bytes = docx_with_shared_header(100, &hdr);
+    let doc = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes.clone())).unwrap();
+    assert_eq!(doc.sections.len(), 100);
+    assert_eq!(
+        doc.headers_footers.len(),
+        2,
+        "one header part and one footer part, however many sections reference them"
+    );
+    assert_eq!(doc.plain_text().matches(&hdr).count(), 1);
+    // Every section still shows the shared header and footer in the IR.
+    let ir = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert_eq!(ir.sections.len(), 100);
+    assert!(
+        ir.sections
+            .iter()
+            .all(|s| s.header.is_some() && s.footer.is_some())
+    );
+}
