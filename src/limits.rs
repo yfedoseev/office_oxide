@@ -155,6 +155,45 @@ pub(crate) fn image_budget_warning() -> Option<String> {
     })
 }
 
+/// The default most table cells one IR may hold when it is written to
+/// `.docx` or `.pptx`: 250,000.
+///
+/// The writers build every cell in memory; a million-cell table took
+/// 2.2 GB to write. Genuine tables in these formats stay far below this.
+pub const DEFAULT_MAX_WRITE_TABLE_CELLS: usize = 250_000;
+
+static MAX_WRITE_TABLE_CELLS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_WRITE_TABLE_CELLS);
+
+/// The most table cells (nested tables included) an IR written to `.docx` or
+/// `.pptx` may hold before the write is refused.
+pub fn max_write_table_cells() -> usize {
+    MAX_WRITE_TABLE_CELLS.load(Ordering::Relaxed)
+}
+
+/// Set the table-cell limit for every write afterwards. `usize::MAX`
+/// disables the bound.
+pub fn set_max_write_table_cells(cells: usize) {
+    MAX_WRITE_TABLE_CELLS.store(cells, Ordering::Relaxed);
+}
+
+/// The default most list items one Markdown document may parse into:
+/// 100,000. Each item becomes about 250 bytes of IR.
+pub const DEFAULT_MAX_MARKDOWN_LIST_ITEMS: usize = 100_000;
+
+static MAX_MARKDOWN_LIST_ITEMS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_MARKDOWN_LIST_ITEMS);
+
+/// The most list items (nested ones included) `DocumentIR::from_markdown`
+/// keeps; the rest are dropped with a notice.
+pub fn max_markdown_list_items() -> usize {
+    MAX_MARKDOWN_LIST_ITEMS.load(Ordering::Relaxed)
+}
+
+/// Set the Markdown list-item limit for every parse afterwards.
+/// `usize::MAX` disables the bound.
+pub fn set_max_markdown_list_items(items: usize) {
+    MAX_MARKDOWN_LIST_ITEMS.store(items, Ordering::Relaxed);
+}
+
 /// A document's remaining text budget.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TextBudget {
