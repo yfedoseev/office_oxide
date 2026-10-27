@@ -365,15 +365,18 @@ fn extract_slides_via_persist(
     // ids to one `Slide` container, and reading it for each would copy its
     // text once per entry: 10,000 entries over a 100,000-character slide
     // were a gigabyte of text from a 395 KB file.
-    let mut slide_offsets: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // An entry whose persist id resolves to nothing is an empty slide; one is
+    // kept, as a placeholder for the slide count, and the rest are left out
+    // with the aliased ones, so unresolvable entries cannot be listed without
+    // bound.
+    let mut slide_offsets: std::collections::HashSet<Option<usize>> =
+        std::collections::HashSet::new();
     let mut aliased_entries = 0usize;
     let mut slides_cut_by_budget = false;
     for entry in slide_list_entries(&slide_list) {
-        if let Some(offset) = dir.resolve(entry.persist_id_ref) {
-            if !slide_offsets.insert(offset) {
-                aliased_entries += 1;
-                continue;
-            }
+        if !slide_offsets.insert(dir.resolve(entry.persist_id_ref)) {
+            aliased_entries += 1;
+            continue;
         }
         let (mut slide, links) = resolve_slide(
             stream,
@@ -390,6 +393,10 @@ fn extract_slides_via_persist(
             .as_deref()
             .unwrap_or(&deck_headers_footers);
         for text in hf_texts {
+            // Every slide gets a copy of the deck's header/footer text.
+            if !text_budget.charge(text.len()) {
+                break;
+            }
             slide.text_runs.push(TextRun {
                 text_type: TextType::Other,
                 text: text.clone(),
@@ -500,7 +507,7 @@ fn extract_slides_via_persist(
     if aliased_entries > 0 {
         notices.push(format!(
             "{aliased_entries} slide-list entries name a slide or notes page that an earlier \
-             entry already names; they were left out"
+             entry already names, or name none; they were left out"
         ));
     }
     if slides_cut_by_budget || text_budget.exhausted() {
@@ -1243,6 +1250,9 @@ fn extract_shape_text_in(
             RT_TEXT_CHARS => {
                 let text = decode_utf16le(&rec.data);
                 if !text.is_empty() {
+                    if !budget.charge(text.len()) {
+                        return;
+                    }
                     out.push(TextRun {
                         text_type: current_type,
                         text,
@@ -1256,6 +1266,9 @@ fn extract_shape_text_in(
             RT_TEXT_BYTES => {
                 let text = decode_text_bytes(&rec.data);
                 if !text.is_empty() {
+                    if !budget.charge(text.len()) {
+                        return;
+                    }
                     out.push(TextRun {
                         text_type: current_type,
                         text,
@@ -3874,15 +3887,28 @@ mod tests {
     /// list also holds `aliases` further entries, each with its own persist id
     /// that the persist directory maps to the first slide's container.
     fn deck_with_aliased_entries(texts: &[String], aliases: u32) -> (Vec<u8>, Vec<u8>) {
+        deck_with_entries(texts, aliases, 0, &[])
+    }
+
+    /// As [`deck_with_aliased_entries`], with `unresolved` further list
+    /// entries whose persist ids the directory does not map, and
+    /// `doc_children` (a deck-level header/footer, say) ahead of the slide
+    /// list in the `DocumentContainer`.
+    fn deck_with_entries(
+        texts: &[String],
+        aliases: u32,
+        unresolved: u32,
+        doc_children: &[u8],
+    ) -> (Vec<u8>, Vec<u8>) {
         let n = texts.len() as u32;
-        let ids: Vec<u32> = (2..2 + n + aliases).collect();
+        let ids: Vec<u32> = (2..2 + n + aliases + unresolved).collect();
         let entries: Vec<u8> = ids
             .iter()
             .map(|&id| slide_persist_atom_bytes(id, 256 + id))
             .collect::<Vec<_>>()
             .concat();
         let doc = make_container(RT_SLIDE_LIST_WITH_TEXT, SLWT_SLIDES, &entries);
-        let mut stream = make_container(RT_DOCUMENT, 0, &doc);
+        let mut stream = make_container(RT_DOCUMENT, 0, &[doc_children, &doc].concat());
         let mut offsets = vec![0u32];
         for text in texts {
             offsets.push(stream.len() as u32);
@@ -3902,6 +3928,41 @@ mod tests {
         let edit_offset = stream.len() as u32;
         stream.extend(user_edit_atom_bytes(0, pd_offset, 1));
         (stream, current_user_bytes(edit_offset))
+    }
+
+    /// A deck-level footer is copied onto every slide, so it is charged for
+    /// each copy: many slides under a small budget stop short of all of them.
+    #[test]
+    fn test_header_footer_copies_are_charged_to_the_text_budget() {
+        let footer = header_footer_container_bytes("d", &"F".repeat(500));
+        let texts: Vec<String> = (0..40).map(|i| format!("slide {i}")).collect();
+        let (stream, cu) = deck_with_entries(&texts, 0, 0, &footer);
+        let whole = extract_deck_text(&stream, Some(&cu));
+        assert_eq!(whole.slides.len(), 40);
+        let cut = extract_deck_text_with_budget(
+            &stream,
+            Some(&cu),
+            crate::limits::TextBudget::with_limit(2_000),
+        );
+        let total: usize = cut
+            .slides
+            .iter()
+            .flat_map(|s| &s.text_runs)
+            .map(|r| r.text.len())
+            .sum();
+        assert!(total <= 2_000, "{total} characters under a 2,000 budget");
+        assert!(cut.slides.len() < 40);
+        assert!(!cut.notices.is_empty());
+    }
+
+    /// Entries that name no slide are one empty placeholder, not one slide
+    /// each.
+    #[test]
+    fn test_unresolvable_slide_list_entries_are_not_listed_without_bound() {
+        let (stream, cu) = deck_with_entries(&["real".to_string()], 0, 400, &[]);
+        let deck = extract_deck_text(&stream, Some(&cu));
+        assert_eq!(deck.slides.len(), 2, "the slide and one placeholder");
+        assert!(deck.notices[0].contains("399 slide-list entries"), "{:?}", deck.notices);
     }
 
     /// Slide-list entries with distinct persist ids that the directory maps to
