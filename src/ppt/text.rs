@@ -231,7 +231,7 @@ fn extract_slides_without_persist(stream: &[u8]) -> Vec<SlideText> {
     let mut tables = Vec::new();
     let mut image_refs = Vec::new();
     let mut ole_object_refs = Vec::new();
-    extract_shape_text(
+    extract_shape_text_in(
         &content,
         0,
         &[],
@@ -243,6 +243,7 @@ fn extract_slides_without_persist(stream: &[u8]) -> Vec<SlideText> {
         &mut tables,
         &mut image_refs,
         &mut ole_object_refs,
+        &mut crate::limits::TextBudget::new(),
     );
     runs.retain(|r| !is_field_placeholder_only(&r.text));
     if runs.is_empty() && tables.is_empty() && image_refs.is_empty() {
@@ -276,7 +277,7 @@ fn collect_slide_containers(
             let mut tables = Vec::new();
             let mut image_refs = Vec::new();
             let mut ole_object_refs = Vec::new();
-            extract_shape_text(
+            extract_shape_text_in(
                 &rec.data,
                 0,
                 &[],
@@ -288,6 +289,7 @@ fn collect_slide_containers(
                 &mut tables,
                 &mut image_refs,
                 &mut ole_object_refs,
+                &mut crate::limits::TextBudget::new(),
             );
             runs.retain(|r| !is_field_placeholder_only(&r.text));
             let hidden = slide_is_hidden(&rec.data);
@@ -381,6 +383,7 @@ fn extract_slides_via_persist(
             &entry.outline_texts,
             &hyperlinks,
             &ole_objects,
+            &mut text_budget,
         );
         let hf_texts = links
             .headers_footers
@@ -396,7 +399,7 @@ fn extract_slides_via_persist(
         }
         // The slides read so far stay; the one that does not fit, and the
         // rest, are left out.
-        if !text_budget.charge(slide_text_len(&slide)) {
+        if text_budget.exhausted() {
             slides_cut_by_budget = true;
             break;
         }
@@ -428,6 +431,7 @@ fn extract_slides_via_persist(
                 &entry.outline_texts,
                 &hyperlinks,
                 &ole_objects,
+                &mut text_budget,
             ) else {
                 continue;
             };
@@ -507,18 +511,6 @@ fn extract_slides_via_persist(
         master_text,
         notices,
     })
-}
-
-/// The characters of text a resolved slide holds, for the text budget.
-fn slide_text_len(slide: &SlideText) -> usize {
-    let runs = |runs: &[TextRun]| runs.iter().map(|r| r.text.len()).sum::<usize>();
-    runs(&slide.text_runs)
-        + slide
-            .tables
-            .iter()
-            .flat_map(|t| t.rows.iter().flatten())
-            .map(|cell| runs(cell))
-            .sum::<usize>()
 }
 
 /// `masterId` → `persistIdRef` for every entry of the
@@ -659,7 +651,7 @@ fn collect_master_static_runs(
             let hyperlink = resolve_shape_hyperlink(&rec.data, hyperlinks);
             let mut runs = Vec::new();
             let mut tables = Vec::new();
-            extract_shape_text(
+            extract_shape_text_in(
                 &rec.data,
                 depth + 1,
                 &[],
@@ -671,6 +663,7 @@ fn collect_master_static_runs(
                 &mut tables,
                 &mut Vec::new(),
                 &mut Vec::new(),
+                &mut crate::limits::TextBudget::new(),
             );
             let table_runs = tables.into_iter().flat_map(|t| t.rows).flatten().flatten();
             out.extend(runs.into_iter().chain(table_runs).filter(|r| {
@@ -900,6 +893,7 @@ fn resolve_notes(
     outline_texts: &[TextRun],
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
+    budget: &mut crate::limits::TextBudget,
 ) -> Option<(Vec<TextRun>, Option<u32>)> {
     let offset = dir.resolve(persist_id_ref)?;
     let children = bounded_container_children(stream, offset, RT_NOTES)?;
@@ -912,7 +906,7 @@ fn resolve_notes(
                 .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         });
     let mut runs = Vec::new();
-    extract_shape_text(
+    extract_shape_text_in(
         &children,
         0,
         outline_texts,
@@ -924,6 +918,7 @@ fn resolve_notes(
         &mut Vec::new(),
         &mut Vec::new(),
         &mut Vec::new(),
+        budget,
     );
     runs.retain(|r| r.text_type == TextType::Notes && !r.text.trim().is_empty());
     Some((runs, slide_id_ref))
@@ -946,6 +941,7 @@ fn resolve_slide(
     outline_texts: &[TextRun],
     hyperlinks: &HashMap<u32, String>,
     ole_objects: &HashMap<u32, OleObjectInfo>,
+    budget: &mut crate::limits::TextBudget,
 ) -> (SlideText, SlideLinks) {
     let mut text_runs = Vec::new();
     let mut tables = Vec::new();
@@ -968,7 +964,7 @@ fn resolve_slide(
                         .get(16..20)
                         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 });
-            extract_shape_text(
+            extract_shape_text_in(
                 &children,
                 0,
                 outline_texts,
@@ -980,6 +976,7 @@ fn resolve_slide(
                 &mut tables,
                 &mut image_refs,
                 &mut ole_object_refs,
+                budget,
             );
             hidden = slide_is_hidden(&children);
 
@@ -1206,7 +1203,7 @@ fn apply_master_inheritance(text_runs: &mut [TextRun], styles: &MasterStyles) {
 /// length on one shape can, at worst, truncate the remaining shapes within
 /// that *same* container — it can never affect anything outside the region
 /// this function was called with.
-fn extract_shape_text(
+fn extract_shape_text_in(
     data: &[u8],
     depth: usize,
     outline_texts: &[TextRun],
@@ -1218,6 +1215,7 @@ fn extract_shape_text(
     tables: &mut Vec<super::table::TableBlock>,
     image_refs: &mut Vec<usize>,
     ole_object_refs: &mut Vec<OleObjectInfo>,
+    budget: &mut crate::limits::TextBudget,
 ) {
     if depth > MAX_SHAPE_DEPTH {
         return;
@@ -1278,6 +1276,13 @@ fn extract_shape_text(
                     i32::from_le_bytes([rec.data[0], rec.data[1], rec.data[2], rec.data[3]]);
                 if index >= 0 {
                     if let Some(run) = outline_texts.get(index as usize) {
+                        // One reference is a few bytes and the run it names is
+                        // stored once, so repeating the reference copies the
+                        // run once per repeat: charge each copy before making
+                        // it, and stop at the first one that does not fit.
+                        if !run.text.is_empty() && !budget.charge(run.text.len()) {
+                            return;
+                        }
                         if !run.text.is_empty() {
                             let mut run = run.clone();
                             run.hyperlink = current_hyperlink.map(str::to_string);
@@ -1360,7 +1365,7 @@ fn extract_shape_text(
                 if let Some(info) = resolve_shape_ole_object(&rec.data, ole_objects) {
                     ole_object_refs.push(info);
                 }
-                extract_shape_text(
+                extract_shape_text_in(
                     &rec.data,
                     depth + 1,
                     outline_texts,
@@ -1372,6 +1377,7 @@ fn extract_shape_text(
                     tables,
                     image_refs,
                     ole_object_refs,
+                    budget,
                 );
             },
             RT_SPGR_CONTAINER => {
@@ -1385,10 +1391,11 @@ fn extract_shape_text(
                     outline_texts,
                     hyperlinks,
                     current_hyperlink,
+                    budget,
                 ) {
                     tables.push(table);
                 } else {
-                    extract_shape_text(
+                    extract_shape_text_in(
                         &rec.data,
                         depth + 1,
                         outline_texts,
@@ -1400,11 +1407,12 @@ fn extract_shape_text(
                         tables,
                         image_refs,
                         ole_object_refs,
+                        budget,
                     );
                 }
             },
             _ if rec.header.is_container() => {
-                extract_shape_text(
+                extract_shape_text_in(
                     &rec.data,
                     depth + 1,
                     outline_texts,
@@ -1416,6 +1424,7 @@ fn extract_shape_text(
                     tables,
                     image_refs,
                     ole_object_refs,
+                    budget,
                 );
             },
             _ => {},
@@ -1436,6 +1445,7 @@ fn try_extract_table_from_spgr(
     outline_texts: &[TextRun],
     hyperlinks: &HashMap<u32, String>,
     current_hyperlink: Option<&str>,
+    budget: &mut crate::limits::TextBudget,
 ) -> Option<super::table::TableBlock> {
     if depth > MAX_SHAPE_DEPTH {
         return None;
@@ -1475,7 +1485,7 @@ fn try_extract_table_from_spgr(
         let shape_hyperlink = resolve_shape_hyperlink(&rec.data, hyperlinks);
         let hyperlink_ref = shape_hyperlink.as_deref().or(current_hyperlink);
         let mut runs = Vec::new();
-        extract_shape_text(
+        extract_shape_text_in(
             &rec.data,
             depth + 1,
             outline_texts,
@@ -1487,6 +1497,7 @@ fn try_extract_table_from_spgr(
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
+            budget,
         );
         cells.push(super::table::TableCellData { left, top, runs });
     }
@@ -2058,6 +2069,38 @@ fn decode_utf16le(data: &[u8]) -> String {
     let (pairs, _rest) = data.as_chunks::<2>();
     let chars: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
     String::from_utf16_lossy(&chars)
+}
+
+/// [`extract_shape_text_in`] with an unlimited budget, for tests that do not
+/// exercise it.
+#[cfg(test)]
+fn extract_shape_text(
+    data: &[u8],
+    depth: usize,
+    outline_texts: &[TextRun],
+    hyperlinks: &HashMap<u32, String>,
+    ole_objects: &HashMap<u32, OleObjectInfo>,
+    current_hyperlink: Option<&str>,
+    current_placeholder_role: Option<&str>,
+    out: &mut Vec<TextRun>,
+    tables: &mut Vec<super::table::TableBlock>,
+    image_refs: &mut Vec<usize>,
+    ole_object_refs: &mut Vec<OleObjectInfo>,
+) {
+    extract_shape_text_in(
+        data,
+        depth,
+        outline_texts,
+        hyperlinks,
+        ole_objects,
+        current_hyperlink,
+        current_placeholder_role,
+        out,
+        tables,
+        image_refs,
+        ole_object_refs,
+        &mut crate::limits::TextBudget::with_limit(usize::MAX),
+    );
 }
 
 #[cfg(test)]
@@ -3848,7 +3891,7 @@ mod tests {
             stream.extend(make_container(RT_SLIDE, 0, &c));
         }
         let first_slide = offsets[1];
-        offsets.extend(std::iter::repeat(first_slide).take(aliases as usize));
+        offsets.extend(std::iter::repeat_n(first_slide, aliases as usize));
         let pd_offset = stream.len() as u32;
         let dir: Vec<(u32, u32)> = offsets
             .iter()
@@ -3897,6 +3940,42 @@ mod tests {
             "{:?}",
             cut.notices
         );
+    }
+
+    /// One shape-tree walk over a few thousand `OutlineTextRefAtom`s that
+    /// name one stored run copies it once per reference. Each copy is charged
+    /// before it is made, so the walk stops with the budget rather than after
+    /// materializing every copy.
+    #[test]
+    fn test_repeated_outline_text_references_stop_at_the_text_budget() {
+        let outline_texts = vec![TextRun {
+            text_type: TextType::Body,
+            text: "x".repeat(1000),
+            ..Default::default()
+        }];
+        let outline_ref = make_atom(RT_OUTLINE_TEXT_REF_ATOM, 0, &0i32.to_le_bytes());
+        let shapes: Vec<u8> = (0..2000)
+            .flat_map(|_| make_container(0xF004, 0, &make_container(0xF00D, 0, &outline_ref)))
+            .collect();
+        let mut runs = Vec::new();
+        let mut budget = crate::limits::TextBudget::with_limit(5_000);
+        extract_shape_text_in(
+            &shapes,
+            0,
+            &outline_texts,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            None,
+            &mut runs,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut budget,
+        );
+        let copied: usize = runs.iter().map(|r| r.text.len()).sum();
+        assert!(copied <= 5_000, "{copied} characters copied under a 5,000 budget");
+        assert!(budget.exhausted());
     }
 
     /// A master reference cycle (title master naming itself through a
