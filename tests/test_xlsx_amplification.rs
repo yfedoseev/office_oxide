@@ -220,3 +220,37 @@ fn test_a_dense_wide_sheet_is_unaffected_by_padding_charges() {
     assert!(!doc.to_markdown().contains("character budget"));
     assert!(!doc.to_ir().metadata.text_truncated);
 }
+
+#[test]
+fn test_shared_formula_budget_is_per_document_not_per_sheet() {
+    set_budgets();
+    // Each of six sheets translates about 20,000 characters, under the
+    // 60,000 budget on its own; together they are twice the budget.
+    let master = format!("A1+{}", "1+".repeat(500));
+    let mut sheet = format!(r#"<worksheet xmlns="{NS}"><sheetData>"#);
+    sheet.push_str(&format!(
+        r#"<row r="1"><c r="B1"><f t="shared" ref="B1:B21" si="0">{master}</f><v>1</v></c></row>"#
+    ));
+    for r in 2..=21 {
+        sheet.push_str(&format!(
+            r#"<row r="{r}"><c r="B{r}"><f t="shared" si="0"/><v>1</v></c></row>"#
+        ));
+    }
+    sheet.push_str("</sheetData></worksheet>");
+    let mut sheets = String::new();
+    let mut rels = String::new();
+    let mut parts = Vec::new();
+    for i in 1..=6 {
+        sheets.push_str(&format!(r#"<sheet name="S{i}" sheetId="{i}" r:id="rId{i}"/>"#));
+        rels.push_str(&worksheet_rel(&format!("rId{i}"), &format!("worksheets/sheet{i}.xml")));
+        parts.push((format!("xl/worksheets/sheet{i}.xml"), sheet.clone().into_bytes()));
+    }
+    let parts: Vec<(&str, Vec<u8>)> = parts.iter().map(|(n, d)| (n.as_str(), d.clone())).collect();
+    let doc = open(package(&sheets, &rels, &parts)).unwrap();
+    let text = doc.plain_text();
+    assert!(
+        text.contains("unreadable sheet"),
+        "the sheets past the document total are reported"
+    );
+    assert!(text.contains("S1"), "the sheets within it are read");
+}

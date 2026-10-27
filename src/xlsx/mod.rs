@@ -454,7 +454,10 @@ impl XlsxDocument {
         }
 
         // Phase 2: parse worksheets (parallel when feature enabled). A
-        // sheet whose part does not parse is recorded, not fatal.
+        // sheet whose part does not parse is recorded, not fatal. The
+        // translated shared-formula text of all sheets is charged to one
+        // document-wide budget.
+        let formula_budget = crate::limits::SharedTextBudget::new();
         let parsed = crate::core::parallel::map_collect(
             bundles,
             |b| -> Result<std::result::Result<Worksheet, (String, String)>> {
@@ -465,7 +468,7 @@ impl XlsxDocument {
                     ws.chart_text = b.chart_text;
                     return Ok(Ok(ws));
                 }
-                match Worksheet::parse(&b.data, b.name, &b.rels) {
+                match Worksheet::parse_within(&b.data, b.name, &b.rels, formula_budget.clone()) {
                     Ok(mut ws) => {
                         ws.kind = b.kind;
                         ws.state = b.state;

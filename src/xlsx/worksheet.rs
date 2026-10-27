@@ -848,6 +848,17 @@ impl Worksheet {
         name: String,
         rels: &crate::core::relationships::Relationships,
     ) -> crate::core::Result<Self> {
+        Self::parse_within(xml_data, name, rels, crate::limits::SharedTextBudget::new())
+    }
+
+    /// [`Self::parse`] with the translated shared-formula text charged to
+    /// `formulas`, the budget of the whole document rather than of this sheet.
+    pub(crate) fn parse_within(
+        xml_data: &[u8],
+        name: String,
+        rels: &crate::core::relationships::Relationships,
+        formulas: crate::limits::SharedTextBudget,
+    ) -> crate::core::Result<Self> {
         // Use plain Reader (not NsReader) for performance — worksheet XML is always
         // in the SML namespace, so namespace resolution is unnecessary overhead.
         // This is the hot path: worksheets can have thousands of cells.
@@ -862,7 +873,7 @@ impl Worksheet {
         // end iff at least one was seen.
         let mut margins_in: Option<PageMarginsIn> = None;
         let mut page_setup_raw: Option<PageSetupRaw> = None;
-        let mut shared = SharedFormulas::default();
+        let mut shared = SharedFormulas::with_budget(formulas);
         let mut conditional_formats = Vec::new();
         let mut data_validations = Vec::new();
         let mut header_footer = SheetHeaderFooter::default();

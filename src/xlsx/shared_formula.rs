@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use super::cell::CellRef;
 use crate::core::{Error, Result};
-use crate::limits::{MAX_FORMULA_CHARS, TextBudget};
+use crate::limits::{MAX_FORMULA_CHARS, SharedTextBudget};
 
 /// Excel's grid limits (ECMA-376 §18.3.1.73 / §18.3.1.13).
 const MAX_COL: i64 = 16_383;
@@ -24,10 +24,10 @@ const MAX_ROW: i64 = 1_048_575;
 #[derive(Debug)]
 pub struct SharedFormulas {
     masters: HashMap<u32, (CellRef, String)>,
-    /// Characters of translated follower text this worksheet may hold. A
+    /// Characters of translated follower text the whole document may hold. A
     /// follower stores its own copy of the master's formula, so a long master
     /// shared by many cells multiplies; every translation is charged here.
-    budget: TextBudget,
+    budget: SharedTextBudget,
     /// Followers whose master hadn't been seen yet. A group's master
     /// normally comes first, but not always — calamine ships a fixture with
     /// the records deliberately reversed — so these are resolved in a second
@@ -37,13 +37,13 @@ pub struct SharedFormulas {
 
 impl Default for SharedFormulas {
     fn default() -> Self {
-        Self::with_budget(TextBudget::new())
+        Self::with_budget(SharedTextBudget::new())
     }
 }
 
 impl SharedFormulas {
     /// A collection whose follower translations are charged to `budget`.
-    pub(crate) fn with_budget(budget: TextBudget) -> Self {
+    pub(crate) fn with_budget(budget: SharedTextBudget) -> Self {
         Self {
             masters: HashMap::new(),
             budget,
@@ -69,7 +69,7 @@ impl SharedFormulas {
 
     /// Charge one translated follower (its length in bytes, which bounds
     /// its characters) to the worksheet's budget.
-    fn charge(&mut self, si: u32, formula: &str) -> Result<()> {
+    fn charge(&self, si: u32, formula: &str) -> Result<()> {
         if self.budget.charge(formula.len()) {
             Ok(())
         } else {
