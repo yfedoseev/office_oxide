@@ -166,6 +166,11 @@ pub(crate) const MAX_STYLE_NAME_CHARS: usize = 255;
 /// cell that follows it, so a longer one is refused.
 pub(crate) const MAX_FORMULA_CHARS: usize = 8192;
 
+/// What one empty table cell in the IR counts for against the text budget:
+/// its allocation is a few hundred bytes, where a character of text is one,
+/// so the default budget admits about four million of them.
+pub(crate) const EMPTY_TABLE_CELL_CHARS: usize = 64;
+
 #[cfg(test)]
 thread_local! {
     /// Bytes of style name examined on this thread, so a test can assert that a

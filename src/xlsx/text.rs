@@ -28,6 +28,9 @@ impl XlsxDocument {
     }
 }
 
+/// What an unused column of a Markdown table row costs: `" | "`.
+const MARKDOWN_PAD_CHARS: usize = 3;
+
 /// `B2 (Author)` — the same marker `to_ir()` puts on a comment's endnote.
 pub(crate) fn comment_marker(cell_ref: &str, author: Option<&str>) -> String {
     match author {
@@ -396,7 +399,7 @@ impl XlsxDocument {
                 .filter(|&n| n > 0)
                 .collect::<Vec<_>>()
         }));
-        let mut cell_text = |cell: &Cell| -> Option<String> {
+        let mut cell_text = |cell: &Cell, budget: &mut TextBudget| -> Option<String> {
             let text = fmt.text(cell);
             budget
                 .charge(text.len())
@@ -409,7 +412,7 @@ impl XlsxDocument {
                 // Every non-empty cell of the row, tab-separated.
                 let mut line = String::new();
                 for cell in &row.cells {
-                    let Some(text) = cell_text(cell) else {
+                    let Some(text) = cell_text(cell, budget) else {
                         break 'rows;
                     };
                     if text.trim().is_empty() {
@@ -440,11 +443,18 @@ impl XlsxDocument {
         // A row keeps the cells that fit the budget (the rest empty) and
         // reports that the budget is spent, so the table ends after it.
         // Each cell goes under its own column's header (§18.3.1.4 `r`).
-        let mut row_line = |row: &Row| -> (String, bool) {
+        // Every row is laid out the sheet's full width, so the columns a
+        // row does not use are output too: " | " for each one. They are
+        // charged like text, which bounds a sheet whose cells sit at A1
+        // and XFD1 however many rows it stores, as `to_csv` does.
+        let mut row_line = |row: &Row, budget: &mut TextBudget| -> (Option<String>, bool) {
             let mut cells: Vec<String> = vec![String::new(); col_count];
+            if !budget.charge(col_count.saturating_mul(MARKDOWN_PAD_CHARS)) {
+                return (None, true);
+            }
             let mut spent = false;
             for c in &row.cells {
-                match cell_text(c) {
+                match cell_text(c, budget) {
                     Some(t) => place(&mut cells, c.reference.col, t),
                     None => {
                         spent = true;
@@ -452,20 +462,27 @@ impl XlsxDocument {
                     },
                 }
             }
-            (format!("| {} |", cells.join(" | ")), spent)
+            (Some(format!("| {} |", cells.join(" | "))), spent)
         };
-        let (header, spent) = row_line(&ws.rows[0]);
+        let (header, spent) = row_line(&ws.rows[0], budget);
+        let Some(header) = header else {
+            // Not even the header fits: the sheet is its heading alone.
+            return Some(lines.join("\n"));
+        };
         lines.push(header);
 
-        // Separator row
+        // Separator row, as wide as the table.
+        if !budget.charge(col_count.saturating_mul(MARKDOWN_PAD_CHARS + 2)) {
+            return Some(lines.join("\n"));
+        }
         let sep: Vec<&str> = vec!["---"; col_count];
         lines.push(format!("| {} |", sep.join(" | ")));
 
         // Data rows
         if !spent {
             for row in ws.rows.iter().skip(1) {
-                let (line, spent) = row_line(row);
-                lines.push(line);
+                let (line, spent) = row_line(row, budget);
+                lines.extend(line);
                 if spent {
                     break;
                 }

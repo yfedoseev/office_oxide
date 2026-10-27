@@ -287,12 +287,25 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             }
             out
         } else {
-            // Genuine grid → emit a Table.
+            // Genuine grid → emit a Table. Rows are already cut where the
+            // text spent the budget, so only the padding is charged below.
+            let text_spent = budget.exhausted();
             let mut rows: Vec<TableRow> = Vec::with_capacity(parsed_rows.len());
             for (row_idx, cells) in parsed_rows.iter().enumerate() {
                 // Lay the row out on the grid: a cell goes at its own column
                 // index and skipped columns become empty cells, so `B2`
                 // stays under the `B` header even when `A2` is absent.
+                // Every row is as wide as the sheet, so the columns it does
+                // not use become empty cells, each an allocation. They
+                // are charged to the budget, which ends the table at the row
+                // that spends it: a sheet with cells at A1 and XFD1 and a
+                // thousand rows between would otherwise be 16 million cells.
+                let padding = grid_width.saturating_sub(cells.len());
+                if !text_spent
+                    && !budget.charge(padding.saturating_mul(crate::limits::EMPTY_TABLE_CELL_CHARS))
+                {
+                    break;
+                }
                 let mut tcells: Vec<TableCell> = Vec::with_capacity(grid_width);
                 for cd in cells {
                     let content = if cd.text.is_empty() {
@@ -635,7 +648,9 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
-            text_truncated: !doc.unreadable_sheets.is_empty() || pivot_truncated,
+            text_truncated: !doc.unreadable_sheets.is_empty()
+                || pivot_truncated
+                || budget.exhausted(),
             defined_names: doc
                 .workbook
                 .defined_names

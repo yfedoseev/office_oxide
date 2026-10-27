@@ -131,3 +131,92 @@ fn test_shared_formula_within_budget_still_translates() {
     let json = serde_json::to_string(&doc.to_ir()).unwrap();
     assert!(json.contains("A6+"), "the last follower's formula is translated");
 }
+
+/// The letters of 1-based column `n` (`1` is `A`, `27` is `AA`).
+fn col_name(mut n: usize) -> String {
+    let mut out = Vec::new();
+    while n > 0 {
+        n -= 1;
+        out.push(b'A' + (n % 26) as u8);
+        n /= 26;
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap()
+}
+
+/// `rows` rows with one cell each in column A, and one cell in column
+/// `width` of the first row: every row is laid out `width` columns wide.
+fn sparse_wide_workbook(rows: usize, width: usize) -> Vec<u8> {
+    let far = col_name(width);
+    let mut sheet = format!(r#"<worksheet xmlns="{NS}"><sheetData>"#);
+    for r in 1..=rows {
+        sheet.push_str(&format!(r#"<row r="{r}"><c r="A{r}" t="inlineStr"><is><t>x</t></is></c>"#));
+        if r == 1 {
+            sheet.push_str(&format!(r#"<c r="{far}1" t="inlineStr"><is><t>y</t></is></c>"#));
+        }
+        sheet.push_str("</row>");
+    }
+    sheet.push_str("</sheetData></worksheet>");
+    package(
+        r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#,
+        &worksheet_rel("rId1", "worksheets/sheet1.xml"),
+        &[("xl/worksheets/sheet1.xml", sheet.into_bytes())],
+    )
+}
+
+#[test]
+fn test_column_padding_of_sparse_rows_is_charged_to_the_text_budget() {
+    set_budgets();
+    // 2,000 rows, each laid out 200 columns wide: 3 characters of padding
+    // per column in Markdown is 1.2 MB against a 60,000 budget.
+    let doc = open(sparse_wide_workbook(2_000, 200)).unwrap();
+    let md = doc.to_markdown();
+    assert!(md.contains("character budget"), "Markdown carries no truncation notice");
+    assert!(md.len() < TEXT_BUDGET + 2_000, "{} bytes of Markdown", md.len());
+}
+
+#[test]
+fn test_ir_table_rows_padded_to_the_sheet_width_are_bounded() {
+    set_budgets();
+    let doc = open(sparse_wide_workbook(2_000, 200)).unwrap();
+    let ir = doc.to_ir();
+    let cells: usize = ir
+        .sections
+        .iter()
+        .flat_map(|s| &s.elements)
+        .filter_map(|e| match e {
+            office_oxide::ir::Element::Table(t) => {
+                Some(t.rows.iter().map(|r| r.cells.len()).sum::<usize>())
+            },
+            _ => None,
+        })
+        .sum();
+    assert!(cells < 2_000, "{cells} table cells were built from a 3 KB workbook");
+    assert!(ir.metadata.text_truncated, "the truncation is not flagged");
+    let html = doc.to_html();
+    assert!(html.contains("character budget"), "HTML carries no truncation notice");
+}
+
+#[test]
+fn test_a_dense_wide_sheet_is_unaffected_by_padding_charges() {
+    set_budgets();
+    // Every column of every row is filled, so nothing is padding.
+    let width = 150;
+    let mut sheet = format!(r#"<worksheet xmlns="{NS}"><sheetData>"#);
+    for r in 1..=5 {
+        sheet.push_str(&format!(r#"<row r="{r}">"#));
+        for c in 1..=width {
+            sheet.push_str(&format!(r#"<c r="{}{r}"><v>{c}</v></c>"#, col_name(c)));
+        }
+        sheet.push_str("</row>");
+    }
+    sheet.push_str("</sheetData></worksheet>");
+    let bytes = package(
+        r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#,
+        &worksheet_rel("rId1", "worksheets/sheet1.xml"),
+        &[("xl/worksheets/sheet1.xml", sheet.into_bytes())],
+    );
+    let doc = open(bytes).unwrap();
+    assert!(!doc.to_markdown().contains("character budget"));
+    assert!(!doc.to_ir().metadata.text_truncated);
+}
