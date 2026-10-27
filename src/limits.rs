@@ -132,6 +132,11 @@ impl TextBudget {
         }
     }
 
+    /// The limit this budget was created with.
+    pub(crate) fn limit(&self) -> usize {
+        self.total
+    }
+
     pub(crate) fn exhausted(&self) -> bool {
         self.exhausted
     }
@@ -155,6 +160,11 @@ impl TextBudget {
 /// document multiply into gigabytes of output (one megabyte of name times the
 /// number of paragraphs).
 pub(crate) const MAX_STYLE_NAME_CHARS: usize = 255;
+
+/// The longest formula, in characters: Excel's own limit (ECMA-376 Part 1
+/// §18.17, 8,192 characters). A shared formula's master is copied into every
+/// cell that follows it, so a longer one is refused.
+pub(crate) const MAX_FORMULA_CHARS: usize = 8192;
 
 #[cfg(test)]
 thread_local! {

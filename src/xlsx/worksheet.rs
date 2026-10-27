@@ -945,7 +945,7 @@ impl Worksheet {
         // always — calamine ships a fixture with the records reversed — so
         // followers that arrived first are filled in now.
         if shared.has_pending() {
-            for (at, formula) in shared.resolve_pending() {
+            for (at, formula) in shared.resolve_pending()? {
                 if let Some(cell) = rows
                     .iter_mut()
                     .find(|r| r.index == at.row + 1)
@@ -1545,7 +1545,7 @@ fn parse_cell_fast(
                     let text = read_text_fast(reader)?;
                     // A shared group's master carries the text once, here.
                     if let Some(si) = si {
-                        shared.add_master(si, reference.clone(), text.clone());
+                        shared.add_master(si, reference.clone(), text.clone())?;
                     }
                     formula = Some(text);
                 },
@@ -1564,7 +1564,7 @@ fn parse_cell_fast(
                 // by the row/column offset. Discarding it made a formula
                 // cell indistinguishable from one with no formula.
                 formula = match shared_si(e)? {
-                    Some(si) => shared.follower(si, &reference),
+                    Some(si) => shared.follower(si, &reference)?,
                     None => None,
                 };
             },
