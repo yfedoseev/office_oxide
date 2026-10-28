@@ -29,17 +29,50 @@ impl DocumentIR {
     /// let ir = DocumentIR::from_markdown(md, DocumentFormat::Docx);
     /// assert!(!ir.sections.is_empty());
     /// ```
+    ///
+    /// At most [`crate::limits::max_markdown_list_items`] list items are
+    /// kept (each is about 250 bytes of IR, from as little as four bytes of
+    /// Markdown); the rest are dropped, a notice paragraph ends the last
+    /// section, and `Metadata::text_truncated` and a warning say so.
     pub fn from_markdown(markdown: &str, format: DocumentFormat) -> Self {
-        let mut parser = MarkdownParser::new(markdown);
-        let sections = parser.parse_sections();
-        DocumentIR {
-            metadata: Metadata {
-                format,
-                title: None,
-                ..Default::default()
-            },
-            sections,
+        Self::from_markdown_with_list_limit(
+            markdown,
+            format,
+            crate::limits::max_markdown_list_items(),
+        )
+    }
+
+    pub(crate) fn from_markdown_with_list_limit(
+        markdown: &str,
+        format: DocumentFormat,
+        max_list_items: usize,
+    ) -> Self {
+        let mut parser = MarkdownParser::new(markdown, max_list_items);
+        let mut sections = parser.parse_sections();
+        let mut metadata = Metadata {
+            format,
+            title: None,
+            ..Default::default()
+        };
+        if parser.dropped_list_items > 0 {
+            let notice = format!(
+                "[{} list item(s) dropped: the document exceeds the {} list item limit \
+                 (office_oxide::limits::set_max_markdown_list_items)]",
+                parser.dropped_list_items, max_list_items
+            );
+            metadata.text_truncated = true;
+            metadata.warnings.push(notice.clone());
+            if sections.is_empty() {
+                sections.push(Section::default());
+            }
+            if let Some(last) = sections.last_mut() {
+                last.elements.push(Element::Paragraph(Paragraph {
+                    content: vec![InlineContent::Text(TextSpan::plain(notice))],
+                    ..Default::default()
+                }));
+            }
         }
+        DocumentIR { metadata, sections }
     }
 }
 
@@ -50,13 +83,19 @@ impl DocumentIR {
 struct MarkdownParser<'a> {
     lines: Vec<&'a str>,
     pos: usize,
+    /// List items still allowed, over the whole document.
+    list_items_left: usize,
+    /// List items read and dropped for want of allowance.
+    dropped_list_items: usize,
 }
 
 impl<'a> MarkdownParser<'a> {
-    fn new(src: &'a str) -> Self {
+    fn new(src: &'a str, max_list_items: usize) -> Self {
         Self {
             lines: src.lines().collect(),
             pos: 0,
+            list_items_left: max_list_items,
+            dropped_list_items: 0,
         }
     }
 
@@ -351,6 +390,11 @@ impl<'a> MarkdownParser<'a> {
                 break;
             }
             self.advance();
+            if self.list_items_left == 0 {
+                self.dropped_list_items += 1;
+                continue;
+            }
+            self.list_items_left -= 1;
             // CommonMark §5.2: an ordered list starts at its first item's
             // number.
             if ordered && items.is_empty() {
@@ -798,5 +842,61 @@ mod tests {
         let ir = DocumentIR::from_markdown("", DocumentFormat::Docx);
         assert_eq!(ir.sections.len(), 1);
         assert!(ir.sections[0].elements.is_empty());
+    }
+
+    fn item_count(l: &List) -> usize {
+        l.items
+            .iter()
+            .map(|i| 1 + i.nested.as_ref().map_or(0, item_count))
+            .sum()
+    }
+
+    #[test]
+    fn test_list_items_past_the_limit_are_dropped_with_a_notice() {
+        let md = "- x\n".repeat(100) + "\nafter\n";
+        let ir = DocumentIR::from_markdown_with_list_limit(&md, DocumentFormat::Docx, 10);
+        let kept: usize = ir.sections[0]
+            .elements
+            .iter()
+            .map(|e| {
+                if let Element::List(l) = e {
+                    item_count(l)
+                } else {
+                    0
+                }
+            })
+            .sum();
+        assert_eq!(kept, 10);
+        assert!(ir.metadata.text_truncated);
+        assert!(ir.metadata.warnings[0].contains("90 list item(s) dropped"));
+        let text = ir.plain_text();
+        assert!(text.contains("after"), "text after the list is still read");
+        assert!(text.contains("list item limit"), "the notice reaches every renderer");
+    }
+
+    #[test]
+    fn test_nested_and_ordered_items_count_toward_the_limit() {
+        let md = "1. a\n   - b\n   - c\n2. d\n";
+        let ir = DocumentIR::from_markdown_with_list_limit(md, DocumentFormat::Docx, 3);
+        let kept: usize = ir.sections[0]
+            .elements
+            .iter()
+            .map(|e| {
+                if let Element::List(l) = e {
+                    item_count(l)
+                } else {
+                    0
+                }
+            })
+            .sum();
+        assert_eq!(kept, 3);
+        assert!(ir.metadata.text_truncated);
+    }
+
+    #[test]
+    fn test_a_list_within_the_limit_is_untouched() {
+        let ir = DocumentIR::from_markdown_with_list_limit("- a\n- b\n", DocumentFormat::Docx, 2);
+        assert!(!ir.metadata.text_truncated);
+        assert!(ir.metadata.warnings.is_empty());
     }
 }

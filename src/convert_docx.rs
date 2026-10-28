@@ -154,6 +154,7 @@ impl<'a, 'd> Cx<'a, 'd> {
 }
 
 pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
+    crate::limits::begin_image_budget();
     let folds = StyleFolds::default();
     let cx = Cx {
         doc,
@@ -200,12 +201,18 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
     // `Section.header` as soon as any section had an unequal number of
     // header and footer refs, and gave every section every other section's
     // headers on top of that.
-    let mut hf_iter = doc.headers_footers.iter();
+    // Each stored entry is converted once; a section that shares it gets a
+    // copy, whose text is charged to the document's text budget so that a
+    // package of many sections over one large header cannot multiply it
+    // without bound.
+    let mut hf_converted: Vec<Option<Option<(HeaderFooter, usize)>>> =
+        vec![None; doc.headers_footers.len()];
+    let mut hf_budget = crate::limits::TextBudget::new();
     let mut per_section: Vec<SectionHeaders> = Vec::new();
-    for sp in &doc.sections {
+    for slots in &doc.hf_by_ref {
         let mut slot = SectionHeaders::default();
-        for _ in 0..(sp.header_refs.len() + sp.footer_refs.len()) {
-            let Some(hf) = hf_iter.next() else { break };
+        for idx in slots.iter().flatten().copied() {
+            let hf = &doc.headers_footers[idx];
             // A first-page part in a section without `w:titlePg` is never
             // shown by Word; carrying it made every surface print it and
             // the writer, which emits `w:titlePg` for any first-page
@@ -213,15 +220,27 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             if !hf.active {
                 continue;
             }
-            let mut tmp: Vec<Element> = Vec::new();
-            convert_block_elements(&hf.content, &mut tmp, doc);
-            if tmp
-                .iter()
-                .all(|e| matches!(e, Element::Paragraph(p) if p.content.is_empty()))
-            {
+            let converted = hf_converted[idx].get_or_insert_with(|| {
+                let mut tmp: Vec<Element> = Vec::new();
+                convert_block_elements(&hf.content, &mut tmp, doc);
+                if tmp
+                    .iter()
+                    .all(|e| matches!(e, Element::Paragraph(p) if p.content.is_empty()))
+                {
+                    None
+                } else {
+                    // The size of a copy: its serialised form, which holds the
+                    // text, the structure and the image bytes (as base64).
+                    let chars = serde_json::to_vec(&tmp).map_or(usize::MAX, |v| v.len());
+                    Some((HeaderFooter { content: tmp }, chars))
+                }
+            });
+            let Some((part, chars)) = converted.clone() else {
+                continue;
+            };
+            if !hf_budget.charge(chars) {
                 continue;
             }
-            let part = HeaderFooter { content: tmp };
             let target = match (hf.is_header, hf.hf_type) {
                 (true, crate::docx::HeaderFooterType::First) => &mut slot.first_header,
                 (true, crate::docx::HeaderFooterType::Even) => &mut slot.even_header,
@@ -234,6 +253,7 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         }
         per_section.push(slot);
     }
+    let hf_truncated = hf_budget.exhausted().then(|| hf_budget.notice());
 
     let mut ir_sections: Vec<Section> = Vec::with_capacity(windows.len());
     let mut doc_title: Option<String> = None;
@@ -399,11 +419,13 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
-            text_truncated: !doc.unreadable_parts.is_empty(),
+            text_truncated: !doc.unreadable_parts.is_empty() || hf_truncated.is_some(),
             warnings: doc
                 .unreadable_parts
                 .iter()
                 .map(|p| format!("skipped unreadable part {p}"))
+                .chain(hf_truncated)
+                .chain(crate::limits::image_budget_warning())
                 .chain(crate::core::core_properties::package_warnings(Some(
                     &doc.package_properties,
                 )))
@@ -1020,7 +1042,7 @@ fn collect_paragraph_inline_images(
                     // A linked picture has no bytes in the package, only
                     // its target; it used to be dropped without trace.
                     let (data, ext) = match embedded_image(d, doc) {
-                        Some((data, ext)) => (Some(data), ext),
+                        Some((data, ext)) => (data, ext),
                         None if d.linked_image.is_some() => (None, None),
                         None => continue,
                     };
@@ -1170,7 +1192,7 @@ fn drawing_to_float_element(
     }
 
     let (data, ext) = match embedded_image(d, doc) {
-        Some((data, ext)) => (Some(data), ext),
+        Some((data, ext)) => (data, ext),
         None if d.linked_image.is_some() => (None, None),
         None => return None,
     };
@@ -1203,14 +1225,20 @@ fn drawing_to_float_element(
 
 /// A drawing's embedded picture bytes and file extension, if the package
 /// holds them.
+///
+/// The bytes are shared in the document and copied into each IR `Image`;
+/// each copy is charged to the image-byte budget (`limits::set_max_image_bytes`)
+/// and, once it is spent, the image keeps its place without its bytes.
 fn embedded_image(
     d: &crate::docx::DrawingInfo,
     doc: &crate::docx::DocxDocument,
-) -> Option<(Vec<u8>, Option<String>)> {
+) -> Option<(Option<Vec<u8>>, Option<String>)> {
     if d.relationship_id.is_empty() {
         return None;
     }
-    doc.images.get(&d.relationship_id).cloned()
+    let (data, ext) = doc.images.get(&d.relationship_id)?;
+    let copy = crate::limits::charge_image_bytes(data.len()).then(|| data.to_vec());
+    Some((copy, ext.clone()))
 }
 
 /// Translate a paragraph's `<w:jc>` justification into the IR's

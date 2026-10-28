@@ -162,3 +162,50 @@ fn test_xls_open_stops_copying_shared_strings_at_the_budget() {
     );
     assert!(doc.to_ir().metadata.text_truncated, "the workbook is flagged truncated");
 }
+
+/// A document of `sections` sections that all reference one 5,000-character
+/// header part: the part is stored once, but the IR gives each section a
+/// copy, and those copies are charged to the budget.
+fn docx_shared_header(sections: usize) -> Vec<u8> {
+    let rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    let wml = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    let mut body = String::new();
+    for i in 0..sections {
+        body.push_str(&format!(
+            r#"<w:p><w:r><w:t>s{i}</w:t></w:r><w:pPr><w:sectPr><w:headerReference w:type="default" r:id="rId1"/></w:sectPr></w:pPr></w:p>"#
+        ));
+    }
+    let parts: Vec<(&str, String)> = vec![
+        ("[Content_Types].xml", r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.into()),
+        ("_rels/.rels", format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{rel}/officeDocument" Target="word/document.xml"/></Relationships>"#)),
+        ("word/document.xml", format!(r#"<w:document xmlns:w="{wml}" xmlns:r="{rel}"><w:body>{body}</w:body></w:document>"#)),
+        ("word/_rels/document.xml.rels", format!(r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{rel}/header" Target="header1.xml"/></Relationships>"#)),
+        ("word/header1.xml", format!(r#"<w:hdr xmlns:w="{wml}"><w:p><w:r><w:t>{}</w:t></w:r></w:p></w:hdr>"#, "z".repeat(5_000))),
+    ];
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
+    for (name, data) in parts {
+        zip.start_file(name, opts).unwrap();
+        zip.write_all(data.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+#[test]
+fn test_docx_ir_stops_copying_a_shared_header_at_the_budget() {
+    set_max_text_chars(BUDGET);
+    let doc =
+        Document::from_reader(Cursor::new(docx_shared_header(8)), DocumentFormat::Docx).unwrap();
+    let ir = doc.to_ir();
+    let with_header = ir.sections.iter().filter(|s| s.header.is_some()).count();
+    assert_eq!(with_header, 2, "the two copies that fit are kept");
+    assert!(ir.metadata.text_truncated, "the document is flagged truncated");
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("character budget")),
+        "{:?}",
+        ir.metadata.warnings
+    );
+}

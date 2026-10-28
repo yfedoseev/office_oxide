@@ -39,12 +39,103 @@ pub fn create_from_markdown_to_writer<W: Write + Seek>(
     create_from_ir_to_writer(&ir, format, writer)
 }
 
+/// The cells the writer for `format` builds for `table`: its grid, not the
+/// number of cell entries. The `.pptx` writer pads every row to the widest
+/// row; the `.docx` writer lays the table on a grid as wide as the widest
+/// row's column spans (each span, and the width, clamped to
+/// `MAX_TABLE_COLS` as `convert_ir_table` clamps them) and gives every
+/// row that width, filling the cells a row span covers.
+fn written_table_cells(table: &Table, format: DocumentFormat) -> usize {
+    let width = if format == DocumentFormat::Docx {
+        let max_cols = crate::docx::write::MAX_TABLE_COLS;
+        table
+            .rows
+            .iter()
+            .map(|r| {
+                r.cells
+                    .iter()
+                    .map(|c| (c.col_span.max(1) as usize).min(max_cols))
+                    .fold(0usize, usize::saturating_add)
+                    .min(max_cols)
+            })
+            .max()
+            .unwrap_or(0)
+    } else {
+        table.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0)
+    };
+    table.rows.len().saturating_mul(width)
+}
+
+/// Refuse an IR whose tables hold more cells than
+/// [`crate::limits::max_write_table_cells`]: the `.docx` and `.pptx`
+/// writers build every cell in memory, so the count is the cost.
+///
+/// Counted with an explicit stack: the IR is `Deserialize` and can nest
+/// deeper than the call stack allows.
+fn check_table_cell_budget(ir: &DocumentIR, format: DocumentFormat) -> Result<()> {
+    if !matches!(format, DocumentFormat::Docx | DocumentFormat::Pptx) {
+        return Ok(());
+    }
+    let limit = crate::limits::max_write_table_cells();
+    let mut cells = 0usize;
+    let mut stack: Vec<&[Element]> = Vec::new();
+    for s in &ir.sections {
+        stack.push(&s.elements);
+        for hf in [
+            &s.header,
+            &s.footer,
+            &s.first_page_header,
+            &s.first_page_footer,
+            &s.even_page_header,
+            &s.even_page_footer,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            stack.push(&hf.content);
+        }
+    }
+    let mut lists: Vec<&List> = Vec::new();
+    loop {
+        while let Some(list) = lists.pop() {
+            for item in &list.items {
+                stack.push(&item.content);
+                lists.extend(item.nested.as_ref());
+            }
+        }
+        let Some(elements) = stack.pop() else { break };
+        for e in elements {
+            match e {
+                Element::Table(t) => {
+                    cells = cells.saturating_add(written_table_cells(t, format));
+                    for cell in t.rows.iter().flat_map(|r| &r.cells) {
+                        stack.push(&cell.content);
+                    }
+                    if cells > limit {
+                        return Err(crate::core::Error::PackageLimit(format!(
+                            "the document holds more than {limit} table cells; the limit is \
+                             office_oxide::limits::set_max_write_table_cells"
+                        ))
+                        .into());
+                    }
+                },
+                Element::List(l) => lists.push(l),
+                Element::TextBox(t) => stack.push(&t.content),
+                Element::Footnote(n) | Element::Endnote(n) => stack.push(&n.content),
+                _ => {},
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Create a document file from a `DocumentIR`.
 pub fn create_from_ir(
     ir: &DocumentIR,
     format: DocumentFormat,
     path: impl AsRef<Path>,
 ) -> Result<()> {
+    check_table_cell_budget(ir, format)?;
     match format {
         DocumentFormat::Docx => {
             let writer = ir_to_docx(ir);
@@ -69,6 +160,7 @@ pub fn create_from_ir_to_writer<W: Write + Seek>(
     format: DocumentFormat,
     writer: W,
 ) -> Result<()> {
+    check_table_cell_budget(ir, format)?;
     match format {
         DocumentFormat::Docx => {
             let w = ir_to_docx(ir);

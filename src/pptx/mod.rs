@@ -217,12 +217,14 @@ impl PptxDocument {
             /// `Err` when the slide part itself could not be read.
             slide_data: std::result::Result<Vec<u8>, String>,
             slide_rels: Relationships,
-            notes: Option<NotesBundle>,
+            /// The slide's notes, parsed once per notes part and shared by
+            /// every slide that relates to it.
+            notes: Option<std::sync::Arc<TextBody>>,
             comments_data: Vec<Vec<u8>>,
             /// rId → (raw bytes, format-extension lowercase like "png" / "jpeg").
             /// Pre-resolved here in Phase 1 so the parallel slide parser
             /// (Phase 2) doesn't need access to the OPC reader.
-            media: std::collections::HashMap<String, (Vec<u8>, String)>,
+            media: std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)>,
             /// rId → text lines of a chart part (`ppt/charts/chartN.xml`)
             /// or SmartArt data part (`ppt/diagrams/dataN.xml`). The slide
             /// XML holds only the reference; the text lives in the part.
@@ -230,11 +232,6 @@ impl PptxDocument {
             /// Index into `layouts` of the slide's layout, when its
             /// layout relationship resolves.
             layout_index: Option<usize>,
-        }
-        struct NotesBundle {
-            part_name: String,
-            data: Vec<u8>,
-            rels: Relationships,
         }
         impl SlideBundle {
             fn unreadable(part_name: String, err: &str) -> Self {
@@ -257,7 +254,31 @@ impl PptxDocument {
             presentation_default: std::sync::Arc::new(master::parse_default_text_style(&pres_data)),
             ..Default::default()
         };
+        // Every distinct slide is a part of the package, so a slide list
+        // longer than the package may hold entries can only repeat itself.
+        if presentation.slides.len() > crate::limits::max_package_entries() {
+            return Err(crate::core::Error::PackageLimit(format!(
+                "the slide list names {} slides; the limit is {} (the package entry limit)",
+                presentation.slides.len(),
+                crate::limits::max_package_entries()
+            ))
+            .into());
+        }
+        // Notes parts already read, by part name: the body parsed from each
+        // (`None` when absent, unreadable or empty). Several slides can
+        // relate to one notes part; reading and holding it per slide
+        // multiplied its size by the slide count.
+        let mut notes_cache: std::collections::HashMap<
+            crate::core::opc::PartName,
+            Option<std::sync::Arc<TextBody>>,
+        > = std::collections::HashMap::new();
         let mut bundles = Vec::with_capacity(presentation.slides.len());
+        // A slide part is read and kept once however many `p:sldId` entries
+        // name it (ECMA-376 Part 1 §19.2.1.34: the list orders the slides
+        // of the presentation; a slide is one part). Repeats would
+        // otherwise re-parse, store and render the same part once per entry.
+        let mut seen_slides: std::collections::HashSet<crate::core::opc::PartName> =
+            std::collections::HashSet::new();
         for (slide_idx, slide_id) in presentation.slides.iter().enumerate() {
             // Resolve by rel_id, or by the `slideN.xml` convention when the
             // entry carries no r:id.
@@ -271,6 +292,14 @@ impl PptxDocument {
                     .map_err(|e| (candidate.clone(), e.to_string()))
             };
             let part_name = match resolved {
+                Ok(pn) if !seen_slides.insert(pn.clone()) => {
+                    record(
+                        pn.as_str(),
+                        &"the slide list names this part more than once; \
+                        only its first entry is kept",
+                    );
+                    continue;
+                },
                 Ok(pn) if opc.has_part(&pn) => pn,
                 Ok(pn) => {
                     let name = pn.as_str().to_string();
@@ -311,18 +340,31 @@ impl PptxDocument {
                     },
                     // A notes relationship to an absent part: nothing to read.
                     Ok(notes_part) if !opc.has_part(&notes_part) => None,
-                    Ok(notes_part) => match opc.read_part(&notes_part) {
-                        Ok(data) => Some(NotesBundle {
-                            part_name: notes_part.as_str().to_string(),
-                            data,
-                            rels: opc
-                                .read_rels_for(&notes_part)
-                                .unwrap_or_else(|_| Relationships::empty()),
-                        }),
-                        Err(e) => {
-                            record(notes_part.as_str(), &e);
-                            None
-                        },
+                    Ok(notes_part) => {
+                        if let Some(cached) = notes_cache.get(&notes_part) {
+                            cached.clone()
+                        } else {
+                            let body = match opc.read_part(&notes_part) {
+                                Ok(data) => {
+                                    let rels = opc
+                                        .read_rels_for(&notes_part)
+                                        .unwrap_or_else(|_| Relationships::empty());
+                                    match slide::extract_notes_body(&data, &rels) {
+                                        Ok(body) => body.map(std::sync::Arc::new),
+                                        Err(e) => {
+                                            record(notes_part.as_str(), &e);
+                                            None
+                                        },
+                                    }
+                                },
+                                Err(e) => {
+                                    record(notes_part.as_str(), &e);
+                                    None
+                                },
+                            };
+                            notes_cache.insert(notes_part, body.clone());
+                            body
+                        }
                     },
                 },
             };
@@ -398,12 +440,7 @@ impl PptxDocument {
                         },
                     };
                 parsed.layout_index = b.layout_index;
-                if let Some(notes) = &b.notes {
-                    match slide::extract_notes_body(&notes.data, &notes.rels) {
-                        Ok(body) => parsed.notes = body,
-                        Err(e) => problems.push((notes.part_name.clone(), e.to_string())),
-                    }
-                }
+                parsed.notes = b.notes.clone();
                 for data in &b.comments_data {
                     parsed
                         .comments
@@ -564,7 +601,10 @@ struct PartCache {
     masters: Vec<MasterEntry>,
     master_index: std::collections::HashMap<crate::core::opc::PartName, Option<usize>>,
     /// Target part → (bytes, extension); `None` when unreadable.
-    images: std::collections::HashMap<crate::core::opc::PartName, Option<(Vec<u8>, String)>>,
+    images: std::collections::HashMap<
+        crate::core::opc::PartName,
+        Option<(std::sync::Arc<[u8]>, String)>,
+    >,
     /// (target part, is-chart) → text lines.
     part_text: std::collections::HashMap<(crate::core::opc::PartName, bool), Vec<String>>,
     /// Every part this cache decompressed, in order — what the caching
@@ -690,7 +730,7 @@ impl PartCache {
         opc: &mut OpcReader<R>,
         source: &crate::core::opc::PartName,
         rels: &Relationships,
-    ) -> std::collections::HashMap<String, (Vec<u8>, String)> {
+    ) -> std::collections::HashMap<String, (std::sync::Arc<[u8]>, String)> {
         let mut media = std::collections::HashMap::new();
         for rel in rels.all() {
             if rel.rel_type != rel_types::IMAGE
@@ -713,7 +753,7 @@ impl PartCache {
                     .and_then(|s| s.to_str())
                     .map(|s| s.to_ascii_lowercase())
                     .unwrap_or_else(|| guess_format_from_bytes(&bytes).to_string());
-                Some((bytes, ext))
+                Some((bytes.into(), ext))
             });
             if let Some(found) = entry {
                 media.insert(rel.id.clone(), found.clone());

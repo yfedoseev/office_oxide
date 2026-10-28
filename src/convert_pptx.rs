@@ -2,6 +2,7 @@ use crate::format::DocumentFormat;
 use crate::ir::*;
 
 pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
+    crate::limits::begin_image_budget();
     // Slide size sits at presentation level — every slide in the
     // deck shares it.
     let page_setup = doc
@@ -11,6 +12,11 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         .and_then(slide_page_setup);
 
     let mut sections = Vec::new();
+    // Converted notes, by the shared body they came from, and the budget
+    // their per-slide copies are charged against.
+    let mut notes_cache: std::collections::HashMap<usize, (Vec<Element>, usize)> =
+        std::collections::HashMap::new();
+    let mut notes_budget = crate::limits::TextBudget::new();
 
     for slide in doc.slides.iter() {
         if let Some(ref err) = slide.parse_error {
@@ -79,14 +85,22 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         // Converted through the same `convert_text_body` ordinary slide
         // body text already uses, so bold/italic/bullets/numbering in
         // notes survive instead of being flattened to plain lines.
+        //
+        // Slides that share a notes part share one parsed body; it is
+        // converted once and each slide gets a copy of the result, whose
+        // text is charged to the document's text budget.
         let speaker_notes = slide.notes.as_ref().and_then(|tb| {
-            let mut converted = Vec::new();
-            convert_text_body(tb, &mut converted);
-            if converted.is_empty() {
-                None
-            } else {
-                Some(converted)
-            }
+            let key = std::sync::Arc::as_ptr(tb) as usize;
+            let (converted, chars) = notes_cache.entry(key).or_insert_with(|| {
+                let mut converted = Vec::new();
+                convert_text_body(tb, &mut converted);
+                // The size of a copy: its serialised form, which holds every
+                // string (link targets, tooltips, font names), the structure
+                // and any image bytes, not just the visible text.
+                let chars = serde_json::to_vec(&converted).map_or(usize::MAX, |v| v.len());
+                (converted, chars)
+            });
+            (!converted.is_empty() && notes_budget.charge(*chars)).then(|| converted.clone())
         });
 
         // Slide comments are review content that reached no consumer at
@@ -153,7 +167,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         });
     }
 
-    DocumentIR {
+    let mut ir = DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Pptx,
             title,
@@ -167,7 +181,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
-            text_truncated: !doc.unreadable_parts.is_empty(),
+            text_truncated: !doc.unreadable_parts.is_empty() || notes_budget.exhausted(),
             ..crate::core::core_properties::ooxml_metadata_extras(
                 cp,
                 doc.app_properties.as_ref(),
@@ -175,7 +189,14 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             )
         },
         sections,
+    };
+    if notes_budget.exhausted() {
+        ir.metadata.warnings.push(notes_budget.notice());
     }
+    ir.metadata
+        .warnings
+        .extend(crate::limits::image_budget_warning());
+    ir
 }
 
 /// Smallest and largest legal `p:sldSz` extent, in EMU
@@ -399,7 +420,13 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
                 .unwrap_or((None, None));
             let img_el = Element::Image(Image {
                 alt_text: pic.alt_text.clone(),
-                data: pic.data.clone(),
+                // Pictures share the media bytes; each IR image owns a copy,
+                // charged to the image-byte budget.
+                data: pic
+                    .data
+                    .as_deref()
+                    .filter(|d| crate::limits::charge_image_bytes(d.len()))
+                    .map(<[u8]>::to_vec),
                 format,
                 display_width_emu: display_w,
                 display_height_emu: display_h,
