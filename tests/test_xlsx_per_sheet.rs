@@ -3,12 +3,16 @@
 //! allowance, given back when the sheet is released, while the text budget
 //! caps what the whole run may output.
 //!
-//! Limits are process-global, so every test in this binary sets the same
-//! small values and builds workbooks of a few kilobytes.
+//! Limits are process-global, so every test holds the scope that serialises
+//! them and restores them, and builds workbooks of a few kilobytes.
 
 use std::io::{Cursor, Write};
 
+use office_oxide::limits::*;
 use office_oxide::{Document, DocumentFormat};
+
+mod common;
+use common::LimitScope;
 
 const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const REL_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
@@ -34,12 +38,15 @@ const PICTURE: usize = 6_000;
 /// eager IR is cut in the second sheet; each sheet has the same allowance to
 /// itself, so each fits. A sheet's pictures have room for one picture and a
 /// half, and the whole run for two and a third.
-fn set_budgets() {
-    office_oxide::limits::set_max_text_chars(200_000);
-    office_oxide::limits::set_max_ir_padding_bytes(PADDING_PER_SHEET * 3 / 2 * cell_bytes());
-    office_oxide::limits::set_max_sheet_ir_padding_bytes(PADDING_PER_SHEET * 3 / 2 * cell_bytes());
-    office_oxide::limits::set_max_image_bytes(PICTURE * 3 / 2);
-    office_oxide::limits::set_max_total_image_bytes((PICTURE * 7 / 3) as u64);
+fn set_budgets() -> LimitScope {
+    let padding = PADDING_PER_SHEET * 3 / 2 * cell_bytes();
+    let mut scope = LimitScope::new();
+    scope.set(max_text_chars, set_max_text_chars, 200_000);
+    scope.set(max_ir_padding_bytes, set_max_ir_padding_bytes, padding);
+    scope.set(max_sheet_ir_padding_bytes, set_max_sheet_ir_padding_bytes, padding);
+    scope.set(max_image_bytes, set_max_image_bytes, PICTURE * 3 / 2);
+    scope.set(max_total_image_bytes, set_max_total_image_bytes, (PICTURE * 7 / 3) as u64);
+    scope
 }
 
 fn col_name(mut n: usize) -> String {
@@ -114,7 +121,7 @@ fn open(bytes: Vec<u8>) -> Document {
 
 #[test]
 fn test_every_renderer_shows_each_sheet_whole_where_the_eager_ir_is_cut() {
-    set_budgets();
+    let _limits = set_budgets();
     let doc = open(workbook(SHEETS, ROWS, FAR));
     let last = format!("s{SHEETS}r{ROWS}");
 
@@ -174,7 +181,7 @@ fn mentions(section: &office_oxide::ir::Section, notice: &str) -> bool {
 
 #[test]
 fn test_the_sheet_by_sheet_ir_returns_each_sheet_whole() {
-    set_budgets();
+    let _limits = set_budgets();
     let doc = open(workbook(SHEETS, ROWS, FAR));
     let xlsx = doc.as_xlsx().unwrap();
     let mut it = xlsx.sheets_ir();
@@ -202,7 +209,7 @@ fn test_the_sheet_by_sheet_ir_returns_each_sheet_whole() {
 
 #[test]
 fn test_a_sheet_past_its_own_allowance_is_cut_and_the_next_sheet_is_whole() {
-    set_budgets();
+    let _limits = set_budgets();
     // The middle sheet needs 100 rows of padding, the allowance holds 60.
     let doc = open(workbook_of_rows(&[ROWS, 100, ROWS], FAR));
     let items: Vec<_> = doc.as_xlsx().unwrap().sheets_ir().collect();
@@ -276,7 +283,7 @@ fn images(section: &office_oxide::ir::Section) -> usize {
 
 #[test]
 fn test_a_sheets_pictures_are_its_own_allowance_and_the_run_has_a_total() {
-    set_budgets();
+    let _limits = set_budgets();
     let doc = open(picture_sheets(4));
     // Held at once, four pictures of 6,000 bytes do not fit 9,000.
     let eager = doc.to_ir();

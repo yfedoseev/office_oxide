@@ -1,9 +1,13 @@
 //! The slide list is bounded by the package entry limit. This test lowers
-//! the process-wide limit, so it has a test binary to itself.
+//! the process-wide limit for the length of the test.
 
 use std::io::{Cursor, Write};
 
+use office_oxide::limits::{max_package_entries, set_max_package_entries};
 use office_oxide::pptx::PptxDocument;
+
+mod common;
+use common::LimitScope;
 
 #[test]
 fn test_slide_list_longer_than_the_entry_limit_is_refused() {
@@ -25,7 +29,8 @@ fn test_slide_list_longer_than_the_entry_limit_is_refused() {
     }
     let bytes = zip.finish().unwrap().into_inner();
 
-    office_oxide::limits::set_max_package_entries(10);
+    let mut limits = LimitScope::new();
+    limits.set(max_package_entries, set_max_package_entries, 10);
     let err = PptxDocument::from_reader(Cursor::new(bytes))
         .expect_err("40 slides listed under a 10-entry limit");
     assert!(err.to_string().contains("slide list"), "{err}");

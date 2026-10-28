@@ -6,26 +6,36 @@
 //! assert the product is bounded (an `Err` or a documented truncation)
 //! rather than materialised.
 //!
-//! The budgets are process-global, so every test in this binary sets the
-//! same low values and builds documents of a few kilobytes.
+//! The budgets are process-global: every test that lowers them holds the scope
+//! that serialises them and restores them, and the tests that rely on the
+//! defaults hold the matching guard. Documents are a few kilobytes.
 
 use std::io::{Cursor, Write};
 
-use office_oxide::limits::set_max_text_chars;
+use office_oxide::limits::{
+    max_image_bytes, max_ir_padding_bytes, max_sheet_ir_padding_bytes, max_text_chars,
+    set_max_image_bytes, set_max_ir_padding_bytes, set_max_sheet_ir_padding_bytes,
+    set_max_text_chars,
+};
 use office_oxide::{Document, DocumentFormat};
+
+mod common;
+use common::LimitScope;
 
 /// The text budget every test here runs under.
 const TEXT_BUDGET: usize = 60_000;
 
-fn set_budgets() {
-    set_max_text_chars(TEXT_BUDGET);
+fn set_budgets() -> LimitScope {
+    let mut scope = LimitScope::new();
+    scope.set(max_text_chars, set_max_text_chars, TEXT_BUDGET);
     // About a thousand empty cells: five rows of the 200-column sheets below.
     let allowance = 1_000
         * (std::mem::size_of::<office_oxide::ir::TableCell>()
             + std::mem::size_of::<office_oxide::ir::Element>());
-    office_oxide::limits::set_max_ir_padding_bytes(allowance);
+    scope.set(max_ir_padding_bytes, set_max_ir_padding_bytes, allowance);
     // `to_html` converts a sheet at a time, against a sheet's allowance.
-    office_oxide::limits::set_max_sheet_ir_padding_bytes(allowance);
+    scope.set(max_sheet_ir_padding_bytes, set_max_sheet_ir_padding_bytes, allowance);
+    scope
 }
 
 const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
@@ -106,7 +116,7 @@ fn formula_and_value_counts(ws: &office_oxide::xlsx::Worksheet) -> (usize, usize
 
 #[test]
 fn test_shared_formula_master_copied_into_many_followers_is_bounded() {
-    set_budgets();
+    let _limits = set_budgets();
     // 4,000 characters (under the 8,192 limit) copied into 100 followers is
     // 400,000 characters against a 60,000 budget: the followers that fit keep
     // their formula, the others keep their cell and value without one.
@@ -128,7 +138,7 @@ fn test_shared_formula_master_copied_into_many_followers_is_bounded() {
 
 #[test]
 fn test_shared_formula_master_over_excel_limit_is_dropped_but_the_cell_is_kept() {
-    set_budgets();
+    let _limits = set_budgets();
     let doc = open(shared_formula_workbook(9_000, 1)).expect("the sheet stays readable");
     let ws = &doc.as_xlsx().unwrap().worksheets[0];
     assert_eq!(formula_and_value_counts(ws), (0, 2));
@@ -144,7 +154,7 @@ fn test_shared_formula_master_over_excel_limit_is_dropped_but_the_cell_is_kept()
 
 #[test]
 fn test_shared_formula_within_budget_still_translates() {
-    set_budgets();
+    let _limits = set_budgets();
     let doc = open(shared_formula_workbook(20, 5)).expect("a modest shared formula opens");
     assert!(doc.plain_text().contains('1'));
     let json = serde_json::to_string(&doc.to_ir()).unwrap();
@@ -185,7 +195,7 @@ fn sparse_wide_workbook(rows: usize, width: usize) -> Vec<u8> {
 
 #[test]
 fn test_column_padding_of_sparse_rows_is_charged_to_the_text_budget() {
-    set_budgets();
+    let _limits = set_budgets();
     // 2,000 rows, each laid out 200 columns wide: 3 characters of padding
     // per column in Markdown is 1.2 MB against a 60,000 budget.
     let doc = open(sparse_wide_workbook(2_000, 200)).unwrap();
@@ -196,7 +206,7 @@ fn test_column_padding_of_sparse_rows_is_charged_to_the_text_budget() {
 
 #[test]
 fn test_ir_table_rows_padded_to_the_sheet_width_are_bounded() {
-    set_budgets();
+    let _limits = set_budgets();
     let doc = open(sparse_wide_workbook(2_000, 200)).unwrap();
     let ir = doc.to_ir();
     let cells: usize = ir
@@ -227,7 +237,7 @@ fn test_ir_table_rows_padded_to_the_sheet_width_are_bounded() {
 
 #[test]
 fn test_a_dense_wide_sheet_is_unaffected_by_padding_charges() {
-    set_budgets();
+    let _limits = set_budgets();
     // Every column of every row is filled, so nothing is padding.
     let width = 150;
     let mut sheet = format!(r#"<worksheet xmlns="{NS}"><sheetData>"#);
@@ -251,7 +261,7 @@ fn test_a_dense_wide_sheet_is_unaffected_by_padding_charges() {
 
 #[test]
 fn test_shared_formula_budget_is_per_document_not_per_sheet() {
-    set_budgets();
+    let _limits = set_budgets();
     // Each of six sheets translates about 20,000 characters, under the
     // 60,000 budget on its own; together they are twice the budget.
     let master = format!("A1+{}", "1+".repeat(500));
@@ -297,7 +307,7 @@ fn test_shared_formula_budget_is_per_document_not_per_sheet() {
 
 #[test]
 fn test_padding_is_charged_after_the_text_has_spent_its_budget() {
-    set_budgets();
+    let _limits = set_budgets();
     // The last row's text spends the whole text budget; the rows before it
     // are still laid out 200 columns wide and must still be paid for.
     let far = col_name(200);
@@ -407,8 +417,8 @@ fn ir_image_count(ir: &office_oxide::DocumentIR) -> usize {
 
 #[test]
 fn test_one_picture_drawn_from_many_anchors_shares_its_bytes_and_is_bounded_in_the_ir() {
-    set_budgets();
-    office_oxide::limits::set_max_image_bytes(IMAGE_BUDGET);
+    let mut limits = set_budgets();
+    limits.set(max_image_bytes, set_max_image_bytes, IMAGE_BUDGET);
     // 100 anchors of a 1,000-byte picture: 100,000 bytes of IR images
     // against a 10,000-byte budget.
     let doc = open(picture_fan_out_workbook(100, 1_000)).unwrap();
@@ -426,8 +436,8 @@ fn test_one_picture_drawn_from_many_anchors_shares_its_bytes_and_is_bounded_in_t
 
 #[test]
 fn test_the_picture_notice_is_given_once_not_on_every_later_sheet() {
-    set_budgets();
-    office_oxide::limits::set_max_image_bytes(IMAGE_BUDGET);
+    let mut limits = set_budgets();
+    limits.set(max_image_bytes, set_max_image_bytes, IMAGE_BUDGET);
     // The first sheet spends the picture budget; the two sheets after it have
     // no pictures and nothing to be told about.
     let doc = open(picture_workbook(100, 1_000, 2)).unwrap();
@@ -446,8 +456,8 @@ fn test_the_picture_notice_is_given_once_not_on_every_later_sheet() {
 
 #[test]
 fn test_many_distinct_small_pictures_within_the_budget_are_all_kept() {
-    set_budgets();
-    office_oxide::limits::set_max_image_bytes(IMAGE_BUDGET);
+    let mut limits = set_budgets();
+    limits.set(max_image_bytes, set_max_image_bytes, IMAGE_BUDGET);
     let doc = open(picture_fan_out_workbook(5, 1_000)).unwrap();
     let ir = doc.to_ir();
     assert_eq!(ir_image_count(&ir), 5);
@@ -486,7 +496,7 @@ fn comment_fan_out_workbook(comments: usize, author_len: usize) -> Vec<u8> {
 
 #[test]
 fn test_one_comment_author_named_by_many_comments_is_charged_to_the_text_budget() {
-    set_budgets();
+    let _limits = set_budgets();
     // 100 comments by an author whose name is 2,000 characters: 200,000
     // characters of rendered names against a 60,000 budget.
     let doc = open(comment_fan_out_workbook(100, 2_000)).unwrap();
@@ -518,7 +528,7 @@ fn test_one_comment_author_named_by_many_comments_is_charged_to_the_text_budget(
 
 #[test]
 fn test_a_few_comments_by_one_author_are_unaffected() {
-    set_budgets();
+    let _limits = set_budgets();
     let doc = open(comment_fan_out_workbook(3, 20)).unwrap();
     assert!(!doc.plain_text().contains("character budget"));
     assert!(!doc.to_ir().metadata.text_truncated);
@@ -566,7 +576,7 @@ fn threaded_comment_workbook(threads: usize, author_len: usize) -> Vec<u8> {
 
 #[test]
 fn test_threaded_comment_flood_keeps_the_cells_and_reports_the_truncation() {
-    set_budgets();
+    let _limits = set_budgets();
     // 20 threads of 2,000 characters on each of two sheets: 40,000 per
     // sheet, under the 60,000 budget alone, 80,000 together.
     let doc = open(threaded_comment_workbook(20, 2_000)).unwrap();
@@ -650,7 +660,7 @@ fn pivot_fan_out_workbook(
 
 #[test]
 fn test_one_pivot_cache_named_by_many_pivots_is_shared_and_its_output_charged() {
-    set_budgets();
+    let _limits = set_budgets();
     // 40 pivots over a cache of 50 records of 100 characters: 5,000
     // characters stored once, 200,000 rendered against a 60,000 budget.
     let doc = open(pivot_fan_out_workbook(40, 50, 100, 1, 1)).unwrap();
@@ -675,7 +685,7 @@ fn test_one_pivot_cache_named_by_many_pivots_is_shared_and_its_output_charged() 
 
 #[test]
 fn test_a_few_pivots_over_one_cache_are_unaffected() {
-    set_budgets();
+    let _limits = set_budgets();
     let doc = open(pivot_fan_out_workbook(2, 5, 20, 1, 1)).unwrap();
     assert!(!doc.to_markdown().contains("character budget"));
     assert!(!doc.to_ir().metadata.text_truncated);
@@ -683,7 +693,7 @@ fn test_a_few_pivots_over_one_cache_are_unaffected() {
 
 #[test]
 fn test_sheets_naming_one_part_are_read_once_and_the_rest_reported() {
-    set_budgets();
+    let _limits = set_budgets();
     let mut sheets = String::new();
     for i in 1..=30 {
         sheets.push_str(&format!(r#"<sheet name="S{i}" sheetId="{i}" r:id="rId1"/>"#));
@@ -705,7 +715,7 @@ fn test_sheets_naming_one_part_are_read_once_and_the_rest_reported() {
 
 #[test]
 fn test_pivot_headers_are_charged_when_a_cache_has_no_records() {
-    set_budgets();
+    let _limits = set_budgets();
     // 100 pivots over a cache of 100 fields of 100 characters and no
     // records: the field names are stored once (10,000 characters) and
     // written once per pivot, which is 1,000,000 against a 60,000 budget.
@@ -735,7 +745,7 @@ fn test_pivot_headers_are_charged_when_a_cache_has_no_records() {
 
 #[test]
 fn test_one_sheet_part_under_several_spellings_is_still_read_once() {
-    set_budgets();
+    let _limits = set_budgets();
     // The zip layer finds one entry under all of these.
     let spellings = [
         "worksheets/sheet2.xml",
@@ -826,7 +836,7 @@ fn ir_hyperlinks(ir: &office_oxide::DocumentIR) -> (usize, usize) {
 
 #[test]
 fn test_a_hyperlink_target_longer_than_excels_limit_is_dropped_and_reported() {
-    set_budgets();
+    let _limits = set_budgets();
     // Excel stores at most 2,083 characters of a hyperlink address; a
     // 1 MB target cannot come from it and was copied onto every link.
     let doc = open(hyperlink_fan_out_workbook(40, 100_000)).unwrap();
@@ -843,7 +853,7 @@ fn test_a_hyperlink_target_longer_than_excels_limit_is_dropped_and_reported() {
 
 #[test]
 fn test_one_hyperlink_target_on_many_cells_is_charged_to_the_text_budget() {
-    set_budgets();
+    let _limits = set_budgets();
     // 2,000 characters on each of 100 cells is 200,000 against a 60,000
     // budget.
     let doc = open(hyperlink_fan_out_workbook(100, 2_000)).unwrap();
@@ -862,7 +872,7 @@ fn test_one_hyperlink_target_on_many_cells_is_charged_to_the_text_budget() {
 
 #[test]
 fn test_a_few_ordinary_hyperlinks_are_unaffected() {
-    set_budgets();
+    let _limits = set_budgets();
     let doc = open(hyperlink_fan_out_workbook(3, 40)).unwrap();
     let ir = doc.to_ir();
     assert_eq!(ir_hyperlinks(&ir).1, 3);
@@ -929,7 +939,7 @@ fn ir_span_count(ir: &office_oxide::DocumentIR) -> usize {
 
 #[test]
 fn test_rich_text_runs_of_one_shared_string_are_charged_for_every_cell_that_names_it() {
-    set_budgets();
+    let _limits = set_budgets();
     // 100 runs of one character each in 50 cells: 5,000 characters of text,
     // but 5,000 spans of a few hundred bytes each against a 60,000 budget.
     let doc = open(rich_text_fan_out_workbook(100, 50)).unwrap();
@@ -948,7 +958,7 @@ fn test_rich_text_runs_of_one_shared_string_are_charged_for_every_cell_that_name
 
 #[test]
 fn test_a_few_rich_text_cells_are_unaffected() {
-    set_budgets();
+    let _limits = set_budgets();
     let doc = open(rich_text_fan_out_workbook(3, 5)).unwrap();
     let ir = doc.to_ir();
     assert_eq!(ir_span_count(&ir), 15);
@@ -993,7 +1003,7 @@ fn ir_number_formats(ir: &office_oxide::DocumentIR) -> Vec<String> {
 
 #[test]
 fn test_a_number_format_code_longer_than_excels_limit_is_not_copied_into_every_cell() {
-    set_budgets();
+    let _limits = set_budgets();
     // Excel accepts at most 255 characters of format code; a 100,000
     // character one was copied into every cell that used it.
     let code = format!("0.{}", "0".repeat(100_000));
@@ -1014,7 +1024,7 @@ fn test_a_number_format_code_longer_than_excels_limit_is_not_copied_into_every_c
 
 #[test]
 fn test_an_ordinary_number_format_code_is_still_reported_on_each_cell() {
-    set_budgets();
+    let _limits = set_budgets();
     let doc = open(number_format_workbook("0.00", 5)).unwrap();
     let ir = doc.to_ir();
     assert_eq!(ir_number_formats(&ir), vec!["0.00"; 5]);
@@ -1023,7 +1033,7 @@ fn test_an_ordinary_number_format_code_is_still_reported_on_each_cell() {
 
 #[test]
 fn test_rich_text_runs_longer_than_the_cell_text_shown_are_charged_in_full() {
-    set_budgets();
+    let _limits = set_budgets();
     // The cell's displayed text stops at 32 KB, but its spans are built from
     // the runs: two 40,000-character runs, named by 20 cells.
     let mut sst = format!(r#"<sst xmlns="{NS}" count="20" uniqueCount="1"><si>"#);
@@ -1056,7 +1066,7 @@ fn test_rich_text_runs_longer_than_the_cell_text_shown_are_charged_in_full() {
 #[test]
 fn test_hyperlinks_over_one_relationship_share_one_target_allocation() {
     use office_oxide::xlsx::HyperlinkTarget;
-    set_budgets();
+    let _limits = set_budgets();
     let doc = open(hyperlink_fan_out_workbook(100, 2_000)).unwrap();
     let links = &doc.as_xlsx().unwrap().worksheets[0].hyperlinks;
     assert_eq!(links.len(), 100);
@@ -1140,7 +1150,7 @@ fn multi_sheet_workbook(sheets: usize, rows: usize, far: usize) -> Vec<u8> {
 #[test]
 fn test_the_sheet_by_sheet_path_matches_the_whole_document_one() {
     use office_oxide::ir_render::{HtmlOptions, ImageEmbed, MarkdownOptions};
-    set_budgets();
+    let _limits = set_budgets();
     let fixtures = vec![
         ("sparse", sparse_wide_workbook(30, 10)),
         ("wide", sparse_wide_workbook(3, 150)),

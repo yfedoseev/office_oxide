@@ -539,61 +539,105 @@ pub fn set_max_total_image_bytes(bytes: u64) {
 }
 
 thread_local! {
-    /// Image bytes still available to the conversion running on this
-    /// thread, and whether it ran out.
-    static IMAGE_BUDGET: std::cell::Cell<(u64, bool)> =
-        const { std::cell::Cell::new((u64::MAX, false)) };
+    /// Image bytes still available to the conversion running on this thread,
+    /// and whether it ran out; `None` outside a conversion's scope.
+    static IMAGE_BUDGET: std::cell::Cell<Option<(u64, bool)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// A conversion's image budget, alive while the guard is. Dropping it —
+/// at the end of the conversion, on an early return or while unwinding —
+/// puts back the budget that was running before, so a conversion's spent
+/// allowance can never reach the next one on the same thread.
+#[must_use = "the budget ends when the guard is dropped"]
+pub(crate) struct ImageBudgetScope {
+    previous: Option<(u64, bool)>,
+}
+
+impl Drop for ImageBudgetScope {
+    fn drop(&mut self) {
+        let _ = IMAGE_BUDGET.try_with(|b| b.set(self.previous));
+    }
 }
 
 /// Start a conversion's image budget at the configured limit.
-pub(crate) fn begin_image_budget() {
-    IMAGE_BUDGET.with(|b| b.set((max_image_bytes() as u64, false)));
+pub(crate) fn begin_image_budget() -> ImageBudgetScope {
+    let previous = IMAGE_BUDGET.with(|b| b.replace(Some((max_image_bytes() as u64, false))));
+    ImageBudgetScope { previous }
 }
 
 thread_local! {
     /// Text the running conversion has copied out of the document's shared
-    /// storage (a hyperlink target, a shared header, a speaker-notes body).
-    static COPIED_TEXT: std::cell::RefCell<TextBudget> =
-        std::cell::RefCell::new(TextBudget::new());
+    /// storage (a hyperlink target, a shared header, a speaker-notes body);
+    /// `None` outside a conversion's scope.
+    static COPIED_TEXT: std::cell::Cell<Option<TextBudget>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// A conversion's budget for copied text, alive while the guard is; see
+/// [`ImageBudgetScope`].
+#[must_use = "the budget ends when the guard is dropped"]
+pub(crate) struct CopiedTextScope {
+    previous: Option<TextBudget>,
+}
+
+impl Drop for CopiedTextScope {
+    fn drop(&mut self) {
+        let _ = COPIED_TEXT.try_with(|b| b.set(self.previous));
+    }
 }
 
 /// Start a conversion's budget for copied text at the configured limit
 /// ([`max_text_chars`]).
-pub(crate) fn begin_copied_text_budget() {
-    COPIED_TEXT.with(|b| *b.borrow_mut() = TextBudget::new());
+pub(crate) fn begin_copied_text_budget() -> CopiedTextScope {
+    let previous = COPIED_TEXT.with(|b| b.replace(Some(TextBudget::new())));
+    CopiedTextScope { previous }
 }
 
 /// Charge `chars` of text about to be copied into the output against the
 /// running conversion's budget, before the copy is made. `false` (from the
-/// first refusal on) means the caller leaves the text out.
+/// first refusal on) means the caller leaves the text out. Outside a
+/// conversion's scope each copy is held to the configured limit on its own,
+/// as no running total exists to charge.
 pub(crate) fn charge_copied_text(chars: usize) -> bool {
-    COPIED_TEXT.with(|b| b.borrow_mut().charge(chars))
+    COPIED_TEXT.with(|b| match b.get() {
+        Some(mut budget) => {
+            let ok = budget.charge(chars);
+            b.set(Some(budget));
+            ok
+        },
+        None => chars <= max_text_chars(),
+    })
 }
 
 /// The line to report when copied text was left out, or `None` when the
 /// budget held.
 pub(crate) fn copied_text_notice() -> Option<String> {
     COPIED_TEXT.with(|b| {
-        let b = b.borrow();
-        b.exhausted().then(|| b.notice())
+        let budget = b.get()?;
+        budget.exhausted().then(|| budget.notice())
     })
 }
 
 /// Charge `bytes` of image data against the running conversion's budget.
 /// `false` (from the first refusal on) means the caller leaves the bytes out.
+/// Outside a conversion's scope each picture is held to the configured
+/// limit on its own, as no running total exists to charge.
 pub(crate) fn charge_image_bytes(bytes: usize) -> bool {
     IMAGE_BUDGET.with(|b| {
-        let (remaining, exhausted) = b.get();
+        let Some((remaining, exhausted)) = b.get() else {
+            return bytes as u64 <= max_image_bytes() as u64;
+        };
         if exhausted {
             return false;
         }
         match remaining.checked_sub(bytes as u64) {
             Some(rest) => {
-                b.set((rest, false));
+                b.set(Some((rest, false)));
                 true
             },
             None => {
-                b.set((0, true));
+                b.set(Some((0, true)));
                 false
             },
         }
@@ -603,13 +647,16 @@ pub(crate) fn charge_image_bytes(bytes: usize) -> bool {
 /// The warning a conversion records when image bytes were left out, or
 /// `None` when the budget held.
 pub(crate) fn image_budget_warning() -> Option<String> {
-    IMAGE_BUDGET.with(|b| b.get().1).then(|| {
-        format!(
-            "some image bytes were left out: the document's images exceed the {} byte budget \
-             (office_oxide::limits::set_max_image_bytes)",
-            max_image_bytes()
-        )
-    })
+    IMAGE_BUDGET
+        .with(|b| b.get())
+        .is_some_and(|(_, exhausted)| exhausted)
+        .then(|| {
+            format!(
+                "some image bytes were left out: the document's images exceed the {} byte \
+                 budget (office_oxide::limits::set_max_image_bytes)",
+                max_image_bytes()
+            )
+        })
 }
 
 /// The default most table cells one IR may hold when it is written to
@@ -931,10 +978,126 @@ mod tests {
     /// it would truncate every other test's output.
     #[test]
     fn test_setter_round_trips() {
-        let before = max_text_chars();
-        set_max_text_chars(before.saturating_add(1));
-        assert_eq!(max_text_chars(), before.saturating_add(1));
-        set_max_text_chars(before);
-        assert_eq!(max_text_chars(), before);
+        // One more than the default of a limit that only sheet-by-sheet
+        // conversions read, so no other test in this binary can notice it.
+        let mut limits = test_support::LimitScope::new();
+        limits.set(
+            max_total_image_bytes,
+            set_max_total_image_bytes,
+            DEFAULT_MAX_TOTAL_IMAGE_BYTES + 1,
+        );
+        assert_eq!(max_total_image_bytes(), DEFAULT_MAX_TOTAL_IMAGE_BYTES + 1);
+        drop(limits);
+        assert_eq!(max_total_image_bytes(), DEFAULT_MAX_TOTAL_IMAGE_BYTES);
+    }
+
+    /// A conversion that returns early (or fails) leaves nothing behind for
+    /// the next one on the thread: the scopes end with the function, so the
+    /// budgets of one conversion are never the next one's.
+    #[test]
+    fn test_an_early_return_leaves_no_budget_for_the_next_conversion() {
+        fn conversion(fail: bool) -> bool {
+            let _image = begin_image_budget();
+            let _text = begin_copied_text_budget();
+            assert!(!charge_copied_text(usize::MAX));
+            assert!(!charge_image_bytes(usize::MAX));
+            assert!(copied_text_notice().is_some());
+            assert!(image_budget_warning().is_some());
+            if fail {
+                return false;
+            }
+            true
+        }
+        assert!(!conversion(true));
+        assert!(copied_text_notice().is_none(), "the spent text budget leaked");
+        assert!(image_budget_warning().is_none(), "the spent image budget leaked");
+
+        // A panic unwinding through a conversion ends its scope as well.
+        let unwound = std::panic::catch_unwind(|| {
+            let _text = begin_copied_text_budget();
+            let _image = begin_image_budget();
+            charge_copied_text(usize::MAX);
+            charge_image_bytes(usize::MAX);
+            panic!("conversion failed");
+        });
+        assert!(unwound.is_err());
+        assert!(copied_text_notice().is_none());
+        assert!(image_budget_warning().is_none());
+
+        // The next conversion starts fresh.
+        let _text = begin_copied_text_budget();
+        assert!(charge_copied_text(10));
+        assert!(copied_text_notice().is_none());
+    }
+
+    /// A scope inside another gives the outer budget back when it ends.
+    #[test]
+    fn test_a_nested_scope_restores_the_budget_it_replaced() {
+        let _outer = begin_copied_text_budget();
+        assert!(charge_copied_text(5));
+        {
+            let _inner = begin_copied_text_budget();
+            assert!(!charge_copied_text(usize::MAX));
+            assert!(copied_text_notice().is_some());
+        }
+        assert!(
+            copied_text_notice().is_none(),
+            "the inner budget replaced the outer one for good"
+        );
+        assert!(charge_copied_text(5));
+    }
+
+    /// Outside any conversion there is no running total, but a charge is not
+    /// unlimited either: it is held to the configured limit on its own.
+    #[test]
+    fn test_charges_outside_a_conversion_are_held_to_the_configured_limit() {
+        assert!(charge_image_bytes(1));
+        assert!(!charge_image_bytes(usize::MAX));
+        assert!(charge_copied_text(1));
+        assert!(!charge_copied_text(usize::MAX));
+        assert!(copied_text_notice().is_none());
+        assert!(image_budget_warning().is_none());
+    }
+}
+
+/// Serialises tests that change a process-wide limit, and puts the limit
+/// back when the test ends, however it ends.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Mutex, MutexGuard};
+
+    static LIMITS: Mutex<()> = Mutex::new(());
+
+    /// Holds the lock on the limits for as long as it lives and restores
+    /// every limit it set, in reverse order, when dropped.
+    pub(crate) struct LimitScope {
+        restore: Vec<Box<dyn FnOnce()>>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl LimitScope {
+        pub(crate) fn new() -> Self {
+            Self {
+                restore: Vec::new(),
+                // A test that failed while holding the lock leaves it
+                // poisoned, and its guard has already restored the limits.
+                _lock: LIMITS.lock().unwrap_or_else(|e| e.into_inner()),
+            }
+        }
+
+        /// Set a limit for the rest of the scope.
+        pub(crate) fn set<T: Copy + 'static>(&mut self, get: fn() -> T, set: fn(T), value: T) {
+            let before = get();
+            set(value);
+            self.restore.push(Box::new(move || set(before)));
+        }
+    }
+
+    impl Drop for LimitScope {
+        fn drop(&mut self) {
+            while let Some(restore) = self.restore.pop() {
+                restore();
+            }
+        }
     }
 }

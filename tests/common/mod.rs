@@ -21,6 +21,57 @@ use std::io::Cursor;
 
 pub mod ppt;
 
+/// Serialises the tests of one binary that change a process-wide limit
+/// (`office_oxide::limits::set_max_*`) against each other and against the
+/// tests that need the defaults, and puts every limit back when the test
+/// ends, however it ends.
+static LIMITS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// A test that sets limits holds one of these: the exclusive lock on the
+/// limits for as long as it lives, and every limit it set restored, last set
+/// first, when it is dropped.
+#[allow(dead_code)]
+pub struct LimitScope {
+    restore: Vec<Box<dyn FnOnce()>>,
+    _lock: std::sync::RwLockWriteGuard<'static, ()>,
+}
+
+#[allow(dead_code)]
+impl LimitScope {
+    /// Take the exclusive lock on the limits.
+    pub fn new() -> Self {
+        Self {
+            restore: Vec::new(),
+            // A test that failed while holding the lock poisoned it; its
+            // guard has already restored the limits.
+            _lock: LIMITS.write().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+
+    /// Set a limit for the rest of the scope: `get` and `set` are the
+    /// limit's accessor and setter in `office_oxide::limits`.
+    pub fn set<T: Copy + 'static>(&mut self, get: fn() -> T, set: fn(T), value: T) {
+        let before = get();
+        set(value);
+        self.restore.push(Box::new(move || set(before)));
+    }
+}
+
+impl Drop for LimitScope {
+    fn drop(&mut self) {
+        while let Some(restore) = self.restore.pop() {
+            restore();
+        }
+    }
+}
+
+/// A test that relies on the default limits holds one of these, so a sibling
+/// test that lowers a limit cannot do so while it runs.
+#[allow(dead_code)]
+pub fn default_limits() -> std::sync::RwLockReadGuard<'static, ()> {
+    LIMITS.read().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Sentinel directory id: no sibling / child.
 const NO_ENTRY: u32 = 0xFFFF_FFFF;
 

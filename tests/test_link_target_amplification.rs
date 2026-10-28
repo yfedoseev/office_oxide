@@ -3,15 +3,18 @@
 //! Markdown are charged to the text budget; and a target too long to be a
 //! genuine address is refused outright.
 //!
-//! These tests lower the process-wide text budget, so they have a test binary
-//! to themselves, and each sets the same value.
+//! These tests lower the process-wide text budget, so each holds the scope
+//! that serialises them and puts the budget back.
 
 use std::io::{Cursor, Write};
 
 use office_oxide::docx::{DocxDocument, HyperlinkTarget, ParagraphContent};
 use office_oxide::ir::{DocumentIR, Element, InlineContent};
-use office_oxide::limits::set_max_text_chars;
+use office_oxide::limits::{max_text_chars, set_max_text_chars};
 use office_oxide::{Document, DocumentFormat};
+
+mod common;
+use common::LimitScope;
 
 const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const PKG_REL: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
@@ -25,8 +28,10 @@ const TARGET_LEN: usize = 50_000;
 const TEXT_BUDGET: usize = 300_000;
 const LINKS: usize = 40;
 
-fn limits() {
-    set_max_text_chars(TEXT_BUDGET);
+fn limits() -> LimitScope {
+    let mut scope = LimitScope::new();
+    scope.set(max_text_chars, set_max_text_chars, TEXT_BUDGET);
+    scope
 }
 
 fn zip_of(parts: Vec<(String, String)>) -> Vec<u8> {
@@ -167,7 +172,7 @@ fn assert_budget_notice(ir: &DocumentIR) {
 
 #[test]
 fn test_relationship_target_beyond_the_length_cap_is_refused() {
-    limits();
+    let _limits = limits();
     let bytes = docx(&url(1 << 20), 400, false);
     let err = DocxDocument::from_reader(Cursor::new(bytes)).unwrap_err();
     assert!(err.to_string().contains("Target"), "{err}");
@@ -186,7 +191,7 @@ fn test_relationship_target_beyond_the_length_cap_is_refused() {
 
 #[test]
 fn test_docx_links_naming_one_relationship_share_its_text() {
-    limits();
+    let _limits = limits();
     let doc = DocxDocument::from_reader(Cursor::new(docx(&url(TARGET_LEN), LINKS, false))).unwrap();
     let mut targets = Vec::new();
     for e in &doc.body.elements {
@@ -210,7 +215,7 @@ fn test_docx_links_naming_one_relationship_share_its_text() {
 
 #[test]
 fn test_docx_ir_copies_of_a_link_target_are_charged_and_cut_off_loudly() {
-    limits();
+    let _limits = limits();
     let bytes = docx(&url(TARGET_LEN), LINKS, false);
     let ir = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
         .unwrap()
@@ -228,7 +233,7 @@ fn test_docx_ir_copies_of_a_link_target_are_charged_and_cut_off_loudly() {
 
 #[test]
 fn test_docx_markdown_copies_of_a_link_target_are_charged_and_cut_off_loudly() {
-    limits();
+    let _limits = limits();
     let bytes = docx(&url(TARGET_LEN), LINKS, false);
     let md = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
         .unwrap()
@@ -243,7 +248,7 @@ fn test_docx_markdown_copies_of_a_link_target_are_charged_and_cut_off_loudly() {
 
 #[test]
 fn test_docx_fragment_copies_made_while_reading_are_charged() {
-    limits();
+    let _limits = limits();
     let bytes = docx(&url(TARGET_LEN), LINKS, true);
     let doc = DocxDocument::from_reader(Cursor::new(bytes.clone())).unwrap();
     let mut owned = 0usize;
@@ -282,7 +287,7 @@ fn test_docx_fragment_copies_made_while_reading_are_charged() {
 
 #[test]
 fn test_pptx_runs_naming_one_relationship_share_its_text_and_ir_copies_are_charged() {
-    limits();
+    let _limits = limits();
     let bytes = pptx(&url(TARGET_LEN), LINKS);
     let doc = office_oxide::pptx::PptxDocument::from_reader(Cursor::new(bytes.clone())).unwrap();
     let mut targets = Vec::new();
@@ -326,7 +331,7 @@ fn test_pptx_runs_naming_one_relationship_share_its_text_and_ir_copies_are_charg
 /// Pictures linked to one long target: the Markdown names it once per picture.
 #[test]
 fn test_pptx_markdown_copies_of_a_picture_link_target_are_charged_and_cut_off_loudly() {
-    limits();
+    let _limits = limits();
     let pic = |i: usize| {
         format!(
             r#"<p:pic><p:nvPicPr><p:cNvPr id="{id}" name="P{i}" descr="pic{i}"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:link="rId1"/></p:blipFill><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="100" cy="100"/></a:xfrm></p:spPr></p:pic>"#,
@@ -355,7 +360,7 @@ fn test_pptx_markdown_copies_of_a_picture_link_target_are_charged_and_cut_off_lo
 /// the tooltip, which is charged along with the link.
 #[test]
 fn test_docx_tooltip_copies_are_charged_with_the_link() {
-    limits();
+    let _limits = limits();
     let tip = "t".repeat(20_000);
     let runs: String = (0..LINKS)
         .map(|i| format!(r#"<w:r><w:t>run{i} </w:t></w:r>"#))

@@ -9,7 +9,13 @@ use office_oxide::core::Error as CoreError;
 use office_oxide::core::editable::EditablePackage;
 use office_oxide::core::opc::{OpcWriter, PartName};
 use office_oxide::core::relationships::rel_types;
+use office_oxide::limits::{
+    max_package_bytes, max_package_entries, set_max_package_bytes, set_max_package_entries,
+};
 use office_oxide::{Document, DocumentFormat, OfficeError};
+
+mod common;
+use common::LimitScope;
 
 /// A DOCX whose three media parts each hold `part_len` bytes.
 fn docx_with_media(part_len: usize) -> Vec<u8> {
@@ -39,7 +45,8 @@ fn test_package_limits_bound_the_edit_and_read_paths() {
     // Each media part fits the per-part cap; together they do not fit a
     // 2.5-part package budget.
     let bytes = docx_with_media(1 << 20);
-    office_oxide::limits::set_max_package_bytes((5 << 20) / 2);
+    let mut limits = LimitScope::new();
+    limits.set(max_package_bytes, set_max_package_bytes, (5 << 20) / 2);
 
     // The edit path loads every part eagerly.
     let err = EditablePackage::from_reader(Cursor::new(bytes.clone()))
@@ -52,11 +59,11 @@ fn test_package_limits_bound_the_edit_and_read_paths() {
         .expect("reading the text does not read the media");
     assert_eq!(doc.plain_text().trim(), "x");
 
-    office_oxide::limits::set_max_package_bytes(u64::MAX);
+    set_max_package_bytes(u64::MAX);
     EditablePackage::from_reader(Cursor::new(bytes.clone())).expect("unbounded again");
 
     // Entry count: the package has 3 media + document + rels + content types.
-    office_oxide::limits::set_max_package_entries(3);
+    limits.set(max_package_entries, set_max_package_entries, 3);
     let err = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
         .err()
         .expect("too many entries");
@@ -65,8 +72,4 @@ fn test_package_limits_bound_the_edit_and_read_paths() {
             && err.to_string().contains("package limit"),
         "{err}"
     );
-    office_oxide::limits::set_max_package_entries(
-        office_oxide::limits::DEFAULT_MAX_PACKAGE_ENTRIES,
-    );
-    office_oxide::limits::set_max_package_bytes(office_oxide::limits::DEFAULT_MAX_PACKAGE_BYTES);
 }
