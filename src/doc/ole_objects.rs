@@ -9,6 +9,7 @@
 //! example) 12 embedded Excel workbooks showed no trace of any of them
 //! anywhere in the IR.
 
+use std::collections::HashMap;
 use std::io::{Read, Seek};
 
 use crate::cfb::{CfbReader, DirEntry, EntryType};
@@ -17,12 +18,6 @@ use crate::cfb::{CfbReader, DirEntry, EntryType};
 /// `cfb::directory::NO_ENTRY` (not reachable from here — that module is
 /// private to `cfb`).
 const NO_ENTRY: u32 = 0xFFFF_FFFF;
-
-/// Bound on how many directory entries a single walk may visit —
-/// `ObjectPool`'s own storage tree comes from an untrusted file, so a
-/// corrupted/adversarial sibling chain must not spin unboundedly. Well
-/// above any real document's actual embedded-object count.
-const MAX_ENTRIES_WALKED: usize = 50_000;
 
 /// One embedded OLE object found under `ObjectPool`, identified only by
 /// the presence of a well-known stream name within its own storage.
@@ -40,7 +35,11 @@ pub struct EmbeddedOleObject {
 /// expectations — this is a best-effort enhancement, never a hard
 /// requirement for reading the rest of the document.
 pub fn extract_ole_objects<R: Read + Seek>(reader: &CfbReader<R>) -> Vec<EmbeddedOleObject> {
-    let entries = reader.entries();
+    classify_objects(reader.entries())
+}
+
+/// The walk behind [`extract_ole_objects`], over a bare directory.
+fn classify_objects(entries: &[DirEntry]) -> Vec<EmbeddedOleObject> {
     if entries.is_empty() || entries[0].entry_type != EntryType::RootStorage {
         return Vec::new();
     }
@@ -53,15 +52,23 @@ pub fn extract_ole_objects<R: Read + Seek>(reader: &CfbReader<R>) -> Vec<Embedde
     }
 
     let mut out = Vec::new();
+    // Many object storages can name the same child tree; classify each
+    // distinct tree once rather than walking it again for every object.
+    let mut classified: HashMap<u32, Option<String>> = HashMap::new();
     for obj_idx in collect_children(entries, pool.child) {
         let obj = &entries[obj_idx];
         if obj.entry_type != EntryType::Storage {
             continue; // a stray non-storage entry directly under ObjectPool
         }
-        let children = collect_children(entries, obj.child);
-        let names: Vec<&str> = children.iter().map(|&i| entries[i].name.as_str()).collect();
-        if let Some(description) = classify(&names) {
-            out.push(EmbeddedOleObject { description });
+        let description = classified.entry(obj.child).or_insert_with(|| {
+            let children = collect_children(entries, obj.child);
+            let names: Vec<&str> = children.iter().map(|&i| entries[i].name.as_str()).collect();
+            classify(&names)
+        });
+        if let Some(description) = description {
+            out.push(EmbeddedOleObject {
+                description: description.clone(),
+            });
         }
     }
     out
@@ -93,17 +100,18 @@ fn classify(names: &[&str]) -> Option<String> {
 }
 
 /// Find a direct child of the RB-tree rooted at `root` matching `name`,
-/// case-insensitively. Explicit-stack and entry-count-bounded — the
-/// tree comes from an untrusted file, so a corrupted/adversarial
-/// sibling cycle must not overflow the stack or loop unboundedly.
+/// case-insensitively. Explicit-stack with a visited set — the tree
+/// comes from an untrusted file, so a corrupted/adversarial sibling
+/// cycle must not overflow the stack or loop unboundedly. Each entry is
+/// visited once and the walk stops at the first match.
 fn find_direct_child(entries: &[DirEntry], root: u32, name: &str) -> Option<usize> {
     let mut stack = vec![root];
-    let mut visited = 0usize;
+    let mut seen = vec![false; entries.len()];
     while let Some(node) = stack.pop() {
-        visited += 1;
-        if visited > MAX_ENTRIES_WALKED || node == NO_ENTRY || node as usize >= entries.len() {
+        if node == NO_ENTRY || node as usize >= entries.len() || seen[node as usize] {
             continue;
         }
+        seen[node as usize] = true;
         let entry = &entries[node as usize];
         if entry.name.eq_ignore_ascii_case(name) {
             return Some(node as usize);
@@ -115,17 +123,18 @@ fn find_direct_child(entries: &[DirEntry], root: u32, name: &str) -> Option<usiz
 }
 
 /// All directory entry indices in the RB tree rooted at `root`,
-/// explicit-stack and entry-count-bounded for the same reason as
-/// [`find_direct_child`].
+/// explicit-stack with a visited set for the same reason as
+/// [`find_direct_child`]: each entry appears once, so the walk is bounded
+/// by the directory however its pointers are wired.
 fn collect_children(entries: &[DirEntry], root: u32) -> Vec<usize> {
     let mut out = Vec::new();
     let mut stack = vec![root];
-    let mut visited = 0usize;
+    let mut seen = vec![false; entries.len()];
     while let Some(node) = stack.pop() {
-        visited += 1;
-        if visited > MAX_ENTRIES_WALKED || node == NO_ENTRY || node as usize >= entries.len() {
+        if node == NO_ENTRY || node as usize >= entries.len() || seen[node as usize] {
             continue;
         }
+        seen[node as usize] = true;
         let entry = &entries[node as usize];
         out.push(node as usize);
         stack.push(entry.left_sibling);
@@ -227,6 +236,28 @@ mod tests {
             entry("Loop", EntryType::Storage, NO_ENTRY, NO_ENTRY, 1),
         ];
         let out = collect_children(&entries, entries[0].child);
-        assert!(!out.is_empty());
+        assert_eq!(out, vec![1], "a cyclic entry is reported once, not once per step");
+    }
+
+    /// Object storages whose sibling pointers loop on themselves, and a
+    /// pool of many such objects, cost a walk bounded by the directory
+    /// (every entry once), not by a per-walk step cap times the objects.
+    #[test]
+    fn test_self_looping_object_pool_walks_each_entry_once() {
+        let n: u32 = 200;
+        let mut entries = vec![
+            entry("Root Entry", EntryType::RootStorage, 1, NO_ENTRY, NO_ENTRY),
+            entry("ObjectPool", EntryType::Storage, 2, NO_ENTRY, NO_ENTRY),
+        ];
+        // Objects 2..2+n: each is its own left and right sibling, and its
+        // child tree is the shared looping stream below.
+        let stream = 2 + n;
+        for i in 0..n {
+            entries.push(entry(&format!("_{i}"), EntryType::Storage, stream, 2 + i, 2 + i));
+        }
+        entries.push(entry("Workbook", EntryType::Stream, NO_ENTRY, stream, stream));
+        let pool = collect_children(&entries, entries[1].child);
+        assert_eq!(pool.len(), 1, "the self-looping object is listed once");
+        assert_eq!(classify_objects(&entries).len(), 1);
     }
 }
