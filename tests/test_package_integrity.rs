@@ -174,31 +174,56 @@ fn test_a_deflated_sheet_failing_its_crc_keeps_its_own_cells_and_is_reported() {
     );
 }
 
+/// A deflate stream that decodes completely to a different length than the
+/// entry declares is a damaged header, not damaged content (an edit that
+/// rewrote line endings does this): the bytes are kept, as for a bad CRC-32,
+/// and the entry is reported.
 #[test]
-fn test_a_sheet_larger_than_its_declared_size_is_not_presented_as_sound() {
-    let parts = workbook_parts();
-    let body = parts
-        .iter()
+fn test_a_sheet_that_differs_from_its_declared_size_keeps_its_cells_and_is_reported() {
+    for delta in [-20i64, 20] {
+        let parts = workbook_parts();
+        let body = parts
+            .iter()
+            .find(|(n, _)| *n == "xl/worksheets/sheet2.xml")
+            .unwrap()
+            .1
+            .clone();
+        let mut data = deflated_zip(&parts);
+        let len = body.len() as u32;
+        assert_eq!(replace_le32(&mut data, len, (len as i64 + delta) as u32), 2);
+
+        let doc = Document::from_reader(Cursor::new(data), DocumentFormat::Xlsx).unwrap();
+        let text = doc.plain_text();
+        assert!(text.contains("alpha"), "{delta}: {text}");
+        assert!(text.contains("bravo-marker"), "{delta}: {text}");
+        let warnings = doc.to_ir().metadata.warnings;
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("xl/worksheets/sheet2.xml") && w.contains("declared size")),
+            "{delta}: {warnings:?}"
+        );
+    }
+}
+
+/// The tolerance is bounded by what the header declares: an entry that
+/// inflates far past its declared size is refused, not read to the part limit.
+#[test]
+fn test_an_entry_that_inflates_far_past_its_declared_size_is_still_refused() {
+    let mut parts = workbook_parts();
+    let big = sheet(&"x".repeat(4 * 1024 * 1024));
+    parts
+        .iter_mut()
         .find(|(n, _)| *n == "xl/worksheets/sheet2.xml")
         .unwrap()
-        .1
-        .clone();
+        .1 = big.clone();
     let mut data = deflated_zip(&parts);
-    let len = body.len() as u32;
-    assert_eq!(replace_le32(&mut data, len, len - 20), 2, "local and central header");
+    let len = big.len() as u32;
+    assert_eq!(replace_le32(&mut data, len, 1000), 2);
 
     let doc = Document::from_reader(Cursor::new(data), DocumentFormat::Xlsx).unwrap();
     let text = doc.plain_text();
     assert!(text.contains("alpha"), "{text}");
-    // The damaged sheet is lost, loudly: named in the text and in the
-    // warnings, not dropped without a trace.
-    let meta = doc.to_ir().metadata;
+    assert!(!text.contains("xxxxxxxx"), "the oversized entry must not be read");
     assert!(text.contains("unreadable sheet \"Second\""), "{text}");
-    assert!(
-        meta.warnings
-            .iter()
-            .any(|w| w.contains("xl/worksheets/sheet2.xml")),
-        "{:?}",
-        meta.warnings
-    );
 }

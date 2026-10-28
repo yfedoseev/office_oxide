@@ -155,7 +155,8 @@ pub(crate) fn ooxml_metadata_extras(
 }
 
 /// The package-level integrity warnings every OOXML converter reports: one
-/// line per part whose bytes failed their CRC-32 and were read as stored.
+/// line per part whose bytes failed their CRC-32 or differed from their
+/// declared size and were read as stored.
 pub(crate) fn package_warnings(
     package: Option<&crate::core::properties::PackageProperties>,
 ) -> Vec<String> {
@@ -165,8 +166,8 @@ pub(crate) fn package_warnings(
                 .iter()
                 .map(|name| {
                     format!(
-                        "part '{name}' failed its CRC-32 check; its content was read as \
-                         stored and may be damaged"
+                        "part '{name}' failed its CRC-32 check or differs from its declared size; \
+                         its content was read as stored and may be damaged"
                     )
                 })
                 .collect()

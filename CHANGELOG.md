@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A deflated package part whose length differs from the size its zip header declares is read and reported, instead of being dropped as unreadable.** Tools that rewrite line endings inside a package leave such headers; a wrong CRC-32 was already tolerated and 7-Zip and LibreOffice extract these entries. The bytes are kept, `Metadata::warnings` names the part, and an entry that inflates more than a quarter past its declared size is still refused as a decompression bomb. A stream that ends short of the declared size is reported too.
+
+- **A Markdown table no longer carries grid columns that only continue column spans.** A table whose rows each have their own cell boundaries (typical of Word 6/95 tables) was written as one column per boundary, mostly empty; a column in which no row starts a cell holds no text and is now left out.
+
 - **A `.docx` or `.pptx` whose package-level or main-part relationships part the zip cannot decode opens again, with the loss reported.** A damaged `_rels/.rels`, `word/_rels/document.xml.rels` or `ppt/_rels/presentation.xml.rels` (an unsupported compression method, an encrypted entry) was read as an empty set of relationships and the document opened; an earlier change in this release made such a document refuse to open. It opens as it always did (the main part is found through `[Content_Types].xml`), and the part is listed in `unreadable_parts`, in the metadata warnings and in the text, with `text_truncated` set. Editing such a document is still refused, because saving it would write out a package without its relationships.
 
 - **A damaged theme no longer adds a notice to a document's text or sets `text_truncated`.** A theme holds colours and fonts, no text, so the document yields every word it did before; the part is still listed in the metadata warnings (`.xlsx`, `.docx`, `.pptx`). Only a part the reader reached through a theme relationship is taken for one without text; a part's name never decides it, so a header stored under a name that looks like a theme is still reported as lost text.

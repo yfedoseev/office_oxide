@@ -848,6 +848,36 @@ fn open_zip_checked<R: Read + Seek>(mut reader: R, max_entries: usize) -> Result
 /// difference.
 pub const MAX_PART_SIZE: u64 = 512 * 1024 * 1024;
 
+/// Decode a deflated entry whose stream is complete but whose length is not
+/// the one its header declares. `Err` carries the bytes inflated by an
+/// attempt that gave up (so the caller can charge them) when the entry is
+/// not deflated, the stream is damaged or incomplete, or it inflates more
+/// than a quarter (and 64 KiB) past the declared size: a header that is
+/// wrong by a little is a damaged header, one that is wrong by a lot is a
+/// decompression bomb.
+fn inflate_despite_declared_size<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    index: usize,
+    declared: u64,
+) -> std::result::Result<Vec<u8>, u64> {
+    let Ok(raw) = archive.by_index_raw(index) else {
+        return Err(0);
+    };
+    if raw.compression() != zip::CompressionMethod::Deflated {
+        return Err(0);
+    }
+    let bound = declared
+        .saturating_add(declared / 4)
+        .saturating_add(64 * 1024)
+        .min(MAX_PART_SIZE);
+    let mut decoder = flate2::read::DeflateDecoder::new(raw);
+    let mut out = Vec::with_capacity((declared as usize).min(1 << 20));
+    match (&mut decoder).take(bound + 1).read_to_end(&mut out) {
+        Ok(_) if out.len() as u64 <= bound => Ok(out),
+        _ => Err(out.len() as u64),
+    }
+}
+
 pub(crate) fn read_zip_entry<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     entries: &ZipEntryIndex,
@@ -886,9 +916,12 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
     // The package-wide account, checked against the declared size before
     // reading and against the actual size after.
     entries.charge(index, file.size(), name, 0)?;
-    let mut buf = Vec::with_capacity((file.size() as usize).min(1 << 20));
+    let declared = file.size();
+    let mut buf = Vec::with_capacity((declared as usize).min(1 << 20));
     let mut capped = (&mut file).take(MAX_PART_SIZE + 1);
-    match capped.read_to_end(&mut buf) {
+    let read = capped.read_to_end(&mut buf);
+    drop(file);
+    match read {
         Ok(_) => {},
         // A CRC-32 mismatch means the bytes may not be the ones the
         // producer wrote. Refusing the part cost real documents their
@@ -900,15 +933,39 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
         Err(e)
             if e.kind() == std::io::ErrorKind::InvalidData
                 && e.to_string().contains("checksum")
-                && buf.len() as u64 == file.size() =>
+                && buf.len() as u64 == declared =>
         {
             log::warn!("opc: part '{name}' failed its CRC-32 check; read as stored");
             entries.record_crc_mismatch(name);
+        },
+        // A deflate stream that is complete but decodes to a different
+        // length than the header declares (an edit that rewrote line
+        // endings does this) is rejected by the zip layer. The stream itself
+        // is sound, so it is decoded directly, within a bound derived from
+        // the declared size, and reported like a checksum mismatch.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            match inflate_despite_declared_size(archive, index, declared) {
+                Ok(bytes) => {
+                    log::warn!("opc: part '{name}' differs from its declared size; read as stored");
+                    entries.record_crc_mismatch(name);
+                    buf = bytes;
+                },
+                Err(inflated) => {
+                    entries.note_failed_read(index, (buf.len() as u64).saturating_add(inflated));
+                    return Err(e.into());
+                },
+            }
         },
         Err(e) => {
             entries.note_failed_read(index, buf.len() as u64);
             return Err(e.into());
         },
+    }
+    // A stream that ended short of the declared size read without error; it
+    // is as much a damaged entry as one that ran long.
+    if (buf.len() as u64) < declared {
+        log::warn!("opc: part '{name}' is shorter than its declared size");
+        entries.record_crc_mismatch(name);
     }
     if buf.len() as u64 > MAX_PART_SIZE {
         entries.note_failed_read(index, buf.len() as u64);
@@ -918,7 +975,7 @@ pub(crate) fn read_zip_entry<R: Read + Seek>(
         });
     }
     // A lying declared size is caught here, before the bytes are kept.
-    if let Err(e) = entries.charge(index, buf.len() as u64, name, file.size()) {
+    if let Err(e) = entries.charge(index, buf.len() as u64, name, declared) {
         entries.note_failed_read(index, buf.len() as u64);
         return Err(e);
     }
@@ -1466,10 +1523,12 @@ mod tests {
         zip.write_all(&vec![0u8; 1 << 20]).unwrap();
         let good = zip.finish().unwrap().into_inner();
         // Damage the compressed stream where a read inflates the most before
-        // it fails (a checksum mismatch alone keeps the bytes).
+        // it fails (a checksum mismatch alone keeps the bytes, and so does a
+        // stream that is complete but of another length: only a stream that
+        // breaks, such as one cut short, fails after inflating).
         let limit = 2 << 20;
         let mut found: Option<(u64, Vec<u8>)> = None;
-        for at in 40..good.len().min(400) {
+        for at in 40..good.len() {
             let mut bytes = good.clone();
             bytes[at] ^= 0x5A;
             let Ok(mut archive) = ZipArchive::new(std::io::Cursor::new(bytes.clone())) else {
