@@ -304,3 +304,50 @@ fn test_one_image_drawn_many_times_stops_copying_at_the_default_budget() {
         ir.metadata.warnings
     );
 }
+
+// ---------------------------------------------------------------------------
+// DOCX: a style sheet of tens of thousands of chained styles
+// ---------------------------------------------------------------------------
+
+/// Each style is about 1 KB in memory for about 100 bytes of XML, and a
+/// `w:basedOn` chain is only ever followed 20 links deep. A sheet far past
+/// anything a word processor produces (Word stops near 4,000 styles) keeps its
+/// first styles, resolves them as before, and says the rest were left out.
+#[test]
+fn test_style_sheet_with_tens_of_thousands_of_chained_styles_is_cut_loudly() {
+    let n = 30_000;
+    let mut styles = format!(r#"<w:styles xmlns:w="{WML}">"#);
+    for i in 0..n {
+        let based = if i > 0 {
+            format!(r#"<w:basedOn w:val="S{}"/>"#, i - 1)
+        } else {
+            String::new()
+        };
+        styles.push_str(&format!(
+            r#"<w:style w:type="paragraph" w:styleId="S{i}"><w:name w:val="s{i}"/>{based}</w:style>"#
+        ));
+    }
+    styles.push_str("</w:styles>");
+    let parts = vec![
+        ("[Content_Types].xml".to_string(), r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.to_string()),
+        ("_rels/.rels".to_string(), rels(&[("rId1", "officeDocument", "word/document.xml")])),
+        (
+            "word/document.xml".to_string(),
+            format!(r#"<w:document xmlns:w="{WML}"><w:body><w:p><w:pPr><w:pStyle w:val="S5"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p></w:body></w:document>"#),
+        ),
+        ("word/_rels/document.xml.rels".to_string(), rels(&[("rId1", "styles", "styles.xml")])),
+        ("word/styles.xml".to_string(), styles),
+    ];
+    let bytes = zip_of(parts);
+    let doc = office_oxide::docx::DocxDocument::from_reader(Cursor::new(bytes.clone())).unwrap();
+    let kept = doc.styles.as_ref().unwrap().styles.len();
+    assert!(kept > 0 && kept <= 20_000, "{kept} styles kept");
+    let ir = Document::from_reader(Cursor::new(bytes), DocumentFormat::Docx)
+        .unwrap()
+        .to_ir();
+    assert!(
+        ir.metadata.warnings.iter().any(|w| w.contains("style")),
+        "{:?}",
+        ir.metadata.warnings
+    );
+}

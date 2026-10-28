@@ -487,6 +487,19 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
                             )
                         }),
                 )
+                .chain(
+                    doc.styles
+                        .as_ref()
+                        .filter(|s| s.styles_left_out > 0)
+                        .map(|s| {
+                            format!(
+                                "{} style(s) were left out because the style sheet holds more \
+                                 than {} styles",
+                                s.styles_left_out,
+                                crate::docx::styles::MAX_STYLES
+                            )
+                        }),
+                )
                 .collect(),
             ..crate::core::core_properties::ooxml_metadata_extras(
                 cp,
