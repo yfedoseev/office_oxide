@@ -249,6 +249,11 @@ impl GridBudget {
 /// characters a cell, as Markdown charges an absent column): at the default a
 /// sheet may hold about 900,000 of them, enough for a multi-sheet export of
 /// a hundred sparse columns and several thousand rows.
+///
+/// This is the allowance of a conversion that holds the whole workbook at once
+/// (`Document::to_ir`, which every sheet shares). A conversion that holds one
+/// sheet at a time has each sheet's own,
+/// [`DEFAULT_MAX_SHEET_IR_PADDING_BYTES`].
 pub const DEFAULT_MAX_IR_PADDING_BYTES: usize = 512 << 20;
 
 static MAX_IR_PADDING_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_IR_PADDING_BYTES);
@@ -678,6 +683,16 @@ mod tests {
         assert!(b.exhausted());
         assert!(b.notice().contains("empty table cells"));
         assert!(!IrPaddingBudget::with_limit(usize::MAX).charge_cells(usize::MAX));
+    }
+
+    #[test]
+    fn test_a_sheets_padding_allowance_names_its_own_limit_and_the_sheet() {
+        let b = IrPaddingBudget::new_for_sheet();
+        assert!(b.notice().contains("set_max_sheet_ir_padding_bytes"));
+        assert!(b.notice().starts_with("[sheet truncated"));
+        let d = IrPaddingBudget::new();
+        assert!(d.notice().contains("set_max_ir_padding_bytes"));
+        assert!(d.notice().starts_with("[workbook truncated"));
     }
 
     #[test]
