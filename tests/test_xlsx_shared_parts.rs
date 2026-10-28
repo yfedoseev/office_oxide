@@ -519,3 +519,99 @@ fn test_the_relationships_of_a_drawing_named_by_many_chartsheets_are_read_once()
         "30 chartsheets naming a drawing whose relationships are {pad} bytes add {linked} bytes to opening over one, {unlinked} when they do not name it: the relationships are read per chartsheet"
     );
 }
+
+/// A package of `t` threaded-comment parts of `entries` messages each and `l`
+/// small legacy comments parts, with one sheet for each of the `t * l` pairs.
+fn comment_pairs(t: usize, l: usize, entries: usize) -> Vec<u8> {
+    const THREADED: &str =
+        "http://schemas.microsoft.com/office/2017/10/relationships/threadedComment";
+    let mut parts: Vec<(String, String)> = Vec::new();
+    let mut names = String::new();
+    let mut wb_rels = String::new();
+    let mut n = 0;
+    for j in 0..t {
+        let mut s = String::from(
+            r#"<ThreadedComments xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments">"#,
+        );
+        for i in 0..entries {
+            s.push_str(&format!(
+                r#"<threadedComment ref="A{}" id="{{{i}}}"><text>x</text></threadedComment>"#,
+                i + 1
+            ));
+        }
+        s.push_str("</ThreadedComments>");
+        parts.push((format!("xl/threadedComments/t{j}.xml"), s));
+    }
+    for i in 0..l {
+        parts.push((
+            format!("xl/comments{i}.xml"),
+            format!(
+                r#"<comments xmlns="{NS}"><authors><author>a</author></authors><commentList><comment ref="B1" authorId="0"><text><t>y</t></text></comment></commentList></comments>"#
+            ),
+        ));
+        for j in 0..t {
+            n += 1;
+            names.push_str(&format!(r#"<sheet name="S{n}" sheetId="{n}" r:id="rId{n}"/>"#));
+            wb_rels.push_str(&format!(
+                r#"<Relationship Id="rId{n}" Type="{R}/worksheet" Target="worksheets/sheet{n}.xml"/>"#
+            ));
+            parts.push((format!("xl/worksheets/sheet{n}.xml"), one_cell("")));
+            parts.push((
+                format!("xl/worksheets/_rels/sheet{n}.xml.rels"),
+                format!(
+                    r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/comments" Target="../comments{i}.xml"/><Relationship Id="rId2" Type="{THREADED}" Target="../threadedComments/t{j}.xml"/></Relationships>"#
+                ),
+            ));
+        }
+    }
+    parts.push((
+        "[Content_Types].xml".into(),
+        r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#.into(),
+    ));
+    parts.push((
+        "_rels/.rels".into(),
+        format!(r#"<Relationships xmlns="{REL_NS}"><Relationship Id="rId1" Type="{R}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#),
+    ));
+    parts.push((
+        "xl/workbook.xml".into(),
+        format!(r#"<workbook xmlns="{NS}" xmlns:r="{R}"><sheets>{names}</sheets></workbook>"#),
+    ));
+    parts.push((
+        "xl/_rels/workbook.xml.rels".into(),
+        format!(r#"<Relationships xmlns="{REL_NS}">{wb_rels}</Relationships>"#),
+    ));
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts: zip::write::FileOptions<'_, '_, ()> =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (name, data) in parts {
+        zip.start_file(name, opts).unwrap();
+        zip.write_all(data.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+#[test]
+fn test_large_threaded_parts_paired_with_many_legacy_parts_cost_nothing_once_the_budget_is_spent() {
+    let mut limits = serial();
+    // The first pairs spend the comment allowance; every later pair then has
+    // nothing to merge and must not even group the threaded part's messages.
+    limits.set(max_text_chars, set_max_text_chars, 1_000);
+    // What each further legacy part adds to opening, against two threaded
+    // parts of `entries` messages: the sheets' own cost, from messages of
+    // few, and what the large parts add to it.
+    let per_legacy_part = |entries| {
+        let by = |l| {
+            let bytes = comment_pairs(2, l, entries);
+            let (doc, used) = bytes_during(|| open(bytes));
+            assert!(doc.to_ir().metadata.text_truncated);
+            drop(doc);
+            used
+        };
+        by(22).saturating_sub(by(2)) / 20
+    };
+    let (small, large) = (per_legacy_part(20), per_legacy_part(5_000));
+    assert!(
+        large < small + 5_000 * 8,
+        "each further legacy part costs {large} bytes to open against two threaded parts of 5,000 messages, {small} against two of 20: the messages are grouped per pair"
+    );
+}

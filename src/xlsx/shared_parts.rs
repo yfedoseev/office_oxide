@@ -69,7 +69,7 @@ pub(super) struct SharedDrawing {
 pub(super) struct SharedParts {
     drawings: HashMap<String, Option<Arc<SharedDrawing>>>,
     comments: HashMap<String, Option<Arc<[SheetComment]>>>,
-    threaded: HashMap<String, Option<Arc<Vec<worksheet::RawThreadedComment>>>>,
+    threaded: HashMap<String, Option<Arc<worksheet::ThreadedComments>>>,
     /// Merged comments by the pair of parts merged.
     merged: HashMap<(String, String), (Arc<[SheetComment]>, bool)>,
     tables: HashMap<String, Option<Arc<SheetTable>>>,
@@ -149,8 +149,7 @@ impl SharedParts {
                 .unwrap_or_else(|| Arc::from([])),
             _ => Arc::from([]),
         };
-        let threaded: Arc<Vec<worksheet::RawThreadedComment>> = match (threaded_path, threaded_key)
-        {
+        let threaded: Arc<worksheet::ThreadedComments> = match (threaded_path, threaded_key) {
             (Some(path), Some(key)) => self
                 .threaded
                 .entry(key)
@@ -158,7 +157,7 @@ impl SharedParts {
                     XlsxDocument::read_xml_entry(archive, entries, &path)
                         .ok()
                         .and_then(|d| worksheet::parse_threaded_comments(&d).ok())
-                        .map(Arc::new)
+                        .map(|messages| Arc::new(worksheet::ThreadedComments::new(messages)))
                 })
                 .clone()
                 .unwrap_or_default(),
