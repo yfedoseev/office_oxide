@@ -451,8 +451,17 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
             // words are document content and used to be dropped entirely —
             // a deck built out of SmartArt extracted as empty.
             crate::pptx::GraphicContent::Text(ref lines) => {
+                // The part's lines are stored once and shared by every frame
+                // that names it; each frame's copy in the IR (a paragraph per
+                // line) is charged before it is made, and left out once the
+                // budget is spent.
+                let per_line = std::mem::size_of::<Element>() + std::mem::size_of::<TextSpan>();
+                let fits = crate::limits::charge_copied_text(crate::pptx::shape::lines_cost(
+                    lines, per_line,
+                ));
                 let paras: Vec<Element> = lines
                     .iter()
+                    .filter(|_| fits)
                     .map(|t| {
                         Element::Paragraph(Paragraph {
                             content: vec![InlineContent::Text(TextSpan::plain(t.clone()))],

@@ -228,7 +228,7 @@ impl PptxDocument {
             /// rId → text lines of a chart part (`ppt/charts/chartN.xml`)
             /// or SmartArt data part (`ppt/diagrams/dataN.xml`). The slide
             /// XML holds only the reference; the text lives in the part.
-            part_text: std::collections::HashMap<String, Vec<String>>,
+            part_text: slide::PartText,
             /// Index into `layouts` of the slide's layout, when its
             /// layout relationship resolves.
             layout_index: Option<usize>,
@@ -609,7 +609,8 @@ struct PartCache {
         Option<(std::sync::Arc<[u8]>, String)>,
     >,
     /// (target part, is-chart) → text lines.
-    part_text: std::collections::HashMap<(crate::core::opc::PartName, bool), Vec<String>>,
+    part_text:
+        std::collections::HashMap<(crate::core::opc::PartName, bool), std::sync::Arc<[String]>>,
     /// Every part this cache decompressed, in order — what the caching
     /// tests count.
     #[cfg(test)]
@@ -772,8 +773,8 @@ impl PartCache {
         opc: &mut OpcReader<R>,
         source: &crate::core::opc::PartName,
         rels: &Relationships,
-    ) -> std::collections::HashMap<String, Vec<String>> {
-        let mut out = std::collections::HashMap::new();
+    ) -> slide::PartText {
+        let mut out = slide::PartText::new();
         for rel in rels.all() {
             let is_chart = rel.rel_type == rel_types::CHART;
             if !is_chart && rel.rel_type != rel_types::DIAGRAM_DATA {
@@ -787,21 +788,21 @@ impl PartCache {
                     .entry((target, is_chart))
                     .or_insert_with_key(|(target, _)| {
                         if !opc.has_part(target) {
-                            return Vec::new();
+                            return std::sync::Arc::from(Vec::new());
                         }
                         let Ok(data) = opc.read_part(target) else {
-                            return Vec::new();
+                            return std::sync::Arc::from(Vec::new());
                         };
                         #[cfg(test)]
                         self.reads.borrow_mut().push(target.as_str().to_string());
-                        if is_chart {
+                        std::sync::Arc::from(if is_chart {
                             crate::core::chart::chart_text_lines(&data)
                         } else {
                             slide::diagram_data_text_lines(&data)
-                        }
+                        })
                     });
             if !lines.is_empty() {
-                out.insert(rel.id.clone(), lines.clone());
+                out.insert(rel.id.clone(), std::sync::Arc::clone(lines));
             }
         }
         out
@@ -1076,7 +1077,7 @@ mod part_cache_tests {
             let media = parts.media_for(&mut opc, &slide, &rels);
             assert_eq!(media["rId2"].1, "png");
             let text = parts.part_text_for(&mut opc, &slide, &rels);
-            assert_eq!(text["rId3"], vec!["Title: Revenue".to_string()]);
+            assert_eq!(&*text["rId3"], &["Title: Revenue".to_string()][..]);
         }
         let reads = parts.reads.borrow();
         let mut sorted = reads.clone();
