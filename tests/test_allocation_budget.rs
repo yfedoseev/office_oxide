@@ -23,6 +23,15 @@ static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 /// its own, which the per-thread count cannot see.
 static PROCESS_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// Bytes live now and the most that were live at once, across threads.
+static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+fn grow_live(by: usize) {
+    let now = LIVE_BYTES.fetch_add(by, Ordering::Relaxed) + by;
+    PEAK_BYTES.fetch_max(now, Ordering::Relaxed);
+}
+
 thread_local! {
     /// Bytes requested by this thread, so a byte budget is not disturbed
     /// by tests running in parallel.
@@ -40,17 +49,21 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         PROCESS_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        grow_live(layout.size());
         count_bytes(layout.size());
         // SAFETY: same layout contract as the caller's.
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
         // SAFETY: `ptr` came from `System.alloc` with this layout.
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         PROCESS_BYTES.fetch_add(new_size, Ordering::Relaxed);
+        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
+        grow_live(new_size);
         count_bytes(new_size);
         // SAFETY: forwarded unchanged.
         unsafe { System.realloc(ptr, layout, new_size) }
@@ -82,6 +95,15 @@ fn process_bytes_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let before = PROCESS_BYTES.load(Ordering::SeqCst);
     let out = f();
     (out, PROCESS_BYTES.load(Ordering::SeqCst) - before)
+}
+
+/// The most bytes that were live at once, above those live when `f` began,
+/// while running `f`. Only meaningful while holding [`serial`].
+fn peak_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let start = LIVE_BYTES.load(Ordering::SeqCst);
+    PEAK_BYTES.store(start, Ordering::SeqCst);
+    let out = f();
+    (out, PEAK_BYTES.load(Ordering::SeqCst).saturating_sub(start))
 }
 
 /// Bytes this thread requested from the allocator while running `f`.
@@ -805,5 +827,55 @@ fn test_docx_open_does_not_copy_a_charts_text_per_drawing() {
     assert!(
         bytes_requested < 16 << 20,
         "{bytes_requested} bytes requested opening {DRAWINGS} drawings of one 1 MiB chart"
+    );
+}
+
+/// A table style's 1 MiB face name is folded into the formatting of every
+/// table that uses the style; the fold of each table is kept for the whole
+/// conversion. Under the default text budget (256 Mi characters) 300 tables
+/// of 1 MiB each used to be kept in full, 300 MiB, plus the copies made to
+/// build them. The charge makes the first few fit and leaves the rest out.
+#[test]
+fn test_docx_to_ir_does_not_keep_a_table_styles_face_name_per_table() {
+    let _serial = serial();
+    const TABLES: usize = 300;
+    let name = "F".repeat(1 << 20);
+    let styles = format!(
+        r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="table" w:styleId="T"><w:name w:val="T"/><w:rPr><w:rFonts w:ascii="{name}" w:hAnsi="{name}"/></w:rPr></w:style></w:styles>"#
+    );
+    let table = r#"<w:tbl><w:tblPr><w:tblStyle w:val="T"/></w:tblPr><w:tblGrid><w:gridCol w:w="1000"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/>"#;
+    let body = table.repeat(TABLES);
+    let doc = format!(
+        r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>"#
+    );
+    let bytes = zip_of(&[
+        (
+            "[Content_Types].xml",
+            br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>"#,
+        ),
+        (
+            "_rels/.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+        ),
+        (
+            "word/_rels/document.xml.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#,
+        ),
+        ("word/document.xml", doc.as_bytes()),
+        ("word/styles.xml", styles.as_bytes()),
+    ]);
+    let doc =
+        office_oxide::Document::from_reader(Cursor::new(bytes), office_oxide::DocumentFormat::Docx)
+            .unwrap();
+    // A small text budget stands in for the default one.
+    office_oxide::limits::set_max_text_chars(8 << 20);
+    let (ir, peak) = peak_during(|| doc.to_ir());
+    office_oxide::limits::set_max_text_chars(office_oxide::limits::DEFAULT_MAX_TEXT_CHARS);
+    assert!(ir.metadata.text_truncated);
+    // The budget (8 Mi) holds a handful of copies; one kept per table would
+    // be 300 MiB.
+    assert!(
+        peak < 64 << 20,
+        "{peak} bytes live at once converting {TABLES} tables under a 1 MiB table-style face name"
     );
 }

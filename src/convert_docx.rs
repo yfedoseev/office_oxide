@@ -102,7 +102,15 @@ impl<'a, 'd> Cx<'a, 'd> {
         let base = match cached {
             Some(b) => b,
             None => {
-                let b = Rc::new(sheet.run_style_base(layer, pkey, ckey));
+                // The memo keeps the fold for the whole conversion, one per
+                // table-style layer: its text is charged, and left out once
+                // the budget cannot take it.
+                let fold = sheet.run_style_base(layer, pkey, ckey);
+                let b = Rc::new(if crate::limits::charge_copied_text(fold.heap_chars()) {
+                    fold
+                } else {
+                    fold.clone_light()
+                });
                 self.folds.runs.borrow_mut().insert(key, Rc::clone(&b));
                 b
             },
@@ -144,7 +152,13 @@ impl<'a, 'd> Cx<'a, 'd> {
         let base = match cached {
             Some(b) => b,
             None => {
-                let b = Rc::new(sheet.paragraph_style_base(layer, pkey));
+                // Kept for the whole conversion, like the run folds: charged.
+                let fold = sheet.paragraph_style_base(layer, pkey);
+                let b = Rc::new(if crate::limits::charge_copied_text(fold.heap_chars()) {
+                    fold
+                } else {
+                    fold.clone_light()
+                });
                 self.folds
                     .paragraphs
                     .borrow_mut()
