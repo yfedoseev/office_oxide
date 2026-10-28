@@ -522,13 +522,25 @@ impl Document {
     /// Unlike [`Self::to_markdown`], which uses the format-specific
     /// renderer, this goes through the IR so that options such as
     /// [`ir_render::ImageEmbed::Base64`] apply uniformly to every format.
+    ///
+    /// A spreadsheet is converted and rendered one sheet at a time, so only
+    /// one sheet's IR exists at once (see
+    /// [`xlsx::XlsxDocument::sheets_ir`]).
     pub fn to_markdown_with(&self, options: ir_render::MarkdownOptions) -> String {
-        self.to_ir().to_markdown_with(options)
+        match &self.inner {
+            DocumentInner::Xlsx(doc) => {
+                ir_render::markdown_from_sections(doc.sheets_ir().map(|s| s.section), options)
+            },
+            _ => self.to_ir().to_markdown_with(options),
+        }
     }
 
     /// Convert to an HTML fragment.
+    ///
+    /// A spreadsheet is converted and rendered one sheet at a time (see
+    /// [`Self::to_html_with`]).
     pub fn to_html(&self) -> String {
-        self.to_ir().to_html()
+        self.to_html_with(ir_render::HtmlOptions::default())
     }
 
     /// Convert to an HTML fragment with explicit rendering options.
@@ -536,8 +548,17 @@ impl Document {
     /// With [`ir_render::ImageEmbed::Base64`] the fragment carries its
     /// images inline as `data:` URIs, so it renders standalone — the
     /// counterpart of [`Self::to_markdown_with`].
+    ///
+    /// A spreadsheet is converted and rendered one sheet at a time, so only
+    /// one sheet's IR exists at once (see
+    /// [`xlsx::XlsxDocument::sheets_ir`]).
     pub fn to_html_with(&self, options: ir_render::HtmlOptions) -> String {
-        self.to_ir().to_html_with(options)
+        match &self.inner {
+            DocumentInner::Xlsx(doc) => {
+                ir_render::html_from_sections(doc.sheets_ir().map(|s| s.section), options)
+            },
+            _ => self.to_ir().to_html_with(options),
+        }
     }
 
     /// Convert to the format-agnostic Document IR.

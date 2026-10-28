@@ -44,6 +44,7 @@ pub mod worksheet;
 pub mod write;
 mod xlsb;
 
+pub use crate::convert_xlsx::{SheetIr, SheetIrs};
 pub use cell::{Cell, CellRef, CellValue};
 pub use date::DateTimeValue;
 pub use error::{Result, XlsxError};

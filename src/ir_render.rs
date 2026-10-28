@@ -323,15 +323,7 @@ impl DocumentIR {
     /// self-contained preview — the mirror of `to_markdown_with`'s existing
     /// image-embedding option.
     pub fn to_html_with(&self, options: HtmlOptions) -> String {
-        HTML_OPTIONS.with(|o| o.set(options));
-        let section_texts: Vec<String> = self
-            .sections
-            .iter()
-            .map(render_section_html)
-            .filter(|s| !s.is_empty())
-            .collect();
-        HTML_OPTIONS.with(|o| o.set(HtmlOptions::default()));
-        section_texts.join("\n<hr />\n")
+        html_from_sections(&self.sections, options)
     }
 
     /// Render the IR as markdown.
@@ -341,16 +333,61 @@ impl DocumentIR {
 
     /// Render the IR as markdown with explicit options.
     pub fn to_markdown_with(&self, options: MarkdownOptions) -> String {
-        MARKDOWN_OPTIONS.with(|o| o.set(options));
-        let section_texts: Vec<String> = self
-            .sections
-            .iter()
-            .map(render_section_markdown)
-            .filter(|s| !s.is_empty())
-            .collect();
-        MARKDOWN_OPTIONS.with(|o| o.set(MarkdownOptions::default()));
-        section_texts.join("\n\n---\n\n")
+        markdown_from_sections(&self.sections, options)
     }
+}
+
+/// Separates the HTML of two sections.
+const HTML_SECTION_SEPARATOR: &str = "\n<hr />\n";
+
+/// Separates the Markdown of two sections.
+const MARKDOWN_SECTION_SEPARATOR: &str = "\n\n---\n\n";
+
+/// Render sections as an HTML fragment, each as soon as it is handed over and
+/// dropped once rendered: the output of `DocumentIR::to_html_with`, without
+/// the sections having to exist together.
+pub(crate) fn html_from_sections<S: std::borrow::Borrow<Section>>(
+    sections: impl IntoIterator<Item = S>,
+    options: HtmlOptions,
+) -> String {
+    let mut out = String::new();
+    HTML_OPTIONS.with(|o| o.set(options));
+    for section in sections {
+        let html = render_section_html(section.borrow());
+        drop(section);
+        if html.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str(HTML_SECTION_SEPARATOR);
+        }
+        out.push_str(&html);
+    }
+    HTML_OPTIONS.with(|o| o.set(HtmlOptions::default()));
+    out
+}
+
+/// Render sections as Markdown, each as soon as it is handed over and
+/// dropped once rendered; see [`html_from_sections`].
+pub(crate) fn markdown_from_sections<S: std::borrow::Borrow<Section>>(
+    sections: impl IntoIterator<Item = S>,
+    options: MarkdownOptions,
+) -> String {
+    let mut out = String::new();
+    MARKDOWN_OPTIONS.with(|o| o.set(options));
+    for section in sections {
+        let md = render_section_markdown(section.borrow());
+        drop(section);
+        if md.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str(MARKDOWN_SECTION_SEPARATOR);
+        }
+        out.push_str(&md);
+    }
+    MARKDOWN_OPTIONS.with(|o| o.set(MarkdownOptions::default()));
+    out
 }
 
 // ---------------------------------------------------------------------------

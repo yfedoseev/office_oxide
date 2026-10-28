@@ -265,6 +265,43 @@ impl XlsxDocument {
         Some(buf)
     }
 
+    /// Convert the workbook to IR one section at a time, in the order of
+    /// [`Document::to_ir`](crate::Document::to_ir)`().sections`: each worksheet,
+    /// then the chart text, the pivot caches and the sheets that could not
+    /// be read.
+    ///
+    /// Nothing is converted until the iterator is advanced, and nothing it
+    /// has handed out is kept, so a caller that uses and drops each
+    /// [`SheetIr`](super::SheetIr) before asking for the next holds about
+    /// one sheet's IR whatever the workbook's size. This is how a browser
+    /// holds a page, and how openpyxl's read-only mode and Apache POI's
+    /// event model hold a worksheet.
+    ///
+    /// The allowances that bound the IR's memory are therefore a sheet's,
+    /// fresh for each: the empty cells that pad its rows
+    /// ([`limits::max_sheet_ir_padding_bytes`](crate::limits::max_sheet_ir_padding_bytes))
+    /// and the picture bytes it copies
+    /// ([`limits::max_image_bytes`](crate::limits::max_image_bytes)). What
+    /// bounds the run as a whole stays document-wide: the text budget
+    /// ([`limits::max_text_chars`](crate::limits::max_text_chars)), which the
+    /// padding is charged to as well, and the total of picture bytes copied
+    /// ([`limits::max_total_image_bytes`](crate::limits::max_total_image_bytes)).
+    /// A sheet that does not fit its own allowance is cut, with a notice in
+    /// the section, a [`SheetIr::warnings`](super::SheetIr::warnings) entry
+    /// and [`SheetIr::text_truncated`](super::SheetIr::text_truncated), and
+    /// the next sheet is converted whole; a document-wide limit ends the
+    /// iteration the same way. [`Document::to_ir`](crate::Document::to_ir)
+    /// holds every sheet at once, so it keeps document-wide allowances.
+    pub fn sheets_ir(&self) -> super::SheetIrs<'_> {
+        super::SheetIrs::new(self)
+    }
+
+    /// Convert worksheet `sheet_index` alone, with a sheet's own allowances
+    /// (see [`Self::sheets_ir`]); `None` when there is no such worksheet.
+    pub fn sheet_ir(&self, sheet_index: usize) -> Option<super::SheetIr> {
+        crate::convert_xlsx::sheet_to_ir(self, sheet_index)
+    }
+
     /// Convert to CSV string (default: first sheet).
     pub fn to_csv(&self) -> String {
         self.sheet_to_csv(0).unwrap_or_default()

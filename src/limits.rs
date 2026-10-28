@@ -265,12 +265,42 @@ pub fn set_max_ir_padding_bytes(bytes: usize) {
     MAX_IR_PADDING_BYTES.store(bytes, Ordering::Relaxed);
 }
 
-/// A document's remaining allowance of bytes for IR padding cells.
+/// The default allowance of memory for the empty table cells that pad the
+/// rows of one `.xlsx` sheet while the sheet is held in the IR: 1 GiB.
+///
+/// When a workbook is converted a sheet at a time (the sheet-by-sheet IR of
+/// [`XlsxDocument::sheets_ir`](crate::xlsx::XlsxDocument::sheets_ir), and
+/// `to_html`, `to_markdown_with` over a spreadsheet) only one sheet's cells
+/// exist at once, so the allowance is the sheet's, not the document's, and it
+/// is given back when the sheet is released. At about 600 bytes a cell the
+/// default holds about 1.8 million of them in one sheet: 18,000 rows of a
+/// hundred sparse columns. The characters the padding adds to the output are
+/// still charged, for the whole run, to the text budget's limit.
+pub const DEFAULT_MAX_SHEET_IR_PADDING_BYTES: usize = 1 << 30;
+
+static MAX_SHEET_IR_PADDING_BYTES: AtomicUsize =
+    AtomicUsize::new(DEFAULT_MAX_SHEET_IR_PADDING_BYTES);
+
+/// The per-sheet allowance of bytes for the empty cells padding the rows of
+/// a spreadsheet sheet in the IR, when sheets are converted one at a time.
+pub fn max_sheet_ir_padding_bytes() -> usize {
+    MAX_SHEET_IR_PADDING_BYTES.load(Ordering::Relaxed)
+}
+
+/// Set the per-sheet empty-cell padding allowance for every sheet converted
+/// afterwards. `usize::MAX` disables the bound.
+pub fn set_max_sheet_ir_padding_bytes(bytes: usize) {
+    MAX_SHEET_IR_PADDING_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// A remaining allowance of bytes for IR padding cells: the document's, or
+/// one sheet's.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct IrPaddingBudget {
     total: usize,
     remaining: usize,
     exhausted: bool,
+    per_sheet: bool,
 }
 
 impl IrPaddingBudget {
@@ -278,11 +308,20 @@ impl IrPaddingBudget {
         Self::with_limit(max_ir_padding_bytes())
     }
 
+    /// A fresh allowance for one sheet.
+    pub(crate) fn new_for_sheet() -> Self {
+        Self {
+            per_sheet: true,
+            ..Self::with_limit(max_sheet_ir_padding_bytes())
+        }
+    }
+
     pub(crate) fn with_limit(total: usize) -> Self {
         Self {
             total,
             remaining: total,
             exhausted: false,
+            per_sheet: false,
         }
     }
 
@@ -319,6 +358,14 @@ impl IrPaddingBudget {
     }
 
     pub(crate) fn notice(&self) -> String {
+        if self.per_sheet {
+            return format!(
+                "[sheet truncated: its rows are padded to the sheet's width with more than {} \
+                 bytes of empty table cells (office_oxide::limits::set_max_sheet_ir_padding_bytes) \
+                 — later rows of this sheet are missing]",
+                self.total
+            );
+        }
         format!(
             "[workbook truncated: its rows are padded to the sheet's width with more than {} \
              bytes of empty table cells (office_oxide::limits::set_max_ir_padding_bytes) — \
@@ -344,6 +391,28 @@ pub fn max_image_bytes() -> usize {
 /// `usize::MAX` disables the bound.
 pub fn set_max_image_bytes(bytes: usize) {
     MAX_IMAGE_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// The default total of picture bytes a run may copy into the IR when a
+/// workbook is converted a sheet at a time: 4 GiB, four times a sheet's.
+///
+/// A sheet's own allowance ([`max_image_bytes`]) is given back with the sheet,
+/// so without a total, a workbook of many sheets each drawing the same picture
+/// would copy it once per sheet without bound.
+pub const DEFAULT_MAX_TOTAL_IMAGE_BYTES: u64 = 4 << 30;
+
+static MAX_TOTAL_IMAGE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_TOTAL_IMAGE_BYTES);
+
+/// The most picture bytes all the sheets of one workbook may copy into the IR
+/// in a sheet-by-sheet conversion.
+pub fn max_total_image_bytes() -> u64 {
+    MAX_TOTAL_IMAGE_BYTES.load(Ordering::Relaxed)
+}
+
+/// Set the total picture-byte limit for every sheet-by-sheet conversion
+/// afterwards. `u64::MAX` disables the bound.
+pub fn set_max_total_image_bytes(bytes: u64) {
+    MAX_TOTAL_IMAGE_BYTES.store(bytes, Ordering::Relaxed);
 }
 
 thread_local! {

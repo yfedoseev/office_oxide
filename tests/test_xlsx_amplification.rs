@@ -20,11 +20,12 @@ const TEXT_BUDGET: usize = 60_000;
 fn set_budgets() {
     set_max_text_chars(TEXT_BUDGET);
     // About a thousand empty cells: five rows of the 200-column sheets below.
-    office_oxide::limits::set_max_ir_padding_bytes(
-        1_000
-            * (std::mem::size_of::<office_oxide::ir::TableCell>()
-                + std::mem::size_of::<office_oxide::ir::Element>()),
-    );
+    let allowance = 1_000
+        * (std::mem::size_of::<office_oxide::ir::TableCell>()
+            + std::mem::size_of::<office_oxide::ir::Element>());
+    office_oxide::limits::set_max_ir_padding_bytes(allowance);
+    // `to_html` converts a sheet at a time, against a sheet's allowance.
+    office_oxide::limits::set_max_sheet_ir_padding_bytes(allowance);
 }
 
 const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
@@ -1071,4 +1072,129 @@ fn test_hyperlinks_over_one_relationship_share_one_target_allocation() {
             .iter()
             .all(|t| std::sync::Arc::ptr_eq(t, &targets[0]))
     );
+}
+
+/// Cells merged across columns and down rows, with a merge covering a cell
+/// that holds a value.
+fn merged_workbook() -> Vec<u8> {
+    let sheet = format!(
+        r#"<worksheet xmlns="{NS}"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>head</t></is></c><c r="D1" t="inlineStr"><is><t>d</t></is></c></row><row r="2"><c r="A2"><v>1</v></c><c r="B2"><v>2</v></c></row><row r="3"><c r="A3"><v>3</v></c></row><row r="4"><c r="C4"><v>9</v></c></row></sheetData><mergeCells count="2"><mergeCell ref="A1:C1"/><mergeCell ref="A2:A3"/></mergeCells></worksheet>"#
+    );
+    package(
+        r#"<sheet name="M" sheetId="1" r:id="rId1"/>"#,
+        &worksheet_rel("rId1", "worksheets/sheet1.xml"),
+        &[("xl/worksheets/sheet1.xml", sheet.into_bytes())],
+    )
+}
+
+/// A sheet of flowing sentences (laid out as paragraphs) and an empty sheet.
+fn prose_workbook() -> Vec<u8> {
+    let mut sheet = format!(r#"<worksheet xmlns="{NS}"><sheetData>"#);
+    for r in 1..=12 {
+        sheet.push_str(&format!(
+            r#"<row r="{r}"><c r="A{r}" t="inlineStr"><is><t>This is a flowing sentence number {r} of some prose in a document style sheet.</t></is></c></row>"#
+        ));
+    }
+    sheet.push_str("</sheetData></worksheet>");
+    package(
+        r#"<sheet name="Prose" sheetId="1" r:id="rId1"/><sheet name="Empty" sheetId="2" r:id="rId2"/>"#,
+        &format!(
+            "{}{}",
+            worksheet_rel("rId1", "worksheets/sheet1.xml"),
+            worksheet_rel("rId2", "worksheets/sheet2.xml")
+        ),
+        &[
+            ("xl/worksheets/sheet1.xml", sheet.into_bytes()),
+            (
+                "xl/worksheets/sheet2.xml",
+                format!(r#"<worksheet xmlns="{NS}"><sheetData/></worksheet>"#).into_bytes(),
+            ),
+        ],
+    )
+}
+
+/// `sheets` sheets of `rows` rows, a label in column A and a number in
+/// column `far`.
+fn multi_sheet_workbook(sheets: usize, rows: usize, far: usize) -> Vec<u8> {
+    let far_name = col_name(far);
+    let (mut names, mut rels, mut parts) = (String::new(), String::new(), Vec::new());
+    for i in 1..=sheets {
+        let mut sheet = format!(r#"<worksheet xmlns="{NS}"><sheetData>"#);
+        for r in 1..=rows {
+            sheet.push_str(&format!(
+                r#"<row r="{r}"><c r="A{r}" t="inlineStr"><is><t>s{i}r{r}</t></is></c><c r="{far_name}{r}"><v>{r}</v></c></row>"#
+            ));
+        }
+        sheet.push_str("</sheetData></worksheet>");
+        names.push_str(&format!(r#"<sheet name="Sheet{i}" sheetId="{i}" r:id="rId{i}"/>"#));
+        rels.push_str(&worksheet_rel(&format!("rId{i}"), &format!("worksheets/sheet{i}.xml")));
+        parts.push((format!("xl/worksheets/sheet{i}.xml"), sheet.into_bytes()));
+    }
+    let parts: Vec<(&str, Vec<u8>)> = parts.iter().map(|(n, d)| (n.as_str(), d.clone())).collect();
+    package(&names, &rels, &parts)
+}
+
+/// Within the budgets, a workbook converted and rendered a sheet at a time is
+/// the workbook converted and rendered whole: the same sections, metadata,
+/// HTML and Markdown, down to the byte.
+#[test]
+fn test_the_sheet_by_sheet_path_matches_the_whole_document_one() {
+    use office_oxide::ir_render::{HtmlOptions, ImageEmbed, MarkdownOptions};
+    set_budgets();
+    let fixtures = vec![
+        ("sparse", sparse_wide_workbook(30, 10)),
+        ("wide", sparse_wide_workbook(3, 150)),
+        ("merged", merged_workbook()),
+        ("prose", prose_workbook()),
+        ("pictures", picture_workbook(3, 50, 2)),
+        ("comments", comment_fan_out_workbook(5, 5)),
+        ("pivots", pivot_fan_out_workbook(2, 5, 4, 3, 4)),
+        ("links", hyperlink_fan_out_workbook(5, 20)),
+        ("rich", rich_text_fan_out_workbook(5, 3)),
+        ("number formats", number_format_workbook("0.00", 5)),
+        ("several sheets", multi_sheet_workbook(3, 10, 20)),
+    ];
+    for (name, bytes) in fixtures {
+        let doc = open(bytes).unwrap();
+        let ir = doc.to_ir();
+        assert!(!ir.metadata.text_truncated, "{name}: not within the budgets");
+
+        let xlsx = doc.as_xlsx().unwrap();
+        let mut sheets = xlsx.sheets_ir();
+        let sections: Vec<_> = sheets.by_ref().map(|s| s.section).collect();
+        assert_eq!(
+            serde_json::to_string(&sections).unwrap(),
+            serde_json::to_string(&ir.sections).unwrap(),
+            "{name}: sections differ"
+        );
+        assert_eq!(
+            serde_json::to_string(&sheets.metadata()).unwrap(),
+            serde_json::to_string(&ir.metadata).unwrap(),
+            "{name}: metadata differs"
+        );
+
+        assert_eq!(doc.to_html(), ir.to_html(), "{name}: HTML differs");
+        let embed = MarkdownOptions {
+            image_embed: ImageEmbed::Base64,
+        };
+        assert_eq!(
+            doc.to_html_with(HtmlOptions {
+                image_embed: ImageEmbed::Base64
+            }),
+            ir.to_html_with(HtmlOptions {
+                image_embed: ImageEmbed::Base64
+            }),
+            "{name}: embedded-image HTML differs"
+        );
+        assert_eq!(
+            doc.to_markdown_with(MarkdownOptions::default()),
+            ir.to_markdown_with(MarkdownOptions::default()),
+            "{name}: Markdown differs"
+        );
+        assert_eq!(
+            doc.to_markdown_with(embed),
+            ir.to_markdown_with(embed),
+            "{name}: embedded-image Markdown differs"
+        );
+    }
 }
