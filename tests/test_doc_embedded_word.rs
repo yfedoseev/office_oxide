@@ -9,7 +9,9 @@
 
 mod common;
 
-use common::{CfbNode, FibTweaks, LimitScope, Para, Subdocs, build_doc_streams, cfb_tree};
+use common::{
+    CfbNode, FibTweaks, LimitScope, Para, Subdocs, build_doc_streams, cfb_tree, default_limits,
+};
 use office_oxide::ir::Element;
 use office_oxide::limits::{max_embedded_bytes, max_embedded_packages, max_text_chars};
 use office_oxide::limits::{set_max_embedded_bytes, set_max_embedded_packages, set_max_text_chars};
@@ -58,6 +60,7 @@ fn open(bytes: Vec<u8>) -> Document {
 
 #[test]
 fn test_the_text_of_an_embedded_word_document_follows_its_placeholder() {
+    let _defaults = default_limits();
     let doc = open(host(vec![word_object("_1", "Festive spread recipe")]));
     let text = doc.plain_text();
     let at = |needle: &str| {
@@ -70,6 +73,7 @@ fn test_the_text_of_an_embedded_word_document_follows_its_placeholder() {
 
 #[test]
 fn test_every_surface_carries_the_embedded_text() {
+    let _defaults = default_limits();
     let doc = open(host(vec![word_object("_1", "Festive spread recipe")]));
     assert!(doc.to_markdown().contains("Festive spread recipe"));
     let ir = doc.to_ir();
@@ -144,6 +148,7 @@ fn test_embedded_text_is_charged_to_the_text_budget() {
 
 #[test]
 fn test_an_embedded_document_that_cannot_be_read_keeps_its_placeholder() {
+    let _defaults = default_limits();
     let broken = CfbNode::Storage(
         "_1".into(),
         vec![
@@ -164,6 +169,7 @@ fn test_an_embedded_document_that_cannot_be_read_keeps_its_placeholder() {
 /// embedded document is not followed.
 #[test]
 fn test_objects_inside_an_embedded_document_are_not_followed() {
+    let _defaults = default_limits();
     let (wd, table) = streams("outer embedded text");
     let inner = word_object("_9", "inner embedded text");
     let outer = CfbNode::Storage(
@@ -182,6 +188,7 @@ fn test_objects_inside_an_embedded_document_are_not_followed() {
 
 #[test]
 fn test_a_document_without_embedded_objects_is_unchanged() {
+    let _defaults = default_limits();
     let (wd, table) = streams("Host body text");
     let bytes = cfb_tree(vec![
         CfbNode::Stream("WordDocument".into(), wd),
@@ -209,6 +216,7 @@ fn test_the_byte_allowance_stops_reading_embedded_documents() {
 /// time it is copied, and each copy is in the text, as it is in the file.
 #[test]
 fn test_a_document_embedded_under_several_names_appears_once_per_copy() {
+    let _defaults = default_limits();
     let doc = open(host(vec![
         word_object("_1", "shared article"),
         word_object("_2", "shared article"),
