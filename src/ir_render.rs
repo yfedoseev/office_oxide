@@ -966,11 +966,28 @@ fn render_table_markdown(table: &Table) -> String {
         return String::new();
     }
 
+    // A GFM table cannot span columns, so a cell that covers several grid
+    // columns is followed by empty ones. A grid column in which no row starts
+    // a cell only continues spans: it holds no text and no cell's own
+    // position, and writing it just widens the table (a Word 6/95 table whose
+    // rows each have their own boundaries came out 28 columns wide for 14
+    // cells). Only those columns are left out.
+    let keep: Vec<usize> = (0..col_count)
+        .filter(|&c| {
+            grid.iter()
+                .any(|row| row.get(c).is_some_and(Option::is_some))
+        })
+        .collect();
+    let col_count = keep.len();
+    if col_count == 0 {
+        return String::new();
+    }
+
     let mut result = String::new();
 
     let write_row = |cells: &[Option<&TableCell>], out: &mut String| {
         out.push('|');
-        for slot in cells.iter().take(col_count) {
+        for slot in keep.iter().map(|&c| cells.get(c).copied().flatten()) {
             out.push(' ');
             out.push_str(&slot.map(render_cell_markdown).unwrap_or_default());
             out.push_str(" |");
@@ -1711,6 +1728,63 @@ mod tests {
         assert!(md.contains("| H1 | H2 |"));
         assert!(md.contains("| --- | --- |"));
         assert!(md.contains("| A | B |"));
+    }
+
+    fn spanning(text: &str, col_span: u32) -> TableCell {
+        TableCell {
+            col_span,
+            ..cell(text)
+        }
+    }
+
+    fn table_of(rows: Vec<Vec<TableCell>>) -> DocumentIR {
+        simple_ir(vec![Element::Table(Table {
+            rows: rows
+                .into_iter()
+                .map(|cells| TableRow {
+                    cells,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })])
+    }
+
+    /// A grid column that no cell starts in, in any row, only continues
+    /// spans: writing it adds empty columns and no text.
+    #[test]
+    fn test_markdown_table_drops_grid_columns_that_only_continue_spans() {
+        let md = table_of(vec![
+            vec![spanning("X", 2), spanning("Y", 2)],
+            vec![spanning("P", 2), spanning("Q", 2)],
+        ])
+        .to_markdown();
+        assert_eq!(md, "| X | Y |\n| --- | --- |\n| P | Q |");
+    }
+
+    #[test]
+    fn test_markdown_table_keeps_a_column_some_row_starts_a_cell_in() {
+        let md = table_of(vec![
+            vec![spanning("X", 2), cell("Y")],
+            vec![cell("P"), cell("Q"), cell("R")],
+        ])
+        .to_markdown();
+        assert_eq!(md, "| X |  | Y |\n| --- | --- | --- |\n| P | Q | R |");
+    }
+
+    #[test]
+    fn test_markdown_table_with_misaligned_rows_loses_no_cell() {
+        // Word 6/95 style: every row has its own boundaries.
+        let md = table_of(vec![
+            vec![spanning("a", 2), spanning("b", 2), cell("c")],
+            vec![cell("d"), spanning("e", 3), cell("f")],
+        ])
+        .to_markdown();
+        for t in ["a", "b", "c", "d", "e", "f"] {
+            assert!(md.contains(&format!("| {t} ")), "{t} missing from {md}");
+        }
+        let widths: Vec<_> = md.lines().map(|l| l.matches('|').count()).collect();
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "ragged: {md}");
     }
 
     #[test]
