@@ -764,7 +764,11 @@ pub(crate) fn merge_threaded_comments(
             // Each message line names its author, so a long name repeated
             // down a long thread is charged for every message. A thread
             // that does not fit is left out whole, and so are the rest.
-            let line_chars = author.as_ref().map_or(0, |a| a.len() + 2) + m.text.len();
+            // A message is a string of its own until the thread's lines are
+            // joined, however short its text.
+            let line_chars = author.as_ref().map_or(0, |a| a.len() + 2)
+                + m.text.len()
+                + std::mem::size_of::<String>();
             if !budget.charge(line_chars) {
                 truncated = true;
                 break 'threads;
@@ -2585,6 +2589,29 @@ mod tests {
         let (merged, truncated) = merge_threaded_comments(&[], &threaded, &persons, &mut budget);
         assert!(truncated, "5,000 characters of thread text exceed a 1,000 budget");
         assert!(merged.is_empty(), "a thread that does not fit is left out whole");
+    }
+
+    /// A message of one character is still a string of its own, so the
+    /// messages of a thread are charged for more than their text: many short
+    /// ones cannot be merged for a budget of their characters.
+    #[test]
+    fn test_a_short_threaded_message_is_charged_as_the_string_that_holds_it() {
+        let threaded = ThreadedComments::new(
+            (0..100)
+                .map(|_| RawThreadedComment {
+                    cell_ref: "A1".to_string(),
+                    parent_id: None,
+                    person_id: None,
+                    text: "x".to_string(),
+                })
+                .collect(),
+        );
+        // The note that holds the thread, and the messages' text, fit.
+        let note = std::mem::size_of::<crate::ir::Note>() + 2;
+        let mut budget = crate::limits::TextBudget::with_limit(note + 100 + 100);
+        let (merged, truncated) =
+            merge_threaded_comments(&[], &threaded, &std::collections::HashMap::new(), &mut budget);
+        assert!(truncated && merged.is_empty(), "100 strings cost more than 100 characters");
     }
 
     #[test]
