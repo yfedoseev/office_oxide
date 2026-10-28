@@ -46,6 +46,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     let mut image_budget = crate::limits::TextBudget::with_limit(crate::limits::max_image_bytes());
     let mut comments_truncated = false;
     let mut warnings: Vec<String> = Vec::new();
+    let mut format_code_omitted = false;
     let mut padding_budget = crate::limits::TextBudget::new();
 
     for (ws_idx, ws) in doc.worksheets.iter().enumerate() {
@@ -149,7 +150,7 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
                     std::mem::take(&mut buf)
                 };
                 let (data_type, raw_number, number_format, number_format_id) =
-                    cell_semantics(doc, cell, &date_indices);
+                    cell_semantics(doc, cell, &date_indices, &mut format_code_omitted);
                 cells.push(CellData {
                     col: cell.reference.col,
                     hyperlink: link.map(|(target, _)| target.clone()),
@@ -715,6 +716,13 @@ pub(crate) fn xlsx_to_ir(doc: &crate::xlsx::XlsxDocument) -> DocumentIR {
     if budget.exhausted() {
         warnings.push(budget.notice());
     }
+    if format_code_omitted {
+        warnings.push(format!(
+            "some cells' number format code is longer than {} characters and is not listed on \
+             them (they keep their format id and values)",
+            crate::limits::MAX_NUMBER_FORMAT_CHARS
+        ));
+    }
     let mut ir = DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Xlsx,
@@ -978,6 +986,7 @@ fn cell_semantics(
     doc: &crate::xlsx::XlsxDocument,
     cell: &crate::xlsx::Cell,
     date_indices: &std::collections::HashSet<u32>,
+    format_code_omitted: &mut bool,
 ) -> (Option<CellDataType>, Option<f64>, Option<String>, Option<u32>) {
     use crate::xlsx::CellValue;
 
@@ -990,13 +999,24 @@ fn cell_semantics(
         .style_index
         .and_then(|idx| doc.styles.as_ref()?.number_format_id_for(idx))
         .filter(|&id| id != 0);
-    let fmt_str = cell
+    let declared = cell
         .style_index
-        .and_then(|idx| doc.styles.as_ref()?.number_format_for(idx))
-        .map(|s| s.to_string())
-        .or_else(|| {
+        .and_then(|idx| doc.styles.as_ref()?.number_format_for(idx));
+    let max = crate::limits::MAX_NUMBER_FORMAT_CHARS;
+    // The code is copied onto every cell of the style, so one longer than
+    // Excel allows is left off rather than multiplied (and is never copied
+    // to be measured). A character is at most four bytes, so only a short
+    // code is counted.
+    let fmt_str = match declared {
+        Some(code) if code.len() > max * 4 || code.chars().count() > max => {
+            *format_code_omitted = true;
+            None
+        },
+        Some(code) => Some(code.to_string()),
+        None => {
             fmt_id.and_then(|id| crate::xlsx::numfmt::builtin_format_code(id).map(str::to_string))
-        });
+        },
+    };
 
     let (data_type, raw_number) = match &cell.value {
         CellValue::Empty => unreachable!("handled above"),

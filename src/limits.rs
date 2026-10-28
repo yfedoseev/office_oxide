@@ -466,6 +466,15 @@ pub(crate) const MAX_FORMULA_CHARS: usize = 8192;
 /// spreadsheet application: the links that name it are left out, reported.
 pub(crate) const MAX_HYPERLINK_TARGET_CHARS: usize = 2083;
 
+/// The longest number-format code listed on an IR cell, in characters:
+/// Excel's own limit for a custom format (255).
+///
+/// A format code is stored once in the stylesheet and listed on every numeric
+/// cell that uses the style, so a megabyte code would be a megabyte per cell.
+/// A longer code cannot come from a spreadsheet application; the cells keep
+/// their format id and their values, and the code is left off, reported.
+pub(crate) const MAX_NUMBER_FORMAT_CHARS: usize = 255;
+
 /// What one empty table cell in the IR counts for against the text budget:
 /// its allocation is a few hundred bytes, where a character of text is one,
 /// so the default budget admits about four million of them.

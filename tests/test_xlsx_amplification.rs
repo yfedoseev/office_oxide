@@ -877,3 +877,69 @@ fn test_a_few_rich_text_cells_are_unaffected() {
     assert_eq!(ir_span_count(&ir), 15);
     assert!(!ir.metadata.text_truncated);
 }
+
+/// `cells` numeric cells in column A, all in a style whose number format code
+/// is `code`.
+fn number_format_workbook(code: &str, cells: usize) -> Vec<u8> {
+    let styles = format!(
+        r#"<styleSheet xmlns="{NS}"><numFmts count="1"><numFmt numFmtId="164" formatCode="{code}"/></numFmts><fonts count="1"><font/></fonts><fills count="1"><fill/></fills><borders count="1"><border/></borders><cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="164" applyNumberFormat="1"/></cellXfs></styleSheet>"#
+    );
+    let mut sheet = format!(r#"<worksheet xmlns="{NS}"><sheetData>"#);
+    for r in 1..=cells {
+        sheet.push_str(&format!(r#"<row r="{r}"><c r="A{r}" s="1"><v>{r}</v></c></row>"#));
+    }
+    sheet.push_str("</sheetData></worksheet>");
+    package(
+        r#"<sheet name="S" sheetId="1" r:id="rId1"/>"#,
+        &worksheet_rel("rId1", "worksheets/sheet1.xml"),
+        &[
+            ("xl/worksheets/sheet1.xml", sheet.into_bytes()),
+            ("xl/styles.xml", styles.into_bytes()),
+        ],
+    )
+}
+
+/// The number-format code of every table cell in the IR that has one.
+fn ir_number_formats(ir: &office_oxide::DocumentIR) -> Vec<String> {
+    use office_oxide::ir::Element;
+    ir.sections
+        .iter()
+        .flat_map(|s| &s.elements)
+        .filter_map(|e| match e {
+            Element::Table(t) => Some(t),
+            _ => None,
+        })
+        .flat_map(|t| t.rows.iter().flat_map(|r| &r.cells))
+        .filter_map(|c| c.number_format.clone())
+        .collect()
+}
+
+#[test]
+fn test_a_number_format_code_longer_than_excels_limit_is_not_copied_into_every_cell() {
+    set_budgets();
+    // Excel accepts at most 255 characters of format code; a 100,000
+    // character one was copied into every cell that used it.
+    let code = format!("0.{}", "0".repeat(100_000));
+    let doc = open(number_format_workbook(&code, 40)).unwrap();
+    let ir = doc.to_ir();
+    let copied: usize = ir_number_formats(&ir).iter().map(String::len).sum();
+    assert_eq!(copied, 0, "{copied} bytes of format code were copied into the IR");
+    assert!(
+        ir.metadata
+            .warnings
+            .iter()
+            .any(|w| w.contains("number format")),
+        "no warning: {:?}",
+        ir.metadata.warnings
+    );
+    assert!(doc.plain_text().contains("40"), "the cells keep their values");
+}
+
+#[test]
+fn test_an_ordinary_number_format_code_is_still_reported_on_each_cell() {
+    set_budgets();
+    let doc = open(number_format_workbook("0.00", 5)).unwrap();
+    let ir = doc.to_ir();
+    assert_eq!(ir_number_formats(&ir), vec!["0.00"; 5]);
+    assert!(ir.metadata.warnings.is_empty(), "{:?}", ir.metadata.warnings);
+}
