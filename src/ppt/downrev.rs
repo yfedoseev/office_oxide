@@ -843,4 +843,23 @@ mod tests {
         assert!(out.contains("AAAA"), "leading text survives truncation");
         assert!(!out.is_empty(), "truncation still yields text");
     }
+
+    #[test]
+    fn test_append_slide_downrev_drops_symbol_only_package_r4() {
+        // R4 characterisation: `text_has_alnum` drops every package whose text
+        // has no alphanumeric character. A shape whose only content is symbols
+        // or punctuation (a decorative glyph, a purely symbolic label) is
+        // therefore intentionally NOT surfaced — a deliberate recall trade-off,
+        // not a bug. This pins that contract so a later "keep all text" change
+        // is forced to reckon with it.
+        let xml = "<p:sp><a:p><a:r><a:t>@#$%!?</a:t></a:r></a:p></p:sp>";
+        let slide = container(0x03EE, &[record(0x03EF, 0, &carrier(xml))]);
+        let mut runs = Vec::new();
+        let mut budget = DownrevBudget::new();
+        append_slide_downrev(&slide, &mut runs, &mut budget);
+        assert!(
+            runs.is_empty(),
+            "symbol-only package is intentionally dropped (R4)"
+        );
+    }
 }

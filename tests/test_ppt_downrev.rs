@@ -397,3 +397,48 @@ fn test_downrev_identical_package_kept_on_each_slide() {
         "slide 2 must ALSO extract the shared package (R1: per-slide text)"
     );
 }
+
+/// Build a fully-valid (but synthesised) legacy `.ppt` byte stream carrying
+/// downrev packages on two slides, via the same `common` builders the other
+/// tests use. It is persisted as `tests/fixtures/wps_downrev.ppt` so G5 can run
+/// against a real on-disk file (not an in-memory cursor). A captured real WPS
+/// export would be a stricter fixture but is not checked in.
+fn build_downrev_ppt_bytes() -> Vec<u8> {
+    let stream = ppt_stream_with_persist(&[slide_one(), slide_two()], &[master_group()]);
+    cfb_with_stream("PowerPoint Document", &stream)
+}
+
+/// G5 (real-file regression): a committed, fully-valid `.ppt` fixture is read
+/// from disk through the public `Document::from_reader` API (real file IO, not a
+/// cursor). Downrev text must surface per slide and master text must not leak.
+/// The fixture is (re)created from `build_downrev_ppt_bytes` only if it is
+/// missing, so the test is self-healing yet normally exercises the checked-in
+/// file.
+#[test]
+fn test_downrev_real_file_fixture_regression() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/wps_downrev.ppt"
+    );
+    if !std::path::Path::new(path).exists() {
+        std::fs::create_dir_all(dir).expect("create fixtures dir");
+        std::fs::write(path, build_downrev_ppt_bytes()).expect("write fixture");
+    }
+    let file = std::fs::File::open(path).expect("wps_downrev.ppt fixture must exist");
+    let doc = Document::from_reader(file, DocumentFormat::Ppt).expect("fixture opens");
+    let ppt = doc.as_ppt().expect("parsed as ppt");
+    assert_eq!(ppt.slides.len(), 2, "one slide per SlideContainer");
+    let text = ppt.plain_text();
+    assert!(text.contains("Quarterly results"), "slide 1 downrev text");
+    assert!(text.contains("Outlook"), "slide 2 downrev text");
+    assert!(
+        !text.contains("Master title style"),
+        "master downrev text must not leak into slides"
+    );
+    assert_eq!(
+        text.matches("Steady growth expected").count(),
+        1,
+        "within-slide duplicate packages collapse to one run"
+    );
+}
