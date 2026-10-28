@@ -91,24 +91,28 @@ pub fn set_max_text_chars(chars: usize) {
     MAX_TEXT_CHARS.store(chars, Ordering::Relaxed);
 }
 
-/// The default per-document allowance of empty grid slots: 8 Mi.
+/// The default per-document allowance of empty grid slots: 16 Mi.
 ///
 /// A legacy `.xls` sheet is stored as rows that run to their last used
 /// column, so one number in column 255 of each of 65,535 rows costs 256
 /// slots per row: 16.7M slots from 65,535 records, and six such sheets
 /// made a 7 MB file allocate 2.6 GB. Each slot is a `CellValue` and an
 /// `XF` index in the sheet, and converting the sheet to the IR adds a table
-/// cell for it, about 70 bytes in all: the earlier 32 Mi allowance let that
-/// file reach 0.9 GB on open and 2.1 GB in `to_ir`; 8 Mi bounds both near a
-/// quarter of that. Only the *empty* slots that pad a row out to its last
-/// cell are charged, never the cells themselves, so a dense 65,536 x 256
-/// sheet (which carries 16.7M cells and a file to match) costs nothing, and
-/// a sheet whose rows reach their last column with up to about 32,000 rows
-/// of nothing in between still fits. A workbook that needs more is cut at
-/// the row that does not fit, loudly; processes that read such workbooks
-/// raise the allowance with
-/// [the setter](crate::limits::set_max_grid_padding_cells).
-pub const DEFAULT_MAX_GRID_PADDING_CELLS: usize = 8 << 20;
+/// cell for it, about 70 bytes in all: a 32 Mi allowance let that file
+/// reach 0.9 GB on open and 2.1 GB in `to_ir`; 16 Mi bounds both near half of
+/// that. Only the *empty* slots that pad a row out to its last cell are
+/// charged, never the cells themselves, so a dense 65,536 x 256 sheet (which
+/// carries 16.7M cells and a file to match) costs nothing, and a sheet whose
+/// rows reach their last column with up to about 64,000 rows of nothing in
+/// between still fits.
+///
+/// The document's allowance is shared by its sheets, but no sheet may spend
+/// more than [`DEFAULT_MAX_SHEET_GRID_PADDING_CELLS`] of it, so one sparse
+/// sheet cannot leave the later sheets of a workbook without rows. A
+/// workbook that needs more is cut at the row that does not fit, loudly, and
+/// the notice names the sheet; processes that read such workbooks raise the
+/// allowance with [the setter](crate::limits::set_max_grid_padding_cells).
+pub const DEFAULT_MAX_GRID_PADDING_CELLS: usize = 16 << 20;
 
 static MAX_GRID_PADDING_CELLS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_GRID_PADDING_CELLS);
 
@@ -121,6 +125,30 @@ pub fn max_grid_padding_cells() -> usize {
 /// afterwards. `usize::MAX` disables the bound.
 pub fn set_max_grid_padding_cells(cells: usize) {
     MAX_GRID_PADDING_CELLS.store(cells, Ordering::Relaxed);
+}
+
+/// The default allowance of empty grid slots for one `.xls` sheet: 8 Mi.
+///
+/// This is what the whole document was allowed before sheets had their own:
+/// a sheet that fitted then fits now. A realistic wide sheet (65,000 rows of
+/// 60 columns, 60% filled) pads about 2.4M slots, so a workbook of several
+/// such sheets fits within the document's
+/// [`DEFAULT_MAX_GRID_PADDING_CELLS`], while a hostile sparse sheet is cut at
+/// this and leaves the rest of the document its allowance.
+pub const DEFAULT_MAX_SHEET_GRID_PADDING_CELLS: usize = 8 << 20;
+
+static MAX_SHEET_GRID_PADDING_CELLS: AtomicUsize =
+    AtomicUsize::new(DEFAULT_MAX_SHEET_GRID_PADDING_CELLS);
+
+/// The per-sheet allowance of empty slots padding spreadsheet rows.
+pub fn max_sheet_grid_padding_cells() -> usize {
+    MAX_SHEET_GRID_PADDING_CELLS.load(Ordering::Relaxed)
+}
+
+/// Set the per-sheet empty-slot allowance for every document read
+/// afterwards. `usize::MAX` disables the bound.
+pub fn set_max_sheet_grid_padding_cells(cells: usize) {
+    MAX_SHEET_GRID_PADDING_CELLS.store(cells, Ordering::Relaxed);
 }
 
 /// The default per-document allowance of inflated image bytes: 256 Mi.
@@ -181,61 +209,142 @@ impl InflateBudget {
     }
 }
 
-/// A document's remaining allowance of empty grid slots.
-#[derive(Debug, Clone, Copy)]
+/// How many cut sheets a notice names before it counts the rest.
+const GRID_CUTS_NAMED: usize = 5;
+
+/// A document's remaining allowance of empty grid slots: a total for the
+/// document, and one for the sheet being read.
+#[derive(Debug, Clone)]
 pub(crate) struct GridBudget {
     total: usize,
     remaining: usize,
+    sheet_total: usize,
+    sheet_remaining: usize,
+    /// The sheet being read has spent its own allowance.
+    sheet_exhausted: bool,
+    /// The document's allowance is spent.
     exhausted: bool,
+    /// Name of the sheet being read.
+    sheet: String,
+    /// Sheets cut so far: `(name, cut by the document's allowance)`.
+    cuts: Vec<(String, bool)>,
 }
 
 impl GridBudget {
     pub(crate) fn new() -> Self {
-        Self::with_limit(max_grid_padding_cells())
+        Self::with_limits(max_grid_padding_cells(), max_sheet_grid_padding_cells())
     }
 
+    /// An allowance of `total` for the document that no sheet may exceed on
+    /// its own: the first sheet to need more than `total` takes it all.
+    #[cfg(test)]
     pub(crate) fn with_limit(total: usize) -> Self {
+        Self::with_limits(total, total)
+    }
+
+    pub(crate) fn with_limits(total: usize, per_sheet: usize) -> Self {
         Self {
             total,
             remaining: total,
+            sheet_total: per_sheet,
+            sheet_remaining: per_sheet,
+            sheet_exhausted: false,
             exhausted: false,
+            sheet: String::new(),
+            cuts: Vec::new(),
         }
     }
 
-    /// Charge `slots` empty slots. Returns `false` when they do not fit, and
-    /// for every nonzero charge once the allowance is spent; the caller stops
-    /// building rows. A charge of zero always succeeds: a row that needs no
-    /// padding costs nothing, however much of the allowance is gone.
+    /// Start a sheet: it gets its own allowance, within what is left of the
+    /// document's.
+    pub(crate) fn begin_sheet(&mut self, name: &str) {
+        self.sheet_remaining = self.sheet_total;
+        self.sheet_exhausted = false;
+        self.sheet.clear();
+        self.sheet.push_str(name);
+    }
+
+    /// Charge `slots` empty slots. Returns `false` when they do not fit the
+    /// sheet's or the document's allowance, and for every nonzero charge once
+    /// either is spent; the caller stops building rows. A charge of zero
+    /// always succeeds: a row that needs no padding costs nothing, however
+    /// much of the allowance is gone.
     pub(crate) fn charge(&mut self, slots: usize) -> bool {
         if slots == 0 {
             return true;
         }
-        if self.exhausted {
+        if self.exhausted || self.sheet_exhausted {
             return false;
         }
-        match self.remaining.checked_sub(slots) {
-            Some(rest) => {
+        match (self.remaining.checked_sub(slots), self.sheet_remaining.checked_sub(slots)) {
+            (Some(rest), Some(sheet_rest)) => {
                 self.remaining = rest;
+                self.sheet_remaining = sheet_rest;
                 true
             },
-            None => {
-                self.remaining = 0;
-                self.exhausted = true;
+            (rest, _) => {
+                // The document's allowance is what ran out when it cannot
+                // pay; otherwise the sheet's own.
+                let by_document = rest.is_none();
+                if by_document {
+                    self.remaining = 0;
+                    self.exhausted = true;
+                } else {
+                    self.sheet_remaining = 0;
+                    self.sheet_exhausted = true;
+                }
+                self.cuts.push((self.sheet.clone(), by_document));
                 false
             },
         }
     }
 
-    pub(crate) fn exhausted(&self) -> bool {
-        self.exhausted
+    /// One notice for the sheets cut by their own allowance and one for the
+    /// sheet the document's allowance ran out on, each naming the sheets.
+    pub(crate) fn notices(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let by_sheet: Vec<&str> = self
+            .cuts
+            .iter()
+            .filter(|(_, by_document)| !by_document)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !by_sheet.is_empty() {
+            out.push(format!(
+                "[sheet truncated: the sparse rows of {} need more than {} empty cells of padding \
+                 (office_oxide::limits::set_max_sheet_grid_padding_cells) — later rows of \
+                 {} are missing]",
+                Self::name_list(&by_sheet),
+                self.sheet_total,
+                if by_sheet.len() == 1 {
+                    "this sheet"
+                } else {
+                    "these sheets"
+                }
+            ));
+        }
+        if let Some((name, _)) = self.cuts.iter().find(|(_, by_document)| *by_document) {
+            out.push(format!(
+                "[workbook truncated: its sparse rows need more than {} empty cells of padding \
+                 (office_oxide::limits::set_max_grid_padding_cells) — rows from sheet '{name}' \
+                 on are missing]",
+                self.total
+            ));
+        }
+        out
     }
 
-    pub(crate) fn notice(&self) -> String {
-        format!(
-            "[workbook truncated: its sparse rows need more than {} empty cells of padding \
-             (office_oxide::limits::set_max_grid_padding_cells) — later rows are missing]",
-            self.total
-        )
+    fn name_list(names: &[&str]) -> String {
+        let shown: Vec<String> = names
+            .iter()
+            .take(GRID_CUTS_NAMED)
+            .map(|n| format!("'{n}'"))
+            .collect();
+        let mut list = shown.join(", ");
+        if names.len() > GRID_CUTS_NAMED {
+            list.push_str(&format!(" and {} more", names.len() - GRID_CUTS_NAMED));
+        }
+        format!("sheet{} {list}", if names.len() == 1 { "" } else { "s" })
     }
 }
 
@@ -779,6 +888,34 @@ mod tests {
         let d = IrPaddingBudget::new();
         assert!(d.notice().contains("set_max_ir_padding_bytes"));
         assert!(d.notice().starts_with("[workbook truncated"));
+    }
+
+    #[test]
+    fn test_grid_notices_name_the_sheets_and_the_limit_that_cut_them() {
+        let mut b = GridBudget::with_limits(100, 10);
+        b.begin_sheet("A");
+        assert!(b.charge(10));
+        assert!(!b.charge(1), "the sheet's allowance is spent");
+        assert!(b.charge(0));
+        b.begin_sheet("B");
+        assert!(b.charge(10), "a new sheet has its own allowance");
+        for name in ["C", "D", "E", "F", "G", "H"] {
+            b.begin_sheet(name);
+            assert!(!b.charge(11));
+        }
+        let notices = b.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("'A'") && notices[0].contains("and 2 more"), "{notices:?}");
+        assert!(notices[0].contains("set_max_sheet_grid_padding_cells"));
+        let mut b = GridBudget::with_limits(15, 10);
+        b.begin_sheet("A");
+        assert!(b.charge(10));
+        b.begin_sheet("B");
+        assert!(!b.charge(6), "only 5 of the document's allowance is left");
+        let notices = b.notices();
+        assert!(
+            notices[0].contains("sheet 'B'") && notices[0].contains("set_max_grid_padding_cells")
+        );
     }
 
     #[test]
