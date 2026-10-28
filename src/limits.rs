@@ -352,6 +352,29 @@ pub fn set_max_write_table_cells(cells: usize) {
     MAX_WRITE_TABLE_CELLS.store(cells, Ordering::Relaxed);
 }
 
+/// The default most worksheets an IR written to `.xlsx` may hold: 32,767.
+///
+/// Every sheet is a part of its own with a relationships part beside it, so
+/// this keeps the package under the 65,535 entries a zip without ZIP64
+/// extensions can hold. Excel itself has no fixed sheet limit (memory
+/// decides) and openpyxl none at all, but a genuine workbook has tens or
+/// hundreds of sheets, not tens of thousands.
+pub const DEFAULT_MAX_WRITE_SHEETS: usize = 32_767;
+
+static MAX_WRITE_SHEETS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_WRITE_SHEETS);
+
+/// The most sections (worksheets) an IR written to `.xlsx` may hold before
+/// the write is refused.
+pub fn max_write_sheets() -> usize {
+    MAX_WRITE_SHEETS.load(Ordering::Relaxed)
+}
+
+/// Set the worksheet limit for every write afterwards. `usize::MAX`
+/// disables the bound.
+pub fn set_max_write_sheets(sheets: usize) {
+    MAX_WRITE_SHEETS.store(sheets, Ordering::Relaxed);
+}
+
 /// The default most list items one Markdown document may parse into:
 /// 100,000. Each item becomes about 250 bytes of IR.
 pub const DEFAULT_MAX_MARKDOWN_LIST_ITEMS: usize = 100_000;

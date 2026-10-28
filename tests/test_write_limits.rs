@@ -122,3 +122,20 @@ fn test_cells_are_counted_across_tables_and_inside_nested_content() {
     let nested = ir_with(vec![Element::Table(outer)], DocumentFormat::Docx);
     assert!(write(&nested, DocumentFormat::Docx).is_err());
 }
+
+#[test]
+fn test_a_workbook_with_too_many_sections_is_refused_when_writing() {
+    office_oxide::limits::set_max_write_sheets(3);
+    let sections = |n: usize| DocumentIR {
+        metadata: Metadata {
+            format: DocumentFormat::Xlsx,
+            ..Default::default()
+        },
+        sections: (0..n).map(|_| Section::default()).collect(),
+    };
+    let err =
+        write(&sections(4), DocumentFormat::Xlsx).expect_err("4 sections exceed a limit of 3");
+    assert!(matches!(err, OfficeError::Core(CoreError::PackageLimit(_))), "{err:?}");
+    assert!(err.to_string().contains("set_max_write_sheets"));
+    write(&sections(3), DocumentFormat::Xlsx).expect("3 sections are within the limit");
+}
