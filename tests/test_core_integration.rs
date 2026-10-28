@@ -133,7 +133,7 @@ fn test_full_round_trip() {
     let doc_rels = reader.read_rels_for(&doc_name).unwrap();
     let style_rels = doc_rels.get_by_type(rel_types::STYLES);
     assert_eq!(style_rels.len(), 1);
-    assert_eq!(style_rels[0].target, "styles.xml");
+    assert_eq!(&*style_rels[0].target, "styles.xml");
 
     let theme_rels = doc_rels.get_by_type(rel_types::THEME);
     assert_eq!(theme_rels.len(), 1);
@@ -212,7 +212,7 @@ fn test_relationships_external_target_mode() {
     let rels = Relationships::parse(xml).unwrap();
     let r = rels.get_by_id("rId1").unwrap();
     assert_eq!(r.target_mode, TargetMode::External);
-    assert_eq!(r.target, "https://example.com");
+    assert_eq!(&*r.target, "https://example.com");
 }
 
 #[test]
@@ -414,7 +414,7 @@ fn test_relationships_builder_generates_sequential_ids() {
 
     let hyperlink = rels.get_by_id("rId3").unwrap();
     assert_eq!(hyperlink.target_mode, TargetMode::External);
-    assert_eq!(hyperlink.target, "https://example.com");
+    assert_eq!(&*hyperlink.target, "https://example.com");
 }
 
 // ---------------------------------------------------------------------------

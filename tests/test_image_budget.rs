@@ -215,7 +215,10 @@ fn test_pptx_pictures_sharing_one_image_stop_copying_at_the_budget() {
 }
 
 /// Notes whose size is almost all link target, not visible text: the
-/// per-slide copies are charged by what they hold, not by what they show.
+/// per-slide copies are charged by what they hold, not by what they show. The
+/// one shared conversion, whose link target is itself a copy of the
+/// relationship's text, is charged to the same budget, so one slide's notes fit
+/// where two copies of the notes alone would.
 #[test]
 fn test_pptx_shared_notes_made_of_link_targets_stay_bounded() {
     limits();
@@ -274,6 +277,6 @@ fn test_pptx_shared_notes_made_of_link_targets_stay_bounded() {
         .iter()
         .filter(|s| s.speaker_notes.is_some())
         .count();
-    assert_eq!(with_notes, 2, "copies are charged by what they hold, not by their visible text");
+    assert_eq!(with_notes, 1, "copies are charged by what they hold, not by their visible text");
     assert!(ir.metadata.text_truncated);
 }

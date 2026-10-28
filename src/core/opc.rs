@@ -396,7 +396,7 @@ impl<R: Read + Seek> OpcReader<R> {
         // Primary: use the officeDocument relationship from _rels/.rels
         if let Some(rel) = self.package_rels.first_by_type(rel_types::OFFICE_DOCUMENT) {
             let target = if rel.target.starts_with('/') {
-                rel.target.clone()
+                rel.target.to_string()
             } else {
                 format!("/{}", rel.target)
             };

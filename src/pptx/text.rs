@@ -1153,9 +1153,7 @@ mod tests {
                             italic: None,
                             strikethrough: false,
                             hyperlink: Some(HyperlinkInfo {
-                                target: HyperlinkTarget::External(
-                                    "https://example.com".to_string(),
-                                ),
+                                target: HyperlinkTarget::External("https://example.com".into()),
                                 tooltip: None,
                             }),
                             font_size_hundredths_pt: None,

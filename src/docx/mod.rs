@@ -67,6 +67,7 @@ pub use table::{
 
 use std::io::{Read, Seek};
 use std::path::Path;
+use std::sync::Arc;
 
 use log::debug;
 use quick_xml::events::Event;
@@ -122,6 +123,9 @@ pub struct DocxDocument {
     /// part and the error. They are skipped so the body still opens —
     /// the policy Tika/POI follow — and reported here instead of vanishing.
     pub unreadable_parts: Vec<String>,
+    /// Set when hyperlink target text copied while reading exceeded the text
+    /// budget and some link lost its fragment or its target.
+    pub(crate) link_notice: Option<String>,
     /// Font programs found under `word/fonts/`. Each entry is
     /// `(font_name, ttf_or_otf_bytes)`. PDF→DOCX→PDF round-trips use these
     /// to preserve typeface fidelity (e.g. CJK / math fonts beyond
@@ -262,12 +266,13 @@ impl DocxDocument {
         };
 
         // Parse main document
+        let links = LinkBudget::new();
         let doc_data = opc.read_part(&main_part)?;
         // A part cut off mid-element parses to whatever was read before the
         // cut and reports success; check the root actually closed.
         xml::check_root_closed(&doc_data, main_part.as_str(), "document")?;
         let (mut body, sections, alt_chunk_rids, alt_chunk_positions) =
-            parse_document(&doc_data, &doc_rels)?;
+            parse_document(&doc_data, &doc_rels, &links)?;
 
         // Resolve each `<w:altChunk>` and splice its text in at the point
         // the document references it. HTML and plain-text chunks are read;
@@ -421,7 +426,7 @@ impl DocxDocument {
                             },
                         };
                         if let Ok(hf_rels) = opc.read_rels_for(&part_name) {
-                            resolve_hyperlinks(&mut content, &hf_rels);
+                            resolve_hyperlinks(&mut content, &hf_rels, &links);
                             qualify_part_images(
                                 &mut content,
                                 &part_name,
@@ -514,7 +519,7 @@ impl DocxDocument {
             // "URL" for every note hyperlink.
             if let Ok(note_rels) = opc.read_rels_for(&part) {
                 for n in &mut notes {
-                    resolve_hyperlinks(&mut n.content, &note_rels);
+                    resolve_hyperlinks(&mut n.content, &note_rels, &links);
                     qualify_part_images(
                         &mut n.content,
                         &part,
@@ -621,6 +626,7 @@ impl DocxDocument {
             headers_footers,
             hf_by_ref,
             unreadable_parts: unreadable_parts.into_inner(),
+            link_notice: links.notice(),
             embedded_fonts,
             images,
             core_properties,
@@ -1117,6 +1123,7 @@ type ParsedDocument = (Body, Vec<SectionProperties>, Vec<String>, Vec<usize>);
 fn parse_document(
     xml_data: &[u8],
     rels: &crate::core::relationships::Relationships,
+    links: &LinkBudget,
 ) -> CoreResult<ParsedDocument> {
     let mut reader = make_content_reader(xml_data);
     let mut elements = Vec::new();
@@ -1193,7 +1200,7 @@ fn parse_document(
     }
 
     // Resolve hyperlink targets using relationships
-    resolve_hyperlinks(&mut elements, rels);
+    resolve_hyperlinks(&mut elements, rels, links);
 
     // Detect mid-document section breaks: paragraphs whose <w:pPr>
     // carries a <w:sectPr>. Each such paragraph terminates a section,
@@ -1224,10 +1231,74 @@ fn parse_document(
     Ok((body, all_sections, alt_chunk_rids, alt_chunk_positions))
 }
 
+/// The characters of hyperlink target text one document may materialise while
+/// it is read, shared by every part: a relationship's target is stored once and
+/// shared by the links that name it, but a link that adds a fragment, or names
+/// an internal target, owns a copy of the text.
+struct LinkBudget {
+    spent: std::cell::RefCell<crate::limits::TextBudget>,
+}
+
+impl LinkBudget {
+    fn new() -> Self {
+        Self {
+            spent: std::cell::RefCell::new(crate::limits::TextBudget::new()),
+        }
+    }
+
+    /// Charge `chars` before they are copied; `false` when the budget is spent.
+    fn charge(&self, chars: usize) -> bool {
+        self.spent.borrow_mut().charge(chars)
+    }
+
+    /// The notice to report when some link text was left out.
+    fn notice(&self) -> Option<String> {
+        let b = self.spent.borrow();
+        b.exhausted().then(|| {
+            format!(
+                "some hyperlink targets were shortened or left out: their text exceeds the {} \
+                 character budget (office_oxide::limits::set_max_text_chars)",
+                b.limit()
+            )
+        })
+    }
+}
+
+/// A hyperlink's target from the relationship it names (ECMA-376 §17.16.22):
+/// the relationship's own text, shared, plus any `w:anchor` as a URI fragment.
+/// Text that would have to be copied is charged first; when the budget is
+/// spent the link keeps the shared external target without its fragment, or
+/// loses an internal target.
+fn resolve_link_target(
+    rel: &crate::core::relationships::Relationship,
+    fragment: Option<&str>,
+    links: &LinkBudget,
+) -> HyperlinkTarget {
+    if rel.target_mode != TargetMode::External {
+        return if links.charge(rel.target.len() + fragment.map_or(0, |f| f.len() + 1)) {
+            let mut t = rel.target.to_string();
+            if let Some(frag) = fragment {
+                t.push('#');
+                t.push_str(frag);
+            }
+            HyperlinkTarget::Internal(t)
+        } else {
+            HyperlinkTarget::Internal(String::new())
+        };
+    }
+    match fragment {
+        Some(frag) if links.charge(rel.target.len() + 1 + frag.len()) => {
+            HyperlinkTarget::External(format!("{}#{frag}", rel.target).into())
+        },
+        _ => HyperlinkTarget::External(Arc::clone(&rel.target)),
+    }
+}
+
 /// Walk the element tree and resolve hyperlink rIds to actual URLs.
 fn resolve_hyperlinks(
     elements: &mut [BlockElement],
     rels: &crate::core::relationships::Relationships,
+    links: &LinkBudget,
 ) {
     for elem in elements.iter_mut() {
         match elem {
@@ -1238,20 +1309,11 @@ fn resolve_hyperlinks(
                             if let HyperlinkTarget::External(ref r_id) = hl.target {
                                 match rels.get_by_id(r_id) {
                                     Some(rel) => {
-                                        // A `w:anchor` alongside `r:id` is a URI
-                                        // fragment of the resolved target.
-                                        let mut t = rel.target.clone();
-                                        if let Some(frag) =
-                                            hl.fragment.as_deref().filter(|f| !f.is_empty())
-                                        {
-                                            t.push('#');
-                                            t.push_str(frag);
-                                        }
-                                        hl.target = if rel.target_mode == TargetMode::External {
-                                            HyperlinkTarget::External(t)
-                                        } else {
-                                            HyperlinkTarget::Internal(t)
-                                        };
+                                        hl.target = resolve_link_target(
+                                            rel,
+                                            hl.fragment.as_deref().filter(|f| !f.is_empty()),
+                                            links,
+                                        );
                                     },
                                     // Unresolvable relationship: a bare
                                     // relationship id is not a URL. Fall back
@@ -1267,11 +1329,11 @@ fn resolve_hyperlinks(
                                 }
                             }
                             for run in &mut hl.runs {
-                                resolve_hyperlinks_in_run(run, rels);
+                                resolve_hyperlinks_in_run(run, rels, links);
                             }
                         },
                         ParagraphContent::Run(run) => {
-                            resolve_hyperlinks_in_run(run, rels);
+                            resolve_hyperlinks_in_run(run, rels, links);
                         },
                     }
                 }
@@ -1279,7 +1341,7 @@ fn resolve_hyperlinks(
             BlockElement::Table(t) => {
                 for row in &mut t.rows {
                     for cell in &mut row.cells {
-                        resolve_hyperlinks(&mut cell.content, rels);
+                        resolve_hyperlinks(&mut cell.content, rels, links);
                     }
                 }
             },
@@ -1291,13 +1353,17 @@ fn resolve_hyperlinks(
 /// prose is ordinary content and carries ordinary links), and a linked
 /// picture's relationship id to its target — like a hyperlink's, `r:link`
 /// is scoped to the part it appears in.
-fn resolve_hyperlinks_in_run(run: &mut Run, rels: &crate::core::relationships::Relationships) {
+fn resolve_hyperlinks_in_run(
+    run: &mut Run,
+    rels: &crate::core::relationships::Relationships,
+    links: &LinkBudget,
+) {
     for rc in &mut run.content {
         match rc {
-            RunContent::TextBox(blocks) => resolve_hyperlinks(blocks, rels),
+            RunContent::TextBox(blocks) => resolve_hyperlinks(blocks, rels, links),
             RunContent::Drawing(d) => {
                 if let Some(rid) = d.linked_image_rid.as_deref() {
-                    d.linked_image = rels.get_by_id(rid).map(|rel| rel.target.clone());
+                    d.linked_image = rels.get_by_id(rid).map(|rel| Arc::clone(&rel.target));
                     if d.linked_image.is_none() {
                         log::warn!("docx: linked picture {rid} has no relationship");
                     }
@@ -1972,7 +2038,7 @@ fn hyperlink_target_from_instr(instr: &str) -> Option<(HyperlinkTarget, Option<S
                 u.push('#');
                 u.push_str(&a);
             }
-            HyperlinkTarget::External(u)
+            HyperlinkTarget::External(u.into())
         },
         (None, Some(a)) => HyperlinkTarget::Internal(a),
         (None, None) => return None,
@@ -1999,7 +2065,7 @@ fn parse_hyperlink(
     let (target, fragment) = match (r_id, anchor) {
         // Will be resolved to the actual URL after parsing via
         // `resolve_hyperlinks()`.
-        (Some(r_id), anchor) => (HyperlinkTarget::External(r_id), anchor),
+        (Some(r_id), anchor) => (HyperlinkTarget::External(r_id.into()), anchor),
         (None, Some(anchor)) => (HyperlinkTarget::Internal(anchor), None),
         (None, None) => (HyperlinkTarget::Internal(String::new()), None),
     };
@@ -3729,7 +3795,7 @@ mod tests {
 <w:p><w:r><w:t>para</w:t></w:r></w:p>
 </w:body></w:document>"#;
         let rels = crate::core::relationships::Relationships::empty();
-        let parsed = parse_document(xml, &rels).unwrap();
+        let parsed = parse_document(xml, &rels, &LinkBudget::new()).unwrap();
         let BlockElement::Table(table) = &parsed.0.elements[0] else {
             panic!("first element is the table")
         };
@@ -4587,7 +4653,7 @@ mod tests {
         });
         let hl = hl.expect("hyperlink was not captured");
         match &hl.target {
-            HyperlinkTarget::External(rid) => assert_eq!(rid, "rId7"),
+            HyperlinkTarget::External(rid) => assert_eq!(&**rid, "rId7"),
             other => panic!("expected an External target carrying r:id, got {other:?}"),
         }
         assert_eq!(hl.fragment.as_deref(), Some("section1"));
@@ -4611,7 +4677,7 @@ mod tests {
         });
         let hl = hl.expect("field-code hyperlink was not resolved");
         match &hl.target {
-            HyperlinkTarget::External(url) => assert_eq!(url, "https://example.com/page"),
+            HyperlinkTarget::External(url) => assert_eq!(&**url, "https://example.com/page"),
             other => panic!("expected an External URL target, got {other:?}"),
         }
         let text: String = hl
@@ -5818,7 +5884,7 @@ mod tests {
         let hl = hl.expect("hyperlink was not captured in the footnote body");
         assert_eq!(
             hl.target,
-            HyperlinkTarget::External("https://example.com/source".to_string()),
+            HyperlinkTarget::External("https://example.com/source".into()),
             "the footnote hyperlink must resolve against footnotes.xml's own rels, not the \
              document's — got {:?}",
             hl.target

@@ -1408,7 +1408,7 @@ fn parse_hyperlink(
 
     let target = if let Some(rid) = r_id {
         if let Some(rel) = rels.get_by_id(&rid) {
-            HyperlinkTarget::External(rel.target.clone())
+            HyperlinkTarget::External(rel.target.to_string())
         } else {
             return Ok(None);
         }

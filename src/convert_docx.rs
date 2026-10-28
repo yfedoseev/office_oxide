@@ -155,6 +155,7 @@ impl<'a, 'd> Cx<'a, 'd> {
 
 pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
     crate::limits::begin_image_budget();
+    crate::limits::begin_copied_text_budget();
     let folds = StyleFolds::default();
     let cx = Cx {
         doc,
@@ -207,7 +208,6 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
     // without bound.
     let mut hf_converted: Vec<Option<Option<(HeaderFooter, usize)>>> =
         vec![None; doc.headers_footers.len()];
-    let mut hf_budget = crate::limits::TextBudget::new();
     let mut per_section: Vec<SectionHeaders> = Vec::new();
     for slots in &doc.hf_by_ref {
         let mut slot = SectionHeaders::default();
@@ -238,7 +238,7 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             let Some((part, chars)) = converted.clone() else {
                 continue;
             };
-            if !hf_budget.charge(chars) {
+            if !crate::limits::charge_copied_text(chars) {
                 continue;
             }
             let target = match (hf.is_header, hf.hf_type) {
@@ -253,7 +253,6 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
         }
         per_section.push(slot);
     }
-    let hf_truncated = hf_budget.exhausted().then(|| hf_budget.notice());
 
     let mut ir_sections: Vec<Section> = Vec::with_capacity(windows.len());
     let mut doc_title: Option<String> = None;
@@ -402,6 +401,8 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
     // Real document metadata beats a title guessed from the first heading,
     // but the guess stays as the fallback for files with no core properties.
     let cp = doc.core_properties.as_ref();
+    // Read after every conversion above: links in the body are charged too.
+    let copied_text_notice = crate::limits::copied_text_notice();
     DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Docx,
@@ -419,12 +420,15 @@ pub(crate) fn docx_to_ir(doc: &crate::docx::DocxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
-            text_truncated: !doc.unreadable_parts.is_empty() || hf_truncated.is_some(),
+            text_truncated: !doc.unreadable_parts.is_empty()
+                || copied_text_notice.is_some()
+                || doc.link_notice.is_some(),
             warnings: doc
                 .unreadable_parts
                 .iter()
                 .map(|p| format!("skipped unreadable part {p}"))
-                .chain(hf_truncated)
+                .chain(copied_text_notice)
+                .chain(doc.link_notice.clone())
                 .chain(crate::limits::image_budget_warning())
                 .chain(crate::core::core_properties::package_warnings(Some(
                     &doc.package_properties,
@@ -1058,7 +1062,7 @@ fn collect_paragraph_inline_images(
                         alt_text: d.description.clone(),
                         decorative: d.decorative,
                         data,
-                        source_url: d.linked_image.clone(),
+                        source_url: linked_image_url(d),
                         format,
                         display_width_emu: Some(d.width.0.max(0) as u64),
                         display_height_emu: Some(d.height.0.max(0) as u64),
@@ -1205,7 +1209,7 @@ fn drawing_to_float_element(
         alt_text: d.description.clone(),
         decorative: d.decorative,
         data,
-        source_url: d.linked_image.clone(),
+        source_url: linked_image_url(d),
         format,
         display_width_emu: Some(width_emu),
         display_height_emu: Some(height_emu),
@@ -1221,6 +1225,15 @@ fn drawing_to_float_element(
         }),
         ..Default::default()
     }))
+}
+
+/// A linked picture's target as an owned URL, charged to the copied-text
+/// budget before it is copied; `None` once the budget is spent.
+fn linked_image_url(d: &crate::docx::DrawingInfo) -> Option<String> {
+    d.linked_image
+        .as_deref()
+        .filter(|url| crate::limits::charge_copied_text(url.len()))
+        .map(str::to_string)
 }
 
 /// A drawing's embedded picture bytes and file extension, if the package
@@ -1355,11 +1368,16 @@ struct RunContext<'a, 'd> {
 /// links become fragment references (`#bookmark`) rather than being
 /// dropped — a table-of-contents built from internal links used to lose
 /// every one of its destinations.
-fn hyperlink_url(hl: &crate::docx::Hyperlink) -> Option<String> {
+///
+/// The external target is borrowed from the document, where every link that
+/// names it shares one allocation; a copy is made, and charged, only where the
+/// URL lands in an IR span.
+fn hyperlink_url(hl: &crate::docx::Hyperlink) -> Option<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
     match &hl.target {
-        crate::docx::HyperlinkTarget::External(url) => Some(url.clone()),
+        crate::docx::HyperlinkTarget::External(url) => Some(Cow::Borrowed(url)),
         crate::docx::HyperlinkTarget::Internal(anchor) if !anchor.is_empty() => {
-            Some(format!("#{anchor}"))
+            Some(Cow::Owned(format!("#{anchor}")))
         },
         crate::docx::HyperlinkTarget::Internal(_) => None,
     }
@@ -1535,6 +1553,9 @@ fn convert_run_content(
     // `crate::core::units::HalfPoint::from_word_sz`).
     let push_text = |text: &str, content: &mut Vec<InlineContent>| {
         eff.for_each_script_segment(text, ascii, |piece, face| {
+            // Each span owns its link, so the URL is charged before it is
+            // copied; once the budget is spent the text stays, unlinked.
+            let link = link.filter(|(url, _)| crate::limits::charge_copied_text(url.len()));
             content.push(InlineContent::Text(TextSpan {
                 text: piece.to_string(),
                 bold,

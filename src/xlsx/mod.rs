@@ -1238,7 +1238,7 @@ fn read_drawing_for_sheet<R: Read + Seek>(
         let Some(bytes) = read_media_cached(archive, entries, &media_path, media) else {
             continue;
         };
-        let ext = std::path::Path::new(&rel.target)
+        let ext = std::path::Path::new(&*rel.target)
             .extension()
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_lowercase())
@@ -1361,7 +1361,7 @@ fn read_rich_value_images<R: Read + Seek>(
         let Some(bytes) = read_media_cached(archive, entries, &media_path, media) else {
             continue;
         };
-        let ext = Path::new(&rel.target)
+        let ext = Path::new(&*rel.target)
             .extension()
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_lowercase())

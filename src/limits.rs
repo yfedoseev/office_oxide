@@ -298,6 +298,35 @@ pub(crate) fn begin_image_budget() {
     IMAGE_BUDGET.with(|b| b.set((max_image_bytes() as u64, false)));
 }
 
+thread_local! {
+    /// Text the running conversion has copied out of the document's shared
+    /// storage (a hyperlink target, a shared header, a speaker-notes body).
+    static COPIED_TEXT: std::cell::RefCell<TextBudget> =
+        std::cell::RefCell::new(TextBudget::new());
+}
+
+/// Start a conversion's budget for copied text at the configured limit
+/// ([`max_text_chars`]).
+pub(crate) fn begin_copied_text_budget() {
+    COPIED_TEXT.with(|b| *b.borrow_mut() = TextBudget::new());
+}
+
+/// Charge `chars` of text about to be copied into the output against the
+/// running conversion's budget, before the copy is made. `false` (from the
+/// first refusal on) means the caller leaves the text out.
+pub(crate) fn charge_copied_text(chars: usize) -> bool {
+    COPIED_TEXT.with(|b| b.borrow_mut().charge(chars))
+}
+
+/// The line to report when copied text was left out, or `None` when the
+/// budget held.
+pub(crate) fn copied_text_notice() -> Option<String> {
+    COPIED_TEXT.with(|b| {
+        let b = b.borrow();
+        b.exhausted().then(|| b.notice())
+    })
+}
+
 /// Charge `bytes` of image data against the running conversion's budget.
 /// `false` (from the first refusal on) means the caller leaves the bytes out.
 pub(crate) fn charge_image_bytes(bytes: usize) -> bool {

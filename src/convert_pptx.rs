@@ -3,6 +3,7 @@ use crate::ir::*;
 
 pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
     crate::limits::begin_image_budget();
+    crate::limits::begin_copied_text_budget();
     // Slide size sits at presentation level — every slide in the
     // deck shares it.
     let page_setup = doc
@@ -12,11 +13,10 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         .and_then(slide_page_setup);
 
     let mut sections = Vec::new();
-    // Converted notes, by the shared body they came from, and the budget
-    // their per-slide copies are charged against.
+    // Converted notes, by the shared body they came from; their per-slide
+    // copies are charged to the copied-text budget.
     let mut notes_cache: std::collections::HashMap<usize, (Vec<Element>, usize)> =
         std::collections::HashMap::new();
-    let mut notes_budget = crate::limits::TextBudget::new();
 
     for slide in doc.slides.iter() {
         if let Some(ref err) = slide.parse_error {
@@ -100,7 +100,8 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
                 let chars = serde_json::to_vec(&converted).map_or(usize::MAX, |v| v.len());
                 (converted, chars)
             });
-            (!converted.is_empty() && notes_budget.charge(*chars)).then(|| converted.clone())
+            (!converted.is_empty() && crate::limits::charge_copied_text(*chars))
+                .then(|| converted.clone())
         });
 
         // Slide comments are review content that reached no consumer at
@@ -167,6 +168,8 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         });
     }
 
+    // Read after every conversion above: links and notes are charged too.
+    let copied_text_notice = crate::limits::copied_text_notice();
     let mut ir = DocumentIR {
         metadata: Metadata {
             format: DocumentFormat::Pptx,
@@ -181,7 +184,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
             modified: cp.and_then(|c| c.modified.clone()),
             description: cp.and_then(|c| c.description.clone()),
             has_macros: doc.has_macros,
-            text_truncated: !doc.unreadable_parts.is_empty() || notes_budget.exhausted(),
+            text_truncated: !doc.unreadable_parts.is_empty() || copied_text_notice.is_some(),
             ..crate::core::core_properties::ooxml_metadata_extras(
                 cp,
                 doc.app_properties.as_ref(),
@@ -190,9 +193,7 @@ pub(crate) fn pptx_to_ir(doc: &crate::pptx::PptxDocument) -> DocumentIR {
         },
         sections,
     };
-    if notes_budget.exhausted() {
-        ir.metadata.warnings.push(notes_budget.notice());
-    }
+    ir.metadata.warnings.extend(copied_text_notice);
     ir.metadata
         .warnings
         .extend(crate::limits::image_budget_warning());
@@ -431,7 +432,7 @@ fn convert_shape(shape: &crate::pptx::Shape, elements: &mut Vec<Element>) {
                 display_width_emu: display_w,
                 display_height_emu: display_h,
                 hyperlink: pic.hyperlink.as_ref().and_then(hyperlink_info_url),
-                source_url: pic.link_target.clone(),
+                source_url: pic.link_target.as_deref().and_then(copied_url),
                 ..Default::default()
             });
             push_positional_textbox(elements, vec![img_el], pic.position.as_ref());
@@ -748,10 +749,21 @@ fn emu_to_twips(emu: i64) -> i32 {
 /// own `hyperlink_url` treats `w:anchor`.
 fn hyperlink_info_url(info: &crate::pptx::HyperlinkInfo) -> Option<String> {
     match &info.target {
-        crate::pptx::HyperlinkTarget::External(url) => Some(url.clone()),
-        crate::pptx::HyperlinkTarget::Internal(loc) if !loc.is_empty() => Some(format!("#{loc}")),
+        crate::pptx::HyperlinkTarget::External(url) => copied_url(url),
+        crate::pptx::HyperlinkTarget::Internal(loc) if !loc.is_empty() => {
+            // `#` and the target, charged before either is copied.
+            crate::limits::charge_copied_text(loc.len() + 1).then(|| format!("#{loc}"))
+        },
         crate::pptx::HyperlinkTarget::Internal(_) => None,
     }
+}
+
+/// A target shared in the document, copied into one IR field. The copy is
+/// charged to the copied-text budget first, so a relationship target that many
+/// runs name cannot be multiplied without bound; `None` once the budget is
+/// spent.
+fn copied_url(url: &str) -> Option<String> {
+    crate::limits::charge_copied_text(url.len()).then(|| url.to_string())
 }
 
 fn convert_text_paragraph_inline(para: &crate::pptx::TextParagraph) -> Vec<InlineContent> {

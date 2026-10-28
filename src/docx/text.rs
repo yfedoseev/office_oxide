@@ -74,6 +74,7 @@ impl DocxDocument {
     /// of every page. Without this, simple-but-meaningful artefacts like
     /// `My header` / `My footer` are silently dropped.
     pub fn to_markdown(&self) -> String {
+        crate::limits::begin_copied_text_budget();
         let mut out = String::new();
         let ctx = MarkdownCtx {
             styles: self.styles.as_ref(),
@@ -125,6 +126,16 @@ impl DocxDocument {
 
         while out.ends_with('\n') {
             out.pop();
+        }
+        // A link target is shared in the document and copied into the output
+        // once per link; when the copies outgrew the text budget the links
+        // past it were written without their targets, and the output says so.
+        for notice in crate::limits::copied_text_notice()
+            .into_iter()
+            .chain(self.link_notice.clone())
+        {
+            out.push_str("\n\n");
+            out.push_str(&notice);
         }
         out
     }
@@ -585,6 +596,13 @@ fn markdown_blocks_inner(
                             flush_run(&mut pending, out);
                             let text = runs_to_plain_text(&hl.runs, hidden);
                             match &hl.target {
+                                // Past the budget the link text stays,
+                                // unlinked.
+                                HyperlinkTarget::External(url)
+                                    if !crate::limits::charge_copied_text(url.len()) =>
+                                {
+                                    out.push_str(&text);
+                                },
                                 HyperlinkTarget::External(url) => {
                                     out.push('[');
                                     out.push_str(&text);
@@ -804,6 +822,7 @@ fn markdown_drawing(drawing: &DrawingInfo, out: &mut String) {
     if let Some(url) = drawing
         .linked_image
         .as_deref()
+        .filter(|u| crate::limits::charge_copied_text(u.len()))
         .and_then(crate::ir_render::safe_url)
     {
         out.push_str("![");
