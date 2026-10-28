@@ -417,6 +417,7 @@ impl DocDocument {
                     fib.fc_plcf_and_ref,
                     fib.lcb_plcf_and_ref,
                     &comment_authors,
+                    &mut work_warnings,
                 );
             }
             // Text boxes: each box's story is delimited by its PLC.
@@ -1230,7 +1231,11 @@ fn plcf_hdd_first_section_cp(table_stream: &[u8], fc: u32, lcb: u32) -> Option<u
 /// `Vec` (meaning "fall back to the merged substory") whenever either
 /// PLC is absent/malformed, or the two disagree on comment count — that
 /// mismatch means the file doesn't match the fixed-size assumptions
-/// here closely enough to trust a per-comment split.
+/// here closely enough to trust a per-comment split. A `PlcfandTxt` whose
+/// boundaries run backwards is refused the same way, and reported in
+/// `warnings`: its ranges would overlap, and copying each one would copy the
+/// story again and again.
+#[allow(clippy::too_many_arguments)]
 fn parse_comments(
     table_stream: &[u8],
     raw_comment_text: &str,
@@ -1239,10 +1244,18 @@ fn parse_comments(
     fc_ref: u32,
     lcb_ref: u32,
     authors: &[String],
+    warnings: &mut Vec<String>,
 ) -> Vec<ParsedComment> {
-    let Some(bodies) = parse_plcf_and_txt_ranges(table_stream, raw_comment_text, fc_txt, lcb_txt)
-    else {
-        return Vec::new();
+    let bodies = match parse_plcf_and_txt_ranges(table_stream, raw_comment_text, fc_txt, lcb_txt) {
+        Ok(Some(bodies)) => bodies,
+        Ok(None) => return Vec::new(),
+        Err(()) => {
+            warnings.push(
+                "comments are not split: the comment text boundaries (PlcfandTxt) run backwards,                  so the comments are shown as one block"
+                    .to_string(),
+            );
+            return Vec::new();
+        },
     };
     let ibsts = parse_plcf_and_ref_ibsts(table_stream, fc_ref, lcb_ref);
     if bodies.len() != ibsts.len() {
@@ -1269,27 +1282,34 @@ fn parse_comments(
 /// usual PLC boundary CPs, and the final entry is undefined/ignored, per
 /// [MS-DOC] "PlcfandTxt". Each range's leading `0x0005` reference-mark
 /// character is stripped before returning.
+///
+/// `Ok(None)` when the PLC is absent or malformed; `Err(())` when its CPs
+/// decrease (a PLC's CPs are non-decreasing, [MS-DOC] "PLC"). With
+/// non-decreasing CPs the ranges are disjoint and in order, so one forward
+/// pass over the text cuts them all: nothing is copied twice, and the copies
+/// total at most the story, which the text budget was charged when the piece
+/// table was read.
 fn parse_plcf_and_txt_ranges(
     table_stream: &[u8],
     raw_comment_text: &str,
     fc: u32,
     lcb: u32,
-) -> Option<Vec<String>> {
+) -> std::result::Result<Option<Vec<String>>, ()> {
     if lcb == 0 {
-        return None;
+        return Ok(None);
     }
     let start = fc as usize;
     let end = start.saturating_add(lcb as usize).min(table_stream.len());
     if start >= end || !(end - start).is_multiple_of(4) {
-        return None;
+        return Ok(None);
     }
     let total_cps = (end - start) / 4;
     if total_cps < 2 {
-        return None;
+        return Ok(None);
     }
     let n = total_cps - 2;
     if n == 0 {
-        return None;
+        return Ok(None);
     }
 
     let cps: Vec<usize> = (0..=n)
@@ -1302,20 +1322,38 @@ fn parse_plcf_and_txt_ranges(
             ]) as usize
         })
         .collect();
+    if cps.windows(2).any(|w| w[1] < w[0]) {
+        return Err(());
+    }
 
-    Some(
+    // The byte offset of the character at each CP, found by advancing one
+    // cursor through the text; CPs past the end of the text are its end.
+    let mut at_char = 0usize;
+    let mut at_byte = 0usize;
+    let mut byte_of = |cp: usize| -> usize {
+        for c in raw_comment_text[at_byte..].chars() {
+            if at_char >= cp {
+                break;
+            }
+            at_char += 1;
+            at_byte += c.len_utf8();
+        }
+        at_byte
+    };
+    let bounds: Vec<usize> = cps.iter().map(|&cp| byte_of(cp)).collect();
+    Ok(Some(
         (0..n)
             .map(|i| {
-                let (lo, hi) = (cps[i], cps[i + 1]);
+                let (lo, hi) = (bounds[i], bounds[i + 1]);
                 if hi <= lo {
                     return String::new();
                 }
-                let text: String = raw_comment_text.chars().skip(lo).take(hi - lo).collect();
-                let text = text.strip_prefix('\u{5}').unwrap_or(&text);
+                let text = &raw_comment_text[lo..hi];
+                let text = text.strip_prefix('\u{5}').unwrap_or(text);
                 sanitize_text(text).trim().to_string()
             })
             .collect(),
-    )
+    ))
 }
 
 /// `PlcfandRef`'s data elements are `ATRDPre10` structures (30 bytes
@@ -2402,6 +2440,7 @@ mod tests {
             and_ref_fc,
             and_ref.len() as u32,
             &authors,
+            &mut Vec::new(),
         );
 
         assert_eq!(comments.len(), 2, "expected 2 split comments: {comments:?}");
@@ -2437,6 +2476,7 @@ mod tests {
             and_txt.len() as u32,
             and_ref.len() as u32,
             &[],
+            &mut Vec::new(),
         );
         assert!(comments.is_empty(), "count mismatch must fall back to empty: {comments:?}");
     }

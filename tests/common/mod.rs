@@ -215,6 +215,35 @@ pub fn build_doc_streams(
     build_streams(paras, subdocs, tweaks, &[], &[])
 }
 
+/// Append a `PlcfandTxt` ([MS-DOC] "PlcfandTxt", the comment-body boundary
+/// CPs `aCP`: `n + 2` entries for `n` comments) and a `PlcfandRef` of `n`
+/// 30-byte `ATRDPre10` entries to a built document's Table stream and point
+/// the FIB's `fcPlcfandRef`/`fcPlcfandTxt` (0x00BA/0x00C2) at them, so the
+/// reader sees `and_txt_cps.len() - 2` comments.
+#[allow(dead_code)]
+pub fn with_comment_plcs(word_doc: &mut [u8], table: &mut Vec<u8>, and_txt_cps: &[u32]) {
+    let n = and_txt_cps.len().saturating_sub(2);
+    let fc_ref = table.len() as u32;
+    for i in 0..=n {
+        table.extend_from_slice(&(i as u32).to_le_bytes());
+    }
+    table.extend(std::iter::repeat_n(0u8, 30 * n));
+    let lcb_ref = table.len() as u32 - fc_ref;
+    let fc_txt = table.len() as u32;
+    for cp in and_txt_cps {
+        table.extend_from_slice(&cp.to_le_bytes());
+    }
+    let lcb_txt = table.len() as u32 - fc_txt;
+    for (off, v) in [
+        (0x00BA, fc_ref),
+        (0x00BE, lcb_ref),
+        (0x00C2, fc_txt),
+        (0x00C6, lcb_txt),
+    ] {
+        word_doc[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+}
+
 /// Build a synthetic `.doc` whose paragraphs carry the given PAPX `istd` values
 /// and whose Table stream ends with `stsh` (an STSH style sheet).
 ///

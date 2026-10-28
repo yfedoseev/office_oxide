@@ -45,3 +45,10 @@ name = "fuzz_doc_pieces"
 path = "fuzz_targets/fuzz_doc_pieces.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_doc_comments"
+path = "fuzz_targets/fuzz_doc_comments.rs"
+test = false
+doc = false
+bench = false
